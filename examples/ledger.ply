@@ -1,0 +1,243 @@
+// A double-entry ledger, in cents. A posting is positive on the debit side and
+// negative on the credit side, so an entry is balanced exactly when its
+// postings sum to zero. Everything here is pure: every definition has an empty
+// footprint, so every test in this file is free to run concurrently with every
+// other one.
+
+type Kind =
+  | Asset
+  | Liability
+  | Equity
+  | Revenue
+  | Expense
+
+type Account = { code: String, kind: Kind }
+
+type Posting = { account: String, amount: Int }
+
+type Entry = { date: Int, memo: String, postings: List<Posting> }
+
+type Option<a> = None | Some(a)
+
+type Balance =
+  | Balanced
+  | Off(Int)
+
+type Posted =
+  | Accepted(List<Entry>)
+  | Rejected(Int)
+
+fn debit(account: String, amount: Int) -> Posting =
+  {account: account, amount: amount}
+
+fn credit(account: String, amount: Int) -> Posting =
+  {account: account, amount: -amount}
+
+fn entry(date: Int, memo: String, postings: List<Posting>) -> Entry =
+  {date: date, memo: memo, postings: postings}
+
+fn transfer(date: Int, memo: String, from: String, to: String, amount: Int) -> Entry =
+  entry(date, memo, [debit(to, amount), credit(from, amount)])
+
+fn sum_postings(ps: List<Posting>) -> Int =
+  match ps {
+    [p, ..rest] -> p.amount + sum_postings(rest),
+    _ -> 0,
+  }
+
+fn check(e: Entry) -> Balance =
+  match sum_postings(e.postings) {
+    0 -> Balanced,
+    off -> Off(off),
+  }
+
+fn is_balanced(e: Entry) -> Bool =
+  match check(e) {
+    Balanced -> true,
+    Off(_) -> false,
+  }
+
+// The only way into a ledger: an entry that does not balance never lands.
+fn post(ledger: List<Entry>, e: Entry) -> Posted =
+  match check(e) {
+    Balanced -> Accepted(push(ledger, e)),
+    Off(off) -> Rejected(off),
+  }
+
+fn account_total(ps: List<Posting>, account: String) -> Int =
+  fold(ps, 0, |acc, p: Posting| if p.account == account { acc + p.amount } else { acc })
+
+fn balance(ledger: List<Entry>, account: String) -> Int =
+  match ledger {
+    [e, ..rest] -> account_total(e.postings, account) + balance(rest, account),
+    _ -> 0,
+  }
+
+fn trial_balance(ledger: List<Entry>) -> Int =
+  fold(ledger, 0, |acc, e: Entry| acc + sum_postings(e.postings))
+
+fn kind_of(chart: List<Account>, code: String) -> Option<Kind> =
+  match chart {
+    [a, ..rest] -> if a.code == code { Some(a.kind) } else { kind_of(rest, code) },
+    _ -> None,
+  }
+
+// Debits raise an asset or an expense and lower everything else, so a
+// presented figure is the raw balance times the account's normal sign.
+fn normal_sign(kind: Kind) -> Int =
+  match kind {
+    Asset -> 1,
+    Expense -> 1,
+    Liability -> -1,
+    Equity -> -1,
+    Revenue -> -1,
+  }
+
+fn presented(chart: List<Account>, ledger: List<Entry>, code: String) -> Option<Int> =
+  match kind_of(chart, code) {
+    Some(kind) -> Some(normal_sign(kind) * balance(ledger, code)),
+    None -> None,
+  }
+
+fn touching(ledger: List<Entry>, account: String) -> List<Entry> =
+  filter(ledger, |e: Entry| account_total(e.postings, account) != 0)
+
+fn memos(ledger: List<Entry>) -> List<String> =
+  map(ledger, |e: Entry| e.memo)
+
+fn running_from(ledger: List<Entry>, account: String, opening: Int, seen: List<Int>) -> List<Int> =
+  match ledger {
+    [e, ..rest] -> {
+      let next = opening + account_total(e.postings, account);
+      running_from(rest, account, next, push(seen, next))
+    },
+    _ -> seen,
+  }
+
+fn running(ledger: List<Entry>, account: String) -> List<Int> =
+  running_from(ledger, account, 0, [])
+
+fn chart() -> List<Account> = [
+  {code: "cash", kind: Asset},
+  {code: "receivable", kind: Asset},
+  {code: "loan", kind: Liability},
+  {code: "capital", kind: Equity},
+  {code: "sales", kind: Revenue},
+  {code: "rent", kind: Expense},
+]
+
+fn journal() -> List<Entry> = [
+  transfer(20260104, "seed capital", "capital", "cash", 500000),
+  transfer(20260111, "january rent", "cash", "rent", 120000),
+  entry(20260118, "invoice #1", [
+    debit("receivable", 90000),
+    credit("sales", 90000),
+  ]),
+  transfer(20260125, "invoice #1 paid", "receivable", "cash", 90000),
+]
+
+test "a transfer moves one amount between two accounts" {
+  let e = transfer(20260104, "seed capital", "capital", "cash", 500000);
+  assert_eq(len(e.postings), 2);
+  assert_eq(account_total(e.postings, "cash"), 500000);
+  assert_eq(account_total(e.postings, "capital"), -500000)
+}
+
+test "debit and credit are mirror images" {
+  assert_eq(debit("cash", 250).amount, 250);
+  assert_eq(credit("cash", 250).amount, -250);
+  assert_eq(sum_postings([debit("cash", 250), credit("cash", 250)]), 0)
+}
+
+test "a balanced entry reports Balanced" {
+  assert_eq(check(transfer(20260104, "seed", "capital", "cash", 1)), Balanced);
+  assert(is_balanced(transfer(20260104, "seed", "capital", "cash", 1)))
+}
+
+test "an unbalanced entry says how far off it is" {
+  let lopsided = entry(20260104, "typo", [
+    debit("cash", 500000),
+    credit("capital", 499000),
+  ]);
+  assert_eq(check(lopsided), Off(1000));
+  assert(!is_balanced(lopsided))
+}
+
+test "posting accepts a balanced entry" {
+  let e = transfer(20260201, "february rent", "cash", "rent", 120000);
+  match post([], e) {
+    Accepted(ledger) -> assert_eq(len(ledger), 1),
+    Rejected(off) -> panic("balanced entry rejected, off by " ++ int_to_string(off)),
+  }
+}
+
+test "posting rejects an unbalanced entry and leaves the ledger alone" {
+  let e = entry(20260201, "typo", [debit("cash", 10), credit("capital", 9)]);
+  match post(journal(), e) {
+    Accepted(_) -> panic("an unbalanced entry was posted"),
+    Rejected(off) -> assert_eq(off, 1),
+  }
+}
+
+test "a balance sums every posting that names the account" {
+  assert_eq(balance(journal(), "cash"), 470000);
+  assert_eq(balance(journal(), "rent"), 120000);
+  assert_eq(balance(journal(), "sales"), -90000);
+  assert_eq(balance(journal(), "receivable"), 0)
+}
+
+test "an account nobody posted to is flat" {
+  assert_eq(balance(journal(), "goodwill"), 0);
+  assert_eq(balance([], "cash"), 0)
+}
+
+test "every entry balances, so the whole journal balances" {
+  assert_eq(trial_balance(journal()), 0);
+  assert_eq(len(filter(journal(), |e: Entry| !is_balanced(e))), 0)
+}
+
+test "presentation flips the sign of the credit-normal accounts" {
+  assert_eq(presented(chart(), journal(), "cash"), Some(470000));
+  assert_eq(presented(chart(), journal(), "sales"), Some(90000));
+  assert_eq(presented(chart(), journal(), "rent"), Some(120000));
+  assert_eq(presented(chart(), journal(), "capital"), Some(500000))
+}
+
+test "an account outside the chart has no presentation" {
+  assert_eq(presented(chart(), journal(), "goodwill"), None);
+  assert_eq(kind_of(chart(), "loan"), Some(Liability));
+  assert_eq(kind_of([], "cash"), None)
+}
+
+test "only the entries that move an account are selected" {
+  assert_eq(len(touching(journal(), "cash")), 3);
+  assert_eq(len(touching(journal(), "sales")), 1);
+  assert_eq(len(touching(journal(), "goodwill")), 0);
+  assert_eq(memos(touching(journal(), "sales")), ["invoice #1"])
+}
+
+test "the running balance walks the journal in order" {
+  assert_eq(running(journal(), "cash"), [500000, 380000, 380000, 470000]);
+  assert_eq(running([], "cash"), []);
+  assert_eq(len(running(journal(), "cash")), len(journal()))
+}
+
+test "memos come back in the order they were posted" {
+  assert_eq(memos(journal()), [
+    "seed capital",
+    "january rent",
+    "invoice #1",
+    "invoice #1 paid",
+  ])
+}
+
+test "a ledger built one entry at a time agrees with the literal one" {
+  let built = fold(journal(), [], |acc, e: Entry|
+    match post(acc, e) {
+      Accepted(next) -> next,
+      Rejected(_) -> acc,
+    });
+  assert_eq(len(built), 4);
+  assert_eq(balance(built, "cash"), balance(journal(), "cash"));
+  assert_eq(trial_balance(built), 0)
+}
