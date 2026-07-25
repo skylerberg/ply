@@ -3,7 +3,7 @@ use crate::cli::CacheScope;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_span::{Diagnostic, Span, SourceMap, codes};
-use ply_store::{RUNTIME_VERSION, Store};
+use ply_store::{FRONTEND_VERSION, RUNTIME_VERSION, Store};
 use serde_json::{Value, json};
 
 pub fn stats(scope: &CacheScope, style: Style) -> i32 {
@@ -20,20 +20,37 @@ pub fn stats(scope: &CacheScope, style: Style) -> i32 {
             "ok": true,
             "exit_code": EXIT_OK,
             "runtime_version": RUNTIME_VERSION,
+            "frontend_version": FRONTEND_VERSION,
+            "root": store.root().display().to_string(),
             "directory": store.dir().display().to_string(),
             "results_file": store.path().display().to_string(),
+            "frontend_file": store.frontend_path().display().to_string(),
             "entries": store.len(),
+            "frontend": {
+                "sources": store.sources_len(),
+                "definitions": store.defs_len(),
+                "declarations": store.decls_len(),
+            },
             "warnings": warnings_json(&warnings),
         }));
         return EXIT_OK;
     }
 
     print_warnings(&warnings, style);
-    println!("{IND}{}", style.dim(&store.path().display().to_string()));
+    println!("{IND}{}", style.dim(&store.dir().display().to_string()));
     println!(
         "{IND}runtime {RUNTIME_VERSION} · {} cached {}",
         style.bold(&store.len().to_string()),
         plural(store.len(), "result")
+    );
+    println!(
+        "{IND}front end {FRONTEND_VERSION} · {} {} · {} {} · {} {}",
+        style.bold(&store.sources_len().to_string()),
+        plural(store.sources_len(), "file"),
+        store.defs_len(),
+        plural(store.defs_len(), "definition"),
+        store.decls_len(),
+        plural(store.decls_len(), "declaration"),
     );
     EXIT_OK
 }
@@ -95,12 +112,13 @@ pub fn clear(scope: &CacheScope, style: Style) -> i32 {
 }
 
 fn open(scope: &CacheScope, action: &str, style: Style) -> Result<Store, i32> {
-    match Store::open(&scope.path) {
+    let root = crate::load::project_root(&scope.path);
+    match Store::open(&root) {
         Ok(store) => Ok(store),
         Err(e) => {
             let diagnostic = Diagnostic::error(
                 codes::RUNTIME_ERROR,
-                format!("could not open a cache under `{}`: {e:#}", scope.path.display()),
+                format!("could not open a cache under `{}`: {e:#}", root.display()),
             )
             .primary(Span::DUMMY, "the cache directory is unusable")
             .note("pass the directory the cache belongs to; the default is `.`");

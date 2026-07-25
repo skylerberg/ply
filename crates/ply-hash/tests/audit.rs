@@ -306,19 +306,26 @@ fn a_match_binder_that_captures_a_parameter_changes_the_hash() {
     changed("match binder capture", &source("y", "x"), &source("x", "x"), "f");
 }
 
+/// `db` and `audit` declare the same operations, so performing one and
+/// performing the other differ by a consistent renaming and by nothing a hash
+/// may see. What must stay distinguishable is a definition that *chooses*
+/// between them while both are in view: `f` performs the first, `g` the second,
+/// and the handler discharges exactly one. Two identical handler clauses that
+/// catch different atoms would otherwise share a hash while leaving different
+/// residual footprints.
 #[test]
-fn two_effects_with_identical_declarations_are_distinguishable() {
-    // `db` and `audit` declare the same operations. Performing one is not
-    // performing the other: they yield different atoms, so they conflict
-    // differently and are discharged by different handlers.
-    let source = |effect: &str| {
+fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
+    let source = |handled: &str| {
         format!(
             "effect db {{\n  write emit[r](key: Int) -> Int\n}}\n\
              effect audit {{\n  write emit[r](key: Int) -> Int\n}}\n\
-             fn f(k: Int) -> Int / {{{effect}.write[log]}} = {effect}.emit[log](k)"
+             fn f(k: Int) -> Int / {{db.write[log]}} = db.emit[log](k)\n\
+             fn g(k: Int) -> Int / {{audit.write[log]}} = audit.emit[log](k)\n\
+             fn caught(k: Int) -> Int / {{audit.write[log], db.write[log]}} =\n\
+               handle f(k) + g(k) with {{ {handled}.emit[log](x) -> x, }}"
         )
     };
-    changed("switching which effect is performed", &source("db"), &source("audit"), "f");
+    changed("switching which effect is handled", &source("db"), &source("audit"), "caught");
 }
 
 /// Aliases are expanded by the checker, so `Meters` and `Feet` below are both

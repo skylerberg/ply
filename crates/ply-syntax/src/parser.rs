@@ -16,29 +16,45 @@ type PResult<T> = Result<T, Bail>;
 /// overflows. Real code stays far below this; generated code need not.
 const MAX_DEPTH: u32 = 128;
 
+/// Parses a snippet as the anonymous module: it can neither import nor be
+/// imported, which is all a test or an editor scratch buffer needs.
 pub fn parse(source: SourceId, text: &str) -> Result<Module, Vec<Diagnostic>> {
-    let (module, diags) = parse_recovering(source, text);
+    parse_module(source, ModuleName::anonymous(), text)
+}
+
+pub fn parse_module(
+    source: SourceId,
+    name: ModuleName,
+    text: &str,
+) -> Result<Module, Vec<Diagnostic>> {
+    let (module, diags) = Parser::new(source, text).run(name);
     if diags.is_empty() { Ok(module) } else { Err(diags) }
 }
 
 /// Parses as much as possible and hands back both the partial tree and every
 /// diagnostic. Editors and `--json` consumers want the tree even when it is
 /// wrong; [`parse`] is the strict wrapper.
-pub fn parse_recovering(source: SourceId, text: &str) -> (Module, Vec<Diagnostic>) {
-    Parser::new(source, text).run()
+pub fn parse_recovering(
+    source: SourceId,
+    name: ModuleName,
+    text: &str,
+) -> (Module, Vec<Diagnostic>) {
+    Parser::new(source, text).run(name)
 }
 
-pub fn parse_many<'a>(
-    inputs: impl IntoIterator<Item = (SourceId, &'a str)>,
-) -> Result<Module, Vec<Diagnostic>> {
-    let mut module = Module::default();
+/// Each input becomes its own module. Nothing is concatenated: a name in one
+/// file is invisible in another until it is exported and imported.
+pub fn parse_program<'a>(
+    inputs: impl IntoIterator<Item = (SourceId, ModuleName, &'a str)>,
+) -> Result<Program, Vec<Diagnostic>> {
+    let mut program = Program::default();
     let mut diags = Vec::new();
-    for (source, text) in inputs {
-        let (m, d) = parse_recovering(source, text);
-        module.items.extend(m.items);
+    for (source, name, text) in inputs {
+        let (module, d) = parse_recovering(source, name, text);
+        program.modules.push(module);
         diags.extend(d);
     }
-    if diags.is_empty() { Ok(module) } else { Err(diags) }
+    if diags.is_empty() { Ok(program) } else { Err(diags) }
 }
 
 pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>> {
@@ -199,29 +215,133 @@ impl Parser {
         Err(Bail)
     }
 
-    fn run(mut self) -> (Module, Vec<Diagnostic>) {
+    fn run(mut self, name: ModuleName) -> (Module, Vec<Diagnostic>) {
+        let source = self.source;
+        let mut imports = self.imports();
         let mut items = Vec::new();
         while !self.at_eof() {
             self.no_brace = false;
             self.depth = 0;
+            if self.at(&TokenKind::Kw(Kw::Import)) {
+                self.import_out_of_order(items.first());
+                match self.import_decl() {
+                    Ok(decl) => imports.push(decl),
+                    Err(Bail) => self.recover_to_item(),
+                }
+                continue;
+            }
             match self.item() {
                 Ok(item) => items.push(item),
                 Err(Bail) => self.recover_to_item(),
             }
         }
-        (Module { items }, self.diags)
+        (Module { name, source, imports, items }, self.diags)
+    }
+
+    /// Every `import` precedes every item, so the import table is complete
+    /// before any body is parsed.
+    fn imports(&mut self) -> Vec<ImportDecl> {
+        let mut out = Vec::new();
+        while self.at(&TokenKind::Kw(Kw::Import)) {
+            match self.import_decl() {
+                Ok(decl) => out.push(decl),
+                Err(Bail) => self.recover_to_item(),
+            }
+        }
+        out
+    }
+
+    /// Reported rather than silently accepted: a later pass would otherwise have
+    /// to look ahead to know what a name in an earlier body could mean.
+    fn import_out_of_order(&mut self, first_item: Option<&Item>) {
+        let span = self.span();
+        let mut d = Diagnostic::error(
+            codes::UNEXPECTED_TOKEN,
+            "`import` must appear before every definition",
+        )
+        .primary(span, "this `import` follows a definition")
+        .note("move it to the top of the file, above the first `fn`, `type`, `effect` or `test`");
+        if let Some(item) = first_item {
+            d = d.secondary(item.span(), "the first definition is here");
+        }
+        self.push(d);
+    }
+
+    fn import_decl(&mut self) -> PResult<ImportDecl> {
+        let start = self.advance();
+        let mut path = vec![self.expect_ident("a module path after `import`")?];
+        while self.eat(&TokenKind::Dot) {
+            path.push(self.expect_ident("another module path segment after `.`")?);
+        }
+
+        // `as` is contextual: it stays usable as an ordinary identifier.
+        let kind = if self.at_ident_text("as") {
+            self.advance();
+            ImportKind::Alias(self.expect_ident("a name to bind the module as, after `as`")?)
+        } else if self.at(&TokenKind::LParen) {
+            let open = self.advance();
+            let names = self.comma_list(&TokenKind::RParen, Self::import_name)?;
+            let close =
+                self.expect_close(&TokenKind::RParen, open, "`)` to close the imported names")?;
+            if names.is_empty() {
+                self.push(
+                    Diagnostic::error(codes::UNEXPECTED_TOKEN, "this `import` selects no names")
+                        .primary(open.to(close), "an empty list imports nothing")
+                        .note(
+                            "write `import <module>` to bind the module itself, \
+                             or list the names to bring into scope",
+                        ),
+                );
+                return Err(Bail);
+            }
+            ImportKind::Names(names)
+        } else {
+            ImportKind::Module
+        };
+
+        let both = match &kind {
+            ImportKind::Alias(_) => self.at(&TokenKind::LParen),
+            ImportKind::Names(_) => self.at_ident_text("as"),
+            ImportKind::Module => false,
+        };
+        if both {
+            let span = self.span();
+            self.push(
+                Diagnostic::error(
+                    codes::UNEXPECTED_TOKEN,
+                    "an `import` may rename the module or select names, but not both",
+                )
+                .primary(span, "remove this")
+                .note(
+                    "`import m as x` binds the module as `x`; \
+                     `import m (a, b)` binds `a` and `b` and no module binder",
+                ),
+            );
+            return Err(Bail);
+        }
+
+        Ok(ImportDecl { path, kind, span: start.to(self.prev_span()) })
+    }
+
+    fn import_name(&mut self) -> PResult<Ident> {
+        self.expect_ident("a name to import from the module")
     }
 
     fn at_item_start(&self) -> bool {
         matches!(
             self.kind(),
-            TokenKind::Kw(Kw::Fn | Kw::Type | Kw::Effect | Kw::Nondet | Kw::Test)
+            TokenKind::Kw(
+                Kw::Import | Kw::Pub | Kw::Fn | Kw::Type | Kw::Effect | Kw::Nondet | Kw::Test
+            )
         )
     }
 
     fn recover_to_item(&mut self) {
         let mut depth = 0i32;
-        if !self.at_eof() {
+        // Both callers consume the leading keyword before they can fail, so
+        // already being at an item start means progress was made and the token
+        // belongs to the next construct rather than the abandoned one.
+        if !self.at_eof() && !self.at_item_start() {
             self.advance();
         }
         loop {
@@ -242,19 +362,58 @@ impl Parser {
         }
     }
 
+    /// A qualified reference uses `::` rather than `.` because with `.` it would
+    /// be token-identical to a perform and to a field access, and telling those
+    /// apart needs scope information the parser does not have.
+    fn qname(&mut self, what: &str) -> PResult<QName> {
+        let first = self.expect_ident(what)?;
+        if !self.eat(&TokenKind::ColonColon) {
+            return Ok(QName::bare(first));
+        }
+        let name = self.expect_ident("a name after `::`")?;
+        if self.at(&TokenKind::ColonColon) {
+            let span = self.span();
+            self.push(
+                Diagnostic::error(codes::UNEXPECTED_TOKEN, "a qualified name has at most one `::`")
+                    .primary(span, "unexpected `::`")
+                    .note(
+                        "a module binder is a single name: `import store.orders` binds `orders`, \
+                         so write `orders::place`",
+                    ),
+            );
+            return Err(Bail);
+        }
+        Ok(QName::qualified(first, name))
+    }
+
     fn item(&mut self) -> PResult<Item> {
+        let pub_span = self.at(&TokenKind::Kw(Kw::Pub)).then(|| self.advance());
+        let vis = if pub_span.is_some() { Visibility::Public } else { Visibility::Private };
+
         match self.kind() {
-            TokenKind::Kw(Kw::Fn) => self.fn_def().map(Item::Fn),
-            TokenKind::Kw(Kw::Type) => self.type_def().map(Item::Type),
+            TokenKind::Kw(Kw::Fn) => self.fn_def(vis).map(|d| Item::Fn(Box::new(d))),
+            TokenKind::Kw(Kw::Type) => self.type_def(vis).map(|d| Item::Type(Box::new(d))),
             TokenKind::Kw(Kw::Effect) | TokenKind::Kw(Kw::Nondet) => {
-                self.effect_def().map(Item::Effect)
+                self.effect_def(vis).map(|d| Item::Effect(Box::new(d)))
             }
-            TokenKind::Kw(Kw::Test) => self.test_def().map(Item::Test),
+            TokenKind::Kw(Kw::Test) => {
+                if let Some(span) = pub_span {
+                    self.push(
+                        Diagnostic::error(
+                            codes::UNEXPECTED_TOKEN,
+                            "a `test` cannot be `pub`",
+                        )
+                        .primary(span, "remove `pub`")
+                        .note("a test has no name another module could reference"),
+                    );
+                }
+                self.test_def().map(|d| Item::Test(Box::new(d)))
+            }
             _ => Err(self.error_here("an item: `fn`, `type`, `effect`, `nondet effect`, or `test`")),
         }
     }
 
-    fn fn_def(&mut self) -> PResult<FnDef> {
+    fn fn_def(&mut self, vis: Visibility) -> PResult<FnDef> {
         let start = self.advance();
         let name = self.expect_ident("a function name after `fn`")?;
         let generics = if self.at(&TokenKind::Lt) {
@@ -279,7 +438,7 @@ impl Parser {
         };
 
         let span = start.to(body.span);
-        Ok(FnDef { name, generics, params, ret, effects, body, span })
+        Ok(FnDef { vis, name, generics, params, ret, effects, body, span })
     }
 
     fn param(&mut self) -> PResult<Param> {
@@ -317,7 +476,7 @@ impl Parser {
         Ok(Generics { types, effects })
     }
 
-    fn type_def(&mut self) -> PResult<TypeDef> {
+    fn type_def(&mut self, vis: Visibility) -> PResult<TypeDef> {
         let start = self.advance();
         let name = self.expect_ident("a type name after `type`")?;
         let mut params = Vec::new();
@@ -342,7 +501,7 @@ impl Parser {
             TypeDefBody::Alias(self.ty()?)
         };
         let span = start.to(self.prev_span());
-        Ok(TypeDef { name, params, body, span })
+        Ok(TypeDef { vis, name, params, body, span })
     }
 
     /// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or
@@ -377,7 +536,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn effect_def(&mut self) -> PResult<EffectDef> {
+    fn effect_def(&mut self, vis: Visibility) -> PResult<EffectDef> {
         let start = self.span();
         let nondet = self.eat(&TokenKind::Kw(Kw::Nondet));
         self.expect(&TokenKind::Kw(Kw::Effect), "`effect` after `nondet`")?;
@@ -388,7 +547,7 @@ impl Parser {
             ops.push(self.op_def()?);
         }
         let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the operation list")?;
-        Ok(EffectDef { name, nondet, ops, span: start.to(close) })
+        Ok(EffectDef { vis, name, nondet, ops, span: start.to(close) })
     }
 
     fn op_def(&mut self) -> PResult<OpDef> {
@@ -505,21 +664,21 @@ impl Parser {
                 let close = self.expect_close(&TokenKind::RBrace, open, "`}`")?;
                 Ok(TypeExpr::Record { fields, span: open.to(close) })
             }
-            TokenKind::Ident(name) => {
-                let name = name.clone();
-                let ident = Ident::new(name.clone(), self.advance());
+            TokenKind::Ident(_) => {
+                let q = self.qname("a type")?;
                 if self.at(&TokenKind::Lt) {
-                    let open = self.advance();
+                    self.advance();
                     let args = self.comma_list(&TokenKind::Gt, Self::ty)?;
                     let close = self.expect_gt("`>` to close the type arguments")?;
-                    let _ = open;
-                    return Ok(TypeExpr::Con { name: ident, args, span: start.to(close) });
+                    return Ok(TypeExpr::Con { name: q, args, span: start.to(close) });
                 }
-                if starts_upper(&name) {
-                    Ok(TypeExpr::Con { name: ident, args: Vec::new(), span: start })
-                } else {
-                    Ok(TypeExpr::Var(ident))
+                // A type parameter is bound by the enclosing `<..>`, never by a
+                // module, so only a bare lowercase name can be one.
+                if q.is_bare() && !starts_upper(q.symbol()) {
+                    return Ok(TypeExpr::Var(q.name));
                 }
+                let span = q.span;
+                Ok(TypeExpr::Con { name: q, args: Vec::new(), span })
             }
             _ => Err(self.error_here("a type")),
         }
@@ -570,7 +729,7 @@ impl Parser {
     }
 
     fn atom(&mut self) -> PResult<AtomExpr> {
-        let effect = self.expect_ident("an effect name")?;
+        let effect = self.qname("an effect name")?;
         self.expect(&TokenKind::Dot, "`.` and then `read` or `write`")?;
         let mode = self.mode()?;
         let resource = if self.at(&TokenKind::LBracket) {
@@ -643,8 +802,8 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     // `db.get[users](k)` performs an effect; `r.f` reads a field.
-                    // Only a bare name can be an effect, and an operation is
-                    // always applied to a resource or an argument list.
+                    // Only a name can be an effect, and an operation is always
+                    // applied to a resource or an argument list.
                     let effect = match &e.kind {
                         ExprKind::Var(v)
                             if matches!(self.kind_at(1), TokenKind::Ident(_))
@@ -721,8 +880,9 @@ impl Parser {
                 if name.as_str() == "with_cell" && matches!(self.kind_at(1), TokenKind::LBracket) {
                     return self.with_cell_expr();
                 }
-                self.advance();
-                Ok(Expr { kind: ExprKind::Var(Ident::new(name, start)), span: start })
+                let q = self.qname("an expression")?;
+                let span = q.span;
+                Ok(Expr { kind: ExprKind::Var(q), span })
             }
             TokenKind::LParen => {
                 let saved = std::mem::replace(&mut self.no_brace, false);
@@ -787,7 +947,7 @@ impl Parser {
             return Ok((name, value));
         }
         let span = name.span;
-        Ok((name.clone(), Expr { kind: ExprKind::Var(name), span }))
+        Ok((name.clone(), Expr { kind: ExprKind::Var(name.into()), span }))
     }
 
     fn block_expr(&mut self) -> PResult<Expr> {
@@ -833,7 +993,7 @@ impl Parser {
         self.expect(&TokenKind::Eq, "`=` and an initializer")?;
         let value = self.expr()?;
         let semi = self.expect(&TokenKind::Semi, "`;` to end the `let`")?;
-        Ok(Stmt::Let { pat, ty, value, span: start.to(semi) })
+        Ok(Stmt::Let { pat, ty, value: Box::new(value), span: start.to(semi) })
     }
 
     fn lambda_expr(&mut self) -> PResult<Expr> {
@@ -957,7 +1117,7 @@ impl Parser {
     }
 
     fn handle_clause(&mut self) -> PResult<HandleClause> {
-        let effect = self.expect_ident("an effect name, or `return`")?;
+        let effect = self.qname("an effect name, or `return`")?;
         self.expect(&TokenKind::Dot, "`.` and the operation name")?;
         let op = self.expect_ident("an operation name")?;
         let resource = self.opt_resource()?;
@@ -1066,13 +1226,13 @@ impl Parser {
             }
             TokenKind::LBracket => self.list_pattern(),
             TokenKind::LBrace => self.record_pattern(),
-            TokenKind::Ident(name) => {
-                let ident = Ident::new(name.clone(), self.advance());
-                if !starts_upper(&name) {
-                    return Ok(Pattern { kind: PatternKind::Var(ident), span: start });
+            TokenKind::Ident(_) => {
+                let q = self.qname("a pattern")?;
+                if q.is_bare() && !starts_upper(q.symbol()) {
+                    return Ok(Pattern { kind: PatternKind::Var(q.name), span: start });
                 }
                 let mut args = Vec::new();
-                let mut end = ident.span;
+                let mut end = q.span;
                 if self.at(&TokenKind::LParen) {
                     let open = self.advance();
                     args = self.comma_list(&TokenKind::RParen, Self::pattern)?;
@@ -1082,7 +1242,7 @@ impl Parser {
                         "`)` to close the constructor arguments",
                     )?;
                 }
-                Ok(Pattern { kind: PatternKind::Ctor { name: ident, args }, span: start.to(end) })
+                Ok(Pattern { kind: PatternKind::Ctor { name: q, args }, span: start.to(end) })
             }
             _ => Err(self.error_here("a pattern")),
         }

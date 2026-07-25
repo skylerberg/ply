@@ -3,6 +3,7 @@
 
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::*;
+use ply_syntax::resolve::{Resolved, resolve};
 
 pub fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
@@ -41,13 +42,17 @@ pub fn unit() -> Expr {
     ex(ExprKind::Lit(Lit::Unit))
 }
 
+pub fn qname(name: &str) -> QName {
+    QName::bare(id(name))
+}
+
 pub fn var(name: &str) -> Expr {
-    ex(ExprKind::Var(id(name)))
+    ex(ExprKind::Var(qname(name)))
 }
 
 pub fn var_at(name: &str, span: Span) -> Expr {
     Expr {
-        kind: ExprKind::Var(Ident::new(name, span)),
+        kind: ExprKind::Var(QName::bare(Ident::new(name, span))),
         span,
     }
 }
@@ -112,7 +117,7 @@ pub fn let_(pat: Pattern, value: Expr) -> Stmt {
     Stmt::Let {
         pat,
         ty: None,
-        value,
+        value: Box::new(value),
         span: sp(),
     }
 }
@@ -187,7 +192,7 @@ pub fn pbool(b: bool) -> Pattern {
 pub fn pctor(name: &str, args: Vec<Pattern>) -> Pattern {
     Pattern {
         kind: PatternKind::Ctor {
-            name: id(name),
+            name: qname(name),
             args,
         },
         span: sp(),
@@ -241,7 +246,7 @@ pub fn match_(scrutinee: Expr, arms: Vec<MatchArm>) -> Expr {
 
 pub fn perform(effect: &str, op: &str, resource: Option<&str>, args: Vec<Expr>) -> Expr {
     ex(ExprKind::Perform {
-        effect: id(effect),
+        effect: qname(effect),
         op: id(op),
         resource: resource.map(id),
         args,
@@ -256,7 +261,7 @@ pub fn clause(
     body: Expr,
 ) -> HandleClause {
     HandleClause {
-        effect: id(effect),
+        effect: qname(effect),
         op: id(op),
         resource: resource.map(id),
         params: params.iter().map(|p| id(p)).collect(),
@@ -295,7 +300,8 @@ pub fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
 }
 
 pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
-    Item::Fn(FnDef {
+    Item::Fn(Box::new(FnDef {
+        vis: Visibility::Private,
         name: id(name),
         generics: Generics::default(),
         params: params.iter().map(|p| param(p)).collect(),
@@ -303,26 +309,27 @@ pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
         effects: None,
         body,
         span: sp(),
-    })
+    }))
 }
 
 pub fn test_def(name: &str, body: Expr) -> Item {
-    Item::Test(TestDef {
+    Item::Test(Box::new(TestDef {
         name: name.to_string(),
         name_span: sp(),
         nondet: false,
         body,
         span: sp(),
-    })
+    }))
 }
 
 pub fn type_def(name: &str, variants: &[(&str, usize)]) -> Item {
     let int_ty = TypeExpr::Con {
-        name: id("Int"),
+        name: qname("Int"),
         args: Vec::new(),
         span: sp(),
     };
-    Item::Type(TypeDef {
+    Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
         name: id(name),
         params: Vec::new(),
         body: TypeDefBody::Sum(
@@ -336,16 +343,17 @@ pub fn type_def(name: &str, variants: &[(&str, usize)]) -> Item {
                 .collect(),
         ),
         span: sp(),
-    })
+    }))
 }
 
 pub fn effect_def(name: &str, ops: &[(&str, Mode, bool)]) -> Item {
     let int_ty = TypeExpr::Con {
-        name: id("Int"),
+        name: qname("Int"),
         args: Vec::new(),
         span: sp(),
     };
-    Item::Effect(EffectDef {
+    Item::Effect(Box::new(EffectDef {
+        vis: Visibility::Private,
         name: id(name),
         nondet: false,
         ops: ops
@@ -360,9 +368,26 @@ pub fn effect_def(name: &str, ops: &[(&str, Mode, bool)]) -> Item {
             })
             .collect(),
         span: sp(),
-    })
+    }))
 }
 
+/// One anonymous module standing alone: bare names stay bare, so a hand-built
+/// AST reads exactly as it did before modules existed.
 pub fn module(items: Vec<Item>) -> Module {
-    Module { items }
+    Module {
+        name: ModuleName::anonymous(),
+        source: SourceId(0),
+        imports: Vec::new(),
+        items,
+    }
+}
+
+pub fn standalone(items: Vec<Item>) -> (Program, Resolved) {
+    standalone_module(module(items))
+}
+
+pub fn standalone_module(module: Module) -> (Program, Resolved) {
+    let program = Program::single(module);
+    let resolved = resolve(&program).expect("a module with no imports resolves");
+    (program, resolved)
 }

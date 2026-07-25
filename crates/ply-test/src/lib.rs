@@ -12,7 +12,8 @@ use ply_eval::Interp;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, Store};
-use ply_syntax::ast::Module;
+use ply_syntax::ast::Program;
+use ply_syntax::resolve::Resolved;
 use serde::Serialize;
 use std::any::Any;
 use std::collections::BTreeSet;
@@ -126,7 +127,10 @@ impl TestResult {
 
 #[derive(Clone, Debug)]
 pub struct Failure {
+    /// The label as the source wrote it. Not unique program-wide; `key` is.
     pub name: String,
+    /// `<module>.<label>`, and the key this failure's closure is looked up by.
+    pub key: Symbol,
     pub diagnostic: Diagnostic,
     /// Definitions in this test's closure whose hash is not in the store —
     /// the suspects for this failure.
@@ -169,19 +173,52 @@ pub trait Executor: Sync {
 }
 
 pub struct InterpExecutor<'a> {
-    pub module: &'a Module,
+    pub program: &'a Program,
+    pub resolved: &'a Resolved,
     pub check: &'a CheckOutput,
+    /// Per test, its module and its position among that module's tests.
+    ///
+    /// The evaluator indexes tests within the AST it was given, and the
+    /// incremental front end reports tests from modules it never parsed, so a
+    /// position in `check.tests` is not a position in `program`. This is the
+    /// key that means the same thing in both.
+    addresses: Vec<(Symbol, usize)>,
+}
+
+impl<'a> InterpExecutor<'a> {
+    pub fn new(
+        program: &'a Program,
+        resolved: &'a Resolved,
+        check: &'a CheckOutput,
+    ) -> InterpExecutor<'a> {
+        let mut seen: std::collections::BTreeMap<Symbol, usize> = Default::default();
+        let addresses = check
+            .tests
+            .iter()
+            .map(|t| {
+                let module = t.module.as_symbol().clone();
+                let ordinal = seen.entry(module.clone()).or_default();
+                let at = *ordinal;
+                *ordinal += 1;
+                (module, at)
+            })
+            .collect();
+        InterpExecutor { program, resolved, check, addresses }
+    }
 }
 
 impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Interp<'a>;
 
     fn worker(&self) -> Interp<'a> {
-        Interp::new(self.module, self.check)
+        Interp::new(self.program, self.resolved, self.check)
     }
 
     fn execute(&self, worker: &mut Interp<'a>, index: usize) -> Result<(), Diagnostic> {
-        worker.eval_test(index)
+        match self.addresses.get(index) {
+            Some((module, ordinal)) => worker.eval_test_in(module, *ordinal),
+            None => worker.eval_test(index),
+        }
     }
 }
 
@@ -228,12 +265,14 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
 
 pub fn run(
     selection: &Selection,
-    module: &Module,
+    program: &Program,
+    resolved: &Resolved,
     check: &CheckOutput,
     hashes: &HashOutput,
     store: &mut Store,
 ) -> RunReport {
-    run_with(selection, check, hashes, store, &InterpExecutor { module, check })
+    let executor = InterpExecutor::new(program, resolved, check);
+    run_with(selection, check, hashes, store, &executor)
 }
 
 pub fn run_with<E: Executor>(
@@ -246,10 +285,7 @@ pub fn run_with<E: Executor>(
     let started = Instant::now();
     let mut warnings = Vec::new();
 
-    // Snapshotted before the first write: a test that passes in group 0 records
-    // the hashes in its closure, and a definition they share would then stop
-    // looking changed to a test that fails in group 3.
-    let changed = absent_definitions(hashes, store);
+    let changed = changed_definitions(hashes, store);
 
     let mut results: Vec<TestResult> = Vec::new();
     let mut failures = Vec::new();
@@ -289,13 +325,16 @@ pub fn run_with<E: Executor>(
                 failed += 1;
                 failures.push(Failure {
                     name: test.name.clone(),
+                    key: test.key.clone(),
                     diagnostic: diagnostic.clone(),
-                    suspects: suspects_for(hashes, &test.name, &changed),
+                    suspects: suspects_for(hashes, &test.key, &changed),
                 });
             } else {
                 passed += 1;
-                if !test.nondet {
-                    record_pass(store, hashes, check, index, hash);
+                if !test.nondet
+                    && let Some(hash) = hash
+                {
+                    store.put(hash, Outcome::Pass);
                 }
             }
 
@@ -310,6 +349,8 @@ pub fn run_with<E: Executor>(
             });
         }
     }
+
+    observe_definitions(store, hashes, check, selection, &results);
 
     if let Err(e) = store.flush() {
         warnings.push(
@@ -413,7 +454,7 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
     };
 
     let (name, span) = match check.tests.get(index) {
-        Some(t) => (t.name.clone(), t.span),
+        Some(t) => (t.key.to_string(), t.span),
         None => (format!("test {index}"), ply_span::Span::DUMMY),
     };
 
@@ -423,47 +464,60 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
         .note("the other tests still ran, and this one was not cached")
 }
 
-/// Definitions whose hash the store has never seen green. Against a warm cache
-/// that is exactly what the last edit touched, transitively.
-fn absent_definitions(hashes: &HashOutput, store: &Store) -> BTreeSet<Symbol> {
+/// Definitions the store has never recorded seeing. Against a warm cache that
+/// is exactly what the last edit touched, transitively.
+fn changed_definitions(hashes: &HashOutput, store: &Store) -> BTreeSet<Symbol> {
     hashes
         .defs
         .iter()
-        .filter(|(_, hash)| store.get(**hash).is_none())
+        .filter(|(_, hash)| !store.knows_definition(**hash))
         .map(|(name, _)| name.clone())
         .collect()
 }
 
-fn suspects_for(hashes: &HashOutput, test_name: &str, changed: &BTreeSet<Symbol>) -> Vec<Symbol> {
-    match hashes.closure.get(&Symbol::new(test_name)) {
-        Some(closure) => closure
-            .intersection(changed)
-            .filter(|s| s.as_str() != test_name)
-            .cloned()
-            .collect(),
+/// The single place a test's key becomes a key into the hash graph: two callers
+/// disagreeing about that convention would silently mis-attribute a failure
+/// rather than fail.
+fn closure_of<'a>(hashes: &'a HashOutput, key: &Symbol) -> Option<&'a BTreeSet<Symbol>> {
+    hashes.closure.get(key)
+}
+
+fn suspects_for(hashes: &HashOutput, key: &Symbol, changed: &BTreeSet<Symbol>) -> Vec<Symbol> {
+    match closure_of(hashes, key) {
+        Some(closure) => closure.intersection(changed).filter(|s| *s != key).cloned().collect(),
         None => Vec::new(),
     }
 }
 
-/// A green test vouches for every definition it reached, so their hashes are
-/// recorded alongside its own. That record is what later lets a failure name the
-/// handful of definitions that changed underneath it rather than its whole
-/// closure.
-fn record_pass(
+/// Hands the store every definition except those an *unresolved* test reached:
+/// one that failed, or that was selected and never executed because a filter or
+/// a stale selection dropped it.
+///
+/// Recording a definition retires it as a suspect, and neither of those
+/// outcomes is evidence that anything under it is fine. Recording them anyway is
+/// what empties the suspect set on the second `ply test` of the same red code.
+fn observe_definitions(
     store: &mut Store,
     hashes: &HashOutput,
     check: &CheckOutput,
-    index: usize,
-    hash: Option<DefHash>,
+    selection: &Selection,
+    results: &[TestResult],
 ) {
-    if let Some(hash) = hash {
-        store.put(hash, Outcome::Pass);
-    }
-    if let Some(closure) = hashes.closure.get(&Symbol::new(&check.tests[index].name)) {
-        for name in closure {
-            if let Some(&def) = hashes.defs.get(name) {
-                store.put(def, Outcome::Pass);
-            }
-        }
-    }
+    let proven: BTreeSet<usize> = results.iter().filter(|r| r.passed()).map(|r| r.index).collect();
+    let implicated: BTreeSet<&Symbol> = (0..check.tests.len())
+        .filter(|index| {
+            let green = selection.reason(*index) == Some(Reason::Cached);
+            !green && !proven.contains(index)
+        })
+        .filter_map(|index| closure_of(hashes, &check.tests[index].key))
+        .flatten()
+        .collect();
+
+    store.observe_definitions(
+        hashes
+            .defs
+            .iter()
+            .filter(|(name, _)| !implicated.contains(name))
+            .map(|(_, hash)| *hash),
+    );
 }

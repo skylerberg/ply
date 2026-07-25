@@ -25,7 +25,7 @@ pub enum Command {
     Check(CheckArgs),
     /// Select, schedule and run the tests.
     Test(TestArgs),
-    /// Evaluate `main`.
+    /// Evaluate `main`. A directory must hold exactly one.
     Run(RunArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
@@ -35,7 +35,8 @@ pub enum Command {
 
 #[derive(Args, Debug)]
 pub struct CheckArgs {
-    /// A `.ply` file, or a directory whose `*.ply` files form one module.
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -46,11 +47,22 @@ pub struct CheckArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
+
+    /// Report which files were parsed and which definitions were rechecked,
+    /// with the reason a skip was refused.
+    #[arg(long)]
+    pub explain: bool,
+
+    /// Neither read nor write the front-end cache: parse every file and
+    /// recheck every definition.
+    #[arg(long)]
+    pub no_incremental: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct TestArgs {
-    /// A `.ply` file, or a directory whose `*.ply` files form one module.
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -68,18 +80,25 @@ pub struct TestArgs {
     #[arg(long)]
     pub no_cache: bool,
 
-    /// Only consider tests whose name contains this substring.
+    /// Only consider tests whose `<module>.<label>` key contains this
+    /// substring.
     #[arg(long, value_name = "SUBSTRING")]
     pub filter: Option<String>,
 
     /// Worker threads. Defaults to one per core.
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub jobs: Option<u32>,
+
+    /// Neither read nor write the front-end cache. The result cache is
+    /// untouched; `--no-cache` is what disables both.
+    #[arg(long)]
+    pub no_incremental: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// A `.ply` file, or a directory whose `*.ply` files form one module.
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -90,7 +109,8 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct HashArgs {
-    /// A `.ply` file, or a directory whose `*.ply` files form one module.
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -119,7 +139,8 @@ pub enum CacheAction {
 
 #[derive(Args, Debug)]
 pub struct CacheScope {
-    /// The directory whose `.ply-cache` is meant.
+    /// The project whose `.ply-cache` is meant; a `.ply` file means its
+    /// directory.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 

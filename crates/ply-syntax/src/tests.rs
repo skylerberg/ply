@@ -3,8 +3,9 @@
 //! a string diff.
 
 use crate::ast::*;
-use crate::parser::{parse, parse_recovering};
-use ply_span::{Diagnostic, SourceId, Span, codes};
+use crate::parser::{parse, parse_program, parse_recovering};
+use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use std::path::Path;
 
 const SRC: SourceId = SourceId(0);
 
@@ -525,7 +526,7 @@ fn every_diagnostic_carries_a_code_and_a_real_span() {
 
 #[test]
 fn a_bad_item_does_not_stop_later_items_from_parsing() {
-    let (module, diags) = parse_recovering(SRC, "fn a() = ;\nfn b() = 1\nfn c() = 2");
+    let (module, diags) = parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\nfn b() = 1\nfn c() = 2");
     assert_eq!(diags.len(), 1);
     assert_eq!(dump_module(&module), "(fn b () 1)\n(fn c () 2)");
 }
@@ -533,7 +534,7 @@ fn a_bad_item_does_not_stop_later_items_from_parsing() {
 #[test]
 fn several_independent_errors_are_reported_in_one_run() {
     let (module, diags) =
-        parse_recovering(SRC, "fn a() = ;\ntype T = ;\neffect e { bogus }\ntest \"t\" { 1 }");
+        parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\ntype T = ;\neffect e { bogus }\ntest \"t\" { 1 }");
     assert!(diags.len() >= 3, "expected several diagnostics, got {diags:#?}");
     assert_eq!(module.items.len(), 1, "the well-formed test should still parse");
     assert!(matches!(&module.items[0], Item::Test(_)));
@@ -541,7 +542,7 @@ fn several_independent_errors_are_reported_in_one_run() {
 
 #[test]
 fn recovery_skips_over_braces_inside_the_broken_item() {
-    let (module, diags) = parse_recovering(SRC, "fn a() { let = 1; }\nfn b() = 3");
+    let (module, diags) = parse_recovering(SRC, ModuleName::anonymous(), "fn a() { let = 1; }\nfn b() = 3");
     assert_eq!(diags.len(), 1, "{diags:#?}");
     assert_eq!(dump_module(&module), "(fn b () 3)");
 }
@@ -596,8 +597,26 @@ fn lexer_diagnostics_reach_the_parse_result() {
 
 #[test]
 fn parsing_terminates_on_pathological_input() {
-    for src in ["{{{{{{{{", "((((((((", "fn f(((((", "|||||", "....", "<<<<", "-----", "fn fn fn"] {
-        let (_, diags) = parse_recovering(SRC, src);
+    for src in [
+        "{{{{{{{{",
+        "((((((((",
+        "fn f(((((",
+        "|||||",
+        "....",
+        "<<<<",
+        "-----",
+        "fn fn fn",
+        "import import import",
+        "import",
+        "import.import",
+        "import a as as as",
+        "import a ((((",
+        "pub pub pub",
+        "pub import a",
+        "::::::",
+        "a::::b",
+    ] {
+        let (_, diags) = parse_recovering(SRC, ModuleName::anonymous(), src);
         assert!(!diags.is_empty(), "expected a diagnostic for {src:?}");
     }
 }
@@ -633,9 +652,10 @@ fn a_long_flat_expression_does_not_hit_the_depth_limit() {
 
 #[test]
 fn token_soup_never_panics_or_hangs() {
-    const ALPHABET: [&str; 28] = [
+    const ALPHABET: [&str; 32] = [
         "fn", "type", "effect", "nondet", "test", "let", "if", "else", "match", "handle", "with",
         "x", "X", "\"s\"", "1", "(", ")", "{", "}", "[", "]", "|", "||", ",", ";", ".", "->", "=",
+        "import", "pub", "as", "::",
     ];
     // xorshift so the corpus is reproducible without a dependency.
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
@@ -650,7 +670,7 @@ fn token_soup_never_panics_or_hangs() {
         let src: Vec<&str> =
             (0..len).map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize]).collect();
         let src = src.join(" ");
-        let (_, diags) = parse_recovering(SRC, &src);
+        let (_, diags) = parse_recovering(SRC, ModuleName::anonymous(), &src);
         for d in &diags {
             let span = d.primary_span().expect("every diagnostic has a span");
             assert!(span.end as usize <= src.len(), "span past end of {src:?}");
@@ -715,10 +735,33 @@ fn reformatting_does_not_change_the_parse() {
 }
 
 fn dump_module(m: &Module) -> String {
-    m.items.iter().map(dump_item).collect::<Vec<_>>().join("\n")
+    m.imports
+        .iter()
+        .map(dump_import)
+        .chain(m.items.iter().map(dump_item))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn dump_import(i: &ImportDecl) -> String {
+    let path: Vec<_> = i.path.iter().map(|s| s.name.to_string()).collect();
+    match &i.kind {
+        ImportKind::Module => format!("(import {})", path.join(".")),
+        ImportKind::Alias(a) => format!("(import {} as {})", path.join("."), a.name),
+        ImportKind::Names(ns) => {
+            let ns: Vec<_> = ns.iter().map(|n| n.name.to_string()).collect();
+            format!("(import {} ({}))", path.join("."), ns.join(", "))
+        }
+    }
 }
 
 fn dump_item(i: &Item) -> String {
+    let vis = if i.visibility().is_public() { "pub " } else { "" };
+    let body = dump_item_body(i);
+    format!("({vis}{}", &body[1..])
+}
+
+fn dump_item_body(i: &Item) -> String {
     match i {
         Item::Fn(f) => {
             let mut s = format!("(fn {}", f.name.name);
@@ -806,10 +849,10 @@ fn dump_params(ps: &[Param]) -> String {
 fn dump_ty(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Var(i) => i.name.to_string(),
-        TypeExpr::Con { name, args, .. } if args.is_empty() => name.name.to_string(),
+        TypeExpr::Con { name, args, .. } if args.is_empty() => name.to_string(),
         TypeExpr::Con { name, args, .. } => {
             let args: Vec<_> = args.iter().map(dump_ty).collect();
-            format!("{}<{}>", name.name, args.join(", "))
+            format!("{}<{}>", name, args.join(", "))
         }
         TypeExpr::Fn { params, ret, effects, .. } => {
             let ps: Vec<_> = params.iter().map(dump_ty).collect();
@@ -831,7 +874,7 @@ fn dump_row(r: &RowExpr) -> String {
         .iter()
         .map(|a| {
             let res = a.resource.as_ref().map(|r| format!("[{}]", r.name)).unwrap_or_default();
-            format!("{}.{}{}", a.effect.name, a.mode.as_str(), res)
+            format!("{}.{}{}", a.effect, a.mode.as_str(), res)
         })
         .collect();
     match &r.tail {
@@ -872,7 +915,7 @@ fn dump_lit(l: &Lit) -> String {
 fn dump_expr(e: &Expr) -> String {
     match &e.kind {
         ExprKind::Lit(l) => dump_lit(l),
-        ExprKind::Var(i) => i.name.to_string(),
+        ExprKind::Var(q) => q.to_string(),
         ExprKind::Binary { op, lhs, rhs } => {
             format!("({} {} {})", op_str(*op), dump_expr(lhs), dump_expr(rhs))
         }
@@ -939,7 +982,7 @@ fn dump_expr(e: &Expr) -> String {
         }
         ExprKind::Perform { effect, op, resource, args } => {
             let res = resource.as_ref().map(|r| format!("[{}]", r.name)).unwrap_or_default();
-            let mut s = format!("(perform {}.{}{}", effect.name, op.name, res);
+            let mut s = format!("(perform {}.{}{}", effect, op.name, res);
             for a in args {
                 s.push_str(&format!(" {}", dump_expr(a)));
             }
@@ -952,7 +995,7 @@ fn dump_expr(e: &Expr) -> String {
                 let ps: Vec<_> = c.params.iter().map(|p| p.name.to_string()).collect();
                 s.push_str(&format!(
                     " (clause {}.{}{} ({}) {})",
-                    c.effect.name,
+                    c.effect,
                     c.op.name,
                     res,
                     ps.join(" "),
@@ -980,7 +1023,7 @@ fn dump_pat(p: &Pattern) -> String {
         PatternKind::Var(i) => i.name.to_string(),
         PatternKind::Lit(l) => dump_lit(l),
         PatternKind::Ctor { name, args } => {
-            let mut s = format!("(ctor {}", name.name);
+            let mut s = format!("(ctor {}", name);
             for a in args {
                 s.push_str(&format!(" {}", dump_pat(a)));
             }
@@ -1002,4 +1045,433 @@ fn dump_pat(p: &Pattern) -> String {
             format!("(plist {})", is.join(" "))
         }
     }
+}
+
+// --- Modules ----------------------------------------------------------------
+
+#[test]
+fn a_module_name_is_its_path_with_separators_turned_into_dots() {
+    let name = ModuleName::from_relative_path(Path::new("store/orders.ply")).unwrap();
+    assert_eq!(name.as_str(), "store.orders");
+    assert_eq!(name.default_binder().as_str(), "orders");
+    assert_eq!(name.qualify(&Symbol::new("place")).as_str(), "store.orders.place");
+    assert_eq!(name.segments().collect::<Vec<_>>(), ["store", "orders"]);
+}
+
+#[test]
+fn a_top_level_file_is_a_single_segment_module() {
+    let name = ModuleName::from_relative_path(Path::new("ledger.ply")).unwrap();
+    assert_eq!(name.as_str(), "ledger");
+    assert_eq!(name.default_binder().as_str(), "ledger");
+}
+
+#[test]
+fn a_path_segment_that_is_not_an_identifier_is_a_diagnostic() {
+    for bad in ["my-crate/a.ply", "a/b c.ply", "a.b.ply", "9lives/x.ply"] {
+        let err = ModuleName::from_relative_path(Path::new(bad))
+            .expect_err(&format!("expected `{bad}` to be rejected"));
+        assert_eq!(err.code, codes::INVALID_MODULE_PATH);
+        assert!(!err.notes.is_empty(), "{bad} should say what to do about it");
+    }
+}
+
+#[test]
+fn the_anonymous_module_leaves_names_bare() {
+    let anon = ModuleName::anonymous();
+    assert!(anon.is_anonymous());
+    assert_eq!(anon.qualify(&Symbol::new("place")).as_str(), "place");
+}
+
+#[test]
+fn a_qualified_name_never_collides_with_one_a_module_could_declare() {
+    // `.` cannot be lexed inside an identifier, so no source-writable name can
+    // equal a qualified one.
+    let qualified = ModuleName::from_dotted("store.orders").qualify(&Symbol::new("place"));
+    assert!(!crate::lexer::is_ident(qualified.as_str()));
+}
+
+#[test]
+fn items_are_private_until_marked_pub() {
+    let m = ok("fn a() = 1\npub fn b() = 2\ntype T = Int\npub type U = Int\n\
+                effect e { read r() -> Int }\npub effect f { read r() -> Int }");
+    let vis: Vec<bool> = m.items.iter().map(|i| i.visibility().is_public()).collect();
+    assert_eq!(vis, [false, true, false, true, false, true]);
+}
+
+#[test]
+fn pub_survives_on_the_definition_itself() {
+    let m = ok("pub fn b() = 2");
+    let Item::Fn(f) = &m.items[0] else { panic!("expected a fn") };
+    assert_eq!(f.vis, Visibility::Public);
+    assert_eq!(m.name, ModuleName::anonymous());
+    assert!(m.imports.is_empty());
+}
+
+#[test]
+fn a_test_cannot_be_pub() {
+    let diags = errs("pub test \"t\" { 1 }");
+    assert_eq!(diags.len(), 1);
+    assert!(diags[0].message.contains("cannot be `pub`"));
+}
+
+#[test]
+fn pub_does_not_stop_error_recovery_from_finding_the_next_item() {
+    let (module, diags) =
+        parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\npub fn b() = 1");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(module.items.len(), 1);
+}
+
+#[test]
+fn a_double_colon_lexes_as_one_token_rather_than_two_colons() {
+    use crate::lexer::{TokenKind, lex};
+    let (tokens, diags) = lex(SRC, "a::b : c");
+    assert!(diags.is_empty());
+    let kinds: Vec<_> = tokens.iter().map(|t| t.kind.clone()).collect();
+    assert_eq!(kinds[1], TokenKind::ColonColon);
+    assert_eq!(kinds[3], TokenKind::Colon);
+}
+
+#[test]
+fn a_qualified_name_prints_the_way_it_is_written() {
+    let sp = Span::new(SRC, 0, 1);
+    let bare = QName::bare(Ident::new("place", sp));
+    assert_eq!(bare.to_string(), "place");
+    assert!(bare.is_bare());
+
+    let qualified = QName::qualified(Ident::new("orders", sp), Ident::new("place", sp));
+    assert_eq!(qualified.to_string(), "orders::place");
+    assert!(!qualified.is_bare());
+    assert_eq!(qualified.symbol().as_str(), "place");
+}
+
+#[test]
+fn imports_parse_in_all_three_forms() {
+    assert_eq!(dump("import store.orders"), "(import store.orders)");
+    assert_eq!(dump("import store.orders as ord"), "(import store.orders as ord)");
+    assert_eq!(
+        dump("import store.orders (place, cancel)"),
+        "(import store.orders (place, cancel))"
+    );
+    assert_eq!(dump("import ledger"), "(import ledger)");
+    assert_eq!(dump("import a.b.c.d"), "(import a.b.c.d)");
+    assert_eq!(dump("import a (one,)"), "(import a (one))");
+}
+
+#[test]
+fn an_import_binds_its_last_segment_unless_aliased_or_selective() {
+    let m = ok("import store.orders\nimport store.orders as ord\nimport store.orders (place)");
+    assert_eq!(m.imports.len(), 3);
+    for i in &m.imports {
+        assert_eq!(i.module_name().as_str(), "store.orders");
+    }
+    assert_eq!(m.imports[0].binder().unwrap().as_str(), "orders");
+    assert_eq!(m.imports[1].binder().unwrap().as_str(), "ord");
+    assert!(m.imports[2].binder().is_none(), "a selective import binds no module binder");
+}
+
+#[test]
+fn every_part_of_an_import_carries_a_real_span() {
+    let src = "import store.orders as ord";
+    let m = ok(src);
+    let i = &m.imports[0];
+    assert_eq!(snippet(src, i.span), src);
+    assert_eq!(snippet(src, i.path_span()), "store.orders");
+    assert_eq!(snippet(src, i.binder_span()), "ord");
+    assert_eq!(snippet(src, i.path[0].span), "store");
+    assert_eq!(snippet(src, i.path[1].span), "orders");
+
+    let src = "import store.orders (place, cancel)";
+    let m = ok(src);
+    let i = &m.imports[0];
+    assert_eq!(snippet(src, i.span), src);
+    assert_eq!(snippet(src, i.binder_span()), src, "a selective import points at the whole decl");
+    let ImportKind::Names(names) = &i.kind else { panic!("expected a selective import") };
+    assert_eq!(snippet(src, names[0].span), "place");
+    assert_eq!(snippet(src, names[1].span), "cancel");
+
+    let src = "import store.orders";
+    let m = ok(src);
+    assert_eq!(snippet(src, m.imports[0].binder_span()), "orders");
+}
+
+#[test]
+fn imports_come_before_items_in_the_tree_they_produce() {
+    let m = ok("import a\nimport b as c\npub fn f() = 1");
+    assert_eq!(m.imports.len(), 2);
+    assert_eq!(m.items.len(), 1);
+    assert_eq!(dump_module(&m), "(import a)\n(import b as c)\n(pub fn f () 1)");
+}
+
+#[test]
+fn as_is_contextual_and_stays_usable_as_an_identifier() {
+    assert_eq!(dump("fn f(as: Int) = as"), "(fn f ((as Int)) as)");
+    assert_eq!(dump("import a as as"), "(import a as as)");
+}
+
+#[test]
+fn pub_applies_to_every_item_kind_that_can_carry_it() {
+    assert_eq!(dump("pub fn f() = 1"), "(pub fn f () 1)");
+    assert_eq!(dump("pub type T = Int"), "(pub type T = Int)");
+    assert_eq!(
+        dump("pub effect db { read get() -> Int }"),
+        "(pub effect db (op read get () -> Int))"
+    );
+    assert_eq!(
+        dump("pub nondet effect clock { read now() -> Int }"),
+        "(pub nondet effect clock (op read now () -> Int))"
+    );
+    assert_eq!(dump("type T = Int"), "(type T = Int)");
+}
+
+#[test]
+fn malformed_imports_are_diagnostics_with_a_code_and_a_real_span() {
+    for src in [
+        "import",
+        "import .",
+        "import 1",
+        "import a.",
+        "import a.1",
+        "import a as",
+        "import a as 1",
+        "import a as b (c)",
+        "import a (b) as c",
+        "import a (",
+        "import a ()",
+        "import a (b",
+        "import a (1)",
+        "import a (b c)",
+    ] {
+        let ds = errs(src);
+        assert!(!ds.is_empty(), "expected a diagnostic for {src:?}");
+        for d in &ds {
+            assert!(!d.code.is_empty(), "empty code for {src:?}");
+            let span = d.primary_span().unwrap_or_else(|| panic!("no span for {src:?}"));
+            assert!(!span.is_dummy(), "dummy span for {src:?}");
+            assert!(span.end as usize <= src.len(), "span past end for {src:?}");
+            assert!(span.start <= span.end, "inverted span for {src:?}");
+        }
+    }
+}
+
+#[test]
+fn an_import_may_rename_or_select_but_not_both() {
+    for src in ["import a as b (c)", "import a (c) as b"] {
+        let ds = errs(src);
+        assert!(
+            ds.iter().any(|d| d.message.contains("not both")),
+            "expected the `as`-plus-list diagnostic for {src:?}: {ds:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_import_that_selects_nothing_says_what_to_write_instead() {
+    let ds = errs("import a ()");
+    assert!(ds[0].message.contains("selects no names"), "{}", ds[0].message);
+    assert!(ds[0].notes.iter().any(|n| n.contains("bind the module")), "{:#?}", ds[0]);
+}
+
+#[test]
+fn a_malformed_import_does_not_stop_the_rest_of_the_file_from_parsing() {
+    let (m, ds) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "import a as\nimport b\nfn f() = 1\nfn g() = 2",
+    );
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    assert_eq!(dump_module(&m), "(import b)\n(fn f () 1)\n(fn g () 2)");
+}
+
+#[test]
+fn an_import_after_a_definition_is_reported_and_still_recorded() {
+    let src = "import a\nfn f() = 1\nimport b\nfn g() = 2";
+    let (m, ds) = parse_recovering(SRC, ModuleName::anonymous(), src);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    assert!(ds[0].message.contains("before every definition"), "{}", ds[0].message);
+    assert_eq!(snippet(src, ds[0].primary_span().unwrap()), "import");
+
+    let first = ds[0].labels.iter().find(|l| !l.primary).expect("a secondary label");
+    assert_eq!(snippet(src, first.span), "fn f() = 1");
+    assert!(!ds[0].notes.is_empty(), "it should say where to move the import");
+
+    assert_eq!(m.imports.len(), 2, "the misplaced import is still recorded");
+    assert_eq!(m.items.len(), 2);
+}
+
+#[test]
+fn each_out_of_order_import_is_reported_separately() {
+    let (_, ds) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn f() = 1\nimport a\nimport b\nfn g() = 2",
+    );
+    assert_eq!(ds.len(), 2, "{ds:#?}");
+}
+
+#[test]
+fn a_broken_item_before_an_import_does_not_swallow_it() {
+    let (m, ds) =
+        parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\nimport b\nfn c() = 1");
+    assert!(ds.len() >= 2, "expected both the bad body and the misplaced import: {ds:#?}");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.items.len(), 1);
+}
+
+#[test]
+fn import_errors_and_item_errors_are_reported_in_one_run() {
+    let (m, ds) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "import a as\nimport b ()\nimport c\nfn f() = ;\nimport d\npub fn g() = 1",
+    );
+    assert!(ds.len() >= 4, "expected four independent errors, got {ds:#?}");
+    assert_eq!(dump_module(&m), "(import c)\n(import d)\n(pub fn g () 1)");
+}
+
+#[test]
+fn a_duplicate_import_binding_parses_so_resolution_can_reject_it() {
+    let m = ok("import a.orders\nimport b.orders");
+    assert_eq!(m.imports.len(), 2);
+    assert_eq!(m.imports[0].binder(), m.imports[1].binder());
+    assert_ne!(m.imports[0].binder_span(), m.imports[1].binder_span());
+
+    let m = ok("import orders\nimport store.placement as orders");
+    assert_eq!(m.imports[0].binder().unwrap().as_str(), "orders");
+    assert_eq!(m.imports[1].binder().unwrap().as_str(), "orders");
+
+    let m = ok("import a (place)\nimport b (place)");
+    let (ImportKind::Names(x), ImportKind::Names(y)) = (&m.imports[0].kind, &m.imports[1].kind)
+    else {
+        panic!("expected two selective imports")
+    };
+    assert_eq!(x[0].name, y[0].name);
+    assert_ne!(x[0].span, y[0].span);
+}
+
+#[test]
+fn qualified_references_parse_in_every_position() {
+    assert_eq!(expr("orders::place(x)"), "(call orders::place x)");
+    assert_eq!(expr("store::db.get[users](k)"), "(perform store::db.get[users] k)");
+    assert_eq!(expr("store::clock.now()"), "(perform store::clock.now)");
+    assert_eq!(
+        expr("match v { orders::Placed(x) -> x, orders::Cancelled -> 0 }"),
+        "(match v (arm (ctor orders::Placed x) x) (arm (ctor orders::Cancelled) 0))"
+    );
+    assert_eq!(dump("fn f(x: orders::Order) = x"), "(fn f ((x orders::Order)) x)");
+    assert_eq!(
+        dump("fn f(x: orders::Slot<Int>) -> orders::Order = x"),
+        "(fn f ((x orders::Slot<Int>)) -> orders::Order x)"
+    );
+    assert_eq!(
+        dump("fn f() / {store::db.read[users], clock.write} = 1"),
+        "(fn f () / {store::db.read[users], clock.write} 1)"
+    );
+    assert_eq!(
+        expr("handle f() with { store::db.get[users](k) -> k, return x -> x }"),
+        "(handle (call f) (clause store::db.get[users] (k) k) (ret x x))"
+    );
+}
+
+#[test]
+fn a_qualified_name_is_neither_a_field_access_nor_a_perform() {
+    assert_eq!(expr("orders::place"), "orders::place");
+    assert_eq!(expr("orders.place"), "(field orders place)");
+    assert_eq!(expr("orders::rec.field"), "(field orders::rec field)");
+    assert_eq!(expr("orders::f(x).g"), "(field (call orders::f x) g)");
+}
+
+#[test]
+fn a_qualified_reference_spans_the_binder_through_the_name() {
+    let src = "fn f() = orders::place(x)";
+    let m = ok(src);
+    let Item::Fn(f) = &m.items[0] else { panic!() };
+    let ExprKind::App { func, .. } = &f.body.kind else { panic!("expected a call") };
+    let ExprKind::Var(q) = &func.kind else { panic!("expected a qualified name") };
+    assert_eq!(snippet(src, q.span), "orders::place");
+    assert_eq!(snippet(src, q.module.as_ref().unwrap().span), "orders");
+    assert_eq!(snippet(src, q.name.span), "place");
+
+    let src = "fn f() = store::db.get[users](k)";
+    let m = ok(src);
+    let Item::Fn(f) = &m.items[0] else { panic!() };
+    let ExprKind::Perform { effect, .. } = &f.body.kind else { panic!("expected a perform") };
+    assert_eq!(snippet(src, effect.span), "store::db");
+}
+
+#[test]
+fn a_module_path_in_a_reference_is_a_single_binder() {
+    let ds = errs("fn f() = a::b::c");
+    assert!(ds.iter().any(|d| d.message.contains("at most one `::`")), "{ds:#?}");
+    assert!(errs("fn f(x: a::b::C) = x").iter().any(|d| d.message.contains("at most one `::`")));
+    assert!(
+        errs("fn f() = match v { a::b::C -> 1 }")
+            .iter()
+            .any(|d| d.message.contains("at most one `::`"))
+    );
+}
+
+#[test]
+fn a_dangling_double_colon_is_a_diagnostic_with_a_real_span() {
+    for src in ["fn f() = a::", "fn f() = ::a", "fn f(x: a::) = x", "fn f() / {a::.read} = 1"] {
+        let ds = errs(src);
+        assert!(!ds.is_empty(), "expected a diagnostic for {src:?}");
+        for d in &ds {
+            let span = d.primary_span().unwrap_or_else(|| panic!("no span for {src:?}"));
+            assert!(!span.is_dummy(), "dummy span for {src:?}");
+            assert!(span.end as usize <= src.len(), "span past end for {src:?}");
+        }
+    }
+}
+
+#[test]
+fn a_local_binder_may_share_a_module_binders_name() {
+    assert_eq!(
+        expr("{ let orders = 1; orders + orders::count() }"),
+        "(block (let orders 1) (+ orders (call orders::count)))"
+    );
+}
+
+#[test]
+fn a_module_with_imports_and_pub_items_parses_whole() {
+    let src = r#"
+import ledger
+import store.orders as ord
+import store.orders (place, cancel)
+
+pub type Order = Placed(Int) | Cancelled
+
+pub effect db {
+  read  get[r](key: Int) -> Order
+  write put[r](key: Int, value: Order) -> Unit
+}
+
+pub fn total(xs: List<ord::Order>) -> Int / {store::db.read[users]} =
+  fold(xs, 0, |acc, x| acc + ledger::amount(x))
+
+fn internal() = place(1) + cancel(2)
+
+test "cross-module" {
+  handle { assert_eq(total([]), 0) } with { store::db.get[users](k) -> Cancelled }
+}
+"#;
+    let m = ok(src);
+    assert_eq!(m.imports.len(), 3);
+    assert_eq!(m.items.len(), 5);
+    let vis: Vec<bool> = m.items.iter().map(|i| i.visibility().is_public()).collect();
+    assert_eq!(vis, [true, true, true, false, false]);
+}
+
+#[test]
+fn each_input_to_parse_program_becomes_its_own_module() {
+    let program = parse_program([
+        (SourceId(0), ModuleName::from_dotted("a"), "fn one() = 1"),
+        (SourceId(1), ModuleName::from_dotted("b"), "fn two() = 2"),
+    ])
+    .unwrap();
+    assert_eq!(program.modules.len(), 2);
+    assert_eq!(program.modules[0].items.len(), 1);
+    assert_eq!(program.modules[1].items.len(), 1);
+    assert_eq!(program.index_of(&ModuleName::from_dotted("b")), Some(1));
+    assert!(program.find(&ModuleName::from_dotted("c")).is_none());
 }

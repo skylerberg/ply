@@ -3,7 +3,8 @@ use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
-use ply_syntax::ast::{Mode, Module};
+use ply_syntax::ast::Mode;
+use ply_syntax::resolve::Resolved;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,7 +37,8 @@ impl Drop for TempRoot {
 }
 
 struct Program {
-    module: Module,
+    program: ply_syntax::ast::Program,
+    resolved: Resolved,
     check: CheckOutput,
     hashes: HashOutput,
 }
@@ -44,11 +46,14 @@ struct Program {
 impl Program {
     fn compile(src: &str) -> Program {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let check = ply_core::check_module(&module)
+        let program = ply_syntax::ast::Program::single(module);
+        let resolved = ply_syntax::resolve(&program)
+            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+        let check = ply_core::check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes =
-            ply_hash::hash_module(&module, &check).unwrap_or_else(|d| panic!("hash: {d:#?}"));
-        Program { module, check, hashes }
+        let hashes = ply_hash::hash_program(&program, &resolved, &check)
+            .unwrap_or_else(|d| panic!("hash: {d:#?}"));
+        Program { program, resolved, check, hashes }
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -64,7 +69,7 @@ impl Program {
     }
 
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        run(selection, &self.module, &self.check, &self.hashes, store)
+        run(selection, &self.program, &self.resolved, &self.check, &self.hashes, store)
     }
 
     fn def_hash(&self, name: &str) -> ply_hash::DefHash {
@@ -525,8 +530,27 @@ fn a_red_test_does_not_vouch_for_the_definitions_it_exercised() {
     let selection = program.select(&store);
     program.run(&selection, &mut store);
 
-    assert!(store.get(program.def_hash("bad")).is_none());
-    assert!(store.get(program.def_hash("good")).is_some());
+    assert!(!store.knows_definition(program.def_hash("bad")));
+    assert!(store.knows_definition(program.def_hash("good")));
+}
+
+#[test]
+fn definitions_are_recorded_apart_from_test_results() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(ARITHMETIC);
+    let selection = program.select(&store);
+    assert_eq!(program.run(&selection, &mut store).failed, 0);
+
+    for name in ["add", "mul", "twice"] {
+        let hash = program.def_hash(name);
+        assert!(store.knows_definition(hash), "`{name}` was never recorded");
+        assert!(
+            store.get(hash).is_none(),
+            "`{name}` is a definition, not a test outcome"
+        );
+    }
+    assert_eq!(store.len(), 3, "one result per test and nothing else");
 }
 
 const LEDGER: &str = r#"
@@ -602,6 +626,120 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
         suspects.contains(&"credit"),
         "a sibling test passing first must not clear a suspect: {suspects:?}"
     );
+}
+
+/// Two tests over an overlapping closure: `base is right` covers `base`, and
+/// `total is right` covers `base` and `total`. Both definitions are supplied as
+/// expressions so a variant can move one hash without touching the other.
+fn shared(base: &str, total: &str) -> String {
+    format!(
+        "fn base(x: Int) -> Int = {base}\n\
+         fn total(x: Int) -> Int = {total}\n\
+         \n\
+         test \"base is right\" {{ assert_eq(base(1), 2) }}\n\
+         test \"total is right\" {{ assert_eq(total(1), 12) }}\n"
+    )
+}
+
+#[test]
+fn a_green_sibling_never_clears_a_suspect_on_a_later_run() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+
+    let green = Program::compile(&shared("x + 1", "base(x) + 10"));
+    let selection = green.select(&store);
+    assert_eq!(green.run(&selection, &mut store).failed, 0);
+
+    // `base` is rewritten into something value-identical, so its hash moves
+    // while the test covering it stays green; `total` is broken outright.
+    let red = Program::compile(&shared("1 + x", "base(x) + 11"));
+    let doomed = red.index_of("total is right");
+
+    for round in 0..3 {
+        let selection = red.select(&store);
+        assert!(selection.to_run.contains(&doomed), "round {round}: a red test always re-runs");
+
+        let report = red.run(&selection, &mut store);
+        assert_eq!(report.failed, 1, "round {round}: {:#?}", report.results);
+        let suspects: Vec<&str> =
+            report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            suspects,
+            vec!["base", "total"],
+            "round {round}: a passing sibling must not vouch for a red test's definitions"
+        );
+        assert!(
+            !store.knows_definition(red.def_hash("base")),
+            "round {round}: `base` is still under suspicion, so it is still unrecorded"
+        );
+    }
+}
+
+#[test]
+fn a_run_that_skipped_a_test_does_not_vouch_for_what_it_would_have_covered() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+
+    let green = Program::compile(&shared("x + 1", "base(x) + 10"));
+    let selection = green.select(&store);
+    assert_eq!(green.run(&selection, &mut store).failed, 0);
+
+    let red = Program::compile(&shared("1 + x", "base(x) + 11"));
+    let base = red.index_of("base is right");
+    let doomed = red.index_of("total is right");
+
+    // What `--filter base` narrows a selection to: `total is right` keeps its
+    // reason but is never handed to a group.
+    let mut filtered = red.select(&store);
+    filtered.to_run.retain(|&i| i == base);
+    filtered.groups = vec![vec![base]];
+    let report = red.run(&filtered, &mut store);
+    assert_eq!((report.passed, report.failed), (1, 0));
+    assert!(
+        !report.results.iter().any(|r| r.index == doomed),
+        "the narrowed run must not have executed `total is right`"
+    );
+
+    let selection = red.select(&store);
+    let report = red.run(&selection, &mut store);
+    assert_eq!(report.failed, 1);
+    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        suspects,
+        vec!["base", "total"],
+        "a test that never ran cannot have cleared its own closure"
+    );
+}
+
+#[test]
+fn going_green_ends_the_suspicion_a_failure_kept_alive() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+
+    let green = Program::compile(&shared("x + 1", "base(x) + 10"));
+    let selection = green.select(&store);
+    assert_eq!(green.run(&selection, &mut store).failed, 0);
+
+    let red = Program::compile(&shared("1 + x", "base(x) + 11"));
+    let selection = red.select(&store);
+    assert_eq!(red.run(&selection, &mut store).failed, 1);
+
+    let fixed = Program::compile(&shared("1 + x", "base(x) + 10"));
+    let selection = fixed.select(&store);
+    let report = fixed.run(&selection, &mut store);
+    assert_eq!(report.failed, 0, "{:#?}", report.failures);
+    assert!(store.knows_definition(fixed.def_hash("base")));
+    assert!(store.knows_definition(fixed.def_hash("total")));
+
+    // Only `total` moves now, so it is the only thing the next failure may name.
+    let broken = Program::compile(&shared("1 + x", "base(x) + 12"));
+    let selection = broken.select(&store);
+    assert_eq!(selection.to_run, vec![broken.index_of("total is right")]);
+
+    let report = broken.run(&selection, &mut store);
+    assert_eq!(report.failed, 1);
+    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    assert_eq!(suspects, vec!["total"]);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use anyhow::Context;
 use ply_hash::DefHash;
 use ply_span::Diagnostic;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const RESULTS_FILE: &str = "results.json";
+const RESULTS_STEM: &str = "results";
 
 /// Independent of [`RUNTIME_VERSION`]: the layout can change without
 /// invalidating results, and results can be invalidated without the layout
 /// changing.
 const FORMAT: u32 = 1;
 
-const TEMP_PREFIX: &str = "results.";
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// A temp file younger than this may belong to a concurrent writer that has not
@@ -25,12 +25,25 @@ const TEMP_SUFFIX: &str = ".tmp";
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
 pub(crate) type Entries = BTreeMap<DefHash, Outcome>;
+pub(crate) type Definitions = BTreeSet<DefHash>;
+
+/// `definitions` records which definitions a run has already seen. No test
+/// outcome can stand in for it: a green test vouches for the definitions in
+/// *its* closure, which says nothing about whether they are the ones that
+/// changed under a red one.
+#[derive(Default)]
+pub(crate) struct Cache {
+    pub(crate) results: Entries,
+    pub(crate) definitions: Definitions,
+}
 
 #[derive(Deserialize)]
 struct CacheFile {
     format: u32,
     runtime_version: String,
     results: Entries,
+    #[serde(default)]
+    definitions: Definitions,
 }
 
 #[derive(Serialize)]
@@ -38,6 +51,7 @@ struct CacheFileRef<'a> {
     format: u32,
     runtime_version: &'a str,
     results: &'a Entries,
+    definitions: &'a Definitions,
 }
 
 pub(crate) enum LoadError {
@@ -80,7 +94,7 @@ impl LoadError {
     }
 }
 
-pub(crate) fn load(path: &Path) -> Result<Entries, LoadError> {
+pub(crate) fn load(path: &Path) -> Result<Cache, LoadError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return Err(LoadError::Missing),
@@ -93,34 +107,43 @@ pub(crate) fn load(path: &Path) -> Result<Entries, LoadError> {
     if file.runtime_version != RUNTIME_VERSION {
         return Err(LoadError::Version(file.runtime_version));
     }
-    Ok(file.results)
+    Ok(Cache {
+        results: file.results,
+        definitions: file.definitions,
+    })
 }
 
-pub(crate) fn save(dir: &Path, path: &Path, entries: &Entries) -> anyhow::Result<()> {
+pub(crate) fn save(dir: &Path, path: &Path, cache: &Cache) -> anyhow::Result<()> {
     let file = CacheFileRef {
         format: FORMAT,
         runtime_version: RUNTIME_VERSION,
-        results: entries,
+        results: &cache.results,
+        definitions: &cache.definitions,
     };
     let mut bytes =
         serde_json::to_vec_pretty(&file).context("could not serialize the result cache")?;
     bytes.push(b'\n');
+    write_atomic(dir, path, RESULTS_STEM, &bytes, "result cache")
+}
 
-    let temp = temp_path(dir);
-    if let Err(e) = write_new(&temp, &bytes) {
+pub(crate) fn write_atomic(
+    dir: &Path,
+    path: &Path,
+    stem: &str,
+    bytes: &[u8],
+    what: &str,
+) -> anyhow::Result<()> {
+    let temp = temp_path(dir, stem);
+    if let Err(e) = write_new(&temp, bytes) {
         let _ = fs::remove_file(&temp);
-        return Err(anyhow::Error::new(e).context(format!(
-            "could not write the result cache `{}`",
-            temp.display()
-        )));
+        return Err(anyhow::Error::new(e)
+            .context(format!("could not write the {what} `{}`", temp.display())));
     }
 
     if let Err(e) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
-        return Err(anyhow::Error::new(e).context(format!(
-            "could not replace the result cache `{}`",
-            path.display()
-        )));
+        return Err(anyhow::Error::new(e)
+            .context(format!("could not replace the {what} `{}`", path.display())));
     }
 
     // Without this the rename can be lost by a crash even though the data was
@@ -137,7 +160,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-fn temp_path(dir: &Path) -> PathBuf {
+fn temp_path(dir: &Path, stem: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -145,7 +168,7 @@ fn temp_path(dir: &Path) -> PathBuf {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     dir.join(format!(
-        "{TEMP_PREFIX}{}.{seq}.{nanos}{TEMP_SUFFIX}",
+        "{stem}.{}.{seq}.{nanos}{TEMP_SUFFIX}",
         std::process::id()
     ))
 }
@@ -155,7 +178,10 @@ pub(crate) fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
     for entry in read.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(TEMP_PREFIX) || !name.ends_with(TEMP_SUFFIX) {
+        let ours = [RESULTS_STEM, crate::frontend::FRONTEND_STEM]
+            .iter()
+            .any(|stem| name.starts_with(&format!("{stem}.")));
+        if !ours || !name.ends_with(TEMP_SUFFIX) {
             continue;
         }
         if let Some(max_age) = max_age

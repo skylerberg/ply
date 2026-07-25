@@ -4,9 +4,8 @@ use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
 fn eval_in(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
-    let m = module(items);
-    let mut interp = Interp::for_module(&m);
-    interp.eval_expr_for_test(&e)
+    let (program, resolved) = standalone(items);
+    Interp::for_program(&program, &resolved).eval_expr_for_test(&e)
 }
 
 fn eval(e: Expr) -> Result<Value, Diagnostic> {
@@ -14,9 +13,10 @@ fn eval(e: Expr) -> Result<Value, Diagnostic> {
 }
 
 fn eval_depth(items: Vec<Item>, e: Expr, depth: usize) -> Result<Value, Diagnostic> {
-    let m = module(items);
-    let mut interp = Interp::for_module(&m).with_max_depth(depth);
-    interp.eval_expr_for_test(&e)
+    let (program, resolved) = standalone(items);
+    Interp::for_program(&program, &resolved)
+        .with_max_depth(depth)
+        .eval_expr_for_test(&e)
 }
 
 #[track_caller]
@@ -1282,7 +1282,8 @@ fn eval_test_runs_the_indexed_test_and_reports_a_failure() {
             callv("assert_eq", vec![callv("two", vec![]), int(3)]),
         ),
     ]);
-    let mut interp = Interp::for_module(&m);
+    let (program, resolved) = standalone_module(m);
+    let mut interp = Interp::for_program(&program, &resolved);
     assert_eq!(interp.test_count(), 2);
     assert_eq!(interp.test_name(1), Some("fails"));
     assert!(interp.eval_test(0).is_ok());
@@ -1306,8 +1307,8 @@ fn a_failed_test_does_not_poison_the_next_one() {
         "must be unhandled",
         perform("state", "get", None, vec![]),
     ));
-    let m = module(all);
-    let mut interp = Interp::for_module(&m);
+    let (program, resolved) = standalone(all);
+    let mut interp = Interp::for_program(&program, &resolved);
     assert_eq!(interp.eval_test(0).unwrap_err().code, codes::RUNTIME_ERROR);
     assert_eq!(
         interp.eval_test(1).unwrap_err().code,
@@ -1315,15 +1316,19 @@ fn a_failed_test_does_not_poison_the_next_one() {
     );
 }
 
+/// There is no longer one `main` per program, so choosing an entry point is
+/// the caller's job; the evaluator only answers to a program-wide name.
 #[test]
-fn eval_main_calls_the_main_definition() {
-    let m = module(vec![fn_def("main", &[], bin(BinOp::Add, int(1), int(2)))]);
-    let mut interp = Interp::for_module(&m);
-    assert_eq!(interp.eval_main().unwrap().render(), "3");
+fn call_invokes_a_definition_by_its_program_wide_name() {
+    let (program, resolved) =
+        standalone(vec![fn_def("main", &[], bin(BinOp::Add, int(1), int(2)))]);
+    let mut interp = Interp::for_program(&program, &resolved);
+    assert_eq!(interp.call("main", Vec::new(), sp()).unwrap().render(), "3");
 
-    let empty = module(vec![]);
-    let mut interp = Interp::for_module(&empty);
-    assert_eq!(interp.eval_main().unwrap_err().code, codes::UNKNOWN_NAME);
+    let (empty, resolved) = standalone(Vec::new());
+    let mut interp = Interp::for_program(&empty, &resolved);
+    let d = interp.call("main", Vec::new(), sp()).unwrap_err();
+    assert_eq!(d.code, codes::UNKNOWN_NAME);
 }
 
 #[test]

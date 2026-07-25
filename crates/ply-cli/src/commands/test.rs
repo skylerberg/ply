@@ -1,9 +1,10 @@
 use super::common::{
-    IND, diagnostic_json, diagnostics_json, emit_json, exit_code, location, plural,
-    print_diagnostics, print_warnings, report_load_error,
+    IND, diagnostic_json, emit_json, exit_code, location, millis, phases_json, plural,
+    print_diagnostics, print_phases, print_warnings, report_load_error,
 };
 use crate::cli::TestArgs;
-use crate::load::{Loaded, load};
+use crate::driver;
+use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
 use crate::EXIT_COMPILE_ERROR;
 use ply_core::{CheckOutput, Footprint};
@@ -15,30 +16,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
-    let loaded = match load(&args.path) {
-        Ok(loaded) => loaded,
-        Err(err) => return report_load_error("test", &err, args.json, style),
-    };
-
-    let hashes = match loaded.hashes() {
-        Ok(hashes) => hashes,
-        Err(diagnostics) => {
-            if args.json {
-                emit_json(&json!({
-                    "command": "test",
-                    "ok": false,
-                    "exit_code": EXIT_COMPILE_ERROR,
-                    "diagnostics": diagnostics_json(&diagnostics, &loaded.sources),
-                }));
-            } else {
-                print_diagnostics(&diagnostics, &loaded.sources, style);
-            }
-            return EXIT_COMPILE_ERROR;
-        }
-    };
-
     let mut warnings = Vec::new();
-    let mut cache = match Cache::open(&loaded.root, args.no_cache) {
+    let mut cache = match Cache::open(&project_root(&args.path), args.no_cache) {
         Ok(cache) => cache,
         Err(diagnostic) => {
             if args.json {
@@ -49,29 +28,85 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
                     "diagnostics": [diagnostic_json(&diagnostic, &SourceMap::new())],
                 }));
             } else {
-                print_diagnostics(std::slice::from_ref(&diagnostic), &loaded.sources, style);
+                print_diagnostics(std::slice::from_ref(&diagnostic), &SourceMap::new(), style);
             }
             return EXIT_COMPILE_ERROR;
         }
     };
     warnings.append(&mut cache.warnings);
-    warnings.extend(cache.store.take_warnings());
 
+    let incremental = !args.no_incremental && !args.no_cache;
+    let loaded = if incremental {
+        driver::load_incremental(&args.path, &mut cache.store)
+    } else {
+        load(&args.path)
+    };
+    let mut loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(err) => return report_load_error("test", &err, args.json, style),
+    };
+    warnings.extend(cache.store.take_warnings());
+    warnings.extend(loaded.frontend.warnings.iter().cloned());
+
+    let mut hashes = loaded.hashes.clone();
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
-    let plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
+    let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
+
+    // Evaluation needs an AST, and gate 1 may have skipped the file a selected
+    // test lives in. Only those modules are re-parsed — with their imports, which
+    // is everything the tests can reach — rather than the whole project: a run
+    // that reparses everything the moment one test is selected has no incremental
+    // front end at all, and one selected test is the normal case.
+    //
+    // The parse is also the only check on the cache that does not trust it. A
+    // fingerprint that authorized a skip and then disagrees with a real parse is
+    // a cache that lied, so the hashes are compared and the run says so.
+    //
+    // *Every* selected test's module is named, not only the ones missing an AST
+    // now. The first load wrote its fingerprints back, so a file it parsed
+    // because its bytes changed is a file the second load would skip — and the
+    // second load is the one that has to produce the bodies.
+    let mut needed: Vec<ply_syntax::ast::ModuleName> = Vec::new();
+    for test in plan.selection.to_run.iter().filter_map(|&i| loaded.check.tests.get(i)) {
+        if !needed.contains(&test.module) {
+            needed.push(test.module.clone());
+        }
+    }
+    if needed.iter().any(|m| !loaded.has_ast(m)) {
+        let unparsed = needed;
+        let reloaded = if incremental {
+            driver::load_to_evaluate(&args.path, &mut cache.store, &unparsed)
+        } else {
+            load(&args.path)
+        };
+        match reloaded {
+            Ok(full) => {
+                if disagrees(&hashes, &full.hashes) {
+                    warnings.push(cache_lied());
+                }
+                loaded = full;
+                hashes = loaded.hashes.clone();
+                let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
+                plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
+            }
+            Err(err) => return report_load_error("test", &err, args.json, style),
+        }
+    }
 
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
-    let report = match &pool {
-        Some(pool) => pool.install(|| {
-            ply_test::run(&plan.selection, &loaded.module, &loaded.check, &hashes, &mut cache.store)
-        }),
-        None => ply_test::run(
+    let mut run = || {
+        ply_test::run(
             &plan.selection,
-            &loaded.module,
+            &loaded.program,
+            &loaded.resolved,
             &loaded.check,
             &hashes,
             &mut cache.store,
-        ),
+        )
+    };
+    let report = match &pool {
+        Some(pool) => pool.install(run),
+        None => run(),
     };
     warnings.extend(report.warnings.iter().cloned());
 
@@ -103,11 +138,14 @@ impl Plan {
             return Plan { selection, visible, filtered_out: 0 };
         };
 
+        // Matched against `<module>.<label>` rather than the label alone, so
+        // `--filter store.` narrows to a module without a second flag, and a
+        // label substring still matches because the key contains the label.
         let visible: Vec<usize> = check
             .tests
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.name.contains(needle))
+            .filter(|(_, t)| t.key.as_str().contains(needle))
             .map(|(i, _)| i)
             .collect();
         let keeps = |i: &usize| visible.binary_search(i).is_ok();
@@ -202,6 +240,29 @@ impl Drop for Cache {
     }
 }
 
+/// The front-end cache authorized a skip and a real parse then disagreed with
+/// it. Nothing the user wrote caused this, and the run recovered, but a cache
+/// that can be wrong once must never be wrong silently.
+/// Whether a real parse produced a different hash from the one the front-end
+/// cache had promised. Only names present in both are compared: the second load
+/// parses more than the first, so it legitimately knows more.
+fn disagrees(cached: &HashOutput, parsed: &HashOutput) -> bool {
+    cached
+        .defs
+        .iter()
+        .any(|(name, hash)| parsed.defs.get(name).is_some_and(|fresh| fresh != hash))
+        || cached.tests != parsed.tests
+}
+
+fn cache_lied() -> Diagnostic {
+    Diagnostic::warning(
+        codes::CACHE_CORRUPT,
+        "the front-end cache disagreed with a fresh parse; this run ignored it",
+    )
+    .note("every file was parsed and every definition rechecked")
+    .note("run `ply cache clear` if it happens again")
+}
+
 fn scratch_failed(dir: &Path, cause: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
@@ -280,13 +341,19 @@ fn print_human(
 
     if args.explain {
         print_explain(loaded, hashes, plan, style);
+        print_phases(&loaded.frontend.phases, style);
     }
 
     if !report.results.is_empty() {
         println!();
-        let name_width = name_column(&report.results);
-        for result in &report.results {
-            println!("{IND}{}", result_line(result, name_width, style));
+        let names: Vec<String> = report
+            .results
+            .iter()
+            .map(|r| display_name(&loaded.check, r.index, &r.name))
+            .collect();
+        let name_width = name_column(&names);
+        for (result, name) in report.results.iter().zip(&names) {
+            println!("{IND}{}", result_line(result, name, name_width, style));
         }
     }
 
@@ -295,7 +362,7 @@ fn print_human(
 
     for failure in &report.failures {
         println!();
-        println!("{IND}{}", style.bold(&failure.name));
+        println!("{IND}{}", style.bold(failure.key.as_str()));
         println!("{IND}  {}", failure.diagnostic.message);
         if let Some(at) =
             failure.diagnostic.primary_span().and_then(|s| location(&loaded.sources, s))
@@ -326,26 +393,32 @@ fn print_human(
 
 fn no_tests_note(loaded: &Loaded, args: &TestArgs) -> &'static str {
     if loaded.check.tests.is_empty() {
-        "no `test` items in this module"
+        "no `test` items in this program"
     } else if args.filter.is_some() {
-        "no test name contains that substring; nothing was verified"
+        "no test key contains that substring; nothing was verified"
     } else {
         "nothing to report"
     }
 }
 
-/// Long test names are the norm — they are sentences — so the duration column
-/// follows the longest one rather than a guess that everything overruns.
-fn name_column(results: &[TestResult]) -> usize {
-    results
-        .iter()
-        .map(|r| r.name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .clamp(24, 64)
+/// Two modules may label a test identically, so a single-module run reads the
+/// label and anything larger reads `<module>.<label>` — the same key `--filter`
+/// matches on.
+fn display_name(check: &CheckOutput, index: usize, fallback: &str) -> String {
+    match check.tests.get(index) {
+        Some(test) if check.modules.len() > 1 => test.key.to_string(),
+        Some(test) => test.name.clone(),
+        None => fallback.to_string(),
+    }
 }
 
-fn result_line(result: &TestResult, name_width: usize, style: Style) -> String {
+/// Long test names are the norm — they are sentences — so the duration column
+/// follows the longest one rather than a guess that everything overruns.
+fn name_column(names: &[String]) -> usize {
+    names.iter().map(|n| n.chars().count()).max().unwrap_or(0).clamp(24, 64)
+}
+
+fn result_line(result: &TestResult, name: &str, name_width: usize, style: Style) -> String {
     let (mark, width): (String, usize) = if style.is_styled() {
         let mark = match result.status {
             Status::Passed => style.green("✓"),
@@ -364,11 +437,7 @@ fn result_line(result: &TestResult, name_width: usize, style: Style) -> String {
     // `mark` may carry escapes, so the padding is computed rather than left to
     // `{:<width$}`, which counts bytes.
     let pad = " ".repeat(width.saturating_sub(display_width(&mark)));
-    format!(
-        "{mark}{pad} {:<name_width$} {:>8.1}ms",
-        result.name,
-        millis(result.duration)
-    )
+    format!("{mark}{pad} {name:<name_width$} {:>8.1}ms", millis(result.duration))
 }
 
 fn print_summary(report: &RunReport, style: Style) {
@@ -386,6 +455,21 @@ fn print_summary(report: &RunReport, style: Style) {
 fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style) {
     let check = &loaded.check;
     println!();
+    for file in &loaded.frontend.files {
+        let state = if !file.parsed {
+            style.green("skipped")
+        } else if file.rechecked {
+            style.yellow("checked")
+        } else {
+            style.dim("parsed")
+        };
+        println!(
+            "{IND}{state:<9} {} {}",
+            file.path.display(),
+            style.dim(&file.refusal.describe())
+        );
+    }
+    println!();
     for &index in &plan.visible {
         let Some(test) = check.tests.get(index) else { continue };
         let reason = plan.selection.reason(index).unwrap_or(Reason::Unhashed);
@@ -399,7 +483,7 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             "{IND}{verb} {} {:<16} {}",
             style.dim(&hash),
             reason.as_str(),
-            test.name
+            display_name(check, index, &test.name)
         );
     }
 
@@ -434,7 +518,7 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
         );
         for &index in group {
             if let Some(test) = check.tests.get(index) {
-                println!("{IND}    {}", test.name);
+                println!("{IND}    {}", display_name(check, index, &test.name));
             }
         }
     }
@@ -474,7 +558,9 @@ fn report_json(
             let reason = selection.reason(index).unwrap_or(Reason::Unhashed);
             Some(json!({
                 "index": index,
+                "key": test.key,
                 "name": test.name,
+                "module": test.module.as_str(),
                 "hash": hashes.tests.get(index).map(|h| h.to_hex()),
                 "nondet": test.nondet,
                 "selected": reason.runs(),
@@ -503,9 +589,12 @@ fn report_json(
         .results
         .iter()
         .map(|r| {
+            let test = check.tests.get(r.index);
             json!({
                 "index": r.index,
-                "name": r.name,
+                "key": test.map(|t| t.key.clone()),
+                "name": test.map_or_else(|| r.name.clone(), |t| t.name.clone()),
+                "module": test.map(|t| t.module.to_string()),
                 "hash": r.hash.map(|h| h.to_hex()),
                 "group": r.group,
                 "status": r.status,
@@ -521,6 +610,7 @@ fn report_json(
         .map(|f| {
             json!({
                 "name": f.name,
+                "key": f.key,
                 "diagnostic": diagnostic_json(&f.diagnostic, sources),
                 "location": f.diagnostic.primary_span().and_then(|s| location(sources, s)),
                 "suspects": f.suspects,
@@ -530,10 +620,22 @@ fn report_json(
 
     json!({
         "command": "test",
+        "front_end": json!({
+            "incremental": loaded.frontend.incremental,
+            "parsed": loaded.frontend.parsed(),
+            "skipped": loaded.frontend.skipped(),
+            "cached": loaded.frontend.cached(),
+            "rechecked": loaded.frontend.rechecked(),
+            "phases": phases_json(&loaded.frontend.phases),
+        }),
         "ok": report.is_success(),
         "exit_code": exit_code(report.is_success()),
         "root": loaded.root.display().to_string(),
         "files": loaded.file_names(),
+        "modules": loaded.modules().iter().map(|m| json!({
+            "name": m.name.as_str(),
+            "file": m.path.display().to_string(),
+        })).collect::<Vec<_>>(),
         "filter": args.filter,
         "no_cache": args.no_cache,
         "workers": workers,
@@ -556,10 +658,6 @@ fn report_json(
         "diagnostics": Value::Array(Vec::new()),
         "warnings": warnings.iter().map(|w| diagnostic_json(w, sources)).collect::<Vec<_>>(),
     })
-}
-
-fn millis(d: std::time::Duration) -> f64 {
-    (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
 }
 
 fn display_width(s: &str) -> usize {
@@ -603,12 +701,37 @@ test \"writes users when asked\" {
 test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 ";
 
-    fn fixture() -> (tempfile::TempDir, Loaded, HashOutput) {
+    fn write(dir: &Path, rel: &str, text: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, Loaded, HashOutput) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("m.ply"), SOURCE).unwrap();
+        for (rel, text) in files {
+            write(dir.path(), rel, text);
+        }
         let loaded = load(dir.path()).unwrap();
         let hashes = loaded.hashes().unwrap();
         (dir, loaded, hashes)
+    }
+
+    fn fixture() -> (tempfile::TempDir, Loaded, HashOutput) {
+        project(&[("m.ply", SOURCE)])
+    }
+
+    fn run(loaded: &Loaded, selection: &Selection, store: &mut Store) -> RunReport {
+        ply_test::run(
+            selection,
+            &loaded.program,
+            &loaded.resolved,
+            &loaded.check,
+            &loaded.hashes().unwrap(),
+            store,
+        )
     }
 
     fn plan_for(filter: Option<&str>) -> (tempfile::TempDir, Loaded, HashOutput, Plan) {
@@ -617,6 +740,18 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let selected = ply_test::select(&loaded.check, &hashes, &store);
         let plan = Plan::new(selected, &loaded.check, filter);
         (dir, loaded, hashes, plan)
+    }
+
+    fn args_for(filter: Option<&str>) -> TestArgs {
+        TestArgs {
+            path: PathBuf::from("."),
+            json: true,
+            explain: false,
+            no_incremental: false,
+            no_cache: false,
+            filter: filter.map(str::to_string),
+            jobs: None,
+        }
     }
 
     #[test]
@@ -632,18 +767,17 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     #[test]
     fn a_write_is_scheduled_apart_from_the_reads_of_the_same_resource() {
         let (_dir, loaded, _h, plan) = plan_for(None);
-        let index_of = |name: &str| {
-            loaded.check.tests.iter().position(|t| t.name == name).unwrap()
-        };
+        let index_of =
+            |name: &str| loaded.check.tests.iter().position(|t| t.name == name).unwrap();
         let group_of = |name: &str| plan.selection.group_of(index_of(name)).unwrap();
 
         assert_eq!(
             loaded.check.tests[index_of("reads orders only")].footprint.to_string(),
-            "{db.read[users]}"
+            "{m.db.read[users]}"
         );
         assert_eq!(
             loaded.check.tests[index_of("writes users when asked")].footprint.to_string(),
-            "{db.write[users]}"
+            "{m.db.write[users]}"
         );
         assert_eq!(group_of("reads orders only"), group_of("reads orders only again"));
         assert_ne!(group_of("reads orders only"), group_of("writes users when asked"));
@@ -669,15 +803,28 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(plan.selection.total, 0);
         assert!(plan.selection.to_run.is_empty());
         assert!(plan.selection.groups.is_empty());
-        let args = TestArgs {
-            path: PathBuf::from("."),
-            json: false,
-            explain: false,
-            no_cache: false,
-            filter: Some("no such test".into()),
-            jobs: None,
+        assert!(no_tests_note(&loaded, &args_for(Some("no such test"))).contains("substring"));
+    }
+
+    #[test]
+    fn the_filter_matches_the_module_qualified_key() {
+        let (dir, loaded, hashes) = project(&[
+            ("alpha.ply", "test \"shared label\" { assert_eq(1, 1) }\n"),
+            ("beta.ply", "test \"shared label\" { assert_eq(2, 2) }\n"),
+        ]);
+        let store = Store::open(dir.path()).unwrap();
+        let keys: Vec<&str> = loaded.check.tests.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, ["alpha.shared label", "beta.shared label"]);
+
+        let select = |needle| {
+            Plan::new(
+                ply_test::select(&loaded.check, &hashes, &store),
+                &loaded.check,
+                Some(needle),
+            )
         };
-        assert!(no_tests_note(&loaded, &args).contains("substring"));
+        assert_eq!(select("beta.").visible, vec![1]);
+        assert_eq!(select("shared label").visible, vec![0, 1]);
     }
 
     #[test]
@@ -685,8 +832,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
         let selected = ply_test::select(&loaded.check, &hashes, &store);
-        let report =
-            ply_test::run(&selected, &loaded.module, &loaded.check, &hashes, &mut store);
+        let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.passed, 4);
         assert_eq!(report.failed, 0);
 
@@ -698,9 +844,47 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     }
 
     #[test]
+    fn tests_from_every_module_are_selected_and_run_together() {
+        let (dir, loaded, hashes) = project(&[
+            ("lib.ply", "pub fn one() -> Int = 1\ntest \"one is one\" { assert_eq(one(), 1) }\n"),
+            (
+                "app.ply",
+                "import lib\n\
+                 fn two() -> Int = lib::one() + lib::one()\n\
+                 test \"two is two\" { assert_eq(two(), 2) }\n",
+            ),
+        ]);
+        assert_eq!(loaded.module_count(), 2);
+
+        let mut store = Store::open(dir.path()).unwrap();
+        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        assert_eq!(selected.total, 2);
+        let report = run(&loaded, &selected, &mut store);
+        assert_eq!(report.passed, 2, "failures: {:?}", report.failures);
+        assert!(report.is_success());
+    }
+
+    #[test]
+    fn a_failing_test_names_its_suspects_by_program_wide_name() {
+        let (dir, loaded, hashes) = project(&[
+            ("lib.ply", "pub fn one() -> Int = 2\n"),
+            (
+                "app.ply",
+                "import lib\ntest \"one is one\" { assert_eq(lib::one(), 1) }\n",
+            ),
+        ]);
+        let mut store = Store::open(dir.path()).unwrap();
+        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let report = run(&loaded, &selected, &mut store);
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].suspects, vec![ply_span::Symbol::new("lib.one")]);
+    }
+
+    #[test]
     fn no_cache_never_touches_the_real_store() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("m.ply"), SOURCE).unwrap();
+        write(dir.path(), "m.ply", SOURCE);
         let loaded = load(dir.path()).unwrap();
         let hashes = loaded.hashes().unwrap();
 
@@ -709,7 +893,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             let scratch = cache.scratch.clone().expect("bypass must use a scratch store");
             let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
             assert_eq!(selected.to_run.len(), 4);
-            ply_test::run(&selected, &loaded.module, &loaded.check, &hashes, &mut cache.store);
+            run(&loaded, &selected, &mut cache.store);
             assert!(!cache.store.is_empty());
             scratch
         };
@@ -734,19 +918,12 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     #[test]
     fn a_failure_is_never_cached_so_it_re_runs() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("m.ply"),
-            "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n",
-        )
-        .unwrap();
-        let loaded = load(dir.path()).unwrap();
-        let hashes = loaded.hashes().unwrap();
+        let (dir, loaded, hashes) =
+            project(&[("m.ply", "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n")]);
         let mut store = Store::open(dir.path()).unwrap();
 
         let selected = ply_test::select(&loaded.check, &hashes, &store);
-        let report =
-            ply_test::run(&selected, &loaded.module, &loaded.check, &hashes, &mut store);
+        let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.failed, 1);
         assert_eq!(exit_code(report.is_success()), crate::EXIT_FAILED);
         assert_eq!(report.failures[0].diagnostic.code, codes::ASSERTION_FAILED);
@@ -758,34 +935,18 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     #[test]
     fn the_json_report_is_one_object_with_selection_results_and_failures() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("m.ply"),
+        let (dir, loaded, hashes) = project(&[(
+            "m.ply",
             "fn f() -> Int = 1\n\
              test \"good\" { assert_eq(f(), 1) }\n\
              test \"bad\" { assert_eq(f(), 2) }\n",
-        )
-        .unwrap();
-        let loaded = load(dir.path()).unwrap();
-        let hashes = loaded.hashes().unwrap();
+        )]);
         let mut store = Store::open(dir.path()).unwrap();
-        let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store),
-            &loaded.check,
-            None,
-        );
-        let report =
-            ply_test::run(&plan.selection, &loaded.module, &loaded.check, &hashes, &mut store);
+        let plan =
+            Plan::new(ply_test::select(&loaded.check, &hashes, &store), &loaded.check, None);
+        let report = run(&loaded, &plan.selection, &mut store);
 
-        let args = TestArgs {
-            path: dir.path().to_path_buf(),
-            json: true,
-            explain: false,
-            no_cache: false,
-            filter: None,
-            jobs: None,
-        };
-        let v = report_json(&loaded, &hashes, &plan, &report, &args, 4, &[]);
+        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
 
         assert_eq!(v["command"], "test");
         assert_eq!(v["ok"], false);
@@ -793,16 +954,39 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(v["selection"]["total"], 2);
         assert_eq!(v["selection"]["selected"], 2);
         assert_eq!(v["selection"]["tests"][0]["reason"], "new");
+        assert_eq!(v["selection"]["tests"][0]["key"], "m.good");
+        assert_eq!(v["selection"]["tests"][0]["module"], "m");
         assert_eq!(v["selection"]["tests"][0]["hash"].as_str().unwrap().len(), 64);
+        assert_eq!(v["modules"][0]["name"], "m");
         assert_eq!(v["failures"].as_array().unwrap().len(), 1);
-        assert_eq!(v["failures"][0]["name"], "bad");
         assert_eq!(v["failures"][0]["diagnostic"]["code"], codes::ASSERTION_FAILED);
         assert_eq!(v["failures"][0]["diagnostic"]["labels"][0]["start"]["line"], 3);
         // `f` is in the failing test's closure and has never gone green.
-        assert_eq!(v["failures"][0]["suspects"], json!(["f"]));
+        assert_eq!(v["failures"][0]["suspects"], json!(["m.f"]));
         assert!(v["failures"][0]["location"].as_str().unwrap().contains("m.ply:3:"));
         assert_eq!(v["summary"]["failed"], 1);
         assert_eq!(v["summary"]["passed"], 1);
+    }
+
+    #[test]
+    fn two_failures_sharing_a_label_are_told_apart_by_their_key() {
+        let (dir, loaded, hashes) = project(&[
+            ("alpha.ply", "fn one() -> Int = 1\ntest \"it adds up\" { assert_eq(one(), 2) }\n"),
+            ("beta.ply", "fn two() -> Int = 2\ntest \"it adds up\" { assert_eq(two(), 3) }\n"),
+        ]);
+        let mut store = Store::open(dir.path()).unwrap();
+        let plan =
+            Plan::new(ply_test::select(&loaded.check, &hashes, &store), &loaded.check, None);
+        let report = run(&loaded, &plan.selection, &mut store);
+        assert_eq!(report.failed, 2);
+
+        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
+        let keys: Vec<&str> =
+            v["failures"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["alpha.it adds up", "beta.it adds up"]);
+        for f in v["failures"].as_array().unwrap() {
+            assert_eq!(f["name"], "it adds up");
+        }
     }
 
     #[test]
@@ -822,24 +1006,34 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     #[test]
     fn a_nondet_test_always_runs_and_is_never_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("m.ply"),
+        let (dir, loaded, hashes) = project(&[(
+            "m.ply",
             "nondet effect clock {\n  read now() -> Int\n}\n\
              test/nondet \"reads the clock\" { assert(clock.now() > 0) }\n",
-        )
-        .unwrap();
-        let loaded = load(dir.path()).unwrap();
-        let hashes = loaded.hashes().unwrap();
+        )]);
         let mut store = Store::open(dir.path()).unwrap();
 
         let selected = ply_test::select(&loaded.check, &hashes, &store);
         assert_eq!(selected.reason(0), Some(Reason::Nondet));
-        ply_test::run(&selected, &loaded.module, &loaded.check, &hashes, &mut store);
+        run(&loaded, &selected, &mut store);
 
         let store = Store::open(dir.path()).unwrap();
         let again = ply_test::select(&loaded.check, &hashes, &store);
         assert_eq!(again.to_run, vec![0]);
+    }
+
+    #[test]
+    fn a_label_is_shown_bare_in_one_module_and_qualified_across_several() {
+        let (_dir, one, _h) = project(&[("m.ply", "test \"only\" { assert_eq(1, 1) }\n")]);
+        assert_eq!(display_name(&one.check, 0, "fallback"), "only");
+
+        let (_dir, two, _h) = project(&[
+            ("alpha.ply", "test \"shared\" { assert_eq(1, 1) }\n"),
+            ("beta.ply", "test \"shared\" { assert_eq(2, 2) }\n"),
+        ]);
+        assert_eq!(display_name(&two.check, 0, "fallback"), "alpha.shared");
+        assert_eq!(display_name(&two.check, 1, "fallback"), "beta.shared");
+        assert_eq!(display_name(&two.check, 9, "fallback"), "fallback");
     }
 
     #[test]
@@ -851,15 +1045,15 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             group: 0,
             duration: Duration::from_micros(2100),
             status: Status::Failed,
-        failure: None,
+            failure: None,
         };
-        let plain = result_line(&result, 44, Style::plain());
+        let plain = result_line(&result, &result.name, 44, Style::plain());
         assert!(plain.starts_with("FAIL "));
         assert!(!plain.contains('\x1b'));
         assert!(plain.contains("balance never goes negative"));
         assert!(plain.trim_end().ends_with("2.1ms"));
 
-        let styled = result_line(&result, 44, Style::new(true));
+        let styled = result_line(&result, &result.name, 44, Style::new(true));
         assert!(styled.contains('✗'));
         assert!(styled.contains('\x1b'));
     }
@@ -875,9 +1069,8 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             status,
             failure: None,
         };
-        let column = |status| {
-            result_line(&make(status), 24, Style::plain()).find("n ").unwrap()
-        };
+        let column =
+            |status| result_line(&make(status), "n", 24, Style::plain()).find("n ").unwrap();
         assert_eq!(column(Status::Passed), column(Status::Failed));
         assert_eq!(column(Status::Passed), column(Status::Panicked));
     }
@@ -887,12 +1080,11 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
         let first = ply_test::select(&loaded.check, &hashes, &store);
-        ply_test::run(&first, &loaded.module, &loaded.check, &hashes, &mut store);
+        run(&loaded, &first, &mut store);
 
         let mut store = Store::open(dir.path()).unwrap();
         let second = ply_test::select(&loaded.check, &hashes, &store);
-        let report =
-            ply_test::run(&second, &loaded.module, &loaded.check, &hashes, &mut store);
+        let report = run(&loaded, &second, &mut store);
         assert!(report.results.is_empty());
         assert_eq!(report.cached, 4);
         assert!(report.is_success());
@@ -911,5 +1103,27 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let selected = ply_test::select(&loaded.check, &hashes, &store);
         assert_eq!(selected.reason(0), Some(Reason::PreviousFailure));
         assert!(selected.to_run.contains(&0));
+    }
+
+    /// Two structurally identical tests in different modules have the same
+    /// hash, so proving one proves the other — the corollary the ADR calls out
+    /// as looking like a bug.
+    #[test]
+    fn identical_tests_in_two_modules_share_one_cache_entry() {
+        let (dir, loaded, hashes) = project(&[
+            ("alpha.ply", "test \"same\" { assert_eq(1 + 1, 2) }\n"),
+            ("beta.ply", "test \"same\" { assert_eq(1 + 1, 2) }\n"),
+        ]);
+        assert_eq!(hashes.tests[0], hashes.tests[1]);
+
+        let mut store = Store::open(dir.path()).unwrap();
+        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        assert_eq!(selected.to_run.len(), 2);
+        run(&loaded, &selected, &mut store);
+
+        let store = Store::open(dir.path()).unwrap();
+        let again = ply_test::select(&loaded.check, &hashes, &store);
+        assert!(again.to_run.is_empty());
+        assert_eq!(again.cached.len(), 2);
     }
 }

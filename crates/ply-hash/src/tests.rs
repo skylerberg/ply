@@ -14,12 +14,16 @@ fn id(name: &str) -> Ident {
     Ident::new(name, Span::DUMMY)
 }
 
+fn qn(name: &str) -> QName {
+    QName::bare(id(name))
+}
+
 fn e(kind: ExprKind) -> Expr {
     Expr { kind, span: Span::DUMMY }
 }
 
 fn var(name: &str) -> Expr {
-    e(ExprKind::Var(id(name)))
+    e(ExprKind::Var(qn(name)))
 }
 
 fn int(v: i64) -> Expr {
@@ -59,14 +63,14 @@ fn typed_param(name: &str, ty: &str) -> Param {
 }
 
 fn ty_con(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
-    TypeExpr::Con { name: id(name), args, span: Span::DUMMY }
+    TypeExpr::Con { name: qn(name), args, span: Span::DUMMY }
 }
 
 fn let_(name: &str, value: Expr) -> Stmt {
     Stmt::Let {
         pat: Pattern { kind: PatternKind::Var(id(name)), span: Span::DUMMY },
         ty: None,
-        value,
+        value: Box::new(value),
         span: Span::DUMMY,
     }
 }
@@ -80,7 +84,7 @@ fn pvar(name: &str) -> Pattern {
 }
 
 fn pctor(name: &str, args: Vec<Pattern>) -> Pattern {
-    pat(PatternKind::Ctor { name: id(name), args })
+    pat(PatternKind::Ctor { name: qn(name), args })
 }
 
 fn arm(pattern: Pattern, body: Expr) -> MatchArm {
@@ -100,7 +104,8 @@ fn list(items: Vec<Expr>) -> Expr {
 }
 
 fn func(name: &str, params: &[&str], body: Expr) -> Item {
-    Item::Fn(FnDef {
+    Item::Fn(Box::new(FnDef {
+        vis: Visibility::Private,
         name: id(name),
         generics: Generics::default(),
         params: params.iter().map(|p| param(p)).collect(),
@@ -108,21 +113,26 @@ fn func(name: &str, params: &[&str], body: Expr) -> Item {
         effects: None,
         body,
         span: Span::DUMMY,
-    })
+    }))
 }
 
 fn test_item(name: &str, body: Expr) -> Item {
-    Item::Test(TestDef {
+    Item::Test(Box::new(TestDef {
         name: name.to_string(),
         name_span: Span::DUMMY,
         nondet: false,
         body,
         span: Span::DUMMY,
-    })
+    }))
 }
 
 fn module(items: Vec<Item>) -> Module {
-    Module { items }
+    Module {
+        name: ModuleName::anonymous(),
+        source: Span::DUMMY.source,
+        imports: Vec::new(),
+        items,
+    }
 }
 
 fn hashes(items: Vec<Item>) -> HashOutput {
@@ -196,7 +206,8 @@ fn renaming_a_recursive_definition_changes_no_hash() {
 fn renaming_a_type_changes_no_hash_of_its_users() {
     let program = |ty: &str| {
         vec![
-            Item::Type(TypeDef {
+            Item::Type(Box::new(TypeDef {
+                vis: Visibility::Private,
                 name: id(ty),
                 params: vec![],
                 body: TypeDefBody::Sum(vec![
@@ -208,8 +219,9 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                     },
                 ]),
                 span: Span::DUMMY,
-            }),
-            Item::Fn(FnDef {
+            })),
+            Item::Fn(Box::new(FnDef {
+                vis: Visibility::Private,
                 name: id("describe"),
                 generics: Generics::default(),
                 params: vec![typed_param("u", ty)],
@@ -223,7 +235,7 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                     ],
                 }),
                 span: Span::DUMMY,
-            }),
+            })),
         ]
     };
     assert_eq!(hash_of(program("User"), "describe"), hash_of(program("Account"), "describe"));
@@ -233,7 +245,8 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
 fn renaming_an_effect_changes_no_hash_of_its_performers() {
     let program = |eff: &str| {
         vec![
-            Item::Effect(EffectDef {
+            Item::Effect(Box::new(EffectDef {
+                vis: Visibility::Private,
                 name: id(eff),
                 nondet: false,
                 ops: vec![OpDef {
@@ -245,12 +258,12 @@ fn renaming_an_effect_changes_no_hash_of_its_performers() {
                     span: Span::DUMMY,
                 }],
                 span: Span::DUMMY,
-            }),
+            })),
             func(
                 "lookup",
                 &["k"],
                 e(ExprKind::Perform {
-                    effect: id(eff),
+                    effect: qn(eff),
                     op: id("get"),
                     resource: Some(id("users")),
                     args: vec![var("k")],
@@ -444,7 +457,8 @@ fn refinement_separates_members_that_differ_only_deeper_in_the_cycle() {
 #[test]
 fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
     let annotated = |atoms: Vec<(&str, Mode, &str)>| {
-        vec![Item::Fn(FnDef {
+        vec![Item::Fn(Box::new(FnDef {
+            vis: Visibility::Private,
             name: id("f"),
             generics: Generics::default(),
             params: vec![],
@@ -453,7 +467,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
                 atoms: atoms
                     .into_iter()
                     .map(|(eff, mode, res)| AtomExpr {
-                        effect: id(eff),
+                        effect: qn(eff),
                         mode,
                         resource: Some(id(res)),
                         span: Span::DUMMY,
@@ -464,7 +478,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
             }),
             body: int(0),
             span: Span::DUMMY,
-        })]
+        }))]
     };
     let a = hash_of(
         annotated(vec![("db", Mode::Read, "users"), ("db", Mode::Write, "orders")]),
@@ -522,12 +536,13 @@ fn changing_a_type_definition_changes_the_hash_of_its_users() {
             vec![VariantDef { name: id("Active"), fields: vec![], span: Span::DUMMY }];
         variants.extend(extra);
         vec![
-            Item::Type(TypeDef {
+            Item::Type(Box::new(TypeDef {
+                vis: Visibility::Private,
                 name: id("Status"),
                 params: vec![],
                 body: TypeDefBody::Sum(variants),
                 span: Span::DUMMY,
-            }),
+            })),
             func("mk", &[], var("Active")),
         ]
     };
@@ -679,7 +694,8 @@ fn string_literals_cannot_be_confused_with_their_neighbours() {
 fn an_absent_annotation_differs_from_a_written_one() {
     let bare = hash_of(vec![func("f", &["x"], var("x"))], "f");
     let annotated = hash_of(
-        vec![Item::Fn(FnDef {
+        vec![Item::Fn(Box::new(FnDef {
+            vis: Visibility::Private,
             name: id("f"),
             generics: Generics::default(),
             params: vec![typed_param("x", "Int")],
@@ -687,7 +703,7 @@ fn an_absent_annotation_differs_from_a_written_one() {
             effects: None,
             body: var("x"),
             span: Span::DUMMY,
-        })],
+        }))],
         "f",
     );
     assert_ne!(bare, annotated);
@@ -696,7 +712,8 @@ fn an_absent_annotation_differs_from_a_written_one() {
 #[test]
 fn a_generic_parameter_is_positional_not_named() {
     let generic = |declared: [&str; 2], used: [&str; 2]| {
-        vec![Item::Fn(FnDef {
+        vec![Item::Fn(Box::new(FnDef {
+            vis: Visibility::Private,
             name: id("f"),
             generics: Generics { types: vec![id(declared[0]), id(declared[1])], effects: vec![] },
             params: vec![typed_param("x", used[0]), typed_param("y", used[1])],
@@ -704,7 +721,7 @@ fn a_generic_parameter_is_positional_not_named() {
             effects: None,
             body: var("x"),
             span: Span::DUMMY,
-        })]
+        }))]
     };
     assert_eq!(
         hash_of(generic(["a", "b"], ["a", "b"]), "f"),
@@ -719,7 +736,8 @@ fn a_generic_parameter_is_positional_not_named() {
 #[test]
 fn a_free_type_name_is_not_a_generic_parameter() {
     let concrete = hash_of(
-        vec![Item::Fn(FnDef {
+        vec![Item::Fn(Box::new(FnDef {
+            vis: Visibility::Private,
             name: id("f"),
             generics: Generics::default(),
             params: vec![typed_param("x", "Int")],
@@ -727,11 +745,12 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             effects: None,
             body: var("x"),
             span: Span::DUMMY,
-        })],
+        }))],
         "f",
     );
     let generic = hash_of(
-        vec![Item::Fn(FnDef {
+        vec![Item::Fn(Box::new(FnDef {
+            vis: Visibility::Private,
             name: id("f"),
             generics: Generics { types: vec![id("Int")], effects: vec![] },
             params: vec![typed_param("x", "Int")],
@@ -739,7 +758,7 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             effects: None,
             body: var("x"),
             span: Span::DUMMY,
-        })],
+        }))],
         "f",
     );
     assert_ne!(concrete, generic);
@@ -756,7 +775,7 @@ fn handler_program(resource: &str, clause_body: Expr) -> Vec<Item> {
             body: Box::new(e(ExprKind::Handle {
                 body: Box::new(callv("body", vec![])),
                 clauses: vec![HandleClause {
-                    effect: id("db"),
+                    effect: qn("db"),
                     op: id("get"),
                     resource: Some(id(resource)),
                     params: vec![id("k")],
@@ -804,7 +823,7 @@ fn the_operation_of_a_perform_is_part_of_the_hash() {
             "f",
             &["k"],
             e(ExprKind::Perform {
-                effect: id("db"),
+                effect: qn("db"),
                 op: id(op),
                 resource: mode_resource.map(id),
                 args: vec![var("k")],
@@ -822,13 +841,13 @@ fn the_operation_of_a_perform_is_part_of_the_hash() {
 fn a_nondet_test_differs_from_a_deterministic_one() {
     let body = callv("assert", vec![e(ExprKind::Lit(Lit::Bool(true)))]);
     let det = hashes(vec![test_item("t", body.clone())]);
-    let nondet = hashes(vec![Item::Test(TestDef {
+    let nondet = hashes(vec![Item::Test(Box::new(TestDef {
         name: "t".to_string(),
         name_span: Span::DUMMY,
         nondet: true,
         body,
         span: Span::DUMMY,
-    })]);
+    }))]);
     assert_ne!(det.tests[0], nondet.tests[0]);
 }
 
@@ -874,7 +893,8 @@ fn a_cycle_hash_is_stable_across_runs() {
 fn a_recursive_type_hashes_and_is_rename_invariant() {
     let program = |name: &str| {
         vec![
-            Item::Type(TypeDef {
+            Item::Type(Box::new(TypeDef {
+                vis: Visibility::Private,
                 name: id(name),
                 params: vec![],
                 body: TypeDefBody::Sum(vec![
@@ -886,7 +906,7 @@ fn a_recursive_type_hashes_and_is_rename_invariant() {
                     },
                 ]),
                 span: Span::DUMMY,
-            }),
+            })),
             func("empty", &[], var("Nil")),
         ]
     };
@@ -942,7 +962,8 @@ fn builtins_and_unknown_names_are_not_dependencies() {
 #[test]
 fn deps_include_the_types_and_effects_a_definition_mentions() {
     let out = hashes(vec![
-        Item::Type(TypeDef {
+        Item::Type(Box::new(TypeDef {
+            vis: Visibility::Private,
             name: id("Status"),
             params: vec![],
             body: TypeDefBody::Sum(vec![VariantDef {
@@ -951,8 +972,9 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
                 span: Span::DUMMY,
             }]),
             span: Span::DUMMY,
-        }),
-        Item::Effect(EffectDef {
+        })),
+        Item::Effect(Box::new(EffectDef {
+            vis: Visibility::Private,
             name: id("db"),
             nondet: false,
             ops: vec![OpDef {
@@ -964,13 +986,13 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
                 span: Span::DUMMY,
             }],
             span: Span::DUMMY,
-        }),
+        })),
         func(
             "f",
             &[],
             block(
                 vec![Stmt::Expr(e(ExprKind::Perform {
-                    effect: id("db"),
+                    effect: qn("db"),
                     op: id("get"),
                     resource: Some(id("users")),
                     args: vec![],
@@ -982,6 +1004,36 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
     let deps: Vec<String> = out.deps[&Symbol::new("f")].iter().map(|s| s.to_string()).collect();
     assert_eq!(deps, vec!["db", "Status"]);
     assert!(!out.defs.contains_key(&Symbol::new("Status")));
+    assert!(out.decls.contains_key(&Symbol::new("Status")));
+    assert!(out.decls.contains_key(&Symbol::new("db")));
+    assert!(!out.decls.contains_key(&Symbol::new("f")));
+}
+
+/// A declaration is content-addressed like anything else, so renaming a type
+/// moves nothing and changing its shape moves it.
+#[test]
+fn declaration_hashes_follow_structure_not_names() {
+    let program = |name: &str, extra: Vec<VariantDef>| {
+        let mut variants =
+            vec![VariantDef { name: id("Active"), fields: vec![], span: Span::DUMMY }];
+        variants.extend(extra);
+        vec![Item::Type(Box::new(TypeDef {
+            vis: Visibility::Private,
+            name: id(name),
+            params: vec![],
+            body: TypeDefBody::Sum(variants),
+            span: Span::DUMMY,
+        }))]
+    };
+    let status = hashes(program("Status", vec![]));
+    let renamed = hashes(program("State", vec![]));
+    assert_eq!(status.decls[&Symbol::new("Status")], renamed.decls[&Symbol::new("State")]);
+
+    let widened = hashes(program(
+        "Status",
+        vec![VariantDef { name: id("Banned"), fields: vec![], span: Span::DUMMY }],
+    ));
+    assert_ne!(status.decls[&Symbol::new("Status")], widened.decls[&Symbol::new("Status")]);
 }
 
 #[test]
@@ -1001,7 +1053,8 @@ fn duplicate_definitions_are_reported_rather_than_silently_merged() {
 #[test]
 fn duplicate_variants_across_types_are_reported() {
     let sum = |ty: &str, variant: &str| {
-        Item::Type(TypeDef {
+        Item::Type(Box::new(TypeDef {
+            vis: Visibility::Private,
             name: id(ty),
             params: vec![],
             body: TypeDefBody::Sum(vec![VariantDef {
@@ -1010,7 +1063,7 @@ fn duplicate_variants_across_types_are_reported() {
                 span: Span::DUMMY,
             }]),
             span: Span::DUMMY,
-        })
+        }))
     };
     let err = hash_ast(&module(vec![sum("A", "Same"), sum("B", "Same")])).expect_err("duplicate");
     assert_eq!(err[0].code, ply_span::codes::DUPLICATE_DEFINITION);
@@ -1042,6 +1095,7 @@ fn a_hash_serializes_as_a_hex_string() {
 fn an_empty_module_hashes_to_nothing() {
     let out = hash_ast(&module(vec![])).unwrap();
     assert!(out.defs.is_empty());
+    assert!(out.decls.is_empty());
     assert!(out.tests.is_empty());
     assert!(out.closure.is_empty());
 }
@@ -1210,22 +1264,53 @@ fn look_alikes(a: &str, b: &str, eff: &str) -> HashOutput {
     parsed(&LOOK_ALIKES.replace("{a}", a).replace("{b}", b).replace("{eff}", eff))
 }
 
+/// A definition that performs one of two byte-identical effects and one that
+/// performs the other differ by a consistent renaming of the two and by nothing
+/// else, so they are one definition. Nothing local can separate them — that is
+/// what "byte-identical declaration" means — and the alternatives all cost more
+/// than they buy: a rank over the program's names makes adding an unrelated
+/// module renumber existing hashes, and a rank over source position makes moving
+/// an item do the same.
+///
+/// It stays sound because the moment anything *pins* one of the two, that thing
+/// records which slot it meant; see [`a_handler_records_which_look_alike_it_discharges`].
 #[test]
-fn switching_between_two_identically_declared_effects_changes_the_hash() {
-    assert_ne!(
+fn performing_either_of_two_identically_declared_effects_is_one_definition() {
+    assert_eq!(
         look_alikes("db", "audit", "db").defs[&Symbol::new("f")],
         look_alikes("db", "audit", "audit").defs[&Symbol::new("f")],
     );
 }
 
-/// Look-alikes are ranked by name, so a rename that keeps their order — `audit`
-/// before `db`, `alerts` before `cache` — leaves every performer alone.
+/// The separating context. `f` performs the first declared effect and `g` the
+/// second; a handler for one discharges exactly one of them, and which one it
+/// picked is part of its identity.
 #[test]
-fn renaming_look_alike_effects_in_order_changes_no_hash() {
-    assert_eq!(
-        look_alikes("audit", "db", "audit").defs[&Symbol::new("f")],
-        look_alikes("alerts", "cache", "alerts").defs[&Symbol::new("f")],
+fn a_handler_records_which_look_alike_it_discharges() {
+    let source = |handled: &str| {
+        format!(
+            "effect db {{\n  write emit[r](v: Int) -> Int\n}}\n\
+             effect audit {{\n  write emit[r](v: Int) -> Int\n}}\n\
+             fn f(v: Int) -> Int / {{db.write[log]}} = db.emit[log](v)\n\
+             fn g(v: Int) -> Int / {{audit.write[log]}} = audit.emit[log](v)\n\
+             fn caught(v: Int) -> Int / {{audit.write[log], db.write[log]}} =\n\
+               handle f(v) + g(v) with {{ {handled}.emit[log](x) -> x, }}\n"
+        )
+    };
+    assert_ne!(
+        parsed(&source("db")).defs[&Symbol::new("caught")],
+        parsed(&source("audit")).defs[&Symbol::new("caught")],
     );
+}
+
+/// Renaming an effect is free even when the program holds a second one declared
+/// exactly like it, and free in either direction: the pair below is renamed so
+/// that the two swap places in every name ordering.
+#[test]
+fn renaming_look_alike_effects_changes_no_hash() {
+    let f = |a: &str, b: &str, eff: &str| look_alikes(a, b, eff).defs[&Symbol::new("f")];
+    assert_eq!(f("audit", "db", "audit"), f("alerts", "cache", "alerts"));
+    assert_eq!(f("audit", "db", "audit"), f("zebra", "alpha", "zebra"));
 }
 
 #[test]

@@ -1,12 +1,15 @@
 use crate::env::{TypeEnv, generalize, instantiate};
 use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
-use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, Type};
+use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use crate::unify::{Fresh, Subst, UnifyError, unify, unify_row};
-use crate::{CheckOutput, CtorInfo, DefInfo, EffectInfo, OpInfo, TestInfo};
+use crate::{
+    CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, ModuleInfo, OpInfo, TestInfo,
+};
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
 use ply_syntax::ast::*;
+use ply_syntax::resolve::{Namespace, Resolved, Scope, resolve};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
@@ -17,25 +20,59 @@ const CELL: &str = "cell";
 const BUILTIN_TYPES: &[(&str, usize)] =
     &[("Int", 0), ("Bool", 0), ("String", 0), ("Unit", 0), ("List", 1), ("Cell", 1)];
 
-pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let mut c = Checker::new();
-    c.collect_types(module);
-    c.collect_effects(module);
-    c.collect_ctors(module);
-    c.check_fns(module);
-    c.check_tests(module);
+pub fn check_program_with(
+    program: &Program,
+    resolved: &Resolved,
+    known: &Known,
+) -> Result<CheckOutput, Vec<Diagnostic>> {
+    let mut c = Checker::new(program, resolved, known);
+    for module in &program.modules {
+        c.record_module(module);
+    }
+    for &i in &resolved.order {
+        c.module = i;
+        let module = &program.modules[i];
+        c.collect_types(module);
+        c.collect_effects(module);
+        c.collect_ctors(module);
+    }
+    for &i in &resolved.order {
+        c.module = i;
+        c.check_fns(&program.modules[i]);
+    }
+    // Load order, not dependency order: this position is the same index
+    // `HashOutput::tests` is built on, and that one walks the program.
+    for (i, module) in program.modules.iter().enumerate() {
+        c.module = i;
+        c.check_tests(module);
+    }
     c.check_comparisons();
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(c.diags)
     } else {
-        Ok(CheckOutput { defs: c.defs, tests: c.tests, effects: c.effects, ctors: c.ctors })
+        Ok(CheckOutput {
+            defs: c.defs,
+            tests: c.tests,
+            effects: c.effects,
+            ctors: c.ctors,
+            modules: c.modules,
+        })
     }
+}
+
+pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
+    let program = Program::single(module.clone());
+    let resolved = resolve(&program)?;
+    check_program_with(&program, &resolved, &Known::default())
 }
 
 #[derive(Clone, Debug)]
 struct TypeDecl {
     params: Vec<Symbol>,
     alias: Option<TypeExpr>,
+    /// An alias body is written in its own module's scope, so expanding one at a
+    /// use site in another module has to resolve its names back there.
+    owner: usize,
     span: Span,
 }
 
@@ -49,7 +86,14 @@ struct PerformSite {
     direct: bool,
 }
 
-struct Checker {
+/// Every map below is keyed by the program-wide name, so two modules may
+/// declare the same simple name without either one being rewritten.
+struct Checker<'a> {
+    program: &'a Program,
+    resolved: &'a Resolved,
+    known: &'a Known,
+    /// The module whose declarations and imports a bare name is resolved in.
+    module: usize,
     subst: Subst,
     fresh: Fresh,
     env: TypeEnv,
@@ -59,6 +103,7 @@ struct Checker {
     ctors: IndexMap<Symbol, CtorInfo>,
     defs: IndexMap<Symbol, DefInfo>,
     tests: Vec<TestInfo>,
+    modules: IndexMap<Symbol, ModuleInfo>,
     ty_params: FxHashMap<Symbol, Type>,
     row_params: FxHashMap<Symbol, RowVar>,
     /// Effect operation signatures have no generic list of their own, so a type
@@ -72,9 +117,13 @@ struct Checker {
     comparisons: Vec<(Span, Type)>,
 }
 
-impl Checker {
-    fn new() -> Self {
+impl<'a> Checker<'a> {
+    fn new(program: &'a Program, resolved: &'a Resolved, known: &'a Known) -> Self {
         let mut c = Checker {
+            program,
+            resolved,
+            known,
+            module: 0,
             subst: Subst::new(),
             fresh: Fresh::default(),
             env: TypeEnv::new(),
@@ -84,6 +133,7 @@ impl Checker {
             ctors: IndexMap::new(),
             defs: IndexMap::new(),
             tests: Vec::new(),
+            modules: IndexMap::new(),
             ty_params: FxHashMap::default(),
             row_params: FxHashMap::default(),
             auto_ty_params: false,
@@ -93,6 +143,113 @@ impl Checker {
         };
         c.install_prelude();
         c
+    }
+
+    fn name_of(&self, module: usize) -> ModuleName {
+        self.program.modules[module].name.clone()
+    }
+
+    fn qualify(&self, name: &Symbol) -> Symbol {
+        self.program.modules[self.module].name.qualify(name)
+    }
+
+    fn scope(&self) -> &'a Scope {
+        &self.resolved.scopes[self.module]
+    }
+
+    fn record_module(&mut self, module: &Module) {
+        let mut items = Vec::new();
+        for item in &module.items {
+            let Some(name) = item.name() else { continue };
+            items.push(module.name.qualify(&name.name));
+            if let Item::Type(def) = item
+                && let TypeDefBody::Sum(variants) = &def.body
+            {
+                items.extend(variants.iter().map(|v| module.name.qualify(&v.name.name)));
+            }
+        }
+        let mut imports: Vec<ModuleName> = Vec::new();
+        for import in &module.imports {
+            let name = import.module_name();
+            if !imports.contains(&name) {
+                imports.push(name);
+            }
+        }
+        self.modules.insert(
+            module.name.as_symbol().clone(),
+            ModuleInfo { name: module.name.clone(), source: module.source, items, imports },
+        );
+    }
+
+    /// The order below is normative rather than an optimization: a local always
+    /// wins, and a module's own items always shadow the prelude.
+    fn value_key(&mut self, q: &QName) -> Option<ValueKey> {
+        if !q.is_bare() {
+            let name = self.global(Namespace::Value, q)?;
+            return Some(ValueKey { name, prelude: false });
+        }
+        let name = q.symbol();
+        if self.env.depth_of(name).is_some_and(|depth| depth > 0) {
+            return Some(ValueKey { name: name.clone(), prelude: false });
+        }
+        if let Some(binding) = self.scope().get(Namespace::Value, name) {
+            return Some(ValueKey { name: binding.qualified.clone(), prelude: false });
+        }
+        if self.env.depth_of(name) == Some(0) {
+            return Some(ValueKey { name: name.clone(), prelude: true });
+        }
+        self.unknown_name(q);
+        None
+    }
+
+    /// `cell_get` / `cell_set` are call forms rather than schemes, so the
+    /// application rule has to recognise them before inferring the callee — and
+    /// silently, since a local or a module item of that name is not one.
+    fn cell_form(&self, q: &QName) -> Option<Mode> {
+        if !q.is_bare() || self.env.depth_of(q.symbol()) != Some(0) {
+            return None;
+        }
+        if self.scope().get(Namespace::Value, q.symbol()).is_some() {
+            return None;
+        }
+        match q.symbol().as_str() {
+            "cell_get" => Some(Mode::Read),
+            "cell_set" => Some(Mode::Write),
+            _ => None,
+        }
+    }
+
+    /// Silent counterpart to [`Checker::global`], for the second look a
+    /// diagnostic needs after the reference has already been resolved once.
+    fn declared_value(&self, q: &QName) -> Option<Symbol> {
+        if q.is_bare() {
+            self.scope().get(Namespace::Value, q.symbol()).map(|b| b.qualified.clone())
+        } else {
+            self.resolved
+                .lookup(self.module, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.clone())
+        }
+    }
+
+    /// The name a reference denotes, program-wide. Locals are the caller's
+    /// business: they win over everything here, and are looked up first.
+    fn global(&mut self, ns: Namespace, q: &QName) -> Option<Symbol> {
+        if q.is_bare()
+            && let Some(binding) = self.scope().get(ns, q.symbol())
+        {
+            return Some(binding.qualified.clone());
+        }
+        if q.is_bare() {
+            return None;
+        }
+        match self.resolved.lookup(self.module, ns, q) {
+            Ok(binding) => Some(binding.qualified.clone()),
+            Err(d) => {
+                self.diags.push(d);
+                None
+            }
+        }
     }
 
     fn install_prelude(&mut self) {
@@ -209,16 +366,16 @@ impl Checker {
     fn collect_types(&mut self, module: &Module) {
         for item in &module.items {
             let Item::Type(def) = item else { continue };
-            let name = def.name.name.clone();
+            let name = module.name.qualify(&def.name.name);
             if let Some(prev) = self.types.get(&name) {
                 self.duplicate(&def.name, prev.span, "type");
                 continue;
             }
-            if BUILTIN_TYPES.iter().any(|(b, _)| *b == name.as_str()) {
+            if BUILTIN_TYPES.iter().any(|(b, _)| *b == def.name.name.as_str()) {
                 self.diags.push(
                     Diagnostic::error(
                         codes::DUPLICATE_DEFINITION,
-                        format!("`{name}` is a builtin type"),
+                        format!("`{}` is a builtin type", def.name.name),
                     )
                     .primary(def.name.span, "cannot be redefined")
                     .note("choose a different name for this type"),
@@ -234,6 +391,7 @@ impl Checker {
                 TypeDecl {
                     params: def.params.iter().map(|p| p.name.clone()).collect(),
                     alias,
+                    owner: self.module,
                     span: def.span,
                 },
             );
@@ -243,8 +401,8 @@ impl Checker {
     fn collect_effects(&mut self, module: &Module) {
         for item in &module.items {
             let Item::Effect(def) = item else { continue };
-            let name = def.name.name.clone();
-            if name.as_str() == CELL {
+            let name = module.name.qualify(&def.name.name);
+            if def.name.name.as_str() == CELL {
                 self.diags.push(
                     Diagnostic::error(
                         codes::DUPLICATE_DEFINITION,
@@ -285,7 +443,14 @@ impl Checker {
             }
             self.effects.insert(
                 name.clone(),
-                EffectInfo { name, nondet: def.nondet, ops, span: def.span },
+                EffectInfo {
+                    name,
+                    module: module.name.clone(),
+                    simple_name: def.name.name.clone(),
+                    nondet: def.nondet,
+                    ops,
+                    span: def.span,
+                },
             );
         }
     }
@@ -294,7 +459,8 @@ impl Checker {
         for item in &module.items {
             let Item::Type(def) = item else { continue };
             let TypeDefBody::Sum(variants) = &def.body else { continue };
-            let Some(decl) = self.types.get(&def.name.name).cloned() else { continue };
+            let type_name = module.name.qualify(&def.name.name);
+            let Some(decl) = self.types.get(&type_name).cloned() else { continue };
 
             self.ty_params.clear();
             let mut vars = Vec::new();
@@ -303,12 +469,11 @@ impl Checker {
                 vars.push(v);
                 self.ty_params.insert(p.clone(), Type::Var(v));
             }
-            let result = Type::Con(
-                def.name.name.clone(),
-                vars.iter().map(|v| Type::Var(*v)).collect(),
-            );
+            let result =
+                Type::Con(type_name.clone(), vars.iter().map(|v| Type::Var(*v)).collect());
             for (index, variant) in variants.iter().enumerate() {
-                if let Some(prev) = self.ctors.get(&variant.name.name) {
+                let ctor_name = module.name.qualify(&variant.name.name);
+                if let Some(prev) = self.ctors.get(&ctor_name) {
                     self.duplicate(&variant.name, prev.span, "constructor");
                     continue;
                 }
@@ -323,12 +488,14 @@ impl Checker {
                     }
                 };
                 let scheme = Scheme { ty_vars: vars.clone(), row_vars: vec![], ty };
-                self.env.bind_global(variant.name.name.clone(), scheme.clone());
+                self.env.bind_global(ctor_name.clone(), scheme.clone());
                 self.ctors.insert(
-                    variant.name.name.clone(),
+                    ctor_name.clone(),
                     CtorInfo {
-                        name: variant.name.name.clone(),
-                        type_name: def.name.name.clone(),
+                        name: ctor_name,
+                        module: module.name.clone(),
+                        simple_name: variant.name.name.clone(),
+                        type_name: type_name.clone(),
                         index,
                         arity: fields.len(),
                         fields,
@@ -389,53 +556,59 @@ impl Checker {
         self.fresh.ty()
     }
 
-    fn conv_con(&mut self, name: &Ident, args: &[TypeExpr], span: Span) -> Type {
-        if args.is_empty() && self.ty_params.contains_key(&name.name) {
-            return self.ty_params[&name.name].clone();
+    fn conv_con(&mut self, name: &QName, args: &[TypeExpr], span: Span) -> Type {
+        if name.is_bare() && args.is_empty() && self.ty_params.contains_key(name.symbol()) {
+            return self.ty_params[name.symbol()].clone();
         }
         let args: Vec<Type> = args.iter().map(|a| self.conv_type(a)).collect();
 
-        if let Some((_, arity)) = BUILTIN_TYPES.iter().find(|(b, _)| *b == name.name.as_str()) {
+        if name.is_bare()
+            && let Some((_, arity)) = BUILTIN_TYPES.iter().find(|(b, _)| *b == name.symbol().as_str())
+        {
             if args.len() != *arity {
-                self.arity_error(span, &name.name, *arity, args.len(), "type arguments");
+                self.arity_error(span, name.symbol(), *arity, args.len(), "type arguments");
                 return self.fresh.ty();
             }
-            if name.name.as_str() == "Cell" {
+            if name.symbol().as_str() == "Cell" {
                 // A written `Cell<T>` says nothing about which region the cell
                 // came from, so leave the region open and let unification with a
                 // `with_cell` binder decide it.
                 let region = self.fresh.ty();
                 return Type::Con(Symbol::new("Cell"), vec![region, args[0].clone()]);
             }
-            return Type::Con(name.name.clone(), args);
+            return Type::Con(name.symbol().clone(), args);
         }
 
-        let Some(decl) = self.types.get(&name.name).cloned() else {
-            if args.is_empty() && self.auto_ty_params {
-                return self.type_param(name);
+        let Some(qualified) = self.global(Namespace::Type, name) else {
+            if name.is_bare() {
+                if args.is_empty() && self.auto_ty_params {
+                    return self.type_param(&name.name);
+                }
+                self.unknown_type(name);
             }
-            self.diags.push(
-                Diagnostic::error(codes::UNKNOWN_TYPE, format!("unknown type `{}`", name.name))
-                    .primary(name.span, "not found")
-                    .note("declare it with `type`, or check the spelling"),
-            );
+            return self.fresh.ty();
+        };
+
+        // Declared but not collected: the declaration itself was rejected, and
+        // that diagnostic is the one worth reading.
+        let Some(decl) = self.types.get(&qualified).cloned() else {
             return self.fresh.ty();
         };
 
         if args.len() != decl.params.len() {
-            self.arity_error(span, &name.name, decl.params.len(), args.len(), "type arguments");
+            self.arity_error(span, name.symbol(), decl.params.len(), args.len(), "type arguments");
             return self.fresh.ty();
         }
 
         let Some(alias) = decl.alias.clone() else {
-            return Type::Con(name.name.clone(), args);
+            return Type::Con(qualified, args);
         };
 
-        if self.alias_stack.contains(&name.name) {
+        if self.alias_stack.contains(&qualified) {
             self.diags.push(
                 Diagnostic::error(
                     codes::UNKNOWN_TYPE,
-                    format!("type alias `{}` expands into itself", name.name),
+                    format!("type alias `{}` expands into itself", name.symbol()),
                 )
                 .primary(name.span, "cyclic alias")
                 .note("break the cycle, or make this a `type` with variants"),
@@ -447,11 +620,38 @@ impl Checker {
         for (p, a) in decl.params.iter().zip(&args) {
             self.ty_params.insert(p.clone(), a.clone());
         }
-        self.alias_stack.push(name.name.clone());
+        self.alias_stack.push(qualified);
+        let owner = std::mem::replace(&mut self.module, decl.owner);
         let expanded = self.conv_type(&alias);
+        self.module = owner;
         self.alias_stack.pop();
         self.ty_params = saved;
         expanded
+    }
+
+    fn unknown_type(&mut self, name: &QName) {
+        let mut d =
+            Diagnostic::error(codes::UNKNOWN_TYPE, format!("unknown type `{}`", name.symbol()))
+                .primary(name.span, "not found")
+                .note("declare it with `type`, or check the spelling");
+        if let Some(module) = self.exporter(Namespace::Type, name.symbol()) {
+            d = d.note(format!("module `{module}` exports it: `import {module} ({})`", name.symbol()));
+        }
+        self.diags.push(d);
+    }
+
+    /// A module that exports this name, so a missing `import` reads as a missing
+    /// import rather than a missing definition.
+    fn exporter(&self, ns: Namespace, name: &Symbol) -> Option<ModuleName> {
+        let me = self.module;
+        self.resolved
+            .declarations
+            .iter()
+            .enumerate()
+            .find(|(i, d)| {
+                *i != me && d.get(ns, name).is_some_and(|decl| decl.vis.is_public())
+            })
+            .map(|(i, _)| self.name_of(i))
     }
 
     fn arity_error(&mut self, span: Span, name: &Symbol, expected: usize, found: usize, what: &str) {
@@ -477,11 +677,7 @@ impl Checker {
     }
 
     fn conv_atom(&mut self, a: &AtomExpr) -> Option<EffectAtom> {
-        let effect = a.effect.name.clone();
-        if effect.as_str() != CELL && !self.effects.contains_key(&effect) {
-            self.unknown_effect(&a.effect);
-            return None;
-        }
+        let effect = self.effect_name(&a.effect)?;
         let resource = match &a.resource {
             Some(r) => Resource::Named(r.name.clone()),
             None => Resource::Singleton,
@@ -489,8 +685,11 @@ impl Checker {
         if let Some(info) = self.effects.get(&effect)
             && !info.ops.values().any(|o| o.mode == a.mode)
         {
-            let known: Vec<String> =
-                info.ops.values().map(|o| format!("{}.{}", effect, o.mode.as_str())).collect();
+            let known: Vec<String> = info
+                .ops
+                .values()
+                .map(|o| format!("{}.{}", info.simple_name, o.mode.as_str()))
+                .collect();
             self.diags.push(
                 Diagnostic::error(
                     codes::UNKNOWN_OPERATION,
@@ -522,18 +721,44 @@ impl Checker {
         None
     }
 
-    fn unknown_effect(&mut self, id: &Ident) {
-        let known: Vec<String> = self.effects.keys().map(|k| format!("`{k}`")).collect();
+    /// `cell` is not in [`Checker::effects`] — it is the builtin regions
+    /// perform under, and no declaration produces it.
+    fn effect_name(&mut self, q: &QName) -> Option<Symbol> {
+        if q.is_bare() && q.symbol().as_str() == CELL {
+            return Some(Symbol::new(CELL));
+        }
+        match self.global(Namespace::Effect, q) {
+            Some(name) if self.effects.contains_key(&name) => Some(name),
+            Some(_) => None,
+            None => {
+                if q.is_bare() {
+                    self.unknown_effect(q);
+                }
+                None
+            }
+        }
+    }
+
+    fn unknown_effect(&mut self, q: &QName) {
+        let known: Vec<String> =
+            self.scope().effects.keys().map(|k| format!("`{k}`")).collect();
         let mut d = Diagnostic::error(
             codes::UNKNOWN_EFFECT,
-            format!("unknown effect `{}`", id.name),
+            format!("unknown effect `{}`", q.symbol()),
         )
-        .primary(id.span, "not declared");
+        .primary(q.span, "not declared");
         d = if known.is_empty() {
             d.note("declare it with `effect <name> { .. }`")
         } else {
             d.note(format!("effects in scope: {}", known.join(", ")))
         };
+        if let Some(module) = self.exporter(Namespace::Effect, q.symbol()) {
+            d = d.note(format!(
+                "module `{module}` declares it: `import {module}` and write `{}::{}`",
+                module.default_binder(),
+                q.symbol()
+            ));
+        }
         self.diags.push(d);
     }
 
@@ -562,6 +787,9 @@ impl Checker {
             fns.push(def);
         }
 
+        // Only a bare reference can reach a definition in this same module: a
+        // qualified one names an imported module, and a module cannot import
+        // itself. So mutual recursion stays a within-module question.
         let adj: Vec<Vec<usize>> = fns
             .iter()
             .map(|d| {
@@ -569,17 +797,23 @@ impl Checker {
                 collect_refs(&d.body, &mut refs);
                 let mut seen = FxHashSet::default();
                 refs.iter()
-                    .filter_map(|r| index.get(r).copied())
+                    .filter(|r| r.is_bare())
+                    .filter_map(|r| index.get(r.symbol()).copied())
                     .filter(|i| seen.insert(*i))
                     .collect()
             })
             .collect();
 
         for comp in sccs(fns.len(), &adj) {
+            let names: Vec<Symbol> =
+                comp.iter().map(|&i| self.qualify(&fns[i].name.name)).collect();
+            if self.publish_known(module, &comp, &fns, &names) {
+                continue;
+            }
             let mut sigs = Vec::new();
-            for &i in &comp {
+            for (slot, &i) in comp.iter().enumerate() {
                 let sig = self.signature(fns[i]);
-                self.env.bind_global(fns[i].name.name.clone(), Scheme::mono(sig.fn_ty.clone()));
+                self.env.bind_global(names[slot].clone(), Scheme::mono(sig.fn_ty.clone()));
                 sigs.push(sig);
             }
             for (slot, &i) in comp.iter().enumerate() {
@@ -588,18 +822,20 @@ impl Checker {
             for sig in &sigs {
                 self.close_unreachable_row(sig);
             }
-            for &i in &comp {
-                self.env.remove_global(&fns[i].name.name);
+            for name in &names {
+                self.env.remove_global(name);
             }
             for (slot, &i) in comp.iter().enumerate() {
                 let def = fns[i];
-                let scheme = generalize(&self.subst, &self.env, &sigs[slot].fn_ty);
+                let scheme = generalize(&self.subst, &mut self.env, &sigs[slot].fn_ty);
                 let row = self.subst.resolve_row(&sigs[slot].published_row);
-                self.env.bind_global(def.name.name.clone(), scheme.clone());
+                self.env.bind_global(names[slot].clone(), scheme.clone());
                 self.defs.insert(
-                    def.name.name.clone(),
+                    names[slot].clone(),
                     DefInfo {
-                        name: def.name.name.clone(),
+                        name: names[slot].clone(),
+                        module: module.name.clone(),
+                        simple_name: def.name.name.clone(),
                         scheme,
                         footprint: Footprint(row.atoms),
                         span: def.span,
@@ -607,6 +843,57 @@ impl Checker {
                 );
             }
         }
+    }
+
+    /// Publishes a mutually recursive group straight from the interfaces the
+    /// caller supplied, without walking a single body. All or nothing: the
+    /// members of a group are typed together, so one of them missing means the
+    /// group has to be inferred.
+    ///
+    /// The scheme's quantified variables are renumbered onto this run's counter
+    /// first. A stored scheme is canonicalized, so its variables start at zero,
+    /// and this run has almost certainly already bound those numbers to
+    /// something else — leaving them alone would let `generalize` resolve them
+    /// through the substitution and read a variable that was never this
+    /// scheme's.
+    fn publish_known(
+        &mut self,
+        module: &Module,
+        comp: &[usize],
+        fns: &[&FnDef],
+        names: &[Symbol],
+    ) -> bool {
+        if !names.iter().all(|n| self.known.defs.contains_key(n)) {
+            return false;
+        }
+        for (slot, &i) in comp.iter().enumerate() {
+            let entry = &self.known.defs[&names[slot]];
+            let scheme = self.adopt(&entry.scheme);
+            self.env.bind_global(names[slot].clone(), scheme.clone());
+            self.defs.insert(
+                names[slot].clone(),
+                DefInfo {
+                    name: names[slot].clone(),
+                    module: module.name.clone(),
+                    simple_name: fns[i].name.name.clone(),
+                    scheme,
+                    footprint: entry.footprint.clone(),
+                    span: fns[i].span,
+                },
+            );
+        }
+        true
+    }
+
+    /// The same scheme with its quantified variables drawn from this run.
+    fn adopt(&mut self, scheme: &Scheme) -> Scheme {
+        if scheme.ty_vars.is_empty() && scheme.row_vars.is_empty() {
+            return scheme.clone();
+        }
+        let ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|_| self.fresh.ty_var()).collect();
+        let row_vars: Vec<RowVar> = scheme.row_vars.iter().map(|_| self.fresh.row_var()).collect();
+        let ty = crate::env::rename_scheme(scheme, &ty_vars, &row_vars);
+        Scheme { ty_vars, row_vars, ty }
     }
 
     /// A tail that no parameter or result type mentions can never be filled in
@@ -764,30 +1051,45 @@ impl Checker {
     }
 
     fn check_tests(&mut self, module: &Module) {
-        let mut index = 0usize;
+        let known = self.known.tests.get(module.name.as_symbol());
+        let mut position = 0;
         for item in &module.items {
             let Item::Test(def) = item else { continue };
-            self.ty_params.clear();
-            self.row_params.clear();
-            self.performs.clear();
+            let cached = known.and_then(|slots| slots.get(position)).and_then(Option::as_ref);
+            position += 1;
 
-            self.env.push();
-            let (_, row) = self.infer(&def.body);
-            self.env.pop();
+            // A cached footprint carries the determinism verdict with it: an
+            // effect's `nondet` marker is part of its declaration's hash, so a
+            // test whose hash is unchanged cannot have acquired a nondeterminism
+            // that was absent when it was checked.
+            let footprint = match cached {
+                Some(entry) => entry.footprint.clone(),
+                None => {
+                    self.ty_params.clear();
+                    self.row_params.clear();
+                    self.performs.clear();
 
-            let row = self.subst.resolve_row(&row);
-            let footprint = Footprint(row.atoms.clone());
-            if !def.nondet {
-                self.check_determinism(def, &footprint);
-            }
+                    self.env.push();
+                    let (_, row) = self.infer(&def.body);
+                    self.env.pop();
+
+                    let row = self.subst.resolve_row(&row);
+                    let footprint = Footprint(row.atoms.clone());
+                    if !def.nondet {
+                        self.check_determinism(def, &footprint);
+                    }
+                    footprint
+                }
+            };
             self.tests.push(TestInfo {
                 name: def.name.clone(),
-                index,
+                module: module.name.clone(),
+                key: module.name.qualify(&Symbol::new(&def.name)),
+                index: self.tests.len(),
                 nondet: def.nondet,
                 footprint,
                 span: def.span,
             });
-            index += 1;
         }
     }
 
@@ -830,9 +1132,33 @@ impl Checker {
         }
     }
 
+    /// A suggestion has to be writable where it is suggested: the program-wide
+    /// `store.db` is not syntax, `store::db` or a bare `db` is.
+    fn as_written(&self, effect: &Symbol) -> String {
+        let scope = self.scope();
+        if let Some((name, _)) = scope.effects.iter().find(|(_, b)| &b.qualified == effect) {
+            return name.to_string();
+        }
+        let simple = self
+            .effects
+            .get(effect)
+            .map(|info| info.simple_name.clone())
+            .unwrap_or_else(|| Symbol::new(effect.as_str()));
+        for (binder, &(owner, _)) in &scope.modules {
+            if self.resolved.declarations[owner]
+                .get(Namespace::Effect, &simple)
+                .is_some_and(|d| d.qualified == *effect)
+            {
+                return format!("{binder}::{simple}");
+            }
+        }
+        simple.to_string()
+    }
+
     fn example_clause(&self, effect: &Symbol, atom: &EffectAtom) -> String {
+        let written = self.as_written(effect);
         let Some(info) = self.effects.get(effect) else {
-            return format!("{effect}.<op>() -> <value>");
+            return format!("{written}.<op>() -> <value>");
         };
         let op = info
             .ops
@@ -848,9 +1174,9 @@ impl Checker {
                 };
                 let args: Vec<String> =
                     (0..op.params.len()).map(|i| format!("a{i}")).collect();
-                format!("{effect}.{}{resource}({}) -> <value>", op.name, args.join(", "))
+                format!("{written}.{}{resource}({}) -> <value>", op.name, args.join(", "))
             }
-            None => format!("{effect}.<op>() -> <value>"),
+            None => format!("{written}.<op>() -> <value>"),
         }
     }
 
@@ -890,14 +1216,18 @@ impl Checker {
         match &e.kind {
             ExprKind::Lit(l) => (lit_type(l), Row::empty()),
 
-            ExprKind::Var(id) => {
-                if is_cell_builtin(&id.name) && self.env.depth_of(&id.name) == Some(0) {
+            ExprKind::Var(q) => {
+                let key = match self.value_key(q) {
+                    Some(key) => key,
+                    None => return (self.fresh.ty(), Row::empty()),
+                };
+                if key.prelude && is_cell_builtin(&key.name) {
                     self.diags.push(
                         Diagnostic::error(
                             codes::RESOURCE_REQUIRED,
-                            format!("`{}` must be called directly", id.name),
+                            format!("`{}` must be called directly", key.name),
                         )
-                        .primary(id.span, "used as a value")
+                        .primary(q.span, "used as a value")
                         .note(
                             "the atom it performs names the region of the cell it is given, so it \
                              cannot be passed around as a first-class function",
@@ -905,13 +1235,13 @@ impl Checker {
                     );
                     return (self.fresh.ty(), Row::empty());
                 }
-                match self.env.lookup(&id.name) {
+                match self.env.lookup(&key.name) {
                     Some(scheme) => {
                         let scheme = scheme.clone();
                         (instantiate(&scheme, &mut self.fresh), Row::empty())
                     }
                     None => {
-                        self.unknown_name(id);
+                        self.unknown_name(q);
                         (self.fresh.ty(), Row::empty())
                     }
                 }
@@ -1071,7 +1401,7 @@ impl Checker {
                 self.bind_pattern(pat, &vt, &mut bindings);
                 for (name, t) in bindings {
                     let scheme = if generalizable {
-                        generalize(&self.subst, &self.env, &t)
+                        generalize(&self.subst, &mut self.env, &t)
                     } else {
                         Scheme::mono(t)
                     };
@@ -1126,14 +1456,10 @@ impl Checker {
     }
 
     fn infer_app(&mut self, e: &Expr, func: &Expr, args: &[Expr]) -> (Type, Row) {
-        if let ExprKind::Var(id) = &func.kind
-            && self.env.depth_of(&id.name) == Some(0)
+        if let ExprKind::Var(q) = &func.kind
+            && let Some(mode) = self.cell_form(q)
         {
-            match id.name.as_str() {
-                "cell_get" => return self.infer_cell_op(e, args, Mode::Read),
-                "cell_set" => return self.infer_cell_op(e, args, Mode::Write),
-                _ => {}
-            }
+            return self.infer_cell_op(e, args, mode);
         }
 
         let (ft, mut row) = self.infer(func);
@@ -1248,7 +1574,7 @@ impl Checker {
     fn infer_perform(
         &mut self,
         e: &Expr,
-        effect: &Ident,
+        effect: &QName,
         op: &Ident,
         resource: Option<&Ident>,
         args: &[Expr],
@@ -1275,7 +1601,7 @@ impl Checker {
                     codes::ARITY_MISMATCH,
                     format!(
                         "`{}.{}` takes {} argument{}, but {}",
-                        info.name,
+                        info.simple_name,
                         op_info.name,
                         params.len(),
                         if params.len() == 1 { "" } else { "s" },
@@ -1297,16 +1623,29 @@ impl Checker {
         (ret, row)
     }
 
-    fn resolve_op(&mut self, effect: &Ident, op: &Ident) -> Option<(EffectInfo, OpInfo)> {
-        let Some(info) = self.effects.get(&effect.name).cloned() else {
-            self.unknown_effect(effect);
+    fn resolve_op(&mut self, effect: &QName, op: &Ident) -> Option<(EffectInfo, OpInfo)> {
+        let name = self.effect_name(effect)?;
+        let Some(info) = self.effects.get(&name).cloned() else {
+            if name.as_str() == CELL {
+                self.diags.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_EFFECT,
+                        "`cell` is a builtin effect and cannot be performed directly",
+                    )
+                    .primary(effect.span, "not a declared effect")
+                    .note(
+                        "read and write a region's cell with `cell_get(c)` and `cell_set(c, v)` \
+                         inside `with_cell[r](..) { c -> .. }`",
+                    ),
+                );
+            }
             return None;
         };
         let Some(op_info) = info.ops.get(&op.name).cloned() else {
             let known: Vec<String> = info.ops.keys().map(|k| format!("`{k}`")).collect();
             let mut d = Diagnostic::error(
                 codes::UNKNOWN_OPERATION,
-                format!("effect `{}` has no operation `{}`", effect.name, op.name),
+                format!("effect `{}` has no operation `{}`", effect.symbol(), op.name),
             )
             .primary(op.span, "not declared")
             .secondary(info.span, format!("`{}` is declared here", info.name));
@@ -1345,7 +1684,8 @@ impl Checker {
                     .note(format!(
                         "write `{}.{}[<resource>](..)`; the label is what lets two tests be \
                          scheduled together",
-                        info.name, op.name
+                        self.as_written(&info.name),
+                        op.name
                     )),
                 );
                 None
@@ -1577,7 +1917,7 @@ impl Checker {
                             PatternKind::Ctor { name, args }
                                 if args.iter().all(is_irrefutable) =>
                             {
-                                Some(name.name.clone())
+                                self.declared_value(name)
                             }
                             _ => None,
                         })
@@ -1585,7 +1925,7 @@ impl Checker {
                     variants
                         .iter()
                         .filter(|c| !covered.contains(&c.name))
-                        .map(|c| format!("`{}`", c.name))
+                        .map(|c| format!("`{}`", c.simple_name))
                         .collect()
                 }
             }
@@ -1616,15 +1956,20 @@ impl Checker {
                 self.expect(pat.span, scrutinee, &t, "pattern literal");
             }
             PatternKind::Ctor { name, args } => {
-                let Some(info) = self.ctors.get(&name.name).cloned() else {
-                    self.diags.push(
-                        Diagnostic::error(
-                            codes::UNKNOWN_NAME,
-                            format!("unknown constructor `{}`", name.name),
-                        )
-                        .primary(name.span, "not found")
-                        .note("constructors come from a `type` declaration with variants"),
-                    );
+                let info = self
+                    .global(Namespace::Value, name)
+                    .and_then(|qualified| self.ctors.get(&qualified).cloned());
+                let Some(info) = info else {
+                    if name.is_bare() || self.declared_value(name).is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                codes::UNKNOWN_NAME,
+                                format!("unknown constructor `{}`", name.symbol()),
+                            )
+                            .primary(name.span, "not found")
+                            .note("constructors come from a `type` declaration with variants"),
+                        );
+                    }
                     return;
                 };
                 let ty = instantiate(&info.scheme, &mut self.fresh);
@@ -1796,20 +2141,28 @@ impl Checker {
         self.diags.push(d);
     }
 
-    fn unknown_name(&mut self, id: &Ident) {
+    fn unknown_name(&mut self, q: &QName) {
         let mut d =
-            Diagnostic::error(codes::UNKNOWN_NAME, format!("unknown name `{}`", id.name))
-                .primary(id.span, "not found in this scope");
-        if let Some(near) = self.nearest_name(&id.name) {
+            Diagnostic::error(codes::UNKNOWN_NAME, format!("unknown name `{}`", q.symbol()))
+                .primary(q.span, "not found in this scope");
+        if let Some(near) = self.nearest_name(q.symbol()) {
             d = d.note(format!("a name in scope looks similar: `{near}`"));
+        }
+        if let Some(module) = self.exporter(Namespace::Value, q.symbol()) {
+            d = d.note(format!(
+                "module `{module}` exports it: add `import {module} ({})`",
+                q.symbol()
+            ));
         }
         self.diags.push(d);
     }
 
+    /// Candidates are the simple names this module can actually write, not the
+    /// program-wide ones: suggesting `store.orders.place` for `plce` would name
+    /// something the file cannot say.
     fn nearest_name(&self, name: &Symbol) -> Option<Symbol> {
         let mut best: Option<(usize, Symbol)> = None;
-        let candidates = self.defs.keys().chain(self.ctors.keys());
-        for c in candidates {
+        for c in self.scope().values.keys() {
             let d = edit_distance(name.as_str(), c.as_str());
             if d > 0 && d * 3 <= name.as_str().len().max(1) && best.as_ref().is_none_or(|(b, _)| d < *b)
             {
@@ -1818,6 +2171,13 @@ impl Checker {
         }
         best.map(|(_, s)| s)
     }
+}
+
+/// A resolved value reference: the [`TypeEnv`] key it denotes, and whether it
+/// landed on the prelude rather than on a local or a module item.
+struct ValueKey {
+    name: Symbol,
+    prelude: bool,
 }
 
 struct Signature {
@@ -1960,10 +2320,10 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn collect_refs(e: &Expr, out: &mut Vec<Symbol>) {
+fn collect_refs<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
     match &e.kind {
         ExprKind::Lit(_) => {}
-        ExprKind::Var(id) => out.push(id.name.clone()),
+        ExprKind::Var(q) => out.push(q),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_refs(lhs, out);
             collect_refs(rhs, out);

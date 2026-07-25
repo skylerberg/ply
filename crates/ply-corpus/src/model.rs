@@ -1,0 +1,505 @@
+//! The corpus as data, plus the reference evaluator.
+//!
+//! Every generated definition is mirrored here in Rust so a test can assert a
+//! real expected value instead of a tautology. That mirror is the load-bearing
+//! part of this file: if it disagrees with `ply-eval` by one, the corpus does
+//! not pass and the generator refuses to write it.
+
+use std::collections::BTreeSet;
+
+pub type DefId = usize;
+pub type ModuleId = usize;
+
+/// `prim::clamp`'s modulus. Every generated body funnels through it, which is
+/// what keeps a value in a range where no intermediate can overflow `Int`.
+pub const CLAMP: i64 = 100_003;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Eff {
+    Db,
+    Cache,
+    Clock,
+}
+
+impl Eff {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Eff::Db => "db",
+            Eff::Cache => "cache",
+            Eff::Clock => "clock",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Atom {
+    pub effect: Eff,
+    /// `None` is the singleton resource of an operation declared without `[r]`.
+    pub resource: Option<String>,
+    pub write: bool,
+}
+
+impl Atom {
+    pub fn read(effect: Eff, resource: impl Into<String>) -> Atom {
+        Atom {
+            effect,
+            resource: Some(resource.into()),
+            write: false,
+        }
+    }
+
+    pub fn write(effect: Eff, resource: impl Into<String>) -> Atom {
+        Atom {
+            effect,
+            resource: Some(resource.into()),
+            write: true,
+        }
+    }
+
+    pub fn singleton_read(effect: Eff) -> Atom {
+        Atom {
+            effect,
+            resource: None,
+            write: false,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mode = if self.write { "write" } else { "read" };
+        match &self.resource {
+            Some(r) => format!("effects::{}.{mode}[{r}]", self.effect.as_str()),
+            None => format!("effects::{}.{mode}", self.effect.as_str()),
+        }
+    }
+}
+
+pub type Footprint = BTreeSet<Atom>;
+
+/// A shape drives both the emitted source and the reference evaluator, so the
+/// two cannot drift apart.
+#[derive(Clone, Debug)]
+pub struct Def {
+    pub id: DefId,
+    pub module: ModuleId,
+    pub name: String,
+    pub arity: usize,
+    pub shape: Shape,
+    /// Extra calls folded into the definition's tail. This is what pushes the
+    /// mean out-degree above what a single shape provides.
+    pub extras: Vec<Call>,
+    pub footprint: Footprint,
+    pub weight: u32,
+    pub public: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Call {
+    pub target: DefId,
+    pub offset: i64,
+}
+
+#[derive(Clone, Debug)]
+pub enum Shape {
+    Arith { a: i64, b: i64 },
+    Compose { f: Call, g: Call },
+    Guard { m: i64, f: Call, b: i64 },
+    Fold { n: i64, k: i64 },
+    Record { m: i64, k: i64 },
+    Sum { off: i64, f: Call, idle: i64 },
+    Chain { inner: Call, outer: DefId, b: i64 },
+    ListMap { n: i64, k: i64 },
+    Pair { f: Call, a: i64, b: i64 },
+    TableCount { table: usize, a: i64, f: Call },
+    TableSum { table: usize, a: i64 },
+    TableAppend { table: usize, a: i64, b: i64 },
+    CachePeek { region: usize, a: i64 },
+    CachePoke { region: usize, a: i64 },
+    Now { a: i64 },
+}
+
+impl Shape {
+    pub fn calls(&self) -> Vec<Call> {
+        match self {
+            Shape::Compose { f, g } => vec![*f, *g],
+            Shape::Guard { f, .. }
+            | Shape::Sum { f, .. }
+            | Shape::Pair { f, .. }
+            | Shape::TableCount { f, .. } => vec![*f],
+            Shape::Chain { inner, outer, .. } => vec![
+                *inner,
+                Call {
+                    target: *outer,
+                    offset: 0,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Atoms this shape performs itself, before anything its callees add.
+    pub fn own_atoms(&self, tables: &[String], regions: &[String]) -> Footprint {
+        let mut out = Footprint::new();
+        match self {
+            Shape::TableCount { table, .. } | Shape::TableSum { table, .. } => {
+                out.insert(Atom::read(Eff::Db, &tables[*table]));
+            }
+            Shape::TableAppend { table, .. } => {
+                out.insert(Atom::read(Eff::Db, &tables[*table]));
+                out.insert(Atom::write(Eff::Db, &tables[*table]));
+            }
+            Shape::CachePeek { region, .. } => {
+                out.insert(Atom::read(Eff::Cache, &regions[*region]));
+            }
+            Shape::CachePoke { region, .. } => {
+                out.insert(Atom::read(Eff::Cache, &regions[*region]));
+                out.insert(Atom::write(Eff::Cache, &regions[*region]));
+            }
+            Shape::Now { .. } => {
+                out.insert(Atom::singleton_read(Eff::Clock));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    pub fn is_block(&self) -> bool {
+        matches!(self, Shape::TableAppend { .. } | Shape::CachePoke { .. })
+    }
+
+    /// A body that emits as exactly one expression on one line. The benchmark's
+    /// edit sites need one, because a one-line body can be rewritten textually
+    /// without a parser.
+    pub fn is_one_liner(&self) -> bool {
+        !self.is_block() && !matches!(self, Shape::Sum { .. })
+    }
+}
+
+/// The per-module `stage` helper: the only definition that returns the module's
+/// sum type, and the reason a `match` appears in generated code at all.
+#[derive(Clone, Debug)]
+pub struct Helper {
+    pub name: String,
+    pub m: i64,
+    pub b: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Module {
+    pub id: ModuleId,
+    /// Dotted, as the compiler will derive it from the path.
+    pub name: String,
+    pub path: String,
+    pub layer: usize,
+    pub imports: Vec<ModuleId>,
+    pub defs: Vec<DefId>,
+    pub helper: Helper,
+    pub status_type: String,
+    pub ctor_ready: String,
+    pub ctor_idle: String,
+    pub needs_effects: bool,
+}
+
+impl Module {
+    /// The name another module refers to this one by: `ImportDecl::binder` is
+    /// the last path segment.
+    pub fn binder(&self) -> &str {
+        self.name.rsplit('.').next().unwrap_or(&self.name)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Test {
+    pub module: ModuleId,
+    pub label: String,
+    pub nondet: bool,
+    pub root: DefId,
+    pub calls: Vec<Vec<i64>>,
+    pub expected: Vec<i64>,
+    pub world: World,
+    /// Exactly the atoms the mirror saw performed. A declared atom that never
+    /// fires gets no clause, so it survives into the test's own footprint —
+    /// which is where a non-trivial conflict graph comes from.
+    pub granted: Footprint,
+    /// Table index -> length after every call, asserted at the end so a write
+    /// that silently does nothing cannot pass.
+    pub final_table_len: Vec<(usize, usize)>,
+    pub final_region: Vec<(usize, i64)>,
+}
+
+/// The state a test's handlers stand in for. Read-only resources never change,
+/// so the same value serves as both the handler's literal and the mirror's seed.
+#[derive(Clone, Debug, Default)]
+pub struct World {
+    pub tables: Vec<(usize, Vec<i64>)>,
+    pub regions: Vec<(usize, i64)>,
+    pub clock: i64,
+    /// Every atom performed so far. Under-reporting here becomes an unhandled
+    /// effect at runtime, which is why `verify` runs on every generated corpus.
+    pub touched: Footprint,
+}
+
+impl World {
+    pub fn table(&self, index: usize) -> &[i64] {
+        self.tables
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn read_table(&mut self, label: &str, index: usize) -> &[i64] {
+        self.touched.insert(Atom::read(Eff::Db, label));
+        self.tables
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn table_mut(&mut self, index: usize) -> Option<&mut Vec<i64>> {
+        self.tables
+            .iter_mut()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| v)
+    }
+
+    pub fn region(&self, index: usize) -> i64 {
+        self.regions
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
+    }
+
+    fn read_region(&mut self, label: &str, index: usize) -> i64 {
+        self.touched.insert(Atom::read(Eff::Cache, label));
+        self.region(index)
+    }
+
+    fn set_region(&mut self, index: usize, value: i64) {
+        if let Some(slot) = self.regions.iter_mut().find(|(i, _)| *i == index) {
+            slot.1 = value;
+        } else {
+            self.regions.push((index, value));
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Corpus {
+    pub modules: Vec<Module>,
+    pub defs: Vec<Def>,
+    pub tests: Vec<Test>,
+    pub tables: Vec<String>,
+    pub regions: Vec<String>,
+}
+
+pub fn clamp(v: i64) -> i64 {
+    v % CLAMP
+}
+
+pub fn mix(a: i64, b: i64) -> i64 {
+    clamp(a * 31 + b * 17 + 7)
+}
+
+pub fn weigh(id: i64, weight: i64) -> i64 {
+    clamp(id * 11 + weight)
+}
+
+pub fn total(xs: &[i64]) -> i64 {
+    xs.iter().fold(0, |acc, v| clamp(acc + v))
+}
+
+impl Corpus {
+    /// The value `def(args)` evaluates to under `world`, which is mutated by
+    /// exactly the writes the definition performs.
+    pub fn eval(&self, def: DefId, args: &[i64], world: &mut World) -> i64 {
+        let def = &self.defs[def];
+        let p0 = args.first().copied().unwrap_or(0);
+        let p1 = args.get(1).copied().unwrap_or(0);
+
+        let core = match &def.shape {
+            Shape::Arith { a, b } => clamp(p0 * a + b),
+            Shape::Compose { f, g } => {
+                let left = self.invoke(*f, p0, world);
+                let right = self.invoke(*g, p0, world);
+                mix(left, right)
+            }
+            Shape::Guard { m, f, b } => {
+                if p0 % m == 0 {
+                    self.invoke(*f, p0, world)
+                } else {
+                    clamp(p0 + b)
+                }
+            }
+            Shape::Fold { n, k } => (0..*n).fold(0, |acc, v| clamp(acc + v * k + p0)),
+            Shape::Record { m, k } => weigh(p0 % m, clamp(p0 * k)),
+            Shape::Sum { off, f, idle } => {
+                let module = &self.modules[def.module];
+                let x = p0 + off;
+                if x % module.helper.m == 0 {
+                    *idle
+                } else {
+                    self.invoke(*f, clamp(x + module.helper.b), world)
+                }
+            }
+            Shape::Chain { inner, outer, b } => {
+                let v = self.invoke(*inner, p0, world);
+                self.invoke_with(
+                    Call {
+                        target: *outer,
+                        offset: 0,
+                    },
+                    v + b,
+                    world,
+                )
+            }
+            Shape::ListMap { n, k } => {
+                let xs: Vec<i64> = (0..*n).map(|v| clamp(v * k + p0)).collect();
+                total(&xs)
+            }
+            Shape::Pair { f, a, b } => {
+                let left = self.invoke(*f, p0, world);
+                mix(left, p1 * a + b)
+            }
+            Shape::TableCount { table, a, f } => {
+                let n = world.read_table(&self.tables[*table], *table).len() as i64;
+                let rest = self.invoke(*f, p0, world);
+                clamp(n * a + rest)
+            }
+            Shape::TableSum { table, a } => {
+                let sum = total(world.read_table(&self.tables[*table], *table));
+                clamp(sum + p0 * a)
+            }
+            Shape::TableAppend { table, a, b } => {
+                let label = &self.tables[*table];
+                let before = world.read_table(label, *table).len() as i64;
+                let pushed = clamp(p0 * a);
+                world.touched.insert(Atom::write(Eff::Db, label));
+                if let Some(rows) = world.table_mut(*table) {
+                    rows.push(pushed);
+                }
+                clamp(before * b + p0)
+            }
+            Shape::CachePeek { region, a } => {
+                clamp(world.read_region(&self.regions[*region], *region) + p0 * a)
+            }
+            Shape::CachePoke { region, a } => {
+                let label = &self.regions[*region];
+                let seen = world.read_region(label, *region);
+                world.touched.insert(Atom::write(Eff::Cache, label));
+                world.set_region(*region, clamp(seen + p0));
+                clamp(seen * a + p0)
+            }
+            Shape::Now { a } => {
+                world.touched.insert(Atom::singleton_read(Eff::Clock));
+                clamp(world.clock % a + p0)
+            }
+        };
+
+        if def.extras.is_empty() {
+            return core;
+        }
+        let mut sum = 0i64;
+        for extra in &def.extras {
+            sum += self.invoke(*extra, p0, world);
+        }
+        mix(core, sum)
+    }
+
+    fn invoke(&self, call: Call, p0: i64, world: &mut World) -> i64 {
+        self.invoke_with(call, p0 + call.offset, world)
+    }
+
+    fn invoke_with(&self, call: Call, arg: i64, world: &mut World) -> i64 {
+        let args = call_args(self.defs[call.target].arity, arg, call.offset);
+        self.eval(call.target, &args, world)
+    }
+
+    pub fn module_of(&self, def: DefId) -> &Module {
+        &self.modules[self.defs[def].module]
+    }
+
+    pub fn effectful_defs(&self) -> usize {
+        self.defs.iter().filter(|d| !d.footprint.is_empty()).count()
+    }
+}
+
+/// A second parameter is synthesized from the call's own offset rather than
+/// drawn, so emission and evaluation cannot pick different values for it.
+pub fn call_args(arity: usize, first: i64, offset: i64) -> Vec<i64> {
+    if arity >= 2 {
+        vec![first, second_arg(offset)]
+    } else {
+        vec![first]
+    }
+}
+
+pub fn second_arg(offset: i64) -> i64 {
+    offset * 7 % 97 + 3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_atom_renders_as_the_row_syntax_it_will_be_parsed_from() {
+        assert_eq!(
+            Atom::read(Eff::Db, "users").render(),
+            "effects::db.read[users]"
+        );
+        assert_eq!(
+            Atom::write(Eff::Cache, "hot").render(),
+            "effects::cache.write[hot]"
+        );
+        assert_eq!(
+            Atom::singleton_read(Eff::Clock).render(),
+            "effects::clock.read"
+        );
+    }
+
+    #[test]
+    fn clamp_agrees_with_the_prelude_definition_it_mirrors() {
+        assert_eq!(clamp(100_004), 1);
+        assert_eq!(clamp(-1), -1);
+        assert_eq!(mix(2, 3), 2 * 31 + 3 * 17 + 7);
+    }
+
+    #[test]
+    fn a_module_binder_is_its_last_dotted_segment() {
+        let module = Module {
+            id: 0,
+            name: "store0.rules_3".into(),
+            path: "store0/rules_3.ply".into(),
+            layer: 0,
+            imports: Vec::new(),
+            defs: Vec::new(),
+            helper: Helper {
+                name: "stage_0".into(),
+                m: 3,
+                b: 1,
+            },
+            status_type: "Status0".into(),
+            ctor_ready: "Ready0".into(),
+            ctor_idle: "Idle0".into(),
+            needs_effects: false,
+        };
+        assert_eq!(module.binder(), "rules_3");
+    }
+
+    #[test]
+    fn a_written_table_is_the_only_one_a_footprint_reports_writing() {
+        let tables = vec!["users".to_string(), "orders".to_string()];
+        let regions = vec!["hot".to_string()];
+        let append = Shape::TableAppend {
+            table: 1,
+            a: 2,
+            b: 3,
+        };
+        let atoms = append.own_atoms(&tables, &regions);
+        assert_eq!(atoms.len(), 2);
+        assert!(atoms.contains(&Atom::write(Eff::Db, "orders")));
+        assert!(!atoms.contains(&Atom::write(Eff::Db, "users")));
+    }
+}
