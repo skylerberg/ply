@@ -20,7 +20,7 @@ impl Selection {
     pub fn explain(&self, check: &CheckOutput, hashes: &HashOutput) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.total + self.groups.len());
         for (index, reason) in self.reasons.iter().enumerate() {
-            let name = check.tests.get(index).map(|t| t.name.as_str()).unwrap_or("<unknown>");
+            let name = check.tests.get(index).map(|t| t.key.as_str()).unwrap_or("<unknown>");
             let hash = hashes
                 .tests
                 .get(index)
@@ -32,7 +32,7 @@ impl Selection {
         for (g, group) in self.groups.iter().enumerate() {
             let names: Vec<&str> = group
                 .iter()
-                .map(|&i| check.tests.get(i).map(|t| t.name.as_str()).unwrap_or("<unknown>"))
+                .map(|&i| check.tests.get(i).map(|t| t.key.as_str()).unwrap_or("<unknown>"))
                 .collect();
             let footprint = group
                 .iter()
@@ -55,7 +55,9 @@ impl Selection {
             .map(|(index, reason)| {
                 json!({
                     "index": index,
+                    "key": check.tests.get(index).map(|t| t.key.clone()),
                     "name": check.tests.get(index).map(|t| t.name.clone()),
+                    "module": check.tests.get(index).map(|t| t.module.to_string()),
                     "hash": hashes.tests.get(index).map(|h| h.to_hex()),
                     "selected": reason.runs(),
                     "reason": reason,
@@ -110,7 +112,7 @@ impl RunReport {
         )];
         for failure in &self.failures {
             lines.push(String::new());
-            lines.push(failure.name.clone());
+            lines.push(failure.key.to_string());
             lines.push(format!("  {}", failure.diagnostic.message));
             for note in &failure.diagnostic.notes {
                 lines.push(format!("  = {note}"));
@@ -150,6 +152,7 @@ fn test_json(result: &TestResult) -> Value {
 
 fn failure_json(failure: &Failure) -> Value {
     json!({
+        "key": failure.key,
         "name": failure.name,
         "diagnostic": failure.diagnostic,
         "suspects": failure.suspects,

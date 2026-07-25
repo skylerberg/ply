@@ -80,32 +80,61 @@ impl Subst {
         self.rigid_row.contains(&v)
     }
 
-    pub fn shallow_ty(&self, t: &Type) -> Type {
-        let mut cur = t.clone();
+    /// Borrowed rather than cloned: the traversals below visit every node of
+    /// every type in the program, and a clone per node makes each of them
+    /// quadratic in the size of a type. Terminates because [`Subst::bind_ty`]
+    /// occurs-checks, so a chain of variables is acyclic.
+    fn shallow_ref<'a>(&'a self, t: &'a Type) -> &'a Type {
+        let mut cur = t;
         while let Type::Var(v) = cur {
-            match self.ty.get(&v) {
-                Some(next) => cur = next.clone(),
-                None => return Type::Var(v),
+            match self.ty.get(v) {
+                Some(next) => cur = next,
+                None => break,
             }
         }
         cur
     }
 
+    pub fn shallow_ty(&self, t: &Type) -> Type {
+        self.shallow_ref(t).clone()
+    }
+
     pub fn resolve_ty(&self, t: &Type) -> Type {
-        match self.shallow_ty(t) {
-            Type::Var(v) => Type::Var(v),
+        match self.shallow_ref(t) {
+            Type::Var(v) => Type::Var(*v),
             Type::Con(name, args) => {
-                Type::Con(name, args.iter().map(|a| self.resolve_ty(a)).collect())
+                Type::Con(name.clone(), args.iter().map(|a| self.resolve_ty(a)).collect())
             }
             Type::Fn { params, ret, effects } => Type::Fn {
                 params: params.iter().map(|p| self.resolve_ty(p)).collect(),
-                ret: Box::new(self.resolve_ty(&ret)),
-                effects: self.resolve_row(&effects),
+                ret: Box::new(self.resolve_ty(ret)),
+                effects: self.resolve_row(effects),
             },
             Type::Record(fields) => Type::Record(
                 fields.iter().map(|(k, v)| (k.clone(), self.resolve_ty(v))).collect(),
             ),
         }
+    }
+
+    /// The tail a row ends in once its variables are followed. Separate from
+    /// [`Subst::resolve_row`] because collecting the atoms along the way is
+    /// wasted work when only the tail is wanted.
+    pub fn resolved_tail(&self, r: &Row) -> Option<RowVar> {
+        let mut tail = r.tail;
+        let mut hops = 0usize;
+        while let Some(v) = tail {
+            match self.row.get(&v) {
+                Some(next) if next.tail != Some(v) => tail = next.tail,
+                _ => return Some(v),
+            }
+            // A row chain is acyclic by construction, but a corrupt one would
+            // hang inference rather than fail it.
+            hops += 1;
+            if hops > self.row.len() {
+                return tail;
+            }
+        }
+        None
     }
 
     pub fn resolve_row(&self, r: &Row) -> Row {
@@ -152,21 +181,21 @@ impl Subst {
     }
 
     pub fn free_vars(&self, t: &Type, tys: &mut BTreeSet<TyVar>, rows: &mut BTreeSet<RowVar>) {
-        match self.shallow_ty(t) {
+        match self.shallow_ref(t) {
             Type::Var(v) => {
-                tys.insert(v);
+                tys.insert(*v);
             }
             Type::Con(_, args) => {
-                for a in &args {
+                for a in args {
                     self.free_vars(a, tys, rows);
                 }
             }
             Type::Fn { params, ret, effects } => {
-                for p in &params {
+                for p in params {
                     self.free_vars(p, tys, rows);
                 }
-                self.free_vars(&ret, tys, rows);
-                if let Some(v) = self.resolve_row(&effects).tail {
+                self.free_vars(ret, tys, rows);
+                if let Some(v) = self.resolved_tail(effects) {
                     rows.insert(v);
                 }
             }

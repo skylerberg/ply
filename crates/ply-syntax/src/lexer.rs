@@ -5,6 +5,8 @@ use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kw {
+    Pub,
+    Import,
     Fn,
     Type,
     Effect,
@@ -23,6 +25,8 @@ pub enum Kw {
 impl Kw {
     pub fn as_str(self) -> &'static str {
         match self {
+            Kw::Pub => "pub",
+            Kw::Import => "import",
             Kw::Fn => "fn",
             Kw::Type => "type",
             Kw::Effect => "effect",
@@ -41,6 +45,8 @@ impl Kw {
 
     pub fn from_text(s: &str) -> Option<Kw> {
         Some(match s {
+            "pub" => Kw::Pub,
+            "import" => Kw::Import,
             "fn" => Kw::Fn,
             "type" => Kw::Type,
             "effect" => Kw::Effect,
@@ -76,6 +82,7 @@ pub enum TokenKind {
     Comma,
     Semi,
     Colon,
+    ColonColon,
     Dot,
     DotDot,
     Underscore,
@@ -127,6 +134,7 @@ impl TokenKind {
             TokenKind::Comma => ",",
             TokenKind::Semi => ";",
             TokenKind::Colon => ":",
+            TokenKind::ColonColon => "::",
             TokenKind::Dot => ".",
             TokenKind::DotDot => "..",
             TokenKind::Underscore => "_",
@@ -174,6 +182,13 @@ struct Lexer<'a> {
     source: SourceId,
     pos: usize,
     diags: Vec<Diagnostic>,
+}
+
+/// Public because module names are derived from file and directory names, which
+/// never pass through the lexer.
+pub fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -394,7 +409,9 @@ impl<'a> Lexer<'a> {
             ']' => TokenKind::RBracket,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semi,
-            ':' => TokenKind::Colon,
+            ':' => {
+                if self.eat(':') { TokenKind::ColonColon } else { TokenKind::Colon }
+            }
             '.' => {
                 if self.eat('.') {
                     TokenKind::DotDot

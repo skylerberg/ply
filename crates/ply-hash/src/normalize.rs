@@ -13,10 +13,13 @@
 use ply_span::Symbol;
 use ply_syntax::ast::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeMap;
 
 use crate::DefHash;
-use crate::graph::{ModuleIndex, NodeBody, NodeId};
+use crate::graph::{NodeBody, NodeId, ProgramIndex, ValueTarget};
+
+fn qualifier(q: &QName) -> Option<&Symbol> {
+    q.module.as_ref().map(|m| &m.name)
+}
 
 /// The parser's nesting limit does not bound this walk: a left-leaning operator
 /// chain is parsed iteratively at constant depth but is still an arbitrarily
@@ -34,6 +37,7 @@ mod tag {
     pub const REF_SELF: u8 = 3;
     pub const REF_INDEX: u8 = 4;
     pub const FREE: u8 = 5;
+    pub const FREE_QUALIFIED: u8 = 9;
     pub const CTOR: u8 = 6;
     pub const TY_PARAM: u8 = 7;
     pub const ROW_PARAM: u8 = 8;
@@ -133,10 +137,18 @@ fn mode_byte(mode: Mode) -> u8 {
 pub type ComponentIndices = FxHashMap<usize, u32>;
 pub type HashTable = FxHashMap<usize, DefHash>;
 
+/// Effect node -> its slot in the enumeration built for the component being
+/// encoded. See [`crate::effect_order`].
+pub type EffectIndex = FxHashMap<usize, u32>;
+
 pub struct Normalizer<'a> {
-    index: &'a ModuleIndex<'a>,
+    index: &'a ProgramIndex<'a>,
+    /// Which module's bodies are being walked. It decides what a name denotes
+    /// and nothing else: no byte written below depends on it.
+    module: usize,
     hashes: &'a HashTable,
     component: &'a ComponentIndices,
+    effects: &'a EffectIndex,
     out: Vec<u8>,
     refs: Vec<NodeId>,
     seen: Vec<bool>,
@@ -147,14 +159,18 @@ pub struct Normalizer<'a> {
 
 impl<'a> Normalizer<'a> {
     pub fn new(
-        index: &'a ModuleIndex<'a>,
+        index: &'a ProgramIndex<'a>,
+        module: usize,
         hashes: &'a HashTable,
         component: &'a ComponentIndices,
+        effects: &'a EffectIndex,
     ) -> Self {
         Normalizer {
             index,
+            module,
             hashes,
             component,
+            effects,
             out: Vec::new(),
             refs: Vec::new(),
             seen: vec![false; index.nodes.len()],
@@ -231,56 +247,83 @@ impl<'a> Normalizer<'a> {
         }
     }
 
-    fn value_ref(&mut self, name: &Symbol) {
-        if let Some(level) = self.values.iter().rposition(|s| *s == name) {
-            self.tag(tag::LOCAL);
-            self.u32v(level as u32);
-        } else if let Some(&node) = self.index.fns.get(name) {
-            self.node_ref(node);
-        } else if let Some(&owner) = self.index.ctors.get(name) {
-            self.tag(tag::CTOR);
-            self.node_ref(owner);
-            self.strv(name);
-        } else {
-            self.tag(tag::FREE);
-            self.strv(name);
+    /// A name nothing in the index answers to. The qualifier is kept because
+    /// `a::log` and `b::log` are different references even when neither module
+    /// is in the index — dropping it would alias them.
+    fn free_ref(&mut self, qual: Option<&Symbol>, name: &Symbol) {
+        match qual {
+            None => {
+                self.tag(tag::FREE);
+                self.strv(name);
+            }
+            Some(module) => {
+                self.tag(tag::FREE_QUALIFIED);
+                self.strv(module);
+                self.strv(name);
+            }
         }
     }
 
-    fn type_ref(&mut self, name: &Symbol) {
-        if let Some(level) = self.ty_params.iter().rposition(|s| *s == name) {
+    fn ctor_bytes(&mut self, owner: NodeId, name: &Symbol) {
+        self.tag(tag::CTOR);
+        self.node_ref(owner);
+        self.strv(name);
+    }
+
+    /// A local binder wins over everything, and only a bare name can be one: a
+    /// module binder is a fourth namespace reachable only through `::`.
+    fn value_ref(&mut self, q: &QName) {
+        if q.is_bare()
+            && let Some(level) = self.values.iter().rposition(|s| **s == q.name.name)
+        {
+            self.tag(tag::LOCAL);
+            self.u32v(level as u32);
+            return;
+        }
+        match self.index.value(self.module, q) {
+            Some(ValueTarget::Fn(node)) => self.node_ref(node),
+            Some(ValueTarget::Ctor { owner, name }) => self.ctor_bytes(owner, &name),
+            None => self.free_ref(qualifier(q), &q.name.name),
+        }
+    }
+
+    fn type_ref(&mut self, qual: Option<&Symbol>, name: &Symbol) {
+        if qual.is_none()
+            && let Some(level) = self.ty_params.iter().rposition(|s| **s == *name)
+        {
             self.tag(tag::TY_PARAM);
             self.u32v(level as u32);
-        } else if let Some(&node) = self.index.types.get(name) {
+        } else if let Some(node) = self.index.ty(self.module, qual, name) {
             self.node_ref(node);
         } else {
-            self.tag(tag::FREE);
-            self.strv(name);
+            self.free_ref(qual, name);
         }
     }
 
     /// Effects are nominal: `db` and `audit` may declare byte-identical
     /// operations and are still different capabilities, performed as different
     /// atoms and discharged by different handlers. A declaration alone therefore
-    /// cannot identify one, so a reference carries a discriminator too.
-    fn effect_ref(&mut self, name: &Symbol) {
-        if let Some(&node) = self.index.effects.get(name) {
+    /// cannot identify one, so a reference carries its slot in the enclosing
+    /// component's effect enumeration as well.
+    ///
+    /// The slot is what a de Bruijn level is for a local binder: it says *which*
+    /// of the effects this definition can see is meant, without naming it and
+    /// without consulting anything the definition cannot reach. Two definitions
+    /// that differ only by a consistent renaming of their effects therefore
+    /// hash alike, and any context that can tell them apart differs itself.
+    fn effect_ref(&mut self, q: &QName) {
+        if let Some(node) = self.index.effect(self.module, q) {
             self.node_ref(node);
-            self.u32v(self.index.effect_ids.get(&node.0).copied().unwrap_or(0));
+            self.u32v(self.effects.get(&node.0).copied().unwrap_or(0));
         } else {
-            self.tag(tag::FREE);
-            self.strv(name);
+            self.free_ref(qualifier(q), &q.name.name);
         }
     }
 
-    fn ctor_ref(&mut self, name: &Symbol) {
-        if let Some(&owner) = self.index.ctors.get(name) {
-            self.tag(tag::CTOR);
-            self.node_ref(owner);
-            self.strv(name);
-        } else {
-            self.tag(tag::FREE);
-            self.strv(name);
+    fn ctor_ref(&mut self, q: &QName) {
+        match self.index.ctor(self.module, q) {
+            Some(ValueTarget::Ctor { owner, name }) => self.ctor_bytes(owner, &name),
+            _ => self.free_ref(qualifier(q), &q.name.name),
         }
     }
 
@@ -371,12 +414,13 @@ impl<'a> Normalizer<'a> {
         match t {
             TypeExpr::Var(name) => {
                 self.tag(tag::TY_CON);
-                self.type_ref(&name.name);
+                self.type_ref(None, &name.name);
                 self.len(0);
             }
             TypeExpr::Con { name, args, .. } => {
                 self.tag(tag::TY_CON);
-                self.type_ref(&name.name);
+                let qual = name.module.as_ref().map(|m| m.name.clone());
+                self.type_ref(qual.as_ref(), &name.name.name);
                 self.len(args.len());
                 for a in args {
                     self.type_expr(a);
@@ -451,7 +495,7 @@ impl<'a> Normalizer<'a> {
 
     fn atom(&mut self, a: &'a AtomExpr) {
         self.tag(tag::ATOM);
-        self.effect_ref(&a.effect.name);
+        self.effect_ref(&a.effect);
         self.out.push(mode_byte(a.mode));
         self.opt(a.resource.as_ref(), |s, r| s.strv(&r.name));
     }
@@ -471,7 +515,7 @@ impl<'a> Normalizer<'a> {
             }
             ExprKind::Var(name) => {
                 self.tag(tag::E_VAR);
-                self.value_ref(&name.name);
+                self.value_ref(name);
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 self.tag(tag::E_BINARY);
@@ -556,7 +600,7 @@ impl<'a> Normalizer<'a> {
             }
             ExprKind::Perform { effect, op, resource, args } => {
                 self.tag(tag::E_PERFORM);
-                self.effect_ref(&effect.name);
+                self.effect_ref(effect);
                 self.strv(&op.name);
                 self.opt(resource.as_ref(), |s, r| s.strv(&r.name));
                 self.len(args.len());
@@ -570,7 +614,7 @@ impl<'a> Normalizer<'a> {
                 self.len(clauses.len());
                 for c in clauses {
                     self.tag(tag::CLAUSE);
-                    self.effect_ref(&c.effect.name);
+                    self.effect_ref(&c.effect);
                     self.strv(&c.op.name);
                     self.opt(c.resource.as_ref(), |s, r| s.strv(&r.name));
                     self.len(c.params.len());
@@ -690,7 +734,7 @@ impl<'a> Normalizer<'a> {
             }
             PatternKind::Ctor { name, args } => {
                 self.tag(tag::P_CTOR);
-                self.ctor_ref(&name.name);
+                self.ctor_ref(name);
                 self.len(args.len());
                 for a in args {
                     self.pattern(a);
@@ -715,33 +759,6 @@ impl<'a> Normalizer<'a> {
             }
         }
     }
-}
-
-/// Effects that declare exactly the same operations are told apart by their rank
-/// in name order among that group of look-alikes. Nothing else can separate
-/// them: their declarations are byte-identical by construction, and source
-/// position would make moving an item change hashes. Almost every effect is the
-/// only one of its shape, gets rank 0, and so stays free to rename.
-pub fn effect_disambiguators(index: &ModuleIndex<'_>) -> FxHashMap<usize, u32> {
-    let no_hashes = HashTable::default();
-    let no_component = ComponentIndices::default();
-    let mut groups: BTreeMap<Vec<u8>, Vec<(&Symbol, usize)>> = BTreeMap::new();
-    for (v, node) in index.nodes.iter().enumerate() {
-        if matches!(node.body, NodeBody::Effect(_)) {
-            let mut nz = Normalizer::new(index, &no_hashes, &no_component);
-            nz.node(node.body);
-            groups.entry(nz.finish().0).or_default().push((node.name, v));
-        }
-    }
-
-    let mut out = FxHashMap::default();
-    for members in groups.values_mut() {
-        members.sort_unstable();
-        for (rank, (_, v)) in members.iter().enumerate() {
-            out.insert(*v, rank as u32);
-        }
-    }
-    out
 }
 
 /// How many statements from `from` are `let`s that may be written in any order
@@ -844,7 +861,7 @@ fn is_pure(e: &Expr) -> bool {
 fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
     grow(|| match &e.kind {
         ExprKind::Lit(_) => false,
-        ExprKind::Var(name) => names.contains(&name.name),
+        ExprKind::Var(name) => name.is_bare() && names.contains(&name.name.name),
         ExprKind::Binary { lhs, rhs, .. } => mentions(lhs, names) || mentions(rhs, names),
         ExprKind::Unary { operand, .. } => mentions(operand, names),
         ExprKind::Lambda { params, body } => {
@@ -896,7 +913,8 @@ fn pattern_mentions(p: &Pattern, names: &FxHashSet<Symbol>) -> bool {
         PatternKind::Wildcard | PatternKind::Lit(_) => false,
         PatternKind::Var(name) => names.contains(&name.name),
         PatternKind::Ctor { name, args } => {
-            names.contains(&name.name) || args.iter().any(|a| pattern_mentions(a, names))
+            (name.is_bare() && names.contains(&name.name.name))
+                || args.iter().any(|a| pattern_mentions(a, names))
         }
         PatternKind::Record { fields, .. } => {
             fields.iter().any(|(_, pat)| pattern_mentions(pat, names))

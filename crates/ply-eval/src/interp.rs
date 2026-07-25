@@ -4,9 +4,10 @@ use crate::value::{Closure, ClosureKind, Value, first_difference, type_error, va
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
-    BinOp, Expr, ExprKind, HandleClause, Ident, Item, Lit, MatchArm, Module, Param, Pattern,
-    PatternKind, ReturnClause, Stmt, TestDef, TypeDefBody, UnOp,
+    BinOp, Expr, ExprKind, HandleClause, Ident, Item, Lit, MatchArm, Param, Pattern, PatternKind,
+    Program, QName, ReturnClause, Stmt, TestDef, TypeDefBody, UnOp,
 };
+use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -30,82 +31,108 @@ fn grow<R>(f: impl FnOnce() -> R) -> R {
 
 struct HandlerFrame {
     clauses: Arc<Vec<HandleClause>>,
+    /// Each clause's effect under its program-wide name, resolved where the
+    /// `handle` was written: a perform reached from another module spells the
+    /// same effect differently, and the two only meet once both are qualified.
+    effects: Arc<Vec<Symbol>>,
     env: Env,
+    /// The module the clause bodies were written in, which is not the one the
+    /// perform that triggers them is reached from.
+    module: usize,
+}
+
+/// Ordered exactly as [`CheckOutput::tests`] is — load order, then source order
+/// — because the index into the two is the same index.
+struct TestSlot<'a> {
+    module: usize,
+    def: &'a TestDef,
 }
 
 pub struct Interp<'a> {
-    module: &'a Module,
+    program: &'a Program,
+    resolved: &'a Resolved,
     check: Option<&'a CheckOutput>,
+    /// Keyed by program-wide name, so two modules may declare one simple name.
     globals: FxHashMap<Symbol, Value>,
     ctors: FxHashMap<Symbol, usize>,
     ops: FxHashMap<(Symbol, Symbol), bool>,
-    tests: Vec<&'a TestDef>,
+    tests: Vec<TestSlot<'a>>,
     handlers: Vec<HandlerFrame>,
+    /// The module a bare name is resolved in: the one that wrote the expression
+    /// being evaluated, not the one that called it.
+    module: usize,
     depth: usize,
     max_depth: usize,
 }
 
 impl<'a> Interp<'a> {
-    pub fn new(module: &'a Module, check: &'a CheckOutput) -> Self {
-        Self::build(module, Some(check))
+    pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Self {
+        Self::build(program, resolved, Some(check))
     }
 
-    /// Everything the evaluator needs is derivable from the AST alone, so
-    /// evaluation can be exercised without a type-check pass.
-    pub fn for_module(module: &'a Module) -> Self {
-        Self::build(module, None)
+    /// Everything the evaluator needs is derivable from the resolved AST alone,
+    /// so evaluation can be exercised without a type-check pass.
+    pub fn for_program(program: &'a Program, resolved: &'a Resolved) -> Self {
+        Self::build(program, resolved, None)
     }
 
-    fn build(module: &'a Module, check: Option<&'a CheckOutput>) -> Self {
+    fn build(
+        program: &'a Program,
+        resolved: &'a Resolved,
+        check: Option<&'a CheckOutput>,
+    ) -> Self {
         let mut globals = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> = FxHashMap::default();
         let mut ops = FxHashMap::default();
         let mut tests = Vec::new();
 
-        for item in &module.items {
-            match item {
-                Item::Fn(f) => {
-                    let params = f.params.iter().map(|p| p.name.name.clone()).collect();
-                    let closure = Closure {
-                        name: Some(f.name.name.clone()),
-                        kind: ClosureKind::Fn {
-                            params,
-                            body: Arc::new(f.body.clone()),
-                            env: Env::empty(),
-                        },
-                    };
-                    globals.insert(f.name.name.clone(), Value::Closure(Arc::new(closure)));
-                }
-                Item::Type(t) => {
-                    if let TypeDefBody::Sum(variants) = &t.body {
-                        for v in variants {
-                            ctors.insert(v.name.name.clone(), v.fields.len());
+        for (m, module) in program.modules.iter().enumerate() {
+            let qualify = |name: &Symbol| module.name.qualify(name);
+            for item in &module.items {
+                match item {
+                    Item::Fn(f) => {
+                        let params = f.params.iter().map(|p| p.name.name.clone()).collect();
+                        let closure = Closure {
+                            name: Some(qualify(&f.name.name)),
+                            kind: ClosureKind::Fn {
+                                params,
+                                body: Arc::new(f.body.clone()),
+                                env: Env::empty(),
+                                module: m,
+                            },
+                        };
+                        globals.insert(qualify(&f.name.name), Value::Closure(Arc::new(closure)));
+                    }
+                    Item::Type(t) => {
+                        if let TypeDefBody::Sum(variants) = &t.body {
+                            for v in variants {
+                                ctors.insert(qualify(&v.name.name), v.fields.len());
+                            }
                         }
                     }
-                }
-                Item::Effect(e) => {
-                    for op in &e.ops {
-                        ops.insert(
-                            (e.name.name.clone(), op.name.name.clone()),
-                            op.resource_param,
-                        );
+                    Item::Effect(e) => {
+                        for op in &e.ops {
+                            ops.insert(
+                                (qualify(&e.name.name), op.name.name.clone()),
+                                op.resource_param,
+                            );
+                        }
                     }
+                    Item::Test(t) => tests.push(TestSlot { module: m, def: t }),
                 }
-                Item::Test(t) => tests.push(t),
             }
         }
 
-        ctors.entry(Symbol::new("Some")).or_insert(1);
-        ctors.entry(Symbol::new("None")).or_insert(0);
-
         Interp {
-            module,
+            program,
+            resolved,
             check,
             globals,
             ctors,
             ops,
             tests,
             handlers: Vec::new(),
+            module: 0,
             depth: 0,
             max_depth: DEFAULT_MAX_DEPTH,
         }
@@ -116,8 +143,8 @@ impl<'a> Interp<'a> {
         self
     }
 
-    pub fn module(&self) -> &'a Module {
-        self.module
+    pub fn program(&self) -> &'a Program {
+        self.program
     }
 
     pub fn check(&self) -> Option<&'a CheckOutput> {
@@ -129,22 +156,54 @@ impl<'a> Interp<'a> {
     }
 
     pub fn test_name(&self, index: usize) -> Option<&'a str> {
-        self.tests.get(index).map(|t| t.name.as_str())
+        self.tests.get(index).map(|t| t.def.name.as_str())
     }
 
     pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let test = *self.tests.get(index).ok_or_else(|| {
-            Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                format!(
-                    "no test at index {index}; the module defines {}",
-                    self.tests.len()
-                ),
-            )
-            .primary(Span::DUMMY, "requested test does not exist")
-        })?;
+        let (module, body) = {
+            let slot = self.tests.get(index).ok_or_else(|| {
+                Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!(
+                        "no test at index {index}; the program defines {}",
+                        self.tests.len()
+                    ),
+                )
+                .primary(Span::DUMMY, "requested test does not exist")
+            })?;
+            (slot.module, &slot.def.body)
+        };
         self.reset();
-        self.eval(&test.body, &Env::empty()).map(|_| ())
+        self.module = module;
+        self.eval(body, &Env::empty()).map(|_| ())
+    }
+
+    /// Runs the `ordinal`-th test declared by `module`.
+    ///
+    /// A position in this program is not a position in a [`CheckOutput`]: the
+    /// incremental front end reports every module's tests while parsing only
+    /// some of them, so the two lists agree on order but not on length. Naming
+    /// the module is what survives that. Two tests in one module may share a
+    /// label, so the ordinal — not the label — is the second half of the key.
+    pub fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic> {
+        let program = self.program;
+        let found = self
+            .tests
+            .iter()
+            .filter(|t| program.modules[t.module].name.as_symbol() == module)
+            .nth(ordinal)
+            .map(|slot| (slot.module, &slot.def.body));
+        let Some((owner, body)) = found else {
+            return Err(Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("module `{module}` has no test at position {ordinal}"),
+            )
+            .primary(Span::DUMMY, "this test's module was not parsed")
+            .note("run `ply cache clear`, or pass `--no-incremental`"));
+        };
+        self.reset();
+        self.module = owner;
+        self.eval(body, &Env::empty()).map(|_| ())
     }
 
     pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
@@ -152,16 +211,14 @@ impl<'a> Interp<'a> {
         self.eval(e, &Env::empty())
     }
 
-    pub fn eval_main(&mut self) -> Result<Value, Diagnostic> {
-        self.call("main", Vec::new(), Span::DUMMY)
-    }
-
+    /// `name` is the program-wide name — `app.main`, not `main`.
     pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
         self.reset();
         let sym = Symbol::new(name);
         let f = self.globals.get(&sym).cloned().ok_or_else(|| {
             Diagnostic::error(codes::UNKNOWN_NAME, format!("no definition named `{name}`"))
-                .primary(span, "not defined in this module")
+                .primary(span, "not defined in this program")
+                .note("this name is program-wide: `store.orders.place`, not `place`")
         })?;
         self.apply(f, args, span)
     }
@@ -171,6 +228,27 @@ impl<'a> Interp<'a> {
     fn reset(&mut self) {
         self.handlers.clear();
         self.depth = 0;
+        self.module = 0;
+    }
+
+    /// Resolution already decided what this denotes; nothing here re-derives it.
+    ///
+    /// A bare name goes straight to the module's scope rather than through
+    /// [`Resolved::lookup`], because a miss there is the ordinary prelude case
+    /// and building a diagnostic for every `len(..)` would not be free.
+    fn global(&self, ns: Namespace, q: &QName) -> Option<Symbol> {
+        if q.is_bare() {
+            return self
+                .resolved
+                .scopes
+                .get(self.module)
+                .and_then(|scope| scope.get(ns, q.symbol()))
+                .map(|b| b.qualified.clone());
+        }
+        self.resolved
+            .lookup(self.module, ns, q)
+            .ok()
+            .map(|b| b.qualified.clone())
     }
 
     fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
@@ -191,10 +269,12 @@ impl<'a> Interp<'a> {
     fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Diagnostic> {
         match &e.kind {
             ExprKind::Lit(lit) => Ok(literal(lit)),
-            ExprKind::Var(id) => self.lookup(&id.name, id.span, env),
+            ExprKind::Var(q) => self.lookup(q, env),
             ExprKind::Unary { op, operand } => self.eval_unary(*op, operand, env, e.span),
             ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs, env, e.span),
-            ExprKind::Lambda { params, body } => Ok(eval_lambda(params, body, env)),
+            ExprKind::Lambda { params, body } => {
+                Ok(eval_lambda(params, body, env, self.module))
+            }
             ExprKind::App { func, args } => self.eval_app(func, args, env, e.span),
             ExprKind::If {
                 cond,
@@ -356,24 +436,27 @@ impl<'a> Interp<'a> {
     #[inline(never)]
     fn eval_perform(
         &mut self,
-        effect: &Ident,
+        effect: &QName,
         op: &Ident,
         resource: Option<&Ident>,
         args: &[Expr],
         env: &Env,
         span: Span,
     ) -> Result<Value, Diagnostic> {
+        let name = self.effect_name(effect);
         let mut argv = Vec::with_capacity(args.len());
         for a in args {
             argv.push(self.eval(a, env)?);
         }
-        self.perform(
-            &effect.name,
-            &op.name,
-            resource.map(|r| r.name.clone()),
-            argv,
-            span,
-        )
+        self.perform(&name, &op.name, resource.map(|r| r.name.clone()), argv, span)
+    }
+
+    /// An effect no module declares keeps the name as written. Inference has
+    /// already rejected that, and falling back this way keeps a perform and the
+    /// clause meant to handle it agreeing rather than mysteriously not.
+    fn effect_name(&self, effect: &QName) -> Symbol {
+        self.global(Namespace::Effect, effect)
+            .unwrap_or_else(|| effect.symbol().clone())
     }
 
     #[inline(never)]
@@ -384,10 +467,14 @@ impl<'a> Interp<'a> {
         return_clause: Option<&ReturnClause>,
         env: &Env,
     ) -> Result<Value, Diagnostic> {
+        let effects: Vec<Symbol> =
+            clauses.iter().map(|c| self.effect_name(&c.effect)).collect();
         let mark = self.handlers.len();
         self.handlers.push(HandlerFrame {
             clauses: Arc::new(clauses.to_vec()),
+            effects: Arc::new(effects),
             env: env.clone(),
+            module: self.module,
         });
         let result = self.eval(body, env);
         self.handlers.truncate(mark);
@@ -419,20 +506,28 @@ impl<'a> Interp<'a> {
         self.eval(body, &scope)
     }
 
-    fn lookup(&self, name: &Symbol, span: Span, env: &Env) -> Result<Value, Diagnostic> {
-        if let Some(v) = env.lookup(name) {
+    /// Locals, then the module's own items and its selective imports, then the
+    /// prelude — the resolution order the whole language is specified in.
+    fn lookup(&self, q: &QName, env: &Env) -> Result<Value, Diagnostic> {
+        if q.is_bare()
+            && let Some(v) = env.lookup(q.symbol())
+        {
             return Ok(v.clone());
         }
-        if let Some(v) = self.globals.get(name) {
-            return Ok(v.clone());
+        if let Some(name) = self.global(Namespace::Value, q) {
+            if let Some(v) = self.globals.get(&name) {
+                return Ok(v.clone());
+            }
+            if let Some(&arity) = self.ctors.get(&name) {
+                return Ok(ctor_value(&name, arity));
+            }
         }
-        if let Some(&arity) = self.ctors.get(name) {
-            return Ok(ctor_value(name, arity));
-        }
-        if let Some(b) = Builtin::from_name(name) {
+        if q.is_bare()
+            && let Some(b) = Builtin::from_name(q.symbol())
+        {
             return Ok(Value::builtin(b));
         }
-        Err(err_unknown_name(name, span))
+        Err(err_unknown_name(q))
     }
 
     pub(crate) fn apply(
@@ -447,7 +542,7 @@ impl<'a> Interp<'a> {
         };
 
         match &closure.kind {
-            ClosureKind::Fn { params, body, env } => {
+            ClosureKind::Fn { params, body, env, module } => {
                 if params.len() != args.len() {
                     return Err(arity_error(
                         span,
@@ -461,9 +556,13 @@ impl<'a> Interp<'a> {
                     scope = scope.bind(p.clone(), v);
                 }
                 let body = body.clone();
+                // The body's bare names mean what they meant where it was
+                // written, which is not where it is being called from.
+                let caller = std::mem::replace(&mut self.module, *module);
                 self.enter(span)?;
                 let result = grow(|| self.eval(&body, &scope));
                 self.leave();
+                self.module = caller;
                 result
             }
             ClosureKind::Ctor { name, arity } => {
@@ -498,9 +597,11 @@ impl<'a> Interp<'a> {
 
         for i in (0..self.handlers.len()).rev() {
             let clauses = self.handlers[i].clauses.clone();
+            let effects = self.handlers[i].effects.clone();
             let Some(index) = clauses
                 .iter()
-                .position(|c| clause_matches(c, effect, op, &resource))
+                .zip(effects.iter())
+                .position(|(c, e)| clause_matches(c, e, effect, op, &resource))
             else {
                 continue;
             };
@@ -516,7 +617,9 @@ impl<'a> Interp<'a> {
                 scope = scope.bind(p.name.clone(), v);
             }
 
+            let handler_module = self.handlers[i].module;
             let outer = self.handlers.split_off(i);
+            let performer = std::mem::replace(&mut self.module, handler_module);
             let result = match self.enter(span) {
                 Err(d) => Err(d),
                 Ok(()) => {
@@ -525,6 +628,7 @@ impl<'a> Interp<'a> {
                     r
                 }
             };
+            self.module = performer;
             self.handlers.truncate(i);
             self.handlers.extend(outer);
             return result;
@@ -603,9 +707,13 @@ impl<'a> Interp<'a> {
             PatternKind::Var(id) => {
                 // A nullary constructor written bare is indistinguishable from a
                 // binder in the AST, so the constructor table decides.
-                match self.ctors.get(&id.name) {
-                    Some(0) => matches!(value, Value::Ctor { name, args }
-                        if *name == id.name && args.is_empty()),
+                let declared = self.global(Namespace::Value, &QName::bare(id.clone()));
+                match declared.as_ref().and_then(|name| self.ctors.get(name)) {
+                    Some(0) => {
+                        let ctor = declared.expect("a hit came from a resolved name");
+                        matches!(value, Value::Ctor { name, args }
+                            if *name == ctor && args.is_empty())
+                    }
                     _ => {
                         *env = env.bind(id.name.clone(), value.clone());
                         true
@@ -624,7 +732,8 @@ impl<'a> Interp<'a> {
                     name: vname,
                     args: vargs,
                 } => {
-                    if *vname != name.name || vargs.len() != args.len() {
+                    let expected = self.global(Namespace::Value, name);
+                    if expected.as_ref() != Some(vname) || vargs.len() != args.len() {
                         return Ok(false);
                     }
                     for (p, v) in args.iter().zip(vargs.iter()) {
@@ -717,13 +826,14 @@ fn literal(lit: &Lit) -> Value {
 }
 
 #[inline(never)]
-fn eval_lambda(params: &[Param], body: &Expr, env: &Env) -> Value {
+fn eval_lambda(params: &[Param], body: &Expr, env: &Env, module: usize) -> Value {
     Value::Closure(Arc::new(Closure {
         name: None,
         kind: ClosureKind::Fn {
             params: params.iter().map(|p| p.name.name.clone()).collect(),
             body: Arc::new(body.clone()),
             env: env.clone(),
+            module,
         },
     }))
 }
@@ -746,11 +856,12 @@ fn ctor_value(name: &Symbol, arity: usize) -> Value {
 /// an operation declared without `[r]` has exactly one anyway.
 fn clause_matches(
     c: &HandleClause,
+    clause_effect: &Symbol,
     effect: &Symbol,
     op: &Symbol,
     resource: &Option<Symbol>,
 ) -> bool {
-    c.effect.name == *effect
+    clause_effect == effect
         && c.op.name == *op
         && match (&c.resource, resource) {
             (None, _) => true,
@@ -843,12 +954,9 @@ fn err_recursion_limit(span: Span, max: usize) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_unknown_name(name: &Symbol, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::UNKNOWN_NAME,
-        format!("cannot find `{name}` in this scope"),
-    )
-    .primary(span, "not bound here")
+fn err_unknown_name(q: &QName) -> Diagnostic {
+    Diagnostic::error(codes::UNKNOWN_NAME, format!("cannot find `{q}` in this scope"))
+        .primary(q.span, "not bound here")
 }
 
 #[cold]

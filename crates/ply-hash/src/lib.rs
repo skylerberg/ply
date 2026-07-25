@@ -9,14 +9,14 @@ mod tests;
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Symbol};
-use ply_syntax::ast::Module;
-use rustc_hash::FxHashMap;
+use ply_syntax::ast::{Module, Program};
+use ply_syntax::resolve::Resolved;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;
 
-use graph::{ModuleIndex, NodeBody, NodeId};
-use normalize::{ComponentIndices, HashTable, Normalizer};
+use graph::{Entry, NodeBody, NodeId, ProgramIndex};
+use normalize::{ComponentIndices, EffectIndex, HashTable, Normalizer};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DefHash(pub [u8; 32]);
@@ -76,12 +76,16 @@ impl<'de> Deserialize<'de> for DefHash {
     }
 }
 
-/// `deps` and `closure` are keyed by name for every top-level definition — `fn`,
-/// `type` and `effect` alike — and additionally by its declared name for every
-/// test, which is how a failure is attributed to suspects.
+/// Every map is keyed by the program-wide name — `store.orders.place`, and
+/// `<module>.<label>` for a test. Those keys are namespace metadata: they change
+/// when a definition moves and the hashes they point at do not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashOutput {
     pub defs: IndexMap<Symbol, DefHash>,
+    /// `type` and `effect` declarations, which `defs` deliberately omits — only a
+    /// `fn` is a definition a test can be selected on. They are hashed all the
+    /// same, because a cached interface has to be keyed by one.
+    pub decls: IndexMap<Symbol, DefHash>,
     pub tests: Vec<DefHash>,
     /// Direct references, definition name -> names it mentions.
     pub deps: IndexMap<Symbol, Vec<Symbol>>,
@@ -89,7 +93,28 @@ pub struct HashOutput {
     pub closure: IndexMap<Symbol, BTreeSet<Symbol>>,
 }
 
+/// Hashes every module of a program at once. A cross-module reference is
+/// normalized to the referent's hash exactly as a same-module one is, so nothing
+/// a module system introduces — its name, its imports, its `pub` markers — can
+/// reach a hash.
+pub fn hash_program(
+    program: &Program,
+    resolved: &Resolved,
+    _check: &ply_core::CheckOutput,
+) -> Result<HashOutput, Vec<Diagnostic>> {
+    hash_program_ast(program, resolved)
+}
 
+/// [`hash_program`] without the type-check output, which normalization does not
+/// need: a hash is a function of resolved source structure alone.
+pub fn hash_program_ast(
+    program: &Program,
+    resolved: &Resolved,
+) -> Result<HashOutput, Vec<Diagnostic>> {
+    hash_index(ProgramIndex::of_program(program, resolved)?)
+}
+
+/// One module with nothing imported. Convenience for snippets and tests.
 pub fn hash_module(
     module: &Module,
     _check: &ply_core::CheckOutput,
@@ -97,31 +122,62 @@ pub fn hash_module(
     hash_ast(module)
 }
 
-/// [`hash_module`] without the type-check output, which normalization does not
-/// need: a hash is a function of the source structure alone.
+/// [`hash_module`] without the type-check output.
 pub fn hash_ast(module: &Module) -> Result<HashOutput, Vec<Diagnostic>> {
-    let index = ModuleIndex::build(module)?;
+    hash_index(ProgramIndex::single(module)?)
+}
+
+fn hash_index(index: ProgramIndex<'_>) -> Result<HashOutput, Vec<Diagnostic>> {
     let n = index.nodes.len();
     let no_hashes = HashTable::default();
     let no_component = ComponentIndices::default();
+    let no_effects = EffectIndex::default();
 
+    // What a definition references does not depend on what any of them hash to,
+    // so one pass with nothing known yields the reference graph, plus a sketch
+    // that orders a cycle's members without appealing to source position.
     let mut edges: Vec<Vec<NodeId>> = Vec::with_capacity(n);
+    let mut sketches: Vec<Vec<u8>> = Vec::with_capacity(n);
     for node in &index.nodes {
-        let mut nz = Normalizer::new(&index, &no_hashes, &no_component);
+        let mut nz = Normalizer::new(&index, node.module, &no_hashes, &no_component, &no_effects);
         nz.node(node.body);
-        edges.push(nz.finish().1);
+        let (bytes, refs) = nz.finish();
+        edges.push(refs);
+        sketches.push(bytes);
     }
 
     let components = graph::tarjan(n, &edges);
+    let mut component_of = vec![usize::MAX; n];
+    for (ci, component) in components.iter().enumerate() {
+        for &v in component {
+            component_of[v] = ci;
+        }
+    }
+
+    // Components arrive dependency-first, so a component's own enumeration can
+    // splice in the ones it references.
+    let mut orders: Vec<Vec<usize>> = Vec::with_capacity(components.len());
+    for (ci, component) in components.iter().enumerate() {
+        let mut members = component.clone();
+        members.sort_by(|&a, &b| sketches[a].cmp(&sketches[b]).then(a.cmp(&b)));
+        let mut order = Vec::new();
+        for &v in &members {
+            effect_order(&index, &edges[v], &component_of, &orders, Some(ci), &mut order);
+        }
+        orders.push(order);
+    }
+
     let mut hashes = HashTable::default();
-    for component in &components {
+    for (ci, component) in components.iter().enumerate() {
+        let effects = slots(&orders[ci]);
         if graph::is_cyclic(component, &edges) {
-            for (v, hash) in hash_component(&index, component, &hashes) {
+            for (v, hash) in hash_component(&index, component, &hashes, &effects) {
                 hashes.insert(v, hash);
             }
         } else {
             let v = component[0];
-            let mut nz = Normalizer::new(&index, &hashes, &no_component);
+            let module = index.nodes[v].module;
+            let mut nz = Normalizer::new(&index, module, &hashes, &no_component, &effects);
             nz.node(index.nodes[v].body);
             hashes.insert(v, DefHash::of(&nz.finish().0));
         }
@@ -129,15 +185,63 @@ pub fn hash_ast(module: &Module) -> Result<HashOutput, Vec<Diagnostic>> {
 
     let mut test_hashes = Vec::with_capacity(index.tests.len());
     let mut test_refs = Vec::with_capacity(index.tests.len());
-    for (_, test) in &index.tests {
-        let mut nz = Normalizer::new(&index, &hashes, &no_component);
-        nz.test_def(test);
+    for test in &index.tests {
+        let mut nz = Normalizer::new(&index, test.module, &no_hashes, &no_component, &no_effects);
+        nz.test_def(test.def);
+        let refs = nz.finish().1;
+        let mut order = Vec::new();
+        effect_order(&index, &refs, &component_of, &orders, None, &mut order);
+        let effects = slots(&order);
+
+        let mut nz = Normalizer::new(&index, test.module, &hashes, &no_component, &effects);
+        nz.test_def(test.def);
         let (bytes, refs) = nz.finish();
         test_hashes.push(DefHash::of(&bytes));
         test_refs.push(refs);
     }
 
     Ok(assemble(&index, &components, &edges, &hashes, test_hashes, test_refs))
+}
+
+/// The effects one component can see, in an order derived only from what it
+/// references — never from a name, a module, or a source position.
+///
+/// A referent contributes its own enumeration before this component's own
+/// mentions are added, which is what anchors a slot to the *referent*. Without
+/// that anchor two definitions that handle different effects around the same
+/// callee would both write slot 0 and collapse onto one hash. A referent's
+/// enumeration is a function of its hash, so a slot means the same thing in
+/// every program where that hash appears.
+fn effect_order(
+    index: &ProgramIndex<'_>,
+    refs: &[NodeId],
+    component_of: &[usize],
+    orders: &[Vec<usize>],
+    own: Option<usize>,
+    out: &mut Vec<usize>,
+) {
+    let push = |node: usize, out: &mut Vec<usize>| {
+        if !out.contains(&node) {
+            out.push(node);
+        }
+    };
+    for r in refs {
+        if index.is_effect(*r) {
+            push(r.0, out);
+        }
+        let ci = component_of.get(r.0).copied().unwrap_or(usize::MAX);
+        if Some(ci) == own {
+            continue;
+        }
+        let Some(inner) = orders.get(ci) else { continue };
+        for &node in inner {
+            push(node, out);
+        }
+    }
+}
+
+fn slots(order: &[usize]) -> EffectIndex {
+    order.iter().enumerate().map(|(i, &node)| (node, i as u32)).collect()
 }
 
 /// A cyclic component is hashed as a unit and each member identified by an index
@@ -152,12 +256,13 @@ pub fn hash_ast(module: &Module) -> Result<HashOutput, Vec<Diagnostic>> {
 /// interchangeable at every call site. They share an index, and so a hash —
 /// property 5 reaching inside a cycle, not a tie broken arbitrarily.
 fn hash_component(
-    index: &ModuleIndex<'_>,
+    index: &ProgramIndex<'_>,
     component: &[usize],
     hashes: &HashTable,
+    effects: &EffectIndex,
 ) -> Vec<(usize, DefHash)> {
     let encode = |classes: &ComponentIndices, v: usize| {
-        let mut nz = Normalizer::new(index, hashes, classes);
+        let mut nz = Normalizer::new(index, index.nodes[v].module, hashes, classes, effects);
         nz.node(index.nodes[v].body);
         nz.finish().0
     };
@@ -209,7 +314,7 @@ fn hash_component(
 }
 
 fn assemble(
-    index: &ModuleIndex<'_>,
+    index: &ProgramIndex<'_>,
     components: &[Vec<usize>],
     edges: &[Vec<NodeId>],
     hashes: &HashTable,
@@ -243,32 +348,35 @@ fn assemble(
         component_closure.push(closure);
     }
 
-    let node_of_item: FxHashMap<usize, usize> =
-        index.nodes.iter().enumerate().map(|(v, node)| (node.item, v)).collect();
-    let test_of_item: FxHashMap<usize, usize> =
-        index.tests.iter().enumerate().map(|(t, (item, _))| (*item, t)).collect();
-
     let mut out = HashOutput { tests: test_hashes, ..HashOutput::default() };
-    for item in 0..(index.nodes.len() + index.tests.len()) {
-        if let Some(&v) = node_of_item.get(&item) {
-            let name = index.nodes[v].name.clone();
-            if let (NodeBody::Fn(_), Some(hash)) = (index.nodes[v].body, hashes.get(&v)) {
-                out.defs.insert(name.clone(), *hash);
-            }
-            let deps = edges[v].iter().map(|r| index.nodes[r.0].name.clone()).collect();
-            let closure = component_closure.get(component_of[v]).cloned().unwrap_or_default();
-            record(&mut out, name, deps, closure);
-        } else if let Some(&t) = test_of_item.get(&item) {
-            let name = Symbol::new(&index.tests[t].1.name);
-            let deps = test_refs[t].iter().map(|r| index.nodes[r.0].name.clone()).collect();
-            let mut closure = BTreeSet::new();
-            closure.insert(name.clone());
-            for r in &test_refs[t] {
-                if let Some(inner) = component_closure.get(component_of[r.0]) {
-                    closure.extend(inner.iter().cloned());
+    for entry in &index.order {
+        match *entry {
+            Entry::Def(NodeId(v)) => {
+                let name = index.nodes[v].name.clone();
+                if let Some(hash) = hashes.get(&v) {
+                    match index.nodes[v].body {
+                        NodeBody::Fn(_) => out.defs.insert(name.clone(), *hash),
+                        NodeBody::Type(_) | NodeBody::Effect(_) => {
+                            out.decls.insert(name.clone(), *hash)
+                        }
+                    };
                 }
+                let deps = edges[v].iter().map(|r| index.nodes[r.0].name.clone()).collect();
+                let closure = component_closure.get(component_of[v]).cloned().unwrap_or_default();
+                record(&mut out, name, deps, closure);
             }
-            record(&mut out, name, deps, closure);
+            Entry::Test(t) => {
+                let name = index.tests[t].key.clone();
+                let deps = test_refs[t].iter().map(|r| index.nodes[r.0].name.clone()).collect();
+                let mut closure = BTreeSet::new();
+                closure.insert(name.clone());
+                for r in &test_refs[t] {
+                    if let Some(inner) = component_closure.get(component_of[r.0]) {
+                        closure.extend(inner.iter().cloned());
+                    }
+                }
+                record(&mut out, name, deps, closure);
+            }
         }
     }
     out

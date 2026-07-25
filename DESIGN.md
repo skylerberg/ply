@@ -143,6 +143,18 @@ Mutually recursive definitions are hashed as a strongly-connected component:
 self-references become component-local indices, the component is hashed as a
 whole, and each member's hash is `BLAKE3(component_hash ‖ index)`.
 
+Effects are the one nominal thing in the language — `db` and `audit` may declare
+byte-identical operations and are still different capabilities — so a reference
+to one carries its **slot** in the enumeration of the effects that definition's
+component can reach, alongside the declaration's hash. The slot is a de Bruijn
+level for effects: it says which of the effects in view is meant without naming
+it and without consulting anything the definition cannot reach. Two definitions
+that differ only by a consistent renaming of their effects therefore hash alike
+— they are one computation — while any context that can tell the two apart
+reaches both and records which one it picked. A rank over the program's effect
+names would separate them, at the price of making a definition's identity depend
+on modules it does not import; that is not a price content addressing can pay.
+
 A **codebase** is a content-addressed store `Hash → (Definition, Type, Footprint)`
 plus a **namespace** mapping names to hashes. Renaming edits only the namespace.
 Because the referent's *hash* is substituted for its name, renaming a function

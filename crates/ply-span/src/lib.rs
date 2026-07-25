@@ -197,6 +197,13 @@ pub mod codes {
     pub const UNKNOWN_EFFECT: &str = "E0103";
     pub const UNKNOWN_OPERATION: &str = "E0104";
     pub const DUPLICATE_DEFINITION: &str = "E0105";
+    pub const UNKNOWN_MODULE: &str = "E0106";
+    pub const PRIVATE_NAME: &str = "E0107";
+    pub const AMBIGUOUS_IMPORT: &str = "E0108";
+    pub const MODULE_CYCLE: &str = "E0109";
+    pub const DUPLICATE_IMPORT: &str = "E0110";
+    pub const INVALID_MODULE_PATH: &str = "E0111";
+    pub const AMBIGUOUS_ENTRY_POINT: &str = "E0112";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -209,6 +216,11 @@ pub mod codes {
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     pub const ASSERTION_FAILED: &str = "E0501";
     pub const RUNTIME_ERROR: &str = "E0502";
+    /// `W` rather than `E`: cache trouble is never a fault in the user's
+    /// program, so these are always warnings.
+    pub const CACHE_UNREADABLE: &str = "W0601";
+    pub const CACHE_CORRUPT: &str = "W0602";
+    pub const CACHE_VERSION_CHANGED: &str = "W0603";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,6 +306,53 @@ mod tests {
         assert_eq!(a.to(b), Span::new(s, 5, 25));
         assert_eq!(Span::DUMMY.to(b), b);
         assert_eq!(a.to(Span::DUMMY), a);
+    }
+
+    /// A code is matched on by tooling long after the release that introduced
+    /// it, so a number may never be reused or renumbered.
+    #[test]
+    fn every_registered_code_has_its_published_number() {
+        let registry = [
+            ("UNEXPECTED_TOKEN", codes::UNEXPECTED_TOKEN, "E0001"),
+            ("UNTERMINATED_STRING", codes::UNTERMINATED_STRING, "E0002"),
+            ("UNKNOWN_NAME", codes::UNKNOWN_NAME, "E0101"),
+            ("UNKNOWN_TYPE", codes::UNKNOWN_TYPE, "E0102"),
+            ("UNKNOWN_EFFECT", codes::UNKNOWN_EFFECT, "E0103"),
+            ("UNKNOWN_OPERATION", codes::UNKNOWN_OPERATION, "E0104"),
+            ("DUPLICATE_DEFINITION", codes::DUPLICATE_DEFINITION, "E0105"),
+            ("UNKNOWN_MODULE", codes::UNKNOWN_MODULE, "E0106"),
+            ("PRIVATE_NAME", codes::PRIVATE_NAME, "E0107"),
+            ("AMBIGUOUS_IMPORT", codes::AMBIGUOUS_IMPORT, "E0108"),
+            ("MODULE_CYCLE", codes::MODULE_CYCLE, "E0109"),
+            ("DUPLICATE_IMPORT", codes::DUPLICATE_IMPORT, "E0110"),
+            ("INVALID_MODULE_PATH", codes::INVALID_MODULE_PATH, "E0111"),
+            ("AMBIGUOUS_ENTRY_POINT", codes::AMBIGUOUS_ENTRY_POINT, "E0112"),
+            ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
+            ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
+            ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
+            ("NOT_A_FUNCTION", codes::NOT_A_FUNCTION, "E0204"),
+            ("NON_EXHAUSTIVE_MATCH", codes::NON_EXHAUSTIVE_MATCH, "E0205"),
+            ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
+            ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
+            ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
+            ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
+            ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
+            ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
+            ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
+            ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
+            ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
+            ("CACHE_VERSION_CHANGED", codes::CACHE_VERSION_CHANGED, "W0603"),
+        ];
+
+        for (name, code, expected) in registry {
+            assert_eq!(code, expected, "`{name}` moved to a different number");
+        }
+
+        let mut numbers: Vec<&str> = registry.iter().map(|(_, code, _)| *code).collect();
+        numbers.sort_unstable();
+        let before = numbers.len();
+        numbers.dedup();
+        assert_eq!(before, numbers.len(), "two constants share one number: {numbers:?}");
     }
 
     #[test]

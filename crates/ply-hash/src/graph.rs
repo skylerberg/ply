@@ -1,8 +1,19 @@
-//! The reference graph over a module's top-level definitions, and the strongly
-//! connected components that decide which definitions must be hashed together.
+//! The reference graph over every top-level definition in a program, and the
+//! strongly connected components that decide which definitions must be hashed
+//! together.
+//!
+//! The index is deliberately module-*aware* and the hashes it feeds are
+//! module-*blind*: which module owns a definition decides only what a name
+//! denotes, and a resolved reference is written as the referent's hash. Moving a
+//! definition therefore changes the keys of the output maps and nothing else.
 
+use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{EffectDef, FnDef, Ident, Item, Module, TestDef, TypeDef, TypeDefBody};
+use ply_syntax::ast::{
+    EffectDef, FnDef, Ident, Item, Module, ModuleName, Program, QName, TestDef, TypeDef,
+    TypeDefBody,
+};
+use ply_syntax::resolve::{Binding, Resolved};
 use rustc_hash::FxHashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -15,77 +26,277 @@ pub enum NodeBody<'a> {
     Effect(&'a EffectDef),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Node<'a> {
-    pub name: &'a Symbol,
-    /// Position in `Module::items`, which fixes the order of the output but
+    /// The program-wide name, `store.orders.place`. It keys the output maps and
     /// never enters a hash.
-    pub item: usize,
+    pub name: Symbol,
+    pub simple: &'a Symbol,
+    /// Index into [`ProgramIndex::modules`].
+    pub module: usize,
     pub body: NodeBody<'a>,
 }
 
-pub struct ModuleIndex<'a> {
-    pub nodes: Vec<Node<'a>>,
-    pub fns: FxHashMap<Symbol, NodeId>,
-    pub types: FxHashMap<Symbol, NodeId>,
-    pub effects: FxHashMap<Symbol, NodeId>,
-    /// Variant name -> the type definition that declares it.
-    pub ctors: FxHashMap<Symbol, NodeId>,
-    pub tests: Vec<(usize, &'a TestDef)>,
-    /// What separates an effect from the other effects declaring exactly the
-    /// same operations, since structure alone cannot.
-    pub effect_ids: FxHashMap<usize, u32>,
+#[derive(Clone, Debug)]
+pub struct TestNode<'a> {
+    /// `<module>.<label>`, which is what keeps two identically-labelled tests in
+    /// different modules distinct.
+    pub key: Symbol,
+    pub module: usize,
+    pub def: &'a TestDef,
 }
 
-impl<'a> ModuleIndex<'a> {
-    pub fn build(module: &'a Module) -> Result<ModuleIndex<'a>, Vec<Diagnostic>> {
-        let mut idx = ModuleIndex {
-            nodes: Vec::new(),
-            fns: FxHashMap::default(),
-            types: FxHashMap::default(),
-            effects: FxHashMap::default(),
-            ctors: FxHashMap::default(),
-            tests: Vec::new(),
-            effect_ids: FxHashMap::default(),
-        };
-        let mut diags = Vec::new();
-        let mut fn_spans: FxHashMap<Symbol, Span> = FxHashMap::default();
-        let mut type_spans: FxHashMap<Symbol, Span> = FxHashMap::default();
-        let mut effect_spans: FxHashMap<Symbol, Span> = FxHashMap::default();
-        let mut ctor_spans: FxHashMap<Symbol, Span> = FxHashMap::default();
+/// One entry of the output order: modules in load order, items in source order.
+#[derive(Clone, Copy, Debug)]
+pub enum Entry {
+    Def(NodeId),
+    Test(usize),
+}
 
-        for (item_ix, item) in module.items.iter().enumerate() {
-            match item {
-                Item::Fn(d) => {
-                    let id = NodeId(idx.nodes.len());
-                    idx.nodes.push(Node { name: &d.name.name, item: item_ix, body: NodeBody::Fn(d) });
-                    declare(&mut idx.fns, &mut fn_spans, &d.name, id, "definition", &mut diags);
-                }
-                Item::Type(d) => {
-                    let id = NodeId(idx.nodes.len());
-                    idx.nodes.push(Node { name: &d.name.name, item: item_ix, body: NodeBody::Type(d) });
-                    declare(&mut idx.types, &mut type_spans, &d.name, id, "type", &mut diags);
-                    if let TypeDefBody::Sum(variants) = &d.body {
-                        for v in variants {
-                            declare(&mut idx.ctors, &mut ctor_spans, &v.name, id, "variant", &mut diags);
+#[derive(Clone, Debug)]
+pub enum ValueTarget {
+    Fn(NodeId),
+    /// The type that declares the variant, plus the variant's own name — a
+    /// constructor has no node of its own.
+    Ctor { owner: NodeId, name: Symbol },
+}
+
+#[derive(Debug, Default)]
+struct ModuleItems {
+    fns: FxHashMap<Symbol, NodeId>,
+    types: FxHashMap<Symbol, NodeId>,
+    effects: FxHashMap<Symbol, NodeId>,
+    /// Variant name -> the type definition that declares it.
+    ctors: FxHashMap<Symbol, NodeId>,
+}
+
+/// A declaring module and the name it declares the referent under. Resolution is
+/// carried as a `(module, name)` pair rather than a qualified string so that
+/// nothing here depends on how [`ModuleName::qualify`] spells a program-wide
+/// name.
+type Target = (usize, Symbol);
+
+/// The unqualified names one module's bodies see, projected onto nodes. It is a
+/// view of what resolution already decided, never a second decision.
+#[derive(Debug, Default)]
+struct ScopeIndex {
+    values: FxHashMap<Symbol, Target>,
+    types: FxHashMap<Symbol, Target>,
+    effects: FxHashMap<Symbol, Target>,
+    modules: FxHashMap<Symbol, usize>,
+}
+
+pub struct ProgramIndex<'a> {
+    pub modules: Vec<&'a Module>,
+    pub nodes: Vec<Node<'a>>,
+    pub tests: Vec<TestNode<'a>>,
+    pub order: Vec<Entry>,
+    items: Vec<ModuleItems>,
+    scopes: Vec<ScopeIndex>,
+}
+
+fn qualifier(q: &QName) -> Option<&Symbol> {
+    q.module.as_ref().map(|m| &m.name)
+}
+
+/// The name `qualified` has inside the module that declares it. Inverse of
+/// [`ModuleName::qualify`], and the identity for the anonymous module.
+fn simple_of(qualified: &Symbol, owner: &ModuleName) -> Symbol {
+    if owner.is_anonymous() {
+        return qualified.clone();
+    }
+    let prefix = format!("{owner}.");
+    qualified
+        .as_str()
+        .strip_prefix(prefix.as_str())
+        .map(Symbol::new)
+        .unwrap_or_else(|| qualified.clone())
+}
+
+impl<'a> ProgramIndex<'a> {
+    /// One module with no project root, which can neither import nor be
+    /// imported.
+    pub fn single(module: &'a Module) -> Result<ProgramIndex<'a>, Vec<Diagnostic>> {
+        ProgramIndex::build(vec![module], None)
+    }
+
+    pub fn of_program(
+        program: &'a Program,
+        resolved: &Resolved,
+    ) -> Result<ProgramIndex<'a>, Vec<Diagnostic>> {
+        ProgramIndex::build(program.modules.iter().collect(), Some(resolved))
+    }
+
+    /// `resolved` is the single source of truth for what an unqualified name
+    /// means. Without it each module sees only its own items, which is exactly
+    /// right for a module that cannot import.
+    pub fn build(
+        modules: Vec<&'a Module>,
+        resolved: Option<&Resolved>,
+    ) -> Result<ProgramIndex<'a>, Vec<Diagnostic>> {
+        let mut nodes: Vec<Node<'a>> = Vec::new();
+        let mut tests: Vec<TestNode<'a>> = Vec::new();
+        let mut order: Vec<Entry> = Vec::new();
+        let mut all_items: Vec<ModuleItems> = Vec::new();
+        let mut diags = Vec::new();
+
+        for (m, module) in modules.iter().copied().enumerate() {
+            let mut items = ModuleItems::default();
+            let mut spans = Spans::default();
+            let push = |nodes: &mut Vec<Node<'a>>,
+                            order: &mut Vec<Entry>,
+                            body: NodeBody<'a>,
+                            name: &'a Ident| {
+                let id = NodeId(nodes.len());
+                nodes.push(Node {
+                    name: module.name.qualify(&name.name),
+                    simple: &name.name,
+                    module: m,
+                    body,
+                });
+                order.push(Entry::Def(id));
+                id
+            };
+            for item in &module.items {
+                match item {
+                    Item::Fn(d) => {
+                        let id = push(&mut nodes, &mut order, NodeBody::Fn(d), &d.name);
+                        declare(&mut items.fns, &mut spans.fns, &d.name, id, "definition", &mut diags);
+                    }
+                    Item::Type(d) => {
+                        let id = push(&mut nodes, &mut order, NodeBody::Type(d), &d.name);
+                        declare(&mut items.types, &mut spans.types, &d.name, id, "type", &mut diags);
+                        if let TypeDefBody::Sum(variants) = &d.body {
+                            for v in variants {
+                                let (ctors, seen) = (&mut items.ctors, &mut spans.ctors);
+                                declare(ctors, seen, &v.name, id, "variant", &mut diags);
+                            }
                         }
                     }
+                    Item::Effect(d) => {
+                        let id = push(&mut nodes, &mut order, NodeBody::Effect(d), &d.name);
+                        declare(&mut items.effects, &mut spans.effects, &d.name, id, "effect", &mut diags);
+                    }
+                    Item::Test(d) => {
+                        order.push(Entry::Test(tests.len()));
+                        tests.push(TestNode {
+                            key: module.name.qualify(&Symbol::new(&d.name)),
+                            module: m,
+                            def: d,
+                        });
+                    }
                 }
-                Item::Effect(d) => {
-                    let id = NodeId(idx.nodes.len());
-                    idx.nodes.push(Node { name: &d.name.name, item: item_ix, body: NodeBody::Effect(d) });
-                    declare(&mut idx.effects, &mut effect_spans, &d.name, id, "effect", &mut diags);
-                }
-                Item::Test(d) => idx.tests.push((item_ix, d)),
             }
+            all_items.push(items);
         }
 
         if !diags.is_empty() {
             return Err(diags);
         }
-        idx.effect_ids = crate::normalize::effect_disambiguators(&idx);
-        Ok(idx)
+
+        let scopes = build_scopes(&modules, &all_items, resolved);
+        Ok(ProgramIndex { modules, nodes, tests, order, items: all_items, scopes })
     }
+
+    pub fn is_effect(&self, node: NodeId) -> bool {
+        self.nodes.get(node.0).is_some_and(|n| matches!(n.body, NodeBody::Effect(_)))
+    }
+
+    pub fn value(&self, module: usize, q: &QName) -> Option<ValueTarget> {
+        let (owner, name) = self.target(module, |s| &s.values, qualifier(q), &q.name.name)?;
+        let items = self.items.get(owner)?;
+        if let Some(&node) = items.fns.get(&name) {
+            return Some(ValueTarget::Fn(node));
+        }
+        items.ctors.get(&name).map(|&owner| ValueTarget::Ctor { owner, name })
+    }
+
+    pub fn ctor(&self, module: usize, q: &QName) -> Option<ValueTarget> {
+        let (owner, name) = self.target(module, |s| &s.values, qualifier(q), &q.name.name)?;
+        let items = self.items.get(owner)?;
+        items.ctors.get(&name).map(|&owner| ValueTarget::Ctor { owner, name })
+    }
+
+    pub fn ty(&self, module: usize, qual: Option<&Symbol>, name: &Symbol) -> Option<NodeId> {
+        let (owner, name) = self.target(module, |s| &s.types, qual, name)?;
+        self.items.get(owner)?.types.get(&name).copied()
+    }
+
+    pub fn effect(&self, module: usize, q: &QName) -> Option<NodeId> {
+        let (owner, name) = self.target(module, |s| &s.effects, qualifier(q), &q.name.name)?;
+        self.items.get(owner)?.effects.get(&name).copied()
+    }
+
+    /// A qualified name consults only the named module's declarations and never
+    /// the current scope; a bare one consults only the current scope. Visibility
+    /// is deliberately not checked: `pub` decides whether a reference is *legal*,
+    /// which inference reports, and never which definition it denotes — so
+    /// adding or removing it cannot move a hash.
+    fn target(
+        &self,
+        module: usize,
+        space: impl Fn(&ScopeIndex) -> &FxHashMap<Symbol, Target>,
+        qual: Option<&Symbol>,
+        name: &Symbol,
+    ) -> Option<Target> {
+        let scope = self.scopes.get(module)?;
+        match qual {
+            Some(binder) => scope.modules.get(binder).map(|&owner| (owner, name.clone())),
+            None => space(scope).get(name).cloned(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Spans {
+    fns: FxHashMap<Symbol, Span>,
+    types: FxHashMap<Symbol, Span>,
+    effects: FxHashMap<Symbol, Span>,
+    ctors: FxHashMap<Symbol, Span>,
+}
+
+fn build_scopes(
+    modules: &[&Module],
+    items: &[ModuleItems],
+    resolved: Option<&Resolved>,
+) -> Vec<ScopeIndex> {
+    (0..modules.len())
+        .map(|m| match resolved.and_then(|r| r.scopes.get(m)) {
+            Some(scope) => {
+                let project = |bindings: &IndexMap<Symbol, Binding>| {
+                    bindings
+                        .iter()
+                        .filter(|(_, b)| b.owner < modules.len())
+                        .map(|(name, b)| {
+                            (name.clone(), (b.owner, simple_of(&b.qualified, &modules[b.owner].name)))
+                        })
+                        .collect()
+                };
+                ScopeIndex {
+                    values: project(&scope.values),
+                    types: project(&scope.types),
+                    effects: project(&scope.effects),
+                    modules: scope
+                        .modules
+                        .iter()
+                        .filter(|(_, (owner, _))| *owner < modules.len())
+                        .map(|(binder, (owner, _))| (binder.clone(), *owner))
+                        .collect(),
+                }
+            }
+            None => ScopeIndex {
+                values: items[m]
+                    .fns
+                    .keys()
+                    .chain(items[m].ctors.keys())
+                    .map(|name| (name.clone(), (m, name.clone())))
+                    .collect(),
+                types: items[m].types.keys().map(|n| (n.clone(), (m, n.clone()))).collect(),
+                effects: items[m].effects.keys().map(|n| (n.clone(), (m, n.clone()))).collect(),
+                modules: FxHashMap::default(),
+            },
+        })
+        .collect()
 }
 
 fn declare(

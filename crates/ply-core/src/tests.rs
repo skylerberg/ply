@@ -35,7 +35,7 @@ fn ex_at(kind: ExprKind, start: u32) -> Expr {
 }
 
 fn var(name: &str) -> Expr {
-    ex(ExprKind::Var(id(name)))
+    ex(ExprKind::Var(id(name).into()))
 }
 
 fn int(v: i64) -> Expr {
@@ -76,7 +76,7 @@ fn let_(name: &str, value: Expr) -> Stmt {
     Stmt::Let {
         pat: Pattern { kind: PatternKind::Var(id(name)), span: any() },
         ty: None,
-        value,
+        value: Box::new(value),
         span: any(),
     }
 }
@@ -94,7 +94,7 @@ fn perform_at(
 ) -> Expr {
     ex_at(
         ExprKind::Perform {
-            effect: id(effect),
+            effect: id(effect).into(),
             op: id(op),
             resource: resource.map(id),
             args,
@@ -105,7 +105,7 @@ fn perform_at(
 
 fn clause(effect: &str, op: &str, resource: Option<&str>, params: &[&str], body: Expr) -> HandleClause {
     HandleClause {
-        effect: id(effect),
+        effect: id(effect).into(),
         op: id(op),
         resource: resource.map(id),
         params: params.iter().map(|p| id(p)).collect(),
@@ -128,7 +128,7 @@ fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
 }
 
 fn con(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
-    TypeExpr::Con { name: id(name), args, span: any() }
+    TypeExpr::Con { name: id(name).into(), args, span: any() }
 }
 
 fn tvar(name: &str) -> TypeExpr {
@@ -140,7 +140,7 @@ fn row(atoms: &[(&str, Mode, Option<&str>)], tail: Option<&str>) -> RowExpr {
         atoms: atoms
             .iter()
             .map(|(e, m, r)| AtomExpr {
-                effect: id(e),
+                effect: id(e).into(),
                 mode: *m,
                 resource: r.map(id),
                 span: any(),
@@ -158,6 +158,7 @@ struct FnBuilder {
 fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
     FnBuilder {
         def: FnDef {
+            vis: Visibility::Private,
             name: id(name),
             generics: Generics::default(),
             params: params
@@ -199,12 +200,12 @@ impl FnBuilder {
     }
 
     fn item(self) -> Item {
-        Item::Fn(self.def)
+        Item::Fn(Box::new(self.def))
     }
 }
 
 fn effect_def(name: &str, nondet: bool, ops: Vec<OpDef>) -> Item {
-    Item::Effect(EffectDef { name: id(name), nondet, ops, span: any() })
+    Item::Effect(Box::new(EffectDef { vis: Visibility::Private, name: id(name), nondet, ops, span: any() }))
 }
 
 fn op(name: &str, mode: Mode, resource_param: bool, params: Vec<TypeExpr>, ret: TypeExpr) -> OpDef {
@@ -212,17 +213,17 @@ fn op(name: &str, mode: Mode, resource_param: bool, params: Vec<TypeExpr>, ret: 
 }
 
 fn test_def(name: &str, nondet: bool, body: Expr) -> Item {
-    Item::Test(TestDef {
+    Item::Test(Box::new(TestDef {
         name: name.to_string(),
         name_span: any(),
         nondet,
         body,
         span: any(),
-    })
+    }))
 }
 
 fn module(items: Vec<Item>) -> Module {
-    Module { items }
+    Module { name: ModuleName::anonymous(), source: SRC, imports: Vec::new(), items }
 }
 
 fn check(items: Vec<Item>) -> CheckOutput {
@@ -770,7 +771,7 @@ fn unknown_effects_and_operations_are_reported_at_their_own_idents() {
         "a",
         &[],
         ex(ExprKind::Perform {
-            effect: id_at("nope", 30),
+            effect: id_at("nope", 30).into(),
             op: id("x"),
             resource: None,
             args: vec![],
@@ -781,7 +782,7 @@ fn unknown_effects_and_operations_are_reported_at_their_own_idents() {
         "b",
         &[],
         ex(ExprKind::Perform {
-            effect: id("db"),
+            effect: id("db").into(),
             op: id_at("nope", 60),
             resource: Some(id("users")),
             args: vec![],
@@ -880,7 +881,8 @@ fn a_definition_used_before_it_is_written_still_generalizes() {
 
 #[test]
 fn sum_types_give_constructors_and_exhaustiveness() {
-    let option = Item::Type(TypeDef {
+    let option = Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
         name: id("Option"),
         params: vec![id("a")],
         body: TypeDefBody::Sum(vec![
@@ -888,7 +890,7 @@ fn sum_types_give_constructors_and_exhaustiveness() {
             VariantDef { name: id("Some"), fields: vec![tvar("a")], span: any() },
         ]),
         span: any(),
-    });
+    }));
     let arm = |kind: PatternKind, body: Expr| MatchArm {
         pat: Pattern { kind, span: any() },
         guard: None,
@@ -898,10 +900,10 @@ fn sum_types_give_constructors_and_exhaustiveness() {
     let full = ex(ExprKind::Match {
         scrutinee: Box::new(var("o")),
         arms: vec![
-            arm(PatternKind::Ctor { name: id("None"), args: vec![] }, int(0)),
+            arm(PatternKind::Ctor { name: id("None").into(), args: vec![] }, int(0)),
             arm(
                 PatternKind::Ctor {
-                    name: id("Some"),
+                    name: id("Some").into(),
                     args: vec![Pattern { kind: PatternKind::Var(id("v")), span: any() }],
                 },
                 var("v"),
@@ -920,7 +922,7 @@ fn sum_types_give_constructors_and_exhaustiveness() {
 
     let partial = ex(ExprKind::Match {
         scrutinee: Box::new(var("o")),
-        arms: vec![arm(PatternKind::Ctor { name: id("None"), args: vec![] }, int(0))],
+        arms: vec![arm(PatternKind::Ctor { name: id("None").into(), args: vec![] }, int(0))],
     });
     let diags = check_err(vec![option, func("partial", &["o"], partial).item()]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
@@ -963,12 +965,13 @@ fn a_user_effect_may_not_be_called_cell() {
 
 #[test]
 fn a_type_alias_is_expanded_and_a_cyclic_one_is_caught() {
-    let alias = Item::Type(TypeDef {
+    let alias = Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
         name: id("Count"),
         params: vec![],
         body: TypeDefBody::Alias(con("Int", vec![])),
         span: any(),
-    });
+    }));
     let out = check(vec![
         alias,
         func("bump", &["n"], add(var("n"), int(1)))
@@ -977,12 +980,13 @@ fn a_type_alias_is_expanded_and_a_cyclic_one_is_caught() {
     ]);
     assert_eq!(sig(&out, "bump"), "(Int) -> Int");
 
-    let cyclic = Item::Type(TypeDef {
+    let cyclic = Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
         name: id("Loop"),
         params: vec![],
         body: TypeDefBody::Alias(con("Loop", vec![])),
         span: any(),
-    });
+    }));
     let diags = check_err(vec![
         cyclic,
         func("f", &["x"], var("x")).param_types(vec![Some(con("Loop", vec![]))]).item(),
@@ -1342,4 +1346,373 @@ fn comparing_ordinary_values_stays_legal() {
         .item(),
     ]);
     assert_eq!(sig(&out, "cmp"), "<a>(a, a) -> Bool");
+}
+
+// Cross-module checking. These parse real source rather than building the AST,
+// because what is under test is how imports, `pub` and `::` reach inference.
+
+fn parse_program(files: &[(&str, &str)]) -> Program {
+    Program {
+        modules: files
+            .iter()
+            .enumerate()
+            .map(|(i, (name, text))| {
+                ply_syntax::parse_module(
+                    SourceId(i as u32),
+                    ModuleName::from_dotted(name),
+                    text,
+                )
+                .unwrap_or_else(|d| panic!("`{name}` should parse: {}", render(&d)))
+            })
+            .collect(),
+    }
+}
+
+fn check_files(files: &[(&str, &str)]) -> CheckOutput {
+    let program = parse_program(files);
+    let resolved = ply_syntax::resolve(&program)
+        .unwrap_or_else(|d| panic!("expected resolution to succeed: {}", render(&d)));
+    match crate::check_program(&program, &resolved) {
+        Ok(out) => out,
+        Err(diags) => panic!("expected success, got: {}", render(&diags)),
+    }
+}
+
+fn check_files_err(files: &[(&str, &str)]) -> Vec<Diagnostic> {
+    let program = parse_program(files);
+    match ply_syntax::resolve(&program) {
+        Err(diags) => diags,
+        Ok(resolved) => match crate::check_program(&program, &resolved) {
+            Ok(_) => panic!("expected failure, but the program checked"),
+            Err(diags) => diags,
+        },
+    }
+}
+
+#[test]
+fn a_definition_resolves_through_three_modules() {
+    let out = check_files(&[
+        ("base", "pub fn one() -> Int = 1"),
+        ("middle", "import base (one)\npub fn two() -> Int = one() + one()"),
+        ("top", "import middle\nfn four() -> Int = middle::two() + middle::two()"),
+    ]);
+
+    assert_eq!(sig(&out, "base.one"), "() -> Int");
+    assert_eq!(sig(&out, "middle.two"), "() -> Int");
+    assert_eq!(sig(&out, "top.four"), "() -> Int");
+    assert!(out.defs.contains_key(&Symbol::new("top.four")));
+    assert!(!out.defs.contains_key(&Symbol::new("four")));
+}
+
+#[test]
+fn a_diamond_import_reaches_one_definition_by_both_paths() {
+    let out = check_files(&[
+        ("base", "pub fn one() -> Int = 1"),
+        ("left", "import base (one)\npub fn l() -> Int = one()"),
+        ("right", "import base\npub fn r() -> Int = base::one()"),
+        ("top", "import left\nimport right\nfn t() -> Int = left::l() + right::r()"),
+    ]);
+
+    assert_eq!(sig(&out, "top.t"), "() -> Int");
+    assert_eq!(out.defs.len(), 4);
+    assert_eq!(out.modules.len(), 4);
+    assert_eq!(
+        out.modules[&Symbol::new("top")].imports,
+        vec![ModuleName::from_dotted("left"), ModuleName::from_dotted("right")]
+    );
+}
+
+#[test]
+fn a_private_definition_cannot_be_called_from_another_module() {
+    let diags = check_files_err(&[
+        ("store", "fn secret() -> Int = 1\npub fn place() -> Int = secret()"),
+        ("app", "import store\nfn f() -> Int = store::secret()"),
+    ]);
+    let d = only(&diags, codes::PRIVATE_NAME);
+    assert!(d.message.contains("private to module `store`"), "{}", d.message);
+    assert!(
+        d.notes.iter().any(|n| n.contains("pub fn secret")),
+        "the fix must name the module that would have to export it: {:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn a_module_cycle_is_rejected_before_anything_is_inferred() {
+    let diags = check_files_err(&[
+        ("a", "import b\npub fn f() -> Int = b::g()"),
+        ("b", "import a\npub fn g() -> Int = a::f()"),
+    ]);
+    let d = only(&diags, codes::MODULE_CYCLE);
+    assert!(d.message.contains("`a` -> `b` -> `a`"), "{}", d.message);
+}
+
+#[test]
+fn an_imported_name_colliding_with_a_local_one_is_ambiguous() {
+    let diags = check_files_err(&[
+        ("store", "pub fn place() -> Int = 1"),
+        ("app", "import store (place)\nfn place() -> Int = 2"),
+    ]);
+    assert!(has_code(&diags, codes::AMBIGUOUS_IMPORT), "{}", render(&diags));
+}
+
+#[test]
+fn a_local_binder_beats_a_module_item_which_beats_the_prelude() {
+    let out = check_files(&[(
+        "app",
+        "fn len(x: Int) -> Int = x + 1\n\
+         fn shadowed(len: Int) -> Int = len\n\
+         fn module_item() -> Int = len(1)",
+    )]);
+
+    // The parameter wins over the module's own `len`...
+    assert_eq!(sig(&out, "app.shadowed"), "(Int) -> Int");
+    // ...and the module's own `len` wins over the prelude's `List<a> -> Int`.
+    assert_eq!(sig(&out, "app.module_item"), "() -> Int");
+}
+
+#[test]
+fn the_prelude_is_still_reachable_where_no_module_item_shadows_it() {
+    let out = check_files(&[("app", "fn count(xs: List<Int>) -> Int = len(xs)")]);
+    assert_eq!(sig(&out, "app.count"), "(List<Int>) -> Int");
+}
+
+#[test]
+fn a_local_named_like_a_module_binder_does_not_hide_it() {
+    let out = check_files(&[
+        ("orders", "pub fn place() -> Int = 7"),
+        ("app", "import orders\nfn f(orders: Int) -> Int = orders + orders::place()"),
+    ]);
+    assert_eq!(sig(&out, "app.f"), "(Int) -> Int");
+}
+
+#[test]
+fn two_modules_may_declare_the_same_effect_without_contending() {
+    let out = check_files(&[
+        ("left", "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)"),
+        ("right", "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)"),
+    ]);
+
+    assert_eq!(footprint(&out, "left.read_one"), "{left.db.read[users]}");
+    assert_eq!(footprint(&out, "right.read_one"), "{right.db.read[users]}");
+    assert!(
+        !def(&out, "left.read_one")
+            .footprint
+            .conflicts_with(&def(&out, "right.read_one").footprint)
+    );
+}
+
+#[test]
+fn one_effect_shared_by_two_modules_keeps_its_resource_labels_contending() {
+    let out = check_files(&[
+        ("store", "pub effect db { read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Unit }"),
+        ("reader", "import store (db)\npub fn r() -> Int = db.get[users](1)"),
+        ("writer", "import store (db)\npub fn w() -> Unit = db.put[users](1, 2)"),
+    ]);
+
+    assert_eq!(footprint(&out, "reader.r"), "{store.db.read[users]}");
+    assert_eq!(footprint(&out, "writer.w"), "{store.db.write[users]}");
+    assert!(
+        def(&out, "reader.r").footprint.conflicts_with(&def(&out, "writer.w").footprint),
+        "a resource label is a claim about the world, not about a file"
+    );
+}
+
+#[test]
+fn a_qualified_effect_can_be_performed_and_handled() {
+    let out = check_files(&[
+        ("store", "pub effect db { read get[r](key: Int) -> Int }"),
+        (
+            "app",
+            "import store\n\
+             fn reads() -> Int = store::db.get[users](1)\n\
+             fn handled() -> Int = handle reads() with { store::db.get[users](k) -> k }",
+        ),
+    ]);
+
+    assert_eq!(footprint(&out, "app.reads"), "{store.db.read[users]}");
+    assert_eq!(footprint(&out, "app.handled"), "{}");
+}
+
+#[test]
+fn a_constructor_crosses_a_module_boundary_in_expressions_and_patterns() {
+    let out = check_files(&[
+        ("shapes", "pub type Shape = Circle(Int) | Square(Int)"),
+        (
+            "app",
+            "import shapes\n\
+             fn make() -> shapes::Shape = shapes::Circle(2)\n\
+             fn area(s: shapes::Shape) -> Int = match s { shapes::Circle(r) -> r * r, shapes::Square(w) -> w * w }",
+        ),
+    ]);
+
+    assert_eq!(sig(&out, "app.make"), "() -> shapes.Shape");
+    assert_eq!(sig(&out, "app.area"), "(shapes.Shape) -> Int");
+    assert!(out.ctors.contains_key(&Symbol::new("shapes.Circle")));
+}
+
+#[test]
+fn a_private_constructor_is_rejected_at_the_pattern() {
+    let diags = check_files_err(&[
+        ("shapes", "type Shape = Circle(Int)"),
+        ("app", "import shapes\nfn f(s: Int) -> Int = match s { shapes::Circle(r) -> r, _ -> 0 }"),
+    ]);
+    assert!(has_code(&diags, codes::PRIVATE_NAME), "{}", render(&diags));
+}
+
+#[test]
+fn a_public_alias_expands_in_the_module_that_wrote_it() {
+    let out = check_files(&[
+        ("money", "type Cents = Int\npub type Money = Cents"),
+        ("app", "import money\nfn total(m: money::Money) -> Int = m + 1"),
+    ]);
+
+    // `Cents` is private to `money`, so only expanding the alias in its own
+    // module's scope can give `Money` a meaning here.
+    assert_eq!(sig(&out, "app.total"), "(Int) -> Int");
+}
+
+#[test]
+fn an_unimported_module_binder_is_an_unknown_module() {
+    let diags = check_files_err(&[
+        ("store", "pub fn place() -> Int = 1"),
+        ("app", "fn f() -> Int = store::place()"),
+    ]);
+    let d = only(&diags, codes::UNKNOWN_MODULE);
+    assert!(d.notes.iter().any(|n| n.contains("import store")), "{:?}", d.notes);
+}
+
+#[test]
+fn a_name_that_is_exported_elsewhere_says_which_import_would_fix_it() {
+    let diags = check_files_err(&[
+        ("store", "pub fn place() -> Int = 1"),
+        ("app", "fn f() -> Int = place()"),
+    ]);
+    let d = only(&diags, codes::UNKNOWN_NAME);
+    assert!(
+        d.notes.iter().any(|n| n.contains("import store (place)")),
+        "{:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn tests_are_keyed_by_module_so_two_labels_may_repeat() {
+    let out = check_files(&[
+        ("left", "test \"it works\" { assert(true) }"),
+        ("right", "test \"it works\" { assert(true) }"),
+    ]);
+
+    assert_eq!(out.tests.len(), 2);
+    let keys: Vec<&str> = out.tests.iter().map(|t| t.key.as_str()).collect();
+    assert_eq!(keys, vec!["left.it works", "right.it works"]);
+    assert_eq!(out.tests[0].index, 0);
+    assert_eq!(out.tests[1].index, 1);
+}
+
+#[test]
+fn a_nondet_effect_stays_nondet_across_a_module_boundary() {
+    let diags = check_files_err(&[
+        ("clock", "pub nondet effect clock { read now() -> Int }"),
+        ("app", "import clock\ntest \"reads the clock\" { assert(clock::clock.now() > 0) }"),
+    ]);
+    let d = only(&diags, codes::NONDET_IN_DET_TEST);
+    // The suggested handler has to be writable in the file it is suggested to:
+    // `clock.clock` is the program-wide name and is not syntax.
+    assert!(
+        d.notes.iter().any(|n| n.contains("clock::clock.now()")),
+        "{:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn a_suggestion_for_a_selectively_imported_effect_stays_unqualified() {
+    let diags = check_files_err(&[
+        ("timing", "pub nondet effect clock { read now() -> Int }"),
+        ("app", "import timing (clock)\ntest \"reads\" { assert(clock.now() > 0) }"),
+    ]);
+    let d = only(&diags, codes::NONDET_IN_DET_TEST);
+    assert!(
+        d.notes.iter().any(|n| n.contains("{ clock.now() -> <value> }")),
+        "{:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn identical_definitions_in_two_modules_are_kept_apart_by_key_alone() {
+    let out = check_files(&[
+        ("left", "pub fn twice(x: Int) -> Int = x + x"),
+        ("right", "pub fn twice(x: Int) -> Int = x + x"),
+    ]);
+
+    assert_eq!(sig(&out, "left.twice"), "(Int) -> Int");
+    assert_eq!(sig(&out, "right.twice"), "(Int) -> Int");
+    assert_eq!(def(&out, "left.twice").simple_name.as_str(), "twice");
+    assert_eq!(def(&out, "right.twice").module, ModuleName::from_dotted("right"));
+}
+
+#[test]
+fn a_single_module_check_still_leaves_every_name_bare() {
+    let out = check(vec![func("f", &[], int(1)).item()]);
+    assert!(out.defs.contains_key(&Symbol::new("f")));
+    assert_eq!(out.modules.len(), 1);
+    assert!(out.modules[&Symbol::new("")].name.is_anonymous());
+}
+
+#[test]
+fn a_selective_import_shadows_the_prelude_without_being_ambiguous() {
+    let out = check_files(&[
+        ("mine", "pub fn len(x: Int) -> Int = x"),
+        ("app", "import mine (len)\nfn f() -> Int = len(3)"),
+    ]);
+    assert_eq!(sig(&out, "app.f"), "() -> Int");
+}
+
+#[test]
+fn a_qualified_name_in_the_wrong_namespace_says_what_the_module_exports() {
+    let diags = check_files_err(&[
+        ("shapes", "pub type Shape = Circle(Int)"),
+        ("app", "import shapes\nfn f() -> Int = shapes::Shape"),
+    ]);
+    let d = only(&diags, codes::UNKNOWN_NAME);
+    assert!(d.message.contains("has no definition `Shape`"), "{}", d.message);
+    assert!(d.notes.iter().any(|n| n.contains("`Circle`")), "{:?}", d.notes);
+}
+
+/// The example corpus is the one place cross-module resolution meets real code:
+/// `tests/fixtures/` holds the programs that are meant to fail, so anything
+/// here failing to check is a regression rather than a fixture.
+#[test]
+fn the_example_corpus_checks_as_one_program() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .expect("the example corpus is part of the repository")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    paths.sort();
+
+    let sources: Vec<(String, String)> = paths
+        .iter()
+        .map(|path| {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(path).expect("example is readable");
+            (name, text)
+        })
+        .collect();
+    let files: Vec<(&str, &str)> =
+        sources.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect();
+
+    let out = check_files(&files);
+    assert_eq!(out.modules.len(), files.len());
+    assert!(
+        out.defs.keys().all(|k| k.as_str().contains('.')),
+        "every definition is keyed by its program-wide name"
+    );
+    assert!(
+        out.tests.iter().all(|t| t.key.as_str().starts_with(t.module.as_str())),
+        "a test key is `<module>.<label>`, which is what keeps two labels apart"
+    );
 }
