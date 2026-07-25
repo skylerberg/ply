@@ -39,6 +39,9 @@ pub enum ClosureKind {
         params: Vec<Symbol>,
         body: Arc<Expr>,
         env: Env,
+        /// Index into `Program::modules`: the scope the body's bare names are
+        /// resolved in, which travels with the closure rather than the caller.
+        module: usize,
     },
     Ctor {
         name: Symbol,

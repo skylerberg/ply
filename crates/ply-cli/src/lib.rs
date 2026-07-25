@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod driver;
 pub mod load;
 pub mod style;
 

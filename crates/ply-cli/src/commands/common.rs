@@ -72,6 +72,33 @@ pub fn emit_json(value: &Value) {
     }
 }
 
+pub fn phases_json(phases: &crate::driver::Phases) -> Value {
+    let mut out = serde_json::Map::new();
+    for (label, taken) in phases.labelled() {
+        out.insert(label.replace(' ', "_"), json!(millis(taken)));
+    }
+    out.insert("total".to_string(), json!(millis(phases.total())));
+    Value::Object(out)
+}
+
+/// Every phase, longest first, so what dominated a run is the first line read.
+pub fn print_phases(phases: &crate::driver::Phases, style: Style) {
+    println!();
+    println!("{IND}{}", style.bold("front-end time"));
+    let total = phases.total().as_secs_f64();
+    let mut rows = phases.labelled();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    for (label, taken) in rows {
+        let share = if total > 0.0 { taken.as_secs_f64() / total * 100.0 } else { 0.0 };
+        println!("{IND}  {label:<11} {:>8.2}ms {}", millis(taken), style.dim(&format!("{share:>5.1}%")));
+    }
+    println!("{IND}  {:<11} {:>8.2}ms", "total", millis(phases.total()));
+}
+
+pub fn millis(d: std::time::Duration) -> f64 {
+    (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
+}
+
 pub fn plural(n: usize, word: &str) -> String {
     if n == 1 { word.to_string() } else { format!("{word}s") }
 }
