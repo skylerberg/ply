@@ -129,8 +129,25 @@ fn clause(
         op: id(op),
         resource: resource.map(id),
         params: params.iter().map(|p| id(p)).collect(),
+        resume: None,
         body,
         span: any(),
+    }
+}
+
+/// `op(x̄) resume κ -> body`: the general form, whose body has the whole
+/// `handle`'s type rather than the operation's.
+fn general_clause(
+    effect: &str,
+    op: &str,
+    resource: Option<&str>,
+    params: &[&str],
+    binder: &str,
+    body: Expr,
+) -> HandleClause {
+    HandleClause {
+        resume: Some(id(binder)),
+        ..clause(effect, op, resource, params, body)
     }
 }
 
@@ -140,6 +157,30 @@ fn handle(body: Expr, clauses: Vec<HandleClause>) -> Expr {
         clauses,
         return_clause: None,
     })
+}
+
+fn handle_ret(body: Expr, clauses: Vec<HandleClause>, binder: &str, ret: Expr) -> Expr {
+    ex(ExprKind::Handle {
+        body: Box::new(body),
+        clauses,
+        return_clause: Some(Box::new(ReturnClause {
+            binder: id(binder),
+            body: ret,
+            span: any(),
+        })),
+    })
+}
+
+fn str_lit(v: &str) -> Expr {
+    ex(ExprKind::Lit(Lit::Str(v.to_string())))
+}
+
+fn net_effect() -> Item {
+    effect_def(
+        "net",
+        false,
+        vec![op("fetch", Mode::Read, false, vec![], con("Int", vec![]))],
+    )
 }
 
 fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
@@ -523,6 +564,127 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
     ]);
     assert_eq!(footprint(&out, "reader"), "{db.read[users]}");
     assert_eq!(footprint(&out, "isolated"), "{}");
+}
+
+/// ADR 0005 §4.1. `ρ_κ := ρ_h` is self-referential, and it is the one row
+/// variable a self-occurrence is sound for; unification's occurs check must not
+/// see it and must not be relaxed for it.
+#[test]
+fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
+    let out = check(vec![
+        db_effect(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
+        func(
+            "resumed",
+            &[],
+            handle(
+                call("reader", vec![]),
+                vec![general_clause(
+                    "db",
+                    "get",
+                    Some("users"),
+                    &["k"],
+                    "kont",
+                    app(var("kont"), vec![int(7)]),
+                )],
+            ),
+        )
+        .item(),
+    ]);
+    assert_eq!(footprint(&out, "resumed"), "{}");
+    assert_eq!(sig(&out, "resumed"), "() -> Int");
+}
+
+/// ADR 0005 §4.2. A row is a set, so the number of resumptions cannot move a
+/// footprint — which is what keeps the conflict graph invariant under
+/// multi-shot.
+#[test]
+fn resuming_zero_once_or_twice_gives_one_footprint() {
+    let program = |body: Expr| {
+        vec![
+            db_effect(),
+            net_effect(),
+            func(
+                "reader",
+                &[],
+                perform("db", "get", Some("users"), vec![int(1)]),
+            )
+            .item(),
+            func(
+                "handled",
+                &[],
+                handle(
+                    call("reader", vec![]),
+                    vec![general_clause(
+                        "db",
+                        "get",
+                        Some("users"),
+                        &["k"],
+                        "kont",
+                        body,
+                    )],
+                ),
+            )
+            .item(),
+        ]
+    };
+    let never = perform("net", "fetch", None, vec![]);
+    let once = app(var("kont"), vec![int(7)]);
+    let twice = add(
+        app(var("kont"), vec![int(7)]),
+        app(var("kont"), vec![int(8)]),
+    );
+    let of = |body| footprint(&check(program(body)), "handled");
+    assert_eq!(of(never), "{net.read}");
+    assert_eq!(of(once), "{}");
+    assert_eq!(of(twice), "{}");
+}
+
+/// A tail-resumptive clause's body is the *operation's* result; a general
+/// clause's body is the whole `handle`'s. Confusing the two is silent, because
+/// the two types coincide whenever the handled body has the operation's type.
+#[test]
+fn a_general_clause_returns_the_handles_result_not_the_operations() {
+    let items = |body: Expr| {
+        vec![
+            db_effect(),
+            func(
+                "reader",
+                &[],
+                perform("db", "get", Some("users"), vec![int(1)]),
+            )
+            .item(),
+            func(
+                "handled",
+                &[],
+                handle_ret(
+                    call("reader", vec![]),
+                    vec![general_clause(
+                        "db",
+                        "get",
+                        Some("users"),
+                        &["k"],
+                        "kont",
+                        body,
+                    )],
+                    "x",
+                    call("int_to_string", vec![var("x")]),
+                ),
+            )
+            .item(),
+        ]
+    };
+    assert_eq!(
+        sig(&check(items(str_lit("aborted"))), "handled"),
+        "() -> String"
+    );
+    let diags = check_err(items(int(0)));
+    assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
 #[test]

@@ -229,6 +229,13 @@ pub mod codes {
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     pub const ASSERTION_FAILED: &str = "E0501";
     pub const RUNTIME_ERROR: &str = "E0502";
+    /// Never a warning: the result cache would record whichever engine ran
+    /// first and never recompute it.
+    pub const ENGINE_DIVERGENCE: &str = "E0503";
+    /// A handler clause the tree-walker cannot express. Its own number rather
+    /// than `RUNTIME_ERROR` so that a consumer can tell a refusal to run from a
+    /// defect while running: the two call for opposite responses.
+    pub const MACHINE_ONLY_CLAUSE: &str = "E0504";
     /// `W` rather than `E`: cache trouble is never a fault in the user's
     /// program, so these are always warnings.
     pub const CACHE_UNREADABLE: &str = "W0601";
@@ -367,6 +374,8 @@ mod tests {
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
+            ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
+            ("MACHINE_ONLY_CLAUSE", codes::MACHINE_ONLY_CLAUSE, "E0504"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
             (

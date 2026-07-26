@@ -57,7 +57,7 @@ pub use schema::fingerprint as schema_fingerprint;
 /// the serialized form changes, and says to bump this. The semantic half is
 /// not — no test can see that the evaluator started rounding differently — so a
 /// change to `ply-eval` or to normalization must bump this by hand.
-pub const RUNTIME_VERSION: &str = "0.3.0";
+pub const RUNTIME_VERSION: &str = "0.4.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -75,7 +75,7 @@ pub const RUNTIME_VERSION: &str = "0.3.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.5.0";
+pub const FRONTEND_VERSION: &str = "0.6.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///
