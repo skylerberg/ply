@@ -19,7 +19,9 @@ pub struct TypeEnv {
 
 impl Default for TypeEnv {
     fn default() -> Self {
-        TypeEnv { scopes: vec![Scope::default()] }
+        TypeEnv {
+            scopes: vec![Scope::default()],
+        }
     }
 }
 
@@ -89,7 +91,9 @@ impl TypeEnv {
         for scope in &mut self.scopes {
             let schemes = &scope.schemes;
             scope.open.retain(|name| {
-                let Some(scheme) = schemes.get(name) else { return false };
+                let Some(scheme) = schemes.get(name) else {
+                    return false;
+                };
                 let (mut tys, mut rows) = (BTreeSet::new(), BTreeSet::new());
                 subst.free_vars(&scheme.ty, &mut tys, &mut rows);
                 for v in &scheme.ty_vars {
@@ -114,10 +118,12 @@ pub fn instantiate(scheme: &Scheme, fresh: &mut Fresh) -> Type {
     if scheme.ty_vars.is_empty() && scheme.row_vars.is_empty() {
         return scheme.ty.clone();
     }
-    let tys: FxHashMap<TyVar, Type> =
-        scheme.ty_vars.iter().map(|v| (*v, fresh.ty())).collect();
-    let rows: FxHashMap<RowVar, RowVar> =
-        scheme.row_vars.iter().map(|v| (*v, fresh.row_var())).collect();
+    let tys: FxHashMap<TyVar, Type> = scheme.ty_vars.iter().map(|v| (*v, fresh.ty())).collect();
+    let rows: FxHashMap<RowVar, RowVar> = scheme
+        .row_vars
+        .iter()
+        .map(|v| (*v, fresh.row_var()))
+        .collect();
     rename(&scheme.ty, &tys, &rows)
 }
 
@@ -130,24 +136,36 @@ pub fn rename_scheme(scheme: &Scheme, ty_vars: &[TyVar], row_vars: &[RowVar]) ->
         .zip(ty_vars)
         .map(|(from, to)| (*from, Type::Var(*to)))
         .collect();
-    let rows: FxHashMap<RowVar, RowVar> =
-        scheme.row_vars.iter().zip(row_vars).map(|(from, to)| (*from, *to)).collect();
+    let rows: FxHashMap<RowVar, RowVar> = scheme
+        .row_vars
+        .iter()
+        .zip(row_vars)
+        .map(|(from, to)| (*from, *to))
+        .collect();
     rename(&scheme.ty, &tys, &rows)
 }
 
 fn rename(t: &Type, tys: &FxHashMap<TyVar, Type>, rows: &FxHashMap<RowVar, RowVar>) -> Type {
     match t {
         Type::Var(v) => tys.get(v).cloned().unwrap_or(Type::Var(*v)),
-        Type::Con(name, args) => {
-            Type::Con(name.clone(), args.iter().map(|a| rename(a, tys, rows)).collect())
-        }
-        Type::Fn { params, ret, effects } => Type::Fn {
+        Type::Con(name, args) => Type::Con(
+            name.clone(),
+            args.iter().map(|a| rename(a, tys, rows)).collect(),
+        ),
+        Type::Fn {
+            params,
+            ret,
+            effects,
+        } => Type::Fn {
             params: params.iter().map(|p| rename(p, tys, rows)).collect(),
             ret: Box::new(rename(ret, tys, rows)),
             effects: rename_row(effects, rows),
         },
         Type::Record(fields) => Type::Record(
-            fields.iter().map(|(k, v)| (k.clone(), rename(v, tys, rows))).collect(),
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), rename(v, tys, rows)))
+                .collect(),
         ),
     }
 }
@@ -211,7 +229,9 @@ mod tests {
             effects: Row::empty(),
         };
         let scheme = generalize(&subst, &mut env, &ty);
-        let Type::Var(free_var) = free else { unreachable!() };
+        let Type::Var(free_var) = free else {
+            unreachable!()
+        };
         assert_eq!(scheme.ty_vars, vec![free_var]);
     }
 
@@ -233,7 +253,11 @@ mod tests {
         let mut fresh = Fresh::default();
         let mut env = TypeEnv::new();
         let row = fresh.row();
-        let ty = Type::Fn { params: vec![], ret: Box::new(Type::unit()), effects: row.clone() };
+        let ty = Type::Fn {
+            params: vec![],
+            ret: Box::new(Type::unit()),
+            effects: row.clone(),
+        };
         let scheme = generalize(&subst, &mut env, &ty);
         assert_eq!(scheme.row_vars, vec![row.tail.unwrap()]);
     }

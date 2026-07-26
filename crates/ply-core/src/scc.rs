@@ -97,7 +97,9 @@ mod tests {
     #[test]
     fn a_deep_chain_does_not_overflow_the_stack() {
         let n = 100_000;
-        let adj: Vec<Vec<usize>> = (0..n).map(|i| if i + 1 < n { vec![i + 1] } else { vec![] }).collect();
+        let adj: Vec<Vec<usize>> = (0..n)
+            .map(|i| if i + 1 < n { vec![i + 1] } else { vec![] })
+            .collect();
         let out = sccs(n, &adj);
         assert_eq!(out.len(), n);
         assert_eq!(out[0], vec![n - 1]);

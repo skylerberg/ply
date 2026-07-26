@@ -1,6 +1,7 @@
 //! Content addressing: a definition's identity is its normalized structure, so
 //! a name is never part of it and renaming rebuilds nothing.
 
+pub mod body;
 pub mod graph;
 pub mod normalize;
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;
 
+use body::{BodySet, StoredBody};
 use graph::{Entry, NodeBody, NodeId, ProgramIndex};
 use normalize::{ComponentIndices, EffectIndex, HashTable, Normalizer};
 
@@ -111,10 +113,29 @@ pub fn hash_program_ast(
     program: &Program,
     resolved: &Resolved,
 ) -> Result<HashOutput, Vec<Diagnostic>> {
-    hash_index(ProgramIndex::of_program(program, resolved)?)
+    hash_index(ProgramIndex::of_program(program, resolved)?, None)
 }
 
-/// One module with nothing imported. Convenience for snippets and tests.
+/// [`hash_program_ast`], keeping the normalized bytes it would otherwise throw
+/// away. They *are* the stored body — a definition's identity and its stored
+/// form are one byte stream — so collecting them costs a copy and nothing else.
+pub fn hash_program_with_bodies(
+    program: &Program,
+    resolved: &Resolved,
+) -> Result<(HashOutput, BodySet), Vec<Diagnostic>> {
+    let mut bodies = BodySet::default();
+    let hashes = hash_index(
+        ProgramIndex::of_program(program, resolved)?,
+        Some(&mut bodies),
+    )?;
+    Ok((hashes, bodies))
+}
+
+/// One module with nothing imported: a snippet, an editor buffer, a test.
+///
+/// A module that declares an `import` is refused with `E0106` — the referent is
+/// not here to be hashed, and writing its name instead would silently alias two
+/// different definitions. Use [`hash_program`] for anything that imports.
 pub fn hash_module(
     module: &Module,
     _check: &ply_core::CheckOutput,
@@ -124,10 +145,19 @@ pub fn hash_module(
 
 /// [`hash_module`] without the type-check output.
 pub fn hash_ast(module: &Module) -> Result<HashOutput, Vec<Diagnostic>> {
-    hash_index(ProgramIndex::single(module)?)
+    hash_index(ProgramIndex::single(module)?, None)
 }
 
-fn hash_index(index: ProgramIndex<'_>) -> Result<HashOutput, Vec<Diagnostic>> {
+pub fn hash_ast_with_bodies(module: &Module) -> Result<(HashOutput, BodySet), Vec<Diagnostic>> {
+    let mut bodies = BodySet::default();
+    let hashes = hash_index(ProgramIndex::single(module)?, Some(&mut bodies))?;
+    Ok((hashes, bodies))
+}
+
+fn hash_index(
+    index: ProgramIndex<'_>,
+    mut bodies: Option<&mut BodySet>,
+) -> Result<HashOutput, Vec<Diagnostic>> {
     let n = index.nodes.len();
     let no_hashes = HashTable::default();
     let no_component = ComponentIndices::default();
@@ -162,7 +192,14 @@ fn hash_index(index: ProgramIndex<'_>) -> Result<HashOutput, Vec<Diagnostic>> {
         members.sort_by(|&a, &b| sketches[a].cmp(&sketches[b]).then(a.cmp(&b)));
         let mut order = Vec::new();
         for &v in &members {
-            effect_order(&index, &edges[v], &component_of, &orders, Some(ci), &mut order);
+            effect_order(
+                &index,
+                &edges[v],
+                &component_of,
+                &orders,
+                Some(ci),
+                &mut order,
+            );
         }
         orders.push(order);
     }
@@ -171,15 +208,24 @@ fn hash_index(index: ProgramIndex<'_>) -> Result<HashOutput, Vec<Diagnostic>> {
     for (ci, component) in components.iter().enumerate() {
         let effects = slots(&orders[ci]);
         if graph::is_cyclic(component, &edges) {
-            for (v, hash) in hash_component(&index, component, &hashes, &effects) {
+            let (members, packed, classes) = hash_component(&index, component, &hashes, &effects);
+            for (v, hash) in members {
                 hashes.insert(v, hash);
+                if let Some(bodies) = bodies.as_deref_mut() {
+                    bodies.insert(hash, StoredBody::member(&packed, classes[&v]));
+                }
             }
         } else {
             let v = component[0];
             let module = index.nodes[v].module;
             let mut nz = Normalizer::new(&index, module, &hashes, &no_component, &effects);
             nz.node(index.nodes[v].body);
-            hashes.insert(v, DefHash::of(&nz.finish().0));
+            let encoding = nz.finish().0;
+            let hash = DefHash::of(&encoding);
+            hashes.insert(v, hash);
+            if let Some(bodies) = bodies.as_deref_mut() {
+                bodies.insert(hash, StoredBody::solo(&encoding));
+            }
         }
     }
 
@@ -198,9 +244,19 @@ fn hash_index(index: ProgramIndex<'_>) -> Result<HashOutput, Vec<Diagnostic>> {
         let (bytes, refs) = nz.finish();
         test_hashes.push(DefHash::of(&bytes));
         test_refs.push(refs);
+        if let Some(bodies) = bodies.as_deref_mut() {
+            bodies.push_test(StoredBody::solo(&bytes));
+        }
     }
 
-    Ok(assemble(&index, &components, &edges, &hashes, test_hashes, test_refs))
+    Ok(assemble(
+        &index,
+        &components,
+        &edges,
+        &hashes,
+        test_hashes,
+        test_refs,
+    ))
 }
 
 /// The effects one component can see, in an order derived only from what it
@@ -233,7 +289,9 @@ fn effect_order(
         if Some(ci) == own {
             continue;
         }
-        let Some(inner) = orders.get(ci) else { continue };
+        let Some(inner) = orders.get(ci) else {
+            continue;
+        };
         for &node in inner {
             push(node, out);
         }
@@ -241,7 +299,11 @@ fn effect_order(
 }
 
 fn slots(order: &[usize]) -> EffectIndex {
-    order.iter().enumerate().map(|(i, &node)| (node, i as u32)).collect()
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| (node, i as u32))
+        .collect()
 }
 
 /// A cyclic component is hashed as a unit and each member identified by an index
@@ -260,7 +322,7 @@ fn hash_component(
     component: &[usize],
     hashes: &HashTable,
     effects: &EffectIndex,
-) -> Vec<(usize, DefHash)> {
+) -> (Vec<(usize, DefHash)>, Vec<u8>, ComponentIndices) {
     let encode = |classes: &ComponentIndices, v: usize| {
         let mut nz = Normalizer::new(index, index.nodes[v].module, hashes, classes, effects);
         nz.node(index.nodes[v].body);
@@ -279,9 +341,7 @@ fn hash_component(
         classes = component
             .iter()
             .zip(&encodings)
-            .map(|(&v, e)| {
-                (v, distinct.binary_search(&e.as_slice()).unwrap_or(0) as u32)
-            })
+            .map(|(&v, e)| (v, distinct.binary_search(&e.as_slice()).unwrap_or(0) as u32))
             .collect();
 
         // A round that splits nothing never will, and once every member is
@@ -302,15 +362,11 @@ fn hash_component(
     }
     let component_hash = DefHash::of(&bytes);
 
-    component
+    let members = component
         .iter()
-        .map(|&v| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&component_hash.0);
-            hasher.update(&classes[&v].to_le_bytes());
-            (v, DefHash(*hasher.finalize().as_bytes()))
-        })
-        .collect()
+        .map(|&v| (v, body::member_hash(component_hash, classes[&v])))
+        .collect();
+    (members, bytes, classes)
 }
 
 fn assemble(
@@ -348,7 +404,10 @@ fn assemble(
         component_closure.push(closure);
     }
 
-    let mut out = HashOutput { tests: test_hashes, ..HashOutput::default() };
+    let mut out = HashOutput {
+        tests: test_hashes,
+        ..HashOutput::default()
+    };
     for entry in &index.order {
         match *entry {
             Entry::Def(NodeId(v)) => {
@@ -361,13 +420,22 @@ fn assemble(
                         }
                     };
                 }
-                let deps = edges[v].iter().map(|r| index.nodes[r.0].name.clone()).collect();
-                let closure = component_closure.get(component_of[v]).cloned().unwrap_or_default();
+                let deps = edges[v]
+                    .iter()
+                    .map(|r| index.nodes[r.0].name.clone())
+                    .collect();
+                let closure = component_closure
+                    .get(component_of[v])
+                    .cloned()
+                    .unwrap_or_default();
                 record(&mut out, name, deps, closure);
             }
             Entry::Test(t) => {
                 let name = index.tests[t].key.clone();
-                let deps = test_refs[t].iter().map(|r| index.nodes[r.0].name.clone()).collect();
+                let deps = test_refs[t]
+                    .iter()
+                    .map(|r| index.nodes[r.0].name.clone())
+                    .collect();
                 let mut closure = BTreeSet::new();
                 closure.insert(name.clone());
                 for r in &test_refs[t] {

@@ -31,7 +31,7 @@ fn grow<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)
 }
 
-mod tag {
+pub(crate) mod tag {
     pub const LOCAL: u8 = 1;
     pub const REF_HASH: u8 = 2;
     pub const REF_SELF: u8 = 3;
@@ -97,7 +97,7 @@ mod tag {
     pub const RETURN_CLAUSE: u8 = 94;
 }
 
-fn binop_byte(op: BinOp) -> u8 {
+pub(crate) fn binop_byte(op: BinOp) -> u8 {
     match op {
         BinOp::Add => 1,
         BinOp::Sub => 2,
@@ -116,14 +116,14 @@ fn binop_byte(op: BinOp) -> u8 {
     }
 }
 
-fn unop_byte(op: UnOp) -> u8 {
+pub(crate) fn unop_byte(op: UnOp) -> u8 {
     match op {
         UnOp::Neg => 1,
         UnOp::Not => 2,
     }
 }
 
-fn mode_byte(mode: Mode) -> u8 {
+pub(crate) fn mode_byte(mode: Mode) -> u8 {
     match mode {
         Mode::Read => 0,
         Mode::Write => 1,
@@ -380,7 +380,11 @@ impl<'a> Normalizer<'a> {
     fn effect_def(&mut self, d: &'a EffectDef) {
         self.tag(tag::EFFECT);
         self.boolv(d.nondet);
-        let mut ops: Vec<Vec<u8>> = d.ops.iter().map(|op| self.capture(|s| s.op_def(op))).collect();
+        let mut ops: Vec<Vec<u8>> = d
+            .ops
+            .iter()
+            .map(|op| self.capture(|s| s.op_def(op)))
+            .collect();
         ops.sort_unstable();
         self.len(ops.len());
         for bytes in ops {
@@ -426,7 +430,12 @@ impl<'a> Normalizer<'a> {
                     self.type_expr(a);
                 }
             }
-            TypeExpr::Fn { params, ret, effects, .. } => {
+            TypeExpr::Fn {
+                params,
+                ret,
+                effects,
+                ..
+            } => {
                 self.tag(tag::TY_FN);
                 self.len(params.len());
                 for p in params {
@@ -508,7 +517,10 @@ impl<'a> Normalizer<'a> {
         match &e.kind {
             // `{ e }` and `e` are the same computation; treating them alike is
             // what makes wrapping a body in braces a formatting change.
-            ExprKind::Block { stmts, tail: Some(tail) } if stmts.is_empty() => self.expr(tail),
+            ExprKind::Block {
+                stmts,
+                tail: Some(tail),
+            } if stmts.is_empty() => self.expr(tail),
             ExprKind::Lit(l) => {
                 self.tag(tag::E_LIT);
                 self.lit(l);
@@ -549,7 +561,11 @@ impl<'a> Normalizer<'a> {
                     self.expr(a);
                 }
             }
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.tag(tag::E_IF);
                 self.expr(cond);
                 self.expr(then_branch);
@@ -598,7 +614,12 @@ impl<'a> Normalizer<'a> {
                     self.expr(i);
                 }
             }
-            ExprKind::Perform { effect, op, resource, args } => {
+            ExprKind::Perform {
+                effect,
+                op,
+                resource,
+                args,
+            } => {
                 self.tag(tag::E_PERFORM);
                 self.effect_ref(effect);
                 self.strv(&op.name);
@@ -608,7 +629,11 @@ impl<'a> Normalizer<'a> {
                     self.expr(a);
                 }
             }
-            ExprKind::Handle { body, clauses, return_clause } => {
+            ExprKind::Handle {
+                body,
+                clauses,
+                return_clause,
+            } => {
                 self.tag(tag::E_HANDLE);
                 self.expr(body);
                 self.len(clauses.len());
@@ -637,7 +662,12 @@ impl<'a> Normalizer<'a> {
                     }
                 }
             }
-            ExprKind::WithCell { resource, init, binder, body } => {
+            ExprKind::WithCell {
+                resource,
+                init,
+                binder,
+                body,
+            } => {
                 self.tag(tag::E_WITH_CELL);
                 self.strv(&resource.name);
                 self.expr(init);
@@ -806,9 +836,10 @@ fn pattern_binders(p: &Pattern, out: &mut FxHashSet<Symbol>) -> usize {
         }
         PatternKind::Wildcard | PatternKind::Lit(_) => 0,
         PatternKind::Ctor { args, .. } => args.iter().map(|a| pattern_binders(a, out)).sum(),
-        PatternKind::Record { fields, .. } => {
-            fields.iter().map(|(_, pat)| pattern_binders(pat, out)).sum()
-        }
+        PatternKind::Record { fields, .. } => fields
+            .iter()
+            .map(|(_, pat)| pattern_binders(pat, out))
+            .sum(),
         PatternKind::List { items, rest } => {
             let mut n: usize = items.iter().map(|i| pattern_binders(i, out)).sum();
             if let Some(rest) = rest {
@@ -834,9 +865,11 @@ fn is_pure(e: &Expr) -> bool {
         ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
         ExprKind::Unary { operand, .. } => is_pure(operand),
         ExprKind::Lambda { body, .. } => is_pure(body),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            is_pure(cond) && is_pure(then_branch) && is_pure(else_branch)
-        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_pure(cond) && is_pure(then_branch) && is_pure(else_branch),
         ExprKind::Match { scrutinee, arms } => {
             is_pure(scrutinee)
                 && arms
@@ -870,9 +903,11 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
         ExprKind::App { func, args } => {
             mentions(func, names) || args.iter().any(|a| mentions(a, names))
         }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            mentions(cond, names) || mentions(then_branch, names) || mentions(else_branch, names)
-        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => mentions(cond, names) || mentions(then_branch, names) || mentions(else_branch, names),
         ExprKind::Match { scrutinee, arms } => {
             mentions(scrutinee, names)
                 || arms.iter().any(|a| {
@@ -893,18 +928,22 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
         ExprKind::Field { base, .. } => mentions(base, names),
         ExprKind::List { items } => items.iter().any(|i| mentions(i, names)),
         ExprKind::Perform { args, .. } => args.iter().any(|a| mentions(a, names)),
-        ExprKind::Handle { body, clauses, return_clause } => {
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
             mentions(body, names)
                 || clauses.iter().any(|c| {
                     c.params.iter().any(|p| names.contains(&p.name)) || mentions(&c.body, names)
                 })
-                || return_clause.as_deref().is_some_and(|r| {
-                    names.contains(&r.binder.name) || mentions(&r.body, names)
-                })
+                || return_clause
+                    .as_deref()
+                    .is_some_and(|r| names.contains(&r.binder.name) || mentions(&r.body, names))
         }
-        ExprKind::WithCell { init, binder, body, .. } => {
-            names.contains(&binder.name) || mentions(init, names) || mentions(body, names)
-        }
+        ExprKind::WithCell {
+            init, binder, body, ..
+        } => names.contains(&binder.name) || mentions(init, names) || mentions(body, names),
     })
 }
 

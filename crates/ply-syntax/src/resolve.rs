@@ -6,7 +6,10 @@
 //! program-wide qualified names, which is what makes the namespace metadata
 //! over hashes rather than part of them.
 
-use crate::ast::{Ident, ImportDecl, ImportKind, Item, Module, ModuleName, Program, QName, TypeDefBody, Visibility};
+use crate::ast::{
+    Ident, ImportDecl, ImportKind, Item, Module, ModuleName, Program, QName, TypeDefBody,
+    Visibility,
+};
 use indexmap::IndexMap;
 use indexmap::map::Entry;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -72,7 +75,10 @@ impl Declarations {
 
     /// The names another module may name through `binder::name`.
     pub fn exported(&self, ns: Namespace) -> impl Iterator<Item = &Symbol> {
-        self.space(ns).iter().filter(|(_, d)| d.vis.is_public()).map(|(n, _)| n)
+        self.space(ns)
+            .iter()
+            .filter(|(_, d)| d.vis.is_public())
+            .map(|(n, _)| n)
     }
 }
 
@@ -181,12 +187,7 @@ impl Resolved {
     /// A bare name must already have failed local lookup — locals are not in
     /// scope here and win unconditionally. A qualified name never consults the
     /// current module's scope at all.
-    pub fn lookup(
-        &self,
-        module: usize,
-        ns: Namespace,
-        q: &QName,
-    ) -> Result<&Binding, Diagnostic> {
+    pub fn lookup(&self, module: usize, ns: Namespace, q: &QName) -> Result<&Binding, Diagnostic> {
         let Some(scope) = self.scopes.get(module) else {
             return Err(Diagnostic::error(
                 codes::UNKNOWN_MODULE,
@@ -292,11 +293,17 @@ impl Resolved {
 
     fn unknown_in_module(&self, owner: usize, ns: Namespace, q: &QName) -> Diagnostic {
         let module = &self.scopes[owner].module;
-        let exported: Vec<String> =
-            self.declarations[owner].exported(ns).map(|n| format!("`{n}`")).collect();
+        let exported: Vec<String> = self.declarations[owner]
+            .exported(ns)
+            .map(|n| format!("`{n}`"))
+            .collect();
         let mut d = Diagnostic::error(
             codes::UNKNOWN_NAME,
-            format!("module `{module}` has no {} `{}`", ns.describe(), q.symbol()),
+            format!(
+                "module `{module}` has no {} `{}`",
+                ns.describe(),
+                q.symbol()
+            ),
         )
         .primary(q.span, format!("not declared in `{module}`"));
         d = if exported.is_empty() {
@@ -358,8 +365,7 @@ pub fn resolve(program: &Program) -> Result<Resolved, Vec<Diagnostic>> {
         }
     }
 
-    let declarations: Vec<Declarations> =
-        program.modules.iter().map(declarations_of).collect();
+    let declarations: Vec<Declarations> = program.modules.iter().map(declarations_of).collect();
     let declared: Vec<Bindings> = declarations
         .iter()
         .enumerate()
@@ -399,7 +405,13 @@ pub fn resolve(program: &Program) -> Result<Resolved, Vec<Diagnostic>> {
     }
 
     if diags.is_empty() {
-        Ok(Resolved { scopes, declarations, declared, index, order })
+        Ok(Resolved {
+            scopes,
+            declarations,
+            declared,
+            index,
+            order,
+        })
     } else {
         Err(diags)
     }
@@ -432,18 +444,14 @@ fn declarations_of(module: &Module) -> Declarations {
     out
 }
 
-fn declare(
-    out: &mut Declarations,
-    ns: Namespace,
-    module: &Module,
-    name: &Ident,
-    vis: Visibility,
-) {
-    out.space_mut(ns).entry(name.name.clone()).or_insert_with(|| Declared {
-        qualified: module.name.qualify(&name.name),
-        vis,
-        span: name.span,
-    });
+fn declare(out: &mut Declarations, ns: Namespace, module: &Module, name: &Ident, vis: Visibility) {
+    out.space_mut(ns)
+        .entry(name.name.clone())
+        .or_insert_with(|| Declared {
+            qualified: module.name.qualify(&name.name),
+            vis,
+            span: name.span,
+        });
 }
 
 fn bindings_of(owner: usize, declarations: &Declarations) -> Bindings {
@@ -452,7 +460,11 @@ fn bindings_of(owner: usize, declarations: &Declarations) -> Bindings {
         for (name, declared) in declarations.space(ns) {
             out.space_mut(ns).insert(
                 name.clone(),
-                Binding { qualified: declared.qualified.clone(), owner, span: declared.span },
+                Binding {
+                    qualified: declared.qualified.clone(),
+                    owner,
+                    span: declared.span,
+                },
             );
         }
     }
@@ -476,7 +488,9 @@ struct ScopeBuilder<'a> {
 impl ScopeBuilder<'_> {
     fn imports(&mut self, imports: &[ImportDecl]) {
         for import in imports {
-            let Some(target) = self.target(import) else { continue };
+            let Some(target) = self.target(import) else {
+                continue;
+            };
             self.edges.push((target, import.path_span()));
             match &import.kind {
                 ImportKind::Module | ImportKind::Alias(_) => self.bind_module(import, target),
@@ -516,14 +530,19 @@ impl ScopeBuilder<'_> {
         d = if near.is_empty() {
             d.note("a module is a file: `store/orders.ply` is `store.orders`, relative to the project root")
         } else {
-            d.note(format!("modules with that last segment: {}", near.join(", ")))
+            d.note(format!(
+                "modules with that last segment: {}",
+                near.join(", ")
+            ))
         };
         self.diags.push(d);
         None
     }
 
     fn bind_module(&mut self, import: &ImportDecl, target: usize) {
-        let Some(binder) = import.binder() else { return };
+        let Some(binder) = import.binder() else {
+            return;
+        };
         let span = import.binder_span();
         match self.scope.modules.entry(binder.clone()) {
             Entry::Vacant(slot) => {
@@ -537,8 +556,14 @@ impl ScopeBuilder<'_> {
                         codes::DUPLICATE_IMPORT,
                         format!("two imports bind the module name `{binder}`"),
                     )
-                    .primary(span, format!("`{}` would also be `{binder}`", import.module_name()))
-                    .secondary(first, format!("`{previous}` is already bound as `{binder}`"))
+                    .primary(
+                        span,
+                        format!("`{}` would also be `{binder}`", import.module_name()),
+                    )
+                    .secondary(
+                        first,
+                        format!("`{previous}` is already bound as `{binder}`"),
+                    )
                     .note(format!(
                         "rename one of them: `import {} as <other>`",
                         import.module_name()
@@ -566,7 +591,9 @@ impl ScopeBuilder<'_> {
             )
             .primary(name.span, format!("not found in `{module}`"));
             d = if exported.is_empty() {
-                d.note(format!("`{module}` exports nothing; mark an item `pub` to export it"))
+                d.note(format!(
+                    "`{module}` exports nothing; mark an item `pub` to export it"
+                ))
             } else {
                 d.note(format!("`{module}` exports: {}", exported.join(", ")))
             };
@@ -585,7 +612,9 @@ impl ScopeBuilder<'_> {
             .collect();
         if public.is_empty() {
             let ns = found[0];
-            let declared = self.declarations[target].get(ns, &name.name).expect("just found");
+            let declared = self.declarations[target]
+                .get(ns, &name.name)
+                .expect("just found");
             let keyword = match ns {
                 Namespace::Value => "fn",
                 Namespace::Type => "type",
@@ -598,7 +627,10 @@ impl ScopeBuilder<'_> {
                 )
                 .primary(name.span, "not exported")
                 .secondary(declared.span, "declared here, without `pub`")
-                .note(format!("write `pub {keyword} {}` in `{module}` to export it", name.name))
+                .note(format!(
+                    "write `pub {keyword} {}` in `{module}` to export it",
+                    name.name
+                ))
                 .note("items are private by default"),
             );
             return;
@@ -628,7 +660,11 @@ impl ScopeBuilder<'_> {
             );
             self.scope.space_mut(ns).insert(
                 name.name.clone(),
-                Binding { qualified: binding.qualified, owner: target, span: name.span },
+                Binding {
+                    qualified: binding.qualified,
+                    owner: target,
+                    span: name.span,
+                },
             );
         }
     }
@@ -721,7 +757,10 @@ fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
                         let key = canonical(&nodes);
                         if !found.contains(&key) {
                             found.push(key);
-                            cycles.push(Cycle { nodes, closing: span });
+                            cycles.push(Cycle {
+                                nodes,
+                                closing: span,
+                            });
                         }
                     }
                     Color::Black => {}
@@ -739,7 +778,12 @@ fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
 /// Rotated so the smallest index leads: the same cycle reached from two roots
 /// must compare equal, or it would be reported twice.
 fn canonical(nodes: &[usize]) -> Vec<usize> {
-    let Some(at) = nodes.iter().enumerate().min_by_key(|(_, n)| **n).map(|(i, _)| i) else {
+    let Some(at) = nodes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, n)| **n)
+        .map(|(i, _)| i)
+    else {
         return Vec::new();
     };
     nodes[at..].iter().chain(&nodes[..at]).copied().collect()
@@ -765,13 +809,16 @@ fn cycle_diagnostic(program: &Program, cycle: &Cycle) -> Diagnostic {
         .map(|n| format!("`{n}`"))
         .collect::<Vec<_>>()
         .join(" -> ");
-    Diagnostic::error(codes::MODULE_CYCLE, format!("module cycle: {chain} -> `{first}`"))
-        .primary(cycle.closing, "this import closes the cycle")
-        .note(
-            "each of these has to be checked before the next, and the last before the first, so \
+    Diagnostic::error(
+        codes::MODULE_CYCLE,
+        format!("module cycle: {chain} -> `{first}`"),
+    )
+    .primary(cycle.closing, "this import closes the cycle")
+    .note(
+        "each of these has to be checked before the next, and the last before the first, so \
              there is no order to check them in",
-        )
-        .note("move what they share into a module that all of them import")
+    )
+    .note("move what they share into a module that all of them import")
 }
 
 #[cfg(test)]
@@ -796,7 +843,8 @@ mod tests {
     }
 
     fn at(r: &Resolved, name: &str) -> usize {
-        r.index_of(&ModuleName::from_dotted(name)).expect("module is in the program")
+        r.index_of(&ModuleName::from_dotted(name))
+            .expect("module is in the program")
     }
 
     fn bare(name: &str) -> QName {
@@ -825,26 +873,43 @@ mod tests {
 
     fn text_of(d: &Diagnostic) -> String {
         let labels: Vec<&str> = d.labels.iter().map(|l| l.message.as_str()).collect();
-        format!("{} | {} | {}", d.message, labels.join(" / "), d.notes.join(" / "))
+        format!(
+            "{} | {} | {}",
+            d.message,
+            labels.join(" / "),
+            d.notes.join(" / ")
+        )
     }
 
     #[test]
     fn a_name_resolves_across_three_modules() {
         let r = resolve(&program(&[
             ("base", "pub fn one() -> Int = 1"),
-            ("middle", "import base (one)\npub fn two() -> Int = one() + one()"),
-            ("top", "import middle\nfn four() -> Int = middle::two() + middle::two()"),
+            (
+                "middle",
+                "import base (one)\npub fn two() -> Int = one() + one()",
+            ),
+            (
+                "top",
+                "import middle\nfn four() -> Int = middle::two() + middle::two()",
+            ),
         ]))
         .expect("resolves");
 
         let middle = at(&r, "middle");
         let top = at(&r, "top");
         assert_eq!(
-            r.lookup(middle, Namespace::Value, &bare("one")).unwrap().qualified.as_str(),
+            r.lookup(middle, Namespace::Value, &bare("one"))
+                .unwrap()
+                .qualified
+                .as_str(),
             "base.one"
         );
         assert_eq!(
-            r.lookup(top, Namespace::Value, &qualified("middle", "two")).unwrap().qualified.as_str(),
+            r.lookup(top, Namespace::Value, &qualified("middle", "two"))
+                .unwrap()
+                .qualified
+                .as_str(),
             "middle.two"
         );
         let position = |name: &str| r.order.iter().position(|&i| i == at(&r, name)).unwrap();
@@ -858,7 +923,10 @@ mod tests {
             ("base", "pub fn one() -> Int = 1"),
             ("left", "import base (one)\npub fn l() -> Int = one()"),
             ("right", "import base (one)\npub fn r() -> Int = one()"),
-            ("top", "import left\nimport right\nfn t() -> Int = left::l() + right::r()"),
+            (
+                "top",
+                "import left\nimport right\nfn t() -> Int = left::l() + right::r()",
+            ),
         ]))
         .expect("resolves");
 
@@ -870,23 +938,36 @@ mod tests {
         assert!(position("right") < position("top"));
 
         let top = at(&r, "top");
-        assert!(r.lookup(top, Namespace::Value, &qualified("left", "l")).is_ok());
+        assert!(
+            r.lookup(top, Namespace::Value, &qualified("left", "l"))
+                .is_ok()
+        );
         // `base` is reachable only through `left` and `right`, never directly.
-        let d = r.lookup(top, Namespace::Value, &qualified("base", "one")).unwrap_err();
+        let d = r
+            .lookup(top, Namespace::Value, &qualified("base", "one"))
+            .unwrap_err();
         assert_eq!(d.code, codes::UNKNOWN_MODULE);
     }
 
     #[test]
     fn a_private_name_cannot_be_reached_from_another_module() {
         let r = resolve(&program(&[
-            ("store", "fn secret() -> Int = 1\npub fn public() -> Int = secret()"),
+            (
+                "store",
+                "fn secret() -> Int = 1\npub fn public() -> Int = secret()",
+            ),
             ("app", "import store\nfn use() -> Int = store::public()"),
         ]))
         .expect("resolves");
 
         let app = at(&r, "app");
-        assert!(r.lookup(app, Namespace::Value, &qualified("store", "public")).is_ok());
-        let d = r.lookup(app, Namespace::Value, &qualified("store", "secret")).unwrap_err();
+        assert!(
+            r.lookup(app, Namespace::Value, &qualified("store", "public"))
+                .is_ok()
+        );
+        let d = r
+            .lookup(app, Namespace::Value, &qualified("store", "secret"))
+            .unwrap_err();
         assert_eq!(d.code, codes::PRIVATE_NAME);
         let shown = text_of(&d);
         assert!(shown.contains("private to module `store`"), "{shown}");
@@ -901,7 +982,10 @@ mod tests {
         ]);
         let d = only(&diags, codes::PRIVATE_NAME);
         let shown = text_of(&d);
-        assert!(shown.contains("`secret` is private to module `store`"), "{shown}");
+        assert!(
+            shown.contains("`secret` is private to module `store`"),
+            "{shown}"
+        );
         assert!(shown.contains("pub fn secret"), "{shown}");
     }
 
@@ -937,7 +1021,11 @@ mod tests {
             ("c", "import a\npub fn h() -> Int = 1"),
         ]);
         let d = only(&diags, codes::MODULE_CYCLE);
-        assert!(d.message.contains("`a` -> `b` -> `c` -> `a`"), "{}", d.message);
+        assert!(
+            d.message.contains("`a` -> `b` -> `c` -> `a`"),
+            "{}",
+            d.message
+        );
     }
 
     #[test]
@@ -964,17 +1052,26 @@ mod tests {
     fn qualifying_the_reference_fixes_an_ambiguous_import() {
         let r = resolve(&program(&[
             ("store", "pub fn place() -> Int = 1"),
-            ("app", "import store\nfn place() -> Int = store::place() + 1"),
+            (
+                "app",
+                "import store\nfn place() -> Int = store::place() + 1",
+            ),
         ]))
         .expect("resolves once the import binds the module rather than the name");
 
         let app = at(&r, "app");
         assert_eq!(
-            r.lookup(app, Namespace::Value, &bare("place")).unwrap().qualified.as_str(),
+            r.lookup(app, Namespace::Value, &bare("place"))
+                .unwrap()
+                .qualified
+                .as_str(),
             "app.place"
         );
         assert_eq!(
-            r.lookup(app, Namespace::Value, &qualified("store", "place")).unwrap().qualified.as_str(),
+            r.lookup(app, Namespace::Value, &qualified("store", "place"))
+                .unwrap()
+                .qualified
+                .as_str(),
             "store.place"
         );
     }
@@ -1000,28 +1097,42 @@ mod tests {
             ("app", "import left\nimport right as left"),
         ]);
         let d = only(&diags, codes::DUPLICATE_IMPORT);
-        assert!(d.message.contains("bind the module name `left`"), "{}", d.message);
+        assert!(
+            d.message.contains("bind the module name `left`"),
+            "{}",
+            d.message
+        );
     }
 
     #[test]
     fn an_unknown_module_is_reported_at_the_import_path() {
         let diags = errors(&[("app", "import store.orders\nfn f() -> Int = 1")]);
         let d = only(&diags, codes::UNKNOWN_MODULE);
-        assert!(d.message.contains("no module named `store.orders`"), "{}", d.message);
+        assert!(
+            d.message.contains("no module named `store.orders`"),
+            "{}",
+            d.message
+        );
     }
 
     #[test]
     fn a_module_binder_lives_in_its_own_namespace() {
         let r = resolve(&program(&[
             ("orders", "pub fn place() -> Int = 1"),
-            ("app", "import orders\nfn f(orders: Int) -> Int = orders + orders::place()"),
+            (
+                "app",
+                "import orders\nfn f(orders: Int) -> Int = orders + orders::place()",
+            ),
         ]))
         .expect("a local named `orders` does not hide the module binder");
 
         let app = at(&r, "app");
         assert!(r.scopes[app].modules.contains_key(&Symbol::new("orders")));
         assert_eq!(
-            r.lookup(app, Namespace::Value, &qualified("orders", "place")).unwrap().qualified.as_str(),
+            r.lookup(app, Namespace::Value, &qualified("orders", "place"))
+                .unwrap()
+                .qualified
+                .as_str(),
             "orders.place"
         );
     }
@@ -1030,13 +1141,21 @@ mod tests {
     fn an_alias_rebinds_the_module_and_the_default_binder_goes_away() {
         let r = resolve(&program(&[
             ("store.orders", "pub fn place() -> Int = 1"),
-            ("app", "import store.orders as ord\nfn f() -> Int = ord::place()"),
+            (
+                "app",
+                "import store.orders as ord\nfn f() -> Int = ord::place()",
+            ),
         ]))
         .expect("resolves");
 
         let app = at(&r, "app");
-        assert!(r.lookup(app, Namespace::Value, &qualified("ord", "place")).is_ok());
-        let d = r.lookup(app, Namespace::Value, &qualified("orders", "place")).unwrap_err();
+        assert!(
+            r.lookup(app, Namespace::Value, &qualified("ord", "place"))
+                .is_ok()
+        );
+        let d = r
+            .lookup(app, Namespace::Value, &qualified("orders", "place"))
+            .unwrap_err();
         assert_eq!(d.code, codes::UNKNOWN_MODULE);
     }
 
@@ -1050,31 +1169,52 @@ mod tests {
 
         let app = at(&r, "app");
         assert!(r.scopes[app].modules.is_empty());
-        let d = r.lookup(app, Namespace::Value, &qualified("orders", "place")).unwrap_err();
+        let d = r
+            .lookup(app, Namespace::Value, &qualified("orders", "place"))
+            .unwrap_err();
         assert_eq!(d.code, codes::UNKNOWN_MODULE);
         let shown = text_of(&d);
         assert!(shown.contains("add `import orders`"), "{shown}");
-        assert!(shown.contains("a selective import binds no module name"), "{shown}");
-        assert!(shown.contains("this import brings in names from `orders`"), "{shown}");
+        assert!(
+            shown.contains("a selective import binds no module name"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("this import brings in names from `orders`"),
+            "{shown}"
+        );
     }
 
     #[test]
     fn a_public_type_exports_its_constructors_and_a_private_one_does_not() {
         let r = resolve(&program(&[
-            ("shapes", "pub type Shape = Circle(Int) | Square(Int)\ntype Hidden = Only(Int)"),
+            (
+                "shapes",
+                "pub type Shape = Circle(Int) | Square(Int)\ntype Hidden = Only(Int)",
+            ),
             ("app", "import shapes\nfn f() -> Int = 1"),
         ]))
         .expect("resolves");
 
         let app = at(&r, "app");
-        assert!(r.lookup(app, Namespace::Type, &qualified("shapes", "Shape")).is_ok());
-        assert!(r.lookup(app, Namespace::Value, &qualified("shapes", "Circle")).is_ok());
+        assert!(
+            r.lookup(app, Namespace::Type, &qualified("shapes", "Shape"))
+                .is_ok()
+        );
+        assert!(
+            r.lookup(app, Namespace::Value, &qualified("shapes", "Circle"))
+                .is_ok()
+        );
         assert_eq!(
-            r.lookup(app, Namespace::Value, &qualified("shapes", "Only")).unwrap_err().code,
+            r.lookup(app, Namespace::Value, &qualified("shapes", "Only"))
+                .unwrap_err()
+                .code,
             codes::PRIVATE_NAME
         );
         assert_eq!(
-            r.lookup(app, Namespace::Type, &qualified("shapes", "Hidden")).unwrap_err().code,
+            r.lookup(app, Namespace::Type, &qualified("shapes", "Hidden"))
+                .unwrap_err()
+                .code,
             codes::PRIVATE_NAME
         );
     }
@@ -1088,10 +1228,15 @@ mod tests {
         .expect("resolves");
 
         let app = at(&r, "app");
-        assert!(r.lookup(app, Namespace::Effect, &qualified("clock", "clock")).is_ok());
+        assert!(
+            r.lookup(app, Namespace::Effect, &qualified("clock", "clock"))
+                .is_ok()
+        );
         let clock = at(&r, "clock");
         assert_eq!(
-            r.declarations[clock].effects[&Symbol::new("clock")].qualified.as_str(),
+            r.declarations[clock].effects[&Symbol::new("clock")]
+                .qualified
+                .as_str(),
             "clock.clock"
         );
     }
@@ -1117,7 +1262,10 @@ mod tests {
         let module = parse_module(SourceId(0), ModuleName::anonymous(), "fn f() -> Int = 1")
             .expect("parses");
         let r = resolve(&Program::single(module)).expect("resolves");
-        assert_eq!(r.scopes[0].values[&Symbol::new("f")].qualified.as_str(), "f");
+        assert_eq!(
+            r.scopes[0].values[&Symbol::new("f")].qualified.as_str(),
+            "f"
+        );
         assert_eq!(r.order, vec![0]);
     }
 
@@ -1168,8 +1316,10 @@ mod tests {
             ("c", "import d\npub fn h() -> Int = 1"),
             ("d", "import c\npub fn i() -> Int = 1"),
         ]);
-        let cycles: Vec<&Diagnostic> =
-            diags.iter().filter(|d| d.code == codes::MODULE_CYCLE).collect();
+        let cycles: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == codes::MODULE_CYCLE)
+            .collect();
         assert_eq!(cycles.len(), 2, "{diags:?}");
     }
 
@@ -1177,11 +1327,17 @@ mod tests {
     fn importing_one_module_twice_is_not_a_cycle() {
         let r = resolve(&program(&[
             ("store", "pub fn place() -> Int = 1"),
-            ("app", "import store\nimport store (place)\nfn f() -> Int = place() + store::place()"),
+            (
+                "app",
+                "import store\nimport store (place)\nfn f() -> Int = place() + store::place()",
+            ),
         ]))
         .expect("resolves");
         let app = at(&r, "app");
         assert!(r.lookup(app, Namespace::Value, &bare("place")).is_ok());
-        assert!(r.lookup(app, Namespace::Value, &qualified("store", "place")).is_ok());
+        assert!(
+            r.lookup(app, Namespace::Value, &qualified("store", "place"))
+                .is_ok()
+        );
     }
 }

@@ -22,7 +22,9 @@ fn dump(src: &str) -> String {
 
 fn expr(src: &str) -> String {
     let m = ok(&format!("fn t() = {src}"));
-    let Item::Fn(f) = &m.items[0] else { panic!("expected a fn") };
+    let Item::Fn(f) = &m.items[0] else {
+        panic!("expected a fn")
+    };
     dump_expr(&f.body)
 }
 
@@ -67,7 +69,10 @@ fn fn_generics_may_be_only_effect_vars() {
 
 #[test]
 fn fn_generics_may_be_only_types() {
-    assert_eq!(dump("fn id<a>(x: a) -> a = x"), "(fn id <a> ((x a)) -> a x)");
+    assert_eq!(
+        dump("fn id<a>(x: a) -> a = x"),
+        "(fn id <a> ((x a)) -> a x)"
+    );
 }
 
 #[test]
@@ -88,7 +93,10 @@ fn empty_row_with_only_a_tail() {
 #[test]
 fn type_alias_versus_sum() {
     assert_eq!(dump("type Id = Int"), "(type Id = Int)");
-    assert_eq!(dump("type Pair = {a: Int, b: String}"), "(type Pair = {a: Int, b: String})");
+    assert_eq!(
+        dump("type Pair = {a: Int, b: String}"),
+        "(type Pair = {a: Int, b: String})"
+    );
     assert_eq!(
         dump("type Option<a> = None | Some(a)"),
         "(type Option <a> = (| (v None) (v Some a)))"
@@ -97,7 +105,10 @@ fn type_alias_versus_sum() {
         dump("type Color =\n  | Red\n  | Green\n  | Blue"),
         "(type Color = (| (v Red) (v Green) (v Blue)))"
     );
-    assert_eq!(dump("type Wrap = Wrap(Int)"), "(type Wrap = (| (v Wrap Int)))");
+    assert_eq!(
+        dump("type Wrap = Wrap(Int)"),
+        "(type Wrap = (| (v Wrap Int)))"
+    );
 }
 
 #[test]
@@ -131,7 +142,10 @@ fn effect_with_no_operations() {
 #[test]
 fn test_items_carry_their_name_and_determinism() {
     assert_eq!(dump("test \"a name\" { 1 }"), "(test \"a name\" (block 1))");
-    assert_eq!(dump("test/nondet \"b\" { 1 }"), "(test/nondet \"b\" (block 1))");
+    assert_eq!(
+        dump("test/nondet \"b\" { 1 }"),
+        "(test/nondet \"b\" (block 1))"
+    );
 }
 
 #[test]
@@ -200,7 +214,10 @@ fn perform_versus_field_versus_qualified_name() {
     assert_eq!(expr("Mod.thing"), "(field Mod thing)");
     assert_eq!(expr("a.b.c"), "(field (field a b) c)");
     assert_eq!(expr("f(x).load(y)"), "(call (field (call f x) load) y)");
-    assert_eq!(expr("db.get[users](k).name"), "(field (perform db.get[users] k) name)");
+    assert_eq!(
+        expr("db.get[users](k).name"),
+        "(field (perform db.get[users] k) name)"
+    );
 }
 
 #[test]
@@ -208,7 +225,10 @@ fn lambdas_with_zero_one_and_many_parameters() {
     assert_eq!(expr("|| 1"), "(lam () 1)");
     assert_eq!(expr("|x| x + 1"), "(lam ((x _)) (+ x 1))");
     assert_eq!(expr("|x: Int, y| x"), "(lam ((x Int) (y _)) x)");
-    assert_eq!(expr("f(|| 1, |x| x)"), "(call f (lam () 1) (lam ((x _)) x))");
+    assert_eq!(
+        expr("f(|| 1, |x| x)"),
+        "(call f (lam () 1) (lam ((x _)) x))"
+    );
 }
 
 #[test]
@@ -251,8 +271,14 @@ fn if_without_else_yields_unit() {
 
 #[test]
 fn an_if_condition_does_not_swallow_the_then_block() {
-    assert_eq!(expr("if x == 1 { 2 } else { 3 }"), "(if (== x 1) (block 2) (block 3))");
-    assert_eq!(expr("if f(x) { 2 } else { 3 }"), "(if (call f x) (block 2) (block 3))");
+    assert_eq!(
+        expr("if x == 1 { 2 } else { 3 }"),
+        "(if (== x 1) (block 2) (block 3))"
+    );
+    assert_eq!(
+        expr("if f(x) { 2 } else { 3 }"),
+        "(if (call f x) (block 2) (block 3))"
+    );
     assert_eq!(
         expr("if f({a: 1}) { 2 } else { 3 }"),
         "(if (call f (rec (a 1))) (block 2) (block 3))"
@@ -323,7 +349,10 @@ fn handler_clause_commas_are_optional() {
 
 #[test]
 fn a_return_clause_is_recognised_by_the_binder_that_follows() {
-    assert_eq!(expr("handle f() with { return x -> x }"), "(handle (call f) (ret x x))");
+    assert_eq!(
+        expr("handle f() with { return x -> x }"),
+        "(handle (call f) (ret x x))"
+    );
 }
 
 #[test]
@@ -364,7 +393,10 @@ fn match_arm_guards() {
 
 #[test]
 fn a_match_scrutinee_does_not_swallow_the_arm_block() {
-    assert_eq!(expr("match f(x) { _ -> 1 }"), "(match (call f x) (arm _ 1))");
+    assert_eq!(
+        expr("match f(x) { _ -> 1 }"),
+        "(match (call f x) (arm _ 1))"
+    );
 }
 
 #[test]
@@ -389,7 +421,10 @@ fn function_types_nest_to_the_right_and_carry_rows() {
 
 #[test]
 fn a_parenthesized_type_is_not_a_tuple() {
-    assert_eq!(dump("fn f(x: (Int)) -> Unit = x"), "(fn f ((x Int)) -> Unit x)");
+    assert_eq!(
+        dump("fn f(x: (Int)) -> Unit = x"),
+        "(fn f ((x Int)) -> Unit x)"
+    );
 }
 
 #[test]
@@ -402,7 +437,10 @@ fn nested_type_arguments_close_with_two_angle_brackets() {
 
 #[test]
 fn lowercase_type_names_are_variables_and_uppercase_are_constructors() {
-    assert_eq!(dump("fn f(x: a, y: A) -> Unit = x"), "(fn f ((x a) (y A)) -> Unit x)");
+    assert_eq!(
+        dump("fn f(x: a, y: A) -> Unit = x"),
+        "(fn f ((x a) (y A)) -> Unit x)"
+    );
 }
 
 #[test]
@@ -416,7 +454,9 @@ fn a_binary_expression_spans_both_operands() {
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
     assert_eq!(snippet(src, f.body.span), "1 + 2 * 3");
-    let ExprKind::Binary { rhs, .. } = &f.body.kind else { panic!() };
+    let ExprKind::Binary { rhs, .. } = &f.body.kind else {
+        panic!()
+    };
     assert_eq!(snippet(src, rhs.span), "2 * 3");
 }
 
@@ -426,7 +466,15 @@ fn a_perform_spans_from_the_effect_to_the_closing_paren() {
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
     assert_eq!(snippet(src, f.body.span), "db.get[users](k)");
-    let ExprKind::Perform { effect, op, resource, .. } = &f.body.kind else { panic!() };
+    let ExprKind::Perform {
+        effect,
+        op,
+        resource,
+        ..
+    } = &f.body.kind
+    else {
+        panic!()
+    };
     assert_eq!(snippet(src, effect.span), "db");
     assert_eq!(snippet(src, op.span), "get");
     assert_eq!(snippet(src, resource.as_ref().unwrap().span), "users");
@@ -453,8 +501,12 @@ fn a_let_statement_spans_through_its_semicolon() {
     let src = "fn f() { let x = 1; x }";
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    let ExprKind::Block { stmts, .. } = &f.body.kind else { panic!() };
-    let Stmt::Let { span, .. } = &stmts[0] else { panic!() };
+    let ExprKind::Block { stmts, .. } = &f.body.kind else {
+        panic!()
+    };
+    let Stmt::Let { span, .. } = &stmts[0] else {
+        panic!()
+    };
     assert_eq!(snippet(src, *span), "let x = 1;");
 }
 
@@ -463,7 +515,14 @@ fn a_synthesized_else_branch_gets_an_empty_span_at_the_end_of_the_then_block() {
     let src = "fn f() = if a { 1 }";
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    let ExprKind::If { then_branch, else_branch, .. } = &f.body.kind else { panic!() };
+    let ExprKind::If {
+        then_branch,
+        else_branch,
+        ..
+    } = &f.body.kind
+    else {
+        panic!()
+    };
     assert!(!else_branch.span.is_dummy());
     assert_eq!(else_branch.span.start, else_branch.span.end);
     assert_eq!(else_branch.span.start, then_branch.span.end);
@@ -516,7 +575,9 @@ fn every_diagnostic_carries_a_code_and_a_real_span() {
         assert!(!ds.is_empty(), "expected a diagnostic for {src:?}");
         for d in &ds {
             assert!(!d.code.is_empty(), "empty code for {src:?}");
-            let span = d.primary_span().unwrap_or_else(|| panic!("no span for {src:?}"));
+            let span = d
+                .primary_span()
+                .unwrap_or_else(|| panic!("no span for {src:?}"));
             assert!(!span.is_dummy(), "dummy span for {src:?}");
             assert!(span.end as usize <= src.len(), "span past end for {src:?}");
             assert!(span.start <= span.end, "inverted span for {src:?}");
@@ -526,23 +587,41 @@ fn every_diagnostic_carries_a_code_and_a_real_span() {
 
 #[test]
 fn a_bad_item_does_not_stop_later_items_from_parsing() {
-    let (module, diags) = parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\nfn b() = 1\nfn c() = 2");
+    let (module, diags) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn a() = ;\nfn b() = 1\nfn c() = 2",
+    );
     assert_eq!(diags.len(), 1);
     assert_eq!(dump_module(&module), "(fn b () 1)\n(fn c () 2)");
 }
 
 #[test]
 fn several_independent_errors_are_reported_in_one_run() {
-    let (module, diags) =
-        parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\ntype T = ;\neffect e { bogus }\ntest \"t\" { 1 }");
-    assert!(diags.len() >= 3, "expected several diagnostics, got {diags:#?}");
-    assert_eq!(module.items.len(), 1, "the well-formed test should still parse");
+    let (module, diags) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn a() = ;\ntype T = ;\neffect e { bogus }\ntest \"t\" { 1 }",
+    );
+    assert!(
+        diags.len() >= 3,
+        "expected several diagnostics, got {diags:#?}"
+    );
+    assert_eq!(
+        module.items.len(),
+        1,
+        "the well-formed test should still parse"
+    );
     assert!(matches!(&module.items[0], Item::Test(_)));
 }
 
 #[test]
 fn recovery_skips_over_braces_inside_the_broken_item() {
-    let (module, diags) = parse_recovering(SRC, ModuleName::anonymous(), "fn a() { let = 1; }\nfn b() = 3");
+    let (module, diags) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn a() { let = 1; }\nfn b() = 3",
+    );
     assert_eq!(diags.len(), 1, "{diags:#?}");
     assert_eq!(dump_module(&module), "(fn b () 3)");
 }
@@ -559,7 +638,11 @@ fn an_unexpected_token_names_what_was_expected_and_what_was_found() {
 fn an_unclosed_delimiter_points_at_where_it_opened() {
     let src = "fn f() { 1 ";
     let ds = errs(src);
-    let opened = ds[0].labels.iter().find(|l| !l.primary).expect("a secondary label");
+    let opened = ds[0]
+        .labels
+        .iter()
+        .find(|l| !l.primary)
+        .expect("a secondary label");
     assert_eq!(snippet(src, opened.span), "{");
 }
 
@@ -573,26 +656,41 @@ fn a_missing_function_body_says_what_to_write() {
 #[test]
 fn an_operation_without_a_mode_says_read_or_write() {
     let ds = errs("effect db { get() -> Int }");
-    assert!(ds[0].message.contains("`read` or `write`"), "{}", ds[0].message);
+    assert!(
+        ds[0].message.contains("`read` or `write`"),
+        "{}",
+        ds[0].message
+    );
 }
 
 #[test]
 fn a_tuple_type_is_rejected_with_a_note() {
     let ds = errs("fn f(x: (Int, Bool)) = x");
-    assert!(ds[0].notes.iter().any(|n| n.contains("record")), "{:#?}", ds[0]);
+    assert!(
+        ds[0].notes.iter().any(|n| n.contains("record")),
+        "{:#?}",
+        ds[0]
+    );
 }
 
 #[test]
 fn a_duplicate_return_clause_is_reported_once() {
     let ds = errs("fn f() = handle g() with { return x -> x, return y -> y }");
     assert_eq!(ds.len(), 1);
-    assert!(ds[0].message.contains("only one `return`"), "{}", ds[0].message);
+    assert!(
+        ds[0].message.contains("only one `return`"),
+        "{}",
+        ds[0].message
+    );
 }
 
 #[test]
 fn lexer_diagnostics_reach_the_parse_result() {
     let ds = errs("fn f() = \"oops");
-    assert!(ds.iter().any(|d| d.code == codes::UNTERMINATED_STRING), "{ds:#?}");
+    assert!(
+        ds.iter().any(|d| d.code == codes::UNTERMINATED_STRING),
+        "{ds:#?}"
+    );
 }
 
 #[test]
@@ -633,15 +731,27 @@ fn pathological_nesting_is_a_diagnostic_rather_than_a_stack_overflow() {
         );
     }
 
-    let ty = format!("fn f(x: {}Int{}) = x", "List<".repeat(20_000), ">".repeat(20_000));
-    assert!(errs(&ty).iter().any(|d| d.message.contains("nested too deeply")));
+    let ty = format!(
+        "fn f(x: {}Int{}) = x",
+        "List<".repeat(20_000),
+        ">".repeat(20_000)
+    );
+    assert!(
+        errs(&ty)
+            .iter()
+            .any(|d| d.message.contains("nested too deeply"))
+    );
 
     let pat = format!(
         "fn f() = match v {{ {}x{} -> 1 }}",
         "Some(".repeat(20_000),
         ")".repeat(20_000)
     );
-    assert!(errs(&pat).iter().any(|d| d.message.contains("nested too deeply")));
+    assert!(
+        errs(&pat)
+            .iter()
+            .any(|d| d.message.contains("nested too deeply"))
+    );
 }
 
 #[test]
@@ -667,8 +777,9 @@ fn token_soup_never_panics_or_hangs() {
     };
     for _ in 0..3_000 {
         let len = (next() % 24) as usize;
-        let src: Vec<&str> =
-            (0..len).map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize]).collect();
+        let src: Vec<&str> = (0..len)
+            .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+            .collect();
         let src = src.join(" ");
         let (_, diags) = parse_recovering(SRC, ModuleName::anonymous(), &src);
         for d in &diags {
@@ -756,7 +867,11 @@ fn dump_import(i: &ImportDecl) -> String {
 }
 
 fn dump_item(i: &Item) -> String {
-    let vis = if i.visibility().is_public() { "pub " } else { "" };
+    let vis = if i.visibility().is_public() {
+        "pub "
+    } else {
+        ""
+    };
     let body = dump_item_body(i);
     format!("({vis}{}", &body[1..])
 }
@@ -854,14 +969,24 @@ fn dump_ty(t: &TypeExpr) -> String {
             let args: Vec<_> = args.iter().map(dump_ty).collect();
             format!("{}<{}>", name, args.join(", "))
         }
-        TypeExpr::Fn { params, ret, effects, .. } => {
+        TypeExpr::Fn {
+            params,
+            ret,
+            effects,
+            ..
+        } => {
             let ps: Vec<_> = params.iter().map(dump_ty).collect();
-            let eff = effects.as_ref().map(|r| format!(" / {}", dump_row(r))).unwrap_or_default();
+            let eff = effects
+                .as_ref()
+                .map(|r| format!(" / {}", dump_row(r)))
+                .unwrap_or_default();
             format!("(fn ({}) -> {}{})", ps.join(", "), dump_ty(ret), eff)
         }
         TypeExpr::Record { fields, .. } => {
-            let fs: Vec<_> =
-                fields.iter().map(|(n, t)| format!("{}: {}", n.name, dump_ty(t))).collect();
+            let fs: Vec<_> = fields
+                .iter()
+                .map(|(n, t)| format!("{}: {}", n.name, dump_ty(t)))
+                .collect();
             format!("{{{}}}", fs.join(", "))
         }
         TypeExpr::Unit { .. } => "()".to_string(),
@@ -873,7 +998,11 @@ fn dump_row(r: &RowExpr) -> String {
         .atoms
         .iter()
         .map(|a| {
-            let res = a.resource.as_ref().map(|r| format!("[{}]", r.name)).unwrap_or_default();
+            let res = a
+                .resource
+                .as_ref()
+                .map(|r| format!("[{}]", r.name))
+                .unwrap_or_default();
             format!("{}.{}{}", a.effect, a.mode.as_str(), res)
         })
         .collect();
@@ -936,7 +1065,11 @@ fn dump_expr(e: &Expr) -> String {
             }
             format!("{s})")
         }
-        ExprKind::If { cond, then_branch, else_branch } => format!(
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => format!(
             "(if {} {} {})",
             dump_expr(cond),
             dump_expr(then_branch),
@@ -950,7 +1083,12 @@ fn dump_expr(e: &Expr) -> String {
                     .as_ref()
                     .map(|g| format!(" (guard {})", dump_expr(g)))
                     .unwrap_or_default();
-                s.push_str(&format!(" (arm {}{} {})", dump_pat(&a.pat), g, dump_expr(&a.body)));
+                s.push_str(&format!(
+                    " (arm {}{} {})",
+                    dump_pat(&a.pat),
+                    g,
+                    dump_expr(&a.body)
+                ));
             }
             format!("{s})")
         }
@@ -959,8 +1097,16 @@ fn dump_expr(e: &Expr) -> String {
             for st in stmts {
                 match st {
                     Stmt::Let { pat, ty, value, .. } => {
-                        let t = ty.as_ref().map(|t| format!(" {}", dump_ty(t))).unwrap_or_default();
-                        s.push_str(&format!(" (let {}{} {})", dump_pat(pat), t, dump_expr(value)));
+                        let t = ty
+                            .as_ref()
+                            .map(|t| format!(" {}", dump_ty(t)))
+                            .unwrap_or_default();
+                        s.push_str(&format!(
+                            " (let {}{} {})",
+                            dump_pat(pat),
+                            t,
+                            dump_expr(value)
+                        ));
                     }
                     Stmt::Expr(e) => s.push_str(&format!(" {}", dump_expr(e))),
                 }
@@ -971,27 +1117,49 @@ fn dump_expr(e: &Expr) -> String {
             format!("{s})")
         }
         ExprKind::Record { fields } => {
-            let fs: Vec<_> =
-                fields.iter().map(|(n, v)| format!("({} {})", n.name, dump_expr(v))).collect();
+            let fs: Vec<_> = fields
+                .iter()
+                .map(|(n, v)| format!("({} {})", n.name, dump_expr(v)))
+                .collect();
             format!("(rec {})", fs.join(" "))
         }
         ExprKind::Field { base, field } => format!("(field {} {})", dump_expr(base), field.name),
         ExprKind::List { items } => {
             let is: Vec<_> = items.iter().map(dump_expr).collect();
-            if is.is_empty() { "(list)".to_string() } else { format!("(list {})", is.join(" ")) }
+            if is.is_empty() {
+                "(list)".to_string()
+            } else {
+                format!("(list {})", is.join(" "))
+            }
         }
-        ExprKind::Perform { effect, op, resource, args } => {
-            let res = resource.as_ref().map(|r| format!("[{}]", r.name)).unwrap_or_default();
+        ExprKind::Perform {
+            effect,
+            op,
+            resource,
+            args,
+        } => {
+            let res = resource
+                .as_ref()
+                .map(|r| format!("[{}]", r.name))
+                .unwrap_or_default();
             let mut s = format!("(perform {}.{}{}", effect, op.name, res);
             for a in args {
                 s.push_str(&format!(" {}", dump_expr(a)));
             }
             format!("{s})")
         }
-        ExprKind::Handle { body, clauses, return_clause } => {
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
             let mut s = format!("(handle {}", dump_expr(body));
             for c in clauses {
-                let res = c.resource.as_ref().map(|r| format!("[{}]", r.name)).unwrap_or_default();
+                let res = c
+                    .resource
+                    .as_ref()
+                    .map(|r| format!("[{}]", r.name))
+                    .unwrap_or_default();
                 let ps: Vec<_> = c.params.iter().map(|p| p.name.to_string()).collect();
                 s.push_str(&format!(
                     " (clause {}.{}{} ({}) {})",
@@ -1007,7 +1175,12 @@ fn dump_expr(e: &Expr) -> String {
             }
             format!("{s})")
         }
-        ExprKind::WithCell { resource, init, binder, body } => format!(
+        ExprKind::WithCell {
+            resource,
+            init,
+            binder,
+            body,
+        } => format!(
             "(with_cell [{}] {} {} {})",
             resource.name,
             dump_expr(init),
@@ -1030,8 +1203,10 @@ fn dump_pat(p: &Pattern) -> String {
             format!("{s})")
         }
         PatternKind::Record { fields, rest } => {
-            let mut fs: Vec<_> =
-                fields.iter().map(|(n, p)| format!("({} {})", n.name, dump_pat(p))).collect();
+            let mut fs: Vec<_> = fields
+                .iter()
+                .map(|(n, p)| format!("({} {})", n.name, dump_pat(p)))
+                .collect();
             if *rest {
                 fs.push("..".to_string());
             }
@@ -1054,7 +1229,10 @@ fn a_module_name_is_its_path_with_separators_turned_into_dots() {
     let name = ModuleName::from_relative_path(Path::new("store/orders.ply")).unwrap();
     assert_eq!(name.as_str(), "store.orders");
     assert_eq!(name.default_binder().as_str(), "orders");
-    assert_eq!(name.qualify(&Symbol::new("place")).as_str(), "store.orders.place");
+    assert_eq!(
+        name.qualify(&Symbol::new("place")).as_str(),
+        "store.orders.place"
+    );
     assert_eq!(name.segments().collect::<Vec<_>>(), ["store", "orders"]);
 }
 
@@ -1071,7 +1249,10 @@ fn a_path_segment_that_is_not_an_identifier_is_a_diagnostic() {
         let err = ModuleName::from_relative_path(Path::new(bad))
             .expect_err(&format!("expected `{bad}` to be rejected"));
         assert_eq!(err.code, codes::INVALID_MODULE_PATH);
-        assert!(!err.notes.is_empty(), "{bad} should say what to do about it");
+        assert!(
+            !err.notes.is_empty(),
+            "{bad} should say what to do about it"
+        );
     }
 }
 
@@ -1092,8 +1273,10 @@ fn a_qualified_name_never_collides_with_one_a_module_could_declare() {
 
 #[test]
 fn items_are_private_until_marked_pub() {
-    let m = ok("fn a() = 1\npub fn b() = 2\ntype T = Int\npub type U = Int\n\
-                effect e { read r() -> Int }\npub effect f { read r() -> Int }");
+    let m = ok(
+        "fn a() = 1\npub fn b() = 2\ntype T = Int\npub type U = Int\n\
+                effect e { read r() -> Int }\npub effect f { read r() -> Int }",
+    );
     let vis: Vec<bool> = m.items.iter().map(|i| i.visibility().is_public()).collect();
     assert_eq!(vis, [false, true, false, true, false, true]);
 }
@@ -1101,7 +1284,9 @@ fn items_are_private_until_marked_pub() {
 #[test]
 fn pub_survives_on_the_definition_itself() {
     let m = ok("pub fn b() = 2");
-    let Item::Fn(f) = &m.items[0] else { panic!("expected a fn") };
+    let Item::Fn(f) = &m.items[0] else {
+        panic!("expected a fn")
+    };
     assert_eq!(f.vis, Visibility::Public);
     assert_eq!(m.name, ModuleName::anonymous());
     assert!(m.imports.is_empty());
@@ -1148,7 +1333,10 @@ fn a_qualified_name_prints_the_way_it_is_written() {
 #[test]
 fn imports_parse_in_all_three_forms() {
     assert_eq!(dump("import store.orders"), "(import store.orders)");
-    assert_eq!(dump("import store.orders as ord"), "(import store.orders as ord)");
+    assert_eq!(
+        dump("import store.orders as ord"),
+        "(import store.orders as ord)"
+    );
     assert_eq!(
         dump("import store.orders (place, cancel)"),
         "(import store.orders (place, cancel))"
@@ -1167,7 +1355,10 @@ fn an_import_binds_its_last_segment_unless_aliased_or_selective() {
     }
     assert_eq!(m.imports[0].binder().unwrap().as_str(), "orders");
     assert_eq!(m.imports[1].binder().unwrap().as_str(), "ord");
-    assert!(m.imports[2].binder().is_none(), "a selective import binds no module binder");
+    assert!(
+        m.imports[2].binder().is_none(),
+        "a selective import binds no module binder"
+    );
 }
 
 #[test]
@@ -1185,8 +1376,14 @@ fn every_part_of_an_import_carries_a_real_span() {
     let m = ok(src);
     let i = &m.imports[0];
     assert_eq!(snippet(src, i.span), src);
-    assert_eq!(snippet(src, i.binder_span()), src, "a selective import points at the whole decl");
-    let ImportKind::Names(names) = &i.kind else { panic!("expected a selective import") };
+    assert_eq!(
+        snippet(src, i.binder_span()),
+        src,
+        "a selective import points at the whole decl"
+    );
+    let ImportKind::Names(names) = &i.kind else {
+        panic!("expected a selective import")
+    };
     assert_eq!(snippet(src, names[0].span), "place");
     assert_eq!(snippet(src, names[1].span), "cancel");
 
@@ -1200,7 +1397,10 @@ fn imports_come_before_items_in_the_tree_they_produce() {
     let m = ok("import a\nimport b as c\npub fn f() = 1");
     assert_eq!(m.imports.len(), 2);
     assert_eq!(m.items.len(), 1);
-    assert_eq!(dump_module(&m), "(import a)\n(import b as c)\n(pub fn f () 1)");
+    assert_eq!(
+        dump_module(&m),
+        "(import a)\n(import b as c)\n(pub fn f () 1)"
+    );
 }
 
 #[test]
@@ -1246,7 +1446,9 @@ fn malformed_imports_are_diagnostics_with_a_code_and_a_real_span() {
         assert!(!ds.is_empty(), "expected a diagnostic for {src:?}");
         for d in &ds {
             assert!(!d.code.is_empty(), "empty code for {src:?}");
-            let span = d.primary_span().unwrap_or_else(|| panic!("no span for {src:?}"));
+            let span = d
+                .primary_span()
+                .unwrap_or_else(|| panic!("no span for {src:?}"));
             assert!(!span.is_dummy(), "dummy span for {src:?}");
             assert!(span.end as usize <= src.len(), "span past end for {src:?}");
             assert!(span.start <= span.end, "inverted span for {src:?}");
@@ -1268,8 +1470,16 @@ fn an_import_may_rename_or_select_but_not_both() {
 #[test]
 fn an_import_that_selects_nothing_says_what_to_write_instead() {
     let ds = errs("import a ()");
-    assert!(ds[0].message.contains("selects no names"), "{}", ds[0].message);
-    assert!(ds[0].notes.iter().any(|n| n.contains("bind the module")), "{:#?}", ds[0]);
+    assert!(
+        ds[0].message.contains("selects no names"),
+        "{}",
+        ds[0].message
+    );
+    assert!(
+        ds[0].notes.iter().any(|n| n.contains("bind the module")),
+        "{:#?}",
+        ds[0]
+    );
 }
 
 #[test]
@@ -1288,12 +1498,23 @@ fn an_import_after_a_definition_is_reported_and_still_recorded() {
     let src = "import a\nfn f() = 1\nimport b\nfn g() = 2";
     let (m, ds) = parse_recovering(SRC, ModuleName::anonymous(), src);
     assert_eq!(ds.len(), 1, "{ds:#?}");
-    assert!(ds[0].message.contains("before every definition"), "{}", ds[0].message);
+    assert!(
+        ds[0].message.contains("before every definition"),
+        "{}",
+        ds[0].message
+    );
     assert_eq!(snippet(src, ds[0].primary_span().unwrap()), "import");
 
-    let first = ds[0].labels.iter().find(|l| !l.primary).expect("a secondary label");
+    let first = ds[0]
+        .labels
+        .iter()
+        .find(|l| !l.primary)
+        .expect("a secondary label");
     assert_eq!(snippet(src, first.span), "fn f() = 1");
-    assert!(!ds[0].notes.is_empty(), "it should say where to move the import");
+    assert!(
+        !ds[0].notes.is_empty(),
+        "it should say where to move the import"
+    );
 
     assert_eq!(m.imports.len(), 2, "the misplaced import is still recorded");
     assert_eq!(m.items.len(), 2);
@@ -1311,9 +1532,15 @@ fn each_out_of_order_import_is_reported_separately() {
 
 #[test]
 fn a_broken_item_before_an_import_does_not_swallow_it() {
-    let (m, ds) =
-        parse_recovering(SRC, ModuleName::anonymous(), "fn a() = ;\nimport b\nfn c() = 1");
-    assert!(ds.len() >= 2, "expected both the bad body and the misplaced import: {ds:#?}");
+    let (m, ds) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn a() = ;\nimport b\nfn c() = 1",
+    );
+    assert!(
+        ds.len() >= 2,
+        "expected both the bad body and the misplaced import: {ds:#?}"
+    );
     assert_eq!(m.imports.len(), 1);
     assert_eq!(m.items.len(), 1);
 }
@@ -1325,7 +1552,10 @@ fn import_errors_and_item_errors_are_reported_in_one_run() {
         ModuleName::anonymous(),
         "import a as\nimport b ()\nimport c\nfn f() = ;\nimport d\npub fn g() = 1",
     );
-    assert!(ds.len() >= 4, "expected four independent errors, got {ds:#?}");
+    assert!(
+        ds.len() >= 4,
+        "expected four independent errors, got {ds:#?}"
+    );
     assert_eq!(dump_module(&m), "(import c)\n(import d)\n(pub fn g () 1)");
 }
 
@@ -1352,13 +1582,19 @@ fn a_duplicate_import_binding_parses_so_resolution_can_reject_it() {
 #[test]
 fn qualified_references_parse_in_every_position() {
     assert_eq!(expr("orders::place(x)"), "(call orders::place x)");
-    assert_eq!(expr("store::db.get[users](k)"), "(perform store::db.get[users] k)");
+    assert_eq!(
+        expr("store::db.get[users](k)"),
+        "(perform store::db.get[users] k)"
+    );
     assert_eq!(expr("store::clock.now()"), "(perform store::clock.now)");
     assert_eq!(
         expr("match v { orders::Placed(x) -> x, orders::Cancelled -> 0 }"),
         "(match v (arm (ctor orders::Placed x) x) (arm (ctor orders::Cancelled) 0))"
     );
-    assert_eq!(dump("fn f(x: orders::Order) = x"), "(fn f ((x orders::Order)) x)");
+    assert_eq!(
+        dump("fn f(x: orders::Order) = x"),
+        "(fn f ((x orders::Order)) x)"
+    );
     assert_eq!(
         dump("fn f(x: orders::Slot<Int>) -> orders::Order = x"),
         "(fn f ((x orders::Slot<Int>)) -> orders::Order x)"
@@ -1386,8 +1622,12 @@ fn a_qualified_reference_spans_the_binder_through_the_name() {
     let src = "fn f() = orders::place(x)";
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    let ExprKind::App { func, .. } = &f.body.kind else { panic!("expected a call") };
-    let ExprKind::Var(q) = &func.kind else { panic!("expected a qualified name") };
+    let ExprKind::App { func, .. } = &f.body.kind else {
+        panic!("expected a call")
+    };
+    let ExprKind::Var(q) = &func.kind else {
+        panic!("expected a qualified name")
+    };
     assert_eq!(snippet(src, q.span), "orders::place");
     assert_eq!(snippet(src, q.module.as_ref().unwrap().span), "orders");
     assert_eq!(snippet(src, q.name.span), "place");
@@ -1395,15 +1635,24 @@ fn a_qualified_reference_spans_the_binder_through_the_name() {
     let src = "fn f() = store::db.get[users](k)";
     let m = ok(src);
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    let ExprKind::Perform { effect, .. } = &f.body.kind else { panic!("expected a perform") };
+    let ExprKind::Perform { effect, .. } = &f.body.kind else {
+        panic!("expected a perform")
+    };
     assert_eq!(snippet(src, effect.span), "store::db");
 }
 
 #[test]
 fn a_module_path_in_a_reference_is_a_single_binder() {
     let ds = errs("fn f() = a::b::c");
-    assert!(ds.iter().any(|d| d.message.contains("at most one `::`")), "{ds:#?}");
-    assert!(errs("fn f(x: a::b::C) = x").iter().any(|d| d.message.contains("at most one `::`")));
+    assert!(
+        ds.iter().any(|d| d.message.contains("at most one `::`")),
+        "{ds:#?}"
+    );
+    assert!(
+        errs("fn f(x: a::b::C) = x")
+            .iter()
+            .any(|d| d.message.contains("at most one `::`"))
+    );
     assert!(
         errs("fn f() = match v { a::b::C -> 1 }")
             .iter()
@@ -1413,11 +1662,18 @@ fn a_module_path_in_a_reference_is_a_single_binder() {
 
 #[test]
 fn a_dangling_double_colon_is_a_diagnostic_with_a_real_span() {
-    for src in ["fn f() = a::", "fn f() = ::a", "fn f(x: a::) = x", "fn f() / {a::.read} = 1"] {
+    for src in [
+        "fn f() = a::",
+        "fn f() = ::a",
+        "fn f(x: a::) = x",
+        "fn f() / {a::.read} = 1",
+    ] {
         let ds = errs(src);
         assert!(!ds.is_empty(), "expected a diagnostic for {src:?}");
         for d in &ds {
-            let span = d.primary_span().unwrap_or_else(|| panic!("no span for {src:?}"));
+            let span = d
+                .primary_span()
+                .unwrap_or_else(|| panic!("no span for {src:?}"));
             assert!(!span.is_dummy(), "dummy span for {src:?}");
             assert!(span.end as usize <= src.len(), "span past end for {src:?}");
         }

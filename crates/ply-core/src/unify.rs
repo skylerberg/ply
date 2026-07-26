@@ -102,16 +102,24 @@ impl Subst {
     pub fn resolve_ty(&self, t: &Type) -> Type {
         match self.shallow_ref(t) {
             Type::Var(v) => Type::Var(*v),
-            Type::Con(name, args) => {
-                Type::Con(name.clone(), args.iter().map(|a| self.resolve_ty(a)).collect())
-            }
-            Type::Fn { params, ret, effects } => Type::Fn {
+            Type::Con(name, args) => Type::Con(
+                name.clone(),
+                args.iter().map(|a| self.resolve_ty(a)).collect(),
+            ),
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => Type::Fn {
                 params: params.iter().map(|p| self.resolve_ty(p)).collect(),
                 ret: Box::new(self.resolve_ty(ret)),
                 effects: self.resolve_row(effects),
             },
             Type::Record(fields) => Type::Record(
-                fields.iter().map(|(k, v)| (k.clone(), self.resolve_ty(v))).collect(),
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.resolve_ty(v)))
+                    .collect(),
             ),
         }
     }
@@ -190,7 +198,11 @@ impl Subst {
                     self.free_vars(a, tys, rows);
                 }
             }
-            Type::Fn { params, ret, effects } => {
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
                 for p in params {
                     self.free_vars(p, tys, rows);
                 }
@@ -212,9 +224,7 @@ fn occurs_ty(v: TyVar, t: &Type) -> bool {
     match t {
         Type::Var(w) => *w == v,
         Type::Con(_, args) => args.iter().any(|a| occurs_ty(v, a)),
-        Type::Fn { params, ret, .. } => {
-            params.iter().any(|p| occurs_ty(v, p)) || occurs_ty(v, ret)
-        }
+        Type::Fn { params, ret, .. } => params.iter().any(|p| occurs_ty(v, p)) || occurs_ty(v, ret),
         Type::Record(fields) => fields.values().any(|f| occurs_ty(v, f)),
     }
 }
@@ -222,7 +232,12 @@ fn occurs_ty(v: TyVar, t: &Type) -> bool {
 pub fn unify(s: &mut Subst, f: &mut Fresh, expected: &Type, found: &Type) -> UnifyResult {
     let a = s.shallow_ty(expected);
     let b = s.shallow_ty(found);
-    let mismatch = || Box::new(UnifyError::Mismatch { expected: a.clone(), found: b.clone() });
+    let mismatch = || {
+        Box::new(UnifyError::Mismatch {
+            expected: a.clone(),
+            found: b.clone(),
+        })
+    };
     match (&a, &b) {
         (Type::Var(x), Type::Var(y)) if x == y => Ok(()),
         (Type::Var(x), _) if !s.is_rigid_ty(*x) => s.bind_ty(*x, &b),
@@ -240,11 +255,22 @@ pub fn unify(s: &mut Subst, f: &mut Fresh, expected: &Type, found: &Type) -> Uni
         }
 
         (
-            Type::Fn { params: p1, ret: r1, effects: e1 },
-            Type::Fn { params: p2, ret: r2, effects: e2 },
+            Type::Fn {
+                params: p1,
+                ret: r1,
+                effects: e1,
+            },
+            Type::Fn {
+                params: p2,
+                ret: r2,
+                effects: e2,
+            },
         ) => {
             if p1.len() != p2.len() {
-                return Err(Box::new(UnifyError::Arity { expected: p1.len(), found: p2.len() }));
+                return Err(Box::new(UnifyError::Arity {
+                    expected: p1.len(),
+                    found: p2.len(),
+                }));
             }
             for (x, y) in p1.iter().zip(p2) {
                 unify(s, f, x, y)?;
@@ -272,7 +298,12 @@ pub fn unify_row(s: &mut Subst, f: &mut Fresh, expected: &Row, found: &Row) -> U
     let b = s.resolve_row(found);
     let only_a: BTreeSet<EffectAtom> = a.atoms.difference(&b.atoms).cloned().collect();
     let only_b: BTreeSet<EffectAtom> = b.atoms.difference(&a.atoms).cloned().collect();
-    let bad = || Box::new(UnifyError::RowMismatch { expected: a.clone(), found: b.clone() });
+    let bad = || {
+        Box::new(UnifyError::RowMismatch {
+            expected: a.clone(),
+            found: b.clone(),
+        })
+    };
 
     match (a.tail, b.tail) {
         (None, None) => {
@@ -304,7 +335,13 @@ pub fn unify_row(s: &mut Subst, f: &mut Fresh, expected: &Row, found: &Row) -> U
             let v3 = f.row_var();
             let mut atoms = only_a;
             atoms.extend(only_b);
-            s.bind_row(v1, Row { atoms, tail: Some(v3) })
+            s.bind_row(
+                v1,
+                Row {
+                    atoms,
+                    tail: Some(v3),
+                },
+            )
         }
         (Some(v1), Some(v2)) => match (s.is_rigid_row(v1), s.is_rigid_row(v2)) {
             (true, true) => Err(bad()),
@@ -312,18 +349,42 @@ pub fn unify_row(s: &mut Subst, f: &mut Fresh, expected: &Row, found: &Row) -> U
                 if !only_b.is_empty() {
                     return Err(bad());
                 }
-                s.bind_row(v2, Row { atoms: only_a, tail: Some(v1) })
+                s.bind_row(
+                    v2,
+                    Row {
+                        atoms: only_a,
+                        tail: Some(v1),
+                    },
+                )
             }
             (false, true) => {
                 if !only_a.is_empty() {
                     return Err(bad());
                 }
-                s.bind_row(v1, Row { atoms: only_b, tail: Some(v2) })
+                s.bind_row(
+                    v1,
+                    Row {
+                        atoms: only_b,
+                        tail: Some(v2),
+                    },
+                )
             }
             (false, false) => {
                 let v3 = f.row_var();
-                s.bind_row(v1, Row { atoms: only_b, tail: Some(v3) })?;
-                s.bind_row(v2, Row { atoms: only_a, tail: Some(v3) })
+                s.bind_row(
+                    v1,
+                    Row {
+                        atoms: only_b,
+                        tail: Some(v3),
+                    },
+                )?;
+                s.bind_row(
+                    v2,
+                    Row {
+                        atoms: only_a,
+                        tail: Some(v3),
+                    },
+                )
             }
         },
     }
@@ -368,8 +429,14 @@ mod tests {
         let (mut s, mut f) = ctx();
         let r = atom("db", "users", Mode::Read);
         let w = atom("db", "orders", Mode::Write);
-        let left = Row { atoms: [r.clone()].into(), tail: Some(f.row_var()) };
-        let right = Row { atoms: [w.clone()].into(), tail: Some(f.row_var()) };
+        let left = Row {
+            atoms: [r.clone()].into(),
+            tail: Some(f.row_var()),
+        };
+        let right = Row {
+            atoms: [w.clone()].into(),
+            tail: Some(f.row_var()),
+        };
         unify_row(&mut s, &mut f, &left, &right).unwrap();
         let lr = s.resolve_row(&left);
         let rr = s.resolve_row(&right);
@@ -385,8 +452,14 @@ mod tests {
         let v = f.row_var();
         let a = atom("db", "users", Mode::Read);
         let b = atom("db", "users", Mode::Write);
-        let left = Row { atoms: [a.clone()].into(), tail: Some(v) };
-        let right = Row { atoms: [b.clone()].into(), tail: Some(v) };
+        let left = Row {
+            atoms: [a.clone()].into(),
+            tail: Some(v),
+        };
+        let right = Row {
+            atoms: [b.clone()].into(),
+            tail: Some(v),
+        };
         unify_row(&mut s, &mut f, &left, &right).unwrap();
         assert_eq!(s.resolve_row(&left), s.resolve_row(&right));
         assert_eq!(s.resolve_row(&left).atoms, [a, b].into());
@@ -399,7 +472,10 @@ mod tests {
         let b = atom("db", "users", Mode::Write);
         let v = f.row_var();
         let closed = Row::closed([a.clone(), b.clone()]);
-        let open = Row { atoms: [a].into(), tail: Some(v) };
+        let open = Row {
+            atoms: [a].into(),
+            tail: Some(v),
+        };
         unify_row(&mut s, &mut f, &closed, &open).unwrap();
         assert_eq!(s.resolve_row(&Row::open(v)), Row::closed([b]));
     }
@@ -409,7 +485,10 @@ mod tests {
         let (mut s, mut f) = ctx();
         let a = atom("db", "users", Mode::Read);
         let closed = Row::empty();
-        let open = Row { atoms: [a].into(), tail: Some(f.row_var()) };
+        let open = Row {
+            atoms: [a].into(),
+            tail: Some(f.row_var()),
+        };
         assert!(unify_row(&mut s, &mut f, &closed, &open).is_err());
     }
 
@@ -447,7 +526,11 @@ mod tests {
         let (mut s, mut f) = ctx();
         let a = f.ty();
         let row = f.row();
-        let lhs = Type::Fn { params: vec![a.clone()], ret: Box::new(a), effects: row.clone() };
+        let lhs = Type::Fn {
+            params: vec![a.clone()],
+            ret: Box::new(a),
+            effects: row.clone(),
+        };
         let atoms = Row::closed([atom("db", "users", Mode::Read)]);
         let rhs = Type::Fn {
             params: vec![Type::int()],
@@ -466,8 +549,18 @@ mod tests {
             ret: Box::new(Type::int()),
             effects: Row::empty(),
         };
-        let rhs = Type::Fn { params: vec![], ret: Box::new(Type::int()), effects: Row::empty() };
+        let rhs = Type::Fn {
+            params: vec![],
+            ret: Box::new(Type::int()),
+            effects: Row::empty(),
+        };
         let err = unify(&mut s, &mut f, &lhs, &rhs).unwrap_err();
-        assert!(matches!(*err, UnifyError::Arity { expected: 1, found: 0 }));
+        assert!(matches!(
+            *err,
+            UnifyError::Arity {
+                expected: 1,
+                found: 0
+            }
+        ));
     }
 }

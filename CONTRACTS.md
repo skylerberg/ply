@@ -442,6 +442,15 @@ pub fn hash_module(module: &Module, check: &CheckOutput)
     -> Result<HashOutput, Vec<Diagnostic>>;
 ```
 
+`hash_module` and `hash_ast` hash **one module with no program around it**, so
+they have no namespace to resolve an import against. A module that declares one
+is therefore refused with `UNKNOWN_MODULE` rather than hashed. Accepting it would
+write the binder the file happened to spell where the referent's hash belongs,
+which aliases two modules imported under one name, aliases two selective imports
+of one name, and makes `as`-renaming an import move a hash — the last
+contradicting required test 4 above. Anything that imports goes through
+`hash_program`.
+
 Normalization, per DESIGN.md §3 — this is the crate's whole point, get it exact:
 
 - Local binders become de Bruijn **levels**; a local's *name* never enters the hash.
@@ -493,11 +502,14 @@ impl Store {
 ```
 
 The cache key is `(RUNTIME_VERSION, DefHash)`; bumping `RUNTIME_VERSION` (a
-`pub const &str` in this crate) invalidates everything. JSON on disk is fine —
-this is not the bottleneck and being able to read the cache by hand is worth
-more than speed. Writes must be atomic (temp file + rename) so an interrupted
-run cannot corrupt the cache. A corrupt or unreadable cache must degrade to an
-empty cache with a warning, never a crash.
+`pub const &str` in this crate) invalidates everything. The **result** cache is
+JSON on disk and stays that way: it is small, and `cat .ply-cache/results.json`
+answering "why didn't this test re-run" is worth more than its parse cost. It is
+small only because the pass records live beside it rather than in it — see Cache
+storage below, which is the authority. The
+**front-end** cache is not JSON — see Cache storage below. Writes must be atomic
+(temp file + rename) so an interrupted run cannot corrupt the cache. A corrupt or
+unreadable cache must degrade to an empty cache with a warning, never a crash.
 
 ---
 
@@ -558,20 +570,25 @@ pub struct CachedOp {
 }
 
 impl Store {
-    pub fn source(&self, path: &Path) -> Option<&SourceFingerprint>;
+    pub fn fingerprint(&self, path: &Path) -> Option<Arc<SourceFingerprint>>;
     pub fn put_source(&mut self, path: &Path, f: SourceFingerprint) -> bool;
     pub fn forget_source(&mut self, path: &Path) -> bool;
     pub fn source_paths(&self) -> Vec<PathBuf>;
-    pub fn cached_def(&self, hash: DefHash) -> Option<&CachedDef>;
+    pub fn def(&self, hash: DefHash) -> Option<Arc<CachedDef>>;
+    pub fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDef>>;
     pub fn put_def(&mut self, hash: DefHash, def: CachedDef);
-    pub fn cached_decl(&self, hash: DefHash) -> Option<&CachedDecl>;
+    pub fn decl(&self, hash: DefHash) -> Option<Arc<CachedDecl>>;
+    pub fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDecl>>;
     pub fn put_decl(&mut self, hash: DefHash, decl: CachedDecl);
     pub fn prune(&mut self, keep: &[PathBuf]) -> Pruned;
     pub fn sources_len(&self) -> usize;
     pub fn defs_len(&self) -> usize;
     pub fn decls_len(&self) -> usize;
     pub fn frontend_is_empty(&self) -> bool;
+    /// The front-end cache's index; `frontend_data_path` is the data file
+    /// beside it. Both live under `Store::dir`.
     pub fn frontend_path(&self) -> &Path;
+    pub fn frontend_data_path(&self) -> &Path;
     pub fn root(&self) -> &Path;
 }
 
@@ -616,6 +633,19 @@ is exact.
   removing a file shifts every later one.
 - Never write a fingerprint for a file that failed to parse or typecheck.
 - Nothing consults mtime. Content hashes only.
+- `CheckOutput`'s `defs`, `effects`, `ctors` and `modules` are ordered by the
+  run's files and, within a file, by source position — never by the order
+  inference happened to visit them in. Inference walks modules dependency-first
+  and does not walk a skipped one at all, so a check-ordered map lists a project
+  differently depending on what the cache held, and two `ply check --types` runs
+  over one unchanged tree stop diffing against each other.
+- `ImportEdge::exports` is a gate 1 refusal condition, not decoration: a digest
+  that no longer matches refuses the skip. It is the only condition that sees a
+  name a file imports **without using**, which is in no `deps` entry, so
+  deleting or renaming such a name downstream would otherwise leave a dangling
+  import unreported. The digest is over every top-level `(name, DefHash)` pair,
+  including private ones — a `DefEntry` carries no visibility, so a skipped
+  module's side of the comparison cannot be filtered and neither may the other.
 - `prune` may only be called after a run that discovered every `.ply` file under
   the store root.
 - `Store::clear` discards both caches. `FRONTEND_VERSION` and `RUNTIME_VERSION`
@@ -651,6 +681,188 @@ a skip was refused (`content changed`, `dependency <name> changed`,
 loaded from cache or rechecked. `ply test --explain` prints the same block for
 its front-end phase, before the existing selection and scheduling output.
 `ply cache stats` reports both caches' sizes.
+
+---
+
+## Cache storage
+
+`docs/adr/0003-cache-storage.md` has the reasoning and the measurements; this
+section is the contract. **Where it disagrees with the two sections above, this
+section wins** — it was written after them.
+
+The result cache stays JSON. The front-end cache becomes a binary
+content-addressed store: `.ply-cache/frontend.idx`, a small index rewritten
+whole and atomically, over `.ply-cache/frontend.dat`, an append-only data file
+that is mmap'd and whose entries are decoded on demand. `Store::open` must be
+under **5 ms at 10,000 definitions** and must decode no entry.
+
+That budget covers the *whole* of `Store::open`, both caches. The result cache is
+therefore split across two JSON files, because its two halves have opposite
+read profiles:
+
+| file | holds | read |
+| --- | --- | --- |
+| `results.json` | `DefHash -> Outcome`, and the definitions a run has seen | whole, at `Store::open` |
+| `passes.json` | `PassRecord` per test key | only when something asks for a baseline — that is, only when a test failed |
+
+A pass record is a whole closure, so at 10,000 definitions the records are seven
+of the result cache's nine megabytes while a green run never looks at one.
+`Store::open` must not read `passes.json`, and no accessor other than
+`pass_record`, `pass_records_len` and `prune`'s baseline roots may force it.
+`prune` must ask `Frontend::prune_would_change` before gathering those roots, or
+a run with nothing to prune pays for the file anyway.
+
+Both files carry `format` and `runtime_version`. `results.json` format 1 held the
+pass records inline; it is still read, its records are relocated by the first
+flush, and it is rewritten as format 2. **Nothing is discarded and no test
+re-runs** — which is why this is a format bump and not a `RUNTIME_VERSION` bump.
+`passes.json` is written before `results.json` in a flush, so the inline copy is
+never dropped before the records exist somewhere else.
+
+### Constants and types
+
+The files are `frontend.idx` and `frontend.dat` under `Store::dir`, reachable as
+`frontend_path` and `frontend_data_path`.
+
+```rust
+/// The on-disk generation of the front-end cache, in both file headers.
+pub const FRONTEND_FORMAT: u32;
+
+/// Covers every stored shape: `Type`, `Scheme`, `Footprint`, the fingerprint's
+/// fields, the declaration bodies, and `BODY_ENCODING`. Written into both file
+/// headers; a mismatch discards the front-end cache.
+pub fn schema_fingerprint() -> ContentHash;
+
+/// Version of the definition-body encoding, which lives in `ply-hash`.
+pub const BODY_ENCODING: u32;
+
+/// One definition's canonical body bytes, keyed by its `DefHash`.
+pub struct DefBody { .. }
+impl DefBody {
+    pub fn new(encoding: u32, bytes: Vec<u8>) -> DefBody;
+    pub fn encoding(&self) -> u32;
+    pub fn as_bytes(&self) -> &[u8];
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
+impl Store {
+    pub fn body(&self, hash: DefHash) -> Option<Arc<DefBody>>;
+    pub fn put_body(&mut self, hash: DefHash, body: DefBody);
+    pub fn has_body(&self, hash: DefHash) -> bool;
+    pub fn bodies_len(&self) -> usize;
+
+    pub fn stats(&self) -> CacheStats;
+    /// Same precondition as `prune`: a run that discovered every `.ply` file.
+    pub fn compact(&mut self, keep: &[PathBuf]) -> anyhow::Result<Compaction>;
+    /// A program-wide name, a simple name, or a hash prefix of >= 4 hex chars.
+    pub fn lookup(&self, query: &str) -> Vec<Found>;
+}
+
+pub struct CacheStats {
+    pub results: usize,
+    pub definitions_seen: usize,
+    pub sources: usize,
+    pub defs: usize,
+    pub decls: usize,
+    pub bodies: usize,
+    /// `results.json` and `passes.json` together.
+    pub results_bytes: u64,
+    pub index_bytes: u64,
+    pub data_bytes: u64,
+    /// What `compact` would reclaim. `None` while the front end is one JSON
+    /// document, which has no unreachable region to measure.
+    pub garbage_bytes: Option<u64>,
+}
+
+pub struct Compaction {
+    pub dropped: Pruned,          // `Pruned` gained a `bodies` count
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+pub enum Found { Def(FoundDef), Test(FoundTest) }
+pub struct FoundDef {
+    pub hash: DefHash, pub name: Symbol, pub kind: DefKind,
+    pub path: PathBuf, pub span: FileSpan,
+}
+pub struct FoundTest {
+    pub hash: DefHash, pub name: String, pub nondet: bool,
+    pub footprint: Footprint, pub path: PathBuf, pub span: FileSpan,
+}
+```
+
+### Definition bodies
+
+`bodies: DefHash -> DefBody` is the third element DESIGN.md §3 promises and only
+Type and Footprint ever delivered. M5's bisection has to *evaluate* a historical
+definition set, which its types alone cannot do.
+
+The encoding lives in `ply-hash`, beside the normalizer whose byte stream it is.
+Required properties, each of which is testable:
+
+1. The bytes are a function of the `DefHash`: names, spans and module membership
+   never enter them, locals are de Bruijn levels, and a free reference is the
+   referent's hash.
+2. They are self-checking against their own key. For a definition that is its own
+   component `blake3(bytes)` *is* the key; for a member of a recursive component
+   the bytes are the component's and the key is `blake3(bytes ‖ index_le_u32)`.
+   `put_body` refuses a body that does not verify, and warns.
+3. Decoding yields an *evaluable* definition, not the user's source: names are
+   synthesized, spans come back `Span::DUMMY`, and the reconstituted program is
+   resolved from its own synthesized namespace.
+4. A decoded definition is equal to the original only up to normalization's
+   semantics-preserving rewrites — reordered commutable `let`s, sorted effect
+   operations, sorted record *type* fields, a dropped `{ e }` wrapper.
+
+### Versioning
+
+Three gates, because a non-self-describing encoding that misparses produces a
+wrong *footprint*, and footprints decide which tests may run concurrently:
+
+- **Compile time.** `ply_store::schema` names every variant of every stored enum
+  through exhaustive `match`es with no wildcard arm, so adding a variant does not
+  compile until it is named, and a coverage test then fails until an exemplar
+  value mentions it.
+- **Test time.** A pin test compares `schema_fingerprint()` against a constant,
+  prints the new digest and says to bump `FRONTEND_VERSION`.
+- **Run time.** Both file headers carry a magic number, `FRONTEND_FORMAT`,
+  `schema_fingerprint()`, `blake3(FRONTEND_VERSION)` and a shared nonce pairing
+  the two files. Any mismatch degrades to an empty front-end cache with a
+  warning. Below that, every entry carries a length prefix and a checksum, so a
+  torn append is detected per entry. **A mismatch must never misparse.**
+
+### Writing, compaction, migration
+
+- Readers take no lock: an append never moves a byte another process has mapped.
+- Writers must hold the cache lock. A writer that cannot take it within the
+  bounded wait **writes nothing and warns** — interleaved frames are corruption,
+  where a lost update is only a recheck. This replaces today's best-effort lock.
+- A flush re-reads the index under the lock, truncates the data file to the
+  `data_len` that index records (recovering a torn tail), appends, `fsync`s the
+  data file, then writes the index atomically. The data must be durable before
+  the index that names it.
+- An entry is unreachable when nothing in the pruned index names it: a
+  fingerprint for a path that no longer exists, an interface or body whose
+  `DefHash` no surviving fingerprint declares, or any superseded record.
+  `compact` copies the reachable records into a fresh data file and index under
+  the lock. It never runs automatically; `ply cache stats` reports the garbage
+  ratio and suggests it past 50%.
+- **Migration.** There is no reader for the JSON front-end cache. A `Store::open`
+  that finds `frontend.json` and no `frontend.idx` warns (`W0603`) that the
+  format changed, that this run recomputes types and hashes for the whole
+  project, and that the *result* cache is untouched so no test re-runs; it starts
+  from an empty front-end cache and deletes `frontend.json` at the next
+  successful flush.
+
+### Transitional
+
+`cached_def`, `cached_def_of`, `cached_decl`, `cached_decl_of` and `source`
+return borrowed entries, which a store that materializes an entry from a mapped
+byte range cannot do. `def`, `def_of`, `decl`, `decl_of` and `fingerprint` are
+their replacements and are the contract. The borrowed forms remain until the
+mmap lands and are removed by the same change, which has to touch their call
+sites anyway. Do not add callers.
 
 ---
 
@@ -741,8 +953,18 @@ ply check [PATH]            typecheck; print inferred signatures with `--types`
 ply test  [PATH]            the main event
 ply run   [PATH]            evaluate `main`
 ply hash  [PATH]            definition hashes, `--deps` to show the graph
-ply cache clear|stats
+ply cache clear|stats|compact|inspect <def>
 ```
+
+`ply cache stats` reports both caches' entry counts and bytes, and the front-end
+data file's garbage ratio, suggesting `compact` past 50% — which is also what a
+dry run would have printed, so there is no second code path for one.
+`ply cache compact` must discover every `.ply` file under the root before it
+drops anything. `ply cache inspect <def>` takes a program-wide name, a simple
+name, or a hash prefix of at least four hex characters, and prints per match the
+hash, kind, declaring file, resolved type, footprint, resolution witness, whether
+a body is stored, and — for a test — its cached outcome. Several matches print
+several entries; no match is `E0101`. All four take `--json`.
 
 `ply test` flags: `--json`, `--explain` (why each test was selected or skipped,
 and how groups were formed), `--no-cache`, `--filter <substring>`, `--jobs <n>`.
@@ -770,3 +992,295 @@ $ ply test
        at src/ledger.ply:88:5
      suspects: apply_debit, Ledger.balance
 ```
+
+---
+
+## Machine-shaped failure
+
+`docs/adr/0004-machine-shaped-failure.md` has the reasoning; this section is the
+contract. **Where it disagrees with the `ply-test` section above, this section
+wins** — it was landed after it.
+
+### The rule everything else follows from
+
+A failure artifact answers, in this order: which change caused this, what
+actually ran, what else could have, and what was asserted. The terminal output
+follows the same order, because the culprit is the answer and the diff is the
+evidence. A field an agent cannot act on does not go in the artifact.
+
+### `Failure` — landed in `ply-test`
+
+```rust
+pub struct Failure {
+    pub name: String,
+    pub key: Symbol,
+    pub diagnostic: Diagnostic,
+    /// Unchanged: the raw closure ∩ changed intersection, by name.
+    pub suspects: Vec<Symbol>,
+    /// `None` until `ply-eval` carries the payload instead of rendering it into
+    /// the diagnostic's notes.
+    pub assertion: Option<Assertion>,
+    pub attribution: Attribution,
+}
+
+pub struct Attribution {
+    /// The same *set* as `Failure::suspects`, ranked and annotated. The order
+    /// differs deliberately.
+    pub suspects: Vec<Suspect>,
+    pub bisection: Bisection,
+    pub slice: Option<CausalSlice>,
+}
+impl Attribution {
+    pub fn from_suspects(names: &[Symbol], hashes: &HashOutput) -> Attribution;
+    pub fn resolve(&mut self, bisection: Bisection, slice: Option<CausalSlice>);
+    pub fn culprits(&self) -> Vec<Symbol>;
+}
+
+pub struct Suspect {
+    pub name: Symbol,
+    pub hash: Option<DefHash>,
+    pub before: Option<DefHash>,        // at the last pass; None with no baseline
+    pub change: Option<ChangeKind>,     // None when the two were never compared
+    pub ran: Option<bool>,              // None when the failure was not traced
+    pub depth: Option<usize>,           // 0 is the failing frame
+    pub culprit: bool,
+}
+```
+
+Every judgement is tri-state where the evidence may be missing. A consumer that
+cannot tell "did not run" from "was not traced" acts on the wrong one.
+
+**Ranking**, total and deterministic: bisected culprit; on the failing stack,
+innermost first; ran but had returned; untraced; did not run — ties broken toward
+an edit over an inherited hash, then by name. Two runs over one failure must
+produce byte-identical artifacts.
+
+### Bisection — landed in `ply-test::bisect`
+
+```rust
+pub enum ChangeKind { Edited, Derived, Added, Removed }
+pub struct Change {
+    pub name: Symbol,
+    pub before: Option<DefHash>, pub after: Option<DefHash>,
+    pub kind: ChangeKind,
+    /// Its published interface — canonicalized scheme and footprint — is the
+    /// same on both sides.
+    pub independent: bool,
+}
+impl Change {
+    pub fn edited(name: Symbol, before: DefHash, after: DefHash, independent: bool) -> Change;
+    pub fn derived(name: Symbol, before: DefHash, after: DefHash) -> Change;
+    pub fn added(name: Symbol, after: DefHash) -> Change;    // never independent
+    pub fn removed(name: Symbol, before: DefHash) -> Change; // never independent
+}
+
+pub struct DepEdges { .. }               // unioned over BOTH configurations
+impl DepEdges {
+    pub fn new() -> DepEdges;
+    pub fn add(&mut self, from: Symbol, to: Symbol);
+    pub fn extend_from_hashes(&mut self, hashes: &HashOutput);
+    pub fn referrers(&self, name: &Symbol) -> impl Iterator<Item = &Symbol>;
+}
+
+pub enum FusionReason { Independent, InterfaceChanged, Existence }
+pub struct Cluster { pub members: Vec<Symbol>, pub reason: FusionReason }
+
+pub struct Delta { pub test: Option<Change>, pub changes: Vec<Change>,
+                   pub clusters: Vec<Cluster> }
+impl Delta {
+    pub fn new(test: Option<Change>, changes: Vec<Change>, edges: &DepEdges) -> Delta;
+    pub fn candidates(&self) -> usize;
+    pub fn flipped_names(&self, flipped: &[usize]) -> Vec<Symbol>;
+}
+
+pub enum Unresolved { DoesNotCheck, DifferentFailure, MissingBody, BudgetSpent }
+pub enum TrialOutcome { Fails, Passes, Unresolved(Unresolved) }
+pub struct Trial { pub outcome: TrialOutcome, pub cached: bool }
+
+pub trait Hybrid {
+    fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial;
+}
+
+pub struct Budget { pub max_trials: usize }   // DEFAULT = 64, in evaluations
+pub struct SearchStats {
+    pub candidates: usize, pub clusters: usize,
+    pub evaluated: usize, pub cached: usize, pub memoized: usize,
+    pub unresolved: usize, pub exhausted: bool,
+}
+
+pub enum Skipped { NotRequested, NeverPassed, Nondet, Panicked, NoChanges, NoBodies }
+pub enum Verdict { Bisected, Sole, TestChanged, NotInTheGraph, NotReproduced,
+                   Inconclusive, NotAttempted(Skipped) }
+pub enum Confidence { Minimal, Fused, Partial, None }
+
+pub struct Bisection {
+    pub verdict: Verdict, pub confidence: Confidence,
+    pub groups: Vec<Vec<Symbol>>, pub reason: String, pub search: SearchStats,
+}
+impl Bisection {
+    pub fn not_attempted(why: Skipped) -> Bisection;
+    pub fn culprits(&self) -> Vec<Symbol>;
+    pub fn is_conclusive(&self) -> bool;
+}
+
+pub fn bisect(delta: &Delta, hybrid: &mut dyn Hybrid, budget: Budget) -> Bisection;
+```
+
+Requirements, in the order a defect in them costs most:
+
+- **`Derived` is decided by re-normalizing the current body against the baseline
+  hash table**, not by comparing name sets or interfaces. Both cheaper tests are
+  unsound, and a false `Derived` drops a real candidate and yields a confidently
+  wrong culprit.
+- **Fusion rule**: a candidate whose interface is unchanged stands alone; one
+  whose interface changed is fused with every candidate that mentions it.
+  `Added`/`Removed` are never independent. An unavailable baseline interface
+  means `independent: false` — conservative in the safe direction.
+- **`DepEdges` must union both eras.** The current graph misses a baseline body
+  referencing a since-deleted definition; the baseline graph misses a caller
+  written against a since-added one.
+- Every hybrid runs the test **as it is written now**. `H(∅)` failing is an
+  answer: `TestChanged` if the test was edited, `NotInTheGraph` if it was not.
+- A hybrid that does not typecheck is `Unresolved`, never a failure. **Any**
+  unresolved trial caps confidence at `Partial` — the search walked around a
+  question it could not ask. A search that narrows *nothing* while hitting
+  unresolved trials is `Inconclusive`, not `Bisected` over the whole set.
+- A hybrid that passes may be written to the result cache as `Pass` under its own
+  test hash. Bisection must **never** call `observe_definitions`: a definition
+  proved fine in a hybrid has not been vindicated in the real program, and
+  recording it would empty the next run's suspect set.
+- A cached trial costs nothing and is not charged against the budget. The budget
+  is in evaluations, never in seconds — an artifact that varies with machine load
+  cannot be diffed against yesterday's.
+
+### Causal slice — landed in `ply-test::slice`
+
+```rust
+pub struct CausalSlice {
+    pub traced: bool,
+    pub reproduced: bool,
+    pub entered: Vec<Entered>,     // first-entry order
+    pub stack: Vec<Frame>,         // outermost first; the last frame failed
+    pub observed: Footprint,       // atoms actually performed
+    pub truncated: bool,
+}
+pub struct Entered { pub name: Symbol, pub hash: Option<DefHash>, pub calls: u32 }
+pub struct Frame   { pub name: Symbol, pub hash: Option<DefHash>, pub call_site: Span }
+impl CausalSlice {
+    pub fn untraced() -> CausalSlice;
+    pub fn ran(&self, name: &Symbol) -> bool;
+    pub fn depth_of(&self, name: &Symbol) -> Option<usize>;
+    pub fn path(&self) -> Vec<&Symbol>;
+}
+
+pub enum AssertionKind { Eq, Bool, Panic, Runtime, UnhandledEffect, RecursionLimit }
+pub struct Difference { pub path: String, pub expected: String, pub actual: String }
+pub struct Assertion {
+    pub kind: AssertionKind,
+    pub expected: Option<String>, pub actual: Option<String>,
+    pub first_difference: Option<Difference>,
+    pub message: Option<String>,
+}
+```
+
+Tracing happens on a **re-run**, not on the first execution: the green path is
+the one that must be fast, and a `det` test replays identically by construction.
+The traced re-run doubles as the reproduction check — a `det` test that passes on
+replay sets `reproduced: false` and is reported rather than bisected.
+
+Everything on the stack ran; not everything that ran is on the stack. A
+definition that returned before the assertion has `ran: true` and `depth: None`.
+
+### Required of other crates — not yet implemented
+
+```rust
+// ply-store — the baseline. One record per test key, overwritten on each pass,
+// never written for a failing or nondet test.
+pub struct PassRecord {
+    pub test_hash: DefHash,
+    pub closure: BTreeMap<Symbol, DefHash>,
+}
+impl Store {
+    pub fn pass_record(&self, key: &Symbol) -> Option<&PassRecord>;
+    pub fn put_pass_record(&mut self, key: Symbol, record: PassRecord);
+    /// Bodies, per ADR 0003 — name-erased and hash-linked, so a hybrid mixing
+    /// two namespaces needs no module layout invented for it.
+    pub fn body(&self, hash: DefHash) -> Option<&Definition>;
+}
+```
+
+`prune` gains a second retention root: every hash reachable from a surviving
+`PassRecord::closure`. Dropping those silently downgrades every future bisection
+to `no_bodies`.
+
+`ply-eval` gains the tracer — hooked at `Interp::apply` for named closures and at
+the perform site for atoms, both of which already hold the qualified name — and a
+structured `Assertion` payload alongside the diagnostic. `ply-core` and `ply-eval`
+must both accept a hash-linked definition graph so a hybrid can be checked and
+run without being re-resolved.
+
+### `ply test` flags and JSON
+
+```
+--bisect <auto|always|never>   default auto
+--bisect-budget <n>            hybrid evaluations, default 64
+--trace <auto|always|never>    default auto: trace a failing test's re-run
+```
+
+`auto` bisects when the test failed and did not panic, is not `test/nondet`, has
+a `PassRecord`, has a non-empty delta, and has bodies. `always` ignores the
+budget and still respects those preconditions — none can be waived without
+inventing evidence. A single-cluster delta produces a verdict having evaluated
+nothing, which is the common case and why the default is on.
+
+Bisections are scheduled through `group_by_conflict` over the failing tests'
+footprints: a hybrid performs the same effects the real test does.
+
+`ply test --json` carries `"schema_version": 2` at the top level and the failure
+artifact of ADR 0004 §7. `failures[].suspects` becoming an array of objects is a
+breaking change against v1, ranked so a consumer reading only `suspects[0]` gets
+the best guess. `ply-test`'s own `report::failure_json` is the reference shape;
+`ply-cli` adds `location`, `module`, `test_hash` and `footprint` from the
+`SourceMap` and `CheckOutput` it holds and `ply-test` does not.
+
+### Required tests
+
+1. One edited definition → named exactly, `confidence: minimal`, **zero**
+   hybrids evaluated.
+2. Five edits, one culprit → named exactly, in at most `2·log₂(5)` evaluations.
+3. Two edits that only fail together → both named, neither alone.
+4. A signature change and its caller → one fused cluster, no hybrid splitting
+   them is ever built, `confidence: fused`.
+5. A `Derived` change is never a candidate and sorts below every edited suspect.
+6. A test that never passed → `not_attempted`/`never_passed`, zero hybrids, and
+   still a causal slice.
+7. `test/nondet` → `not_attempted`/`nondet`. 8. A panic →
+   `not_attempted`/`panicked`.
+9. Editing only the test body → `test_changed` naming the test.
+10. The baseline reproduces it and the test is unedited → `not_in_the_graph`.
+11. A hybrid that does not typecheck is `unresolved`; the search completes and
+    confidence drops to `partial`.
+12. Bisection never calls `observe_definitions`: the next run's suspect set is
+    unchanged.
+13. A hybrid already in the result cache is answered without evaluating and is
+    not charged against the budget.
+14. A spent budget → `exhausted: true`, `partial`, and the true cause still in
+    the set.
+15. The causal slice names only definitions that ran; its stack ends at the
+    failing frame.
+16. A definition that returned before the assertion has `ran: true`,
+    `depth: null`.
+17. Two runs over one failure produce byte-identical artifacts, including the
+    order of `suspects` and `culprit.groups`.
+18. `--bisect never` → `not_attempted`/`not_requested`, nothing evaluated.
+19. The summary prints the culprit above the assertion when one exists, and no
+    culprit line when none does.
+20. A search that narrows nothing while hitting unresolved trials reports
+    `Inconclusive`, not `Bisected` over the whole change set.
+
+### Not in M5
+
+Shrinking input **values** is property-test territory and belongs to **M8**:
+`test` takes no parameters, so there is nothing to shrink. Do not build a value
+shrinker speculatively. Also deferred: bisecting across git history, forking a
+fixture per hybrid (M6), a seed as the repro artifact (M7), and suggesting a fix.

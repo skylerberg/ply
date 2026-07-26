@@ -53,7 +53,12 @@ impl Program {
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
         let hashes = ply_hash::hash_program(&program, &resolved, &check)
             .unwrap_or_else(|d| panic!("hash: {d:#?}"));
-        Program { program, resolved, check, hashes }
+        Program {
+            program,
+            resolved,
+            check,
+            hashes,
+        }
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -69,18 +74,31 @@ impl Program {
     }
 
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        run(selection, &self.program, &self.resolved, &self.check, &self.hashes, store)
+        run(
+            selection,
+            &self.program,
+            &self.resolved,
+            &self.check,
+            &self.hashes,
+            store,
+        )
     }
 
     fn def_hash(&self, name: &str) -> ply_hash::DefHash {
-        self.hashes.defs.get(&Symbol::new(name)).copied().expect("a definition by that name")
+        self.hashes
+            .defs
+            .get(&Symbol::new(name))
+            .copied()
+            .expect("a definition by that name")
     }
 }
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
     EffectAtom::new(
         effect,
-        resource.map(|r| Resource::Named(Symbol::new(r))).unwrap_or(Resource::Singleton),
+        resource
+            .map(|r| Resource::Named(Symbol::new(r)))
+            .unwrap_or(Resource::Singleton),
         mode,
     )
 }
@@ -98,9 +116,11 @@ fn reads(resources: &[&str]) -> Footprint {
 fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
     let mut classes: Vec<Vec<usize>> = Vec::new();
     for (p, (_, footprint)) in tests.iter().enumerate() {
-        let slot = classes
-            .iter()
-            .position(|class| class.iter().all(|&q| !footprint.conflicts_with(&tests[q].1)));
+        let slot = classes.iter().position(|class| {
+            class
+                .iter()
+                .all(|&q| !footprint.conflicts_with(&tests[q].1))
+        });
         match slot {
             Some(k) => classes[k].push(p),
             None => classes.push(vec![p]),
@@ -111,7 +131,11 @@ fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
 
 fn assert_groups_are_conflict_free(groups: &[Vec<usize>], tests: &[(usize, Footprint)]) {
     let footprint = |index: usize| {
-        &tests.iter().find(|(i, _)| *i == index).expect("index came from the input").1
+        &tests
+            .iter()
+            .find(|(i, _)| *i == index)
+            .expect("index came from the input")
+            .1
     };
     for group in groups {
         for (a, &i) in group.iter().enumerate() {
@@ -143,13 +167,21 @@ fn pure_tests_all_land_in_the_first_group() {
 
 #[test]
 fn a_pure_test_joins_the_group_of_an_effectful_one() {
-    let tests = vec![(0, writes(&["users"])), (1, Footprint::empty()), (2, Footprint::empty())];
+    let tests = vec![
+        (0, writes(&["users"])),
+        (1, Footprint::empty()),
+        (2, Footprint::empty()),
+    ];
     assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
 }
 
 #[test]
 fn writes_to_disjoint_resources_group_together() {
-    let tests = vec![(0, writes(&["users"])), (1, writes(&["orders"])), (2, writes(&["ledger"]))];
+    let tests = vec![
+        (0, writes(&["users"])),
+        (1, writes(&["orders"])),
+        (2, writes(&["ledger"])),
+    ];
     assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
 }
 
@@ -163,20 +195,34 @@ fn readers_of_one_resource_group_and_the_writer_is_separated() {
     ];
     let groups = group_by_conflict(&tests);
     assert_eq!(groups.len(), 2);
-    assert!(groups.contains(&vec![2]), "the writer runs alone: {groups:?}");
-    assert!(groups.contains(&vec![0, 1, 3]), "the readers share a group: {groups:?}");
+    assert!(
+        groups.contains(&vec![2]),
+        "the writer runs alone: {groups:?}"
+    );
+    assert!(
+        groups.contains(&vec![0, 1, 3]),
+        "the readers share a group: {groups:?}"
+    );
     assert_groups_are_conflict_free(&groups, &tests);
 }
 
 #[test]
 fn a_write_to_one_resource_does_not_separate_readers_of_another() {
-    let tests = vec![(0, reads(&["users"])), (1, writes(&["orders"])), (2, reads(&["users"]))];
+    let tests = vec![
+        (0, reads(&["users"])),
+        (1, writes(&["orders"])),
+        (2, reads(&["users"])),
+    ];
     assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
 }
 
 #[test]
 fn the_largest_footprint_claims_the_first_group() {
-    let tests = vec![(0, writes(&["a"])), (1, writes(&["b"])), (2, writes(&["a", "b"]))];
+    let tests = vec![
+        (0, writes(&["a"])),
+        (1, writes(&["b"])),
+        (2, writes(&["a", "b"])),
+    ];
     // Source order would pair 0 and 1 and push 2 into a second group; colouring
     // the two-atom test first inverts which group each ends up in.
     assert_eq!(group_by_conflict(&tests), vec![vec![2], vec![0, 1]]);
@@ -234,7 +280,10 @@ fn grouping_partitions_every_selected_test_exactly_once() {
         (12, reads(&["orders"])),
     ];
     let groups = group_by_conflict(&tests);
-    assert_eq!(sorted(groups.iter().flatten().copied()), vec![3, 7, 8, 11, 12]);
+    assert_eq!(
+        sorted(groups.iter().flatten().copied()),
+        vec![3, 7, 8, 11, 12]
+    );
     assert_groups_are_conflict_free(&groups, &tests);
 }
 
@@ -287,7 +336,12 @@ fn a_warm_cache_selects_nothing() {
 
     let first = program.select(&store);
     let report = program.run(&first, &mut store);
-    assert_eq!((report.passed, report.failed), (3, 0), "{:#?}", report.failures);
+    assert_eq!(
+        (report.passed, report.failed),
+        (3, 0),
+        "{:#?}",
+        report.failures
+    );
 
     let second = program.select(&store);
     assert!(second.to_run.is_empty());
@@ -393,7 +447,11 @@ fn a_nondet_test_always_runs_and_is_never_cached() {
         assert_eq!(selection.reason(nondet), Some(Reason::Nondet));
         assert!(selection.to_run.contains(&nondet), "round {round}");
         if round > 0 {
-            assert_eq!(selection.reason(pure), Some(Reason::Cached), "round {round}");
+            assert_eq!(
+                selection.reason(pure),
+                Some(Reason::Cached),
+                "round {round}"
+            );
             assert_eq!(selection.to_run, vec![nondet], "round {round}");
         }
         let report = program.run(&selection, &mut store);
@@ -419,7 +477,10 @@ fn a_stored_failure_is_never_trusted() {
     let mul = program.index_of("mul is right");
     store.put(
         program.hashes.tests[mul],
-        Outcome::Fail { message: "written by something else".into(), diagnostic: None },
+        Outcome::Fail {
+            message: "written by something else".into(),
+            diagnostic: None,
+        },
     );
 
     let selection = program.select(&store);
@@ -495,7 +556,8 @@ fn a_failure_is_never_cached_and_re_runs_until_it_goes_green() {
         );
     }
 
-    let fixed = Program::compile(&ONE_RED.replace("fn bad() -> Int = 2", "fn bad() -> Int = 3 - 2"));
+    let fixed =
+        Program::compile(&ONE_RED.replace("fn bad() -> Int = 2", "fn bad() -> Int = 3 - 2"));
     let selection = fixed.select(&store);
     assert!(selection.to_run.contains(&bad));
     let report = fixed.run(&selection, &mut store);
@@ -586,7 +648,11 @@ fn a_failure_names_only_the_changed_definitions_in_its_closure() {
 
     let report = red.run(&selection, &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    let suspects: Vec<&str> = report.failures[0]
+        .suspects
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     assert_eq!(
         suspects,
         vec!["debit", "settle"],
@@ -617,11 +683,19 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
     );
     let selection = red.select(&store);
     assert_eq!(selection.to_run.len(), 2);
-    assert_eq!(selection.groups, vec![vec![0, 1]], "both are pure, so they share a group");
+    assert_eq!(
+        selection.groups,
+        vec![vec![0, 1]],
+        "both are pure, so they share a group"
+    );
 
     let report = red.run(&selection, &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    let suspects: Vec<&str> = report.failures[0]
+        .suspects
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     assert!(
         suspects.contains(&"credit"),
         "a sibling test passing first must not clear a suspect: {suspects:?}"
@@ -657,12 +731,18 @@ fn a_green_sibling_never_clears_a_suspect_on_a_later_run() {
 
     for round in 0..3 {
         let selection = red.select(&store);
-        assert!(selection.to_run.contains(&doomed), "round {round}: a red test always re-runs");
+        assert!(
+            selection.to_run.contains(&doomed),
+            "round {round}: a red test always re-runs"
+        );
 
         let report = red.run(&selection, &mut store);
         assert_eq!(report.failed, 1, "round {round}: {:#?}", report.results);
-        let suspects: Vec<&str> =
-            report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+        let suspects: Vec<&str> = report.failures[0]
+            .suspects
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         assert_eq!(
             suspects,
             vec!["base", "total"],
@@ -703,7 +783,11 @@ fn a_run_that_skipped_a_test_does_not_vouch_for_what_it_would_have_covered() {
     let selection = red.select(&store);
     let report = red.run(&selection, &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    let suspects: Vec<&str> = report.failures[0]
+        .suspects
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     assert_eq!(
         suspects,
         vec!["base", "total"],
@@ -738,7 +822,11 @@ fn going_green_ends_the_suspicion_a_failure_kept_alive() {
 
     let report = broken.run(&selection, &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0].suspects.iter().map(|s| s.as_str()).collect();
+    let suspects: Vec<&str> = report.failures[0]
+        .suspects
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     assert_eq!(suspects, vec!["total"]);
 }
 
@@ -751,7 +839,10 @@ fn the_report_accounts_for_every_selected_test_exactly_once() {
     let selection = program.select(&store);
     let report = program.run(&selection, &mut store);
     assert_eq!(report.passed + report.failed, selection.to_run.len());
-    assert_eq!(sorted(report.results.iter().map(|r| r.index)), selection.to_run);
+    assert_eq!(
+        sorted(report.results.iter().map(|r| r.index)),
+        selection.to_run
+    );
     assert!(report.warnings.is_empty(), "{:#?}", report.warnings);
     assert!(!report.is_success());
 }
@@ -836,16 +927,33 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
     let doomed = program.index_of("mul is right");
 
     let executor = PanickingExecutor { panic_on: doomed };
-    let report = run_with(&selection, &program.check, &program.hashes, &mut store, &executor);
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
 
     assert_eq!(report.passed, 2, "the other tests must still have run");
     assert_eq!(report.failed, 1);
 
-    let panicked = report.results.iter().find(|r| r.index == doomed).expect("reported");
+    let panicked = report
+        .results
+        .iter()
+        .find(|r| r.index == doomed)
+        .expect("reported");
     assert_eq!(panicked.status, Status::Panicked);
-    let diagnostic = panicked.failure.as_ref().expect("a panic carries a diagnostic");
+    let diagnostic = panicked
+        .failure
+        .as_ref()
+        .expect("a panic carries a diagnostic");
     assert_eq!(diagnostic.code, ply_span::codes::RUNTIME_ERROR);
-    assert!(diagnostic.message.contains("deliberate panic"), "{}", diagnostic.message);
+    assert!(
+        diagnostic.message.contains("deliberate panic"),
+        "{}",
+        diagnostic.message
+    );
     assert!(diagnostic.message.contains("mul is right"));
     assert!(
         diagnostic.primary_span().is_some_and(|s| !s.is_dummy()),
@@ -879,11 +987,26 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
         reasons: vec![Reason::New; 3],
     };
     let executor = PanickingExecutor { panic_on: 0 };
-    let report = run_with(&selection, &program.check, &program.hashes, &mut store, &executor);
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
 
     assert_eq!((report.passed, report.failed), (2, 1));
-    assert!(report.results.iter().skip(1).all(|r| r.status == Status::Passed));
-    assert_eq!(report.results.iter().map(|r| r.group).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert!(
+        report
+            .results
+            .iter()
+            .skip(1)
+            .all(|r| r.status == Status::Passed)
+    );
+    assert_eq!(
+        report.results.iter().map(|r| r.group).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }
 
 // ---------------------------------------------------------------- reporting
@@ -909,17 +1032,30 @@ fn the_json_report_carries_the_diagnostic_and_the_suspects() {
 
     let failure = &json["failures"][0];
     assert_eq!(failure["name"], "settle nets out");
-    assert_eq!(failure["diagnostic"]["code"], ply_span::codes::ASSERTION_FAILED);
+    assert_eq!(
+        failure["diagnostic"]["code"],
+        ply_span::codes::ASSERTION_FAILED
+    );
     // Only the expectation inside the test moved, so no definition is under
     // suspicion — the test is the thing that changed.
     assert_eq!(failure["suspects"], serde_json::json!([]));
 
     assert_eq!(json["tests"][0]["status"], "failed");
-    assert!(json["tests"][0]["hash"].as_str().is_some_and(|h| h.len() == 64));
+    assert!(
+        json["tests"][0]["hash"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64)
+    );
 
     let summary = report.summary();
-    assert!(summary[0].starts_with("1 failed, 0 passed, 1 cached"), "{summary:#?}");
-    assert!(summary.iter().any(|l| l.contains("expected 7, found 6")), "{summary:#?}");
+    assert!(
+        summary[0].starts_with("1 failed, 0 passed, 1 cached"),
+        "{summary:#?}"
+    );
+    assert!(
+        summary.iter().any(|l| l.contains("expected 7, found 6")),
+        "{summary:#?}"
+    );
     assert!(report.results[0].line().starts_with('✗'));
 }
 
@@ -938,7 +1074,10 @@ fn the_summary_lists_the_suspects_for_a_failure() {
     ));
     let selection = red.select(&store);
     let summary = red.run(&selection, &mut store).summary();
-    assert!(summary.iter().any(|l| l == "  suspects: debit, settle"), "{summary:#?}");
+    assert!(
+        summary.iter().any(|l| l == "  suspects: debit, settle"),
+        "{summary:#?}"
+    );
 }
 
 #[test]
@@ -950,7 +1089,10 @@ fn explain_covers_every_test_and_every_group() {
     let selection = program.select(&store);
     let lines = selection.explain(&program.check, &program.hashes);
     assert_eq!(lines.len(), selection.total + selection.groups.len());
-    assert!(lines.iter().take(3).all(|l| l.starts_with("run ")), "{lines:#?}");
+    assert!(
+        lines.iter().take(3).all(|l| l.starts_with("run ")),
+        "{lines:#?}"
+    );
 
     program.run(&selection, &mut store);
     let selection = program.select(&store);
@@ -1001,7 +1143,12 @@ fn a_module_whose_tests_are_all_isolated_runs_as_a_single_group() {
     assert_eq!(selection.groups, vec![vec![0, 1, 2, 3]]);
 
     let report = program.run(&selection, &mut store);
-    assert_eq!((report.passed, report.failed), (4, 0), "{:#?}", report.failures);
+    assert_eq!(
+        (report.passed, report.failed),
+        (4, 0),
+        "{:#?}",
+        report.failures
+    );
     assert!(report.results.iter().all(|r| r.group == 0));
 }
 
@@ -1017,4 +1164,230 @@ fn every_group_is_run_in_sequence() {
     assert_eq!(report.passed, 3);
     assert_eq!(report.results.iter().filter(|r| r.group == 0).count(), 1);
     assert_eq!(report.results.iter().filter(|r| r.group == 1).count(), 2);
+}
+
+// -------------------------------------------------------------- attribution
+
+/// The rich suspect list and the flat one are two views of one set, so a
+/// consumer that reads either gets the same answer about *what* is suspect.
+#[test]
+fn the_attribution_covers_exactly_the_suspect_set() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+
+    let green = Program::compile(LEDGER);
+    let selection = green.select(&store);
+    assert_eq!(green.run(&selection, &mut store).failed, 0);
+
+    let red = Program::compile(&LEDGER.replace(
+        "fn debit(balance: Int, amount: Int) -> Int = balance - amount",
+        "fn debit(balance: Int, amount: Int) -> Int = balance - amount - 1",
+    ));
+    let selection = red.select(&store);
+    let report = red.run(&selection, &mut store);
+
+    let failure = &report.failures[0];
+    let mut rich: Vec<&str> = failure
+        .attribution
+        .suspects
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    rich.sort_unstable();
+    let flat: Vec<&str> = failure.suspects.iter().map(|s| s.as_str()).collect();
+    assert_eq!(rich, flat);
+    assert!(
+        failure
+            .attribution
+            .suspects
+            .iter()
+            .all(|s| s.hash.is_some())
+    );
+    // Nothing has been compared or traced yet, so every judgement is withheld
+    // rather than guessed at.
+    assert!(failure.attribution.suspects.iter().all(|s| s.ran.is_none()));
+    assert!(
+        failure
+            .attribution
+            .suspects
+            .iter()
+            .all(|s| s.before.is_none())
+    );
+    assert!(failure.attribution.slice.is_none());
+}
+
+#[test]
+fn a_run_that_did_not_bisect_says_so_rather_than_naming_nobody() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program =
+        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
+    let selection = program.select(&store);
+    let report = program.run(&selection, &mut store);
+
+    let bisection = &report.failures[0].attribution.bisection;
+    assert_eq!(
+        bisection.verdict,
+        crate::Verdict::NotAttempted(crate::Skipped::NotRequested)
+    );
+    assert_eq!(bisection.confidence, crate::Confidence::None);
+    assert!(bisection.culprits().is_empty());
+    assert!(!bisection.is_conclusive());
+}
+
+/// A `test/nondet` outcome is not a function of the definition set, so the
+/// artifact has to say the question was not asked rather than leave a consumer
+/// to infer it from an empty culprit list.
+#[test]
+fn a_nondet_failure_is_marked_unbisectable_at_the_point_it_fails() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(
+        "nondet effect clock {\n  read now() -> Int\n}\n\
+         test/nondet \"clock is negative\" { assert(clock.now() < 0) }\n",
+    );
+    let selection = program.select(&store);
+    let report = program.run(&selection, &mut store);
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        report.failures[0].attribution.bisection.verdict,
+        crate::Verdict::NotAttempted(crate::Skipped::Nondet)
+    );
+}
+
+#[test]
+fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
+    use crate::bisect::{Bisection, Confidence, SearchStats, Verdict};
+    use crate::slice::{CausalSlice, Entered, Frame};
+
+    let hashes = HashOutput::default();
+    let names = [
+        Symbol::new("m.formats"),
+        Symbol::new("m.debit"),
+        Symbol::new("m.settle"),
+    ];
+    let mut attribution = crate::Attribution::from_suspects(&names, &hashes);
+
+    let frame = |name: &str| Frame {
+        name: Symbol::new(name),
+        hash: None,
+        call_site: ply_span::Span::new(SourceId(0), 0, 1),
+    };
+    let slice = CausalSlice {
+        traced: true,
+        reproduced: true,
+        entered: ["m.settle", "m.debit"]
+            .iter()
+            .map(|n| Entered {
+                name: Symbol::new(n),
+                hash: None,
+                calls: 1,
+            })
+            .collect(),
+        stack: vec![frame("m.settle"), frame("m.debit")],
+        observed: Footprint::empty(),
+        truncated: false,
+    };
+    attribution.resolve(
+        Bisection {
+            verdict: Verdict::Bisected,
+            confidence: Confidence::Minimal,
+            groups: vec![vec![Symbol::new("m.debit")]],
+            reason: "narrowed 3 changed definitions to m.debit".into(),
+            search: SearchStats::default(),
+        },
+        Some(slice),
+    );
+
+    let order: Vec<&str> = attribution
+        .suspects
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(order, ["m.debit", "m.settle", "m.formats"]);
+    assert!(attribution.suspects[0].culprit);
+    assert_eq!(attribution.suspects[0].depth, Some(0));
+    assert_eq!(attribution.suspects[1].depth, Some(1));
+    assert_eq!(attribution.suspects[2].ran, Some(false));
+    assert_eq!(attribution.culprits(), vec![Symbol::new("m.debit")]);
+}
+
+/// A definition can be a cause without the store having noticed it change —
+/// dropping it because it is not in the suspect set would discard the answer.
+#[test]
+fn a_culprit_outside_the_suspect_set_is_added_rather_than_dropped() {
+    let mut attribution =
+        crate::Attribution::from_suspects(&[Symbol::new("m.a")], &HashOutput::default());
+    attribution.resolve(
+        crate::Bisection {
+            verdict: crate::Verdict::Bisected,
+            confidence: crate::Confidence::Minimal,
+            groups: vec![vec![Symbol::new("m.z")]],
+            reason: String::new(),
+            search: crate::SearchStats::default(),
+        },
+        None,
+    );
+    let names: Vec<&str> = attribution
+        .suspects
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names, ["m.z", "m.a"]);
+    assert!(attribution.suspects[0].culprit);
+}
+
+#[test]
+fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program =
+        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
+    let selection = program.select(&store);
+    let mut report = program.run(&selection, &mut store);
+
+    report.failures[0].attribution.resolve(
+        crate::Bisection {
+            verdict: crate::Verdict::Bisected,
+            confidence: crate::Confidence::Minimal,
+            groups: vec![vec![Symbol::new("debit")]],
+            reason: "narrowed 2 changed definitions to debit in 2 runs (1 answered from the cache)"
+                .into(),
+            search: crate::SearchStats {
+                evaluated: 2,
+                cached: 1,
+                ..Default::default()
+            },
+        },
+        None,
+    );
+
+    let summary = report.summary();
+    let culprit = summary
+        .iter()
+        .position(|l| l.contains("culprit: debit"))
+        .expect("a culprit line");
+    let diff = summary
+        .iter()
+        .position(|l| l.contains("expected 7"))
+        .expect("the assertion line");
+    assert!(
+        culprit < diff,
+        "the culprit must come before the diff:\n{summary:#?}"
+    );
+
+    let json = report.to_json();
+    assert_eq!(json["schema_version"], crate::report::SCHEMA_VERSION);
+    let failure = &json["failures"][0];
+    assert_eq!(failure["culprit"]["verdict"], "bisected");
+    assert_eq!(failure["culprit"]["confidence"], "minimal");
+    assert_eq!(
+        failure["culprit"]["definitions"],
+        serde_json::json!(["debit"])
+    );
+    assert_eq!(failure["culprit"]["search"]["evaluated"], 2);
+    assert_eq!(failure["culprit"]["skipped"], serde_json::Value::Null);
+    assert!(failure["causal_slice"].is_null());
+    assert!(failure["assertion"].is_null());
 }

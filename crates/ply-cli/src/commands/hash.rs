@@ -1,4 +1,6 @@
-use super::common::{IND, diagnostics_json, emit_json, plural, print_diagnostics, report_load_error};
+use super::common::{
+    IND, diagnostics_json, emit_json, plural, print_diagnostics, report_load_error,
+};
 use crate::cli::HashArgs;
 use crate::load::{Loaded, load};
 use crate::style::Style;
@@ -9,8 +11,7 @@ use serde_json::{Value, json};
 
 /// Printed under every listing, because the grouping below is the one thing in
 /// this output that could be mistaken for part of a hash.
-const MODULES_ARE_NOT_HASHED: &str =
-    "module names, imports and `pub` are erased by normalization: moving a \
+const MODULES_ARE_NOT_HASHED: &str = "module names, imports and `pub` are erased by normalization: moving a \
      definition between modules changes no hash";
 
 pub fn execute(args: &HashArgs, style: Style) -> i32 {
@@ -57,7 +58,11 @@ fn print_human(loaded: &Loaded, hashes: &HashOutput, deps: bool, style: Style) {
         );
 
         for def in loaded.defs_of(module.name) {
-            let hash = hashes.defs.get(&def.name).map(|h| h.short()).unwrap_or_else(|| blank.clone());
+            let hash = hashes
+                .defs
+                .get(&def.name)
+                .map(|h| h.short())
+                .unwrap_or_else(|| blank.clone());
             println!("{IND}  {}  {}", style.dim(&hash), def.simple_name);
             if deps {
                 print_edges(hashes, &def.name, style);
@@ -65,8 +70,17 @@ fn print_human(loaded: &Loaded, hashes: &HashOutput, deps: bool, style: Style) {
         }
 
         for (index, test) in loaded.tests_of(module.name) {
-            let hash = hashes.tests.get(index).map(|h| h.short()).unwrap_or_else(|| blank.clone());
-            println!("{IND}  {}  {} {:?}", style.dim(&hash), style.dim("test"), test.name);
+            let hash = hashes
+                .tests
+                .get(index)
+                .map(|h| h.short())
+                .unwrap_or_else(|| blank.clone());
+            println!(
+                "{IND}  {}  {} {:?}",
+                style.dim(&hash),
+                style.dim("test"),
+                test.name
+            );
             if deps {
                 print_edges(hashes, &test.key, style);
             }
@@ -91,11 +105,19 @@ fn print_edges(hashes: &HashOutput, name: &Symbol, style: Style) {
         && !deps.is_empty()
     {
         let names: Vec<&str> = deps.iter().map(|d| d.as_str()).collect();
-        println!("{IND}                {} {}", style.dim("deps:"), names.join(", "));
+        println!(
+            "{IND}                {} {}",
+            style.dim("deps:"),
+            names.join(", ")
+        );
     }
     if let Some(closure) = hashes.closure.get(name) {
         let names: Vec<&str> = closure.iter().map(|d| d.as_str()).collect();
-        println!("{IND}                {} {}", style.dim("closure:"), names.join(", "));
+        println!(
+            "{IND}                {} {}",
+            style.dim("closure:"),
+            names.join(", ")
+        );
     }
 }
 
@@ -228,7 +250,10 @@ mod tests {
             .unwrap();
         assert_eq!(two["deps"], json!(["m.one"]));
         assert_eq!(two["closure"], json!(["m.one", "m.two"]));
-        assert_eq!(v["tests"][0]["closure"], json!(["m.one", "m.two", "m.two is two"]));
+        assert_eq!(
+            v["tests"][0]["closure"],
+            json!(["m.one", "m.two", "m.two is two"])
+        );
     }
 
     fn def(hashes: &HashOutput, name: &str) -> ply_hash::DefHash {
