@@ -188,6 +188,30 @@ impl Subst {
         Ok(())
     }
 
+    /// Solves the one row variable a self-occurrence is sound for: the row of a
+    /// `handle`'s continuation, which is by construction the residual row of the
+    /// `handle` itself.
+    ///
+    /// `ρ_κ := ρ_h` is self-referential because `ρ_h` is built from the clause
+    /// rows and a clause's row may end in `ρ_κ`. A row is a set and set union is
+    /// idempotent, so the least fixed point is reached in one step: drop the
+    /// self-occurrence from the tail and substituting back gives `A ∪ A = A`.
+    ///
+    /// Deliberately not routed through [`unify_row`], whose occurs check must
+    /// stay exactly as strict as it is — every *other* self-occurrence is a real
+    /// error. Does nothing if `v` was already solved, because then unification
+    /// has already decided what it is and this would overwrite that.
+    pub fn solve_continuation_row(&mut self, v: RowVar, row: &Row) {
+        if self.row.contains_key(&v) {
+            return;
+        }
+        let mut solved = self.resolve_row(row);
+        if solved.tail == Some(v) {
+            solved.tail = None;
+        }
+        self.row.insert(v, solved);
+    }
+
     pub fn free_vars(&self, t: &Type, tys: &mut BTreeSet<TyVar>, rows: &mut BTreeSet<RowVar>) {
         match self.shallow_ref(t) {
             Type::Var(v) => {

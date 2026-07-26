@@ -5,9 +5,10 @@
 //! can act on a failure without re-deriving which of its edits caused it.
 
 use crate::bisect::Bisection;
+use crate::schedule::{Isolation, Parallelism, shared_footprint};
 use crate::slice::{Assertion, CausalSlice};
 use crate::{Attribution, Failure, Reason, RunReport, Selection, Status, Suspect, TestResult};
-use ply_core::CheckOutput;
+use ply_core::{CheckOutput, Footprint};
 use ply_hash::HashOutput;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -38,8 +39,12 @@ impl Selection {
                 .map(|h| h.short())
                 .unwrap_or_else(|| "-".repeat(12));
             let verb = if reason.runs() { "run " } else { "skip" };
+            let isolation = match check.tests.get(index) {
+                Some(test) => explain_isolation(&test.footprint),
+                None => String::new(),
+            };
             lines.push(format!(
-                "{verb} {hash}  {name}  ({})",
+                "{verb} {hash}  {name}  ({}){isolation}",
                 explain_reason(*reason)
             ));
         }
@@ -66,6 +71,7 @@ impl Selection {
                 names.join(", ")
             ));
         }
+        lines.extend(explain_parallelism(&self.parallelism));
         lines
     }
 
@@ -85,6 +91,8 @@ impl Selection {
                     "reason": reason,
                     "group": self.group_of(index),
                     "footprint": check.tests.get(index).map(|t| t.footprint.to_string()),
+                    "isolation": self.isolation_of(index).map(|i| i.as_str()),
+                    "shared_atoms": check.tests.get(index).map(|t| shared_atoms(&t.footprint)),
                 })
             })
             .collect();
@@ -93,9 +101,42 @@ impl Selection {
             "selected": self.to_run.len(),
             "cached": self.cached.len(),
             "groups": self.groups,
+            "isolated": self.parallelism.isolated,
+            "parallelism": self.parallelism,
             "tests": tests,
         })
     }
+}
+
+fn shared_atoms(footprint: &Footprint) -> Vec<String> {
+    shared_footprint(footprint)
+        .atoms()
+        .map(|a| a.to_string())
+        .collect()
+}
+
+fn explain_isolation(footprint: &Footprint) -> String {
+    match Isolation::of(footprint) {
+        Isolation::World => "  isolation: world".to_string(),
+        Isolation::Shared => format!("  isolation: shared {}", shared_footprint(footprint)),
+    }
+}
+
+fn explain_parallelism(p: &Parallelism) -> Vec<String> {
+    if p.total == 0 {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "isolated: {} of {} — {} can contend with another test",
+        p.isolated, p.total, p.shared
+    )];
+    if p.scheduled > 0 {
+        lines.push(format!(
+            "{} group(s) for {} selected test(s); the shared ones alone need {}",
+            p.groups, p.scheduled, p.shared_groups
+        ));
+    }
+    lines
 }
 
 fn explain_reason(reason: Reason) -> &'static str {
@@ -117,6 +158,8 @@ impl RunReport {
             "cached": self.cached,
             "duration_ms": millis(self.duration),
             "success": self.is_success(),
+            "isolated": self.parallelism.isolated,
+            "parallelism": self.parallelism,
             "tests": self.results.iter().map(test_json).collect::<Vec<_>>(),
             "failures": self.failures.iter().map(failure_json).collect::<Vec<_>>(),
             "warnings": self.warnings,
@@ -137,6 +180,12 @@ impl RunReport {
             self.cached,
             self.duration.as_secs_f64()
         )];
+        if self.parallelism.total > 0 {
+            lines.push(format!(
+                "isolated: {} of {}",
+                self.parallelism.isolated, self.parallelism.total
+            ));
+        }
         for failure in &self.failures {
             lines.push(String::new());
             lines.push(failure.key.to_string());

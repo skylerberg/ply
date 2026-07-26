@@ -1,5 +1,5 @@
 use super::common::{
-    IND, diagnostic_json, emit_json, exit_code, location, millis, phases_json, plural,
+    IND, diagnostic_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
     print_diagnostics, print_phases, print_warnings, report_load_error,
 };
 use crate::EXIT_COMPILE_ERROR;
@@ -12,14 +12,17 @@ use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 use ply_store::Store;
 use ply_test::{
-    Bisection, Failure, Reason, RunReport, Selection, Skipped, Status, Suspect, TestResult, Verdict,
+    Bisection, Failure, Isolation, Reason, RunReport, Selection, Skipped, Status, Suspect,
+    TestResult, Verdict,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
-    let mut cache = match Cache::open(&project_root(&args.path), args.no_cache) {
+    let engine: ply_eval::EngineChoice = args.engine.into();
+    let no_cache = cache_bypassed(args);
+    let mut cache = match Cache::open(&project_root(&args.path), no_cache) {
         Ok(cache) => cache,
         Err(diagnostic) => {
             if args.json {
@@ -41,7 +44,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     warnings.extend(opened);
     warnings.extend(migration);
 
-    let incremental = !args.no_incremental && !args.no_cache;
+    let incremental = !args.no_incremental && !no_cache;
     let loaded = if incremental {
         driver::load_incremental(&args.path, &mut cache.store)
     } else {
@@ -113,6 +116,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             &loaded.check,
             &hashes,
             &mut cache.store,
+            engine,
         )
     };
     let mut report = match &pool {
@@ -137,6 +141,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // here. Silently, the artifact would say `never_passed` about a test that
     // passed yesterday.
     warnings.extend(cache.store.take_warnings());
+    let warnings = once_each(warnings);
 
     if args.json {
         emit_json(&report_json(
@@ -148,6 +153,13 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
         );
     }
     exit_code(report.is_success())
+}
+
+/// A stored `Pass` is a claim about what the authoritative engine did, so a run
+/// on any other engine may neither believe one nor leave one behind. Asking for
+/// a non-default engine therefore implies `--no-cache` without saying so.
+fn cache_bypassed(args: &TestArgs) -> bool {
+    args.no_cache || ply_eval::EngineChoice::from(args.engine).bypasses_cache()
 }
 
 /// `--bisect never` goes *through* the diagnosis rather than around it, so that
@@ -216,6 +228,16 @@ impl Plan {
             .map(|&i| (i, check.tests[i].footprint.clone()))
             .collect();
         let groups = ply_test::group_by_conflict(&footprints);
+        // Counted over the visible tests, because `selected 2 of 3` and
+        // `isolated 1 of 3` have to share a denominator a person can check.
+        let parallelism = ply_test::parallelism(
+            visible
+                .iter()
+                .filter_map(|&i| check.tests.get(i))
+                .map(|t| &t.footprint),
+            &footprints,
+            &groups,
+        );
 
         Plan {
             filtered_out: check.tests.len() - visible.len(),
@@ -224,9 +246,11 @@ impl Plan {
                 cached,
                 to_run,
                 groups,
-                // Indexed by test index, so it stays whole even when the plan is
-                // narrowed; nothing reads its length.
+                // Indexed by test index, so they stay whole even when the plan
+                // is narrowed; nothing reads their length.
                 reasons: selection.reasons,
+                isolation: selection.isolation,
+                parallelism,
             },
             visible,
         }
@@ -399,10 +423,33 @@ fn print_human(
             plural(workers, "worker")
         );
     }
-    if args.no_cache {
+    let parallelism = &selection.parallelism;
+    if parallelism.total > 0 {
+        let shared = if parallelism.shared == 0 {
+            String::new()
+        } else {
+            style.dim(&format!(
+                " · {} {} can contend",
+                parallelism.shared,
+                plural(parallelism.shared, "test")
+            ))
+        };
+        println!(
+            "{IND}{} {} of {}{shared}",
+            style.bold("isolated"),
+            style.bold(&parallelism.isolated.to_string()),
+            parallelism.total,
+        );
+    }
+    if cache_bypassed(args) {
+        let why = if args.no_cache {
+            "--no-cache".to_string()
+        } else {
+            format!("--engine {}", args.engine.as_str())
+        };
         println!(
             "{IND}{}",
-            style.dim("--no-cache: results were neither read nor recorded")
+            style.dim(&format!("{why}: results were neither read nor recorded"))
         );
     }
     if plan.filtered_out > 0 {
@@ -674,11 +721,22 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             .get(index)
             .map(|h| h.short())
             .unwrap_or_else(|| "-".repeat(12));
+        let isolation = plan
+            .selection
+            .isolation_of(index)
+            .unwrap_or_else(|| Isolation::of(&test.footprint));
+        let shared = ply_test::shared_footprint(&test.footprint);
+        let atoms = if isolation.is_world() {
+            String::new()
+        } else {
+            format!(" {shared}")
+        };
         println!(
-            "{IND}{verb} {} {:<16} {}",
+            "{IND}{verb} {} {:<16} {:<40} {}",
             style.dim(&hash),
             reason.as_str(),
-            display_name(check, index, &test.name)
+            display_name(check, index, &test.name),
+            style.dim(&format!("isolation: {}{atoms}", isolation.as_str()))
         );
     }
 
@@ -703,6 +761,19 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
     }
     println!();
     println!("{IND}{}", style.dim("concurrency groups"));
+    let parallelism = &plan.selection.parallelism;
+    println!(
+        "{IND}  {}",
+        style.dim(&format!(
+            "{} of {} world-isolated and free · {} {} for the {} shared {}",
+            parallelism.isolated,
+            parallelism.total,
+            parallelism.shared_groups,
+            plural(parallelism.shared_groups, "group"),
+            parallelism.shared,
+            plural(parallelism.shared, "test"),
+        ))
+    );
     for (g, group) in plan.selection.groups.iter().enumerate() {
         let footprint = plan.group_footprint(group, check);
         println!(
@@ -763,6 +834,14 @@ fn report_json(
                 "why": why(reason),
                 "group": selection.group_of(index),
                 "footprint": test.footprint.to_string(),
+                "isolation": selection
+                    .isolation_of(index)
+                    .unwrap_or_else(|| Isolation::of(&test.footprint))
+                    .as_str(),
+                "shared_atoms": ply_test::shared_footprint(&test.footprint)
+                    .atoms()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>(),
             }))
         })
         .collect();
@@ -825,12 +904,13 @@ fn report_json(
             "file": m.path.display().to_string(),
         })).collect::<Vec<_>>(),
         "filter": args.filter,
-        "no_cache": args.no_cache,
+        "no_cache": cache_bypassed(args),
         "workers": workers,
         "options": {
             "bisect": args.bisect.as_str(),
             "bisect_budget": args.bisect_budget,
             "trace": args.trace.as_str(),
+            "engine": args.engine.as_str(),
         },
         "selection": {
             "total": selection.total,
@@ -838,6 +918,8 @@ fn report_json(
             "cached": selection.cached.len(),
             "filtered_out": plan.filtered_out,
             "groups": groups,
+            "isolated": selection.parallelism.isolated,
+            "parallelism": selection.parallelism,
             "tests": tests,
         },
         "summary": {
@@ -1026,6 +1108,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             &loaded.check,
             &loaded.hashes().unwrap(),
             store,
+            ply_eval::EngineChoice::Both,
         )
     }
 
@@ -1049,6 +1132,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect: When::Auto,
             bisect_budget: 64,
             trace: When::Auto,
+            engine: crate::cli::EngineArg::default(),
         }
     }
 
@@ -1109,6 +1193,12 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         // Both survivors only read, so the writer's group is gone entirely.
         assert_eq!(plan.selection.groups.len(), 1);
         assert_eq!(plan.selection.groups[0].len(), 2);
+        // `isolated n of m` has to answer for the same m as `selected n of m`.
+        let parallelism = &plan.selection.parallelism;
+        assert_eq!(parallelism.total, 2);
+        assert_eq!(parallelism.isolated, 0);
+        assert_eq!(parallelism.shared_groups, 1);
+        assert!(parallelism.holds(), "{parallelism:?}");
     }
 
     #[test]

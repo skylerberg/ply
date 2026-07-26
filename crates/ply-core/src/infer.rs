@@ -2051,6 +2051,14 @@ impl<'a> Checker<'a> {
         let (body_ty, body_row) = self.infer(body);
         let after_body = self.performs.len();
 
+        // One `ρ_κ` per `handle` and not one per clause: every clause's
+        // continuation is the same residual computation. Allocated only when a
+        // clause actually binds one, so that a program without any general
+        // clause produces the identical variable numbering it did before.
+        let general = clauses.iter().any(|c| c.resume.is_some());
+        let continuation_row = general.then(|| self.fresh.row_var());
+        let result_var = general.then(|| self.fresh.ty());
+
         let mut handled: BTreeSet<EffectAtom> = BTreeSet::new();
         let mut clause_rows = Row::empty();
         for clause in clauses {
@@ -2098,14 +2106,40 @@ impl<'a> Checker<'a> {
             for (name, t) in clause.params.iter().zip(&params) {
                 self.env.bind(name.name.clone(), Scheme::mono(t.clone()));
             }
+            if let Some(binder) = &clause.resume {
+                let (result, row) = (
+                    result_var.clone().expect("a general clause is present"),
+                    continuation_row.expect("a general clause is present"),
+                );
+                self.env.bind(
+                    binder.name.clone(),
+                    Scheme::mono(Type::Fn {
+                        params: vec![ret.clone()],
+                        ret: Box::new(result),
+                        effects: Row::open(row),
+                    }),
+                );
+            }
             let (clause_ty, clause_row) = self.infer(&clause.body);
             self.env.pop();
-            self.expect(
-                clause.body.span,
-                &ret,
-                &clause_ty,
-                "a handler clause returns the operation's result",
-            );
+            // A general clause's body *is* the `handle`'s answer, so it is
+            // checked against the result rather than against the operation's
+            // return type; the tail-resumptive form is the one whose body has to
+            // be something the perform site can receive.
+            match (&clause.resume, &result_var) {
+                (Some(_), Some(result)) => self.expect(
+                    clause.body.span,
+                    result,
+                    &clause_ty,
+                    "a clause that binds a continuation returns the `handle`'s result",
+                ),
+                _ => self.expect(
+                    clause.body.span,
+                    &ret,
+                    &clause_ty,
+                    "a handler clause returns the operation's result",
+                ),
+            }
             clause_rows = self.join(e.span, clause_rows, clause_row);
         }
 
@@ -2122,9 +2156,21 @@ impl<'a> Checker<'a> {
             None => (body_ty, Row::empty()),
         };
 
+        if let Some(result) = &result_var {
+            self.expect(
+                e.span,
+                result,
+                &result_ty,
+                "every clause of a `handle` produces its result",
+            );
+        }
+
         let remaining = body_row.without(&handled);
         let row = self.join(e.span, remaining, clause_rows);
         let row = self.join(e.span, row, return_row);
+        if let Some(v) = continuation_row {
+            self.subst.solve_continuation_row(v, &row);
+        }
         (result_ty, row)
     }
 

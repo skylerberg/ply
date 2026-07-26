@@ -4,6 +4,7 @@ use ply_corpus::bench;
 use ply_corpus::build::generate;
 use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write;
+use ply_eval::EngineChoice;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -95,8 +96,15 @@ struct BenchArgs {
     /// Repeats per scenario; the fastest run is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
+    /// The evaluator whose wall clock the `execute` phase is measuring.
+    #[arg(long, default_value = "machine", value_parser = parse_engine)]
+    engine: EngineChoice,
     #[arg(long)]
     json: bool,
+}
+
+fn parse_engine(s: &str) -> Result<EngineChoice, String> {
+    EngineChoice::parse(s).ok_or_else(|| format!("expected treewalk, machine or both, got `{s}`"))
 }
 
 #[derive(Args, Debug)]
@@ -130,6 +138,7 @@ fn run() -> Result<()> {
                 &args.corpus,
                 &bench::Options {
                     repeats: args.repeats,
+                    engine: args.engine,
                 },
             )?;
             emit_report(&report, args.json)
@@ -209,6 +218,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
             &root,
             &bench::Options {
                 repeats: args.repeats,
+                engine: EngineChoice::default(),
             },
         )?);
     }

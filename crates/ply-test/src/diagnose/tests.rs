@@ -906,6 +906,7 @@ fn summary_of(attribution: crate::Attribution) -> Vec<String> {
         cached: 0,
         failures: vec![failure_with(attribution)],
         duration: std::time::Duration::from_millis(1),
+        parallelism: Default::default(),
         results: Vec::new(),
         warnings: Vec::new(),
     }

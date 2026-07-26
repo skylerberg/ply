@@ -1,11 +1,29 @@
 use crate::build::*;
-use crate::{Interp, Value};
+use crate::differential::compare_answers;
+use crate::{Interp, Machine, Value};
 use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
+/// Runs both engines, so that every test below is a differential test. The
+/// comparison lives here rather than in a suite of its own so that a divergence
+/// fails the test that found it: a run leaves a cache entry behind, and a wrong
+/// one is permanent.
 fn eval_in(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
-    Interp::for_program(&program, &resolved).eval_expr_for_test(&e)
+    let mut treewalk = Interp::for_program(&program, &resolved);
+    let mut machine = Machine::for_program(&program, &resolved);
+    let left = treewalk.eval_expr_for_test(&e);
+    let right = machine.eval_expr_for_test(&e);
+    if let Some(d) = compare_answers(
+        &treewalk,
+        &machine,
+        "the expression under test",
+        &left,
+        &right,
+    ) {
+        panic!("treewalk and machine disagree — {d}");
+    }
+    left
 }
 
 fn eval(e: Expr) -> Result<Value, Diagnostic> {
@@ -15,7 +33,7 @@ fn eval(e: Expr) -> Result<Value, Diagnostic> {
 fn eval_depth(items: Vec<Item>, e: Expr, depth: usize) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
     Interp::for_program(&program, &resolved)
-        .with_max_depth(depth)
+        .with_max_calls(depth)
         .eval_expr_for_test(&e)
 }
 
@@ -281,7 +299,11 @@ fn unbounded_recursion_becomes_a_diagnostic_not_a_stack_overflow() {
     let items = vec![fn_def(
         "spin",
         &["n"],
-        callv("spin", vec![bin(BinOp::Add, var("n"), int(1))]),
+        bin(
+            BinOp::Add,
+            int(1),
+            callv("spin", vec![bin(BinOp::Add, var("n"), int(1))]),
+        ),
     )];
     let d = match eval_depth(items, callv("spin", vec![int(0)]), 64) {
         Err(d) => d,
@@ -311,7 +333,7 @@ fn recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack() {
                     ),
                 ),
             )];
-            let depth = crate::DEFAULT_MAX_DEPTH as i64;
+            let depth = crate::DEFAULT_MAX_CALLS as i64;
             matches!(
                 eval_in(items, callv("down", vec![int(depth - 1)])),
                 Ok(Value::Int(0))
@@ -531,6 +553,46 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
     let d = err(e);
     assert_eq!(d.code, codes::NON_EXHAUSTIVE_MATCH);
     assert!(d.message.contains("`let` pattern"), "{}", d.message);
+}
+
+/// ADR 0005 §6. Approximating a general clause as tail-resumptive would produce
+/// a plausible wrong answer, and the result cache would keep it.
+#[test]
+fn the_tree_walker_refuses_a_clause_that_binds_a_continuation() {
+    let items = vec![state_effect()];
+    let e = handle(
+        block(
+            vec![discard(callv("cell_set", vec![var("c"), int(7)]))],
+            Some(perform("state", "get", None, vec![])),
+        ),
+        vec![general_clause(
+            "state",
+            "get",
+            None,
+            &[],
+            "k",
+            callv("k", vec![int(1)]),
+        )],
+    );
+    let e = with_cell("log", int(0), "c", e);
+
+    let (program, resolved) = standalone(items);
+    let mut treewalk = Interp::for_program(&program, &resolved);
+    let d = treewalk
+        .eval_expr_for_test(&e)
+        .expect_err("the tree-walker cannot run a general clause");
+    assert_eq!(d.code, codes::MACHINE_ONLY_CLAUSE);
+    assert!(d.message.contains("`state.get`"), "{}", d.message);
+    assert!(crate::is_machine_only(&d));
+    let untouched = treewalk.world().cells().all(|(_, v)| v.render() == "0");
+    assert!(
+        untouched,
+        "the refusal lands before the handled body runs, world was {:?}",
+        treewalk.world()
+    );
+
+    let mut machine = Machine::for_program(&program, &resolved);
+    assert_eq!(machine.eval_expr_for_test(&e).unwrap().render(), "1");
 }
 
 #[test]
@@ -1343,4 +1405,28 @@ fn values_render_readably_for_a_report_reader() {
     );
     let long = eval(callv("range", vec![int(40)])).unwrap().render();
     assert!(long.ends_with("… 8 more]"), "{long}");
+}
+
+/// The default engine is the authoritative one, and only the authoritative one
+/// may read or write a cached `Pass`. A multi-shot program is machine-only, so
+/// while the default was the tree-walker the milestone's headline capability
+/// and the project's headline capability were mutually exclusive: every
+/// program with a `resume` clause needed a non-default engine and was
+/// therefore uncacheable.
+#[test]
+fn the_default_engine_is_the_one_whose_results_may_be_cached() {
+    use crate::{Engine, EngineChoice};
+
+    assert_eq!(EngineChoice::default().primary(), Engine::default());
+    assert!(!EngineChoice::default().bypasses_cache());
+    assert_eq!(Engine::default(), Engine::Machine);
+
+    // An explicit choice is reported as itself, never as whatever the default
+    // happens to be — the bug the flip exposed.
+    assert_eq!(EngineChoice::Treewalk.primary(), Engine::Treewalk);
+    assert_eq!(EngineChoice::Machine.primary(), Engine::Machine);
+
+    assert!(EngineChoice::Treewalk.bypasses_cache());
+    assert!(EngineChoice::Both.bypasses_cache());
+    assert_eq!(EngineChoice::Both.auditor(), Some(Engine::Treewalk));
 }

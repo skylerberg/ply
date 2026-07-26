@@ -265,8 +265,25 @@ pub fn clause(
         op: id(op),
         resource: resource.map(id),
         params: params.iter().map(|p| id(p)).collect(),
+        resume: None,
         body,
         span: sp(),
+    }
+}
+
+/// `op(x̄) resume κ -> body`. The body's value is the whole `handle`'s result,
+/// and reaching the resumption is up to the body.
+pub fn general_clause(
+    effect: &str,
+    op: &str,
+    resource: Option<&str>,
+    params: &[&str],
+    binder: &str,
+    body: Expr,
+) -> HandleClause {
+    HandleClause {
+        resume: Some(id(binder)),
+        ..clause(effect, op, resource, params, body)
     }
 }
 

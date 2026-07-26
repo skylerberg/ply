@@ -12,7 +12,7 @@ pub mod slice;
 mod tests;
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::Interp;
+use ply_eval::{Engine, EngineChoice, Interp, Machine, World, compare_outcomes};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
@@ -34,7 +34,10 @@ pub use bisect::{
 };
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
-pub use schedule::group_by_conflict;
+pub use schedule::{
+    Isolation, Parallelism, WORLD_BACKED, group_by_conflict, is_world_backed, parallelism,
+    shared_footprint, world_isolated,
+};
 pub use slice::{
     Assertion, AssertionKind, CausalSlice, Difference, Entered, Event, Frame, SliceBuilder, Tracing,
 };
@@ -82,11 +85,20 @@ pub struct Selection {
     pub groups: Vec<Vec<usize>>,
     /// Indexed by test index, length `total`.
     pub reasons: Vec<Reason>,
+    /// Indexed by test index, length `total`. Covers cached tests too: whether
+    /// a test could disturb another is a fact about the test, not about this
+    /// run.
+    pub isolation: Vec<Isolation>,
+    pub parallelism: Parallelism,
 }
 
 impl Selection {
     pub fn reason(&self, index: usize) -> Option<Reason> {
         self.reasons.get(index).copied()
+    }
+
+    pub fn isolation_of(&self, index: usize) -> Option<Isolation> {
+        self.isolation.get(index).copied()
     }
 
     pub fn group_of(&self, index: usize) -> Option<usize> {
@@ -109,6 +121,8 @@ impl fmt::Debug for Selection {
             .field("to_run", &self.to_run)
             .field("groups", &self.groups)
             .field("reasons", &self.reasons)
+            .field("isolation", &self.isolation)
+            .field("parallelism", &self.parallelism)
             .finish()
     }
 }
@@ -291,6 +305,10 @@ pub struct RunReport {
     pub cached: usize,
     pub failures: Vec<Failure>,
     pub duration: Duration,
+    /// Carried through from the selection this run executed, so a consumer of
+    /// the report alone can still see how much of the corpus is trivially
+    /// parallel.
+    pub parallelism: Parallelism,
     /// Every test that actually ran, in execution order.
     pub results: Vec<TestResult>,
     /// Problems with the run itself rather than with any test — a cache that
@@ -330,6 +348,27 @@ pub struct InterpExecutor<'a> {
     /// position in `check.tests` is not a position in `program`. This is the
     /// key that means the same thing in both.
     addresses: Vec<(Symbol, usize)>,
+    fixture: Option<&'a (dyn Fn() -> World + Sync)>,
+    engine: EngineChoice,
+}
+
+/// One test's evaluator. Under [`EngineChoice::Both`] it is two of them, run
+/// over the same test so that a disagreement fails the run at the test that
+/// produced it.
+pub enum Worker<'a> {
+    Treewalk(Box<Interp<'a>>),
+    Machine(Box<Machine<'a>>),
+    Both(Box<Interp<'a>>, Box<Machine<'a>>),
+}
+
+impl Worker<'_> {
+    /// The world of the engine whose verdict is reported.
+    pub fn world(&self) -> &World {
+        match self {
+            Worker::Treewalk(i) | Worker::Both(i, _) => i.world(),
+            Worker::Machine(m) => m.world(),
+        }
+    }
 }
 
 impl<'a> InterpExecutor<'a> {
@@ -355,21 +394,103 @@ impl<'a> InterpExecutor<'a> {
             resolved,
             check,
             addresses,
+            fixture: None,
+            engine: EngineChoice::default(),
+        }
+    }
+
+    /// The world every test forks from. A `World` holds `Rc` and cannot cross a
+    /// thread, so this is a factory called on each worker's own thread rather
+    /// than a value — one fixture per worker, one fork per test.
+    ///
+    /// A test's writes therefore reach neither the base nor a sibling worker,
+    /// which is the premise the scheduler's world-backed exemption rests on: a
+    /// shared mutable fixture here would make `cell` atoms contend again.
+    pub fn with_fixture(mut self, fixture: &'a (dyn Fn() -> World + Sync)) -> Self {
+        self.fixture = Some(fixture);
+        self
+    }
+
+    pub fn with_engine(mut self, engine: EngineChoice) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    fn interp(&self) -> Box<Interp<'a>> {
+        let mut interp = Interp::new(self.program, self.resolved, self.check);
+        if let Some(fixture) = self.fixture {
+            interp.set_base_world(fixture());
+        }
+        Box::new(interp)
+    }
+
+    fn machine(&self) -> Box<Machine<'a>> {
+        let mut machine = Machine::new(self.program, self.resolved, self.check);
+        if let Some(fixture) = self.fixture {
+            machine.set_base_world(fixture());
+        }
+        Box::new(machine)
+    }
+
+    fn run_one<E: ply_eval::Evaluator>(&self, e: &mut E, index: usize) -> Result<(), Diagnostic> {
+        match self.addresses.get(index) {
+            Some((module, ordinal)) => e.eval_test_in(module, *ordinal),
+            None => e.eval_test(index),
         }
     }
 }
 
 impl<'a> Executor for InterpExecutor<'a> {
-    type Worker = Interp<'a>;
+    type Worker = Worker<'a>;
 
-    fn worker(&self) -> Interp<'a> {
-        Interp::new(self.program, self.resolved, self.check)
+    fn worker(&self) -> Worker<'a> {
+        match self.engine {
+            EngineChoice::Treewalk => Worker::Treewalk(self.interp()),
+            EngineChoice::Machine => Worker::Machine(self.machine()),
+            EngineChoice::Both => Worker::Both(self.interp(), self.machine()),
+        }
     }
 
-    fn execute(&self, worker: &mut Interp<'a>, index: usize) -> Result<(), Diagnostic> {
-        match self.addresses.get(index) {
-            Some((module, ordinal)) => worker.eval_test_in(module, *ordinal),
-            None => worker.eval_test(index),
+    fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
+        match worker {
+            Worker::Treewalk(i) => self.run_one(i.as_mut(), index),
+            Worker::Machine(m) => self.run_one(m.as_mut(), index),
+            Worker::Both(i, m) => {
+                // Both are stepped even when the first has already failed: an
+                // engine that skipped a test is at a different point in the
+                // corpus, and every later comparison becomes meaningless.
+                let left = self.run_one(i.as_mut(), index);
+                let right = self.run_one(m.as_mut(), index);
+                // Comparing a refusal against an answer reports a divergence
+                // between an engine that declined to start and one that did the
+                // work, which is not a disagreement about what the program means.
+                if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
+                    return right;
+                }
+                let subject = self
+                    .check
+                    .tests
+                    .get(index)
+                    .map(|t| t.key.to_string())
+                    .unwrap_or_else(|| format!("test {index}"));
+                let span = self
+                    .check
+                    .tests
+                    .get(index)
+                    .map_or(ply_span::Span::DUMMY, |t| t.span);
+                match compare_outcomes(i.as_ref(), m.as_ref(), &subject, Some(index), &left, &right)
+                {
+                    Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
+                    // The authoritative engine's answer, so that which engine a
+                    // run reports never depends on whether auditing was on. The
+                    // two have just been proved equal, so this is a statement
+                    // about provenance rather than about the value.
+                    None => match EngineChoice::Both.primary() {
+                        Engine::Machine => right,
+                        Engine::Treewalk => left,
+                    },
+                }
+            }
         }
     }
 }
@@ -413,6 +534,11 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
         .map(|&i| (i, check.tests[i].footprint.clone()))
         .collect();
     let groups = group_by_conflict(&footprints);
+    let parallelism = parallelism(
+        check.tests.iter().map(|t| &t.footprint),
+        &footprints,
+        &groups,
+    );
 
     Selection {
         total,
@@ -420,6 +546,12 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
         to_run,
         groups,
         reasons,
+        isolation: check
+            .tests
+            .iter()
+            .map(|t| Isolation::of(&t.footprint))
+            .collect(),
+        parallelism,
     }
 }
 
@@ -510,11 +642,7 @@ pub fn diagnose_failures(
         let complete = mixture
             .as_ref()
             .is_some_and(|m| hybrid::bodies_available(store, &fresh, m));
-        let test_body = check
-            .tests
-            .iter()
-            .position(|t| t.key == failure.key)
-            .and_then(|index| BodyHybrid::test_body(&fresh, hashes, index));
+        let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
         let absent = match (&mixture, complete) {
             (Some(_), false) => Skipped::NoBodies,
             _ => Skipped::NoHybrids,
@@ -585,8 +713,9 @@ pub fn run(
     check: &CheckOutput,
     hashes: &HashOutput,
     store: &mut Store,
+    engine: EngineChoice,
 ) -> RunReport {
-    let executor = InterpExecutor::new(program, resolved, check);
+    let executor = InterpExecutor::new(program, resolved, check).with_engine(engine);
     run_with(selection, check, hashes, store, &executor)
 }
 
@@ -701,6 +830,7 @@ pub fn run_with<E: Executor>(
         cached: selection.cached.len(),
         failures,
         duration: started.elapsed(),
+        parallelism: selection.parallelism,
         results,
         warnings,
     }

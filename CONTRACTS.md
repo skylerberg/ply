@@ -1284,3 +1284,504 @@ Shrinking input **values** is property-test territory and belongs to **M8**:
 `test` takes no parameters, so there is nothing to shrink. Do not build a value
 shrinker speculatively. Also deferred: bisecting across git history, forking a
 fixture per hybrid (M6), a seed as the repro artifact (M7), and suggesting a fix.
+
+---
+
+## The control stack and the world
+
+`docs/adr/0005-control-stack-and-world.md` has the reasoning; this section is
+the contract. **Where it disagrees with any section above, this section wins** —
+it was landed after them.
+
+### The rule everything else follows from
+
+> State is a value the machine threads. Control is a value the machine splices.
+> A continuation captures control only.
+
+A resumption therefore observes the world **as of the handler's call to
+`resume`**, never as of the capture. There is exactly one current world at every
+point of an execution and it moves forward. Snapshot-at-capture makes a
+cell-backed state handler unwritable — the clause's own write would be discarded
+before the computation that asked for it ran — and the ADR's §3 is the argument.
+
+The world is **monotone**: an entry is never removed. That is what makes a
+`CellId` unable to dangle, and it is what lets a continuation captured inside a
+`with_cell` region be resumed outside it and read the cell successfully rather
+than being forbidden.
+
+### `Value` — landed in `ply-eval`
+
+```rust
+pub enum Value {
+    Int(i64), Bool(bool), Str(Arc<str>), Unit,
+    List(Vector<Value>),
+    Record(Arc<BTreeMap<Symbol, Value>>),
+    Ctor { name: Symbol, args: Arc<Vec<Value>> },
+    Closure(Arc<Closure>),
+    /// A key into the `World`, not a pointer into it.
+    Cell(CellId),
+    /// Callable with exactly one argument — the value the `perform` it was
+    /// captured at should have produced. Any other count is `ARITY_MISMATCH`.
+    Continuation(Rc<Continuation>),
+}
+
+impl Value {
+    pub fn as_cell(&self, span: Span, what: &str) -> Result<CellId, Diagnostic>;
+}
+```
+
+`Cell(Rc<RefCell<Value>>)` is gone, and with it the "cell cannot be read while it
+is already borrowed" runtime error — a `RefCell` reentrancy failure cannot happen
+to a map entry. `values_equal` compares cells by `CellId`, which is the same
+identity comparison `Rc::ptr_eq` gave. A `Continuation` compares like a closure:
+`RUNTIME_ERROR`, "cannot compare functions for equality".
+
+### `ply-eval::world` — landed
+
+```rust
+pub struct CellId(pub u32);          // Display: "#7"
+
+pub struct World { .. }              // Clone, Default, Debug
+impl World {
+    pub fn new() -> World;
+    /// O(1); structural sharing. The whole of "fork a fixture per test".
+    pub fn fork(&self) -> World;
+    pub fn alloc(&mut self, initial: Value) -> CellId;
+    pub fn get(&self, id: CellId) -> Option<&Value>;
+    /// `false` when the id is not in this world; the caller must report it.
+    pub fn set(&mut self, id: CellId, value: Value) -> bool;
+    pub fn with(&self, id: CellId, value: Value) -> World;
+    pub fn contains(&self, id: CellId) -> bool;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    /// Ascending by id, so two runs iterate identically.
+    pub fn cells(&self) -> impl Iterator<Item = (CellId, &Value)>;
+    pub fn high_water(&self) -> u32;
+}
+```
+
+Two worlds forked from one ancestor agree on every id below the ancestor's
+high-water mark and may hand out the **same** id for different cells above it.
+That is sound only because the machine holds one world at a time and no operation
+carries a value from one fork into a sibling. Do not "fix" this into a global
+counter; a landed test asserts the collision.
+
+Handler-backed resources need no second map. A handler is a closure, its state is
+a cell, and the cell is in the world — so a fixture is a `(World, Value)` pair
+and forking it is `World::fork` plus a `Value` clone.
+
+### `ply-eval::code` — landed
+
+The AST lowered once per machine, with `Rc` on every node, so a frame can hold a
+subexpression without a lifetime on `Value` and without cloning a subtree per
+push. The shape mirrors `ExprKind` one to one; patterns, names, literals and
+operators are reused from the AST.
+
+```rust
+pub type Code = Rc<Node>;
+pub struct Node { pub kind: NodeKind, pub span: Span }
+pub enum NodeKind { Lit, Var, Unary, Binary, Lambda, App, If, Match, Block,
+                    Record, Field, List, Perform, Handle, WithCell }
+pub struct Arm { pub pat: Pattern, pub guard: Option<Code>, pub body: Code, pub span: Span }
+pub enum Stmt { Let { pat: Pattern, value: Code, span: Span }, Expr(Code) }
+pub struct Clause {
+    pub effect: QName, pub op: Symbol, pub resource: Option<Symbol>,
+    pub params: Rc<Vec<Symbol>>,
+    /// `None` is the tail-resumptive form, which needs no capture.
+    pub resume: Option<Symbol>,
+    pub body: Code, pub span: Span,
+}
+pub struct ReturnArm { pub binder: Symbol, pub body: Code, pub span: Span }
+
+pub fn lower(e: &Expr) -> Code;
+```
+
+`lower_clause` sets `resume: None` today and must read `HandleClause::resume` as
+soon as the grammar below lands. It is the only place that has to learn about it.
+
+### `ply-eval::cont` — landed
+
+```rust
+pub enum Frame { .. }                // 20 kinds; see the ADR's table
+pub struct Prompt {
+    pub clauses: Rc<Vec<Clause>>,
+    /// Program-wide effect names, parallel to `clauses`, resolved where the
+    /// `handle` was written.
+    pub effects: Rc<Vec<Symbol>>,
+    pub ret: Option<Rc<ReturnArm>>,
+    pub env: Env, pub module: usize, pub span: Span,
+}
+impl Prompt {
+    pub fn clause_for(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
+        -> Option<usize>;
+}
+
+pub struct Segment { .. }
+impl Segment {
+    pub fn base() -> Segment;
+    pub fn under(prompt: Rc<Prompt>) -> Segment;
+    pub fn prompt(&self) -> Option<&Rc<Prompt>>;
+    pub fn frames(&self) -> usize;
+}
+
+pub enum Next { Frame(Frame, Stack), Leave(Rc<Prompt>, Stack), Done }
+pub struct Handled { pub segments: usize, pub prompt: Rc<Prompt>, pub clause: usize }
+
+pub struct Stack { .. }              // Clone, Default
+impl Stack {
+    pub fn new() -> Stack;
+    pub fn frames(&self) -> usize;   // O(1); this is what bounds recursion now
+    pub fn segments(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn push(&self, frame: Frame) -> Stack;
+    pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack;
+    pub fn prompt(&self) -> Option<&Rc<Prompt>>;
+    pub fn next(&self) -> Next;
+    pub fn find_handler(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
+        -> Option<Handled>;
+    /// Cuts the innermost `segments` segments away. The returned stack is what
+    /// the clause runs on; the continuation is what resuming puts back.
+    pub fn capture(&self, segments: usize) -> (Continuation, Stack);
+    pub fn resume(&self, k: &Continuation) -> Stack;
+}
+
+pub struct Continuation { .. }       // Clone
+impl Continuation {
+    pub fn frames(&self) -> usize;
+    pub fn segments(&self) -> usize;
+}
+```
+
+`capture` copies **one entry per enclosing handler crossed**, never one per
+pending frame. That is the property that makes multi-shot affordable, and
+required test 15 pins it.
+
+### `ply-eval::machine` — not implemented
+
+```rust
+/// A resource limit on the heap the frames live on. Not the bound a runaway
+/// recursion hits — that is `limit::DEFAULT_MAX_CALLS`, which both engines
+/// share and which a recursion reaches first, since a call costs a frame.
+pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
+
+pub enum Progress { Running, Halted(Value) }
+
+pub struct Machine<'a> { .. }
+impl<'a> Machine<'a> {
+    pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Machine<'a>;
+    pub fn for_program(program: &'a Program, resolved: &'a Resolved) -> Machine<'a>;
+    pub fn with_max_frames(self, max: usize) -> Machine<'a>;
+    pub fn with_max_calls(self, max: usize) -> Machine<'a>;
+    /// The atoms this engine performed at the last entry point.
+    pub fn trace(&self) -> &Trace;
+    pub fn set_base_world(&mut self, world: World);
+    pub fn world(&self) -> &World;
+    pub fn test_count(&self) -> usize;
+    pub fn test_name(&self, index: usize) -> Option<&'a str>;
+    pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic>;
+    pub fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic>;
+    pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic>;
+    pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic>;
+    /// One transition. Public so a stepper, a tracer and a fuel budget can each
+    /// be written outside the machine.
+    pub fn step(&mut self) -> Result<Progress, Diagnostic>;
+}
+```
+
+The entry points mirror `Interp`'s exactly, which is what makes `Engine` a
+drop-in. The transition rules are ADR 0005 §1.3 and are normative — in
+particular:
+
+- `W` is threaded through capture and through resumption **unchanged**;
+- a tail-resumptive clause runs on the post-capture stack with a `Frame::Resume`
+  pushed for it, so `op(x̄) -> e` is exactly `op(x̄) resume k -> k(e)`;
+- a clause body runs on the stack *below* its own handler, so a clause that
+  performs the operation it handles reaches the next handler out.
+
+### `ply-eval::Engine` — landed
+
+```rust
+pub enum Engine { Treewalk, Machine }   // Default = Machine
+impl Engine {
+    pub fn as_str(self) -> &'static str;
+    pub fn parse(s: &str) -> Option<Engine>;
+}
+```
+
+The default is the authoritative engine and flipping it is a `RUNTIME_VERSION`
+bump, which is why it is written here: a cached `Pass` is a claim about what the
+authoritative engine did. It is `Machine` as of `RUNTIME_VERSION` 0.4.0.
+
+`Interp` gains `world()` and `set_base_world(World)`; every entry point forks
+from the base world rather than starting from an empty one. `Machine` carries the
+same two.
+
+Neither type holds an `Engine`. The choice is made once per run, by `ply-test`'s
+executor, which constructs an `Interp` or a `Machine` as its `Worker` — the
+`Executor` trait already exists for exactly this and already carries no `Send`
+bound. A field inside the evaluator would put a branch on the hot path for a
+decision that is fixed before the first test starts.
+
+### `ply-syntax` — not implemented
+
+```
+hClause := IDENT "." IDENT ("[" IDENT "]")? "(" IDENT,* ")" ("resume" IDENT)? "->" expr ","?
+```
+
+```rust
+pub struct HandleClause {
+    pub effect: QName, pub op: Ident, pub resource: Option<Ident>,
+    pub params: Vec<Ident>,
+    /// The continuation binder of a general clause.
+    pub resume: Option<Ident>,
+    pub body: Expr, pub span: Span,
+}
+```
+
+`resume` is a **contextual** keyword: recognized only between a clause's `)` and
+its `->`. `lexer::is_ident("resume")` stays true, no `Kw::Resume` is added, and a
+program that binds `resume` as an ordinary name is unaffected. The binder is an
+ordinary value binder in the clause body's scope under the ordinary resolution
+order.
+
+Bare `-> e` stays tail-resumptive with its current typing rule. Do not make every
+clause general: it retypes every handler in every existing program and forces a
+capture at every `perform`.
+
+### `ply-core` — not implemented
+
+The handle rule is **unchanged** — a row is a set, so resuming twice does not
+change it:
+
+```
+footprint(handle body with H) = (row(body) \ handled) ∪ ⋃ row(clause_i) ∪ row(return)
+```
+
+A general clause types as:
+
+```
+Γ, x̄ : params_i, κ : (ret_i) -> R / ρ_κ  ⊢  body_i : R / ρ_i
+```
+
+where `R` is the `handle` expression's result type — the return clause's body
+type, or the handled body's type when there is no return clause — and a
+tail-resumptive clause keeps `body_i : ret_i`.
+
+`ρ_κ` is solved as follows and an implementer must get both halves right:
+
+- **One `ρ_κ` per `handle`, not per clause.** Every clause's continuation is the
+  same residual computation. Allocate it fresh before inferring any clause and
+  bind it into every general clause's environment.
+- **Solving it drops a self-occurrence in the tail.** `ρ_κ := ρ_h` is
+  self-referential because `ρ_h` is built from clause rows that may carry `ρ_κ`
+  as their tail. Set union is idempotent, so solve `ρ_κ` to `ρ_h` with `ρ_κ`
+  removed from the tail and the fixpoint is reached in one step. This is the
+  **only** row variable permitted a self-occurrence; it must be created and
+  solved inside `infer_handle`, and general unification's occurs check must not
+  change.
+
+`nondet` needs no change: an operation performed once and resumed twice produces
+its value once, at the `perform`, and both resumptions receive it.
+
+`ply-core::ty` stays pinned. World-backedness is a claim about the *execution
+model* — two tests get two worlds — not about two atoms, so it lives in the
+scheduler, below.
+
+### `ply-test` — not implemented
+
+```rust
+/// Effects whose atoms name state living in a `World`. Exactly one at v0.
+pub const WORLD_BACKED: &[&str] = &["cell"];
+
+pub fn is_world_backed(atom: &EffectAtom) -> bool;
+/// Every atom is world-backed. The empty footprint is world-isolated.
+pub fn world_isolated(f: &Footprint) -> bool;
+/// The atoms that can conflict across tests: `f` minus its world-backed atoms.
+pub fn shared_footprint(f: &Footprint) -> Footprint;
+```
+
+`group_by_conflict` colours `shared_footprint`s, not raw footprints. A
+world-backed atom conflicts with nothing across tests, because each test's cells
+are entries in its own forked world and no reference crosses.
+
+Each worker forks the base world per test. `Selection` gains, and `RunReport`
+reports:
+
+- `isolation: World | Shared` per test, with the atoms that made it shared;
+- `isolated: n of m` in the summary and in `--json`.
+
+Required properties, and they are the milestone's measurable claim rather than a
+slogan: every world-isolated test is in group 0 for any number of them; adding
+*N* world-isolated tests changes the group count by **zero**; the group count
+equals the colouring of the shared tests alone.
+
+### `ply-hash` — not implemented
+
+The `resume` binder **enters normalization**. A clause with a binder is a
+different definition from one without. Renaming the binder must change no hash —
+it is a local and becomes a de Bruijn level like every other. This is a
+`BODY_ENCODING` and a `FRONTEND_VERSION` bump.
+
+Omitting the binder from the hash makes two programs with different semantics
+share one cache entry, which is the most expensive defect available in this
+system.
+
+### The recursion bound — `ply-eval::limit`
+
+```rust
+/// The most nested calls a program may hold at once. Both engines answer to it
+/// and phrase the diagnostic identically, because a divergence on a deeply
+/// recursive program fails `--engine both` on every corpus that has one.
+pub const DEFAULT_MAX_CALLS: usize = 10_000;
+```
+
+`Stack::calls()` is the machine's count — the `Frame::Call`s pending, O(1)
+through push, pop, capture and splice — and `Interp` counts its own nesting the
+same way. A tail call is charged like any other: eliding it left a
+tail-recursive runaway unbounded on the machine while the tree-walker diagnosed
+it, which is ADR 0005 §7.1.
+
+### The tracer — `ply-eval::trace`
+
+```rust
+pub struct Trace { .. }
+impl Trace {
+    pub fn footprint(&self) -> &Footprint;   // the atoms performed
+    pub fn performs(&self) -> u64;           // how many, in total
+}
+```
+
+Cleared at every entry point, so it describes one test. It records a `perform`,
+building its atom exactly as inference builds the declared one; `cell_get` /
+`cell_set` are builtins over a `CellId` that carries no resource label, and the
+world comparison covers them. `Evaluator::observed_footprint` and
+`observed_performs` are how `--engine both` reads it, and a corpus whose
+`footprints_compared` is short of `compared` fails the audit.
+
+### `ply-cli` — not implemented
+
+```
+--engine <treewalk|machine|both>    default machine
+```
+
+On `ply test`, `ply run` and `ply check`. `both` runs each test on each engine and
+compares, per test:
+
+- the `Result<(), Diagnostic>` by **full JSON serialization** — code, severity,
+  message, every label with its span, every note. Not "both failed";
+- the observed footprint from the tracer;
+- the final world, as the `(CellId, rendered Value)` sequence from `World::cells`.
+
+A mismatch **fails the run** with a diagnostic naming the test and both outcomes.
+Never a warning: a divergence between two evaluators of one language is made
+sticky by the cache.
+
+A clause with a `resume` binder is machine-only. The tree-walker must refuse it
+with `E0504` (`MACHINE_ONLY_CLAUSE`), naming the clause and saying which engine
+runs it — never approximate it as tail-resumptive. Its own code rather than
+`RUNTIME_ERROR` because a consumer has to tell a refusal to start from a defect
+while running: `ply-test` classifies the latter as a panic and declines to
+bisect it, and `ply_eval::is_machine_only` is how the two are separated. Under
+`both` such a test runs once, on the machine — `differential::Compared::Refused`
+and `Report::machine_only` keep it out of what was compared — and `--explain`
+records it as `machine-only`.
+
+`ply check --engine treewalk` refuses the same program, and that verdict may not
+depend on the front-end cache: gate 1 skips a file whose bytes did not change, so
+`ply check` parses any skipped module whose source mentions `resume` before it
+scans. A refusal derived from the modules a run happened to parse makes `ply
+check` exit 2 cold and 0 warm over untouched source.
+
+`--engine` other than the default implies `--no-cache` in both directions: a
+`Pass` in the store is a claim about the authoritative engine, and a
+non-authoritative one may neither read nor write one. Flipping the default is a
+`RUNTIME_VERSION` bump.
+
+`ply test` also prints `isolated: n of m` in its summary.
+
+### Deleted with the machine
+
+Each of these is a workaround for the native stack, and the explicit stack is
+what retires it. They go in the change that deletes the tree-walker, which
+follows the flip rather than accompanying it: `--engine both` is what would
+catch a bad flip, so it outlives the flip by one change.
+
+| deleted | why |
+| --- | --- |
+| `grow()`, `stacker::maybe_grow`, the `stacker` dependency | a Ply call costs one `Frame::Call` on the heap |
+| `Interp`'s own nesting counter | the bound is `DEFAULT_MAX_CALLS` on `Stack::calls()`, which both engines already share |
+| `#[inline(never)]` on the `eval_*` arms | they keep the recursive `eval` frame small |
+| `Interp`, `Engine`, `--engine` | one milestone of two evaluators, then one |
+| `tests::recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack` | it asserts a property that stops existing, not one that fails |
+
+The **semantic** limit stays: a runaway recursion is a diagnostic, not an
+out-of-memory kill. Its message keeps the phrase "recursion limit" so ADR 0004's
+`AssertionKind::RecursionLimit` still classifies it, and it can now name the
+innermost `Call` frames.
+
+### Workspace
+
+`rpds = "1.2.1"` — persistent `List` and `RedBlackTreeMap`, parameterized over
+the shared-pointer kind so both use `Rc` and non-atomic refcounts, matching the
+existing decision that an `Interp` is confined to one thread. `RedBlackTreeMap`
+iterates in key order, which the byte-identical-artifact rule needs.
+
+### Required tests
+
+Numbered as in ADR 0005; `(landed)` marks the ones already passing.
+
+1. Every `ply-eval` unit test passes on both engines, compared by full
+   diagnostic equality.
+2. `--engine both` over `examples/`, `tests/fixtures/` and the generated corpus
+   reports zero divergences.
+3. A tree-walker asked to run a `resume` clause refuses and does not evaluate it.
+4. Forking a world and writing to the fork leaves the original unchanged.
+   *(landed)*
+5. Two tests that both retain `cell.write[users]` run in one group and neither
+   sees the other's writes.
+6. A cell is still readable through a continuation resumed after its `with_cell`
+   region returned — a **success**, not an error.
+7. A base world seeded once and forked per test gives every test the seeded state
+   and no test another's writes.
+8. Zero resumptions: the clause sees the writes made before the `perform` and
+   none after it.
+9. One resumption: `put(5); get()` answers `5`.
+10. Two resumptions: the `amb` example evaluates to `30` **and** leaves the trace
+    cell at `2`. Both halves are the test.
+11. Save-and-restore around each resumption gives each branch the same start.
+12. A continuation resumed after its `handle` returned splices onto the
+    then-current stack and runs.
+13. `op(x) -> e` and `op(x) resume k -> k(e)` agree on result, world and
+    footprint on every fixture with a handler.
+14. A handler performing the operation it handles reaches the next handler out,
+    under both clause forms.
+15. Capturing across *n* handlers copies *n* segments regardless of pending frame
+    count. *(landed)*
+16. A continuation captured inside `map`'s callback and resumed twice produces
+    two complete lists.
+17. Exceeding `DEFAULT_MAX_FRAMES` is a diagnostic containing "recursion limit"
+    whose notes name the innermost `Call` frames.
+18. A continuation applied to the wrong number of arguments is `ARITY_MISMATCH`.
+19. One footprint for the same program resuming zero, one and two times.
+20. `ρ_κ` does not trip the occurs check; a clause calling its own continuation
+    infers a closed row.
+21. Adding *N* world-isolated tests leaves the group count unchanged, for
+    N = 0, 1, 100.
+22. `--json` reports `isolation` per test and `isolated: n of m`, agreeing with
+    the footprints.
+23. A `nondet` operation resumed twice delivers one value to both resumptions.
+24. Adding a `resume` binder changes that definition's hash.
+25. Renaming the `resume` binder changes no hash.
+
+### Not in M6
+
+- **A source-level `fixture` construct.** M6 lands the mechanism and no syntax.
+  This is the milestone's largest gap: "build a fixture once, fork per test in
+  microseconds" is demonstrable through the API and not writable in Ply.
+- **A world snapshot/restore builtin** — a capability with no type-level account,
+  since restoring un-does writes the row still reports. M7.
+- **Reclaiming world entries.** Every cheap rule is unsound; correct reclamation
+  needs reachability from the live environment graph.
+- **One-shot / linearity annotations on continuations.**
+- **Effect-typed control operators** beyond `resume`: no `shift`/`reset`, no
+  first-class prompts. `handle` is the only delimiter.

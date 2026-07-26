@@ -153,13 +153,18 @@ impl<'a> BodyHybrid<'a> {
         }
     }
 
-    /// The current test's stored body, when this run's normalization agrees with
-    /// the hash the run published for it. Disagreement means the bytes are not
-    /// this test's, and a hybrid built on them would answer about another test.
-    pub fn test_body(bodies: &BodySet, hashes: &HashOutput, index: usize) -> Option<StoredBody> {
-        let body = bodies.tests().get(index)?;
-        let published = hashes.tests.get(index)?;
-        (body.key() == Some(*published)).then(|| body.clone())
+    /// The current test's stored body, found by the hash the run published for
+    /// it rather than by position.
+    ///
+    /// Position would be wrong: the incremental front end hands `ply-test` only
+    /// the modules it re-parsed, so `bodies` is indexed over those while the
+    /// published test list covers the whole program.
+    pub fn test_body(bodies: &BodySet, published: DefHash) -> Option<StoredBody> {
+        bodies
+            .tests()
+            .iter()
+            .find(|body| body.key() == Some(published))
+            .cloned()
     }
 
     pub fn take_proved(&mut self) -> Vec<DefHash> {
