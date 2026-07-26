@@ -377,6 +377,49 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
         text.contains("· {}"),
         "the group's defining footprint is missing:\n{text}"
     );
+    assert!(text.contains("isolation: world"), "got:\n{text}");
+    assert!(text.contains("world-isolated and free"), "got:\n{text}");
+}
+
+/// The milestone's claim has to be a number a project can watch, on every run
+/// and not only under `--explain`.
+#[test]
+fn a_run_reports_how_many_tests_cannot_disturb_another() {
+    let dir = project(GREEN);
+    let text = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
+    assert!(text.contains("isolated 2 of 2"), "got:\n{text}");
+
+    // The writing test cannot pass — an atom that escapes the test is an
+    // operation nothing handles — but the schedule is still an artifact about
+    // it, which is the half being asserted here.
+    let effectful = project(
+        "effect db {\n  write put[t](v: Int) -> Unit\n}\n\
+         fn store(v: Int) -> Int / {db.write[users]} = { db.put[users](v); v }\n\
+         test \"writes\" { assert_eq(store(1), 1) }\n\
+         test \"pure\" { assert_eq(1, 1) }\n",
+    );
+    let out = ply(effectful.path())
+        .args(["test", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(v["selection"]["isolated"], 1);
+    assert_eq!(v["selection"]["parallelism"]["total"], 2);
+    assert_eq!(v["selection"]["parallelism"]["shared"], 1);
+
+    let tests = v["selection"]["tests"].as_array().unwrap();
+    let writes = tests
+        .iter()
+        .find(|t| t["name"] == "writes")
+        .expect("the writing test");
+    assert_eq!(writes["isolation"], "shared");
+    assert_eq!(writes["shared_atoms"][0], "m.db.write[users]");
+    let pure = tests
+        .iter()
+        .find(|t| t["name"] == "pure")
+        .expect("the pure test");
+    assert_eq!(pure["isolation"], "world");
+    assert_eq!(pure["shared_atoms"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -1657,6 +1700,49 @@ fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
     assert_eq!(failure["suspects"][1]["culprit"], false);
 }
 
+/// The same narrowing, in a project where the incremental front end skips a
+/// file. `ply-test` is handed only the re-parsed modules, so the fresh body set
+/// covers a prefix of the program's tests while the published test list covers
+/// all of them; looking the failing test's body up by position instead of by
+/// hash silently disabled every hybrid and the failure fell back to
+/// `not_attempted` / `no_hybrids`.
+#[test]
+fn a_skipped_file_does_not_cost_the_failure_its_culprit() {
+    let dir = project(LEDGER);
+    // Sorts before `m.ply`, so its tests take the indices the fresh body set
+    // would otherwise line `m`'s up against.
+    std::fs::write(
+        dir.path().join("a.ply"),
+        "pub fn untouched(x: Int) -> Int = x\n\
+         test \"untouched is the identity\" { assert_eq(untouched(1), 1) }\n\
+         test \"untouched keeps zero\" { assert_eq(untouched(0), 0) }\n",
+    )
+    .unwrap();
+    ply(dir.path()).arg("test").assert().success();
+
+    std::fs::write(
+        dir.path().join("m.ply"),
+        LEDGER
+            .replace(
+                "if n < 0 { 0 - 1 } else { 1 }",
+                "if n < 0 { 0 - 1 } else { 0 - 1 }",
+            )
+            .replace("(a + b) + c", "a + (b + c)"),
+    )
+    .unwrap();
+
+    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    assert_eq!(
+        v["front_end"]["skipped"], 1,
+        "the point of the fixture is that a file was skipped: {}",
+        v["front_end"]
+    );
+    let culprit = &v["failures"][0]["culprit"];
+    assert_eq!(culprit["verdict"], "bisected", "{culprit}");
+    assert_eq!(culprit["definitions"], serde_json::json!(["m.normal_sign"]));
+    assert!(culprit["search"]["evaluated"].as_u64().unwrap() > 0);
+}
+
 /// `--bisect never` must still cost nothing, now that there is an engine it
 /// could have driven.
 #[test]
@@ -1757,4 +1843,178 @@ fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
             .contains("mutually recursive"),
         "the artifact has to say why they are inseparable: {culprit}"
     );
+}
+
+// --- engines ----------------------------------------------------------------
+
+/// A clause that binds a continuation. `--engine machine` runs it; ADR 0005 §3.2
+/// pins both halves of the answer, the value and the cell the two resumptions
+/// left behind.
+const MULTI_SHOT: &str = "\
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+test \"both branches\" {
+  with_cell[trace](0) { c -> {
+    let total = handle {
+      let b = amb.flip[coin]();
+      cell_set(c, cell_get(c) + 1);
+      if b { 10 } else { 20 }
+    } with {
+      amb.flip[coin]() resume k -> k(true) + k(false),
+      return x -> x
+    };
+    assert_eq(total, 30);
+    assert_eq(cell_get(c), 2)
+  } }
+}
+";
+
+/// The milestone's headline capability and the project's headline capability
+/// have to hold at once. A multi-shot program is machine-only, and only the
+/// authoritative engine may write a cached `Pass` — so while the default was
+/// the tree-walker, every program with a `resume` clause needed `--engine
+/// machine`, which implies `--no-cache`, and could never be cached at all.
+#[test]
+fn a_multi_shot_program_runs_and_caches_with_no_flags_at_all() {
+    let dir = project(MULTI_SHOT);
+    let cold = ply(dir.path()).arg("test").output().unwrap();
+    assert_eq!(cold.status.code(), Some(0), "{}", stdout_of(&cold));
+    assert!(
+        stdout_of(&cold).contains("1 passed"),
+        "{}",
+        stdout_of(&cold)
+    );
+
+    let warm = ply(dir.path()).arg("test").output().unwrap();
+    assert_eq!(warm.status.code(), Some(0), "{}", stdout_of(&warm));
+    assert!(
+        stdout_of(&warm).contains("1 cached"),
+        "{}",
+        stdout_of(&warm)
+    );
+}
+
+#[test]
+fn the_machine_runs_a_clause_that_binds_a_continuation() {
+    let dir = project(MULTI_SHOT);
+    let out = ply(dir.path())
+        .args(["test", "--engine", "machine"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert!(stdout_of(&out).contains("1 passed"), "{}", stdout_of(&out));
+}
+
+/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine. A
+/// refusal compared against an answer would fail every run over a corpus that
+/// contains one — which is every corpus the flag exists to audit.
+#[test]
+fn engine_both_does_not_call_a_refusal_a_divergence() {
+    let dir = project(MULTI_SHOT);
+    let out = ply(dir.path())
+        .args(["test", "--engine", "both"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert!(!stdout_of(&out).contains("E0503"), "{}", stdout_of(&out));
+}
+
+#[test]
+fn the_tree_walker_refuses_it_and_names_the_engine_that_runs_it() {
+    let dir = project(MULTI_SHOT);
+    let out = ply(dir.path())
+        .args(["test", "--engine", "treewalk"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("E0504") || text.contains("binds a continuation"),
+        "{text}"
+    );
+    assert!(text.contains("--engine machine"), "{text}");
+}
+
+/// The refusal is derived from the AST, and gate 1 skips a file whose bytes did
+/// not change. A `ply check` that answered differently on the second run over
+/// untouched source would be the worst kind of cache defect: invisible.
+///
+/// Only the tree-walker refuses, so only it is asked twice. The default engine
+/// runs a multi-shot program, which is the milestone's headline capability and
+/// is asserted here rather than assumed.
+#[test]
+fn check_refuses_the_same_program_cold_and_warm() {
+    let dir = project(MULTI_SHOT);
+    let refuse = |dir: &std::path::Path| {
+        ply(dir)
+            .args(["check", "--engine", "treewalk"])
+            .output()
+            .unwrap()
+    };
+    let cold = refuse(dir.path());
+    let warm = refuse(dir.path());
+    assert_eq!(cold.status.code(), Some(2));
+    assert_eq!(warm.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(cold.stderr).unwrap(),
+        String::from_utf8(warm.stderr).unwrap()
+    );
+
+    for engine in ["machine", "both"] {
+        let out = ply(dir.path())
+            .args(["check", "--engine", engine])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "--engine {engine}");
+    }
+    let default = ply(dir.path()).arg("check").output().unwrap();
+    assert_eq!(default.status.code(), Some(0), "{}", stdout_of(&default));
+}
+
+/// The pre-filter that decides which skipped files to re-parse keys on the text
+/// `resume`, so a project without one must not start parsing everything again.
+#[test]
+fn a_project_with_no_general_clause_still_skips_every_unchanged_file() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("check").assert().success();
+    let out = ply(dir.path())
+        .args(["check", "--explain"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(text.contains("skipped   m.ply"), "{text}");
+}
+
+/// One unreadable file is found by more than one read — a lazy consult and a
+/// flush that re-reads to merge — and each reports it. The reader is told once,
+/// and human output and `--json` have to agree on that.
+#[test]
+fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("test").assert().success();
+    for entry in std::fs::read_dir(dir.path().join(".ply-cache")).unwrap() {
+        std::fs::write(entry.unwrap().path(), "garbage").unwrap();
+    }
+
+    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    let v = json_of(&out);
+    let messages: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["message"].as_str().unwrap())
+        .collect();
+    let passes: Vec<&&str> = messages
+        .iter()
+        .filter(|m| m.contains("passes.json"))
+        .collect();
+    assert_eq!(passes.len(), 1, "{messages:#?}");
+
+    let mut unique = messages.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), messages.len(), "{messages:#?}");
+    assert_eq!(out.status.code(), Some(0));
 }

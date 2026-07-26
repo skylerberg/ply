@@ -1035,6 +1035,7 @@ fn handler_program(resource: &str, clause_body: Expr) -> Vec<Item> {
                     op: id("get"),
                     resource: Some(id(resource)),
                     params: vec![id("k")],
+                    resume: None,
                     body: clause_body,
                     span: Span::DUMMY,
                 }],
@@ -1063,6 +1064,27 @@ fn handler_clause_parameters_are_de_bruijn_bound() {
         hash_of(items, "run")
     };
     assert_eq!(a, renamed);
+}
+
+/// ADR 0005, required tests 24 and 25. Omitting the binder from the hash makes
+/// a general clause and a tail-resumptive one — two different semantics — share
+/// one cache entry, which is the most expensive defect this system has.
+#[test]
+fn binding_a_continuation_changes_the_hash_and_renaming_the_binder_does_not() {
+    let with_binder = |binder: &str| {
+        let mut items = handler_program("users", callv(binder, vec![int(1)]));
+        if let Item::Fn(d) = &mut items[0]
+            && let ExprKind::WithCell { body, .. } = &mut d.body.kind
+            && let ExprKind::Handle { clauses, .. } = &mut body.kind
+        {
+            clauses[0].resume = Some(id(binder));
+        }
+        hash_of(items, "run")
+    };
+    let tail_resumptive = hash_of(handler_program("users", callv("k", vec![int(1)])), "run");
+
+    assert_ne!(with_binder("resume"), tail_resumptive);
+    assert_eq!(with_binder("resume"), with_binder("kont"));
 }
 
 #[test]

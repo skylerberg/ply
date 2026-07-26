@@ -620,8 +620,12 @@ pub struct HandleClause {
     pub op: Ident,
     pub resource: Option<Ident>,
     pub params: Vec<Ident>,
-    /// The clause body's value is returned to the perform site. Tail-resumptive
-    /// only in v0, so no continuation is reified.
+    /// `op(x) resume k -> ...` binds the delimited continuation as `k`, and the
+    /// clause's body then has the whole `handle`'s type rather than the
+    /// operation's. `None` is the tail-resumptive form, where the body's value
+    /// goes straight back to the perform site — which is `op(x) resume k ->
+    /// k(e)` with the resumption supplied by the machine.
+    pub resume: Option<Ident>,
     pub body: Expr,
     pub span: Span,
 }

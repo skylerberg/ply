@@ -166,9 +166,11 @@ fn narrow(before: &Compiled, after: &Compiled, key: &str) -> ply_test::Bisection
         hybrid::bodies_available(&store, &after.bodies, &mixture),
         "the fixture must have every body a mixture needs"
     );
-    let test_body =
-        BodyHybrid::test_body(&after.bodies, &after.hashes, after.test_index(key.as_str()))
-            .expect("the current test's body");
+    let test_body = BodyHybrid::test_body(
+        &after.bodies,
+        after.hashes.tests[after.test_index(key.as_str())],
+    )
+    .expect("the current test's body");
     let mut builder = BodyHybrid::new(
         &store,
         &after.bodies,
@@ -368,6 +370,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
             attribution: Default::default(),
         }],
         duration: std::time::Duration::ZERO,
+        parallelism: Default::default(),
         results: Vec::new(),
         warnings: Vec::new(),
     };

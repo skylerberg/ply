@@ -1,22 +1,23 @@
 use crate::builtins::Builtin;
 use crate::env::Env;
-use crate::value::{Closure, ClosureKind, Value, first_difference, type_error, values_equal};
+use crate::handler::{OpDecl, check_operation, performed_atom};
+use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS};
+use crate::trace::Trace;
+use crate::value::{Closure, ClosureKind, Value, type_error, values_equal};
+use crate::world::World;
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
-    BinOp, Expr, ExprKind, HandleClause, Ident, Item, Lit, MatchArm, Param, Pattern, PatternKind,
-    Program, QName, ReturnClause, Stmt, TestDef, TypeDefBody, UnOp,
+    BinOp, Expr, ExprKind, HandleClause, Ident, Item, Lit, MatchArm, Mode, Param, Pattern,
+    PatternKind, Program, QName, ReturnClause, Stmt, TestDef, TypeDefBody, UnOp,
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
-/// A semantic limit on runaway recursion, not a stack-safety one: [`grow`]
-/// keeps the native stack from being the binding constraint.
-pub const DEFAULT_MAX_DEPTH: usize = 10_000;
+/// An operation's declaration, by program-wide effect name and operation name.
+pub(crate) type OpTable = FxHashMap<(Symbol, Symbol), (bool, Mode)>;
 
 /// One Ply call costs several native frames and an unoptimized build makes each
 /// of them large, so a worker's default 2 MiB runs out long before
@@ -39,6 +40,11 @@ struct HandlerFrame {
     /// The module the clause bodies were written in, which is not the one the
     /// perform that triggers them is reached from.
     module: usize,
+    /// The calls pending when this handler was installed. A clause body runs on
+    /// the stack *below* its own handler, so those are the calls pending while
+    /// it runs — which is what the machine's `capture` does to its own stack,
+    /// and the two engines have to charge one program the same way.
+    calls: usize,
 }
 
 /// Ordered exactly as [`CheckOutput::tests`] is — load order, then source order
@@ -55,14 +61,22 @@ pub struct Interp<'a> {
     /// Keyed by program-wide name, so two modules may declare one simple name.
     globals: FxHashMap<Symbol, Value>,
     ctors: FxHashMap<Symbol, usize>,
-    ops: FxHashMap<(Symbol, Symbol), bool>,
+    ops: OpTable,
     tests: Vec<TestSlot<'a>>,
     handlers: Vec<HandlerFrame>,
+    /// The world every entry point forks from, so one seeded world serves every
+    /// test in a run without any of them observing another's writes.
+    base_world: World,
+    world: World,
+    /// What this entry point performed, which is not what its row said it could.
+    trace: Trace,
     /// The module a bare name is resolved in: the one that wrote the expression
     /// being evaluated, not the one that called it.
     module: usize,
-    depth: usize,
-    max_depth: usize,
+    /// The pending calls, innermost last, by name. Its length is the depth the
+    /// budget bounds, so the two are one field rather than two that can drift.
+    calls: Vec<Option<Symbol>>,
+    max_calls: usize,
 }
 
 impl<'a> Interp<'a> {
@@ -110,7 +124,7 @@ impl<'a> Interp<'a> {
                         for op in &e.ops {
                             ops.insert(
                                 (qualify(&e.name.name), op.name.name.clone()),
-                                op.resource_param,
+                                (op.resource_param, op.mode),
                             );
                         }
                     }
@@ -128,19 +142,42 @@ impl<'a> Interp<'a> {
             ops,
             tests,
             handlers: Vec::new(),
+            base_world: World::new(),
+            world: World::new(),
+            trace: Trace::new(),
             module: 0,
-            depth: 0,
-            max_depth: DEFAULT_MAX_DEPTH,
+            calls: Vec::new(),
+            max_calls: DEFAULT_MAX_CALLS,
         }
     }
 
-    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
-        self.max_depth = max_depth.max(1);
+    pub fn with_max_calls(mut self, max_calls: usize) -> Self {
+        self.max_calls = max_calls.max(1);
         self
+    }
+
+    /// The atoms this engine performed at the last entry point.
+    pub fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     pub fn program(&self) -> &'a Program {
         self.program
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub(crate) fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
+    /// Every subsequent entry point forks from `world` rather than from an
+    /// empty one. A fixture built once is handed to every test this way.
+    pub fn set_base_world(&mut self, world: World) {
+        self.base_world = world;
+        self.world = self.base_world.fork();
     }
 
     pub fn check(&self) -> Option<&'a CheckOutput> {
@@ -223,8 +260,10 @@ impl<'a> Interp<'a> {
     /// entry point to the next.
     fn reset(&mut self) {
         self.handlers.clear();
-        self.depth = 0;
+        self.calls.clear();
+        self.trace.clear();
         self.module = 0;
+        self.world = self.base_world.fork();
     }
 
     /// Resolution already decided what this denotes; nothing here re-derives it.
@@ -247,16 +286,22 @@ impl<'a> Interp<'a> {
             .map(|b| b.qualified.clone())
     }
 
-    fn enter(&mut self, span: Span) -> Result<(), Diagnostic> {
-        if self.depth >= self.max_depth {
-            return Err(err_recursion_limit(span, self.max_depth));
+    fn enter(&mut self, name: Option<&Symbol>, span: Span) -> Result<(), Diagnostic> {
+        if self.calls.len() >= self.max_calls {
+            return Err(self.err_recursion_limit(span));
         }
-        self.depth += 1;
+        self.calls.push(name.cloned());
         Ok(())
     }
 
     fn leave(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
+        self.calls.pop();
+    }
+
+    fn err_recursion_limit(&self, span: Span) -> Diagnostic {
+        let innermost: Vec<Option<Symbol>> =
+            self.calls.iter().rev().take(NAMED_CALLS).cloned().collect();
+        limit::err_recursion_limit(span, NESTED_CALLS, self.max_calls, &innermost)
     }
 
     /// Every arm that needs more than a handful of locals is out of line: an
@@ -467,6 +512,16 @@ impl<'a> Interp<'a> {
         return_clause: Option<&ReturnClause>,
         env: &Env,
     ) -> Result<Value, Diagnostic> {
+        // Refused before the body runs, not when the clause is reached: a
+        // program that ran halfway and then failed has already written to the
+        // world, and the refusal is about what this engine can express at all.
+        if let Some(c) = clauses.iter().find(|c| c.resume.is_some()) {
+            return Err(crate::differential::machine_only_clause(
+                c.span,
+                &self.effect_name(&c.effect),
+                c.op.name.as_str(),
+            ));
+        }
         let effects: Vec<Symbol> = clauses
             .iter()
             .map(|c| self.effect_name(&c.effect))
@@ -477,6 +532,7 @@ impl<'a> Interp<'a> {
             effects: Arc::new(effects),
             env: env.clone(),
             module: self.module,
+            calls: self.calls.len(),
         });
         let result = self.eval(body, env);
         self.handlers.truncate(mark);
@@ -485,10 +541,7 @@ impl<'a> Interp<'a> {
         match return_clause {
             Some(rc) => {
                 let scope = env.bind(rc.binder.name.clone(), value);
-                self.enter(rc.span)?;
-                let out = grow(|| self.eval(&rc.body, &scope));
-                self.leave();
-                out
+                grow(|| self.eval(&rc.body, &scope))
             }
             None => Ok(value),
         }
@@ -503,7 +556,7 @@ impl<'a> Interp<'a> {
         env: &Env,
     ) -> Result<Value, Diagnostic> {
         let initial = self.eval(init, env)?;
-        let cell = Rc::new(RefCell::new(initial));
+        let cell = self.world.alloc(initial);
         let scope = env.bind(binder.name.clone(), Value::Cell(cell));
         self.eval(body, &scope)
     }
@@ -566,12 +619,26 @@ impl<'a> Interp<'a> {
                 // The body's bare names mean what they meant where it was
                 // written, which is not where it is being called from.
                 let caller = std::mem::replace(&mut self.module, *module);
-                self.enter(span)?;
-                let result = grow(|| self.eval(&body, &scope));
-                self.leave();
+                let entered = self.enter(closure.name.as_ref(), span);
+                let result = match entered {
+                    Err(d) => Err(d),
+                    Ok(()) => {
+                        let r = grow(|| self.eval(&body, &scope));
+                        self.leave();
+                        r
+                    }
+                };
                 self.module = caller;
                 result
             }
+            // Only a caller mixing the two engines' values reaches this, and
+            // answering with the wrong function would be worse than refusing.
+            ClosureKind::Code { .. } => Err(Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("{} was compiled for the machine engine", closure.describe()),
+            )
+            .primary(span, "this function cannot run on the tree-walker")
+            .note("run this program with `--engine machine`")),
             ClosureKind::Ctor { name, arity } => {
                 if *arity != args.len() {
                     return Err(arity_error(span, &format!("`{name}`"), *arity, args.len()));
@@ -600,7 +667,11 @@ impl<'a> Interp<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        self.check_operation_exists(effect, op, resource.is_some(), span)?;
+        let decl = op_decl(&self.ops, effect, op);
+        check_operation(decl, effect, op, resource.is_some(), span)?;
+        if let Some(atom) = performed_atom(effect, resource.as_ref(), decl) {
+            self.trace.record(atom);
+        }
 
         for i in (0..self.handlers.len()).rev() {
             let clauses = self.handlers[i].clauses.clone();
@@ -625,16 +696,17 @@ impl<'a> Interp<'a> {
             }
 
             let handler_module = self.handlers[i].module;
+            let installed_at = self.handlers[i].calls;
             let outer = self.handlers.split_off(i);
             let performer = std::mem::replace(&mut self.module, handler_module);
-            let result = match self.enter(span) {
-                Err(d) => Err(d),
-                Ok(()) => {
-                    let r = grow(|| self.eval(&clause.body, &scope));
-                    self.leave();
-                    r
-                }
-            };
+            // The clause runs below its own handler, so the calls the body made
+            // since the handler was installed are not pending while it runs —
+            // they are held aside exactly as the machine's `capture` holds them,
+            // and put back when the value returns to the perform site.
+            let pending = self.calls.split_off(installed_at);
+            let result = grow(|| self.eval(&clause.body, &scope));
+            self.calls.truncate(installed_at);
+            self.calls.extend(pending);
             self.module = performer;
             self.handlers.truncate(i);
             self.handlers.extend(outer);
@@ -642,39 +714,6 @@ impl<'a> Interp<'a> {
         }
 
         Err(err_unhandled(span, effect, op, resource.as_ref()))
-    }
-
-    /// Inference rules these out; reaching one means the evaluator was handed a
-    /// module that was never checked, so name the mistake rather than guess.
-    #[cold]
-    #[inline(never)]
-    fn check_operation_exists(
-        &self,
-        effect: &Symbol,
-        op: &Symbol,
-        has_resource: bool,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
-        match self.ops.get(&(effect.clone(), op.clone())) {
-            Some(&resource_param) => {
-                if resource_param && !has_resource {
-                    return Err(Diagnostic::error(
-                        codes::RESOURCE_REQUIRED,
-                        format!(
-                            "`{effect}.{op}` is resource-parameterized and needs a `[resource]`"
-                        ),
-                    )
-                    .primary(span, "missing resource label"));
-                }
-                Ok(())
-            }
-            None if self.ops.keys().any(|(e, _)| e == effect) => Err(Diagnostic::error(
-                codes::UNKNOWN_OPERATION,
-                format!("effect `{effect}` has no operation `{op}`"),
-            )
-            .primary(span, "unknown operation")),
-            None => Ok(()),
-        }
     }
 
     fn eval_binary(
@@ -795,35 +834,22 @@ impl<'a> Interp<'a> {
             },
         })
     }
+}
 
-    pub(crate) fn assert_eq_failure(
-        &self,
-        actual: &Value,
-        expected: &Value,
-        span: Span,
-    ) -> Diagnostic {
-        let mut diag = Diagnostic::error(
-            codes::ASSERTION_FAILED,
-            format!(
-                "assertion failed: expected {}, found {}",
-                expected.render(),
-                actual.render()
-            ),
-        )
-        .primary(span, "these values are not equal")
-        .note(format!("expected: {}", expected.render()))
-        .note(format!("actual:   {}", actual.render()));
-
-        if let Some((path, exp, act)) = first_difference(actual, expected) {
-            diag = diag.note(format!(
-                "first difference at `{path}`: expected {exp}, found {act}"
-            ));
-        }
-        diag
+/// What the two engines share so that a mis-declared operation reads the same
+/// whichever one ran it.
+pub(crate) fn op_decl(ops: &OpTable, effect: &Symbol, op: &Symbol) -> OpDecl {
+    match ops.get(&(effect.clone(), op.clone())) {
+        Some(&(resource_param, mode)) => OpDecl::Declared {
+            resource_param,
+            mode,
+        },
+        None if ops.keys().any(|(e, _)| e == effect) => OpDecl::NoSuchOp,
+        None => OpDecl::UnknownEffect,
     }
 }
 
-fn literal(lit: &Lit) -> Value {
+pub(crate) fn literal(lit: &Lit) -> Value {
     match lit {
         Lit::Int(i) => Value::Int(*i),
         Lit::Bool(b) => Value::Bool(*b),
@@ -845,7 +871,7 @@ fn eval_lambda(params: &[Param], body: &Expr, env: &Env, module: usize) -> Value
     }))
 }
 
-fn ctor_value(name: &Symbol, arity: usize) -> Value {
+pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
     if arity == 0 {
         Value::ctor(name.clone(), Vec::new())
     } else {
@@ -878,7 +904,7 @@ fn clause_matches(
 }
 
 #[inline(never)]
-fn strict_binary(
+pub(crate) fn strict_binary(
     op: BinOp,
     l: &Value,
     r: &Value,
@@ -950,18 +976,7 @@ pub(crate) fn arity_error(span: Span, what: &str, expected: usize, got: usize) -
 
 #[cold]
 #[inline(never)]
-fn err_recursion_limit(span: Span, max: usize) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("recursion limit of {max} nested calls exceeded"),
-    )
-    .primary(span, "this call is too deeply nested")
-    .note("check for a recursive call that never reaches its base case")
-}
-
-#[cold]
-#[inline(never)]
-fn err_unknown_name(q: &QName) -> Diagnostic {
+pub(crate) fn err_unknown_name(q: &QName) -> Diagnostic {
     Diagnostic::error(
         codes::UNKNOWN_NAME,
         format!("cannot find `{q}` in this scope"),
@@ -971,7 +986,7 @@ fn err_unknown_name(q: &QName) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_not_a_function(span: Span, v: &Value) -> Diagnostic {
+pub(crate) fn err_not_a_function(span: Span, v: &Value) -> Diagnostic {
     Diagnostic::error(
         codes::NOT_A_FUNCTION,
         format!("cannot call a value of type {}", v.type_name()),
@@ -981,7 +996,7 @@ fn err_not_a_function(span: Span, v: &Value) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_non_exhaustive(span: Span, v: &Value) -> Diagnostic {
+pub(crate) fn err_non_exhaustive(span: Span, v: &Value) -> Diagnostic {
     Diagnostic::error(
         codes::NON_EXHAUSTIVE_MATCH,
         "no match arm applied to the scrutinee",
@@ -992,7 +1007,7 @@ fn err_non_exhaustive(span: Span, v: &Value) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
+pub(crate) fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
     Diagnostic::error(
         codes::NON_EXHAUSTIVE_MATCH,
         "`let` pattern did not match the bound value",
@@ -1003,7 +1018,7 @@ fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>) -> Diagnostic {
+pub(crate) fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>) -> Diagnostic {
     let known: Vec<String> = fields.keys().map(|k| format!("`{k}`")).collect();
     Diagnostic::error(
         codes::UNKNOWN_NAME,
@@ -1026,7 +1041,7 @@ fn err_zero_divisor(span: Span, what: &str) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_overflow(span: Span, what: &str, a: i64, b: i64) -> Diagnostic {
+pub(crate) fn err_overflow(span: Span, what: &str, a: i64, b: i64) -> Diagnostic {
     let detail = if what == "negation" {
         format!("-{a} does not fit in Int")
     } else {
@@ -1038,7 +1053,7 @@ fn err_overflow(span: Span, what: &str, a: i64, b: i64) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_unhandled(
+pub(crate) fn err_unhandled(
     span: Span,
     effect: &Symbol,
     op: &Symbol,

@@ -348,6 +348,48 @@ fn handler_clause_commas_are_optional() {
 }
 
 #[test]
+fn a_clause_may_bind_its_continuation() {
+    assert_eq!(
+        expr("handle f() with { amb.flip[coin]() resume k -> k(true) + k(false) }"),
+        "(handle (call f) (clause amb.flip[coin] () resume k \
+         (+ (call k true) (call k false))))"
+    );
+    assert_eq!(
+        expr("handle f() with { st.put(v) resume k -> k(()) }"),
+        "(handle (call f) (clause st.put (v) resume k (call k unit)))"
+    );
+}
+
+/// `resume` is a keyword only between a clause's `)` and its `->`. A program
+/// that already binds it as an ordinary name has to keep working.
+#[test]
+fn resume_is_contextual_and_stays_an_ordinary_identifier_elsewhere() {
+    assert!(crate::lexer::is_ident("resume"));
+    assert_eq!(expr("resume(1)"), "(call resume 1)");
+    assert_eq!(
+        expr("handle f() with { st.get() -> resume }"),
+        "(handle (call f) (clause st.get () resume))"
+    );
+    assert_eq!(
+        expr("handle f() with { st.get(resume) -> resume }"),
+        "(handle (call f) (clause st.get (resume) resume))"
+    );
+    let m = ok("fn resume(x: Int) -> Int = x");
+    assert!(matches!(&m.items[0], Item::Fn(f) if f.name.name.as_str() == "resume"));
+}
+
+#[test]
+fn a_clause_that_says_resume_without_a_binder_is_reported_there() {
+    let ds = errs("fn f() = handle g() with { st.get() resume -> 1 }");
+    assert_eq!(ds[0].code, codes::UNEXPECTED_TOKEN);
+    assert!(
+        ds[0].message.contains("a name to bind the continuation to"),
+        "{}",
+        ds[0].message
+    );
+}
+
+#[test]
 fn a_return_clause_is_recognised_by_the_binder_that_follows() {
     assert_eq!(
         expr("handle f() with { return x -> x }"),
@@ -1161,12 +1203,18 @@ fn dump_expr(e: &Expr) -> String {
                     .map(|r| format!("[{}]", r.name))
                     .unwrap_or_default();
                 let ps: Vec<_> = c.params.iter().map(|p| p.name.to_string()).collect();
+                let k = c
+                    .resume
+                    .as_ref()
+                    .map(|k| format!(" resume {}", k.name))
+                    .unwrap_or_default();
                 s.push_str(&format!(
-                    " (clause {}.{}{} ({}) {})",
+                    " (clause {}.{}{} ({}){} {})",
                     c.effect,
                     c.op.name,
                     res,
                     ps.join(" "),
+                    k,
                     dump_expr(&c.body)
                 ));
             }

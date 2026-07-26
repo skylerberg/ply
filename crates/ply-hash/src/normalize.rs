@@ -647,6 +647,18 @@ impl<'a> Normalizer<'a> {
                     for p in &c.params {
                         self.values.push(&p.name);
                     }
+                    // Whether a clause binds a continuation is part of what the
+                    // definition *is* — the two forms have different typing and
+                    // different semantics — so the marker is hashed. The name is
+                    // not: it is a local, and becomes a de Bruijn level like
+                    // every other.
+                    match &c.resume {
+                        None => self.tag(tag::NONE),
+                        Some(binder) => {
+                            self.tag(tag::SOME);
+                            self.values.push(&binder.name);
+                        }
+                    }
                     self.expr(&c.body);
                     self.values.truncate(mark);
                 }

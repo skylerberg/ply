@@ -1,24 +1,56 @@
-use super::common::{IND, emit_json, plural, print_warnings, report_load_error};
-use crate::EXIT_OK;
+use super::common::{
+    IND, diagnostic_json, emit_json, once_each, plural, print_diagnostics, print_warnings,
+    report_load_error,
+};
 use crate::cli::CheckArgs;
 use crate::driver;
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
+use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_core::print_scheme;
 use ply_span::Diagnostic;
 use ply_store::Store;
+use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
+
+/// The contextual keyword a general clause is written with.
+const RESUME: &str = "resume";
 
 pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
-    let loaded = match check(args, &mut warnings) {
-        Ok(loaded) => loaded,
+    let (mut loaded, mut store) = match check(args, &mut warnings) {
+        Ok(pair) => pair,
         Err(err) => return report_load_error("check", &err, args.json, style),
     };
 
+    let refused = match refuse_machine_only(args, &mut loaded, store.as_mut(), &mut warnings) {
+        Ok(refused) => refused,
+        Err(err) => return report_load_error("check", &err, args.json, style),
+    };
+    let warnings = once_each(warnings);
+
     if args.json {
-        emit_json(&report_json(&loaded, &warnings));
-        return EXIT_OK;
+        let mut report = report_json(&loaded, &warnings);
+        if !refused.is_empty() {
+            let rendered: Vec<Value> = refused
+                .iter()
+                .map(|d| diagnostic_json(d, &loaded.sources))
+                .collect();
+            report["ok"] = json!(false);
+            report["exit_code"] = json!(EXIT_COMPILE_ERROR);
+            report["diagnostics"] = Value::Array(rendered);
+        }
+        emit_json(&report);
+        return if refused.is_empty() {
+            EXIT_OK
+        } else {
+            EXIT_COMPILE_ERROR
+        };
+    }
+
+    if !refused.is_empty() {
+        print_diagnostics(&refused, &loaded.sources, style);
+        return EXIT_COMPILE_ERROR;
     }
 
     let modules = loaded.module_count();
@@ -42,14 +74,58 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     EXIT_OK
 }
 
+/// A program the chosen engine cannot express is not a program that checks,
+/// whatever inference said about it. Only `treewalk` refuses: under `both` such
+/// a program runs once, on the machine, so it is runnable.
+///
+/// The clauses live in the AST, and gate 1 may have skipped the file that holds
+/// one — so a scan of what this run happened to parse would make the exit code
+/// depend on what the cache held, over source that never changed. Any skipped
+/// file whose text mentions `resume` is parsed first. The binder has to be
+/// written in the file that writes the clause, so the pre-filter cannot miss
+/// one, and a project with no general clause pays a substring search per file.
+fn refuse_machine_only(
+    args: &CheckArgs,
+    loaded: &mut Loaded,
+    store: Option<&mut Store>,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<Vec<Diagnostic>, crate::load::LoadError> {
+    if ply_eval::EngineChoice::from(args.engine) != ply_eval::EngineChoice::Treewalk {
+        return Ok(Vec::new());
+    }
+    let unscanned: Vec<ModuleName> = loaded
+        .modules()
+        .iter()
+        .filter(|m| !loaded.has_ast(m.name))
+        .filter(|m| {
+            loaded
+                .sources
+                .get(m.info.source)
+                .is_some_and(|f| f.text.contains(RESUME))
+        })
+        .map(|m| m.name.clone())
+        .collect();
+    if !unscanned.is_empty() {
+        *loaded = match store {
+            Some(store) => {
+                let full = driver::load_to_evaluate(&args.path, store, &unscanned);
+                warnings.extend(store.take_warnings());
+                full?
+            }
+            None => load(&args.path)?,
+        };
+    }
+    Ok(ply_eval::machine_only_clauses(&loaded.program))
+}
+
 /// A cache that cannot be opened is never a reason to refuse to typecheck: the
 /// front end degrades to the full path and says so.
 fn check(
     args: &CheckArgs,
     warnings: &mut Vec<Diagnostic>,
-) -> Result<Loaded, crate::load::LoadError> {
+) -> Result<(Loaded, Option<Store>), crate::load::LoadError> {
     if args.no_incremental {
-        return load(&args.path);
+        return Ok((load(&args.path)?, None));
     }
     let root = project_root(&args.path);
     match Store::open(&root) {
@@ -64,9 +140,9 @@ fn check(
             if let Ok(loaded) = &loaded {
                 warnings.extend(loaded.frontend.warnings.iter().cloned());
             }
-            loaded
+            Ok((loaded?, Some(store)))
         }
-        Err(_) => load(&args.path),
+        Err(_) => Ok((load(&args.path)?, None)),
     }
 }
 

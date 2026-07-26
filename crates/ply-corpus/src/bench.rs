@@ -20,6 +20,7 @@
 use crate::pipeline::{Front, Phase, Timings, front};
 use crate::write::{EditSite, read_manifest};
 use anyhow::{Context, Result, bail};
+use ply_eval::EngineChoice;
 use ply_store::Store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -60,11 +61,18 @@ pub struct Options {
     /// Repetitions per scenario; the fastest is reported, because a slower run
     /// only ever means the machine did something else as well.
     pub repeats: usize,
+    /// Which evaluator the `execute` phase is measuring. The two engines have
+    /// to be compared on one harness for the wall-clock exit criterion to mean
+    /// anything.
+    pub engine: EngineChoice,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { repeats: 3 }
+        Options {
+            repeats: 3,
+            engine: EngineChoice::default(),
+        }
     }
 }
 
@@ -289,7 +297,7 @@ fn measure_inner(
             }
             Reset::None => {}
         }
-        let (timings, shape) = once(root)?;
+        let (timings, shape) = once(root, options.engine)?;
         let keep = match &best {
             None => true,
             Some((current, _)) => timings.total() < current.total(),
@@ -337,7 +345,7 @@ struct Shape {
     failed: usize,
 }
 
-fn once(root: &Path) -> Result<(Timings, Shape)> {
+fn once(root: &Path, engine: EngineChoice) -> Result<(Timings, Shape)> {
     let Front {
         program,
         resolved,
@@ -356,7 +364,9 @@ fn once(root: &Path) -> Result<(Timings, Shape)> {
     timings.record(Phase::Select, started.elapsed());
 
     let started = Instant::now();
-    let report = ply_test::run(&selection, &program, &resolved, &check, &hashes, &mut store);
+    let report = ply_test::run(
+        &selection, &program, &resolved, &check, &hashes, &mut store, engine,
+    );
     timings.record(Phase::Execute, started.elapsed());
 
     Ok((
@@ -499,7 +509,14 @@ mod tests {
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let report = run(&root, &Options { repeats: 2 }).unwrap();
+        let report = run(
+            &root,
+            &Options {
+                repeats: 2,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         let named = |name: &str| {
             report
                 .scenarios
@@ -524,7 +541,14 @@ mod tests {
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let report = run(&root, &Options { repeats: 1 }).unwrap();
+        let report = run(
+            &root,
+            &Options {
+                repeats: 1,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         let warm = report.scenarios.iter().find(|s| s.name == "warm").unwrap();
         let rename = report
             .scenarios

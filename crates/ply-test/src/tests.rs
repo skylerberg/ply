@@ -1,5 +1,9 @@
-use crate::{Executor, Reason, Selection, Status, group_by_conflict, run, run_with, select};
+use crate::{
+    Executor, Isolation, Parallelism, Reason, Selection, Status, group_by_conflict, run, run_with,
+    select,
+};
 use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
+use ply_eval::{CellId, Value, World};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
@@ -73,6 +77,8 @@ impl Program {
         select(&self.check, &self.hashes, store)
     }
 
+    /// Both engines, so that every scheduling and caching test in this file is
+    /// also a differential test over a real Ply program.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
         run(
             selection,
@@ -81,6 +87,7 @@ impl Program {
             &self.check,
             &self.hashes,
             store,
+            ply_eval::EngineChoice::Both,
         )
     }
 
@@ -129,19 +136,23 @@ fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
     classes.len()
 }
 
+/// Sharing a group is a claim about the *escaping* atoms: world-backed state is
+/// forked per test and cannot be contended for.
 fn assert_groups_are_conflict_free(groups: &[Vec<usize>], tests: &[(usize, Footprint)]) {
     let footprint = |index: usize| {
-        &tests
-            .iter()
-            .find(|(i, _)| *i == index)
-            .expect("index came from the input")
-            .1
+        crate::shared_footprint(
+            &tests
+                .iter()
+                .find(|(i, _)| *i == index)
+                .expect("index came from the input")
+                .1,
+        )
     };
     for group in groups {
         for (a, &i) in group.iter().enumerate() {
             for &j in &group[a + 1..] {
                 assert!(
-                    !footprint(i).conflicts_with(footprint(j)),
+                    !footprint(i).conflicts_with(&footprint(j)),
                     "tests {i} and {j} share a group but conflict: {} vs {}",
                     footprint(i),
                     footprint(j)
@@ -294,6 +305,168 @@ fn grouping_is_deterministic_and_handles_an_empty_input() {
     assert_eq!(group_by_conflict(&tests), group_by_conflict(&tests));
 }
 
+// ------------------------------------------------------- world isolation
+
+fn cells(resources: &[&str]) -> Footprint {
+    Footprint::from_atoms(resources.iter().map(|r| atom("cell", Some(r), Mode::Write)))
+}
+
+#[test]
+fn a_cell_atom_is_world_backed_and_a_db_atom_is_not() {
+    assert!(crate::is_world_backed(&atom(
+        "cell",
+        Some("users"),
+        Mode::Write
+    )));
+    assert!(!crate::is_world_backed(&atom(
+        "db",
+        Some("users"),
+        Mode::Write
+    )));
+
+    // A user effect is module-qualified and `cell` is a reserved name, so the
+    // one effect that gets the exemption cannot be impersonated.
+    assert!(!crate::is_world_backed(&atom(
+        "m.cell",
+        Some("users"),
+        Mode::Write
+    )));
+
+    assert!(crate::world_isolated(&Footprint::empty()));
+    assert!(crate::world_isolated(&cells(&["users", "orders"])));
+    assert!(!crate::world_isolated(
+        &cells(&["users"]).union(&writes(&["users"]))
+    ));
+
+    let mixed = cells(&["users"]).union(&writes(&["orders"]));
+    assert_eq!(crate::shared_footprint(&mixed), writes(&["orders"]));
+    assert!(crate::shared_footprint(&cells(&["users"])).is_empty());
+}
+
+/// The claim the milestone is making: once a resource is handler-backed it does
+/// not matter how much of it a test writes, or that another test writes the
+/// same name — each is writing to its own forked world.
+#[test]
+fn tests_whose_resources_are_all_handler_backed_group_together() {
+    let tests = vec![
+        (0, cells(&["users"])),
+        (1, cells(&["users"])),
+        (2, cells(&["users", "orders", "ledger"])),
+        (3, cells(&["orders"])),
+    ];
+    assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2, 3]]);
+    assert_groups_are_conflict_free(&group_by_conflict(&tests), &tests);
+}
+
+/// The half that must not regress: a real shared resource is still serialized.
+#[test]
+fn a_resource_that_escapes_the_world_still_separates_its_writers() {
+    let tests = vec![
+        (0, writes(&["users"])),
+        (1, writes(&["users"])),
+        (2, cells(&["users"])),
+    ];
+    let groups = group_by_conflict(&tests);
+    assert_eq!(
+        groups.len(),
+        2,
+        "the two real writers cannot share: {groups:?}"
+    );
+    assert!(
+        groups[0].contains(&2),
+        "the isolated test is free: {groups:?}"
+    );
+    assert_groups_are_conflict_free(&groups, &tests);
+}
+
+#[test]
+fn a_mixed_footprint_conflicts_only_through_the_atoms_that_escape() {
+    // Every test writes `cell[users]`; only 0 and 1 also touch a real `users`.
+    let tests = vec![
+        (0, cells(&["users"]).union(&writes(&["users"]))),
+        (1, cells(&["users"]).union(&reads(&["users"]))),
+        (2, cells(&["users"]).union(&writes(&["orders"]))),
+        (3, cells(&["users"])),
+    ];
+    let groups = group_by_conflict(&tests);
+    assert_groups_are_conflict_free(&groups, &tests);
+    assert_eq!(groups.len(), 2);
+    assert!(
+        groups.iter().any(|g| g.contains(&0) && !g.contains(&1)),
+        "a real write and a real read of `users` may not share a group: {groups:?}"
+    );
+    assert!(
+        groups[0].contains(&3),
+        "the fully isolated test is in group 0: {groups:?}"
+    );
+}
+
+#[test]
+fn every_world_isolated_test_lands_in_group_zero() {
+    let mut tests: Vec<(usize, Footprint)> = vec![(0, writes(&["a"])), (1, writes(&["a"]))];
+    for i in 2..40 {
+        tests.push((i, cells(&["a"])));
+    }
+    let groups = group_by_conflict(&tests);
+    assert_eq!(groups.len(), 2);
+    for (i, footprint) in &tests {
+        if crate::world_isolated(footprint) {
+            assert!(groups[0].contains(i), "test {i} is free but not in group 0");
+        }
+    }
+}
+
+/// For N = 0, 1 and 100.
+#[test]
+fn adding_world_isolated_tests_does_not_change_the_group_count() {
+    let shared: Vec<(usize, Footprint)> = vec![
+        (0, writes(&["users"])),
+        (1, reads(&["users"])),
+        (2, writes(&["orders"])),
+    ];
+    let baseline = group_by_conflict(&shared).len();
+    assert_eq!(baseline, 2);
+
+    for n in [0usize, 1, 100] {
+        let mut tests = shared.clone();
+        for i in 0..n {
+            tests.push((3 + i, cells(&["users", "orders"])));
+        }
+        let groups = group_by_conflict(&tests);
+        assert_eq!(
+            groups.len(),
+            baseline,
+            "adding {n} world-isolated tests changed the group count"
+        );
+        assert_groups_are_conflict_free(&groups, &tests);
+        assert_eq!(
+            sorted(groups.iter().flatten().copied()).len(),
+            tests.len(),
+            "every test is still scheduled exactly once"
+        );
+
+        let p = crate::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
+        assert_eq!(p.isolated, n);
+        assert_eq!(p.shared, 3);
+        assert_eq!(p.shared_groups, baseline);
+        assert!(p.holds(), "{p:?}");
+    }
+}
+
+#[test]
+fn a_selection_of_only_isolated_tests_needs_one_group_and_no_shared_ones() {
+    let tests: Vec<(usize, Footprint)> = (0..4).map(|i| (i, cells(&["users"]))).collect();
+    let groups = group_by_conflict(&tests);
+    let p = crate::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
+    assert_eq!((p.total, p.isolated, p.shared), (4, 4, 0));
+    assert_eq!((p.groups, p.shared_groups), (1, 0));
+    assert!(p.holds(), "{p:?}");
+
+    let empty = crate::parallelism(std::iter::empty(), &[], &[]);
+    assert_eq!((empty.groups, empty.shared_groups), (0, 0));
+    assert!(empty.holds(), "{empty:?}");
+}
+
 // ---------------------------------------------------------------- selection
 
 const ARITHMETIC: &str = r#"
@@ -313,6 +486,46 @@ test "twice is right" {
   assert_eq(twice(5), 10)
 }
 "#;
+
+const MULTI_SHOT: &str = r#"
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+test "both branches" {
+  with_cell[trace](0) { c -> {
+    let total = handle {
+      let b = amb.flip[coin]();
+      cell_set(c, cell_get(c) + 1);
+      if b { 10 } else { 20 }
+    } with {
+      amb.flip[coin]() resume k -> k(true) + k(false),
+      return x -> x
+    };
+    assert_eq(total, 30);
+    assert_eq(cell_get(c), 2)
+  } }
+}
+"#;
+
+/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine.
+/// Auditing a refusal against an answer would fail every run over a corpus that
+/// contains one, which is every corpus the choice exists to audit.
+#[test]
+fn a_test_only_the_machine_can_run_is_not_reported_as_a_divergence() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(MULTI_SHOT);
+
+    let selection = program.select(&store);
+    let report = program.run(&selection, &mut store);
+    assert_eq!(
+        (report.passed, report.failed),
+        (1, 0),
+        "{:#?}",
+        report.failures
+    );
+}
 
 #[test]
 fn a_cold_cache_selects_every_test() {
@@ -858,6 +1071,8 @@ fn an_empty_selection_runs_nothing() {
         to_run: Vec::new(),
         groups: Vec::new(),
         reasons: vec![Reason::Cached; 3],
+        isolation: vec![Isolation::World; 3],
+        parallelism: Parallelism::default(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 0));
@@ -875,6 +1090,8 @@ fn a_selected_test_left_out_of_every_group_is_still_run() {
         to_run: vec![0, 1, 2],
         groups: vec![vec![0]],
         reasons: vec![Reason::New; 3],
+        isolation: vec![Isolation::World; 3],
+        parallelism: Parallelism::default(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!(report.passed, 3, "no selected test may be silently skipped");
@@ -892,6 +1109,8 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
         to_run: vec![0, 99],
         groups: vec![vec![0, 99]],
         reasons: vec![Reason::New; 3],
+        isolation: vec![Isolation::World; 3],
+        parallelism: Parallelism::default(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed), (1, 0));
@@ -985,6 +1204,8 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
         to_run: vec![0, 1, 2],
         groups: vec![vec![0], vec![1], vec![2]],
         reasons: vec![Reason::New; 3],
+        isolation: vec![Isolation::World; 3],
+        parallelism: Parallelism::default(),
     };
     let executor = PanickingExecutor { panic_on: 0 };
     let report = run_with(
@@ -1088,16 +1309,34 @@ fn explain_covers_every_test_and_every_group() {
 
     let selection = program.select(&store);
     let lines = selection.explain(&program.check, &program.hashes);
-    assert_eq!(lines.len(), selection.total + selection.groups.len());
+    let per_test = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("run ") || l.starts_with("skip"))
+            .count()
+    };
+    assert_eq!(per_test(&lines), selection.total);
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("group ")).count(),
+        selection.groups.len()
+    );
     assert!(
         lines.iter().take(3).all(|l| l.starts_with("run ")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("isolated: 3 of 3")),
         "{lines:#?}"
     );
 
     program.run(&selection, &mut store);
     let selection = program.select(&store);
     let lines = selection.explain(&program.check, &program.hashes);
-    assert!(lines.iter().all(|l| l.starts_with("skip")), "{lines:#?}");
+    assert_eq!(per_test(&lines), 3);
+    assert!(
+        lines.iter().take(3).all(|l| l.starts_with("skip")),
+        "{lines:#?}"
+    );
 
     let json = selection.to_json(&program.check, &program.hashes);
     assert_eq!(json["selected"], 0);
@@ -1150,6 +1389,169 @@ fn a_module_whose_tests_are_all_isolated_runs_as_a_single_group() {
         report.failures
     );
     assert!(report.results.iter().all(|r| r.group == 0));
+}
+
+/// A `cell` atom surviving into a test's footprint needs a continuation
+/// captured inside a `with_cell` region, which no program can write until the
+/// machine lands — so the footprint is injected rather than inferred. Every
+/// other input here is the real thing: real hashes, real selection, real
+/// execution.
+fn with_footprint(program: &mut Program, name: &str, footprint: Footprint) {
+    let index = program.index_of(name);
+    program.check.tests[index].footprint = footprint;
+}
+
+#[test]
+fn two_tests_retaining_the_same_cell_resource_run_in_one_group() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let mut program = Program::compile(DISJOINT_CELLS);
+    with_footprint(&mut program, "users cell", cells(&["users"]));
+    with_footprint(&mut program, "orders cell", cells(&["users"]));
+
+    let selection = program.select(&store);
+    assert_eq!(selection.groups, vec![vec![0, 1, 2, 3]]);
+    assert_eq!(selection.parallelism.isolated, 4);
+    assert_eq!(selection.parallelism.shared_groups, 0);
+
+    let report = program.run(&selection, &mut store);
+    assert_eq!(
+        (report.passed, report.failed),
+        (4, 0),
+        "{:#?}",
+        report.failures
+    );
+    assert!(report.results.iter().all(|r| r.group == 0));
+}
+
+#[test]
+fn a_test_that_reaches_a_real_resource_is_still_serialized_against_its_writer() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut program = Program::compile(DISJOINT_CELLS);
+    with_footprint(
+        &mut program,
+        "users cell",
+        cells(&["users"]).union(&writes(&["accounts"])),
+    );
+    with_footprint(&mut program, "orders cell", reads(&["accounts"]));
+    with_footprint(&mut program, "pure one", cells(&["accounts"]));
+
+    let selection = program.select(&store);
+    assert_eq!(selection.groups.len(), 2);
+    assert!(
+        selection.group_of(0) != selection.group_of(1),
+        "a real write and a real read of `accounts` must not share a group: {:?}",
+        selection.groups
+    );
+    assert_eq!(selection.group_of(2), Some(0));
+    assert_eq!(selection.group_of(3), Some(0));
+
+    let p = &selection.parallelism;
+    assert_eq!((p.total, p.isolated, p.shared), (4, 2, 2));
+    assert_eq!((p.groups, p.shared_groups), (2, 2));
+    assert!(p.holds(), "{p:?}");
+}
+
+/// The artifact's numbers are the footprints' numbers, not a second opinion.
+#[test]
+fn the_artifact_reports_isolation_per_test_and_in_total() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut program = Program::compile(DISJOINT_CELLS);
+    with_footprint(&mut program, "users cell", cells(&["users"]));
+    with_footprint(
+        &mut program,
+        "orders cell",
+        cells(&["orders"]).union(&writes(&["ledger"])),
+    );
+
+    let selection = program.select(&store);
+    let json = selection.to_json(&program.check, &program.hashes);
+    assert_eq!(json["isolated"], 3);
+    assert_eq!(json["parallelism"]["total"], 4);
+    assert_eq!(json["parallelism"]["shared"], 1);
+    assert_eq!(json["parallelism"]["shared_groups"], 1);
+    assert_eq!(json["tests"][0]["isolation"], "world");
+    assert_eq!(
+        json["tests"][0]["shared_atoms"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(json["tests"][1]["isolation"], "shared");
+    assert_eq!(json["tests"][1]["shared_atoms"][0], "db.write[ledger]");
+
+    for (index, test) in program.check.tests.iter().enumerate() {
+        let reported = json["tests"][index]["isolation"].as_str().unwrap();
+        let expected = if crate::world_isolated(&test.footprint) {
+            "world"
+        } else {
+            "shared"
+        };
+        assert_eq!(
+            reported, expected,
+            "test {index} disagrees with its footprint"
+        );
+    }
+
+    let lines = selection.explain(&program.check, &program.hashes);
+    assert!(
+        lines.iter().any(|l| l.starts_with("isolated: 3 of 4")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("isolation: shared {db.write[ledger]}")),
+        "{lines:#?}"
+    );
+
+    let mut store = root.store();
+    let summary = program.run(&selection, &mut store).summary();
+    assert!(
+        summary.iter().any(|l| l == "isolated: 3 of 4"),
+        "{summary:#?}"
+    );
+}
+
+/// The fork point ADR 0005 asks `ply-test` for: a worker outlives a single test,
+/// so a test that inherited the previous one's world would be sharing state
+/// through the back door the whole design exists to close.
+#[test]
+fn each_test_forks_the_fixture_rather_than_inheriting_the_previous_world() {
+    let program = Program::compile(DISJOINT_CELLS);
+    let fixture: &(dyn Fn() -> World + Sync) = &|| {
+        let mut world = World::new();
+        world.alloc(Value::Int(7));
+        world
+    };
+    let executor = crate::InterpExecutor::new(&program.program, &program.resolved, &program.check)
+        .with_fixture(fixture);
+
+    let mut worker = executor.worker();
+    assert_eq!(
+        worker.world().len(),
+        1,
+        "the worker starts from the fixture"
+    );
+
+    executor
+        .execute(&mut worker, 0)
+        .expect("the first test passes");
+    let after_first = worker.world().len();
+    assert!(after_first > 1, "the test allocated a cell of its own");
+
+    executor
+        .execute(&mut worker, 1)
+        .expect("the second test passes");
+    assert_eq!(
+        worker.world().len(),
+        after_first,
+        "the second test forked the fixture, not the first test's world"
+    );
+    assert!(
+        matches!(worker.world().get(CellId(0)), Some(Value::Int(7))),
+        "every test still sees the seeded state"
+    );
 }
 
 #[test]

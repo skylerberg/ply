@@ -6,7 +6,7 @@ use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 use ply_core::DefInfo;
-use ply_eval::Interp;
+use ply_eval::{Engine, EngineChoice, Interp, Machine, Value as PlyValue, compare_answers};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use serde_json::{Value, json};
 
@@ -38,9 +38,8 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let name = entry.name.clone();
     let module = entry.module.to_string();
     let span = entry.span;
-    let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
-
-    match interp.call(name.as_str(), Vec::new(), span) {
+    let engine: EngineChoice = args.engine.into();
+    match evaluate(&loaded, engine, name.as_str(), span) {
         Ok(value) => {
             let rendered = value.to_string();
             if args.json {
@@ -83,6 +82,37 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                 }
             }
             EXIT_FAILED
+        }
+    }
+}
+
+/// Under `both`, the authoritative engine's answer is what `main` produced and
+/// the other engine's is only ever a reason to fail: a value the two disagree
+/// about must never be printed as if it were the program's.
+fn evaluate(
+    loaded: &Loaded,
+    engine: EngineChoice,
+    name: &str,
+    span: Span,
+) -> Result<PlyValue, Diagnostic> {
+    let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
+    let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+
+    match engine {
+        EngineChoice::Treewalk => interp.call(name, Vec::new(), span),
+        EngineChoice::Machine => machine.call(name, Vec::new(), span),
+        EngineChoice::Both => {
+            let left = interp.call(name, Vec::new(), span);
+            let right = machine.call(name, Vec::new(), span);
+            // A refusal is not a disagreement: the tree-walker declined to
+            // start, so the machine's answer is the only one there is.
+            if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
+                return right;
+            }
+            match compare_answers(&interp, &machine, name, &left, &right) {
+                Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
+                None => left,
+            }
         }
     }
 }

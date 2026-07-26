@@ -27,7 +27,7 @@ use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 /// The generation of the encoding below. A decoder refuses bytes written under
 /// any other value, because a stream this compact cannot tell a shape change
 /// from a plausible one.
-pub const BODY_ENCODING: u32 = 1;
+pub const BODY_ENCODING: u32 = 2;
 
 /// A definition that is its own strongly connected component: the payload is its
 /// normalized bytes and `blake3(payload)` is the key.
@@ -1215,6 +1215,11 @@ impl Decoder<'_> {
                             name
                         })
                         .collect();
+                    let resume = self.opt(|s| {
+                        let name = ident(local_name(s.values));
+                        s.values += 1;
+                        Ok(name)
+                    })?;
                     let body = self.expr()?;
                     self.values = mark;
                     clauses.push(HandleClause {
@@ -1222,6 +1227,7 @@ impl Decoder<'_> {
                         op,
                         resource,
                         params,
+                        resume,
                         body,
                         span: Span::DUMMY,
                     });

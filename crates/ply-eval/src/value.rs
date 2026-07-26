@@ -1,8 +1,10 @@
 use crate::builtins::Builtin;
+use crate::code::Code;
+use crate::cont::Continuation;
 use crate::env::Env;
+use crate::world::CellId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Expr;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -24,9 +26,18 @@ pub enum Value {
     Unit,
     List(Vector<Value>),
     Record(Arc<BTreeMap<Symbol, Value>>),
-    Ctor { name: Symbol, args: Arc<Vec<Value>> },
+    Ctor {
+        name: Symbol,
+        args: Arc<Vec<Value>>,
+    },
     Closure(Arc<Closure>),
-    Cell(Rc<RefCell<Value>>),
+    /// A key into the [`World`](crate::world::World), not a pointer into it, so
+    /// that state is a value the machine threads rather than a location values
+    /// alias.
+    Cell(CellId),
+    /// A captured continuation. Callable with exactly one argument — the value
+    /// the `perform` it was captured at should have returned.
+    Continuation(Rc<Continuation>),
 }
 
 pub struct Closure {
@@ -43,6 +54,14 @@ pub enum ClosureKind {
         /// resolved in, which travels with the closure rather than the caller.
         module: usize,
     },
+    /// The tree-walker deep-clones an `Expr` per closure; the machine lowers
+    /// once and every closure after that is a pointer.
+    Code {
+        params: Rc<Vec<Symbol>>,
+        body: Code,
+        env: Env,
+        module: usize,
+    },
     Ctor {
         name: Symbol,
         arity: usize,
@@ -54,6 +73,7 @@ impl Closure {
     pub fn arity(&self) -> usize {
         match &self.kind {
             ClosureKind::Fn { params, .. } => params.len(),
+            ClosureKind::Code { params, .. } => params.len(),
             ClosureKind::Ctor { arity, .. } => *arity,
             ClosureKind::Builtin(b) => b.arity().0,
         }
@@ -64,7 +84,9 @@ impl Closure {
             (Some(n), _) => format!("`{n}`"),
             (None, ClosureKind::Ctor { name, .. }) => format!("`{name}`"),
             (None, ClosureKind::Builtin(b)) => format!("`{}`", b.name()),
-            (None, ClosureKind::Fn { .. }) => "an anonymous function".to_string(),
+            (None, ClosureKind::Fn { .. } | ClosureKind::Code { .. }) => {
+                "an anonymous function".to_string()
+            }
         }
     }
 }
@@ -103,6 +125,7 @@ impl Value {
             Value::Ctor { .. } => "variant",
             Value::Closure(_) => "function",
             Value::Cell(_) => "Cell",
+            Value::Continuation(_) => "continuation",
         }
     }
 
@@ -134,9 +157,9 @@ impl Value {
         }
     }
 
-    pub fn as_cell(&self, span: Span, what: &str) -> Result<&Rc<RefCell<Value>>, Diagnostic> {
+    pub fn as_cell(&self, span: Span, what: &str) -> Result<CellId, Diagnostic> {
         match self {
-            Value::Cell(c) => Ok(c),
+            Value::Cell(id) => Ok(*id),
             other => Err(type_error(span, what, "Cell", other)),
         }
     }
@@ -208,14 +231,12 @@ impl Value {
                     None => write!(out, "<fn>"),
                 };
             }
-            Value::Cell(c) => match c.try_borrow() {
-                Ok(v) => {
-                    out.push_str("<cell ");
-                    v.write(out, depth + 1);
-                    out.push('>');
-                }
-                Err(_) => out.push_str("<cell>"),
-            },
+            Value::Cell(id) => {
+                let _ = write!(out, "<cell {id}>");
+            }
+            Value::Continuation(k) => {
+                let _ = write!(out, "<continuation {} frames>", k.frames());
+            }
         }
     }
 }
@@ -296,8 +317,9 @@ pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic
             }
             true
         }
-        (Value::Cell(x), Value::Cell(y)) => Rc::ptr_eq(x, y),
-        (Value::Closure(_), _) | (_, Value::Closure(_)) => {
+        (Value::Cell(x), Value::Cell(y)) => x == y,
+        (Value::Closure(_) | Value::Continuation(_), _)
+        | (_, Value::Closure(_) | Value::Continuation(_)) => {
             return Err(Diagnostic::error(
                 codes::RUNTIME_ERROR,
                 "cannot compare functions for equality",

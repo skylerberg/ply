@@ -16,6 +16,7 @@ pub mod write;
 pub use spec::CorpusSpec;
 
 use anyhow::{Result, bail};
+use ply_eval::EngineChoice;
 use ply_store::Store;
 use std::path::Path;
 
@@ -32,6 +33,10 @@ pub struct Verified {
 /// Compiles and runs a corpus with the real crates. This is the only thing that
 /// can tell the generator its reference evaluator still agrees with `ply-eval`,
 /// so it runs by default rather than behind a flag.
+///
+/// It runs on both engines, because generated programs are the corpus most
+/// likely to reach a shape no hand-written test covers, and a divergence found
+/// anywhere else is found later.
 pub fn verify(root: &Path) -> Result<Verified> {
     let front = pipeline::front(root)?;
     let mut store = Store::open(root)?;
@@ -45,6 +50,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
         &front.check,
         &front.hashes,
         &mut store,
+        EngineChoice::Both,
     );
 
     if report.failed > 0 {

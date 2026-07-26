@@ -1374,6 +1374,16 @@ impl Parser {
             open,
             "`)` to close the clause parameters",
         )?;
+        // `resume` is a keyword only here, between a clause's `)` and its `->`.
+        // Nothing else is grammatical in that position, so consuming it on
+        // sight costs no ordinary name its meaning and lets a missing binder be
+        // reported against `resume` rather than against `->`.
+        let resume = if self.at_ident_text("resume") {
+            self.advance();
+            Some(self.expect_ident("a name to bind the continuation to")?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Arrow, "`->` and the clause body")?;
         let body = self.expr()?;
         let span = effect.span.to(body.span);
@@ -1382,6 +1392,7 @@ impl Parser {
             op,
             resource,
             params,
+            resume,
             body,
             span,
         })

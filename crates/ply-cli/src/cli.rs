@@ -53,6 +53,36 @@ impl When {
     }
 }
 
+/// Which evaluator runs. `both` runs each program on both and fails the run on
+/// any disagreement, which is the only check that catches an engine drifting.
+///
+/// Mirrors `ply_eval::EngineChoice` rather than deriving `ValueEnum` on it,
+/// because `ply-eval` does not depend on `clap` and should not start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum EngineArg {
+    Treewalk,
+    #[default]
+    Machine,
+    Both,
+}
+
+impl EngineArg {
+    pub fn as_str(self) -> &'static str {
+        ply_eval::EngineChoice::from(self).as_str()
+    }
+}
+
+impl From<EngineArg> for ply_eval::EngineChoice {
+    fn from(a: EngineArg) -> ply_eval::EngineChoice {
+        match a {
+            EngineArg::Treewalk => ply_eval::EngineChoice::Treewalk,
+            EngineArg::Machine => ply_eval::EngineChoice::Machine,
+            EngineArg::Both => ply_eval::EngineChoice::Both,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct CheckArgs {
     /// A `.ply` file, or a project root: every `*.ply` under it is a module
@@ -77,6 +107,11 @@ pub struct CheckArgs {
     /// recheck every definition.
     #[arg(long)]
     pub no_incremental: bool,
+
+    /// Which evaluator the program has to be runnable by. A handler clause
+    /// that binds a continuation is refused by `treewalk`.
+    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
+    pub engine: EngineArg,
 }
 
 #[derive(Args, Debug)]
@@ -129,6 +164,12 @@ pub struct TestArgs {
     /// the re-run of a failure; `always` traces the first execution too.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
+
+    /// Which evaluator runs. `both` runs each test on both and fails on any
+    /// disagreement. Anything but the default neither reads nor writes the
+    /// result cache.
+    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
+    pub engine: EngineArg,
 }
 
 #[derive(Args, Debug)]
@@ -141,6 +182,12 @@ pub struct RunArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
+
+    /// Which evaluator runs. `both` runs each test on both and fails on any
+    /// disagreement. Anything but the default neither reads nor writes the
+    /// result cache.
+    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
+    pub engine: EngineArg,
 }
 
 #[derive(Args, Debug)]

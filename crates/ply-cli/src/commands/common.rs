@@ -3,6 +3,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_span::{Diagnostic, Severity, SourceMap, Span};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 /// The gutter the specified output shape is indented by.
 pub const IND: &str = "   ";
@@ -30,6 +31,18 @@ pub fn location(sources: &SourceMap, span: Span) -> Option<String> {
 pub fn print_diagnostics(diagnostics: &[Diagnostic], sources: &SourceMap, style: Style) {
     let rendered = ply_span::render::all_to_terminal(diagnostics, sources);
     eprint!("{}", style.sanitize(&rendered));
+}
+
+/// One unreadable file is found more than once — a lazy read consults it, and a
+/// later flush re-reads it to merge — and each drain reports what it found. The
+/// reader is told once. Deduplicated here rather than in the store so that human
+/// output and `--json` cannot disagree about it.
+pub fn once_each(warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
+    warnings
+        .into_iter()
+        .filter(|d| seen.insert((d.code, d.message.clone())))
+        .collect()
 }
 
 /// Cache trouble and scheduling trouble are not the user's program misbehaving,
