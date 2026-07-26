@@ -1,40 +1,50 @@
 //! Two caches over one `.ply-cache` directory: results,
 //! `(RUNTIME_VERSION, DefHash) -> Outcome` beside the set of definitions a run
 //! has already seen, and the front end,
-//! `(FRONTEND_VERSION, path | DefHash) -> fingerprint | interface`.
+//! `(FRONTEND_VERSION, path | DefHash) -> fingerprint | interface | body`.
 //!
 //! Selection in Ply is exact rather than heuristic, so the cache is load-bearing
 //! — a wrong answer here is a test that never runs. Every path in this crate is
 //! arranged so the only two outcomes are "no result", which is safe because the
 //! test re-runs, and "the result that was recorded"; never anything between.
 //!
-//! The on-disk form is JSON keyed by hex hash, because reading and editing it
-//! by hand is worth more than the microseconds. The result cache is
-//! pretty-printed; the front-end cache is not, because it reaches tens of
-//! megabytes on a large project and is rewritten whole whenever a definition
-//! changes, at which point the whitespace costs more than it buys. `jq .`
-//! restores it for the rare occasion someone reads it.
+//! The two caches get different formats because they answer different
+//! questions. The **result** cache is pretty-printed JSON keyed by hex hash:
+//! it is small, and `cat`ting it to find out why a test did not re-run is worth
+//! far more than its parse cost. The **front-end** cache is a binary
+//! content-addressed store — a small index over an append-only data file, with
+//! entries decoded on demand — because nobody has ever debugged anything by
+//! reading fifteen megabytes of serialized type schemes, while everybody pays
+//! for parsing them. `ply cache inspect` is the readable interface, and prints a
+//! resolved type rather than a serialization of one.
 
+mod binary;
+mod bodies;
 mod canonical;
+mod codec;
 mod diag;
 mod disk;
 pub mod frontend;
+mod idx;
+mod schema;
 
 #[cfg(test)]
 mod tests;
 
 use anyhow::Context;
 use ply_hash::DefHash;
-use ply_span::Diagnostic;
+use ply_span::{Diagnostic, Symbol};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use canonical::{canonicalize_decl_body, canonicalize_scheme};
 pub use frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
     ImportEdge, Member, NameRef, SourceFingerprint, exports_digest, witness_holds,
 };
+pub use schema::fingerprint as schema_fingerprint;
 
 /// Bumping this invalidates every cached result in existence: a cache file
 /// written by a different runtime version is discarded whole, never merged.
@@ -47,7 +57,7 @@ pub use frontend::{
 /// the serialized form changes, and says to bump this. The semantic half is
 /// not — no test can see that the evaluator started rounding differently — so a
 /// change to `ply-eval` or to normalization must bump this by hand.
-pub const RUNTIME_VERSION: &str = "0.2.0";
+pub const RUNTIME_VERSION: &str = "0.3.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -65,7 +75,19 @@ pub const RUNTIME_VERSION: &str = "0.2.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.3.0";
+pub const FRONTEND_VERSION: &str = "0.5.0";
+
+/// The on-disk generation of the front-end cache, carried in its file header.
+///
+/// Separate from [`FRONTEND_VERSION`], which says what the *front end* computes;
+/// this says how what it computed is written down. Either one moving discards
+/// the cache, and both are checked before an entry is read.
+pub const FRONTEND_FORMAT: u32 = 4;
+
+/// The version of the definition-body encoding, which lives in `ply-hash`.
+/// Folded into [`schema_fingerprint`], so bumping it invalidates the front-end
+/// cache without anything else having to remember to.
+pub const BODY_ENCODING: u32 = ply_hash::body::BODY_ENCODING;
 
 /// Directory created under the root passed to [`Store::open`].
 pub const CACHE_DIR_NAME: &str = ".ply-cache";
@@ -132,6 +154,155 @@ impl<'de> Deserialize<'de> for ContentHash {
 
 pub use ply_span::codes;
 
+/// One definition's canonical body bytes, keyed by its [`DefHash`]: the
+/// `Definition` that a codebase is supposed to map a hash to alongside its type
+/// and footprint, and that this store never held.
+///
+/// Opaque here on purpose: the encoding is the normalizer's byte stream and
+/// belongs beside it in `ply-hash`, where a change to normalization and a change
+/// to the body encoding are the same edit. This crate only has to store it,
+/// hand it back, and refuse it when the encoding is not the one this build
+/// speaks.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct DefBody {
+    encoding: u32,
+    #[serde(with = "hex_bytes")]
+    bytes: Vec<u8>,
+}
+
+impl DefBody {
+    pub fn new(encoding: u32, bytes: Vec<u8>) -> DefBody {
+        DefBody { encoding, bytes }
+    }
+
+    pub fn encoding(&self) -> u32 {
+        self.encoding
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'));
+        }
+        s.serialize_str(&out)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        let raw = text.as_bytes();
+        if raw.len() % 2 != 0 {
+            return Err(serde::de::Error::custom("odd-length body encoding"));
+        }
+        let mut out = Vec::with_capacity(raw.len() / 2);
+        for pair in raw.chunks_exact(2) {
+            let hi = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| serde::de::Error::custom("malformed body encoding"))?;
+            let lo = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| serde::de::Error::custom("malformed body encoding"))?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        Ok(out)
+    }
+}
+
+/// The definition set a test last passed against, keyed by `<module>.<label>`.
+///
+/// Keyed by *name*, which is the one place in Ply a name is load-bearing for a
+/// cache. `DefHash -> Pass` cannot answer this: a test's hash covers its whole
+/// closure, so a regression moves it and there is nothing to look up. A baseline
+/// has to be found under a key the edit did not move. The cost is that renaming
+/// a test's label loses its baseline — one missing bisection, never a wrong one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassRecord {
+    pub test_hash: DefHash,
+    /// The *functions* in the closure, by program-wide name as
+    /// [`crate::CachedTest::key`] qualifies them.
+    pub closure: std::collections::BTreeMap<Symbol, DefHash>,
+    /// The `type` and `effect` declarations, kept apart because a `fn` and a
+    /// `type` may share a name. One map for both would record whichever the
+    /// writer preferred and drop the other, so an edit to the loser would be
+    /// invisible to every later bisection and the winner's hash would be handed
+    /// to everything that mentions either.
+    pub decls: std::collections::BTreeMap<Symbol, DefHash>,
+}
+
+impl PassRecord {
+    /// Every hash the record names, in either namespace. Retention has to see
+    /// all of them: a body kept for the value half and dropped for the
+    /// declaration half is a baseline that cannot be rebuilt.
+    pub fn hashes(&self) -> impl Iterator<Item = DefHash> {
+        self.closure.values().chain(self.decls.values()).copied()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PassRecordRepr {
+    test_hash: DefHash,
+    closure: std::collections::BTreeMap<String, DefHash>,
+    /// Absent from records written before declarations were tracked. Reading one
+    /// as empty is what the writer meant then, and costs nothing beyond the
+    /// first pass that rewrites it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    decls: std::collections::BTreeMap<String, DefHash>,
+}
+
+impl Serialize for PassRecord {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        PassRecordRepr {
+            test_hash: self.test_hash,
+            closure: self
+                .closure
+                .iter()
+                .map(|(name, hash)| (name.to_string(), *hash))
+                .collect(),
+            decls: self
+                .decls
+                .iter()
+                .map(|(name, hash)| (name.to_string(), *hash))
+                .collect(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PassRecord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let repr = PassRecordRepr::deserialize(d)?;
+        Ok(PassRecord {
+            test_hash: repr.test_hash,
+            closure: repr
+                .closure
+                .into_iter()
+                .map(|(name, hash)| (Symbol::new(name), hash))
+                .collect(),
+            decls: repr
+                .decls
+                .into_iter()
+                .map(|(name, hash)| (Symbol::new(name), hash))
+                .collect(),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Outcome {
     Pass,
@@ -197,21 +368,94 @@ pub struct Store {
     path: PathBuf,
     entries: disk::Entries,
     definitions: disk::Definitions,
+    passes: Passes,
     dirty: bool,
     frontend_path: PathBuf,
+    frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
-    /// The bytes this store's copy of the front-end cache was read from, so a
-    /// flush can tell "nobody else wrote" from "merge needed" without parsing
-    /// the file a second time.
-    frontend_digest: Option<ContentHash>,
-    frontend_dirty: bool,
-    /// Set by whoever removed something, which is only correct for a run that
-    /// saw every file under the root. A merging flush would resurrect exactly
-    /// what was removed, so such a run has to write the front-end cache whole.
-    /// The cost is losing entries a concurrent run added mid-flight, which is a
-    /// recheck rather than a wrong answer.
-    authoritative: bool,
     warnings: Vec<Diagnostic>,
+}
+
+/// The pass records, read on the first question rather than at
+/// [`Store::open`].
+///
+/// A record is a whole closure — every name a test reached and what it hashed
+/// to — so they are by far the largest thing the result cache holds, and only a
+/// *failing* test ever reads one. Charging every green run for that file is what
+/// put `Store::open` an order of magnitude over the budget the store was
+/// rebuilt to meet.
+#[derive(Default)]
+struct Passes {
+    path: PathBuf,
+    stored: OnceLock<disk::Passes>,
+    /// This run's, which shadow anything on disk under the same key.
+    added: disk::Passes,
+    dirty: bool,
+    /// Carried over from a format 1 result cache, which held them inline. Used
+    /// only while the file they moved to does not exist yet.
+    inline: disk::Passes,
+    warnings: Mutex<Vec<Diagnostic>>,
+}
+
+impl Passes {
+    fn stored(&self) -> &disk::Passes {
+        self.stored
+            .get_or_init(|| match disk::load_passes(&self.path) {
+                Ok(passes) => passes,
+                Err(disk::LoadError::Missing) => self.inline.clone(),
+                Err(e) => {
+                    self.warnings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(e.into_passes_diagnostic(&self.path));
+                    self.inline.clone()
+                }
+            })
+    }
+
+    fn get(&self, key: &Symbol) -> Option<&PassRecord> {
+        match self.added.get(key) {
+            Some(record) => Some(record),
+            None => self.stored().get(key),
+        }
+    }
+
+    /// Comparing against what is on disk is what forces the read, and it is
+    /// worth it: without it a re-proved baseline rewrites the file on every run
+    /// that re-ran anything. A run that records a pass has just executed a test,
+    /// so it can afford the read; a run that recorded none never gets here.
+    fn put(&mut self, key: Symbol, record: PassRecord) {
+        if self.get(&key) == Some(&record) {
+            return;
+        }
+        self.added.insert(key, record);
+        self.dirty = true;
+    }
+
+    fn all(&self) -> impl Iterator<Item = (&Symbol, &PassRecord)> {
+        self.stored()
+            .iter()
+            .filter(|(key, _)| !self.added.contains_key(*key))
+            .chain(self.added.iter())
+    }
+
+    fn clear(&mut self) {
+        self.added.clear();
+        self.inline.clear();
+        self.stored = OnceLock::from(disk::Passes::new());
+        self.dirty = false;
+    }
+
+    fn take_warnings(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.warnings.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn warnings(&self) -> Vec<Diagnostic> {
+        self.warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -219,7 +463,110 @@ pub struct Pruned {
     pub sources: usize,
     pub defs: usize,
     pub decls: usize,
+    pub bodies: usize,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Compaction {
+    pub dropped: Pruned,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CacheStats {
+    pub results: usize,
+    pub definitions_seen: usize,
+    pub sources: usize,
+    pub defs: usize,
+    pub decls: usize,
+    pub bodies: usize,
+    pub results_bytes: u64,
+    pub index_bytes: u64,
+    pub data_bytes: u64,
+    /// What [`Store::compact`] would reclaim: the region of the append-only data
+    /// file that no index record names.
+    pub garbage_bytes: Option<u64>,
+}
+
+/// A cached entry [`Store::lookup`] matched. Tests are their own variant because
+/// a test has no name a reference could reach, and what one is asked about — did
+/// it pass, may it run beside that other one — is not what a definition is
+/// asked about.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Found {
+    Def(FoundDef),
+    Test(FoundTest),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FoundDef {
+    pub hash: DefHash,
+    pub name: Symbol,
+    pub kind: DefKind,
+    pub path: PathBuf,
+    pub span: FileSpan,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FoundTest {
+    pub hash: DefHash,
+    pub name: String,
+    pub nondet: bool,
+    pub footprint: ply_core::Footprint,
+    pub path: PathBuf,
+    pub span: FileSpan,
+}
+
+impl Found {
+    pub fn hash(&self) -> DefHash {
+        match self {
+            Found::Def(d) => d.hash,
+            Found::Test(t) => t.hash,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Found::Def(d) => &d.path,
+            Found::Test(t) => &t.path,
+        }
+    }
+}
+
+/// A missing file is nothing cached, which is zero bytes rather than an error:
+/// every caller here is reporting sizes, and none of them wants a run to fail
+/// because a cache it does not need is absent.
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// A query is a hash prefix when it is short-but-not-too-short lowercase hex.
+/// Four characters is two bytes, which is ambiguous often enough to be worth
+/// showing every match and short enough to type.
+fn hash_prefix(query: &str) -> Option<Vec<u8>> {
+    let query = query.to_ascii_lowercase();
+    if query.len() < 4 || query.len() > 64 || !query.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(query.into_bytes())
+}
+
+fn starts_with(hash: DefHash, prefix: Option<&[u8]>) -> bool {
+    let Some(prefix) = prefix else { return false };
+    hash.to_hex().as_bytes().starts_with(prefix)
+}
+
+/// A program-wide name matches in full, and its last segment matches on its own,
+/// because a person reading a diagnostic sees `place` and types `place`.
+fn names_match(name: &Symbol, query: &str) -> bool {
+    name.as_str() == query || name.as_str().rsplit('.').next() == Some(query)
+}
+
+/// The front-end cache as a single JSON document, which nothing reads any more.
+/// Kept only so that a flush can delete it once there is something to replace it
+/// with.
+const LEGACY_FRONTEND_FILE: &str = "frontend.json";
 
 impl Store {
     /// Opens/creates `<root>/.ply-cache`. Fails only if that directory cannot
@@ -230,20 +577,26 @@ impl Store {
             .with_context(|| format!("could not create the cache directory `{}`", dir.display()))?;
 
         let path = dir.join(disk::RESULTS_FILE);
+        let passes_path = dir.join(disk::PASSES_FILE);
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
+        let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
+        let (frontend, frontend_warnings) =
+            frontend::Frontend::open(&frontend_path, &frontend_data_path);
         let mut store = Store {
             root: root.to_path_buf(),
             dir,
             path,
             entries: disk::Entries::new(),
             definitions: disk::Definitions::new(),
+            passes: Passes {
+                path: passes_path,
+                ..Passes::default()
+            },
             dirty: false,
             frontend_path,
-            frontend: frontend::Frontend::default(),
-            frontend_digest: None,
-            frontend_dirty: false,
-            authoritative: false,
-            warnings: Vec::new(),
+            frontend_data_path,
+            frontend,
+            warnings: frontend_warnings,
         };
         disk::sweep_stale_temps(&store.dir);
 
@@ -251,6 +604,13 @@ impl Store {
             Ok(cache) => {
                 store.entries = cache.results;
                 store.definitions = cache.definitions;
+                // A format 1 file is rewritten on the way out whether or not it
+                // held any records, so the next run never pays to scan it again.
+                if cache.migrating {
+                    store.passes.inline = cache.inline_passes;
+                    store.passes.dirty = !store.passes.inline.is_empty();
+                    store.dirty = true;
+                }
             }
             Err(disk::LoadError::Missing) => {}
             Err(e) => {
@@ -258,18 +618,6 @@ impl Store {
                 // Nothing was loaded, so nothing is pending; the flag exists
                 // here only to get the unusable file replaced.
                 store.dirty = true;
-            }
-        }
-
-        match frontend::load_with_digest(&store.frontend_path) {
-            Ok((f, digest)) => {
-                store.frontend = f;
-                store.frontend_digest = Some(digest);
-            }
-            Err(frontend::LoadError::Missing) => {}
-            Err(e) => {
-                store.warnings.push(e.into_diagnostic(&store.frontend_path));
-                store.frontend_dirty = true;
             }
         }
         Ok(store)
@@ -284,70 +632,110 @@ impl Store {
         self.dirty = true;
     }
 
+    pub fn pass_record(&self, key: &Symbol) -> Option<&PassRecord> {
+        self.passes.get(key)
+    }
+
+    /// The caller must observe the same rule that governs [`Outcome::Pass`]:
+    /// **never for a failing or `nondet` test**. A baseline taken from a red run
+    /// would have bisection compare one broken configuration against another.
+    pub fn put_pass_record(&mut self, key: Symbol, record: PassRecord) {
+        self.passes.put(key, record);
+    }
+
+    pub fn pass_records_len(&self) -> usize {
+        self.passes.all().count()
+    }
+
     /// Folds in whatever another process wrote since [`Store::open`], so two
     /// concurrent runs cannot silently discard each other's results.
+    ///
+    /// A writer that cannot take the cache lock within the bounded wait writes
+    /// **nothing** and warns: two processes appending to one data file
+    /// interleave frames, which is corruption, where a lost update is only a
+    /// recheck.
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        if !self.dirty && !self.frontend_dirty {
+        if !self.dirty && !self.passes.dirty && !self.frontend.is_dirty() {
             return Ok(());
         }
-        let _lock = disk::Lock::acquire(&self.dir);
-
-        if self.dirty {
-            let mut merged = disk::load(&self.path).unwrap_or_default();
-            merged
-                .results
-                .extend(self.entries.iter().map(|(h, o)| (*h, o.clone())));
-            merged.definitions.extend(self.definitions.iter().copied());
-
-            disk::save(&self.dir, &self.path, &merged)?;
-            self.entries = merged.results;
-            self.definitions = merged.definitions;
-            self.dirty = false;
+        let lock = disk::Lock::acquire(&self.dir);
+        if !lock.held {
+            self.warnings.push(
+                Diagnostic::warning(
+                    codes::CACHE_UNREADABLE,
+                    format!(
+                        "another `ply` run is holding the cache lock in `{}`",
+                        self.dir.display()
+                    ),
+                )
+                .note("nothing was written; this run is unaffected and the next one recomputes"),
+            );
+            return Ok(());
         }
 
-        if self.frontend_dirty {
-            // Re-reading is only ever for entries some *other* process added.
-            // When the bytes on disk are the ones this store already parsed
-            // there is nothing to merge, and this run's map is already the
-            // answer — no second parse, and no copy of it either. At ten
-            // thousand definitions both of those are tens of milliseconds on a
-            // run that changed one definition.
-            let untouched = frontend::digest_of(&self.frontend_path) == self.frontend_digest;
-            if self.authoritative || untouched {
-                let written = frontend::save(&self.dir, &self.frontend_path, &self.frontend)?;
-                self.frontend_digest = Some(written);
-            } else {
-                // Both interface maps are content-keyed, so an entry another
-                // process wrote is as good as one of ours and the union is
-                // always sound. A fingerprint is not, but it is re-validated
-                // against the file's bytes before it is ever believed, so
-                // last-writer-wins costs at worst a parse.
-                let mut merged = frontend::load(&self.frontend_path).unwrap_or_default();
-                for (&hash, slots) in &self.frontend.defs {
-                    let into = merged.defs.entry(hash).or_default();
-                    for def in slots {
-                        frontend::upsert(into, def.clone(), hash, |d: &CachedDef| &d.names);
-                    }
-                }
-                for (&hash, slots) in &self.frontend.decls {
-                    let into = merged.decls.entry(hash).or_default();
-                    for decl in slots {
-                        frontend::upsert(into, decl.clone(), hash, |d: &CachedDecl| &d.names);
-                    }
-                }
-                merged.sources.extend(
-                    self.frontend
-                        .sources
-                        .iter()
-                        .map(|(p, f)| (p.clone(), f.clone())),
-                );
-                let written = frontend::save(&self.dir, &self.frontend_path, &merged)?;
-                self.frontend = merged;
-                self.frontend_digest = Some(written);
+        // Before the results, because writing them is what drops the inline
+        // copy a format 1 file still carries: the records have to be somewhere
+        // else first or a crash between the two loses every baseline.
+        self.write_passes()?;
+        self.write_results()?;
+
+        if self.frontend.is_dirty() {
+            self.frontend
+                .flush(&self.dir, &self.frontend_path, &self.frontend_data_path)?;
+            let _ = std::fs::remove_file(self.dir.join(LEGACY_FRONTEND_FILE));
+        }
+        Ok(())
+    }
+
+    /// Folds this run's results into whatever is on disk. The caller holds the
+    /// lock, which is what stops two writers from each reading the same cache
+    /// and the second rename dropping the first one's entries.
+    fn write_results(&mut self) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let mut merged = disk::load(&self.path).unwrap_or_default();
+        merged
+            .results
+            .extend(self.entries.iter().map(|(h, o)| (*h, o.clone())));
+        merged.definitions.extend(self.definitions.iter().copied());
+        disk::save(&self.dir, &self.path, &merged)?;
+        self.entries = merged.results;
+        self.definitions = merged.definitions;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Folds this run's pass records into whatever is on disk, under the same
+    /// lock and for the same reason as the results.
+    ///
+    /// Last writer wins per test, which is what "the configuration it last
+    /// passed at" means. A foreign record is as good as a local one: both name a
+    /// set of hashes that test actually went green against.
+    fn write_passes(&mut self) -> anyhow::Result<()> {
+        if !self.passes.dirty {
+            return Ok(());
+        }
+        let mut merged = match disk::load_passes(&self.passes.path) {
+            Ok(passes) => passes,
+            Err(disk::LoadError::Missing) => std::mem::take(&mut self.passes.inline),
+            Err(e) => {
+                self.warnings
+                    .push(e.into_passes_diagnostic(&self.passes.path));
+                std::mem::take(&mut self.passes.inline)
             }
-            self.frontend_dirty = false;
-            self.authoritative = false;
-        }
+        };
+        merged.extend(
+            self.passes
+                .added
+                .iter()
+                .map(|(key, record)| (key.clone(), record.clone())),
+        );
+        disk::save_passes(&self.dir, &self.passes.path, &merged)?;
+        self.passes.added.clear();
+        self.passes.inline.clear();
+        self.passes.stored = OnceLock::from(merged);
+        self.passes.dirty = false;
         Ok(())
     }
 
@@ -357,15 +745,16 @@ impl Store {
     pub fn clear(&mut self) -> anyhow::Result<()> {
         self.entries.clear();
         self.definitions.clear();
-        self.frontend = frontend::Frontend::default();
-        self.frontend_digest = None;
+        self.passes.clear();
+        self.frontend.clear();
         self.warnings.clear();
         self.dirty = false;
-        self.frontend_dirty = false;
-        self.authoritative = false;
         let _lock = disk::Lock::acquire(&self.dir);
         remove(&self.path, "result cache")?;
+        remove(&self.passes.path, "pass records")?;
         remove(&self.frontend_path, "front-end cache")?;
+        remove(&self.frontend_data_path, "front-end cache")?;
+        remove(&self.dir.join(LEGACY_FRONTEND_FILE), "front-end cache")?;
         disk::sweep_temps(&self.dir, None);
         Ok(())
     }
@@ -416,15 +805,22 @@ impl Store {
         self.definitions.len()
     }
 
-    /// Every degradation this cache took on the way up. Empty in the normal
-    /// case; a caller that never reports these turns a corrupt cache into
-    /// silence.
-    pub fn warnings(&self) -> &[Diagnostic] {
-        &self.warnings
+    /// Every degradation this cache took, including the ones a *read* found: an
+    /// entry is decoded on demand, so a frame that does not verify is discovered
+    /// long after the store was opened. A caller that never reports these turns a
+    /// corrupt cache into silence.
+    pub fn warnings(&self) -> Vec<Diagnostic> {
+        let mut warnings = self.warnings.clone();
+        warnings.extend(self.passes.warnings());
+        warnings.extend(self.frontend.warnings());
+        warnings
     }
 
     pub fn take_warnings(&mut self) -> Vec<Diagnostic> {
-        std::mem::take(&mut self.warnings)
+        let mut warnings = std::mem::take(&mut self.warnings);
+        warnings.extend(self.passes.take_warnings());
+        warnings.extend(self.frontend.take_warnings());
+        warnings
     }
 
     pub fn dir(&self) -> &Path {
@@ -443,28 +839,28 @@ impl Store {
         &self.frontend_path
     }
 
+    /// The append-only data file the index points into. Both live under
+    /// [`Store::dir`].
+    pub fn frontend_data_path(&self) -> &Path {
+        &self.frontend_data_path
+    }
+
     /// What this file compiled to last time — trustworthy only after its
     /// `content_hash` has been compared against the bytes on disk now.
-    pub fn source(&self, path: &Path) -> Option<&SourceFingerprint> {
-        self.frontend.sources.get(&self.key(path)?)
+    pub fn fingerprint(&self, path: &Path) -> Option<Arc<SourceFingerprint>> {
+        self.frontend.fingerprint(&self.key(path)?)
     }
 
     /// Returns `false` for a path that cannot be keyed relative to the root, in
     /// which case the file is simply never eligible for the fast path.
     ///
-    /// Re-storing what is already here is not a write. That is what lets a run
-    /// where nothing changed flush nothing: the cache file is rewritten whole,
-    /// and at ten thousand definitions that is the single largest cost in a run
-    /// that had no work to do.
+    /// Re-storing what is already here is not a write, so a run that re-derives
+    /// exactly what is cached leaves the cache clean and flushes nothing.
     pub fn put_source(&mut self, path: &Path, fingerprint: SourceFingerprint) -> bool {
         let Some(key) = self.key(path) else {
             return false;
         };
-        if self.frontend.sources.get(&key) == Some(&fingerprint) {
-            return true;
-        }
-        self.frontend.sources.insert(key, fingerprint);
-        self.frontend_dirty = true;
+        self.frontend.put_source(key, fingerprint);
         true
     }
 
@@ -472,40 +868,39 @@ impl Store {
         let Some(key) = self.key(path) else {
             return false;
         };
-        let removed = self.frontend.sources.remove(&key).is_some();
-        if removed {
-            self.frontend_dirty = true;
-            self.authoritative = true;
-        }
-        removed
+        self.frontend.forget_source(&key)
     }
 
     pub fn source_paths(&self) -> Vec<PathBuf> {
         self.frontend
-            .sources
-            .keys()
+            .source_keys()
+            .into_iter()
             .map(|key| self.root.join(key))
             .collect()
     }
 
     pub fn sources_len(&self) -> usize {
-        self.frontend.sources.len()
+        self.frontend.sources_len()
     }
 
     /// Some interface stored under this hash. Correct only where any of them
     /// will do — to reuse one as a definition's published type, ask for it by
-    /// name with [`Store::cached_def_of`], because several definitions can share
-    /// a hash and their schemes are not interchangeable.
-    pub fn cached_def(&self, hash: DefHash) -> Option<&CachedDef> {
-        self.frontend.defs.get(&hash)?.first()
+    /// name with [`Store::def_of`], because several definitions can share a hash
+    /// and their schemes are not interchangeable.
+    pub fn def(&self, hash: DefHash) -> Option<Arc<CachedDef>> {
+        self.frontend.def(hash)
     }
 
-    pub fn cached_def_of(&self, hash: DefHash, name: &ply_span::Symbol) -> Option<&CachedDef> {
-        self.frontend
-            .defs
-            .get(&hash)?
-            .iter()
-            .find(|d| frontend::declares(&d.names, name, hash))
+    pub fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDef>> {
+        self.frontend.def_of(hash, name)
+    }
+
+    pub fn decl(&self, hash: DefHash) -> Option<Arc<CachedDecl>> {
+        self.frontend.decl(hash)
+    }
+
+    pub fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDecl>> {
+        self.frontend.decl_of(hash, name)
     }
 
     /// Stores the canonical form of `def`, which is what comes back out. A
@@ -513,38 +908,61 @@ impl Store {
     /// canonicalize its own side with [`canonicalize_scheme`] first, or the two
     /// differ by nothing but the numbers its counter reached.
     pub fn put_def(&mut self, hash: DefHash, def: CachedDef) {
-        let slots = self.frontend.defs.entry(hash).or_default();
-        if frontend::upsert(slots, def.canonicalized(), hash, |d: &CachedDef| &d.names) {
-            self.frontend_dirty = true;
-        }
+        self.frontend.put_def(hash, def);
     }
 
     pub fn defs_len(&self) -> usize {
-        self.frontend.defs.values().map(Vec::len).sum()
-    }
-
-    pub fn cached_decl(&self, hash: DefHash) -> Option<&CachedDecl> {
-        self.frontend.decls.get(&hash)?.first()
-    }
-
-    pub fn cached_decl_of(&self, hash: DefHash, name: &ply_span::Symbol) -> Option<&CachedDecl> {
-        self.frontend
-            .decls
-            .get(&hash)?
-            .iter()
-            .find(|d| frontend::declares(&d.names, name, hash))
+        self.frontend.defs_len()
     }
 
     /// Canonicalizes on the way in, as [`Store::put_def`] does.
     pub fn put_decl(&mut self, hash: DefHash, decl: CachedDecl) {
-        let slots = self.frontend.decls.entry(hash).or_default();
-        if frontend::upsert(slots, decl.canonicalized(), hash, |d: &CachedDecl| &d.names) {
-            self.frontend_dirty = true;
-        }
+        self.frontend.put_decl(hash, decl);
     }
 
     pub fn decls_len(&self) -> usize {
-        self.frontend.decls.values().map(Vec::len).sum()
+        self.frontend.decls_len()
+    }
+
+    /// The stored body of the definition this hash names, if this build speaks
+    /// its encoding.
+    pub fn body(&self, hash: DefHash) -> Option<Arc<DefBody>> {
+        let body = self.frontend.body(hash)?;
+        (body.encoding() == BODY_ENCODING).then_some(body)
+    }
+
+    pub fn has_body(&self, hash: DefHash) -> bool {
+        self.body(hash).is_some()
+    }
+
+    /// A body is name-free, so it is a function of its hash and one hash has one
+    /// body — unlike an interface, which is written in names a hash erases and
+    /// therefore needs a slot per declaring name.
+    ///
+    /// A second, *different* body for a hash is that assumption failing. It is
+    /// kept out and reported rather than overwriting what is there, because
+    /// which of the two is wrong is exactly what nobody knows at that point.
+    pub fn put_body(&mut self, hash: DefHash, body: DefBody) {
+        if let frontend::StoredBody::Conflict = self.frontend.put_body(hash, body) {
+            self.warnings.push(
+                Diagnostic::warning(
+                    codes::CACHE_CORRUPT,
+                    format!(
+                        "two different bodies were stored for definition `{}`",
+                        hash.short()
+                    ),
+                )
+                .note(
+                    "a body is keyed by a hash of itself, so this means the body encoding \
+                     depends on something the hash does not cover",
+                )
+                .note("keeping the body already stored; the new one is discarded"),
+            );
+        }
+    }
+
+    pub fn bodies_len(&self) -> usize {
+        self.frontend.bodies_len()
     }
 
     /// Only call this after a run that discovered every `.ply` file under the
@@ -555,36 +973,110 @@ impl Store {
     pub fn prune(&mut self, keep: &[PathBuf]) -> Pruned {
         let keep: std::collections::BTreeSet<String> =
             keep.iter().filter_map(|p| self.key(p)).collect();
-
-        let before = self.frontend.sources.len();
-        self.frontend.sources.retain(|key, _| keep.contains(key));
-        let sources = before - self.frontend.sources.len();
-
-        let live: std::collections::BTreeSet<DefHash> = self
-            .frontend
-            .sources
-            .values()
-            .flat_map(|f| f.referenced_hashes())
-            .collect();
-
-        let before = self.defs_len();
-        self.frontend.defs.retain(|hash, _| live.contains(hash));
-        let defs = before - self.defs_len();
-
-        let before = self.decls_len();
-        self.frontend.decls.retain(|hash, _| live.contains(hash));
-        let decls = before - self.decls_len();
-
-        let pruned = Pruned {
-            sources,
-            defs,
-            decls,
-        };
-        if sources + defs + decls > 0 {
-            self.frontend_dirty = true;
-            self.authoritative = true;
+        // Asked before the roots are gathered, because gathering them reads the
+        // pass records — and a run over an unchanged project has nothing to
+        // prune, so it must not be charged for that file.
+        if !self.frontend.prune_would_change(&keep) {
+            return Pruned::default();
         }
-        pruned
+        self.frontend.prune(&keep, &self.baseline_hashes())
+    }
+
+    /// The second retention root. A baseline names definitions that are no
+    /// longer in any source file — that is the entire point of one — so pruning
+    /// to what the files declare now would delete exactly the bodies bisection
+    /// exists to compare against, and every later failure would degrade to
+    /// `no_bodies` with nothing to say why.
+    fn baseline_hashes(&self) -> std::collections::BTreeSet<DefHash> {
+        self.passes
+            .all()
+            .flat_map(|(_, record)| record.hashes())
+            .collect()
+    }
+
+    /// Reclaims the space [`Store::prune`] makes unreachable, which on an
+    /// append-only data file is the only thing that ever shrinks it.
+    ///
+    /// Carries `prune`'s precondition for the same reason: it takes the files
+    /// discovered by a run that saw the whole root, and dropping an entry
+    /// because a partial run did not mention it would throw away work no error
+    /// would ever report.
+    pub fn compact(&mut self, keep: &[PathBuf]) -> anyhow::Result<Compaction> {
+        let bytes_before = self.frontend_bytes();
+        let dropped = self.prune(keep);
+        let lock = disk::Lock::acquire(&self.dir);
+        if !lock.held {
+            anyhow::bail!(
+                "another `ply` run is holding the cache lock in `{}`",
+                self.dir.display()
+            );
+        }
+        self.write_results()?;
+        self.frontend
+            .compact(&self.dir, &self.frontend_path, &self.frontend_data_path)?;
+        let _ = std::fs::remove_file(self.dir.join(LEGACY_FRONTEND_FILE));
+        Ok(Compaction {
+            dropped,
+            bytes_before,
+            bytes_after: self.frontend_bytes(),
+        })
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            results: self.entries.len(),
+            definitions_seen: self.definitions.len(),
+            sources: self.sources_len(),
+            defs: self.defs_len(),
+            decls: self.decls_len(),
+            bodies: self.bodies_len(),
+            results_bytes: file_bytes(&self.path) + file_bytes(&self.passes.path),
+            index_bytes: file_bytes(&self.frontend_path),
+            data_bytes: file_bytes(&self.frontend_data_path),
+            garbage_bytes: Some(self.frontend.garbage_bytes()),
+        }
+    }
+
+    /// Every cached entry a query names: a program-wide name, a name as its
+    /// module wrote it, or a hash prefix of at least four hex characters.
+    ///
+    /// Several matches are returned rather than refused. For a prefix that is
+    /// what was asked for, and for a simple name declared in two modules it is
+    /// the honest answer — the store holds no namespace that could pick one.
+    pub fn lookup(&self, query: &str) -> Vec<Found> {
+        let prefix = hash_prefix(query);
+        let mut found = Vec::new();
+        for (key, fingerprint) in self.frontend.sources() {
+            let path = self.root.join(key);
+            for def in &fingerprint.defs {
+                if names_match(&def.name, query) || starts_with(def.hash, prefix.as_deref()) {
+                    found.push(Found::Def(FoundDef {
+                        hash: def.hash,
+                        name: def.name.clone(),
+                        kind: def.kind,
+                        path: path.clone(),
+                        span: def.span,
+                    }));
+                }
+            }
+            for test in &fingerprint.tests {
+                if test.name == query || starts_with(test.hash, prefix.as_deref()) {
+                    found.push(Found::Test(FoundTest {
+                        hash: test.hash,
+                        name: test.name.clone(),
+                        nondet: test.nondet,
+                        footprint: test.footprint.clone(),
+                        path: path.clone(),
+                        span: test.span,
+                    }));
+                }
+            }
+        }
+        found
+    }
+
+    fn frontend_bytes(&self) -> u64 {
+        file_bytes(&self.frontend_path) + file_bytes(&self.frontend_data_path)
     }
 
     pub fn frontend_is_empty(&self) -> bool {
@@ -594,7 +1086,7 @@ impl Store {
     /// Whether [`Store::flush`] would rewrite the front-end cache. A run that
     /// found everything already cached must leave this `false`.
     pub fn frontend_is_dirty(&self) -> bool {
-        self.frontend_dirty
+        self.frontend.is_dirty()
     }
 
     fn key(&self, path: &Path) -> Option<String> {

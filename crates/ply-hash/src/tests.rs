@@ -19,7 +19,10 @@ fn qn(name: &str) -> QName {
 }
 
 fn e(kind: ExprKind) -> Expr {
-    Expr { kind, span: Span::DUMMY }
+    Expr {
+        kind,
+        span: Span::DUMMY,
+    }
 }
 
 fn var(name: &str) -> Expr {
@@ -35,7 +38,10 @@ fn str_lit(v: &str) -> Expr {
 }
 
 fn call(func: Expr, args: Vec<Expr>) -> Expr {
-    e(ExprKind::App { func: Box::new(func), args })
+    e(ExprKind::App {
+        func: Box::new(func),
+        args,
+    })
 }
 
 fn callv(name: &str, args: Vec<Expr>) -> Expr {
@@ -43,32 +49,58 @@ fn callv(name: &str, args: Vec<Expr>) -> Expr {
 }
 
 fn add(lhs: Expr, rhs: Expr) -> Expr {
-    e(ExprKind::Binary { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+    e(ExprKind::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    })
 }
 
 fn bin(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-    e(ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+    e(ExprKind::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    })
 }
 
 fn lambda(params: &[&str], body: Expr) -> Expr {
-    e(ExprKind::Lambda { params: params.iter().map(|p| param(p)).collect(), body: Box::new(body) })
+    e(ExprKind::Lambda {
+        params: params.iter().map(|p| param(p)).collect(),
+        body: Box::new(body),
+    })
 }
 
 fn param(name: &str) -> Param {
-    Param { name: id(name), ty: None, span: Span::DUMMY }
+    Param {
+        name: id(name),
+        ty: None,
+        span: Span::DUMMY,
+    }
 }
 
 fn typed_param(name: &str, ty: &str) -> Param {
-    Param { name: id(name), ty: Some(ty_con(ty, vec![])), span: Span::DUMMY }
+    Param {
+        name: id(name),
+        ty: Some(ty_con(ty, vec![])),
+        span: Span::DUMMY,
+    }
 }
 
 fn ty_con(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
-    TypeExpr::Con { name: qn(name), args, span: Span::DUMMY }
+    TypeExpr::Con {
+        name: qn(name),
+        args,
+        span: Span::DUMMY,
+    }
 }
 
 fn let_(name: &str, value: Expr) -> Stmt {
     Stmt::Let {
-        pat: Pattern { kind: PatternKind::Var(id(name)), span: Span::DUMMY },
+        pat: Pattern {
+            kind: PatternKind::Var(id(name)),
+            span: Span::DUMMY,
+        },
         ty: None,
         value: Box::new(value),
         span: Span::DUMMY,
@@ -76,7 +108,10 @@ fn let_(name: &str, value: Expr) -> Stmt {
 }
 
 fn pat(kind: PatternKind) -> Pattern {
-    Pattern { kind, span: Span::DUMMY }
+    Pattern {
+        kind,
+        span: Span::DUMMY,
+    }
 }
 
 fn pvar(name: &str) -> Pattern {
@@ -84,19 +119,32 @@ fn pvar(name: &str) -> Pattern {
 }
 
 fn pctor(name: &str, args: Vec<Pattern>) -> Pattern {
-    pat(PatternKind::Ctor { name: qn(name), args })
+    pat(PatternKind::Ctor {
+        name: qn(name),
+        args,
+    })
 }
 
 fn arm(pattern: Pattern, body: Expr) -> MatchArm {
-    MatchArm { pat: pattern, guard: None, body, span: Span::DUMMY }
+    MatchArm {
+        pat: pattern,
+        guard: None,
+        body,
+        span: Span::DUMMY,
+    }
 }
 
 fn block(stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
-    e(ExprKind::Block { stmts, tail: tail.map(Box::new) })
+    e(ExprKind::Block {
+        stmts,
+        tail: tail.map(Box::new),
+    })
 }
 
 fn record(fields: Vec<(&str, Expr)>) -> Expr {
-    e(ExprKind::Record { fields: fields.into_iter().map(|(n, v)| (id(n), v)).collect() })
+    e(ExprKind::Record {
+        fields: fields.into_iter().map(|(n, v)| (id(n), v)).collect(),
+    })
 }
 
 fn list(items: Vec<Expr>) -> Expr {
@@ -140,7 +188,10 @@ fn hashes(items: Vec<Item>) -> HashOutput {
 }
 
 fn hash_of(items: Vec<Item>, name: &str) -> DefHash {
-    *hashes(items).defs.get(&Symbol::new(name)).expect("definition should be hashed")
+    *hashes(items)
+        .defs
+        .get(&Symbol::new(name))
+        .expect("definition should be hashed")
 }
 
 /// `a` calls `b` calls `c` calls `d`, with a test on top of `a`. The chain the
@@ -151,7 +202,10 @@ fn chain(a: &str, b: &str, c: &str, d: &str) -> Vec<Item> {
         func(b, &["y"], callv(c, vec![var("y")])),
         func(c, &["z"], callv(d, vec![var("z"), int(2)])),
         func(d, &["p", "q"], add(var("p"), var("q"))),
-        test_item("the chain adds up", callv("assert_eq", vec![callv(a, vec![int(1)]), int(4)])),
+        test_item(
+            "the chain adds up",
+            callv("assert_eq", vec![callv(a, vec![int(1)]), int(4)]),
+        ),
     ]
 }
 
@@ -162,10 +216,22 @@ fn renaming_a_transitively_called_definition_changes_no_hash() {
     let before = hashes(chain("a", "b", "c", "d"));
     let after = hashes(chain("a", "b", "c", "renamed_deep_helper"));
 
-    assert_eq!(before.defs[&Symbol::new("a")], after.defs[&Symbol::new("a")]);
-    assert_eq!(before.defs[&Symbol::new("b")], after.defs[&Symbol::new("b")]);
-    assert_eq!(before.defs[&Symbol::new("c")], after.defs[&Symbol::new("c")]);
-    assert_eq!(before.defs[&Symbol::new("d")], after.defs[&Symbol::new("renamed_deep_helper")]);
+    assert_eq!(
+        before.defs[&Symbol::new("a")],
+        after.defs[&Symbol::new("a")]
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("b")],
+        after.defs[&Symbol::new("b")]
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("c")],
+        after.defs[&Symbol::new("c")]
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("d")],
+        after.defs[&Symbol::new("renamed_deep_helper")]
+    );
     assert_eq!(before.tests, after.tests);
 }
 
@@ -199,7 +265,10 @@ fn renaming_a_recursive_definition_changes_no_hash() {
             }),
         )]
     };
-    assert_eq!(hash_of(fact("fact"), "fact"), hash_of(fact("factorial"), "factorial"));
+    assert_eq!(
+        hash_of(fact("fact"), "fact"),
+        hash_of(fact("factorial"), "factorial")
+    );
 }
 
 #[test]
@@ -211,7 +280,11 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                 name: id(ty),
                 params: vec![],
                 body: TypeDefBody::Sum(vec![
-                    VariantDef { name: id("Active"), fields: vec![], span: Span::DUMMY },
+                    VariantDef {
+                        name: id("Active"),
+                        fields: vec![],
+                        span: Span::DUMMY,
+                    },
                     VariantDef {
                         name: id("Banned"),
                         fields: vec![ty_con("String", vec![])],
@@ -238,7 +311,10 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
             })),
         ]
     };
-    assert_eq!(hash_of(program("User"), "describe"), hash_of(program("Account"), "describe"));
+    assert_eq!(
+        hash_of(program("User"), "describe"),
+        hash_of(program("Account"), "describe")
+    );
 }
 
 #[test]
@@ -271,7 +347,10 @@ fn renaming_an_effect_changes_no_hash_of_its_performers() {
             ),
         ]
     };
-    assert_eq!(hash_of(program("db"), "lookup"), hash_of(program("store"), "lookup"));
+    assert_eq!(
+        hash_of(program("db"), "lookup"),
+        hash_of(program("store"), "lookup")
+    );
 }
 
 // ---- property 2: renaming a local changes no hash ----
@@ -288,7 +367,10 @@ fn renaming_parameters_and_let_bindings_changes_no_hash() {
             ),
         )]
     };
-    assert_eq!(hash_of(program("x", "y", "t"), "f"), hash_of(program("a", "b", "u"), "f"));
+    assert_eq!(
+        hash_of(program("x", "y", "t"), "f"),
+        hash_of(program("a", "b", "u"), "f")
+    );
 }
 
 #[test]
@@ -322,20 +404,35 @@ fn renaming_a_match_binder_changes_no_hash() {
 
 #[test]
 fn shadowing_resolves_to_the_innermost_binder() {
-    let shadowed = hash_of(vec![func("f", &[], lambda(&["x"], lambda(&["x"], var("x"))))], "f");
-    let distinct = hash_of(vec![func("f", &[], lambda(&["x"], lambda(&["y"], var("y"))))], "f");
-    let outer = hash_of(vec![func("f", &[], lambda(&["x"], lambda(&["y"], var("x"))))], "f");
+    let shadowed = hash_of(
+        vec![func("f", &[], lambda(&["x"], lambda(&["x"], var("x"))))],
+        "f",
+    );
+    let distinct = hash_of(
+        vec![func("f", &[], lambda(&["x"], lambda(&["y"], var("y"))))],
+        "f",
+    );
+    let outer = hash_of(
+        vec![func("f", &[], lambda(&["x"], lambda(&["y"], var("x"))))],
+        "f",
+    );
     assert_eq!(shadowed, distinct);
     assert_ne!(shadowed, outer);
 }
 
 #[test]
 fn a_local_shadows_a_top_level_definition_of_the_same_name() {
-    let out = hashes(vec![func("helper", &[], int(0)), func("f", &["helper"], var("helper"))]);
+    let out = hashes(vec![
+        func("helper", &[], int(0)),
+        func("f", &["helper"], var("helper")),
+    ]);
     assert_eq!(out.deps[&Symbol::new("f")], Vec::<Symbol>::new());
     assert_eq!(
         out.defs[&Symbol::new("f")],
-        hash_of(vec![func("helper", &[], int(0)), func("f", &["x"], var("x"))], "f"),
+        hash_of(
+            vec![func("helper", &[], int(0)), func("f", &["x"], var("x"))],
+            "f"
+        ),
     );
 }
 
@@ -367,11 +464,19 @@ fn de_bruijn_levels_distinguish_which_binder_is_used() {
 fn a_let_binding_is_not_in_scope_in_its_own_right_hand_side() {
     // `let x = x` refers to whatever `x` meant outside, not to itself.
     let inner = hash_of(
-        vec![func("f", &["x"], block(vec![let_("x", var("x"))], Some(var("x"))))],
+        vec![func(
+            "f",
+            &["x"],
+            block(vec![let_("x", var("x"))], Some(var("x"))),
+        )],
         "f",
     );
     let renamed = hash_of(
-        vec![func("f", &["p"], block(vec![let_("q", var("p"))], Some(var("q"))))],
+        vec![func(
+            "f",
+            &["p"],
+            block(vec![let_("q", var("p"))], Some(var("q"))),
+        )],
         "f",
     );
     assert_eq!(inner, renamed);
@@ -382,7 +487,14 @@ fn a_let_binding_is_not_in_scope_in_its_own_right_hand_side() {
 #[test]
 fn wrapping_a_body_in_a_block_changes_no_hash() {
     let bare = hash_of(vec![func("f", &["x"], add(var("x"), int(1)))], "f");
-    let braced = hash_of(vec![func("f", &["x"], block(vec![], Some(add(var("x"), int(1)))))], "f");
+    let braced = hash_of(
+        vec![func(
+            "f",
+            &["x"],
+            block(vec![], Some(add(var("x"), int(1)))),
+        )],
+        "f",
+    );
     assert_eq!(bare, braced);
 }
 
@@ -394,7 +506,11 @@ fn reordering_top_level_items_changes_no_hash() {
     let before = hash_ast(&module(forward)).unwrap();
     let after = hash_ast(&module(reversed)).unwrap();
     for name in ["a", "b", "c", "d"] {
-        assert_eq!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_eq!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_eq!(before.tests, after.tests);
 }
@@ -416,9 +532,18 @@ fn reordering_mutually_recursive_definitions_changes_no_hash() {
     let odd = parity("is_odd", "is_even", false);
     let forward = hashes(vec![even.clone(), odd.clone()]);
     let backward = hashes(vec![odd, even]);
-    assert_eq!(forward.defs[&Symbol::new("is_even")], backward.defs[&Symbol::new("is_even")]);
-    assert_eq!(forward.defs[&Symbol::new("is_odd")], backward.defs[&Symbol::new("is_odd")]);
-    assert_ne!(forward.defs[&Symbol::new("is_even")], forward.defs[&Symbol::new("is_odd")]);
+    assert_eq!(
+        forward.defs[&Symbol::new("is_even")],
+        backward.defs[&Symbol::new("is_even")]
+    );
+    assert_eq!(
+        forward.defs[&Symbol::new("is_odd")],
+        backward.defs[&Symbol::new("is_odd")]
+    );
+    assert_ne!(
+        forward.defs[&Symbol::new("is_even")],
+        forward.defs[&Symbol::new("is_odd")]
+    );
 }
 
 /// `f(n) = g(n-1)` and `g(n) = f(n-1)` differ only in which of the two they
@@ -428,13 +553,30 @@ fn reordering_mutually_recursive_definitions_changes_no_hash() {
 /// other reordering.
 #[test]
 fn indistinguishable_cycle_members_share_one_hash() {
-    let even = func("is_even", &["n"], callv("is_odd", vec![bin(BinOp::Sub, var("n"), int(1))]));
-    let odd = func("is_odd", &["n"], callv("is_even", vec![bin(BinOp::Sub, var("n"), int(1))]));
+    let even = func(
+        "is_even",
+        &["n"],
+        callv("is_odd", vec![bin(BinOp::Sub, var("n"), int(1))]),
+    );
+    let odd = func(
+        "is_odd",
+        &["n"],
+        callv("is_even", vec![bin(BinOp::Sub, var("n"), int(1))]),
+    );
     let forward = hashes(vec![even.clone(), odd.clone()]);
     let backward = hashes(vec![odd, even]);
-    assert_eq!(forward.defs[&Symbol::new("is_even")], forward.defs[&Symbol::new("is_odd")]);
-    assert_eq!(forward.defs[&Symbol::new("is_even")], backward.defs[&Symbol::new("is_even")]);
-    assert_eq!(forward.defs[&Symbol::new("is_odd")], backward.defs[&Symbol::new("is_odd")]);
+    assert_eq!(
+        forward.defs[&Symbol::new("is_even")],
+        forward.defs[&Symbol::new("is_odd")]
+    );
+    assert_eq!(
+        forward.defs[&Symbol::new("is_even")],
+        backward.defs[&Symbol::new("is_even")]
+    );
+    assert_eq!(
+        forward.defs[&Symbol::new("is_odd")],
+        backward.defs[&Symbol::new("is_odd")]
+    );
 }
 
 /// Refinement has to keep splitting past the first round: `a` and `c` are told
@@ -481,17 +623,28 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
         }))]
     };
     let a = hash_of(
-        annotated(vec![("db", Mode::Read, "users"), ("db", Mode::Write, "orders")]),
+        annotated(vec![
+            ("db", Mode::Read, "users"),
+            ("db", Mode::Write, "orders"),
+        ]),
         "f",
     );
     let b = hash_of(
-        annotated(vec![("db", Mode::Write, "orders"), ("db", Mode::Read, "users")]),
+        annotated(vec![
+            ("db", Mode::Write, "orders"),
+            ("db", Mode::Read, "users"),
+        ]),
         "f",
     );
     assert_eq!(a, b);
 
-    let different =
-        hash_of(annotated(vec![("db", Mode::Read, "users"), ("db", Mode::Write, "users")]), "f");
+    let different = hash_of(
+        annotated(vec![
+            ("db", Mode::Read, "users"),
+            ("db", Mode::Write, "users"),
+        ]),
+        "f",
+    );
     assert_ne!(a, different);
 }
 
@@ -504,10 +657,22 @@ fn editing_a_body_changes_exactly_its_transitive_dependents() {
     edited[3] = func("d", &["p", "q"], bin(BinOp::Mul, var("p"), var("q")));
     let after = hashes(edited);
 
-    assert_ne!(before.defs[&Symbol::new("d")], after.defs[&Symbol::new("d")]);
-    assert_ne!(before.defs[&Symbol::new("c")], after.defs[&Symbol::new("c")]);
-    assert_ne!(before.defs[&Symbol::new("b")], after.defs[&Symbol::new("b")]);
-    assert_ne!(before.defs[&Symbol::new("a")], after.defs[&Symbol::new("a")]);
+    assert_ne!(
+        before.defs[&Symbol::new("d")],
+        after.defs[&Symbol::new("d")]
+    );
+    assert_ne!(
+        before.defs[&Symbol::new("c")],
+        after.defs[&Symbol::new("c")]
+    );
+    assert_ne!(
+        before.defs[&Symbol::new("b")],
+        after.defs[&Symbol::new("b")]
+    );
+    assert_ne!(
+        before.defs[&Symbol::new("a")],
+        after.defs[&Symbol::new("a")]
+    );
     assert_ne!(before.tests[0], after.tests[0]);
 }
 
@@ -523,8 +688,14 @@ fn editing_a_body_leaves_unrelated_definitions_alone() {
     };
     let before = hashes(program(int(1)));
     let after = hashes(program(int(2)));
-    assert_ne!(before.defs[&Symbol::new("touched")], after.defs[&Symbol::new("touched")]);
-    assert_eq!(before.defs[&Symbol::new("untouched")], after.defs[&Symbol::new("untouched")]);
+    assert_ne!(
+        before.defs[&Symbol::new("touched")],
+        after.defs[&Symbol::new("touched")]
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("untouched")],
+        after.defs[&Symbol::new("untouched")]
+    );
     assert_eq!(before.tests[0], after.tests[0]);
     assert_ne!(before.tests[1], after.tests[1]);
 }
@@ -532,8 +703,11 @@ fn editing_a_body_leaves_unrelated_definitions_alone() {
 #[test]
 fn changing_a_type_definition_changes_the_hash_of_its_users() {
     let program = |extra: Vec<VariantDef>| {
-        let mut variants =
-            vec![VariantDef { name: id("Active"), fields: vec![], span: Span::DUMMY }];
+        let mut variants = vec![VariantDef {
+            name: id("Active"),
+            fields: vec![],
+            span: Span::DUMMY,
+        }];
         variants.extend(extra);
         vec![
             Item::Type(Box::new(TypeDef {
@@ -548,7 +722,11 @@ fn changing_a_type_definition_changes_the_hash_of_its_users() {
     };
     let before = hash_of(program(vec![]), "mk");
     let after = hash_of(
-        program(vec![VariantDef { name: id("Banned"), fields: vec![], span: Span::DUMMY }]),
+        program(vec![VariantDef {
+            name: id("Banned"),
+            fields: vec![],
+            span: Span::DUMMY,
+        }]),
         "mk",
     );
     assert_ne!(before, after);
@@ -558,16 +736,29 @@ fn changing_a_type_definition_changes_the_hash_of_its_users() {
 fn changing_one_member_of_a_cycle_changes_the_whole_component() {
     let program = |lit: i64| {
         vec![
-            func("ping", &["n"], callv("pong", vec![bin(BinOp::Sub, var("n"), int(lit))])),
+            func(
+                "ping",
+                &["n"],
+                callv("pong", vec![bin(BinOp::Sub, var("n"), int(lit))]),
+            ),
             func("pong", &["n"], callv("ping", vec![var("n")])),
             func("caller", &[], callv("ping", vec![int(3)])),
         ]
     };
     let before = hashes(program(1));
     let after = hashes(program(2));
-    assert_ne!(before.defs[&Symbol::new("ping")], after.defs[&Symbol::new("ping")]);
-    assert_ne!(before.defs[&Symbol::new("pong")], after.defs[&Symbol::new("pong")]);
-    assert_ne!(before.defs[&Symbol::new("caller")], after.defs[&Symbol::new("caller")]);
+    assert_ne!(
+        before.defs[&Symbol::new("ping")],
+        after.defs[&Symbol::new("ping")]
+    );
+    assert_ne!(
+        before.defs[&Symbol::new("pong")],
+        after.defs[&Symbol::new("pong")]
+    );
+    assert_ne!(
+        before.defs[&Symbol::new("caller")],
+        after.defs[&Symbol::new("caller")]
+    );
 }
 
 // ---- property 5: structurally identical definitions hash identically ----
@@ -579,8 +770,14 @@ fn structurally_identical_definitions_share_a_hash() {
         func("succ", &["n"], add(var("n"), int(1))),
         func("plus_two", &["n"], add(var("n"), int(2))),
     ]);
-    assert_eq!(out.defs[&Symbol::new("increment")], out.defs[&Symbol::new("succ")]);
-    assert_ne!(out.defs[&Symbol::new("increment")], out.defs[&Symbol::new("plus_two")]);
+    assert_eq!(
+        out.defs[&Symbol::new("increment")],
+        out.defs[&Symbol::new("succ")]
+    );
+    assert_ne!(
+        out.defs[&Symbol::new("increment")],
+        out.defs[&Symbol::new("plus_two")]
+    );
 }
 
 #[test]
@@ -602,11 +799,19 @@ fn identical_definitions_hash_identically_across_modules() {
 #[test]
 fn swapping_two_arguments_changes_the_hash() {
     let a = hash_of(
-        vec![func("caller", &["x", "y"], callv("f", vec![var("x"), var("y")]))],
+        vec![func(
+            "caller",
+            &["x", "y"],
+            callv("f", vec![var("x"), var("y")]),
+        )],
         "caller",
     );
     let b = hash_of(
-        vec![func("caller", &["x", "y"], callv("f", vec![var("y"), var("x")]))],
+        vec![func(
+            "caller",
+            &["x", "y"],
+            callv("f", vec![var("y"), var("x")]),
+        )],
         "caller",
     );
     assert_ne!(a, b);
@@ -614,9 +819,18 @@ fn swapping_two_arguments_changes_the_hash() {
 
 #[test]
 fn swapping_two_record_fields_changes_the_hash() {
-    let a = hash_of(vec![func("f", &[], record(vec![("a", int(1)), ("b", int(2))]))], "f");
-    let b = hash_of(vec![func("f", &[], record(vec![("b", int(2)), ("a", int(1))]))], "f");
-    let c = hash_of(vec![func("f", &[], record(vec![("a", int(2)), ("b", int(1))]))], "f");
+    let a = hash_of(
+        vec![func("f", &[], record(vec![("a", int(1)), ("b", int(2))]))],
+        "f",
+    );
+    let b = hash_of(
+        vec![func("f", &[], record(vec![("b", int(2)), ("a", int(1))]))],
+        "f",
+    );
+    let c = hash_of(
+        vec![func("f", &[], record(vec![("a", int(2)), ("b", int(1))]))],
+        "f",
+    );
     assert_ne!(a, b);
     assert_ne!(a, c);
 }
@@ -625,7 +839,10 @@ fn swapping_two_record_fields_changes_the_hash() {
 fn swapping_two_match_arms_changes_the_hash() {
     let arms = |first: i64, second: i64| {
         let arm = |lit: i64| MatchArm {
-            pat: Pattern { kind: PatternKind::Lit(Lit::Int(lit)), span: Span::DUMMY },
+            pat: Pattern {
+                kind: PatternKind::Lit(Lit::Int(lit)),
+                span: Span::DUMMY,
+            },
             guard: None,
             body: int(lit * 10),
             span: Span::DUMMY,
@@ -644,8 +861,14 @@ fn swapping_two_match_arms_changes_the_hash() {
 
 #[test]
 fn swapping_the_operands_of_a_binary_operator_changes_the_hash() {
-    let a = hash_of(vec![func("f", &["x", "y"], bin(BinOp::Sub, var("x"), var("y")))], "f");
-    let b = hash_of(vec![func("f", &["x", "y"], bin(BinOp::Sub, var("y"), var("x")))], "f");
+    let a = hash_of(
+        vec![func("f", &["x", "y"], bin(BinOp::Sub, var("x"), var("y")))],
+        "f",
+    );
+    let b = hash_of(
+        vec![func("f", &["x", "y"], bin(BinOp::Sub, var("y"), var("x")))],
+        "f",
+    );
     assert_ne!(a, b);
 }
 
@@ -654,7 +877,10 @@ fn differently_shaped_trees_do_not_collide() {
     let shapes: Vec<(&str, Expr)> = vec![
         ("two element list", list(vec![int(1), int(2)])),
         ("nested list", list(vec![list(vec![int(1), int(2)])])),
-        ("pair of lists", list(vec![list(vec![int(1)]), list(vec![int(2)])])),
+        (
+            "pair of lists",
+            list(vec![list(vec![int(1)]), list(vec![int(2)])]),
+        ),
         ("empty list", list(vec![])),
         ("empty record", record(vec![])),
         ("unit literal", e(ExprKind::Lit(Lit::Unit))),
@@ -667,11 +893,29 @@ fn differently_shaped_trees_do_not_collide() {
         ("nullary call", callv("f", vec![])),
         ("bare reference", var("f")),
         ("record with one field", record(vec![("a", int(1))])),
-        ("record with two fields", record(vec![("a", int(1)), ("b", int(1))])),
-        ("field access", e(ExprKind::Field { base: Box::new(var("f")), field: id("a") })),
-        ("statement then tail", block(vec![Stmt::Expr(int(1))], Some(int(2)))),
-        ("two statements", block(vec![Stmt::Expr(int(1)), Stmt::Expr(int(2))], None)),
-        ("let then tail", block(vec![let_("v", int(1))], Some(int(2)))),
+        (
+            "record with two fields",
+            record(vec![("a", int(1)), ("b", int(1))]),
+        ),
+        (
+            "field access",
+            e(ExprKind::Field {
+                base: Box::new(var("f")),
+                field: id("a"),
+            }),
+        ),
+        (
+            "statement then tail",
+            block(vec![Stmt::Expr(int(1))], Some(int(2))),
+        ),
+        (
+            "two statements",
+            block(vec![Stmt::Expr(int(1)), Stmt::Expr(int(2))], None),
+        ),
+        (
+            "let then tail",
+            block(vec![let_("v", int(1))], Some(int(2))),
+        ),
     ];
     let mut seen: Vec<(DefHash, &str)> = Vec::new();
     for (label, body) in shapes {
@@ -685,8 +929,14 @@ fn differently_shaped_trees_do_not_collide() {
 
 #[test]
 fn string_literals_cannot_be_confused_with_their_neighbours() {
-    let a = hash_of(vec![func("f", &[], list(vec![str_lit("ab"), str_lit("c")]))], "f");
-    let b = hash_of(vec![func("f", &[], list(vec![str_lit("a"), str_lit("bc")]))], "f");
+    let a = hash_of(
+        vec![func("f", &[], list(vec![str_lit("ab"), str_lit("c")]))],
+        "f",
+    );
+    let b = hash_of(
+        vec![func("f", &[], list(vec![str_lit("a"), str_lit("bc")]))],
+        "f",
+    );
     assert_ne!(a, b);
 }
 
@@ -715,7 +965,10 @@ fn a_generic_parameter_is_positional_not_named() {
         vec![Item::Fn(Box::new(FnDef {
             vis: Visibility::Private,
             name: id("f"),
-            generics: Generics { types: vec![id(declared[0]), id(declared[1])], effects: vec![] },
+            generics: Generics {
+                types: vec![id(declared[0]), id(declared[1])],
+                effects: vec![],
+            },
             params: vec![typed_param("x", used[0]), typed_param("y", used[1])],
             ret: None,
             effects: None,
@@ -752,7 +1005,10 @@ fn a_free_type_name_is_not_a_generic_parameter() {
         vec![Item::Fn(Box::new(FnDef {
             vis: Visibility::Private,
             name: id("f"),
-            generics: Generics { types: vec![id("Int")], effects: vec![] },
+            generics: Generics {
+                types: vec![id("Int")],
+                effects: vec![],
+            },
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
@@ -863,14 +1119,28 @@ fn a_tests_name_is_not_part_of_its_identity() {
 fn cycle_members_that_differ_get_distinct_hashes() {
     let out = hashes(vec![
         func("ping", &["n"], callv("pong", vec![var("n")])),
-        func("pong", &["n"], callv("ping", vec![bin(BinOp::Sub, var("n"), int(1))])),
+        func(
+            "pong",
+            &["n"],
+            callv("ping", vec![bin(BinOp::Sub, var("n"), int(1))]),
+        ),
     ]);
-    assert_ne!(out.defs[&Symbol::new("ping")], out.defs[&Symbol::new("pong")]);
+    assert_ne!(
+        out.defs[&Symbol::new("ping")],
+        out.defs[&Symbol::new("pong")]
+    );
 }
 
 #[test]
 fn a_self_recursive_definition_is_not_hashed_like_a_call_to_a_twin() {
-    let recursive = hash_of(vec![func("loop_forever", &["n"], callv("loop_forever", vec![var("n")]))], "loop_forever");
+    let recursive = hash_of(
+        vec![func(
+            "loop_forever",
+            &["n"],
+            callv("loop_forever", vec![var("n")]),
+        )],
+        "loop_forever",
+    );
     let delegating = hashes(vec![
         func("a", &["n"], callv("b", vec![var("n")])),
         func("b", &["n"], var("n")),
@@ -883,7 +1153,11 @@ fn a_cycle_hash_is_stable_across_runs() {
     let program = || {
         vec![
             func("ping", &["n"], callv("pong", vec![var("n")])),
-            func("pong", &["n"], callv("ping", vec![bin(BinOp::Sub, var("n"), int(1))])),
+            func(
+                "pong",
+                &["n"],
+                callv("ping", vec![bin(BinOp::Sub, var("n"), int(1))]),
+            ),
         ]
     };
     assert_eq!(hashes(program()).defs, hashes(program()).defs);
@@ -898,7 +1172,11 @@ fn a_recursive_type_hashes_and_is_rename_invariant() {
                 name: id(name),
                 params: vec![],
                 body: TypeDefBody::Sum(vec![
-                    VariantDef { name: id("Nil"), fields: vec![], span: Span::DUMMY },
+                    VariantDef {
+                        name: id("Nil"),
+                        fields: vec![],
+                        span: Span::DUMMY,
+                    },
                     VariantDef {
                         name: id("Cons"),
                         fields: vec![ty_con("Int", vec![]), ty_con(name, vec![])],
@@ -910,7 +1188,10 @@ fn a_recursive_type_hashes_and_is_rename_invariant() {
             func("empty", &[], var("Nil")),
         ]
     };
-    assert_eq!(hash_of(program("IntList"), "empty"), hash_of(program("Ints"), "empty"));
+    assert_eq!(
+        hash_of(program("IntList"), "empty"),
+        hash_of(program("Ints"), "empty")
+    );
 }
 
 #[test]
@@ -919,11 +1200,15 @@ fn deps_are_direct_and_closure_is_transitive() {
     assert_eq!(out.deps[&Symbol::new("a")], vec![Symbol::new("b")]);
     assert_eq!(out.deps[&Symbol::new("d")], Vec::<Symbol>::new());
 
-    let closure_of_a: Vec<String> =
-        out.closure[&Symbol::new("a")].iter().map(|s| s.to_string()).collect();
+    let closure_of_a: Vec<String> = out.closure[&Symbol::new("a")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure_of_a, vec!["a", "b", "c", "d"]);
-    let closure_of_c: Vec<String> =
-        out.closure[&Symbol::new("c")].iter().map(|s| s.to_string()).collect();
+    let closure_of_c: Vec<String> = out.closure[&Symbol::new("c")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure_of_c, vec!["c", "d"]);
 }
 
@@ -944,18 +1229,30 @@ fn a_cycle_closure_contains_every_member() {
         func("pong", &["n"], callv("ping", vec![var("n")])),
         func("caller", &[], callv("ping", vec![int(0)])),
     ]);
-    let ping: Vec<String> = out.closure[&Symbol::new("ping")].iter().map(|s| s.to_string()).collect();
+    let ping: Vec<String> = out.closure[&Symbol::new("ping")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(ping, vec!["ping", "pong"]);
-    let caller: Vec<String> =
-        out.closure[&Symbol::new("caller")].iter().map(|s| s.to_string()).collect();
+    let caller: Vec<String> = out.closure[&Symbol::new("caller")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(caller, vec!["caller", "ping", "pong"]);
 }
 
 #[test]
 fn builtins_and_unknown_names_are_not_dependencies() {
-    let out = hashes(vec![func("f", &["x"], callv("assert_eq", vec![var("x"), int(1)]))]);
+    let out = hashes(vec![func(
+        "f",
+        &["x"],
+        callv("assert_eq", vec![var("x"), int(1)]),
+    )]);
     assert_eq!(out.deps[&Symbol::new("f")], Vec::<Symbol>::new());
-    let closure: Vec<String> = out.closure[&Symbol::new("f")].iter().map(|s| s.to_string()).collect();
+    let closure: Vec<String> = out.closure[&Symbol::new("f")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure, vec!["f"]);
 }
 
@@ -1001,7 +1298,10 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
             ),
         ),
     ]);
-    let deps: Vec<String> = out.deps[&Symbol::new("f")].iter().map(|s| s.to_string()).collect();
+    let deps: Vec<String> = out.deps[&Symbol::new("f")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(deps, vec!["db", "Status"]);
     assert!(!out.defs.contains_key(&Symbol::new("Status")));
     assert!(out.decls.contains_key(&Symbol::new("Status")));
@@ -1014,8 +1314,11 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
 #[test]
 fn declaration_hashes_follow_structure_not_names() {
     let program = |name: &str, extra: Vec<VariantDef>| {
-        let mut variants =
-            vec![VariantDef { name: id("Active"), fields: vec![], span: Span::DUMMY }];
+        let mut variants = vec![VariantDef {
+            name: id("Active"),
+            fields: vec![],
+            span: Span::DUMMY,
+        }];
         variants.extend(extra);
         vec![Item::Type(Box::new(TypeDef {
             vis: Visibility::Private,
@@ -1027,13 +1330,23 @@ fn declaration_hashes_follow_structure_not_names() {
     };
     let status = hashes(program("Status", vec![]));
     let renamed = hashes(program("State", vec![]));
-    assert_eq!(status.decls[&Symbol::new("Status")], renamed.decls[&Symbol::new("State")]);
+    assert_eq!(
+        status.decls[&Symbol::new("Status")],
+        renamed.decls[&Symbol::new("State")]
+    );
 
     let widened = hashes(program(
         "Status",
-        vec![VariantDef { name: id("Banned"), fields: vec![], span: Span::DUMMY }],
+        vec![VariantDef {
+            name: id("Banned"),
+            fields: vec![],
+            span: Span::DUMMY,
+        }],
     ));
-    assert_ne!(status.decls[&Symbol::new("Status")], widened.decls[&Symbol::new("Status")]);
+    assert_ne!(
+        status.decls[&Symbol::new("Status")],
+        widened.decls[&Symbol::new("Status")]
+    );
 }
 
 #[test]
@@ -1128,9 +1441,16 @@ test "the ledger closes out" {
 fn parsed_rename_through_three_intermediaries_changes_no_hash() {
     let before = parsed(LEDGER);
     let after = parsed(&LEDGER.replace("apply_debit", "post_debit_entry"));
-    assert_eq!(before.defs[&Symbol::new("apply_debit")], after.defs[&Symbol::new("post_debit_entry")]);
+    assert_eq!(
+        before.defs[&Symbol::new("apply_debit")],
+        after.defs[&Symbol::new("post_debit_entry")]
+    );
     for name in ["settle", "close_out", "report"] {
-        assert_eq!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_eq!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_eq!(before.tests, after.tests);
 }
@@ -1178,7 +1498,11 @@ fn apply_debit(balance: Int, amount: Int) -> Int = balance - amount
     let before = parsed(LEDGER);
     let after = parsed(reordered);
     for name in ["apply_debit", "settle", "close_out", "report"] {
-        assert_eq!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_eq!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_eq!(before.tests, after.tests);
 }
@@ -1194,7 +1518,11 @@ fn parsed_editing_a_leaf_changes_it_and_every_dependent() {
     let before = parsed(LEDGER);
     let after = parsed(&LEDGER.replace("balance - amount", "balance - amount - 1"));
     for name in ["apply_debit", "settle", "close_out", "report"] {
-        assert_ne!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_ne!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_ne!(before.tests[0], after.tests[0]);
 }
@@ -1208,22 +1536,38 @@ fn succ(n: Int) -> Int = n + 1
 fn plus_two(n: Int) -> Int = n + 2
 "#,
     );
-    assert_eq!(out.defs[&Symbol::new("increment")], out.defs[&Symbol::new("succ")]);
-    assert_ne!(out.defs[&Symbol::new("increment")], out.defs[&Symbol::new("plus_two")]);
+    assert_eq!(
+        out.defs[&Symbol::new("increment")],
+        out.defs[&Symbol::new("succ")]
+    );
+    assert_ne!(
+        out.defs[&Symbol::new("increment")],
+        out.defs[&Symbol::new("plus_two")]
+    );
 }
 
 #[test]
 fn parsed_swapping_arguments_or_arms_changes_the_hash() {
-    let base = parsed("fn f(a: Int, b: Int) -> Int = apply(a, b)\nfn apply(x: Int, y: Int) -> Int = x - y");
-    let swapped = parsed("fn f(a: Int, b: Int) -> Int = apply(b, a)\nfn apply(x: Int, y: Int) -> Int = x - y");
-    assert_ne!(base.defs[&Symbol::new("f")], swapped.defs[&Symbol::new("f")]);
+    let base = parsed(
+        "fn f(a: Int, b: Int) -> Int = apply(a, b)\nfn apply(x: Int, y: Int) -> Int = x - y",
+    );
+    let swapped = parsed(
+        "fn f(a: Int, b: Int) -> Int = apply(b, a)\nfn apply(x: Int, y: Int) -> Int = x - y",
+    );
+    assert_ne!(
+        base.defs[&Symbol::new("f")],
+        swapped.defs[&Symbol::new("f")]
+    );
 
     let arms = |first: &str, second: &str| {
         parsed(&format!(
             "fn f(n: Int) -> Int = match n {{ {first} -> 1, {second} -> 2, _ -> 3 }}"
         ))
     };
-    assert_ne!(arms("0", "1").defs[&Symbol::new("f")], arms("1", "0").defs[&Symbol::new("f")]);
+    assert_ne!(
+        arms("0", "1").defs[&Symbol::new("f")],
+        arms("1", "0").defs[&Symbol::new("f")]
+    );
 }
 
 #[test]
@@ -1250,7 +1594,10 @@ test "reads are handled" {{
     };
     let before = parsed(&source("db", "lookup"));
     let after = parsed(&source("store", "fetch"));
-    assert_eq!(before.defs[&Symbol::new("lookup")], after.defs[&Symbol::new("fetch")]);
+    assert_eq!(
+        before.defs[&Symbol::new("lookup")],
+        after.defs[&Symbol::new("fetch")]
+    );
     assert_eq!(before.tests, after.tests);
 }
 
@@ -1261,7 +1608,12 @@ const LOOK_ALIKES: &str = "effect {a} {\n  write emit[r](v: Int) -> Int\n}\n\
                            fn f(v: Int) -> Int / {{eff}.write[log]} = {eff}.emit[log](v)";
 
 fn look_alikes(a: &str, b: &str, eff: &str) -> HashOutput {
-    parsed(&LOOK_ALIKES.replace("{a}", a).replace("{b}", b).replace("{eff}", eff))
+    parsed(
+        &LOOK_ALIKES
+            .replace("{a}", a)
+            .replace("{b}", b)
+            .replace("{eff}", eff),
+    )
 }
 
 /// A definition that performs one of two byte-identical effects and one that
@@ -1349,7 +1701,10 @@ fn two_let_bindings_of_the_same_name_are_not_reordered() {
     let program = |first: i64, second: i64| {
         format!("fn f() -> Int = {{ let a = {first}; let a = {second}; a }}")
     };
-    assert_ne!(parsed(&program(1, 2)).defs[&Symbol::new("f")], parsed(&program(2, 1)).defs[&Symbol::new("f")]);
+    assert_ne!(
+        parsed(&program(1, 2)).defs[&Symbol::new("f")],
+        parsed(&program(2, 1)).defs[&Symbol::new("f")]
+    );
 }
 
 /// A dependency chain far deeper than any call stack Tarjan could afford to use.
@@ -1358,11 +1713,18 @@ fn a_very_deep_dependency_chain_does_not_overflow_the_stack() {
     const DEPTH: usize = 2000;
     let mut items = vec![func("d0", &["n"], var("n"))];
     for i in 1..DEPTH {
-        items.push(func(&format!("d{i}"), &["n"], callv(&format!("d{}", i - 1), vec![var("n")])));
+        items.push(func(
+            &format!("d{i}"),
+            &["n"],
+            callv(&format!("d{}", i - 1), vec![var("n")]),
+        ));
     }
     let out = hashes(items);
     assert_eq!(out.defs.len(), DEPTH);
-    assert_eq!(out.closure[&Symbol::new(format!("d{}", DEPTH - 1))].len(), DEPTH);
+    assert_eq!(
+        out.closure[&Symbol::new(format!("d{}", DEPTH - 1))].len(),
+        DEPTH
+    );
     let unique: BTreeSet<DefHash> = out.defs.values().copied().collect();
     assert_eq!(unique.len(), DEPTH);
 }
@@ -1384,8 +1746,14 @@ fn tarjan_groups_cycles_and_orders_them_before_their_dependents() {
         vec![],
     ];
     let components = graph::tarjan(5, &edges);
-    let cycle = components.iter().position(|c| c.len() == 3).expect("the cycle is one component");
-    let dependent = components.iter().position(|c| c == &[3]).expect("3 stands alone");
+    let cycle = components
+        .iter()
+        .position(|c| c.len() == 3)
+        .expect("the cycle is one component");
+    let dependent = components
+        .iter()
+        .position(|c| c == &[3])
+        .expect("3 stands alone");
     assert!(cycle < dependent);
     let mut members = components[cycle].clone();
     members.sort_unstable();

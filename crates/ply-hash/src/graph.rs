@@ -58,7 +58,10 @@ pub enum ValueTarget {
     Fn(NodeId),
     /// The type that declares the variant, plus the variant's own name — a
     /// constructor has no node of its own.
-    Ctor { owner: NodeId, name: Symbol },
+    Ctor {
+        owner: NodeId,
+        name: Symbol,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +123,36 @@ impl<'a> ProgramIndex<'a> {
         ProgramIndex::build(vec![module], None)
     }
 
+    /// Without a [`Resolved`] there is no module namespace, so an imported name
+    /// would be written into the hash as the name the file spelled it with.
+    /// Two files importing different modules under one binder would then hash
+    /// alike, and editing the referent would move no hash here — a green cache
+    /// over changed code, which nothing downstream can detect.
+    fn imports_need_a_program(modules: &[&'a Module]) -> Vec<Diagnostic> {
+        let mut diags = Vec::new();
+        for module in modules {
+            for import in &module.imports {
+                diags.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_MODULE,
+                        format!("no module named `{}` in this program", import.module_name()),
+                    )
+                    .primary(import.path_span(), "not found")
+                    .note(
+                        "this module is being hashed on its own, so there is no namespace for \
+                         an import to resolve against",
+                    )
+                    .note(
+                        "hash every module of the program together — `hash_program` — so that a \
+                         cross-module reference normalizes to the referent's hash rather than to \
+                         its name",
+                    ),
+                );
+            }
+        }
+        diags
+    }
+
     pub fn of_program(
         program: &'a Program,
         resolved: &Resolved,
@@ -128,8 +161,9 @@ impl<'a> ProgramIndex<'a> {
     }
 
     /// `resolved` is the single source of truth for what an unqualified name
-    /// means. Without it each module sees only its own items, which is exactly
-    /// right for a module that cannot import.
+    /// means. Without it each module sees only its own items, and a module that
+    /// imports is refused rather than hashed against a namespace that is not
+    /// there.
     pub fn build(
         modules: Vec<&'a Module>,
         resolved: Option<&Resolved>,
@@ -138,15 +172,18 @@ impl<'a> ProgramIndex<'a> {
         let mut tests: Vec<TestNode<'a>> = Vec::new();
         let mut order: Vec<Entry> = Vec::new();
         let mut all_items: Vec<ModuleItems> = Vec::new();
-        let mut diags = Vec::new();
+        let mut diags = match resolved {
+            Some(_) => Vec::new(),
+            None => ProgramIndex::imports_need_a_program(&modules),
+        };
 
         for (m, module) in modules.iter().copied().enumerate() {
             let mut items = ModuleItems::default();
             let mut spans = Spans::default();
             let push = |nodes: &mut Vec<Node<'a>>,
-                            order: &mut Vec<Entry>,
-                            body: NodeBody<'a>,
-                            name: &'a Ident| {
+                        order: &mut Vec<Entry>,
+                        body: NodeBody<'a>,
+                        name: &'a Ident| {
                 let id = NodeId(nodes.len());
                 nodes.push(Node {
                     name: module.name.qualify(&name.name),
@@ -161,11 +198,25 @@ impl<'a> ProgramIndex<'a> {
                 match item {
                     Item::Fn(d) => {
                         let id = push(&mut nodes, &mut order, NodeBody::Fn(d), &d.name);
-                        declare(&mut items.fns, &mut spans.fns, &d.name, id, "definition", &mut diags);
+                        declare(
+                            &mut items.fns,
+                            &mut spans.fns,
+                            &d.name,
+                            id,
+                            "definition",
+                            &mut diags,
+                        );
                     }
                     Item::Type(d) => {
                         let id = push(&mut nodes, &mut order, NodeBody::Type(d), &d.name);
-                        declare(&mut items.types, &mut spans.types, &d.name, id, "type", &mut diags);
+                        declare(
+                            &mut items.types,
+                            &mut spans.types,
+                            &d.name,
+                            id,
+                            "type",
+                            &mut diags,
+                        );
                         if let TypeDefBody::Sum(variants) = &d.body {
                             for v in variants {
                                 let (ctors, seen) = (&mut items.ctors, &mut spans.ctors);
@@ -175,7 +226,14 @@ impl<'a> ProgramIndex<'a> {
                     }
                     Item::Effect(d) => {
                         let id = push(&mut nodes, &mut order, NodeBody::Effect(d), &d.name);
-                        declare(&mut items.effects, &mut spans.effects, &d.name, id, "effect", &mut diags);
+                        declare(
+                            &mut items.effects,
+                            &mut spans.effects,
+                            &d.name,
+                            id,
+                            "effect",
+                            &mut diags,
+                        );
                     }
                     Item::Test(d) => {
                         order.push(Entry::Test(tests.len()));
@@ -195,11 +253,20 @@ impl<'a> ProgramIndex<'a> {
         }
 
         let scopes = build_scopes(&modules, &all_items, resolved);
-        Ok(ProgramIndex { modules, nodes, tests, order, items: all_items, scopes })
+        Ok(ProgramIndex {
+            modules,
+            nodes,
+            tests,
+            order,
+            items: all_items,
+            scopes,
+        })
     }
 
     pub fn is_effect(&self, node: NodeId) -> bool {
-        self.nodes.get(node.0).is_some_and(|n| matches!(n.body, NodeBody::Effect(_)))
+        self.nodes
+            .get(node.0)
+            .is_some_and(|n| matches!(n.body, NodeBody::Effect(_)))
     }
 
     pub fn value(&self, module: usize, q: &QName) -> Option<ValueTarget> {
@@ -208,13 +275,19 @@ impl<'a> ProgramIndex<'a> {
         if let Some(&node) = items.fns.get(&name) {
             return Some(ValueTarget::Fn(node));
         }
-        items.ctors.get(&name).map(|&owner| ValueTarget::Ctor { owner, name })
+        items
+            .ctors
+            .get(&name)
+            .map(|&owner| ValueTarget::Ctor { owner, name })
     }
 
     pub fn ctor(&self, module: usize, q: &QName) -> Option<ValueTarget> {
         let (owner, name) = self.target(module, |s| &s.values, qualifier(q), &q.name.name)?;
         let items = self.items.get(owner)?;
-        items.ctors.get(&name).map(|&owner| ValueTarget::Ctor { owner, name })
+        items
+            .ctors
+            .get(&name)
+            .map(|&owner| ValueTarget::Ctor { owner, name })
     }
 
     pub fn ty(&self, module: usize, qual: Option<&Symbol>, name: &Symbol) -> Option<NodeId> {
@@ -241,7 +314,10 @@ impl<'a> ProgramIndex<'a> {
     ) -> Option<Target> {
         let scope = self.scopes.get(module)?;
         match qual {
-            Some(binder) => scope.modules.get(binder).map(|&owner| (owner, name.clone())),
+            Some(binder) => scope
+                .modules
+                .get(binder)
+                .map(|&owner| (owner, name.clone())),
             None => space(scope).get(name).cloned(),
         }
     }
@@ -268,7 +344,10 @@ fn build_scopes(
                         .iter()
                         .filter(|(_, b)| b.owner < modules.len())
                         .map(|(name, b)| {
-                            (name.clone(), (b.owner, simple_of(&b.qualified, &modules[b.owner].name)))
+                            (
+                                name.clone(),
+                                (b.owner, simple_of(&b.qualified, &modules[b.owner].name)),
+                            )
                         })
                         .collect()
                 };
@@ -291,8 +370,16 @@ fn build_scopes(
                     .chain(items[m].ctors.keys())
                     .map(|name| (name.clone(), (m, name.clone())))
                     .collect(),
-                types: items[m].types.keys().map(|n| (n.clone(), (m, n.clone()))).collect(),
-                effects: items[m].effects.keys().map(|n| (n.clone(), (m, n.clone()))).collect(),
+                types: items[m]
+                    .types
+                    .keys()
+                    .map(|n| (n.clone(), (m, n.clone())))
+                    .collect(),
+                effects: items[m]
+                    .effects
+                    .keys()
+                    .map(|n| (n.clone(), (m, n.clone())))
+                    .collect(),
                 modules: FxHashMap::default(),
             },
         })
@@ -315,7 +402,9 @@ fn declare(
             )
             .primary(name.span, "redefined here")
             .secondary(first, "first defined here")
-            .note(format!("rename one of them; every {what} in a module needs a distinct name")),
+            .note(format!(
+                "rename one of them; every {what} in a module needs a distinct name"
+            )),
         );
         return;
     }
@@ -390,7 +479,9 @@ pub fn tarjan(n: usize, edges: &[Vec<NodeId>]) -> Vec<Vec<usize>> {
 
 pub fn is_cyclic(component: &[usize], edges: &[Vec<NodeId>]) -> bool {
     match component {
-        [only] => edges.get(*only).is_some_and(|e| e.iter().any(|r| r.0 == *only)),
+        [only] => edges
+            .get(*only)
+            .is_some_and(|e| e.iter().any(|r| r.0 == *only)),
         _ => true,
     }
 }

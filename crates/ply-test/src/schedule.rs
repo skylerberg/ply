@@ -11,7 +11,12 @@ use ply_core::Footprint;
 pub fn group_by_conflict(tests: &[(usize, Footprint)]) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..tests.len()).collect();
     order.sort_by(|&a, &b| {
-        tests[b].1.0.len().cmp(&tests[a].1.0.len()).then(tests[a].0.cmp(&tests[b].0))
+        tests[b]
+            .1
+            .0
+            .len()
+            .cmp(&tests[a].1.0.len())
+            .then(tests[a].0.cmp(&tests[b].0))
     });
 
     let mut classes: Vec<Vec<usize>> = Vec::new();
@@ -19,9 +24,11 @@ pub fn group_by_conflict(tests: &[(usize, Footprint)]) -> Vec<Vec<usize>> {
         let footprint = &tests[p].1;
         // Conflict is not transitive, so a colour class is only safe if the
         // candidate clears every member of it, not just one representative.
-        let slot = classes
-            .iter()
-            .position(|class| class.iter().all(|&q| !footprint.conflicts_with(&tests[q].1)));
+        let slot = classes.iter().position(|class| {
+            class
+                .iter()
+                .all(|&q| !footprint.conflicts_with(&tests[q].1))
+        });
         match slot {
             Some(k) => classes[k].push(p),
             None => classes.push(vec![p]),

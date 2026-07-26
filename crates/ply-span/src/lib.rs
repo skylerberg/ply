@@ -76,7 +76,11 @@ impl Span {
 
     /// A span usable where no real source location exists (builtins, synthesized
     /// nodes). Never rendered with a snippet.
-    pub const DUMMY: Span = Span { source: SourceId(u32::MAX), start: 0, end: 0 };
+    pub const DUMMY: Span = Span {
+        source: SourceId(u32::MAX),
+        start: 0,
+        end: 0,
+    };
 
     pub fn is_dummy(&self) -> bool {
         self.source.0 == u32::MAX
@@ -91,7 +95,11 @@ impl Span {
         if other.is_dummy() || self.source != other.source {
             return self;
         }
-        Span { source: self.source, start: self.start.min(other.start), end: self.end.max(other.end) }
+        Span {
+            source: self.source,
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
     }
 
     pub fn range(&self) -> std::ops::Range<usize> {
@@ -110,9 +118,14 @@ pub struct SourceFile {
 impl SourceFile {
     /// 1-based line and column (column counted in `char`s, not bytes).
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
-        let line = self.line_starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let line = self
+            .line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1);
         let line_start = self.line_starts[line] as usize;
-        let col = self.text[line_start..(offset as usize).min(self.text.len())].chars().count();
+        let col = self.text[line_start..(offset as usize).min(self.text.len())]
+            .chars()
+            .count();
         (line as u32 + 1, col as u32 + 1)
     }
 
@@ -244,16 +257,27 @@ impl Diagnostic {
     }
 
     pub fn warning(code: &'static str, message: impl Into<String>) -> Self {
-        Diagnostic { severity: Severity::Warning, ..Self::error(code, message) }
+        Diagnostic {
+            severity: Severity::Warning,
+            ..Self::error(code, message)
+        }
     }
 
     pub fn primary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.labels.push(Label { span, message: message.into(), primary: true });
+        self.labels.push(Label {
+            span,
+            message: message.into(),
+            primary: true,
+        });
         self
     }
 
     pub fn secondary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.labels.push(Label { span, message: message.into(), primary: false });
+        self.labels.push(Label {
+            span,
+            message: message.into(),
+            primary: false,
+        });
         self
     }
 
@@ -326,7 +350,11 @@ mod tests {
             ("MODULE_CYCLE", codes::MODULE_CYCLE, "E0109"),
             ("DUPLICATE_IMPORT", codes::DUPLICATE_IMPORT, "E0110"),
             ("INVALID_MODULE_PATH", codes::INVALID_MODULE_PATH, "E0111"),
-            ("AMBIGUOUS_ENTRY_POINT", codes::AMBIGUOUS_ENTRY_POINT, "E0112"),
+            (
+                "AMBIGUOUS_ENTRY_POINT",
+                codes::AMBIGUOUS_ENTRY_POINT,
+                "E0112",
+            ),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
@@ -341,7 +369,11 @@ mod tests {
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
-            ("CACHE_VERSION_CHANGED", codes::CACHE_VERSION_CHANGED, "W0603"),
+            (
+                "CACHE_VERSION_CHANGED",
+                codes::CACHE_VERSION_CHANGED,
+                "W0603",
+            ),
         ];
 
         for (name, code, expected) in registry {
@@ -352,7 +384,11 @@ mod tests {
         numbers.sort_unstable();
         let before = numbers.len();
         numbers.dedup();
-        assert_eq!(before, numbers.len(), "two constants share one number: {numbers:?}");
+        assert_eq!(
+            before,
+            numbers.len(),
+            "two constants share one number: {numbers:?}"
+        );
     }
 
     #[test]

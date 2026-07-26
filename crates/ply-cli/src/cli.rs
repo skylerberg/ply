@@ -29,8 +29,28 @@ pub enum Command {
     Run(RunArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
-    /// Inspect or discard the result cache.
+    /// Read, reclaim or discard what the caches hold.
     Cache(CacheArgs),
+}
+
+/// A three-way switch for work a run may do on its own behalf.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum When {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl When {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            When::Auto => "auto",
+            When::Always => "always",
+            When::Never => "never",
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -93,6 +113,22 @@ pub struct TestArgs {
     /// untouched; `--no-cache` is what disables both.
     #[arg(long)]
     pub no_incremental: bool,
+
+    /// Attribute a failure to the change that caused it. `auto` bisects a
+    /// failing det test that has passed before; `never` reports no culprit at
+    /// all.
+    #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
+    pub bisect: When,
+
+    /// Hybrid programs a bisection may evaluate. Counted in evaluations rather
+    /// than seconds, so two runs over the same failure agree.
+    #[arg(long, default_value_t = 64, value_name = "N")]
+    pub bisect_budget: usize,
+
+    /// Record which definitions a failing test actually entered. `auto` traces
+    /// the re-run of a failure; `always` traces the first execution too.
+    #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
+    pub trace: When,
 }
 
 #[derive(Args, Debug)]
@@ -133,12 +169,33 @@ pub struct CacheArgs {
 pub enum CacheAction {
     /// Discard every cached result, so the next run re-proves everything.
     Clear(CacheScope),
-    /// Report where the cache lives and how much it holds.
+    /// Report where the cache lives, how much it holds, and what is reclaimable.
     Stats(CacheScope),
+    /// Reclaim the space nothing points at any more.
+    Compact(CacheScope),
+    /// Print what the cache holds for one definition, resolved and readable.
+    Inspect(InspectArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct CacheScope {
+    /// The project whose `.ply-cache` is meant; a `.ply` file means its
+    /// directory.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InspectArgs {
+    /// A program-wide name (`store.orders.place`), a name as its module wrote
+    /// it (`place`), or a hash prefix of at least four hex characters.
+    #[arg(value_name = "DEF")]
+    pub query: String,
+
     /// The project whose `.ply-cache` is meant; a `.ply` file means its
     /// directory.
     #[arg(default_value = ".")]
@@ -189,5 +246,37 @@ mod tests {
         assert!(Cli::try_parse_from(["ply", "cache"]).is_err());
         assert!(Cli::try_parse_from(["ply", "cache", "stats"]).is_ok());
         assert!(Cli::try_parse_from(["ply", "cache", "clear"]).is_ok());
+        assert!(Cli::try_parse_from(["ply", "cache", "compact"]).is_ok());
+    }
+
+    #[test]
+    fn inspect_needs_something_to_look_up() {
+        assert!(Cli::try_parse_from(["ply", "cache", "inspect"]).is_err());
+        let cli = Cli::parse_from(["ply", "cache", "inspect", "9f2c", "src"]);
+        match cli.command {
+            Command::Cache(args) => match args.action {
+                CacheAction::Inspect(inspect) => {
+                    assert_eq!(inspect.query, "9f2c");
+                    assert_eq!(inspect.path, PathBuf::from("src"));
+                }
+                other => panic!("expected `inspect`, got {other:?}"),
+            },
+            other => panic!("expected `cache`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_bisection_switches_default_to_auto_and_reject_a_fourth_word() {
+        let cli = Cli::parse_from(["ply", "test"]);
+        match cli.command {
+            Command::Test(args) => {
+                assert_eq!(args.bisect, When::Auto);
+                assert_eq!(args.trace, When::Auto);
+                assert_eq!(args.bisect_budget, 64);
+            }
+            other => panic!("expected `test`, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["ply", "test", "--bisect", "sometimes"]).is_err());
+        assert!(Cli::try_parse_from(["ply", "test", "--bisect", "never"]).is_ok());
     }
 }

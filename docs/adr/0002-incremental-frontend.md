@@ -1,6 +1,8 @@
 # 2. The incremental front end
 
-Status: accepted (interface landed, implementation outstanding)
+Status: accepted (interface landed, implementation outstanding). Its *storage* is
+superseded by ADR 0003 — the gates, the witness and the invalidation table below
+stand unchanged; "one file written atomically" does not.
 
 ## Context
 

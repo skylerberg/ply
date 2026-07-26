@@ -76,11 +76,7 @@ impl<'a> Interp<'a> {
         Self::build(program, resolved, None)
     }
 
-    fn build(
-        program: &'a Program,
-        resolved: &'a Resolved,
-        check: Option<&'a CheckOutput>,
-    ) -> Self {
+    fn build(program: &'a Program, resolved: &'a Resolved, check: Option<&'a CheckOutput>) -> Self {
         let mut globals = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> = FxHashMap::default();
         let mut ops = FxHashMap::default();
@@ -272,9 +268,7 @@ impl<'a> Interp<'a> {
             ExprKind::Var(q) => self.lookup(q, env),
             ExprKind::Unary { op, operand } => self.eval_unary(*op, operand, env, e.span),
             ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs, env, e.span),
-            ExprKind::Lambda { params, body } => {
-                Ok(eval_lambda(params, body, env, self.module))
-            }
+            ExprKind::Lambda { params, body } => Ok(eval_lambda(params, body, env, self.module)),
             ExprKind::App { func, args } => self.eval_app(func, args, env, e.span),
             ExprKind::If {
                 cond,
@@ -448,7 +442,13 @@ impl<'a> Interp<'a> {
         for a in args {
             argv.push(self.eval(a, env)?);
         }
-        self.perform(&name, &op.name, resource.map(|r| r.name.clone()), argv, span)
+        self.perform(
+            &name,
+            &op.name,
+            resource.map(|r| r.name.clone()),
+            argv,
+            span,
+        )
     }
 
     /// An effect no module declares keeps the name as written. Inference has
@@ -467,8 +467,10 @@ impl<'a> Interp<'a> {
         return_clause: Option<&ReturnClause>,
         env: &Env,
     ) -> Result<Value, Diagnostic> {
-        let effects: Vec<Symbol> =
-            clauses.iter().map(|c| self.effect_name(&c.effect)).collect();
+        let effects: Vec<Symbol> = clauses
+            .iter()
+            .map(|c| self.effect_name(&c.effect))
+            .collect();
         let mark = self.handlers.len();
         self.handlers.push(HandlerFrame {
             clauses: Arc::new(clauses.to_vec()),
@@ -542,7 +544,12 @@ impl<'a> Interp<'a> {
         };
 
         match &closure.kind {
-            ClosureKind::Fn { params, body, env, module } => {
+            ClosureKind::Fn {
+                params,
+                body,
+                env,
+                module,
+            } => {
                 if params.len() != args.len() {
                     return Err(arity_error(
                         span,
@@ -955,8 +962,11 @@ fn err_recursion_limit(span: Span, max: usize) -> Diagnostic {
 #[cold]
 #[inline(never)]
 fn err_unknown_name(q: &QName) -> Diagnostic {
-    Diagnostic::error(codes::UNKNOWN_NAME, format!("cannot find `{q}` in this scope"))
-        .primary(q.span, "not bound here")
+    Diagnostic::error(
+        codes::UNKNOWN_NAME,
+        format!("cannot find `{q}` in this scope"),
+    )
+    .primary(q.span, "not bound here")
 }
 
 #[cold]

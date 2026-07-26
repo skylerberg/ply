@@ -14,9 +14,10 @@ use ply_span::{SourceId, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 
 fn program_of(files: &[(&str, &str)]) -> Program {
-    let inputs = files.iter().enumerate().map(|(i, (name, source))| {
-        (SourceId(i as u32), ModuleName::from_dotted(name), *source)
-    });
+    let inputs = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, source))| (SourceId(i as u32), ModuleName::from_dotted(name), *source));
     match ply_syntax::parse_program(inputs) {
         Ok(program) => program,
         Err(diags) => panic!("program did not parse: {diags:#?}"),
@@ -94,7 +95,11 @@ fn redirecting_a_call_moves_a_definition_that_sees_both_look_alikes() {
     for (what, template, (first, second)) in forms {
         let via_a = hashes(&[("a", &a), ("b", &b), ("c", &template.replace('M', first))]);
         let via_b = hashes(&[("a", &a), ("b", &b), ("c", &template.replace('M', second))]);
-        assert_ne!(def(&via_a, "c.go"), def(&via_b, "c.go"), "{what}: the caller did not move");
+        assert_ne!(
+            def(&via_a, "c.go"),
+            def(&via_b, "c.go"),
+            "{what}: the caller did not move"
+        );
     }
 }
 
@@ -103,9 +108,14 @@ fn redirecting_a_call_moves_a_definition_that_sees_both_look_alikes() {
 #[test]
 fn a_selective_import_and_a_qualified_path_reach_one_hash() {
     let a = look_alike("db");
-    let qualified = hashes(&[("a", &a), ("c", "import a\npub fn go(v: Int) -> Int = a::log(v)\n")]);
-    let selective =
-        hashes(&[("a", &a), ("c", "import a (log)\npub fn go(v: Int) -> Int = log(v)\n")]);
+    let qualified = hashes(&[
+        ("a", &a),
+        ("c", "import a\npub fn go(v: Int) -> Int = a::log(v)\n"),
+    ]);
+    let selective = hashes(&[
+        ("a", &a),
+        ("c", "import a (log)\npub fn go(v: Int) -> Int = log(v)\n"),
+    ]);
     assert_eq!(def(&qualified, "c.go"), def(&selective, "c.go"));
 }
 
@@ -120,7 +130,11 @@ fn many_look_alike_effects_never_alias_where_a_definition_can_tell_them_apart() 
     for named in [true, false] {
         let mut files: Vec<(String, String)> = (0..8)
             .map(|i| {
-                let effect = if named { "db".to_string() } else { format!("e{i}") };
+                let effect = if named {
+                    "db".to_string()
+                } else {
+                    format!("e{i}")
+                };
                 (format!("m{i}"), look_alike(&effect))
             })
             .collect();
@@ -137,17 +151,27 @@ fn many_look_alike_effects_never_alias_where_a_definition_can_tell_them_apart() 
             ));
         }
 
-        let borrowed: Vec<(&str, &str)> =
-            files.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(m, s)| (m.as_str(), s.as_str()))
+            .collect();
         let out = hashes(&borrowed);
 
         let performers: std::collections::BTreeSet<DefHash> =
             (0..8).map(|i| def(&out, &format!("m{i}.log"))).collect();
-        assert_eq!(performers.len(), 1, "the performers are one definition (named: {named})");
+        assert_eq!(
+            performers.len(),
+            1,
+            "the performers are one definition (named: {named})"
+        );
 
         let observers: std::collections::BTreeSet<DefHash> =
             (0..8).map(|i| def(&out, &format!("c{i}.go"))).collect();
-        assert_eq!(observers.len(), 8, "two observers aliased (shared effect name: {named})");
+        assert_eq!(
+            observers.len(),
+            8,
+            "two observers aliased (shared effect name: {named})"
+        );
     }
 }
 
@@ -175,7 +199,10 @@ fn a_selective_import_that_captures_a_prelude_name_moves_the_hash() {
     ]);
     let after = hashes(&[
         ("a", provider),
-        ("b", "import a (len)\nfn count(xs: List<Int>) -> Int = len(xs)\n"),
+        (
+            "b",
+            "import a (len)\nfn count(xs: List<Int>) -> Int = len(xs)\n",
+        ),
     ]);
     assert_ne!(def(&before, "b.count"), def(&after, "b.count"));
 }
@@ -187,7 +214,10 @@ fn a_selective_import_that_captures_a_prelude_name_moves_the_hash() {
 fn two_imports_of_one_name_are_rejected_in_either_order() {
     let a = "pub fn f(x: Int) -> Int = x + 1\n";
     let b = "pub fn f(x: Int) -> Int = x - 1\n";
-    for order in ["import a (f)\nimport b (f)\n", "import b (f)\nimport a (f)\n"] {
+    for order in [
+        "import a (f)\nimport b (f)\n",
+        "import b (f)\nimport a (f)\n",
+    ] {
         let c = format!("{order}fn g(x: Int) -> Int = f(x)\n");
         assert!(
             errors(&[("a", a), ("b", b), ("c", &c)]).contains(&codes::DUPLICATE_IMPORT),
@@ -257,7 +287,10 @@ fn adding_an_unrelated_module_changes_no_hash() {
     let before = hashes(base);
     let with_extra = hashes(&[
         ("m", &look_alike("db")),
-        ("aaa", "pub effect other {\n  read peek() -> Int\n}\npub fn f(x: Int) -> Int = x\n"),
+        (
+            "aaa",
+            "pub effect other {\n  read peek() -> Int\n}\npub fn f(x: Int) -> Int = x\n",
+        ),
     ]);
     assert_eq!(def(&before, "m.log"), def(&with_extra, "m.log"));
 }
@@ -284,8 +317,16 @@ fn reordering_the_files_of_a_program_changes_no_hash() {
 fn moving_a_look_alike_effect_of_the_same_name_changes_no_hash() {
     let before = hashes(&[("a", &look_alike("db")), ("b", &look_alike("db"))]);
     let after = hashes(&[("b", &look_alike("db")), ("z", &look_alike("db"))]);
-    assert_eq!(def(&before, "b.log"), def(&after, "b.log"), "an untouched module drifted");
-    assert_eq!(def(&before, "a.log"), def(&after, "z.log"), "the moved definition drifted");
+    assert_eq!(
+        def(&before, "b.log"),
+        def(&after, "b.log"),
+        "an untouched module drifted"
+    );
+    assert_eq!(
+        def(&before, "a.log"),
+        def(&after, "z.log"),
+        "the moved definition drifted"
+    );
 }
 
 /// Adding a file is not an edit to any existing definition, so it may not
@@ -330,15 +371,20 @@ fn effects_whose_operations_differ_in_type_are_not_look_alikes() {
              pub fn use_it(k: Int) -> {ty} / {{{effect}.read[x]}} = {effect}.get[x](k)\n"
         )
     };
-    let before = hashes(&[("m", &module("alpha", "Foo")), ("n", &module("beta", "Bar"))]);
-    let after = hashes(&[("m", &module("zebra", "Foo")), ("n", &module("beta", "Bar"))]);
+    let before = hashes(&[
+        ("m", &module("alpha", "Foo")),
+        ("n", &module("beta", "Bar")),
+    ]);
+    let after = hashes(&[
+        ("m", &module("zebra", "Foo")),
+        ("n", &module("beta", "Bar")),
+    ]);
     assert_eq!(def(&before, "n.use_it"), def(&after, "n.use_it"));
 }
 
 /// `hash_module` / `hash_ast` hash one module with no project around it, so
 /// every qualified reference falls through to a free name. The qualifier has to
-/// survive that fall: without it `a::log` and `b::log` name one thing, and the
-/// entry point accepts a module with `import`s without complaint.
+/// survive that fall: without it `a::log` and `b::log` name one thing.
 #[test]
 fn single_module_hashing_does_not_alias_qualified_references() {
     let of = |source: &str| {
@@ -346,7 +392,93 @@ fn single_module_hashing_does_not_alias_qualified_references() {
         hash_ast(&module).expect("hashes").defs[&Symbol::new("go")]
     };
     assert_ne!(
-        of("import a\npub fn go(v: Int) -> Int = a::log(v)\n"),
-        of("import b\npub fn go(v: Int) -> Int = b::log(v)\n"),
+        of("pub fn go(v: Int) -> Int = a::log(v)\n"),
+        of("pub fn go(v: Int) -> Int = b::log(v)\n"),
     );
+}
+
+/// The one-module entry point may not accept a module whose references resolve
+/// only against other modules: with nothing to resolve against it would write
+/// the binder the file happened to spell, and a name is exactly what content
+/// addressing refuses to key on. The three tests after this one are the
+/// separate failures that accepting it produces.
+#[test]
+fn a_lone_module_that_imports_is_refused_rather_than_hashed_by_name() {
+    let module = ply_syntax::parse(SourceId(0), "import a.b\npub fn go() -> Int = b::log()\n")
+        .expect("parses");
+    let diags = hash_ast(&module).expect_err("a lone module cannot resolve an import");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].code, codes::UNKNOWN_MODULE);
+    assert!(
+        !diags[0].primary_span().expect("a real span").is_dummy(),
+        "the import declaration is the thing to point at"
+    );
+    assert!(
+        diags[0].notes.iter().any(|n| n.contains("hash_program")),
+        "the diagnostic has to say what to do instead: {:?}",
+        diags[0].notes
+    );
+}
+
+/// Two files importing *different* modules under one binder are token-identical
+/// below the import, so hashing by binder gives them one hash and one cache
+/// entry.
+#[test]
+fn two_modules_aliased_by_one_binder_are_not_hashed_alike() {
+    let of = |source: &str| {
+        let module = ply_syntax::parse(SourceId(0), source).expect("parses");
+        hash_ast(&module)
+    };
+    assert!(of("import x.y as m\npub fn go(v: Int) -> Int = m::log(v)\n").is_err());
+    assert!(of("import p.q as m\npub fn go(v: Int) -> Int = m::log(v)\n").is_err());
+}
+
+/// A selective import binds a *bare* name, so the reference does not even carry
+/// a qualifier that could have kept the two apart.
+#[test]
+fn two_selectively_imported_names_are_not_hashed_alike() {
+    let of = |source: &str| {
+        let module = ply_syntax::parse(SourceId(0), source).expect("parses");
+        hash_ast(&module)
+    };
+    assert!(of("import x.y (log)\npub fn go(v: Int) -> Int = log(v)\n").is_err());
+    assert!(of("import p.q (log)\npub fn go(v: Int) -> Int = log(v)\n").is_err());
+}
+
+/// The failure that contradicts a required invariant outright: `as`-renaming an
+/// import must change no hash, and hashing by binder makes it change one.
+#[test]
+fn an_as_rename_cannot_move_a_hash_because_neither_form_is_hashed() {
+    let of = |source: &str| {
+        let module = ply_syntax::parse(SourceId(0), source).expect("parses");
+        hash_ast(&module)
+    };
+    assert!(of("import x.y\npub fn go(v: Int) -> Int = y::log(v)\n").is_err());
+    assert!(of("import x.y as m\npub fn go(v: Int) -> Int = m::log(v)\n").is_err());
+
+    // Through the entry point that has the namespace, the rename is free.
+    let before = hashes(&[
+        ("x.y", "pub fn log(v: Int) -> Int = v\n"),
+        ("app", "import x.y\npub fn go(v: Int) -> Int = y::log(v)\n"),
+    ]);
+    let after = hashes(&[
+        ("x.y", "pub fn log(v: Int) -> Int = v\n"),
+        (
+            "app",
+            "import x.y as m\npub fn go(v: Int) -> Int = m::log(v)\n",
+        ),
+    ]);
+    assert_eq!(def(&before, "app.go"), def(&after, "app.go"));
+}
+
+#[test]
+fn every_import_of_a_lone_module_is_reported() {
+    let module = ply_syntax::parse(
+        SourceId(0),
+        "import a\nimport b (f)\npub fn go() -> Int = f()\n",
+    )
+    .expect("parses");
+    let diags = hash_ast(&module).expect_err("both imports are unresolvable here");
+    assert_eq!(diags.len(), 2);
+    assert!(diags.iter().all(|d| d.code == codes::UNKNOWN_MODULE));
 }

@@ -44,7 +44,10 @@ pub struct LoadError {
 
 impl LoadError {
     pub(crate) fn bare(diagnostics: Vec<Diagnostic>) -> LoadError {
-        LoadError { sources: SourceMap::new(), diagnostics }
+        LoadError {
+            sources: SourceMap::new(),
+            diagnostics,
+        }
     }
 }
 
@@ -96,7 +99,11 @@ impl Loaded {
     }
 
     pub fn defs_of(&self, module: &ModuleName) -> Vec<&DefInfo> {
-        self.check.defs.values().filter(|d| &d.module == module).collect()
+        self.check
+            .defs
+            .values()
+            .filter(|d| &d.module == module)
+            .collect()
     }
 
     /// Tests declared by one module, paired with their index in
@@ -113,7 +120,11 @@ impl Loaded {
     /// Every definition named `main`, whatever module declares it.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
-        self.check.defs.values().filter(|d| d.simple_name == main).collect()
+        self.check
+            .defs
+            .values()
+            .filter(|d| d.simple_name == main)
+            .collect()
     }
 }
 
@@ -148,7 +159,10 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
     if meta.is_file() {
         let root = project_root(path);
         let path = tidy(path);
-        let relative = path.file_name().map(PathBuf::from).unwrap_or_else(|| path.clone());
+        let relative = path
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.clone());
         return Ok((root, vec![Discovered { path, relative }]));
     }
 
@@ -177,6 +191,27 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
         })
         .collect();
     Ok((root, discovered))
+}
+
+/// Every `.ply` file under `root`, sorted.
+///
+/// Unlike [`discover`], finding none is not an error: a cache whose sources have
+/// all been deleted is exactly the state compaction exists to clean up, and
+/// refusing there would leave the garbage permanently unreclaimable. An I/O
+/// failure *is* an error, because a partial walk names fewer files than exist
+/// and anything that prunes to it would throw away live work.
+pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // A project rooted at `.` keys its cache under the empty path, which names
+    // the cache directory correctly and reads as no directory at all.
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let mut files = Vec::new();
+    collect(root, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 
 /// Hidden directories are excluded, which is also what keeps `.ply-cache` and
@@ -212,7 +247,11 @@ fn tidy(path: &Path) -> PathBuf {
 /// [`ModuleName::from_relative_path`] has no source to point at. The file is in
 /// the map by the time it is called here, so its first line is a better anchor
 /// than none.
-pub(crate) fn anchor(mut diagnostic: Diagnostic, sources: &SourceMap, source: SourceId) -> Diagnostic {
+pub(crate) fn anchor(
+    mut diagnostic: Diagnostic,
+    sources: &SourceMap,
+    source: SourceId,
+) -> Diagnostic {
     let end = sources
         .get(source)
         .map(|f| f.text.find('\n').unwrap_or(f.text.len()) as u32)
@@ -253,7 +292,11 @@ mod tests {
     }
 
     fn names(loaded: &Loaded) -> Vec<String> {
-        loaded.modules().iter().map(|m| m.name.to_string()).collect()
+        loaded
+            .modules()
+            .iter()
+            .map(|m| m.name.to_string())
+            .collect()
     }
 
     #[test]
@@ -267,7 +310,12 @@ mod tests {
         let loaded = load(dir.path()).unwrap();
         assert_eq!(names(&loaded), ["a", "b", "store.orders"]);
         assert_eq!(loaded.module_count(), 3);
-        assert!(loaded.check.defs.contains_key(&Symbol::new("store.orders.c")));
+        assert!(
+            loaded
+                .check
+                .defs
+                .contains_key(&Symbol::new("store.orders.c"))
+        );
     }
 
     #[test]
@@ -278,7 +326,9 @@ mod tests {
 
         let err = load(dir.path()).unwrap_err();
         assert!(
-            err.diagnostics.iter().any(|d| d.code == codes::UNKNOWN_NAME),
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::UNKNOWN_NAME),
             "a directory must no longer be concatenated: {:?}",
             err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         );
@@ -305,7 +355,11 @@ mod tests {
     fn hidden_directories_are_not_part_of_the_program() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "ok.ply", "fn ok() -> Int = 1\n");
-        write(dir.path(), ".ply-cache/stale.ply", "this is not even valid ply\n");
+        write(
+            dir.path(),
+            ".ply-cache/stale.ply",
+            "this is not even valid ply\n",
+        );
         write(dir.path(), ".git/x.ply", "nor is this\n");
 
         let loaded = load(dir.path()).unwrap();
@@ -339,7 +393,11 @@ mod tests {
         let err = load(Path::new("definitely/not/here.ply")).unwrap_err();
         assert_eq!(err.diagnostics.len(), 1);
         assert_eq!(err.diagnostics[0].code, codes::RUNTIME_ERROR);
-        assert!(err.diagnostics[0].message.contains("definitely/not/here.ply"));
+        assert!(
+            err.diagnostics[0]
+                .message
+                .contains("definitely/not/here.ply")
+        );
     }
 
     #[test]
@@ -365,23 +423,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "bad.ply", "fn f() -> Int = 1 + true\n");
         let err = load(dir.path()).unwrap_err();
-        assert!(err.diagnostics.iter().any(|d| d.code == codes::TYPE_MISMATCH));
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::TYPE_MISMATCH)
+        );
     }
 
     #[test]
     fn a_module_cycle_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "a.ply", "import b\npub fn a() -> Int = b::b()\n");
-        write(dir.path(), "b.ply", "import a\npub fn b() -> Int = a::a()\n");
+        write(
+            dir.path(),
+            "a.ply",
+            "import b\npub fn a() -> Int = b::b()\n",
+        );
+        write(
+            dir.path(),
+            "b.ply",
+            "import a\npub fn b() -> Int = a::a()\n",
+        );
         let err = load(dir.path()).unwrap_err();
-        assert!(err.diagnostics.iter().any(|d| d.code == codes::MODULE_CYCLE));
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::MODULE_CYCLE)
+        );
     }
 
     #[test]
     fn entry_points_finds_main_in_whatever_module_declares_it() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "lib.ply", "pub fn one() -> Int = 1\n");
-        write(dir.path(), "app.ply", "import lib\nfn main() -> Int = lib::one()\n");
+        write(
+            dir.path(),
+            "app.ply",
+            "import lib\nfn main() -> Int = lib::one()\n",
+        );
 
         let loaded = load(dir.path()).unwrap();
         let mains = loaded.entry_points();
@@ -397,14 +475,22 @@ mod tests {
         write(dir.path(), "two.ply", "fn main() -> Int = 2\n");
 
         let loaded = load(dir.path()).unwrap();
-        let mains: Vec<&str> = loaded.entry_points().iter().map(|d| d.name.as_str()).collect();
+        let mains: Vec<&str> = loaded
+            .entry_points()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(mains, ["one.main", "two.main"]);
     }
 
     #[test]
     fn defs_and_tests_can_be_read_back_per_module() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "a.ply", "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n");
+        write(
+            dir.path(),
+            "a.ply",
+            "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n",
+        );
         write(dir.path(), "b.ply", "fn b() -> Int = 2\n");
 
         let loaded = load(dir.path()).unwrap();
