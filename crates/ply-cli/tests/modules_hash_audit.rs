@@ -20,7 +20,12 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
         out.insert(format!("decl {name}"), hash.to_hex());
     }
     for (i, test) in loaded.check.tests.iter().enumerate() {
-        let hash = loaded.hashes.tests.get(i).map(|h| h.to_hex()).unwrap_or_default();
+        let hash = loaded
+            .hashes
+            .tests
+            .get(i)
+            .map(|h| h.to_hex())
+            .unwrap_or_default();
         out.insert(format!("test {}", test.key), hash);
     }
     out
@@ -41,7 +46,11 @@ fn agree(dir: &Path, what: &str) {
         .into_iter()
         .filter(|key| a.get(*key) != b.get(*key))
         .map(|key| {
-            format!("  {key}\n    full        {:?}\n    incremental {:?}", a.get(key), b.get(key))
+            format!(
+                "  {key}\n    full        {:?}\n    incremental {:?}",
+                a.get(key),
+                b.get(key)
+            )
         })
         .collect();
     assert!(
@@ -52,7 +61,10 @@ fn agree(dir: &Path, what: &str) {
 }
 
 fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
-    e.diagnostics.iter().map(|d| format!("{}: {}", d.code, d.message)).collect()
+    e.diagnostics
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect()
 }
 
 fn write(dir: &Path, name: &str, text: &str) {
@@ -87,7 +99,11 @@ fn adding_a_look_alike_effect_keeps_the_two_front_ends_in_agreement() {
     agree(dir.path(), "cold");
     agree(dir.path(), "warm");
 
-    write(dir.path(), "aaa.ply", "pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n");
+    write(
+        dir.path(),
+        "aaa.ply",
+        "pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n",
+    );
     agree(dir.path(), "after a new file declared a look-alike effect");
 }
 
@@ -101,6 +117,10 @@ fn adding_an_unrelated_effect_keeps_the_two_front_ends_in_agreement() {
     agree(dir.path(), "cold");
     agree(dir.path(), "warm");
 
-    write(dir.path(), "aaa.ply", "pub effect alpha {\n  write put(key: Int) -> Int\n}\n");
+    write(
+        dir.path(),
+        "aaa.ply",
+        "pub effect alpha {\n  write put(key: Int) -> Int\n}\n",
+    );
     agree(dir.path(), "after a new file declared an unrelated effect");
 }

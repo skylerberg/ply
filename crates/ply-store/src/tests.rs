@@ -25,6 +25,10 @@ impl TempRoot {
         self.0.join(CACHE_DIR_NAME).join("results.json")
     }
 
+    fn passes_file(&self) -> PathBuf {
+        self.0.join(CACHE_DIR_NAME).join("passes.json")
+    }
+
     fn open(&self) -> Store {
         Store::open(&self.0).unwrap()
     }
@@ -122,7 +126,7 @@ fn the_file_is_hand_readable_and_keyed_by_hex_hash() {
     let text = fs::read_to_string(root.cache_file()).unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(json["runtime_version"], RUNTIME_VERSION);
-    assert_eq!(json["format"], 1);
+    assert_eq!(json["format"], 2);
     assert_eq!(json["results"][hash(1).to_hex()]["outcome"], "pass");
     assert!(
         text.contains('\n'),
@@ -409,11 +413,21 @@ fn a_lock_excludes_a_second_holder_and_is_released_on_drop() {
     assert!(after.held, "dropping the holder releases the lock");
 }
 
+/// A writer that cannot take the lock now writes nothing, so a lock a killed
+/// process left behind would block every write forever if it were not broken by
+/// age.
 #[test]
 fn a_lock_left_by_a_dead_process_never_blocks_a_flush() {
     let root = TempRoot::new("lock-abandoned");
     let mut store = root.open();
-    fs::write(store.dir().join("lock"), "").unwrap();
+    let lock = store.dir().join("lock");
+    fs::write(&lock, "").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
 
     let started = std::time::Instant::now();
     store.put(hash(1), Outcome::Pass);
@@ -643,33 +657,189 @@ fn fingerprint(n: u8) -> SourceFingerprint {
     fp
 }
 
-/// The cache file is rewritten whole, so a run that re-derives exactly what is
-/// already stored must not flush at all. This is the difference between a warm
-/// run costing nothing and costing a full serialization of the project.
+fn body(bytes: &[u8]) -> DefBody {
+    DefBody::new(BODY_ENCODING, bytes.to_vec())
+}
+
+fn def() -> CachedDef {
+    CachedDef::new(scheme(), footprint())
+}
+
+impl TempRoot {
+    fn index_file(&self) -> PathBuf {
+        self.0.join(CACHE_DIR_NAME).join("frontend.idx")
+    }
+
+    fn data_file(&self) -> PathBuf {
+        self.0.join(CACHE_DIR_NAME).join("frontend.dat")
+    }
+}
+
+/// The header field offsets the format fixes, named here so a test that damages
+/// one says which one it damaged.
+mod at {
+    pub(super) const MAGIC: usize = 0;
+    pub(super) const SCHEMA: usize = 16;
+    pub(super) const NONCE: usize = 48;
+    pub(super) const DATA_LEN: usize = 56;
+    pub(super) const VERSION: usize = 64;
+    pub(super) const CHECKSUM: usize = 100;
+}
+
+fn patch(path: &Path, offset: usize, bytes: &[u8]) {
+    let mut file = fs::read(path).unwrap();
+    file[offset..offset + bytes.len()].copy_from_slice(bytes);
+    fs::write(path, file).unwrap();
+}
+
+/// Every frame in a data file, as `(offset, kind, payload length)`, by walking
+/// it the way nothing in the store ever does — a frame is only ever reached
+/// through an index record that already claims where it is.
+fn frames(path: &Path) -> Vec<(usize, u8, usize)> {
+    let bytes = fs::read(path).unwrap();
+    let mut out = Vec::new();
+    let mut at = 56;
+    while at + 13 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        if at + 13 + len > bytes.len() {
+            break;
+        }
+        out.push((at, bytes[at], len));
+        at += 13 + len;
+    }
+    out
+}
+
+fn frame_checksum(kind: u8, payload: &[u8]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[kind]);
+    hasher.update(&(payload.len() as u32).to_le_bytes());
+    hasher.update(payload);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    out
+}
+
+/// Rewrites one frame's payload and repairs its checksum, which is what an
+/// encoding change looks like from the outside: bytes that verify but no longer
+/// mean what the decoder expects.
+fn rewrite_payload(path: &Path, frame: usize, edit: impl FnOnce(&mut Vec<u8>)) {
+    let (offset, kind, len) = frames(path)[frame];
+    let mut bytes = fs::read(path).unwrap();
+    let mut payload = bytes[offset + 13..offset + 13 + len].to_vec();
+    edit(&mut payload);
+    assert_eq!(payload.len(), len, "this helper cannot resize a frame");
+    bytes[offset + 5..offset + 13].copy_from_slice(&frame_checksum(kind, &payload));
+    bytes[offset + 13..offset + 13 + len].copy_from_slice(&payload);
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_fingerprint_an_interface_and_a_body_survive_a_round_trip_through_disk() {
+    let root = TempRoot::new("frontend-round-trip");
+    let file = root.path().join("src/user.ply");
+
+    let mut store = root.open();
+    assert!(store.frontend_is_empty());
+    assert!(store.put_source(&file, fingerprint(1)));
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("Row", hash(9))]),
+    );
+    store.put_decl(
+        hash(9),
+        CachedDecl::new(DeclBody::Effect {
+            nondet: false,
+            ops: vec![CachedOp {
+                name: ply_span::Symbol::new("op"),
+                mode: Mode::Read,
+                resource_param: true,
+                params: vec![Type::int()],
+                ret: Type::int(),
+            }],
+        }),
+    );
+    store.put_body(hash(1), body(b"\x00\x01\xfe\xff normalized"));
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty());
+    assert_eq!(reopened.sources_len(), 1);
+    assert_eq!(reopened.defs_len(), 1);
+    assert_eq!(reopened.decls_len(), 1);
+    assert_eq!(reopened.bodies_len(), 1);
+
+    assert_eq!(
+        reopened.fingerprint(&file).as_deref(),
+        Some(&fingerprint(1)),
+        "keyed by its path under the root"
+    );
+
+    let cached = reopened.def(hash(1)).unwrap();
+    assert_eq!(cached.scheme, scheme());
+    assert_eq!(cached.footprint, footprint());
+    assert_eq!(cached.names, vec![NameRef::new("Row", hash(9))]);
+
+    let decl = reopened.decl(hash(9)).unwrap();
+    assert_eq!(
+        decl.body,
+        DeclBody::Effect {
+            nondet: false,
+            ops: vec![CachedOp {
+                name: ply_span::Symbol::new("op"),
+                mode: Mode::Read,
+                resource_param: true,
+                params: vec![Type::int()],
+                ret: Type::int(),
+            }],
+        }
+    );
+    assert_eq!(
+        reopened.body(hash(1)).unwrap().as_bytes(),
+        b"\x00\x01\xfe\xff normalized",
+        "arbitrary bytes must survive, not just text"
+    );
+    assert!(reopened.body(hash(2)).is_none());
+}
+
+/// The index is rewritten whole on every flush, so a run that re-derives exactly
+/// what is already stored must not flush at all.
 #[test]
 fn re_storing_identical_entries_leaves_the_cache_clean() {
     let root = TempRoot::new("frontend-idempotent");
     let file = root.path().join("src/user.ply");
-    let def = || CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("m.f", hash(1))]);
+    let witnessed =
+        || CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("m.f", hash(1))]);
 
     let mut store = root.open();
     store.put_source(&file, fingerprint(1));
-    store.put_def(hash(1), def());
+    store.put_def(hash(1), witnessed());
     store.flush().unwrap();
-    let written = fs::metadata(store.frontend_path()).unwrap().len();
+    let index = fs::read(root.index_file()).unwrap();
+    let data = fs::read(root.data_file()).unwrap();
 
     let mut store = root.open();
     store.put_source(&file, fingerprint(1));
-    store.put_def(hash(1), def());
-    assert!(!store.frontend_is_dirty(), "identical entries must not dirty the cache");
+    store.put_def(hash(1), witnessed());
+    assert!(
+        !store.frontend_is_dirty(),
+        "identical entries must not dirty the cache"
+    );
     store.flush().unwrap();
-    assert_eq!(fs::metadata(store.frontend_path()).unwrap().len(), written);
+    assert_eq!(fs::read(root.index_file()).unwrap(), index);
+    assert_eq!(
+        fs::read(root.data_file()).unwrap(),
+        data,
+        "an append-only file must not grow for an entry it already holds"
+    );
 
-    // A real change still lands.
     store.put_source(&file, fingerprint(2));
     assert!(store.frontend_is_dirty());
     store.flush().unwrap();
-    assert_eq!(root.open().source(&file), Some(&fingerprint(2)));
+    assert_eq!(
+        root.open().fingerprint(&file).as_deref(),
+        Some(&fingerprint(2))
+    );
 }
 
 /// Two definitions in different modules with the same `DefHash` and different
@@ -702,10 +872,10 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
 
     let reopened = root.open();
     assert_eq!(reopened.defs_len(), 2);
-    assert_eq!(reopened.cached_def_of(shared, &alpha).unwrap().scheme, scheme());
-    assert_eq!(reopened.cached_def_of(shared, &beta).unwrap().scheme, other);
+    assert_eq!(reopened.def_of(shared, &alpha).unwrap().scheme, scheme());
+    assert_eq!(reopened.def_of(shared, &beta).unwrap().scheme, other);
     assert_eq!(
-        reopened.cached_def_of(shared, &ply_span::Symbol::new("gamma.h")),
+        reopened.def_of(shared, &ply_span::Symbol::new("gamma.h")),
         None,
         "a third definition must miss rather than borrow someone else's scheme"
     );
@@ -720,67 +890,11 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     store.flush().unwrap();
     let reopened = root.open();
     assert_eq!(reopened.defs_len(), 2);
-    assert_eq!(reopened.cached_def_of(shared, &alpha).unwrap().footprint, footprint());
-    assert_eq!(reopened.cached_def_of(shared, &beta).unwrap().scheme, other);
-}
-
-#[test]
-fn a_fingerprint_and_an_interface_survive_a_round_trip_through_disk() {
-    let root = TempRoot::new("frontend-round-trip");
-    let file = root.path().join("src/user.ply");
-
-    let mut store = root.open();
-    assert!(store.frontend_is_empty());
-    assert!(store.put_source(&file, fingerprint(1)));
-    store.put_def(
-        hash(1),
-        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("Row", hash(9))]),
-    );
-    store.put_decl(
-        hash(9),
-        CachedDecl::new(DeclBody::Effect {
-            nondet: false,
-            ops: vec![CachedOp {
-                name: ply_span::Symbol::new("op"),
-                mode: Mode::Read,
-                resource_param: true,
-                params: vec![Type::int()],
-                ret: Type::int(),
-            }],
-        }),
-    );
-    store.flush().unwrap();
-
-    let reopened = root.open();
-    assert!(reopened.warnings().is_empty());
-    assert_eq!(reopened.sources_len(), 1);
-    assert_eq!(reopened.defs_len(), 1);
-    assert_eq!(reopened.decls_len(), 1);
-
-    let fp = reopened
-        .source(&file)
-        .expect("keyed by its path under the root");
-    assert_eq!(fp, &fingerprint(1));
-
-    let def = reopened.cached_def(hash(1)).unwrap();
-    assert_eq!(def.scheme, scheme());
-    assert_eq!(def.footprint, footprint());
-    assert_eq!(def.names, vec![NameRef::new("Row", hash(9))]);
-
-    let decl = reopened.cached_decl(hash(9)).unwrap();
     assert_eq!(
-        decl.body,
-        DeclBody::Effect {
-            nondet: false,
-            ops: vec![CachedOp {
-                name: ply_span::Symbol::new("op"),
-                mode: Mode::Read,
-                resource_param: true,
-                params: vec![Type::int()],
-                ret: Type::int(),
-            }],
-        }
+        reopened.def_of(shared, &alpha).unwrap().footprint,
+        footprint()
     );
+    assert_eq!(reopened.def_of(shared, &beta).unwrap().scheme, other);
 }
 
 #[test]
@@ -791,18 +905,15 @@ fn a_source_key_is_relative_so_the_cache_survives_the_checkout_moving() {
     store.put_source(&file, fingerprint(1));
     store.flush().unwrap();
 
-    let text = fs::read_to_string(store.frontend_path()).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["frontend_version"], FRONTEND_VERSION);
-    assert_eq!(json["format"], 2);
+    let index = fs::read(root.index_file()).unwrap();
+    let text = String::from_utf8_lossy(&index).to_string();
     assert!(
-        json["sources"]["src/user.ply"].is_object(),
-        "the key must be root-relative with `/` separators, got {}",
-        json["sources"]
+        text.contains("src/user.ply"),
+        "the key must be root-relative with `/` separators"
     );
     assert!(
         !text.contains(root.path().to_str().unwrap()),
-        "no absolute path may reach the cache file"
+        "no absolute path may reach the cache"
     );
 }
 
@@ -815,26 +926,25 @@ fn a_path_that_cannot_be_keyed_is_refused_rather_than_mis_keyed() {
     // the same name.
     let outside = root.path().join("../elsewhere.ply");
     assert!(!store.put_source(&outside, fingerprint(1)));
-    assert!(store.source(&outside).is_none());
+    assert!(store.fingerprint(&outside).is_none());
     assert_eq!(store.sources_len(), 0);
+}
+
+fn seeded(tag: &str) -> TempRoot {
+    let root = TempRoot::new(tag);
+    let mut store = root.open();
+    store.put(hash(1), Outcome::Pass);
+    store.put_source(&root.path().join("a.ply"), fingerprint(1));
+    store.put_def(hash(1), def());
+    store.put_body(hash(1), body(b"one"));
+    store.flush().unwrap();
+    root
 }
 
 #[test]
 fn the_two_caches_are_versioned_and_invalidated_independently() {
-    let root = TempRoot::new("frontend-version");
-    let mut store = root.open();
-    store.put(hash(1), Outcome::Pass);
-    store.put_source(&root.path().join("a.ply"), fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
-    store.flush().unwrap();
-
-    let text = fs::read_to_string(store.frontend_path()).unwrap();
-    let stale = text.replace(
-        &format!("\"{FRONTEND_VERSION}\""),
-        "\"0.0.1-some-older-front-end\"",
-    );
-    assert_ne!(stale, text, "the version must actually appear in the file");
-    fs::write(store.frontend_path(), stale).unwrap();
+    let root = seeded("frontend-version");
+    patch(&root.index_file(), at::VERSION, &[0xab; 32]);
 
     let reopened = root.open();
     assert_eq!(reopened.sources_len(), 0);
@@ -849,57 +959,306 @@ fn the_two_caches_are_versioned_and_invalidated_independently() {
     assert!(reopened.warnings()[0].message.contains("front end"));
 }
 
+/// The gate that exists because a binary encoding cannot fail loudly on its own:
+/// a stored shape that changed without a version bump would otherwise decode
+/// into a plausible wrong `Footprint`, and footprints decide which tests may run
+/// concurrently.
 #[test]
-fn a_corrupt_front_end_cache_degrades_to_empty_and_repairs_itself() {
-    let root = TempRoot::new("frontend-corrupt");
+fn a_cache_written_against_other_shapes_is_refused() {
+    for (tag, file) in [
+        (
+            "frontend-schema-idx",
+            TempRoot::index_file as fn(&TempRoot) -> PathBuf,
+        ),
+        ("frontend-schema-dat", TempRoot::data_file),
+    ] {
+        let root = seeded(tag);
+        patch(&file(&root), at::SCHEMA, &[0x5a; 32]);
+
+        let store = root.open();
+        assert!(store.frontend_is_empty(), "{tag}");
+        assert_eq!(store.warnings().len(), 1, "{tag}");
+        assert_eq!(
+            store.warnings()[0].code,
+            codes::CACHE_VERSION_CHANGED,
+            "{tag}"
+        );
+        assert_eq!(store.len(), 1, "{tag}: the result cache is untouched");
+    }
+}
+
+#[test]
+fn a_corrupt_header_degrades_to_an_empty_cache() {
+    for (tag, file) in [
+        (
+            "frontend-magic-idx",
+            TempRoot::index_file as fn(&TempRoot) -> PathBuf,
+        ),
+        ("frontend-magic-dat", TempRoot::data_file),
+    ] {
+        let root = seeded(tag);
+        patch(&file(&root), at::MAGIC, b"NOTAPLY!");
+
+        let store = root.open();
+        assert!(store.frontend_is_empty(), "{tag}");
+        assert_eq!(store.warnings().len(), 1, "{tag}");
+        assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT, "{tag}");
+        assert_eq!(store.warnings()[0].severity, Severity::Warning, "{tag}");
+    }
+}
+
+#[test]
+fn an_index_that_does_not_match_its_own_checksum_is_refused() {
+    let root = seeded("frontend-index-checksum");
+    patch(&root.index_file(), at::CHECKSUM, &[0u8; 32]);
+
     let mut store = root.open();
-    store.put_source(&root.path().join("a.ply"), fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
+    assert!(store.frontend_is_empty());
+    assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT);
+
+    store.put_def(hash(2), def());
     store.flush().unwrap();
+    let repaired = root.open();
+    assert!(repaired.warnings().is_empty(), "it must repair itself");
+    assert_eq!(repaired.defs_len(), 1);
+    assert_eq!(
+        repaired.sources_len(),
+        0,
+        "nothing from a file it refused to read may come back"
+    );
+}
 
-    let text = fs::read_to_string(store.frontend_path()).unwrap();
-    fs::write(store.frontend_path(), &text[..text.len() / 2]).unwrap();
+/// The two files carry a shared nonce, so an index cannot be read against a data
+/// file it was not written for — the case where one of the two is deleted, or
+/// restored from a backup.
+#[test]
+fn an_index_and_a_data_file_that_were_not_written_together_are_refused() {
+    let root = seeded("frontend-unpaired");
+    let other = seeded("frontend-unpaired-other");
+    fs::copy(other.data_file(), root.data_file()).unwrap();
 
-    let mut damaged = root.open();
-    assert!(damaged.frontend_is_empty());
-    assert_eq!(damaged.warnings().len(), 1);
-    assert_eq!(damaged.warnings()[0].code, codes::CACHE_CORRUPT);
-    assert_eq!(damaged.warnings()[0].severity, Severity::Warning);
-    assert!(
-        damaged.source(&root.path().join("a.ply")).is_none(),
-        "a damaged cache must not answer"
+    let store = root.open();
+    assert!(store.frontend_is_empty());
+    assert_eq!(store.warnings().len(), 1);
+    assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT);
+    assert!(store.warnings()[0].message.contains("data file"));
+}
+
+#[test]
+fn an_index_without_its_data_file_is_refused_rather_than_answered_from() {
+    let root = seeded("frontend-no-data");
+    fs::remove_file(root.data_file()).unwrap();
+
+    let store = root.open();
+    assert!(store.frontend_is_empty());
+    assert_eq!(store.warnings().len(), 1);
+    assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT);
+}
+
+/// The bound that makes an offset safe to follow. Damaging `data_len` is how a
+/// truncated data file presents itself, and every entry must lie wholly below
+/// it.
+#[test]
+fn an_index_entry_pointing_past_the_end_of_the_data_file_is_refused() {
+    let root = seeded("frontend-past-end");
+    let data_len = u64::from_le_bytes(
+        fs::read(root.index_file()).unwrap()[at::DATA_LEN..at::DATA_LEN + 8]
+            .try_into()
+            .unwrap(),
+    );
+    patch(
+        &root.index_file(),
+        at::DATA_LEN,
+        &(data_len - 16).to_le_bytes(),
     );
 
-    damaged.put_def(hash(2), CachedDef::new(scheme(), footprint()));
-    damaged.flush().unwrap();
+    let store = root.open();
+    assert!(store.frontend_is_empty());
+    assert_eq!(store.warnings().len(), 1);
+    assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT);
+    assert!(
+        store.warnings()[0]
+            .message
+            .contains("past the end of the data file"),
+        "got {}",
+        store.warnings()[0].message
+    );
+}
 
-    let repaired = root.open();
-    assert!(repaired.warnings().is_empty());
-    assert_eq!(repaired.defs_len(), 1);
-    assert!(repaired.cached_def(hash(2)).is_some());
+/// A killed writer leaves bytes above the length the index vouches for. They are
+/// invisible, because nothing points at them, and the next flush truncates them
+/// away rather than appending after them.
+#[test]
+fn a_torn_append_is_invisible_and_is_recovered_by_the_next_flush() {
+    let root = seeded("frontend-torn-append");
+    let committed = fs::metadata(root.data_file()).unwrap().len();
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(root.data_file())
+            .unwrap();
+        file.write_all(&[0xcc; 4096]).unwrap();
+    }
+
+    let mut store = root.open();
+    assert!(
+        store.warnings().is_empty(),
+        "a torn tail is not a corrupt cache: {:?}",
+        store.warnings()
+    );
+    assert_eq!(store.defs_len(), 1);
+    assert_eq!(store.sources_len(), 1);
+
+    store.put_def(hash(2), def());
+    store.flush().unwrap();
+    let after = fs::metadata(root.data_file()).unwrap().len();
+    assert!(
+        after < committed + 4096,
+        "the torn tail must be truncated, not appended after: {committed} -> {after}"
+    );
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty());
+    assert_eq!(reopened.defs_len(), 2);
+    assert!(reopened.def(hash(1)).is_some());
+    assert!(reopened.def(hash(2)).is_some());
+}
+
+/// A frame whose bytes were damaged in place. The checksum is what makes this a
+/// miss instead of a plausible wrong answer.
+#[test]
+fn an_entry_whose_checksum_fails_is_not_cached_and_is_reported() {
+    let root = TempRoot::new("frontend-frame-checksum");
+    let mut store = root.open();
+    store.put_def(hash(1), def());
+    store.put_def(hash(2), CachedDef::new(scheme(), Footprint::empty()));
+    store.flush().unwrap();
+
+    let (offset, _, len) = frames(&root.data_file())[0];
+    let mut bytes = fs::read(root.data_file()).unwrap();
+    bytes[offset + 13 + len / 2] ^= 0xff;
+    fs::write(root.data_file(), bytes).unwrap();
+
+    let mut store = root.open();
+    assert!(
+        store.warnings().is_empty(),
+        "the damage is inside an entry, so opening cannot see it"
+    );
+    assert!(
+        store.def(hash(1)).is_none(),
+        "a damaged entry must not answer"
+    );
+    assert!(
+        store.def(hash(2)).is_some(),
+        "one bad frame must not cost the rest of the cache"
+    );
+
+    let warnings = store.take_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, codes::CACHE_CORRUPT);
+    assert!(warnings[0].message.contains("checksum"));
+    assert!(!warnings[0].notes.is_empty());
+}
+
+/// The case a checksum cannot catch and a tag must: bytes that verify but were
+/// written to a different shape. Nothing may decode into a value.
+#[test]
+fn a_payload_whose_shape_drifted_is_refused_rather_than_misread() {
+    let root = TempRoot::new("frontend-shape-drift");
+    let mut store = root.open();
+    store.put_def(hash(1), def());
+    store.flush().unwrap();
+
+    // The first byte of a payload is the tag that says what shape follows.
+    rewrite_payload(&root.data_file(), 0, |payload| payload[0] ^= 0x01);
+
+    let mut store = root.open();
+    assert!(store.def(hash(1)).is_none());
+    let warnings = store.take_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, codes::CACHE_CORRUPT);
+}
+
+/// The crash window: a flush has written its temp index in full and died before
+/// the rename. Nothing in it may be visible, and the previous cache must be
+/// exactly as it was.
+#[test]
+fn an_entry_written_but_never_renamed_is_not_observable() {
+    let root = seeded("frontend-crash-window");
+    let committed = fs::read(root.index_file()).unwrap();
+
+    let ahead = seeded("frontend-crash-window-source");
+    let mut moved = ahead.open();
+    moved.put_def(hash(2), CachedDef::new(scheme(), Footprint::empty()));
+    moved.flush().unwrap();
+    let unrenamed = fs::read(ahead.index_file()).unwrap();
+    assert_ne!(unrenamed, committed);
+
+    fs::write(
+        root.path()
+            .join(CACHE_DIR_NAME)
+            .join("frontend.4242.0.0.tmp"),
+        &unrenamed,
+    )
+    .unwrap();
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty());
+    assert_eq!(reopened.sources_len(), 1);
+    assert_eq!(reopened.defs_len(), 1);
+    assert!(
+        reopened.def(hash(2)).is_none(),
+        "an entry that never reached the rename must not be readable"
+    );
+    assert_eq!(
+        fs::read(root.index_file()).unwrap(),
+        committed,
+        "opening the cache must not disturb it"
+    );
+}
+
+/// Frames a writer appended but whose index it has not yet renamed into place
+/// are equally invisible: the index on disk is the only thing that says an entry
+/// exists.
+#[test]
+fn an_appended_frame_no_index_names_is_not_observable() {
+    let root = seeded("frontend-unindexed-frame");
+    let index = fs::read(root.index_file()).unwrap();
+
+    let source = TempRoot::new("frontend-unindexed-frame-source");
+    let mut other = source.open();
+    other.put_def(hash(7), CachedDef::new(scheme(), Footprint::empty()));
+    other.flush().unwrap();
+    let donor = fs::read(source.data_file()).unwrap();
+
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(root.data_file())
+            .unwrap();
+        file.write_all(&donor[56..]).unwrap();
+    }
+
+    let store = root.open();
+    assert!(store.warnings().is_empty());
+    assert!(store.def(hash(7)).is_none());
+    assert_eq!(store.defs_len(), 1);
+    assert_eq!(fs::read(root.index_file()).unwrap(), index);
 }
 
 #[test]
 fn clearing_the_cache_discards_types_as_well_as_results() {
-    let root = TempRoot::new("frontend-clear");
+    let root = seeded("frontend-clear");
     let mut store = root.open();
-    store.put(hash(1), Outcome::Pass);
-    store.put_source(&root.path().join("a.ply"), fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
-    store.put_decl(
-        hash(2),
-        CachedDecl::new(DeclBody::Type {
-            arity: 0,
-            ctors: vec![],
-        }),
-    );
-    store.flush().unwrap();
     assert!(store.frontend_path().exists());
 
     store.clear().unwrap();
     assert_eq!(store.len(), 0);
     assert!(store.frontend_is_empty());
     assert!(!store.frontend_path().exists());
+    assert!(!store.frontend_data_path().exists());
 
     let reopened = root.open();
     assert!(reopened.warnings().is_empty());
@@ -913,6 +1272,7 @@ fn flush_without_changes_writes_no_front_end_cache_either() {
     let mut store = root.open();
     store.flush().unwrap();
     assert!(!store.frontend_path().exists());
+    assert!(!store.frontend_data_path().exists());
     assert!(temp_files(store.dir()).is_empty());
 }
 
@@ -922,16 +1282,41 @@ fn interfaces_merge_across_processes_because_they_are_content_keyed() {
     let mut first = root.open();
     let mut second = root.open();
 
-    first.put_def(hash(1), CachedDef::new(scheme(), footprint()));
+    first.put_def(hash(1), def());
     first.flush().unwrap();
 
-    second.put_def(hash(2), CachedDef::new(scheme(), footprint()));
+    second.put_def(hash(2), def());
     second.flush().unwrap();
 
     let reopened = root.open();
     assert_eq!(reopened.defs_len(), 2);
-    assert!(reopened.cached_def(hash(1)).is_some());
-    assert!(reopened.cached_def(hash(2)).is_some());
+    assert!(reopened.def(hash(1)).is_some());
+    assert!(reopened.def(hash(2)).is_some());
+}
+
+/// A writer that cannot take the lock keeps its work in memory and says so.
+/// Interleaved frames are corruption, where a lost update is only a recheck.
+#[test]
+fn a_writer_that_cannot_take_the_lock_writes_nothing() {
+    let root = TempRoot::new("frontend-lock-refused");
+    let mut store = root.open();
+    let held = disk::Lock::acquire(store.dir());
+    assert!(held.held);
+
+    store.put_def(hash(1), def());
+    store.flush().unwrap();
+    assert!(
+        !store.frontend_path().exists(),
+        "nothing may be written without the lock"
+    );
+    let warnings = store.take_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].message.contains("lock"));
+    assert!(store.frontend_is_dirty(), "the work is still pending");
+
+    drop(held);
+    store.flush().unwrap();
+    assert_eq!(root.open().defs_len(), 1);
 }
 
 #[test]
@@ -943,8 +1328,8 @@ fn pruning_drops_dead_files_and_the_interfaces_only_they_referred_to() {
     let mut store = root.open();
     store.put_source(&kept, fingerprint(1));
     store.put_source(&deleted, fingerprint(2));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
-    store.put_def(hash(2), CachedDef::new(scheme(), footprint()));
+    store.put_def(hash(1), def());
+    store.put_def(hash(2), def());
     store.put_decl(
         hash(2),
         CachedDecl::new(DeclBody::Type {
@@ -952,6 +1337,8 @@ fn pruning_drops_dead_files_and_the_interfaces_only_they_referred_to() {
             ctors: vec![],
         }),
     );
+    store.put_body(hash(1), body(b"kept"));
+    store.put_body(hash(2), body(b"dead"));
     store.flush().unwrap();
 
     let pruned = store.prune(std::slice::from_ref(&kept));
@@ -960,12 +1347,15 @@ fn pruning_drops_dead_files_and_the_interfaces_only_they_referred_to() {
         Pruned {
             sources: 1,
             defs: 1,
-            decls: 1
+            decls: 1,
+            bodies: 1,
         }
     );
-    assert!(store.source(&deleted).is_none());
-    assert!(store.source(&kept).is_some());
-    assert!(store.cached_def(hash(1)).is_some());
+    assert!(store.has_body(hash(1)));
+    assert!(!store.has_body(hash(2)));
+    assert!(store.fingerprint(&deleted).is_none());
+    assert!(store.fingerprint(&kept).is_some());
+    assert!(store.def(hash(1)).is_some());
     store.flush().unwrap();
 
     // A merging flush would have resurrected everything pruning removed.
@@ -973,7 +1363,192 @@ fn pruning_drops_dead_files_and_the_interfaces_only_they_referred_to() {
     assert_eq!(reopened.sources_len(), 1);
     assert_eq!(reopened.defs_len(), 1);
     assert_eq!(reopened.decls_len(), 0);
-    assert!(reopened.source(&deleted).is_none());
+    assert_eq!(reopened.bodies_len(), 1);
+    assert!(reopened.fingerprint(&deleted).is_none());
+}
+
+fn pass_record(test: u8, closure: &[(&str, u8)]) -> PassRecord {
+    PassRecord {
+        test_hash: hash(test),
+        closure: closure
+            .iter()
+            .map(|(name, h)| (Symbol::new(*name), hash(*h)))
+            .collect(),
+        decls: Default::default(),
+    }
+}
+
+#[test]
+fn a_pass_record_survives_a_flush_and_a_reopen() {
+    let root = TempRoot::new("pass-record-roundtrip");
+    let key = Symbol::new("ledger.balances");
+    let mut store = root.open();
+    assert!(store.pass_record(&key).is_none());
+
+    store.put_pass_record(key.clone(), pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert_eq!(
+        reopened.pass_record(&key),
+        Some(&pass_record(1, &[("ledger.post", 2)]))
+    );
+    assert_eq!(reopened.pass_records_len(), 1);
+}
+
+/// One record per test, so the baseline is always the *last* configuration it
+/// passed at rather than the first.
+#[test]
+fn a_later_pass_replaces_the_baseline_rather_than_accumulating() {
+    let root = TempRoot::new("pass-record-overwrite");
+    let key = Symbol::new("ledger.balances");
+    let mut store = root.open();
+    store.put_pass_record(key.clone(), pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+    store.put_pass_record(key.clone(), pass_record(3, &[("ledger.post", 4)]));
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert_eq!(reopened.pass_records_len(), 1);
+    assert_eq!(
+        reopened.pass_record(&key),
+        Some(&pass_record(3, &[("ledger.post", 4)]))
+    );
+}
+
+/// The records are read on the first question rather than at `open`, so a
+/// corrupt file produces no warning until something asks — and asking must not
+/// answer "never passed" without saying why it cannot tell.
+#[test]
+fn corrupt_pass_records_warn_and_do_not_claim_the_test_never_passed() {
+    let root = TempRoot::new("pass-record-corrupt");
+    let key = Symbol::new("ledger.balances");
+    let mut store = root.open();
+    store.put_pass_record(key.clone(), pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+    fs::write(root.passes_file(), "{ not json at all").unwrap();
+
+    let mut store = root.open();
+    assert!(
+        store.take_warnings().is_empty(),
+        "`open` must not read them"
+    );
+    assert!(store.pass_record(&key).is_none());
+
+    let warnings = store.warnings();
+    let warning = warnings
+        .first()
+        .expect("an unreadable baseline has to be reported");
+    assert_eq!(warning.code, crate::codes::CACHE_CORRUPT);
+    assert!(
+        warning.message.contains("pass records"),
+        "the failing file has to be named: {}",
+        warning.message
+    );
+    assert!(
+        warning.notes.iter().any(|n| n.contains("no test re-runs")),
+        "losing a baseline re-runs nothing, and the note must not imply it does: {:?}",
+        warning.notes
+    );
+}
+
+/// Re-recording an identical baseline must not dirty the cache, or every warm
+/// run over a green project rewrites the result cache for nothing.
+#[test]
+fn re_recording_the_same_baseline_writes_nothing() {
+    let root = TempRoot::new("pass-record-clean");
+    let key = Symbol::new("ledger.balances");
+    let mut store = root.open();
+    store.put_pass_record(key.clone(), pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+
+    let written = fs::metadata(root.passes_file())
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mut store = root.open();
+    store.put_pass_record(key, pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+    assert_eq!(
+        fs::metadata(root.passes_file())
+            .unwrap()
+            .modified()
+            .unwrap(),
+        written,
+        "an unchanged baseline rewrote the pass records"
+    );
+    assert!(
+        !root.cache_file().exists(),
+        "recording a baseline rewrote the result cache, which holds no baselines"
+    );
+}
+
+/// ADR 0004's silent-wrongness path: prune deletes the baselines, and every
+/// later failure degrades to `no_bodies` with no error to explain it.
+#[test]
+fn pruning_keeps_the_bodies_a_baseline_names_even_when_no_file_declares_them() {
+    let root = TempRoot::new("prune-keeps-baselines");
+    let kept = root.path().join("kept.ply");
+    let deleted = root.path().join("deleted.ply");
+
+    let mut store = root.open();
+    store.put_source(&kept, fingerprint(1));
+    store.put_source(&deleted, fingerprint(2));
+    store.put_def(hash(1), def());
+    store.put_def(hash(2), def());
+    store.put_body(hash(1), body(b"kept"));
+    store.put_body(hash(2), body(b"the baseline's"));
+    store.put_pass_record(
+        Symbol::new("ledger.balances"),
+        pass_record(9, &[("ledger.gone", 2)]),
+    );
+    store.flush().unwrap();
+
+    store.prune(std::slice::from_ref(&kept));
+    assert!(
+        store.has_body(hash(2)),
+        "pruning deleted the body a baseline named"
+    );
+    assert!(store.fingerprint(&deleted).is_none(), "the file still went");
+    store.flush().unwrap();
+    assert!(root.open().has_body(hash(2)));
+}
+
+/// The retention is not unconditional: a body no surviving file *and* no
+/// baseline names is still garbage, or `prune` would stop reclaiming anything
+/// once a single test had ever passed.
+#[test]
+fn a_baseline_retains_only_the_hashes_it_actually_names() {
+    let root = TempRoot::new("prune-baseline-scope");
+    let kept = root.path().join("kept.ply");
+    let deleted = root.path().join("deleted.ply");
+
+    let mut store = root.open();
+    store.put_source(&kept, fingerprint(1));
+    store.put_source(&deleted, fingerprint(2));
+    store.put_def(hash(2), def());
+    store.put_body(hash(2), body(b"nobody's"));
+    store.put_pass_record(
+        Symbol::new("ledger.balances"),
+        pass_record(9, &[("ledger.elsewhere", 7)]),
+    );
+    store.flush().unwrap();
+
+    store.prune(std::slice::from_ref(&kept));
+    assert!(!store.has_body(hash(2)));
+}
+
+#[test]
+fn clearing_discards_the_baselines_with_everything_else() {
+    let root = TempRoot::new("pass-record-clear");
+    let key = Symbol::new("ledger.balances");
+    let mut store = root.open();
+    store.put_pass_record(key.clone(), pass_record(1, &[("ledger.post", 2)]));
+    store.flush().unwrap();
+
+    store.clear().unwrap();
+    assert!(store.pass_record(&key).is_none());
+    assert!(root.open().pass_record(&key).is_none());
 }
 
 #[test]
@@ -982,11 +1557,49 @@ fn pruning_to_the_same_file_set_changes_nothing() {
     let a = root.path().join("a.ply");
     let mut store = root.open();
     store.put_source(&a, fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
+    store.put_def(hash(1), def());
 
     assert_eq!(store.prune(std::slice::from_ref(&a)), Pruned::default());
     assert_eq!(store.sources_len(), 1);
     assert_eq!(store.defs_len(), 1);
+}
+
+/// A prune that drops nothing must leave the cache clean, or every run over an
+/// unchanged project rewrites the index it just read.
+#[test]
+fn pruning_a_project_that_did_not_change_leaves_the_cache_clean() {
+    let root = TempRoot::new("frontend-prune-clean");
+    let a = root.path().join("a.ply");
+    let mut store = root.open();
+    store.put_source(&a, fingerprint(1));
+    store.put_def(hash(1), def());
+    store.flush().unwrap();
+
+    let mut store = root.open();
+    assert_eq!(store.prune(std::slice::from_ref(&a)), Pruned::default());
+    assert!(!store.frontend_is_dirty());
+}
+
+#[test]
+fn forgetting_a_source_survives_the_flush_that_follows_it() {
+    let root = TempRoot::new("frontend-forget");
+    let a = root.path().join("a.ply");
+    let b = root.path().join("b.ply");
+    let mut store = root.open();
+    store.put_source(&a, fingerprint(1));
+    store.put_source(&b, fingerprint(2));
+    store.flush().unwrap();
+
+    let mut store = root.open();
+    assert!(store.forget_source(&a));
+    assert!(!store.forget_source(&a), "it is already gone");
+    assert!(store.fingerprint(&a).is_none());
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert_eq!(reopened.sources_len(), 1);
+    assert!(reopened.fingerprint(&a).is_none());
+    assert!(reopened.fingerprint(&b).is_some());
 }
 
 #[test]
@@ -1005,7 +1618,7 @@ fn source_paths_round_trip_back_to_the_paths_that_were_stored() {
 
 #[test]
 fn a_witness_holds_only_while_every_name_still_denotes_what_it_did() {
-    let def = CachedDef::new(scheme(), footprint()).witnessed_by(vec![
+    let cached = CachedDef::new(scheme(), footprint()).witnessed_by(vec![
         NameRef::new("Row", hash(1)),
         NameRef::new("db", hash(2)),
     ]);
@@ -1015,7 +1628,7 @@ fn a_witness_holds_only_while_every_name_still_denotes_what_it_did() {
         "db" => Some(hash(2)),
         _ => None,
     };
-    assert!(def.witness_holds(resolved));
+    assert!(cached.witness_holds(resolved));
 
     // `Row` was edited: same name, different definition.
     let edited = |name: &ply_span::Symbol| match name.as_str() {
@@ -1023,14 +1636,14 @@ fn a_witness_holds_only_while_every_name_still_denotes_what_it_did() {
         "db" => Some(hash(2)),
         _ => None,
     };
-    assert!(!def.witness_holds(edited));
+    assert!(!cached.witness_holds(edited));
 
     // `Row` was renamed away, so the scheme's `Row` no longer denotes anything.
     let renamed = |name: &ply_span::Symbol| match name.as_str() {
         "db" => Some(hash(2)),
         _ => None,
     };
-    assert!(!def.witness_holds(renamed));
+    assert!(!cached.witness_holds(renamed));
 
     assert!(CachedDef::new(scheme(), footprint()).witness_holds(renamed));
 }
@@ -1118,14 +1731,7 @@ fn a_content_hash_round_trips_through_hex_and_is_not_a_def_hash() {
 
 #[test]
 fn a_stale_result_cache_leaves_the_front_end_alone() {
-    let root = TempRoot::new("frontend-survives-runtime-bump");
-    let file = root.path().join("a.ply");
-    let mut store = root.open();
-    store.put(hash(1), Outcome::Pass);
-    store.put_source(&file, fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
-    store.flush().unwrap();
-
+    let root = seeded("frontend-survives-runtime-bump");
     let text = fs::read_to_string(root.cache_file()).unwrap();
     fs::write(
         root.cache_file(),
@@ -1141,50 +1747,38 @@ fn a_stale_result_cache_leaves_the_front_end_alone() {
         "a type is not invalidated by a change to the evaluator"
     );
     assert_eq!(reopened.defs_len(), 1);
-    assert!(reopened.source(&file).is_some());
+    assert!(reopened.fingerprint(&root.path().join("a.ply")).is_some());
     assert_eq!(reopened.warnings().len(), 1);
     assert_eq!(reopened.warnings()[0].code, codes::CACHE_VERSION_CHANGED);
 }
 
 #[test]
 fn every_shape_of_unreadable_front_end_file_degrades_rather_than_crashes() {
-    let good = format!(r#""format":2,"frontend_version":"{FRONTEND_VERSION}""#);
-    for (tag, contents) in [
-        ("fe-empty", String::new()),
-        ("fe-not-json", "\u{0}\u{1}garbage\u{ff}".to_string()),
-        ("fe-wrong-root-type", "[]".to_string()),
+    for (tag, damage) in [
         (
-            "fe-future-format",
-            r#"{"format":99,"sources":{}}"#.to_string(),
+            "fe-empty",
+            &(|f: &Path| fs::write(f, []).unwrap()) as &dyn Fn(&Path),
         ),
-        ("fe-no-version", r#"{"format":2,"sources":{}}"#.to_string()),
-        (
-            "fe-bad-hash-key",
-            format!(r#"{{{good},"defs":{{"zz":{{"scheme":null}}}}}}"#),
-        ),
-        (
-            "fe-bad-scheme",
-            format!(
-                r#"{{{good},"defs":{{"{}":{{"scheme":{{"ty_vars":"all of them"}}}}}}}}"#,
-                hash(1).to_hex()
-            ),
-        ),
-        (
-            "fe-unknown-decl-tag",
-            format!(
-                r#"{{{good},"decls":{{"{}":{{"body":{{"decl":"module"}}}}}}}}"#,
-                hash(1).to_hex()
-            ),
-        ),
-        (
-            "fe-truncated-fingerprint",
-            format!(r#"{{{good},"sources":{{"a.ply":{{}}}}}}"#),
-        ),
+        ("fe-garbage", &|f| {
+            fs::write(f, b"\x00\x01garbage\xff".repeat(40)).unwrap()
+        }),
+        ("fe-truncated", &|f| {
+            let bytes = fs::read(f).unwrap();
+            fs::write(f, &bytes[..bytes.len() / 2]).unwrap();
+        }),
+        ("fe-header-only", &|f| {
+            let bytes = fs::read(f).unwrap();
+            fs::write(f, &bytes[..132]).unwrap();
+        }),
+        ("fe-future-format", &|f| patch(f, 8, &99u32.to_le_bytes())),
+        ("fe-nonce", &|f| patch(f, at::NONCE, &[0x11; 8])),
+        ("fe-section-past-end", &|f| {
+            // The first descriptor's offset, pushed beyond the file.
+            patch(f, 132 + 8, &u64::MAX.to_le_bytes());
+        }),
     ] {
-        let root = TempRoot::new(tag);
-        let dir = root.path().join(CACHE_DIR_NAME);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("frontend.json"), &contents).unwrap();
+        let root = seeded(tag);
+        damage(&root.index_file());
 
         let mut store = root.open();
         assert!(
@@ -1193,15 +1787,17 @@ fn every_shape_of_unreadable_front_end_file_degrades_rather_than_crashes() {
         );
         assert_eq!(store.warnings().len(), 1, "{tag} must warn");
         assert!(
-            store.warnings()[0].message.contains("frontend.json"),
-            "{tag} must name the offending file"
+            store.warnings()[0].message.contains("frontend.idx"),
+            "{tag} must name the offending file: {}",
+            store.warnings()[0].message
         );
         assert!(
             !store.warnings()[0].notes.is_empty(),
             "{tag} must say what happens next"
         );
+        assert_eq!(store.len(), 1, "{tag} must not touch the result cache");
 
-        store.put_def(hash(5), CachedDef::new(scheme(), footprint()));
+        store.put_def(hash(5), def());
         store.flush().unwrap();
         let repaired = root.open();
         assert!(repaired.warnings().is_empty(), "{tag} must repair itself");
@@ -1214,59 +1810,15 @@ fn every_shape_of_unreadable_front_end_file_degrades_rather_than_crashes() {
     }
 }
 
-/// The crash window: a flush has written its temp file in full and died before
-/// the rename. Nothing in it may be visible, and the previous cache must be
-/// exactly as it was.
+/// Readers take no lock, which is only sound because an append never moves a
+/// byte another process has already mapped.
 #[test]
-fn an_entry_written_but_never_renamed_is_not_observable() {
-    let root = TempRoot::new("frontend-crash-window");
-    let file = root.path().join("a.ply");
-
-    let mut store = root.open();
-    store.put_source(&file, fingerprint(1));
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
-    store.flush().unwrap();
-    let committed = fs::read_to_string(store.frontend_path()).unwrap();
-
-    // Real bytes for a *later* state of the same cache, produced the way a real
-    // flush would produce them.
-    let next = TempRoot::new("frontend-crash-window-source");
-    let mut ahead = next.open();
-    ahead.put_source(&next.path().join("a.ply"), fingerprint(2));
-    ahead.put_def(hash(2), CachedDef::new(scheme(), footprint()));
-    ahead.flush().unwrap();
-    let unrenamed = fs::read_to_string(ahead.frontend_path()).unwrap();
-    assert_ne!(unrenamed, committed);
-
-    fs::write(store.dir().join("frontend.4242.0.0.tmp"), &unrenamed).unwrap();
-
-    let reopened = root.open();
-    assert!(reopened.warnings().is_empty());
-    assert_eq!(reopened.sources_len(), 1);
-    assert_eq!(reopened.defs_len(), 1);
-    assert!(
-        reopened.cached_def(hash(2)).is_none(),
-        "an entry that never reached the rename must not be readable"
-    );
-    assert_eq!(
-        reopened.source(&file).unwrap().content_hash,
-        fingerprint(1).content_hash,
-        "the fingerprint that was committed is the one that answers"
-    );
-    assert_eq!(
-        fs::read_to_string(root.open().frontend_path()).unwrap(),
-        committed,
-        "opening the cache must not disturb it"
-    );
-}
-
-#[test]
-fn a_reader_never_observes_a_partial_front_end_file_while_writers_run() {
+fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
     let root = TempRoot::new("frontend-torn");
-    let seeded = root.path().join("seed.ply");
+    let seeded_file = root.path().join("seed.ply");
     let mut seed = root.open();
-    seed.put_source(&seeded, fingerprint(1));
-    seed.put_def(hash(1), CachedDef::new(scheme(), footprint()));
+    seed.put_source(&seeded_file, fingerprint(1));
+    seed.put_def(hash(1), def());
     seed.flush().unwrap();
 
     const WRITERS: u8 = 3;
@@ -1282,7 +1834,7 @@ fn a_reader_never_observes_a_partial_front_end_file_while_writers_run() {
                     let mut store = root.open();
                     let n = 10 + w * WRITES + i;
                     store.put_source(&root.path().join(format!("f{n}.ply")), fingerprint(n));
-                    store.put_def(hash(n), CachedDef::new(scheme(), footprint()));
+                    store.put_def(hash(n), def());
                     store.flush().unwrap();
                 }
                 finished.fetch_add(1, Ordering::Release);
@@ -1291,16 +1843,16 @@ fn a_reader_never_observes_a_partial_front_end_file_while_writers_run() {
         scope.spawn(move || {
             while finished.load(Ordering::Acquire) < WRITERS as u64 {
                 let store = root.open();
+                let seen = store
+                    .fingerprint(&seeded_file)
+                    .expect("a fingerprint vanished mid-write");
+                assert_eq!(seen.content_hash, fingerprint(1).content_hash);
+                assert!(store.def(hash(1)).is_some());
                 assert!(
                     store.warnings().is_empty(),
                     "a reader saw a torn front-end cache: {:?}",
                     store.warnings()
                 );
-                let seen = store
-                    .source(&seeded)
-                    .expect("a fingerprint vanished mid-write");
-                assert_eq!(seen.content_hash, fingerprint(1).content_hash);
-                assert!(store.cached_def(hash(1)).is_some());
             }
         });
     });
@@ -1356,15 +1908,15 @@ fn a_scheme_is_canonical_by_the_time_it_reaches_the_disk() {
 
     let expected = canonicalize_scheme(&counted_scheme(0, 0));
     assert_eq!(
-        store.cached_def(hash(1)).unwrap().scheme,
+        store.def(hash(1)).unwrap().scheme,
         expected,
         "the counter's numbers must not survive the put"
     );
 
     let reopened = root.open();
-    assert_eq!(reopened.cached_def(hash(1)).unwrap().scheme, expected);
+    assert_eq!(reopened.def(hash(1)).unwrap().scheme, expected);
     assert_eq!(
-        reopened.cached_def(hash(1)).unwrap().names,
+        reopened.def(hash(1)).unwrap().names,
         vec![NameRef::new("Row", hash(9)), NameRef::new("db", hash(8))],
         "a witness is sorted by name so two callers write the same bytes"
     );
@@ -1373,22 +1925,27 @@ fn a_scheme_is_canonical_by_the_time_it_reaches_the_disk() {
     // different global counter has to land on byte-identical bytes.
     let other = TempRoot::new("frontend-canonical-other");
     let mut other_store = other.open();
-    other_store.put_def(hash(1), CachedDef::new(counted_scheme(3, 1), footprint()));
+    other_store.put_def(
+        hash(1),
+        CachedDef::new(counted_scheme(3, 1), footprint()).witnessed_by(vec![
+            NameRef::new("db", hash(8)),
+            NameRef::new("Row", hash(9)),
+        ]),
+    );
     other_store.flush().unwrap();
-    let mine: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(store.frontend_path()).unwrap()).unwrap();
-    let theirs: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(other_store.frontend_path()).unwrap()).unwrap();
+    let mine = fs::read(root.data_file()).unwrap();
+    let theirs = fs::read(other.data_file()).unwrap();
     assert_eq!(
-        mine["defs"][hash(1).to_hex()]["scheme"],
-        theirs["defs"][hash(1).to_hex()]["scheme"]
+        mine[56..],
+        theirs[56..],
+        "one definition must reach the disk as one sequence of bytes"
     );
 }
 
 #[test]
 fn a_declarations_signatures_are_canonical_on_the_disk_too() {
     let root = TempRoot::new("frontend-canonical-decl");
-    let body = |a: u32| DeclBody::Effect {
+    let declared = |a: u32| DeclBody::Effect {
         nondet: false,
         ops: vec![CachedOp {
             name: ply_span::Symbol::new("op"),
@@ -1400,12 +1957,12 @@ fn a_declarations_signatures_are_canonical_on_the_disk_too() {
     };
 
     let mut store = root.open();
-    store.put_decl(hash(1), CachedDecl::new(body(77)));
+    store.put_decl(hash(1), CachedDecl::new(declared(77)));
     store.flush().unwrap();
 
     assert_eq!(
-        root.open().cached_decl(hash(1)).unwrap().body,
-        canonicalize_decl_body(&body(0))
+        root.open().decl(hash(1)).unwrap().body,
+        canonicalize_decl_body(&declared(0))
     );
 }
 
@@ -1413,7 +1970,7 @@ fn a_declarations_signatures_are_canonical_on_the_disk_too() {
 fn an_abandoned_front_end_temp_file_does_not_disturb_the_cache() {
     let root = TempRoot::new("frontend-interrupt");
     let mut store = root.open();
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint()));
+    store.put_def(hash(1), def());
     store.flush().unwrap();
     assert!(
         temp_files(store.dir()).is_empty(),
@@ -1421,7 +1978,7 @@ fn an_abandoned_front_end_temp_file_does_not_disturb_the_cache() {
     );
 
     let abandoned = store.dir().join("frontend.999999.0.0.tmp");
-    fs::write(&abandoned, "{\"format\": 1, \"frontend_ver").unwrap();
+    fs::write(&abandoned, "half an index").unwrap();
 
     let reopened = root.open();
     assert_eq!(reopened.defs_len(), 1, "the previous cache is still whole");
@@ -1440,7 +1997,7 @@ fn an_abandoned_front_end_temp_file_does_not_disturb_the_cache() {
 /// with a bump is read back as though it were the old shape — either as a parse
 /// failure, which costs a whole project's work, or silently as the wrong type,
 /// which is worse. Nothing about a struct definition makes that visible at the
-/// point of the edit, so these two tests are the notice.
+/// point of the edit, so these tests are the notice.
 const BUMP: &str = "the on-disk schema changed. Bump the version constant this \
                     cache is keyed on, then update this pin — a build that reads \
                     an entry written under the old shape has no other way to know";
@@ -1538,144 +2095,453 @@ fn pin_effect_decl() -> CachedDecl {
     })
 }
 
-fn pinned_frontend() -> serde_json::Value {
-    serde_json::json!({
-      "format": 2,
-      "frontend_version": FRONTEND_VERSION,
-      "sources": {
-        "src/user.ply": {
-          "content_hash": content(1).to_hex(),
-          "imports": [{ "module": "store.db", "exports": content(2).to_hex() }],
-          "deps": [{ "name": "store.db.get", "hash": hash(7).to_hex() }],
-          "defs": [
-            {
-              "name": "user.active_users",
-              "hash": hash(2).to_hex(),
-              "span": { "start": 10, "end": 42 },
-              "kind": "fn",
-              "deps": ["store.db.get"]
-            },
-            {
-              "name": "user.User",
-              "hash": hash(3).to_hex(),
-              "span": { "start": 50, "end": 80 },
-              "kind": "type",
-              "members": [{ "name": "user.Active", "span": { "start": 60, "end": 66 } }]
-            }
-          ],
-          "tests": [{
-            "name": "active_users excludes inactive",
-            "hash": hash(5).to_hex(),
-            "nondet": true,
-            "footprint": [{ "effect": "db", "resource": { "Named": "users" }, "mode": "read" }],
-            "span": { "start": 90, "end": 140 },
-            "name_span": { "start": 95, "end": 100 },
-            "deps": ["user.active_users"]
-          }]
-        }
-      },
-      "defs": {
-        hash(2).to_hex(): [{
-          "scheme": {
-            "ty_vars": [0],
-            "row_vars": [0],
-            "ty": { "Fn": {
-              "params": [{ "Var": 0 }],
-              "ret": { "Var": 0 },
-              "effects": { "atoms": [], "tail": 0 }
-            }}
-          },
-          "footprint": [{ "effect": "db", "resource": { "Named": "users" }, "mode": "read" }],
-          "names": [{ "name": "user.User", "hash": hash(3).to_hex() }]
-        }]
-      },
-      "decls": {
-        hash(3).to_hex(): [{
-          "body": {
-            "decl": "type",
-            "arity": 1,
-            "ctors": [{
-              "fields": [{ "Var": 0 }],
-              "scheme": {
-                "ty_vars": [0],
-                "row_vars": [],
-                "ty": { "Fn": {
-                  "params": [{ "Var": 0 }],
-                  "ret": { "Con": ["user.User", [{ "Var": 0 }]] },
-                  "effects": { "atoms": [], "tail": null }
-                }}
-              }
-            }]
-          },
-          "names": [{ "name": "user.User", "hash": hash(3).to_hex() }]
-        }],
-        hash(4).to_hex(): [{
-          "body": {
-            "decl": "effect",
-            "nondet": true,
-            "ops": [{
-              "name": "op",
-              "mode": "write",
-              "resource_param": true,
-              "params": [
-                { "Con": ["Int", []] },
-                { "Record": { "id": { "Con": ["Int", []] } } }
-              ],
-              "ret": { "Con": ["Unit", []] }
-            }]
-          }
-        }]
-      }
-    })
+fn digest(bytes: &[u8]) -> String {
+    ContentHash::of(bytes).to_hex()
 }
 
+/// The encoder is the schema, so the pin is over what it emits. A field that
+/// moved, grew, or changed tag moves one of these.
 #[test]
-fn the_front_end_on_disk_schema_is_pinned() {
-    let root = TempRoot::new("pin-frontend");
+fn the_front_end_entry_encoding_is_pinned() {
+    let found: Vec<(&str, String)> = vec![
+        (
+            "fingerprint",
+            digest(&crate::codec::encode_fingerprint(&pin_fingerprint())),
+        ),
+        (
+            "def",
+            digest(&crate::codec::encode_def(&pin_def().canonicalized())),
+        ),
+        (
+            "type declaration",
+            digest(&crate::codec::encode_decl(&pin_type_decl().canonicalized())),
+        ),
+        (
+            "effect declaration",
+            digest(&crate::codec::encode_decl(
+                &pin_effect_decl().canonicalized(),
+            )),
+        ),
+        (
+            "body",
+            digest(&crate::codec::encode_body(&body(&[0x20, 0xca, 0xfe]))),
+        ),
+    ];
+    let pinned = [
+        ("fingerprint", PINNED_FINGERPRINT),
+        ("def", PINNED_DEF),
+        ("type declaration", PINNED_TYPE_DECL),
+        ("effect declaration", PINNED_EFFECT_DECL),
+        ("body", PINNED_BODY),
+    ];
+    let found: Vec<(&str, &str)> = found.iter().map(|(w, d)| (*w, d.as_str())).collect();
+    assert_eq!(found, pinned.to_vec(), "{BUMP}");
+}
+
+const PINNED_FINGERPRINT: &str = "02e7e6340261171838cb49303958e371ae61d01db729090dec71f8fa7896a003";
+const PINNED_DEF: &str = "6d1312f0f06072ba7f40f0b201b0a2f8005d0d0fe1d3b44c110f8b6b15a99644";
+const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
+const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
+const PINNED_BODY: &str = "7aef282fb14eca939d94a3cd214cd0a16204c6d3df74eddfd8009470a17e361e";
+
+/// The other direction, which the forward pin cannot show: bytes written by an
+/// earlier run of this version still decode to the same values, through the
+/// framing and the index rather than through the encoder alone.
+#[test]
+fn a_front_end_cache_in_the_pinned_shape_loads_back_unchanged() {
+    let root = TempRoot::new("pin-frontend-read");
     let mut store = root.open();
     store.put_source(&root.path().join("src/user.ply"), pin_fingerprint());
     store.put_def(hash(2), pin_def());
     store.put_decl(hash(3), pin_type_decl());
     store.put_decl(hash(4), pin_effect_decl());
+    store.put_body(hash(2), body(&[0x20, 0xca, 0xfe]));
     store.flush().unwrap();
 
-    let written: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(store.frontend_path()).unwrap()).unwrap();
-    assert_eq!(written, pinned_frontend(), "{BUMP} (FRONTEND_VERSION)");
-}
-
-/// The other direction, which the forward pin cannot show: an entry written by
-/// an earlier run of *this* version still loads into the same values.
-#[test]
-fn a_front_end_cache_in_the_pinned_shape_loads_back_unchanged() {
-    let root = TempRoot::new("pin-frontend-read");
-    let dir = root.path().join(CACHE_DIR_NAME);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join("frontend.json"),
-        serde_json::to_string_pretty(&pinned_frontend()).unwrap(),
-    )
-    .unwrap();
-
     let store = root.open();
-    assert!(store.warnings().is_empty(), "{BUMP} (FRONTEND_VERSION)");
+    assert!(store.warnings().is_empty(), "{BUMP}");
     assert_eq!(
-        store.source(&root.path().join("src/user.ply")),
+        store
+            .fingerprint(&root.path().join("src/user.ply"))
+            .as_deref(),
         Some(&pin_fingerprint())
     );
     assert_eq!(
-        store.cached_def(hash(2)),
+        store.def(hash(2)).as_deref(),
         Some(&pin_def().canonicalized()),
         "a scheme is stored canonical, so it comes back canonical"
     );
     assert_eq!(
-        store.cached_decl(hash(3)),
+        store.decl(hash(3)).as_deref(),
         Some(&pin_type_decl().canonicalized())
     );
     assert_eq!(
-        store.cached_decl(hash(4)),
+        store.decl(hash(4)).as_deref(),
         Some(&pin_effect_decl().canonicalized())
     );
+    assert_eq!(
+        store.body(hash(2)).as_deref(),
+        Some(&body(&[0x20, 0xca, 0xfe]))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Definition bodies
+// ---------------------------------------------------------------------------
+
+/// The encoding version is checked per entry as well as by the schema
+/// fingerprint, so an entry that somehow outlived a bump still cannot be handed
+/// to a decoder that would read it as this build's shape.
+#[test]
+fn a_body_written_under_another_encoding_is_not_handed_back() {
+    let root = TempRoot::new("body-encoding");
+    let mut store = root.open();
+    store.put_body(hash(1), DefBody::new(BODY_ENCODING + 1, vec![1, 2, 3]));
+    assert!(store.body(hash(1)).is_none());
+    assert!(!store.has_body(hash(1)));
+    assert_eq!(store.bodies_len(), 1, "it is stored, just not readable");
+}
+
+/// A body is keyed by a hash of itself, so two different bodies under one hash
+/// means the encoding depends on something the hash does not cover. Neither one
+/// can be trusted over the other, so the store keeps what it had and says so.
+#[test]
+fn two_different_bodies_for_one_hash_are_refused_and_reported() {
+    let root = TempRoot::new("body-conflict");
+    let mut store = root.open();
+    store.put_body(hash(1), body(b"first"));
+    store.put_body(hash(1), body(b"first"));
+    assert!(
+        store.warnings().is_empty(),
+        "re-storing the same body is not a conflict"
+    );
+
+    store.put_body(hash(1), body(b"second"));
+    assert_eq!(store.body(hash(1)).unwrap().as_bytes(), b"first");
+    let warnings = store.take_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, codes::CACHE_CORRUPT);
+    assert_eq!(warnings[0].severity, Severity::Warning);
+
+    // And the same across a flush, where the body it disagrees with is on disk.
+    store.flush().unwrap();
+    let mut reopened = root.open();
+    reopened.put_body(hash(1), body(b"second"));
+    assert_eq!(reopened.body(hash(1)).unwrap().as_bytes(), b"first");
+    assert_eq!(reopened.take_warnings().len(), 1);
+}
+
+/// The whole point of the split: two definitions in different modules with one
+/// hash share a body, because a body is name-free and therefore a function of
+/// that hash.
+#[test]
+fn one_body_serves_every_definition_that_shares_its_hash() {
+    let root = TempRoot::new("body-shared");
+    let mut store = root.open();
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("a.f", hash(1))]),
+    );
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("b.g", hash(1))]),
+    );
+    store.put_body(hash(1), body(b"one computation"));
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert_eq!(reopened.defs_len(), 2, "two interfaces");
+    assert_eq!(reopened.bodies_len(), 1, "one body");
+    assert!(
+        reopened
+            .def_of(hash(1), &ply_span::Symbol::new("a.f"))
+            .is_some()
+    );
+    assert!(
+        reopened
+            .def_of(hash(1), &ply_span::Symbol::new("b.g"))
+            .is_some()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inspection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lookup_finds_a_definition_by_full_name_simple_name_or_hash_prefix() {
+    let root = TempRoot::new("lookup");
+    let file = root.path().join("src/user.ply");
+    let mut store = root.open();
+    let mut fp = SourceFingerprint::new(content(1));
+    fp.defs.push(DefEntry {
+        name: ply_span::Symbol::new("user.active_users"),
+        hash: hash(9),
+        span: FileSpan { start: 10, end: 42 },
+        kind: DefKind::Fn,
+        members: Vec::new(),
+        deps: Vec::new(),
+    });
+    store.put_source(&file, fp);
+
+    for query in [
+        "user.active_users",
+        "active_users",
+        &hash(9).to_hex()[..8],
+        &hash(9).to_hex(),
+    ] {
+        let found = store.lookup(query);
+        assert_eq!(found.len(), 1, "`{query}` should have matched once");
+        let Found::Def(found) = &found[0] else {
+            panic!("`{query}` matched a test");
+        };
+        assert_eq!(found.hash, hash(9));
+        assert_eq!(found.kind, DefKind::Fn);
+        assert_eq!(found.path, file);
+        assert_eq!(found.span, FileSpan { start: 10, end: 42 });
+    }
+
+    assert!(
+        store.lookup("user").is_empty(),
+        "a module is not a definition"
+    );
+    assert!(
+        store.lookup("ab").is_empty(),
+        "two hex characters are too ambiguous to be a prefix"
+    );
+}
+
+#[test]
+fn lookup_finds_a_test_by_label_and_keeps_it_distinct_from_a_definition() {
+    let root = TempRoot::new("lookup-test");
+    let file = root.path().join("src/user.ply");
+    let mut store = root.open();
+    store.put_source(&file, fingerprint(1));
+
+    let found = store.lookup("active_users excludes inactive");
+    assert_eq!(found.len(), 1);
+    let Found::Test(test) = &found[0] else {
+        panic!("a test label must not match as a definition");
+    };
+    assert_eq!(test.hash, hash(101));
+    assert!(!test.nondet);
+    assert_eq!(test.footprint, footprint());
+}
+
+/// One name in two modules is two answers, and the store holds no namespace
+/// that could pick between them.
+#[test]
+fn lookup_returns_every_match_rather_than_refusing() {
+    let root = TempRoot::new("lookup-ambiguous");
+    let mut store = root.open();
+    for (module, n) in [("a", 1u8), ("b", 2)] {
+        let mut fp = SourceFingerprint::new(content(n));
+        fp.defs.push(DefEntry {
+            name: ply_span::Symbol::new(format!("{module}.place")),
+            hash: hash(n),
+            span: FileSpan { start: 0, end: 1 },
+            kind: DefKind::Fn,
+            members: Vec::new(),
+            deps: Vec::new(),
+        });
+        store.put_source(&root.path().join(format!("{module}.ply")), fp);
+    }
+
+    let found = store.lookup("place");
+    assert_eq!(found.len(), 2);
+    let mut hashes: Vec<DefHash> = found.iter().map(Found::hash).collect();
+    hashes.sort();
+    assert_eq!(hashes, vec![hash(1), hash(2)]);
+}
+
+#[test]
+fn stats_counts_both_caches_and_measures_what_is_on_disk() {
+    let root = TempRoot::new("stats");
+    let mut store = root.open();
+    store.put(hash(1), Outcome::Pass);
+    store.observe_definitions([hash(1), hash(2)]);
+    store.put_source(&root.path().join("src/user.ply"), fingerprint(1));
+    store.put_def(hash(1), def());
+    store.put_decl(
+        hash(2),
+        CachedDecl::new(DeclBody::Type {
+            arity: 0,
+            ctors: vec![],
+        }),
+    );
+    store.put_body(hash(1), body(b"body"));
+    store.flush().unwrap();
+
+    let stats = root.open().stats();
+    assert_eq!(stats.results, 1);
+    assert_eq!(stats.definitions_seen, 2);
+    assert_eq!(stats.sources, 1);
+    assert_eq!(stats.defs, 1);
+    assert_eq!(stats.decls, 1);
+    assert_eq!(stats.bodies, 1);
+    assert!(stats.results_bytes > 0);
+    assert!(stats.index_bytes > 0);
+    assert!(stats.data_bytes > 0);
+    assert_eq!(
+        stats.garbage_bytes,
+        Some(0),
+        "nothing has been superseded yet"
+    );
+}
+
+/// The number `ply cache stats` reports and compaction reclaims: what the data
+/// file holds that no index record names.
+#[test]
+fn garbage_is_what_no_index_record_names() {
+    let root = TempRoot::new("garbage");
+    let mut store = root.open();
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("m.f", hash(1))]),
+    );
+    store.flush().unwrap();
+    assert_eq!(store.stats().garbage_bytes, Some(0));
+
+    let mut store = root.open();
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), Footprint::empty())
+            .witnessed_by(vec![NameRef::new("m.f", hash(1))]),
+    );
+    store.flush().unwrap();
+    let garbage = store.stats().garbage_bytes.unwrap();
+    assert!(garbage > 0, "the superseded interface is unreachable");
+
+    store.compact(&[]).unwrap();
+    assert_eq!(store.stats().garbage_bytes, Some(0));
+}
+
+#[test]
+fn compacting_drops_what_no_surviving_file_refers_to_and_shrinks_the_cache() {
+    let root = TempRoot::new("compact");
+    let kept = root.path().join("kept.ply");
+    let deleted = root.path().join("deleted.ply");
+
+    let mut store = root.open();
+    store.put_source(&kept, fingerprint(1));
+    store.put_source(&deleted, fingerprint(2));
+    store.put_def(hash(1), def());
+    store.put_def(hash(2), def());
+    store.put_body(hash(2), body(&[7u8; 512]));
+    store.flush().unwrap();
+
+    let mut store = root.open();
+    let compaction = store.compact(std::slice::from_ref(&kept)).unwrap();
+    assert_eq!(compaction.dropped.sources, 1);
+    assert_eq!(compaction.dropped.defs, 1);
+    assert_eq!(compaction.dropped.bodies, 1);
+    assert!(
+        compaction.bytes_after < compaction.bytes_before,
+        "compaction has to actually reclaim the bytes: {} -> {}",
+        compaction.bytes_before,
+        compaction.bytes_after
+    );
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty());
+    assert_eq!(reopened.sources_len(), 1);
+    assert_eq!(reopened.defs_len(), 1);
+    assert_eq!(reopened.bodies_len(), 0);
+    assert!(reopened.def(hash(1)).is_some());
+    assert!(
+        reopened.get(hash(1)).is_none() && reopened.is_empty(),
+        "compaction is a front-end concern and must not touch results"
+    );
+}
+
+/// `Arc` rather than `&`: an entry the store decoded on demand is owned by
+/// nothing the borrow could point into, and a materialized one has to be able to
+/// outlive the lookup that produced it.
+#[test]
+fn a_materialized_entry_outlives_the_store_that_produced_it() {
+    let root = TempRoot::new("arc-entries");
+    let (cached, decl, fingerprint_of_file) = {
+        let mut store = root.open();
+        store.put_def(hash(1), def());
+        store.put_decl(
+            hash(2),
+            CachedDecl::new(DeclBody::Type {
+                arity: 0,
+                ctors: vec![],
+            }),
+        );
+        let file = root.path().join("src/user.ply");
+        store.put_source(&file, fingerprint(1));
+        store.flush().unwrap();
+        (
+            store.def(hash(1)).unwrap(),
+            store.decl(hash(2)).unwrap(),
+            store.fingerprint(&file).unwrap(),
+        )
+    };
+    assert_eq!(cached.footprint, footprint());
+    assert!(matches!(decl.body, DeclBody::Type { arity: 0, .. }));
+    assert_eq!(fingerprint_of_file.content_hash, content(1));
+}
+
+/// The budget the format exists for: opening a ten-thousand-definition cache
+/// must decode nothing and cost a read plus a checksum.
+#[test]
+fn opening_a_ten_thousand_definition_cache_is_under_the_budget() {
+    let root = TempRoot::new("open-budget");
+    let mut store = root.open();
+    let mut defs: Vec<DefHash> = Vec::new();
+    for file in 0..400u32 {
+        let mut fp = SourceFingerprint::new(ContentHash::of(&file.to_le_bytes()));
+        for n in 0..25u32 {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&file.to_le_bytes());
+            bytes[4..8].copy_from_slice(&n.to_le_bytes());
+            let hash = DefHash(bytes);
+            let name = ply_span::Symbol::new(format!("m{file}.d{n}"));
+            fp.defs.push(DefEntry {
+                name: name.clone(),
+                hash,
+                span: FileSpan {
+                    start: n,
+                    end: n + 10,
+                },
+                kind: DefKind::Fn,
+                members: Vec::new(),
+                deps: Vec::new(),
+            });
+            store.put_def(
+                hash,
+                CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new(name, hash)]),
+            );
+            defs.push(hash);
+        }
+        store.put_source(&root.path().join(format!("src/m{file}.ply")), fp);
+    }
+    store.flush().unwrap();
+    assert_eq!(store.defs_len(), 10_000);
+
+    let started = std::time::Instant::now();
+    let reopened = root.open();
+    let elapsed = started.elapsed();
+    assert!(reopened.warnings().is_empty());
+
+    let index_bytes = reopened.stats().index_bytes;
+    eprintln!(
+        "Store::open at 10,000 definitions: {elapsed:?} (index {index_bytes} bytes, data {} bytes)",
+        reopened.stats().data_bytes
+    );
+    // An unoptimized BLAKE3 over half a megabyte of index dominates a debug
+    // build; the budget the ADR sets is a release number.
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_millis(5)
+    };
+    assert!(elapsed < budget, "Store::open took {elapsed:?}");
+
+    // And it decoded nothing: an entry asked for afterwards still answers.
+    assert!(reopened.def(defs[9_999]).is_some());
 }
 
 #[test]
@@ -1685,6 +2551,16 @@ fn the_result_cache_on_disk_schema_is_pinned() {
     store.put(hash(1), Outcome::Pass);
     store.put(hash(2), failure());
     store.observe_definitions([hash(3)]);
+    store.put_pass_record(
+        Symbol::new("ledger.balance never goes negative"),
+        PassRecord {
+            test_hash: hash(1),
+            closure: [(Symbol::new("ledger.apply_debit"), hash(4))]
+                .into_iter()
+                .collect(),
+            decls: Default::default(),
+        },
+    );
     store.flush().unwrap();
 
     let written: serde_json::Value =
@@ -1692,7 +2568,7 @@ fn the_result_cache_on_disk_schema_is_pinned() {
     assert_eq!(
         written,
         serde_json::json!({
-          "format": 1,
+          "format": 2,
           "runtime_version": RUNTIME_VERSION,
           "results": {
             hash(1).to_hex(): { "outcome": "pass" },
@@ -1715,5 +2591,118 @@ fn the_result_cache_on_disk_schema_is_pinned() {
           "definitions": [hash(3).to_hex()]
         }),
         "{BUMP} (RUNTIME_VERSION)"
+    );
+
+    let passes: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.passes_file()).unwrap()).unwrap();
+    assert_eq!(
+        passes,
+        serde_json::json!({
+          "format": 2,
+          "runtime_version": RUNTIME_VERSION,
+          "passes": {
+            "ledger.balance never goes negative": {
+              "test_hash": hash(1).to_hex(),
+              "closure": { "ledger.apply_debit": hash(4).to_hex() }
+            }
+          }
+        }),
+        "{BUMP} (RUNTIME_VERSION)"
+    );
+}
+
+/// The one thing that must survive a format bump: a cache written before the
+/// pass records moved out still answers, and the run that reads it relocates
+/// them rather than dropping them. Losing a baseline costs a bisection, and the
+/// point of reading the old shape at all is that nobody pays that.
+#[test]
+fn a_format_one_result_cache_keeps_its_baselines_and_is_rewritten() {
+    let root = TempRoot::new("pin-results-migrate");
+    let key = Symbol::new("ledger.balance never goes negative");
+    let record = pass_record(1, &[("ledger.apply_debit", 4)]);
+    let legacy = serde_json::json!({
+      "format": 1,
+      "runtime_version": RUNTIME_VERSION,
+      "results": { hash(1).to_hex(): { "outcome": "pass" } },
+      "definitions": [hash(3).to_hex()],
+      "passes": {
+        key.to_string(): {
+          "test_hash": hash(1).to_hex(),
+          "closure": { "ledger.apply_debit": hash(4).to_hex() }
+        }
+      }
+    });
+    fs::create_dir_all(root.cache_file().parent().unwrap()).unwrap();
+    fs::write(
+        root.cache_file(),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let mut store = root.open();
+    assert!(store.warnings().is_empty());
+    assert_eq!(store.get(hash(1)).map(|o| o.is_pass()), Some(true));
+    assert_eq!(store.pass_record(&key), Some(&record));
+    store.flush().unwrap();
+
+    let rewritten: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.cache_file()).unwrap()).unwrap();
+    assert_eq!(rewritten["format"], 2);
+    assert!(
+        rewritten.get("passes").is_none(),
+        "the inline copy outlived the migration"
+    );
+
+    let reopened = root.open();
+    assert_eq!(reopened.pass_record(&key), Some(&record));
+    assert_eq!(reopened.get(hash(1)).map(|o| o.is_pass()), Some(true));
+    assert!(reopened.knows_definition(hash(3)));
+}
+
+/// The regression that made this split necessary: the budget covers
+/// `Store::open`, and a result cache full of baselines is part of what it opens.
+#[test]
+fn a_baseline_for_every_test_does_not_slow_the_open() {
+    let root = TempRoot::new("open-budget-passes");
+    let mut store = root.open();
+    for test in 0..5_000u32 {
+        let closure: Vec<(String, DefHash)> = (0..12u32)
+            .map(|d| {
+                let mut bytes = [0u8; 32];
+                bytes[0..4].copy_from_slice(&test.to_le_bytes());
+                bytes[4..8].copy_from_slice(&d.to_le_bytes());
+                (format!("m{test}.d{d}"), DefHash(bytes))
+            })
+            .collect();
+        store.put_pass_record(
+            Symbol::new(format!("m{test}.t{test} holds for a seeded fixture")),
+            PassRecord {
+                test_hash: hash(test as u8),
+                closure: closure
+                    .into_iter()
+                    .map(|(name, hash)| (Symbol::new(name), hash))
+                    .collect(),
+                decls: Default::default(),
+            },
+        );
+    }
+    store.flush().unwrap();
+    assert!(fs::metadata(root.passes_file()).unwrap().len() > 4_000_000);
+
+    let started = std::time::Instant::now();
+    let reopened = root.open();
+    let elapsed = started.elapsed();
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_millis(5)
+    };
+    assert!(elapsed < budget, "Store::open took {elapsed:?}");
+
+    // And the records are still there for the one run that needs them.
+    assert!(
+        reopened
+            .pass_record(&Symbol::new("m4999.t4999 holds for a seeded fixture"))
+            .is_some()
     );
 }

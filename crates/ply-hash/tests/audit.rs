@@ -24,7 +24,11 @@ fn def(source: &str, name: &str) -> DefHash {
 
 #[track_caller]
 fn changed(what: &str, before: &str, after: &str, name: &str) {
-    assert_ne!(def(before, name), def(after, name), "{what}: hash did not change");
+    assert_ne!(
+        def(before, name),
+        def(after, name),
+        "{what}: hash did not change"
+    );
 }
 
 #[track_caller]
@@ -76,8 +80,18 @@ fn swapping_two_list_elements_changes_the_hash() {
 
 #[test]
 fn changing_an_integer_literal_changes_the_hash() {
-    changed("int literal", "fn f() -> Int = 41", "fn f() -> Int = 42", "f");
-    changed("int literal sign", "fn f() -> Int = 1", "fn f() -> Int = -1", "f");
+    changed(
+        "int literal",
+        "fn f() -> Int = 41",
+        "fn f() -> Int = 42",
+        "f",
+    );
+    changed(
+        "int literal sign",
+        "fn f() -> Int = 1",
+        "fn f() -> Int = -1",
+        "f",
+    );
     changed(
         "int literal in a pattern",
         "fn f(n: Int) -> Int = match n { 0 -> 1, _ -> 2 }",
@@ -88,7 +102,12 @@ fn changing_an_integer_literal_changes_the_hash() {
 
 #[test]
 fn changing_a_string_literal_changes_the_hash() {
-    changed("string literal", r#"fn f() -> String = "ok""#, r#"fn f() -> String = "no""#, "f");
+    changed(
+        "string literal",
+        r#"fn f() -> String = "ok""#,
+        r#"fn f() -> String = "no""#,
+        "f",
+    );
     changed(
         "string split point",
         r#"fn f() -> String = "ab" ++ "c""#,
@@ -105,7 +124,13 @@ fn changing_a_string_literal_changes_the_hash() {
 
 #[test]
 fn changing_a_comparison_operator_changes_the_hash() {
-    for (a, b) in [("<", "<="), ("<", ">"), ("==", "!="), (">=", ">"), ("<=", ">=")] {
+    for (a, b) in [
+        ("<", "<="),
+        ("<", ">"),
+        ("==", "!="),
+        (">=", ">"),
+        ("<=", ">="),
+    ] {
         changed(
             "comparison operator",
             &format!("fn f(x: Int, y: Int) -> Bool = x {a} y"),
@@ -188,8 +213,18 @@ fn changing_an_effect_annotation_changes_the_hash() {
              fn f(k: Int) -> Int / {{{row}}} = db.get[users](k)"
         )
     };
-    changed("added atom", &source("db.read[users]"), &source("db.read[users], db.write[orders]"), "f");
-    changed("dropped annotation", &source("db.read[users]"), "effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, v: Int) -> Int\n}\nfn f(k: Int) -> Int = db.get[users](k)", "f");
+    changed(
+        "added atom",
+        &source("db.read[users]"),
+        &source("db.read[users], db.write[orders]"),
+        "f",
+    );
+    changed(
+        "dropped annotation",
+        &source("db.read[users]"),
+        "effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, v: Int) -> Int\n}\nfn f(k: Int) -> Int = db.get[users](k)",
+        "f",
+    );
 }
 
 #[test]
@@ -205,11 +240,13 @@ fn changing_a_resource_label_changes_the_hash() {
 
 #[test]
 fn changing_read_to_write_changes_the_hash() {
-    let effect = |mode: &str| {
-        format!("effect db {{\n  {mode} touch[r](key: Int) -> Int\n}}\n")
+    let effect = |mode: &str| format!("effect db {{\n  {mode} touch[r](key: Int) -> Int\n}}\n");
+    let program = |mode: &str, row: &str| {
+        format!(
+            "{}fn f(k: Int) -> Int / {{{row}}} = db.touch[users](k)",
+            effect(mode)
+        )
     };
-    let program =
-        |mode: &str, row: &str| format!("{}fn f(k: Int) -> Int / {{{row}}} = db.touch[users](k)", effect(mode));
     changed(
         "operation mode",
         &program("read", "db.read[users]"),
@@ -224,7 +261,12 @@ fn changing_read_to_write_changes_the_hash() {
              fn f(k: Int) -> Int / {{{row}}} = db.get[users](k)"
         )
     };
-    changed("annotated mode", &annotated("db.read[users]"), &annotated("db.write[users]"), "f");
+    changed(
+        "annotated mode",
+        &annotated("db.read[users]"),
+        &annotated("db.write[users]"),
+        "f",
+    );
 }
 
 #[test]
@@ -263,7 +305,10 @@ fn an_empty_record_is_not_unit_and_neither_is_an_empty_list() {
     let unit = def("fn f() -> Unit = ()", "f");
     let empty_list = def("fn f() -> List<Int> = []", "f");
     assert_ne!(empty_record, unit, "an empty record hashes like unit");
-    assert_ne!(empty_record, empty_list, "an empty record hashes like an empty list");
+    assert_ne!(
+        empty_record, empty_list,
+        "an empty record hashes like an empty list"
+    );
     assert_ne!(unit, empty_list, "unit hashes like an empty list");
 }
 
@@ -303,7 +348,12 @@ fn a_match_binder_that_captures_a_parameter_changes_the_hash() {
         )
     };
     // `B(y) -> x` reads the parameter; `B(x) -> x` reads the binder.
-    changed("match binder capture", &source("y", "x"), &source("x", "x"), "f");
+    changed(
+        "match binder capture",
+        &source("y", "x"),
+        &source("x", "x"),
+        "f",
+    );
 }
 
 /// `db` and `audit` declare the same operations, so performing one and
@@ -325,7 +375,12 @@ fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
                handle f(k) + g(k) with {{ {handled}.emit[log](x) -> x, }}"
         )
     };
-    changed("switching which effect is handled", &source("db"), &source("audit"), "caught");
+    changed(
+        "switching which effect is handled",
+        &source("db"),
+        &source("audit"),
+        "caught",
+    );
 }
 
 /// Aliases are expanded by the checker, so `Meters` and `Feet` below are both
@@ -341,7 +396,12 @@ fn swapping_two_transparent_type_aliases_is_free() {
              fn f(x: {ty}) -> {ty} = x"
         )
     };
-    unchanged("transparent alias swap", &source("Meters"), &source("Feet"), "f");
+    unchanged(
+        "transparent alias swap",
+        &source("Meters"),
+        &source("Feet"),
+        "f",
+    );
 }
 
 #[test]
@@ -351,10 +411,19 @@ fn two_sum_types_with_identical_shapes_are_distinguishable() {
             "type Left = L1 | L2\n\
              type Right = R1 | R2\n\
              fn f() -> {} = {ctor}",
-            if ctor.starts_with('L') { "Left" } else { "Right" }
+            if ctor.starts_with('L') {
+                "Left"
+            } else {
+                "Right"
+            }
         )
     };
-    changed("switching which sum type is used", &source("L1"), &source("R1"), "f");
+    changed(
+        "switching which sum type is used",
+        &source("L1"),
+        &source("R1"),
+        "f",
+    );
 }
 
 #[test]
@@ -394,7 +463,11 @@ fn editing_a_body_moves_every_transitive_dependent_and_the_test() {
     let before = hashes(&program("n"));
     let after = hashes(&program("n + 1"));
     for name in ["leaf", "mid", "top"] {
-        assert_ne!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_ne!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_ne!(before.tests, after.tests, "the test hash did not move");
 }
@@ -413,9 +486,16 @@ fn renaming_a_top_level_definition_through_several_callers_is_free() {
     };
     let before = hashes(&program("leaf"));
     let after = hashes(&program("compute_the_leaf_value"));
-    assert_eq!(before.defs[&Symbol::new("leaf")], after.defs[&Symbol::new("compute_the_leaf_value")]);
+    assert_eq!(
+        before.defs[&Symbol::new("leaf")],
+        after.defs[&Symbol::new("compute_the_leaf_value")]
+    );
     for name in ["mid", "top"] {
-        assert_eq!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_eq!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_eq!(before.tests, after.tests);
 }
@@ -470,8 +550,16 @@ fn renaming_a_type_an_effect_and_a_generic_parameter_is_free() {
     };
     let before = hashes(&program("Row", "db", "a"));
     let after = hashes(&program("Record", "store", "elem"));
-    assert_eq!(before.defs[&Symbol::new("f")], after.defs[&Symbol::new("f")], "f");
-    assert_eq!(before.defs[&Symbol::new("pick")], after.defs[&Symbol::new("pick")], "pick");
+    assert_eq!(
+        before.defs[&Symbol::new("f")],
+        after.defs[&Symbol::new("f")],
+        "f"
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("pick")],
+        after.defs[&Symbol::new("pick")],
+        "pick"
+    );
 }
 
 #[test]
@@ -513,7 +601,11 @@ fn reordering_top_level_items_is_free() {
     let before = hashes(forward);
     let after = hashes(reversed);
     for name in ["a", "b", "c"] {
-        assert_eq!(before.defs[&Symbol::new(name)], after.defs[&Symbol::new(name)], "{name}");
+        assert_eq!(
+            before.defs[&Symbol::new(name)],
+            after.defs[&Symbol::new(name)],
+            "{name}"
+        );
     }
     assert_eq!(before.tests, after.tests);
 }
@@ -576,15 +668,31 @@ fn reordering_indistinguishable_mutually_recursive_definitions_is_free() {
     let backward = "fn pong(n: Int) -> Int = ping(n - 1)\nfn ping(n: Int) -> Int = pong(n - 1)";
     let before = hashes(forward);
     let after = hashes(backward);
-    assert_eq!(before.defs[&Symbol::new("ping")], after.defs[&Symbol::new("ping")], "ping");
-    assert_eq!(before.defs[&Symbol::new("pong")], after.defs[&Symbol::new("pong")], "pong");
+    assert_eq!(
+        before.defs[&Symbol::new("ping")],
+        after.defs[&Symbol::new("ping")],
+        "ping"
+    );
+    assert_eq!(
+        before.defs[&Symbol::new("pong")],
+        after.defs[&Symbol::new("pong")],
+        "pong"
+    );
 }
 
 #[test]
 fn renaming_a_test_is_free_but_its_body_is_not() {
-    let program = |name: &str, body: &str| format!("fn g() -> Int = 1\ntest \"{name}\" {{ assert_eq(g(), {body}) }}");
-    assert_eq!(hashes(&program("a", "1")).tests, hashes(&program("b", "1")).tests);
-    assert_ne!(hashes(&program("a", "1")).tests, hashes(&program("a", "2")).tests);
+    let program = |name: &str, body: &str| {
+        format!("fn g() -> Int = 1\ntest \"{name}\" {{ assert_eq(g(), {body}) }}")
+    };
+    assert_eq!(
+        hashes(&program("a", "1")).tests,
+        hashes(&program("b", "1")).tests
+    );
+    assert_ne!(
+        hashes(&program("a", "1")).tests,
+        hashes(&program("a", "2")).tests
+    );
 }
 
 // Determinism and structural sanity.
@@ -606,7 +714,10 @@ fn every_definition_in_a_realistic_module_gets_a_distinct_hash_unless_identical(
         by_hash.entry(*hash).or_default().push(name.clone());
     }
     let collisions: Vec<_> = by_hash.values().filter(|v| v.len() > 1).collect();
-    assert!(collisions.is_empty(), "distinct definitions share a hash: {collisions:?}");
+    assert!(
+        collisions.is_empty(),
+        "distinct definitions share a hash: {collisions:?}"
+    );
 }
 
 /// Normalization walks the expression tree recursively. The parser's own limit
@@ -614,7 +725,9 @@ fn every_definition_in_a_realistic_module_gets_a_distinct_hash_unless_identical(
 /// at constant depth, so an arbitrarily deep tree reaches the normalizer.
 #[test]
 fn a_long_operator_chain_does_not_overflow_the_stack() {
-    let chain = std::iter::repeat_n("a", 20_000).collect::<Vec<_>>().join(" + ");
+    let chain = std::iter::repeat_n("a", 20_000)
+        .collect::<Vec<_>>()
+        .join(" + ");
     let source = format!("fn f(a: Int) -> Int = {chain}");
     let module = ply_syntax::parse(SourceId(0), &source).expect("a long chain parses");
     let out = hash_ast(&module).expect("a long chain hashes");
@@ -665,9 +778,13 @@ fn randomized_acyclic_modules_hash_independently_of_item_order() {
 
         for i in 0..count {
             let name = Symbol::new(format!("d{i}"));
-            assert_eq!(forward.defs[&name], after.defs[&name], "case {case}, {name}");
+            assert_eq!(
+                forward.defs[&name], after.defs[&name],
+                "case {case}, {name}"
+            );
         }
-        let distinct: std::collections::BTreeSet<DefHash> = forward.defs.values().copied().collect();
+        let distinct: std::collections::BTreeSet<DefHash> =
+            forward.defs.values().copied().collect();
         assert!(
             distinct.len() >= 2,
             "case {case}: every definition collapsed to one hash\n{}",
@@ -693,11 +810,18 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
         let mut position = vec![usize::MAX; n];
         for (ci, component) in components.iter().enumerate() {
             for &v in component {
-                assert_eq!(position[v], usize::MAX, "case {case}: node {v} in two components");
+                assert_eq!(
+                    position[v],
+                    usize::MAX,
+                    "case {case}: node {v} in two components"
+                );
                 position[v] = ci;
             }
         }
-        assert!(position.iter().all(|&p| p != usize::MAX), "case {case}: a node was dropped");
+        assert!(
+            position.iter().all(|&p| p != usize::MAX),
+            "case {case}: a node was dropped"
+        );
 
         for (v, outgoing) in edges.iter().enumerate() {
             for w in outgoing {

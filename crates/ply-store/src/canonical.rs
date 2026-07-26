@@ -49,6 +49,10 @@ impl Renumber {
     }
 
     fn ty(&mut self, ty: &Type) -> Type {
+        crate::codec::grow(|| self.ty_inner(ty))
+    }
+
+    fn ty_inner(&mut self, ty: &Type) -> Type {
         match ty {
             Type::Var(v) => Type::Var(self.ty_var(*v)),
             Type::Con(name, args) => {

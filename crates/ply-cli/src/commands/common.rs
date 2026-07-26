@@ -13,7 +13,12 @@ pub fn diagnostic_json(diagnostic: &Diagnostic, sources: &SourceMap) -> Value {
 }
 
 pub fn diagnostics_json(diagnostics: &[Diagnostic], sources: &SourceMap) -> Value {
-    Value::Array(diagnostics.iter().map(|d| diagnostic_json(d, sources)).collect())
+    Value::Array(
+        diagnostics
+            .iter()
+            .map(|d| diagnostic_json(d, sources))
+            .collect(),
+    )
 }
 
 pub fn location(sources: &SourceMap, span: Span) -> Option<String> {
@@ -56,7 +61,11 @@ pub fn report_load_error(command: &str, err: &LoadError, json: bool, style: Styl
     } else {
         print_diagnostics(&err.diagnostics, &err.sources, style);
         let n = err.diagnostics.len();
-        eprintln!("{IND}{} ({n} {})", style.red("compilation failed"), plural(n, "error"));
+        eprintln!(
+            "{IND}{} ({n} {})",
+            style.red("compilation failed"),
+            plural(n, "error")
+        );
     }
     EXIT_COMPILE_ERROR
 }
@@ -89,8 +98,16 @@ pub fn print_phases(phases: &crate::driver::Phases, style: Style) {
     let mut rows = phases.labelled();
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     for (label, taken) in rows {
-        let share = if total > 0.0 { taken.as_secs_f64() / total * 100.0 } else { 0.0 };
-        println!("{IND}  {label:<11} {:>8.2}ms {}", millis(taken), style.dim(&format!("{share:>5.1}%")));
+        let share = if total > 0.0 {
+            taken.as_secs_f64() / total * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{IND}  {label:<11} {:>8.2}ms {}",
+            millis(taken),
+            style.dim(&format!("{share:>5.1}%"))
+        );
     }
     println!("{IND}  {:<11} {:>8.2}ms", "total", millis(phases.total()));
 }
@@ -100,7 +117,13 @@ pub fn millis(d: std::time::Duration) -> f64 {
 }
 
 pub fn plural(n: usize, word: &str) -> String {
-    if n == 1 { word.to_string() } else { format!("{word}s") }
+    if n == 1 {
+        return word.to_string();
+    }
+    match word.strip_suffix('y') {
+        Some(stem) if !stem.ends_with(['a', 'e', 'i', 'o', 'u']) => format!("{stem}ies"),
+        _ => format!("{word}s"),
+    }
 }
 
 pub fn exit_code(ok: bool) -> i32 {
@@ -116,7 +139,10 @@ mod tests {
     fn location_is_one_based_and_names_the_file() {
         let mut sources = SourceMap::new();
         let id = sources.add("src/ledger.ply", "fn f() = 1\nfn g() = 2\n");
-        assert_eq!(location(&sources, Span::new(id, 11, 13)).unwrap(), "src/ledger.ply:2:1");
+        assert_eq!(
+            location(&sources, Span::new(id, 11, 13)).unwrap(),
+            "src/ledger.ply:2:1"
+        );
     }
 
     #[test]
@@ -142,5 +168,8 @@ mod tests {
         assert_eq!(plural(1, "error"), "error");
         assert_eq!(plural(0, "error"), "errors");
         assert_eq!(plural(2, "group"), "groups");
+        assert_eq!(plural(1, "body"), "body");
+        assert_eq!(plural(0, "body"), "bodies");
+        assert_eq!(plural(2, "key"), "keys");
     }
 }

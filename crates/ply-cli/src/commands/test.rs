@@ -2,16 +2,18 @@ use super::common::{
     IND, diagnostic_json, emit_json, exit_code, location, millis, phases_json, plural,
     print_diagnostics, print_phases, print_warnings, report_load_error,
 };
-use crate::cli::TestArgs;
+use crate::EXIT_COMPILE_ERROR;
+use crate::cli::{TestArgs, When};
 use crate::driver;
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
-use crate::EXIT_COMPILE_ERROR;
 use ply_core::{CheckOutput, Footprint};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 use ply_store::Store;
-use ply_test::{Reason, RunReport, Selection, Status, TestResult};
+use ply_test::{
+    Bisection, Failure, Reason, RunReport, Selection, Skipped, Status, Suspect, TestResult, Verdict,
+};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,10 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
         }
     };
     warnings.append(&mut cache.warnings);
+    let opened = cache.store.take_warnings();
+    let migration = crate::migrate::notice(&cache.store, &opened);
+    warnings.extend(opened);
+    warnings.extend(migration);
 
     let incremental = !args.no_incremental && !args.no_cache;
     let loaded = if incremental {
@@ -67,7 +73,12 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // because its bytes changed is a file the second load would skip — and the
     // second load is the one that has to produce the bodies.
     let mut needed: Vec<ply_syntax::ast::ModuleName> = Vec::new();
-    for test in plan.selection.to_run.iter().filter_map(|&i| loaded.check.tests.get(i)) {
+    for test in plan
+        .selection
+        .to_run
+        .iter()
+        .filter_map(|&i| loaded.check.tests.get(i))
+    {
         if !needed.contains(&test.module) {
             needed.push(test.module.clone());
         }
@@ -104,18 +115,58 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             &mut cache.store,
         )
     };
-    let report = match &pool {
+    let mut report = match &pool {
         Some(pool) => pool.install(run),
         None => run(),
     };
     warnings.extend(report.warnings.iter().cloned());
 
+    // After the run, and against the store as the run left it: a pass this run
+    // recorded is a legitimate baseline for a *different* test's failure.
+    warnings.extend(ply_test::diagnose_failures(
+        &mut report,
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &hashes,
+        &mut cache.store,
+        &diagnosis_options(args),
+    ));
+    // Not redundant with the drains above: the pass records are read lazily, on
+    // the first question a failure asks, so an unreadable baseline only warns
+    // here. Silently, the artifact would say `never_passed` about a test that
+    // passed yesterday.
+    warnings.extend(cache.store.take_warnings());
+
     if args.json {
-        emit_json(&report_json(&loaded, &hashes, &plan, &report, args, workers, &warnings));
+        emit_json(&report_json(
+            &loaded, &hashes, &plan, &report, args, workers, &warnings,
+        ));
     } else {
-        print_human(&loaded, &hashes, &plan, &report, args, workers, &warnings, style);
+        print_human(
+            &loaded, &hashes, &plan, &report, args, workers, &warnings, style,
+        );
     }
     exit_code(report.is_success())
+}
+
+/// `--bisect never` goes *through* the diagnosis rather than around it, so that
+/// the artifact has one shape: a consumer branches on `verdict` and never on
+/// whether a field is present.
+fn diagnosis_options(args: &TestArgs) -> ply_test::Options {
+    ply_test::Options {
+        bisect: match args.bisect {
+            When::Auto => ply_test::Mode::Auto,
+            When::Always => ply_test::Mode::Always,
+            When::Never => ply_test::Mode::Never,
+        },
+        trace: match args.trace {
+            When::Auto => ply_test::Tracing::Auto,
+            When::Always => ply_test::Tracing::Always,
+            When::Never => ply_test::Tracing::Never,
+        },
+        budget: ply_test::Budget::new(args.bisect_budget),
+    }
 }
 
 // --- Selection under `--filter` ---------------------------------------------
@@ -135,7 +186,11 @@ impl Plan {
     pub fn new(selection: Selection, check: &CheckOutput, filter: Option<&str>) -> Plan {
         let Some(needle) = filter else {
             let visible = (0..check.tests.len()).collect();
-            return Plan { selection, visible, filtered_out: 0 };
+            return Plan {
+                selection,
+                visible,
+                filtered_out: 0,
+            };
         };
 
         // Matched against `<module>.<label>` rather than the label alone, so
@@ -150,11 +205,16 @@ impl Plan {
             .collect();
         let keeps = |i: &usize| visible.binary_search(i).is_ok();
 
-        let cached: Vec<_> =
-            selection.cached.into_iter().filter(|(i, _)| keeps(i)).collect();
+        let cached: Vec<_> = selection
+            .cached
+            .into_iter()
+            .filter(|(i, _)| keeps(i))
+            .collect();
         let to_run: Vec<usize> = selection.to_run.into_iter().filter(keeps).collect();
-        let footprints: Vec<(usize, Footprint)> =
-            to_run.iter().map(|&i| (i, check.tests[i].footprint.clone())).collect();
+        let footprints: Vec<(usize, Footprint)> = to_run
+            .iter()
+            .map(|&i| (i, check.tests[i].footprint.clone()))
+            .collect();
         let groups = ply_test::group_by_conflict(&footprints);
 
         Plan {
@@ -201,7 +261,11 @@ impl Cache {
             return Cache::scratch();
         }
         match Store::open(root) {
-            Ok(store) => Ok(Cache { store, scratch: None, warnings: Vec::new() }),
+            Ok(store) => Ok(Cache {
+                store,
+                scratch: None,
+                warnings: Vec::new(),
+            }),
             Err(e) => {
                 let mut cache = Cache::scratch()?;
                 cache.warnings.push(
@@ -226,7 +290,11 @@ impl Cache {
 
         std::fs::create_dir_all(&dir).map_err(|e| scratch_failed(&dir, &e.to_string()))?;
         match Store::open(&dir) {
-            Ok(store) => Ok(Cache { store, scratch: Some(dir), warnings: Vec::new() }),
+            Ok(store) => Ok(Cache {
+                store,
+                scratch: Some(dir),
+                warnings: Vec::new(),
+            }),
             Err(e) => Err(scratch_failed(&dir, &format!("{e:#}"))),
         }
     }
@@ -266,7 +334,10 @@ fn cache_lied() -> Diagnostic {
 fn scratch_failed(dir: &Path, cause: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("could not create a scratch cache at `{}`: {cause}", dir.display()),
+        format!(
+            "could not create a scratch cache at `{}`: {cause}",
+            dir.display()
+        ),
     )
     .primary(Span::DUMMY, "the run needs somewhere to record results")
     .note("set TMPDIR to a writable directory, or drop `--no-cache`")
@@ -277,7 +348,10 @@ fn build_pool(
     warnings: &mut Vec<Diagnostic>,
 ) -> (Option<rayon::ThreadPool>, usize) {
     let requested = jobs.unwrap_or(0) as usize;
-    match rayon::ThreadPoolBuilder::new().num_threads(requested).build() {
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(requested)
+        .build()
+    {
         Ok(pool) => {
             let workers = pool.current_num_threads();
             (Some(pool), workers)
@@ -326,7 +400,10 @@ fn print_human(
         );
     }
     if args.no_cache {
-        println!("{IND}{}", style.dim("--no-cache: results were neither read nor recorded"));
+        println!(
+            "{IND}{}",
+            style.dim("--no-cache: results were neither read nor recorded")
+        );
     }
     if plan.filtered_out > 0 {
         println!(
@@ -362,22 +439,7 @@ fn print_human(
 
     for failure in &report.failures {
         println!();
-        println!("{IND}{}", style.bold(failure.key.as_str()));
-        println!("{IND}  {}", failure.diagnostic.message);
-        if let Some(at) =
-            failure.diagnostic.primary_span().and_then(|s| location(&loaded.sources, s))
-        {
-            println!("{IND}    at {}", style.dim(&at));
-        }
-        for note in &failure.diagnostic.notes {
-            println!("{IND}  {} {note}", style.dim("="));
-        }
-        if failure.suspects.is_empty() {
-            println!("{IND}  {}", style.dim("suspects: none — nothing in this test's closure changed"));
-        } else {
-            let names: Vec<&str> = failure.suspects.iter().map(|s| s.as_str()).collect();
-            println!("{IND}  {} {}", style.yellow("suspects:"), names.join(", "));
-        }
+        print_failure(failure, loaded, style);
     }
 
     if selection.total == 0 {
@@ -388,6 +450,117 @@ fn print_human(
     if !warnings.is_empty() {
         println!();
         print_warnings(warnings, style);
+    }
+}
+
+/// The culprit before the diff, because the culprit is the answer and the diff
+/// is the evidence. A reader who already knows which definition broke does not
+/// have to work backwards from an expected/actual pair to find out.
+fn print_failure(failure: &Failure, loaded: &Loaded, style: Style) {
+    for line in failure_lines(failure, loaded, style) {
+        println!("{IND}{line}");
+    }
+}
+
+fn failure_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String> {
+    let mut lines = vec![style.bold(failure.key.as_str())];
+
+    let bisection = &failure.attribution.bisection;
+    if bisection.is_conclusive() {
+        for (i, group) in bisection.groups.iter().enumerate() {
+            let names: Vec<&str> = group.iter().map(|n| n.as_str()).collect();
+            let label = if i == 0 { "culprit:" } else { "        " };
+            let at = group
+                .iter()
+                .find_map(|n| loaded.check.defs.get(n))
+                .and_then(|def| location(&loaded.sources, def.span))
+                .map(|at| format!("   {}", style.dim(&at)))
+                .unwrap_or_default();
+            lines.push(format!("  {} {}{at}", style.red(label), names.join(" + ")));
+        }
+        lines.push(format!("    {}", style.dim(&bisection.reason)));
+    } else if let Some(why) = no_culprit_reason(bisection) {
+        lines.push(format!("  {} {why}", style.dim("no culprit:")));
+    }
+
+    lines.push(format!("  {}", failure.diagnostic.message));
+    if let Some(at) = failure
+        .diagnostic
+        .primary_span()
+        .and_then(|s| location(&loaded.sources, s))
+    {
+        lines.push(format!("    at {}", style.dim(&at)));
+    }
+    for note in &failure.diagnostic.notes {
+        lines.push(format!("  {} {note}", style.dim("=")));
+    }
+
+    if let Some(slice) = &failure.attribution.slice
+        && slice.traced
+        && !slice.stack.is_empty()
+    {
+        let path: Vec<&str> = slice.path().iter().map(|n| n.as_str()).collect();
+        lines.push(format!("  {} {}", style.dim("ran:"), path.join(" → ")));
+        if !slice.reproduced {
+            lines.push(format!(
+                "    {}",
+                style.yellow(
+                    "the replay did not reproduce this failure; treat the path as evidence \
+                     about a different execution"
+                )
+            ));
+        }
+    }
+
+    let rest: Vec<String> = failure
+        .attribution
+        .suspects
+        .iter()
+        .filter(|s| !s.culprit)
+        .map(describe_suspect)
+        .collect();
+    if !rest.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            style.yellow("suspects:"),
+            rest.join(", ")
+        ));
+    } else if failure.suspects.is_empty() {
+        lines.push(format!(
+            "  {}",
+            style.dim("suspects: none — nothing in this test's closure changed")
+        ));
+    }
+    lines
+}
+
+/// Silent when nobody asked for a bisection: a run that was told not to look has
+/// nothing to apologize for, while every other verdict names something the
+/// reader can act on.
+fn no_culprit_reason(bisection: &Bisection) -> Option<&str> {
+    match bisection.verdict {
+        Verdict::NotAttempted(Skipped::NotRequested) => None,
+        _ => Some(bisection.reason.as_str()),
+    }
+}
+
+/// A bare name is a list to read. `derived` and `did not run` are the two
+/// annotations that take a name *off* that list, which is the whole point of
+/// ranking them.
+fn describe_suspect(suspect: &Suspect) -> String {
+    let mut notes: Vec<&str> = Vec::new();
+    if let Some(change) = suspect.change {
+        notes.push(change.as_str());
+    }
+    match suspect.ran {
+        Some(false) => notes.push("did not run"),
+        Some(true) if suspect.depth.is_none() => notes.push("ran, then returned"),
+        _ => {}
+    }
+    if notes.is_empty() {
+        suspect.name.to_string()
+    } else {
+        format!("{} ({})", suspect.name, notes.join(", "))
     }
 }
 
@@ -415,7 +588,12 @@ fn display_name(check: &CheckOutput, index: usize, fallback: &str) -> String {
 /// Long test names are the norm — they are sentences — so the duration column
 /// follows the longest one rather than a guess that everything overruns.
 fn name_column(names: &[String]) -> usize {
-    names.iter().map(|n| n.chars().count()).max().unwrap_or(0).clamp(24, 64)
+    names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(24, 64)
 }
 
 fn result_line(result: &TestResult, name: &str, name_width: usize, style: Style) -> String {
@@ -437,14 +615,25 @@ fn result_line(result: &TestResult, name: &str, name_width: usize, style: Style)
     // `mark` may carry escapes, so the padding is computed rather than left to
     // `{:<width$}`, which counts bytes.
     let pad = " ".repeat(width.saturating_sub(display_width(&mark)));
-    format!("{mark}{pad} {name:<name_width$} {:>8.1}ms", millis(result.duration))
+    format!(
+        "{mark}{pad} {name:<name_width$} {:>8.1}ms",
+        millis(result.duration)
+    )
 }
 
 fn print_summary(report: &RunReport, style: Style) {
     let failed = format!("{} failed", report.failed);
-    let failed = if report.failed > 0 { style.red(&failed) } else { style.dim(&failed) };
+    let failed = if report.failed > 0 {
+        style.red(&failed)
+    } else {
+        style.dim(&failed)
+    };
     let passed = format!("{} passed", report.passed);
-    let passed = if report.passed > 0 { style.green(&passed) } else { style.dim(&passed) };
+    let passed = if report.passed > 0 {
+        style.green(&passed)
+    } else {
+        style.dim(&passed)
+    };
     println!(
         "{IND}{failed}, {passed}, {} cached ({:.2}s)",
         report.cached,
@@ -471,9 +660,15 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
     }
     println!();
     for &index in &plan.visible {
-        let Some(test) = check.tests.get(index) else { continue };
+        let Some(test) = check.tests.get(index) else {
+            continue;
+        };
         let reason = plan.selection.reason(index).unwrap_or(Reason::Unhashed);
-        let verb = if reason.runs() { style.bold("run ") } else { style.dim("skip") };
+        let verb = if reason.runs() {
+            style.bold("run ")
+        } else {
+            style.dim("skip")
+        };
         let hash = hashes
             .tests
             .get(index)
@@ -607,19 +802,12 @@ fn report_json(
     let failures: Vec<Value> = report
         .failures
         .iter()
-        .map(|f| {
-            json!({
-                "name": f.name,
-                "key": f.key,
-                "diagnostic": diagnostic_json(&f.diagnostic, sources),
-                "location": f.diagnostic.primary_span().and_then(|s| location(sources, s)),
-                "suspects": f.suspects,
-            })
-        })
+        .map(|f| failure_json(f, loaded, hashes, report))
         .collect();
 
     json!({
         "command": "test",
+        "schema_version": ply_test::report::SCHEMA_VERSION,
         "front_end": json!({
             "incremental": loaded.frontend.incremental,
             "parsed": loaded.frontend.parsed(),
@@ -639,6 +827,11 @@ fn report_json(
         "filter": args.filter,
         "no_cache": args.no_cache,
         "workers": workers,
+        "options": {
+            "bisect": args.bisect.as_str(),
+            "bisect_budget": args.bisect_budget,
+            "trace": args.trace.as_str(),
+        },
         "selection": {
             "total": selection.total,
             "selected": selection.to_run.len(),
@@ -660,6 +853,107 @@ fn report_json(
     })
 }
 
+/// The failure artifact, built on `ply-test`'s projection rather than beside it.
+///
+/// Everything an agent branches on — the verdict, the ranked suspects, the
+/// causal slice — has exactly one implementation, and this adds only what the
+/// runner does not hold: a rendered diagnostic, a file position, the test's hash
+/// and its declared footprint.
+fn failure_json(
+    failure: &Failure,
+    loaded: &Loaded,
+    hashes: &HashOutput,
+    report: &RunReport,
+) -> Value {
+    let sources = &loaded.sources;
+    let check = &loaded.check;
+    let index = check.tests.iter().position(|t| t.key == failure.key);
+    let test = index.and_then(|i| check.tests.get(i));
+
+    let mut value = ply_test::report::failure_json(failure);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+
+    object.insert(
+        "diagnostic".into(),
+        diagnostic_json(&failure.diagnostic, sources),
+    );
+    object.insert(
+        "module".into(),
+        json!(test.map(|t| t.module.as_str().to_string())),
+    );
+    object.insert(
+        "test_hash".into(),
+        json!(index.and_then(|i| hashes.tests.get(i)).map(|h| h.to_hex())),
+    );
+    object.insert("nondet".into(), json!(test.map(|t| t.nondet)));
+    object.insert(
+        "status".into(),
+        json!(index.and_then(|i| status_of(report, i)).map(status_str)),
+    );
+    object.insert(
+        "location".into(),
+        failure
+            .diagnostic
+            .primary_span()
+            .map_or(Value::Null, |s| location_json(sources, s)),
+    );
+    object.insert(
+        "footprint".into(),
+        json!({
+            "declared": test.map(|t| atoms(&t.footprint)),
+            // Null rather than empty when nothing was traced: "performed no
+            // atom" and "was never watched" are different findings, and a
+            // consumer that reads one as the other looks in the wrong place.
+            "observed": failure
+                .attribution
+                .slice
+                .as_ref()
+                .filter(|s| s.traced)
+                .map(|s| atoms(&s.observed)),
+        }),
+    );
+    value
+}
+
+fn atoms(footprint: &Footprint) -> Vec<String> {
+    footprint.atoms().map(|a| a.to_string()).collect()
+}
+
+fn status_of(report: &RunReport, index: usize) -> Option<Status> {
+    report
+        .results
+        .iter()
+        .find(|r| r.index == index)
+        .map(|r| r.status)
+}
+
+fn status_str(status: Status) -> &'static str {
+    match status {
+        Status::Passed => "passed",
+        Status::Failed => "failed",
+        Status::Panicked => "panicked",
+    }
+}
+
+/// Positions rather than byte offsets, because the consumer of this field opens
+/// an editor with it.
+fn location_json(sources: &SourceMap, span: Span) -> Value {
+    let Some(file) = sources.get(span.source) else {
+        return Value::Null;
+    };
+    let (line, column) = file.line_col(span.start);
+    let (end_line, end_column) = file.line_col(span.end);
+    json!({
+        "file": file.path.display().to_string(),
+        "line": line,
+        "column": column,
+        "end_line": end_line,
+        "end_column": end_column,
+    })
+}
+
 fn display_width(s: &str) -> usize {
     crate::style::strip_ansi(s).chars().count()
 }
@@ -667,6 +961,7 @@ fn display_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ply_span::Symbol;
     use ply_store::Outcome;
     use std::time::Duration;
 
@@ -751,6 +1046,9 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             no_cache: false,
             filter: filter.map(str::to_string),
             jobs: None,
+            bisect: When::Auto,
+            bisect_budget: 64,
+            trace: When::Auto,
         }
     }
 
@@ -767,20 +1065,36 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     #[test]
     fn a_write_is_scheduled_apart_from_the_reads_of_the_same_resource() {
         let (_dir, loaded, _h, plan) = plan_for(None);
-        let index_of =
-            |name: &str| loaded.check.tests.iter().position(|t| t.name == name).unwrap();
+        let index_of = |name: &str| {
+            loaded
+                .check
+                .tests
+                .iter()
+                .position(|t| t.name == name)
+                .unwrap()
+        };
         let group_of = |name: &str| plan.selection.group_of(index_of(name)).unwrap();
 
         assert_eq!(
-            loaded.check.tests[index_of("reads orders only")].footprint.to_string(),
+            loaded.check.tests[index_of("reads orders only")]
+                .footprint
+                .to_string(),
             "{m.db.read[users]}"
         );
         assert_eq!(
-            loaded.check.tests[index_of("writes users when asked")].footprint.to_string(),
+            loaded.check.tests[index_of("writes users when asked")]
+                .footprint
+                .to_string(),
             "{m.db.write[users]}"
         );
-        assert_eq!(group_of("reads orders only"), group_of("reads orders only again"));
-        assert_ne!(group_of("reads orders only"), group_of("writes users when asked"));
+        assert_eq!(
+            group_of("reads orders only"),
+            group_of("reads orders only again")
+        );
+        assert_ne!(
+            group_of("reads orders only"),
+            group_of("writes users when asked")
+        );
         // A test that touches nothing conflicts with nothing, so it shares
         // whichever group it lands in rather than forcing a third.
         assert_eq!(plan.selection.groups.len(), 2);
@@ -846,7 +1160,10 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     #[test]
     fn tests_from_every_module_are_selected_and_run_together() {
         let (dir, loaded, hashes) = project(&[
-            ("lib.ply", "pub fn one() -> Int = 1\ntest \"one is one\" { assert_eq(one(), 1) }\n"),
+            (
+                "lib.ply",
+                "pub fn one() -> Int = 1\ntest \"one is one\" { assert_eq(one(), 1) }\n",
+            ),
             (
                 "app.ply",
                 "import lib\n\
@@ -878,7 +1195,10 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let report = run(&loaded, &selected, &mut store);
 
         assert_eq!(report.failed, 1);
-        assert_eq!(report.failures[0].suspects, vec![ply_span::Symbol::new("lib.one")]);
+        assert_eq!(
+            report.failures[0].suspects,
+            vec![ply_span::Symbol::new("lib.one")]
+        );
     }
 
     #[test]
@@ -890,7 +1210,10 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
         let scratch_dir = {
             let mut cache = Cache::open(dir.path(), true).unwrap();
-            let scratch = cache.scratch.clone().expect("bypass must use a scratch store");
+            let scratch = cache
+                .scratch
+                .clone()
+                .expect("bypass must use a scratch store");
             let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
             assert_eq!(selected.to_run.len(), 4);
             run(&loaded, &selected, &mut cache.store);
@@ -910,16 +1233,30 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         std::fs::write(dir.path().join(ply_store::CACHE_DIR_NAME), "in the way").unwrap();
 
         let cache = Cache::open(dir.path(), false).unwrap();
-        assert!(cache.scratch.is_some(), "the run must fall back rather than abort");
+        assert!(
+            cache.scratch.is_some(),
+            "the run must fall back rather than abort"
+        );
         assert_eq!(cache.warnings.len(), 1);
-        assert!(cache.warnings[0].message.contains("could not open the cache"));
-        assert!(cache.warnings[0].notes.iter().any(|n| n.contains("nothing this run proved")));
+        assert!(
+            cache.warnings[0]
+                .message
+                .contains("could not open the cache")
+        );
+        assert!(
+            cache.warnings[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("nothing this run proved"))
+        );
     }
 
     #[test]
     fn a_failure_is_never_cached_so_it_re_runs() {
-        let (dir, loaded, hashes) =
-            project(&[("m.ply", "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n")]);
+        let (dir, loaded, hashes) = project(&[(
+            "m.ply",
+            "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n",
+        )]);
         let mut store = Store::open(dir.path()).unwrap();
 
         let selected = ply_test::select(&loaded.check, &hashes, &store);
@@ -942,8 +1279,11 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
              test \"bad\" { assert_eq(f(), 2) }\n",
         )]);
         let mut store = Store::open(dir.path()).unwrap();
-        let plan =
-            Plan::new(ply_test::select(&loaded.check, &hashes, &store), &loaded.check, None);
+        let plan = Plan::new(
+            ply_test::select(&loaded.check, &hashes, &store),
+            &loaded.check,
+            None,
+        );
         let report = run(&loaded, &plan.selection, &mut store);
 
         let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
@@ -956,33 +1296,248 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(v["selection"]["tests"][0]["reason"], "new");
         assert_eq!(v["selection"]["tests"][0]["key"], "m.good");
         assert_eq!(v["selection"]["tests"][0]["module"], "m");
-        assert_eq!(v["selection"]["tests"][0]["hash"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            v["selection"]["tests"][0]["hash"].as_str().unwrap().len(),
+            64
+        );
         assert_eq!(v["modules"][0]["name"], "m");
         assert_eq!(v["failures"].as_array().unwrap().len(), 1);
-        assert_eq!(v["failures"][0]["diagnostic"]["code"], codes::ASSERTION_FAILED);
-        assert_eq!(v["failures"][0]["diagnostic"]["labels"][0]["start"]["line"], 3);
+        assert_eq!(
+            v["failures"][0]["diagnostic"]["code"],
+            codes::ASSERTION_FAILED
+        );
+        assert_eq!(
+            v["failures"][0]["diagnostic"]["labels"][0]["start"]["line"],
+            3
+        );
         // `f` is in the failing test's closure and has never gone green.
-        assert_eq!(v["failures"][0]["suspects"], json!(["m.f"]));
-        assert!(v["failures"][0]["location"].as_str().unwrap().contains("m.ply:3:"));
+        // Schema v2: an object per suspect, ranked, not a bare name.
+        assert_eq!(v["failures"][0]["suspects"][0]["name"], "m.f");
+        assert_eq!(v["failures"][0]["suspects"][0]["culprit"], false);
+        let at = &v["failures"][0]["location"];
+        assert!(at["file"].as_str().unwrap().ends_with("m.ply"));
+        assert_eq!(at["line"], 3);
         assert_eq!(v["summary"]["failed"], 1);
         assert_eq!(v["summary"]["passed"], 1);
     }
 
     #[test]
+    fn the_failure_artifact_carries_the_v2_shape_an_agent_branches_on() {
+        let (dir, loaded, hashes) = project(&[(
+            "ledger.ply",
+            "fn balance() -> Int = 0 - 5\n\
+             test \"balance never goes negative\" { assert_eq(balance(), 0) }\n",
+        )]);
+        let mut store = Store::open(dir.path()).unwrap();
+        let plan = Plan::new(
+            ply_test::select(&loaded.check, &hashes, &store),
+            &loaded.check,
+            None,
+        );
+        let report = run(&loaded, &plan.selection, &mut store);
+
+        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 1, &[]);
+        assert_eq!(v["schema_version"], 2);
+
+        let f = &v["failures"][0];
+        assert_eq!(f["key"], "ledger.balance never goes negative");
+        assert_eq!(f["name"], "balance never goes negative");
+        assert_eq!(f["module"], "ledger");
+        assert_eq!(f["nondet"], false);
+        assert_eq!(f["status"], "failed");
+        assert_eq!(f["test_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(f["diagnostic"]["code"], codes::ASSERTION_FAILED);
+        assert!(
+            f["location"]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("ledger.ply")
+        );
+
+        // Present even where the evidence behind them is missing: a field that
+        // vanishes and a field that says "not known" are different answers, and
+        // a consumer branches on the difference.
+        assert!(f["culprit"]["verdict"].is_string());
+        assert!(f["culprit"]["confidence"].is_string());
+        assert!(f["culprit"]["definitions"].is_array());
+        assert!(f["culprit"]["groups"].is_array());
+        assert!(f["culprit"]["reason"].is_string());
+        assert_eq!(f["culprit"]["search"]["evaluated"], 0);
+        assert!(
+            f["assertion"].is_null(),
+            "the evaluator carries no payload yet"
+        );
+        assert!(f["causal_slice"].is_null(), "nothing traced this run");
+        assert_eq!(f["footprint"]["declared"], json!([]));
+        assert!(
+            f["footprint"]["observed"].is_null(),
+            "an untraced run must not claim an empty observed footprint"
+        );
+    }
+
+    /// Two runs over one failure have to produce the same bytes, or yesterday's
+    /// artifact cannot be diffed against today's.
+    #[test]
+    fn the_artifact_is_byte_identical_across_two_runs_over_one_failure() {
+        let (dir, loaded, hashes) = project(&[(
+            "m.ply",
+            "fn a() -> Int = 1\nfn b() -> Int = 2\n\
+             test \"wrong\" { assert_eq(a() + b(), 4) }\n",
+        )]);
+        let render = || {
+            let mut store = Store::open(dir.path()).unwrap();
+            let plan = Plan::new(
+                ply_test::select(&loaded.check, &hashes, &store),
+                &loaded.check,
+                None,
+            );
+            let report = run(&loaded, &plan.selection, &mut store);
+            serde_json::to_string(
+                &report_json(&loaded, &hashes, &plan, &report, &args_for(None), 1, &[])["failures"],
+            )
+            .unwrap()
+        };
+        assert_eq!(render(), render());
+    }
+
+    fn failing(source: &str) -> (tempfile::TempDir, Loaded, HashOutput, RunReport) {
+        let (dir, loaded, hashes) = project(&[("m.ply", source)]);
+        let mut store = Store::open(dir.path()).unwrap();
+        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let report = run(&loaded, &selected, &mut store);
+        (dir, loaded, hashes, report)
+    }
+
+    const ONE_FAILURE: &str = "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n";
+
+    #[test]
+    fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
+        let (_dir, loaded, hashes, mut report) = failing(ONE_FAILURE);
+        let mut args = args_for(None);
+        args.bisect = When::Never;
+        ply_test::diagnose_failures(
+            &mut report,
+            &loaded.program,
+            &loaded.resolved,
+            &loaded.check,
+            &hashes,
+            &mut Store::open(_dir.path()).unwrap(),
+            &diagnosis_options(&args),
+        );
+
+        let bisection = &report.failures[0].attribution.bisection;
+        assert_eq!(
+            bisection.verdict,
+            Verdict::NotAttempted(Skipped::NotRequested)
+        );
+        assert_eq!(bisection.search.evaluated, 0);
+
+        let plan = Plan::new(
+            ply_test::select(&loaded.check, &hashes, &Store::open(_dir.path()).unwrap()),
+            &loaded.check,
+            None,
+        );
+        let v = report_json(&loaded, &hashes, &plan, &report, &args, 1, &[]);
+        assert_eq!(v["failures"][0]["culprit"]["verdict"], "not_attempted");
+        assert_eq!(v["failures"][0]["culprit"]["skipped"], "not_requested");
+        assert_eq!(v["options"]["bisect"], "never");
+    }
+
+    /// The one ordering claim the human form makes.
+    #[test]
+    fn the_culprit_line_comes_above_the_assertion_and_is_absent_when_there_is_none() {
+        let (_dir, loaded, _h, mut report) = failing(ONE_FAILURE);
+
+        let rendered =
+            |report: &RunReport| failure_lines(&report.failures[0], &loaded, Style::plain());
+
+        let quiet = rendered(&report);
+        assert!(
+            !quiet.iter().any(|l| l.contains("culprit")),
+            "an unrequested bisection has nothing to apologize for: {quiet:?}"
+        );
+        assert!(quiet.iter().any(|l| l.contains("assertion failed")));
+
+        let slice = report.failures[0].attribution.slice.clone();
+        report.failures[0].attribution.resolve(
+            Bisection {
+                verdict: Verdict::Sole,
+                confidence: ply_test::Confidence::Minimal,
+                groups: vec![vec![Symbol::new("m.f")]],
+                reason: "one definition changed".into(),
+                search: ply_test::SearchStats::default(),
+            },
+            slice,
+        );
+        let loud = rendered(&report);
+        let culprit = loud
+            .iter()
+            .position(|l| l.contains("culprit: m.f"))
+            .expect("a conclusive bisection must name its culprit");
+        let assertion = loud
+            .iter()
+            .position(|l| l.contains("assertion failed"))
+            .expect("the diff is still the evidence");
+        assert!(
+            culprit < assertion,
+            "the culprit is the answer and must precede the evidence: {loud:?}"
+        );
+        assert!(loud.iter().any(|l| l.contains("one definition changed")));
+
+        let v = failure_json(&report.failures[0], &loaded, &_h, &report);
+        assert_eq!(v["culprit"]["verdict"], "sole");
+        assert_eq!(v["culprit"]["definitions"], json!(["m.f"]));
+        assert_eq!(v["suspects"][0]["name"], "m.f");
+        assert_eq!(v["suspects"][0]["culprit"], true);
+    }
+
+    #[test]
+    fn a_suspect_reads_as_a_reason_to_skip_it_rather_than_a_bare_name() {
+        let plain = Suspect::new(Symbol::new("m.f"), None);
+        assert_eq!(describe_suspect(&plain), "m.f");
+
+        let mut derived = Suspect::new(Symbol::new("m.post"), None);
+        derived.change = Some(ply_test::ChangeKind::Derived);
+        derived.ran = Some(false);
+        assert_eq!(describe_suspect(&derived), "m.post (derived, did not run)");
+
+        let mut returned = Suspect::new(Symbol::new("m.setup"), None);
+        returned.change = Some(ply_test::ChangeKind::Edited);
+        returned.ran = Some(true);
+        assert_eq!(
+            describe_suspect(&returned),
+            "m.setup (edited, ran, then returned)"
+        );
+    }
+
+    #[test]
     fn two_failures_sharing_a_label_are_told_apart_by_their_key() {
         let (dir, loaded, hashes) = project(&[
-            ("alpha.ply", "fn one() -> Int = 1\ntest \"it adds up\" { assert_eq(one(), 2) }\n"),
-            ("beta.ply", "fn two() -> Int = 2\ntest \"it adds up\" { assert_eq(two(), 3) }\n"),
+            (
+                "alpha.ply",
+                "fn one() -> Int = 1\ntest \"it adds up\" { assert_eq(one(), 2) }\n",
+            ),
+            (
+                "beta.ply",
+                "fn two() -> Int = 2\ntest \"it adds up\" { assert_eq(two(), 3) }\n",
+            ),
         ]);
         let mut store = Store::open(dir.path()).unwrap();
-        let plan =
-            Plan::new(ply_test::select(&loaded.check, &hashes, &store), &loaded.check, None);
+        let plan = Plan::new(
+            ply_test::select(&loaded.check, &hashes, &store),
+            &loaded.check,
+            None,
+        );
         let report = run(&loaded, &plan.selection, &mut store);
         assert_eq!(report.failed, 2);
 
         let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
-        let keys: Vec<&str> =
-            v["failures"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap()).collect();
+        let keys: Vec<&str> = v["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["key"].as_str().unwrap())
+            .collect();
         assert_eq!(keys, ["alpha.it adds up", "beta.it adds up"]);
         for f in v["failures"].as_array().unwrap() {
             assert_eq!(f["name"], "it adds up");
@@ -1069,8 +1624,11 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             status,
             failure: None,
         };
-        let column =
-            |status| result_line(&make(status), "n", 24, Style::plain()).find("n ").unwrap();
+        let column = |status| {
+            result_line(&make(status), "n", 24, Style::plain())
+                .find("n ")
+                .unwrap()
+        };
         assert_eq!(column(Status::Passed), column(Status::Failed));
         assert_eq!(column(Status::Passed), column(Status::Panicked));
     }
@@ -1096,7 +1654,10 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let mut store = Store::open(dir.path()).unwrap();
         store.put(
             hashes.tests[0],
-            Outcome::Fail { message: "from an older runtime".into(), diagnostic: None },
+            Outcome::Fail {
+                message: "from an older runtime".into(),
+                diagnostic: None,
+            },
         );
         store.flush().unwrap();
 

@@ -7,7 +7,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 use ply_core::DefInfo;
 use ply_eval::Interp;
-use ply_span::{Diagnostic, Span, codes};
+use ply_span::{Diagnostic, SourceId, Span, codes};
 use serde_json::{Value, json};
 
 pub fn execute(args: &RunArgs, style: Style) -> i32 {
@@ -75,8 +75,9 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                 }));
             } else {
                 print_diagnostics(std::slice::from_ref(&diagnostic), &loaded.sources, style);
-                if let Some(at) =
-                    diagnostic.primary_span().and_then(|s| location(&loaded.sources, s))
+                if let Some(at) = diagnostic
+                    .primary_span()
+                    .and_then(|s| location(&loaded.sources, s))
                 {
                     eprintln!("{IND}{} {at}", style.red("raised at"));
                 }
@@ -101,25 +102,45 @@ pub fn entry_point(loaded: &Loaded) -> Result<&DefInfo, Diagnostic> {
 /// Inference already proved every name resolves, so a missing `main` is a
 /// missing entry point rather than an unbound reference — say so before the
 /// evaluator gets a chance to phrase it worse.
+///
+/// The error is an *absence*, so no code is it: one module has one place `main`
+/// would go and several have none, which is why the second arm labels nothing
+/// rather than aiming at whichever file sorted first. Reading the parsed program
+/// is avoided for a second reason — gate 1 skips files, so an anchor taken from
+/// it would move with the cache.
 fn no_main(loaded: &Loaded) -> Diagnostic {
-    let span = loaded
-        .program
-        .modules
-        .first()
-        .and_then(|m| m.items.first())
-        .map(|item| item.span())
-        .unwrap_or(Span::DUMMY);
-
+    let modules = loaded.modules();
     let mut diagnostic = Diagnostic::error(codes::UNKNOWN_NAME, "no `main` to run")
-        .primary(span, "no module in this program defines an entry point")
-        .note("add `fn main() -> Unit = ...` to one of the loaded modules")
         .note("`ply test` runs the tests; `ply run` runs `main`");
 
-    if loaded.module_count() > 1 {
-        let names: Vec<&str> = loaded.modules().iter().map(|m| m.name.as_str()).collect();
-        diagnostic = diagnostic.note(format!("modules loaded: {}", names.join(", ")));
+    match modules.as_slice() {
+        [only] => {
+            diagnostic = diagnostic
+                .primary(
+                    end_of(loaded, only.info.source),
+                    format!("`{}` declares no entry point", only.name),
+                )
+                .note(format!("add `fn main() -> Unit = ...` to `{}`", only.name));
+        }
+        several => {
+            let names: Vec<&str> = several.iter().map(|m| m.name.as_str()).collect();
+            diagnostic = diagnostic
+                .note("add `fn main() -> Unit = ...` to one of the loaded modules")
+                .note(format!("modules loaded: {}", names.join(", ")));
+        }
     }
     diagnostic
+}
+
+/// The empty span at the end of a file: where the missing definition would be
+/// written, and the one position in the file that is not existing code.
+fn end_of(loaded: &Loaded, source: SourceId) -> Span {
+    let end = loaded
+        .sources
+        .get(source)
+        .map(|f| f.text.len() as u32)
+        .unwrap_or(0);
+    Span::new(source, end, end)
 }
 
 fn ambiguous_main(loaded: &Loaded, candidates: &[&DefInfo]) -> Diagnostic {
@@ -192,6 +213,56 @@ mod tests {
         assert!(d.notes.iter().any(|n| n.contains("fn main")));
     }
 
+    /// The span it used to carry was the first item's, which is a definition
+    /// that has nothing to do with the error — a reader following it is sent to
+    /// read `other`. It now names the position `main` would occupy, which
+    /// overlaps no item.
+    #[test]
+    fn a_missing_main_never_points_at_an_unrelated_definition() {
+        let text = "fn other() -> Int = 1\nfn another() -> Int = 2\n";
+        let (_dir, l) = loaded(text);
+        let d = no_main(&l);
+
+        let span = d.primary_span().expect("one module has one place to point");
+        assert_eq!(
+            span.start, span.end,
+            "the anchor is a position, not an extent"
+        );
+        assert_eq!(span.start as usize, text.len());
+
+        let items: Vec<Span> = l.program.modules[0]
+            .items
+            .iter()
+            .map(|i| i.span())
+            .collect();
+        assert!(
+            items.iter().all(|i| span.start >= i.end),
+            "the anchor landed inside `{}`",
+            l.sources
+                .snippet(*items.iter().find(|i| span.start < i.end).unwrap()),
+        );
+        assert!(!ply_span::render::to_terminal(&d, &l.sources).is_empty());
+    }
+
+    /// With several modules no file is the answer, so labelling one would be
+    /// picking by load order — the same thing `ply run` refuses to do for two
+    /// `main`s.
+    #[test]
+    fn a_missing_main_across_several_modules_labels_no_file_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.ply", "fn f() -> Int = 1\n");
+        write(dir.path(), "b.ply", "fn g() -> Int = 2\n");
+
+        let l = load(dir.path()).unwrap();
+        let d = no_main(&l);
+        assert!(d.labels.is_empty(), "labels: {:?}", d.labels);
+        assert!(d.notes.iter().any(|n| n.contains("a, b")), "{:?}", d.notes);
+        assert!(
+            ply_span::render::to_terminal(&d, &l.sources).contains("E0101"),
+            "an unlabelled diagnostic still has to render"
+        );
+    }
+
     #[test]
     fn a_raising_main_yields_a_diagnostic_not_a_panic() {
         let (_dir, l) = loaded("fn main() -> Unit = panic(\"nope\")\n");
@@ -204,7 +275,11 @@ mod tests {
     fn the_one_main_in_a_multi_module_program_is_the_entry_point() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "lib.ply", "pub fn answer() -> Int = 42\n");
-        write(dir.path(), "app.ply", "import lib\nfn main() -> Int = lib::answer()\n");
+        write(
+            dir.path(),
+            "app.ply",
+            "import lib\nfn main() -> Int = lib::answer()\n",
+        );
 
         let l = load(dir.path()).unwrap();
         assert_eq!(entry_point(&l).unwrap().name.as_str(), "app.main");
@@ -247,6 +322,10 @@ mod tests {
         let l = load(dir.path()).unwrap();
         let d = entry_point(&l).unwrap_err();
         assert_eq!(d.code, codes::UNKNOWN_NAME);
-        assert!(d.notes.iter().any(|n| n.contains("a, b")), "notes: {:?}", d.notes);
+        assert!(
+            d.notes.iter().any(|n| n.contains("a, b")),
+            "notes: {:?}",
+            d.notes
+        );
     }
 }

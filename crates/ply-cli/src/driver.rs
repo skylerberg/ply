@@ -27,16 +27,17 @@ use ply_core::{
     CheckOutput, CtorInfo, DefInfo, EffectInfo, Footprint, Known, KnownDef, KnownTest, ModuleInfo,
     OpInfo, TestInfo, check_program_with,
 };
+use ply_hash::body::BodySet;
 use ply_hash::graph::NodeId;
-use ply_hash::{DefHash, HashOutput, hash_program_ast};
+use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
-use ply_syntax::ast::{Item, Module, ModuleName, Program, TypeDefBody, Visibility};
-use ply_syntax::resolve::resolve;
 use ply_store::{
-    CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefEntry,
-    DefKind, FileSpan, ImportEdge, Member, NameRef, SourceFingerprint, Store,
+    CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
+    DefEntry, DefKind, FileSpan, ImportEdge, Member, NameRef, SourceFingerprint, Store,
     canonicalize_decl_body, canonicalize_scheme, exports_digest, witness_holds,
 };
+use ply_syntax::ast::{Item, Module, ModuleName, Program, TypeDefBody, Visibility};
+use ply_syntax::resolve::resolve;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -126,7 +127,12 @@ pub struct Phases {
 
 impl Phases {
     pub fn total(&self) -> Duration {
-        self.read + self.parse + self.resolve + self.hash + self.check + self.restore
+        self.read
+            + self.parse
+            + self.resolve
+            + self.hash
+            + self.check
+            + self.restore
             + self.write_back
     }
 
@@ -221,7 +227,7 @@ struct FileState {
     source: SourceId,
     text: Arc<str>,
     content: ContentHash,
-    fingerprint: Option<SourceFingerprint>,
+    fingerprint: Option<Arc<SourceFingerprint>>,
     ast: Option<Module>,
     parse: bool,
     recheck: bool,
@@ -232,7 +238,10 @@ impl FileState {
     /// The definitions this file publishes, as gate 1 knows them without a
     /// parse. Only meaningful while the file is a skip candidate.
     fn cached_defs(&self) -> &[DefEntry] {
-        self.fingerprint.as_ref().map(|f| f.defs.as_slice()).unwrap_or(&[])
+        self.fingerprint
+            .as_ref()
+            .map(|f| f.defs.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -282,7 +291,10 @@ impl<'s> Driver<'s> {
             }
         });
         if !diagnostics.is_empty() {
-            return Err(LoadError { sources, diagnostics });
+            return Err(LoadError {
+                sources,
+                diagnostics,
+            });
         }
 
         // Naming is checked with the text already on hand so an unusable path is
@@ -294,7 +306,10 @@ impl<'s> Driver<'s> {
                     path: file.path.clone(),
                     module,
                     source,
-                    text: sources.get(source).map(|f| f.text.clone()).unwrap_or_else(|| "".into()),
+                    text: sources
+                        .get(source)
+                        .map(|f| f.text.clone())
+                        .unwrap_or_else(|| "".into()),
                     content,
                     fingerprint: None,
                     ast: None,
@@ -306,7 +321,10 @@ impl<'s> Driver<'s> {
             }
         }
         if !diagnostics.is_empty() {
-            return Err(LoadError { sources, diagnostics });
+            return Err(LoadError {
+                sources,
+                diagnostics,
+            });
         }
 
         let mut by_module = IndexMap::new();
@@ -314,19 +332,30 @@ impl<'s> Driver<'s> {
             by_module.insert(file.module.as_symbol().clone(), i);
         }
 
-        let mut driver =
-            Driver { root, mode, store, whole_project, needed, sources, files, by_module, phases };
+        let mut driver = Driver {
+            root,
+            mode,
+            store,
+            whole_project,
+            needed,
+            sources,
+            files,
+            by_module,
+            phases,
+        };
         driver.load_fingerprints();
         Ok(driver)
     }
 
     fn load_fingerprints(&mut self) {
-        let Some(store) = self.store.as_deref() else { return };
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
         if self.mode == Mode::Full {
             return;
         }
         for file in &mut self.files {
-            file.fingerprint = store.source(&file.path).cloned();
+            file.fingerprint = store.fingerprint(&file.path);
         }
     }
 
@@ -351,21 +380,26 @@ impl<'s> Driver<'s> {
         // Gate 1 runs to a fixed point: parsing a file can change what its
         // importers see, and refusing a file can pull in the files it imports.
         // Each round can only add to the parse set, so it terminates.
-        let (program, resolved, hashes) = loop {
+        let (program, resolved, hashes, bodies) = loop {
             self.close_over_imports()?;
-            let (program, resolved, hashes) = self.parse_and_hash()?;
-            let table = self.hash_table(&hashes);
-            if !self.refuse_candidates(&table) {
-                break (program, resolved, hashes);
+            let (program, resolved, hashes, bodies) = self.parse_and_hash()?;
+            let gate = self.gate_one(&hashes);
+            if !self.refuse_candidates(&gate) {
+                break (program, resolved, hashes, bodies);
             }
         };
 
         let gate_two = self.decide_rechecks(&hashes);
         let started = Instant::now();
-        let check = check_program_with(&program, &resolved, &gate_two.known)
-            .map_err(|diagnostics| LoadError { sources: self.sources.clone(), diagnostics })?;
+        let check =
+            check_program_with(&program, &resolved, &gate_two.known).map_err(|diagnostics| {
+                LoadError {
+                    sources: self.sources.clone(),
+                    diagnostics,
+                }
+            })?;
         self.phases.check += started.elapsed();
-        self.merge(program, resolved, hashes, check, gate_two.cached)
+        self.merge(program, resolved, hashes, bodies, check, gate_two.cached)
     }
 
     /// A parsed module's imports must be parsed too: `resolve` needs every
@@ -379,7 +413,9 @@ impl<'s> Driver<'s> {
                 if !self.files[i].parse {
                     continue;
                 }
-                let Some(ast) = &self.files[i].ast else { continue };
+                let Some(ast) = &self.files[i].ast else {
+                    continue;
+                };
                 let imports: Vec<Symbol> = ast
                     .imports
                     .iter()
@@ -387,7 +423,9 @@ impl<'s> Driver<'s> {
                     .collect();
                 let importer = self.files[i].module.as_symbol().clone();
                 for name in imports {
-                    let Some(&j) = self.by_module.get(&name) else { continue };
+                    let Some(&j) = self.by_module.get(&name) else {
+                        continue;
+                    };
                     if !self.files[j].parse {
                         self.files[j].parse = true;
                         self.files[j].refusal = Refusal::ImportedByParsed(importer.clone());
@@ -418,19 +456,36 @@ impl<'s> Driver<'s> {
         if diagnostics.is_empty() {
             Ok(())
         } else {
-            Err(LoadError { sources: self.sources.clone(), diagnostics })
+            Err(LoadError {
+                sources: self.sources.clone(),
+                diagnostics,
+            })
         }
     }
 
-    fn parse_and_hash(&mut self) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput), LoadError> {
-        let modules: Vec<Module> =
-            self.files.iter().filter_map(|f| f.ast.clone()).collect();
+    /// The `BodySet` is the normalizer's own byte stream, which the hash is
+    /// taken over — collecting it costs a copy, and recomputing it later would
+    /// mean re-normalizing the whole program.
+    fn parse_and_hash(
+        &mut self,
+    ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
+        let modules: Vec<Module> = self.files.iter().filter_map(|f| f.ast.clone()).collect();
         let program = Program { modules };
-        let resolved = timed(&mut self.phases.resolve, || resolve(&program))
-            .map_err(|diagnostics| LoadError { sources: self.sources.clone(), diagnostics })?;
-        let hashes = timed(&mut self.phases.hash, || hash_program_ast(&program, &resolved))
-            .map_err(|diagnostics| LoadError { sources: self.sources.clone(), diagnostics })?;
-        Ok((program, resolved, hashes))
+        let resolved =
+            timed(&mut self.phases.resolve, || resolve(&program)).map_err(|diagnostics| {
+                LoadError {
+                    sources: self.sources.clone(),
+                    diagnostics,
+                }
+            })?;
+        let (hashes, bodies) = timed(&mut self.phases.hash, || {
+            hash_program_with_bodies(&program, &resolved)
+        })
+        .map_err(|diagnostics| LoadError {
+            sources: self.sources.clone(),
+            diagnostics,
+        })?;
+        Ok((program, resolved, hashes, bodies))
     }
 
     /// Program-wide name -> current hash, over parsed and skipped files alike.
@@ -452,17 +507,31 @@ impl<'s> Driver<'s> {
         table
     }
 
+    /// Everything gate 1 measures a skip candidate against, gathered once per
+    /// round: what every name in the program denotes now, and one digest per
+    /// module over what that module publishes.
+    fn gate_one(&self, hashes: &HashOutput) -> Gate1 {
+        Gate1 {
+            table: self.hash_table(hashes),
+            exports: self
+                .export_table(hashes)
+                .into_iter()
+                .map(|(module, names)| (module, exports_digest(&names)))
+                .collect(),
+        }
+    }
+
     /// Gate 1's second condition, evaluated for every file still hoping to skip.
     /// Returns whether any file was demoted, which means the round has to run
     /// again with a larger parse set.
-    fn refuse_candidates(&mut self, table: &BTreeMap<Symbol, DefHash>) -> bool {
+    fn refuse_candidates(&mut self, gate: &Gate1) -> bool {
         let mut demoted = false;
         let private = self.private_names();
         for i in 0..self.files.len() {
             if self.files[i].parse {
                 continue;
             }
-            if let Some(refusal) = self.gate_one_refusal(i, table, &private) {
+            if let Some(refusal) = self.gate_one_refusal(i, gate, &private) {
                 self.files[i].parse = true;
                 self.files[i].refusal = refusal;
                 demoted = true;
@@ -491,7 +560,7 @@ impl<'s> Driver<'s> {
     fn gate_one_refusal(
         &self,
         i: usize,
-        table: &BTreeMap<Symbol, DefHash>,
+        gate: &Gate1,
         private: &BTreeSet<Symbol>,
     ) -> Option<Refusal> {
         let file = &self.files[i];
@@ -505,10 +574,13 @@ impl<'s> Driver<'s> {
             return Some(Refusal::NotIncremental);
         };
 
-        // A module this file imports may have been deleted outright, in which
-        // case nothing about this file's own bytes would reveal it.
+        // The module-granular check, and the only one that sees a name this
+        // file *imports without using*. Such a name is in no `deps` entry —
+        // nothing references it — so deleting or renaming it downstream leaves
+        // both of this file's other conditions satisfied while its import list
+        // has gone dangling. A missing digest is the module deleted outright.
         for edge in &fingerprint.imports {
-            if !self.by_module.contains_key(&edge.module) {
+            if gate.exports.get(&edge.module) != Some(&edge.exports) {
                 return Some(Refusal::Import(edge.module.clone()));
             }
         }
@@ -517,7 +589,7 @@ impl<'s> Driver<'s> {
         // A definition deleted, moved to another module, or renamed all land
         // here, and so does a dependency whose body changed.
         for dep in &fingerprint.deps {
-            if table.get(&dep.name) != Some(&dep.hash) {
+            if gate.table.get(&dep.name) != Some(&dep.hash) {
                 return Some(Refusal::Dependency(dep.name.clone()));
             }
             // Every entry here crossed a module boundary to get in, so every one
@@ -527,19 +599,20 @@ impl<'s> Driver<'s> {
             }
         }
 
-        let resolve = |name: &Symbol| table.get(name).copied();
+        let resolve = |name: &Symbol| gate.table.get(name).copied();
         for entry in &fingerprint.defs {
             // Asked for by name, not by hash alone: several definitions can share
             // a hash, and a `Scheme` written in another one's names is not this
             // one's interface.
-            let names = match entry.kind {
-                DefKind::Fn => store.cached_def_of(entry.hash, &entry.name).map(|d| d.names.as_slice()),
-                _ => store.cached_decl_of(entry.hash, &entry.name).map(|d| d.names.as_slice()),
+            let holds = match entry.kind {
+                DefKind::Fn => store
+                    .def_of(entry.hash, &entry.name)
+                    .map(|d| witness_holds(&d.names, resolve)),
+                _ => store
+                    .decl_of(entry.hash, &entry.name)
+                    .map(|d| witness_holds(&d.names, resolve)),
             };
-            let Some(names) = names else {
-                return Some(Refusal::InterfaceMissing);
-            };
-            if !witness_holds(names, resolve) {
+            if holds != Some(true) {
                 return Some(Refusal::InterfaceMissing);
             }
         }
@@ -561,7 +634,7 @@ impl<'s> Driver<'s> {
     fn decide_rechecks(&mut self, hashes: &HashOutput) -> GateTwo {
         let witnesses = self.witnesses(hashes);
         let private = self.private_names();
-        let table = self.hash_table(hashes);
+        let one = self.gate_one(hashes);
         let mut gate = GateTwo::default();
         let mut rechecked = vec![false; self.files.len()];
 
@@ -569,7 +642,7 @@ impl<'s> Driver<'s> {
             if !self.files[i].parse {
                 continue;
             }
-            *flag = self.gather(i, hashes, &witnesses, &table, &private, &mut gate);
+            *flag = self.gather(i, hashes, &witnesses, &one, &private, &mut gate);
         }
         for (i, flag) in rechecked.into_iter().enumerate() {
             self.files[i].recheck = flag;
@@ -584,7 +657,7 @@ impl<'s> Driver<'s> {
         i: usize,
         hashes: &HashOutput,
         witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
-        table: &BTreeMap<Symbol, DefHash>,
+        one: &Gate1,
         private: &BTreeSet<Symbol>,
         gate: &mut GateTwo,
     ) -> bool {
@@ -595,7 +668,11 @@ impl<'s> Driver<'s> {
         // A referent that stopped being `pub` moves no hash and fails no
         // witness, so nothing below would notice; the body has to be walked
         // again for the error to be reported against the reference.
-        if self.free_names(i, hashes).iter().any(|n| private.contains(n)) {
+        if self
+            .free_names(i, hashes)
+            .iter()
+            .any(|n| private.contains(n))
+        {
             return true;
         }
 
@@ -613,7 +690,7 @@ impl<'s> Driver<'s> {
                 continue;
             };
             let held = match item {
-                Item::Fn(_) => store.cached_def_of(hash, &name).and_then(|cached| {
+                Item::Fn(_) => store.def_of(hash, &name).and_then(|cached| {
                     same_witness(&cached.names, witness).then(|| KnownDef {
                         scheme: cached.scheme.clone(),
                         footprint: cached.footprint.clone(),
@@ -621,7 +698,7 @@ impl<'s> Driver<'s> {
                 }),
                 _ => {
                     let unmoved = store
-                        .cached_decl_of(hash, &name)
+                        .decl_of(hash, &name)
                         .is_some_and(|cached| same_witness(&cached.names, witness));
                     if unmoved {
                         gate.cached.insert(name.clone());
@@ -640,7 +717,7 @@ impl<'s> Driver<'s> {
             }
         }
 
-        rechecked | self.gather_tests(i, hashes, table, private, gate)
+        rechecked | self.gather_tests(i, hashes, one, private, gate)
     }
 
     /// A test's footprint is written in effect *names*, which a hash erases, and
@@ -661,20 +738,26 @@ impl<'s> Driver<'s> {
         &self,
         i: usize,
         hashes: &HashOutput,
-        table: &BTreeMap<Symbol, DefHash>,
+        one: &Gate1,
         private: &BTreeSet<Symbol>,
         gate: &mut GateTwo,
     ) -> bool {
         let file = &self.files[i];
         let Some(ast) = &file.ast else { return true };
-        let count = ast.items.iter().filter(|i| matches!(i, Item::Test(_))).count();
+        let count = ast
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Test(_)))
+            .count();
         if count == 0 {
             return false;
         }
-        if self.gate_one_refusal(i, table, private).is_some() {
+        if self.gate_one_refusal(i, one, private).is_some() {
             return true;
         }
-        let Some(fingerprint) = &file.fingerprint else { return true };
+        let Some(fingerprint) = &file.fingerprint else {
+            return true;
+        };
 
         let mut by_hash: BTreeMap<DefHash, Option<&Footprint>> = BTreeMap::new();
         for test in &fingerprint.tests {
@@ -694,9 +777,9 @@ impl<'s> Driver<'s> {
         let mut rechecked = false;
         for hash in self.test_hashes_of(i, hashes) {
             match by_hash.get(&hash).copied().flatten() {
-                Some(footprint) => {
-                    slots.push(Some(KnownTest { footprint: footprint.clone() }))
-                }
+                Some(footprint) => slots.push(Some(KnownTest {
+                    footprint: footprint.clone(),
+                })),
                 None => {
                     slots.push(None);
                     rechecked = true;
@@ -704,7 +787,9 @@ impl<'s> Driver<'s> {
             }
         }
         if slots.len() == count {
-            gate.known.tests.insert(file.module.as_symbol().clone(), slots);
+            gate.known
+                .tests
+                .insert(file.module.as_symbol().clone(), slots);
         } else {
             rechecked = true;
         }
@@ -716,7 +801,9 @@ impl<'s> Driver<'s> {
     /// name never appears.
     fn free_names(&self, i: usize, hashes: &HashOutput) -> BTreeSet<Symbol> {
         let file = &self.files[i];
-        let Some(ast) = &file.ast else { return BTreeSet::new() };
+        let Some(ast) = &file.ast else {
+            return BTreeSet::new();
+        };
         let mut declared = BTreeSet::new();
         let mut keys: Vec<Symbol> = Vec::new();
         for item in &ast.items {
@@ -748,9 +835,19 @@ impl<'s> Driver<'s> {
         let mut offset = 0;
         for (j, file) in self.files.iter().enumerate() {
             let Some(ast) = &file.ast else { continue };
-            let count = ast.items.iter().filter(|i| matches!(i, Item::Test(_))).count();
+            let count = ast
+                .items
+                .iter()
+                .filter(|i| matches!(i, Item::Test(_)))
+                .count();
             if j == i {
-                return hashes.tests.iter().skip(offset).take(count).copied().collect();
+                return hashes
+                    .tests
+                    .iter()
+                    .skip(offset)
+                    .take(count)
+                    .copied()
+                    .collect();
             }
             offset += count;
         }
@@ -801,15 +898,27 @@ impl<'s> Driver<'s> {
         program: Program,
         resolved: ply_syntax::resolve::Resolved,
         hashes: HashOutput,
+        bodies: BodySet,
         checked: CheckOutput,
         cached: BTreeSet<Symbol>,
     ) -> Result<Loaded, LoadError> {
         let hashes = &hashes;
-        let out = CheckOutput {
+        // Inference walks modules in dependency order and a skipped module is
+        // not walked at all, so taking either map's order from the check would
+        // make the published order a function of what the cache happened to
+        // hold. Every map below is instead filled file by file, in the run's
+        // file order and each file's source order — a property of the program.
+        let checked = CheckOutput {
             defs: canonical_defs(&checked.defs),
-            tests: Vec::new(),
             effects: canonical_effects(&checked.effects),
             ctors: canonical_ctors(&checked.ctors),
+            ..checked
+        };
+        let out = CheckOutput {
+            defs: IndexMap::new(),
+            tests: Vec::new(),
+            effects: IndexMap::new(),
+            ctors: IndexMap::new(),
             modules: IndexMap::new(),
         };
         let merged = HashOutput {
@@ -819,10 +928,17 @@ impl<'s> Driver<'s> {
             deps: hashes.deps.clone(),
             closure: hashes.closure.clone(),
         };
-        let report = FrontEnd { incremental: self.mode == Mode::Incremental, ..Default::default() };
+        let report = FrontEnd {
+            incremental: self.mode == Mode::Incremental,
+            ..Default::default()
+        };
         let restoring = Instant::now();
 
-        let mut into = Merged { out, merged, report };
+        let mut into = Merged {
+            out,
+            merged,
+            report,
+        };
         for i in 0..self.files.len() {
             if self.files[i].parse {
                 self.restate_checked(i, &checked, hashes, &cached, &mut into);
@@ -837,13 +953,17 @@ impl<'s> Driver<'s> {
                 refusal: self.files[i].refusal.clone(),
             });
         }
-        let Merged { out, mut merged, mut report } = into;
+        let Merged {
+            out,
+            mut merged,
+            mut report,
+        } = into;
 
         merged.closure = closure_of(&merged.deps);
         self.phases.restore += restoring.elapsed();
 
         let writing = Instant::now();
-        report.warnings = self.write_back(hashes, &out, &merged);
+        report.warnings = self.write_back(hashes, &bodies, &out);
         self.phases.write_back += writing.elapsed();
         report.phases = self.phases;
 
@@ -864,8 +984,8 @@ impl<'s> Driver<'s> {
 
     /// A parsed module. Every type, footprint, name and span comes from the
     /// check, whether it inferred the definition or published an interface gate
-    /// 2 handed it; only the test *order* has to be rebuilt, so that it follows
-    /// the run's files rather than the checked program's.
+    /// 2 handed it; only the *order* has to be rebuilt, so that it follows the
+    /// run's files rather than the checked program's.
     fn restate_checked(
         &self,
         i: usize,
@@ -874,19 +994,55 @@ impl<'s> Driver<'s> {
         cached: &BTreeSet<Symbol>,
         into: &mut Merged,
     ) {
-        let Merged { out, merged, report } = into;
+        let Merged {
+            out,
+            merged,
+            report,
+        } = into;
         let file = &self.files[i];
         let Some(ast) = &file.ast else { return };
-        out.modules.insert(file.module.as_symbol().clone(), module_info(ast, file.source));
+        out.modules.insert(
+            file.module.as_symbol().clone(),
+            module_info(ast, file.source),
+        );
         for item in &ast.items {
-            if let Some(ident) = item.name() {
-                let name = file.module.qualify(&ident.name);
-                report.defs.push(DefReport { cached: cached.contains(&name), name });
+            let Some(ident) = item.name() else { continue };
+            let name = file.module.qualify(&ident.name);
+            report.defs.push(DefReport {
+                cached: cached.contains(&name),
+                name: name.clone(),
+            });
+            match item {
+                Item::Fn(_) => {
+                    if let Some(def) = checked.defs.get(&name) {
+                        out.defs.insert(name, def.clone());
+                    }
+                }
+                Item::Effect(_) => {
+                    if let Some(effect) = checked.effects.get(&name) {
+                        out.effects.insert(name, effect.clone());
+                    }
+                }
+                Item::Type(def) => {
+                    let TypeDefBody::Sum(variants) = &def.body else {
+                        continue;
+                    };
+                    for variant in variants {
+                        let ctor = file.module.qualify(&variant.name.name);
+                        if let Some(info) = checked.ctors.get(&ctor) {
+                            out.ctors.insert(ctor, info.clone());
+                        }
+                    }
+                }
+                Item::Test(_) => {}
             }
         }
         for test in checked.tests.iter().filter(|t| t.module == file.module) {
             let index = out.tests.len();
-            out.tests.push(TestInfo { index, ..test.clone() });
+            out.tests.push(TestInfo {
+                index,
+                ..test.clone()
+            });
         }
         merged.tests.extend(self.test_hashes_of(i, hashes));
     }
@@ -894,7 +1050,11 @@ impl<'s> Driver<'s> {
     /// A module gate 1 skipped. There is no AST at all: every name, span, type
     /// and hash comes out of the fingerprint and the interface store.
     fn restore_skipped(&self, i: usize, into: &mut Merged) -> Result<(), LoadError> {
-        let Merged { out, merged, report } = into;
+        let Merged {
+            out,
+            merged,
+            report,
+        } = into;
         let file = &self.files[i];
         let Some(store) = self.store.as_deref() else {
             return Err(self.corrupt(file.module.as_symbol()));
@@ -926,12 +1086,15 @@ impl<'s> Driver<'s> {
         );
 
         for entry in &fingerprint.defs {
-            report.defs.push(DefReport { name: entry.name.clone(), cached: true });
+            report.defs.push(DefReport {
+                name: entry.name.clone(),
+                cached: true,
+            });
             record_deps(merged, &entry.name, &entry.deps);
             let simple = simple_name(&file.module, &entry.name);
             match entry.kind {
                 DefKind::Fn => {
-                    let Some(cached) = store.cached_def_of(entry.hash, &entry.name) else {
+                    let Some(cached) = store.def_of(entry.hash, &entry.name) else {
                         return Err(self.corrupt(&entry.name));
                     };
                     merged.defs.insert(entry.name.clone(), entry.hash);
@@ -948,7 +1111,7 @@ impl<'s> Driver<'s> {
                     );
                 }
                 DefKind::Type => {
-                    let Some(cached) = store.cached_decl_of(entry.hash, &entry.name) else {
+                    let Some(cached) = store.decl_of(entry.hash, &entry.name) else {
                         return Err(self.corrupt(&entry.name));
                     };
                     let DeclBody::Type { ctors, .. } = &cached.body else {
@@ -977,7 +1140,7 @@ impl<'s> Driver<'s> {
                     }
                 }
                 DefKind::Effect => {
-                    let Some(cached) = store.cached_decl_of(entry.hash, &entry.name) else {
+                    let Some(cached) = store.decl_of(entry.hash, &entry.name) else {
                         return Err(self.corrupt(&entry.name));
                     };
                     let DeclBody::Effect { nondet, ops } = &cached.body else {
@@ -1061,14 +1224,16 @@ impl<'s> Driver<'s> {
     fn write_back(
         &mut self,
         hashes: &HashOutput,
+        bodies: &BodySet,
         check: &CheckOutput,
-        merged: &HashOutput,
     ) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
         }
         let witnesses = self.witnesses(hashes);
-        let exports = self.export_table(merged);
+        // The same call gate 1 makes, so that what is written now is exactly
+        // what a later run will compare against.
+        let exports = self.export_table(hashes);
         let table = self.hash_table(hashes);
         let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
         let whole_project = self.whole_project;
@@ -1081,17 +1246,27 @@ impl<'s> Driver<'s> {
         let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
             .filter(|&i| self.files[i].parse)
             .filter_map(|i| {
-                self.fingerprint_of(i, hashes, &table, &exports, &footprints).map(|f| (i, f))
+                self.fingerprint_of(i, hashes, &table, &exports, &footprints)
+                    .map(|f| (i, f))
             })
             .collect();
         let interfaces = self.interfaces(hashes, check, &witnesses);
 
-        let Some(store) = self.store.as_deref_mut() else { return Vec::new() };
+        let Some(store) = self.store.as_deref_mut() else {
+            return Vec::new();
+        };
         for (hash, entry) in interfaces {
             match entry {
                 Interface::Def(def) => store.put_def(hash, def),
                 Interface::Decl(decl) => store.put_decl(hash, decl),
             }
+        }
+        // Only the definitions this run normalized. A skipped file's bodies were
+        // written by the run that parsed it and are immutable, so there is
+        // nothing to refresh — a body is a function of the hash it is filed
+        // under.
+        for (hash, body) in bodies.defs() {
+            store.put_body(hash, DefBody::of(body.clone()));
         }
         for (i, fingerprint) in fingerprints {
             store.put_source(&paths[i], fingerprint);
@@ -1101,21 +1276,31 @@ impl<'s> Driver<'s> {
         }
         match store.flush() {
             Ok(()) => Vec::new(),
+            // A flush writes both caches and either half can be the one that
+            // failed, so naming one here would be a guess. The error's own
+            // chain already says which, which is why it is the whole message.
+            //
             // A cache that could not be written costs the next run its work and
             // costs this one nothing, so it is a warning rather than a failure.
             Err(e) => vec![
                 Diagnostic::warning(
                     codes::CACHE_UNREADABLE,
-                    format!("could not write the front-end cache: {e:#}"),
+                    format!("could not update the cache: {e:#}"),
                 )
-                .note("this run is unaffected; the next one will parse and check everything again"),
+                .note("this run is unaffected; the next one will do this work again"),
             ],
         }
     }
 
     /// Every module's `(name, hash)` pairs, which is what an importer's
     /// `ImportEdge` digest is taken over.
-    fn export_table(&self, merged: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
+    ///
+    /// Deliberately every top-level name, not only the `pub` ones: a skipped
+    /// module's entries come from a fingerprint, and a `DefEntry` carries no
+    /// visibility. Filtering the parsed side alone would make the two disagree,
+    /// and a digest that means different things on either side of a skip is
+    /// worse than a coarse one.
+    fn export_table(&self, hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
         let mut out: BTreeMap<Symbol, Vec<NameRef>> = BTreeMap::new();
         for file in &self.files {
             let mut names: Vec<NameRef> = Vec::new();
@@ -1125,7 +1310,7 @@ impl<'s> Driver<'s> {
                         let Some(ident) = item.name() else { continue };
                         let name = file.module.qualify(&ident.name);
                         if let Some(hash) =
-                            merged.defs.get(&name).or_else(|| merged.decls.get(&name))
+                            hashes.defs.get(&name).or_else(|| hashes.decls.get(&name))
                         {
                             names.push(NameRef::new(name, *hash));
                         }
@@ -1163,7 +1348,10 @@ impl<'s> Driver<'s> {
                 continue;
             }
             let digest = exports_digest(exports.get(&module).map(Vec::as_slice).unwrap_or(&[]));
-            fingerprint.imports.push(ImportEdge { module, exports: digest });
+            fingerprint.imports.push(ImportEdge {
+                module,
+                exports: digest,
+            });
         }
 
         // Free names, and what each resolved to: gate 1's exact condition.
@@ -1259,7 +1447,9 @@ impl<'s> Driver<'s> {
                 let Some(hash) = hashes.defs.get(&name).or_else(|| hashes.decls.get(&name)) else {
                     continue;
                 };
-                let Some(names) = witnesses.get(&name).cloned() else { continue };
+                let Some(names) = witnesses.get(&name).cloned() else {
+                    continue;
+                };
                 let entry = match item {
                     Item::Fn(_) => check.defs.get(&name).map(|d| {
                         Interface::Def(
@@ -1275,12 +1465,13 @@ impl<'s> Driver<'s> {
                         let ctors: Option<Vec<CachedCtor>> = variants
                             .iter()
                             .map(|v| {
-                                check.ctors.get(&file.module.qualify(&v.name.name)).map(|c| {
-                                    CachedCtor {
+                                check
+                                    .ctors
+                                    .get(&file.module.qualify(&v.name.name))
+                                    .map(|c| CachedCtor {
                                         fields: c.fields.clone(),
                                         scheme: c.scheme.clone(),
-                                    }
-                                })
+                                    })
                             })
                             .collect();
                         ctors.map(|ctors| {
@@ -1309,8 +1500,11 @@ impl<'s> Driver<'s> {
                             .collect();
                         ops.map(|ops| {
                             Interface::Decl(
-                                CachedDecl::new(DeclBody::Effect { nondet: info.nondet, ops })
-                                    .witnessed_by(names),
+                                CachedDecl::new(DeclBody::Effect {
+                                    nondet: info.nondet,
+                                    ops,
+                                })
+                                .witnessed_by(names),
                             )
                         })
                     }),
@@ -1335,6 +1529,14 @@ struct Merged {
     out: CheckOutput,
     merged: HashOutput,
     report: FrontEnd,
+}
+
+/// What gate 1 measures a skip candidate against. Both maps cover parsed and
+/// skipped files alike — a skipped file's half comes from the fingerprint whose
+/// content hash already matched the bytes on disk.
+struct Gate1 {
+    table: BTreeMap<Symbol, DefHash>,
+    exports: BTreeMap<Symbol, ContentHash>,
 }
 
 /// What gate 2 decided: the interfaces inference may publish without walking a
@@ -1369,11 +1571,18 @@ fn record_deps(merged: &mut HashOutput, name: &Symbol, deps: &[Symbol]) {
 /// and nothing else would fold them in.
 fn closure_of(deps: &IndexMap<Symbol, Vec<Symbol>>) -> IndexMap<Symbol, BTreeSet<Symbol>> {
     let names: Vec<&Symbol> = deps.keys().collect();
-    let index: BTreeMap<&Symbol, usize> =
-        names.iter().enumerate().map(|(i, name)| (*name, i)).collect();
+    let index: BTreeMap<&Symbol, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (*name, i))
+        .collect();
     let edges: Vec<Vec<NodeId>> = deps
         .values()
-        .map(|ds| ds.iter().filter_map(|d| index.get(d).map(|&i| NodeId(i))).collect())
+        .map(|ds| {
+            ds.iter()
+                .filter_map(|d| index.get(d).map(|&i| NodeId(i)))
+                .collect()
+        })
         .collect();
 
     let components = ply_hash::graph::tarjan(names.len(), &edges);
@@ -1387,8 +1596,7 @@ fn closure_of(deps: &IndexMap<Symbol, Vec<Symbol>>) -> IndexMap<Symbol, BTreeSet
     // Dependency-first, so every closure a component splices in is already built.
     let mut closures: Vec<BTreeSet<Symbol>> = Vec::with_capacity(components.len());
     for (ci, component) in components.iter().enumerate() {
-        let mut closure: BTreeSet<Symbol> =
-            component.iter().map(|&v| names[v].clone()).collect();
+        let mut closure: BTreeSet<Symbol> = component.iter().map(|&v| names[v].clone()).collect();
         for &v in component {
             for r in &edges[v] {
                 if component_of[r.0] != ci
@@ -1426,7 +1634,12 @@ fn module_info(module: &Module, source: SourceId) -> ModuleInfo {
             imports.push(name);
         }
     }
-    ModuleInfo { name: module.name.clone(), source, items, imports }
+    ModuleInfo {
+        name: module.name.clone(),
+        source,
+        items,
+        imports,
+    }
 }
 
 fn simple_name(module: &ModuleName, qualified: &Symbol) -> Symbol {
@@ -1456,7 +1669,10 @@ fn canonical_defs(defs: &IndexMap<Symbol, DefInfo>) -> IndexMap<Symbol, DefInfo>
     for (name, def) in defs {
         out.insert(
             name.clone(),
-            DefInfo { scheme: canonicalize_scheme(&def.scheme), ..def.clone() },
+            DefInfo {
+                scheme: canonicalize_scheme(&def.scheme),
+                ..def.clone()
+            },
         );
     }
     out
@@ -1470,7 +1686,10 @@ fn canonical_defs(defs: &IndexMap<Symbol, DefInfo>) -> IndexMap<Symbol, DefInfo>
 fn canonical_ctors(ctors: &IndexMap<Symbol, CtorInfo>) -> IndexMap<Symbol, CtorInfo> {
     let mut owners: IndexMap<Symbol, Vec<Symbol>> = IndexMap::new();
     for (name, ctor) in ctors {
-        owners.entry(ctor.type_name.clone()).or_default().push(name.clone());
+        owners
+            .entry(ctor.type_name.clone())
+            .or_default()
+            .push(name.clone());
     }
     let mut out = ctors.clone();
     for (_, mut names) in owners {
@@ -1485,7 +1704,10 @@ fn canonical_ctors(ctors: &IndexMap<Symbol, CtorInfo>) -> IndexMap<Symbol, CtorI
                 })
                 .collect(),
         };
-        let DeclBody::Type { ctors: canonical, .. } = canonicalize_decl_body(&body) else {
+        let DeclBody::Type {
+            ctors: canonical, ..
+        } = canonicalize_decl_body(&body)
+        else {
             continue;
         };
         for (name, cached) in names.iter().zip(canonical) {
@@ -1521,7 +1743,13 @@ fn canonical_effects(effects: &IndexMap<Symbol, EffectInfo>) -> IndexMap<Symbol,
                 info.ret = cached.ret;
             }
         }
-        out.insert(name.clone(), EffectInfo { ops, ..effect.clone() });
+        out.insert(
+            name.clone(),
+            EffectInfo {
+                ops,
+                ..effect.clone()
+            },
+        );
     }
     out
 }

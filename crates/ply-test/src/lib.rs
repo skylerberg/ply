@@ -1,8 +1,12 @@
 //! Selection, scheduling, and running — where "a test re-runs iff its hash is
 //! absent from the cache" stops being a claim and becomes an observable.
 
+pub mod bisect;
+pub mod diagnose;
+pub mod hybrid;
 pub mod report;
 pub mod schedule;
+pub mod slice;
 
 #[cfg(test)]
 mod tests;
@@ -11,18 +15,29 @@ use ply_core::{CheckOutput, Footprint};
 use ply_eval::Interp;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
-use ply_store::{Outcome, Store};
+use ply_store::{Outcome, PassRecord, Store};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
 use serde::Serialize;
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+pub use bisect::{
+    Baseline, Bisection, Budget, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
+    DepEdges, Diff, EraTable, FusionReason, Hybrid, Mode, Ns, Regression, Renormalizer,
+    SearchStats, Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, bisect, diff,
+    precheck,
+};
+pub use diagnose::{Evidence, Options, diagnose};
+pub use hybrid::{BodyHybrid, Mixture, Signature};
 pub use schedule::group_by_conflict;
+pub use slice::{
+    Assertion, AssertionKind, CausalSlice, Difference, Entered, Event, Frame, SliceBuilder, Tracing,
+};
 
 /// Why a test was or was not selected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -125,6 +140,134 @@ impl TestResult {
     }
 }
 
+/// A bare name is a list to read; these fields are what turn it into a ranking.
+/// Every one of them is tri-state where the evidence may be missing, because a
+/// consumer that cannot tell "did not run" from "was not traced" will act on the
+/// wrong one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suspect {
+    /// The program-wide name.
+    pub name: Symbol,
+    pub hash: Option<DefHash>,
+    /// Its hash when the test last passed. `None` when no baseline is known.
+    pub before: Option<DefHash>,
+    /// `None` when the two configurations were never compared, so nothing
+    /// distinguishes an edit from a hash that merely moved underneath it.
+    pub change: Option<ChangeKind>,
+    /// `None` when the failing execution was not traced.
+    pub ran: Option<bool>,
+    /// Distance above the failing frame, zero being where it happened.
+    pub depth: Option<usize>,
+    /// Whether bisection put it in the minimal failure-inducing set.
+    pub culprit: bool,
+}
+
+impl Suspect {
+    pub fn new(name: Symbol, hash: Option<DefHash>) -> Suspect {
+        Suspect {
+            name,
+            hash,
+            before: None,
+            change: None,
+            ran: None,
+            depth: None,
+            culprit: false,
+        }
+    }
+
+    /// Most-likely-first: a bisected culprit, then whatever was on the stack when
+    /// it blew up (innermost first), then whatever else ran, then an edit over a
+    /// hash that only moved, then the name. Total and deterministic, because two
+    /// runs over the same failure have to produce the same artifact.
+    fn rank(&self) -> (u8, usize, u8, &str) {
+        let tier = match (self.culprit, self.ran, self.depth) {
+            (true, ..) => 0,
+            (false, _, Some(_)) => 1,
+            (false, Some(true), None) => 2,
+            (false, None, None) => 3,
+            (false, Some(false), None) => 4,
+        };
+        let inherited = u8::from(self.change == Some(ChangeKind::Derived));
+        (
+            tier,
+            self.depth.unwrap_or(usize::MAX),
+            inherited,
+            self.name.as_str(),
+        )
+    }
+}
+
+/// The diagnosis the system is in a position to do, so that a consumer does not
+/// have to re-derive it.
+#[derive(Clone, Debug, Default)]
+pub struct Attribution {
+    /// The same set as [`Failure::suspects`], ranked and annotated. The order
+    /// differs deliberately: `Failure::suspects` is the raw intersection and this
+    /// is the answer.
+    pub suspects: Vec<Suspect>,
+    pub bisection: Bisection,
+    /// `None` until a traced re-run has happened.
+    pub slice: Option<CausalSlice>,
+}
+
+impl Attribution {
+    /// What a run knows before any bisection or tracing: the names, and their
+    /// hashes now.
+    pub fn from_suspects(names: &[Symbol], hashes: &HashOutput) -> Attribution {
+        let mut suspects: Vec<Suspect> = names
+            .iter()
+            .map(|name| {
+                let hash = hashes
+                    .defs
+                    .get(name)
+                    .or_else(|| hashes.decls.get(name))
+                    .copied();
+                Suspect::new(name.clone(), hash)
+            })
+            .collect();
+        suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
+        Attribution {
+            suspects,
+            bisection: Bisection::default(),
+            slice: None,
+        }
+    }
+
+    /// Folds a bisection and a trace into the suspects, then re-ranks. Called
+    /// once both are in hand; the ordering is not stable under partial updates
+    /// and is not meant to be read before this.
+    pub fn resolve(&mut self, bisection: Bisection, slice: Option<CausalSlice>) {
+        let culprits = bisection.culprits();
+        for suspect in &mut self.suspects {
+            suspect.culprit = culprits.contains(&suspect.name);
+            if let Some(slice) = &slice
+                && slice.traced
+                && slice.reproduced
+            {
+                suspect.ran = slice.did_run(&suspect.name);
+                suspect.depth = slice.depth_of(&suspect.name);
+            }
+        }
+        // A culprit bisection found outside the suspect set is still the answer:
+        // the suspect set is "changed and in the closure", and a definition can
+        // be a cause without the store having noticed it change.
+        for name in culprits {
+            if !self.suspects.iter().any(|s| s.name == name) {
+                let mut extra = Suspect::new(name, None);
+                extra.culprit = true;
+                self.suspects.push(extra);
+            }
+        }
+        self.suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
+        self.bisection = bisection;
+        self.slice = slice;
+    }
+
+    pub fn culprits(&self) -> Vec<Symbol> {
+        self.bisection.culprits()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Failure {
     /// The label as the source wrote it. Not unique program-wide; `key` is.
@@ -135,6 +278,10 @@ pub struct Failure {
     /// Definitions in this test's closure whose hash is not in the store —
     /// the suspects for this failure.
     pub suspects: Vec<Symbol>,
+    /// What failed, structured. `None` until the evaluator carries the payload
+    /// rather than rendering it into the diagnostic's notes.
+    pub assertion: Option<Assertion>,
+    pub attribution: Attribution,
 }
 
 #[derive(Clone, Debug)]
@@ -203,7 +350,12 @@ impl<'a> InterpExecutor<'a> {
                 (module, at)
             })
             .collect();
-        InterpExecutor { program, resolved, check, addresses }
+        InterpExecutor {
+            program,
+            resolved,
+            check,
+            addresses,
+        }
     }
 }
 
@@ -256,11 +408,174 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
         reasons.push(reason);
     }
 
-    let footprints: Vec<(usize, Footprint)> =
-        to_run.iter().map(|&i| (i, check.tests[i].footprint.clone())).collect();
+    let footprints: Vec<(usize, Footprint)> = to_run
+        .iter()
+        .map(|&i| (i, check.tests[i].footprint.clone()))
+        .collect();
     let groups = group_by_conflict(&footprints);
 
-    Selection { total, cached, to_run, groups, reasons }
+    Selection {
+        total,
+        cached,
+        to_run,
+        groups,
+        reasons,
+    }
+}
+
+/// Turns each failure's raw suspect list into the ranked, annotated attribution
+/// of ADR 0004. Separate from [`run_with`] because it needs the AST — a delta is
+/// decided by re-normalizing bodies, not by comparing hashes — and because a
+/// caller with no evaluator still wants the answers that need no hybrid.
+///
+/// Returns the diagnoser's own warnings, which are never failures: a diagnosis
+/// that cannot be made leaves the failure exactly as it was.
+pub fn diagnose_failures(
+    report: &mut RunReport,
+    program: &Program,
+    resolved: &Resolved,
+    check: &CheckOutput,
+    hashes: &HashOutput,
+    store: &mut Store,
+    options: &Options,
+) -> Vec<Diagnostic> {
+    if report.failures.is_empty() {
+        return Vec::new();
+    }
+
+    // Built once for the whole run and shared: it re-normalizes the entire
+    // program, which is the expensive half of deciding `Edited` from `Derived`.
+    let test_keys: Vec<Symbol> = check.tests.iter().map(|t| t.key.clone()).collect();
+    let (renormalizer, mut warnings) =
+        match Renormalizer::new(program, resolved, hashes, &test_keys) {
+            Ok(renormalizer) => (Some(renormalizer), Vec::new()),
+            Err(diagnostics) => (None, diagnostics),
+        };
+    let edges = DepEdges::from(hashes);
+
+    // This run's own normalized bytes. A definition it introduced has no stored
+    // body until the cache is flushed, and a hybrid that could not reach the
+    // *current* side of a change would have nothing to flip to. The bytes are
+    // only used where they reproduce the hash the run published, so a program
+    // the front end assembled from cached pieces contributes nothing rather than
+    // something stale.
+    let fresh = ply_hash::hash_program_with_bodies(program, resolved)
+        .map(|(_, bodies)| bodies)
+        .unwrap_or_default();
+
+    // A hybrid that went green is a true claim about exactly its own closure, so
+    // it may be cached — but only after the borrow the search holds on the store
+    // has ended.
+    let mut proved: Vec<DefHash> = Vec::new();
+
+    for failure in &mut report.failures {
+        let baseline = store.pass_record(&failure.key).map(|record| {
+            Baseline::with_decls(
+                record.test_hash,
+                record.closure.clone(),
+                record.decls.clone(),
+            )
+        });
+        let panicked = failure.diagnostic.code == codes::RUNTIME_ERROR;
+        let nondet = check
+            .tests
+            .iter()
+            .find(|t| t.key == failure.key)
+            .is_some_and(|t| t.nondet);
+
+        let test_hash = hashes
+            .tests
+            .iter()
+            .zip(check.tests.iter())
+            .find(|(_, t)| t.key == failure.key)
+            .map(|(hash, _)| *hash);
+
+        let evidence = Evidence {
+            key: &failure.key,
+            test_hash,
+            nondet,
+            panicked,
+            suspects: &failure.suspects,
+            hashes,
+            baseline: baseline.as_ref(),
+            slice: failure.attribution.slice.clone(),
+        };
+
+        // Everything the mixture could need, on either side. `NoBodies` is a
+        // cache somebody pruned — go and stop pruning; `NoHybrids` is a build
+        // that cannot mix eras at all, which nothing outside can fix.
+        let mixture = baseline
+            .as_ref()
+            .map(|baseline| hybrid::mixture_for(hashes, &failure.key, baseline));
+        let complete = mixture
+            .as_ref()
+            .is_some_and(|m| hybrid::bodies_available(store, &fresh, m));
+        let test_body = check
+            .tests
+            .iter()
+            .position(|t| t.key == failure.key)
+            .and_then(|index| BodyHybrid::test_body(&fresh, hashes, index));
+        let absent = match (&mixture, complete) {
+            (Some(_), false) => Skipped::NoBodies,
+            _ => Skipped::NoHybrids,
+        };
+        let mut builder = match (mixture, test_body, complete) {
+            (Some(mixture), Some(test), true) => Some(BodyHybrid::new(
+                store,
+                &fresh,
+                mixture,
+                test,
+                Signature::of(&failure.diagnostic),
+            )),
+            _ => None,
+        };
+
+        // Without a renormalizer nothing can be told apart from a hash that
+        // merely moved, so every change stays a candidate: a wider answer, never
+        // a wrong one.
+        let mut unknown = bisect::Unknown;
+        let mut store_classify;
+        let classify: &mut dyn Classify = match (&renormalizer, &baseline) {
+            (Some(renormalizer), Some(baseline)) => {
+                store_classify = StoreClassify::new(renormalizer, baseline, store, check);
+                &mut store_classify
+            }
+            _ => &mut unknown,
+        };
+
+        failure.attribution = diagnose(
+            evidence,
+            options,
+            &edges,
+            classify,
+            builder.as_mut().map(|b| b as &mut dyn Hybrid),
+            absent,
+        );
+        if let Some(builder) = &mut builder {
+            // Never the failing test's own hash. `H(all)` *is* the current
+            // program, so a replay that goes green would otherwise cache a
+            // `Pass` for the test this run just watched fail — and a red test
+            // has to re-run until it goes green.
+            proved.extend(
+                builder
+                    .take_proved()
+                    .into_iter()
+                    .filter(|hash| Some(*hash) != test_hash),
+            );
+        }
+    }
+
+    // A hybrid's test hash covers its whole closure, so `Pass` under it is true
+    // of that configuration and of nothing else. `observe_definitions` is a
+    // different claim entirely and must never be made here: a definition proved
+    // fine *in a hybrid* has not been vindicated in the real program, and
+    // recording it would empty the next run's suspect set.
+    for hash in proved {
+        store.put(hash, Outcome::Pass);
+    }
+
+    warnings.retain(|d| d.severity != ply_span::Severity::Error);
+    warnings
 }
 
 pub fn run(
@@ -323,11 +638,20 @@ pub fn run_with<E: Executor>(
 
             if let Some(diagnostic) = &executed.failure {
                 failed += 1;
+                let suspects = suspects_for(hashes, &test.key, &changed);
+                let mut attribution = Attribution::from_suspects(&suspects, hashes);
+                if executed.panicked {
+                    attribution.bisection = Bisection::not_attempted(Skipped::Panicked);
+                } else if test.nondet {
+                    attribution.bisection = Bisection::not_attempted(Skipped::Nondet);
+                }
                 failures.push(Failure {
                     name: test.name.clone(),
                     key: test.key.clone(),
                     diagnostic: diagnostic.clone(),
-                    suspects: suspects_for(hashes, &test.key, &changed),
+                    suspects,
+                    assertion: None,
+                    attribution,
                 });
             } else {
                 passed += 1;
@@ -335,6 +659,15 @@ pub fn run_with<E: Executor>(
                     && let Some(hash) = hash
                 {
                     store.put(hash, Outcome::Pass);
+                    let (closure, decls) = closure_hashes(hashes, &test.key);
+                    store.put_pass_record(
+                        test.key.clone(),
+                        PassRecord {
+                            test_hash: hash,
+                            closure,
+                            decls,
+                        },
+                    );
                 }
             }
 
@@ -377,15 +710,22 @@ pub fn run_with<E: Executor>(
 /// one outcome a test runner may never produce.
 fn schedule_of(selection: &Selection, warnings: &mut Vec<Diagnostic>) -> Vec<Vec<usize>> {
     let scheduled: BTreeSet<usize> = selection.groups.iter().flatten().copied().collect();
-    let orphans: Vec<usize> =
-        selection.to_run.iter().copied().filter(|i| !scheduled.contains(i)).collect();
+    let orphans: Vec<usize> = selection
+        .to_run
+        .iter()
+        .copied()
+        .filter(|i| !scheduled.contains(i))
+        .collect();
     if orphans.is_empty() {
         return selection.groups.clone();
     }
     warnings.push(
         Diagnostic::warning(
             codes::RUNTIME_ERROR,
-            format!("{} selected tests were in no concurrency group", orphans.len()),
+            format!(
+                "{} selected tests were in no concurrency group",
+                orphans.len()
+            ),
         )
         .note("they were run one at a time; rebuild the selection with `select`"),
     );
@@ -435,7 +775,12 @@ fn execute_group<E: Executor>(
                     (Some(panic_diagnostic(payload, check, index)), true)
                 }
             };
-            out.push(Executed { index, duration, failure, panicked });
+            out.push(Executed {
+                index,
+                duration,
+                failure,
+                panicked,
+            });
         }
     });
 
@@ -458,10 +803,13 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
         None => (format!("test {index}"), ply_span::Span::DUMMY),
     };
 
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("test `{name}` panicked: {message}"))
-        .primary(span, "the interpreter panicked while running this test")
-        .note("a panic is a defect in Ply itself, not in the test; please report it with this source")
-        .note("the other tests still ran, and this one was not cached")
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("test `{name}` panicked: {message}"),
+    )
+    .primary(span, "the interpreter panicked while running this test")
+    .note("a panic is a defect in Ply itself, not in the test; please report it with this source")
+    .note("the other tests still ran, and this one was not cached")
 }
 
 /// Definitions the store has never recorded seeing. Against a warm cache that
@@ -482,9 +830,37 @@ fn closure_of<'a>(hashes: &'a HashOutput, key: &Symbol) -> Option<&'a BTreeSet<S
     hashes.closure.get(key)
 }
 
+/// Names are how two eras of a program are lined up; hashes are what they are
+/// compared by. A baseline needs both — and it needs one entry per *namespace*,
+/// because a `fn` and a `type` may share a name and preferring either drops the
+/// other's hash from the record for good.
+fn closure_hashes(
+    hashes: &HashOutput,
+    key: &Symbol,
+) -> (BTreeMap<Symbol, DefHash>, BTreeMap<Symbol, DefHash>) {
+    let Some(closure) = closure_of(hashes, key) else {
+        return (BTreeMap::new(), BTreeMap::new());
+    };
+    let mut defs = BTreeMap::new();
+    let mut decls = BTreeMap::new();
+    for name in closure {
+        if let Some(hash) = hashes.defs.get(name) {
+            defs.insert(name.clone(), *hash);
+        }
+        if let Some(hash) = hashes.decls.get(name) {
+            decls.insert(name.clone(), *hash);
+        }
+    }
+    (defs, decls)
+}
+
 fn suspects_for(hashes: &HashOutput, key: &Symbol, changed: &BTreeSet<Symbol>) -> Vec<Symbol> {
     match closure_of(hashes, key) {
-        Some(closure) => closure.intersection(changed).filter(|s| *s != key).cloned().collect(),
+        Some(closure) => closure
+            .intersection(changed)
+            .filter(|s| *s != key)
+            .cloned()
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -503,7 +879,11 @@ fn observe_definitions(
     selection: &Selection,
     results: &[TestResult],
 ) {
-    let proven: BTreeSet<usize> = results.iter().filter(|r| r.passed()).map(|r| r.index).collect();
+    let proven: BTreeSet<usize> = results
+        .iter()
+        .filter(|r| r.passed())
+        .map(|r| r.index)
+        .collect();
     let implicated: BTreeSet<&Symbol> = (0..check.tests.len())
         .filter(|index| {
             let green = selection.reason(*index) == Some(Reason::Cached);

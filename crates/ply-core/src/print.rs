@@ -74,7 +74,11 @@ impl Printer {
                     format!("{name}<{}>", args.join(", "))
                 }
             }
-            Type::Fn { params, ret, effects } => {
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
                 let ps: Vec<String> = params.iter().map(|p| self.ty(p)).collect();
                 let ret = self.ty(ret);
                 let mut s = format!("({}) -> {ret}", ps.join(", "));
@@ -141,7 +145,11 @@ fn as_cell(t: &Type) -> Option<(&Type, &Type)> {
 fn letter_name(letters: &[u8], i: usize) -> String {
     let c = letters[i % letters.len()] as char;
     let round = i / letters.len();
-    if round == 0 { c.to_string() } else { format!("{c}{round}") }
+    if round == 0 {
+        c.to_string()
+    } else {
+        format!("{c}{round}")
+    }
 }
 
 pub fn print_type(t: &Type) -> String {
@@ -201,7 +209,10 @@ mod tests {
     #[test]
     fn atoms_and_a_tail_print_together() {
         let atom = EffectAtom::new("db", Resource::Named(Symbol::new("users")), Mode::Read);
-        let row = Row { atoms: [atom].into(), tail: Some(RowVar(0)) };
+        let row = Row {
+            atoms: [atom].into(),
+            tail: Some(RowVar(0)),
+        };
         assert_eq!(print_row(&row), "{db.read[users] | e}");
     }
 

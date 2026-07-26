@@ -3,9 +3,7 @@ use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
 use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use crate::unify::{Fresh, Subst, UnifyError, unify, unify_row};
-use crate::{
-    CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, ModuleInfo, OpInfo, TestInfo,
-};
+use crate::{CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, ModuleInfo, OpInfo, TestInfo};
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
 use ply_syntax::ast::*;
@@ -17,8 +15,14 @@ use std::collections::BTreeSet;
 /// a user `effect cell` would silently gain the power to observe region state.
 const CELL: &str = "cell";
 
-const BUILTIN_TYPES: &[(&str, usize)] =
-    &[("Int", 0), ("Bool", 0), ("String", 0), ("Unit", 0), ("List", 1), ("Cell", 1)];
+const BUILTIN_TYPES: &[(&str, usize)] = &[
+    ("Int", 0),
+    ("Bool", 0),
+    ("String", 0),
+    ("Unit", 0),
+    ("List", 1),
+    ("Cell", 1),
+];
 
 pub fn check_program_with(
     program: &Program,
@@ -35,6 +39,7 @@ pub fn check_program_with(
         c.collect_types(module);
         c.collect_effects(module);
         c.collect_ctors(module);
+        c.check_value_namespace(module);
     }
     for &i in &resolved.order {
         c.module = i;
@@ -177,7 +182,12 @@ impl<'a> Checker<'a> {
         }
         self.modules.insert(
             module.name.as_symbol().clone(),
-            ModuleInfo { name: module.name.clone(), source: module.source, items, imports },
+            ModuleInfo {
+                name: module.name.clone(),
+                source: module.source,
+                items,
+                imports,
+            },
         );
     }
 
@@ -186,17 +196,29 @@ impl<'a> Checker<'a> {
     fn value_key(&mut self, q: &QName) -> Option<ValueKey> {
         if !q.is_bare() {
             let name = self.global(Namespace::Value, q)?;
-            return Some(ValueKey { name, prelude: false });
+            return Some(ValueKey {
+                name,
+                prelude: false,
+            });
         }
         let name = q.symbol();
         if self.env.depth_of(name).is_some_and(|depth| depth > 0) {
-            return Some(ValueKey { name: name.clone(), prelude: false });
+            return Some(ValueKey {
+                name: name.clone(),
+                prelude: false,
+            });
         }
         if let Some(binding) = self.scope().get(Namespace::Value, name) {
-            return Some(ValueKey { name: binding.qualified.clone(), prelude: false });
+            return Some(ValueKey {
+                name: binding.qualified.clone(),
+                prelude: false,
+            });
         }
         if self.env.depth_of(name) == Some(0) {
-            return Some(ValueKey { name: name.clone(), prelude: true });
+            return Some(ValueKey {
+                name: name.clone(),
+                prelude: true,
+            });
         }
         self.unknown_name(q);
         None
@@ -223,7 +245,9 @@ impl<'a> Checker<'a> {
     /// diagnostic needs after the reference has already been resolved once.
     fn declared_value(&self, q: &QName) -> Option<Symbol> {
         if q.is_bare() {
-            self.scope().get(Namespace::Value, q.symbol()).map(|b| b.qualified.clone())
+            self.scope()
+                .get(Namespace::Value, q.symbol())
+                .map(|b| b.qualified.clone())
         } else {
             self.resolved
                 .lookup(self.module, Namespace::Value, q)
@@ -261,23 +285,45 @@ impl<'a> Checker<'a> {
         let mono = |params: Vec<Type>, ret: Type| Scheme {
             ty_vars: vec![],
             row_vars: vec![],
-            ty: Type::Fn { params, ret: Box::new(ret), effects: Row::empty() },
+            ty: Type::Fn {
+                params,
+                ret: Box::new(ret),
+                effects: Row::empty(),
+            },
         };
-        let poly = |ty_vars: Vec<_>, row_vars: Vec<_>, params: Vec<Type>, ret: Type, eff: Row| {
-            Scheme {
+        let poly =
+            |ty_vars: Vec<_>, row_vars: Vec<_>, params: Vec<Type>, ret: Type, eff: Row| Scheme {
                 ty_vars,
                 row_vars,
-                ty: Type::Fn { params, ret: Box::new(ret), effects: eff },
-            }
-        };
+                ty: Type::Fn {
+                    params,
+                    ret: Box::new(ret),
+                    effects: eff,
+                },
+            };
 
         let entries: Vec<(&str, Scheme)> = vec![
             ("assert", mono(vec![Type::bool()], Type::unit())),
             (
                 "assert_eq",
-                poly(vec![a], vec![], vec![ta.clone(), ta.clone()], Type::unit(), Row::empty()),
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    Type::unit(),
+                    Row::empty(),
+                ),
             ),
-            ("len", poly(vec![a], vec![], vec![Type::list(ta.clone())], Type::int(), Row::empty())),
+            (
+                "len",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![Type::list(ta.clone())],
+                    Type::int(),
+                    Row::empty(),
+                ),
+            ),
             (
                 "push",
                 poly(
@@ -340,10 +386,25 @@ impl<'a> Checker<'a> {
                     re.clone(),
                 ),
             ),
-            ("range", mono(vec![Type::int(), Type::int()], Type::list(Type::int()))),
+            (
+                "range",
+                mono(vec![Type::int(), Type::int()], Type::list(Type::int())),
+            ),
             ("int_to_string", mono(vec![Type::int()], Type::string())),
-            ("string_concat", mono(vec![Type::string(), Type::string()], Type::string())),
-            ("panic", poly(vec![a], vec![], vec![Type::string()], ta.clone(), Row::empty())),
+            (
+                "string_concat",
+                mono(vec![Type::string(), Type::string()], Type::string()),
+            ),
+            (
+                "panic",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![Type::string()],
+                    ta.clone(),
+                    Row::empty(),
+                ),
+            ),
         ];
         for (name, scheme) in entries {
             self.env.bind_global(Symbol::new(name), scheme);
@@ -355,11 +416,23 @@ impl<'a> Checker<'a> {
         let cell_ty = Type::Con(Symbol::new("Cell"), vec![Type::Var(b), ta.clone()]);
         self.env.bind_global(
             Symbol::new("cell_get"),
-            poly(vec![a, b], vec![], vec![cell_ty.clone()], ta.clone(), Row::empty()),
+            poly(
+                vec![a, b],
+                vec![],
+                vec![cell_ty.clone()],
+                ta.clone(),
+                Row::empty(),
+            ),
         );
         self.env.bind_global(
             Symbol::new("cell_set"),
-            poly(vec![a, b], vec![], vec![cell_ty, ta], Type::unit(), Row::empty()),
+            poly(
+                vec![a, b],
+                vec![],
+                vec![cell_ty, ta],
+                Type::unit(),
+                Row::empty(),
+            ),
         );
     }
 
@@ -371,7 +444,10 @@ impl<'a> Checker<'a> {
                 self.duplicate(&def.name, prev.span, "type");
                 continue;
             }
-            if BUILTIN_TYPES.iter().any(|(b, _)| *b == def.name.name.as_str()) {
+            if BUILTIN_TYPES
+                .iter()
+                .any(|(b, _)| *b == def.name.name.as_str())
+            {
                 self.diags.push(
                     Diagnostic::error(
                         codes::DUPLICATE_DEFINITION,
@@ -458,9 +534,13 @@ impl<'a> Checker<'a> {
     fn collect_ctors(&mut self, module: &Module) {
         for item in &module.items {
             let Item::Type(def) = item else { continue };
-            let TypeDefBody::Sum(variants) = &def.body else { continue };
+            let TypeDefBody::Sum(variants) = &def.body else {
+                continue;
+            };
             let type_name = module.name.qualify(&def.name.name);
-            let Some(decl) = self.types.get(&type_name).cloned() else { continue };
+            let Some(decl) = self.types.get(&type_name).cloned() else {
+                continue;
+            };
 
             self.ty_params.clear();
             let mut vars = Vec::new();
@@ -469,8 +549,10 @@ impl<'a> Checker<'a> {
                 vars.push(v);
                 self.ty_params.insert(p.clone(), Type::Var(v));
             }
-            let result =
-                Type::Con(type_name.clone(), vars.iter().map(|v| Type::Var(*v)).collect());
+            let result = Type::Con(
+                type_name.clone(),
+                vars.iter().map(|v| Type::Var(*v)).collect(),
+            );
             for (index, variant) in variants.iter().enumerate() {
                 let ctor_name = module.name.qualify(&variant.name.name);
                 if let Some(prev) = self.ctors.get(&ctor_name) {
@@ -487,7 +569,11 @@ impl<'a> Checker<'a> {
                         effects: Row::empty(),
                     }
                 };
-                let scheme = Scheme { ty_vars: vars.clone(), row_vars: vec![], ty };
+                let scheme = Scheme {
+                    ty_vars: vars.clone(),
+                    row_vars: vec![],
+                    ty,
+                };
                 self.env.bind_global(ctor_name.clone(), scheme.clone());
                 self.ctors.insert(
                     ctor_name.clone(),
@@ -508,6 +594,64 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Functions and constructors share one namespace, so one module cannot
+    /// declare both under a name. It takes a pass of its own because the two
+    /// kinds are collected into separate tables: neither can see the other, and
+    /// the later binder silently wins, leaving the constructor unreachable.
+    fn check_value_namespace(&mut self, module: &Module) {
+        let mut seen: FxHashMap<Symbol, (Span, bool)> = FxHashMap::default();
+        for item in &module.items {
+            let declared: Vec<(&Ident, bool)> = match item {
+                Item::Fn(def) => vec![(&def.name, true)],
+                Item::Type(def) => match &def.body {
+                    TypeDefBody::Sum(variants) => {
+                        variants.iter().map(|v| (&v.name, false)).collect()
+                    }
+                    TypeDefBody::Alias(_) => Vec::new(),
+                },
+                Item::Effect(_) | Item::Test(_) => Vec::new(),
+            };
+            for (name, is_fn) in declared {
+                match seen.get(&name.name) {
+                    // Two of a kind is already reported where that kind's table
+                    // is built, in that kind's own wording.
+                    Some(&(_, was_fn)) if was_fn == is_fn => {}
+                    Some(&(first, _)) => self.value_collision(module, name, first, is_fn),
+                    None => {
+                        seen.insert(name.name.clone(), (name.span, is_fn));
+                    }
+                }
+            }
+        }
+    }
+
+    fn value_collision(&mut self, module: &Module, name: &Ident, first: Span, later_is_fn: bool) {
+        let (later, earlier) = if later_is_fn {
+            ("function", "constructor")
+        } else {
+            ("constructor", "function")
+        };
+        let where_ = if module.name.is_anonymous() {
+            String::new()
+        } else {
+            format!(" in module `{}`", module.name)
+        };
+        self.diags.push(
+            Diagnostic::error(
+                codes::DUPLICATE_DEFINITION,
+                format!("`{}` is defined twice{where_}", name.name),
+            )
+            .primary(name.span, format!("redefined here as a {later}"))
+            .secondary(first, format!("first defined here as a {earlier}"))
+            .note(format!(
+                "functions and constructors share one namespace: nothing written `{}` could say \
+                 which of the two it means",
+                name.name
+            ))
+            .note("rename one of them"),
+        );
+    }
+
     fn duplicate(&mut self, name: &Ident, prev: Span, what: &str) {
         self.diags.push(
             Diagnostic::error(
@@ -525,12 +669,23 @@ impl<'a> Checker<'a> {
             TypeExpr::Var(id) => self.type_param(id),
             TypeExpr::Unit { .. } => Type::unit(),
             TypeExpr::Record { fields, .. } => Type::Record(
-                fields.iter().map(|(k, v)| (k.name.clone(), self.conv_type(v))).collect(),
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.name.clone(), self.conv_type(v)))
+                    .collect(),
             ),
-            TypeExpr::Fn { params, ret, effects, span: _ } => Type::Fn {
+            TypeExpr::Fn {
+                params,
+                ret,
+                effects,
+                span: _,
+            } => Type::Fn {
                 params: params.iter().map(|p| self.conv_type(p)).collect(),
                 ret: Box::new(self.conv_type(ret)),
-                effects: effects.as_ref().map(|r| self.conv_row(r)).unwrap_or_default(),
+                effects: effects
+                    .as_ref()
+                    .map(|r| self.conv_row(r))
+                    .unwrap_or_default(),
             },
             TypeExpr::Con { name, args, span } => self.conv_con(name, args, *span),
         }
@@ -551,7 +706,10 @@ impl<'a> Checker<'a> {
                 format!("unknown type variable `{}`", id.name),
             )
             .primary(id.span, "not declared")
-            .note(format!("add `{}` to the generic list, e.g. `fn f<{}>(..)`", id.name, id.name)),
+            .note(format!(
+                "add `{}` to the generic list, e.g. `fn f<{}>(..)`",
+                id.name, id.name
+            )),
         );
         self.fresh.ty()
     }
@@ -563,7 +721,9 @@ impl<'a> Checker<'a> {
         let args: Vec<Type> = args.iter().map(|a| self.conv_type(a)).collect();
 
         if name.is_bare()
-            && let Some((_, arity)) = BUILTIN_TYPES.iter().find(|(b, _)| *b == name.symbol().as_str())
+            && let Some((_, arity)) = BUILTIN_TYPES
+                .iter()
+                .find(|(b, _)| *b == name.symbol().as_str())
         {
             if args.len() != *arity {
                 self.arity_error(span, name.symbol(), *arity, args.len(), "type arguments");
@@ -596,7 +756,13 @@ impl<'a> Checker<'a> {
         };
 
         if args.len() != decl.params.len() {
-            self.arity_error(span, name.symbol(), decl.params.len(), args.len(), "type arguments");
+            self.arity_error(
+                span,
+                name.symbol(),
+                decl.params.len(),
+                args.len(),
+                "type arguments",
+            );
             return self.fresh.ty();
         }
 
@@ -630,12 +796,17 @@ impl<'a> Checker<'a> {
     }
 
     fn unknown_type(&mut self, name: &QName) {
-        let mut d =
-            Diagnostic::error(codes::UNKNOWN_TYPE, format!("unknown type `{}`", name.symbol()))
-                .primary(name.span, "not found")
-                .note("declare it with `type`, or check the spelling");
+        let mut d = Diagnostic::error(
+            codes::UNKNOWN_TYPE,
+            format!("unknown type `{}`", name.symbol()),
+        )
+        .primary(name.span, "not found")
+        .note("declare it with `type`, or check the spelling");
         if let Some(module) = self.exporter(Namespace::Type, name.symbol()) {
-            d = d.note(format!("module `{module}` exports it: `import {module} ({})`", name.symbol()));
+            d = d.note(format!(
+                "module `{module}` exports it: `import {module} ({})`",
+                name.symbol()
+            ));
         }
         self.diags.push(d);
     }
@@ -648,14 +819,23 @@ impl<'a> Checker<'a> {
             .declarations
             .iter()
             .enumerate()
-            .find(|(i, d)| {
-                *i != me && d.get(ns, name).is_some_and(|decl| decl.vis.is_public())
-            })
+            .find(|(i, d)| *i != me && d.get(ns, name).is_some_and(|decl| decl.vis.is_public()))
             .map(|(i, _)| self.name_of(i))
     }
 
-    fn arity_error(&mut self, span: Span, name: &Symbol, expected: usize, found: usize, what: &str) {
-        let what = if expected == 1 { what.trim_end_matches('s') } else { what };
+    fn arity_error(
+        &mut self,
+        span: Span,
+        name: &Symbol,
+        expected: usize,
+        found: usize,
+        what: &str,
+    ) {
+        let what = if expected == 1 {
+            what.trim_end_matches('s')
+        } else {
+            what
+        };
         self.diags.push(
             Diagnostic::error(
                 codes::ARITY_MISMATCH,
@@ -693,10 +873,19 @@ impl<'a> Checker<'a> {
             self.diags.push(
                 Diagnostic::error(
                     codes::UNKNOWN_OPERATION,
-                    format!("effect `{effect}` declares no `{}` operation", a.mode.as_str()),
+                    format!(
+                        "effect `{effect}` declares no `{}` operation",
+                        a.mode.as_str()
+                    ),
                 )
-                .primary(a.span, format!("no `{}` operation to perform", a.mode.as_str()))
-                .note(format!("`{effect}` can perform: {}", dedup(known).join(", "))),
+                .primary(
+                    a.span,
+                    format!("no `{}` operation to perform", a.mode.as_str()),
+                )
+                .note(format!(
+                    "`{effect}` can perform: {}",
+                    dedup(known).join(", ")
+                )),
             );
             return None;
         }
@@ -740,8 +929,12 @@ impl<'a> Checker<'a> {
     }
 
     fn unknown_effect(&mut self, q: &QName) {
-        let known: Vec<String> =
-            self.scope().effects.keys().map(|k| format!("`{k}`")).collect();
+        let known: Vec<String> = self
+            .scope()
+            .effects
+            .keys()
+            .map(|k| format!("`{k}`"))
+            .collect();
         let mut d = Diagnostic::error(
             codes::UNKNOWN_EFFECT,
             format!("unknown effect `{}`", q.symbol()),
@@ -805,15 +998,18 @@ impl<'a> Checker<'a> {
             .collect();
 
         for comp in sccs(fns.len(), &adj) {
-            let names: Vec<Symbol> =
-                comp.iter().map(|&i| self.qualify(&fns[i].name.name)).collect();
+            let names: Vec<Symbol> = comp
+                .iter()
+                .map(|&i| self.qualify(&fns[i].name.name))
+                .collect();
             if self.publish_known(module, &comp, &fns, &names) {
                 continue;
             }
             let mut sigs = Vec::new();
             for (slot, &i) in comp.iter().enumerate() {
                 let sig = self.signature(fns[i]);
-                self.env.bind_global(names[slot].clone(), Scheme::mono(sig.fn_ty.clone()));
+                self.env
+                    .bind_global(names[slot].clone(), Scheme::mono(sig.fn_ty.clone()));
                 sigs.push(sig);
             }
             for (slot, &i) in comp.iter().enumerate() {
@@ -891,16 +1087,29 @@ impl<'a> Checker<'a> {
             return scheme.clone();
         }
         let ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|_| self.fresh.ty_var()).collect();
-        let row_vars: Vec<RowVar> = scheme.row_vars.iter().map(|_| self.fresh.row_var()).collect();
+        let row_vars: Vec<RowVar> = scheme
+            .row_vars
+            .iter()
+            .map(|_| self.fresh.row_var())
+            .collect();
         let ty = crate::env::rename_scheme(scheme, &ty_vars, &row_vars);
-        Scheme { ty_vars, row_vars, ty }
+        Scheme {
+            ty_vars,
+            row_vars,
+            ty,
+        }
     }
 
     /// A tail that no parameter or result type mentions can never be filled in
     /// by a caller, so leaving it quantified would publish a function as
     /// effect-polymorphic when it is simply pure.
     fn close_unreachable_row(&mut self, sig: &Signature) {
-        let Type::Fn { params, ret, effects } = self.subst.resolve_ty(&sig.fn_ty) else {
+        let Type::Fn {
+            params,
+            ret,
+            effects,
+        } = self.subst.resolve_ty(&sig.fn_ty)
+        else {
             return;
         };
         let Some(tail) = effects.tail else { return };
@@ -913,7 +1122,12 @@ impl<'a> Checker<'a> {
         }
         self.subst.free_vars(&ret, &mut tys, &mut rows);
         if !rows.contains(&tail) {
-            let _ = unify_row(&mut self.subst, &mut self.fresh, &Row::empty(), &Row::open(tail));
+            let _ = unify_row(
+                &mut self.subst,
+                &mut self.fresh,
+                &Row::empty(),
+                &Row::open(tail),
+            );
         }
     }
 
@@ -975,7 +1189,12 @@ impl<'a> Checker<'a> {
         match &sig.declared {
             Some(declared) => self.check_upper_bound(def, declared, &body_row),
             None => {
-                if let Err(e) = unify_row(&mut self.subst, &mut self.fresh, &sig.published_row, &body_row) {
+                if let Err(e) = unify_row(
+                    &mut self.subst,
+                    &mut self.fresh,
+                    &sig.published_row,
+                    &body_row,
+                ) {
                     self.report_unify(&e, def.body.span, "inferred effect row");
                 }
             }
@@ -991,7 +1210,11 @@ impl<'a> Checker<'a> {
         let inferred = self.subst.resolve_row(inferred);
         let declared = self.subst.resolve_row(declared);
 
-        let extra: Vec<EffectAtom> = inferred.atoms.difference(&declared.atoms).cloned().collect();
+        let extra: Vec<EffectAtom> = inferred
+            .atoms
+            .difference(&declared.atoms)
+            .cloned()
+            .collect();
         if !extra.is_empty() {
             let names: Vec<String> = extra.iter().map(|a| format!("`{a}`")).collect();
             let mut d = Diagnostic::error(
@@ -1015,7 +1238,10 @@ impl<'a> Checker<'a> {
             }
             let mut printer = Printer::new();
             d = d
-                .secondary(ann_span, format!("declared row is {}", printer.row(&declared)))
+                .secondary(
+                    ann_span,
+                    format!("declared row is {}", printer.row(&declared)),
+                )
                 .note(format!(
                     "add {} to the `/ {{..}}` annotation, or handle {} inside `{}`",
                     names.join(", "),
@@ -1029,7 +1255,10 @@ impl<'a> Checker<'a> {
             (None, _) => {}
             (Some(v), Some(w)) if v == w => {}
             (Some(v), tail) => {
-                let target = Row { atoms: BTreeSet::new(), tail };
+                let target = Row {
+                    atoms: BTreeSet::new(),
+                    tail,
+                };
                 if unify_row(&mut self.subst, &mut self.fresh, &target, &Row::open(v)).is_err() {
                     let mut printer = Printer::new();
                     let shown = printer.row(&inferred);
@@ -1055,7 +1284,9 @@ impl<'a> Checker<'a> {
         let mut position = 0;
         for item in &module.items {
             let Item::Test(def) = item else { continue };
-            let cached = known.and_then(|slots| slots.get(position)).and_then(Option::as_ref);
+            let cached = known
+                .and_then(|slots| slots.get(position))
+                .and_then(Option::as_ref);
             position += 1;
 
             // A cached footprint carries the determinism verdict with it: an
@@ -1095,7 +1326,9 @@ impl<'a> Checker<'a> {
 
     fn check_determinism(&mut self, def: &TestDef, footprint: &Footprint) {
         for atom in footprint.atoms() {
-            let Some(info) = self.effects.get(&atom.effect) else { continue };
+            let Some(info) = self.effects.get(&atom.effect) else {
+                continue;
+            };
             if !info.nondet {
                 continue;
             }
@@ -1115,7 +1348,10 @@ impl<'a> Checker<'a> {
                 "nondeterministic effect in a deterministic test",
             )
             .primary(span, label)
-            .secondary(def.name_span, format!("test `{}` is deterministic", def.name));
+            .secondary(
+                def.name_span,
+                format!("test `{}` is deterministic", def.name),
+            );
             if !direct {
                 d = d.note(format!(
                     "`{atom}` is performed inside something this expression calls"
@@ -1163,7 +1399,10 @@ impl<'a> Checker<'a> {
         let op = info
             .ops
             .values()
-            .find(|o| o.mode == atom.mode && matches!(&atom.resource, Resource::Named(_)) == o.resource_param)
+            .find(|o| {
+                o.mode == atom.mode
+                    && matches!(&atom.resource, Resource::Named(_)) == o.resource_param
+            })
             .or_else(|| info.ops.values().find(|o| o.mode == atom.mode))
             .or_else(|| info.ops.values().next());
         match op {
@@ -1172,9 +1411,12 @@ impl<'a> Checker<'a> {
                     (Resource::Named(r), true) => format!("[{r}]"),
                     _ => String::new(),
                 };
-                let args: Vec<String> =
-                    (0..op.params.len()).map(|i| format!("a{i}")).collect();
-                format!("{written}.{}{resource}({}) -> <value>", op.name, args.join(", "))
+                let args: Vec<String> = (0..op.params.len()).map(|i| format!("a{i}")).collect();
+                format!(
+                    "{written}.{}{resource}({}) -> <value>",
+                    op.name,
+                    args.join(", ")
+                )
             }
             None => format!("{written}.<op>() -> <value>"),
         }
@@ -1197,8 +1439,11 @@ impl<'a> Checker<'a> {
     /// nondeterministic, so their perform sites stop being evidence.
     fn discharge(&mut self, range: std::ops::Range<usize>, handled: &BTreeSet<EffectAtom>) {
         let start = range.start;
-        let kept: Vec<PerformSite> =
-            self.performs.drain(range).filter(|s| !handled.contains(&s.atom)).collect();
+        let kept: Vec<PerformSite> = self
+            .performs
+            .drain(range)
+            .filter(|s| !handled.contains(&s.atom))
+            .collect();
         self.performs.splice(start..start, kept);
     }
 
@@ -1272,12 +1517,23 @@ impl<'a> Checker<'a> {
                 }
                 let (ret, row) = self.infer(body);
                 self.env.pop();
-                (Type::Fn { params: ptys, ret: Box::new(ret), effects: row }, Row::empty())
+                (
+                    Type::Fn {
+                        params: ptys,
+                        ret: Box::new(ret),
+                        effects: row,
+                    },
+                    Row::empty(),
+                )
             }
 
             ExprKind::App { func, args } => self.infer_app(e, func, args),
 
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 let (ct, crow) = self.infer(cond);
                 self.expect(cond.span, &Type::bool(), &ct, "condition of `if`");
                 let (tt, trow) = self.infer(then_branch);
@@ -1371,32 +1627,44 @@ impl<'a> Checker<'a> {
                 (Type::list(elem), row)
             }
 
-            ExprKind::Perform { effect, op, resource, args } => {
-                self.infer_perform(e, effect, op, resource.as_ref(), args)
-            }
+            ExprKind::Perform {
+                effect,
+                op,
+                resource,
+                args,
+            } => self.infer_perform(e, effect, op, resource.as_ref(), args),
 
-            ExprKind::Handle { body, clauses, return_clause } => {
-                self.infer_handle(e, body, clauses, return_clause.as_deref())
-            }
+            ExprKind::Handle {
+                body,
+                clauses,
+                return_clause,
+            } => self.infer_handle(e, body, clauses, return_clause.as_deref()),
 
-            ExprKind::WithCell { resource, init, binder, body } => {
-                self.infer_with_cell(e, resource, init, binder, body)
-            }
+            ExprKind::WithCell {
+                resource,
+                init,
+                binder,
+                body,
+            } => self.infer_with_cell(e, resource, init, binder, body),
         }
     }
 
     fn infer_stmt(&mut self, stmt: &Stmt) -> Row {
         match stmt {
             Stmt::Expr(e) => self.infer(e).1,
-            Stmt::Let { pat, ty, value, span: _ } => {
+            Stmt::Let {
+                pat,
+                ty,
+                value,
+                span: _,
+            } => {
                 let (mut vt, row) = self.infer(value);
                 if let Some(annotation) = ty {
                     let want = self.conv_type(annotation);
                     self.expect(value.span, &want, &vt, "`let` annotation");
                     vt = want;
                 }
-                let generalizable =
-                    matches!(pat.kind, PatternKind::Var(_) | PatternKind::Wildcard);
+                let generalizable = matches!(pat.kind, PatternKind::Var(_) | PatternKind::Wildcard);
                 let mut bindings = Vec::new();
                 self.bind_pattern(pat, &vt, &mut bindings);
                 for (name, t) in bindings {
@@ -1431,7 +1699,12 @@ impl<'a> Checker<'a> {
                 self.expect(rhs.span, &want, &rt, "right operand");
             }
             None => {
-                self.expect(rhs.span, &lt, &rt, "both sides of a comparison must have one type");
+                self.expect(
+                    rhs.span,
+                    &lt,
+                    &rt,
+                    "both sides of a comparison must have one type",
+                );
                 self.comparisons.push((e.span, lt.clone()));
             }
         }
@@ -1448,9 +1721,15 @@ impl<'a> Checker<'a> {
             }
             let mut printer = Printer::new();
             self.diags.push(
-                Diagnostic::error(codes::TYPE_MISMATCH, "functions cannot be compared for equality")
-                    .primary(span, format!("both sides have type `{}`", printer.ty(&resolved)))
-                    .note("compare the results of calling them instead"),
+                Diagnostic::error(
+                    codes::TYPE_MISMATCH,
+                    "functions cannot be compared for equality",
+                )
+                .primary(
+                    span,
+                    format!("both sides have type `{}`", printer.ty(&resolved)),
+                )
+                .note("compare the results of calling them instead"),
             );
         }
     }
@@ -1472,7 +1751,11 @@ impl<'a> Checker<'a> {
 
         let resolved = self.subst.resolve_ty(&ft);
         match resolved {
-            Type::Fn { params, ret, effects } => {
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
                 if params.len() != args.len() {
                     self.diags.push(
                         Diagnostic::error(
@@ -1484,7 +1767,10 @@ impl<'a> Checker<'a> {
                                 supplied(args.len())
                             ),
                         )
-                        .primary(e.span, format!("expected {}, found {}", params.len(), args.len()))
+                        .primary(
+                            e.span,
+                            format!("expected {}, found {}", params.len(), args.len()),
+                        )
                         .secondary(func.span, "this is the function being called"),
                     );
                     return (*ret, self.join(e.span, row, effects));
@@ -1526,7 +1812,11 @@ impl<'a> Checker<'a> {
 
     fn infer_cell_op(&mut self, e: &Expr, args: &[Expr], mode: Mode) -> (Type, Row) {
         let expected = if mode == Mode::Read { 1 } else { 2 };
-        let name = if mode == Mode::Read { "cell_get" } else { "cell_set" };
+        let name = if mode == Mode::Read {
+            "cell_get"
+        } else {
+            "cell_set"
+        };
         let mut row = Row::empty();
         let mut tys = Vec::new();
         for a in args {
@@ -1535,7 +1825,13 @@ impl<'a> Checker<'a> {
             tys.push(t);
         }
         if args.len() != expected {
-            self.arity_error(e.span, &Symbol::new(name), expected, args.len(), "arguments");
+            self.arity_error(
+                e.span,
+                &Symbol::new(name),
+                expected,
+                args.len(),
+                "arguments",
+            );
             return (self.fresh.ty(), row);
         }
 
@@ -1560,14 +1856,22 @@ impl<'a> Checker<'a> {
                      `cell.read[r]` / `cell.write[r]` atoms can be discharged at the region boundary",
                 ),
             );
-            let ret = if mode == Mode::Read { elem } else { Type::unit() };
+            let ret = if mode == Mode::Read {
+                elem
+            } else {
+                Type::unit()
+            };
             return (ret, row);
         };
 
         let atom = EffectAtom::new(CELL, Resource::Named(resource), mode);
         self.record(atom.clone(), e.span, true);
         let row = self.join(e.span, row, Row::singleton(atom));
-        let ret = if mode == Mode::Read { elem } else { Type::unit() };
+        let ret = if mode == Mode::Read {
+            elem
+        } else {
+            Type::unit()
+        };
         (ret, row)
     }
 
@@ -1608,7 +1912,10 @@ impl<'a> Checker<'a> {
                         supplied(args.len())
                     ),
                 )
-                .primary(e.span, format!("expected {}, found {}", params.len(), args.len()))
+                .primary(
+                    e.span,
+                    format!("expected {}, found {}", params.len(), args.len()),
+                )
                 .secondary(op_info.span, "declared here"),
             );
             return (ret, row);
@@ -1645,14 +1952,22 @@ impl<'a> Checker<'a> {
             let known: Vec<String> = info.ops.keys().map(|k| format!("`{k}`")).collect();
             let mut d = Diagnostic::error(
                 codes::UNKNOWN_OPERATION,
-                format!("effect `{}` has no operation `{}`", effect.symbol(), op.name),
+                format!(
+                    "effect `{}` has no operation `{}`",
+                    effect.symbol(),
+                    op.name
+                ),
             )
             .primary(op.span, "not declared")
             .secondary(info.span, format!("`{}` is declared here", info.name));
             d = if known.is_empty() {
                 d.note(format!("`{}` declares no operations", info.name))
             } else {
-                d.note(format!("operations of `{}`: {}", info.name, known.join(", ")))
+                d.note(format!(
+                    "operations of `{}`: {}",
+                    info.name,
+                    known.join(", ")
+                ))
             };
             self.diags.push(d);
             return None;
@@ -1694,10 +2009,7 @@ impl<'a> Checker<'a> {
                 self.diags.push(
                     Diagnostic::error(
                         codes::RESOURCE_REQUIRED,
-                        format!(
-                            "`{}.{}` is not resource-parameterized",
-                            info.name, op.name
-                        ),
+                        format!("`{}.{}` is not resource-parameterized", info.name, op.name),
                     )
                     .primary(r.span, "unexpected resource label")
                     .secondary(op.span, "declared without `[r]`")
@@ -1852,7 +2164,10 @@ impl<'a> Checker<'a> {
                     codes::TYPE_MISMATCH,
                     format!("the cell escapes its `with_cell[{}]` region", resource.name),
                 )
-                .primary(body.span, format!("this has type `{}`", printer.ty(&resolved)))
+                .primary(
+                    body.span,
+                    format!("this has type `{}`", printer.ty(&resolved)),
+                )
                 .note("read the cell inside the region and return the value instead"),
             );
         }
@@ -1906,17 +2221,18 @@ impl<'a> Checker<'a> {
                 want.iter().map(|b| format!("`{b}`")).collect()
             }
             Type::Con(name, _) => {
-                let variants: Vec<&CtorInfo> =
-                    self.ctors.values().filter(|c| &c.type_name == name).collect();
+                let variants: Vec<&CtorInfo> = self
+                    .ctors
+                    .values()
+                    .filter(|c| &c.type_name == name)
+                    .collect();
                 if variants.is_empty() {
                     vec!["other values".to_string()]
                 } else {
                     let covered: FxHashSet<Symbol> = unguarded
                         .clone()
                         .filter_map(|a| match &a.pat.kind {
-                            PatternKind::Ctor { name, args }
-                                if args.iter().all(is_irrefutable) =>
-                            {
+                            PatternKind::Ctor { name, args } if args.iter().all(is_irrefutable) => {
                                 self.declared_value(name)
                             }
                             _ => None,
@@ -1936,18 +2252,16 @@ impl<'a> Checker<'a> {
             return;
         }
         self.diags.push(
-            Diagnostic::error(codes::NON_EXHAUSTIVE_MATCH, "match does not cover every case")
-                .primary(e.span, format!("not covered: {}", missing.join(", ")))
-                .note("add the missing arms, or a `_` arm"),
+            Diagnostic::error(
+                codes::NON_EXHAUSTIVE_MATCH,
+                "match does not cover every case",
+            )
+            .primary(e.span, format!("not covered: {}", missing.join(", ")))
+            .note("add the missing arms, or a `_` arm"),
         );
     }
 
-    fn bind_pattern(
-        &mut self,
-        pat: &Pattern,
-        scrutinee: &Type,
-        out: &mut Vec<(Symbol, Type)>,
-    ) {
+    fn bind_pattern(&mut self, pat: &Pattern, scrutinee: &Type, out: &mut Vec<(Symbol, Type)>) {
         match &pat.kind {
             PatternKind::Wildcard => {}
             PatternKind::Var(id) => out.push((id.name.clone(), scrutinee.clone())),
@@ -2001,7 +2315,12 @@ impl<'a> Checker<'a> {
             }
             PatternKind::List { items, rest } => {
                 let elem = self.fresh.ty();
-                self.expect(pat.span, scrutinee, &Type::list(elem.clone()), "list pattern");
+                self.expect(
+                    pat.span,
+                    scrutinee,
+                    &Type::list(elem.clone()),
+                    "list pattern",
+                );
                 for item in items {
                     self.bind_pattern(item, &elem, out);
                 }
@@ -2028,7 +2347,8 @@ impl<'a> Checker<'a> {
                         }
                     }
                     if !*rest {
-                        let named: FxHashSet<&Symbol> = fields.iter().map(|(n, _)| &n.name).collect();
+                        let named: FxHashSet<&Symbol> =
+                            fields.iter().map(|(n, _)| &n.name).collect();
                         let omitted: Vec<String> = known
                             .keys()
                             .filter(|k| !named.contains(k))
@@ -2075,7 +2395,12 @@ impl<'a> Checker<'a> {
     fn join(&mut self, span: Span, a: Row, b: Row) -> Row {
         if let (Some(x), Some(y)) = (a.tail, b.tail)
             && x != y
-            && let Err(e) = unify_row(&mut self.subst, &mut self.fresh, &Row::open(x), &Row::open(y))
+            && let Err(e) = unify_row(
+                &mut self.subst,
+                &mut self.fresh,
+                &Row::open(x),
+                &Row::open(y),
+            )
         {
             self.report_unify(&e, span, "this expression combines two effect variables");
         }
@@ -2092,8 +2417,10 @@ impl<'a> Checker<'a> {
         let mut printer = Printer::new();
         let d = match err {
             UnifyError::Mismatch { expected, found } => {
-                let (expected, found) =
-                    (self.subst.resolve_ty(expected), self.subst.resolve_ty(found));
+                let (expected, found) = (
+                    self.subst.resolve_ty(expected),
+                    self.subst.resolve_ty(found),
+                );
                 let (e, f) = (printer.ty(&expected), printer.ty(&found));
                 Diagnostic::error(codes::TYPE_MISMATCH, format!("type mismatch: {context}"))
                     .primary(span, format!("expected `{e}`, found `{f}`"))
@@ -2114,13 +2441,18 @@ impl<'a> Checker<'a> {
             }
             UnifyError::OccursRow { var, row } => {
                 let (v, r) = (printer.row(&Row::open(*var)), printer.row(row));
-                Diagnostic::error(codes::OCCURS_CHECK, format!("infinite effect row: {context}"))
-                    .primary(span, format!("`{v}` would have to equal `{r}`"))
-                    .note("an effect row cannot contain itself")
+                Diagnostic::error(
+                    codes::OCCURS_CHECK,
+                    format!("infinite effect row: {context}"),
+                )
+                .primary(span, format!("`{v}` would have to equal `{r}`"))
+                .note("an effect row cannot contain itself")
             }
             UnifyError::RowMismatch { expected, found } => {
-                let (expected, found) =
-                    (self.subst.resolve_row(expected), self.subst.resolve_row(found));
+                let (expected, found) = (
+                    self.subst.resolve_row(expected),
+                    self.subst.resolve_row(found),
+                );
                 let extra: Vec<String> = found
                     .atoms
                     .difference(&expected.atoms)
@@ -2142,9 +2474,11 @@ impl<'a> Checker<'a> {
     }
 
     fn unknown_name(&mut self, q: &QName) {
-        let mut d =
-            Diagnostic::error(codes::UNKNOWN_NAME, format!("unknown name `{}`", q.symbol()))
-                .primary(q.span, "not found in this scope");
+        let mut d = Diagnostic::error(
+            codes::UNKNOWN_NAME,
+            format!("unknown name `{}`", q.symbol()),
+        )
+        .primary(q.span, "not found in this scope");
         if let Some(near) = self.nearest_name(q.symbol()) {
             d = d.note(format!("a name in scope looks similar: `{near}`"));
         }
@@ -2164,7 +2498,9 @@ impl<'a> Checker<'a> {
         let mut best: Option<(usize, Symbol)> = None;
         for c in self.scope().values.keys() {
             let d = edit_distance(name.as_str(), c.as_str());
-            if d > 0 && d * 3 <= name.as_str().len().max(1) && best.as_ref().is_none_or(|(b, _)| d < *b)
+            if d > 0
+                && d * 3 <= name.as_str().len().max(1)
+                && best.as_ref().is_none_or(|(b, _)| d < *b)
             {
                 best = Some((d, c.clone()));
             }
@@ -2204,7 +2540,11 @@ fn is_cell_builtin(name: &Symbol) -> bool {
 }
 
 fn supplied(n: usize) -> String {
-    if n == 1 { "1 was supplied".to_string() } else { format!("{n} were supplied") }
+    if n == 1 {
+        "1 was supplied".to_string()
+    } else {
+        format!("{n} were supplied")
+    }
 }
 
 fn contains_fn(t: &Type) -> bool {
@@ -2261,7 +2601,11 @@ fn missing_list_lengths<'a>(arms: impl Iterator<Item = &'a MatchArm>) -> Vec<Str
         }
     }
     let longest = exact.iter().copied().max().map_or(0, |n| n + 1);
-    let bound = if open_from == usize::MAX { longest } else { open_from };
+    let bound = if open_from == usize::MAX {
+        longest
+    } else {
+        open_from
+    };
     let mut missing: Vec<String> = (0..bound)
         .filter(|n| !exact.contains(n))
         .map(|n| match n {
@@ -2334,7 +2678,11 @@ fn collect_refs<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
             collect_refs(func, out);
             args.iter().for_each(|a| collect_refs(a, out));
         }
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_refs(cond, out);
             collect_refs(then_branch, out);
             collect_refs(else_branch, out);
@@ -2363,7 +2711,11 @@ fn collect_refs<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
         ExprKind::Field { base, .. } => collect_refs(base, out),
         ExprKind::List { items } => items.iter().for_each(|i| collect_refs(i, out)),
         ExprKind::Perform { args, .. } => args.iter().for_each(|a| collect_refs(a, out)),
-        ExprKind::Handle { body, clauses, return_clause } => {
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
             collect_refs(body, out);
             clauses.iter().for_each(|c| collect_refs(&c.body, out));
             if let Some(rc) = return_clause {

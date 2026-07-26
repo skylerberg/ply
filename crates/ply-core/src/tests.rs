@@ -31,7 +31,10 @@ fn ex(kind: ExprKind) -> Expr {
 }
 
 fn ex_at(kind: ExprKind, start: u32) -> Expr {
-    Expr { kind, span: sp(start) }
+    Expr {
+        kind,
+        span: sp(start),
+    }
 }
 
 fn var(name: &str) -> Expr {
@@ -47,7 +50,10 @@ fn bool_lit(v: bool) -> Expr {
 }
 
 fn app(func: Expr, args: Vec<Expr>) -> Expr {
-    ex(ExprKind::App { func: Box::new(func), args })
+    ex(ExprKind::App {
+        func: Box::new(func),
+        args,
+    })
 }
 
 fn call(name: &str, args: Vec<Expr>) -> Expr {
@@ -58,23 +64,37 @@ fn lambda(params: &[&str], body: Expr) -> Expr {
     ex(ExprKind::Lambda {
         params: params
             .iter()
-            .map(|p| Param { name: id(p), ty: None, span: any() })
+            .map(|p| Param {
+                name: id(p),
+                ty: None,
+                span: any(),
+            })
             .collect(),
         body: Box::new(body),
     })
 }
 
 fn add(l: Expr, r: Expr) -> Expr {
-    ex(ExprKind::Binary { op: BinOp::Add, lhs: Box::new(l), rhs: Box::new(r) })
+    ex(ExprKind::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(l),
+        rhs: Box::new(r),
+    })
 }
 
 fn block(stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
-    ex(ExprKind::Block { stmts, tail: tail.map(Box::new) })
+    ex(ExprKind::Block {
+        stmts,
+        tail: tail.map(Box::new),
+    })
 }
 
 fn let_(name: &str, value: Expr) -> Stmt {
     Stmt::Let {
-        pat: Pattern { kind: PatternKind::Var(id(name)), span: any() },
+        pat: Pattern {
+            kind: PatternKind::Var(id(name)),
+            span: any(),
+        },
         ty: None,
         value: Box::new(value),
         span: any(),
@@ -85,13 +105,7 @@ fn perform(effect: &str, op: &str, resource: Option<&str>, args: Vec<Expr>) -> E
     perform_at(effect, op, resource, args, 0)
 }
 
-fn perform_at(
-    effect: &str,
-    op: &str,
-    resource: Option<&str>,
-    args: Vec<Expr>,
-    start: u32,
-) -> Expr {
+fn perform_at(effect: &str, op: &str, resource: Option<&str>, args: Vec<Expr>, start: u32) -> Expr {
     ex_at(
         ExprKind::Perform {
             effect: id(effect).into(),
@@ -103,7 +117,13 @@ fn perform_at(
     )
 }
 
-fn clause(effect: &str, op: &str, resource: Option<&str>, params: &[&str], body: Expr) -> HandleClause {
+fn clause(
+    effect: &str,
+    op: &str,
+    resource: Option<&str>,
+    params: &[&str],
+    body: Expr,
+) -> HandleClause {
     HandleClause {
         effect: id(effect).into(),
         op: id(op),
@@ -115,7 +135,11 @@ fn clause(effect: &str, op: &str, resource: Option<&str>, params: &[&str], body:
 }
 
 fn handle(body: Expr, clauses: Vec<HandleClause>) -> Expr {
-    ex(ExprKind::Handle { body: Box::new(body), clauses, return_clause: None })
+    ex(ExprKind::Handle {
+        body: Box::new(body),
+        clauses,
+        return_clause: None,
+    })
 }
 
 fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
@@ -128,7 +152,11 @@ fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
 }
 
 fn con(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
-    TypeExpr::Con { name: id(name).into(), args, span: any() }
+    TypeExpr::Con {
+        name: id(name).into(),
+        args,
+        span: any(),
+    }
 }
 
 fn tvar(name: &str) -> TypeExpr {
@@ -163,7 +191,11 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
             generics: Generics::default(),
             params: params
                 .iter()
-                .map(|p| Param { name: id(p), ty: None, span: any() })
+                .map(|p| Param {
+                    name: id(p),
+                    ty: None,
+                    span: any(),
+                })
                 .collect(),
             ret: None,
             effects: None,
@@ -174,6 +206,12 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
 }
 
 impl FnBuilder {
+    /// Moves the *name*'s span, which is what a redefinition label points at.
+    fn named_at(mut self, start: u32) -> Self {
+        self.def.name.span = sp(start);
+        self
+    }
+
     fn generics(mut self, types: &[&str], effects: &[&str]) -> Self {
         self.def.generics = Generics {
             types: types.iter().map(|t| id(t)).collect(),
@@ -205,11 +243,24 @@ impl FnBuilder {
 }
 
 fn effect_def(name: &str, nondet: bool, ops: Vec<OpDef>) -> Item {
-    Item::Effect(Box::new(EffectDef { vis: Visibility::Private, name: id(name), nondet, ops, span: any() }))
+    Item::Effect(Box::new(EffectDef {
+        vis: Visibility::Private,
+        name: id(name),
+        nondet,
+        ops,
+        span: any(),
+    }))
 }
 
 fn op(name: &str, mode: Mode, resource_param: bool, params: Vec<TypeExpr>, ret: TypeExpr) -> OpDef {
-    OpDef { name: id(name), mode, resource_param, params, ret, span: any() }
+    OpDef {
+        name: id(name),
+        mode,
+        resource_param,
+        params,
+        ret,
+        span: any(),
+    }
 }
 
 fn test_def(name: &str, nondet: bool, body: Expr) -> Item {
@@ -223,7 +274,12 @@ fn test_def(name: &str, nondet: bool, body: Expr) -> Item {
 }
 
 fn module(items: Vec<Item>) -> Module {
-    Module { name: ModuleName::anonymous(), source: SRC, imports: Vec::new(), items }
+    Module {
+        name: ModuleName::anonymous(),
+        source: SRC,
+        imports: Vec::new(),
+        items,
+    }
 }
 
 fn check(items: Vec<Item>) -> CheckOutput {
@@ -244,8 +300,11 @@ fn render(diags: &[Diagnostic]) -> String {
     diags
         .iter()
         .map(|d| {
-            let labels: Vec<String> =
-                d.labels.iter().map(|l| format!("  @{}..{} {}", l.span.start, l.span.end, l.message)).collect();
+            let labels: Vec<String> = d
+                .labels
+                .iter()
+                .map(|l| format!("  @{}..{} {}", l.span.start, l.span.end, l.message))
+                .collect();
             format!("[{}] {}\n{}", d.code, d.message, labels.join("\n"))
         })
         .collect::<Vec<_>>()
@@ -257,7 +316,9 @@ fn sig(out: &CheckOutput, name: &str) -> String {
 }
 
 fn def<'a>(out: &'a CheckOutput, name: &str) -> &'a DefInfo {
-    out.defs.get(&Symbol::new(name)).unwrap_or_else(|| panic!("no definition `{name}`"))
+    out.defs
+        .get(&Symbol::new(name))
+        .unwrap_or_else(|| panic!("no definition `{name}`"))
 }
 
 fn footprint(out: &CheckOutput, name: &str) -> String {
@@ -280,7 +341,13 @@ fn db_effect() -> Item {
         "db",
         false,
         vec![
-            op("get", Mode::Read, true, vec![con("Int", vec![])], con("Int", vec![])),
+            op(
+                "get",
+                Mode::Read,
+                true,
+                vec![con("Int", vec![])],
+                con("Int", vec![]),
+            ),
             op(
                 "put",
                 Mode::Write,
@@ -345,7 +412,12 @@ fn a_declared_type_variable_cannot_be_pinned_to_a_concrete_type() {
 fn a_perform_contributes_its_atom_to_the_row() {
     let out = check(vec![
         db_effect(),
-        func("read_one", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "read_one",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
     ]);
     assert_eq!(footprint(&out, "read_one"), "{db.read[users]}");
     assert_eq!(sig(&out, "read_one"), "() -> Int / {db.read[users]}");
@@ -355,16 +427,32 @@ fn a_perform_contributes_its_atom_to_the_row() {
 fn rows_accumulate_through_application_and_composition() {
     let out = check(vec![
         db_effect(),
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
-        func("writer", &[], perform("db", "put", Some("orders"), vec![int(1), int(2)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
+        func(
+            "writer",
+            &[],
+            perform("db", "put", Some("orders"), vec![int(1), int(2)]),
+        )
+        .item(),
         func(
             "both",
             &[],
-            block(vec![Stmt::Expr(call("reader", vec![]))], Some(call("writer", vec![]))),
+            block(
+                vec![Stmt::Expr(call("reader", vec![]))],
+                Some(call("writer", vec![])),
+            ),
         )
         .item(),
     ]);
-    assert_eq!(footprint(&out, "both"), "{db.write[orders], db.read[users]}");
+    assert_eq!(
+        footprint(&out, "both"),
+        "{db.write[orders], db.read[users]}"
+    );
 }
 
 #[test]
@@ -383,7 +471,12 @@ fn effect_polymorphism_threads_a_row_variable_through_a_higher_order_function() 
     let out = check(vec![
         db_effect(),
         apply,
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
         func("use_it", &[], call("apply", vec![var("reader")])).item(),
     ]);
     assert_eq!(sig(&out, "apply"), "<a | e>(() -> a / e) -> a / e");
@@ -397,7 +490,10 @@ fn the_prelude_map_stays_effect_polymorphic_and_pure_at_a_pure_call() {
         func(
             "doubled",
             &["xs"],
-            call("map", vec![var("xs"), lambda(&["x"], add(var("x"), var("x")))]),
+            call(
+                "map",
+                vec![var("xs"), lambda(&["x"], add(var("x"), var("x")))],
+            ),
         )
         .item(),
     ]);
@@ -409,7 +505,12 @@ fn the_prelude_map_stays_effect_polymorphic_and_pure_at_a_pure_call() {
 fn a_handler_subtracts_the_atoms_it_discharges() {
     let out = check(vec![
         db_effect(),
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
         func(
             "isolated",
             &[],
@@ -428,7 +529,12 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
 fn a_handler_only_subtracts_the_resource_it_names() {
     let out = check(vec![
         db_effect(),
-        func("reader", &[], perform("db", "get", Some("orders"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("orders"), vec![int(1)]),
+        )
+        .item(),
         func(
             "still_dirty",
             &[],
@@ -451,7 +557,12 @@ fn a_handler_clause_adds_its_own_effects_to_the_result() {
             false,
             vec![op("fetch", Mode::Read, false, vec![], con("Int", vec![]))],
         ),
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
         func(
             "backed_by_socket",
             &[],
@@ -487,40 +598,66 @@ fn with_cell_discharges_the_cell_atoms_of_its_own_region() {
 #[test]
 fn a_cell_may_not_outlive_the_region_that_discharges_its_atoms() {
     let diags = check_err(vec![
-        func("escaped", &["x"], with_cell("users", var("x"), "c", var("c"))).item(),
+        func(
+            "escaped",
+            &["x"],
+            with_cell("users", var("x"), "c", var("c")),
+        )
+        .item(),
     ]);
     let d = only(&diags, codes::TYPE_MISMATCH);
     assert_eq!(d.message, "the cell escapes its `with_cell[users]` region");
-    assert!(d.labels[0].message.contains("Cell[users]"), "{}", d.labels[0].message);
+    assert!(
+        d.labels[0].message.contains("Cell[users]"),
+        "{}",
+        d.labels[0].message
+    );
 }
 
 #[test]
 fn a_region_escape_is_caught_however_the_cell_is_wrapped() {
-    let in_a_list = with_cell("users", int(0), "c", ex(ExprKind::List { items: vec![var("c")] }));
-    assert!(
-        has_code(&check_err(vec![func("f", &[], in_a_list).item()]), codes::TYPE_MISMATCH),
+    let in_a_list = with_cell(
+        "users",
+        int(0),
+        "c",
+        ex(ExprKind::List {
+            items: vec![var("c")],
+        }),
     );
+    assert!(has_code(
+        &check_err(vec![func("f", &[], in_a_list).item()]),
+        codes::TYPE_MISMATCH
+    ),);
 
     let in_a_record = with_cell(
         "users",
         int(0),
         "c",
-        ex(ExprKind::Record { fields: vec![(id("held"), var("c"))] }),
+        ex(ExprKind::Record {
+            fields: vec![(id("held"), var("c"))],
+        }),
     );
-    assert!(
-        has_code(&check_err(vec![func("g", &[], in_a_record).item()]), codes::TYPE_MISMATCH),
-    );
+    assert!(has_code(
+        &check_err(vec![func("g", &[], in_a_record).item()]),
+        codes::TYPE_MISMATCH
+    ),);
 
     let in_a_closure = with_cell("users", int(0), "c", lambda(&["_ignored"], var("c")));
-    assert!(
-        has_code(&check_err(vec![func("h", &[], in_a_closure).item()]), codes::TYPE_MISMATCH),
-    );
+    assert!(has_code(
+        &check_err(vec![func("h", &[], in_a_closure).item()]),
+        codes::TYPE_MISMATCH
+    ),);
 }
 
 #[test]
 fn a_region_that_returns_a_plain_value_is_accepted() {
     let out = check(vec![
-        func("f", &[], with_cell("users", int(1), "c", call("cell_get", vec![var("c")]))).item(),
+        func(
+            "f",
+            &[],
+            with_cell("users", int(1), "c", call("cell_get", vec![var("c")])),
+        )
+        .item(),
     ]);
     assert_eq!(sig(&out, "f"), "() -> Int");
     assert_eq!(footprint(&out, "f"), "{}");
@@ -537,7 +674,10 @@ fn nested_regions_keep_their_cells_apart() {
             bool_lit(true),
             "d",
             block(
-                vec![Stmt::Expr(call("cell_set", vec![var("d"), bool_lit(false)]))],
+                vec![Stmt::Expr(call(
+                    "cell_set",
+                    vec![var("d"), bool_lit(false)],
+                ))],
                 Some(call("cell_get", vec![var("c")])),
             ),
         ),
@@ -550,7 +690,12 @@ fn nested_regions_keep_their_cells_apart() {
         "outer",
         int(0),
         "c",
-        with_cell("inner", bool_lit(true), "d", call("cell_set", vec![var("c"), bool_lit(false)])),
+        with_cell(
+            "inner",
+            bool_lit(true),
+            "d",
+            call("cell_set", vec![var("c"), bool_lit(false)]),
+        ),
     );
     let diags = check_err(vec![func("confused", &[], bad).item()]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
@@ -574,9 +719,15 @@ fn a_nondet_effect_handled_at_another_resource_still_fails_the_test() {
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
     assert_eq!(primary.span.start, 91);
-    assert!(primary.message.contains("sensors.read[north]"), "{}", primary.message);
     assert!(
-        d.notes.iter().any(|n| n.contains("sensors.read_at[north]()")),
+        primary.message.contains("sensors.read[north]"),
+        "{}",
+        primary.message
+    );
+    assert!(
+        d.notes
+            .iter()
+            .any(|n| n.contains("sensors.read_at[north]()")),
         "{:?}",
         d.notes
     );
@@ -603,7 +754,11 @@ fn two_distinct_effect_variables_cannot_be_merged_by_one_annotation() {
     .effects(row(&[], Some("e")))
     .item();
     let diags = check_err(vec![def]);
-    assert!(has_code(&diags, codes::EFFECT_NOT_PERMITTED), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::EFFECT_NOT_PERMITTED),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -616,10 +771,16 @@ fn a_handled_atom_stops_being_evidence_for_the_determinism_check() {
         vec![Stmt::Expr(handled)],
         Some(perform_at("clock", "now", None, vec![], 20)),
     );
-    let diags = check_err(vec![clock_effect(), test_def("one handled one not", false, body)]);
+    let diags = check_err(vec![
+        clock_effect(),
+        test_def("one handled one not", false, body),
+    ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
-    assert_eq!(primary.span.start, 20, "the blamed perform must be the surviving one");
+    assert_eq!(
+        primary.span.start, 20,
+        "the blamed perform must be the surviving one"
+    );
 }
 
 #[test]
@@ -636,11 +797,22 @@ fn a_cell_whose_region_is_unknown_is_a_resource_error() {
 fn a_handler_inside_a_cell_region_keeps_the_test_isolated() {
     let handled = handle(
         call("reader", vec![]),
-        vec![clause("db", "get", Some("users"), &["k"], call("cell_get", vec![var("c")]))],
+        vec![clause(
+            "db",
+            "get",
+            Some("users"),
+            &["k"],
+            call("cell_get", vec![var("c")]),
+        )],
     );
     let out = check(vec![
         db_effect(),
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
         func("isolated", &[], with_cell("users", int(0), "c", handled)).item(),
     ]);
     assert_eq!(footprint(&out, "isolated"), "{}");
@@ -648,15 +820,25 @@ fn a_handler_inside_a_cell_region_keeps_the_test_isolated() {
 
 #[test]
 fn an_annotation_is_an_upper_bound_and_is_what_gets_published() {
-    let def = func("reads_only", &[], perform("db", "get", Some("users"), vec![int(1)]))
-        .ret(con("Int", vec![]))
-        .effects(row(
-            &[("db", Mode::Read, Some("users")), ("db", Mode::Write, Some("audit"))],
-            None,
-        ))
-        .item();
+    let def = func(
+        "reads_only",
+        &[],
+        perform("db", "get", Some("users"), vec![int(1)]),
+    )
+    .ret(con("Int", vec![]))
+    .effects(row(
+        &[
+            ("db", Mode::Read, Some("users")),
+            ("db", Mode::Write, Some("audit")),
+        ],
+        None,
+    ))
+    .item();
     let out = check(vec![db_effect(), def]);
-    assert_eq!(footprint(&out, "reads_only"), "{db.write[audit], db.read[users]}");
+    assert_eq!(
+        footprint(&out, "reads_only"),
+        "{db.write[audit], db.read[users]}"
+    );
 }
 
 #[test]
@@ -665,7 +847,13 @@ fn an_annotation_that_omits_an_atom_names_the_atom_and_the_perform() {
         "sneaky",
         &[],
         block(
-            vec![Stmt::Expr(perform_at("db", "put", Some("orders"), vec![int(1), int(2)], 40))],
+            vec![Stmt::Expr(perform_at(
+                "db",
+                "put",
+                Some("orders"),
+                vec![int(1), int(2)],
+                40,
+            ))],
             Some(perform("db", "get", Some("users"), vec![int(1)])),
         ),
     )
@@ -677,7 +865,11 @@ fn an_annotation_that_omits_an_atom_names_the_atom_and_the_perform() {
     let d = only(&diags, codes::EFFECT_NOT_PERMITTED);
     assert!(d.message.contains("db.write[orders]"), "{}", d.message);
     assert_eq!(d.primary_span().unwrap().start, 40, "{}", render(&diags));
-    assert!(d.notes.iter().any(|n| n.contains("db.write[orders]")), "{:?}", d.notes);
+    assert!(
+        d.notes.iter().any(|n| n.contains("db.write[orders]")),
+        "{:?}",
+        d.notes
+    );
 }
 
 #[test]
@@ -687,7 +879,11 @@ fn an_undeclared_effect_variable_in_an_annotation_is_an_unbound_row_var() {
         .effects(row(&[], Some("e")))
         .item();
     let diags = check_err(vec![def]);
-    assert!(has_code(&diags, codes::UNBOUND_ROW_VAR), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::UNBOUND_ROW_VAR),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -696,13 +892,20 @@ fn a_nondet_effect_surviving_in_a_det_test_is_e0412() {
         vec![let_("now", perform_at("clock", "now", None, vec![], 77))],
         Some(call("assert", vec![bool_lit(true)])),
     );
-    let diags = check_err(vec![clock_effect(), test_def("uses the clock", false, body)]);
+    let diags = check_err(vec![
+        clock_effect(),
+        test_def("uses the clock", false, body),
+    ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
 
     assert_eq!(d.message, "nondeterministic effect in a deterministic test");
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
     assert_eq!(primary.span.start, 77);
-    assert!(primary.message.contains("clock.read"), "{}", primary.message);
+    assert!(
+        primary.message.contains("clock.read"),
+        "{}",
+        primary.message
+    );
     assert!(primary.message.contains("nondet"), "{}", primary.message);
     assert!(
         d.notes.iter().any(|n| n.contains("clock.now()")),
@@ -719,7 +922,10 @@ fn a_nondet_effect_surviving_in_a_det_test_is_e0412() {
 #[test]
 fn handling_the_nondet_effect_makes_the_test_deterministic() {
     let body = handle(
-        block(vec![Stmt::Expr(perform("clock", "now", None, vec![]))], Some(int(0))),
+        block(
+            vec![Stmt::Expr(perform("clock", "now", None, vec![]))],
+            Some(int(0)),
+        ),
         vec![clause("clock", "now", None, &[], int(1234))],
     );
     let out = check(vec![clock_effect(), test_def("frozen clock", false, body)]);
@@ -729,7 +935,10 @@ fn handling_the_nondet_effect_makes_the_test_deterministic() {
 
 #[test]
 fn test_nondet_opts_out_of_the_determinism_check() {
-    let body = block(vec![Stmt::Expr(perform("clock", "now", None, vec![]))], Some(int(0)));
+    let body = block(
+        vec![Stmt::Expr(perform("clock", "now", None, vec![]))],
+        Some(int(0)),
+    );
     let out = check(vec![clock_effect(), test_def("wall clock", true, body)]);
     assert_eq!(out.tests[0].footprint.to_string(), "{clock.read}");
     assert!(out.tests[0].nondet);
@@ -738,11 +947,21 @@ fn test_nondet_opts_out_of_the_determinism_check() {
 #[test]
 fn e0412_points_through_a_call_when_the_perform_is_indirect() {
     let helper = func("stamp", &[], perform("clock", "now", None, vec![])).item();
-    let body = block(vec![], Some(ex_at(ExprKind::App {
-        func: Box::new(var("stamp")),
-        args: vec![],
-    }, 55)));
-    let diags = check_err(vec![clock_effect(), helper, test_def("indirect", false, body)]);
+    let body = block(
+        vec![],
+        Some(ex_at(
+            ExprKind::App {
+                func: Box::new(var("stamp")),
+                args: vec![],
+            },
+            55,
+        )),
+    );
+    let diags = check_err(vec![
+        clock_effect(),
+        helper,
+        test_def("indirect", false, body),
+    ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
     assert_eq!(primary.span.start, 55);
@@ -755,14 +974,22 @@ fn a_missing_resource_label_is_reported_at_the_perform() {
     let diags = check_err(vec![db_effect(), def]);
     let d = only(&diags, codes::RESOURCE_REQUIRED);
     assert_eq!(d.primary_span().unwrap().start, 12);
-    assert!(d.notes.iter().any(|n| n.contains("db.get[")), "{:?}", d.notes);
+    assert!(
+        d.notes.iter().any(|n| n.contains("db.get[")),
+        "{:?}",
+        d.notes
+    );
 }
 
 #[test]
 fn a_resource_label_on_a_plain_operation_is_rejected() {
     let def = func("f", &[], perform("clock", "now", Some("wall"), vec![])).item();
     let diags = check_err(vec![clock_effect(), def]);
-    assert!(has_code(&diags, codes::RESOURCE_REQUIRED), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::RESOURCE_REQUIRED),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -790,13 +1017,30 @@ fn unknown_effects_and_operations_are_reported_at_their_own_idents() {
     )
     .item();
     let diags = check_err(vec![db_effect(), bad_effect, bad_op]);
-    assert_eq!(only(&diags, codes::UNKNOWN_EFFECT).primary_span().unwrap().start, 30);
-    assert_eq!(only(&diags, codes::UNKNOWN_OPERATION).primary_span().unwrap().start, 60);
+    assert_eq!(
+        only(&diags, codes::UNKNOWN_EFFECT)
+            .primary_span()
+            .unwrap()
+            .start,
+        30
+    );
+    assert_eq!(
+        only(&diags, codes::UNKNOWN_OPERATION)
+            .primary_span()
+            .unwrap()
+            .start,
+        60
+    );
 }
 
 #[test]
 fn an_operation_call_with_the_wrong_arity_is_reported() {
-    let def = func("f", &[], perform("db", "get", Some("users"), vec![int(1), int(2)])).item();
+    let def = func(
+        "f",
+        &[],
+        perform("db", "get", Some("users"), vec![int(1), int(2)]),
+    )
+    .item();
     let diags = check_err(vec![db_effect(), def]);
     let d = only(&diags, codes::ARITY_MISMATCH);
     assert!(d.message.contains("db.get"), "{}", d.message);
@@ -811,7 +1055,13 @@ fn several_independent_errors_are_reported_in_one_run() {
         func("c", &[], add(bool_lit(true), int(1))).item(),
     ];
     let diags = check_err(items);
-    assert_eq!(diags.iter().filter(|d| d.code == codes::UNKNOWN_NAME).count(), 2);
+    assert_eq!(
+        diags
+            .iter()
+            .filter(|d| d.code == codes::UNKNOWN_NAME)
+            .count(),
+        2
+    );
     assert!(has_code(&diags, codes::TYPE_MISMATCH));
 }
 
@@ -827,11 +1077,14 @@ fn mutual_recursion_is_generalized_as_one_component() {
                 rhs: Box::new(int(0)),
             })),
             then_branch: Box::new(bool_lit(true)),
-            else_branch: Box::new(call("is_odd", vec![ex(ExprKind::Binary {
-                op: BinOp::Sub,
-                lhs: Box::new(var("n")),
-                rhs: Box::new(int(1)),
-            })])),
+            else_branch: Box::new(call(
+                "is_odd",
+                vec![ex(ExprKind::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(var("n")),
+                    rhs: Box::new(int(1)),
+                })],
+            )),
         }),
     )
     .item();
@@ -845,11 +1098,14 @@ fn mutual_recursion_is_generalized_as_one_component() {
                 rhs: Box::new(int(0)),
             })),
             then_branch: Box::new(bool_lit(false)),
-            else_branch: Box::new(call("is_even", vec![ex(ExprKind::Binary {
-                op: BinOp::Sub,
-                lhs: Box::new(var("n")),
-                rhs: Box::new(int(1)),
-            })])),
+            else_branch: Box::new(call(
+                "is_even",
+                vec![ex(ExprKind::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(var("n")),
+                    rhs: Box::new(int(1)),
+                })],
+            )),
         }),
     )
     .item();
@@ -886,8 +1142,16 @@ fn sum_types_give_constructors_and_exhaustiveness() {
         name: id("Option"),
         params: vec![id("a")],
         body: TypeDefBody::Sum(vec![
-            VariantDef { name: id("None"), fields: vec![], span: any() },
-            VariantDef { name: id("Some"), fields: vec![tvar("a")], span: any() },
+            VariantDef {
+                name: id("None"),
+                fields: vec![],
+                span: any(),
+            },
+            VariantDef {
+                name: id("Some"),
+                fields: vec![tvar("a")],
+                span: any(),
+            },
         ]),
         span: any(),
     }));
@@ -900,11 +1164,20 @@ fn sum_types_give_constructors_and_exhaustiveness() {
     let full = ex(ExprKind::Match {
         scrutinee: Box::new(var("o")),
         arms: vec![
-            arm(PatternKind::Ctor { name: id("None").into(), args: vec![] }, int(0)),
+            arm(
+                PatternKind::Ctor {
+                    name: id("None").into(),
+                    args: vec![],
+                },
+                int(0),
+            ),
             arm(
                 PatternKind::Ctor {
                     name: id("Some").into(),
-                    args: vec![Pattern { kind: PatternKind::Var(id("v")), span: any() }],
+                    args: vec![Pattern {
+                        kind: PatternKind::Var(id("v")),
+                        span: any(),
+                    }],
                 },
                 var("v"),
             ),
@@ -922,11 +1195,21 @@ fn sum_types_give_constructors_and_exhaustiveness() {
 
     let partial = ex(ExprKind::Match {
         scrutinee: Box::new(var("o")),
-        arms: vec![arm(PatternKind::Ctor { name: id("None").into(), args: vec![] }, int(0))],
+        arms: vec![arm(
+            PatternKind::Ctor {
+                name: id("None").into(),
+                args: vec![],
+            },
+            int(0),
+        )],
     });
     let diags = check_err(vec![option, func("partial", &["o"], partial).item()]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
-    assert!(d.labels[0].message.contains("Some"), "{}", d.labels[0].message);
+    assert!(
+        d.labels[0].message.contains("Some"),
+        "{}",
+        d.labels[0].message
+    );
 }
 
 #[test]
@@ -940,7 +1223,11 @@ fn the_occurs_check_rejects_self_application() {
 fn calling_a_non_function_is_reported_as_such() {
     let def = func("f", &[], app(int(1), vec![int(2)])).item();
     let diags = check_err(vec![def]);
-    assert!(has_code(&diags, codes::NOT_A_FUNCTION), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::NOT_A_FUNCTION),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -950,7 +1237,109 @@ fn duplicate_definitions_are_reported_once_and_the_first_wins() {
         func("f", &[], bool_lit(true)).item(),
     ];
     let diags = check_err(items);
-    assert_eq!(diags.iter().filter(|d| d.code == codes::DUPLICATE_DEFINITION).count(), 1);
+    assert_eq!(
+        diags
+            .iter()
+            .filter(|d| d.code == codes::DUPLICATE_DEFINITION)
+            .count(),
+        1
+    );
+}
+
+/// Constructors and functions are one namespace, so declaring both under a name
+/// makes the second unreachable. Accepting it silently is the worse half: the
+/// call site keeps compiling and quietly means the other thing.
+#[test]
+fn a_function_and_a_constructor_may_not_share_a_name() {
+    let variant = |name: &str, start: u32| VariantDef {
+        name: id_at(name, start),
+        fields: vec![con("Int", vec![])],
+        span: sp(start),
+    };
+    let sum = Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
+        name: id("Wrapper"),
+        params: vec![],
+        body: TypeDefBody::Sum(vec![variant("Tag", 40)]),
+        span: any(),
+    }));
+    let items = vec![func("Tag", &["x"], var("x")).named_at(10).item(), sum];
+
+    let diags = check_err(items);
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert!(
+        d.message.contains("`Tag` is defined twice"),
+        "{}",
+        render(&diags)
+    );
+    assert_eq!(
+        d.primary_span().expect("a real span").start,
+        40,
+        "{}",
+        render(&diags)
+    );
+    assert!(
+        d.labels.iter().any(|l| !l.primary && l.span.start == 10),
+        "the first declaration has to be pointed at too: {}",
+        render(&diags)
+    );
+    assert!(
+        d.notes.iter().any(|n| n.contains("rename")),
+        "{:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn a_constructor_and_a_later_function_are_reported_against_the_function() {
+    let sum = Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
+        name: id("Wrapper"),
+        params: vec![],
+        body: TypeDefBody::Sum(vec![VariantDef {
+            name: id_at("Tag", 10),
+            fields: vec![con("Int", vec![])],
+            span: sp(10),
+        }]),
+        span: any(),
+    }));
+    let items = vec![sum, func("Tag", &["x"], var("x")).named_at(40).item()];
+
+    let diags = check_err(items);
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert_eq!(
+        d.primary_span().expect("a real span").start,
+        40,
+        "{}",
+        render(&diags)
+    );
+    assert!(
+        d.labels.iter().any(|l| l.message.contains("as a function")),
+        "{}",
+        render(&diags)
+    );
+}
+
+/// The check may not fire between namespaces that really are separate, nor
+/// report a same-kind collision a second time.
+#[test]
+fn a_type_an_effect_and_a_function_may_all_share_one_name() {
+    let out = check(vec![
+        Item::Type(Box::new(TypeDef {
+            vis: Visibility::Private,
+            name: id("thing"),
+            params: vec![],
+            body: TypeDefBody::Alias(con("Int", vec![])),
+            span: any(),
+        })),
+        effect_def(
+            "thing",
+            false,
+            vec![op("get", Mode::Read, true, vec![], con("Int", vec![]))],
+        ),
+        func("thing", &[], int(1)).item(),
+    ]);
+    assert_eq!(sig(&out, "thing"), "() -> Int");
 }
 
 #[test]
@@ -960,7 +1349,11 @@ fn a_user_effect_may_not_be_called_cell() {
         false,
         vec![op("peek", Mode::Read, true, vec![], con("Int", vec![]))],
     )]);
-    assert!(has_code(&diags, codes::DUPLICATE_DEFINITION), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::DUPLICATE_DEFINITION),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -989,7 +1382,9 @@ fn a_type_alias_is_expanded_and_a_cyclic_one_is_caught() {
     }));
     let diags = check_err(vec![
         cyclic,
-        func("f", &["x"], var("x")).param_types(vec![Some(con("Loop", vec![]))]).item(),
+        func("f", &["x"], var("x"))
+            .param_types(vec![Some(con("Loop", vec![]))])
+            .item(),
     ]);
     assert!(has_code(&diags, codes::UNKNOWN_TYPE), "{}", render(&diags));
 }
@@ -1003,8 +1398,18 @@ fn a_generic_effect_operation_is_instantiated_per_call_site() {
     );
     let out = check(vec![
         store,
-        func("as_int", &[], perform("store", "echo", Some("k"), vec![int(1)])).item(),
-        func("as_bool", &[], perform("store", "echo", Some("k"), vec![bool_lit(true)])).item(),
+        func(
+            "as_int",
+            &[],
+            perform("store", "echo", Some("k"), vec![int(1)]),
+        )
+        .item(),
+        func(
+            "as_bool",
+            &[],
+            perform("store", "echo", Some("k"), vec![bool_lit(true)]),
+        )
+        .item(),
     ]);
     assert_eq!(sig(&out, "as_int"), "() -> Int / {store.read[k]}");
     assert_eq!(sig(&out, "as_bool"), "() -> Bool / {store.read[k]}");
@@ -1044,7 +1449,12 @@ fn a_return_clause_changes_the_result_type_of_the_handle() {
 fn a_test_footprint_reaches_through_the_functions_it_calls() {
     let out = check(vec![
         db_effect(),
-        func("reader", &[], perform("db", "get", Some("users"), vec![int(1)])).item(),
+        func(
+            "reader",
+            &[],
+            perform("db", "get", Some("users"), vec![int(1)]),
+        )
+        .item(),
         test_def(
             "reads users",
             false,
@@ -1087,18 +1497,34 @@ fn a_handler_that_forwards_to_the_real_effect_stays_honest() {
     let diags = check_err(vec![clock_effect(), test_def("forwarding", false, body)]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
-    assert_eq!(primary.span.start, 30, "the clause body is what still performs it");
+    assert_eq!(
+        primary.span.start, 30,
+        "the clause body is what still performs it"
+    );
 }
 
 #[test]
 fn a_cell_builtin_cannot_escape_as_a_value_or_be_redefined() {
-    let as_value = func("f", &[], block(vec![let_("g", var("cell_get"))], Some(int(1)))).item();
+    let as_value = func(
+        "f",
+        &[],
+        block(vec![let_("g", var("cell_get"))], Some(int(1))),
+    )
+    .item();
     let diags = check_err(vec![as_value]);
-    assert!(has_code(&diags, codes::RESOURCE_REQUIRED), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::RESOURCE_REQUIRED),
+        "{}",
+        render(&diags)
+    );
 
     let redefined = func("cell_get", &["c"], int(0)).item();
     let diags = check_err(vec![redefined]);
-    assert!(has_code(&diags, codes::DUPLICATE_DEFINITION), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::DUPLICATE_DEFINITION),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -1120,7 +1546,10 @@ fn pvar(name: &str) -> Pattern {
 }
 
 fn plist(items: Vec<Pattern>, rest: Option<Pattern>) -> Pattern {
-    pat(PatternKind::List { items, rest: rest.map(Box::new) })
+    pat(PatternKind::List {
+        items,
+        rest: rest.map(Box::new),
+    })
 }
 
 fn match_on(scrutinee: Expr, arms: Vec<(Pattern, Expr)>) -> Expr {
@@ -1128,7 +1557,12 @@ fn match_on(scrutinee: Expr, arms: Vec<(Pattern, Expr)>) -> Expr {
         scrutinee: Box::new(scrutinee),
         arms: arms
             .into_iter()
-            .map(|(p, body)| MatchArm { pat: p, guard: None, body, span: any() })
+            .map(|(p, body)| MatchArm {
+                pat: p,
+                guard: None,
+                body,
+                span: any(),
+            })
             .collect(),
     })
 }
@@ -1157,17 +1591,22 @@ fn an_empty_and_a_cons_arm_cover_every_list() {
 
 #[test]
 fn a_bare_rest_pattern_is_irrefutable() {
-    check(vec![on_int_list(vec![(plist(vec![], Some(pvar("r"))), int(0))]).item()]);
+    check(vec![
+        on_int_list(vec![(plist(vec![], Some(pvar("r"))), int(0))]).item(),
+    ]);
 }
 
 #[test]
 fn a_cons_arm_alone_leaves_the_empty_list_uncovered() {
-    let diags =
-        check_err(vec![
-            on_int_list(vec![(plist(vec![pvar("x")], Some(pvar("r"))), var("x"))]).item()
-        ]);
+    let diags = check_err(vec![
+        on_int_list(vec![(plist(vec![pvar("x")], Some(pvar("r"))), var("x"))]).item(),
+    ]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
-    assert!(d.labels[0].message.contains("the empty list"), "{}", d.labels[0].message);
+    assert!(
+        d.labels[0].message.contains("the empty list"),
+        "{}",
+        d.labels[0].message
+    );
 }
 
 #[test]
@@ -1188,12 +1627,18 @@ fn a_gap_below_the_open_arm_is_reported_by_length() {
     let diags = check_err(vec![
         on_int_list(vec![
             (plist(vec![], None), int(0)),
-            (plist(vec![pvar("x"), pvar("y"), pvar("z")], Some(pvar("r"))), var("x")),
+            (
+                plist(vec![pvar("x"), pvar("y"), pvar("z")], Some(pvar("r"))),
+                var("x"),
+            ),
         ])
         .item(),
     ]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
-    assert_eq!(d.labels[0].message, "not covered: lists of 1 element, lists of 2 elements");
+    assert_eq!(
+        d.labels[0].message,
+        "not covered: lists of 1 element, lists of 2 elements"
+    );
 }
 
 #[test]
@@ -1213,11 +1658,18 @@ fn a_refutable_element_does_not_make_an_arm_cover_that_length() {
     let diags = check_err(vec![
         on_int_list(vec![
             (plist(vec![], None), int(0)),
-            (plist(vec![pat(PatternKind::Lit(Lit::Int(1)))], Some(pvar("r"))), int(1)),
+            (
+                plist(vec![pat(PatternKind::Lit(Lit::Int(1)))], Some(pvar("r"))),
+                int(1),
+            ),
         ])
         .item(),
     ]);
-    assert!(has_code(&diags, codes::NON_EXHAUSTIVE_MATCH), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::NON_EXHAUSTIVE_MATCH),
+        "{}",
+        render(&diags)
+    );
 }
 
 fn pair_record(fields: Vec<(&str, Pattern)>, rest: bool) -> Pattern {
@@ -1229,7 +1681,10 @@ fn pair_record(fields: Vec<(&str, Pattern)>, rest: bool) -> Pattern {
 
 fn pair_ty() -> TypeExpr {
     TypeExpr::Record {
-        fields: vec![(id("first"), con("Int", vec![])), (id("second"), con("Int", vec![]))],
+        fields: vec![
+            (id("first"), con("Int", vec![])),
+            (id("second"), con("Int", vec![])),
+        ],
         span: any(),
     }
 }
@@ -1255,7 +1710,11 @@ fn one_record_arm_naming_every_field_is_exhaustive() {
 #[test]
 fn a_record_arm_with_rest_is_exhaustive_without_naming_every_field() {
     check(vec![
-        on_pair(vec![(pair_record(vec![("first", pvar("a"))], true), var("a"))]).item(),
+        on_pair(vec![(
+            pair_record(vec![("first", pvar("a"))], true),
+            var("a"),
+        )])
+        .item(),
     ]);
 }
 
@@ -1273,7 +1732,11 @@ fn a_record_pattern_without_rest_must_name_every_field() {
     ]);
     let d = only(&diags, codes::TYPE_MISMATCH);
     assert_eq!(d.message, "record pattern does not name every field");
-    assert!(d.labels[0].message.contains("`second`"), "{}", d.labels[0].message);
+    assert!(
+        d.labels[0].message.contains("`second`"),
+        "{}",
+        d.labels[0].message
+    );
 }
 
 #[test]
@@ -1281,14 +1744,21 @@ fn a_refutable_record_field_does_not_make_the_arm_irrefutable() {
     let diags = check_err(vec![
         on_pair(vec![(
             pair_record(
-                vec![("first", pat(PatternKind::Lit(Lit::Int(1)))), ("second", pvar("b"))],
+                vec![
+                    ("first", pat(PatternKind::Lit(Lit::Int(1)))),
+                    ("second", pvar("b")),
+                ],
                 false,
             ),
             var("b"),
         )])
         .item(),
     ]);
-    assert!(has_code(&diags, codes::NON_EXHAUSTIVE_MATCH), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::NON_EXHAUSTIVE_MATCH),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -1313,7 +1783,9 @@ fn comparing_two_functions_is_rejected_before_it_can_run() {
 #[test]
 fn a_function_buried_in_a_compared_value_is_still_rejected() {
     let boxed = |name: &str| {
-        ex(ExprKind::Record { fields: vec![(id("run"), var(name))] })
+        ex(ExprKind::Record {
+            fields: vec![(id("run"), var(name))],
+        })
     };
     let diags = check_err(vec![
         func("f", &["x"], var("x")).item(),
@@ -1339,8 +1811,12 @@ fn comparing_ordinary_values_stays_legal() {
             &["a", "b"],
             ex(ExprKind::Binary {
                 op: BinOp::Eq,
-                lhs: Box::new(ex(ExprKind::List { items: vec![var("a")] })),
-                rhs: Box::new(ex(ExprKind::List { items: vec![var("b")] })),
+                lhs: Box::new(ex(ExprKind::List {
+                    items: vec![var("a")],
+                })),
+                rhs: Box::new(ex(ExprKind::List {
+                    items: vec![var("b")],
+                })),
             }),
         )
         .item(),
@@ -1357,12 +1833,8 @@ fn parse_program(files: &[(&str, &str)]) -> Program {
             .iter()
             .enumerate()
             .map(|(i, (name, text))| {
-                ply_syntax::parse_module(
-                    SourceId(i as u32),
-                    ModuleName::from_dotted(name),
-                    text,
-                )
-                .unwrap_or_else(|d| panic!("`{name}` should parse: {}", render(&d)))
+                ply_syntax::parse_module(SourceId(i as u32), ModuleName::from_dotted(name), text)
+                    .unwrap_or_else(|d| panic!("`{name}` should parse: {}", render(&d)))
             })
             .collect(),
     }
@@ -1393,8 +1865,14 @@ fn check_files_err(files: &[(&str, &str)]) -> Vec<Diagnostic> {
 fn a_definition_resolves_through_three_modules() {
     let out = check_files(&[
         ("base", "pub fn one() -> Int = 1"),
-        ("middle", "import base (one)\npub fn two() -> Int = one() + one()"),
-        ("top", "import middle\nfn four() -> Int = middle::two() + middle::two()"),
+        (
+            "middle",
+            "import base (one)\npub fn two() -> Int = one() + one()",
+        ),
+        (
+            "top",
+            "import middle\nfn four() -> Int = middle::two() + middle::two()",
+        ),
     ]);
 
     assert_eq!(sig(&out, "base.one"), "() -> Int");
@@ -1410,7 +1888,10 @@ fn a_diamond_import_reaches_one_definition_by_both_paths() {
         ("base", "pub fn one() -> Int = 1"),
         ("left", "import base (one)\npub fn l() -> Int = one()"),
         ("right", "import base\npub fn r() -> Int = base::one()"),
-        ("top", "import left\nimport right\nfn t() -> Int = left::l() + right::r()"),
+        (
+            "top",
+            "import left\nimport right\nfn t() -> Int = left::l() + right::r()",
+        ),
     ]);
 
     assert_eq!(sig(&out, "top.t"), "() -> Int");
@@ -1418,18 +1899,28 @@ fn a_diamond_import_reaches_one_definition_by_both_paths() {
     assert_eq!(out.modules.len(), 4);
     assert_eq!(
         out.modules[&Symbol::new("top")].imports,
-        vec![ModuleName::from_dotted("left"), ModuleName::from_dotted("right")]
+        vec![
+            ModuleName::from_dotted("left"),
+            ModuleName::from_dotted("right")
+        ]
     );
 }
 
 #[test]
 fn a_private_definition_cannot_be_called_from_another_module() {
     let diags = check_files_err(&[
-        ("store", "fn secret() -> Int = 1\npub fn place() -> Int = secret()"),
+        (
+            "store",
+            "fn secret() -> Int = 1\npub fn place() -> Int = secret()",
+        ),
         ("app", "import store\nfn f() -> Int = store::secret()"),
     ]);
     let d = only(&diags, codes::PRIVATE_NAME);
-    assert!(d.message.contains("private to module `store`"), "{}", d.message);
+    assert!(
+        d.message.contains("private to module `store`"),
+        "{}",
+        d.message
+    );
     assert!(
         d.notes.iter().any(|n| n.contains("pub fn secret")),
         "the fix must name the module that would have to export it: {:?}",
@@ -1453,7 +1944,11 @@ fn an_imported_name_colliding_with_a_local_one_is_ambiguous() {
         ("store", "pub fn place() -> Int = 1"),
         ("app", "import store (place)\nfn place() -> Int = 2"),
     ]);
-    assert!(has_code(&diags, codes::AMBIGUOUS_IMPORT), "{}", render(&diags));
+    assert!(
+        has_code(&diags, codes::AMBIGUOUS_IMPORT),
+        "{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -1481,7 +1976,10 @@ fn the_prelude_is_still_reachable_where_no_module_item_shadows_it() {
 fn a_local_named_like_a_module_binder_does_not_hide_it() {
     let out = check_files(&[
         ("orders", "pub fn place() -> Int = 7"),
-        ("app", "import orders\nfn f(orders: Int) -> Int = orders + orders::place()"),
+        (
+            "app",
+            "import orders\nfn f(orders: Int) -> Int = orders + orders::place()",
+        ),
     ]);
     assert_eq!(sig(&out, "app.f"), "(Int) -> Int");
 }
@@ -1489,8 +1987,14 @@ fn a_local_named_like_a_module_binder_does_not_hide_it() {
 #[test]
 fn two_modules_may_declare_the_same_effect_without_contending() {
     let out = check_files(&[
-        ("left", "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)"),
-        ("right", "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)"),
+        (
+            "left",
+            "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)",
+        ),
+        (
+            "right",
+            "pub effect db { read get[r](key: Int) -> Int }\npub fn read_one() -> Int = db.get[users](1)",
+        ),
     ]);
 
     assert_eq!(footprint(&out, "left.read_one"), "{left.db.read[users]}");
@@ -1505,15 +2009,26 @@ fn two_modules_may_declare_the_same_effect_without_contending() {
 #[test]
 fn one_effect_shared_by_two_modules_keeps_its_resource_labels_contending() {
     let out = check_files(&[
-        ("store", "pub effect db { read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Unit }"),
-        ("reader", "import store (db)\npub fn r() -> Int = db.get[users](1)"),
-        ("writer", "import store (db)\npub fn w() -> Unit = db.put[users](1, 2)"),
+        (
+            "store",
+            "pub effect db { read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Unit }",
+        ),
+        (
+            "reader",
+            "import store (db)\npub fn r() -> Int = db.get[users](1)",
+        ),
+        (
+            "writer",
+            "import store (db)\npub fn w() -> Unit = db.put[users](1, 2)",
+        ),
     ]);
 
     assert_eq!(footprint(&out, "reader.r"), "{store.db.read[users]}");
     assert_eq!(footprint(&out, "writer.w"), "{store.db.write[users]}");
     assert!(
-        def(&out, "reader.r").footprint.conflicts_with(&def(&out, "writer.w").footprint),
+        def(&out, "reader.r")
+            .footprint
+            .conflicts_with(&def(&out, "writer.w").footprint),
         "a resource label is a claim about the world, not about a file"
     );
 }
@@ -1555,7 +2070,10 @@ fn a_constructor_crosses_a_module_boundary_in_expressions_and_patterns() {
 fn a_private_constructor_is_rejected_at_the_pattern() {
     let diags = check_files_err(&[
         ("shapes", "type Shape = Circle(Int)"),
-        ("app", "import shapes\nfn f(s: Int) -> Int = match s { shapes::Circle(r) -> r, _ -> 0 }"),
+        (
+            "app",
+            "import shapes\nfn f(s: Int) -> Int = match s { shapes::Circle(r) -> r, _ -> 0 }",
+        ),
     ]);
     assert!(has_code(&diags, codes::PRIVATE_NAME), "{}", render(&diags));
 }
@@ -1564,7 +2082,10 @@ fn a_private_constructor_is_rejected_at_the_pattern() {
 fn a_public_alias_expands_in_the_module_that_wrote_it() {
     let out = check_files(&[
         ("money", "type Cents = Int\npub type Money = Cents"),
-        ("app", "import money\nfn total(m: money::Money) -> Int = m + 1"),
+        (
+            "app",
+            "import money\nfn total(m: money::Money) -> Int = m + 1",
+        ),
     ]);
 
     // `Cents` is private to `money`, so only expanding the alias in its own
@@ -1579,7 +2100,11 @@ fn an_unimported_module_binder_is_an_unknown_module() {
         ("app", "fn f() -> Int = store::place()"),
     ]);
     let d = only(&diags, codes::UNKNOWN_MODULE);
-    assert!(d.notes.iter().any(|n| n.contains("import store")), "{:?}", d.notes);
+    assert!(
+        d.notes.iter().any(|n| n.contains("import store")),
+        "{:?}",
+        d.notes
+    );
 }
 
 #[test]
@@ -1614,7 +2139,10 @@ fn tests_are_keyed_by_module_so_two_labels_may_repeat() {
 fn a_nondet_effect_stays_nondet_across_a_module_boundary() {
     let diags = check_files_err(&[
         ("clock", "pub nondet effect clock { read now() -> Int }"),
-        ("app", "import clock\ntest \"reads the clock\" { assert(clock::clock.now() > 0) }"),
+        (
+            "app",
+            "import clock\ntest \"reads the clock\" { assert(clock::clock.now() > 0) }",
+        ),
     ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     // The suggested handler has to be writable in the file it is suggested to:
@@ -1630,11 +2158,16 @@ fn a_nondet_effect_stays_nondet_across_a_module_boundary() {
 fn a_suggestion_for_a_selectively_imported_effect_stays_unqualified() {
     let diags = check_files_err(&[
         ("timing", "pub nondet effect clock { read now() -> Int }"),
-        ("app", "import timing (clock)\ntest \"reads\" { assert(clock.now() > 0) }"),
+        (
+            "app",
+            "import timing (clock)\ntest \"reads\" { assert(clock.now() > 0) }",
+        ),
     ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     assert!(
-        d.notes.iter().any(|n| n.contains("{ clock.now() -> <value> }")),
+        d.notes
+            .iter()
+            .any(|n| n.contains("{ clock.now() -> <value> }")),
         "{:?}",
         d.notes
     );
@@ -1650,7 +2183,10 @@ fn identical_definitions_in_two_modules_are_kept_apart_by_key_alone() {
     assert_eq!(sig(&out, "left.twice"), "(Int) -> Int");
     assert_eq!(sig(&out, "right.twice"), "(Int) -> Int");
     assert_eq!(def(&out, "left.twice").simple_name.as_str(), "twice");
-    assert_eq!(def(&out, "right.twice").module, ModuleName::from_dotted("right"));
+    assert_eq!(
+        def(&out, "right.twice").module,
+        ModuleName::from_dotted("right")
+    );
 }
 
 #[test]
@@ -1677,8 +2213,16 @@ fn a_qualified_name_in_the_wrong_namespace_says_what_the_module_exports() {
         ("app", "import shapes\nfn f() -> Int = shapes::Shape"),
     ]);
     let d = only(&diags, codes::UNKNOWN_NAME);
-    assert!(d.message.contains("has no definition `Shape`"), "{}", d.message);
-    assert!(d.notes.iter().any(|n| n.contains("`Circle`")), "{:?}", d.notes);
+    assert!(
+        d.message.contains("has no definition `Shape`"),
+        "{}",
+        d.message
+    );
+    assert!(
+        d.notes.iter().any(|n| n.contains("`Circle`")),
+        "{:?}",
+        d.notes
+    );
 }
 
 /// The example corpus is the one place cross-module resolution meets real code:
@@ -1697,13 +2241,19 @@ fn the_example_corpus_checks_as_one_program() {
     let sources: Vec<(String, String)> = paths
         .iter()
         .map(|path| {
-            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let text = std::fs::read_to_string(path).expect("example is readable");
             (name, text)
         })
         .collect();
-    let files: Vec<(&str, &str)> =
-        sources.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect();
+    let files: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
 
     let out = check_files(&files);
     assert_eq!(out.modules.len(), files.len());
@@ -1712,7 +2262,9 @@ fn the_example_corpus_checks_as_one_program() {
         "every definition is keyed by its program-wide name"
     );
     assert!(
-        out.tests.iter().all(|t| t.key.as_str().starts_with(t.module.as_str())),
+        out.tests
+            .iter()
+            .all(|t| t.key.as_str().starts_with(t.module.as_str())),
         "a test key is `<module>.<label>`, which is what keeps two labels apart"
     );
 }

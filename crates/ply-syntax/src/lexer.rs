@@ -172,7 +172,12 @@ pub struct Token {
 }
 
 pub fn lex(source: SourceId, text: &str) -> (Vec<Token>, Vec<Diagnostic>) {
-    let mut lexer = Lexer { text, source, pos: 0, diags: Vec::new() };
+    let mut lexer = Lexer {
+        text,
+        source,
+        pos: 0,
+        diags: Vec::new(),
+    };
     let tokens = lexer.run();
     (tokens, lexer.diags)
 }
@@ -247,10 +252,16 @@ impl<'a> Lexer<'a> {
                     None => continue,
                 }
             };
-            out.push(Token { kind, span: self.span_from(start) });
+            out.push(Token {
+                kind,
+                span: self.span_from(start),
+            });
         }
         let end = self.text.len() as u32;
-        out.push(Token { kind: TokenKind::Eof, span: Span::new(self.source, end, end) });
+        out.push(Token {
+            kind: TokenKind::Eof,
+            span: Span::new(self.source, end, end),
+        });
         out
     }
 
@@ -410,7 +421,11 @@ impl<'a> Lexer<'a> {
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semi,
             ':' => {
-                if self.eat(':') { TokenKind::ColonColon } else { TokenKind::Colon }
+                if self.eat(':') {
+                    TokenKind::ColonColon
+                } else {
+                    TokenKind::Colon
+                }
             }
             '.' => {
                 if self.eat('.') {
@@ -504,7 +519,8 @@ impl<'a> Lexer<'a> {
         span: Span,
         label: impl Into<String>,
     ) {
-        self.diags.push(Diagnostic::error(code, message).primary(span, label));
+        self.diags
+            .push(Diagnostic::error(code, message).primary(span, label));
     }
 }
 
@@ -564,7 +580,10 @@ mod tests {
 
     #[test]
     fn integers_allow_underscore_separators() {
-        assert_eq!(kinds("1_000_000"), vec![TokenKind::Int(1_000_000), TokenKind::Eof]);
+        assert_eq!(
+            kinds("1_000_000"),
+            vec![TokenKind::Int(1_000_000), TokenKind::Eof]
+        );
     }
 
     #[test]

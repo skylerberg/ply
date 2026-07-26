@@ -38,8 +38,16 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
             let (el, ec) = file.line_col(l.span.end);
             Some(JsonLabel {
                 file: file.path.display().to_string(),
-                start: JsonPos { line: sl, col: sc, offset: l.span.start },
-                end: JsonPos { line: el, col: ec, offset: l.span.end },
+                start: JsonPos {
+                    line: sl,
+                    col: sc,
+                    offset: l.span.start,
+                },
+                end: JsonPos {
+                    line: el,
+                    col: ec,
+                    offset: l.span.end,
+                },
                 message: l.message.clone(),
                 primary: l.primary,
                 snippet: sources.snippet(l.span).to_string(),
@@ -76,17 +84,27 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
             .iter()
             .map(|n| format!("\n  = {n}"))
             .collect::<String>();
-        return format!("{:?}[{}]: {}{}\n", diag.severity, diag.code, diag.message, notes);
+        return format!(
+            "{:?}[{}]: {}{}\n",
+            diag.severity, diag.code, diag.message, notes
+        );
     };
 
-    let anchor_path = sources.get(anchor.source).unwrap().path.display().to_string();
+    let anchor_path = sources
+        .get(anchor.source)
+        .unwrap()
+        .path
+        .display()
+        .to_string();
     let mut report = Report::build(kind, (anchor_path.clone(), anchor.range()))
         .with_code(diag.code)
         .with_message(&diag.message)
         .with_config(Config::default().with_index_type(ariadne::IndexType::Byte));
 
     for l in &diag.labels {
-        let Some(file) = sources.get(l.span.source) else { continue };
+        let Some(file) = sources.get(l.span.source) else {
+            continue;
+        };
         let path = file.path.display().to_string();
         report = report.with_label(
             ALabel::new((path, l.span.range()))
@@ -124,7 +142,7 @@ pub fn all_to_terminal(diags: &[Diagnostic], sources: &SourceMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{codes, Span};
+    use crate::{Span, codes};
 
     fn fixture() -> (SourceMap, Diagnostic) {
         let mut sm = SourceMap::new();

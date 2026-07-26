@@ -14,7 +14,10 @@ pub struct Ident {
 
 impl Ident {
     pub fn new(name: impl Into<Symbol>, span: Span) -> Self {
-        Ident { name: name.into(), span }
+        Ident {
+            name: name.into(),
+            span,
+        }
     }
 }
 
@@ -34,12 +37,20 @@ pub struct QName {
 impl QName {
     pub fn bare(name: Ident) -> QName {
         let span = name.span;
-        QName { module: None, name, span }
+        QName {
+            module: None,
+            name,
+            span,
+        }
     }
 
     pub fn qualified(module: Ident, name: Ident) -> QName {
         let span = module.span.to(name.span);
-        QName { module: Some(module), name, span }
+        QName {
+            module: Some(module),
+            name,
+            span,
+        }
     }
 
     pub fn is_bare(&self) -> bool {
@@ -225,7 +236,9 @@ pub struct Program {
 
 impl Program {
     pub fn single(module: Module) -> Program {
-        Program { modules: vec![module] }
+        Program {
+            modules: vec![module],
+        }
     }
 
     pub fn find(&self, name: &ModuleName) -> Option<&Module> {
@@ -260,7 +273,11 @@ pub enum ImportKind {
 impl ImportDecl {
     pub fn module_name(&self) -> ModuleName {
         ModuleName::from_dotted(
-            self.path.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."),
+            self.path
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
         )
     }
 
@@ -417,10 +434,24 @@ pub enum TypeExpr {
     /// A type parameter. Never module-qualified — it is bound by the enclosing
     /// `<..>`, not by any module.
     Var(Ident),
-    Con { name: QName, args: Vec<TypeExpr>, span: Span },
-    Fn { params: Vec<TypeExpr>, ret: Box<TypeExpr>, effects: Option<RowExpr>, span: Span },
-    Record { fields: Vec<(Ident, TypeExpr)>, span: Span },
-    Unit { span: Span },
+    Con {
+        name: QName,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        effects: Option<RowExpr>,
+        span: Span,
+    },
+    Record {
+        fields: Vec<(Ident, TypeExpr)>,
+        span: Span,
+    },
+    Unit {
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -498,26 +529,70 @@ pub struct Expr {
 pub enum ExprKind {
     Lit(Lit),
     Var(QName),
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Unary { op: UnOp, operand: Box<Expr> },
-    Lambda { params: Vec<Param>, body: Box<Expr> },
-    App { func: Box<Expr>, args: Vec<Expr> },
-    If { cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
-    Block { stmts: Vec<Stmt>, tail: Option<Box<Expr>> },
-    Record { fields: Vec<(Ident, Expr)> },
-    Field { base: Box<Expr>, field: Ident },
-    List { items: Vec<Expr> },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Unary {
+        op: UnOp,
+        operand: Box<Expr>,
+    },
+    Lambda {
+        params: Vec<Param>,
+        body: Box<Expr>,
+    },
+    App {
+        func: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    Block {
+        stmts: Vec<Stmt>,
+        tail: Option<Box<Expr>>,
+    },
+    Record {
+        fields: Vec<(Ident, Expr)>,
+    },
+    Field {
+        base: Box<Expr>,
+        field: Ident,
+    },
+    List {
+        items: Vec<Expr>,
+    },
 
     /// `db.get[users](key)`, or `store::db.get[users](key)`.
-    Perform { effect: QName, op: Ident, resource: Option<Ident>, args: Vec<Expr> },
+    Perform {
+        effect: QName,
+        op: Ident,
+        resource: Option<Ident>,
+        args: Vec<Expr>,
+    },
 
-    Handle { body: Box<Expr>, clauses: Vec<HandleClause>, return_clause: Option<Box<ReturnClause>> },
+    Handle {
+        body: Box<Expr>,
+        clauses: Vec<HandleClause>,
+        return_clause: Option<Box<ReturnClause>>,
+    },
 
     /// `with_cell[users](init) { c -> body }`. A builtin rather than a
     /// user-level effect so its atoms are discharged at the region boundary and
     /// provably cannot escape.
-    WithCell { resource: Ident, init: Box<Expr>, binder: Ident, body: Box<Expr> },
+    WithCell {
+        resource: Ident,
+        init: Box<Expr>,
+        binder: Ident,
+        body: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -530,7 +605,12 @@ pub struct MatchArm {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Let { pat: Pattern, ty: Option<TypeExpr>, value: Box<Expr>, span: Span },
+    Let {
+        pat: Pattern,
+        ty: Option<TypeExpr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -564,7 +644,16 @@ pub enum PatternKind {
     Wildcard,
     Var(Ident),
     Lit(Lit),
-    Ctor { name: QName, args: Vec<Pattern> },
-    Record { fields: Vec<(Ident, Pattern)>, rest: bool },
-    List { items: Vec<Pattern>, rest: Option<Box<Pattern>> },
+    Ctor {
+        name: QName,
+        args: Vec<Pattern>,
+    },
+    Record {
+        fields: Vec<(Ident, Pattern)>,
+        rest: bool,
+    },
+    List {
+        items: Vec<Pattern>,
+        rest: Option<Box<Pattern>>,
+    },
 }

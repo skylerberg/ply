@@ -44,10 +44,18 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
             .values()
             .map(|op| format!("{} {:?} {:?} {:?}", op.name, op.mode, op.params, op.ret))
             .collect();
-        out.insert(format!("effect {name}"), format!("{} {ops:?}", effect.nondet));
+        out.insert(
+            format!("effect {name}"),
+            format!("{} {ops:?}", effect.nondet),
+        );
     }
     for (i, test) in loaded.check.tests.iter().enumerate() {
-        let hash = loaded.hashes.tests.get(i).map(|h| h.to_hex()).unwrap_or_default();
+        let hash = loaded
+            .hashes
+            .tests
+            .get(i)
+            .map(|h| h.to_hex())
+            .unwrap_or_default();
         out.insert(
             format!("test {i}"),
             format!("{} {} {} {hash}", test.key, test.nondet, test.footprint),
@@ -90,7 +98,10 @@ fn agree(dir: &Path, what: &str) -> Loaded {
 }
 
 fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
-    e.diagnostics.iter().map(|d| format!("{}: {}", d.code, d.message)).collect()
+    e.diagnostics
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect()
 }
 
 fn write(dir: &Path, name: &str, text: &str) {
@@ -104,7 +115,10 @@ fn write(dir: &Path, name: &str, text: &str) {
 fn edit(dir: &Path, name: &str, from: &str, to: &str) {
     let path = dir.join(name);
     let text = fs::read_to_string(&path).unwrap();
-    assert!(text.contains(from), "`{from}` is not in {name}; the fixture drifted");
+    assert!(
+        text.contains(from),
+        "`{from}` is not in {name}; the fixture drifted"
+    );
     fs::write(path, text.replace(from, to)).unwrap();
 }
 
@@ -198,7 +212,10 @@ fn the_example_corpus_agrees_cold_and_warm() {
     let dir = examples();
     agree(dir.path(), "cold");
     let warm = agree(dir.path(), "warm");
-    assert!(warm.frontend.skipped() > 0, "gate 1 never fired on the examples");
+    assert!(
+        warm.frontend.skipped() > 0,
+        "gate 1 never fired on the examples"
+    );
 }
 
 #[test]
@@ -214,8 +231,18 @@ fn editing_a_body_agrees() {
 fn changing_a_signature_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Money = 1");
-    edit(dir.path(), "leaf.ply", "pub fn two()", "pub type Money = Int\npub fn two()");
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "pub fn one() -> Int = 1",
+        "pub fn one() -> Money = 1",
+    );
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "pub fn two()",
+        "pub type Money = Int\npub fn two()",
+    );
     agree(dir.path(), "signature change");
 }
 
@@ -252,14 +279,24 @@ fn renaming_an_effect_agrees() {
 fn moving_a_definition_between_modules_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "core.ply", "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n", "");
+    edit(
+        dir.path(),
+        "core.ply",
+        "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n",
+        "",
+    );
     edit(
         dir.path(),
         "leaf.ply",
         "pub fn one() -> Int = 1",
         "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\npub fn one() -> Int = 1",
     );
-    edit(dir.path(), "shop.ply", "import core", "import core\nimport leaf");
+    edit(
+        dir.path(),
+        "shop.ply",
+        "import core",
+        "import core\nimport leaf",
+    );
     edit(dir.path(), "shop.ply", "core::twice", "leaf::twice");
     agree(dir.path(), "move between modules");
 }
@@ -268,7 +305,11 @@ fn moving_a_definition_between_modules_agrees() {
 fn adding_a_file_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    write(dir.path(), "extra.ply", "import leaf\nfn three() -> Int = leaf::two() + leaf::one()\n");
+    write(
+        dir.path(),
+        "extra.ply",
+        "import leaf\nfn three() -> Int = leaf::two() + leaf::one()\n",
+    );
     agree(dir.path(), "file added");
 }
 
@@ -277,7 +318,11 @@ fn adding_a_file_agrees() {
 #[test]
 fn deleting_a_file_is_reported_rather_than_skipped_past() {
     let dir = corpus();
-    write(dir.path(), "extra.ply", "import leaf\npub fn three() -> Int = leaf::two()\n");
+    write(
+        dir.path(),
+        "extra.ply",
+        "import leaf\npub fn three() -> Int = leaf::two()\n",
+    );
     agree(dir.path(), "cold");
 
     fs::remove_file(dir.path().join("leaf.ply")).unwrap();
@@ -285,7 +330,9 @@ fn deleting_a_file_is_reported_rather_than_skipped_past() {
     let err = driver::load_incremental(dir.path(), &mut store)
         .expect_err("a dangling import must be an error, not a skipped file");
     assert!(
-        err.diagnostics.iter().any(|d| d.code == ply_span::codes::UNKNOWN_MODULE),
+        err.diagnostics
+            .iter()
+            .any(|d| d.code == ply_span::codes::UNKNOWN_MODULE),
         "expected UNKNOWN_MODULE, got {:?}",
         codes(&err)
     );
@@ -304,9 +351,19 @@ fn deleting_an_unreferenced_file_agrees() {
 fn adding_and_removing_an_import_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "shop.ply", "import core", "import core\nimport leaf");
+    edit(
+        dir.path(),
+        "shop.ply",
+        "import core",
+        "import core\nimport leaf",
+    );
     agree(dir.path(), "import added");
-    edit(dir.path(), "shop.ply", "import core\nimport leaf", "import core");
+    edit(
+        dir.path(),
+        "shop.ply",
+        "import core\nimport leaf",
+        "import core",
+    );
     agree(dir.path(), "import removed");
 }
 
@@ -316,7 +373,12 @@ fn adding_and_removing_an_import_agrees() {
 fn reformatting_costs_a_parse_and_no_recheck() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "leaf.ply", "pub fn one()", "// a comment\npub fn  one()");
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "pub fn one()",
+        "// a comment\npub fn  one()",
+    );
     let after = agree(dir.path(), "reformatted");
 
     let leaf = after
@@ -326,14 +388,22 @@ fn reformatting_costs_a_parse_and_no_recheck() {
         .find(|f| f.path.ends_with("leaf.ply"))
         .expect("leaf.ply must be reported");
     assert!(leaf.parsed, "a changed file must be parsed");
-    assert!(!leaf.rechecked, "an unchanged set of hashes must not be rechecked");
+    assert!(
+        !leaf.rechecked,
+        "an unchanged set of hashes must not be rechecked"
+    );
 }
 
 #[test]
 fn a_dependencys_change_reaches_its_dependents() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "core.ply", "pub fn price(i: Item) -> Money =", "pub fn price(i: Item) -> Int =");
+    edit(
+        dir.path(),
+        "core.ply",
+        "pub fn price(i: Item) -> Money =",
+        "pub fn price(i: Item) -> Int =",
+    );
     let after = agree(dir.path(), "dependency changed");
     let shop = after
         .frontend
@@ -341,7 +411,10 @@ fn a_dependencys_change_reaches_its_dependents() {
         .iter()
         .find(|f| f.path.ends_with("shop.ply"))
         .expect("shop.ply must be reported");
-    assert!(shop.parsed, "an importer of a changed module must be parsed");
+    assert!(
+        shop.parsed,
+        "an importer of a changed module must be parsed"
+    );
 }
 
 /// `--no-incremental` must neither read nor write the front-end cache, so a run
@@ -351,7 +424,10 @@ fn the_full_path_writes_no_front_end_cache() {
     let dir = corpus();
     driver::load_full(dir.path()).unwrap();
     let store = Store::open(dir.path()).unwrap();
-    assert!(store.frontend_is_empty(), "the full path must not populate the front-end cache");
+    assert!(
+        store.frontend_is_empty(),
+        "the full path must not populate the front-end cache"
+    );
 }
 
 /// A cache the run cannot believe is a slower run, never a wrong one.
@@ -359,17 +435,35 @@ fn the_full_path_writes_no_front_end_cache() {
 fn a_corrupt_front_end_cache_degrades_to_the_full_path() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    fs::write(dir.path().join(".ply-cache/frontend.json"), "{ this is not json").unwrap();
+    fs::write(
+        dir.path().join(".ply-cache/frontend.idx"),
+        "not an index at all",
+    )
+    .unwrap();
     let after = agree(dir.path(), "corrupt cache");
-    assert_eq!(after.frontend.skipped(), 0, "nothing may be skipped on the evidence of a corrupt cache");
+    assert_eq!(
+        after.frontend.skipped(),
+        0,
+        "nothing may be skipped on the evidence of a corrupt cache"
+    );
 }
 
 #[test]
 fn a_definition_removed_outright_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    edit(dir.path(), "shop.ply", "fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\n", "");
-    edit(dir.path(), "core.ply", "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n", "");
+    edit(
+        dir.path(),
+        "shop.ply",
+        "fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\n",
+        "",
+    );
+    edit(
+        dir.path(),
+        "core.ply",
+        "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n",
+        "",
+    );
     agree(dir.path(), "definition removed");
 }
 
@@ -390,10 +484,19 @@ fn a_whole_editing_session_agrees_at_every_step() {
     edit(dir.path(), "core.ply", "Money", "Cost");
     agree(dir.path(), "step 3: rename a type");
 
-    write(dir.path(), "extra.ply", "import leaf\npub fn four() -> Int = leaf::two() + 2\n");
+    write(
+        dir.path(),
+        "extra.ply",
+        "import leaf\npub fn four() -> Int = leaf::two() + 2\n",
+    );
     agree(dir.path(), "step 4: add a file");
 
-    edit(dir.path(), "extra.ply", "leaf::two() + 2", "leaf::two() + 3");
+    edit(
+        dir.path(),
+        "extra.ply",
+        "leaf::two() + 2",
+        "leaf::two() + 3",
+    );
     agree(dir.path(), "step 5: edit the new file");
 
     fs::remove_file(dir.path().join("extra.ply")).unwrap();
@@ -415,7 +518,8 @@ fn a_whole_editing_session_agrees_at_every_step() {
 #[test]
 fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     let dir = tempfile::tempdir().unwrap();
-    let body = "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
+    let body =
+        "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
     write(dir.path(), "a.ply", body);
     write(dir.path(), "b.ply", body);
 
@@ -427,12 +531,23 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     );
     let warm = agree(dir.path(), "warm");
     assert_ne!(
-        format!("{:?}", warm.check.defs[&ply_span::Symbol::new("a.peel")].scheme),
-        format!("{:?}", warm.check.defs[&ply_span::Symbol::new("b.peel")].scheme),
+        format!(
+            "{:?}",
+            warm.check.defs[&ply_span::Symbol::new("a.peel")].scheme
+        ),
+        format!(
+            "{:?}",
+            warm.check.defs[&ply_span::Symbol::new("b.peel")].scheme
+        ),
         "each definition's scheme must name its own module's type"
     );
     for name in ["a.ply", "b.ply"] {
-        let file = warm.frontend.files.iter().find(|f| f.path.ends_with(name)).unwrap();
+        let file = warm
+            .frontend
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(name))
+            .unwrap();
         assert!(
             !file.parsed,
             "{name} was refused ({}); a shared hash must not cost a recheck",
@@ -490,18 +605,35 @@ fn identically_declared_effects_in_two_modules_agree() {
 #[test]
 fn a_module_declaring_a_type_alias_can_still_be_skipped() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "alias.ply", "pub type Cents = Int\npub fn zero() -> Cents = 0\n");
-    write(dir.path(), "user.ply", "import alias\nfn take() -> alias::Cents = alias::zero()\n");
+    write(
+        dir.path(),
+        "alias.ply",
+        "pub type Cents = Int\npub fn zero() -> Cents = 0\n",
+    );
+    write(
+        dir.path(),
+        "user.ply",
+        "import alias\nfn take() -> alias::Cents = alias::zero()\n",
+    );
     write(dir.path(), "lone.ply", "fn lone() -> Int = 1\n");
 
     agree(dir.path(), "cold");
     let warm = agree(dir.path(), "warm");
-    assert!(warm.frontend.files.iter().any(|f| f.path.ends_with("alias.ply") && !f.parsed));
+    assert!(
+        warm.frontend
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("alias.ply") && !f.parsed)
+    );
 
     write(dir.path(), "lone.ply", "fn lone() -> Int = 2\n");
     let after = agree(dir.path(), "an unrelated edit");
     assert!(
-        after.frontend.files.iter().any(|f| f.path.ends_with("alias.ply") && !f.parsed),
+        after
+            .frontend
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("alias.ply") && !f.parsed),
         "an edit elsewhere must not disturb a module nothing parsed imports"
     );
 }
@@ -522,7 +654,12 @@ fn a_file_whose_tests_changed_is_checked_rather_than_restored() {
         &format!("{base}test \"twice\" {{ assert_eq(f() + f(), 2) }}\n"),
     );
     let after = agree(dir.path(), "a test added");
-    let m = after.frontend.files.iter().find(|f| f.path.ends_with("m.ply")).unwrap();
+    let m = after
+        .frontend
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("m.ply"))
+        .unwrap();
     assert!(m.rechecked, "a file with a new test must be checked");
 }
 
@@ -536,9 +673,18 @@ fn a_test_added_with_a_body_already_present_costs_no_recheck() {
     write(dir.path(), "m.ply", base);
     agree(dir.path(), "cold");
 
-    write(dir.path(), "m.ply", &format!("{base}test \"still one\" {{ assert_eq(f(), 1) }}\n"));
+    write(
+        dir.path(),
+        "m.ply",
+        &format!("{base}test \"still one\" {{ assert_eq(f(), 1) }}\n"),
+    );
     let after = agree(dir.path(), "a duplicate test added");
-    let m = after.frontend.files.iter().find(|f| f.path.ends_with("m.ply")).unwrap();
+    let m = after
+        .frontend
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("m.ply"))
+        .unwrap();
     assert!(!m.rechecked, "the added test's body was already checked");
 }
 
@@ -549,7 +695,12 @@ fn the_example_corpus_agrees_across_a_session() {
     let dir = examples();
     agree(dir.path(), "step 0");
 
-    edit(dir.path(), "report.ply", "fn assets() -> List<String>", "// a note\nfn assets() -> List<String>");
+    edit(
+        dir.path(),
+        "report.ply",
+        "fn assets() -> List<String>",
+        "// a note\nfn assets() -> List<String>",
+    );
     agree(dir.path(), "step 1: a comment");
 
     edit(dir.path(), "ledger.ply", "presented", "presented_value");
@@ -562,7 +713,11 @@ fn the_example_corpus_agrees_across_a_session() {
     edit(dir.path(), "report.ply", "l: Line|", "l: Row|");
     agree(dir.path(), "step 3: rename a type");
 
-    fs::write(dir.path().join("clock.ply"), fs::read_to_string(dir.path().join("clock.ply")).unwrap() + "\npub fn ticks() -> Int = 0\n").unwrap();
+    fs::write(
+        dir.path().join("clock.ply"),
+        fs::read_to_string(dir.path().join("clock.ply")).unwrap() + "\npub fn ticks() -> Int = 0\n",
+    )
+    .unwrap();
     agree(dir.path(), "step 4: add a definition");
 }
 
@@ -608,7 +763,9 @@ fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
     let mut state = [0usize; 3];
     let mut seed: u64 = 0x5eed_1234_9abc_def0;
     for step in 0..60 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let file = (seed >> 33) as usize % variants.len();
         let pick = (seed >> 17) as usize % 3;
         if state[file] == pick {
@@ -618,7 +775,10 @@ fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
 
         let (name, bodies) = &variants[file];
         write(dir.path(), name, bodies[pick]);
-        agree(dir.path(), &format!("shuffle step {step}: {name} -> {pick}"));
+        agree(
+            dir.path(),
+            &format!("shuffle step {step}: {name} -> {pick}"),
+        );
     }
 }
 

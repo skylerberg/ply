@@ -44,13 +44,21 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 
 /// A cache that cannot be opened is never a reason to refuse to typecheck: the
 /// front end degrades to the full path and says so.
-fn check(args: &CheckArgs, warnings: &mut Vec<Diagnostic>) -> Result<Loaded, crate::load::LoadError> {
+fn check(
+    args: &CheckArgs,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<Loaded, crate::load::LoadError> {
     if args.no_incremental {
         return load(&args.path);
     }
     let root = project_root(&args.path);
     match Store::open(&root) {
         Ok(mut store) => {
+            let opened = store.take_warnings();
+            let migration = crate::migrate::notice(&store, &opened);
+            warnings.extend(opened);
+            warnings.extend(migration);
+
             let loaded = driver::load_incremental(&args.path, &mut store);
             warnings.extend(store.take_warnings());
             if let Ok(loaded) = &loaded {
@@ -80,7 +88,11 @@ fn print_explain(loaded: &Loaded, style: Style) {
         );
     }
     for def in &loaded.frontend.defs {
-        let state = if def.cached { style.green("cached") } else { style.yellow("rechecked") };
+        let state = if def.cached {
+            style.green("cached")
+        } else {
+            style.yellow("rechecked")
+        };
         println!("{IND}  {state:<9} {}", def.name);
     }
     super::common::print_phases(&loaded.frontend.phases, style);
@@ -111,8 +123,16 @@ fn print_types(loaded: &Loaded, style: Style) {
         }
 
         for effect in effects {
-            let marker = if effect.nondet { "nondet effect" } else { "effect" };
-            println!("{IND}  {} {}", style.dim(marker), style.bold(effect.simple_name.as_str()));
+            let marker = if effect.nondet {
+                "nondet effect"
+            } else {
+                "effect"
+            };
+            println!(
+                "{IND}  {} {}",
+                style.dim(marker),
+                style.bold(effect.simple_name.as_str())
+            );
             for op in effect.ops.values() {
                 let resource = if op.resource_param { "[r]" } else { "" };
                 let params: Vec<String> = op.params.iter().map(ply_core::print_type).collect();
@@ -305,8 +325,11 @@ mod tests {
     fn every_module_is_reported_with_its_file_and_its_imports() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("store")).unwrap();
-        std::fs::write(dir.path().join("store/orders.ply"), "pub fn place() -> Int = 1\n")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("store/orders.ply"),
+            "pub fn place() -> Int = 1\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("app.ply"),
             "import store.orders\nfn run() -> Int = orders::place()\n",
@@ -320,17 +343,24 @@ mod tests {
         assert_eq!(modules[0]["name"], "app");
         assert_eq!(modules[0]["imports"], json!(["store.orders"]));
         assert_eq!(modules[1]["name"], "store.orders");
-        assert!(modules[1]["file"].as_str().unwrap().ends_with("store/orders.ply"));
+        assert!(
+            modules[1]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("store/orders.ply")
+        );
 
-        // Definitions are reported in the order they were checked, which is
-        // dependency-first across modules rather than the load order above.
+        // Definitions follow the run's files and each file's source order. The
+        // check's own order is dependency-first, which would have put
+        // `store.orders.place` first — and would have put it somewhere else
+        // again on a run where gate 1 skipped that module.
         let names: Vec<&str> = v["definitions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["store.orders.place", "app.run"]);
+        assert_eq!(names, ["app.run", "store.orders.place"]);
     }
 
     #[test]

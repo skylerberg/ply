@@ -40,7 +40,11 @@ pub struct EffectAtom {
 
 impl EffectAtom {
     pub fn new(effect: impl Into<Symbol>, resource: Resource, mode: Mode) -> Self {
-        EffectAtom { effect: effect.into(), resource, mode }
+        EffectAtom {
+            effect: effect.into(),
+            resource,
+            mode,
+        }
     }
 
     /// Two atoms contend iff they name the same resource of the same effect and
@@ -72,11 +76,17 @@ impl Row {
     }
 
     pub fn open(tail: RowVar) -> Self {
-        Row { atoms: BTreeSet::new(), tail: Some(tail) }
+        Row {
+            atoms: BTreeSet::new(),
+            tail: Some(tail),
+        }
     }
 
     pub fn closed(atoms: impl IntoIterator<Item = EffectAtom>) -> Self {
-        Row { atoms: atoms.into_iter().collect(), tail: None }
+        Row {
+            atoms: atoms.into_iter().collect(),
+            tail: None,
+        }
     }
 
     pub fn singleton(atom: EffectAtom) -> Self {
@@ -178,7 +188,11 @@ impl fmt::Display for Footprint {
 pub enum Type {
     Var(TyVar),
     Con(Symbol, Vec<Type>),
-    Fn { params: Vec<Type>, ret: Box<Type>, effects: Row },
+    Fn {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        effects: Row,
+    },
     Record(BTreeMap<Symbol, Type>),
 }
 
@@ -212,7 +226,11 @@ impl fmt::Display for Type {
                 let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{name}<{}>", args.join(", "))
             }
-            Type::Fn { params, ret, effects } => {
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
                 let ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
                 write!(f, "({}) -> {ret}", ps.join(", "))?;
                 if !effects.is_pure() {
@@ -238,7 +256,11 @@ pub struct Scheme {
 
 impl Scheme {
     pub fn mono(ty: Type) -> Self {
-        Scheme { ty_vars: Vec::new(), row_vars: Vec::new(), ty }
+        Scheme {
+            ty_vars: Vec::new(),
+            row_vars: Vec::new(),
+            ty,
+        }
     }
 }
 
@@ -255,7 +277,9 @@ mod tests {
     fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
         EffectAtom::new(
             effect,
-            resource.map(|r| Resource::Named(Symbol::new(r))).unwrap_or(Resource::Singleton),
+            resource
+                .map(|r| Resource::Named(Symbol::new(r)))
+                .unwrap_or(Resource::Singleton),
             mode,
         )
     }
@@ -311,7 +335,10 @@ mod tests {
     fn row_display_round_trips_the_surface_syntax() {
         let r = Row::closed([atom("db", Some("users"), Mode::Read)]);
         assert_eq!(r.to_string(), "{db.read[users]}");
-        let open = Row { atoms: r.atoms.clone(), tail: Some(RowVar(3)) };
+        let open = Row {
+            atoms: r.atoms.clone(),
+            tail: Some(RowVar(3)),
+        };
         assert_eq!(open.to_string(), "{db.read[users] | e3}");
         assert_eq!(Row::empty().to_string(), "{}");
     }
@@ -320,7 +347,10 @@ mod tests {
     fn without_removes_handled_atoms_and_keeps_the_tail() {
         let read = atom("db", Some("users"), Mode::Read);
         let write = atom("db", Some("users"), Mode::Write);
-        let row = Row { atoms: [read.clone(), write.clone()].into(), tail: Some(RowVar(1)) };
+        let row = Row {
+            atoms: [read.clone(), write.clone()].into(),
+            tail: Some(RowVar(1)),
+        };
         let handled: BTreeSet<_> = [read].into();
         let out = row.without(&handled);
         assert_eq!(out.atoms, [write].into());

@@ -28,7 +28,11 @@ pub fn parse_module(
     text: &str,
 ) -> Result<Module, Vec<Diagnostic>> {
     let (module, diags) = Parser::new(source, text).run(name);
-    if diags.is_empty() { Ok(module) } else { Err(diags) }
+    if diags.is_empty() {
+        Ok(module)
+    } else {
+        Err(diags)
+    }
 }
 
 /// Parses as much as possible and hands back both the partial tree and every
@@ -54,7 +58,11 @@ pub fn parse_program<'a>(
         program.modules.push(module);
         diags.extend(d);
     }
-    if diags.is_empty() { Ok(program) } else { Err(diags) }
+    if diags.is_empty() {
+        Ok(program)
+    } else {
+        Err(diags)
+    }
 }
 
 pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>> {
@@ -83,7 +91,14 @@ struct Parser {
 impl Parser {
     fn new(source: SourceId, text: &str) -> Parser {
         let (tokens, diags) = lex(source, text);
-        Parser { source, tokens, pos: 0, diags, no_brace: false, depth: 0 }
+        Parser {
+            source,
+            tokens,
+            pos: 0,
+            diags,
+            no_brace: false,
+            depth: 0,
+        }
     }
 
     fn kind(&self) -> &TokenKind {
@@ -133,20 +148,31 @@ impl Parser {
     }
 
     fn expect(&mut self, k: &TokenKind, what: &str) -> PResult<Span> {
-        if self.at(k) { Ok(self.advance()) } else { Err(self.error_here(what)) }
+        if self.at(k) {
+            Ok(self.advance())
+        } else {
+            Err(self.error_here(what))
+        }
     }
 
     fn expect_close(&mut self, k: &TokenKind, open: Span, what: &str) -> PResult<Span> {
-        if self.at(k) { Ok(self.advance()) } else { Err(self.unclosed(open, what)) }
+        if self.at(k) {
+            Ok(self.advance())
+        } else {
+            Err(self.unclosed(open, what))
+        }
     }
 
     fn unclosed(&mut self, open: Span, what: &str) -> Bail {
         let found = self.kind().describe();
         let span = self.span();
         self.push(
-            Diagnostic::error(codes::UNEXPECTED_TOKEN, format!("expected {what}, found {found}"))
-                .primary(span, format!("expected {what}"))
-                .secondary(open, "unclosed delimiter opened here"),
+            Diagnostic::error(
+                codes::UNEXPECTED_TOKEN,
+                format!("expected {what}, found {found}"),
+            )
+            .primary(span, format!("expected {what}"))
+            .secondary(open, "unclosed delimiter opened here"),
         );
         Bail
     }
@@ -195,8 +221,11 @@ impl Parser {
         let found = self.kind().describe();
         let span = self.span();
         self.push(
-            Diagnostic::error(codes::UNEXPECTED_TOKEN, format!("expected {what}, found {found}"))
-                .primary(span, format!("expected {what}")),
+            Diagnostic::error(
+                codes::UNEXPECTED_TOKEN,
+                format!("expected {what}, found {found}"),
+            )
+            .primary(span, format!("expected {what}")),
         );
         Bail
     }
@@ -208,9 +237,12 @@ impl Parser {
         }
         let span = self.span();
         self.push(
-            Diagnostic::error(codes::UNEXPECTED_TOKEN, "input is nested too deeply to parse")
-                .primary(span, format!("more than {MAX_DEPTH} levels of nesting"))
-                .note("split this into smaller definitions"),
+            Diagnostic::error(
+                codes::UNEXPECTED_TOKEN,
+                "input is nested too deeply to parse",
+            )
+            .primary(span, format!("more than {MAX_DEPTH} levels of nesting"))
+            .note("split this into smaller definitions"),
         );
         Err(Bail)
     }
@@ -235,7 +267,15 @@ impl Parser {
                 Err(Bail) => self.recover_to_item(),
             }
         }
-        (Module { name, source, imports, items }, self.diags)
+        (
+            Module {
+                name,
+                source,
+                imports,
+                items,
+            },
+            self.diags,
+        )
     }
 
     /// Every `import` precedes every item, so the import table is complete
@@ -320,7 +360,11 @@ impl Parser {
             return Err(Bail);
         }
 
-        Ok(ImportDecl { path, kind, span: start.to(self.prev_span()) })
+        Ok(ImportDecl {
+            path,
+            kind,
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn import_name(&mut self) -> PResult<Ident> {
@@ -374,12 +418,15 @@ impl Parser {
         if self.at(&TokenKind::ColonColon) {
             let span = self.span();
             self.push(
-                Diagnostic::error(codes::UNEXPECTED_TOKEN, "a qualified name has at most one `::`")
-                    .primary(span, "unexpected `::`")
-                    .note(
-                        "a module binder is a single name: `import store.orders` binds `orders`, \
+                Diagnostic::error(
+                    codes::UNEXPECTED_TOKEN,
+                    "a qualified name has at most one `::`",
+                )
+                .primary(span, "unexpected `::`")
+                .note(
+                    "a module binder is a single name: `import store.orders` binds `orders`, \
                          so write `orders::place`",
-                    ),
+                ),
             );
             return Err(Bail);
         }
@@ -388,7 +435,11 @@ impl Parser {
 
     fn item(&mut self) -> PResult<Item> {
         let pub_span = self.at(&TokenKind::Kw(Kw::Pub)).then(|| self.advance());
-        let vis = if pub_span.is_some() { Visibility::Public } else { Visibility::Private };
+        let vis = if pub_span.is_some() {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
 
         match self.kind() {
             TokenKind::Kw(Kw::Fn) => self.fn_def(vis).map(|d| Item::Fn(Box::new(d))),
@@ -399,17 +450,16 @@ impl Parser {
             TokenKind::Kw(Kw::Test) => {
                 if let Some(span) = pub_span {
                     self.push(
-                        Diagnostic::error(
-                            codes::UNEXPECTED_TOKEN,
-                            "a `test` cannot be `pub`",
-                        )
-                        .primary(span, "remove `pub`")
-                        .note("a test has no name another module could reference"),
+                        Diagnostic::error(codes::UNEXPECTED_TOKEN, "a `test` cannot be `pub`")
+                            .primary(span, "remove `pub`")
+                            .note("a test has no name another module could reference"),
                     );
                 }
                 self.test_def().map(|d| Item::Test(Box::new(d)))
             }
-            _ => Err(self.error_here("an item: `fn`, `type`, `effect`, `nondet effect`, or `test`")),
+            _ => {
+                Err(self.error_here("an item: `fn`, `type`, `effect`, `nondet effect`, or `test`"))
+            }
         }
     }
 
@@ -426,8 +476,16 @@ impl Parser {
         let params = self.comma_list(&TokenKind::RParen, Self::param)?;
         self.expect_close(&TokenKind::RParen, open, "`)` to close the parameter list")?;
 
-        let ret = if self.eat(&TokenKind::Arrow) { Some(self.ty()?) } else { None };
-        let effects = if self.eat(&TokenKind::Slash) { Some(self.row()?) } else { None };
+        let ret = if self.eat(&TokenKind::Arrow) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+        let effects = if self.eat(&TokenKind::Slash) {
+            Some(self.row()?)
+        } else {
+            None
+        };
 
         let body = if self.eat(&TokenKind::Eq) {
             self.expr()?
@@ -438,12 +496,25 @@ impl Parser {
         };
 
         let span = start.to(body.span);
-        Ok(FnDef { vis, name, generics, params, ret, effects, body, span })
+        Ok(FnDef {
+            vis,
+            name,
+            generics,
+            params,
+            ret,
+            effects,
+            body,
+            span,
+        })
     }
 
     fn param(&mut self) -> PResult<Param> {
         let name = self.expect_ident("a parameter name")?;
-        let ty = if self.eat(&TokenKind::Colon) { Some(self.ty()?) } else { None };
+        let ty = if self.eat(&TokenKind::Colon) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
         let span = name.span.to(ty.as_ref().map_or(name.span, |t| t.span()));
         Ok(Param { name, ty, span })
     }
@@ -501,7 +572,13 @@ impl Parser {
             TypeDefBody::Alias(self.ty()?)
         };
         let span = start.to(self.prev_span());
-        Ok(TypeDef { vis, name, params, body, span })
+        Ok(TypeDef {
+            vis,
+            name,
+            params,
+            body,
+            span,
+        })
     }
 
     /// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or
@@ -546,8 +623,15 @@ impl Parser {
         while !self.at(&TokenKind::RBrace) && !self.at_eof() {
             ops.push(self.op_def()?);
         }
-        let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the operation list")?;
-        Ok(EffectDef { vis, name, nondet, ops, span: start.to(close) })
+        let close =
+            self.expect_close(&TokenKind::RBrace, open, "`}` to close the operation list")?;
+        Ok(EffectDef {
+            vis,
+            name,
+            nondet,
+            ops,
+            span: start.to(close),
+        })
     }
 
     fn op_def(&mut self) -> PResult<OpDef> {
@@ -564,11 +648,22 @@ impl Parser {
         };
         let open = self.expect(&TokenKind::LParen, "`(` to start the operation parameters")?;
         let params = self.comma_list(&TokenKind::RParen, Self::op_param)?;
-        self.expect_close(&TokenKind::RParen, open, "`)` to close the operation parameters")?;
+        self.expect_close(
+            &TokenKind::RParen,
+            open,
+            "`)` to close the operation parameters",
+        )?;
         self.expect(&TokenKind::Arrow, "`->` and a return type")?;
         let ret = self.ty()?;
         let span = start.to(ret.span());
-        Ok(OpDef { name, mode, resource_param, params, ret, span })
+        Ok(OpDef {
+            name,
+            mode,
+            resource_param,
+            params,
+            ret,
+            span,
+        })
     }
 
     /// An operation parameter may be written `name: Type` for documentation; only
@@ -610,7 +705,13 @@ impl Parser {
         };
         let body = self.block_expr()?;
         let span = start.to(body.span);
-        Ok(TestDef { name, name_span, nondet, body, span })
+        Ok(TestDef {
+            name,
+            name_span,
+            nondet,
+            body,
+            span,
+        })
     }
 
     fn ty(&mut self) -> PResult<TypeExpr> {
@@ -637,7 +738,9 @@ impl Parser {
                     if self.eat(&TokenKind::Arrow) {
                         return self.fn_ty(Vec::new(), start);
                     }
-                    return Ok(TypeExpr::Unit { span: open.to(close) });
+                    return Ok(TypeExpr::Unit {
+                        span: open.to(close),
+                    });
                 }
                 let params = self.comma_list(&TokenKind::RParen, Self::ty)?;
                 let close = self.expect_close(&TokenKind::RParen, open, "`)`")?;
@@ -662,7 +765,10 @@ impl Parser {
                 let open = self.advance();
                 let fields = self.comma_list(&TokenKind::RBrace, Self::ty_field)?;
                 let close = self.expect_close(&TokenKind::RBrace, open, "`}`")?;
-                Ok(TypeExpr::Record { fields, span: open.to(close) })
+                Ok(TypeExpr::Record {
+                    fields,
+                    span: open.to(close),
+                })
             }
             TokenKind::Ident(_) => {
                 let q = self.qname("a type")?;
@@ -670,7 +776,11 @@ impl Parser {
                     self.advance();
                     let args = self.comma_list(&TokenKind::Gt, Self::ty)?;
                     let close = self.expect_gt("`>` to close the type arguments")?;
-                    return Ok(TypeExpr::Con { name: q, args, span: start.to(close) });
+                    return Ok(TypeExpr::Con {
+                        name: q,
+                        args,
+                        span: start.to(close),
+                    });
                 }
                 // A type parameter is bound by the enclosing `<..>`, never by a
                 // module, so only a bare lowercase name can be one.
@@ -678,7 +788,11 @@ impl Parser {
                     return Ok(TypeExpr::Var(q.name));
                 }
                 let span = q.span;
-                Ok(TypeExpr::Con { name: q, args: Vec::new(), span })
+                Ok(TypeExpr::Con {
+                    name: q,
+                    args: Vec::new(),
+                    span,
+                })
             }
             _ => Err(self.error_here("a type")),
         }
@@ -686,7 +800,11 @@ impl Parser {
 
     fn fn_ty(&mut self, params: Vec<TypeExpr>, start: Span) -> PResult<TypeExpr> {
         let ret = self.ty()?;
-        let effects = if self.eat(&TokenKind::Slash) { Some(self.row()?) } else { None };
+        let effects = if self.eat(&TokenKind::Slash) {
+            Some(self.row()?)
+        } else {
+            None
+        };
         let end = effects.as_ref().map_or(ret.span(), |r| r.span);
         Ok(TypeExpr::Fn {
             params,
@@ -721,11 +839,20 @@ impl Parser {
             } else {
                 None
             };
-            let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the effect row")?;
-            return Ok(RowExpr { atoms, tail, span: start.to(close) });
+            let close =
+                self.expect_close(&TokenKind::RBrace, open, "`}` to close the effect row")?;
+            return Ok(RowExpr {
+                atoms,
+                tail,
+                span: start.to(close),
+            });
         }
         let tail = self.expect_ident("an effect row: `{..}` or a row variable")?;
-        Ok(RowExpr { atoms: Vec::new(), span: tail.span, tail: Some(tail) })
+        Ok(RowExpr {
+            atoms: Vec::new(),
+            span: tail.span,
+            tail: Some(tail),
+        })
     }
 
     fn atom(&mut self) -> PResult<AtomExpr> {
@@ -741,7 +868,12 @@ impl Parser {
             None
         };
         let span = effect.span.to(self.prev_span());
-        Ok(AtomExpr { effect, mode, resource, span })
+        Ok(AtomExpr {
+            effect,
+            mode,
+            resource,
+            span,
+        })
     }
 
     fn expr(&mut self) -> PResult<Expr> {
@@ -765,7 +897,11 @@ impl Parser {
             let rhs = self.bin_expr(bp + 1)?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
-                kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                kind: ExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
                 span,
             };
         }
@@ -788,7 +924,13 @@ impl Parser {
         let start = self.advance();
         let operand = self.unary_expr()?;
         let span = start.to(operand.span);
-        Ok(Expr { kind: ExprKind::Unary { op, operand: Box::new(operand) }, span })
+        Ok(Expr {
+            kind: ExprKind::Unary {
+                op,
+                operand: Box::new(operand),
+            },
+            span,
+        })
     }
 
     fn postfix_expr(&mut self) -> PResult<Expr> {
@@ -798,7 +940,13 @@ impl Parser {
                 TokenKind::LParen => {
                     let (args, close) = self.call_args()?;
                     let span = e.span.to(close);
-                    e = Expr { kind: ExprKind::App { func: Box::new(e), args }, span };
+                    e = Expr {
+                        kind: ExprKind::App {
+                            func: Box::new(e),
+                            args,
+                        },
+                        span,
+                    };
                 }
                 TokenKind::Dot => {
                     // `db.get[users](k)` performs an effect; `r.f` reads a field.
@@ -820,14 +968,28 @@ impl Parser {
                     let Some(effect) = effect else {
                         let field = self.expect_ident("a field name after `.`")?;
                         let span = e.span.to(field.span);
-                        e = Expr { kind: ExprKind::Field { base: Box::new(e), field }, span };
+                        e = Expr {
+                            kind: ExprKind::Field {
+                                base: Box::new(e),
+                                field,
+                            },
+                            span,
+                        };
                         continue;
                     };
                     let op = self.expect_ident("an operation name")?;
                     let resource = self.opt_resource()?;
                     let (args, close) = self.call_args()?;
                     let span = e.span.to(close);
-                    e = Expr { kind: ExprKind::Perform { effect, op, resource, args }, span };
+                    e = Expr {
+                        kind: ExprKind::Perform {
+                            effect,
+                            op,
+                            resource,
+                            args,
+                        },
+                        span,
+                    };
                 }
                 _ => break,
             }
@@ -850,7 +1012,8 @@ impl Parser {
         let open = self.expect(&TokenKind::LParen, "`(` to start the argument list")?;
         let args = self.comma_list(&TokenKind::RParen, Self::expr);
         let r = args.and_then(|args| {
-            let close = self.expect_close(&TokenKind::RParen, open, "`)` to close the arguments")?;
+            let close =
+                self.expect_close(&TokenKind::RParen, open, "`)` to close the arguments")?;
             Ok((args, close))
         });
         self.no_brace = saved;
@@ -862,19 +1025,31 @@ impl Parser {
         match self.kind().clone() {
             TokenKind::Int(v) => {
                 self.advance();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Int(v)), span: start })
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Int(v)),
+                    span: start,
+                })
             }
             TokenKind::Str(s) => {
                 self.advance();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Str(s)), span: start })
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Str(s)),
+                    span: start,
+                })
             }
             TokenKind::Kw(Kw::True) => {
                 self.advance();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Bool(true)), span: start })
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Bool(true)),
+                    span: start,
+                })
             }
             TokenKind::Kw(Kw::False) => {
                 self.advance();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Bool(false)), span: start })
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Bool(false)),
+                    span: start,
+                })
             }
             TokenKind::Ident(name) => {
                 if name.as_str() == "with_cell" && matches!(self.kind_at(1), TokenKind::LBracket) {
@@ -882,14 +1057,20 @@ impl Parser {
                 }
                 let q = self.qname("an expression")?;
                 let span = q.span;
-                Ok(Expr { kind: ExprKind::Var(q), span })
+                Ok(Expr {
+                    kind: ExprKind::Var(q),
+                    span,
+                })
             }
             TokenKind::LParen => {
                 let saved = std::mem::replace(&mut self.no_brace, false);
                 let open = self.advance();
                 let r = if self.at(&TokenKind::RParen) {
                     let close = self.advance();
-                    Ok(Expr { kind: ExprKind::Lit(Lit::Unit), span: open.to(close) })
+                    Ok(Expr {
+                        kind: ExprKind::Lit(Lit::Unit),
+                        span: open.to(close),
+                    })
                 } else {
                     self.expr().and_then(|mut inner| {
                         let close =
@@ -904,16 +1085,25 @@ impl Parser {
             TokenKind::LBracket => {
                 let saved = std::mem::replace(&mut self.no_brace, false);
                 let open = self.advance();
-                let r = self.comma_list(&TokenKind::RBracket, Self::expr).and_then(|items| {
-                    let close =
-                        self.expect_close(&TokenKind::RBracket, open, "`]` to close the list")?;
-                    Ok(Expr { kind: ExprKind::List { items }, span: open.to(close) })
-                });
+                let r = self
+                    .comma_list(&TokenKind::RBracket, Self::expr)
+                    .and_then(|items| {
+                        let close =
+                            self.expect_close(&TokenKind::RBracket, open, "`]` to close the list")?;
+                        Ok(Expr {
+                            kind: ExprKind::List { items },
+                            span: open.to(close),
+                        })
+                    });
                 self.no_brace = saved;
                 r
             }
             TokenKind::LBrace if !self.no_brace => {
-                if self.at_record_literal() { self.record_expr() } else { self.block_expr() }
+                if self.at_record_literal() {
+                    self.record_expr()
+                } else {
+                    self.block_expr()
+                }
             }
             TokenKind::Pipe | TokenKind::PipePipe => self.lambda_expr(),
             TokenKind::Kw(Kw::If) => self.if_expr(),
@@ -932,10 +1122,16 @@ impl Parser {
     fn record_expr(&mut self) -> PResult<Expr> {
         let saved = std::mem::replace(&mut self.no_brace, false);
         let open = self.advance();
-        let r = self.comma_list(&TokenKind::RBrace, Self::record_field).and_then(|fields| {
-            let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the record")?;
-            Ok(Expr { kind: ExprKind::Record { fields }, span: open.to(close) })
-        });
+        let r = self
+            .comma_list(&TokenKind::RBrace, Self::record_field)
+            .and_then(|fields| {
+                let close =
+                    self.expect_close(&TokenKind::RBrace, open, "`}` to close the record")?;
+                Ok(Expr {
+                    kind: ExprKind::Record { fields },
+                    span: open.to(close),
+                })
+            });
         self.no_brace = saved;
         r
     }
@@ -947,7 +1143,13 @@ impl Parser {
             return Ok((name, value));
         }
         let span = name.span;
-        Ok((name.clone(), Expr { kind: ExprKind::Var(name.into()), span }))
+        Ok((
+            name.clone(),
+            Expr {
+                kind: ExprKind::Var(name.into()),
+                span,
+            },
+        ))
     }
 
     fn block_expr(&mut self) -> PResult<Expr> {
@@ -983,17 +1185,29 @@ impl Parser {
             }
         }
         let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the block")?;
-        Ok(Expr { kind: ExprKind::Block { stmts, tail }, span: open.to(close) })
+        Ok(Expr {
+            kind: ExprKind::Block { stmts, tail },
+            span: open.to(close),
+        })
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
         let start = self.advance();
         let pat = self.pattern()?;
-        let ty = if self.eat(&TokenKind::Colon) { Some(self.ty()?) } else { None };
+        let ty = if self.eat(&TokenKind::Colon) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Eq, "`=` and an initializer")?;
         let value = self.expr()?;
         let semi = self.expect(&TokenKind::Semi, "`;` to end the `let`")?;
-        Ok(Stmt::Let { pat, ty, value: Box::new(value), span: start.to(semi) })
+        Ok(Stmt::Let {
+            pat,
+            ty,
+            value: Box::new(value),
+            span: start.to(semi),
+        })
     }
 
     fn lambda_expr(&mut self) -> PResult<Expr> {
@@ -1008,7 +1222,13 @@ impl Parser {
         };
         let body = self.expr()?;
         let span = start.to(body.span);
-        Ok(Expr { kind: ExprKind::Lambda { params, body: Box::new(body) }, span })
+        Ok(Expr {
+            kind: ExprKind::Lambda {
+                params,
+                body: Box::new(body),
+            },
+            span,
+        })
     }
 
     fn if_expr(&mut self) -> PResult<Expr> {
@@ -1016,10 +1236,17 @@ impl Parser {
         let cond = self.scrutinee()?;
         let then_branch = self.block_expr()?;
         let else_branch = if self.eat(&TokenKind::Kw(Kw::Else)) {
-            if self.at(&TokenKind::Kw(Kw::If)) { self.if_expr()? } else { self.block_expr()? }
+            if self.at(&TokenKind::Kw(Kw::If)) {
+                self.if_expr()?
+            } else {
+                self.block_expr()?
+            }
         } else {
             let end = then_branch.span.end;
-            Expr { kind: ExprKind::Lit(Lit::Unit), span: Span::new(self.source, end, end) }
+            Expr {
+                kind: ExprKind::Lit(Lit::Unit),
+                span: Span::new(self.source, end, end),
+            }
         };
         let span = start.to(else_branch.span);
         Ok(Expr {
@@ -1040,7 +1267,10 @@ impl Parser {
         self.no_brace = saved;
         let (arms, close) = r?;
         Ok(Expr {
-            kind: ExprKind::Match { scrutinee: Box::new(scrutinee), arms },
+            kind: ExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
             span: start.to(close),
         })
     }
@@ -1053,11 +1283,20 @@ impl Parser {
                 return Err(self.unclosed(open, "`}` to close the match arms"));
             }
             let pat = self.pattern()?;
-            let guard = if self.eat(&TokenKind::Kw(Kw::If)) { Some(self.expr()?) } else { None };
+            let guard = if self.eat(&TokenKind::Kw(Kw::If)) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::Arrow, "`->` and the arm body")?;
             let body = self.expr()?;
             let span = pat.span.to(body.span);
-            arms.push(MatchArm { pat, guard, body, span });
+            arms.push(MatchArm {
+                pat,
+                guard,
+                body,
+                span,
+            });
             if !self.eat(&TokenKind::Comma) && !self.at(&TokenKind::RBrace) {
                 let last = arms.last().expect("just pushed");
                 if self.at_eof() {
@@ -1082,7 +1321,10 @@ impl Parser {
 
     fn handle_rest(&mut self, start: Span) -> PResult<Expr> {
         let body = self.expr()?;
-        self.expect(&TokenKind::Kw(Kw::With), "`with` and then the handler clauses")?;
+        self.expect(
+            &TokenKind::Kw(Kw::With),
+            "`with` and then the handler clauses",
+        )?;
         let open = self.expect(&TokenKind::LBrace, "`{` to start the handler clauses")?;
         let mut clauses = Vec::new();
         let mut return_clause: Option<Box<ReturnClause>> = None;
@@ -1111,7 +1353,11 @@ impl Parser {
         }
         let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the handler")?;
         Ok(Expr {
-            kind: ExprKind::Handle { body: Box::new(body), clauses, return_clause },
+            kind: ExprKind::Handle {
+                body: Box::new(body),
+                clauses,
+                return_clause,
+            },
             span: start.to(close),
         })
     }
@@ -1123,11 +1369,22 @@ impl Parser {
         let resource = self.opt_resource()?;
         let open = self.expect(&TokenKind::LParen, "`(` to start the clause parameters")?;
         let params = self.comma_list(&TokenKind::RParen, Self::clause_param)?;
-        self.expect_close(&TokenKind::RParen, open, "`)` to close the clause parameters")?;
+        self.expect_close(
+            &TokenKind::RParen,
+            open,
+            "`)` to close the clause parameters",
+        )?;
         self.expect(&TokenKind::Arrow, "`->` and the clause body")?;
         let body = self.expr()?;
         let span = effect.span.to(body.span);
-        Ok(HandleClause { effect, op, resource, params, body, span })
+        Ok(HandleClause {
+            effect,
+            op,
+            resource,
+            params,
+            body,
+            span,
+        })
     }
 
     fn clause_param(&mut self) -> PResult<Ident> {
@@ -1164,7 +1421,8 @@ impl Parser {
         let binder = self.expect_ident("a name to bind the cell to")?;
         self.expect(&TokenKind::Arrow, "`->` and the region body")?;
         let body = self.expr()?;
-        let close = self.expect_close(&TokenKind::RBrace, brace, "`}` to close the cell's region")?;
+        let close =
+            self.expect_close(&TokenKind::RBrace, brace, "`}` to close the cell's region")?;
 
         Ok(Expr {
             kind: ExprKind::WithCell {
@@ -1189,35 +1447,58 @@ impl Parser {
         match self.kind().clone() {
             TokenKind::Underscore => {
                 self.advance();
-                Ok(Pattern { kind: PatternKind::Wildcard, span: start })
+                Ok(Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: start,
+                })
             }
             TokenKind::Int(v) => {
                 self.advance();
-                Ok(Pattern { kind: PatternKind::Lit(Lit::Int(v)), span: start })
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Int(v)),
+                    span: start,
+                })
             }
             TokenKind::Minus if matches!(self.kind_at(1), TokenKind::Int(_)) => {
                 self.advance();
-                let TokenKind::Int(v) = *self.kind() else { unreachable!() };
+                let TokenKind::Int(v) = *self.kind() else {
+                    unreachable!()
+                };
                 let end = self.advance();
-                Ok(Pattern { kind: PatternKind::Lit(Lit::Int(-v)), span: start.to(end) })
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Int(-v)),
+                    span: start.to(end),
+                })
             }
             TokenKind::Str(s) => {
                 self.advance();
-                Ok(Pattern { kind: PatternKind::Lit(Lit::Str(s)), span: start })
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Str(s)),
+                    span: start,
+                })
             }
             TokenKind::Kw(Kw::True) => {
                 self.advance();
-                Ok(Pattern { kind: PatternKind::Lit(Lit::Bool(true)), span: start })
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Bool(true)),
+                    span: start,
+                })
             }
             TokenKind::Kw(Kw::False) => {
                 self.advance();
-                Ok(Pattern { kind: PatternKind::Lit(Lit::Bool(false)), span: start })
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Bool(false)),
+                    span: start,
+                })
             }
             TokenKind::LParen => {
                 let open = self.advance();
                 if self.at(&TokenKind::RParen) {
                     let close = self.advance();
-                    return Ok(Pattern { kind: PatternKind::Lit(Lit::Unit), span: open.to(close) });
+                    return Ok(Pattern {
+                        kind: PatternKind::Lit(Lit::Unit),
+                        span: open.to(close),
+                    });
                 }
                 let mut inner = self.pattern()?;
                 let close = self.expect_close(&TokenKind::RParen, open, "`)`")?;
@@ -1229,7 +1510,10 @@ impl Parser {
             TokenKind::Ident(_) => {
                 let q = self.qname("a pattern")?;
                 if q.is_bare() && !starts_upper(q.symbol()) {
-                    return Ok(Pattern { kind: PatternKind::Var(q.name), span: start });
+                    return Ok(Pattern {
+                        kind: PatternKind::Var(q.name),
+                        span: start,
+                    });
                 }
                 let mut args = Vec::new();
                 let mut end = q.span;
@@ -1242,7 +1526,10 @@ impl Parser {
                         "`)` to close the constructor arguments",
                     )?;
                 }
-                Ok(Pattern { kind: PatternKind::Ctor { name: q, args }, span: start.to(end) })
+                Ok(Pattern {
+                    kind: PatternKind::Ctor { name: q, args },
+                    span: start.to(end),
+                })
             }
             _ => Err(self.error_here("a pattern")),
         }
@@ -1261,9 +1548,15 @@ impl Parser {
                 let bound = if matches!(self.kind(), TokenKind::Ident(_)) {
                     let name = self.expect_ident("a name after `..`")?;
                     let span = name.span;
-                    Pattern { kind: PatternKind::Var(name), span }
+                    Pattern {
+                        kind: PatternKind::Var(name),
+                        span,
+                    }
                 } else {
-                    Pattern { kind: PatternKind::Wildcard, span: dots }
+                    Pattern {
+                        kind: PatternKind::Wildcard,
+                        span: dots,
+                    }
                 };
                 rest = Some(Box::new(bound));
                 self.eat(&TokenKind::Comma);
@@ -1274,8 +1567,12 @@ impl Parser {
                 break;
             }
         }
-        let close = self.expect_close(&TokenKind::RBracket, open, "`]` to close the list pattern")?;
-        Ok(Pattern { kind: PatternKind::List { items, rest }, span: open.to(close) })
+        let close =
+            self.expect_close(&TokenKind::RBracket, open, "`]` to close the list pattern")?;
+        Ok(Pattern {
+            kind: PatternKind::List { items, rest },
+            span: open.to(close),
+        })
     }
 
     fn record_pattern(&mut self) -> PResult<Pattern> {
@@ -1296,7 +1593,10 @@ impl Parser {
                 self.pattern()?
             } else {
                 let span = name.span;
-                Pattern { kind: PatternKind::Var(name.clone()), span }
+                Pattern {
+                    kind: PatternKind::Var(name.clone()),
+                    span,
+                }
             };
             fields.push((name, pat));
             if !self.eat(&TokenKind::Comma) {
@@ -1306,7 +1606,10 @@ impl Parser {
         let close =
             self.expect_close(&TokenKind::RBrace, open, "`}` to close the record pattern")?;
         Ok(Pattern {
-            kind: PatternKind::Record { fields, rest: has_rest },
+            kind: PatternKind::Record {
+                fields,
+                rest: has_rest,
+            },
             span: open.to(close),
         })
     }

@@ -45,10 +45,18 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
             .values()
             .map(|op| format!("{} {:?} {:?} {:?}", op.name, op.mode, op.params, op.ret))
             .collect();
-        out.insert(format!("effect {name}"), format!("{} {ops:?}", effect.nondet));
+        out.insert(
+            format!("effect {name}"),
+            format!("{} {ops:?}", effect.nondet),
+        );
     }
     for (i, test) in loaded.check.tests.iter().enumerate() {
-        let hash = loaded.hashes.tests.get(i).map(|h| h.to_hex()).unwrap_or_default();
+        let hash = loaded
+            .hashes
+            .tests
+            .get(i)
+            .map(|h| h.to_hex())
+            .unwrap_or_default();
         out.insert(
             format!("test {i}"),
             format!("{} {} {} {hash}", test.key, test.nondet, test.footprint),
@@ -90,7 +98,10 @@ fn agree(dir: &Path, what: &str) -> Loaded {
 }
 
 fn codes(e: &LoadError) -> Vec<String> {
-    e.diagnostics.iter().map(|d| format!("{}: {}", d.code, d.message)).collect()
+    e.diagnostics
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect()
 }
 
 fn write(dir: &Path, name: &str, text: &str) {
@@ -192,10 +203,16 @@ fn adding_an_identically_declared_effect_reranks_a_skipped_performer() {
     write(dir.path(), "p.ply", &performer("x"));
     agree(dir.path(), "cold");
     let warm = agree(dir.path(), "warm");
-    assert!(skipped(&warm, "p.ply"), "the performer must be a skip candidate");
+    assert!(
+        skipped(&warm, "p.ply"),
+        "the performer must be a skip candidate"
+    );
 
     write(dir.path(), "a.ply", EFFECT_DECL);
-    agree(dir.path(), "a module declaring an identical effect appeared");
+    agree(
+        dir.path(),
+        "a module declaring an identical effect appeared",
+    );
 }
 
 /// The rank is decided by sorting the twins' names, so renaming one of them
@@ -209,7 +226,11 @@ fn renaming_an_effect_reranks_its_structural_twin() {
     write(dir.path(), "p.ply", &performer("a"));
     agree(dir.path(), "cold");
 
-    write(dir.path(), "x.ply", "pub effect audit { read get[r](key: Int) -> Int }\n");
+    write(
+        dir.path(),
+        "x.ply",
+        "pub effect audit { read get[r](key: Int) -> Int }\n",
+    );
     agree(dir.path(), "the twin was renamed to sort first");
 }
 
@@ -258,11 +279,19 @@ fn reordering_an_effects_operations_keeps_every_signature_on_its_operation() {
 #[test]
 fn reordering_a_types_variants_changes_its_hash_and_so_costs_a_recheck() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "m.ply", "pub type T =\n  | A(Int)\n  | B(String)\n");
+    write(
+        dir.path(),
+        "m.ply",
+        "pub type T =\n  | A(Int)\n  | B(String)\n",
+    );
     let cold = agree(dir.path(), "cold");
     let before = cold.hashes.decls[&Symbol::new("m.T")];
 
-    write(dir.path(), "m.ply", "pub type T =\n  | B(String)\n  | A(Int)\n");
+    write(
+        dir.path(),
+        "m.ply",
+        "pub type T =\n  | B(String)\n  | A(Int)\n",
+    );
     let after = agree(dir.path(), "the variants were reordered");
     assert_ne!(after.hashes.decls[&Symbol::new("m.T")], before);
 }
@@ -273,10 +302,18 @@ fn reordering_a_types_variants_changes_its_hash_and_so_costs_a_recheck() {
 #[test]
 fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "m.ply", "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
+    write(
+        dir.path(),
+        "m.ply",
+        "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n",
+    );
     agree(dir.path(), "cold");
 
-    write(dir.path(), "m.ply", "fn f() -> Int = 1\ntest \"f is really one\" { assert_eq(f(), 1) }\n");
+    write(
+        dir.path(),
+        "m.ply",
+        "fn f() -> Int = 1\ntest \"f is really one\" { assert_eq(f(), 1) }\n",
+    );
     agree(dir.path(), "the label changed");
     agree(dir.path(), "and the run after that, in case it self-heals");
 }
@@ -288,7 +325,11 @@ fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
 fn removing_pub_from_an_imported_name_is_still_an_error() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "a.ply", "pub fn one() -> Int = 1\n");
-    write(dir.path(), "b.ply", "import a\nfn two() -> Int = a::one() + a::one()\n");
+    write(
+        dir.path(),
+        "b.ply",
+        "import a\nfn two() -> Int = a::one() + a::one()\n",
+    );
     agree(dir.path(), "cold");
 
     write(dir.path(), "a.ply", "fn one() -> Int = 1\n");
@@ -310,7 +351,11 @@ fn editing_a_body_and_reverting_it_restores_every_hash() {
     let dir = corpus();
     let before = snapshot(&agree(dir.path(), "cold"));
 
-    write(dir.path(), "leaf.ply", "pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n");
+    write(
+        dir.path(),
+        "leaf.ply",
+        "pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n",
+    );
     agree(dir.path(), "edited");
     write(dir.path(), "leaf.ply", LEAF);
     assert_eq!(before, snapshot(&agree(dir.path(), "reverted")));
@@ -321,7 +366,11 @@ fn adding_a_definition_and_deleting_it_restores_every_hash() {
     let dir = corpus();
     let before = snapshot(&agree(dir.path(), "cold"));
 
-    write(dir.path(), "leaf.ply", &format!("{LEAF}pub fn three() -> Int = two() + one()\n"));
+    write(
+        dir.path(),
+        "leaf.ply",
+        &format!("{LEAF}pub fn three() -> Int = two() + one()\n"),
+    );
     agree(dir.path(), "a definition was added");
     write(dir.path(), "leaf.ply", LEAF);
     assert_eq!(before, snapshot(&agree(dir.path(), "and deleted again")));
@@ -335,12 +384,22 @@ fn moving_a_definition_between_modules_and_back_changes_no_hash() {
     let shared = hash_of(&agree(dir.path(), "cold"), "a.shared");
 
     write(dir.path(), "a.ply", "");
-    write(dir.path(), "b.ply", "pub fn shared() -> Int = 41 + 1\npub fn other() -> Int = 7\n");
-    assert_eq!(hash_of(&agree(dir.path(), "moved to b"), "b.shared"), shared);
+    write(
+        dir.path(),
+        "b.ply",
+        "pub fn shared() -> Int = 41 + 1\npub fn other() -> Int = 7\n",
+    );
+    assert_eq!(
+        hash_of(&agree(dir.path(), "moved to b"), "b.shared"),
+        shared
+    );
 
     write(dir.path(), "a.ply", "pub fn shared() -> Int = 41 + 1\n");
     write(dir.path(), "b.ply", "pub fn other() -> Int = 7\n");
-    assert_eq!(hash_of(&agree(dir.path(), "moved back"), "a.shared"), shared);
+    assert_eq!(
+        hash_of(&agree(dir.path(), "moved back"), "a.shared"),
+        shared
+    );
 }
 
 /// Renaming a module means moving its file, which changes the fingerprint's key
@@ -351,7 +410,10 @@ fn renaming_a_module_and_renaming_it_back_changes_no_hash() {
     let one = hash_of(&agree(dir.path(), "cold"), "leaf.one");
 
     fs::rename(dir.path().join("leaf.ply"), dir.path().join("frond.ply")).unwrap();
-    assert_eq!(hash_of(&agree(dir.path(), "module renamed"), "frond.one"), one);
+    assert_eq!(
+        hash_of(&agree(dir.path(), "module renamed"), "frond.one"),
+        one
+    );
 
     fs::rename(dir.path().join("frond.ply"), dir.path().join("leaf.ply")).unwrap();
     assert_eq!(hash_of(&agree(dir.path(), "renamed back"), "leaf.one"), one);
@@ -384,8 +446,17 @@ fn rewriting_a_file_with_identical_bytes_invalidates_nothing() {
     let text = fs::read_to_string(dir.path().join("leaf.ply")).unwrap();
     fs::write(dir.path().join("leaf.ply"), text).unwrap();
     let after = agree(dir.path(), "rewritten with identical bytes");
-    let leaf = after.frontend.files.iter().find(|f| f.path.ends_with("leaf.ply")).unwrap();
-    assert!(!leaf.parsed, "mtime moved and nothing else: {}", leaf.refusal.describe());
+    let leaf = after
+        .frontend
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("leaf.ply"))
+        .unwrap();
+    assert!(
+        !leaf.parsed,
+        "mtime moved and nothing else: {}",
+        leaf.refusal.describe()
+    );
 }
 
 /// Gate 1 is conservative about bytes and gate 2 is exact about hashes, so a
@@ -396,9 +467,17 @@ fn a_comment_costs_a_parse_and_no_recheck_anywhere() {
     agree(dir.path(), "cold");
     write(dir.path(), "leaf.ply", &format!("// a note\n{LEAF}"));
     let after = agree(dir.path(), "a comment was added");
-    let leaf = after.frontend.files.iter().find(|f| f.path.ends_with("leaf.ply")).unwrap();
+    let leaf = after
+        .frontend
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("leaf.ply"))
+        .unwrap();
     assert!(leaf.parsed);
-    assert!(!leaf.rechecked, "no hash moved, so nothing may be re-inferred");
+    assert!(
+        !leaf.rechecked,
+        "no hash moved, so nothing may be re-inferred"
+    );
 }
 
 #[test]
@@ -410,7 +489,9 @@ fn aliasing_an_import_differently_and_back_agrees() {
     write(
         dir.path(),
         "shop.ply",
-        &shop.replace("import core", "import core as c").replace("core::", "c::"),
+        &shop
+            .replace("import core", "import core as c")
+            .replace("core::", "c::"),
     );
     agree(dir.path(), "the import was aliased");
     write(dir.path(), "shop.ply", &shop);
@@ -421,12 +502,24 @@ fn aliasing_an_import_differently_and_back_agrees() {
 fn switching_between_a_module_import_and_a_selective_one_agrees() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "a.ply", "pub fn one() -> Int = 1\n");
-    write(dir.path(), "b.ply", "import a\nfn two() -> Int = a::one() + a::one()\n");
+    write(
+        dir.path(),
+        "b.ply",
+        "import a\nfn two() -> Int = a::one() + a::one()\n",
+    );
     agree(dir.path(), "cold");
 
-    write(dir.path(), "b.ply", "import a (one)\nfn two() -> Int = one() + one()\n");
+    write(
+        dir.path(),
+        "b.ply",
+        "import a (one)\nfn two() -> Int = one() + one()\n",
+    );
     agree(dir.path(), "selective");
-    write(dir.path(), "b.ply", "import a\nfn two() -> Int = a::one() + a::one()\n");
+    write(
+        dir.path(),
+        "b.ply",
+        "import a\nfn two() -> Int = a::one() + a::one()\n",
+    );
     agree(dir.path(), "back to a module import");
 }
 
@@ -436,13 +529,29 @@ fn switching_between_a_module_import_and_a_selective_one_agrees() {
 #[test]
 fn renaming_a_type_two_modules_away_agrees() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "a.ply", "pub type T = | Mk(Int)\npub fn mk() -> T = Mk(1)\n");
-    write(dir.path(), "b.ply", "import a\npub fn get() -> a::T = a::mk()\n");
+    write(
+        dir.path(),
+        "a.ply",
+        "pub type T = | Mk(Int)\npub fn mk() -> T = Mk(1)\n",
+    );
+    write(
+        dir.path(),
+        "b.ply",
+        "import a\npub fn get() -> a::T = a::mk()\n",
+    );
     write(dir.path(), "c.ply", "import b\npub fn top() = b::get()\n");
     agree(dir.path(), "cold");
 
-    write(dir.path(), "a.ply", "pub type Renamed = | Mk(Int)\npub fn mk() -> Renamed = Mk(1)\n");
-    write(dir.path(), "b.ply", "import a\npub fn get() -> a::Renamed = a::mk()\n");
+    write(
+        dir.path(),
+        "a.ply",
+        "pub type Renamed = | Mk(Int)\npub fn mk() -> Renamed = Mk(1)\n",
+    );
+    write(
+        dir.path(),
+        "b.ply",
+        "import a\npub fn get() -> a::Renamed = a::mk()\n",
+    );
     agree(dir.path(), "the type was renamed two modules away");
 }
 
@@ -481,19 +590,34 @@ fn changing_only_a_resource_label_reaches_the_importer() {
     write(dir.path(), "m.ply", &m("z"));
     write(dir.path(), "u.ply", &u("z"));
     let after = agree(dir.path(), "the resource label changed");
-    assert_ne!(hash_of(&after, "u.use_it"), before, "a resource is part of the atom");
+    assert_ne!(
+        hash_of(&after, "u.use_it"),
+        before,
+        "a resource is part of the atom"
+    );
 }
 
 #[test]
 fn a_cache_mangled_mid_session_degrades_to_the_full_path_and_recovers() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    write(dir.path(), "leaf.ply", "pub fn one() -> Int = 2\npub fn two() -> Int = one() + one()\n");
+    write(
+        dir.path(),
+        "leaf.ply",
+        "pub fn one() -> Int = 2\npub fn two() -> Int = one() + one()\n",
+    );
     agree(dir.path(), "edited");
 
-    let cache = dir.path().join(".ply-cache/frontend.json");
-    let text = fs::read_to_string(&cache).unwrap();
-    fs::write(&cache, text.replace("\"scheme\"", "\"schemx\"")).unwrap();
+    // Mangled in the payload region rather than replaced wholesale: a header
+    // this build still recognizes over entries it cannot decode is the shape a
+    // half-written append leaves, and it is the one a length prefix and a
+    // checksum have to catch per entry.
+    let data = dir.path().join(".ply-cache/frontend.dat");
+    let mut bytes = fs::read(&data).unwrap();
+    for byte in bytes.iter_mut().skip(64) {
+        *byte ^= 0x5a;
+    }
+    fs::write(&data, &bytes).unwrap();
     agree(dir.path(), "the cache was mangled");
     agree(dir.path(), "and the run after that");
 }
@@ -506,12 +630,10 @@ fn fingerprints_without_their_interfaces_are_refused_rather_than_believed() {
     let dir = corpus();
     agree(dir.path(), "cold");
 
-    let cache = dir.path().join(".ply-cache/frontend.json");
-    let mut value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
-    value["defs"] = serde_json::json!({});
-    value["decls"] = serde_json::json!({});
-    fs::write(&cache, serde_json::to_string(&value).unwrap()).unwrap();
+    // The index still names every fingerprint and every interface; the file the
+    // offsets point into is gone. Nothing an entry claims can be produced, which
+    // is what a garbage collection interrupted between its two files leaves.
+    fs::remove_file(dir.path().join(".ply-cache/frontend.dat")).unwrap();
 
     agree(dir.path(), "fingerprints with no interfaces behind them");
     agree(dir.path(), "and the run after that");
@@ -545,7 +667,11 @@ fn two_stores_open_at_once_leave_a_cache_that_still_agrees() {
     let mut second = Store::open(dir.path()).unwrap();
 
     driver::load_incremental(dir.path(), &mut first).unwrap();
-    write(dir.path(), "leaf.ply", "pub fn one() -> Int = 3\npub fn two() -> Int = one() + one()\n");
+    write(
+        dir.path(),
+        "leaf.ply",
+        "pub fn one() -> Int = 3\npub fn two() -> Int = one() + one()\n",
+    );
     driver::load_incremental(dir.path(), &mut second).unwrap();
     drop(first);
     drop(second);
@@ -596,7 +722,11 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     let start = snapshot(&agree(dir.path(), "step 0"));
 
     let clock = fs::read_to_string(dir.path().join("clock.ply")).unwrap();
-    write(dir.path(), "clock.ply", &format!("{clock}\npub fn ticks() -> Int = 0\n"));
+    write(
+        dir.path(),
+        "clock.ply",
+        &format!("{clock}\npub fn ticks() -> Int = 0\n"),
+    );
     agree(dir.path(), "step 1: a definition appeared");
 
     write(dir.path(), "spare.ply", "pub fn spare() -> Int = 9\n");
@@ -610,7 +740,10 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
 
     write(dir.path(), "clock.ply", &clock);
     let end = snapshot(&agree(dir.path(), "step 5: back to where it started"));
-    assert_eq!(start, end, "an undone session must land on the state it began in");
+    assert_eq!(
+        start, end,
+        "an undone session must land on the state it began in"
+    );
 }
 
 /// A shuffle through states that all compile, seeded so a divergence is
@@ -648,7 +781,9 @@ fn a_shuffle_of_module_states_agrees_at_every_step() {
     let mut state = [0usize; 3];
     let mut seed: u64 = 0xa11d_1700_0bad_f00d;
     for step in 0..60 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let file = (seed >> 33) as usize % variants.len();
         let pick = (seed >> 17) as usize % 3;
         if state[file] == pick {
@@ -657,7 +792,10 @@ fn a_shuffle_of_module_states_agrees_at_every_step() {
         state[file] = pick;
         let (name, bodies) = &variants[file];
         write(dir.path(), name, &bodies[pick]);
-        agree(dir.path(), &format!("shuffle step {step}: {name} -> {pick}"));
+        agree(
+            dir.path(),
+            &format!("shuffle step {step}: {name} -> {pick}"),
+        );
     }
 }
 
@@ -668,7 +806,12 @@ fn ply(dir: &Path) -> Command {
 }
 
 fn test_hashes(dir: &Path, extra: &[&str]) -> Vec<String> {
-    let out = ply(dir).arg("test").arg("--json").args(extra).output().unwrap();
+    let out = ply(dir)
+        .arg("test")
+        .arg("--json")
+        .args(extra)
+        .output()
+        .unwrap();
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("--json emits one object");
     v["selection"]["tests"]
@@ -698,7 +841,11 @@ fn a_relative_and_an_absolute_path_share_one_cache() {
     let dir = corpus();
     ply(dir.path()).args(["check"]).output().unwrap();
 
-    let out = ply(dir.path()).args(["check", "--explain"]).arg(dir.path()).output().unwrap();
+    let out = ply(dir.path())
+        .args(["check", "--explain"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
         text.contains("skipped"),
@@ -715,7 +862,11 @@ fn a_relative_and_an_absolute_path_share_one_cache() {
 #[test]
 fn a_skipped_file_still_contributes_its_reference_graph() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "a.ply", "pub fn one() -> Int = 1\npub fn two() -> Int = one()\n");
+    write(
+        dir.path(),
+        "a.ply",
+        "pub fn one() -> Int = 1\npub fn two() -> Int = one()\n",
+    );
 
     let mut store = Store::open(dir.path()).unwrap();
     driver::load_incremental(dir.path(), &mut store).unwrap();
@@ -723,7 +874,10 @@ fn a_skipped_file_still_contributes_its_reference_graph() {
 
     let mut store = Store::open(dir.path()).unwrap();
     let warm = driver::load_incremental(dir.path(), &mut store).unwrap();
-    assert!(skipped(&warm, "a.ply"), "the fixture is only interesting while the file skips");
+    assert!(
+        skipped(&warm, "a.ply"),
+        "the fixture is only interesting while the file skips"
+    );
     let full = driver::load_full(dir.path()).unwrap();
 
     assert_eq!(warm.hashes.deps, full.hashes.deps);

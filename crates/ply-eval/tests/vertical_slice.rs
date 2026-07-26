@@ -43,15 +43,16 @@ impl Compiled {
         let inputs: Vec<_> = files
             .iter()
             .enumerate()
-            .map(|(i, (name, text))| {
-                (SourceId(i as u32), ModuleName::from_dotted(name), *text)
-            })
+            .map(|(i, (name, text))| (SourceId(i as u32), ModuleName::from_dotted(name), *text))
             .collect();
         let program = ply_syntax::parse_program(inputs).expect("the sample should parse");
         let resolved = resolve(&program).expect("the sample should resolve");
-        let check =
-            check_program(&program, &resolved).expect("the sample should typecheck");
-        Compiled { program, resolved, check }
+        let check = check_program(&program, &resolved).expect("the sample should typecheck");
+        Compiled {
+            program,
+            resolved,
+            check,
+        }
     }
 
     fn interp(&self) -> Interp<'_> {
@@ -74,7 +75,10 @@ fn a_handled_effect_evaluates_through_the_checked_module() {
 #[test]
 fn a_failing_test_yields_an_assertion_diagnostic() {
     let compiled = single();
-    let diag = compiled.interp().eval_test(1).expect_err("the test should fail");
+    let diag = compiled
+        .interp()
+        .eval_test(1)
+        .expect_err("the test should fail");
     assert_eq!(diag.code, ply_span::codes::ASSERTION_FAILED);
     assert_eq!(diag.message, "assertion failed: expected 3, found 2");
     assert!(
@@ -110,8 +114,14 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
         ),
     ]);
     assert_eq!(compiled.check.tests.len(), 1);
-    assert_eq!(compiled.check.tests[0].key.as_str(), "app.the imported effect is handled here");
-    compiled.interp().eval_test(0).expect("the cross-module handler should discharge `store.db`");
+    assert_eq!(
+        compiled.check.tests[0].key.as_str(),
+        "app.the imported effect is handled here"
+    );
+    compiled
+        .interp()
+        .eval_test(0)
+        .expect("the cross-module handler should discharge `store.db`");
 }
 
 /// A clause body runs when a perform deep inside another module reaches it, but
@@ -152,13 +162,31 @@ fn a_handler_clause_body_resolves_where_the_handler_was_written() {
 #[test]
 fn same_named_definitions_in_two_modules_do_not_collide() {
     let compiled = Compiled::new(&[
-        ("alpha", "pub fn answer() -> Int = 1\npub fn wrapped() -> Int = answer()\n"),
-        ("beta", "pub fn answer() -> Int = 2\npub fn wrapped() -> Int = answer()\n"),
+        (
+            "alpha",
+            "pub fn answer() -> Int = 1\npub fn wrapped() -> Int = answer()\n",
+        ),
+        (
+            "beta",
+            "pub fn answer() -> Int = 2\npub fn wrapped() -> Int = answer()\n",
+        ),
     ]);
     let mut interp = compiled.interp();
     let at = ply_span::Span::DUMMY;
-    assert_eq!(interp.call("alpha.wrapped", Vec::new(), at).unwrap().render(), "1");
-    assert_eq!(interp.call("beta.wrapped", Vec::new(), at).unwrap().render(), "2");
+    assert_eq!(
+        interp
+            .call("alpha.wrapped", Vec::new(), at)
+            .unwrap()
+            .render(),
+        "1"
+    );
+    assert_eq!(
+        interp
+            .call("beta.wrapped", Vec::new(), at)
+            .unwrap()
+            .render(),
+        "2"
+    );
 }
 
 /// A constructor's identity is its program-wide name: two modules may each
@@ -167,7 +195,10 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
 #[test]
 fn constructors_from_two_modules_are_distinct_values() {
     let compiled = Compiled::new(&[
-        ("alpha", "pub type A = Wrapped(Int)\npub fn make() -> A = Wrapped(1)\n"),
+        (
+            "alpha",
+            "pub type A = Wrapped(Int)\npub fn make() -> A = Wrapped(1)\n",
+        ),
         (
             "beta",
             "import alpha\n\
@@ -178,7 +209,16 @@ fn constructors_from_two_modules_are_distinct_values() {
     ]);
     let mut interp = compiled.interp();
     let at = ply_span::Span::DUMMY;
-    assert_eq!(interp.call("beta.theirs", Vec::new(), at).unwrap().render(), "1");
-    assert_eq!(interp.call("beta.mine", Vec::new(), at).unwrap().render(), "2");
-    assert_eq!(interp.call("alpha.make", Vec::new(), at).unwrap().render(), "alpha.Wrapped(1)");
+    assert_eq!(
+        interp.call("beta.theirs", Vec::new(), at).unwrap().render(),
+        "1"
+    );
+    assert_eq!(
+        interp.call("beta.mine", Vec::new(), at).unwrap().render(),
+        "2"
+    );
+    assert_eq!(
+        interp.call("alpha.make", Vec::new(), at).unwrap().render(),
+        "alpha.Wrapped(1)"
+    );
 }

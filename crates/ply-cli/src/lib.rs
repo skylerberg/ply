@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod driver;
 pub mod load;
+pub mod migrate;
 pub mod style;
 
 use cli::{CacheAction, Cli, Command};
@@ -27,6 +28,8 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Cache(args) => match &args.action {
             CacheAction::Clear(scope) => commands::cache::clear(scope, style),
             CacheAction::Stats(scope) => commands::cache::stats(scope, style),
+            CacheAction::Compact(scope) => commands::cache::compact(scope, style),
+            CacheAction::Inspect(inspect) => commands::cache::inspect(inspect, style),
         },
     }
 }

@@ -14,9 +14,10 @@ use ply_syntax::ast::{Ident, ImportKind, Item, ModuleName, Program, TypeDefBody}
 use ply_syntax::resolve::{Binding, Namespace, Resolved, Scope};
 
 fn program_of(files: &[(&str, &str)]) -> Program {
-    let inputs = files.iter().enumerate().map(|(i, (name, source))| {
-        (SourceId(i as u32), ModuleName::from_dotted(name), *source)
-    });
+    let inputs = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, source))| (SourceId(i as u32), ModuleName::from_dotted(name), *source));
     match ply_syntax::parse_program(inputs) {
         Ok(program) => program,
         Err(diags) => panic!("program did not parse: {diags:#?}"),
@@ -38,11 +39,17 @@ fn hashes(files: &[(&str, &str)]) -> HashOutput {
 /// show that a definition-level cycle spanning modules costs this crate nothing.
 fn hashes_ignoring_cycles(files: &[(&str, &str)]) -> HashOutput {
     let program = program_of(files);
-    let index: Vec<Symbol> =
-        program.modules.iter().map(|m| m.name.as_symbol().clone()).collect();
+    let index: Vec<Symbol> = program
+        .modules
+        .iter()
+        .map(|m| m.name.as_symbol().clone())
+        .collect();
     let mut resolved = Resolved::default();
     for (owner, module) in program.modules.iter().enumerate() {
-        let mut scope = Scope { module: module.name.clone(), ..Scope::default() };
+        let mut scope = Scope {
+            module: module.name.clone(),
+            ..Scope::default()
+        };
         let mut bind = |ns: Namespace, name: &Ident| {
             scope.space_mut(ns).insert(
                 name.name.clone(),
@@ -70,7 +77,10 @@ fn hashes_ignoring_cycles(files: &[(&str, &str)]) -> HashOutput {
         }
         for import in &module.imports {
             let target = import.module_name();
-            let owner = index.iter().position(|n| n == target.as_symbol()).expect("imported");
+            let owner = index
+                .iter()
+                .position(|n| n == target.as_symbol())
+                .expect("imported");
             if let (ImportKind::Module | ImportKind::Alias(_), Some(binder)) =
                 (&import.kind, import.binder())
             {
@@ -131,10 +141,22 @@ fn moving_a_definition_between_modules_changes_no_hash() {
     ]);
     let before = before();
 
-    assert_eq!(def(&before, "a.shared"), def(&after, "d.shared"), "the moved definition");
-    assert_eq!(def(&before, "a.helper"), def(&after, "a.helper"), "its former neighbour");
+    assert_eq!(
+        def(&before, "a.shared"),
+        def(&after, "d.shared"),
+        "the moved definition"
+    );
+    assert_eq!(
+        def(&before, "a.helper"),
+        def(&after, "a.helper"),
+        "its former neighbour"
+    );
     assert_eq!(def(&before, "b.use_b"), def(&after, "b.use_b"), "a caller");
-    assert_eq!(def(&before, "c.use_c"), def(&after, "c.use_c"), "the other caller");
+    assert_eq!(
+        def(&before, "c.use_c"),
+        def(&after, "c.use_c"),
+        "the other caller"
+    );
     assert_eq!(before.tests, after.tests, "the tests that reach it");
 }
 
@@ -159,8 +181,18 @@ fn renaming_a_definition_imported_by_two_modules_changes_no_hash() {
 fn renaming_a_module_changes_no_hash() {
     let after = hashes(&[
         ("helpers", A_BEFORE),
-        ("b", &B_BEFORE.replace("a::", "helpers::").replace("import a", "import helpers")),
-        ("c", &C_BEFORE.replace("a::", "helpers::").replace("import a", "import helpers")),
+        (
+            "b",
+            &B_BEFORE
+                .replace("a::", "helpers::")
+                .replace("import a", "import helpers"),
+        ),
+        (
+            "c",
+            &C_BEFORE
+                .replace("a::", "helpers::")
+                .replace("import a", "import helpers"),
+        ),
     ]);
     let before = before();
 
@@ -186,12 +218,22 @@ fn visibility_and_imports_are_erased() {
     ]);
     let aliased = hashes(&[
         ("a", A_BEFORE),
-        ("b", &B_BEFORE.replace("import a", "import a as alpha").replace("a::", "alpha::")),
+        (
+            "b",
+            &B_BEFORE
+                .replace("import a", "import a as alpha")
+                .replace("a::", "alpha::"),
+        ),
         ("c", C_BEFORE),
     ]);
     let selective = hashes(&[
         ("a", A_BEFORE),
-        ("b", &B_BEFORE.replace("import a", "import a (shared)").replace("a::shared", "shared")),
+        (
+            "b",
+            &B_BEFORE
+                .replace("import a", "import a (shared)")
+                .replace("a::shared", "shared"),
+        ),
         ("c", C_BEFORE),
     ]);
 
@@ -220,7 +262,11 @@ fn editing_a_definition_moves_its_dependents_in_other_modules() {
     assert_ne!(def(&before, "b.use_b"), def(&after, "b.use_b"));
     assert_ne!(def(&before, "c.use_c"), def(&after, "c.use_c"));
     assert_ne!(before.tests, after.tests);
-    assert_eq!(def(&before, "a.helper"), def(&after, "a.helper"), "an unrelated neighbour");
+    assert_eq!(
+        def(&before, "a.helper"),
+        def(&after, "a.helper"),
+        "an unrelated neighbour"
+    );
 }
 
 #[test]
@@ -277,11 +323,16 @@ fn a_local_binder_does_not_hide_a_module_binder() {
 #[test]
 fn deps_and_closures_are_keyed_by_the_program_wide_name() {
     let out = before();
-    assert_eq!(out.deps[&Symbol::new("b.use_b")], vec![Symbol::new("a.shared")]);
+    assert_eq!(
+        out.deps[&Symbol::new("b.use_b")],
+        vec![Symbol::new("a.shared")]
+    );
     assert_eq!(out.deps[&Symbol::new("a.shared")], Vec::<Symbol>::new());
 
-    let closure: Vec<String> =
-        out.closure[&Symbol::new("b.use_b")].iter().map(|s| s.to_string()).collect();
+    let closure: Vec<String> = out.closure[&Symbol::new("b.use_b")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure, vec!["a.shared", "b.use_b"]);
 
     let test_closure: Vec<String> = out.closure[&Symbol::new("b.b uses shared")]
@@ -296,8 +347,14 @@ fn deps_and_closures_are_keyed_by_the_program_wide_name() {
 #[test]
 fn identically_labelled_tests_in_two_modules_stay_distinct() {
     let out = hashes(&[
-        ("a", "fn f() -> Int = 1\ntest \"same label\" { assert_eq(f(), 1) }\n"),
-        ("b", "fn g() -> Int = 2\ntest \"same label\" { assert_eq(g(), 2) }\n"),
+        (
+            "a",
+            "fn f() -> Int = 1\ntest \"same label\" { assert_eq(f(), 1) }\n",
+        ),
+        (
+            "b",
+            "fn g() -> Int = 2\ntest \"same label\" { assert_eq(g(), 2) }\n",
+        ),
     ]);
     assert!(out.closure.contains_key(&Symbol::new("a.same label")));
     assert!(out.closure.contains_key(&Symbol::new("b.same label")));
@@ -373,7 +430,9 @@ fn performing_an_imported_effect_hashes_like_performing_a_local_one() {
 /// the rank — and every performer's hash — survives one of them moving.
 #[test]
 fn moving_a_look_alike_effect_between_modules_changes_no_hash() {
-    let audit = LOOK_ALIKE.replace("effect db", "effect audit").replace("db.", "audit.");
+    let audit = LOOK_ALIKE
+        .replace("effect db", "effect audit")
+        .replace("db.", "audit.");
     let before = hashes(&[("a", LOOK_ALIKE), ("b", &audit)]);
     let after = hashes(&[("a", LOOK_ALIKE), ("b", ""), ("z", &audit)]);
     assert_eq!(def(&before, "a.log"), def(&after, "a.log"));
@@ -431,7 +490,10 @@ fn a_type_and_its_constructors_survive_a_move() {
 fn a_strongly_connected_component_may_span_modules() {
     let split = hashes_ignoring_cycles(&[
         ("a", "import b\npub fn ping(n: Int) -> Int = b::pong(n)\n"),
-        ("b", "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n"),
+        (
+            "b",
+            "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n",
+        ),
     ]);
     let together = hashes(&[(
         "a",
@@ -442,8 +504,10 @@ fn a_strongly_connected_component_may_span_modules() {
     assert_eq!(def(&split, "b.pong"), def(&together, "a.pong"));
     assert_ne!(def(&split, "a.ping"), def(&split, "b.pong"));
 
-    let closure: Vec<String> =
-        split.closure[&Symbol::new("a.ping")].iter().map(|s| s.to_string()).collect();
+    let closure: Vec<String> = split.closure[&Symbol::new("a.ping")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure, vec!["a.ping", "b.pong"]);
 }
 
@@ -451,10 +515,16 @@ fn a_strongly_connected_component_may_span_modules() {
 fn a_cross_module_component_does_not_depend_on_module_order() {
     let forward = hashes_ignoring_cycles(&[
         ("a", "import b\npub fn ping(n: Int) -> Int = b::pong(n)\n"),
-        ("b", "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n"),
+        (
+            "b",
+            "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n",
+        ),
     ]);
     let backward = hashes_ignoring_cycles(&[
-        ("b", "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n"),
+        (
+            "b",
+            "import a\npub fn pong(n: Int) -> Int = a::ping(n - 1)\n",
+        ),
         ("a", "import b\npub fn ping(n: Int) -> Int = b::pong(n)\n"),
     ]);
     assert_eq!(def(&forward, "a.ping"), def(&backward, "a.ping"));
@@ -470,8 +540,10 @@ fn mutual_recursion_inside_one_module_is_unaffected() {
          fn caller() -> Bool = is_even(4)\n",
     )]);
     assert_ne!(def(&out, "a.is_even"), def(&out, "a.is_odd"));
-    let closure: Vec<String> =
-        out.closure[&Symbol::new("a.caller")].iter().map(|s| s.to_string()).collect();
+    let closure: Vec<String> = out.closure[&Symbol::new("a.caller")]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(closure, vec!["a.caller", "a.is_even", "a.is_odd"]);
 }
 
@@ -514,11 +586,7 @@ fn a_duplicate_definition_is_still_reported_per_module() {
 /// resolved source structure alone.
 #[test]
 fn the_checked_entry_point_agrees_with_the_unchecked_one() {
-    let program = program_of(&[
-        ("a", A_BEFORE),
-        ("b", B_BEFORE),
-        ("c", C_BEFORE),
-    ]);
+    let program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
     let resolved = ply_syntax::resolve(&program).expect("resolves");
     let check = match ply_core::check_program(&program, &resolved) {
         Ok(check) => check,
@@ -563,7 +631,8 @@ fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
     };
 
     // `a` imports `b`, so `a` loads first and is checked second.
-    let importer = "import b\nfn one() -> Int = b::zero() + 1\ntest \"one\" { assert_eq(one(), 1) }\n";
+    let importer =
+        "import b\nfn one() -> Int = b::zero() + 1\ntest \"one\" { assert_eq(one(), 1) }\n";
     let base = "pub fn zero() -> Int = 0\ntest \"zero\" { assert_eq(zero(), 0) }\n";
 
     let mut inverted = paired(&[("a", importer), ("b", base)]);
@@ -572,5 +641,8 @@ fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
 
     inverted.sort();
     agreeing.sort();
-    assert_eq!(inverted, agreeing, "a test was paired with another test's hash");
+    assert_eq!(
+        inverted, agreeing,
+        "a test was paired with another test's hash"
+    );
 }
