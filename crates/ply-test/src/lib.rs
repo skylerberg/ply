@@ -132,8 +132,9 @@ impl fmt::Debug for Selection {
 pub enum Status {
     Passed,
     Failed,
-    /// Kept distinct from `Failed` so a defect in Ply cannot be read as a red
-    /// test.
+    /// Ply failed rather than the program: the evaluator unwound, or it reported
+    /// one of its own invariants broken. Kept distinct from `Failed` so a defect
+    /// in Ply cannot be read as a red test the user should go and fix.
     Panicked,
 }
 
@@ -289,6 +290,15 @@ pub struct Failure {
     /// `<module>.<label>`, and the key this failure's closure is looked up by.
     pub key: Symbol,
     pub diagnostic: Diagnostic,
+    /// Ply's fault rather than the program's, so there is nothing in the
+    /// definition graph to attribute it to.
+    ///
+    /// Three things say so, and no fourth: the run watched the evaluator unwind,
+    /// the evaluator said `INTERNAL_ERROR`, or the two engines disagreed. Reading
+    /// it off `RUNTIME_ERROR` is what made a runaway recursion — a documented
+    /// limit, and as bisectable a regression as any assertion — report itself as
+    /// a defect in Ply and decline to be bisected.
+    pub defect: bool,
     /// Definitions in this test's closure whose hash is not in the store —
     /// the suspects for this failure.
     pub suspects: Vec<Symbol>,
@@ -608,7 +618,6 @@ pub fn diagnose_failures(
                 record.decls.clone(),
             )
         });
-        let panicked = failure.diagnostic.code == codes::RUNTIME_ERROR;
         let nondet = check
             .tests
             .iter()
@@ -626,7 +635,7 @@ pub fn diagnose_failures(
             key: &failure.key,
             test_hash,
             nondet,
-            panicked,
+            defect: failure.defect,
             suspects: &failure.suspects,
             hashes,
             baseline: baseline.as_ref(),
@@ -744,7 +753,7 @@ pub fn run_with<E: Executor>(
             } else {
                 warnings.push(
                     Diagnostic::warning(
-                        codes::RUNTIME_ERROR,
+                        codes::INTERNAL_ERROR,
                         format!(
                             "selection names test {index}, but the module defines {}",
                             check.tests.len()
@@ -759,7 +768,10 @@ pub fn run_with<E: Executor>(
             let index = executed.index;
             let test = &check.tests[index];
             let hash = test_hash(hashes, index);
-            let status = match (&executed.failure, executed.panicked) {
+            let defect = executed.failure.as_ref().is_some_and(|d| {
+                executed.panicked || d.code == codes::INTERNAL_ERROR || is_divergence(d)
+            });
+            let status = match (&executed.failure, defect) {
                 (None, _) => Status::Passed,
                 (Some(_), false) => Status::Failed,
                 (Some(_), true) => Status::Panicked,
@@ -769,7 +781,7 @@ pub fn run_with<E: Executor>(
                 failed += 1;
                 let suspects = suspects_for(hashes, &test.key, &changed);
                 let mut attribution = Attribution::from_suspects(&suspects, hashes);
-                if executed.panicked {
+                if defect {
                     attribution.bisection = Bisection::not_attempted(Skipped::Panicked);
                 } else if test.nondet {
                     attribution.bisection = Bisection::not_attempted(Skipped::Nondet);
@@ -778,6 +790,7 @@ pub fn run_with<E: Executor>(
                     name: test.name.clone(),
                     key: test.key.clone(),
                     diagnostic: diagnostic.clone(),
+                    defect,
                     suspects,
                     assertion: None,
                     attribution,
@@ -817,7 +830,7 @@ pub fn run_with<E: Executor>(
     if let Err(e) = store.flush() {
         warnings.push(
             Diagnostic::warning(
-                codes::RUNTIME_ERROR,
+                codes::CACHE_UNREADABLE,
                 format!("could not write the test cache: {e}"),
             )
             .note("the run itself is valid; every test will simply be re-run next time"),
@@ -851,7 +864,7 @@ fn schedule_of(selection: &Selection, warnings: &mut Vec<Diagnostic>) -> Vec<Vec
     }
     warnings.push(
         Diagnostic::warning(
-            codes::RUNTIME_ERROR,
+            codes::INTERNAL_ERROR,
             format!(
                 "{} selected tests were in no concurrency group",
                 orphans.len()
@@ -919,6 +932,19 @@ fn execute_group<E: Executor>(
     out
 }
 
+/// Two evaluators of one language disagreeing is a defect in Ply by definition:
+/// whatever the program means, at most one of the answers is it, and nothing in
+/// the user's definition graph decides which. Bisecting it would name whichever
+/// definition the disagreement happened to run through.
+///
+/// The one code that must be read rather than observed. An unwind and an
+/// `INTERNAL_ERROR` are things the run watched happen; a divergence is a
+/// comparison the audit made and reported as an ordinary `Err`, so there is no
+/// observation to read it off.
+fn is_divergence(d: &Diagnostic) -> bool {
+    d.code == codes::ENGINE_DIVERGENCE
+}
+
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {
     let message = if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
@@ -934,7 +960,7 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
     };
 
     Diagnostic::error(
-        codes::RUNTIME_ERROR,
+        codes::INTERNAL_ERROR,
         format!("test `{name}` panicked: {message}"),
     )
     .primary(span, "the interpreter panicked while running this test")

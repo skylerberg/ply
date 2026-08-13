@@ -36,7 +36,7 @@ pub use differential::{
 };
 pub use env::Env;
 pub use interp::Interp;
-pub use limit::DEFAULT_MAX_CALLS;
+pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{DEFAULT_MAX_FRAMES, Machine, Progress};
 pub use trace::Trace;
 pub use value::{Closure, ClosureKind, Value, Vector, first_difference, values_equal};

@@ -276,6 +276,11 @@ pub fn failure_json(failure: &Failure) -> Value {
         "key": failure.key,
         "name": failure.name,
         "diagnostic": failure.diagnostic,
+        // Whether to go and read the program or go and report a bug in Ply. Not
+        // derivable from the rest of the artifact: `culprit.skipped` says
+        // `panicked` only when a bisection was attempted and refused, so under
+        // `--bisect never` every failure would look alike.
+        "defect": failure.defect,
         "assertion": failure.assertion.as_ref().map(assertion_json),
         "culprit": culprit_json(&failure.attribution.bisection),
         "causal_slice": failure.attribution.slice.as_ref().map(slice_json),

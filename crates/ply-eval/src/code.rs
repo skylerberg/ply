@@ -125,7 +125,16 @@ pub struct ReturnArm {
     pub span: Span,
 }
 
+/// Grows the host stack rather than bounding the nesting: the parser, inference
+/// and normalization all accept an expression of any depth by growing, and a
+/// bound here would refuse — on the machine only — a program `ply check` and
+/// `ply run` accept. That is an `E0503` divergence on every corpus with a long
+/// operator chain in it.
 pub fn lower(e: &Expr) -> Code {
+    crate::limit::grow(|| lower_node(e))
+}
+
+fn lower_node(e: &Expr) -> Code {
     let kind = match &e.kind {
         ExprKind::Lit(lit) => NodeKind::Lit(lit.clone()),
         ExprKind::Var(q) => NodeKind::Var(q.clone()),

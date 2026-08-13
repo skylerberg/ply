@@ -2710,7 +2710,15 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Grows for the same reason [`Infer::infer`] does: it walks the same tree, so a
+/// chain deep enough to need the growth there needs it here too.
 fn collect_refs<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
+    const RED_ZONE: usize = 256 * 1024;
+    const NEW_SEGMENT: usize = 2 * 1024 * 1024;
+    stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, || collect_refs_inner(e, out))
+}
+
+fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
     match &e.kind {
         ExprKind::Lit(_) => {}
         ExprKind::Var(q) => out.push(q),

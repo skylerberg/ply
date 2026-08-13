@@ -566,7 +566,7 @@ fn use_it(f) = f(0)
         .call("m.use_it", vec![leaked], ply_span::Span::DUMMY)
         .expect_err("the second run has no cell #0");
 
-    assert_eq!(smuggled.code, ply_span::codes::RUNTIME_ERROR);
+    assert_eq!(smuggled.code, ply_span::codes::INTERNAL_ERROR);
     assert!(
         smuggled.message.contains("does not belong to the world"),
         "{smuggled:#?}"

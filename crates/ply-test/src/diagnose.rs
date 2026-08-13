@@ -40,8 +40,9 @@ pub struct Evidence<'a> {
     pub key: &'a Symbol,
     pub test_hash: Option<DefHash>,
     pub nondet: bool,
-    /// A panic is a defect in Ply, not a change to attribute.
-    pub panicked: bool,
+    /// The evaluator failed rather than the program — a defect in Ply, not a
+    /// change to attribute. A runtime error the language defines is not one.
+    pub defect: bool,
     /// The raw closure ∩ changed intersection, by name.
     pub suspects: &'a [Symbol],
     pub hashes: &'a HashOutput,
@@ -67,7 +68,7 @@ pub fn diagnose(
     // and it needs a baseline rather than a hybrid.
     let gate = precheck(
         options.bisect,
-        evidence.panicked,
+        evidence.defect,
         evidence.nondet,
         evidence.baseline,
     );

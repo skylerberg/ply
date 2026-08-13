@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use ply_corpus::bench;
 use ply_corpus::build::generate;
+use ply_corpus::measure;
 use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write;
-use ply_eval::EngineChoice;
+use ply_eval::{Engine, EngineChoice};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -25,6 +26,10 @@ enum Command {
     Bench(BenchArgs),
     /// Generate and benchmark at several sizes, for one comparison table.
     Sweep(SweepArgs),
+    /// Price the control-stack machine's own claims: interpreter throughput
+    /// against the tree-walker, fork against rebuild, resumption cost, and
+    /// what isolation did to the schedule.
+    Measure(MeasureArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -123,6 +128,66 @@ struct SweepArgs {
     json: bool,
 }
 
+#[derive(Args, Debug)]
+struct MeasureArgs {
+    /// A directory a previous `gen` wrote. Omit it for the measurements that
+    /// need no corpus — fork cost and resumption cost.
+    corpus: Option<PathBuf>,
+    /// Repeats per measurement; the fastest is reported.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Which engines the throughput table covers. One engine reports no ratio,
+    /// and is what a profiler should be pointed at.
+    #[arg(long, default_value = "both", value_parser = parse_engine)]
+    engine: EngineChoice,
+    /// World sizes for the fork comparison.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 100, 1_000, 10_000, 100_000])]
+    cells: Vec<usize>,
+    /// Skip everything but the throughput table, so a profile is not dominated
+    /// by measurements that are not being investigated.
+    #[arg(long)]
+    only_throughput: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn measure(args: MeasureArgs) -> Result<()> {
+    let engines: Vec<Engine> = match args.engine {
+        EngineChoice::Treewalk => vec![Engine::Treewalk],
+        EngineChoice::Machine => vec![Engine::Machine],
+        EngineChoice::Both => vec![Engine::Treewalk, Engine::Machine],
+    };
+
+    let mut out = measure::Measurements {
+        throughput: None,
+        scheduling: None,
+        store_open: None,
+        fork: Vec::new(),
+        multi_shot: None,
+    };
+    if !args.only_throughput {
+        out.fork = measure::fork_cost(&args.cells, args.repeats);
+        out.multi_shot = Some(measure::multi_shot(args.repeats)?);
+    }
+
+    if let Some(root) = &args.corpus {
+        out.throughput = Some(measure::throughput(root, &engines, args.repeats)?);
+        if !args.only_throughput {
+            // Scheduling clears the cache, so the store is timed before it
+            // rather than over the empty one it leaves behind.
+            out.store_open = Some(measure::store_open(root, args.repeats)?);
+            out.scheduling = Some(measure::scheduling(root)?);
+        }
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", measure::render(&out));
+    }
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("ply-corpus: {e:#}");
@@ -144,6 +209,7 @@ fn run() -> Result<()> {
             emit_report(&report, args.json)
         }
         Command::Sweep(args) => sweep(args),
+        Command::Measure(args) => measure(args),
     }
 }
 

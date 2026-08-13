@@ -228,6 +228,9 @@ pub mod codes {
     pub const RESOURCE_REQUIRED: &str = "E0304";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     pub const ASSERTION_FAILED: &str = "E0501";
+    /// A program-level failure the language defines: `panic`, division by zero,
+    /// integer overflow, a resource limit. The program is at fault and the
+    /// failure is attributable to a change, so it is bisected like any other.
     pub const RUNTIME_ERROR: &str = "E0502";
     /// Never a warning: the result cache would record whichever engine ran
     /// first and never recompute it.
@@ -236,6 +239,12 @@ pub mod codes {
     /// than `RUNTIME_ERROR` so that a consumer can tell a refusal to run from a
     /// defect while running: the two call for opposite responses.
     pub const MACHINE_ONLY_CLAUSE: &str = "E0504";
+    /// Ply broke one of its own invariants. Its own number rather than
+    /// `RUNTIME_ERROR` because the two call for opposite responses: a runtime
+    /// error is the program's fault and is attributed to whichever change
+    /// introduced it, while this one is Ply's fault and there is nothing in the
+    /// user's definition graph to attribute it to.
+    pub const INTERNAL_ERROR: &str = "E0505";
     /// `W` rather than `E`: cache trouble is never a fault in the user's
     /// program, so these are always warnings.
     pub const CACHE_UNREADABLE: &str = "W0601";

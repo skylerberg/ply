@@ -133,7 +133,7 @@ impl Hybrid for Culprits {
 struct Situation {
     baseline: bool,
     nondet: bool,
-    panicked: bool,
+    defect: bool,
     /// Which way a missing hybrid builder is reported. Only reachable when the
     /// search would have had to run a mixture.
     absent: Skipped,
@@ -144,7 +144,7 @@ impl Default for Situation {
         Situation {
             baseline: true,
             nondet: false,
-            panicked: false,
+            defect: false,
             absent: Skipped::NoBodies,
         }
     }
@@ -203,7 +203,7 @@ impl Case {
             key: &key,
             test_hash: Some(hash(self.test_after)),
             nondet: situation.nondet,
-            panicked: situation.panicked,
+            defect: situation.defect,
             suspects: &suspects,
             hashes: &hashes,
             baseline: situation.baseline.then_some(&base),
@@ -325,7 +325,7 @@ fn fusing_an_interface_change_with_its_caller_beats_discovering_it() {
             key: &key,
             test_hash: Some(hash(case.test_after)),
             nondet: false,
-            panicked: false,
+            defect: false,
             suspects: &suspects,
             hashes: &hashes,
             baseline: Some(&base),
@@ -493,7 +493,7 @@ fn a_panic_is_not_bisected() {
         |_| {},
         Some(&mut hybrid),
         Situation {
-            panicked: true,
+            defect: true,
             ..Situation::default()
         },
         None,
@@ -667,6 +667,7 @@ fn two_runs_over_one_failure_agree_exactly() {
                 name: "a regression".to_string(),
                 key: sym(KEY),
                 diagnostic: ply_span::Diagnostic::error(ply_span::codes::ASSERTION_FAILED, "x"),
+                defect: false,
                 suspects: Vec::new(),
                 assertion: None,
                 attribution: out,
@@ -796,7 +797,7 @@ fn an_unanswerable_classification_is_stated_in_the_reason() {
             key: &key,
             test_hash: Some(hash(case.test_after)),
             nondet: false,
-            panicked: false,
+            defect: false,
             suspects: &suspects,
             hashes: &hashes,
             baseline: Some(&base),
@@ -850,7 +851,7 @@ fn a_culprit_outside_the_raw_suspect_set_is_added_to_it() {
             key: &key,
             test_hash: Some(hash(201)),
             nondet: false,
-            panicked: false,
+            defect: false,
             suspects: &[],
             hashes: &after,
             baseline: Some(&base),
@@ -893,6 +894,7 @@ fn failure_with(attribution: crate::Attribution) -> crate::Failure {
             ply_span::codes::ASSERTION_FAILED,
             "assertion failed: expected 0, found -5",
         ),
+        defect: false,
         suspects: Vec::new(),
         assertion: None,
         attribution,
