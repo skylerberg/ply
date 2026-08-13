@@ -1015,6 +1015,11 @@ pub struct Failure {
     pub name: String,
     pub key: Symbol,
     pub diagnostic: Diagnostic,
+    /// Ply's fault rather than the program's, so there is nothing in the
+    /// definition graph to attribute it to. Observed by the run — the evaluator
+    /// unwound, or it reported `INTERNAL_ERROR` — and never inferred from
+    /// `RUNTIME_ERROR`, which a program reaches legitimately.
+    pub defect: bool,
     /// Unchanged: the raw closure ∩ changed intersection, by name.
     pub suspects: Vec<Symbol>,
     /// `None` until `ply-eval` carries the payload instead of rendering it into
@@ -1434,9 +1439,14 @@ impl Stack {
     pub fn segments(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn push(&self, frame: Frame) -> Stack;
+    /// The owned form of `push`, for a caller replacing its own stack.
+    pub fn pushed(self, frame: Frame) -> Stack;
     pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack;
     pub fn prompt(&self) -> Option<&Rc<Prompt>>;
     pub fn next(&self) -> Next;
+    /// The owned form of `next`: the frame is moved out of its link rather
+    /// than cloned whenever no captured continuation still holds it.
+    pub fn into_next(self) -> Next;
     pub fn find_handler(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
         -> Option<Handled>;
     /// Cuts the innermost `segments` segments away. The returned stack is what
@@ -1633,7 +1643,29 @@ system.
 /// and phrase the diagnostic identically, because a divergence on a deeply
 /// recursive program fails `--engine both` on every corpus that has one.
 pub const DEFAULT_MAX_CALLS: usize = 10_000;
+
+/// The deepest a *value* may nest before a structural walk over it — comparing
+/// two, diffing two — refuses with the same "recursion limit" message. Equal to
+/// `DEFAULT_MAX_CALLS`, so no value the call bound lets a program build is one
+/// this bound then refuses to compare; only iteration gets past it.
+pub const MAX_VALUE_DEPTH: usize = DEFAULT_MAX_CALLS;
 ```
+
+A call is not the only thing a program can nest. A value nests too, and every
+host recursion the evaluator reaches from source needs an answer that is not an
+abort — an abort is not a failure, because it reaches no classifier and loses
+every sibling test's result in the same worker. Three answers, and which one
+applies is decided by what bounds the depth:
+
+- **depth of data** — `values_equal` and `first_difference` refuse past
+  `MAX_VALUE_DEPTH`, because nothing else bounds how deep a value can be built;
+- **dropping a value** — `Value`'s `Drop` dismantles iteratively, because a bound
+  cannot help: a value has to be dropped whatever its depth;
+- **depth of source** — `Interp::eval`, `code::lower`, `Expr::clone`,
+  `Infer::infer` and `collect_refs` *grow* the host stack rather than refuse, as
+  the parser and the normalizer already do. A bound here would reject on one
+  engine a program the front end accepted, which is an `E0503` divergence on
+  every corpus with a long operator chain in it.
 
 `Stack::calls()` is the machine's count — the `Frame::Call`s pending, O(1)
 through push, pop, capture and splice — and `Interp` counts its own nesting the
@@ -1678,13 +1710,34 @@ sticky by the cache.
 
 A clause with a `resume` binder is machine-only. The tree-walker must refuse it
 with `E0504` (`MACHINE_ONLY_CLAUSE`), naming the clause and saying which engine
-runs it — never approximate it as tail-resumptive. Its own code rather than
-`RUNTIME_ERROR` because a consumer has to tell a refusal to start from a defect
-while running: `ply-test` classifies the latter as a panic and declines to
-bisect it, and `ply_eval::is_machine_only` is how the two are separated. Under
+runs it — never approximate it as tail-resumptive. Its own code because a
+consumer has to tell a refusal to start from a program that ran and failed, and
+`ply_eval::is_machine_only` is how the two are separated. Under
 `both` such a test runs once, on the machine — `differential::Compared::Refused`
 and `Report::machine_only` keep it out of what was compared — and `--explain`
 records it as `machine-only`.
+
+Four codes now partition a failing run, and confusing any two of them costs
+something specific:
+
+| code | whose fault | what `ply-test` does |
+| --- | --- | --- |
+| `E0501` / `E0502` | the program's — an assertion, `panic`, division by zero, the recursion limit, a value past `MAX_VALUE_DEPTH` | attributes it: suspects, bisection, culprit |
+| `E0503` `ENGINE_DIVERGENCE` | Ply's — two evaluators of one language disagree | `Status::Panicked`, `Skipped::Panicked`, no bisection |
+| `E0504` | neither; this engine declined to start | reports it; the other engine answers |
+| `E0505` `INTERNAL_ERROR` | Ply's — an evaluator invariant broke | `Status::Panicked`, `Skipped::Panicked`, no bisection |
+
+`Failure::defect` is the observed answer wherever there is one to observe: a run
+that watched the evaluator unwind knows something no diagnostic carries. Reading
+it off `RUNTIME_ERROR` instead is what made a runaway recursion — a documented
+limit, and as bisectable a regression as any assertion — report itself as a
+defect in Ply and switch M5 off for the whole class.
+
+`E0503` is the one exception, and only because there is nothing to observe: the
+divergence is a comparison the audit *made*, handed back as an ordinary `Err`
+rather than as an unwind. Whatever the program means, at most one of the two
+answers is it and nothing in the definition graph decides which — so bisecting it
+would name whichever definition the disagreement happened to run through.
 
 `ply check --engine treewalk` refuses the same program, and that verdict may not
 depend on the front-end cache: gate 1 skips a file whose bytes did not change, so
@@ -1721,10 +1774,17 @@ innermost `Call` frames.
 
 ### Workspace
 
-`rpds = "1.2.1"` — persistent `List` and `RedBlackTreeMap`, parameterized over
-the shared-pointer kind so both use `Rc` and non-atomic refcounts, matching the
-existing decision that an `Interp` is confined to one thread. `RedBlackTreeMap`
-iterates in key order, which the byte-identical-artifact rule needs.
+`rpds = "1.2.1"` — the persistent `RedBlackTreeMap` a `World` is, parameterized
+over the shared-pointer kind so it uses `Rc` and non-atomic refcounts, matching
+the existing decision that an `Interp` is confined to one thread. It iterates in
+key order, which the byte-identical-artifact rule needs.
+
+The control stack does **not** use `rpds::List`. Its links hold the frame
+inline, so pushing one costs a single allocation where `List` — which boxes the
+value separately from the node — costs two, and popping an unshared link costs
+none where `List` cost two more. A push and a pop are the machine's two most
+frequent steps, so that is the difference between the machine's profile being
+its own work and being the allocator's.
 
 ### Required tests
 

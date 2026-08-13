@@ -2,10 +2,12 @@
 //!
 //! The stack is a list of **segments**. A segment is a persistent list of
 //! frames sitting on top of the `handle` that delimits it; the outermost
-//! segment has no delimiter. Capturing a continuation is taking the segments
-//! down to and including the segment whose prompt matches — a `Vec` of two
-//! pointers each, one entry per enclosing handler crossed, and never one entry
-//! per pending frame. That is what makes a second resumption cost the same as
+//! segment has no delimiter. The innermost segment is held by value and the
+//! rest as a persistent list, because every push and every pop rewrites the
+//! innermost one and nothing else can be looking at that rewrite. Capturing a
+//! continuation is taking the segments down to and including the segment whose
+//! prompt matches — a `Vec` of two pointers each, one entry per enclosing
+//! handler crossed, and never one entry per pending frame. That is what makes a second resumption cost the same as
 //! the first, and it is the reason multi-shot is affordable rather than
 //! theoretical.
 //!
@@ -20,7 +22,6 @@ use crate::env::Env;
 use crate::value::{Value, Vector};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, Ident, UnOp};
-use rpds::List;
 use std::rc::Rc;
 
 /// One suspended step. Every variant names the value it is waiting for and what
@@ -250,9 +251,111 @@ impl Prompt {
     }
 }
 
+/// A persistent stack, shared by pointer. One allocation to push, because the
+/// value lives in the link rather than behind a second pointer of its own, and
+/// none at all to pop a link nothing else holds.
+///
+/// `rpds::List` is the obvious alternative and costs two of each, since it
+/// boxes the value away from the link. A push and a pop are the machine's two
+/// most frequent steps.
+struct Chain<T> {
+    head: Option<Rc<Link<T>>>,
+    len: usize,
+}
+
+struct Link<T> {
+    value: T,
+    next: Option<Rc<Link<T>>>,
+}
+
+impl<T> Chain<T> {
+    fn new() -> Chain<T> {
+        Chain { head: None, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn push(mut self, value: T) -> Chain<T> {
+        let len = self.len + 1;
+        Chain {
+            head: Some(Rc::new(Link {
+                value,
+                next: self.head.take(),
+            })),
+            len,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        let mut cur = self.head.as_deref();
+        std::iter::from_fn(move || {
+            let link = cur?;
+            cur = link.next.as_deref();
+            Some(&link.value)
+        })
+    }
+}
+
+impl<T: Clone> Chain<T> {
+    /// Moves the head out when this chain is its only owner, which is every pop
+    /// no captured continuation is sharing.
+    fn pop_front(&mut self) -> Option<T> {
+        let node = self.head.take()?;
+        self.len -= 1;
+        match Rc::try_unwrap(node) {
+            Ok(link) => {
+                self.head = link.next;
+                Some(link.value)
+            }
+            Err(node) => {
+                self.head = node.next.clone();
+                Some(node.value.clone())
+            }
+        }
+    }
+}
+
+impl<T> Clone for Chain<T> {
+    fn clone(&self) -> Chain<T> {
+        Chain {
+            head: self.head.clone(),
+            len: self.len,
+        }
+    }
+}
+
+impl<T> Default for Chain<T> {
+    fn default() -> Chain<T> {
+        Chain::new()
+    }
+}
+
+/// Iterative, because the frames pending on a stack are bounded by
+/// [`DEFAULT_MAX_FRAMES`] and not by anything the native stack could survive
+/// unwinding recursively.
+///
+/// [`DEFAULT_MAX_FRAMES`]: crate::machine::DEFAULT_MAX_FRAMES
+impl<T> Drop for Chain<T> {
+    fn drop(&mut self) {
+        let mut cur = self.head.take();
+        while let Some(node) = cur {
+            match Rc::try_unwrap(node) {
+                Ok(mut link) => cur = link.next.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Segment {
-    frames: List<Frame>,
+    frames: Chain<Frame>,
     prompt: Option<Rc<Prompt>>,
     calls: usize,
 }
@@ -264,7 +367,7 @@ impl Segment {
 
     pub fn under(prompt: Rc<Prompt>) -> Segment {
         Segment {
-            frames: List::new(),
+            frames: Chain::new(),
             prompt: Some(prompt),
             calls: 0,
         }
@@ -304,27 +407,24 @@ pub struct Handled {
     pub clause: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Stack {
-    /// Head is the innermost segment. The last one is always the base.
-    segments: List<Segment>,
+    /// The innermost segment, held by value rather than as the head of
+    /// `under`. Every push and every pop rewrites exactly this, and reaching it
+    /// through a persistent list meant rebuilding a shared node — two
+    /// allocations to install a frame and two more to retire it — for a segment
+    /// nothing else was looking at.
+    top: Segment,
+    /// The segments below `top`, head first. The last one is always the base,
+    /// so `top.prompt.is_none()` holds exactly when this is empty.
+    under: Chain<Segment>,
     frames: usize,
     calls: usize,
 }
 
-impl Default for Stack {
-    fn default() -> Stack {
-        Stack::new()
-    }
-}
-
 impl Stack {
     pub fn new() -> Stack {
-        Stack {
-            segments: List::new().push_front(Segment::base()),
-            frames: 0,
-            calls: 0,
-        }
+        Stack::default()
     }
 
     /// Total pending frames. O(1), and it is the resource bound on a stack that
@@ -342,87 +442,68 @@ impl Stack {
     }
 
     pub fn segments(&self) -> usize {
-        self.segments.len()
+        self.under.len() + 1
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames == 0 && self.segments.len() == 1
+        self.frames == 0 && self.under.is_empty()
     }
 
     pub fn push(&self, frame: Frame) -> Stack {
-        let top = self
-            .segments
-            .first()
-            .expect("a stack always has its base segment");
+        self.clone().pushed(frame)
+    }
+
+    /// The owned form. A machine replacing its own stack has nothing to share
+    /// with, so it neither clones the segments below nor drops the copy after.
+    pub fn pushed(mut self, frame: Frame) -> Stack {
         let calls = is_call(&frame);
-        let replaced = Segment {
-            frames: top.frames.push_front(frame),
-            prompt: top.prompt.clone(),
-            calls: top.calls + calls,
-        };
-        Stack {
-            segments: self
-                .segments
-                .drop_first()
-                .expect("a stack always has its base segment")
-                .push_front(replaced),
-            frames: self.frames + 1,
-            calls: self.calls + calls,
-        }
+        self.top.frames = std::mem::take(&mut self.top.frames).push(frame);
+        self.top.calls += calls;
+        self.frames += 1;
+        self.calls += calls;
+        self
     }
 
     pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack {
-        Stack {
-            segments: self.segments.push_front(Segment::under(prompt)),
-            frames: self.frames,
-            calls: self.calls,
-        }
+        let mut out = self.clone();
+        let displaced = std::mem::replace(&mut out.top, Segment::under(prompt));
+        out.under = std::mem::take(&mut out.under).push(displaced);
+        out
     }
 
     pub fn prompt(&self) -> Option<&Rc<Prompt>> {
-        self.segments.first().and_then(Segment::prompt)
+        self.top.prompt()
     }
 
     pub fn next(&self) -> Next {
-        let top = self
-            .segments
-            .first()
-            .expect("a stack always has its base segment");
-        if let Some(frame) = top.frames.first() {
-            let calls = is_call(frame);
-            let rest = Segment {
-                frames: top
-                    .frames
-                    .drop_first()
-                    .expect("a non-empty list drops its head"),
-                prompt: top.prompt.clone(),
-                calls: top.calls - calls,
-            };
-            let stack = Stack {
-                segments: self
-                    .segments
-                    .drop_first()
-                    .expect("a stack always has its base segment")
-                    .push_front(rest),
-                frames: self.frames - 1,
-                calls: self.calls - calls,
-            };
-            return Next::Frame(frame.clone(), stack);
+        self.clone().into_next()
+    }
+
+    /// The owned form, which is what the machine's return transition uses: the
+    /// popped frame is moved out of its link rather than cloned whenever no
+    /// captured continuation is still holding it.
+    pub fn into_next(mut self) -> Next {
+        if let Some(frame) = self.top.frames.pop_front() {
+            let calls = is_call(&frame);
+            self.top.calls -= calls;
+            self.frames -= 1;
+            self.calls -= calls;
+            return Next::Frame(frame, self);
         }
-        match &top.prompt {
-            Some(prompt) => Next::Leave(
-                prompt.clone(),
-                Stack {
-                    segments: self
-                        .segments
-                        .drop_first()
-                        .expect("a stack always has its base segment"),
-                    frames: self.frames,
-                    calls: self.calls,
-                },
-            ),
+        match self.top.prompt.take() {
+            Some(prompt) => {
+                self.top = self
+                    .under
+                    .pop_front()
+                    .expect("only the base segment has no prompt, and it is the outermost");
+                Next::Leave(prompt, self)
+            }
             None => Next::Done,
         }
+    }
+
+    fn segments_iter(&self) -> impl Iterator<Item = &Segment> {
+        std::iter::once(&self.top).chain(self.under.iter())
     }
 
     pub fn find_handler(
@@ -431,7 +512,7 @@ impl Stack {
         op: &Symbol,
         resource: Option<&Symbol>,
     ) -> Option<Handled> {
-        for (depth, segment) in self.segments.iter().enumerate() {
+        for (depth, segment) in self.segments_iter().enumerate() {
             let Some(prompt) = segment.prompt() else {
                 continue;
             };
@@ -454,22 +535,16 @@ impl Stack {
         let mut frames = 0;
         let mut calls = 0;
         for _ in 0..segments {
-            let top = rest
-                .segments
-                .first()
-                .expect("capture never crosses the base segment")
-                .clone();
-            frames += top.frames();
-            calls += top.calls();
-            rest = Stack {
-                segments: rest
-                    .segments
-                    .drop_first()
-                    .expect("capture never crosses the base segment"),
-                frames: rest.frames - top.frames(),
-                calls: rest.calls - top.calls(),
-            };
-            taken.push(top);
+            let below = rest
+                .under
+                .pop_front()
+                .expect("capture never crosses the base segment");
+            let cut = std::mem::replace(&mut rest.top, below);
+            frames += cut.frames();
+            calls += cut.calls();
+            rest.frames -= cut.frames();
+            rest.calls -= cut.calls();
+            taken.push(cut);
         }
         (
             Continuation {
@@ -487,11 +562,10 @@ impl Stack {
     pub fn resume(&self, k: &Continuation) -> Stack {
         let mut out = self.clone();
         for segment in k.segments.iter().rev() {
-            out = Stack {
-                segments: out.segments.push_front(segment.clone()),
-                frames: out.frames + segment.frames(),
-                calls: out.calls + segment.calls(),
-            };
+            let displaced = std::mem::replace(&mut out.top, segment.clone());
+            out.under = std::mem::take(&mut out.under).push(displaced);
+            out.frames += segment.frames();
+            out.calls += segment.calls();
         }
         out
     }
@@ -651,6 +725,54 @@ mod tests {
         };
         assert_eq!(field_of(&a), "f9");
         assert_eq!(field_of(&b), "f9");
+    }
+
+    /// `into_next` moves the frame out of its link when nothing else holds it,
+    /// so a captured segment has to be the thing that stops it.
+    #[test]
+    fn popping_a_captured_frame_leaves_the_continuation_able_to_splice_it_again() {
+        let s = Stack::new()
+            .push_prompt(prompt())
+            .push(frame(1))
+            .push(frame(2));
+        let (k, below) = s.capture(1);
+
+        let Next::Frame(first, rest) = below.resume(&k).into_next() else {
+            panic!("expected a frame");
+        };
+        assert_eq!(field_of(&first), "f2");
+        let Next::Frame(second, _) = rest.into_next() else {
+            panic!("expected a frame");
+        };
+        assert_eq!(field_of(&second), "f1");
+
+        assert_eq!(k.frames(), 2);
+        let again = below.resume(&k);
+        assert_eq!(again.frames(), 2);
+        let Next::Frame(replayed, _) = again.into_next() else {
+            panic!("expected a frame");
+        };
+        assert_eq!(field_of(&replayed), "f2");
+    }
+
+    /// A stack may hold up to `DEFAULT_MAX_FRAMES` frames, so releasing one has
+    /// to be a loop. A recursive drop through the links would abort the process
+    /// on a worker's stack rather than raise a diagnostic.
+    #[test]
+    fn dropping_a_deep_stack_does_not_recurse_through_the_native_stack() {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(|| {
+                let mut s = Stack::new();
+                for i in 0..200_000 {
+                    s = s.pushed(frame(i));
+                }
+                assert_eq!(s.frames(), 200_000);
+                drop(s);
+            })
+            .expect("failed to spawn")
+            .join()
+            .expect("dropping the stack overflowed the thread stack");
     }
 
     #[test]

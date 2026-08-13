@@ -778,14 +778,14 @@ impl Mode {
 /// `no_bodies` goes and un-prunes it.
 pub fn precheck(
     mode: Mode,
-    panicked: bool,
+    defect: bool,
     nondet: bool,
     baseline: Option<&Baseline>,
 ) -> Result<(), Skipped> {
     if mode == Mode::Never {
         return Err(Skipped::NotRequested);
     }
-    if panicked {
+    if defect {
         return Err(Skipped::Panicked);
     }
     if nondet {
@@ -956,8 +956,13 @@ pub enum Skipped {
     /// `test/nondet` outcomes are not a function of the definition set, so a
     /// hybrid's answer would not be evidence about anything.
     Nondet,
-    /// The interpreter panicked. That is a defect in Ply, not a change to
-    /// attribute.
+    /// The evaluator failed rather than the program: it unwound, or it reported
+    /// one of its own invariants broken. That is a defect in Ply, not a change
+    /// to attribute.
+    ///
+    /// A failure the language *defines* — `panic`, division by zero, a recursion
+    /// limit — is not this. It is the program's own behaviour, a change can
+    /// introduce it, and it bisects like an assertion.
     Panicked,
     /// Baseline and current agree on every definition in the closure.
     NoChanges,
@@ -1000,7 +1005,7 @@ impl Skipped {
                 "`test/nondet` is not a function of the definition set, so bisecting it would prove nothing"
             }
             Skipped::Panicked => {
-                "the interpreter panicked; this is a defect in Ply, not in the program"
+                "the interpreter failed rather than the program; this is a defect in Ply, and no change in the program explains it"
             }
             Skipped::NoChanges => {
                 "no definition in this test's closure changed since it last passed"

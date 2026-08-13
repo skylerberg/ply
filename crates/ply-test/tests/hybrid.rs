@@ -75,11 +75,12 @@ impl Compiled {
     }
 
     /// What the failing test actually reports now, which is the signature every
-    /// hybrid is judged against.
+    /// hybrid is judged against. The authoritative engine, because that is the
+    /// one a real run's failure came from and the one a hybrid answers on.
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
-        let mut interp = ply_eval::Interp::new(&self.program, &self.resolved, &self.check);
-        interp
+        let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
+        machine
             .eval_test(index)
             .expect_err("the fixture must fail as written")
     }
@@ -262,6 +263,53 @@ fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {
     assert!(out.search.evaluated <= 12, "{:?}", out.search);
 }
 
+const RECURSION: &str = r#"
+fn step(n: Int) -> Int = n - 1
+fn guard(n: Int) -> Int = if n < 0 { 0 } else { n }
+fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(step(n)) }
+fn total(n: Int) -> Int = countdown(guard(n))
+
+test "terminates" { assert_eq(total(3), 0) }
+"#;
+
+/// A runaway recursion is a *regression* like any other: something used to
+/// terminate and now does not, and the definition that stopped it terminating is
+/// exactly what a hybrid can find by running one.
+///
+/// Bisection used to be declined outright here, because the recursion limit
+/// carries `RUNTIME_ERROR` and the classifier read that code as "the interpreter
+/// panicked". The wrong sentence was the visible half; this — M5 switched off for
+/// a whole class of real regressions — was the expensive half.
+#[test]
+fn a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit() {
+    let before = Compiled::new(RECURSION);
+    let after = Compiled::new(
+        &RECURSION
+            .replace(
+                "fn step(n: Int) -> Int = n - 1",
+                "fn step(n: Int) -> Int = n + 1",
+            )
+            .replace("if n < 0 { 0 } else { n }", "if n <= 0 { 0 } else { n }"),
+    );
+
+    let diagnostic = after.failure("m.terminates");
+    assert_eq!(diagnostic.code, ply_span::codes::RUNTIME_ERROR);
+    assert!(
+        diagnostic.message.contains("recursion limit"),
+        "{}",
+        diagnostic.message
+    );
+
+    let out = narrow(&before, &after, "m.terminates");
+    assert_eq!(out.verdict, Verdict::Bisected);
+    assert_eq!(out.culprits(), vec![sym("m.step")]);
+    assert!(
+        out.search.evaluated > 0,
+        "the culprit was named without running a mixture: {:?}",
+        out.search
+    );
+}
+
 /// Required test 3: two edits that break the test only together — switching
 /// which branch runs, and changing the branch that was dead. Either alone leaves
 /// the test green, so a search that returned either would be naming a definition
@@ -365,6 +413,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
             name: "doubles".to_string(),
             key: sym("m.doubles"),
             diagnostic: after.failure("m.doubles"),
+            defect: false,
             suspects: vec![sym("m.other")],
             assertion: None,
             attribution: Default::default(),

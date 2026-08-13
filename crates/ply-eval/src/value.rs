@@ -2,6 +2,7 @@ use crate::builtins::Builtin;
 use crate::code::Code;
 use crate::cont::Continuation;
 use crate::env::Env;
+use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::world::CellId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Expr;
@@ -241,6 +242,58 @@ impl Value {
     }
 }
 
+/// Drop glue recurses once per level of nesting, so a value deeper than the host
+/// stack aborts the process on the way *out* — the same hole [`values_equal`]
+/// closes on the way in, and the one hole no bound can close, because a value
+/// has to be dropped whatever its depth.
+///
+/// Dismantling is iterative: a uniquely-owned compound hands its compound
+/// children to an explicit worklist before the glue reaches them, so the glue
+/// only ever sees an emptied node. Scalars are left to the glue and cost
+/// nothing, which is why a list of integers still drops without allocating.
+impl Drop for Value {
+    fn drop(&mut self) {
+        if !nests(self) {
+            return;
+        }
+        let mut pending: Vec<Value> = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(mut v) = pending.pop() {
+            take_children(&mut v, &mut pending);
+        }
+    }
+}
+
+/// Whether dropping this value can reach another one.
+fn nests(v: &Value) -> bool {
+    match v {
+        Value::List(xs) => !xs.is_empty(),
+        Value::Record(fields) => !fields.is_empty(),
+        Value::Ctor { args, .. } => !args.is_empty(),
+        _ => false,
+    }
+}
+
+/// Moves the children that can nest further onto `out`, leaving the value empty.
+///
+/// A shared `Arc` is left alone: it is not being freed here, and whichever owner
+/// does free it takes this path itself.
+fn take_children(v: &mut Value, out: &mut Vec<Value>) {
+    match v {
+        Value::List(xs) | Value::Ctor { args: xs, .. } => {
+            if let Some(items) = Arc::get_mut(xs) {
+                out.extend(items.drain(..).filter(nests));
+            }
+        }
+        Value::Record(fields) => {
+            if let Some(map) = Arc::get_mut(fields) {
+                out.extend(std::mem::take(map).into_values().filter(nests));
+            }
+        }
+        _ => {}
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.render())
@@ -278,7 +331,29 @@ pub(crate) fn type_error(span: Span, what: &str, expected: &str, got: &Value) ->
 }
 
 /// Comparing functions is an error rather than a silently-false answer.
+///
+/// Bounded, because a walk over a value is host recursion that no count of
+/// *calls* reaches: a deep enough value would otherwise abort the process from
+/// inside a worker, losing every sibling test's result rather than failing one.
 pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic> {
+    equal_at(a, b, span, 0)
+}
+
+/// One level down: refuses past the bound, and otherwise grows the host stack so
+/// that the bound is what a program meets. Only the compound arms pay for it —
+/// comparing two integers costs exactly what it did.
+fn descend(
+    span: Span,
+    depth: usize,
+    f: impl FnOnce() -> Result<bool, Diagnostic>,
+) -> Result<bool, Diagnostic> {
+    if depth >= MAX_VALUE_DEPTH {
+        return Err(limit::err_value_depth(span, MAX_VALUE_DEPTH));
+    }
+    grow(f)
+}
+
+fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diagnostic> {
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -288,34 +363,40 @@ pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic
             if x.len() != y.len() {
                 return Ok(false);
             }
-            for (p, q) in x.iter().zip(y.iter()) {
-                if !values_equal(p, q, span)? {
-                    return Ok(false);
+            return descend(span, depth, || {
+                for (p, q) in x.iter().zip(y.iter()) {
+                    if !equal_at(p, q, span, depth + 1)? {
+                        return Ok(false);
+                    }
                 }
-            }
-            true
+                Ok(true)
+            });
         }
         (Value::Record(x), Value::Record(y)) => {
             if x.len() != y.len() || x.keys().ne(y.keys()) {
                 return Ok(false);
             }
-            for (p, q) in x.values().zip(y.values()) {
-                if !values_equal(p, q, span)? {
-                    return Ok(false);
+            return descend(span, depth, || {
+                for (p, q) in x.values().zip(y.values()) {
+                    if !equal_at(p, q, span, depth + 1)? {
+                        return Ok(false);
+                    }
                 }
-            }
-            true
+                Ok(true)
+            });
         }
         (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
             if n1 != n2 || a1.len() != a2.len() {
                 return Ok(false);
             }
-            for (p, q) in a1.iter().zip(a2.iter()) {
-                if !values_equal(p, q, span)? {
-                    return Ok(false);
+            return descend(span, depth, || {
+                for (p, q) in a1.iter().zip(a2.iter()) {
+                    if !equal_at(p, q, span, depth + 1)? {
+                        return Ok(false);
+                    }
                 }
-            }
-            true
+                Ok(true)
+            });
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Closure(_) | Value::Continuation(_), _)
@@ -331,46 +412,59 @@ pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic
     })
 }
 
+/// Bounded exactly as [`values_equal`] is, and for the same reason. Past the
+/// bound no difference can be located, which costs a failure one note rather
+/// than costing the run every result it held.
 pub fn first_difference(actual: &Value, expected: &Value) -> Option<(String, String, String)> {
-    fn go(actual: &Value, expected: &Value, path: &mut String) -> Option<(String, String, String)> {
+    fn go(
+        actual: &Value,
+        expected: &Value,
+        path: &mut String,
+        depth: usize,
+    ) -> Option<(String, String, String)> {
+        if depth >= MAX_VALUE_DEPTH {
+            return None;
+        }
         match (actual, expected) {
-            (Value::List(a), Value::List(e)) if a.len() == e.len() => {
+            (Value::List(a), Value::List(e)) if a.len() == e.len() => grow(|| {
                 for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
                     let mark = path.len();
                     let _ = write!(path, "[{i}]");
-                    if let Some(found) = go(x, y, path) {
+                    if let Some(found) = go(x, y, path, depth + 1) {
                         return Some(found);
                     }
                     path.truncate(mark);
                 }
                 None
-            }
-            (Value::Record(a), Value::Record(e)) if a.keys().eq(e.keys()) => {
+            }),
+            (Value::Record(a), Value::Record(e)) if a.keys().eq(e.keys()) => grow(|| {
                 for ((k, x), y) in a.iter().zip(e.values()) {
                     let mark = path.len();
                     let _ = write!(path, ".{k}");
-                    if let Some(found) = go(x, y, path) {
+                    if let Some(found) = go(x, y, path, depth + 1) {
                         return Some(found);
                     }
                     path.truncate(mark);
                 }
                 None
-            }
+            }),
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 })
                 if n1 == n2 && a1.len() == a2.len() =>
             {
-                for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
-                    let mark = path.len();
-                    let _ = write!(path, ".{n1}.{i}");
-                    if let Some(found) = go(x, y, path) {
-                        return Some(found);
+                grow(|| {
+                    for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
+                        let mark = path.len();
+                        let _ = write!(path, ".{n1}.{i}");
+                        if let Some(found) = go(x, y, path, depth + 1) {
+                            return Some(found);
+                        }
+                        path.truncate(mark);
                     }
-                    path.truncate(mark);
-                }
-                None
+                    None
+                })
             }
             (a, e) => {
-                if values_equal(a, e, Span::DUMMY).unwrap_or(false) || path.is_empty() {
+                if equal_at(a, e, Span::DUMMY, depth).unwrap_or(false) || path.is_empty() {
                     None
                 } else {
                     Some((path.clone(), e.render(), a.render()))
@@ -379,5 +473,5 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<(String, Str
         }
     }
     let mut path = String::new();
-    go(actual, expected, &mut path)
+    go(actual, expected, &mut path, 0)
 }

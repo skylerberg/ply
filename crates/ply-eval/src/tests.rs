@@ -347,6 +347,89 @@ fn recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack() {
     );
 }
 
+/// Runs `f` on a stack half a worker's default, where an unbounded host
+/// recursion aborts the whole test binary rather than failing one test — which
+/// is exactly the failure mode being pinned.
+fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(f)
+        .expect("failed to spawn")
+        .join()
+        .expect("the evaluator overflowed the thread stack")
+}
+
+fn chain(depth: usize) -> Value {
+    let mut v = Value::ctor("Nil", Vec::new());
+    for _ in 0..depth {
+        v = Value::ctor("Link", vec![v]);
+    }
+    v
+}
+
+/// An expression nests without calling anything, so `DEFAULT_MAX_CALLS` never
+/// sees it. Both engines evaluate this — through `eval_in` — and the tree-walker
+/// is the one that recurses natively per node.
+#[test]
+fn a_deeply_nested_expression_evaluates_on_a_one_mebibyte_thread_stack() {
+    let rendered = on_a_small_stack(|| {
+        let mut body = int(1);
+        for _ in 0..3_000 {
+            body = bin(BinOp::Add, body, int(1));
+        }
+        eval_in(vec![fn_def("deep", &[], body)], callv("deep", vec![]))
+            .map(|v| v.render())
+            .map_err(|d| d.message)
+    });
+    assert_eq!(rendered, Ok("3001".to_string()));
+}
+
+/// A value is as deep as the recursion that built it, so anything the call bound
+/// permits has to compare — and then drop, which is drop glue and recurses too.
+#[test]
+fn a_value_the_call_bound_permits_compares_and_drops_on_a_small_stack() {
+    assert!(on_a_small_stack(|| {
+        let deep = crate::MAX_VALUE_DEPTH - 1;
+        crate::values_equal(&chain(deep), &chain(deep), sp()).expect("a legal value compares")
+    }));
+}
+
+/// Past the bound the answer is a diagnostic. Only iteration gets here, which is
+/// why the bound sits where the call bound does.
+#[test]
+fn a_value_past_the_bound_is_a_diagnostic_and_not_an_abort() {
+    let (code, message) = on_a_small_stack(|| {
+        let deep = crate::MAX_VALUE_DEPTH + 2;
+        let d = crate::values_equal(&chain(deep), &chain(deep), sp())
+            .expect_err("past the bound is an error");
+        (d.code, d.message)
+    });
+    assert_eq!(code, codes::RUNTIME_ERROR);
+    assert!(message.contains("recursion limit"), "{message}");
+    assert!(message.contains("nested values"), "{message}");
+}
+
+/// The diff walks the same structure the comparison does, so it needs the same
+/// bound — and it is reached only after a comparison came back false, which is
+/// what this builds.
+#[test]
+fn the_first_difference_of_two_deep_values_is_found_on_a_small_stack() {
+    let found = on_a_small_stack(|| {
+        let deep = crate::MAX_VALUE_DEPTH - 1;
+        let mut other = Value::ctor("End", Vec::new());
+        for _ in 0..deep {
+            other = Value::ctor("Link", vec![other]);
+        }
+        let actual = chain(deep);
+        assert!(!crate::values_equal(&actual, &other, sp()).expect("they compare"));
+        crate::first_difference(&actual, &other)
+    });
+    let (path, expected, actual) = found.expect("the difference is located");
+    assert!(path.ends_with(".Link.0"), "{path}");
+    assert_eq!(expected, "End");
+    assert_eq!(actual, "Nil");
+}
+
 #[test]
 fn the_depth_counter_unwinds_so_sequential_calls_are_not_penalized() {
     let items = vec![fn_def(

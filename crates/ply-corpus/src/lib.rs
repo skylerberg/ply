@@ -7,6 +7,7 @@
 pub mod bench;
 pub mod build;
 pub mod emit;
+pub mod measure;
 pub mod model;
 pub mod pipeline;
 pub mod rng;
