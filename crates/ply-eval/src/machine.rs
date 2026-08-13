@@ -232,7 +232,7 @@ impl<'a> Machine<'a> {
     pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
         let Some(slot) = self.tests.get(index) else {
             return Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
+                codes::INTERNAL_ERROR,
                 format!(
                     "no test at index {index}; the program defines {}",
                     self.tests.len()
@@ -259,7 +259,7 @@ impl<'a> Machine<'a> {
             .map(|slot| (slot.module, lower(slot.body)));
         let Some((owner, body)) = found else {
             return Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
+                codes::INTERNAL_ERROR,
                 format!("module `{module}` has no test at position {ordinal}"),
             )
             .primary(Span::DUMMY, "this test's module was not parsed")
@@ -369,7 +369,7 @@ impl<'a> Machine<'a> {
             return Err(self.err_call_limit(self.current, &transition.stack));
         }
         if transition.stack.frames() > self.max_frames {
-            return Err(self.err_frame_limit(self.current));
+            return Err(self.err_frame_limit(self.current, &transition.stack));
         }
         self.stack = transition.stack;
         self.state = transition.state.into();
@@ -589,8 +589,12 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// The stack is moved out rather than borrowed: a pop that owns its stack
+    /// takes the frame out of its link instead of cloning it. `Next::Done`
+    /// leaves `Stack::default()` behind, which is the stack a `Done` was
+    /// reporting anyway — an empty base segment.
     fn ret(&mut self, value: Value) -> Result<(), Diagnostic> {
-        match self.stack.next() {
+        match std::mem::take(&mut self.stack).into_next() {
             Next::Frame(frame, rest) => {
                 self.stack = rest;
                 self.dispatch(frame, value)
@@ -612,13 +616,13 @@ impl<'a> Machine<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        match callee {
-            Value::Closure(closure) => self.enter_closure(&closure, args, span),
+        match &callee {
+            Value::Closure(closure) => self.enter_closure(closure, args, span),
             Value::Continuation(k) => {
-                let transition = handler::apply_continuation(&self.stack, &k, args, span)?;
+                let transition = handler::apply_continuation(&self.stack, k, args, span)?;
                 self.take(transition)
             }
-            other => Err(err_not_a_function(span, &other)),
+            other => Err(err_not_a_function(span, other)),
         }
     }
 
@@ -986,9 +990,9 @@ impl<'a> Machine<'a> {
 
     pub(crate) fn push(&mut self, frame: Frame, span: Span) -> Result<(), Diagnostic> {
         if self.stack.frames() >= self.max_frames {
-            return Err(self.err_frame_limit(span));
+            return Err(self.err_frame_limit(span, &self.stack));
         }
-        self.stack = self.stack.push(frame);
+        self.stack = std::mem::take(&mut self.stack).pushed(frame);
         Ok(())
     }
 
@@ -1003,12 +1007,12 @@ impl<'a> Machine<'a> {
         limit::err_recursion_limit(span, NESTED_CALLS, self.max_calls, &innermost_calls(stack))
     }
 
-    fn err_frame_limit(&self, span: Span) -> Diagnostic {
+    fn err_frame_limit(&self, span: Span, stack: &Stack) -> Diagnostic {
         limit::err_recursion_limit(
             span,
             PENDING_FRAMES,
             self.max_frames,
-            &innermost_calls(&self.stack),
+            &innermost_calls(stack),
         )
     }
 }
@@ -1023,7 +1027,7 @@ fn innermost_calls(stack: &Stack) -> Vec<Option<Symbol>> {
     let mut out = Vec::new();
     let mut stack = stack.clone();
     for _ in 0..CALL_SCAN_LIMIT {
-        match stack.next() {
+        match stack.into_next() {
             Next::Frame(Frame::Call { name, .. }, rest) => {
                 out.push(name);
                 if out.len() == NAMED_CALLS {

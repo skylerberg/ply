@@ -519,10 +519,26 @@ pub enum UnOp {
     Not,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+}
+
+/// Hand-written so the copy grows the host stack once per level, as parsing,
+/// inference and normalization already do. A derived `Clone` recurses to the
+/// depth of the expression on whatever stack the caller happens to have, and the
+/// tree-walker copies a body per closure on a worker thread — so a chain of
+/// operators the front end accepts could abort the run rather than evaluate.
+impl Clone for Expr {
+    fn clone(&self) -> Expr {
+        const RED_ZONE: usize = 256 * 1024;
+        const NEW_SEGMENT: usize = 2 * 1024 * 1024;
+        stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, || Expr {
+            kind: self.kind.clone(),
+            span: self.span,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]

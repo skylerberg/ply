@@ -229,7 +229,7 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Transiti
             scope = scope.bind(binder.clone(), Value::Continuation(Rc::new(k)));
             below
         }
-        None => below.push(Frame::Resume { k: Rc::new(k) }),
+        None => below.pushed(Frame::Resume { k: Rc::new(k) }),
     };
     Ok(Transition::eval(
         stack,

@@ -266,9 +266,13 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
+        // The authoritative engine, for the reason a cached `Pass` is a claim
+        // about that engine and this trial may write one. It is also the engine
+        // whose answer the failure being explained came from, so a divergence
+        // between the two cannot turn a reproduction into a `DifferentFailure`.
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
-            interp.eval_test(index)
+            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+            machine.eval_test(index)
         }));
         match outcome {
             Ok(Ok(())) => {

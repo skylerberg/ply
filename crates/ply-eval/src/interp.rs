@@ -1,7 +1,7 @@
 use crate::builtins::Builtin;
 use crate::env::Env;
 use crate::handler::{OpDecl, check_operation, performed_atom};
-use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS};
+use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, grow};
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Value, type_error, values_equal};
 use crate::world::World;
@@ -18,17 +18,6 @@ use std::sync::Arc;
 
 /// An operation's declaration, by program-wide effect name and operation name.
 pub(crate) type OpTable = FxHashMap<(Symbol, Symbol), (bool, Mode)>;
-
-/// One Ply call costs several native frames and an unoptimized build makes each
-/// of them large, so a worker's default 2 MiB runs out long before
-/// `max_depth` does. Growing on demand means the depth limit is what a user
-/// hits, and it is reported as a diagnostic instead of aborting the process
-/// (and with it every unrelated test sharing it).
-fn grow<R>(f: impl FnOnce() -> R) -> R {
-    const RED_ZONE: usize = 256 * 1024;
-    const NEW_SEGMENT: usize = 2 * 1024 * 1024;
-    stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)
-}
 
 struct HandlerFrame {
     clauses: Arc<Vec<HandleClause>>,
@@ -196,7 +185,7 @@ impl<'a> Interp<'a> {
         let (module, body) = {
             let slot = self.tests.get(index).ok_or_else(|| {
                 Diagnostic::error(
-                    codes::RUNTIME_ERROR,
+                    codes::INTERNAL_ERROR,
                     format!(
                         "no test at index {index}; the program defines {}",
                         self.tests.len()
@@ -228,7 +217,7 @@ impl<'a> Interp<'a> {
             .map(|slot| (slot.module, &slot.def.body));
         let Some((owner, body)) = found else {
             return Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
+                codes::INTERNAL_ERROR,
                 format!("module `{module}` has no test at position {ordinal}"),
             )
             .primary(Span::DUMMY, "this test's module was not parsed")
@@ -307,7 +296,16 @@ impl<'a> Interp<'a> {
     /// Every arm that needs more than a handful of locals is out of line: an
     /// unoptimized frame is sized for the union of all arms, and this function
     /// sits on the recursion path.
+    /// Grows once per node, not once per Ply call: the call bound does not reach
+    /// this recursion at all, because an expression can nest arbitrarily deep
+    /// while calling nothing. The machine spends a heap frame where this spends
+    /// a native one, so this is what keeps the two engines agreeing on a program
+    /// the front end already accepted.
     fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Diagnostic> {
+        grow(|| self.eval_node(e, env))
+    }
+
+    fn eval_node(&mut self, e: &Expr, env: &Env) -> Result<Value, Diagnostic> {
         match &e.kind {
             ExprKind::Lit(lit) => Ok(literal(lit)),
             ExprKind::Var(q) => self.lookup(q, env),
@@ -591,9 +589,8 @@ impl<'a> Interp<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        let closure = match callee {
-            Value::Closure(c) => c,
-            other => return Err(err_not_a_function(span, &other)),
+        let Value::Closure(closure) = &callee else {
+            return Err(err_not_a_function(span, &callee));
         };
 
         match &closure.kind {
@@ -634,7 +631,7 @@ impl<'a> Interp<'a> {
             // Only a caller mixing the two engines' values reaches this, and
             // answering with the wrong function would be worse than refusing.
             ClosureKind::Code { .. } => Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
+                codes::INTERNAL_ERROR,
                 format!("{} was compiled for the machine engine", closure.describe()),
             )
             .primary(span, "this function cannot run on the tree-walker")
@@ -956,7 +953,7 @@ pub(crate) fn strict_binary(
             }
         }
         BinOp::And | BinOp::Or => Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
+            codes::INTERNAL_ERROR,
             "internal error: a short-circuiting operator reached strict evaluation",
         )
         .primary(span, "please report this")),

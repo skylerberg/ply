@@ -1167,7 +1167,7 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
         .failure
         .as_ref()
         .expect("a panic carries a diagnostic");
-    assert_eq!(diagnostic.code, ply_span::codes::RUNTIME_ERROR);
+    assert_eq!(diagnostic.code, ply_span::codes::INTERNAL_ERROR);
     assert!(
         diagnostic.message.contains("deliberate panic"),
         "{}",
@@ -1227,6 +1227,103 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
     assert_eq!(
         report.results.iter().map(|r| r.group).collect::<Vec<_>>(),
         vec![0, 1, 2]
+    );
+}
+
+// ------------------------------------------------- defects versus red tests
+
+/// An executor whose test reports that Ply broke one of its own invariants,
+/// without unwinding. `catch_unwind` cannot see this one, so the diagnostic's
+/// code is the only evidence there is.
+struct InternalErrorExecutor {
+    fail_on: usize,
+}
+
+impl Executor for InternalErrorExecutor {
+    type Worker = ();
+
+    fn worker(&self) {}
+
+    fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
+        if index == self.fail_on {
+            return Err(Diagnostic::error(
+                ply_span::codes::INTERNAL_ERROR,
+                "internal error: a frame that is not a builtin step reached `advance`",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The reverse of the recursion-limit misclassification, and the more expensive
+/// direction: a defect in Ply reported as an ordinary red test is a bug the user
+/// goes looking for in their own code, and a suspect set invents a culprit for
+/// something no change in the program caused.
+#[test]
+fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(ARITHMETIC);
+    let doomed = program.index_of("mul is right");
+    let selection = program.select(&store);
+
+    let executor = InternalErrorExecutor { fail_on: doomed };
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let result = report
+        .results
+        .iter()
+        .find(|r| r.index == doomed)
+        .expect("reported");
+    assert_eq!(result.status, Status::Panicked);
+    let failure = &report.failures[0];
+    assert!(failure.defect);
+    assert_eq!(
+        failure.attribution.bisection.verdict,
+        crate::Verdict::NotAttempted(crate::Skipped::Panicked)
+    );
+}
+
+const RUNAWAY: &str = r#"
+fn step(n: Int) -> Int = n + 1
+fn spin(n: Int) -> Int = spin(step(n))
+
+test "spins" { assert_eq(spin(0), 0) }
+"#;
+
+/// Exceeding a documented resource limit is the program's behaviour, not Ply
+/// falling over. Reading `panicked` off `RUNTIME_ERROR` said otherwise, which
+/// printed "this is a defect in Ply" over a plain runaway recursion and — the
+/// part that costs more — suppressed bisection for the whole class.
+#[test]
+fn a_runaway_recursion_is_a_red_test_and_not_a_defect_in_ply() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(RUNAWAY);
+    let selection = program.select(&store);
+    let report = program.run(&selection, &mut store);
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.results[0].status, Status::Failed);
+
+    let failure = &report.failures[0];
+    assert!(!failure.defect, "{:#?}", failure.diagnostic);
+    assert_eq!(failure.diagnostic.code, ply_span::codes::RUNTIME_ERROR);
+    assert!(
+        failure.diagnostic.message.contains("recursion limit"),
+        "{}",
+        failure.diagnostic.message
+    );
+    assert_ne!(
+        failure.attribution.bisection.verdict,
+        crate::Verdict::NotAttempted(crate::Skipped::Panicked),
+        "bisection was suppressed for a perfectly bisectable failure"
     );
 }
 

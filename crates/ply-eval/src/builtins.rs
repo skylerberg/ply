@@ -413,7 +413,7 @@ pub fn assert_failure(message: Option<&Value>, span: Span) -> Diagnostic {
 #[cold]
 fn no_such_cell(span: Span, id: CellId) -> Diagnostic {
     Diagnostic::error(
-        codes::RUNTIME_ERROR,
+        codes::INTERNAL_ERROR,
         format!("cell {id} does not belong to the world this code is running in"),
     )
     .primary(span, "this cell was made by a different run")
@@ -426,7 +426,7 @@ fn no_such_cell(span: Span, id: CellId) -> Diagnostic {
 #[cold]
 fn not_a_builtin_step() -> Diagnostic {
     Diagnostic::error(
-        codes::RUNTIME_ERROR,
+        codes::INTERNAL_ERROR,
         "internal error: a frame that is not a builtin step reached `advance`",
     )
     .primary(Span::DUMMY, "please report this")
@@ -592,7 +592,7 @@ mod tests {
             call_site: Span::DUMMY,
         };
         let d = advance(frame, Value::Unit).unwrap_err();
-        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert_eq!(d.code, codes::INTERNAL_ERROR);
         assert!(d.message.contains("internal error"), "{}", d.message);
     }
 
@@ -634,7 +634,7 @@ mod tests {
             Span::DUMMY,
         )
         .unwrap_err();
-        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert_eq!(d.code, codes::INTERNAL_ERROR);
         assert!(d.message.contains("does not belong"), "{}", d.message);
     }
 
