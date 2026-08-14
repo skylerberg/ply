@@ -88,6 +88,9 @@ pub enum NodeKind {
         binder: Symbol,
         body: Code,
     },
+    Simulate {
+        body: Code,
+    },
 }
 
 pub struct Arm {
@@ -218,6 +221,7 @@ fn lower_node(e: &Expr) -> Code {
             binder: binder.name.clone(),
             body: lower(body),
         },
+        ExprKind::Simulate { body } => NodeKind::Simulate { body: lower(body) },
     };
     Rc::new(Node { kind, span: e.span })
 }

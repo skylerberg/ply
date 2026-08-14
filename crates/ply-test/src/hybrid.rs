@@ -20,6 +20,10 @@
 //!   it.
 
 use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
+use crate::key::result_key;
+use crate::schedule::is_seeded;
+use crate::sim::seed_run;
+use ply_eval::{Plan, Seed};
 use ply_hash::body::{BodySet, StoredBody, reconstruct_relinked};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol};
@@ -133,6 +137,14 @@ pub struct BodyHybrid<'a> {
     /// writing it needs a mutable store, which the diagnosis path does not hold,
     /// so the caller drains these afterwards.
     proved: Vec<DefHash>,
+    /// The interleaving the failure being explained happened in, pinned.
+    ///
+    /// A hybrid that explores its own interleavings answers a different question
+    /// from the one the search asked, and a bisection over it names whichever
+    /// definition the *other* interleaving happened to run through. That is a
+    /// confidently wrong culprit rather than an obvious breakage, which is the
+    /// worst shape a defect can take.
+    plan: Plan,
 }
 
 impl<'a> BodyHybrid<'a> {
@@ -150,7 +162,16 @@ impl<'a> BodyHybrid<'a> {
             test,
             signature,
             proved: Vec::new(),
+            plan: Plan::once(Seed::default()),
         }
+    }
+
+    /// Pins every trial to the interleaving the failure happened in. Called with
+    /// [`crate::Failure::seed`]; without it a simulated failure is bisected by
+    /// re-searching, and the answer is about a different execution.
+    pub fn at_seed(mut self, seed: &Seed) -> BodyHybrid<'a> {
+        self.plan = Plan::once(seed.clone());
+        self
     }
 
     /// The current test's stored body, found by the hash the run published for
@@ -244,17 +265,6 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
-        // The hybrid's own test hash covers its whole closure, so a `Pass`
-        // recorded under it is a claim about exactly this configuration. This is
-        // what makes `H(∅)` under an unedited test free: it *is* the hash the
-        // baseline test passed at.
-        let hash = rehashed.tests.first().copied();
-        if let Some(hash) = hash
-            && matches!(self.store.get(hash), Some(Outcome::Pass))
-        {
-            return Trial::passes().from_cache();
-        }
-
         let Ok(check) = ply_core::check_program(&rebuilt.program, &resolved) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
@@ -266,12 +276,33 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
+        // The hybrid's own test hash covers its whole closure, so a `Pass`
+        // recorded under it is a claim about exactly this configuration. This is
+        // what makes `H(∅)` under an unedited test free: it *is* the hash the
+        // baseline test passed at.
+        //
+        // Under a pinned seed the claim is about that seed too, so the key is
+        // the plan's — a trial that passed at one interleaving says nothing
+        // about a search that visited others.
+        let seeded = is_seeded(&check.tests[index].footprint);
+        let hash = rehashed
+            .tests
+            .first()
+            .map(|hash| result_key(*hash, seeded, &self.plan));
+        if let Some(hash) = hash
+            && matches!(self.store.get(hash), Some(Outcome::Pass))
+        {
+            return Trial::passes().from_cache();
+        }
+
         // The authoritative engine, for the reason a cached `Pass` is a claim
         // about that engine and this trial may write one. It is also the engine
         // whose answer the failure being explained came from, so a divergence
         // between the two cannot turn a reproduction into a `DifferentFailure`.
+        let plan = self.plan.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+            seed_run(&mut machine, &plan.seeds()[0], plan.steps);
             machine.eval_test(index)
         }));
         match outcome {

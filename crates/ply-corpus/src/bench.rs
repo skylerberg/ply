@@ -20,7 +20,7 @@
 use crate::pipeline::{Front, Phase, Timings, front};
 use crate::write::{EditSite, read_manifest};
 use anyhow::{Context, Result, bail};
-use ply_eval::EngineChoice;
+use ply_eval::{EngineChoice, Plan};
 use ply_store::Store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -360,12 +360,19 @@ fn once(root: &Path, engine: EngineChoice) -> Result<(Timings, Shape)> {
     timings.record(Phase::CacheOpen, started.elapsed());
 
     let started = Instant::now();
-    let selection = ply_test::select(&check, &hashes, &store);
+    let selection = ply_test::select(&check, &hashes, &store, &Plan::default());
     timings.record(Phase::Select, started.elapsed());
 
     let started = Instant::now();
     let report = ply_test::run(
-        &selection, &program, &resolved, &check, &hashes, &mut store, engine,
+        &selection,
+        &program,
+        &resolved,
+        &check,
+        &hashes,
+        &mut store,
+        engine,
+        ply_test::Search::of(&selection),
     );
     timings.record(Phase::Execute, started.elapsed());
 

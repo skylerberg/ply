@@ -6,6 +6,7 @@ pub mod commands;
 pub mod driver;
 pub mod load;
 pub mod migrate;
+pub mod simulation;
 pub mod style;
 
 use cli::{CacheAction, Cli, Command};

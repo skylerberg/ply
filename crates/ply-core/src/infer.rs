@@ -1,4 +1,5 @@
 use crate::env::{TypeEnv, generalize, instantiate};
+use crate::prelude;
 use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
 use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
@@ -22,6 +23,7 @@ const BUILTIN_TYPES: &[(&str, usize)] = &[
     ("Unit", 0),
     ("List", 1),
     ("Cell", 1),
+    (prelude::TASK_TYPE, 1),
 ];
 
 pub fn check_program_with(
@@ -52,6 +54,7 @@ pub fn check_program_with(
         c.check_tests(module);
     }
     c.check_comparisons();
+    c.check_simulations();
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(c.diags)
     } else {
@@ -120,6 +123,18 @@ struct Checker<'a> {
     /// because the type at a comparison is often still a variable when it is
     /// first seen.
     comparisons: Vec<(Span, Type)>,
+    /// `simulate` regions, checked for the same reason: a region's result type
+    /// and the row of what it calls are both routinely unsolved while its own
+    /// definition is still being walked.
+    simulations: Vec<Simulation>,
+}
+
+/// One `simulate` region, as [`Checker::check_simulations`] revisits it.
+struct Simulation {
+    span: Span,
+    body_span: Span,
+    body_ty: Type,
+    body_row: Row,
 }
 
 impl<'a> Checker<'a> {
@@ -134,7 +149,7 @@ impl<'a> Checker<'a> {
             env: TypeEnv::new(),
             diags: Vec::new(),
             types: IndexMap::new(),
-            effects: IndexMap::new(),
+            effects: prelude::effects(),
             ctors: IndexMap::new(),
             defs: IndexMap::new(),
             tests: Vec::new(),
@@ -145,6 +160,7 @@ impl<'a> Checker<'a> {
             alias_stack: Vec::new(),
             performs: Vec::new(),
             comparisons: Vec::new(),
+            simulations: Vec::new(),
         };
         c.install_prelude();
         c
@@ -489,6 +505,10 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
+            if prelude::is_prelude_effect(&name) {
+                self.prelude_collision(&def.name, &name);
+                continue;
+            }
             if let Some(prev) = self.effects.get(&name) {
                 self.duplicate(&def.name, prev.span, "effect");
                 continue;
@@ -514,6 +534,7 @@ impl<'a> Checker<'a> {
                         params,
                         ret,
                         span: op.span,
+                        scheme: None,
                     },
                 );
             }
@@ -649,6 +670,29 @@ impl<'a> Checker<'a> {
                 name.name
             ))
             .note("rename one of them"),
+        );
+    }
+
+    /// The prelude occupies four program-wide names. Only an anonymous module
+    /// can claim one — anywhere else the declaration is `<module>.clock` and
+    /// shadows the prelude by the ordinary resolution order.
+    fn prelude_collision(&mut self, name: &Ident, qualified: &Symbol) {
+        self.diags.push(
+            Diagnostic::error(
+                codes::DUPLICATE_DEFINITION,
+                format!("`{qualified}` is a prelude effect"),
+            )
+            .primary(name.span, "declared by the language")
+            .note(format!(
+                "the language declares `{}` and `{}`; `simulate {{ .. }}` handles the first three",
+                prelude::SIMULATED.join("`, `"),
+                prelude::SIM
+            ))
+            .note(format!(
+                "rename this effect, or put it in a named module, where its program-wide name \
+                 would be `<module>.{}` and would shadow the prelude",
+                name.name
+            )),
         );
     }
 
@@ -912,6 +956,10 @@ impl<'a> Checker<'a> {
 
     /// `cell` is not in [`Checker::effects`] — it is the builtin regions
     /// perform under, and no declaration produces it.
+    ///
+    /// The prelude effects are, and are consulted last: a module's own items and
+    /// its imports shadow them, which is the ordinary resolution order and what
+    /// leaves `examples/clock.ply`'s `effect clock` uninvolved.
     fn effect_name(&mut self, q: &QName) -> Option<Symbol> {
         if q.is_bare() && q.symbol().as_str() == CELL {
             return Some(Symbol::new(CELL));
@@ -920,6 +968,9 @@ impl<'a> Checker<'a> {
             Some(name) if self.effects.contains_key(&name) => Some(name),
             Some(_) => None,
             None => {
+                if q.is_bare() && prelude::is_prelude_effect(q.symbol()) {
+                    return Some(q.symbol().clone());
+                }
                 if q.is_bare() {
                     self.unknown_effect(q);
                 }
@@ -1333,7 +1384,18 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let effect = atom.effect.clone();
-            let example = self.example_clause(&effect, atom);
+            // The language ships a handler for three of these, so pointing at
+            // `handle .. with { .. }` would send a reader to write by hand what
+            // `simulate` already installs — and with none of its ordering
+            // semantics.
+            let remedy = if prelude::is_simulated(atom) {
+                "handle it here, e.g. `simulate { <body> }`".to_string()
+            } else {
+                format!(
+                    "handle it here, e.g. `handle <body> with {{ {} }}`",
+                    self.example_clause(&effect, atom)
+                )
+            };
             let (span, direct) = match self.site_for(atom) {
                 Some(site) => (site.span, site.direct),
                 None => (def.body.span, false),
@@ -1357,13 +1419,9 @@ impl<'a> Checker<'a> {
                     "`{atom}` is performed inside something this expression calls"
                 ));
             }
-            d = d
-                .note(format!(
-                    "handle it here, e.g. `handle <body> with {{ {example} }}`"
-                ))
-                .note(
-                    "or declare this `test/nondet`, which opts out of the cache and re-runs every time",
-                );
+            d = d.note(remedy).note(
+                "or declare this `test/nondet`, which opts out of the cache and re-runs every time",
+            );
             self.diags.push(d);
         }
     }
@@ -1646,6 +1704,8 @@ impl<'a> Checker<'a> {
                 binder,
                 body,
             } => self.infer_with_cell(e, resource, init, binder, body),
+
+            ExprKind::Simulate { body } => self.infer_simulate(e, body),
         }
     }
 
@@ -1898,7 +1958,7 @@ impl<'a> Checker<'a> {
             return (self.fresh.ty(), row);
         };
 
-        let (params, ret) = self.instantiate_op(&op_info);
+        let (params, ret, op_row) = self.instantiate_op(&op_info);
         if params.len() != args.len() {
             self.diags.push(
                 Diagnostic::error(
@@ -1926,6 +1986,17 @@ impl<'a> Checker<'a> {
 
         let atom = EffectAtom::new(info.name.clone(), res, op_info.mode);
         self.record(atom.clone(), e.span, true);
+        // The operation's own row, which only a prelude operation has: it is how
+        // the effects of a `task.spawn` body reach the row of the code that
+        // spawned it, and therefore the test's footprint and the conflict graph.
+        // Resolved first, exactly as an application resolves a callee's row —
+        // two spawns whose tails have already been solved to different closed
+        // rows must union, not unify.
+        let op_row = self.subst.resolve_row(&op_row);
+        for atom in &op_row.atoms {
+            self.record(atom.clone(), e.span, false);
+        }
+        let row = self.join(e.span, row, op_row);
         let row = self.join(e.span, row, Row::singleton(atom));
         (ret, row)
     }
@@ -2024,18 +2095,28 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Type>, Type) {
-        let scheme = Scheme {
-            ty_vars: op_free_vars(op),
-            row_vars: vec![],
-            ty: Type::Fn {
-                params: op.params.clone(),
-                ret: Box::new(op.ret.clone()),
-                effects: Row::empty(),
+    /// One code path for both kinds of operation: a user-declared one has no
+    /// scheme, so its signature is built here with an empty row, and today's
+    /// rule is this rule at that row.
+    fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
+        let scheme = match &op.scheme {
+            Some(scheme) => scheme.clone(),
+            None => Scheme {
+                ty_vars: op_free_vars(op),
+                row_vars: vec![],
+                ty: Type::Fn {
+                    params: op.params.clone(),
+                    ret: Box::new(op.ret.clone()),
+                    effects: Row::empty(),
+                },
             },
         };
         match instantiate(&scheme, &mut self.fresh) {
-            Type::Fn { params, ret, .. } => (params, *ret),
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => (params, *ret, effects),
             _ => unreachable!("operation schemes are always function types"),
         }
     }
@@ -2070,7 +2151,10 @@ impl<'a> Checker<'a> {
             else {
                 continue;
             };
-            let (params, ret) = self.instantiate_op(&op_info);
+            // A prelude operation's own row is not the clause's to carry: the
+            // clause receives the argument and whatever it does with it — call
+            // the spawned body, or not — is already in the clause's own row.
+            let (params, ret, _) = self.instantiate_op(&op_info);
             if params.len() != clause.params.len() {
                 self.diags.push(
                     Diagnostic::error(
@@ -2220,6 +2304,92 @@ impl<'a> Checker<'a> {
 
         let row = self.join(e.span, init_row, body_row.without(&handled));
         (body_ty, row)
+    }
+
+    /// The `handle` rule with a fixed clause set, plus one atom of its own:
+    ///
+    /// ```text
+    /// Γ ⊢ simulate { body } : T / ( (ρ_b \ {task.*, clock.*, random.*}) ∪ {sim.read} )
+    /// ```
+    ///
+    /// The seeded scheduler's clauses read and write only state created at the
+    /// region's entry and destroyed at its exit, so the `⋃ row(clause_i)` term a
+    /// hand-written handler owes is empty and the only thing added is the seed.
+    /// `cell` is deliberately not discharged: a `with_cell` outside a region
+    /// holding state the tasks inside share is how tasks share memory.
+    fn infer_simulate(&mut self, e: &Expr, body: &Expr) -> (Type, Row) {
+        let mark = self.performs.len();
+        let (body_ty, body_row) = self.infer(body);
+        let handled = prelude::simulated_atoms();
+        self.discharge(mark..self.performs.len(), &handled);
+
+        self.simulations.push(Simulation {
+            span: e.span,
+            body_span: body.span,
+            body_ty: body_ty.clone(),
+            body_row: body_row.clone(),
+        });
+
+        let seed = prelude::seed_atom();
+        self.record(seed.clone(), e.span, true);
+        let row = self.subst.resolve_row(&body_row).without(&handled);
+        let row = self.join(e.span, row, Row::singleton(seed));
+        (body_ty, row)
+    }
+
+    /// Nesting and task escape, asked once the module is solved. Both questions
+    /// are about a row and a type that a region's own definition routinely
+    /// leaves unsolved while it is being walked.
+    fn check_simulations(&mut self) {
+        let seed = prelude::seed_atom();
+        let sites: Vec<Simulation> = std::mem::take(&mut self.simulations);
+        for site in &sites {
+            if self.subst.resolve_row(&site.body_row).contains(&seed) {
+                self.nested_simulation(site, &sites);
+            }
+            let ty = self.subst.resolve_ty(&site.body_ty);
+            if prelude::mentions_task(&ty) {
+                let mut printer = Printer::new();
+                self.diags.push(
+                    Diagnostic::error(
+                        codes::TASK_ESCAPES_SCOPE,
+                        "a task escapes the `simulate` region that spawned it",
+                    )
+                    .primary(
+                        site.body_span,
+                        format!("this has type `{}`", printer.ty(&ty)),
+                    )
+                    .note(
+                        "a `Task` is a key into the region's scheduler, and the scheduler ends \
+                         with the region",
+                    )
+                    .note("`join` the task inside the region and return its value instead"),
+                );
+            }
+        }
+    }
+
+    fn nested_simulation(&mut self, site: &Simulation, sites: &[Simulation]) {
+        let inner = sites
+            .iter()
+            .find(|other| other.span != site.span && encloses(site.body_span, other.span));
+        let mut d = Diagnostic::error(
+            codes::NESTED_SIMULATION,
+            "a `simulate` region inside another `simulate` region",
+        )
+        .primary(site.span, "this region's body reaches `sim.read`");
+        if let Some(inner) = inner {
+            d = d.secondary(inner.span, "the region it reaches is here");
+        } else {
+            d = d.note("something this body calls carries `sim.read`, so it enters a region too");
+        }
+        self.diags.push(
+            d.note(
+                "two schedulers means two notions of `runnable`, and a task in the inner region \
+                 blocking the outer one",
+            )
+            .note("hoist the inner region out, or drop it and let the outer one schedule"),
+        );
     }
 
     fn infer_match(&mut self, e: &Expr, scrutinee: &Expr, arms: &[MatchArm]) -> (Type, Row) {
@@ -2585,6 +2755,14 @@ fn is_cell_builtin(name: &Symbol) -> bool {
     matches!(name.as_str(), "cell_get" | "cell_set")
 }
 
+fn encloses(outer: Span, inner: Span) -> bool {
+    !outer.is_dummy()
+        && !inner.is_dummy()
+        && outer.source == inner.source
+        && outer.start <= inner.start
+        && inner.end <= outer.end
+}
+
 fn supplied(n: usize) -> String {
     if n == 1 {
         "1 was supplied".to_string()
@@ -2780,5 +2958,6 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
             collect_refs(init, out);
             collect_refs(body, out);
         }
+        ExprKind::Simulate { body } => collect_refs(body, out),
     }
 }

@@ -3,6 +3,7 @@ use crate::code::Code;
 use crate::cont::Continuation;
 use crate::env::Env;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
+use crate::sim::TaskId;
 use crate::world::CellId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Expr;
@@ -36,6 +37,12 @@ pub enum Value {
     /// that state is a value the machine threads rather than a location values
     /// alias.
     Cell(CellId),
+    /// A handle on a task, and a key into its region's scheduler for the same
+    /// reason [`Value::Cell`] is one: a key cannot dangle, two keys cannot alias
+    /// across a fork, and identity is integer comparison. The scheduler dies
+    /// with its region, so a handle that outlives it is `E0413` rather than a
+    /// wrong answer.
+    Task(TaskId),
     /// A captured continuation. Callable with exactly one argument — the value
     /// the `perform` it was captured at should have returned.
     Continuation(Rc<Continuation>),
@@ -126,6 +133,7 @@ impl Value {
             Value::Ctor { .. } => "variant",
             Value::Closure(_) => "function",
             Value::Cell(_) => "Cell",
+            Value::Task(_) => "Task",
             Value::Continuation(_) => "continuation",
         }
     }
@@ -162,6 +170,13 @@ impl Value {
         match self {
             Value::Cell(id) => Ok(*id),
             other => Err(type_error(span, what, "Cell", other)),
+        }
+    }
+
+    pub fn as_task(&self, span: Span, what: &str) -> Result<TaskId, Diagnostic> {
+        match self {
+            Value::Task(id) => Ok(*id),
+            other => Err(type_error(span, what, "Task", other)),
         }
     }
 
@@ -234,6 +249,9 @@ impl Value {
             }
             Value::Cell(id) => {
                 let _ = write!(out, "<cell {id}>");
+            }
+            Value::Task(id) => {
+                let _ = write!(out, "<task {id}>");
             }
             Value::Continuation(k) => {
                 let _ = write!(out, "<continuation {} frames>", k.frames());
@@ -399,6 +417,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
+        (Value::Task(x), Value::Task(y)) => x == y,
         (Value::Closure(_) | Value::Continuation(_), _)
         | (_, Value::Closure(_) | Value::Continuation(_)) => {
             return Err(Diagnostic::error(

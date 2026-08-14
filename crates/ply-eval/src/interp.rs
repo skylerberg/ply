@@ -344,6 +344,10 @@ impl<'a> Interp<'a> {
             ExprKind::WithCell {
                 init, binder, body, ..
             } => self.eval_with_cell(init, binder, body, env),
+            // Refused before the body runs, for the reason a general clause is:
+            // running one unnamed interleaving would be a plausible wrong answer
+            // and the result cache would keep it.
+            ExprKind::Simulate { .. } => Err(crate::differential::machine_only_region(e.span)),
         }
     }
 

@@ -1845,3 +1845,684 @@ Numbered as in ADR 0005; `(landed)` marks the ones already passing.
 - **One-shot / linearity annotations on continuations.**
 - **Effect-typed control operators** beyond `resume`: no `shift`/`reset`, no
   first-class prompts. `handle` is the only delimiter.
+
+---
+
+## Deterministic simulation
+
+`docs/adr/0006-deterministic-simulation.md` has the reasoning; this section is
+the contract. **Where it disagrees with any section above, this section wins** —
+it was written after them.
+
+### The rule everything else follows from
+
+> A simulated run is a pure function of its definition set and its seed.
+
+Every source of nondeterminism a Ply program can reach is an effect, and
+simulation is a handler for it. `simulate` is not a new kind of construct: it is
+a `handle` with a fixed clause set whose clauses happen to be written in Rust.
+
+### The prelude effects — landed in `ply-core::prelude`
+
+Declared by the language rather than by a module. Every operation is
+singleton-resource; the atoms are `task.write`, `clock.read`, `clock.write`,
+`random.write` and `sim.read`.
+
+```ply
+nondet effect task {
+  write spawn<a | e>(body: () -> a / e) -> Task<a> / e
+  write join<a>(t: Task<a>) -> a
+  write yield() -> Unit
+}
+
+nondet effect clock {
+  read  now() -> Int
+  write sleep(nanos: Int) -> Unit
+}
+
+nondet effect random {
+  write next() -> Int
+  write below(bound: Int) -> Int
+}
+
+effect sim {
+  read seed() -> Int
+}
+```
+
+`task` is `nondet` because concurrency without a specified scheduler *is*
+nondeterminism: a `det` test that spawns with no scheduler installed is `E0412`.
+`sim` is **not** `nondet` because a seed is an input, and that is the whole
+type-level content of the E0412 story below.
+
+`random.next` is a **write**: drawing advances the stream, so two tasks drawing
+in the other order get the other values. Declaring it `read` would hide a whole
+class of order dependence from the reduction in "Exploration".
+
+An effect declaration whose **program-wide** name equals `task`, `clock`,
+`random` or `sim` is `DUPLICATE_DEFINITION`, pointing at the prelude. Only an
+anonymous module can produce such a name; `examples/clock.ply`'s `effect clock`
+is `clock.clock` and shadows the prelude by the ordinary resolution order.
+
+### `ply-core` — landed
+
+One new field, and nothing in the pinned `ply-core::ty` moves:
+
+```rust
+pub struct OpInfo {
+    pub name: Symbol,
+    pub mode: Mode,
+    pub resource_param: bool,
+    pub params: Vec<Type>,
+    pub ret: Type,
+    /// `Some` only for a prelude operation, whose signature is constructed
+    /// rather than parsed. `None` for every user-declared operation, which stays
+    /// monomorphic and types exactly as it does today.
+    pub scheme: Option<Scheme>,
+}
+```
+
+Perform-site typing: with a scheme, instantiate it, unify the arguments against
+its parameters, and union its instantiated row — the `effects` of its `Type::Fn`
+— with the performed atom. Without one, today's rule, which is that rule with an
+empty row. **One code path.**
+
+`spawn`'s row must carry `e`. Without it a test that spawns a task writing
+`db.write[orders]` reports an empty footprint and the cross-test conflict graph
+runs it beside a test reading `orders`.
+
+Surface syntax for declaring a polymorphic operation is **not in M7**.
+
+The `simulate` typing rule:
+
+```
+Γ ⊢ body : T / ρ_b
+handled = { task.write, clock.read, clock.write, random.write }
+sim.read ∉ ρ_b                                          (else E0416)
+T mentions no Task<_>                                   (else E0413)
+────────────────────────────────────────────────────────────────────
+Γ ⊢ simulate { body } : T / ( (ρ_b \ handled) ∪ {sim.read} )
+```
+
+`cell` is deliberately not in `handled`: a `with_cell` outside a region holding
+state the tasks inside share is how tasks share memory.
+
+`Task<a>` is a prelude type constructor. A `Task` in the region's result type is
+`E0413`, the same result-type check `with_cell` already uses.
+
+### `ply-syntax` — landed
+
+```
+simulate := "simulate" block
+```
+
+```rust
+pub enum ExprKind {
+    // ...
+    /// `simulate { body }`. Installs the seeded scheduler over `body`.
+    Simulate { body: Box<Expr> },
+}
+```
+
+`simulate` is a **contextual** keyword, recognized only immediately before a `{`,
+exactly as `with_cell` is recognized only immediately before a `[`.
+`lexer::is_ident("simulate")` stays true and no `Kw::Simulate` is added.
+
+There is no seed in the syntax. A seed written in source would be part of the
+definition's hash, which makes every seed a different definition and every
+widening of the search a rewrite of the program.
+
+### `ply-hash` — landed
+
+`Simulate` enters normalization with its own discriminant byte. A `simulate`
+region is a different definition from its body, so adding, removing or reordering
+one changes the enclosing definition's hash; reformatting it does not. This is a
+`BODY_ENCODING` and a `FRONTEND_VERSION` bump, alongside the one `OpInfo::scheme`
+forces on the declaration encoding.
+
+### `ply-eval::sim` — landed
+
+The value types every other crate is written against: what a seed *is*, how it
+expands into random streams, what a step's accesses are, and how two steps are
+decided to commute. `ply-eval::sched` consumes them and `ply-eval::machine`
+drives it.
+
+```rust
+/// The repro artifact. `root` seeds the streams; `path` is a choice-sequence
+/// prefix — at scheduling point `i`, `enabled[path[i]]` is resumed when
+/// `i < path.len()`, and the `sched` stream chooses otherwise.
+pub struct Seed { pub root: u64, pub path: Vec<u16> }
+impl Seed {
+    pub fn root(root: u64) -> Seed;
+    pub fn at(root: u64, path: Vec<u16>) -> Seed;
+    pub fn is_root(&self) -> bool;
+    /// `"7"` or `"7:3.0.2"`; the root also accepts `0x`-prefixed hex. Rejects
+    /// everything else — a seed that parses loosely replays something other
+    /// than what failed.
+    pub fn parse(s: &str) -> Option<Seed>;
+    /// Canonical bytes for a cache key, length-prefixed. A different job from
+    /// the text form: unambiguous rather than readable.
+    pub fn to_bytes(&self) -> Vec<u8>;
+    /// The interleaving agreeing with this one up to `at` and taking `choice`
+    /// there; beyond `at` the stream chooses again. Pads when `at` is past the
+    /// recorded path, since a search may reach a point the prefix never named.
+    pub fn branch(&self, at: usize, choice: u16) -> Seed;
+    pub fn choice(&self, i: usize) -> Option<u16>;
+}
+impl Display for Seed;                 // "7" or "7:3.0.2"
+
+/// Display: "@3".
+pub struct TaskId(pub u32);
+
+pub enum Domain { Sched, Rand }
+impl Domain { pub fn as_str(self) -> &'static str; }
+
+/// Counter-mode BLAKE3 rather than a PRNG crate: "the same seed anywhere" is a
+/// promise across versions as well as machines, and a generator crate's version
+/// is not something this project controls.
+pub struct Stream { .. }
+impl Stream {
+    pub fn new(root: u64, domain: Domain) -> Stream;
+    pub fn next_u64(&mut self) -> u64;
+    /// Rejection sampling, specified exactly: with `limit = (u64::MAX / n) * n`,
+    /// draw until `x < limit`, answer `x % n`. `n == 0` is `None`, which the
+    /// `random.below` builtin turns into `RUNTIME_ERROR`.
+    pub fn below(&mut self, n: u64) -> Option<u64>;
+    pub fn drawn(&self) -> u64;
+    /// Pure, so a replay can ask for draw `counter` without serving the ones
+    /// before it.
+    pub fn draw(root: u64, domain: Domain, counter: u64) -> u64;
+}
+
+pub enum SimMode { Once, Random, Dpor }   // Default = Dpor
+impl SimMode {
+    pub fn as_str(self) -> &'static str;
+    pub fn parse(s: &str) -> Option<SimMode>;
+    /// Whether a root's exploration decomposes into independent per-seed claims.
+    /// Only `Random`'s does.
+    pub fn caches_per_seed(self) -> bool;
+}
+
+pub const DEFAULT_BUDGET: u32 = 256;        // interleavings per root, dpor
+pub const DEFAULT_STEPS: u32 = 100_000;     // scheduling steps per interleaving
+pub const DEFAULT_RANDOM_ROOTS: u32 = 64;
+
+pub struct Plan {
+    pub mode: SimMode,
+    /// Ascending and deduplicated by `normalized`.
+    pub roots: Vec<u64>,
+    pub budget: u32,
+    pub steps: u32,
+    /// The fixed path under `Once`, so `--seed 7:3.0.2` names one interleaving
+    /// rather than one root. Empty in every other mode.
+    pub path: Vec<u16>,
+}
+impl Plan {
+    pub fn once(seed: Seed) -> Plan;
+    pub fn random(roots: u32) -> Plan;
+    pub fn normalized(self) -> Plan;
+    pub fn seeds(&self) -> Vec<Seed>;
+    /// Covers every field, length-prefixed. Two plans that search the same thing
+    /// have the same digest, or the cache splits on the order a caller happened
+    /// to write its flags in.
+    pub fn digest(&self) -> [u8; 32];
+}
+impl Default for Plan;   // Dpor, roots [0], DEFAULT_BUDGET, DEFAULT_STEPS
+
+/// One access a step made. Finer than a `Footprint` in exactly one place: a cell
+/// is a *location*, so it is keyed by `CellId` rather than by the `[r]` label
+/// several cells may share.
+pub enum Access {
+    Atom(EffectAtom),
+    Cell { id: CellId, mode: Mode },
+    /// A `with_cell` took the next id from the world's own counter. Allocation
+    /// has no location to name, so it is its own kind of access.
+    Alloc,
+}
+impl Access {
+    /// Two `Atom`s by `EffectAtom::conflicts_with`; two `Cell`s iff the same
+    /// `CellId` and at least one is a `Write`; two `Alloc`s always, since they
+    /// take ids from one counter; anything else never.
+    pub fn conflicts_with(&self, other: &Access) -> bool;
+    pub fn is_write(&self) -> bool;
+}
+impl Display for Access;   // "db.write[users]", "cell.write[#7]" or "cell.alloc"
+
+pub struct StepFootprint { .. }
+impl StepFootprint {
+    pub fn new() -> StepFootprint;
+    pub fn from_accesses(accesses: impl IntoIterator<Item = Access>) -> StepFootprint;
+    pub fn insert(&mut self, access: Access);
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn accesses(&self) -> impl Iterator<Item = &Access>;
+    /// **The dependence relation.** Two steps that do not conflict commute.
+    pub fn conflicts_with(&self, other: &StepFootprint) -> bool;
+    /// What the two contend over, as a diagnostic renders it. Empty exactly when
+    /// they commute.
+    pub fn contention(&self, other: &StepFootprint) -> Vec<&Access>;
+}
+
+/// One end of a race, as the failure artifact prints it. Not a *step* — that is
+/// the unit the scheduler runs; this is where one of them was standing.
+pub struct RaceSite {
+    pub task: TaskId,
+    /// `None` when the failure was not traced. Never guessed.
+    pub definition: Option<Symbol>,
+    pub access: String,
+    pub span: Span,
+}
+/// The two steps whose reordering flipped a passing interleaving to a failing
+/// one. `Some` only when the search observed the flip.
+pub struct Race { pub left: RaceSite, pub right: RaceSite, pub at: u32 }
+
+/// `bounded` means the naive search spent its own budget, so the count is a
+/// lower bound and renders `>= n`.
+pub struct Naive { pub explored: u32, pub bounded: bool }
+impl Display for Naive;
+
+pub struct Exploration {
+    pub explored: u32,
+    /// The frontier emptied within the budget: **every** interleaving ran.
+    pub exhaustive: bool,
+    /// The budget was spent.
+    pub exhausted: bool,
+    /// `--measure-reduction` only.
+    pub naive: Option<Naive>,
+    pub steps: u64,
+    /// Nanoseconds of virtual time the last interleaving consumed.
+    pub virtual_time: i64,
+    pub failure: Option<Seed>,
+    pub race: Option<Race>,
+}
+impl Exploration {
+    /// `None` unless the naive count was measured. Never computed from an
+    /// assumption.
+    pub fn reduction(&self) -> Option<f64>;
+    /// `failure.is_none() && !exhausted`. An exhausted search proved nothing
+    /// about the interleavings it did not reach, so its green verdict may not be
+    /// written to the result cache.
+    pub fn is_cacheable(&self) -> bool;
+}
+```
+
+Requirements the types do not carry:
+
+- **`ply-eval::sim` may name no hash-based collection.** Run queues are `Vec` in
+  insertion order, sets are `BTreeSet`. A rule about how a type is *used* is a
+  rule nobody enforces; a rule about which types may be *named* is greppable, and
+  a landed test greps this module for `HashMap`, `HashSet`, `FxHashMap`,
+  `FxHashSet`, `SystemTime`, `Instant`, `thread::`, `rayon`, `as_ptr` and
+  `strong_count`.
+- No decision may read a pointer, an address, a refcount or an allocation order.
+- The `sched` and `rand` streams have **separate counters**. Sharing one makes
+  adding a `random.next()` call shift the interleaving, so a change to the data
+  becomes a change to the schedule and a bisection over it names the wrong
+  definition. A landed test pins it.
+- Virtual time is nanoseconds since the region was entered, starting at `0`.
+
+### `ply-eval::machine` and `ply-eval::region` — landed
+
+```rust
+impl<'a> Machine<'a> {
+    /// The seed the next entry point's `simulate` region runs at, and the
+    /// scheduling steps one interleaving may spend.
+    pub fn set_seed(&mut self, seed: Seed, steps: u32);
+    /// What the last entry point's `simulate` regions did — **every** region it
+    /// entered, over one choice sequence. `None` when it reached none, which is
+    /// how a test with no region pays nothing.
+    pub fn simulated(&self) -> Option<&region::Record>;
+}
+
+impl region::Record {
+    /// The interleaving, given how the entry point that produced it ended. The
+    /// verdict is the *run's*: a region that completed inside a test whose later
+    /// assertion failed is a failing interleaving.
+    pub fn interleaving(&self, outcome: &Result<(), Diagnostic>) -> Interleaving;
+}
+```
+
+**One trail per entry point, not one per region.** A test may enter several
+`simulate` regions in sequence — only *nesting* is `E0416`, and an ordinary call
+reaches one region twice with no syntax pointing at it. Scheduling point *i* is
+the *i*th of the **run**: one `Seed::path`, one `sched` stream, one step record,
+one `rand` counter, shared by every region the entry point enters, and each step
+tagged with the region that took it so the search never pairs two that ran in
+sequence. A record covering one of several regions is a search input describing
+that region and an `exhaustive: true` asserted about all of them, and a per-region
+choice counter makes one seed mean a different thing in each region — which
+surfaces as `E0415` on a program that is merely unusual.
+
+The machine runs **one** interleaving per entry point — the one its seed names —
+and the search over the others is `ply-test`'s, which re-runs the whole test per
+interleaving from a fresh fork of the base world. That split is what §2.4
+requires: exploration is a test-time activity, and `ply run` explores exactly one
+interleaving. `Executor::execute` is therefore **unchanged**, and so are
+grouping, panic containment and the per-test cache rules.
+
+`ply_test::sim::seed_run` and `ply_test::sim::interleaving_of` are the whole of
+the seam, which is why `Evaluator` gains nothing: the tree-walker refuses a
+region outright and has no interleaving to report.
+
+The scheduler is a **native prompt**: a delimiter on the M6 stack whose clauses
+are Rust. `Segment` gains a native form and `Stack::find_handler` consults both;
+capture, splice, deep handlers and the threaded world are all unchanged. A task
+is `(TaskId, Continuation, TaskState)`, and resuming one is the transition
+ADR 0005 §1.3 already specifies for applying a continuation.
+
+Six rules an implementer must get exactly right:
+
+- **A step** runs from the scheduler's resumption of a task up to and including
+  that task's next scheduler-visible perform. Its access set **excludes** the
+  terminating `task.*` / `clock.*` atom — including it makes every pair of steps
+  dependent and the reduction exactly 1× — and **includes** `random.write`, whose
+  value the program observes rather than the scheduler.
+- **The machine must record cell accesses,** which ADR 0005's tracer does not:
+  it records a `perform`, and `cell_get` / `cell_set` are builtins over a
+  `CellId` that carries no resource label, so the tracer skips them. Under
+  simulation a cell is the *main* way two tasks share state, so a step's
+  `StepFootprint` carries `Access::Cell { id, mode }` per `cell_get` and
+  `cell_set`. A build that omits them explores one interleaving of every
+  cell-backed race in the corpus and reports a large reduction for it.
+- **…and cell allocations,** which are neither. `with_cell` takes the next id
+  from the world's own counter, so two tasks that each open a private cell reach
+  two *different worlds* depending on their order — and §6.1's soundness
+  condition says two independent steps reach the same world. A `with_cell` inside
+  a region contributes `Access::Alloc`.
+- **Control that abandons a region is a diagnostic, never a truncated trace.** A
+  handler outside the region may capture across its delimiter; if it never
+  resumes, the region's tasks are destroyed unfinished and every step after that
+  point is missing from the recording, so DPOR's completeness precondition —
+  every explored execution runs all processes to completion — is violated and the
+  search reports `exhaustive` over schedules it cut short. A run that ends with a
+  region still live is `E0413`. A continuation that re-enters a region which has
+  already delivered its value is `E0413` too: its scheduler is gone. A
+  resumption that *is* legal moves the region's anchor — the stack it delivers
+  its value onto is the one the splice put it over, not the one `simulate` was
+  entered on, or everything the resuming clause still had pending is lost.
+- **Enabledness, not dependence, carries synchronization.** A task blocked on a
+  `join` or a timer is not in the enabled set, so no schedule that runs it early
+  is ever generated. Encoding a join as a conflict produces a search that
+  generates impossible schedules and then prunes them.
+- **The value and world a region delivers are those of the interleaving its seed
+  names.** Every other interleaving is a search and its world is discarded, so
+  `--sim-budget` changes the thoroughness of a test and never the meaning of a
+  program.
+
+`ply run` explores exactly one interleaving — the one its seed names. Exploration
+is a test-time activity.
+
+`simulate` is **machine-only**: the tree-walker refuses it with `E0504` exactly as
+it refuses a `resume` clause, and `machine_only_clauses` learns to scan for it.
+
+### Exploration — landed in `ply-eval::explore`
+
+Dynamic partial-order reduction in the backtrack-set formulation, with
+`StepFootprint::conflicts_with` substituted for the alias analysis the literature
+has to approximate.
+
+```
+explore(prefix):
+    run the test at Seed { root, path: prefix }
+    record steps s₁..sₙ with access sets A₁..Aₙ and enabled sets E₁..Eₙ
+    if the run failed: report it, with this seed
+    for i = n down to 1:
+        for each j < i with  Aⱼ ⋈ Aᵢ
+                       and  task(sⱼ) ≠ task(sᵢ)
+                       and  no k in (j, i) has task(s_k) = task(sᵢ)
+                       and  task(sᵢ) ∈ Eⱼ:
+            backtrack[j] ∪= { task(sᵢ) }
+    for each t in backtrack[j] not yet explored at j:
+        explore(prefix[0..j] ++ [index of t in Eⱼ])
+```
+
+- Sleep sets are **not in M7**. Backtrack sets alone are sound.
+- **Replay is self-checking.** Re-running a prefix must reproduce the recorded
+  enabled set at every choice point it names; a mismatch is `E0415`.
+- **`ply_test::shared_footprint` must not be used here.** It drops `cell` atoms
+  because two *tests* hold two worlds. Two *tasks* hold one world, so dropping
+  them prunes away every shared-memory race in the corpus while reporting a
+  larger reduction for having done it. Required test 22 exists for this mistake
+  and nothing else.
+- **`--measure-reduction`** runs the same search a second time with the
+  dependence relation forced to `true`, which degenerates DPOR into exhaustive
+  enumeration of every schedule respecting per-task order and enabledness. Same
+  code, one flag, no second implementation to disagree with the first. A spent
+  naive budget is reported as `naive >= n`, never as an exact count nobody
+  observed.
+
+### The clock — landed in `ply-eval::sim`
+
+> Virtual time advances at exactly one moment: when no task is enabled and at
+> least one is blocked on a timer. It jumps to the earliest deadline among them,
+> and every task whose deadline equals that time becomes enabled at once.
+
+`clock.now()` observes virtual time and does not move it. `clock.sleep(d)` blocks
+until `now + d`; `d <= 0` is a yield. There is no `clock` stream and no jitter: a
+timeout that can fire while work is still pending is a timeout that can fire
+spuriously, and the exactness is worth more than the extra schedules the
+scheduler's own choices already cover.
+
+When no task is enabled and no timer can fire, the region is `E0414`.
+
+Virtual time does **not** advance for computation. A simulated test cannot detect
+that an implementation got slower and must not be read as a performance test.
+
+### `ply-test::schedule` and `ply-test::key` — landed
+
+```rust
+/// Effects the language simulates. `simulate` discharges exactly these and
+/// nothing else.
+pub const SIMULATED: &[&str] = &["task", "clock", "random"];
+/// The seed effect. Deliberately not `nondet`: a seed is an input.
+pub const SIM_EFFECT: &str = "sim";
+/// Effects naming an input no test can write. Exactly one at v0: `sim`.
+pub const AMBIENT: &[&str] = &["sim"];
+
+pub fn is_ambient(atom: &EffectAtom) -> bool;
+/// Neither world-backed nor ambient: the atoms that can contend across tests.
+pub fn contends(atom: &EffectAtom) -> bool;
+/// This test's outcome is a function of its definitions **and** a seed.
+pub fn is_seeded(f: &Footprint) -> bool;
+
+/// The cache key of a seeded test: its definitions and the whole plan searched.
+/// A `DefHash`, so `Store` needs no new shape; domain-tagged with
+/// `b"ply.sim.key.1"`, so it cannot collide with a definition's own hash.
+pub fn sim_key(test_hash: DefHash, plan: &Plan) -> DefHash;
+/// The per-root key `random` mode additionally writes, under
+/// `b"ply.sim.seed.1"`.
+pub fn seed_key(test_hash: DefHash, seed: &Seed) -> DefHash;
+/// Whether a plan's per-root results may be cached individually.
+pub fn writes_seed_keys(plan: &Plan) -> bool;
+/// The key a test's result belongs under. `seeded` is `is_seeded` over the
+/// test's footprint.
+pub fn result_key(test_hash: DefHash, seeded: bool, plan: &Plan) -> DefHash;
+```
+
+`world_isolated` widened from "every atom is world-backed" to "no atom contends",
+because `sim.read` must not drop every simulated test out of the `isolated: n of
+m` number for no reason. `shared_footprint` drops ambient atoms with the
+world-backed ones. Both are landed, with tests.
+
+### `ply-test` — landed
+
+```rust
+pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan)
+    -> Selection;
+```
+
+A breaking change to `select`, deliberately rather than a `select_with_plan`
+beside it: a caller that kept the old signature while running a non-default plan
+would read and write the wrong cache entry silently, which is the one failure
+mode this section exists to prevent.
+
+**Cache rules, and getting these wrong is the milestone's most expensive defect:**
+
+| test | key | |
+| --- | --- | --- |
+| no `sim.read` in its footprint | `test_hash` | unchanged |
+| `sim.read`, any mode | `sim_key(test_hash, plan)` | **never** the bare `test_hash` |
+| `sim.read`, `random` mode | additionally `seed_key` per root | a widened root set runs only the new roots |
+| `sim.read`, `dpor` mode | plan key only | a root's exploration does not decompose |
+
+- **An exhausted search writes nothing.** A green run that spent its budget is
+  reported green and re-runs next time, because it proved nothing about the
+  interleavings it did not reach. This is the first green `det` test in the
+  language that is not cacheable, and it is correct that it is not.
+- A failing test is not cached, unchanged.
+
+`Failure` gains `seed: Option<Seed>` and `race: Option<Race>`, both `None` when
+nothing observed them. **M5's hybrids run at the failing seed**: `BodyHybrid` uses
+`Plan::once(failing_seed)`. A hybrid that explores its own interleavings answers a
+different question, and a bisection over it names whichever definition the other
+interleaving ran through.
+
+`AssertionKind` gains `Deadlock`, so the classifier still partitions the space.
+
+### `ply-cli` — landed
+
+```
+--seed <SEED>              a `Seed`: "7" or "7:3.0.2". Implies `--sim once`.
+--sim <once|random|dpor>   default dpor
+--sim-roots <N>            default 1 under dpor, 64 under random
+--sim-budget <N>           interleavings per root, default 256
+--sim-steps <N>            scheduling steps per interleaving, default 100_000
+--measure-reduction        also run the unpruned search and report the naive count
+```
+
+On `ply test` and `ply run`. Under `ply run` only `--seed` has an effect.
+
+Summary and `--explain`:
+
+```
+   simulated: 3 of 47 · 61 interleavings · 3 exhaustive
+
+   ✓ transfers are atomic under any interleaving
+       12 interleavings · exhaustive · naive 720 · 60× reduction        3.1ms
+   ✗ balance never goes negative                                        8.2ms
+       seed: 0:1.0.3 · 47 interleavings
+       race: @1  apply_debit   db.write[accounts]   src/ledger.ply:31:5
+             @2  apply_debit   db.write[accounts]   src/ledger.ply:31:5
+       replay: ply test --seed 0:1.0.3 --filter "balance never goes negative"
+       culprit: apply_debit
+```
+
+`--json` carries `"schema_version": 3`: `failures[].seed`, `failures[].race`, and
+per test a `simulation` object of `explored`, `exhaustive`, `exhausted`, `naive`,
+`steps` and `virtual_time_ns`. Absent on a test that reached no region — never
+zero, which a consumer cannot tell from "no region".
+
+### New diagnostic codes — landed
+
+Added to `ply_span::codes`; existing numbers are unchanged, and the registry pin
+test covers all four.
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0413 | `TASK_ESCAPES_SCOPE` | a `Task<_>` in a region's result type, or a `join` of a task whose region ended | the program's |
+| E0414 | `DEADLOCK` | nothing is enabled and no timer can fire, **or** the step budget was spent | the program's |
+| E0415 | `SIMULATION_DIVERGENCE` | a replay did not reproduce the recorded enabled sets | **Ply's** |
+| E0416 | `NESTED_SIMULATION` | `sim.read` is in a `simulate` body's row | the program's |
+
+`E0414` covers deadlock and livelock under one code with two messages: from the
+program's side both are "this stopped making progress" and the fix is in the same
+place. The message names the blocked tasks and what each waits on.
+
+E0413, E0414 and E0416 join `E0501`/`E0502`'s row — the program is at fault,
+`Failure::defect` is `false`, and they are attributed and bisected like any other
+failure. E0415 joins `E0503`'s — Ply's fault, `Status::Panicked`,
+`Skipped::Panicked`, no bisection, for the same reason: the run knows the two
+answers disagree and nothing in the definition graph decides which the program
+meant.
+
+### Versions
+
+`RUNTIME_VERSION` bumps to `0.5.0`; `FRONTEND_VERSION` and `BODY_ENCODING` bump
+for `Simulate` in the AST and `OpInfo::scheme` in the declaration encoding.
+`ply-eval` gains `blake3`, already a workspace dependency at 1.8.5.
+
+### Required tests
+
+The ADR's numbering; forty of them, and these are the ones whose absence would
+let the milestone ship broken rather than merely incomplete.
+
+1. Two tasks incrementing one cell-backed counter: some interleaving loses an
+   update, and the search finds it.
+2. A `det` test spawning with no scheduler is `E0412` naming `task.write`.
+3. A user-written sequential `task` handler discharges `task`; the test is `det`
+   and caches under its bare `test_hash`.
+4. A `Task` in a region's result type is `E0413`.
+5. Joining a task through a continuation resumed after its region ended is
+   `E0413`, not a wrong answer.
+6. A task still runnable when the body returns is run to completion first.
+7. A join cycle is `E0414` naming both tasks and what each waits on.
+8. One seed twice in one process: identical outcome, step sequence and final
+   world.
+9. `--jobs 1` and `--jobs 16` produce byte-identical `--json` at one seed.
+10. `Seed::parse` round-trips `7` and `7:3.0.2` and rejects everything else.
+11. Adding a `random.next()` call changes no scheduling choice that precedes it.
+12. `random.below` is unbiased by the specified rule; `n <= 0` is
+    `RUNTIME_ERROR`.
+13. `ply-eval::sim` names no hash-based collection.
+14. `clock.sleep(30_000_000_000)` costs no measurable wall clock and advances
+    virtual time by exactly that much.
+15. Virtual time does not advance while any task is enabled.
+16. Two tasks sleeping to one deadline both wake at it, and their order is
+    explored.
+17. A timeout does not fire while another task can still run.
+18. Two tasks touching disjoint resources produce **one** interleaving, and the
+    naive count for the same program is greater than one.
+19. Two tasks writing one resource produce both orders.
+20. Read/read produces one interleaving; read/write produces two.
+21. Two tasks writing two different `CellId`s sharing a `[r]` label do not
+    conflict.
+22. A region built on `shared_footprint` fails: `cell` accesses must be in the
+    relation.
+23. `--measure-reduction` reports an exact naive count on a fixture small enough
+    to enumerate by hand, and a `>=` bound when its budget is spent.
+24. An emptied frontier is `exhaustive: true`; a spent budget is
+    `exhaustive: false, exhausted: true`.
+25. A replay whose enabled set does not match is `E0415`, classified as a defect
+    rather than bisected.
+26. `simulate` inside `simulate`, lexically and through a call, is both `E0416`.
+27. A user's own `nondet effect` inside a region is still `E0412`.
+28. `clock.now()` outside any region in a `det` test is still `E0412`.
+29. A handler answering `sim.seed()` closes `sim.read` out of the row and the
+    test caches under its bare hash.
+30. Spawning a task that performs `db.write[orders]` puts that atom in the
+    spawner's row, the test's footprint and the cross-test conflict graph.
+31. Adding N simulated, otherwise-isolated tests changes the group count by zero.
+32. A seeded test is never written under its bare `test_hash`.
+33. Changing `--sim-budget` changes the key and re-runs; changing nothing re-runs
+    nothing.
+34. Under `random`, widening 64 roots to 128 runs 64 tests, not 128.
+35. Under `dpor`, an exhausted search writes no `Pass`.
+36. A bisection over a simulated failure runs every hybrid at the failing seed.
+37. `simulate` under `--engine treewalk` is `E0504` and does not evaluate.
+38. Under `--engine both` a test containing `simulate` runs once, on the machine,
+    and `--explain` records it as `machine-only`.
+39. Adding, removing or reordering a `simulate` region changes the enclosing
+    definition's hash; reformatting it does not.
+40. `--sim-budget 1` and `--sim-budget 256` deliver the same value and final
+    world for a passing program.
+
+Plus one `tests/fixtures/` entry per new code, as every milestone owes.
+
+### Not in M7
+
+- **Real threads.** The simulated handler runs on one thread. `rayon` stays at
+  the test-runner level, scheduling whole tests.
+- **A real network.** ROADMAP's M7 line says "network"; M7 delivers the mechanism
+  and no network effect. Partitions, reordering, duplication and partial writes
+  are each a modelling decision. **This is the largest gap in the milestone.**
+- **Finding races in Rust code.** The races found are between Ply tasks over Ply
+  resources.
+- **Cancellation, a timeout primitive, channels, mutexes.** Cells plus
+  `spawn`/`join`/`yield` is the primitive set; the rest is a library, and a
+  library written in Ply is one whose handlers the effect system can see.
+- **Sleep sets** or any DPOR refinement beyond backtrack sets.
+- **Schedule minimization.** The race pair is the actionable half and it is exact.
+- **Surface syntax for polymorphic operation signatures.**
+- **Simulating a user-declared `nondet` effect.** There is no way to ask the
+  language to simulate `http`. A user simulates their own effect by writing a
+  handler, which is what handlers are for.

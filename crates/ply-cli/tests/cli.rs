@@ -201,9 +201,9 @@ fn a_nondet_test_elsewhere_does_not_cost_an_edited_module_its_body() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("clock.ply"),
-        "nondet effect clock { read now() -> Int }\n\
-         fn tick() -> Int / {clock.read} = clock.now()\n\
-         test/nondet \"the clock ticks\" { assert_eq(handle tick() with { clock.now() -> 1, }, 1) }\n",
+        "nondet effect wall { read now() -> Int }\n\
+         fn tick() -> Int / {wall.read} = wall.now()\n\
+         test/nondet \"the clock ticks\" { assert_eq(handle tick() with { wall.now() -> 1, }, 1) }\n",
     )
     .unwrap();
     let counted = |n: &str| {
@@ -514,8 +514,8 @@ fn a_module_with_no_tests_is_a_clean_run_that_says_so() {
 #[test]
 fn a_nondet_test_in_a_det_test_is_a_compile_error() {
     let dir = project(
-        "nondet effect clock {\n  read now() -> Int\n}\n\
-         test \"reads the clock\" { assert(clock.now() > 0) }\n",
+        "nondet effect wall {\n  read now() -> Int\n}\n\
+         test \"reads the clock\" { assert(wall.now() > 0) }\n",
     );
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -1325,13 +1325,13 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
 // --- the failure artifact ---------------------------------------------------
 
 #[test]
-fn test_json_carries_schema_version_two_and_a_ranked_suspect_object() {
+fn test_json_carries_schema_version_three_and_a_ranked_suspect_object() {
     let dir = project(RED);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v = json_of(&out);
 
-    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["schema_version"], 3);
     let f = &v["failures"][0];
     assert_eq!(f["key"], "m.balance never goes negative");
     assert_eq!(f["name"], "balance never goes negative");
@@ -2017,4 +2017,124 @@ fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
     unique.dedup();
     assert_eq!(unique.len(), messages.len(), "{messages:#?}");
     assert_eq!(out.status.code(), Some(0));
+}
+
+// --- the search plan --------------------------------------------------------
+
+#[test]
+fn the_search_plan_is_published_so_two_runs_can_be_compared() {
+    let dir = project(GREEN);
+    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    let sim = json_of(&out)["options"]["sim"].clone();
+    assert_eq!(sim["mode"], "dpor");
+    assert_eq!(sim["seeds"], 1);
+    assert!(sim["seed"].is_null());
+    assert_eq!(sim["measure_reduction"], false);
+    assert!(sim["budget"].is_number());
+    assert!(sim["steps"].is_number());
+
+    let out = ply(dir.path())
+        .args(["test", "--json", "--sim", "random", "--seeds", "8"])
+        .output()
+        .unwrap();
+    let sim = json_of(&out)["options"]["sim"].clone();
+    assert_eq!(sim["mode"], "random");
+    assert_eq!(sim["seeds"], 8);
+    assert_eq!(sim["budget"], 1);
+}
+
+#[test]
+fn a_replay_names_one_interleaving_and_says_so() {
+    let dir = project(GREEN);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--seed", "7:3.0.2"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let sim = json_of(&out)["options"]["sim"].clone();
+    assert_eq!(sim["mode"], "once");
+    assert_eq!(sim["seed"], "7:3.0.2");
+    assert_eq!(sim["seeds"], 1);
+}
+
+/// A seed that parses loosely replays something other than what failed.
+#[test]
+fn a_seed_that_is_not_a_seed_is_refused_before_anything_runs() {
+    let dir = project(GREEN);
+    for bad in ["7:", "seven", "7.3", "0x", "1_000"] {
+        let out = ply(dir.path())
+            .args(["test", "--seed", bad])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "`{bad}` should not parse");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("is not a seed"), "{stderr}");
+    }
+}
+
+/// A flag that cannot mean anything is refused rather than ignored: silently
+/// dropped, it reads as a search that was widened and was not.
+#[test]
+fn a_flag_with_nothing_to_mean_is_refused() {
+    let dir = project(GREEN);
+
+    // `--seed` names one interleaving, so nothing may widen the search beside it.
+    for widening in [
+        vec!["--sim", "dpor"],
+        vec!["--seeds", "4"],
+        vec!["--sim-budget", "4"],
+    ] {
+        let mut args = vec!["test", "--seed", "7"];
+        args.extend(widening.iter().copied());
+        let out = ply(dir.path()).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?} should conflict");
+    }
+
+    // `random` is one interleaving per seed, so it has no budget to spend.
+    let out = ply(dir.path())
+        .args(["test", "--sim", "random", "--sim-budget", "4"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--sim-budget"), "{stderr}");
+}
+
+/// Every field of the plan is in a seeded test's cache key, so changing one has
+/// to be visible. Nothing in this corpus simulates, so the *selection* is
+/// unaffected — which is the other half of the claim.
+#[test]
+fn widening_the_search_does_not_disturb_a_corpus_that_never_simulates() {
+    let dir = project(GREEN);
+    let first = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    assert_eq!(json_of(&first)["summary"]["passed"], 2);
+
+    let wider = ply(dir.path())
+        .args(["test", "--json", "--sim-budget", "1024"])
+        .output()
+        .unwrap();
+    let v = json_of(&wider);
+    assert_eq!(v["selection"]["selected"], 0, "nothing here reads a seed");
+    assert_eq!(v["options"]["sim"]["budget"], 1024);
+    assert_eq!(v["simulation"]["simulated"], 0);
+    assert_eq!(v["simulation"]["interleavings"], 0);
+}
+
+/// `ply run` chooses which interleaving rather than how many: exploration is a
+/// test-time activity.
+#[test]
+fn run_accepts_a_seed_and_takes_only_that_interleaving() {
+    let dir = project(GREEN);
+    let out = ply(dir.path())
+        .args(["run", "--json", "--seed", "3:1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_of(&out)["value"], "42");
+
+    let out = ply(dir.path())
+        .args(["run", "--seed", "3:"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }

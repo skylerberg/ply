@@ -414,6 +414,61 @@ fn with_cell_is_only_special_before_a_bracket() {
 }
 
 #[test]
+fn simulate_takes_a_block_and_carries_no_seed() {
+    assert_eq!(
+        expr("simulate { let a = task.spawn(|| f()); task.join(a) }"),
+        "(simulate (block (let a (perform task.spawn (lam () (call f)))) (perform task.join a)))"
+    );
+}
+
+#[test]
+fn simulate_is_only_special_before_a_brace() {
+    assert_eq!(expr("simulate"), "simulate");
+    assert_eq!(expr("simulate(1)"), "(call simulate 1)");
+    assert_eq!(expr("simulate.now()"), "(perform simulate.now)");
+}
+
+/// Where a `{` opens the enclosing construct rather than an expression,
+/// `simulate` is an ordinary name — otherwise a variable of that name would
+/// silently swallow the `if`'s branch.
+#[test]
+fn simulate_is_a_name_again_where_a_brace_cannot_start_an_expression() {
+    assert_eq!(
+        expr("if simulate { 1 } else { 2 }"),
+        "(if simulate (block 1) (block 2))"
+    );
+    assert_eq!(
+        expr("if (simulate { true }) { 1 } else { 2 }"),
+        "(if (simulate (block true)) (block 1) (block 2))"
+    );
+}
+
+#[test]
+fn a_simulate_region_is_a_statement_without_a_semicolon() {
+    assert_eq!(
+        dump("fn t() { simulate { f() } 1 }"),
+        "(fn t () (block (simulate (block (call f))) 1))"
+    );
+}
+
+#[test]
+fn a_handle_body_may_be_a_region_without_parentheses() {
+    assert_eq!(
+        expr("handle simulate { f() } with { return x -> x }"),
+        "(handle (simulate (block (call f))) (ret x x))"
+    );
+}
+
+#[test]
+fn simulate_nests_inside_a_handler_and_a_region() {
+    assert_eq!(
+        expr("with_cell[users](0) { c -> simulate { handle f() with { db.get[users](k) -> k } } }"),
+        "(with_cell [users] 0 c (simulate (block (handle (call f) \
+         (clause db.get[users] (k) k)))))"
+    );
+}
+
+#[test]
 fn match_arms_cover_every_pattern_form() {
     assert_eq!(
         expr(
@@ -1235,6 +1290,7 @@ fn dump_expr(e: &Expr) -> String {
             binder.name,
             dump_expr(body)
         ),
+        ExprKind::Simulate { body } => format!("(simulate {})", dump_expr(body)),
     }
 }
 

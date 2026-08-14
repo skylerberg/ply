@@ -18,26 +18,43 @@ pub mod code;
 pub mod cont;
 pub mod differential;
 mod env;
+pub mod explore;
 mod frame;
 pub mod handler;
 mod interp;
 pub mod limit;
 pub mod machine;
+pub mod region;
+pub mod sched;
+pub mod sim;
 pub mod trace;
 mod value;
 pub mod world;
 
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Code, Node, NodeKind, lower};
-pub use cont::{Continuation, Frame, Handled, Next, Prompt, Segment, Stack};
+pub use cont::{
+    Continuation, Delimiter, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
+};
 pub use differential::{
     Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
     is_machine_only, machine_only_clause, machine_only_clauses,
 };
 pub use env::Env;
+// `explore::Step` is deliberately not re-exported: `Step` at the root is the
+// builtin's, and one name for two things is worse than a qualified path.
+pub use explore::{
+    Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
+    measure_reduction,
+};
 pub use interp::Interp;
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{DEFAULT_MAX_FRAMES, Machine, Progress};
+pub use sim::{
+    Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
+    Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,
+    Wake,
+};
 pub use trace::Trace;
 pub use value::{Closure, ClosureKind, Value, Vector, first_difference, values_equal};
 pub use world::{CellId, Fixture, World};

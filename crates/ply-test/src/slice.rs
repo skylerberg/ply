@@ -266,6 +266,11 @@ pub enum AssertionKind {
     /// A `perform` reached no handler. Inference should have ruled this out.
     UnhandledEffect,
     RecursionLimit,
+    /// A simulated region stopped making progress: nothing was enabled and no
+    /// timer could fire, or the per-interleaving step budget was spent. One kind
+    /// for both, because from the program's side they are the same finding and
+    /// the fix is in the same place.
+    Deadlock,
 }
 
 impl AssertionKind {
@@ -277,6 +282,7 @@ impl AssertionKind {
             AssertionKind::Runtime => "runtime",
             AssertionKind::UnhandledEffect => "unhandled_effect",
             AssertionKind::RecursionLimit => "recursion_limit",
+            AssertionKind::Deadlock => "deadlock",
         }
     }
 }

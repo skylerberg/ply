@@ -357,6 +357,17 @@ mod tests {
         (dir, loaded)
     }
 
+    /// The report also carries the prelude's own effects, so an effect is found
+    /// by the name the module gave it rather than by its position.
+    fn effect_named<'a>(report: &'a Value, name: &str) -> &'a Value {
+        report["effects"]
+            .as_array()
+            .expect("effects is a list")
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("no effect named {name} in {report:#}"))
+    }
+
     #[test]
     fn the_json_report_publishes_signatures_and_footprints() {
         let (_dir, loaded) = fixture(
@@ -371,9 +382,9 @@ mod tests {
         assert_eq!(v["definitions"][0]["module"], "m");
         assert_eq!(v["definitions"][0]["simple_name"], "total");
         assert_eq!(v["definitions"][0]["footprint"], "{m.db.read[users]}");
-        assert_eq!(v["effects"][0]["name"], "m.db");
-        assert_eq!(v["effects"][0]["simple_name"], "db");
-        assert_eq!(v["effects"][0]["nondet"], false);
+        let db = effect_named(&v, "m.db");
+        assert_eq!(db["simple_name"], "db");
+        assert_eq!(db["nondet"], false);
         assert_eq!(v["tests"][0]["name"], "total counts");
         assert_eq!(v["tests"][0]["key"], "m.total counts");
         assert_eq!(v["tests"][0]["footprint"], "{}");
@@ -391,10 +402,11 @@ mod tests {
     #[test]
     fn a_nondet_effect_is_flagged_in_the_report() {
         let (_dir, loaded) =
-            fixture("nondet effect clock {\n  read now() -> Int\n}\nfn f() -> Int = 1\n");
+            fixture("nondet effect wall {\n  read now() -> Int\n}\nfn f() -> Int = 1\n");
         let v = report_json(&loaded, &[]);
-        assert_eq!(v["effects"][0]["simple_name"], "clock");
-        assert_eq!(v["effects"][0]["nondet"], true);
+        let wall = effect_named(&v, "m.wall");
+        assert_eq!(wall["simple_name"], "wall");
+        assert_eq!(wall["nondet"], true);
     }
 
     #[test]
