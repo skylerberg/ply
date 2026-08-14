@@ -144,10 +144,7 @@ impl Machine<'_> {
 
             Frame::Call { .. } => self.go_return(value),
 
-            Frame::Resume { k } => {
-                let transition = handler::resume(self.stack(), &k, value);
-                return self.take(transition);
-            }
+            Frame::Resume { k } => return self.resume_continuation(&k, value),
 
             Frame::If {
                 then_branch,
@@ -339,6 +336,7 @@ impl Machine<'_> {
                     value,
                     stack,
                 )?;
+                self.record_alloc_access();
                 return self.take(transition);
             }
 

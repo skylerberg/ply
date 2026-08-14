@@ -417,11 +417,14 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
             suspects: vec![sym("m.other")],
             assertion: None,
             attribution: Default::default(),
+            seed: None,
+            race: None,
         }],
         duration: std::time::Duration::ZERO,
         parallelism: Default::default(),
         results: Vec::new(),
         warnings: Vec::new(),
+        simulation: Default::default(),
     };
     let (_root, mut store) = passed(&before, "m.doubles");
     ply_test::diagnose_failures(

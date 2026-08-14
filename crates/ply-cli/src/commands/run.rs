@@ -6,7 +6,7 @@ use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 use ply_core::DefInfo;
-use ply_eval::{Engine, EngineChoice, Interp, Machine, Value as PlyValue, compare_answers};
+use ply_eval::{Engine, EngineChoice, Interp, Machine, Plan, Value as PlyValue, compare_answers};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use serde_json::{Value, json};
 
@@ -39,7 +39,8 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let module = entry.module.to_string();
     let span = entry.span;
     let engine: EngineChoice = args.engine.into();
-    match evaluate(&loaded, engine, name.as_str(), span) {
+    let plan = crate::simulation::run_plan(args.seed.as_ref());
+    match evaluate(&loaded, engine, name.as_str(), span, &plan) {
         Ok(value) => {
             let rendered = value.to_string();
             if args.json {
@@ -94,9 +95,13 @@ fn evaluate(
     engine: EngineChoice,
     name: &str,
     span: Span,
+    plan: &Plan,
 ) -> Result<PlyValue, Diagnostic> {
     let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+    // `ply run` takes exactly one interleaving, the one its seed names:
+    // exploration is a test-time activity, so there is nothing to search here.
+    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
 
     match engine {
         EngineChoice::Treewalk => interp.call(name, Vec::new(), span),

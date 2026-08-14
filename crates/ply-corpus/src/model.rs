@@ -19,6 +19,7 @@ pub enum Eff {
     Db,
     Cache,
     Clock,
+    Counter,
 }
 
 impl Eff {
@@ -27,6 +28,7 @@ impl Eff {
             Eff::Db => "db",
             Eff::Cache => "cache",
             Eff::Clock => "clock",
+            Eff::Counter => "counter",
         }
     }
 }
@@ -285,13 +287,79 @@ impl World {
     }
 }
 
+/// One task of a concurrent test: a `fn` of its own that bumps one shard
+/// `steps.len()` times with a `task.yield()` between each pair.
+///
+/// A bump is a single operation, so the handler's read-modify-write of the
+/// backing cell cannot be split by any schedule and the shard's total is the
+/// same under all of them. The *order* the bumps land in is not, which is the
+/// point: the outcome is interleaving-invariant so the corpus stays green, and
+/// the search still has every order to prune.
+#[derive(Clone, Debug)]
+pub struct TaskBody {
+    pub name: String,
+    /// Index into [`Corpus::shards`].
+    pub shard: usize,
+    pub steps: Vec<i64>,
+}
+
+impl TaskBody {
+    pub fn contributed(&self) -> i64 {
+        self.steps.iter().sum()
+    }
+}
+
+/// A `simulate` test. Conflict density is expressed as nothing but the mapping
+/// of tasks to shards, because that mapping is the whole of what the dependence
+/// relation reads.
+#[derive(Clone, Debug)]
+pub struct ConcurrentTest {
+    pub module: ModuleId,
+    pub label: String,
+    pub tasks: Vec<TaskBody>,
+    /// Shard indices used, ascending and deduplicated.
+    pub shards: Vec<usize>,
+}
+
+impl ConcurrentTest {
+    pub fn shard_total(&self, shard: usize) -> i64 {
+        self.tasks
+            .iter()
+            .filter(|t| t.shard == shard)
+            .map(TaskBody::contributed)
+            .sum()
+    }
+
+    pub fn total(&self) -> i64 {
+        self.tasks.iter().map(TaskBody::contributed).sum()
+    }
+
+    /// Tasks that share their shard with another task, over all tasks. The
+    /// measured counterpart of `CorpusSpec::conflict_density`, so a measurement
+    /// reports what the corpus has rather than what was asked for.
+    pub fn contention(&self) -> f64 {
+        if self.tasks.is_empty() {
+            return 0.0;
+        }
+        let shared = self
+            .tasks
+            .iter()
+            .filter(|t| self.tasks.iter().filter(|o| o.shard == t.shard).count() > 1)
+            .count();
+        shared as f64 / self.tasks.len() as f64
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Corpus {
     pub modules: Vec<Module>,
     pub defs: Vec<Def>,
     pub tests: Vec<Test>,
+    pub concurrent: Vec<ConcurrentTest>,
     pub tables: Vec<String>,
     pub regions: Vec<String>,
+    /// `counter` resource labels, one per shard a concurrent test can use.
+    pub shards: Vec<String>,
 }
 
 pub fn clamp(v: i64) -> i64 {
@@ -422,6 +490,10 @@ impl Corpus {
 
     pub fn effectful_defs(&self) -> usize {
         self.defs.iter().filter(|d| !d.footprint.is_empty()).count()
+    }
+
+    pub fn concurrent_in(&self, module: ModuleId) -> impl Iterator<Item = &ConcurrentTest> {
+        self.concurrent.iter().filter(move |t| t.module == module)
     }
 }
 

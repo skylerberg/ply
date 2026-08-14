@@ -29,6 +29,13 @@ pub effect cache {
 pub nondet effect clock {
   read now() -> Int
 }
+
+// One operation, so a handler's read-modify-write of the backing cell is one
+// step and no schedule can split it. What a concurrent test then measures is the
+// *order* its tasks ran in, which is the only thing left to explore.
+pub effect counter {
+  write bump[shard](by: Int) -> Unit
+}
 "#;
 
 pub const PRIM_SOURCE: &str = r#"// Arithmetic every generated definition funnels through. `clamp` is what keeps
@@ -115,6 +122,15 @@ fn emit_module(corpus: &Corpus, module: &Module) -> String {
 
     for test in corpus.tests.iter().filter(|t| t.module == module.id) {
         s.push_str(&emit_test(corpus, test));
+        s.push('\n');
+    }
+
+    for test in corpus.concurrent_in(module.id) {
+        for task in &test.tasks {
+            s.push_str(&emit_task(corpus, task));
+            s.push('\n');
+        }
+        s.push_str(&emit_concurrent_test(corpus, test));
         s.push('\n');
     }
     s
@@ -370,6 +386,86 @@ fn emit_test(corpus: &Corpus, test: &Test) -> String {
     )
 }
 
+/// A task body. `task.yield()` between the bumps is what gives the scheduler a
+/// choice to make: an interleaving is a sequence of steps, and a step ends at a
+/// scheduler-visible perform, so a task with one bump and no yield contributes
+/// exactly one step and nothing to explore.
+fn emit_task(corpus: &Corpus, task: &TaskBody) -> String {
+    let label = &corpus.shards[task.shard];
+    let mut s = format!(
+        "fn {}() -> Int / {{effects::counter.write[{label}], task.write}} {{\n",
+        task.name
+    );
+    for (i, by) in task.steps.iter().enumerate() {
+        if i > 0 {
+            s.push_str("  task.yield();\n");
+        }
+        let _ = writeln!(s, "  effects::counter.bump[{label}]({by});");
+    }
+    let _ = writeln!(s, "  {}", task.contributed());
+    s.push_str("}\n");
+    s
+}
+
+/// The test itself: one cell per shard, one handler clause per shard, and
+/// assertions that hold under every interleaving — the per-shard totals and the
+/// values the tasks returned. A concurrent test whose outcome depended on the
+/// order would fail the corpus's own verification pass under some seed and be
+/// useless as a fixed point to measure exploration against.
+fn emit_concurrent_test(corpus: &Corpus, test: &ConcurrentTest) -> String {
+    let mut body: Vec<String> = test
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| format!("let t{i} = task.spawn(|| {}());", task.name))
+        .collect();
+
+    let joins: Vec<String> = (0..test.tasks.len())
+        .map(|i| format!("task.join(t{i})"))
+        .collect();
+    body.push(format!(
+        "assert_eq({}, {});",
+        joins.join(" + "),
+        test.total()
+    ));
+    let asserts: Vec<String> = test
+        .shards
+        .iter()
+        .map(|&shard| format!("assert_eq(cell_get(c{shard}), {})", test.shard_total(shard)))
+        .collect();
+    body.push(asserts.join(";\n"));
+
+    let clauses: Vec<String> = test
+        .shards
+        .iter()
+        .map(|&shard| {
+            format!(
+                "  effects::counter.bump[{}](n) -> cell_set(c{shard}, cell_get(c{shard}) + n),",
+                corpus.shards[shard]
+            )
+        })
+        .collect();
+
+    let mut inner = format!(
+        "handle {{\n  simulate {{\n{}\n  }}\n}} with {{\n{}\n}}",
+        indent(&body.join("\n"), 4),
+        clauses.join("\n")
+    );
+    for &shard in test.shards.iter().rev() {
+        inner = format!(
+            "with_cell[{}](0) {{ c{shard} ->\n{}\n}}",
+            corpus.shards[shard],
+            indent(&inner, 2)
+        );
+    }
+
+    format!(
+        "test \"{}\" {{\n{}\n}}\n",
+        escape(&test.label),
+        indent(&inner, 2)
+    )
+}
+
 /// One clause per atom the root definition may perform. A written resource is
 /// backed by the enclosing cell so the test observes its own writes; a read-only
 /// one is a literal, which is exactly the "no fixture, no teardown" claim.
@@ -596,6 +692,106 @@ mod tests {
             .filter(|t| t.granted != corpus.defs[t.root].footprint)
             .count();
         assert!(partial > 0, "every test granted its root's whole footprint");
+    }
+
+    fn concurrent(density: f64) -> Corpus {
+        generate(&CorpusSpec {
+            seed: 4,
+            modules: 4,
+            defs_per_module: 6,
+            tests: 8,
+            depth: 2,
+            concurrent_tests: 4,
+            tasks_per_test: 3,
+            steps_per_task: 2,
+            conflict_density: density,
+            ..CorpusSpec::default()
+        })
+    }
+
+    /// The declared row is what the reduction reads, so a task naming a shard it
+    /// does not bump — or bumping one it does not name — is the defect that
+    /// would make a density sweep measure nothing.
+    #[test]
+    fn a_task_declares_exactly_the_one_shard_it_bumps() {
+        let corpus = concurrent(0.5);
+        assert!(!corpus.concurrent.is_empty());
+        for test in &corpus.concurrent {
+            for task in &test.tasks {
+                let text = emit_task(&corpus, task);
+                for (i, label) in corpus.shards.iter().enumerate() {
+                    let named = text.contains(&format!("[{label}]"));
+                    assert_eq!(named, i == task.shard, "{} and `{label}`", task.name);
+                }
+                assert_eq!(
+                    text.matches("effects::counter.bump").count(),
+                    task.steps.len()
+                );
+                assert_eq!(text.matches("task.yield()").count(), task.steps.len() - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_concurrent_test_opens_one_cell_and_grants_one_clause_per_shard_it_uses() {
+        let corpus = concurrent(0.5);
+        for test in &corpus.concurrent {
+            let text = emit_concurrent_test(&corpus, test);
+            assert_eq!(text.matches("with_cell[").count(), test.shards.len());
+            assert_eq!(text.matches("-> cell_set(").count(), test.shards.len());
+            assert_eq!(text.matches("task.spawn(").count(), test.tasks.len());
+            assert_eq!(text.matches("task.join(").count(), test.tasks.len());
+            for &shard in &test.shards {
+                assert!(
+                    text.contains(&format!(
+                        "assert_eq(cell_get(c{shard}), {})",
+                        test.shard_total(shard)
+                    )),
+                    "`{}` does not assert shard {shard}'s total\n{text}",
+                    test.label
+                );
+            }
+        }
+    }
+
+    /// Every assertion the emitter writes has to be one the model computed, or
+    /// the corpus is asserting a tautology and its own verification pass proves
+    /// nothing about the scheduler.
+    #[test]
+    fn the_asserted_totals_are_the_models_and_they_add_up() {
+        for density in [0.0, 0.5, 1.0] {
+            let corpus = concurrent(density);
+            for test in &corpus.concurrent {
+                let by_shard: i64 = test.shards.iter().map(|&s| test.shard_total(s)).sum();
+                assert_eq!(by_shard, test.total(), "`{}`", test.label);
+                assert!(test.total() > 0);
+                assert!(
+                    emit_concurrent_test(&corpus, test).contains(&format!("), {});", test.total())),
+                    "`{}` does not assert what the tasks returned",
+                    test.label
+                );
+            }
+        }
+    }
+
+    /// The work each task does must not move with the density, or a sweep is
+    /// comparing two different programs and calling the difference contention.
+    #[test]
+    fn a_task_body_is_the_same_at_every_density_but_for_the_shard_it_names() {
+        let disjoint = concurrent(0.0);
+        let contended = concurrent(1.0);
+        let erase = |corpus: &Corpus, task: &TaskBody| {
+            emit_task(corpus, task).replace(&corpus.shards[task.shard], "_")
+        };
+        let mut compared = 0;
+        for (a, b) in disjoint.concurrent.iter().zip(&contended.concurrent) {
+            for (x, y) in a.tasks.iter().zip(&b.tasks) {
+                assert_eq!(erase(&disjoint, x), erase(&contended, y));
+                compared += 1;
+            }
+            assert!(a.shards.len() > b.shards.len());
+        }
+        assert!(compared > 0, "no task was compared");
     }
 
     #[test]

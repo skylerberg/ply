@@ -1,14 +1,15 @@
 use crate::{
-    Executor, Isolation, Parallelism, Reason, Selection, Status, group_by_conflict, run, run_with,
-    select,
+    Executor, Isolation, Parallelism, Reason, Search, Selection, Status, group_by_conflict, run,
+    run_with, select,
 };
 use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
-use ply_eval::{CellId, Value, World};
+use ply_eval::{CellId, Plan, Value, World};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
 use ply_syntax::ast::Mode;
 use ply_syntax::resolve::Resolved;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -74,7 +75,11 @@ impl Program {
     }
 
     fn select(&self, store: &Store) -> Selection {
-        select(&self.check, &self.hashes, store)
+        self.select_under(store, &Plan::default())
+    }
+
+    fn select_under(&self, store: &Store, plan: &Plan) -> Selection {
+        select(&self.check, &self.hashes, store, plan)
     }
 
     /// Both engines, so that every scheduling and caching test in this file is
@@ -88,6 +93,7 @@ impl Program {
             &self.hashes,
             store,
             ply_eval::EngineChoice::Both,
+            Search::of(selection),
         )
     }
 
@@ -628,11 +634,11 @@ fn renaming_a_definition_selects_nothing() {
 }
 
 const NONDETERMINISTIC: &str = r#"
-nondet effect clock {
+nondet effect wall {
   read now() -> Int
 }
 
-fn tick() -> Int / {clock.read} = clock.now()
+fn tick() -> Int / {wall.read} = wall.now()
 
 test "pure arithmetic" {
   assert_eq(1 + 1, 2)
@@ -642,7 +648,7 @@ test/nondet "the clock advances" {
   handle {
     assert(tick() > 0)
   } with {
-    clock.now() -> 7,
+    wall.now() -> 7,
   }
 }
 "#;
@@ -1073,6 +1079,8 @@ fn an_empty_selection_runs_nothing() {
         reasons: vec![Reason::Cached; 3],
         isolation: vec![Isolation::World; 3],
         parallelism: Parallelism::default(),
+        plan: Plan::default(),
+        narrowed: BTreeMap::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 0));
@@ -1092,6 +1100,8 @@ fn a_selected_test_left_out_of_every_group_is_still_run() {
         reasons: vec![Reason::New; 3],
         isolation: vec![Isolation::World; 3],
         parallelism: Parallelism::default(),
+        plan: Plan::default(),
+        narrowed: BTreeMap::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!(report.passed, 3, "no selected test may be silently skipped");
@@ -1111,6 +1121,8 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
         reasons: vec![Reason::New; 3],
         isolation: vec![Isolation::World; 3],
         parallelism: Parallelism::default(),
+        plan: Plan::default(),
+        narrowed: BTreeMap::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed), (1, 0));
@@ -1206,6 +1218,8 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
         reasons: vec![Reason::New; 3],
         isolation: vec![Isolation::World; 3],
         parallelism: Parallelism::default(),
+        plan: Plan::default(),
+        narrowed: BTreeMap::new(),
     };
     let executor = PanickingExecutor { panic_on: 0 };
     let report = run_with(
@@ -1742,8 +1756,8 @@ fn a_nondet_failure_is_marked_unbisectable_at_the_point_it_fails() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(
-        "nondet effect clock {\n  read now() -> Int\n}\n\
-         test/nondet \"clock is negative\" { assert(clock.now() < 0) }\n",
+        "nondet effect wall {\n  read now() -> Int\n}\n\
+         test/nondet \"clock is negative\" { assert(wall.now() < 0) }\n",
     );
     let selection = program.select(&store);
     let report = program.run(&selection, &mut store);
@@ -1889,4 +1903,588 @@ fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
     assert_eq!(failure["culprit"]["skipped"], serde_json::Value::Null);
     assert!(failure["causal_slice"].is_null());
     assert!(failure["assertion"].is_null());
+}
+
+// ------------------------------------------------------ seeds and the plan
+
+use ply_eval::{Exploration, Naive, Race, RaceSite, Seed, SimMode};
+
+/// An executor that reports a search without running one, so every cache rule
+/// in this section is exercised against the outcomes a real scheduler produces
+/// without waiting for one.
+struct SimExecutor {
+    explorations: BTreeMap<usize, Exploration>,
+    failing: BTreeSet<usize>,
+    /// What the last `execute` was asked to search, per test.
+    plans: std::sync::Mutex<BTreeMap<usize, Plan>>,
+    search: Search,
+}
+
+impl SimExecutor {
+    fn new(selection: &Selection) -> SimExecutor {
+        SimExecutor {
+            explorations: BTreeMap::new(),
+            failing: BTreeSet::new(),
+            plans: std::sync::Mutex::new(BTreeMap::new()),
+            search: Search::of(selection),
+        }
+    }
+
+    fn exploring(mut self, index: usize, exploration: Exploration) -> SimExecutor {
+        self.explorations.insert(index, exploration);
+        self
+    }
+
+    fn failing(mut self, index: usize) -> SimExecutor {
+        self.failing.insert(index);
+        self
+    }
+
+    fn searched(&self, index: usize) -> Option<Plan> {
+        self.plans
+            .lock()
+            .expect("not poisoned")
+            .get(&index)
+            .cloned()
+    }
+}
+
+impl Executor for SimExecutor {
+    type Worker = Option<Exploration>;
+
+    fn worker(&self) -> Option<Exploration> {
+        None
+    }
+
+    fn execute(&self, worker: &mut Option<Exploration>, index: usize) -> Result<(), Diagnostic> {
+        self.plans
+            .lock()
+            .expect("not poisoned")
+            .insert(index, self.search.plan_for(index).clone());
+        *worker = self.explorations.get(&index).cloned();
+        if self.failing.contains(&index) {
+            return Err(Diagnostic::error(
+                ply_span::codes::ASSERTION_FAILED,
+                "balance went negative",
+            ));
+        }
+        Ok(())
+    }
+
+    fn exploration(&self, worker: &Option<Exploration>) -> Option<Exploration> {
+        worker.clone()
+    }
+}
+
+fn passed(store: &Store, key: ply_hash::DefHash) -> bool {
+    matches!(store.get(key), Some(Outcome::Pass))
+}
+
+fn exhaustive(explored: u32) -> Exploration {
+    Exploration {
+        explored,
+        exhaustive: true,
+        steps: u64::from(explored) * 4,
+        ..Exploration::default()
+    }
+}
+
+fn spent(explored: u32) -> Exploration {
+    Exploration {
+        explored,
+        exhausted: true,
+        ..Exploration::default()
+    }
+}
+
+fn failed_at(seed: Seed, explored: u32) -> Exploration {
+    Exploration {
+        explored,
+        failure: Some(seed),
+        ..Exploration::default()
+    }
+}
+
+/// `simulate` is not yet something a fixture can write, and none of the rules
+/// below are about the source that produced the atom. What they are about is a
+/// footprint carrying `sim.read`, which is exactly what the front end publishes
+/// for a test that entered a region.
+fn make_seeded(program: &mut Program, name: &str) -> usize {
+    let index = program.index_of(name);
+    program.check.tests[index].footprint =
+        program.check.tests[index]
+            .footprint
+            .union(&Footprint::from_atoms([atom(
+                crate::SIM_EFFECT,
+                None,
+                Mode::Read,
+            )]));
+    index
+}
+
+fn seeded_program() -> (Program, usize) {
+    let mut program = Program::compile(ARITHMETIC);
+    let index = make_seeded(&mut program, "mul is right");
+    (program, index)
+}
+
+/// The rule whose absence is silent: a run under one plan reading a pass another
+/// plan earned.
+#[test]
+fn a_seeded_test_is_never_written_under_its_bare_hash() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let plan = Plan::default();
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(12));
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+    assert_eq!((report.passed, report.failed), (3, 0));
+
+    let hash = program.hashes.tests[seeded];
+    assert!(store.get(hash).is_none(), "the bare hash must stay empty");
+    assert!(
+        passed(&store, crate::sim_key(hash, &plan)),
+        "the plan key is where the claim lives"
+    );
+    // Every other test is unaffected: nothing about the existing cache changes
+    // for a test whose row never mentions a seed.
+    let plain = program.hashes.tests[program.index_of("add is right")];
+    assert!(passed(&store, plain));
+}
+
+#[test]
+fn widening_the_budget_re_runs_a_seeded_test_and_changing_nothing_does_not() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let narrow = Plan::default();
+
+    let selection = program.select_under(&store, &narrow);
+    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(12));
+    run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let again = program.select_under(&store, &narrow);
+    assert!(
+        again.to_run.is_empty(),
+        "the same plan proved the same thing: {again:?}"
+    );
+
+    let wider = Plan {
+        budget: narrow.budget * 2,
+        ..narrow
+    };
+    let widened = program.select_under(&store, &wider);
+    assert_eq!(
+        widened.to_run,
+        vec![seeded],
+        "a wider search is a different claim and has to be made"
+    );
+    assert_eq!(widened.reason(seeded), Some(Reason::New));
+}
+
+/// A `random` root is a standalone claim, so widening a root set costs only the
+/// roots that are new.
+#[test]
+fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+
+    let four = Plan::random(4);
+    let selection = program.select_under(&store, &four);
+    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(4));
+    run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+    assert_eq!(
+        executor.searched(seeded).map(|p| p.roots),
+        Some(vec![0, 1, 2, 3])
+    );
+
+    let eight = Plan::random(8);
+    let widened = program.select_under(&store, &eight);
+    assert_eq!(widened.to_run, vec![seeded]);
+    assert_eq!(
+        widened.plan_for(seeded).roots,
+        vec![4, 5, 6, 7],
+        "the first four roots each hold a pass of their own"
+    );
+
+    let executor = SimExecutor::new(&widened).exploring(seeded, exhaustive(4));
+    run_with(
+        &widened,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+    assert_eq!(
+        executor.searched(seeded).map(|p| p.roots),
+        Some(vec![4, 5, 6, 7]),
+        "the run must search only what it owes"
+    );
+    // The widened plan's own key is what a third run reads, and it is published
+    // even though only half the roots ran.
+    assert!(program.select_under(&store, &eight).to_run.is_empty());
+}
+
+/// A `dpor` root's exploration does not decompose, so nothing about it can be
+/// lifted out of its search.
+#[test]
+fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let plan = Plan {
+        mode: SimMode::Dpor,
+        roots: vec![0, 1, 2, 3],
+        ..Plan::default()
+    };
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(30));
+    run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let hash = program.hashes.tests[seeded];
+    for root in &plan.roots {
+        assert!(
+            store
+                .get(crate::seed_key(hash, &Seed::root(*root)))
+                .is_none(),
+            "root {root} is not a standalone claim under dpor"
+        );
+    }
+    assert!(passed(&store, crate::sim_key(hash, &plan)));
+
+    let wider = Plan {
+        roots: vec![0, 1, 2, 3, 4],
+        ..plan
+    };
+    let widened = program.select_under(&store, &wider);
+    assert_eq!(widened.to_run, vec![seeded]);
+    assert!(
+        widened.narrowed.is_empty(),
+        "a dpor plan has nothing to narrow: {:?}",
+        widened.narrowed
+    );
+}
+
+/// The first green `det` test in the language that is not cacheable, and it is
+/// correct that it is not.
+#[test]
+fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let plan = Plan::default();
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection).exploring(seeded, spent(256));
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.passed, 3);
+    let result = report
+        .results
+        .iter()
+        .find(|r| r.index == seeded)
+        .expect("reported");
+    assert!(result.passed());
+    assert!(result.green_but_uncached());
+    assert_eq!(result.recorded, Some(crate::Record::Exhausted));
+
+    let hash = program.hashes.tests[seeded];
+    assert!(store.get(hash).is_none());
+    assert!(store.get(crate::sim_key(hash, &plan)).is_none());
+    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
+    assert!(report.simulation.line().unwrap().contains("not cached"));
+}
+
+/// Unchanged, and it has to stay unchanged for a seeded test too.
+#[test]
+fn a_simulated_failure_is_never_cached_under_any_key() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let plan = Plan::random(2);
+    let seed = Seed::at(0, vec![1, 0, 3]);
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection)
+        .exploring(seeded, failed_at(seed.clone(), 47))
+        .failing(seeded);
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    assert_eq!(report.failed, 1);
+    let hash = program.hashes.tests[seeded];
+    assert!(store.get(hash).is_none());
+    assert!(store.get(crate::sim_key(hash, &plan)).is_none());
+    for root in &plan.roots {
+        assert!(
+            store
+                .get(crate::seed_key(hash, &Seed::root(*root)))
+                .is_none()
+        );
+    }
+    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
+}
+
+#[test]
+fn a_failure_carries_the_seed_that_replays_it() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let seed = Seed::at(0, vec![1, 0, 3]);
+
+    let selection = program.select_under(&store, &Plan::default());
+    let executor = SimExecutor::new(&selection)
+        .exploring(
+            seeded,
+            Exploration {
+                race: Some(Race {
+                    left: RaceSite {
+                        task: ply_eval::TaskId(1),
+                        definition: Some(Symbol::new("apply_debit")),
+                        access: "db.write[accounts]".into(),
+                        span: ply_span::Span::DUMMY,
+                    },
+                    right: RaceSite {
+                        task: ply_eval::TaskId(2),
+                        definition: Some(Symbol::new("apply_debit")),
+                        access: "db.write[accounts]".into(),
+                        span: ply_span::Span::DUMMY,
+                    },
+                    at: 3,
+                }),
+                ..failed_at(seed.clone(), 47)
+            },
+        )
+        .failing(seeded);
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let failure = &report.failures[0];
+    assert_eq!(failure.seed, Some(seed));
+    assert_eq!(
+        failure.replay().unwrap(),
+        "ply test --seed 0:1.0.3 --filter \"mul is right\""
+    );
+
+    let summary = report.summary();
+    assert!(summary.iter().any(|l| l.contains("seed: 0:1.0.3")));
+    assert!(summary.iter().any(|l| l.contains("race: @1")));
+    assert!(summary.iter().any(|l| l.contains("@2")));
+    let replay = summary
+        .iter()
+        .position(|l| l.contains("replay: ply test --seed 0:1.0.3"))
+        .expect("the artifact prints the command rather than describing it");
+    assert!(replay > 0);
+
+    let json = report.to_json();
+    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["failures"][0]["seed"], "0:1.0.3");
+    assert_eq!(json["failures"][0]["race"]["left"]["task"], "@1");
+    assert_eq!(json["failures"][0]["race"]["at"], 3);
+    assert!(
+        json["failures"][0]["replay"]
+            .as_str()
+            .unwrap()
+            .contains("--seed 0:1.0.3")
+    );
+}
+
+/// A field the run did not observe is never reported as though it had been.
+#[test]
+fn an_unsimulated_failure_carries_no_seed_and_no_race() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(ONE_RED);
+    let selection = program.select(&store);
+    let report = program.run(&selection, &mut store);
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.failures[0].seed, None);
+    assert_eq!(report.failures[0].race, None);
+    assert!(report.failures[0].replay().is_none());
+    assert!(!report.summary().iter().any(|l| l.contains("replay:")));
+
+    let json = report.to_json();
+    assert!(json["failures"][0]["seed"].is_null());
+    assert!(json["failures"][0]["race"].is_null());
+    assert!(json["simulation"]["simulated"] == 0);
+}
+
+/// A test whose row says it simulated and whose evaluator reported no search is
+/// a run nobody watched. Green, said out loud, and not cached — the direction to
+/// err in, because the other one is silent.
+#[test]
+fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+    let plan = Plan::default();
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection);
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    assert_eq!(report.failed, 0);
+    assert!(
+        store
+            .get(crate::sim_key(program.hashes.tests[seeded], &plan))
+            .is_none()
+    );
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .find(|r| r.index == seeded)
+            .and_then(|r| r.recorded.clone()),
+        Some(crate::Record::Unobserved)
+    );
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].message.contains("reported no search"));
+    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
+}
+
+#[test]
+fn the_summary_counts_the_seeds_the_interleavings_and_the_exhaustive_searches() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let mut program = Program::compile(ARITHMETIC);
+    let one = make_seeded(&mut program, "mul is right");
+    let two = make_seeded(&mut program, "twice is right");
+    let plan = Plan::random(4);
+
+    let selection = program.select_under(&store, &plan);
+    let executor = SimExecutor::new(&selection)
+        .exploring(one, exhaustive(12))
+        .exploring(two, spent(256));
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let summary = report.simulation;
+    assert_eq!(summary.simulated, 2);
+    assert_eq!(summary.total, 3);
+    assert_eq!(summary.seeds, 8, "four roots each, for two simulated tests");
+    assert_eq!(summary.interleavings, 268);
+    assert_eq!(summary.exhaustive, 1);
+    assert_eq!(summary.exhausted, 1);
+
+    let json = report.to_json();
+    assert_eq!(json["simulation"]["seeds"], 8);
+    assert_eq!(json["simulation"]["interleavings"], 268);
+    let simulated = json["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["index"] == one)
+        .expect("reported");
+    assert_eq!(simulated["simulation"]["explored"], 12);
+    assert_eq!(simulated["simulation"]["exhaustive"], true);
+    assert_eq!(simulated["cached"], true);
+    // Absent, never zeroed: a consumer cannot tell an explored count of zero
+    // from a test that never simulated.
+    let plain = json["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["index"] == program.index_of("add is right"))
+        .expect("reported");
+    assert!(plain["simulation"].is_null());
+}
+
+#[test]
+fn a_measured_reduction_is_reported_and_a_spent_naive_budget_is_a_lower_bound() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let (program, seeded) = seeded_program();
+
+    let selection = program.select_under(&store, &Plan::default());
+    let executor = SimExecutor::new(&selection).exploring(
+        seeded,
+        Exploration {
+            naive: Some(Naive {
+                explored: 720,
+                bounded: false,
+            }),
+            ..exhaustive(12)
+        },
+    );
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &executor,
+    );
+
+    let json = report.to_json();
+    let simulated = json["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["index"] == seeded)
+        .expect("reported");
+    assert_eq!(simulated["simulation"]["naive"]["explored"], 720);
+    assert_eq!(simulated["simulation"]["naive"]["rendered"], "720");
+    assert_eq!(simulated["simulation"]["reduction"], 60.0);
+
+    let bounded = Naive {
+        explored: 4096,
+        bounded: true,
+    };
+    assert_eq!(bounded.to_string(), ">= 4096");
 }

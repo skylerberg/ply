@@ -550,6 +550,24 @@ fn world_divergence(left: &World, right: &World) -> Option<(Detail, String, Stri
     }
 }
 
+/// The tree-walker's refusal of a `simulate` region.
+///
+/// A task is a suspended machine state, so scheduling one needs the explicit
+/// control stack. Running the region's body straight through would be a
+/// plausible wrong answer — one interleaving, unnamed by any seed — and the
+/// result cache would keep it.
+pub fn machine_only_region(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::MACHINE_ONLY_CLAUSE,
+        "a `simulate` region installs a scheduler over captured continuations",
+    )
+    .primary(span, "this region needs an explicit control stack")
+    .note(format!(
+        "run this with `--engine {}`",
+        Engine::Machine.as_str()
+    ))
+}
+
 /// The tree-walker's refusal of a clause it cannot run.
 ///
 /// A general clause reifies a continuation, which needs an explicit control
@@ -650,6 +668,10 @@ fn walk_expr(e: &Expr, out: &mut Vec<Diagnostic>) {
             children.extend(return_clause.as_deref().map(|r| &r.body));
         }
         ExprKind::WithCell { init, body, .. } => children.extend([init.as_ref(), body.as_ref()]),
+        ExprKind::Simulate { body } => {
+            out.push(machine_only_region(e.span));
+            children.push(body);
+        }
     }
     for child in children {
         walk_expr(child, out);

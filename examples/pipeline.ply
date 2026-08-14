@@ -1,0 +1,140 @@
+// The control case for the reduction: three workers that run at the same time
+// and share nothing.
+//
+// Each worker reads one shard, yields in the middle so the scheduler has a real
+// choice to make, and writes its own shard back. Their rows name three different
+// resources, so no two of their steps conflict, so every order of those steps
+// reaches the same world — and the search proves it rather than sampling it. The
+// exploration collapses to **one** interleaving, and `--measure-reduction`
+// prints what an unpruned scheduler would have run instead.
+//
+// That number is the whole argument for resource granularity. An effect system
+// that tracked `shard` as one capability would see three writers to one thing
+// and explore every order of them for nothing.
+//
+// `merge` at the bottom is the other half of the comparison: the same three
+// workers pointed at one shard. Their steps do conflict, both orders are
+// explored, and the assertions are about a total rather than about an order —
+// which is the only kind of claim a contended test can honestly make.
+
+effect shard {
+  read  take[r]() -> List<Int>
+  write done[r](rows: List<Int>) -> Unit
+  write add[r](rows: List<Int>) -> Unit
+}
+
+fn compact(rows: List<Int>) -> List<Int> = filter(rows, |v: Int| v != 0)
+
+fn scale(rows: List<Int>, k: Int) -> List<Int> = map(rows, |v: Int| v * k)
+
+fn concat(xs: List<Int>, ys: List<Int>) -> List<Int> =
+  fold(ys, xs, |acc, v: Int| push(acc, v))
+
+fn sum(rows: List<Int>) -> Int = fold(rows, 0, |acc, v: Int| acc + v)
+
+fn north_rows() -> List<Int> = [1, 0, 2]
+
+fn south_rows() -> List<Int> = [3, 0, 4]
+
+fn east_rows() -> List<Int> = [5, 0, 6]
+
+// Three bodies that differ only in the resource label they name. That label is
+// the entire input to the dependence relation, and writing the three out is the
+// clearest way to see it.
+fn drain_north() -> Int / {shard.read[north], shard.write[north], task.write} {
+  let kept = compact(shard.take[north]());
+  task.yield();
+  shard.done[north](scale(kept, 2));
+  len(kept)
+}
+
+fn drain_south() -> Int / {shard.read[south], shard.write[south], task.write} {
+  let kept = compact(shard.take[south]());
+  task.yield();
+  shard.done[south](scale(kept, 2));
+  len(kept)
+}
+
+fn drain_east() -> Int / {shard.read[east], shard.write[east], task.write} {
+  let kept = compact(shard.take[east]());
+  task.yield();
+  shard.done[east](scale(kept, 2));
+  len(kept)
+}
+
+// One shard, three writers. `shard.add` appends in a single operation, so no
+// interleaving loses a batch — but the order the batches land in is a scheduler
+// choice, and the search covers both.
+fn merge_north() -> Int / {shard.read[north], shard.write[merged], task.write} {
+  let kept = compact(shard.take[north]());
+  task.yield();
+  shard.add[merged](kept);
+  len(kept)
+}
+
+fn merge_south() -> Int / {shard.read[south], shard.write[merged], task.write} {
+  let kept = compact(shard.take[south]());
+  task.yield();
+  shard.add[merged](kept);
+  len(kept)
+}
+
+test "three shards that share nothing explore one interleaving" {
+  with_cell[north]([]) { n -> {
+  with_cell[south]([]) { s -> {
+  with_cell[east]([]) { e -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| drain_north());
+        let b = task.spawn(|| drain_south());
+        let c = task.spawn(|| drain_east());
+        assert_eq(task.join(a) + task.join(b) + task.join(c), 6)
+      }
+    } with {
+      shard.take[north]() -> north_rows(),
+      shard.done[north](rows) -> cell_set(n, rows),
+      shard.take[south]() -> south_rows(),
+      shard.done[south](rows) -> cell_set(s, rows),
+      shard.take[east]() -> east_rows(),
+      shard.done[east](rows) -> cell_set(e, rows),
+    };
+    // Outside the region deliberately. Reading the three shards from the
+    // region's own body would make that body share a resource with each worker,
+    // and the control case would stop being one: the reduction is a statement
+    // about what the *tasks* touch, and the region's body is a task too.
+    assert_eq(cell_get(n), [2, 4]);
+    assert_eq(cell_get(s), [6, 8]);
+    assert_eq(cell_get(e), [10, 12])
+  } }
+  } }
+  } }
+}
+
+// Contention, for contrast. The two workers write one shard, so their steps are
+// dependent and both orders are real. What survives every order is the multiset
+// that landed, so that is what the test claims.
+test "two workers sharing one shard lose nothing whichever order they land in" {
+  with_cell[merged]([]) { m -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| merge_north());
+        let b = task.spawn(|| merge_south());
+        assert_eq(task.join(a) + task.join(b), 4);
+        assert_eq(len(cell_get(m)), 4);
+        assert_eq(sum(cell_get(m)), 10)
+      }
+    } with {
+      shard.take[north]() -> north_rows(),
+      shard.take[south]() -> south_rows(),
+      shard.add[merged](rows) -> cell_set(m, concat(cell_get(m), rows)),
+    }
+  } }
+}
+
+test "the stage helpers are pure and keep their ordinary cache entry" {
+  assert_eq(compact([1, 0, 2, 0]), [1, 2]);
+  assert_eq(scale([1, 2], 3), [3, 6]);
+  assert_eq(concat([1], [2, 3]), [1, 2, 3]);
+  assert_eq(sum([1, 2, 3]), 6);
+  assert_eq(sum(concat(compact(north_rows()), compact(south_rows()))), 10)
+}

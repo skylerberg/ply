@@ -4,15 +4,20 @@
 pub mod bisect;
 pub mod diagnose;
 pub mod hybrid;
+pub mod key;
 pub mod report;
 pub mod schedule;
+pub mod sim;
 pub mod slice;
 
 #[cfg(test)]
 mod tests;
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::{Engine, EngineChoice, Interp, Machine, World, compare_outcomes};
+use ply_eval::explore::{Interleaving, explore, measure_reduction};
+use ply_eval::{
+    Engine, EngineChoice, Exploration, Interp, Machine, Plan, Race, Seed, World, compare_outcomes,
+};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
@@ -34,10 +39,13 @@ pub use bisect::{
 };
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
+pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
 pub use schedule::{
-    Isolation, Parallelism, WORLD_BACKED, group_by_conflict, is_world_backed, parallelism,
-    shared_footprint, world_isolated,
+    AMBIENT, Isolation, Parallelism, SIM_EFFECT, SIMULATED, WORLD_BACKED, contends,
+    group_by_conflict, is_ambient, is_seeded, is_world_backed, parallelism, shared_footprint,
+    world_isolated,
 };
+pub use sim::{Record, SimSummary, record_under, replay_command};
 pub use slice::{
     Assertion, AssertionKind, CausalSlice, Difference, Entered, Event, Frame, SliceBuilder, Tracing,
 };
@@ -90,11 +98,25 @@ pub struct Selection {
     /// run.
     pub isolation: Vec<Isolation>,
     pub parallelism: Parallelism,
+    /// The search this selection was made against, and the key a seeded test's
+    /// result is published under. A selection read against one plan says nothing
+    /// about another, which is why it travels with the answer.
+    pub plan: Plan,
+    /// What a seeded test still owes, when the cache already covers part of the
+    /// plan. Only `random` decomposes, so only `random` ever narrows: sixty-four
+    /// roots become a hundred and twenty-eight for the cost of sixty-four runs.
+    pub narrowed: BTreeMap<usize, Plan>,
 }
 
 impl Selection {
     pub fn reason(&self, index: usize) -> Option<Reason> {
         self.reasons.get(index).copied()
+    }
+
+    /// What this test will actually search: the run's plan, unless the cache
+    /// already answered for some of its roots.
+    pub fn plan_for(&self, index: usize) -> &Plan {
+        self.narrowed.get(&index).unwrap_or(&self.plan)
     }
 
     pub fn isolation_of(&self, index: usize) -> Option<Isolation> {
@@ -123,6 +145,8 @@ impl fmt::Debug for Selection {
             .field("reasons", &self.reasons)
             .field("isolation", &self.isolation)
             .field("parallelism", &self.parallelism)
+            .field("plan", &self.plan)
+            .field("narrowed", &self.narrowed)
             .finish()
     }
 }
@@ -147,11 +171,25 @@ pub struct TestResult {
     pub duration: Duration,
     pub status: Status,
     pub failure: Option<Diagnostic>,
+    /// What the search did. `None` — never a zeroed [`Exploration`] — when this
+    /// test reached no `simulate` region, because a consumer cannot tell a zero
+    /// from a test that never simulated anything.
+    pub simulation: Option<Exploration>,
+    /// Absent when nothing was written: a spent budget proved nothing, and a
+    /// seeded test whose search went unobserved is a run nobody watched.
+    pub recorded: Option<Record>,
 }
 
 impl TestResult {
     pub fn passed(&self) -> bool {
         self.status == Status::Passed
+    }
+
+    /// Green, and re-runs next time anyway. The one place a passing `det` test
+    /// is not cacheable, and the summary says so rather than leaving a reader to
+    /// wonder why selection did not shrink.
+    pub fn green_but_uncached(&self) -> bool {
+        self.passed() && matches!(self.recorded, Some(Record::Exhausted | Record::Unobserved))
     }
 }
 
@@ -306,6 +344,24 @@ pub struct Failure {
     /// rather than rendering it into the diagnostic's notes.
     pub assertion: Option<Assertion>,
     pub attribution: Attribution,
+    /// The interleaving this failure happened in. The whole point of M7 is that
+    /// the repro handed to an agent is this rather than a stack trace, so it is
+    /// the field the artifact leads the reproduction with.
+    ///
+    /// `None` on a failure no simulation produced — never a default seed, which
+    /// would replay a different run.
+    pub seed: Option<Seed>,
+    /// The two steps whose reordering flipped a passing interleaving to this
+    /// one. `Some` only when the search actually observed the flip: under
+    /// `once` and `random` there is nothing to observe.
+    pub race: Option<Race>,
+}
+
+impl Failure {
+    /// The command that reproduces exactly this failure, when one exists.
+    pub fn replay(&self) -> Option<String> {
+        Some(replay_command(self.seed.as_ref()?, &self.name))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +380,10 @@ pub struct RunReport {
     /// Problems with the run itself rather than with any test — a cache that
     /// could not be written, a selection naming a test that does not exist.
     pub warnings: Vec<Diagnostic>,
+    /// What the run's simulated tests searched. Zeroed, not absent: it is
+    /// aggregated over the tests that ran, and `simulated == 0` is the honest
+    /// answer for a corpus with no `simulate` region.
+    pub simulation: SimSummary,
 }
 
 impl RunReport {
@@ -345,6 +405,52 @@ pub trait Executor: Sync {
     fn worker(&self) -> Self::Worker;
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
+
+    /// What the search the last [`Executor::execute`] performed did, read off
+    /// the worker that performed it.
+    ///
+    /// `None` means the test reached no `simulate` region, which is how a test
+    /// that simulates nothing pays nothing. It is deliberately not a zeroed
+    /// [`Exploration`]: the cache rules branch on the difference.
+    fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
+        None
+    }
+}
+
+/// The search each test runs, and whether to measure what an unpruned one would
+/// have cost.
+///
+/// `narrowed` is [`Selection::narrowed`], carried here because the plan a test
+/// searches is decided by what the cache already covers and the executor is what
+/// installs it.
+#[derive(Clone, Debug, Default)]
+pub struct Search {
+    pub plan: Plan,
+    pub narrowed: BTreeMap<usize, Plan>,
+    /// Run the same search a second time with the dependence relation forced to
+    /// `true`, so the reduction is a measured number rather than a slogan. Off
+    /// by default: the claim is a benchmark, not something every run pays double
+    /// for.
+    pub measure_reduction: bool,
+}
+
+impl Search {
+    pub fn of(selection: &Selection) -> Search {
+        Search {
+            plan: selection.plan.clone(),
+            narrowed: selection.narrowed.clone(),
+            measure_reduction: false,
+        }
+    }
+
+    pub fn measuring(mut self, measure: bool) -> Search {
+        self.measure_reduction = measure;
+        self
+    }
+
+    pub fn plan_for(&self, index: usize) -> &Plan {
+        self.narrowed.get(&index).unwrap_or(&self.plan)
+    }
 }
 
 pub struct InterpExecutor<'a> {
@@ -360,23 +466,42 @@ pub struct InterpExecutor<'a> {
     addresses: Vec<(Symbol, usize)>,
     fixture: Option<&'a (dyn Fn() -> World + Sync)>,
     engine: EngineChoice,
+    search: Search,
 }
 
 /// One test's evaluator. Under [`EngineChoice::Both`] it is two of them, run
 /// over the same test so that a disagreement fails the run at the test that
 /// produced it.
-pub enum Worker<'a> {
+pub enum Engines<'a> {
     Treewalk(Box<Interp<'a>>),
     Machine(Box<Machine<'a>>),
     Both(Box<Interp<'a>>, Box<Machine<'a>>),
 }
 
-impl Worker<'_> {
+/// One pool thread's evaluators, plus what its last test searched.
+///
+/// The search lives here rather than in the return of `execute` because
+/// `Executor::execute` answers the same question it always did — did this test
+/// pass — and a runner that has no simulation to report should not have to
+/// mention one.
+pub struct Worker<'a> {
+    pub engines: Engines<'a>,
+    exploration: Option<Exploration>,
+}
+
+impl<'a> Worker<'a> {
+    pub fn new(engines: Engines<'a>) -> Worker<'a> {
+        Worker {
+            engines,
+            exploration: None,
+        }
+    }
+
     /// The world of the engine whose verdict is reported.
     pub fn world(&self) -> &World {
-        match self {
-            Worker::Treewalk(i) | Worker::Both(i, _) => i.world(),
-            Worker::Machine(m) => m.world(),
+        match &self.engines {
+            Engines::Treewalk(i) | Engines::Both(i, _) => i.world(),
+            Engines::Machine(m) => m.world(),
         }
     }
 }
@@ -406,6 +531,7 @@ impl<'a> InterpExecutor<'a> {
             addresses,
             fixture: None,
             engine: EngineChoice::default(),
+            search: Search::default(),
         }
     }
 
@@ -423,6 +549,14 @@ impl<'a> InterpExecutor<'a> {
 
     pub fn with_engine(mut self, engine: EngineChoice) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// The search every simulated test in this run performs. Installed on the
+    /// machine per test rather than per worker, because a narrowed plan is a
+    /// fact about one test.
+    pub fn with_search(mut self, search: Search) -> Self {
+        self.search = search;
         self
     }
 
@@ -448,24 +582,92 @@ impl<'a> InterpExecutor<'a> {
             None => e.eval_test(index),
         }
     }
+
+    /// Whether this test's outcome is a function of a seed as well as of its
+    /// definitions, and therefore something to search rather than to run.
+    ///
+    /// Under `--engine treewalk` it never is: `simulate` is machine-only, and
+    /// the tree-walker's job there is to refuse the region with `E0504` rather
+    /// than to have the region scheduled around it. Under `--engine both` the
+    /// search runs once, on the machine, for the same reason.
+    fn searches(&self, index: usize) -> bool {
+        self.engine.primary() == Engine::Machine
+            && self
+                .check
+                .tests
+                .get(index)
+                .is_some_and(|t| is_seeded(&t.footprint))
+    }
+
+    /// The whole test, once per interleaving, each from a fresh fork of the base
+    /// world.
+    ///
+    /// Whole-test replay rather than re-entering the region: restoring the world
+    /// as of region entry is the snapshot/restore capability ADR 0005 refused as
+    /// having no type-level account. A test is re-run, so its writes are re-done
+    /// rather than un-done, and the monotone world survives. It costs re-doing
+    /// whatever setup precedes the region, per interleaving.
+    fn search(&self, index: usize) -> (Result<(), Diagnostic>, Option<Exploration>) {
+        let plan = self.search.plan_for(index);
+        let mut observed = true;
+        let mut interleaving = |seed: &Seed| {
+            let mut machine = self.machine();
+            sim::seed_run(machine.as_mut(), seed, plan.steps);
+            let outcome = self.run_one(machine.as_mut(), index);
+            match sim::interleaving_of(machine.as_ref(), &outcome) {
+                Some(interleaving) => interleaving,
+                // The verdict is still the run's own. An unobserved search must
+                // report nothing about interleavings and must not turn a red
+                // test green on the way.
+                None => {
+                    observed = false;
+                    match outcome {
+                        Ok(()) => Interleaving::passed(Vec::new()),
+                        Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
+                    }
+                }
+            }
+        };
+
+        let explored = if self.search.measure_reduction {
+            measure_reduction(plan, &mut interleaving)
+        } else {
+            explore(plan, &mut interleaving)
+        };
+        let outcome = match explored.diagnostic {
+            Some(diagnostic) => Err(diagnostic),
+            None => Ok(()),
+        };
+        (outcome, observed.then_some(explored.exploration))
+    }
 }
 
 impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Worker<'a>;
 
     fn worker(&self) -> Worker<'a> {
-        match self.engine {
-            EngineChoice::Treewalk => Worker::Treewalk(self.interp()),
-            EngineChoice::Machine => Worker::Machine(self.machine()),
-            EngineChoice::Both => Worker::Both(self.interp(), self.machine()),
-        }
+        Worker::new(match self.engine {
+            EngineChoice::Treewalk => Engines::Treewalk(self.interp()),
+            EngineChoice::Machine => Engines::Machine(self.machine()),
+            EngineChoice::Both => Engines::Both(self.interp(), self.machine()),
+        })
+    }
+
+    fn exploration(&self, worker: &Worker<'a>) -> Option<Exploration> {
+        worker.exploration.clone()
     }
 
     fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
-        match worker {
-            Worker::Treewalk(i) => self.run_one(i.as_mut(), index),
-            Worker::Machine(m) => self.run_one(m.as_mut(), index),
-            Worker::Both(i, m) => {
+        worker.exploration = None;
+        if self.searches(index) {
+            let (outcome, exploration) = self.search(index);
+            worker.exploration = exploration;
+            return outcome;
+        }
+        match &mut worker.engines {
+            Engines::Treewalk(i) => self.run_one(i.as_mut(), index),
+            Engines::Machine(m) => self.run_one(m.as_mut(), index),
+            Engines::Both(i, m) => {
                 // Both are stepped even when the first has already failed: an
                 // engine that skipped a test is at a different point in the
                 // corpus, and every later comparison becomes meaningless.
@@ -509,20 +711,50 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
     hashes.tests.get(index).copied()
 }
 
-pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Selection {
+/// `plan` is what a seeded test's cache entry is keyed on, so a selection made
+/// against one plan says nothing about another. It is a parameter rather than a
+/// second entry point beside the old one for exactly that reason: a caller that
+/// kept the old signature while running a widened search would read and write
+/// the wrong entry, silently.
+pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
+    let plan = plan.clone().normalized();
     let total = check.tests.len();
     let mut reasons = Vec::with_capacity(total);
     let mut cached = Vec::new();
     let mut to_run = Vec::new();
+    let mut narrowed: BTreeMap<usize, Plan> = BTreeMap::new();
 
     for (index, test) in check.tests.iter().enumerate() {
-        let stored = test_hash(hashes, index).map(|hash| store.get(hash));
+        let seeded = is_seeded(&test.footprint);
+        let hash = test_hash(hashes, index);
+        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
+
+        // A `random` plan decomposes into one standalone claim per root, so a
+        // widened root set owes only the roots nothing has answered for. The
+        // plan key is what publishes the widened claim, and this run writes it.
+        let owed = match (seeded, hash) {
+            (true, Some(hash)) if writes_seed_keys(&plan) => plan
+                .roots
+                .iter()
+                .copied()
+                .filter(|&root| {
+                    !matches!(
+                        store.get(seed_key(hash, &Seed::root(root))),
+                        Some(Outcome::Pass)
+                    )
+                })
+                .collect(),
+            _ => plan.roots.clone(),
+        };
 
         let reason = if test.nondet {
             Reason::Nondet
         } else {
             match stored {
                 None => Reason::Unhashed,
+                // Every root already passed on its own, so the widened plan is
+                // proved by the roots it is made of and nothing needs running.
+                Some(None) if owed.is_empty() => Reason::Cached,
                 Some(None) => Reason::New,
                 Some(Some(Outcome::Pass)) => Reason::Cached,
                 // Never trust a stored failure. Nothing here writes one, so it
@@ -534,7 +766,20 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
 
         match (reason, stored) {
             (Reason::Cached, Some(Some(outcome))) => cached.push((index, outcome)),
-            _ => to_run.push(index),
+            (Reason::Cached, _) => cached.push((index, Outcome::Pass)),
+            _ => {
+                if owed.len() < plan.roots.len() {
+                    narrowed.insert(
+                        index,
+                        Plan {
+                            roots: owed,
+                            ..plan.clone()
+                        }
+                        .normalized(),
+                    );
+                }
+                to_run.push(index)
+            }
         }
         reasons.push(reason);
     }
@@ -562,6 +807,8 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store) -> Select
             .map(|t| Isolation::of(&t.footprint))
             .collect(),
         parallelism,
+        plan,
+        narrowed,
     }
 }
 
@@ -656,14 +903,25 @@ pub fn diagnose_failures(
             (Some(_), false) => Skipped::NoBodies,
             _ => Skipped::NoHybrids,
         };
+        // Every hybrid runs at the interleaving this failure happened in. A
+        // hybrid that searches for its own answers a different question, and the
+        // bisection then names whichever definition the other interleaving ran
+        // through.
+        let seed = failure.seed.clone();
         let mut builder = match (mixture, test_body, complete) {
-            (Some(mixture), Some(test), true) => Some(BodyHybrid::new(
-                store,
-                &fresh,
-                mixture,
-                test,
-                Signature::of(&failure.diagnostic),
-            )),
+            (Some(mixture), Some(test), true) => {
+                let hybrid = BodyHybrid::new(
+                    store,
+                    &fresh,
+                    mixture,
+                    test,
+                    Signature::of(&failure.diagnostic),
+                );
+                Some(match &seed {
+                    Some(seed) => hybrid.at_seed(seed),
+                    None => hybrid,
+                })
+            }
             _ => None,
         };
 
@@ -689,15 +947,26 @@ pub fn diagnose_failures(
             absent,
         );
         if let Some(builder) = &mut builder {
-            // Never the failing test's own hash. `H(all)` *is* the current
+            // Never the failing test's own key. `H(all)` *is* the current
             // program, so a replay that goes green would otherwise cache a
             // `Pass` for the test this run just watched fail — and a red test
-            // has to re-run until it goes green.
+            // has to re-run until it goes green. Under a pinned seed the key is
+            // derived, so the bare hash alone is not the whole of it.
+            let forbidden: Vec<DefHash> = test_hash
+                .into_iter()
+                .flat_map(|hash| {
+                    let plan = match &seed {
+                        Some(seed) => Plan::once(seed.clone()),
+                        None => Plan::once(Seed::default()),
+                    };
+                    [hash, sim_key(hash, &plan)]
+                })
+                .collect();
             proved.extend(
                 builder
                     .take_proved()
                     .into_iter()
-                    .filter(|hash| Some(*hash) != test_hash),
+                    .filter(|hash| !forbidden.contains(hash)),
             );
         }
     }
@@ -715,6 +984,7 @@ pub fn diagnose_failures(
     warnings
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     selection: &Selection,
     program: &Program,
@@ -723,8 +993,11 @@ pub fn run(
     hashes: &HashOutput,
     store: &mut Store,
     engine: EngineChoice,
+    search: Search,
 ) -> RunReport {
-    let executor = InterpExecutor::new(program, resolved, check).with_engine(engine);
+    let executor = InterpExecutor::new(program, resolved, check)
+        .with_engine(engine)
+        .with_search(search);
     run_with(selection, check, hashes, store, &executor)
 }
 
@@ -768,6 +1041,7 @@ pub fn run_with<E: Executor>(
             let index = executed.index;
             let test = &check.tests[index];
             let hash = test_hash(hashes, index);
+            let seeded = is_seeded(&test.footprint);
             let defect = executed.failure.as_ref().is_some_and(|d| {
                 executed.panicked || d.code == codes::INTERNAL_ERROR || is_divergence(d)
             });
@@ -776,6 +1050,8 @@ pub fn run_with<E: Executor>(
                 (Some(_), false) => Status::Failed,
                 (Some(_), true) => Status::Panicked,
             };
+            let exploration = executed.exploration;
+            let mut recorded = None;
 
             if let Some(diagnostic) = &executed.failure {
                 failed += 1;
@@ -794,22 +1070,39 @@ pub fn run_with<E: Executor>(
                     suspects,
                     assertion: None,
                     attribution,
+                    seed: exploration.as_ref().and_then(|e| e.failure.clone()),
+                    race: exploration.as_ref().and_then(|e| e.race.clone()),
                 });
             } else {
                 passed += 1;
                 if !test.nondet
                     && let Some(hash) = hash
                 {
-                    store.put(hash, Outcome::Pass);
-                    let (closure, decls) = closure_hashes(hashes, &test.key);
-                    store.put_pass_record(
-                        test.key.clone(),
-                        PassRecord {
-                            test_hash: hash,
-                            closure,
-                            decls,
-                        },
+                    let record = record_under(
+                        hash,
+                        seeded,
+                        &selection.plan,
+                        selection.plan_for(index),
+                        exploration.as_ref(),
                     );
+                    if record == Record::Unobserved {
+                        warnings.push(unobserved_search(&test.key));
+                    }
+                    for key in record.keys() {
+                        store.put(*key, Outcome::Pass);
+                    }
+                    if record.is_written() {
+                        let (closure, decls) = closure_hashes(hashes, &test.key);
+                        store.put_pass_record(
+                            test.key.clone(),
+                            PassRecord {
+                                test_hash: hash,
+                                closure,
+                                decls,
+                            },
+                        );
+                    }
+                    recorded = Some(record);
                 }
             }
 
@@ -821,6 +1114,8 @@ pub fn run_with<E: Executor>(
                 duration: executed.duration,
                 status,
                 failure: executed.failure,
+                simulation: exploration,
+                recorded,
             });
         }
     }
@@ -837,6 +1132,8 @@ pub fn run_with<E: Executor>(
         );
     }
 
+    let simulation = summarize_simulation(selection, &results);
+
     RunReport {
         passed,
         failed,
@@ -846,7 +1143,41 @@ pub fn run_with<E: Executor>(
         parallelism: selection.parallelism,
         results,
         warnings,
+        simulation,
     }
+}
+
+fn summarize_simulation(selection: &Selection, results: &[TestResult]) -> SimSummary {
+    let mut summary = SimSummary {
+        total: results.len(),
+        ..SimSummary::default()
+    };
+    for result in results {
+        let Some(exploration) = &result.simulation else {
+            continue;
+        };
+        summary.simulated += 1;
+        summary.seeds += selection.plan_for(result.index).roots.len();
+        summary.interleavings += u64::from(exploration.explored);
+        summary.exhaustive += usize::from(exploration.exhaustive);
+        summary.exhausted += usize::from(exploration.exhausted);
+        summary.failed += usize::from(exploration.failure.is_some());
+    }
+    summary
+}
+
+/// The test's row says something in its closure entered a `simulate` region and
+/// the evaluator reported no search. Nothing is known about what actually ran,
+/// so nothing is written — and a green run that quietly stopped caching would
+/// look like a bug in selection, which is the one thing this system asks to be
+/// trusted on.
+fn unobserved_search(key: &Symbol) -> Diagnostic {
+    Diagnostic::warning(
+        codes::INTERNAL_ERROR,
+        format!("`{key}` reads a simulation seed, but the run reported no search"),
+    )
+    .note("the test passed and its result was not cached, so it re-runs next time")
+    .note("this is a defect in Ply rather than in the test; please report it")
 }
 
 /// A selected test that no group claims would be silently skipped, which is the
@@ -882,6 +1213,7 @@ struct Executed {
     duration: Duration,
     failure: Option<Diagnostic>,
     panicked: bool,
+    exploration: Option<Exploration>,
 }
 
 /// One worker per pool thread, built lazily so a group smaller than the pool
@@ -918,11 +1250,15 @@ fn execute_group<E: Executor>(
                     (Some(panic_diagnostic(payload, check, index)), true)
                 }
             };
+            // After the unwind check: a worker whose invariants are unknown has
+            // nothing to report about what it searched.
+            let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
             out.push(Executed {
                 index,
                 duration,
                 failure,
                 panicked,
+                exploration,
             });
         }
     });
@@ -937,12 +1273,17 @@ fn execute_group<E: Executor>(
 /// the user's definition graph decides which. Bisecting it would name whichever
 /// definition the disagreement happened to run through.
 ///
-/// The one code that must be read rather than observed. An unwind and an
-/// `INTERNAL_ERROR` are things the run watched happen; a divergence is a
-/// comparison the audit made and reported as an ordinary `Err`, so there is no
-/// observation to read it off.
+/// One seed producing two runs is the same class of defect and gets the same
+/// treatment: a simulated run is meant to be a pure function of its definitions
+/// and its seed, so a replay that reproduced something else is Ply's fault, and
+/// no definition in the program decides which of the two runs was meant.
+///
+/// The two codes that must be read rather than observed. An unwind and an
+/// `INTERNAL_ERROR` are things the run watched happen; both of these are
+/// comparisons the run made and reported as an ordinary `Err`, so there is no
+/// observation to read them off.
 fn is_divergence(d: &Diagnostic) -> bool {
-    d.code == codes::ENGINE_DIVERGENCE
+    d.code == codes::ENGINE_DIVERGENCE || d.code == codes::SIMULATION_DIVERGENCE
 }
 
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {

@@ -27,7 +27,7 @@ use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 /// The generation of the encoding below. A decoder refuses bytes written under
 /// any other value, because a stream this compact cannot tell a shape change
 /// from a plausible one.
-pub const BODY_ENCODING: u32 = 2;
+pub const BODY_ENCODING: u32 = 3;
 
 /// A definition that is its own strongly connected component: the payload is its
 /// normalized bytes and `blake3(payload)` is the key.
@@ -1268,6 +1268,9 @@ impl Decoder<'_> {
                     body,
                 }
             }
+            tag::E_SIMULATE => ExprKind::Simulate {
+                body: Box::new(self.expr()?),
+            },
             other => return Err(bad(format!("tag {other} does not begin an expression"))),
         };
         Ok(Expr {

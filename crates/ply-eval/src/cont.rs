@@ -251,6 +251,36 @@ impl Prompt {
     }
 }
 
+/// Which simulated region a [`Delimiter::Sim`] belongs to: its ordinal among the
+/// regions one entry point has entered.
+///
+/// An ordinal rather than a depth, because a test may run several regions in
+/// sequence — only *nesting* is `E0416` — and a continuation captured in the
+/// first must be recognized as foreign by the second rather than steering it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SimId(pub u32);
+
+/// What delimits a segment. A `handle` expression, or the seeded scheduler a
+/// `simulate` region installs — a native prompt whose clauses are Rust.
+#[derive(Clone)]
+pub enum Delimiter {
+    Ply(Rc<Prompt>),
+    Sim(SimId),
+}
+
+/// Where a perform was answered.
+pub enum Target {
+    Ply {
+        prompt: Rc<Prompt>,
+        clause: usize,
+    },
+    /// The seeded scheduler: a `task.*`, `clock.*` or `random.*` perform that
+    /// reached a `simulate` region's delimiter before any `handle` that names
+    /// it. A user handler nested inside the region therefore still wins, which
+    /// is the ordinary innermost-first rule with no special case.
+    Sim(SimId),
+}
+
 /// A persistent stack, shared by pointer. One allocation to push, because the
 /// value lives in the link rather than behind a second pointer of its own, and
 /// none at all to pop a link nothing else holds.
@@ -356,7 +386,7 @@ impl<T> Drop for Chain<T> {
 #[derive(Clone, Default)]
 pub struct Segment {
     frames: Chain<Frame>,
-    prompt: Option<Rc<Prompt>>,
+    delimiter: Option<Delimiter>,
     calls: usize,
 }
 
@@ -366,15 +396,26 @@ impl Segment {
     }
 
     pub fn under(prompt: Rc<Prompt>) -> Segment {
+        Segment::below(Delimiter::Ply(prompt))
+    }
+
+    pub fn below(delimiter: Delimiter) -> Segment {
         Segment {
             frames: Chain::new(),
-            prompt: Some(prompt),
+            delimiter: Some(delimiter),
             calls: 0,
         }
     }
 
+    pub fn delimiter(&self) -> Option<&Delimiter> {
+        self.delimiter.as_ref()
+    }
+
     pub fn prompt(&self) -> Option<&Rc<Prompt>> {
-        self.prompt.as_ref()
+        match &self.delimiter {
+            Some(Delimiter::Ply(prompt)) => Some(prompt),
+            _ => None,
+        }
     }
 
     pub fn frames(&self) -> usize {
@@ -394,8 +435,9 @@ fn is_call(frame: &Frame) -> usize {
 pub enum Next {
     Frame(Frame, Stack),
     /// The delimited body finished. Apply this handler's `return` clause, if
-    /// any, and carry on with the stack the handler was installed on.
-    Leave(Rc<Prompt>, Stack),
+    /// any, and carry on with the stack the handler was installed on; for a
+    /// `Sim` delimiter it is a task's body that returned.
+    Leave(Delimiter, Stack),
     Done,
 }
 
@@ -403,8 +445,7 @@ pub struct Handled {
     /// How many segments to capture, counting from the innermost. Always at
     /// least one: the segment delimited by the handler itself.
     pub segments: usize,
-    pub prompt: Rc<Prompt>,
-    pub clause: usize,
+    pub target: Target,
 }
 
 #[derive(Clone, Default)]
@@ -416,7 +457,7 @@ pub struct Stack {
     /// nothing else was looking at.
     top: Segment,
     /// The segments below `top`, head first. The last one is always the base,
-    /// so `top.prompt.is_none()` holds exactly when this is empty.
+    /// so `top.delimiter.is_none()` holds exactly when this is empty.
     under: Chain<Segment>,
     frames: usize,
     calls: usize,
@@ -465,10 +506,32 @@ impl Stack {
     }
 
     pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack {
+        self.push_delimiter(Delimiter::Ply(prompt))
+    }
+
+    /// Opens a segment under the seeded scheduler. One per task: a task's body
+    /// returning is `Next::Leave` of its own delimiter, which is how the machine
+    /// learns the task finished rather than the region.
+    pub fn push_sim(&self, region: SimId) -> Stack {
+        self.push_delimiter(Delimiter::Sim(region))
+    }
+
+    pub fn push_delimiter(&self, delimiter: Delimiter) -> Stack {
         let mut out = self.clone();
-        let displaced = std::mem::replace(&mut out.top, Segment::under(prompt));
+        let displaced = std::mem::replace(&mut out.top, Segment::below(delimiter));
         out.under = std::mem::take(&mut out.under).push(displaced);
         out
+    }
+
+    /// Whether this stack is inside `region` — that is, whether the region's
+    /// delimiter is still one of the prompts control would have to leave.
+    ///
+    /// A second `simulate` reached while this holds is genuine nesting. One
+    /// reached while it does not is a region whose control was discarded, which
+    /// is a different mistake and gets a different diagnostic.
+    pub fn holds_sim(&self, region: SimId) -> bool {
+        self.segments_iter()
+            .any(|s| matches!(s.delimiter(), Some(Delimiter::Sim(r)) if *r == region))
     }
 
     pub fn prompt(&self) -> Option<&Rc<Prompt>> {
@@ -490,13 +553,13 @@ impl Stack {
             self.calls -= calls;
             return Next::Frame(frame, self);
         }
-        match self.top.prompt.take() {
-            Some(prompt) => {
+        match self.top.delimiter.take() {
+            Some(delimiter) => {
                 self.top = self
                     .under
                     .pop_front()
-                    .expect("only the base segment has no prompt, and it is the outermost");
-                Next::Leave(prompt, self)
+                    .expect("only the base segment has no delimiter, and it is the outermost");
+                Next::Leave(delimiter, self)
             }
             None => Next::Done,
         }
@@ -506,6 +569,10 @@ impl Stack {
         std::iter::once(&self.top).chain(self.under.iter())
     }
 
+    /// Innermost first, over both delimiter kinds. A `handle` nested inside a
+    /// `simulate` region answers `clock.now()` itself; the same handler written
+    /// outside the region does not, because the region's delimiter is crossed
+    /// first. That is the ordinary shadowing rule and there is no case for it.
     pub fn find_handler(
         &self,
         effect: &Symbol,
@@ -513,14 +580,25 @@ impl Stack {
         resource: Option<&Symbol>,
     ) -> Option<Handled> {
         for (depth, segment) in self.segments_iter().enumerate() {
-            let Some(prompt) = segment.prompt() else {
+            let Some(delimiter) = segment.delimiter() else {
                 continue;
             };
-            if let Some(clause) = prompt.clause_for(effect, op, resource) {
+            let target = match delimiter {
+                Delimiter::Ply(prompt) => {
+                    prompt
+                        .clause_for(effect, op, resource)
+                        .map(|clause| Target::Ply {
+                            prompt: prompt.clone(),
+                            clause,
+                        })
+                }
+                Delimiter::Sim(region) => crate::sim::is_scheduled(effect.as_str(), op.as_str())
+                    .then_some(Target::Sim(*region)),
+            };
+            if let Some(target) = target {
                 return Some(Handled {
                     segments: depth + 1,
-                    prompt: prompt.clone(),
-                    clause,
+                    target,
                 });
             }
         }
@@ -560,8 +638,13 @@ impl Stack {
     /// of one continuation splices the same shared segments, so the second
     /// costs what the first did.
     pub fn resume(&self, k: &Continuation) -> Stack {
+        self.spliced(&k.segments)
+    }
+
+    /// `segments` are innermost first, the order [`Stack::capture`] produced.
+    fn spliced(&self, segments: &[Segment]) -> Stack {
         let mut out = self.clone();
-        for segment in k.segments.iter().rev() {
+        for segment in segments.iter().rev() {
             let displaced = std::mem::replace(&mut out.top, segment.clone());
             out.under = std::mem::take(&mut out.under).push(displaced);
             out.frames += segment.frames();
@@ -598,6 +681,44 @@ impl Continuation {
 
     pub fn segments(&self) -> usize {
         self.segments.len()
+    }
+
+    /// The delimiters this continuation carries, innermost first. A task spawned
+    /// under a `handle` written inside a `simulate` region has to run under that
+    /// handler too, and this is where the machine reads which ones those are.
+    pub fn delimiters(&self) -> Vec<Delimiter> {
+        self.segments
+            .iter()
+            .filter_map(|s| s.delimiter.clone())
+            .collect()
+    }
+
+    /// The region whose delimiter this continuation carries, if any. Innermost
+    /// first, so a continuation cut out of a task names that task's own region.
+    pub fn sim(&self) -> Option<SimId> {
+        self.sim_at().map(|(id, _)| id)
+    }
+
+    /// The stack that would sit below this continuation's `Sim` delimiter once
+    /// it is spliced onto `stack`.
+    ///
+    /// A region's anchor is the stack under its delimiter, and resuming a task
+    /// from a clause body puts the delimiter somewhere new — over whatever that
+    /// clause still had pending. Without moving the anchor the region delivers
+    /// its value onto the stack it was *entered* on and the pending work is lost.
+    pub fn under_sim(&self, stack: &Stack) -> Option<Stack> {
+        let (_, at) = self.sim_at()?;
+        Some(stack.spliced(&self.segments[at + 1..]))
+    }
+
+    fn sim_at(&self) -> Option<(SimId, usize)> {
+        self.segments
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| match s.delimiter {
+                Some(Delimiter::Sim(id)) => Some((id, i)),
+                _ => None,
+            })
     }
 }
 
@@ -827,7 +948,7 @@ mod tests {
             .find_handler(&effect, &op, Some(&users))
             .expect("the outer handler matches");
         assert_eq!(found.segments, 2);
-        assert_eq!(found.clause, 0);
+        assert!(matches!(found.target, Target::Ply { clause: 0, .. }));
 
         let orders = Symbol::new("orders");
         let inner = s
@@ -843,5 +964,49 @@ mod tests {
             s.find_handler(&Symbol::new("db"), &Symbol::new("get"), None)
                 .is_none()
         );
+    }
+
+    /// A `simulate` region's delimiter answers the three simulated effects and
+    /// nothing else, and a `handle` nested inside one still shadows it.
+    #[test]
+    fn a_sim_delimiter_answers_the_scheduled_operations_only() {
+        let s = Stack::new().push_sim(SimId(0));
+        let now = Symbol::new("now");
+        assert!(matches!(
+            s.find_handler(&Symbol::new("clock"), &now, None)
+                .expect("the region handles `clock.now`")
+                .target,
+            Target::Sim(SimId(0))
+        ));
+        assert!(
+            s.find_handler(&Symbol::new("db"), &Symbol::new("get"), None)
+                .is_none(),
+            "a region must not claim an effect the language has never heard of"
+        );
+
+        let clause = Clause {
+            effect: ply_syntax::ast::QName::bare(Ident::new("clock", Span::DUMMY)),
+            op: now.clone(),
+            resource: None,
+            params: Rc::new(Vec::new()),
+            resume: None,
+            body: crate::code::lower(&crate::build::int(0)),
+            span: Span::DUMMY,
+        };
+        let inner = s.push_prompt(Rc::new(Prompt {
+            clauses: Rc::new(vec![clause]),
+            effects: Rc::new(vec![Symbol::new("clock")]),
+            ret: None,
+            env: Env::empty(),
+            module: 0,
+            span: Span::DUMMY,
+        }));
+        assert!(matches!(
+            inner
+                .find_handler(&Symbol::new("clock"), &now, None)
+                .expect("the nested handler matches")
+                .target,
+            Target::Ply { .. }
+        ));
     }
 }

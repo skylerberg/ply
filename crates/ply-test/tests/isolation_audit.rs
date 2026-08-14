@@ -19,7 +19,7 @@
 //! reachable.
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::{EngineChoice, Value, World};
+use ply_eval::{EngineChoice, Plan, Value, World};
 use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
@@ -328,7 +328,8 @@ fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
     for round in 0..3 {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection = ply_test::select(&compiled.check, &compiled.hashes, &store);
+        let selection =
+            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
 
         assert_eq!(
             selection.groups.len(),
@@ -347,6 +348,7 @@ fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
             &compiled.hashes,
             &mut store,
             EngineChoice::Both,
+            ply_test::Search::of(&selection),
         );
         assert_eq!(
             (report.passed, report.failed),
@@ -369,7 +371,7 @@ fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     let compiled = Compiled::new(&contending_source(TESTS));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store);
+    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     assert_eq!(selection.groups.len(), 1);
 
     let executor = Recording {
@@ -441,7 +443,7 @@ fn a_shared_fixture_is_forked_per_test_rather_than_shared_between_them() {
     let compiled = Compiled::new(&contending_source(TESTS));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store);
+    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
 
     let built = AtomicUsize::new(0);
     let fixture: &(dyn Fn() -> World + Sync) = &|| {
@@ -494,7 +496,8 @@ test "real writer" { db.put[users](1) }
         let compiled = Compiled::new(&format!("{shared}{}", contending_source(extra)));
         let root = TempRoot::new();
         let store = root.store();
-        let selection = ply_test::select(&compiled.check, &compiled.hashes, &store);
+        let selection =
+            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
         assert_eq!(selection.parallelism.isolated, extra);
         assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);
         counts.push(selection.groups.len());

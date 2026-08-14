@@ -10,21 +10,24 @@
 
 use crate::builtins::{self, Builtin, Step};
 use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower};
-use crate::cont::{Frame, Next, Stack};
+use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
 use crate::env::Env;
-use crate::handler::{self, Request, Transition};
+use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::interp::{
     OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
     err_unknown_name, literal, op_decl,
 };
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
+use crate::region::{self, Region, StepSite, Trail};
+use crate::sched::{Resumption, Turn};
+use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Value};
 use crate::world::World;
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
-    BinOp, Expr, FnDef, Item, Lit, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
+    BinOp, Expr, FnDef, Item, Lit, Mode, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
@@ -109,6 +112,27 @@ pub struct Machine<'a> {
     current: Span,
     max_frames: usize,
     max_calls: usize,
+    /// The seed the next entry point's `simulate` region runs at, and the
+    /// scheduling-step budget one interleaving may spend. A run is a pure
+    /// function of its definitions and this.
+    seed: Seed,
+    sim_steps: u32,
+    /// The region currently live. Nesting is `E0416` and a region whose control
+    /// was discarded is `E0413`, so at most one is ever live; a `Task` handle
+    /// naming any other region is `E0413` rather than an index into the wrong
+    /// scheduler.
+    sims: Vec<Region>,
+    /// How many regions this entry point has entered. A region's [`SimId`] is
+    /// its ordinal, not its depth: two regions in sequence are two ids, so a
+    /// continuation captured in the first is recognized as foreign by the second
+    /// rather than steering it.
+    entered_sims: u32,
+    /// The one choice sequence this entry point makes, across every region it
+    /// enters. Reset at every entry point, so a test that reached no region
+    /// reports nothing rather than the previous test's search.
+    trail: Trail,
+    /// What this entry point's regions did, built once the last of them ended.
+    record: Option<region::Record>,
 }
 
 impl<'a> Machine<'a> {
@@ -184,6 +208,12 @@ impl<'a> Machine<'a> {
             current: Span::DUMMY,
             max_frames: DEFAULT_MAX_FRAMES,
             max_calls: DEFAULT_MAX_CALLS,
+            seed: Seed::default(),
+            sim_steps: DEFAULT_STEPS,
+            sims: Vec::new(),
+            entered_sims: 0,
+            trail: Trail::new(Seed::default()),
+            record: None,
         }
     }
 
@@ -200,6 +230,28 @@ impl<'a> Machine<'a> {
     /// The atoms this engine performed at the last entry point.
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// Fix the interleaving the next entry point takes.
+    ///
+    /// A `simulate` region's value is the one its seed names; exploring the
+    /// others is a search, and driving that search is the test runner's job
+    /// rather than the machine's. `steps` bounds one interleaving's scheduling
+    /// points, which is what turns a livelock into [`codes::DEADLOCK`].
+    pub fn set_seed(&mut self, seed: Seed, steps: u32) {
+        self.seed = seed;
+        self.sim_steps = steps.max(1);
+    }
+
+    /// What the last entry point's `simulate` regions did, or `None` when it
+    /// reached none. Never a zeroed record: a search that observed nothing must
+    /// say so rather than report an interleaving nobody ran.
+    ///
+    /// Every region of the entry point, over one choice sequence. A record
+    /// covering one of several regions would be a search input describing one
+    /// region and an `exhaustive` claim made about all of them.
+    pub fn simulated(&self) -> Option<&region::Record> {
+        self.record.as_ref()
     }
 
     pub fn program(&self) -> &'a Program {
@@ -310,13 +362,27 @@ impl<'a> Machine<'a> {
                     request.resource.is_some(),
                     request.span,
                 )?;
-                if let Some(atom) =
-                    handler::performed_atom(&request.effect, request.resource.as_ref(), decl)
-                {
+                let atom =
+                    handler::performed_atom(&request.effect, request.resource.as_ref(), decl);
+                if let Some(atom) = atom.clone() {
                     self.trace.record(atom);
                 }
-                let transition = handler::perform(&self.stack, request, decl)?;
-                self.take(transition)?;
+                if !self.sims.is_empty() {
+                    self.note_step_site(request.span);
+                    // A step's accesses are every atom the tracer recorded as
+                    // well as every cell the world did. The scheduler's own
+                    // bookkeeping is dropped inside `record_access`, and a
+                    // prelude operation contributes no atom here at all — the
+                    // seeded handlers' table is the only thing that speaks for
+                    // those, so `random.write` cannot be counted twice.
+                    if let Some(atom) = atom {
+                        self.trail.record_access(Access::Atom(atom));
+                    }
+                }
+                match handler::perform(&self.stack, request, decl)? {
+                    Answered::Handler(transition) => self.take(transition)?,
+                    Answered::Scheduler(scheduled) => self.run_scheduled(scheduled)?,
+                }
                 Ok(Progress::Running)
             }
             State::Halt(value) => {
@@ -337,12 +403,50 @@ impl<'a> Machine<'a> {
         self.world = self.base_world.fork();
         self.trace.clear();
         self.state = State::Halt(Value::Unit);
+        self.sims.clear();
+        self.entered_sims = 0;
+        self.trail = Trail::new(self.seed.clone());
+        self.record = None;
     }
 
     fn drive(&mut self, code: Code, env: Env, module: usize) -> Result<Value, Diagnostic> {
         self.reset();
         self.state = State::Eval { code, env, module };
-        self.run()
+        let outcome = self.run();
+        self.close_regions(outcome)
+    }
+
+    /// A failure abandons the region where it stands. The diagnostic gains the
+    /// task it failed in and the seed that replays it, and the steps taken so
+    /// far are still the interleaving the search observed — a run that failed
+    /// halfway is exactly the run the search is looking for.
+    ///
+    /// A run that *succeeded* with a region still live did not finish that
+    /// region: some handler outside it discarded the continuation it was handed,
+    /// so the region's tasks were destroyed unfinished. The search's whole input
+    /// would be a trace that stops there, and it would report `exhaustive` over
+    /// the schedules it cut short — so the program is refused instead.
+    fn close_regions(&mut self, outcome: Result<Value, Diagnostic>) -> Result<Value, Diagnostic> {
+        let outcome = match self.sims.pop() {
+            None => outcome,
+            Some(mut region) => {
+                self.sims.clear();
+                let failure = match outcome {
+                    Err(diagnostic) => diagnostic,
+                    Ok(_) => err_region_abandoned(region.span, &region.sched.unfinished()),
+                };
+                let failure = region.sched.fail(failure, self.trail.seed());
+                self.trail.leave(
+                    region.handlers.clock().now(),
+                    region.handlers.rand().drawn(),
+                );
+                Err(failure)
+            }
+        };
+        if self.trail.entered() {
+            self.record = Some(self.trail.record());
+        }
+        outcome
     }
 
     fn run(&mut self) -> Result<Value, Diagnostic> {
@@ -585,8 +689,276 @@ impl<'a> Machine<'a> {
                 );
                 self.take(transition)?;
             }
+
+            NodeKind::Simulate { body } => {
+                self.enter_simulate(body.clone(), env, module, span)?;
+            }
         }
         Ok(())
+    }
+
+    /// `simulate { body }` — install the seeded scheduler and give its root task
+    /// the first step.
+    ///
+    /// The region's own stack is captured here rather than pushed onto: every
+    /// task runs on it plus a delimiter of its own, so a resumption splices onto
+    /// the region's control and not onto whichever task ran last.
+    fn enter_simulate(
+        &mut self,
+        body: Code,
+        env: Env,
+        module: usize,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if let Some(outer) = self.sims.last() {
+            // Two mistakes with one symptom. If the outer region's delimiter is
+            // still on the stack, control is genuinely inside it and this is
+            // nesting; if it is not, a handler discarded the region's
+            // continuation and the tasks it left behind will never run.
+            return Err(if self.stack.holds_sim(outer.id) {
+                err_nested_simulation(span, outer.span)
+            } else {
+                err_region_abandoned(outer.span, &outer.sched.unfinished())
+                    .secondary(span, "reached from here")
+            });
+        }
+        let id = SimId(self.entered_sims);
+        self.entered_sims += 1;
+        self.trail.enter(span);
+        self.sims.push(Region::new(
+            id,
+            self.seed.root,
+            self.trail.drawn(),
+            self.sim_steps,
+            self.stack.clone(),
+            body,
+            env,
+            module,
+            span,
+        ));
+        self.schedule()
+    }
+
+    /// A `task.*`, `clock.*` or `random.*` perform that reached its region's
+    /// delimiter. This ends the performing task's step, so it is also the one
+    /// place a step's site is recorded and the last chance the scheduler has to
+    /// hear about the step it is closing.
+    fn run_scheduled(&mut self, scheduled: Scheduled) -> Result<(), Diagnostic> {
+        let Scheduled {
+            region,
+            effect,
+            op,
+            args,
+            span,
+            k,
+        } = scheduled;
+        if region_mut(&mut self.sims, region).is_none() {
+            return Err(err_task_escapes(span, &effect, &op));
+        }
+        self.trail.end_step(span);
+        let live = region_mut(&mut self.sims, region).expect("the region was just found");
+        let task = match live.sched.current() {
+            Some(task) => task,
+            None => {
+                return Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("`{effect}.{op}` was performed while no task was running"),
+                )
+                .primary(span, "performed here"));
+            }
+        };
+
+        match (effect.as_str(), op.as_str()) {
+            ("task", "spawn") => {
+                let [body] = take_args(&effect, &op, args, span)?;
+                // The delimiters the spawn site sat under, which is what the
+                // spawned body has to run under: a `handle` written inside the
+                // region encloses the tasks it lexically contains, and the row
+                // `spawn` publishes already says the enclosing handler
+                // discharges them.
+                let over = k.delimiters();
+                let id = live.sched.spawn(body, over, span);
+                live.sched.suspend(k, Value::Task(id))?;
+            }
+            ("task", "join") => {
+                let [handle] = take_args(&effect, &op, args, span)?;
+                let target = handle.as_task(span, "`task.join`")?;
+                live.sched.join(k, target, span)?;
+            }
+            ("task", "yield") => {
+                let [] = take_args(&effect, &op, args, span)?;
+                live.sched.suspend(k, Value::Unit)?;
+            }
+            _ => {
+                let Some(sig) = crate::sim::signature(&effect, &op) else {
+                    return Err(Diagnostic::error(
+                        codes::UNKNOWN_OPERATION,
+                        format!("`{effect}` has no operation `{op}`"),
+                    )
+                    .primary(span, "unknown operation")
+                    .note("a `simulate` region answers `task`, `clock` and `random`"));
+                };
+                let answer = live.handlers.dispatch(sig, task, &args, span)?;
+                match answer {
+                    Answer::Value(value) => live.sched.suspend(k, value)?,
+                    Answer::Sleeping { deadline } => live.sched.sleep_until(k, deadline, span)?,
+                }
+                if let Some(access) = sig.step_access() {
+                    self.trail.record_access(access);
+                }
+            }
+        }
+        self.schedule()
+    }
+
+    /// A task's body returned to its own delimiter.
+    fn finish_task(&mut self, region: SimId, value: Value) -> Result<(), Diagnostic> {
+        let span = self.current;
+        if region_mut(&mut self.sims, region).is_none() {
+            return Err(err_task_escapes(span, "task", "return"));
+        }
+        self.trail.end_step(span);
+        let live = region_mut(&mut self.sims, region).expect("the region was just found");
+        live.sched.finish(value)?;
+        self.schedule()
+    }
+
+    /// Puts a cell access into the current step's access set.
+    ///
+    /// Two tests hold two worlds, so `ply_test::shared_footprint` may drop
+    /// `cell` atoms; two tasks in one simulated run hold **one** world, and a
+    /// dependence relation that drops them prunes away every shared-memory race
+    /// in the corpus while reporting a *larger* reduction for having done it.
+    fn record_cell_access(&mut self, b: Builtin, args: &[Value]) {
+        let mode = match b {
+            Builtin::CellGet => Mode::Read,
+            Builtin::CellSet => Mode::Write,
+            _ => return,
+        };
+        let Some(Value::Cell(id)) = args.first() else {
+            return;
+        };
+        if self.sims.is_empty() {
+            return;
+        }
+        self.trail.record_access(Access::Cell { id: *id, mode });
+        self.note_step_site(self.current);
+    }
+
+    /// Puts a cell *allocation* into the current step's access set.
+    ///
+    /// Allocation has no location to name — that is the point of it — so it is
+    /// its own kind of access, dependent with every other allocation. Without it
+    /// two tasks that each open a private `with_cell` look like tasks that touch
+    /// nothing, and §6.1's soundness condition is false of them: run in the
+    /// other order they reach a *different world*, because the two ids are
+    /// swapped.
+    pub(crate) fn record_alloc_access(&mut self) {
+        if self.sims.is_empty() {
+            return;
+        }
+        self.trail.record_access(Access::Alloc);
+        self.note_step_site(self.current);
+    }
+
+    /// Names where the running step is standing, once per step.
+    ///
+    /// Guarded on both sides because finding it walks the stack for the
+    /// innermost pending call: outside a region there is no step to name, and
+    /// within one only the step's first access is recorded, so the cost is per
+    /// step rather than per access.
+    fn note_step_site(&mut self, span: Span) {
+        if self.sims.is_empty() || self.trail.has_site() {
+            return;
+        }
+        let site = StepSite {
+            definition: innermost_calls(&self.stack).into_iter().flatten().next(),
+            span,
+        };
+        self.trail.note_site(site);
+    }
+
+    /// Give the next step to whichever task the seed names, or deliver the
+    /// region's value when every task has finished.
+    ///
+    /// Virtual time advances inside [`Scheduler::next`] and only there, and only
+    /// with nothing enabled — which is why a simulated timeout can never fire
+    /// ahead of work that could still run.
+    ///
+    /// [`Scheduler::next`]: crate::sched::Scheduler::next
+    fn schedule(&mut self) -> Result<(), Diagnostic> {
+        let Some(region) = self.sims.last_mut() else {
+            return Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "the machine asked for a scheduling decision outside a simulated region",
+            )
+            .primary(self.current, "no `simulate` region is live here"));
+        };
+        let turn = region
+            .sched
+            .next(region.handlers.clock_mut(), &mut self.trail)?;
+        let region = self.sims.last_mut().expect("the region is still live");
+        match turn {
+            Turn::Complete(value) => {
+                let region = self.sims.pop().expect("the region was just borrowed");
+                self.trail.leave(
+                    region.handlers.clock().now(),
+                    region.handlers.rand().drawn(),
+                );
+                self.stack = region.below;
+                self.go_return(value);
+                Ok(())
+            }
+            Turn::Run { resumption, .. } => {
+                let (below, id) = (region.below.clone(), region.id);
+                match resumption {
+                    Resumption::Enter => {
+                        let (body, env, module) =
+                            (region.body.clone(), region.env.clone(), region.module);
+                        self.stack = below.push_sim(id);
+                        self.go_eval(body, env, module);
+                        Ok(())
+                    }
+                    Resumption::Start { body, over, span } => {
+                        self.stack = install(below, &over);
+                        self.apply(body, Vec::new(), span)
+                    }
+                    Resumption::Resume { k, value } => {
+                        let transition = handler::resume(&below, &k, value);
+                        self.take(transition)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Splices a continuation the program itself named — a `resume k` clause's
+    /// `k`, or the implicit one a tail-resumptive clause gets.
+    ///
+    /// A continuation that crosses a `simulate` region's delimiter re-installs
+    /// that region wherever it is spliced, so the region's own anchor moves with
+    /// it: the value it eventually delivers has to land on the stack the
+    /// resumption put it over, not on the stack the `simulate` was entered on.
+    /// Without that, a clause resuming twice loses everything the first
+    /// resumption still had pending — silently, and with a wrong world.
+    ///
+    /// A continuation naming a region that has already ended is
+    /// [`codes::TASK_ESCAPES_SCOPE`]: the scheduler it belongs to is gone, and
+    /// re-running its tasks against a fresh one would be a different program.
+    pub(crate) fn resume_continuation(
+        &mut self,
+        k: &Continuation,
+        value: Value,
+    ) -> Result<(), Diagnostic> {
+        if let Some(id) = k.sim() {
+            let anchor = k.under_sim(&self.stack);
+            match (region_mut(&mut self.sims, id), anchor) {
+                (Some(region), Some(anchor)) => region.below = anchor,
+                _ => return Err(err_region_ended(self.current)),
+            }
+        }
+        let transition = handler::resume(&self.stack, k, value);
+        self.take(transition)
     }
 
     /// The stack is moved out rather than borrowed: a pop that owns its stack
@@ -599,10 +971,14 @@ impl<'a> Machine<'a> {
                 self.stack = rest;
                 self.dispatch(frame, value)
             }
-            Next::Leave(prompt, rest) => {
+            Next::Leave(Delimiter::Ply(prompt), rest) => {
                 let transition = handler::leave_handle(&prompt, value, rest);
                 self.take(transition)
             }
+            // A task's body returned. The region does not: it delivers its own
+            // value only once every task has finished, which is what makes spawn
+            // structured without a second construct.
+            Next::Leave(Delimiter::Sim(region), _) => self.finish_task(region, value),
             Next::Done => {
                 self.state = State::Halt(value);
                 Ok(())
@@ -619,8 +995,8 @@ impl<'a> Machine<'a> {
         match &callee {
             Value::Closure(closure) => self.enter_closure(closure, args, span),
             Value::Continuation(k) => {
-                let transition = handler::apply_continuation(&self.stack, k, args, span)?;
-                self.take(transition)
+                let value = handler::continuation_argument(args, span)?;
+                self.resume_continuation(k, value)
             }
             other => Err(err_not_a_function(span, other)),
         }
@@ -715,6 +1091,7 @@ impl<'a> Machine<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<(), Diagnostic> {
+        self.record_cell_access(b, &args);
         let step = builtins::call(b, args, &mut self.world, span)?;
         self.run_builtin_step(step, span)
     }
@@ -1015,6 +1392,112 @@ impl<'a> Machine<'a> {
             &innermost_calls(stack),
         )
     }
+}
+
+/// The live region with this id, if it is the one still running.
+///
+/// A [`SimId`] is an ordinal among the regions an entry point has entered, not
+/// an index into the live ones: a continuation captured in a region that has
+/// ended names an id nothing here holds, and that is the point of it.
+fn region_mut(sims: &mut [Region], id: SimId) -> Option<&mut Region> {
+    sims.iter_mut().find(|region| region.id == id)
+}
+
+/// Puts a spawned task under the delimiters its `spawn` site sat under. `over`
+/// is innermost first, so it is installed from the outside in.
+fn install(below: Stack, over: &[Delimiter]) -> Stack {
+    over.iter().rev().fold(below, |stack, delimiter| {
+        stack.push_delimiter(delimiter.clone())
+    })
+}
+
+/// A scheduled operation's arguments, at the arity its prelude declaration has.
+fn take_args<const N: usize>(
+    effect: &Symbol,
+    op: &Symbol,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<[Value; N], Diagnostic> {
+    let len = args.len();
+    <[Value; N]>::try_from(args).map_err(|_| arity_error(span, &format!("`{effect}.{op}`"), N, len))
+}
+
+#[cold]
+#[inline(never)]
+fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::NESTED_SIMULATION,
+        "a `simulate` region may not run inside another one",
+    )
+    .primary(span, "this region is entered while one is already running")
+    .secondary(outer, "the region already running")
+    .note(
+        "two schedulers mean two notions of `runnable` and a state space that is a product of both",
+    )
+    .note("hoist the inner region out, or handle its effects with an ordinary `handle`")
+}
+
+/// A region whose control was discarded while it still had tasks.
+///
+/// A handler outside the region may capture across its delimiter and never
+/// resume, which destroys the scheduler with tasks still runnable. ADR 0006 §1.3
+/// makes the handler the scope precisely so that cannot happen quietly: an
+/// abandoned task is an unexplored interleaving, and a search over the truncated
+/// trace would report `exhaustive` over the schedules it cut short.
+#[cold]
+#[inline(never)]
+fn err_region_abandoned(span: Span, unfinished: &[crate::sim::TaskId]) -> Diagnostic {
+    let waiting = unfinished
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        format!(
+            "this `simulate` region was abandoned with {} still unfinished",
+            plural(unfinished.len(), "task", "tasks")
+        ),
+    )
+    .primary(span, "control left this region and never came back")
+    .note(format!("unfinished when the region was discarded: {waiting}"))
+    .note("a handler outside the region captured across it and did not resume; spawn is structured, so the region's tasks have nowhere to run")
+    .note("resume the continuation, or move the handler inside the `simulate` region")
+}
+
+/// A continuation carrying a region that has already delivered its value.
+#[cold]
+#[inline(never)]
+fn err_region_ended(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        "this continuation re-enters a `simulate` region that has already ended",
+    )
+    .primary(span, "resumed here, after the region delivered its value")
+    .note("a task is a suspended machine state and its scheduler ends with the region, so a second resumption has no scheduler to run against")
+    .note("resume such a continuation at most once, or install the handler inside the `simulate` region so the capture does not cross it")
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// A scheduled operation whose region is gone: a `Task` or a continuation
+/// smuggled past the `}` that ended the scheduler it names.
+#[cold]
+#[inline(never)]
+fn err_task_escapes(span: Span, effect: &str, op: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        format!("`{effect}.{op}` reached a `simulate` region that has already ended"),
+    )
+    .primary(span, "this control outlived the scheduler it belongs to")
+    .note("a task is a key into its region's scheduler, and the scheduler ends with the region")
+    .note("join the task inside the `simulate` region that spawned it")
 }
 
 /// The innermost pending calls, innermost first — the same list the tree-walker

@@ -1,5 +1,6 @@
 use crate::style::ColorChoice;
 use clap::{Args, Parser, Subcommand};
+use ply_eval::Seed;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -17,6 +18,17 @@ pub struct Cli {
     /// terminal and NO_COLOR is unset.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     pub color: ColorChoice,
+}
+
+impl Cli {
+    /// What `clap`'s own machinery cannot check. `None` when the command line is
+    /// coherent.
+    pub fn conflict(&self) -> Option<String> {
+        match &self.command {
+            Command::Test(args) => args.simulation.conflict(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,6 +93,108 @@ impl From<EngineArg> for ply_eval::EngineChoice {
             EngineArg::Both => ply_eval::EngineChoice::Both,
         }
     }
+}
+
+/// Which search a `simulate` region runs.
+///
+/// Mirrors `ply_eval::SimMode` rather than deriving `ValueEnum` on it, because
+/// `ply-eval` does not depend on `clap` and should not start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum SimArg {
+    /// One interleaving, the one the seed names. The replay path.
+    Once,
+    /// One interleaving per seed. No state, and the seeds are independent, which
+    /// is what makes widening a seed set cost only the new seeds.
+    Random,
+    /// Footprint-guided partial-order reduction. Never runs two interleavings
+    /// from one equivalence class, so a small state space finishes exhaustively
+    /// — a proof rather than a sample.
+    #[default]
+    Dpor,
+}
+
+impl SimArg {
+    pub fn as_str(self) -> &'static str {
+        ply_eval::SimMode::from(self).as_str()
+    }
+}
+
+impl From<SimArg> for ply_eval::SimMode {
+    fn from(a: SimArg) -> ply_eval::SimMode {
+        match a {
+            SimArg::Once => ply_eval::SimMode::Once,
+            SimArg::Random => ply_eval::SimMode::Random,
+            SimArg::Dpor => ply_eval::SimMode::Dpor,
+        }
+    }
+}
+
+/// What a run searches, and therefore half of what a simulated test is cached
+/// under. Every field is in the key: a green run under one plan is not a green
+/// run under another.
+#[derive(Args, Clone, Debug)]
+pub struct SimOptions {
+    /// Replay exactly one interleaving: `7`, or `7:3.0.2` for a seed the search
+    /// refined. Implies `--sim once`, and it is the whole of a repro.
+    #[arg(
+        long,
+        value_name = "SEED",
+        value_parser = parse_seed,
+        conflicts_with_all = ["sim", "seeds", "sim_budget"],
+    )]
+    pub seed: Option<Seed>,
+
+    /// Which search each simulated test runs.
+    #[arg(long, value_enum, default_value_t = SimArg::default(), value_name = "MODE")]
+    pub sim: SimArg,
+
+    /// Seeds per simulated test. Defaults to 1 under `dpor`, which already
+    /// enumerates equivalence classes, and 64 under `random`.
+    #[arg(long = "seeds", alias = "sim-roots", value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub seeds: Option<u32>,
+
+    /// Interleavings per seed. Only `dpor` searches more than one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub sim_budget: Option<u32>,
+
+    /// Scheduling steps one interleaving may take before the region is reported
+    /// as making no progress.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub sim_steps: Option<u32>,
+
+    /// Also run the search with the dependence relation forced to `true` and
+    /// report what an unpruned one would have cost. Off by default: the claim is
+    /// a benchmark, not something every run pays double for.
+    #[arg(long)]
+    pub measure_reduction: bool,
+}
+
+impl SimOptions {
+    /// The one contradiction `conflicts_with` cannot express, because it is
+    /// between a flag and a *value* of another flag.
+    ///
+    /// Refused rather than ignored: a `--sim-budget` that is silently dropped
+    /// reads as a search that was widened and was not.
+    pub fn conflict(&self) -> Option<String> {
+        (self.sim == SimArg::Random && self.sim_budget.is_some()).then(|| {
+            "`--sim-budget` has no meaning under `--sim random`, which runs one \
+             interleaving per seed; widen the search with `--seeds N`, or use \
+             `--sim dpor` to spend a budget per seed"
+                .to_string()
+        })
+    }
+}
+
+/// A seed that parses loosely replays something other than what failed, so
+/// every form that is not canonical is refused with the two that are.
+fn parse_seed(text: &str) -> Result<Seed, String> {
+    Seed::parse(text).ok_or_else(|| {
+        format!(
+            "`{text}` is not a seed; write `7` for a whole search or `7:3.0.2` \
+             for one interleaving, and copy the one the failure printed"
+        )
+    })
 }
 
 #[derive(Args, Debug)]
@@ -170,6 +284,9 @@ pub struct TestArgs {
     /// result cache.
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
+
+    #[command(flatten)]
+    pub simulation: SimOptions,
 }
 
 #[derive(Args, Debug)]
@@ -188,6 +305,14 @@ pub struct RunArgs {
     /// result cache.
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
+
+    /// The interleaving a `simulate` region takes: `7`, or `7:3.0.2`.
+    ///
+    /// `ply run` explores exactly one interleaving whatever this says —
+    /// exploration is a test-time activity — so this chooses which one rather
+    /// than how many.
+    #[arg(long, value_name = "SEED", value_parser = parse_seed)]
+    pub seed: Option<Seed>,
 }
 
 #[derive(Args, Debug)]

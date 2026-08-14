@@ -30,6 +30,9 @@ enum Command {
     /// against the tree-walker, fork against rebuild, resumption cost, and
     /// what isolation did to the schedule.
     Measure(MeasureArgs),
+    /// Price the search: interleavings pruned against unpruned, seeds to the
+    /// first failure against sampling, and seeds per second.
+    Sim(SimArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -59,6 +62,18 @@ struct ShapeArgs {
     hub_modules: usize,
     #[arg(long, default_value_t = 192)]
     max_weight: u32,
+    /// `simulate` tests, on top of `--tests`.
+    #[arg(long, default_value_t = 0)]
+    concurrent_tests: usize,
+    #[arg(long, default_value_t = 3)]
+    tasks_per_test: usize,
+    /// `counter.bump` calls per task, separated by a `task.yield()`.
+    #[arg(long, default_value_t = 2)]
+    steps_per_task: usize,
+    /// 0.0 gives every task its own resource, so nothing conflicts and the
+    /// search collapses; 1.0 puts every task on one, so nothing prunes.
+    #[arg(long, default_value_t = 0.5)]
+    conflict_density: f64,
 }
 
 impl From<ShapeArgs> for CorpusSpec {
@@ -75,6 +90,10 @@ impl From<ShapeArgs> for CorpusSpec {
             nondet_fraction: a.nondet_fraction,
             hub_modules: a.hub_modules,
             max_weight: a.max_weight,
+            concurrent_tests: a.concurrent_tests,
+            tasks_per_test: a.tasks_per_test,
+            steps_per_task: a.steps_per_task,
+            conflict_density: a.conflict_density,
         }
     }
 }
@@ -151,6 +170,59 @@ struct MeasureArgs {
     json: bool,
 }
 
+#[derive(Args, Debug)]
+struct SimArgs {
+    /// A `.ply` file, or a directory a previous `gen` wrote.
+    corpus: PathBuf,
+    /// Roots per strategy in the race-finding table. Zero drops that table,
+    /// which is what to do on a corpus with no failing test.
+    #[arg(long, default_value_t = 32)]
+    trials: u32,
+    /// Interleavings a search may run per root. The unpruned side gets the same
+    /// one, so a spent budget is reported on both.
+    #[arg(long, default_value_t = 4096)]
+    budget: u32,
+    /// Scheduling steps one interleaving may take.
+    #[arg(long, default_value_t = ply_eval::sim::DEFAULT_STEPS)]
+    steps: u32,
+    /// Seeds the throughput table times. Sampled, so the rate is one whole test
+    /// per seed with no search state between them.
+    #[arg(long, default_value_t = 64)]
+    rate_seeds: u32,
+    /// Drop the reduction table, which is the expensive one.
+    #[arg(long)]
+    no_reduction: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn simulate(args: SimArgs) -> Result<()> {
+    let out = ply_corpus::simulate::SimMeasurements {
+        root: args.corpus.display().to_string(),
+        reduction: if args.no_reduction {
+            Vec::new()
+        } else {
+            ply_corpus::simulate::reduction(&args.corpus, args.budget, args.steps)?
+        },
+        race: if args.trials == 0 {
+            Vec::new()
+        } else {
+            ply_corpus::simulate::race_power(&args.corpus, args.trials, args.budget, args.steps)?
+        },
+        rate: if args.rate_seeds == 0 {
+            Vec::new()
+        } else {
+            ply_corpus::simulate::seed_rate(&args.corpus, args.rate_seeds, args.steps)?
+        },
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", ply_corpus::simulate::render(&out));
+    }
+    Ok(())
+}
+
 fn measure(args: MeasureArgs) -> Result<()> {
     let engines: Vec<Engine> = match args.engine {
         EngineChoice::Treewalk => vec![Engine::Treewalk],
@@ -210,6 +282,7 @@ fn run() -> Result<()> {
         }
         Command::Sweep(args) => sweep(args),
         Command::Measure(args) => measure(args),
+        Command::Sim(args) => simulate(args),
     }
 }
 
@@ -237,6 +310,7 @@ fn generate_corpus(args: GenArgs) -> Result<()> {
                 "passed": v.passed,
                 "groups": v.groups,
                 "largest_group": v.largest_group,
+                "seeded": v.seeded,
             })),
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -252,6 +326,18 @@ fn generate_corpus(args: GenArgs) -> Result<()> {
         manifest.tests,
         manifest.nondet_tests
     );
+    if manifest.concurrency.tests > 0 {
+        let c = &manifest.concurrency;
+        println!(
+            "  {} concurrent tests · {} tasks × {} steps over {} shards · contention {:.2} (asked {:.2})",
+            c.tests,
+            c.tasks_per_test,
+            c.steps_per_task,
+            c.shards_per_test,
+            c.contention,
+            c.conflict_density
+        );
+    }
     println!(
         "  {} KiB of source · mean out-degree {:.2} · {} distinct resources",
         manifest.bytes / 1024,

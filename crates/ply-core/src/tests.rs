@@ -183,6 +183,19 @@ fn net_effect() -> Item {
     )
 }
 
+fn simulate(body: Expr) -> Expr {
+    simulate_at(body, 0)
+}
+
+fn simulate_at(body: Expr, start: u32) -> Expr {
+    ex_at(
+        ExprKind::Simulate {
+            body: Box::new(body),
+        },
+        start,
+    )
+}
+
 fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
     ex(ExprKind::WithCell {
         resource: id(resource),
@@ -400,9 +413,9 @@ fn db_effect() -> Item {
     )
 }
 
-fn clock_effect() -> Item {
+fn wall_effect() -> Item {
     effect_def(
-        "clock",
+        "wall",
         true,
         vec![op("now", Mode::Read, false, vec![], con("Int", vec![]))],
     )
@@ -926,15 +939,15 @@ fn two_distinct_effect_variables_cannot_be_merged_by_one_annotation() {
 #[test]
 fn a_handled_atom_stops_being_evidence_for_the_determinism_check() {
     let handled = handle(
-        block(vec![], Some(perform_at("clock", "now", None, vec![], 10))),
-        vec![clause("clock", "now", None, &[], int(0))],
+        block(vec![], Some(perform_at("wall", "now", None, vec![], 10))),
+        vec![clause("wall", "now", None, &[], int(0))],
     );
     let body = block(
         vec![Stmt::Expr(handled)],
-        Some(perform_at("clock", "now", None, vec![], 20)),
+        Some(perform_at("wall", "now", None, vec![], 20)),
     );
     let diags = check_err(vec![
-        clock_effect(),
+        wall_effect(),
         test_def("one handled one not", false, body),
     ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
@@ -1051,26 +1064,19 @@ fn an_undeclared_effect_variable_in_an_annotation_is_an_unbound_row_var() {
 #[test]
 fn a_nondet_effect_surviving_in_a_det_test_is_e0412() {
     let body = block(
-        vec![let_("now", perform_at("clock", "now", None, vec![], 77))],
+        vec![let_("now", perform_at("wall", "now", None, vec![], 77))],
         Some(call("assert", vec![bool_lit(true)])),
     );
-    let diags = check_err(vec![
-        clock_effect(),
-        test_def("uses the clock", false, body),
-    ]);
+    let diags = check_err(vec![wall_effect(), test_def("uses the clock", false, body)]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
 
     assert_eq!(d.message, "nondeterministic effect in a deterministic test");
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
     assert_eq!(primary.span.start, 77);
-    assert!(
-        primary.message.contains("clock.read"),
-        "{}",
-        primary.message
-    );
+    assert!(primary.message.contains("wall.read"), "{}", primary.message);
     assert!(primary.message.contains("nondet"), "{}", primary.message);
     assert!(
-        d.notes.iter().any(|n| n.contains("clock.now()")),
+        d.notes.iter().any(|n| n.contains("wall.now()")),
         "expected a handler suggestion, got {:?}",
         d.notes
     );
@@ -1085,12 +1091,12 @@ fn a_nondet_effect_surviving_in_a_det_test_is_e0412() {
 fn handling_the_nondet_effect_makes_the_test_deterministic() {
     let body = handle(
         block(
-            vec![Stmt::Expr(perform("clock", "now", None, vec![]))],
+            vec![Stmt::Expr(perform("wall", "now", None, vec![]))],
             Some(int(0)),
         ),
-        vec![clause("clock", "now", None, &[], int(1234))],
+        vec![clause("wall", "now", None, &[], int(1234))],
     );
-    let out = check(vec![clock_effect(), test_def("frozen clock", false, body)]);
+    let out = check(vec![wall_effect(), test_def("frozen clock", false, body)]);
     assert_eq!(out.tests[0].footprint.to_string(), "{}");
     assert!(!out.tests[0].nondet);
 }
@@ -1098,17 +1104,17 @@ fn handling_the_nondet_effect_makes_the_test_deterministic() {
 #[test]
 fn test_nondet_opts_out_of_the_determinism_check() {
     let body = block(
-        vec![Stmt::Expr(perform("clock", "now", None, vec![]))],
+        vec![Stmt::Expr(perform("wall", "now", None, vec![]))],
         Some(int(0)),
     );
-    let out = check(vec![clock_effect(), test_def("wall clock", true, body)]);
-    assert_eq!(out.tests[0].footprint.to_string(), "{clock.read}");
+    let out = check(vec![wall_effect(), test_def("wall clock", true, body)]);
+    assert_eq!(out.tests[0].footprint.to_string(), "{wall.read}");
     assert!(out.tests[0].nondet);
 }
 
 #[test]
 fn e0412_points_through_a_call_when_the_perform_is_indirect() {
-    let helper = func("stamp", &[], perform("clock", "now", None, vec![])).item();
+    let helper = func("stamp", &[], perform("wall", "now", None, vec![])).item();
     let body = block(
         vec![],
         Some(ex_at(
@@ -1120,7 +1126,7 @@ fn e0412_points_through_a_call_when_the_perform_is_indirect() {
         )),
     );
     let diags = check_err(vec![
-        clock_effect(),
+        wall_effect(),
         helper,
         test_def("indirect", false, body),
     ]);
@@ -1145,8 +1151,8 @@ fn a_missing_resource_label_is_reported_at_the_perform() {
 
 #[test]
 fn a_resource_label_on_a_plain_operation_is_rejected() {
-    let def = func("f", &[], perform("clock", "now", Some("wall"), vec![])).item();
-    let diags = check_err(vec![clock_effect(), def]);
+    let def = func("f", &[], perform("wall", "now", Some("wall"), vec![])).item();
+    let diags = check_err(vec![wall_effect(), def]);
     assert!(
         has_code(&diags, codes::RESOURCE_REQUIRED),
         "{}",
@@ -1644,19 +1650,19 @@ fn an_unconstrained_row_variable_in_a_test_closes_to_empty() {
 #[test]
 fn a_handler_that_forwards_to_the_real_effect_stays_honest() {
     let body = handle(
-        block(vec![], Some(perform_at("clock", "now", None, vec![], 10))),
+        block(vec![], Some(perform_at("wall", "now", None, vec![], 10))),
         vec![clause(
-            "clock",
+            "wall",
             "now",
             None,
             &[],
-            perform_at("clock", "now", None, vec![], 30),
+            perform_at("wall", "now", None, vec![], 30),
         )],
     );
-    let out = check(vec![clock_effect(), func("f", &[], body.clone()).item()]);
-    assert_eq!(footprint(&out, "f"), "{clock.read}");
+    let out = check(vec![wall_effect(), func("f", &[], body.clone()).item()]);
+    assert_eq!(footprint(&out, "f"), "{wall.read}");
 
-    let diags = check_err(vec![clock_effect(), test_def("forwarding", false, body)]);
+    let diags = check_err(vec![wall_effect(), test_def("forwarding", false, body)]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
     let primary = d.labels.iter().find(|l| l.primary).unwrap();
     assert_eq!(
@@ -2429,4 +2435,440 @@ fn the_example_corpus_checks_as_one_program() {
             .all(|t| t.key.as_str().starts_with(t.module.as_str())),
         "a test key is `<module>.<label>`, which is what keeps two labels apart"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The prelude effects and `simulate`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_spawn_answers_a_task_and_join_unwraps_it() {
+    let body = block(
+        vec![let_(
+            "t",
+            perform("task", "spawn", None, vec![lambda(&[], int(1))]),
+        )],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    assert_eq!(sig(&out, "f"), "() -> Int / {sim.read}");
+}
+
+#[test]
+fn joining_something_that_is_not_a_task_is_a_type_error() {
+    let def = func("f", &[], perform("task", "join", None, vec![int(1)])).item();
+    let diags = check_err(vec![def]);
+    assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
+}
+
+#[test]
+fn every_prelude_operation_types_at_its_declared_signature() {
+    let out = check(vec![
+        func("y", &[], perform("task", "yield", None, vec![])).item(),
+        func("n", &[], perform("clock", "now", None, vec![])).item(),
+        func("s", &[], perform("clock", "sleep", None, vec![int(5)])).item(),
+        func("r", &[], perform("random", "next", None, vec![])).item(),
+        func("b", &[], perform("random", "below", None, vec![int(6)])).item(),
+        func("d", &[], perform("sim", "seed", None, vec![])).item(),
+    ]);
+    assert_eq!(sig(&out, "y"), "() -> Unit / {task.write}");
+    assert_eq!(sig(&out, "n"), "() -> Int / {clock.read}");
+    assert_eq!(sig(&out, "s"), "() -> Unit / {clock.write}");
+    assert_eq!(sig(&out, "r"), "() -> Int / {random.write}");
+    assert_eq!(sig(&out, "b"), "() -> Int / {random.write}");
+    assert_eq!(sig(&out, "d"), "() -> Int / {sim.read}");
+}
+
+/// Without `e` on `spawn`'s own row a test that spawns a writer of `orders`
+/// would report an empty footprint, and the cross-test conflict graph would run
+/// it beside a reader of `orders`.
+#[test]
+fn the_effects_of_a_spawned_body_land_in_the_spawners_row() {
+    let spawned = lambda(
+        &[],
+        perform("db", "put", Some("orders"), vec![int(1), int(2)]),
+    );
+    let body = block(
+        vec![let_("t", perform("task", "spawn", None, vec![spawned]))],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let out = check(vec![db_effect(), func("f", &[], body).item()]);
+    assert_eq!(footprint(&out, "f"), "{db.write[orders], task.write}");
+}
+
+#[test]
+fn two_spawns_of_different_resources_union_rather_than_unify() {
+    let north = lambda(
+        &[],
+        perform("db", "put", Some("north"), vec![int(1), int(2)]),
+    );
+    let south = lambda(
+        &[],
+        perform("db", "put", Some("south"), vec![int(1), int(2)]),
+    );
+    let body = block(
+        vec![
+            let_("a", perform("task", "spawn", None, vec![north])),
+            let_("b", perform("task", "spawn", None, vec![south])),
+        ],
+        Some(perform("task", "join", None, vec![var("a")])),
+    );
+    let out = check(vec![db_effect(), func("f", &[], body).item()]);
+    assert_eq!(
+        footprint(&out, "f"),
+        "{db.write[north], db.write[south], task.write}"
+    );
+}
+
+#[test]
+fn a_region_discharges_task_clock_and_random_and_publishes_the_seed() {
+    let body = block(
+        vec![
+            Stmt::Expr(perform("task", "yield", None, vec![])),
+            Stmt::Expr(perform("clock", "now", None, vec![])),
+            Stmt::Expr(perform("clock", "sleep", None, vec![int(1)])),
+            Stmt::Expr(perform("random", "next", None, vec![])),
+        ],
+        Some(int(0)),
+    );
+    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    assert_eq!(footprint(&out, "f"), "{sim.read}");
+}
+
+/// The language does not get to claim it simulated an effect it has never heard
+/// of, and that is the safety property that survives M7.
+#[test]
+fn a_region_discharges_nothing_a_user_declared() {
+    let body = block(
+        vec![Stmt::Expr(perform("task", "yield", None, vec![]))],
+        Some(perform("wall", "now", None, vec![])),
+    );
+    let out = check(vec![wall_effect(), func("f", &[], simulate(body)).item()]);
+    assert_eq!(footprint(&out, "f"), "{sim.read, wall.read}");
+}
+
+/// Cells are world state. A `with_cell` outside a region holding state the tasks
+/// inside share is exactly how two tasks share memory, so the region must leave
+/// those atoms to the region boundary that owns them.
+#[test]
+fn a_region_discharges_the_five_simulated_atoms_and_no_cell() {
+    let handled: Vec<String> = crate::prelude::simulated_atoms()
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(
+        handled,
+        ["clock.read", "clock.write", "random.write", "task.write",]
+    );
+
+    let body = with_cell(
+        "users",
+        int(0),
+        "c",
+        simulate(block(
+            vec![Stmt::Expr(perform("task", "yield", None, vec![]))],
+            Some(call("cell_get", vec![var("c")])),
+        )),
+    );
+    let out = check(vec![func("f", &[], body).item()]);
+    assert_eq!(footprint(&out, "f"), "{sim.read}");
+}
+
+#[test]
+fn a_det_test_that_spawns_with_no_scheduler_is_e0412() {
+    let body = block(
+        vec![let_(
+            "t",
+            perform_at("task", "spawn", None, vec![lambda(&[], int(1))], 31),
+        )],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let diags = check_err(vec![test_def("unscheduled", false, body)]);
+    let d = only(&diags, codes::NONDET_IN_DET_TEST);
+    let primary = d.labels.iter().find(|l| l.primary).unwrap();
+    assert_eq!(primary.span.start, 31);
+    assert!(
+        primary.message.contains("task.write"),
+        "{}",
+        primary.message
+    );
+    assert!(
+        d.notes.iter().any(|n| n.contains("simulate { <body> }")),
+        "the language ships the handler, so that is what to point at: {:?}",
+        d.notes
+    );
+}
+
+#[test]
+fn clock_now_outside_any_region_in_a_det_test_is_still_e0412() {
+    let body = block(vec![], Some(perform_at("clock", "now", None, vec![], 44)));
+    let diags = check_err(vec![test_def("reads the wall", false, body)]);
+    let d = only(&diags, codes::NONDET_IN_DET_TEST);
+    let primary = d.labels.iter().find(|l| l.primary).unwrap();
+    assert_eq!(primary.span.start, 44);
+    assert!(
+        primary.message.contains("clock.read"),
+        "{}",
+        primary.message
+    );
+}
+
+/// The other direction of the same rule: `simulate` is a handler, handlers
+/// discharge, and `sim` is not `nondet` — so a time-dependent, concurrent test
+/// is an ordinary `det`, cacheable one.
+#[test]
+fn a_simulated_test_is_deterministic_and_carries_only_the_seed() {
+    let spawned = lambda(&[], perform("clock", "now", None, vec![]));
+    let body = block(
+        vec![
+            let_("t", perform("task", "spawn", None, vec![spawned])),
+            Stmt::Expr(perform("random", "next", None, vec![])),
+        ],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let out = check(vec![test_def("simulated", false, simulate(body))]);
+    assert_eq!(out.tests[0].footprint.to_string(), "{sim.read}");
+    assert!(!out.tests[0].nondet);
+}
+
+#[test]
+fn a_users_own_nondet_effect_inside_a_region_is_still_e0412() {
+    let body = block(
+        vec![Stmt::Expr(perform("task", "yield", None, vec![]))],
+        Some(perform_at("wall", "now", None, vec![], 66)),
+    );
+    let diags = check_err(vec![
+        wall_effect(),
+        test_def("half simulated", false, simulate(body)),
+    ]);
+    let d = only(&diags, codes::NONDET_IN_DET_TEST);
+    let primary = d.labels.iter().find(|l| l.primary).unwrap();
+    assert_eq!(primary.span.start, 66);
+    assert!(primary.message.contains("wall.read"), "{}", primary.message);
+}
+
+/// A `Task` is a key into the region's scheduler, and the scheduler dies with
+/// the region. This is the same result-type check `with_cell` uses.
+#[test]
+fn a_task_in_a_regions_result_type_is_e0413() {
+    let body = block(
+        vec![],
+        Some(perform("task", "spawn", None, vec![lambda(&[], int(1))])),
+    );
+    let diags = check_err(vec![func("f", &[], simulate_at(body, 12)).item()]);
+    let d = only(&diags, codes::TASK_ESCAPES_SCOPE);
+    assert!(
+        d.labels
+            .iter()
+            .any(|l| l.primary && l.message.contains("Task")),
+        "{:?}",
+        d.labels
+    );
+}
+
+#[test]
+fn a_task_nested_inside_the_result_value_is_also_e0413() {
+    let spawn = perform("task", "spawn", None, vec![lambda(&[], int(1))]);
+    let body = block(vec![], Some(ex(ExprKind::List { items: vec![spawn] })));
+    let diags = check_err(vec![func("f", &[], simulate(body)).item()]);
+    assert!(
+        has_code(&diags, codes::TASK_ESCAPES_SCOPE),
+        "{}",
+        render(&diags)
+    );
+}
+
+#[test]
+fn a_region_inside_a_region_is_e0416_lexically() {
+    let inner = simulate_at(block(vec![], Some(int(1))), 40);
+    let diags = check_err(vec![func("f", &[], simulate_at(inner, 10)).item()]);
+    let d = only(&diags, codes::NESTED_SIMULATION);
+    assert_eq!(d.primary_span().unwrap().start, 10);
+    assert!(
+        d.labels.iter().any(|l| !l.primary && l.span.start == 40),
+        "the nested region is named too: {:?}",
+        d.labels
+    );
+}
+
+#[test]
+fn a_region_that_reaches_one_through_a_call_is_e0416_as_well() {
+    let inner = func("inner", &[], simulate(block(vec![], Some(int(1))))).item();
+    let reached = ex_at(
+        ExprKind::App {
+            func: Box::new(var("inner")),
+            args: vec![],
+        },
+        71,
+    );
+    let outer = func("outer", &[], simulate_at(reached, 70)).item();
+    let diags = check_err(vec![inner, outer]);
+    let d = only(&diags, codes::NESTED_SIMULATION);
+    assert_eq!(d.primary_span().unwrap().start, 70);
+    assert!(
+        d.notes.iter().any(|n| n.contains("calls")),
+        "the transitive case says so: {:?}",
+        d.notes
+    );
+}
+
+/// A handler answering `sim.seed()` with a constant pins one known-interesting
+/// seed as an ordinary regression test, whose outcome is a function of the
+/// definition set alone.
+#[test]
+fn a_handler_answering_sim_seed_closes_the_seed_out_of_the_row() {
+    let region = simulate(block(
+        vec![Stmt::Expr(perform("task", "yield", None, vec![]))],
+        Some(int(0)),
+    ));
+    let body = handle(region, vec![clause("sim", "seed", None, &[], int(7))]);
+    let out = check(vec![test_def("pinned seed", false, body)]);
+    assert_eq!(out.tests[0].footprint.to_string(), "{}");
+}
+
+/// Every `task` operation performs the one atom `task.write`, so a handler that
+/// covers any of them discharges the effect for the whole body. That is what
+/// lets a sequential scheduler written in Ply stand where the seeded one does.
+#[test]
+fn a_user_written_task_handler_discharges_the_effect() {
+    let spawned = block(
+        vec![let_(
+            "t",
+            perform("task", "spawn", None, vec![lambda(&[], int(1))]),
+        )],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let body = handle(
+        spawned,
+        vec![clause(
+            "task",
+            "yield",
+            None,
+            &[],
+            ex(ExprKind::Lit(Lit::Unit)),
+        )],
+    );
+    let out = check(vec![test_def("sequential scheduler", false, body)]);
+    assert_eq!(out.tests[0].footprint.to_string(), "{}");
+    assert!(!out.tests[0].nondet);
+}
+
+#[test]
+fn an_effect_claiming_a_prelude_name_is_a_duplicate_definition() {
+    for name in ["task", "clock", "random", "sim"] {
+        let diags = check_err(vec![effect_def(
+            name,
+            true,
+            vec![op("go", Mode::Read, false, vec![], con("Int", vec![]))],
+        )]);
+        let d = only(&diags, codes::DUPLICATE_DEFINITION);
+        assert!(
+            d.message.contains(name) && d.message.contains("prelude"),
+            "{}",
+            d.message
+        );
+    }
+}
+
+/// The prelude is consulted last, so a module's own declaration wins — which is
+/// what leaves `examples/clock.ply` uninvolved.
+#[test]
+fn a_modules_own_clock_shadows_the_prelude() {
+    let out = check_files(&[(
+        "clock",
+        "nondet effect clock { read now() -> Int }\n\
+         fn f() -> Int = clock.now()\n",
+    )]);
+    assert_eq!(footprint(&out, "clock.f"), "{clock.clock.read}");
+}
+
+#[test]
+fn the_task_type_is_a_builtin_and_cannot_be_redefined() {
+    let diags = check_err(vec![Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
+        name: id("Task"),
+        params: vec![],
+        body: TypeDefBody::Alias(con("Int", vec![])),
+        span: any(),
+    }))]);
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert!(d.message.contains("builtin type"), "{}", d.message);
+}
+
+#[test]
+fn a_written_task_type_annotation_agrees_with_what_spawn_answers() {
+    let body = block(
+        vec![Stmt::Let {
+            pat: Pattern {
+                kind: PatternKind::Var(id("t")),
+                span: any(),
+            },
+            ty: Some(con("Task", vec![con("Int", vec![])])),
+            value: Box::new(perform("task", "spawn", None, vec![lambda(&[], int(1))])),
+            span: any(),
+        }],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    assert_eq!(sig(&out, "f"), "() -> Int / {sim.read}");
+}
+
+#[test]
+fn a_task_of_the_wrong_element_type_is_rejected() {
+    let body = block(
+        vec![Stmt::Let {
+            pat: Pattern {
+                kind: PatternKind::Var(id("t")),
+                span: any(),
+            },
+            ty: Some(con("Task", vec![con("Bool", vec![])])),
+            value: Box::new(perform("task", "spawn", None, vec![lambda(&[], int(1))])),
+            span: any(),
+        }],
+        Some(perform("task", "join", None, vec![var("t")])),
+    );
+    let diags = check_err(vec![func("f", &[], simulate(body)).item()]);
+    assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
+}
+
+/// The atom propagates through calls by the ordinary row rules, so a test whose
+/// closure reaches a region carries the seed with no new analysis.
+#[test]
+fn the_seed_atom_propagates_through_an_ordinary_call() {
+    let helper = func("run", &[], simulate(block(vec![], Some(int(1))))).item();
+    let out = check(vec![
+        helper,
+        func("caller", &[], call("run", vec![])).item(),
+        test_def("through a call", false, call("run", vec![])),
+    ]);
+    assert_eq!(footprint(&out, "caller"), "{sim.read}");
+    assert_eq!(out.tests[0].footprint.to_string(), "{sim.read}");
+    assert!(!out.tests[0].nondet);
+}
+
+/// The three simulation fixtures that fail in the front end. `tests/fixtures/`
+/// owes one program per code, and a fixture that stopped producing its code
+/// would otherwise sit there looking like documentation.
+#[test]
+fn the_simulation_fixtures_produce_the_codes_they_are_named_for() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    for (file, code, expected) in [
+        ("unscheduled_task.ply", codes::NONDET_IN_DET_TEST, 1),
+        ("task_escapes_scope.ply", codes::TASK_ESCAPES_SCOPE, 1),
+        // Lexically, and through a call: one row-membership question answers
+        // both, so the fixture writes both and both must fire.
+        ("nested_simulation.ply", codes::NESTED_SIMULATION, 2),
+    ] {
+        let text = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("`{file}` is part of the repository: {e}"));
+        let name = file.trim_end_matches(".ply");
+        let diags = check_files_err(&[(name, &text)]);
+        let found = diags.iter().filter(|d| d.code == code).count();
+        assert_eq!(
+            found,
+            expected,
+            "`{file}` should produce {expected} × {code}, got:\n{}",
+            render(&diags)
+        );
+    }
 }

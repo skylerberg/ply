@@ -1,0 +1,167 @@
+// Deadlines and backoff against a virtual clock.
+//
+// M7 has no timeout primitive. A timeout is a task that sleeps for the budget
+// racing a task that does the work, and the whole of its behaviour follows from
+// one rule: **virtual time advances only when no task is enabled.** So a
+// deadline cannot arrive while the work could still be running, and a simulated
+// timeout never fires early — the exact opposite of a wall-clock timeout, whose
+// entire failure mode is firing because the machine was busy.
+//
+// The same rule is why `backoff` below asserts a second and a half of retry
+// delay and costs no measurable wall clock: a sleep is a jump, not a wait. Retry
+// logic becomes testable at the timings it actually ships with.
+//
+// What virtual time cannot tell you is how long anything took to compute. A run
+// in which every task is busy takes zero nanoseconds, on purpose. These are
+// tests about order and time of arrival; a performance claim belongs in
+// `benches/`.
+
+effect job {
+  read  state[r]() -> Outcome
+  write finish[r](result: Outcome) -> Unit
+}
+
+type Outcome =
+  | Pending
+  | Done(Int)
+  | TimedOut
+
+// First writer wins, which is what makes "the work finished" and "the deadline
+// passed" a race rather than a last-one-clobbers.
+fn claim(result: Outcome) -> Unit / {job.read[status], job.write[status]} =
+  match job.state[status]() {
+    Pending -> job.finish[status](result),
+    _ -> (),
+  }
+
+fn work(latency: Int, result: Int) -> Unit
+  / {job.read[status], job.write[status], clock.write} {
+  clock.sleep(latency);
+  claim(Done(result))
+}
+
+fn deadline(budget: Int) -> Unit / {job.read[status], job.write[status], clock.write} {
+  clock.sleep(budget);
+  claim(TimedOut)
+}
+
+// Work that never sleeps. It yields, so the scheduler may run anything else that
+// is runnable — but yielding is not idling, so the clock stays where it is.
+fn grind(rounds: Int) -> Int / {task.write} =
+  if rounds <= 0 {
+    0
+  } else {
+    task.yield();
+    1 + grind(rounds - 1)
+  }
+
+fn busy(rounds: Int) -> Unit / {job.read[status], job.write[status], task.write} {
+  let done = grind(rounds);
+  claim(Done(done))
+}
+
+fn backoff(attempts: Int, wait: Int) -> Int / {clock.write} =
+  if attempts <= 0 {
+    0
+  } else {
+    clock.sleep(wait);
+    wait + backoff(attempts - 1, wait * 2)
+  }
+
+test "work that fits inside the budget finishes, and the deadline finds it done" {
+  with_cell[status](Pending) { s -> {
+    handle {
+      simulate {
+        let w = task.spawn(|| work(40_000_000, 7));
+        let d = task.spawn(|| deadline(100_000_000));
+        task.join(w);
+        task.join(d);
+        assert_eq(cell_get(s), Done(7));
+        assert_eq(clock.now(), 100_000_000)
+      }
+    } with {
+      job.state[status]() -> cell_get(s),
+      job.finish[status](result) -> cell_set(s, result),
+    }
+  } }
+}
+
+test "work that overruns the budget loses to the deadline" {
+  with_cell[status](Pending) { s -> {
+    handle {
+      simulate {
+        let w = task.spawn(|| work(250_000_000, 7));
+        let d = task.spawn(|| deadline(100_000_000));
+        task.join(w);
+        task.join(d);
+        assert_eq(cell_get(s), TimedOut);
+        assert_eq(clock.now(), 250_000_000)
+      }
+    } with {
+      job.state[status]() -> cell_get(s),
+      job.finish[status](result) -> cell_set(s, result),
+    }
+  } }
+}
+
+// The property a wall-clock timeout cannot have. The worker never sleeps, so
+// virtual time cannot move, so the one-nanosecond deadline cannot arrive until
+// the worker has finished — under every interleaving, not under most of them.
+test "a deadline cannot fire while the worker can still run" {
+  with_cell[status](Pending) { s -> {
+    handle {
+      simulate {
+        let w = task.spawn(|| busy(4));
+        let d = task.spawn(|| deadline(1));
+        task.join(w);
+        task.join(d);
+        assert_eq(cell_get(s), Done(4));
+        assert_eq(clock.now(), 1)
+      }
+    } with {
+      job.state[status]() -> cell_get(s),
+      job.finish[status](result) -> cell_set(s, result),
+    }
+  } }
+}
+
+test "four exponential backoffs are a second and a half, and cost no wall clock" {
+  simulate {
+    let t = task.spawn(|| backoff(4, 100_000_000));
+    assert_eq(task.join(t), 1_500_000_000);
+    assert_eq(clock.now(), 1_500_000_000)
+  }
+}
+
+test "thirty seconds of virtual time is a jump, not a wait" {
+  simulate {
+    let t = task.spawn(|| {
+      clock.sleep(30_000_000_000);
+      clock.now()
+    });
+    assert_eq(task.join(t), 30_000_000_000);
+    assert_eq(clock.now(), 30_000_000_000)
+  }
+}
+
+test "virtual time stands still while anything at all can run" {
+  simulate {
+    let a = task.spawn(|| grind(3));
+    let b = task.spawn(|| grind(3));
+    assert_eq(task.join(a) + task.join(b), 6);
+    assert_eq(clock.now(), 0)
+  }
+}
+
+test "an outcome is claimed once and the loser leaves it alone" {
+  with_cell[status](Pending) { s -> {
+    handle {
+      claim(Done(1));
+      claim(TimedOut);
+      assert_eq(cell_get(s), Done(1))
+    } with {
+      job.state[status]() -> cell_get(s),
+      job.finish[status](result) -> cell_set(s, result),
+    }
+  } }
+}

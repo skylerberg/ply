@@ -61,6 +61,32 @@ makes on their own:
 at. `crates/ply-corpus/tests/frame_cost.rs` counts the allocations a frame push
 and pop cost, which is the machine-independent half of the same question.
 
+## What `sim` adds
+
+`measure` prices the machine ADR 0005 built; `sim` prices the search ADR 0006
+built on top of it. It drives the real scheduler through the real machine, and
+the one thing it does that `ply test --measure-reduction` cannot is choose the
+root set per trial — which is what makes a median over many trials possible.
+
+```
+cargo run --release -p ply-corpus -- sim <corpus> [--trials N] [--budget N] [--json]
+```
+
+| section | question |
+| --- | --- |
+| exploration | interleavings pruned, the same search with the recording's clocks withheld, and an unpruned enumeration — three columns, one driver |
+| race finding | interleavings to the first failure, `dpor` against sampling, median and worst over `--trials` roots, with misses counted rather than dropped |
+| throughput | seeds per second, where one seed is one whole test replayed from a fresh world |
+
+The middle column of the exploration table is the honest way to price the
+happens-before filter without checking out the tree that predates it: an empty
+stamp is documented to mean "no synchronization known", so a driver that clears
+the stamps reproduces the older search exactly.
+
+A corpus generated with `--concurrent-tests` at a chosen `--conflict-density` is
+what the reduction is measured against; `--tasks-per-test` and `--steps-per-task`
+are the two exponents the schedule count grows in.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

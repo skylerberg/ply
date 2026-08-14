@@ -13,6 +13,7 @@
 //! and its doc comment says what the right answer is.
 
 use ply_core::CheckOutput;
+use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
@@ -106,7 +107,7 @@ fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::new(CORPUS);
-    let selection = select(&compiled.check, &compiled.hashes, &store);
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     run_with(
         &selection,
         &compiled.check,

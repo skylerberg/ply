@@ -1,5 +1,6 @@
 pub mod env;
 pub mod infer;
+pub mod prelude;
 pub mod print;
 mod scc;
 pub mod ty;
@@ -24,6 +25,12 @@ pub struct OpInfo {
     pub params: Vec<Type>,
     pub ret: Type,
     pub span: Span,
+    /// `Some` only for a prelude operation, whose signature is constructed
+    /// rather than parsed and may be polymorphic in a type and in an effect row
+    /// — `task.spawn` needs both. `None` for every user-declared operation,
+    /// which stays monomorphic and types exactly as it did. Surface syntax for
+    /// declaring one is deliberately not in M7.
+    pub scheme: Option<Scheme>,
 }
 
 /// `name` is the program-wide name, `store.db`, and so is the `effect` field of

@@ -58,7 +58,10 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
     let mut hashes = loaded.hashes.clone();
-    let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
+    // Half of what a simulated test is cached under, so it is decided before
+    // selection and never after it.
+    let search = crate::simulation::plan(&args.simulation);
+    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
     let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
 
     // Evaluation needs an AST, and gate 1 may have skipped the file a selected
@@ -100,7 +103,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
                 }
                 loaded = full;
                 hashes = loaded.hashes.clone();
-                let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
+                let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
                 plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
             }
             Err(err) => return report_load_error("test", &err, args.json, style),
@@ -108,6 +111,8 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     }
 
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
+    let simulation =
+        ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
     let mut run = || {
         ply_test::run(
             &plan.selection,
@@ -117,6 +122,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             &hashes,
             &mut cache.store,
             engine,
+            simulation.clone(),
         )
     };
     let mut report = match &pool {
@@ -251,6 +257,11 @@ impl Plan {
                 reasons: selection.reasons,
                 isolation: selection.isolation,
                 parallelism,
+                // A filter hides tests; it does not change what the visible ones
+                // search, and a search that changed with `--filter` would key
+                // the cache on which tests happened to be asked for.
+                plan: selection.plan,
+                narrowed: selection.narrowed,
             },
             visible,
         }
@@ -441,6 +452,9 @@ fn print_human(
             parallelism.total,
         );
     }
+    if let Some(line) = report.simulation.line() {
+        println!("{IND}{}", style.bold(&line));
+    }
     if cache_bypassed(args) {
         let why = if args.no_cache {
             "--no-cache".to_string()
@@ -478,6 +492,9 @@ fn print_human(
         let name_width = name_column(&names);
         for (result, name) in report.results.iter().zip(&names) {
             println!("{IND}{}", result_line(result, name, name_width, style));
+            if let Some(line) = simulation_line(result) {
+                println!("{IND}    {}", style.dim(&line));
+            }
         }
     }
 
@@ -538,9 +555,19 @@ fn failure_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String
     {
         lines.push(format!("    at {}", style.dim(&at)));
     }
+    // A deadlock says which task waits on which in its secondary labels and
+    // nowhere else, so dropping them here leaves the terminal reader with a
+    // count where the JSON has the cycle.
+    for label in failure.diagnostic.labels.iter().filter(|l| !l.primary) {
+        let at = location(&loaded.sources, label.span)
+            .map(|at| format!("   {}", style.dim(&at)))
+            .unwrap_or_default();
+        lines.push(format!("    {}{at}", label.message));
+    }
     for note in &failure.diagnostic.notes {
         lines.push(format!("  {} {note}", style.dim("=")));
     }
+    lines.extend(seed_lines(failure, loaded, style));
 
     if let Some(slice) = &failure.attribution.slice
         && slice.traced
@@ -577,6 +604,40 @@ fn failure_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String
             "  {}",
             style.dim("suspects: none — nothing in this test's closure changed")
         ));
+    }
+    lines
+}
+
+/// The repro, which under M7 is a seed rather than a stack trace.
+///
+/// The replay command is printed rather than described, because the claim being
+/// made is that reproducing a concurrency failure is one command with one
+/// argument, and a reader who has to assemble it does not get to check that.
+fn seed_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String> {
+    let Some(seed) = &failure.seed else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("  {} {seed}", style.dim("seed:"))];
+    if let Some(race) = &failure.race {
+        for (i, site) in [&race.left, &race.right].into_iter().enumerate() {
+            let label = if i == 0 { "race:" } else { "     " };
+            let definition = site
+                .definition
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |d| d.to_string());
+            let at = location(&loaded.sources, site.span)
+                .map(|at| format!("   {}", style.dim(&at)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {} {}  {definition}   {}{at}",
+                style.yellow(label),
+                site.task,
+                site.access
+            ));
+        }
+    }
+    if let Some(command) = failure.replay() {
+        lines.push(format!("  {} {command}", style.dim("replay:")));
     }
     lines
 }
@@ -668,6 +729,39 @@ fn result_line(result: &TestResult, name: &str, name_width: usize, style: Style)
     )
 }
 
+/// What one test's search did, under its result line. Silent for a test that
+/// reached no `simulate` region, so a corpus with none reads exactly as it does
+/// today.
+///
+/// `exhaustive` leads because it is the headline: it means every interleaving
+/// ran, which is a proof rather than a sample. `naive` and the reduction appear
+/// only under `--measure-reduction`, because a number that was not measured is a
+/// slogan.
+fn simulation_line(result: &TestResult) -> Option<String> {
+    let exploration = result.simulation.as_ref()?;
+    let mut parts = vec![format!(
+        "{} {}",
+        exploration.explored,
+        plural(exploration.explored as usize, "interleaving")
+    )];
+    if exploration.exhaustive {
+        parts.push("exhaustive".to_string());
+    }
+    if exploration.exhausted {
+        parts.push("budget spent — not cached".to_string());
+    }
+    if let Some(naive) = exploration.naive {
+        parts.push(format!("naive {naive}"));
+        if let Some(reduction) = exploration.reduction() {
+            // A ratio over a naive count that spent its budget is a lower bound
+            // too, and printing it bare claims a number nobody observed.
+            let bound = if naive.bounded { ">= " } else { "" };
+            parts.push(format!("{bound}{reduction:.0}× reduction"));
+        }
+    }
+    Some(parts.join(" · "))
+}
+
 fn print_summary(report: &RunReport, style: Style) {
     let failed = format!("{} failed", report.failed);
     let failed = if report.failed > 0 {
@@ -731,12 +825,21 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
         } else {
             format!(" {shared}")
         };
+        // A test whose row carries `sim.read` reaches a `simulate` region, and
+        // the tree-walker cannot run one. Under `--engine both` it is therefore
+        // run once, on the machine, and the audit covers strictly less of the
+        // corpus than it did — which is worth saying rather than inferring.
+        let engine = if ply_test::is_seeded(&test.footprint) {
+            " · machine-only"
+        } else {
+            ""
+        };
         println!(
             "{IND}{verb} {} {:<16} {:<40} {}",
             style.dim(&hash),
             reason.as_str(),
             display_name(check, index, &test.name),
-            style.dim(&format!("isolation: {}{atoms}", isolation.as_str()))
+            style.dim(&format!("isolation: {}{atoms}{engine}", isolation.as_str()))
         );
     }
 
@@ -755,6 +858,8 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             println!("{IND}  {:<16} {}", reason.as_str(), style.dim(why(reason)));
         }
     }
+
+    print_explain_search(plan, check, style);
 
     if plan.selection.groups.is_empty() {
         return;
@@ -786,6 +891,68 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             if let Some(test) = check.tests.get(index) {
                 println!("{IND}    {}", display_name(check, index, &test.name));
             }
+        }
+    }
+}
+
+/// What the seeded tests will search, and what each of them still owes.
+///
+/// Silent when nothing in the corpus reads a seed, so a project with no
+/// `simulate` region sees exactly what it saw before.
+fn print_explain_search(plan: &Plan, check: &CheckOutput, style: Style) {
+    let seeded: Vec<usize> = plan
+        .visible
+        .iter()
+        .copied()
+        .filter(|&i| {
+            check
+                .tests
+                .get(i)
+                .is_some_and(|t| ply_test::is_seeded(&t.footprint))
+        })
+        .collect();
+    if seeded.is_empty() {
+        return;
+    }
+    let search = &plan.selection.plan;
+    println!();
+    println!("{IND}{}", style.dim("search"));
+    println!(
+        "{IND}  {}",
+        style.dim(&format!(
+            "{} · {} {} · budget {} · steps {}",
+            search.mode.as_str(),
+            search.roots.len(),
+            plural(search.roots.len(), "seed"),
+            search.budget,
+            search.steps,
+        ))
+    );
+    println!(
+        "{IND}  {}",
+        style.dim(&format!(
+            "{} of {} {} keyed on this plan and never on their bare hash",
+            seeded.len(),
+            plan.visible.len(),
+            plural(plan.visible.len(), "test"),
+        ))
+    );
+    for &index in &seeded {
+        let owed = plan.selection.plan_for(index);
+        if owed.roots.len() == search.roots.len() {
+            continue;
+        }
+        if let Some(test) = check.tests.get(index) {
+            println!(
+                "{IND}  {}",
+                style.dim(&format!(
+                    "{}: {} of {} {} still owed; the rest already passed on their own",
+                    display_name(check, index, &test.name),
+                    owed.roots.len(),
+                    search.roots.len(),
+                    plural(search.roots.len(), "seed"),
+                ))
+            );
         }
     }
 }
@@ -874,6 +1041,11 @@ fn report_json(
                 "status": r.status,
                 "duration_ms": millis(r.duration),
                 "diagnostic": r.failure.as_ref().map(|d| diagnostic_json(d, sources)),
+                // Absent, never zeroed, on a test that reached no region: a
+                // consumer cannot tell an explored count of zero from a test
+                // that never simulated anything.
+                "simulation": r.simulation.as_ref().map(ply_test::report::exploration_json),
+                "cached": r.recorded.as_ref().map(|record| record.is_written()),
             })
         })
         .collect();
@@ -911,6 +1083,25 @@ fn report_json(
             "bisect_budget": args.bisect_budget,
             "trace": args.trace.as_str(),
             "engine": args.engine.as_str(),
+            // The whole plan, because every field of it is in a seeded test's
+            // cache key and a consumer comparing two runs needs to see which
+            // one searched more.
+            "sim": {
+                "mode": selection.plan.mode.as_str(),
+                "seed": args.simulation.seed.as_ref().map(|s| s.to_string()),
+                "seeds": selection.plan.roots.len(),
+                "budget": selection.plan.budget,
+                "steps": selection.plan.steps,
+                "measure_reduction": args.simulation.measure_reduction,
+            },
+        },
+        "simulation": {
+            "simulated": report.simulation.simulated,
+            "seeds": report.simulation.seeds,
+            "interleavings": report.simulation.interleavings,
+            "exhaustive": report.simulation.exhaustive,
+            "exhausted": report.simulation.exhausted,
+            "failed": report.simulation.failed,
         },
         "selection": {
             "total": selection.total,
@@ -1043,6 +1234,7 @@ fn display_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ply_eval::Plan as SimPlan;
     use ply_span::Symbol;
     use ply_store::Outcome;
     use std::time::Duration;
@@ -1109,13 +1301,14 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             &loaded.hashes().unwrap(),
             store,
             ply_eval::EngineChoice::Both,
+            ply_test::Search::of(selection),
         )
     }
 
     fn plan_for(filter: Option<&str>) -> (tempfile::TempDir, Loaded, HashOutput, Plan) {
         let (dir, loaded, hashes) = fixture();
         let store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let plan = Plan::new(selected, &loaded.check, filter);
         (dir, loaded, hashes, plan)
     }
@@ -1133,6 +1326,14 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect_budget: 64,
             trace: When::Auto,
             engine: crate::cli::EngineArg::default(),
+            simulation: crate::cli::SimOptions {
+                seed: None,
+                sim: crate::cli::SimArg::default(),
+                seeds: None,
+                sim_budget: None,
+                sim_steps: None,
+                measure_reduction: false,
+            },
         }
     }
 
@@ -1222,7 +1423,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
         let select = |needle| {
             Plan::new(
-                ply_test::select(&loaded.check, &hashes, &store),
+                ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
                 &loaded.check,
                 Some(needle),
             )
@@ -1235,13 +1436,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn a_warm_cache_selects_nothing_and_a_second_run_stays_empty() {
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.passed, 4);
         assert_eq!(report.failed, 0);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store);
+        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert!(again.to_run.is_empty());
         assert_eq!(again.cached.len(), 4);
         assert_eq!(Plan::new(again, &loaded.check, None).selection.total, 4);
@@ -1264,7 +1465,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(loaded.module_count(), 2);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(selected.total, 2);
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.passed, 2, "failures: {:?}", report.failures);
@@ -1281,7 +1482,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             ),
         ]);
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let report = run(&loaded, &selected, &mut store);
 
         assert_eq!(report.failed, 1);
@@ -1304,7 +1505,8 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
                 .scratch
                 .clone()
                 .expect("bypass must use a scratch store");
-            let selected = ply_test::select(&loaded.check, &hashes, &cache.store);
+            let selected =
+                ply_test::select(&loaded.check, &hashes, &cache.store, &SimPlan::default());
             assert_eq!(selected.to_run.len(), 4);
             run(&loaded, &selected, &mut cache.store);
             assert!(!cache.store.is_empty());
@@ -1349,14 +1551,14 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.failed, 1);
         assert_eq!(exit_code(report.is_success()), crate::EXIT_FAILED);
         assert_eq!(report.failures[0].diagnostic.code, codes::ASSERTION_FAILED);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store);
+        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(again.to_run.len(), 1, "a red test must re-run");
     }
 
@@ -1370,7 +1572,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store),
+            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
         );
@@ -1401,7 +1603,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             3
         );
         // `f` is in the failing test's closure and has never gone green.
-        // Schema v2: an object per suspect, ranked, not a bare name.
+        // Since v2: an object per suspect, ranked, not a bare name.
         assert_eq!(v["failures"][0]["suspects"][0]["name"], "m.f");
         assert_eq!(v["failures"][0]["suspects"][0]["culprit"], false);
         let at = &v["failures"][0]["location"];
@@ -1412,7 +1614,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     }
 
     #[test]
-    fn the_failure_artifact_carries_the_v2_shape_an_agent_branches_on() {
+    fn the_failure_artifact_carries_the_v3_shape_an_agent_branches_on() {
         let (dir, loaded, hashes) = project(&[(
             "ledger.ply",
             "fn balance() -> Int = 0 - 5\n\
@@ -1420,14 +1622,14 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store),
+            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
         );
         let report = run(&loaded, &plan.selection, &mut store);
 
         let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 1, &[]);
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
 
         let f = &v["failures"][0];
         assert_eq!(f["key"], "ledger.balance never goes negative");
@@ -1457,6 +1659,12 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             f["assertion"].is_null(),
             "the evaluator carries no payload yet"
         );
+        // v3. Null rather than absent on a failure no simulation produced: a
+        // consumer branches on the difference, and a default seed would replay
+        // a different run.
+        assert!(f["seed"].is_null());
+        assert!(f["replay"].is_null());
+        assert!(f["race"].is_null());
         assert!(f["causal_slice"].is_null(), "nothing traced this run");
         assert_eq!(f["footprint"]["declared"], json!([]));
         assert!(
@@ -1477,7 +1685,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let render = || {
             let mut store = Store::open(dir.path()).unwrap();
             let plan = Plan::new(
-                ply_test::select(&loaded.check, &hashes, &store),
+                ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
                 &loaded.check,
                 None,
             );
@@ -1493,7 +1701,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn failing(source: &str) -> (tempfile::TempDir, Loaded, HashOutput, RunReport) {
         let (dir, loaded, hashes) = project(&[("m.ply", source)]);
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let report = run(&loaded, &selected, &mut store);
         (dir, loaded, hashes, report)
     }
@@ -1523,7 +1731,12 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(bisection.search.evaluated, 0);
 
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &Store::open(_dir.path()).unwrap()),
+            ply_test::select(
+                &loaded.check,
+                &hashes,
+                &Store::open(_dir.path()).unwrap(),
+                &SimPlan::default(),
+            ),
             &loaded.check,
             None,
         );
@@ -1581,6 +1794,54 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(v["suspects"][0]["culprit"], true);
     }
 
+    /// E0414's whole value is the cycle, and the cycle lives in the secondary
+    /// labels. A terminal reader who gets only the count has to open the JSON to
+    /// learn which task waits on which, which is the artifact being reported
+    /// twice rather than once.
+    #[test]
+    fn a_deadlock_names_every_blocked_task_and_what_it_waits_on() {
+        const DEADLOCK: &str = "\
+type Slot =
+  | Empty
+  | Peer(Task<Int>)
+
+test \"stuck\" {
+  simulate {
+    with_cell[slot](Empty) { peer -> {
+      let first = task.spawn(|| {
+        clock.sleep(1);
+        match cell_get(peer) {
+          Peer(other) -> task.join(other),
+          Empty -> 0,
+        }
+      });
+      let second = task.spawn(|| task.join(first));
+      cell_set(peer, Peer(second));
+      task.join(first)
+    } }
+  }
+}
+";
+        let (_dir, loaded, _hashes, report) = failing(DEADLOCK);
+        assert_eq!(report.failures[0].diagnostic.code, codes::DEADLOCK);
+
+        let lines = failure_lines(&report.failures[0], &loaded, Style::plain());
+        for waiting in [
+            "@0 waits here for @1 to finish",
+            "@1 waits here for @2 to finish",
+            "@2 waits here for @1 to finish",
+        ] {
+            let line = lines
+                .iter()
+                .find(|l| l.contains(waiting))
+                .unwrap_or_else(|| panic!("`{waiting}` is missing from {lines:?}"));
+            assert!(
+                line.contains("m.ply:"),
+                "a wait without a location is not actionable: {line}"
+            );
+        }
+    }
+
     #[test]
     fn a_suspect_reads_as_a_reason_to_skip_it_rather_than_a_bare_name() {
         let plain = Suspect::new(Symbol::new("m.f"), None);
@@ -1614,7 +1875,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         ]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store),
+            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
         );
@@ -1653,17 +1914,17 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn a_nondet_test_always_runs_and_is_never_recorded() {
         let (dir, loaded, hashes) = project(&[(
             "m.ply",
-            "nondet effect clock {\n  read now() -> Int\n}\n\
-             test/nondet \"reads the clock\" { assert(clock.now() > 0) }\n",
+            "nondet effect wall {\n  read now() -> Int\n}\n\
+             test/nondet \"reads the clock\" { assert(wall.now() > 0) }\n",
         )]);
         let mut store = Store::open(dir.path()).unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(selected.reason(0), Some(Reason::Nondet));
         run(&loaded, &selected, &mut store);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store);
+        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(again.to_run, vec![0]);
     }
 
@@ -1691,6 +1952,8 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             duration: Duration::from_micros(2100),
             status: Status::Failed,
             failure: None,
+            simulation: None,
+            recorded: None,
         };
         let plain = result_line(&result, &result.name, 44, Style::plain());
         assert!(plain.starts_with("FAIL "));
@@ -1703,6 +1966,46 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert!(styled.contains('\x1b'));
     }
 
+    /// A naive search that spent its budget bounds the ratio as well as the
+    /// count, and the ratio is the number the milestone is claimed on.
+    #[test]
+    fn a_reduction_over_a_bounded_naive_count_is_reported_as_a_bound() {
+        let line = |naive: ply_eval::Naive| {
+            simulation_line(&TestResult {
+                index: 0,
+                name: "n".into(),
+                hash: None,
+                group: 0,
+                duration: Duration::from_millis(1),
+                status: Status::Passed,
+                failure: None,
+                simulation: Some(ply_eval::Exploration {
+                    explored: 1,
+                    exhaustive: true,
+                    naive: Some(naive),
+                    ..Default::default()
+                }),
+                recorded: None,
+            })
+            .expect("a simulated test has a line")
+        };
+
+        let exact = line(ply_eval::Naive {
+            explored: 720,
+            bounded: false,
+        });
+        assert!(exact.contains("naive 720"), "{exact}");
+        assert!(exact.contains("720× reduction"), "{exact}");
+        assert!(!exact.contains(">="), "{exact}");
+
+        let bounded = line(ply_eval::Naive {
+            explored: 4096,
+            bounded: true,
+        });
+        assert!(bounded.contains("naive >= 4096"), "{bounded}");
+        assert!(bounded.contains(">= 4096× reduction"), "{bounded}");
+    }
+
     #[test]
     fn the_pass_and_panic_marks_line_up_with_the_failure_mark() {
         let make = |status| TestResult {
@@ -1713,6 +2016,8 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             duration: Duration::from_millis(1),
             status,
             failure: None,
+            simulation: None,
+            recorded: None,
         };
         let column = |status| {
             result_line(&make(status), "n", 24, Style::plain())
@@ -1727,11 +2032,11 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn cached_results_do_not_appear_as_run_results() {
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
-        let first = ply_test::select(&loaded.check, &hashes, &store);
+        let first = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         run(&loaded, &first, &mut store);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let second = ply_test::select(&loaded.check, &hashes, &store);
+        let second = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let report = run(&loaded, &second, &mut store);
         assert!(report.results.is_empty());
         assert_eq!(report.cached, 4);
@@ -1751,7 +2056,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         );
         store.flush().unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(selected.reason(0), Some(Reason::PreviousFailure));
         assert!(selected.to_run.contains(&0));
     }
@@ -1768,12 +2073,12 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(hashes.tests[0], hashes.tests[1]);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store);
+        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(selected.to_run.len(), 2);
         run(&loaded, &selected, &mut store);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store);
+        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert!(again.to_run.is_empty());
         assert_eq!(again.cached.len(), 2);
     }

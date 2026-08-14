@@ -30,6 +30,20 @@ pub struct RenameSite {
     pub replacement: String,
 }
 
+/// What the concurrent half of a corpus looks like, so a measurement can plot
+/// exploration against contention without re-deriving it from the source.
+/// `contention` is measured from the corpus that was written rather than copied
+/// from the spec, because the two differ whenever the shard count rounds.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConcurrencyProfile {
+    pub tests: usize,
+    pub tasks_per_test: usize,
+    pub steps_per_task: usize,
+    pub shards_per_test: usize,
+    pub conflict_density: f64,
+    pub contention: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub spec: CorpusSpec,
@@ -39,6 +53,8 @@ pub struct Manifest {
     pub effectful_definitions: usize,
     pub tests: usize,
     pub nondet_tests: usize,
+    #[serde(default)]
+    pub concurrency: ConcurrencyProfile,
     pub bytes: usize,
     pub distinct_resources: usize,
     pub mean_out_degree: f64,
@@ -139,6 +155,7 @@ fn manifest_for(
         effectful_definitions: corpus.effectful_defs(),
         tests: corpus.tests.len(),
         nondet_tests: corpus.tests.iter().filter(|t| t.nondet).count(),
+        concurrency: profile(spec, corpus),
         bytes,
         distinct_resources: corpus.tables.len() + corpus.regions.len(),
         mean_out_degree: edges as f64 / corpus.defs.len().max(1) as f64,
@@ -150,6 +167,19 @@ fn manifest_for(
             replacement: format!("{}_renamed", corpus.defs[leaf].name),
         },
     })
+}
+
+fn profile(spec: &CorpusSpec, corpus: &Corpus) -> ConcurrencyProfile {
+    let tests = corpus.concurrent.len();
+    let mean = |v: f64| if tests == 0 { 0.0 } else { v / tests as f64 };
+    ConcurrencyProfile {
+        tests,
+        tasks_per_test: spec.tasks_per_test,
+        steps_per_task: spec.steps_per_task,
+        shards_per_test: spec.shards_per_test(),
+        conflict_density: spec.conflict_density,
+        contention: mean(corpus.concurrent.iter().map(|t| t.contention()).sum()),
+    }
 }
 
 fn reverse_edges(corpus: &Corpus) -> Vec<Vec<DefId>> {

@@ -917,7 +917,10 @@ impl<'s> Driver<'s> {
         let out = CheckOutput {
             defs: IndexMap::new(),
             tests: Vec::new(),
-            effects: IndexMap::new(),
+            // The maps below are rebuilt file by file, and no file declares the
+            // prelude effects, so they have to be seeded here or a run's
+            // `CheckOutput` would answer that `clock` is not `nondet`.
+            effects: ply_core::prelude::effects(),
             ctors: IndexMap::new(),
             modules: IndexMap::new(),
         };
@@ -1169,6 +1172,7 @@ impl<'s> Driver<'s> {
                                 params: cached.params.clone(),
                                 ret: cached.ret.clone(),
                                 span: member.span.rebase(source),
+                                scheme: None,
                             },
                         );
                     }

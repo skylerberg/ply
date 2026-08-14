@@ -93,9 +93,30 @@ This is where the unit/integration distinction is meant to stop mattering.
 
 ## M7 — Deterministic simulation
 
-Virtualized scheduler, clock, network, and RNG driven by a seed. The repro
-artifact handed to an agent becomes a seed rather than a stack trace. Thousands
-of adversarial interleavings per change.
+Concurrency arrives as an effect, because the language has none: `task.spawn` /
+`task.join` are operations with one declared signature, so a threaded production
+handler and a seeded simulated one cannot drift. A task is a suspended machine
+state, which is what M6's explicit control stack bought.
+
+- `simulate { .. }` — `handle` with a fixed clause set over `task`, `clock` and
+  `random`, structured so the handler is the scope
+- Virtual clock: time advances only when nothing is runnable, so a simulated
+  timeout can never fire early
+- A seed determines the whole run; `ply test --seed 7:3.0.2` replays exactly, and
+  the seed is the repro artifact in M5's failure JSON
+- Footprint-guided partial-order reduction: two tasks whose footprints do not
+  conflict commute, so those interleavings are never explored. The reduction is
+  **measured** against an unpruned search, because that number is the evidence
+  that resource-granular effects were worth it
+- `sim.read` in the row makes the seed dependency part of the type, and the
+  cache key covers the definition set **and** the search plan
+
+**Exit:** a `det`, cacheable test over concurrent, time-dependent code; a
+reported reduction against the naive interleaving count; and `exhaustive: true`
+on a test, which is a proof over every interleaving rather than a sample.
+
+`docs/adr/0006-deterministic-simulation.md`. Not in M7: real threads, a real
+network effect, and finding races in Rust code.
 
 ## M8 — Specs
 

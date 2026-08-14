@@ -932,6 +932,8 @@ fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
             suspects: Vec::new(),
             assertion: None,
             attribution: out,
+            seed: None,
+            race: None,
         })
         .to_string()
     };
