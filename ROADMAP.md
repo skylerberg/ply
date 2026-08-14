@@ -204,9 +204,15 @@ interpreter cost**, which is the number W6 turns on.
   pools all want one, and `List<(K,V)>` is not a substitute at request volume
 - Compile-time derivation over normalized definitions: `derive json for Order`
 - JSON encode and decode, derived rather than hand-written
+- A dictionary is a **record** — `JsonCodec<a> = {encode: .., decode: ..}` — which
+  Ply's structural records give for free and which is what a typeclass dictionary
+  elaborates to anyway
 - Framework signatures take explicit dictionaries — the elaborated form of a
   typeclass constraint, so a resolution layer can be added later as sugar rather
   than as a rewrite
+- Constraints checked at the **signature**, not at instantiation: `where
+  derivable(json, a)`. Bare reflection fails late, which is the expensive failure
+  for an agent; this repairs it without any dispatch machinery
 - `Float`, and a decimal type — `i64` cents is a decision you regret later
 
 Type-directed **dispatch** is deliberately not decided here. Derivation is the
