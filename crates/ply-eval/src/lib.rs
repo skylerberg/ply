@@ -21,6 +21,7 @@ mod env;
 pub mod explore;
 mod frame;
 pub mod handler;
+pub mod host;
 mod interp;
 pub mod limit;
 pub mod machine;
@@ -41,6 +42,10 @@ pub use differential::{
     is_machine_only, machine_only_clause, machine_only_clauses,
 };
 pub use env::Env;
+pub use host::{
+    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
+    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending,
+};
 // `explore::Step` is deliberately not re-exported: `Step` at the root is the
 // builtin's, and one name for two things is worse than a qualified path.
 pub use explore::{

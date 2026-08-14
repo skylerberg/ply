@@ -35,8 +35,8 @@ use ply_prove::domain::{self, Finite};
 use ply_prove::property::{self, GenStream, Judge, Outcome, TypeWorld, judge_case, run_property};
 use ply_prove::prove::{self, Blocker, Decision, Goal, Limits, Proof};
 use ply_prove::{
-    Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
-    ObligationKind, ProvePlan, Rule, Vacuity, VacuityKind,
+    Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
+    ProvePlan, Rule, Vacuity, VacuityKind,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
@@ -56,7 +56,10 @@ pub fn of<'a>(
     check: &'a CheckOutput,
     complete: bool,
     obligations: usize,
-) -> (Box<dyn ply_test::obligation::Discharger + 'a>, Option<Diagnostic>) {
+) -> (
+    Box<dyn ply_test::obligation::Discharger + 'a>,
+    Option<Diagnostic>,
+) {
     // Every clause and every law body is an AST this run has to hold: a claim
     // is discharged by reasoning about the expression that states it, and there
     // is no cached form of one. A partial parse would silently answer
@@ -276,10 +279,7 @@ impl<'a> Prover<'a> {
             ..Limits::default()
         };
         let (decision, blockers) = prove::decide_and_diagnose(&self.ctx, &goal, &limits);
-        Some(Reach {
-            decision,
-            blockers,
-        })
+        Some(Reach { decision, blockers })
     }
 }
 
@@ -461,6 +461,11 @@ impl<'a> Prover<'a> {
             "String" => {
                 let mut out = vec![Value::str(String::new())];
                 out.extend(literals.strings.iter().map(|s| Value::str(s.clone())));
+                out
+            }
+            "Bytes" => {
+                let mut out = vec![Value::bytes([])];
+                out.extend(literals.bytes.iter().map(Value::bytes));
                 out
             }
             "Int" => {
@@ -761,6 +766,7 @@ const WITNESS_PER_BINDER: usize = 12;
 struct Literals {
     ints: Vec<i64>,
     strings: Vec<String>,
+    bytes: Vec<Vec<u8>>,
 }
 
 impl Literals {
@@ -778,6 +784,11 @@ impl Literals {
                         self.strings.push(s.clone());
                     }
                 }
+                ExprKind::Lit(ply_syntax::ast::Lit::Bytes(b)) => {
+                    if !self.bytes.contains(b) {
+                        self.bytes.push(b.clone());
+                    }
+                }
                 ExprKind::Lit(_) | ExprKind::Var(_) => {}
                 ExprKind::Binary { lhs, rhs, .. } => {
                     stack.push(lhs);
@@ -787,9 +798,10 @@ impl Literals {
                     // `-1000000` is a negation of a literal in the AST and a
                     // bound in the guard, so the value the search wants is the
                     // negated one.
-                    if let (ply_syntax::ast::UnOp::Neg, ExprKind::Lit(
-                        ply_syntax::ast::Lit::Int(k),
-                    )) = (op, &operand.kind)
+                    if let (
+                        ply_syntax::ast::UnOp::Neg,
+                        ExprKind::Lit(ply_syntax::ast::Lit::Int(k)),
+                    ) = (op, &operand.kind)
                     {
                         let negated = k.saturating_neg();
                         if !self.ints.contains(&negated) {
@@ -956,11 +968,7 @@ struct Search<'a, 'p> {
 
 impl LawSearch for Search<'_, '_> {
     fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
-        let values = self
-            .points
-            .get(point as usize)
-            .cloned()
-            .unwrap_or_default();
+        let values = self.points.get(point as usize).cloned().unwrap_or_default();
         let scope: Vec<(Symbol, Value)> = self
             .binders
             .iter()

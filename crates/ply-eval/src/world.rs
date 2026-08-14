@@ -450,7 +450,7 @@ mod tests {
             rhs_span: Span::DUMMY,
             span: Span::DUMMY,
         });
-        let (k, _below) = stack.capture(1);
+        let (k, _below) = stack.capture(1, 0);
         let at_capture = world.fork();
 
         world.set(c, Value::Int(2));

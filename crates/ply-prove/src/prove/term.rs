@@ -272,8 +272,8 @@ impl Terms {
             return existing;
         }
         let id = self.nodes.len();
-        let is_int = sort.as_ref().is_some_and(is_int_type)
-            || matches!(node, Node::Int(_) | Node::Lin(_));
+        let is_int =
+            sort.as_ref().is_some_and(is_int_type) || matches!(node, Node::Int(_) | Node::Lin(_));
         self.index.insert(node.clone(), id);
         self.nodes.push(node);
         self.sorts.push(sort);
@@ -425,7 +425,6 @@ impl Terms {
     pub fn opaque(&mut self, name: &str, sort: Option<Type>) -> TermId {
         self.mk(Node::Opaque(Symbol::new(name)), sort)
     }
-
 }
 
 pub fn is_int_type(t: &Type) -> bool {
@@ -489,10 +488,7 @@ mod tests {
     fn projection_reduces_over_a_record_literal() {
         let mut terms = Terms::new();
         let v = terms.int_lit(7);
-        let record = terms.mk(
-            Node::Record(vec![(Symbol::new("balance"), v)]),
-            None,
-        );
+        let record = terms.mk(Node::Record(vec![(Symbol::new("balance"), v)]), None);
         assert_eq!(terms.field(record, Symbol::new("balance")), v);
     }
 

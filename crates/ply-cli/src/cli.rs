@@ -46,6 +46,8 @@ pub enum Command {
     Review(ReviewArgs),
     /// Evaluate `main`. A directory must hold exactly one.
     Run(RunArgs),
+    /// List every host handler this binary can bind: the trusted computing base.
+    Hosts(HostsArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Read, reclaim or discard what the caches hold.
@@ -292,6 +294,13 @@ pub struct TestArgs {
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
 
+    /// Bind the real host handlers. Off by default, and the default is the
+    /// point: a suite that silently acquires a live dependency is the failure
+    /// mode this language exists to prevent. A test that reaches a bound
+    /// handler always runs and is never cached.
+    #[arg(long)]
+    pub host: bool,
+
     #[command(flatten)]
     pub simulation: SimOptions,
 }
@@ -425,6 +434,34 @@ pub struct RunArgs {
     /// than how many.
     #[arg(long, value_name = "SEED", value_parser = parse_seed)]
     pub seed: Option<Seed>,
+
+    /// Bind the real host handlers. Off by default: reaching the boundary with
+    /// nothing bound is a diagnostic naming the handler that would have served
+    /// it, never a silent syscall.
+    #[arg(long)]
+    pub host: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HostsArgs {
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// List the handlers as bound rather than reporting that nothing is.
+    /// Resolution — and therefore any registration error — happens either way.
+    #[arg(long)]
+    pub host: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long, conflicts_with = "digest")]
+    pub json: bool,
+
+    /// Print `b3:...` and nothing else: the one line a CI check pins against
+    /// the trusted computing base.
+    #[arg(long)]
+    pub digest: bool,
 }
 
 #[derive(Args, Debug)]

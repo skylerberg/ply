@@ -414,6 +414,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
             key: sym("m.doubles"),
             diagnostic: after.failure("m.doubles"),
             defect: false,
+            host: false,
             suspects: vec![sym("m.other")],
             assertion: None,
             attribution: Default::default(),

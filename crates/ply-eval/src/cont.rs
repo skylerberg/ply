@@ -22,6 +22,7 @@ use crate::env::Env;
 use crate::value::{Value, Vector};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, Ident, UnOp};
+use std::cell::Cell;
 use std::rc::Rc;
 
 /// One suspended step. Every variant names the value it is waiting for and what
@@ -534,6 +535,55 @@ impl Stack {
             .any(|s| matches!(s.delimiter(), Some(Delimiter::Sim(r)) if *r == region))
     }
 
+    /// How many segments [`Stack::capture`] takes to cut out to and including
+    /// the innermost region delimiter — what a task's own control is.
+    ///
+    /// The same count [`Stack::find_handler`] reports for a `Sim` target, and it
+    /// is here so that a caller who already knows the perform belongs to the
+    /// region — the host boundary, parking a task on a pending token — does not
+    /// have to search by operation name to find out where to cut.
+    pub fn sim_depth(&self) -> Option<usize> {
+        self.segments_iter()
+            .position(|s| matches!(s.delimiter(), Some(Delimiter::Sim(_))))
+            .map(|depth| depth + 1)
+    }
+
+    /// The whole stack as one task's control, delimited by `region`.
+    ///
+    /// This is what a **lazily opened** production region needs and no other
+    /// caller does. ADR 0011 §9 opens one at the first `task.*` that reaches the
+    /// host binding, so the region has no body: its root task is the computation
+    /// already in progress, which is this entire stack. [`Stack::capture`] cannot
+    /// express that — it never crosses the base segment, because for every other
+    /// caller the base is what the capture is being cut *out of*.
+    ///
+    /// The delimiter lands on the base segment rather than beside it, because a
+    /// segment carrying no delimiter is where [`Stack::into_next`] answers
+    /// `Done`: a region delimiter pushed under a delimiter-less base would never
+    /// be reached and the root task's return would end the run instead of the
+    /// task.
+    pub fn into_task(mut self, region: SimId, born: u64) -> Continuation {
+        let (frames, calls) = (self.frames, self.calls);
+        let mut taken = Vec::with_capacity(self.segments());
+        loop {
+            match self.under.pop_front() {
+                Some(below) => taken.push(std::mem::replace(&mut self.top, below)),
+                None => {
+                    self.top.delimiter = Some(Delimiter::Sim(region));
+                    taken.push(self.top);
+                    break;
+                }
+            }
+        }
+        Continuation {
+            segments: Rc::new(taken),
+            frames,
+            calls,
+            born,
+            resumes: Rc::new(Cell::new(0)),
+        }
+    }
+
     pub fn prompt(&self) -> Option<&Rc<Prompt>> {
         self.top.prompt()
     }
@@ -607,7 +657,14 @@ impl Stack {
 
     /// Cuts the innermost `segments` segments away. The returned stack is what
     /// the handler clause runs on; the continuation is what resuming puts back.
-    pub fn capture(&self, segments: usize) -> (Continuation, Stack) {
+    ///
+    /// `born` is the machine's at-most-once host-operation count at the moment
+    /// of capture, and it is a parameter rather than a default because a
+    /// continuation that does not know when it was born cannot be told apart
+    /// from one captured before the last packet went out. Zero is the
+    /// conservative answer and the right one for every caller with no host
+    /// binding.
+    pub fn capture(&self, segments: usize, born: u64) -> (Continuation, Stack) {
         let mut taken = Vec::with_capacity(segments);
         let mut rest = self.clone();
         let mut frames = 0;
@@ -629,6 +686,8 @@ impl Stack {
                 segments: Rc::new(taken),
                 frames,
                 calls,
+                born,
+                resumes: Rc::new(Cell::new(0)),
             },
             rest,
         )
@@ -666,11 +725,61 @@ pub struct Continuation {
     segments: Rc<Vec<Segment>>,
     frames: usize,
     calls: usize,
+    /// The machine's at-most-once host-operation count when this was captured.
+    born: u64,
+    /// Resumptions so far, **shared across clones**. A `Continuation` is cloned
+    /// by `Rc` and handed to a scheduler, a frame and a clause binder alike; two
+    /// clones are one continuation, and a per-clone counter would let a second
+    /// resumption launder itself through a `let k2 = k`.
+    resumes: Rc<Cell<u32>>,
 }
 
 impl Continuation {
     pub fn frames(&self) -> usize {
         self.frames
+    }
+
+    /// [`Machine::host_ops`] when this continuation was captured.
+    ///
+    /// [`Machine::host_ops`]: crate::machine::Machine::host_ops
+    pub fn born(&self) -> u64 {
+        self.born
+    }
+
+    pub fn resumes(&self) -> u32 {
+        self.resumes.get()
+    }
+
+    /// Counts this resumption and decides whether it may proceed, answering the
+    /// ordinal of the refused resumption when it may not.
+    ///
+    /// `resumes > 1 && host_ops > born`, and both halves matter. A first
+    /// resumption is always allowed — that is ordinary tail-resumptive control.
+    /// A second is allowed whenever no at-most-once host operation has happened
+    /// since the capture, which is *always* in a hermetic run, where `host_ops`
+    /// is zero for the life of the entry point. So nothing multi-shot currently
+    /// does changes under W1.
+    ///
+    /// It over-approximates deliberately: it refuses when such an operation
+    /// happened anywhere after the capture — in another task, or in the clause
+    /// rather than inside the continuation — even though replaying this
+    /// particular control would repeat nothing. The precise rule needs a
+    /// per-resumption liveness scope on the control stack, interacting with
+    /// capture, splice, `Next::Leave` and task start, in the one part of the
+    /// system where a defect is silent and sends a packet twice.
+    ///
+    /// It lives on the continuation, and [`crate::handler::resume`] is the only
+    /// caller, so there is no way to splice a continuation back onto a stack
+    /// without passing through it. The count saturates: a program that resumes
+    /// one continuation four billion times is refused for other reasons long
+    /// before, and wrapping to zero would silently re-open the boundary.
+    pub(crate) fn admit(&self, host_ops: u64) -> Result<(), u32> {
+        let resumes = self.resumes.get().saturating_add(1);
+        self.resumes.set(resumes);
+        if resumes > 1 && host_ops > self.born {
+            return Err(resumes);
+        }
+        Ok(())
     }
 
     /// What splicing this back costs against the call budget: a resumption
@@ -728,6 +837,8 @@ impl Clone for Continuation {
             segments: Rc::clone(&self.segments),
             frames: self.frames,
             calls: self.calls,
+            born: self.born,
+            resumes: Rc::clone(&self.resumes),
         }
     }
 }
@@ -809,7 +920,7 @@ mod tests {
             .push(frame(2));
         assert_eq!(s.segments(), 2);
 
-        let (k, below) = s.capture(1);
+        let (k, below) = s.capture(1, 0);
         assert_eq!(k.frames(), 2);
         assert_eq!(k.segments(), 1);
         assert_eq!(below.segments(), 1);
@@ -819,7 +930,7 @@ mod tests {
     #[test]
     fn resuming_reinstalls_the_handler_that_delimited_the_capture() {
         let s = Stack::new().push_prompt(prompt()).push(frame(1));
-        let (k, below) = s.capture(1);
+        let (k, below) = s.capture(1, 0);
         assert!(below.prompt().is_none());
 
         let resumed = below.resume(&k);
@@ -830,7 +941,7 @@ mod tests {
     #[test]
     fn a_continuation_may_be_resumed_twice_onto_different_stacks() {
         let s = Stack::new().push_prompt(prompt()).push(frame(9));
-        let (k, below) = s.capture(1);
+        let (k, below) = s.capture(1, 0);
 
         let once = below.resume(&k);
         let twice = below.push(frame(5)).resume(&k);
@@ -856,7 +967,7 @@ mod tests {
             .push_prompt(prompt())
             .push(frame(1))
             .push(frame(2));
-        let (k, below) = s.capture(1);
+        let (k, below) = s.capture(1, 0);
 
         let Next::Frame(first, rest) = below.resume(&k).into_next() else {
             panic!("expected a frame");
@@ -906,7 +1017,7 @@ mod tests {
             .push_prompt(prompt())
             .push(frame(3));
 
-        let (k, below) = s.capture(3);
+        let (k, below) = s.capture(3, 0);
         assert_eq!(k.segments(), 3);
         assert_eq!(k.frames(), 3);
         assert_eq!(below.segments(), 1);

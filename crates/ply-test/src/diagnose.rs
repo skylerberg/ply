@@ -8,7 +8,7 @@
 //! guesses, because naming the wrong definition is worse than naming none.
 
 use crate::bisect::{
-    Baseline, Bisection, Budget, Classify, Delta, DepEdges, Diff, Hybrid, Mode, NoHybrid,
+    Baseline, Bisection, Budget, Classify, Delta, DepEdges, Diff, Gate, Hybrid, Mode, NoHybrid,
     Regression, Skipped, Verdict, bisect, diff, precheck,
 };
 use crate::slice::{CausalSlice, Tracing};
@@ -43,6 +43,11 @@ pub struct Evidence<'a> {
     /// The evaluator failed rather than the program — a defect in Ply, not a
     /// change to attribute. A runtime error the language defines is not one.
     pub defect: bool,
+    /// The failing run reached a host handler, read off what the runtime did
+    /// rather than off the prediction selection made. Bisection re-runs a test
+    /// once per candidate set, so this is the difference between a search and a
+    /// packet sent sixty-four times.
+    pub host: bool,
     /// The raw closure ∩ changed intersection, by name.
     pub suspects: &'a [Symbol],
     pub hashes: &'a HashOutput,
@@ -67,10 +72,13 @@ pub fn diagnose(
     // anybody actually edited is the field that shrinks an agent's reading list,
     // and it needs a baseline rather than a hybrid.
     let gate = precheck(
-        options.bisect,
-        evidence.defect,
-        evidence.nondet,
-        evidence.baseline,
+        Gate::new(
+            options.bisect,
+            evidence.defect,
+            evidence.nondet,
+            evidence.baseline,
+        )
+        .hosted(evidence.host),
     );
     let diff = evidence.baseline.map(|baseline| {
         let regression = Regression {

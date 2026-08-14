@@ -36,6 +36,9 @@ enum Command {
     /// Price the spec tier: where obligations land, why the ones that fell
     /// short did, and what shrinking bought.
     Prove(ProveArgs),
+    /// Price a request: what one costs per layer, and what the endpoint
+    /// sustains under load. The number W6's decision on M9 turns on.
+    Serve(ServeArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -238,6 +241,88 @@ fn simulate(args: SimArgs) -> Result<()> {
 }
 
 #[derive(Args, Debug)]
+struct ServeArgs {
+    /// The repository root, which is where `examples/hello.ply` is read from.
+    /// The endpoint under measurement is the one W1 shipped, not a copy.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The `ply` binary the load table drives. Defaults to this binary's
+    /// sibling, so a release measurement never silently serves from a debug
+    /// build.
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    /// Requests per ladder rung. Each is one connection.
+    #[arg(long, default_value_t = 2000)]
+    ladder_requests: u32,
+    /// Repeats per rung; the fastest is reported.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Requests per load point.
+    #[arg(long, default_value_t = 2000)]
+    requests: u32,
+    /// Simultaneous client connections to sweep. `serve` recursion is charged
+    /// against the call budget, so a point costs `requests` nested calls.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
+    concurrency: Vec<u32>,
+    /// Drop the per-request ladder, which is the slow half.
+    #[arg(long)]
+    no_ladder: bool,
+    /// Drop the load table, which is the half that needs a built `ply`.
+    #[arg(long)]
+    no_load: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn serve(args: ServeArgs) -> Result<()> {
+    let ladder = if args.no_ladder {
+        None
+    } else {
+        Some(ply_corpus::serve::ladder(
+            &args.repo,
+            args.ladder_requests,
+            args.repeats,
+        )?)
+    };
+
+    let mut load = Vec::new();
+    if !args.no_load {
+        let ply = match &args.ply {
+            Some(path) => path.clone(),
+            None => ply_corpus::serve::ply_binary()?,
+        };
+        // The sequential endpoint is `examples/hello.ply` as written, and it
+        // serves one connection at a time however many arrive — so it is
+        // reported at concurrency 1 alone. Sweeping it would measure a queue.
+        load.push(ply_corpus::serve::load(
+            &args.repo,
+            &ply,
+            ply_corpus::serve::Shape::Sequential,
+            1,
+            args.requests,
+        )?);
+        for &concurrency in &args.concurrency {
+            load.push(ply_corpus::serve::load(
+                &args.repo,
+                &ply,
+                ply_corpus::serve::Shape::Concurrent,
+                concurrency,
+                args.requests,
+            )?);
+            load.push(ply_corpus::serve::load_floor(concurrency, args.requests)?);
+        }
+    }
+
+    let out = ply_corpus::serve::Measurements { ladder, load };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", ply_corpus::serve::render(&out));
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
 struct ProveArgs {
     /// One or more `.ply` files or directories. Each is reported on its own row
     /// so a generated corpus never averages with a written one.
@@ -335,6 +420,7 @@ fn run() -> Result<()> {
         Command::Measure(args) => measure(args),
         Command::Sim(args) => simulate(args),
         Command::Prove(args) => prove(args),
+        Command::Serve(args) => serve(args),
     }
 }
 

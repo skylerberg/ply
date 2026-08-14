@@ -166,6 +166,17 @@ fn literals() {
 }
 
 #[test]
+fn byte_literals_parse_in_expression_and_pattern_position() {
+    assert_eq!(expr("b\"GET\""), "b[71, 69, 84]");
+    assert_eq!(expr("b\"\""), "b[]");
+    assert_eq!(expr("b\"\\r\\n\""), "b[13, 10]");
+    assert_eq!(
+        expr("match m { b\"GET\" -> 1, _ -> 0 }"),
+        "(match m (arm b[71, 69, 84] 1) (arm _ 0))"
+    );
+}
+
+#[test]
 fn arithmetic_binds_tighter_than_comparison_which_binds_tighter_than_logic() {
     assert_eq!(expr("a || b && c"), "(|| a (&& b c))");
     assert_eq!(expr("a && b || c"), "(|| (&& a b) c)");
@@ -1156,6 +1167,7 @@ fn dump_lit(l: &Lit) -> String {
         Lit::Int(v) => v.to_string(),
         Lit::Bool(b) => b.to_string(),
         Lit::Str(s) => format!("{s:?}"),
+        Lit::Bytes(b) => format!("b{b:?}"),
         Lit::Unit => "unit".to_string(),
     }
 }

@@ -1,0 +1,558 @@
+// A Ply program that reaches a real socket.
+//
+//     $ ply run examples/hello.ply --host
+//     $ curl -i localhost:8080
+//
+// Without `--host` the same command is `E0424`: nothing is bound, the run is
+// hermetic, and the diagnostic names the handler that would have served the
+// operation. That is the whole shape of W1 — the program does not change, the
+// binding does. The tests at the bottom run this same code against an
+// in-memory socket, and they are `det` and cacheable.
+//
+// Read the rows. `serve_one` publishes `{net.write[conn]}` and nothing else,
+// so it cannot open a listener; `serve` adds `{net.write[listener]}` because it
+// accepts. Those are inferred, checked as an upper bound against the
+// annotation, and they are what a host handler binds against and what the
+// scheduler groups on — not comments that can go stale.
+//
+// One file on purpose: `ply run` on a file argument loads that module alone,
+// so a program with an `import` can only be run by directory, and a directory
+// may hold only one `main`.
+
+// --- The boundary -----------------------------------------------------------
+
+// Copied from `crates/ply-host/ply/net.ply`, which is what `ply_host::tcp`
+// registers against. An operation whose signature drifts from that file is
+// `E0421` at bind time, before anything runs, naming the one that moved — so
+// this block is a contract with the host and not a convenience.
+//
+// Every operation is a `write`, `recv` included, and that is not an oversight.
+// A mode is a claim about commutation: `recv` consumes bytes from the kernel's
+// receive buffer, so two tasks reading one socket race exactly as two writers
+// do, and calling it a read would let the conflict graph run them side by side.
+// Over-approximating costs parallelism; under-approximating costs correctness,
+// silently, which is the failure mode this milestone is built around.
+//
+// `nondet` is load-bearing too. ADR 0011 §4 points the determinism arrow at the
+// declaration: a handler registered `Nondeterministic` requires the word below,
+// so a `det` test that reaches a socket is `E0412` whether or not `--host` was
+// passed. What arrives on a socket is not a function of program state, and this
+// is where that is said.
+nondet effect net {
+  write listen[s](port: Int) -> Int
+  write accept[s](listener: Int) -> Int
+  write recv[s](conn: Int, max: Int) -> Bytes
+  write send[s](conn: Int, payload: Bytes) -> Int
+  write close[s](socket: Int) -> Unit
+}
+
+// --- Requests ---------------------------------------------------------------
+//
+// The parser is Ply rather than `httparse` behind a host handler, and ADR 0011
+// rejects the alternative for the reason this section demonstrates: a parser
+// inside a host handler joins the trusted computing base, where nothing checks
+// it and `ply hosts` can only print its name. Written here it is ordinary code
+// — its row is empty, `ply test` selects it exactly, and a defect in it is a
+// failing test rather than a line in the TCB. The boundary should carry bytes
+// and nothing else.
+//
+// This is not W3's parser: no chunked encoding, no keep-alive, no trailers, no
+// header lookup, and the body is never read. A request carrying one is answered
+// from its head and the connection closed, which is what `Connection: close` on
+// every response below promises.
+
+type Request = { method: Bytes, target: Bytes, version: Bytes }
+
+type Parsed =
+  | Complete(Request)
+  // The head has not ended. A parser cannot tell "still arriving" from "never
+  // coming"; the caller decides which it was.
+  | Incomplete
+  // Why, in a sentence. It goes in the 400 body, because a client that sent a
+  // bad request is the only one who can fix it.
+  | Malformed(String)
+
+// The most head this endpoint will hold. Not tuning: every scan below walks the
+// buffer, so an unbounded head is unbounded work bought with one packet.
+fn max_head() -> Int = 2048
+
+// Both scans fold over `range` rather than recursing. A tail call is charged
+// against the call budget like any other, so a byte-at-a-time recursion over a
+// 2 KiB head would sit a fifth of the way into the recursion limit for one
+// lookup. A fold's nesting is constant. It is also, measurably, where every
+// microsecond of this endpoint goes: see the note at the foot of the file.
+
+// The index of the first `byte` at or after `from`, or -1.
+fn index_of(hay: Bytes, byte: Int, from: Int) -> Int =
+  fold(range(from, bytes_len(hay)), -1, |found, i|
+    if found >= 0 { found } else if bytes_at(hay, i) == byte { i } else { found })
+
+// The index just past the first CRLF CRLF, or -1 while the head is unfinished.
+// This is the framing decision, and the only reason the endpoint knows a
+// request has arrived whole.
+fn head_end(head: Bytes) -> Int =
+  fold(range(0, bytes_len(head) - 3), -1, |found, i|
+    if found >= 0 {
+      found
+    } else if bytes_at(head, i) == 13 && bytes_at(head, i + 1) == 10
+           && bytes_at(head, i + 2) == 13 && bytes_at(head, i + 3) == 10 {
+      i + 4
+    } else {
+      found
+    })
+
+fn all_upper(b: Bytes) -> Bool =
+  fold(range(0, bytes_len(b)), true, |ok, i|
+    ok && bytes_at(b, i) >= 65 && bytes_at(b, i) <= 90)
+
+// Bytes throughout, never `String`. A request target is bytes on the wire and a
+// peer is free to send ones that are not UTF-8; decoding first would either
+// lose them to U+FFFD or fail on a request this endpoint is meant to answer
+// with a 400. Nothing here converts, so nothing here can.
+fn parse(head: Bytes) -> Parsed {
+  if head_end(head) < 0 {
+    Incomplete
+  } else {
+    let lf = index_of(head, 10, 0);
+    if lf < 1 || bytes_at(head, lf - 1) != 13 {
+      Malformed("the request line must end with CRLF")
+    } else {
+      request_line(bytes_slice(head, 0, lf - 1))
+    }
+  }
+}
+
+fn request_line(line: Bytes) -> Parsed {
+  let sp1 = index_of(line, 32, 0);
+  let sp2 = index_of(line, 32, sp1 + 1);
+  if sp1 < 0 || sp2 < 0 {
+    Malformed("a request line is `METHOD TARGET VERSION`")
+  } else if index_of(line, 32, sp2 + 1) >= 0 {
+    Malformed("a request line holds exactly two spaces")
+  } else {
+    parts(
+      bytes_slice(line, 0, sp1),
+      bytes_slice(line, sp1 + 1, sp2),
+      bytes_slice(line, sp2 + 1, bytes_len(line)))
+  }
+}
+
+fn parts(method: Bytes, target: Bytes, version: Bytes) -> Parsed =
+  if bytes_len(method) == 0 || !all_upper(method) {
+    Malformed("a method is one or more uppercase ASCII letters")
+  } else if bytes_len(target) == 0 || bytes_at(target, 0) != 47 {
+    Malformed("this endpoint serves origin-form targets, which begin with `/`")
+  } else if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
+    Malformed("the version must be HTTP/1.1 or HTTP/1.0")
+  } else {
+    Complete({method: method, target: target, version: version})
+  }
+
+// --- Responses --------------------------------------------------------------
+
+// `Content-Length` counts bytes, and a client reads it to know where the body
+// ends. Building it from the string's character count would truncate every body
+// outside ASCII — on exactly the input a test written in English never has.
+fn response(status: String, body: String) -> Bytes =
+  bytes_of_string(
+    "HTTP/1.1 " ++ status ++ "\r\n"
+      ++ "Content-Type: text/plain; charset=utf-8\r\n"
+      ++ "Content-Length: " ++ int_to_string(bytes_len(bytes_of_string(body))) ++ "\r\n"
+      ++ "Connection: close\r\n"
+      ++ "\r\n"
+      ++ body)
+
+fn greeting() -> String = "hello from ply\n"
+
+// The endpoint, in one pure function: bytes in, bytes out.
+//
+// W1's answer is fixed, so the parsed request is not consulted beyond whether
+// it parsed. That is not laziness — a request has to be understood before it
+// can be refused, and the 400 below is the only thing standing between a
+// malformed head and a panic on a socket.
+fn answer(head: Bytes) -> Bytes =
+  match parse(head) {
+    Complete(_) -> response("200 OK", greeting()),
+    Incomplete -> response("400 Bad Request", "the request head never ended\n"),
+    Malformed(why) -> response("400 Bad Request", why ++ "\n"),
+  }
+
+// --- The server -------------------------------------------------------------
+
+// How many chunks the endpoint will take before it gives up on a head that
+// never ends. W1 has no cancellation and no timeout — ADR 0011 calls that the
+// milestone's largest gap — so this count and `max_head` are the only two
+// things between a peer that dribbles one byte at a time and a thread that
+// never comes back.
+fn max_chunks() -> Int = 16
+
+// Read until the head ends, the peer stops talking, or one of those two bounds
+// is reached. A single `recv` is what `curl` produces essentially always, and
+// "essentially always" is the shape of every defect this project has found: a
+// request split across packets is ordinary TCP, so it is read here and tested
+// below.
+fn read_head(c: Int, so_far: Bytes, chunks_left: Int) -> Bytes / {net.write[conn]} =
+  if chunks_left <= 0 || head_end(so_far) >= 0 || bytes_len(so_far) >= max_head() {
+    so_far
+  } else {
+    let chunk = net.recv[conn](c, max_head());
+    if bytes_len(chunk) == 0 {
+      so_far
+    } else {
+      read_head(c, bytes_concat(so_far, chunk), chunks_left - 1)
+    }
+  }
+
+// One connection, start to finish. A head that never ended and a head that
+// overran `max_head` both arrive here without a terminator and are answered
+// 400, which is the same sentence to the peer either way: nothing readable came
+// out of this connection.
+//
+// `Connection: close` and this `net.close` are one decision written twice, for
+// the peer and for the socket. W1 has no keep-alive.
+//
+// `net.send` answers how many bytes it took, and the handler's contract is that
+// it takes all of them — partial writes are W3's. The assertion is where that
+// contract is checked rather than assumed, because a short write that nobody
+// looked at is a truncated response the client reads as a complete one.
+fn serve_one(c: Int) -> Unit / {net.write[conn]} {
+  let response = answer(read_head(c, b"", max_chunks()));
+  assert_eq(net.send[conn](c, response), bytes_len(response));
+  net.close[conn](c)
+}
+
+// Accept `count` connections, answer each, and stop. One at a time: a task per
+// connection is the production scheduler's demonstration, not this one's.
+//
+// A count rather than a loop, because Ply has no loop and a tail call is
+// charged against the call budget like every other call. `serve` is bounded by
+// the recursion limit however it is written, so the bound is named here where a
+// reader can see it rather than discovered at connection ten thousand.
+fn serve(server: Int, count: Int) -> Int / {net.write[listener], net.write[conn]} =
+  if count <= 0 {
+    0
+  } else {
+    serve_one(net.accept[listener](server));
+    1 + serve(server, count - 1)
+  }
+
+// The listener is closed rather than left to the process exiting, so the port
+// is released at a point in the program rather than at a point in the runtime.
+fn listen_and_serve(port: Int, count: Int) -> Int
+  / {net.write[listener], net.write[conn]} {
+  let server = net.listen[listener](port);
+  let served = serve(server, count);
+  net.close[listener](server);
+  served
+}
+
+// Definitions rather than arguments: `ply run` passes none. A test rewrites
+// these two lines to take an ephemeral port and stop after one connection.
+fn port() -> Int = 8080
+
+fn connections() -> Int = 64
+
+// The only `main` under `examples/`, which is what lets `ply run examples`
+// have an entry point at all: with two, `ply run` reports both candidates
+// rather than picking by load order, and a module that imports another cannot
+// be named as a file instead.
+fn main() -> Int / {net.write[listener], net.write[conn]} =
+  listen_and_serve(port(), connections())
+
+// --- The simulated socket ---------------------------------------------------
+//
+// The twin ADR 0008 §5 asks for, at the size W1 can afford: one cell holding
+// what the peer will say, one holding what the endpoint said back. It satisfies
+// the same declared signature as the host handler because there is only one
+// signature — the `effect` at the top — and that is the entire argument for
+// putting I/O behind an effect rather than behind a function.
+//
+// Every test below is `det` and cacheable, and only because these handlers
+// discharge every `net` atom the code under test can perform: leave one out and
+// the test does not become flaky, it fails to compile with `E0412`.
+//
+// What the type cannot tell you is whether every *operation* has a clause. A
+// handler discharges an atom, and `recv`, `send` and `close` are one atom —
+// `net.write[conn]` — so a missing clause is an unhandled-effect diagnostic at
+// run time rather than a compile error. That is the atom-versus-operation seam
+// ADR 0011 §6 names for the host registry, showing up on the Ply side.
+
+fn first_chunk(queued: List<Bytes>) -> Bytes =
+  match queued {
+    [first, ..] -> first,
+    _ -> b"",
+  }
+
+fn later_chunks(queued: List<Bytes>) -> List<Bytes> =
+  match queued {
+    [_, ..rest] -> rest,
+    _ -> [],
+  }
+
+fn get_root() -> Bytes = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+fn ok() -> Bytes = response("200 OK", greeting())
+
+fn bad(why: String) -> Bytes = response("400 Bad Request", why ++ "\n")
+
+fn reason(head: Bytes) -> String =
+  match parse(head) {
+    Malformed(why) -> why,
+    Incomplete -> "incomplete",
+    Complete(_) -> "complete",
+  }
+
+// --- Tests: the parser ------------------------------------------------------
+
+test "a well-formed request line is split into its three parts" {
+  assert_eq(parse(get_root()), Complete({
+    method: b"GET",
+    target: b"/",
+    version: b"HTTP/1.1",
+  }));
+  assert_eq(
+    parse(b"POST /orders HTTP/1.0\r\n\r\n"),
+    Complete({method: b"POST", target: b"/orders", version: b"HTTP/1.0"}))
+}
+
+test "a head is incomplete until CRLF CRLF, whatever has arrived so far" {
+  assert_eq(head_end(b""), -1);
+  assert_eq(head_end(b"GET / HTTP/1.1\r\n"), -1);
+  assert_eq(head_end(b"GET / HTTP/1.1\r\n\r"), -1);
+  assert_eq(head_end(get_root()), bytes_len(get_root()));
+  assert_eq(parse(b"GET / HTTP/1.1\r\nHost: x\r\n"), Incomplete)
+}
+
+test "a head ends at the first blank line and not at a later one" {
+  let two = b"GET / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n";
+  assert_eq(head_end(two), 18);
+  assert_eq(parse(two), Complete({method: b"GET", target: b"/", version: b"HTTP/1.1"}))
+}
+
+test "every way of malforming a request line names itself" {
+  assert_eq(reason(b"GET /\r\n\r\n"), "a request line is `METHOD TARGET VERSION`");
+  assert_eq(reason(b"GET / HTTP/1.1 extra\r\n\r\n"), "a request line holds exactly two spaces");
+  assert_eq(reason(b" / HTTP/1.1\r\n\r\n"), "a method is one or more uppercase ASCII letters");
+  assert_eq(reason(b"get / HTTP/1.1\r\n\r\n"), "a method is one or more uppercase ASCII letters");
+  assert_eq(reason(b"GET  HTTP/1.1\r\n\r\n"),
+    "this endpoint serves origin-form targets, which begin with `/`");
+  assert_eq(reason(b"GET http://x/ HTTP/1.1\r\n\r\n"),
+    "this endpoint serves origin-form targets, which begin with `/`");
+  assert_eq(reason(b"GET / HTTP/2.0\r\n\r\n"), "the version must be HTTP/1.1 or HTTP/1.0");
+  assert_eq(reason(b"GET / \r\n\r\n"), "the version must be HTTP/1.1 or HTTP/1.0");
+  assert_eq(reason(b"GET / HTTP/1.1\n\r\n\r\n"), "the request line must end with CRLF")
+}
+
+// The peer chooses the bytes, so the parser has to survive every one of them
+// rather than the ones a test author would think to write.
+test "a target that is not UTF-8 is refused rather than decoded" {
+  assert_eq(reason(b"GET \xff\xfe HTTP/1.1\r\n\r\n"),
+    "this endpoint serves origin-form targets, which begin with `/`");
+  assert_eq(
+    parse(b"GET /\xff HTTP/1.1\r\n\r\n"),
+    Complete({method: b"GET", target: b"/\xff", version: b"HTTP/1.1"}));
+  assert(!bytes_is_utf8(b"/\xff"))
+}
+
+test "an empty head and a head of blank lines are both refused" {
+  assert_eq(parse(b""), Incomplete);
+  assert_eq(reason(b"\r\n\r\n"), "a request line is `METHOD TARGET VERSION`");
+  assert_eq(reason(b"\r\n\r\n\r\n"), "a request line is `METHOD TARGET VERSION`")
+}
+
+test "a request with a body is answered from its head alone" {
+  let posted = b"POST /orders HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+  assert_eq(head_end(posted), 44);
+  assert_eq(reason(posted), "complete")
+}
+
+test "a response declares the byte length of its body, not its character count" {
+  assert_eq(response("200 OK", "hi"), bytes_of_string(
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi"));
+
+  // Three characters, six bytes, and a client reads the second number.
+  assert_eq(bytes_len(bytes_of_string("ééé")), 6);
+  assert_eq(
+    bytes_len(response("200 OK", "ééé")),
+    bytes_len(response("200 OK", "abcdef")))
+}
+
+test "a good head answers 200 and every bad one answers 400" {
+  assert_eq(answer(get_root()), ok());
+  assert_eq(answer(b"GET / HTTP/1.1\r\n"), bad("the request head never ended"));
+  assert_eq(answer(b"GET / HTTP/9\r\n\r\n"), bad("the version must be HTTP/1.1 or HTTP/1.0"));
+  assert_eq(answer(b""), bad("the request head never ended"))
+}
+
+// --- Tests: the server, over the simulated socket ---------------------------
+
+test "the simulated socket answers a well-formed request with the fixed 200" {
+  with_cell[inbox]([get_root()]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      assert_eq(listen_and_serve(0, 1), 1)
+    } with {
+      net.listen[listener](p) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [ok()])
+  } }
+  } }
+}
+
+// The case a single `recv` would have passed and a real network would have
+// failed: the head arrives in three pieces, one of them splitting the version
+// token, and the terminator only in the last.
+test "a request split across packets is read to its terminator" {
+  with_cell[inbox]([b"GET / HT", b"TP/1.1\r\nHost: localhost\r", b"\n\r\n"]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [ok()]);
+    assert_eq(cell_get(inbox), [])
+  } }
+  } }
+}
+
+test "a malformed request is answered 400 and the connection is closed" {
+  with_cell[inbox]([b"GET /\r\n\r\n"]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+  with_cell[closed](0) { closed -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
+    };
+    assert_eq(cell_get(outbox), [bad("a request line is `METHOD TARGET VERSION`")]);
+    assert_eq(cell_get(closed), 1)
+  } }
+  } }
+  } }
+}
+
+// A peer that opens a connection and goes away. `recv` answers empty, which is
+// EOF, and the endpoint has to answer and close rather than read forever.
+test "a peer that says nothing gets a 400 rather than a hung thread" {
+  with_cell[inbox]([]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [bad("the request head never ended")])
+  } }
+  } }
+}
+
+// The bound has to hold against a peer that never stops and never finishes,
+// because W1 cannot cancel one.
+test "a head that never ends stops after `max_chunks` and answers 400" {
+  with_cell[reads](0) { reads -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        cell_set(reads, cell_get(reads) + 1);
+        b"Filler: xxxxxxxx\r\n"
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(reads), max_chunks());
+    assert_eq(cell_get(outbox), [bad("the request head never ended")])
+  } }
+  } }
+}
+
+test "each accepted connection is answered exactly once" {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      assert_eq(listen_and_serve(0, 3), 3)
+    } with {
+      net.listen[listener](p) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max) -> get_root(),
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [ok(), ok(), ok()])
+  } }
+}
+
+test "serving no connections opens a listener and touches no socket" {
+  handle {
+    assert_eq(listen_and_serve(0, 0), 0)
+  } with {
+    net.listen[listener](p) -> 1,
+    net.accept[listener](l) -> panic("nothing should be accepted"),
+    net.close[listener](l) -> (),
+    net.recv[conn](c, max) -> panic("nothing should be read"),
+    net.send[conn](c, payload) -> panic("nothing should be sent"),
+    net.close[conn](c) -> panic("nothing should be closed"),
+  }
+}
+
+// The number W1 owes W6, measured on a release build with the machine engine
+// and no socket involved, over a 35-byte head:
+//
+//   whole request, read loop included   1.05 ms   ~950 req/s per thread
+//   `answer` alone (parse and build)    0.56 ms
+//   one `head_end` over the head        0.105 ms  ~3.0 µs per byte examined
+//   building the response               0.010 ms
+//
+// So the endpoint's cost is a function of head length and of almost nothing
+// else. `fold` over `range` materializes one boxed `Int` per byte, and the
+// three scans plus `head_end` twice in `read_head` are where the millisecond
+// goes; the response, nine string concatenations, is a rounding error. The
+// first lever is a native byte search, not a faster interpreter — which is a
+// real answer to W6's question and not the one M9 assumes.

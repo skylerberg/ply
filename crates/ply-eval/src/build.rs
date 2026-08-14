@@ -38,6 +38,10 @@ pub fn string(s: &str) -> Expr {
     ex(ExprKind::Lit(Lit::Str(s.to_string())))
 }
 
+pub fn bytes(b: &[u8]) -> Expr {
+    ex(ExprKind::Lit(Lit::Bytes(b.to_vec())))
+}
+
 pub fn unit() -> Expr {
     ex(ExprKind::Lit(Lit::Unit))
 }
@@ -171,6 +175,13 @@ pub fn pint(i: i64) -> Pattern {
 pub fn pstr(s: &str) -> Pattern {
     Pattern {
         kind: PatternKind::Lit(Lit::Str(s.to_string())),
+        span: sp(),
+    }
+}
+
+pub fn pbytes(b: &[u8]) -> Pattern {
+    Pattern {
+        kind: PatternKind::Lit(Lit::Bytes(b.to_vec())),
         span: sp(),
     }
 }

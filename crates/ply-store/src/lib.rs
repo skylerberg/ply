@@ -62,8 +62,11 @@ pub use schema::fingerprint as schema_fingerprint;
 /// The shape half of that rule is enforced: a pin test in this crate fails when
 /// the serialized form changes, and says to bump this. The semantic half is
 /// not — no test can see that the evaluator started rounding differently — so a
-/// change to `ply-eval` or to normalization must bump this by hand.
-pub const RUNTIME_VERSION: &str = "0.5.0";
+/// change to `ply-eval` or to normalization must bump this by hand. **And a
+/// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
+/// `string_upper` read `std`'s Unicode tables, which is the one thing the
+/// evaluator does that this repository does not decide.
+pub const RUNTIME_VERSION: &str = "0.6.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -81,7 +84,7 @@ pub const RUNTIME_VERSION: &str = "0.5.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.7.0";
+pub const FRONTEND_VERSION: &str = "0.8.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
@@ -94,7 +97,7 @@ pub const FRONTEND_VERSION: &str = "0.7.0";
 /// Bump it for any change to the fragment, to a rule's meaning, to generation or
 /// shrinking, or to the on-disk shape of a [`CachedObligation`] — none of those
 /// moves an obligation's key, and all of them change what a cache hit claims.
-pub const PROVER_VERSION: &str = "0.1.0";
+pub const PROVER_VERSION: &str = "0.2.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///

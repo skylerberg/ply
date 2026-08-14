@@ -1,6 +1,7 @@
 use crate::builtins::Builtin;
 use crate::env::Env;
 use crate::handler::{OpDecl, check_operation, performed_atom};
+use crate::host::{HostBinding, err_hermetic, err_machine_only_host, operation_label};
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, grow};
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Value, type_error, values_equal};
@@ -66,6 +67,14 @@ pub struct Interp<'a> {
     /// budget bounds, so the two are one field rather than two that can drift.
     calls: Vec<Option<Symbol>>,
     max_calls: usize,
+    /// What the run's host boundary is, held only in order to *refuse* at it.
+    ///
+    /// The tree-walker serves no host operation: a `Pending` answer needs a
+    /// reactor it has no way to poll. It carries the binding so that reaching
+    /// the boundary is the same diagnostic on both engines — `E0424` when
+    /// nothing is bound, and a machine-only refusal when something is — rather
+    /// than an `E0303` that tells the reader to file a bug.
+    binding: Option<Arc<HostBinding>>,
 }
 
 impl<'a> Interp<'a> {
@@ -141,7 +150,13 @@ impl<'a> Interp<'a> {
             module: 0,
             calls: Vec::new(),
             max_calls: DEFAULT_MAX_CALLS,
+            binding: None,
         }
+    }
+
+    /// The run's host boundary. See [`Interp::binding`].
+    pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
+        self.binding = Some(binding);
     }
 
     pub fn with_max_calls(mut self, max_calls: usize) -> Self {
@@ -718,6 +733,16 @@ impl<'a> Interp<'a> {
             return result;
         }
 
+        if let Some(binding) = &self.binding
+            && let Some(path) = binding.would_serve(effect, op, resource.as_ref())
+        {
+            let operation = operation_label(effect, op, resource.as_ref());
+            return Err(if binding.is_hermetic() {
+                err_hermetic(span, &operation, path)
+            } else {
+                err_machine_only_host(span, &operation, path)
+            });
+        }
         Err(err_unhandled(span, effect, op, resource.as_ref()))
     }
 
@@ -775,6 +800,7 @@ impl<'a> Interp<'a> {
                 (Lit::Int(a), Value::Int(b)) => a == b,
                 (Lit::Bool(a), Value::Bool(b)) => a == b,
                 (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
+                (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
                 (Lit::Unit, Value::Unit) => true,
                 _ => false,
             },
@@ -859,6 +885,7 @@ pub(crate) fn literal(lit: &Lit) -> Value {
         Lit::Int(i) => Value::Int(*i),
         Lit::Bool(b) => Value::Bool(*b),
         Lit::Str(s) => Value::str(s),
+        Lit::Bytes(b) => Value::bytes(b),
         Lit::Unit => Value::Unit,
     }
 }

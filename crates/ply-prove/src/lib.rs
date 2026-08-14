@@ -22,8 +22,8 @@
 pub mod concurrency;
 pub mod domain;
 pub mod key;
-pub mod prove;
 pub mod property;
+pub mod prove;
 pub mod shrink;
 
 use ply_core::{Footprint, LawBinder, Resource, Type};
@@ -420,9 +420,7 @@ impl Obligation {
     /// at all.
     pub fn generated(&self) -> &[LawBinder] {
         match self.kind {
-            ObligationKind::Ensures { .. } => {
-                &self.binders[..self.binders.len().saturating_sub(1)]
-            }
+            ObligationKind::Ensures { .. } => &self.binders[..self.binders.len().saturating_sub(1)],
             ObligationKind::Law => &self.binders,
         }
     }

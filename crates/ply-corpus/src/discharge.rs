@@ -214,7 +214,9 @@ fn reach(prover: &Prover<'_>, obligations: &[Obligation], plan: &ProvePlan) -> R
         }
     }
     table.blockers = histogram.into_iter().collect();
-    table.blockers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    table
+        .blockers
+        .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     table
 }
 
@@ -316,7 +318,11 @@ pub fn render(runs: &[Discharged]) -> String {
         if run.reach.blockers.is_empty() && run.gaps.is_empty() {
             continue;
         }
-        let _ = writeln!(s, "\n  {} — why an obligation did not reach a proof", short(&run.project));
+        let _ = writeln!(
+            s,
+            "\n  {} — why an obligation did not reach a proof",
+            short(&run.project)
+        );
         for (blocker, count) in &run.reach.blockers {
             let _ = writeln!(s, "    {count:>4}  {blocker}");
         }
@@ -354,7 +360,11 @@ pub fn render(runs: &[Discharged]) -> String {
     }
 
     let _ = writeln!(s, "\ndischarge cost, in process, cache bypassed");
-    let _ = writeln!(s, "  {:<28} {:>6} {:>12} {:>14}", "project", "oblig", "total (ms)", "per oblig (ms)");
+    let _ = writeln!(
+        s,
+        "  {:<28} {:>6} {:>12} {:>14}",
+        "project", "oblig", "total (ms)", "per oblig (ms)"
+    );
     for run in runs {
         let per = if run.obligations == 0 {
             0.0
