@@ -227,6 +227,23 @@ pub mod codes {
     pub const UNHANDLED_EFFECT: &str = "E0303";
     pub const RESOURCE_REQUIRED: &str = "E0304";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
+    /// A `Task` in a `simulate` region's result type, or a `join` of a task
+    /// whose region has already ended. The scheduler dies with its region, so a
+    /// task handle that outlives it names nothing.
+    pub const TASK_ESCAPES_SCOPE: &str = "E0413";
+    /// A simulated region made no more progress: nothing is enabled and no timer
+    /// can fire, or the per-interleaving step budget was spent. One code for
+    /// both, because from the program's side they are one problem with one fix
+    /// and the message is where the two differ.
+    pub const DEADLOCK: &str = "E0414";
+    /// Replaying a seed did not reproduce the recorded schedule. Ply's fault
+    /// rather than the program's — the same class as [`ENGINE_DIVERGENCE`], and
+    /// handled the same way, because a run that is not a function of its seed
+    /// invalidates every artifact the simulation produced.
+    pub const SIMULATION_DIVERGENCE: &str = "E0415";
+    /// A `simulate` region inside a `simulate` region, lexically or through a
+    /// call. Two schedulers means two notions of "runnable".
+    pub const NESTED_SIMULATION: &str = "E0416";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -381,10 +398,19 @@ mod tests {
             ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
             ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
+            ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
+            ("DEADLOCK", codes::DEADLOCK, "E0414"),
+            (
+                "SIMULATION_DIVERGENCE",
+                codes::SIMULATION_DIVERGENCE,
+                "E0415",
+            ),
+            ("NESTED_SIMULATION", codes::NESTED_SIMULATION, "E0416"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
             ("MACHINE_ONLY_CLAUSE", codes::MACHINE_ONLY_CLAUSE, "E0504"),
+            ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
             (

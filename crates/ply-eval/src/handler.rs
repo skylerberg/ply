@@ -18,7 +18,7 @@
 //!   makes a cell-backed state handler writable.
 
 use crate::code::{Clause, Code, ReturnArm};
-use crate::cont::{Continuation, Frame, Prompt, Stack};
+use crate::cont::{Continuation, Frame, Prompt, SimId, Stack, Target};
 use crate::env::Env;
 use crate::interp::arity_error;
 use crate::value::Value;
@@ -84,6 +84,33 @@ pub fn performed_atom(
 pub struct Transition {
     pub stack: Stack,
     pub state: State,
+}
+
+/// Who answered a `perform`.
+pub enum Answered {
+    Handler(Transition),
+    /// A `simulate` region's delimiter was reached first. The machine holds the
+    /// scheduler, so [`perform`] does the search and the split and hands over
+    /// the pieces rather than deciding anything about tasks.
+    Scheduler(Scheduled),
+}
+
+/// A `task.*`, `clock.*` or `random.*` perform, split at its region's
+/// delimiter.
+pub struct Scheduled {
+    pub region: SimId,
+    pub effect: Symbol,
+    pub op: Symbol,
+    pub args: Vec<Value>,
+    pub span: Span,
+    /// The performing task's control, up to and including the region's
+    /// delimiter. Resuming it reinstalls the delimiter, so the task's next
+    /// perform finds the scheduler again.
+    ///
+    /// The stack it was cut from is not carried: it is the stack the region
+    /// itself sits on, which the region already holds, and two copies of one
+    /// stack is two things that can disagree.
+    pub k: Continuation,
 }
 
 impl Transition {
@@ -195,7 +222,7 @@ pub fn perform_args(
 /// the whole of `op(x̄) -> e` being `op(x̄) resume κ -> κ(e)`.
 ///
 /// `W` is not a parameter. Capture and resumption do not touch the world.
-pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Transition, Diagnostic> {
+pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Answered, Diagnostic> {
     let Request {
         effect,
         op,
@@ -208,7 +235,21 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Transiti
     let Some(found) = stack.find_handler(&effect, &op, resource.as_ref()) else {
         return Err(err_unhandled(span, &effect, &op, resource.as_ref()));
     };
-    let clause = &found.prompt.clauses[found.clause];
+    let (prompt, clause_at) = match found.target {
+        Target::Ply { prompt, clause } => (prompt, clause),
+        Target::Sim(region) => {
+            let (k, _region_stack) = stack.capture(found.segments);
+            return Ok(Answered::Scheduler(Scheduled {
+                region,
+                effect,
+                op,
+                args,
+                span,
+                k,
+            }));
+        }
+    };
+    let clause = &prompt.clauses[clause_at];
     if clause.params.len() != args.len() {
         return Err(arity_error(
             span,
@@ -219,7 +260,7 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Transiti
     }
 
     let (k, below) = stack.capture(found.segments);
-    let mut scope = found.prompt.env.clone();
+    let mut scope = prompt.env.clone();
     for (p, v) in clause.params.iter().zip(args) {
         scope = scope.bind(p.clone(), v);
     }
@@ -231,12 +272,12 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Transiti
         }
         None => below.pushed(Frame::Resume { k: Rc::new(k) }),
     };
-    Ok(Transition::eval(
+    Ok(Answered::Handler(Transition::eval(
         stack,
         &clause.body,
         scope,
-        found.prompt.module,
-    ))
+        prompt.module,
+    )))
 }
 
 /// `Frame::Resume(k)` — hand a value to a captured continuation.
@@ -254,17 +295,11 @@ pub fn resume(stack: &Stack, k: &Continuation, value: Value) -> Transition {
 
 /// Applying a `Value::Continuation`. It takes exactly one argument — the value
 /// the `perform` it was captured at should have produced.
-pub fn apply_continuation(
-    stack: &Stack,
-    k: &Continuation,
-    mut args: Vec<Value>,
-    span: Span,
-) -> Result<Transition, Diagnostic> {
+pub fn continuation_argument(mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     if args.len() != 1 {
         return Err(arity_error(span, "a continuation", 1, args.len()));
     }
-    let value = args.pop().expect("a one-argument call has an argument");
-    Ok(resume(stack, k, value))
+    Ok(args.pop().expect("a one-argument call has an argument"))
 }
 
 /// `⟨Eval(with_cell[r](i){x→b}, ρ, m), K, W⟩ → ⟨Eval(i, ρ, m), K·WithCellBody, W⟩`

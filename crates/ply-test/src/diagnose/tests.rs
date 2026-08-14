@@ -671,6 +671,8 @@ fn two_runs_over_one_failure_agree_exactly() {
                 suspects: Vec::new(),
                 assertion: None,
                 attribution: out,
+                seed: None,
+                race: None,
             })
             .to_string(),
             hybrid.trials,
@@ -898,6 +900,8 @@ fn failure_with(attribution: crate::Attribution) -> crate::Failure {
         suspects: Vec::new(),
         assertion: None,
         attribution,
+        seed: None,
+        race: None,
     }
 }
 
@@ -911,6 +915,7 @@ fn summary_of(attribution: crate::Attribution) -> Vec<String> {
         parallelism: Default::default(),
         results: Vec::new(),
         warnings: Vec::new(),
+        simulation: Default::default(),
     }
     .summary()
 }

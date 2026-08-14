@@ -1,0 +1,189 @@
+// Two transfers out of one account, and the oldest concurrency bug there is: a
+// balance checked in one place and spent in another.
+//
+// `transfer` reads the balance, decides the amount fits, and only then debits.
+// Between the two it stamps the movement with `clock.now()` — ordinary code, and
+// a scheduling point, because `clock` is one of the three effects `simulate`
+// hands to the seeded scheduler. So the other transfer is free to run inside the
+// window between the check and the debit, both pass a check against the same
+// balance, and the account ends up overdrawn. Nothing in the source looks like a
+// yield, which is why the bug survives review.
+//
+// `settle` is the same transfer with the check pushed into the resource:
+// `bank.take` decides and debits in one operation, so no schedule can separate
+// them. That is the fix a real system makes too — the check belongs where the
+// state is.
+//
+// Conservation holds under every interleaving of either version, because both
+// debit and credit the same amounts. Non-negativity is the property only
+// `settle` keeps, and `tests/fixtures/bank_race.ply` is `transfer` with that
+// property asserted: it passes under most seeds and fails under the ones that
+// let both checks run before either debit.
+
+effect bank {
+  read  balance[r](account: String) -> Int
+  write credit[r](account: String, amount: Int) -> Unit
+  write take[r](account: String, amount: Int) -> Bool
+  write record[r](movement: Movement) -> Unit
+}
+
+type Account = { name: String, balance: Int }
+
+type Movement = { at: Int, from: String, to: String, amount: Int }
+
+fn balance_of(accounts: List<Account>, name: String) -> Int =
+  fold(accounts, 0, |acc, a: Account| if a.name == name { a.balance } else { acc })
+
+fn credited(accounts: List<Account>, name: String, amount: Int) -> List<Account> =
+  map(accounts, |a: Account|
+    if a.name == name { {name: a.name, balance: a.balance + amount} } else { a })
+
+fn total(accounts: List<Account>) -> Int =
+  fold(accounts, 0, |acc, a: Account| acc + a.balance)
+
+fn overdrawn(accounts: List<Account>) -> Int =
+  len(filter(accounts, |a: Account| a.balance < 0))
+
+fn opening() -> List<Account> = [
+  {name: "alice", balance: 100},
+  {name: "bob", balance: 50},
+  {name: "carol", balance: 50},
+]
+
+// The bug. Nothing in the row says "this is not atomic", because atomicity is
+// not a property of one function — it is a property of what may run between its
+// performs, and that is what `simulate` gets to decide.
+fn transfer(from: String, to: String, amount: Int) -> Bool
+  / {bank.read[accounts], bank.write[accounts], bank.write[journal], clock.read} {
+  if bank.balance[accounts](from) < amount {
+    false
+  } else {
+    let at = clock.now();
+    bank.credit[accounts](from, -amount);
+    bank.credit[accounts](to, amount);
+    bank.record[journal]({at: at, from: from, to: to, amount: amount});
+    true
+  }
+}
+
+// The fix. `bank.take` is one operation, so the decision and the debit are one
+// step and no interleaving separates them. The money is briefly out of both
+// accounts, which is why conservation is asserted after every task has been
+// joined rather than in the middle of one.
+fn settle(from: String, to: String, amount: Int) -> Bool
+  / {bank.write[accounts], bank.write[journal], clock.read} {
+  if bank.take[accounts](from, amount) {
+    let at = clock.now();
+    bank.credit[accounts](to, amount);
+    bank.record[journal]({at: at, from: from, to: to, amount: amount});
+    true
+  } else {
+    false
+  }
+}
+
+test "a lone transfer moves the money and stops at the balance" {
+  with_cell[accounts](opening()) { ledger -> {
+  with_cell[journal]([]) { log -> {
+    handle {
+      simulate {
+        assert(settle("alice", "bob", 60));
+        assert(!settle("alice", "bob", 60));
+        assert_eq(balance_of(cell_get(ledger), "alice"), 40);
+        assert_eq(balance_of(cell_get(ledger), "bob"), 110);
+        assert_eq(total(cell_get(ledger)), 200);
+        assert_eq(len(cell_get(log)), 1)
+      }
+    } with {
+      bank.take[accounts](who, amount) ->
+        if balance_of(cell_get(ledger), who) < amount {
+          false
+        } else {
+          cell_set(ledger, credited(cell_get(ledger), who, -amount));
+          true
+        },
+      bank.credit[accounts](who, amount) ->
+        cell_set(ledger, credited(cell_get(ledger), who, amount)),
+      bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+    }
+  } }
+  } }
+}
+
+// The racy version, asserting only what survives every interleaving. Both
+// transfers debit alice and credit somebody, whichever order the scheduler
+// picks, so the money is conserved even when the check was wrong about whether
+// it was there to begin with.
+test "two unguarded transfers conserve the money whichever order they run in" {
+  with_cell[accounts](opening()) { ledger -> {
+  with_cell[journal]([]) { log -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| transfer("alice", "bob", 60));
+        let b = task.spawn(|| transfer("alice", "carol", 60));
+        task.join(a);
+        task.join(b);
+        assert_eq(total(cell_get(ledger)), 200);
+        assert_eq(
+          fold(cell_get(log), 0, |acc, m: Movement| acc + m.amount),
+          100 - balance_of(cell_get(ledger), "alice"))
+      }
+    } with {
+      bank.balance[accounts](who) -> balance_of(cell_get(ledger), who),
+      bank.credit[accounts](who, amount) ->
+        cell_set(ledger, credited(cell_get(ledger), who, amount)),
+      bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+    }
+  } }
+  } }
+}
+
+// The one the milestone exists for. `overdrawn` is the assertion the unguarded
+// transfer fails under some interleavings; with the check inside the resource it
+// holds under all of them, and a search that empties its frontier says so —
+// `exhaustive: true` is a proof over every interleaving rather than a sample.
+//
+// Exactly one of the two can be afforded, so exactly one movement is journalled,
+// no matter which one won. An invariant about a count rather than about an order
+// is what a concurrent test can honestly assert.
+test "the guarded transfer never overdraws, under every interleaving" {
+  with_cell[accounts](opening()) { ledger -> {
+  with_cell[journal]([]) { log -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| settle("alice", "bob", 60));
+        let b = task.spawn(|| settle("alice", "carol", 60));
+        task.join(a);
+        task.join(b);
+        assert_eq(overdrawn(cell_get(ledger)), 0);
+        assert_eq(total(cell_get(ledger)), 200);
+        assert_eq(balance_of(cell_get(ledger), "alice"), 40);
+        assert_eq(len(cell_get(log)), 1);
+        assert_eq(fold(cell_get(log), 0, |acc, m: Movement| acc + m.amount), 60)
+      }
+    } with {
+      bank.take[accounts](who, amount) ->
+        if balance_of(cell_get(ledger), who) < amount {
+          false
+        } else {
+          cell_set(ledger, credited(cell_get(ledger), who, -amount));
+          true
+        },
+      bank.credit[accounts](who, amount) ->
+        cell_set(ledger, credited(cell_get(ledger), who, amount)),
+      bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+    }
+  } }
+  } }
+}
+
+// Nothing here is concurrent, so nothing here is seeded: the pure helpers keep
+// their ordinary `det` test and their ordinary cache entry, keyed by hash alone.
+test "the helpers add up" {
+  assert_eq(total(opening()), 200);
+  assert_eq(balance_of(opening(), "alice"), 100);
+  assert_eq(balance_of(opening(), "nobody"), 0);
+  assert_eq(overdrawn(opening()), 0);
+  assert_eq(overdrawn(credited(opening(), "bob", -60)), 1);
+  assert_eq(total(credited(opening(), "bob", -60)), 140)
+}

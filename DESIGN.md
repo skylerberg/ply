@@ -203,6 +203,15 @@ error[E0412]: nondeterministic effect in a deterministic test
 
 `test/nondet` opts out and is never cached.
 
+**One qualification, from §6.** A `det` test may carry `sim.read`, because a seed
+is an input rather than a nondeterminism. Its outcome is then a function of its
+definitions *and* of the search that was performed, so it is keyed on
+`(test_hash, plan)` and never on `test_hash` alone — a run under one plan must
+not read a pass another plan earned. A search that spends its budget is reported
+green and **not** cached: it proved nothing about the interleavings it did not
+reach. That is the only green `det` test in the language that re-runs, and it is
+correct that it does.
+
 ## 5. Diagnostics for a machine consumer
 
 Failure output is a structured artifact, not terminal prose. `ply test --json`
@@ -214,10 +223,65 @@ pass and that lie in the failing test's closure. Usually one or two entries.
 The agent should not have to re-derive which of its twelve edits broke things.
 The system already knows.
 
+## 6. Simulation
+
+A `nondet` atom leaves the row when a handler discharges it, and a handler is
+free to be supplied by the language. `simulate { .. }` installs one for the three
+effects the language can model — `task`, `clock` and `random` — and does it with
+no new typing rule: it is `handle` with a fixed clause set.
+
+```ply
+test "transfers are atomic under any interleaving" {
+  simulate {
+    let a = task.spawn(|| transfer(alice, bob, 50));
+    let b = task.spawn(|| transfer(bob, alice, 30));
+    task.join(a); task.join(b);
+    assert_eq(balance(alice) + balance(bob), 100)
+  }
+}
+```
+
+Concurrency is an effect, so the scheduler is a test double like any other: the
+signature is declared once and a production handler, a sequential one written in
+Ply, and the seeded one cannot drift. A task is a suspended machine state, which
+is what the explicit control stack bought.
+
+**The seed.** A region's row gains `sim.read` — the seed dependency, in the type
+— and everything the seeded handler produces is a function of that seed and the
+requests made so far. A simulated run is therefore a pure function of its
+definition set and its seed, which is why `clock.now()` becomes usable in an
+ordinary `det`, cacheable test. A failure reports its seed and `ply test --seed
+<n>` replays it exactly.
+
+**The reduction is the point.** Two tasks whose footprints do not conflict
+commute, so exploring both orders is provably redundant. Partial-order reduction
+algorithms spend their complexity approximating that relation; Ply computes it
+exactly, at resource granularity, with the same predicate that decides which
+tests may run concurrently. When the search exhausts its frontier the result is
+not a sample but a proof over every interleaving.
+
+**Over every interleaving the scheduler could have chosen.** Tasks interleave at
+the operations the scheduler answers — `task`, `clock` and `random` — so a task
+that reads shared state and writes it back with none of those in between runs the
+two as one step, and no schedule separates them. That is a real limit and ADR 0006
+§3.3 states it: put a `task.yield()` in the window, or a `clock.now()` stamp the
+code was going to write anyway, or push the check into the resource so there is
+nothing to separate.
+
+**What this costs, plainly.** Row four of the table above needs a qualification:
+a test that depends on time, order or randomness no longer fails to compile — it
+becomes a test over a seed set, and a green run is a claim about the seeds that
+were run. The risk that a seed you did not run would have failed is real. It is
+also visible on every run, often zero when the search is exhaustive, and widened
+with one flag — where wall-clock flakiness was none of those.
+
+`docs/adr/0006-deterministic-simulation.md` is the specification.
+
 ## Non-goals for the vertical slice
 
 Native codegen (the v0 evaluator is a tree-walking interpreter), multi-shot
 continuations, VM-level snapshot/fork, deterministic scheduling simulation, and
 spec-derived property tests are all deliberately deferred. See ROADMAP.md — each
 has a milestone, and the M0–M4 architecture is shaped so none of them requires a
-rewrite.
+rewrite. §6 is M7 and describes what that milestone lands, not what the vertical
+slice ships.

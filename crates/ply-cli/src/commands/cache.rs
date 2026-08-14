@@ -955,10 +955,10 @@ mod tests {
     fn inspect_prints_an_effect_declaration_operation_by_operation() {
         let dir = checked(&[(
             "store.ply",
-            "nondet effect clock {\n  read now() -> Int\n  write set[c](t: Int) -> Unit\n}\n",
+            "nondet effect wall {\n  read now() -> Int\n  write set[c](t: Int) -> Unit\n}\n",
         )]);
         let store = Store::open(dir.path()).unwrap();
-        let found = store.lookup("clock");
+        let found = store.lookup("wall");
         assert_eq!(found.len(), 1);
 
         let entry = Entry::of(&found[0], &store);

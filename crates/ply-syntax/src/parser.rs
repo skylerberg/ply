@@ -1055,6 +1055,16 @@ impl Parser {
                 if name.as_str() == "with_cell" && matches!(self.kind_at(1), TokenKind::LBracket) {
                     return self.with_cell_expr();
                 }
+                // Contextual, like `with_cell`: `simulate` stays an identifier
+                // everywhere else. Where a `{` cannot open an expression it
+                // opens the enclosing construct's block instead, so `simulate`
+                // is an ordinary name there and a region has to be parenthesized.
+                if name.as_str() == "simulate"
+                    && !self.no_brace
+                    && matches!(self.kind_at(1), TokenKind::LBrace)
+                {
+                    return self.simulate_expr();
+                }
                 let q = self.qname("an expression")?;
                 let span = q.span;
                 Ok(Expr {
@@ -1446,6 +1456,18 @@ impl Parser {
         })
     }
 
+    fn simulate_expr(&mut self) -> PResult<Expr> {
+        let start = self.advance();
+        let body = self.block_expr()?;
+        let span = start.to(body.span);
+        Ok(Expr {
+            kind: ExprKind::Simulate {
+                body: Box::new(body),
+            },
+            span,
+        })
+    }
+
     fn pattern(&mut self) -> PResult<Pattern> {
         self.deeper()?;
         let r = self.pattern_body();
@@ -1657,6 +1679,7 @@ fn is_block_like(kind: &ExprKind) -> bool {
             | ExprKind::Match { .. }
             | ExprKind::Handle { .. }
             | ExprKind::WithCell { .. }
+            | ExprKind::Simulate { .. }
     )
 }
 

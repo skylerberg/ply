@@ -11,13 +11,14 @@ pub mod measure;
 pub mod model;
 pub mod pipeline;
 pub mod rng;
+pub mod simulate;
 pub mod spec;
 pub mod write;
 
 pub use spec::CorpusSpec;
 
 use anyhow::{Result, bail};
-use ply_eval::EngineChoice;
+use ply_eval::{EngineChoice, Plan};
 use ply_store::Store;
 use std::path::Path;
 
@@ -29,6 +30,9 @@ pub struct Verified {
     pub failed: usize,
     pub groups: usize,
     pub largest_group: usize,
+    /// Tests whose footprint carries `sim.read` — the ones whose result is a
+    /// function of the definition set *and* a seed.
+    pub seeded: usize,
 }
 
 /// Compiles and runs a corpus with the real crates. This is the only thing that
@@ -43,7 +47,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
     let mut store = Store::open(root)?;
     store.clear()?;
 
-    let selection = ply_test::select(&front.check, &front.hashes, &store);
+    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
     let report = ply_test::run(
         &selection,
         &front.program,
@@ -52,6 +56,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
         &front.hashes,
         &mut store,
         EngineChoice::Both,
+        ply_test::Search::of(&selection),
     );
 
     if report.failed > 0 {
@@ -76,6 +81,12 @@ pub fn verify(root: &Path) -> Result<Verified> {
         failed: report.failed,
         groups: selection.groups.len(),
         largest_group: selection.groups.iter().map(|g| g.len()).max().unwrap_or(0),
+        seeded: front
+            .check
+            .tests
+            .iter()
+            .filter(|t| ply_test::is_seeded(&t.footprint))
+            .count(),
     })
 }
 
@@ -215,6 +226,69 @@ mod tests {
         assert_eq!(verify(&root).unwrap().failed, 0);
     }
 
+    fn concurrent_spec(density: f64) -> CorpusSpec {
+        CorpusSpec {
+            seed: 31,
+            modules: 4,
+            defs_per_module: 6,
+            tests: 8,
+            depth: 2,
+            concurrent_tests: 4,
+            tasks_per_test: 3,
+            steps_per_task: 2,
+            conflict_density: density,
+            ..CorpusSpec::default()
+        }
+    }
+
+    fn verify_at(density: f64) -> Verified {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let spec = concurrent_spec(density);
+        write::write(&root, &spec, &generate(&spec)).unwrap();
+        verify(&root).unwrap_or_else(|e| panic!("density {density} does not compile: {e:#}"))
+    }
+
+    /// A generated concurrent test has to be green under **every** interleaving,
+    /// or the corpus cannot be the fixed point a reduction is measured against:
+    /// a failure would be reported as a race rather than as a bad generator.
+    #[test]
+    fn a_concurrent_corpus_compiles_and_passes_at_every_density() {
+        for density in [0.0, 0.5, 1.0] {
+            let verified = verify_at(density);
+            assert_eq!(verified.failed, 0, "density {density}");
+            assert_eq!(verified.passed, verified.tests, "density {density}");
+            assert_eq!(
+                verified.seeded, 4,
+                "density {density}: a `simulate` test must carry `sim.read`"
+            );
+        }
+    }
+
+    /// `sim.read` names an input no test can write, so adding simulated tests to
+    /// an otherwise-isolated corpus must not serialize anything.
+    #[test]
+    fn concurrent_tests_do_not_change_how_the_suite_is_scheduled() {
+        let plain = {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("corpus");
+            let spec = CorpusSpec {
+                concurrent_tests: 0,
+                ..concurrent_spec(0.5)
+            };
+            write::write(&root, &spec, &generate(&spec)).unwrap();
+            verify(&root).unwrap()
+        };
+        let with_concurrency = verify_at(0.5);
+
+        assert_eq!(plain.seeded, 0);
+        assert_eq!(with_concurrency.tests, plain.tests + 4);
+        assert_eq!(
+            with_concurrency.groups, plain.groups,
+            "four simulated tests changed the group count"
+        );
+    }
+
     /// The corpus exists to measure incremental selection, so the property it
     /// measures has to hold on the corpus itself.
     #[test]
@@ -235,7 +309,7 @@ mod tests {
 
         let front = pipeline::front(&root).unwrap();
         let store = Store::open(&root).unwrap();
-        let selection = ply_test::select(&front.check, &front.hashes, &store);
+        let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
         let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
         assert_eq!(
             selection.to_run.len(),

@@ -39,6 +39,9 @@ const TABLE_WORDS: [&str; 16] = [
 const REGION_WORDS: [&str; 8] = [
     "hot", "warm", "cold", "edge", "shard", "digest", "window", "bucket",
 ];
+const SHARD_WORDS: [&str; 8] = [
+    "lane", "mile", "berth", "slot", "track", "gate", "dock", "aisle",
+];
 
 /// How many calls a definition makes beyond what its shape already requires.
 const MAX_EXTRAS: usize = 3;
@@ -46,6 +49,7 @@ const MAX_EXTRAS: usize = 3;
 pub fn generate(spec: &CorpusSpec) -> Corpus {
     let tables = labels(&TABLE_WORDS, spec.tables);
     let regions = labels(&REGION_WORDS, spec.regions);
+    let shards = labels(&SHARD_WORDS, spec.shards_per_test());
     let root = Rng::new(spec.seed);
 
     let mut modules = plan_modules(spec, &root);
@@ -53,8 +57,10 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
         modules: Vec::new(),
         defs: Vec::new(),
         tests: Vec::new(),
+        concurrent: Vec::new(),
         tables,
         regions,
+        shards,
     };
 
     for id in 0..modules.len() {
@@ -69,6 +75,10 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
 
     mark_public(&mut corpus);
     corpus.tests = generate_tests(spec, &root, &corpus);
+    corpus.concurrent = generate_concurrent_tests(spec, &root, &corpus);
+    for test in &corpus.concurrent {
+        corpus.modules[test.module].needs_effects = true;
+    }
     corpus
 }
 
@@ -565,6 +575,61 @@ fn build_test(
     }
 }
 
+/// Concurrency, generated at a chosen conflict density.
+///
+/// The shape is fixed and only the contention varies, because a measurement of
+/// how exploration scales with contention has to hold everything else still:
+/// same task count, same step count, same arithmetic, and the assignment of
+/// tasks to shards as the only independent variable. At density 0 no two steps
+/// conflict and the search should collapse to one interleaving; at density 1
+/// every pair conflicts and there is nothing to prune.
+fn generate_concurrent_tests(
+    spec: &CorpusSpec,
+    root: &Rng,
+    corpus: &Corpus,
+) -> Vec<ConcurrentTest> {
+    let mut out = Vec::with_capacity(spec.concurrent_tests);
+    // One task is a sequential program with a `simulate` around it, and a
+    // corpus of those measures nothing. `validate` refuses the spec; this is
+    // what keeps `generate` alone from emitting a test with no tasks in it.
+    if spec.tasks_per_test < 2 || corpus.modules.is_empty() || corpus.shards.is_empty() {
+        return out;
+    }
+    let shard_count = spec.shards_per_test().min(corpus.shards.len());
+
+    for index in 0..spec.concurrent_tests {
+        let module = index % corpus.modules.len();
+        let mut rng = root.fork(0x4000_0000 + index as u64);
+
+        let tasks: Vec<TaskBody> = (0..spec.tasks_per_test)
+            .map(|i| TaskBody {
+                name: format!("worker_{index}_{i}"),
+                shard: i % shard_count,
+                steps: (0..spec.steps_per_task)
+                    .map(|_| rng.between(1, 9))
+                    .collect(),
+            })
+            .collect();
+
+        let mut shards: Vec<usize> = tasks.iter().map(|t| t.shard).collect();
+        shards.sort_unstable();
+        shards.dedup();
+
+        out.push(ConcurrentTest {
+            module,
+            label: format!(
+                "{} tasks over {} shard{} (case {index})",
+                tasks.len(),
+                shards.len(),
+                if shards.len() == 1 { "" } else { "s" }
+            ),
+            tasks,
+            shards,
+        });
+    }
+    out
+}
+
 fn phrase(rng: &mut Rng, shape: &Shape) -> &'static str {
     let generic = [
         "agrees with its worked example",
@@ -588,6 +653,7 @@ fn index_of(labels: &[String], label: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn small() -> CorpusSpec {
         CorpusSpec {
@@ -597,6 +663,117 @@ mod tests {
             tests: 24,
             depth: 3,
             ..CorpusSpec::default()
+        }
+    }
+
+    fn concurrent(density: f64) -> CorpusSpec {
+        CorpusSpec {
+            concurrent_tests: 6,
+            tasks_per_test: 4,
+            steps_per_task: 3,
+            conflict_density: density,
+            ..small()
+        }
+    }
+
+    #[test]
+    fn no_concurrency_is_asked_for_by_default_and_none_is_generated() {
+        assert_eq!(CorpusSpec::default().concurrent_tests, 0);
+        assert!(generate(&small()).concurrent.is_empty());
+    }
+
+    /// The knob's two ends, which are the two ends of the claim: at 0.0 the
+    /// dependence relation has nothing to relate and the search should collapse
+    /// to one interleaving, at 1.0 it relates everything and there is nothing to
+    /// prune. Anything in between is an interpolation of these.
+    #[test]
+    fn density_zero_gives_every_task_its_own_shard_and_density_one_gives_them_all_the_same() {
+        let disjoint = generate(&concurrent(0.0));
+        for test in &disjoint.concurrent {
+            let shards: BTreeSet<usize> = test.tasks.iter().map(|t| t.shard).collect();
+            assert_eq!(shards.len(), test.tasks.len(), "`{}`", test.label);
+            assert_eq!(test.contention(), 0.0);
+        }
+
+        let contended = generate(&concurrent(1.0));
+        for test in &contended.concurrent {
+            let shards: BTreeSet<usize> = test.tasks.iter().map(|t| t.shard).collect();
+            assert_eq!(shards.len(), 1, "`{}`", test.label);
+            assert_eq!(test.contention(), 1.0);
+        }
+    }
+
+    #[test]
+    fn contention_rises_with_the_density_asked_for() {
+        let mean = |d: f64| {
+            let corpus = generate(&concurrent(d));
+            corpus
+                .concurrent
+                .iter()
+                .map(|t| t.contention())
+                .sum::<f64>()
+                / corpus.concurrent.len() as f64
+        };
+        let (low, mid, high) = (mean(0.0), mean(0.5), mean(1.0));
+        assert!(low < mid && mid < high, "{low} {mid} {high}");
+    }
+
+    /// Only the shard assignment may move with the density, or a measurement
+    /// across densities is comparing two different programs and attributing the
+    /// difference to contention.
+    #[test]
+    fn density_changes_the_shard_assignment_and_nothing_else() {
+        let disjoint = generate(&concurrent(0.0));
+        let contended = generate(&concurrent(1.0));
+        assert_eq!(disjoint.concurrent.len(), contended.concurrent.len());
+        for (a, b) in disjoint.concurrent.iter().zip(&contended.concurrent) {
+            assert_eq!(a.module, b.module);
+            assert_eq!(a.total(), b.total());
+            for (x, y) in a.tasks.iter().zip(&b.tasks) {
+                assert_eq!(x.name, y.name);
+                assert_eq!(x.steps, y.steps);
+            }
+        }
+    }
+
+    #[test]
+    fn a_module_hosting_a_concurrent_test_imports_the_effect_it_performs() {
+        let corpus = generate(&concurrent(0.5));
+        assert!(!corpus.concurrent.is_empty());
+        for test in &corpus.concurrent {
+            assert!(
+                corpus.modules[test.module].needs_effects,
+                "module {} hosts `{}` and would not import `core.effects`",
+                corpus.modules[test.module].name, test.label
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_body_is_named_apart_from_every_generated_definition() {
+        let corpus = generate(&concurrent(0.5));
+        let defs: BTreeSet<&str> = corpus.defs.iter().map(|d| d.name.as_str()).collect();
+        let mut workers = BTreeSet::new();
+        for test in &corpus.concurrent {
+            for task in &test.tasks {
+                assert!(!defs.contains(task.name.as_str()), "{}", task.name);
+                assert!(workers.insert(task.name.clone()), "{}", task.name);
+            }
+        }
+        assert_eq!(workers.len(), 6 * 4);
+    }
+
+    #[test]
+    fn the_same_seed_produces_the_same_concurrent_tests() {
+        let a = generate(&concurrent(0.5));
+        let b = generate(&concurrent(0.5));
+        for (x, y) in a.concurrent.iter().zip(&b.concurrent) {
+            assert_eq!(x.label, y.label);
+            assert_eq!(x.total(), y.total());
+            assert_eq!(
+                x.tasks.iter().map(|t| t.steps.clone()).collect::<Vec<_>>(),
+                y.tasks.iter().map(|t| t.steps.clone()).collect::<Vec<_>>()
+            );
         }
     }
 

@@ -6,9 +6,11 @@
 
 use crate::bisect::Bisection;
 use crate::schedule::{Isolation, Parallelism, shared_footprint};
+use crate::sim::SimSummary;
 use crate::slice::{Assertion, CausalSlice};
 use crate::{Attribution, Failure, Reason, RunReport, Selection, Status, Suspect, TestResult};
 use ply_core::{CheckOutput, Footprint};
+use ply_eval::{Exploration, Race, RaceSite};
 use ply_hash::HashOutput;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -16,7 +18,10 @@ use std::time::Duration;
 /// Bumped whenever a field in the failure artifact changes meaning or leaves.
 /// A machine consumer that acts without asking a follow-up question needs to
 /// know what it is parsing before it parses it.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3 adds `failures[].seed`, `failures[].replay`, `failures[].race` and a
+/// per-test `simulation` object.
+pub const SCHEMA_VERSION: u32 = 3;
 
 fn millis(d: Duration) -> f64 {
     (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
@@ -160,6 +165,7 @@ impl RunReport {
             "success": self.is_success(),
             "isolated": self.parallelism.isolated,
             "parallelism": self.parallelism,
+            "simulation": simulation_summary_json(&self.simulation),
             "tests": self.results.iter().map(test_json).collect::<Vec<_>>(),
             "failures": self.failures.iter().map(failure_json).collect::<Vec<_>>(),
             "warnings": self.warnings,
@@ -186,6 +192,7 @@ impl RunReport {
                 self.parallelism.isolated, self.parallelism.total
             ));
         }
+        lines.extend(self.simulation.line());
         for failure in &self.failures {
             lines.push(String::new());
             lines.push(failure.key.to_string());
@@ -194,6 +201,7 @@ impl RunReport {
             for note in &failure.diagnostic.notes {
                 lines.push(format!("  = {note}"));
             }
+            lines.extend(seed_lines(failure));
             if let Some(path) = ran_path(&failure.attribution) {
                 lines.push(format!("  ran: {path}"));
             }
@@ -204,6 +212,36 @@ impl RunReport {
         }
         lines
     }
+}
+
+/// The seed, the race it came from, and the command that replays it.
+///
+/// The replay line is printed rather than described because the point of the
+/// milestone is that reproducing a concurrency failure is one command with one
+/// argument, and a reader should not have to assemble it.
+pub fn seed_lines(failure: &Failure) -> Vec<String> {
+    let Some(seed) = &failure.seed else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("  seed: {seed}")];
+    if let Some(race) = &failure.race {
+        lines.push(format!("  race: {}", race_site(&race.left)));
+        lines.push(format!("        {}", race_site(&race.right)));
+    }
+    lines.push(format!(
+        "  replay: {}",
+        crate::replay_command(seed, &failure.name)
+    ));
+    lines
+}
+
+fn race_site(site: &RaceSite) -> String {
+    let definition = site
+        .definition
+        .as_ref()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{}  {definition}   {}", site.task, site.access)
 }
 
 /// Silent when there is no culprit to lead with, so that a run which could not
@@ -266,6 +304,62 @@ fn test_json(result: &TestResult) -> Value {
         "status": result.status,
         "duration_ms": millis(result.duration),
         "diagnostic": result.failure,
+        "simulation": result.simulation.as_ref().map(exploration_json),
+        "cached": result.recorded.as_ref().map(|r| r.is_written()),
+    })
+}
+
+/// Absent — not zeroed — on a test that reached no `simulate` region. A consumer
+/// cannot tell an explored count of zero from a test that never simulated.
+pub fn exploration_json(exploration: &Exploration) -> Value {
+    json!({
+        "explored": exploration.explored,
+        // The headline. `true` means every interleaving of this test ran, up to
+        // an equivalence that provably preserves outcomes — a proof rather than
+        // a sample.
+        "exhaustive": exploration.exhaustive,
+        // The budget was spent, so the run is green and not cached.
+        "exhausted": exploration.exhausted,
+        "naive": exploration.naive.map(|naive| json!({
+            "explored": naive.explored,
+            // A spent naive budget is a lower bound, and a lower bound reported
+            // as an exact count is a number nobody observed.
+            "bounded": naive.bounded,
+            "rendered": naive.to_string(),
+        })),
+        "reduction": exploration.reduction(),
+        "steps": exploration.steps,
+        "virtual_time_ns": exploration.virtual_time,
+        "failing_seed": exploration.failure.as_ref().map(|s| s.to_string()),
+    })
+}
+
+fn simulation_summary_json(summary: &SimSummary) -> Value {
+    json!({
+        "simulated": summary.simulated,
+        "total": summary.total,
+        "seeds": summary.seeds,
+        "interleavings": summary.interleavings,
+        "exhaustive": summary.exhaustive,
+        "exhausted": summary.exhausted,
+        "failed": summary.failed,
+    })
+}
+
+fn race_json(race: &Race) -> Value {
+    json!({
+        "at": race.at,
+        "left": race_site_json(&race.left),
+        "right": race_site_json(&race.right),
+    })
+}
+
+fn race_site_json(site: &RaceSite) -> Value {
+    json!({
+        "task": site.task.to_string(),
+        "definition": site.definition.as_ref().map(|d| d.to_string()),
+        "access": site.access,
+        "span": span_json(site.span),
     })
 }
 
@@ -281,6 +375,13 @@ pub fn failure_json(failure: &Failure) -> Value {
         // `panicked` only when a bisection was attempted and refused, so under
         // `--bisect never` every failure would look alike.
         "defect": failure.defect,
+        // The repro artifact. Null on a failure no simulation produced — never
+        // a default seed, which would replay a different run.
+        "seed": failure.seed.as_ref().map(|s| s.to_string()),
+        "replay": failure.replay(),
+        // Only when the search actually observed the flip. Under `once` and
+        // `random` there is nothing to observe, and a race is never inferred.
+        "race": failure.race.as_ref().map(race_json),
         "assertion": failure.assertion.as_ref().map(assertion_json),
         "culprit": culprit_json(&failure.attribution.bisection),
         "causal_slice": failure.attribution.slice.as_ref().map(slice_json),

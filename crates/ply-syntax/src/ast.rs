@@ -609,6 +609,15 @@ pub enum ExprKind {
         binder: Ident,
         body: Box<Expr>,
     },
+
+    /// `simulate { body }`. A `handle` with a fixed clause set: it installs the
+    /// seeded scheduler over `task`, `clock` and `random`, and its own row gains
+    /// `sim.read`, the seed dependency. There is no seed in the syntax — one
+    /// written in source would be part of the definition's hash, making every
+    /// seed a different definition.
+    Simulate {
+        body: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Debug)]

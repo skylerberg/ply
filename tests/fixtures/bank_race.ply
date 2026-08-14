@@ -1,0 +1,78 @@
+// A test that passes under most seeds and fails under some — which is what a
+// race is, and what the search exists to stop being a matter of luck.
+//
+// `transfer` is `examples/bank.ply`'s unguarded transfer: it checks the balance,
+// stamps the movement with `clock.now()`, and only then debits. `clock.now()` is
+// a scheduling point, so the other transfer may run inside the window between
+// the check and the debit. Both then pass a check against a balance of 100, both
+// debit 60, and alice ends at -20.
+//
+// Run it at a seed that orders the two tasks end to end and it passes. Run it
+// under the default `dpor` search and the flip is found, reported with the seed
+// that reproduces it and with the pair of steps that had to be reordered:
+//
+//   ply test --seed <the seed the failure printed> --filter "no account"
+//
+// Conservation still holds — both transfers debit and credit the same amounts,
+// see `examples/bank.ply` — so the assertion that fails here is exactly the one
+// the bug breaks, and nothing else.
+
+effect bank {
+  read  balance[r](account: String) -> Int
+  write credit[r](account: String, amount: Int) -> Unit
+  write record[r](movement: Movement) -> Unit
+}
+
+type Account = { name: String, balance: Int }
+
+type Movement = { at: Int, from: String, to: String, amount: Int }
+
+fn balance_of(accounts: List<Account>, name: String) -> Int =
+  fold(accounts, 0, |acc, a: Account| if a.name == name { a.balance } else { acc })
+
+fn credited(accounts: List<Account>, name: String, amount: Int) -> List<Account> =
+  map(accounts, |a: Account|
+    if a.name == name { {name: a.name, balance: a.balance + amount} } else { a })
+
+fn overdrawn(accounts: List<Account>) -> Int =
+  len(filter(accounts, |a: Account| a.balance < 0))
+
+fn opening() -> List<Account> = [
+  {name: "alice", balance: 100},
+  {name: "bob", balance: 50},
+  {name: "carol", balance: 50},
+]
+
+fn transfer(from: String, to: String, amount: Int) -> Bool
+  / {bank.read[accounts], bank.write[accounts], bank.write[journal], clock.read} {
+  if bank.balance[accounts](from) < amount {
+    false
+  } else {
+    let at = clock.now();
+    bank.credit[accounts](from, -amount);
+    bank.credit[accounts](to, amount);
+    bank.record[journal]({at: at, from: from, to: to, amount: amount});
+    true
+  }
+}
+
+test "no account is ever overdrawn" {
+  with_cell[accounts](opening()) { ledger -> {
+  with_cell[journal]([]) { log -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| transfer("alice", "bob", 60));
+        let b = task.spawn(|| transfer("alice", "carol", 60));
+        task.join(a);
+        task.join(b);
+        assert_eq(overdrawn(cell_get(ledger)), 0)
+      }
+    } with {
+      bank.balance[accounts](who) -> balance_of(cell_get(ledger), who),
+      bank.credit[accounts](who, amount) ->
+        cell_set(ledger, credited(cell_get(ledger), who, amount)),
+      bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+    }
+  } }
+  } }
+}
