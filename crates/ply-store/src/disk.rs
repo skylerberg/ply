@@ -1,7 +1,10 @@
-use crate::{Outcome, PassRecord, RUNTIME_VERSION};
+use crate::obligations::CachedObligation;
+use crate::reviews::ReviewRecord;
+use crate::{Outcome, PROVER_VERSION, PassRecord, RUNTIME_VERSION};
 use anyhow::Context;
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Symbol};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +17,31 @@ pub(crate) const RESULTS_FILE: &str = "results.json";
 const RESULTS_STEM: &str = "results";
 pub(crate) const PASSES_FILE: &str = "passes.json";
 const PASSES_STEM: &str = "passes";
+pub(crate) const OBLIGATIONS_FILE: &str = "obligations.json";
+const OBLIGATIONS_STEM: &str = "obligations";
+pub(crate) const REVIEWS_FILE: &str = "reviews.json";
+const REVIEWS_STEM: &str = "reviews";
+
+/// Both new files are read on their first question rather than at
+/// `Store::open`, so neither is in the way of the open budget, and both are
+/// pretty-printed JSON for the reason the result cache is: `cat`ting one to find
+/// out why an obligation did not re-run is worth more than its parse cost.
+const OBLIGATIONS_FORMAT: u32 = 1;
+const REVIEWS_FORMAT: u32 = 1;
+
+/// A review baseline is a decision a person made about a set of hashes. It
+/// survives every version constant in this crate deliberately: a new prover, a
+/// new runtime and a new front end all leave "this is what I accepted"
+/// standing, and a change that *does* move a `DefHash` shows up as a changed
+/// definition — which is a re-read, never a false unchanged.
+///
+/// `2` because `ReviewRecord::specs` changed meaning: it holds each claim's
+/// *sentence* rather than its obligation key, so that re-implementing a
+/// definition no longer reads as rewriting the claims about it. A baseline
+/// written under `1` is discarded rather than compared, which reports its
+/// definitions as unreviewed — one re-accept — where reading it would have
+/// reported every definition's spec as changed.
+const REVIEWS_VERSION: &str = "2";
 
 /// Independent of [`RUNTIME_VERSION`]: the layout can change without
 /// invalidating results, and results can be invalidated without the layout
@@ -38,6 +66,8 @@ const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 pub(crate) type Entries = BTreeMap<DefHash, Outcome>;
 pub(crate) type Definitions = BTreeSet<DefHash>;
 pub(crate) type Passes = BTreeMap<Symbol, PassRecord>;
+pub(crate) type Obligations = BTreeMap<DefHash, CachedObligation>;
+pub(crate) type Reviews = BTreeMap<Symbol, ReviewRecord>;
 
 /// `definitions` records which definitions a run has already seen. No test
 /// outcome can stand in for it: a green test vouches for the definitions in
@@ -166,6 +196,75 @@ impl LoadError {
              a failure is attributed as if it had never passed",
         )
     }
+
+    /// Losing the obligation cache costs a re-discharge and never a wrong label:
+    /// every obligation is attempted again from nothing.
+    pub(crate) fn into_obligations_diagnostic(self, path: &Path) -> Diagnostic {
+        let display = path.display();
+        let d = match self {
+            LoadError::Missing => Diagnostic::warning(
+                crate::codes::CACHE_UNREADABLE,
+                format!("no obligation cache at `{display}`"),
+            ),
+            LoadError::Io(e) => Diagnostic::warning(
+                crate::codes::CACHE_UNREADABLE,
+                format!("could not read the obligation cache `{display}`: {e}"),
+            ),
+            LoadError::Parse(e) => Diagnostic::warning(
+                crate::codes::CACHE_CORRUPT,
+                format!("the obligation cache `{display}` is corrupt: {e}"),
+            ),
+            LoadError::Format(found) => Diagnostic::warning(
+                crate::codes::CACHE_CORRUPT,
+                format!(
+                    "the obligation cache `{display}` is format {found}, \
+                     this build reads {OBLIGATIONS_FORMAT}"
+                ),
+            ),
+            LoadError::Version(found) => Diagnostic::warning(
+                crate::codes::CACHE_VERSION_CHANGED,
+                format!(
+                    "the obligation cache `{display}` was written by prover `{found}`, \
+                     this build is `{PROVER_VERSION}`"
+                ),
+            ),
+        };
+        d.note("every obligation is discharged again; no test re-runs")
+    }
+
+    /// Losing a review baseline reports every definition as unreviewed, which is
+    /// a re-read rather than a wrong answer — and is the direction to fail in.
+    pub(crate) fn into_reviews_diagnostic(self, path: &Path) -> Diagnostic {
+        let display = path.display();
+        let d = match self {
+            LoadError::Missing => Diagnostic::warning(
+                crate::codes::CACHE_UNREADABLE,
+                format!("no review records at `{display}`"),
+            ),
+            LoadError::Io(e) => Diagnostic::warning(
+                crate::codes::CACHE_UNREADABLE,
+                format!("could not read the review records `{display}`: {e}"),
+            ),
+            LoadError::Parse(e) => Diagnostic::warning(
+                crate::codes::CACHE_CORRUPT,
+                format!("the review records `{display}` are corrupt: {e}"),
+            ),
+            LoadError::Format(found) => Diagnostic::warning(
+                crate::codes::CACHE_CORRUPT,
+                format!(
+                    "the review records `{display}` are format {found}, \
+                     this build reads {REVIEWS_FORMAT}"
+                ),
+            ),
+            LoadError::Version(found) => Diagnostic::warning(
+                crate::codes::CACHE_VERSION_CHANGED,
+                format!(
+                    "the review records `{display}` are version `{found}`, this build reads `{REVIEWS_VERSION}`"
+                ),
+            ),
+        };
+        d.note("every definition is reported as never reviewed until it is accepted again")
+    }
 }
 
 pub(crate) fn load(path: &Path) -> Result<Cache, LoadError> {
@@ -239,6 +338,108 @@ fn intern(repr: PassesRepr) -> Passes {
         .collect()
 }
 
+/// The shape both files added in M8 share: a format, the version whose entries
+/// these are, and the entries. One shape rather than two so that a third cannot
+/// arrive with a different idea of where the version goes.
+#[derive(Deserialize)]
+struct VersionedFile<T> {
+    format: u32,
+    version: String,
+    entries: T,
+}
+
+#[derive(Serialize)]
+struct VersionedFileRef<'a, T> {
+    format: u32,
+    version: &'a str,
+    entries: &'a T,
+}
+
+fn load_versioned<T: DeserializeOwned>(
+    path: &Path,
+    format: u32,
+    version: &str,
+) -> Result<T, LoadError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err(LoadError::Missing),
+        Err(e) => return Err(LoadError::Io(e)),
+    };
+    let file: VersionedFile<T> = serde_json::from_str(&text).map_err(LoadError::Parse)?;
+    if file.format != format {
+        return Err(LoadError::Format(file.format));
+    }
+    if file.version != version {
+        return Err(LoadError::Version(file.version));
+    }
+    Ok(file.entries)
+}
+
+fn save_versioned<T: Serialize>(
+    dir: &Path,
+    path: &Path,
+    stem: &str,
+    format: u32,
+    version: &str,
+    entries: &T,
+    what: &str,
+) -> anyhow::Result<()> {
+    let file = VersionedFileRef {
+        format,
+        version,
+        entries,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&file)
+        .with_context(|| format!("could not serialize the {what}"))?;
+    bytes.push(b'\n');
+    write_atomic(dir, path, stem, &bytes, what)
+}
+
+pub(crate) fn load_obligations(path: &Path) -> Result<Obligations, LoadError> {
+    load_versioned(path, OBLIGATIONS_FORMAT, PROVER_VERSION)
+}
+
+pub(crate) fn save_obligations(
+    dir: &Path,
+    path: &Path,
+    obligations: &Obligations,
+) -> anyhow::Result<()> {
+    save_versioned(
+        dir,
+        path,
+        OBLIGATIONS_STEM,
+        OBLIGATIONS_FORMAT,
+        PROVER_VERSION,
+        obligations,
+        "obligation cache",
+    )
+}
+
+pub(crate) fn load_reviews(path: &Path) -> Result<Reviews, LoadError> {
+    let repr: BTreeMap<String, ReviewRecord> =
+        load_versioned(path, REVIEWS_FORMAT, REVIEWS_VERSION)?;
+    Ok(repr
+        .into_iter()
+        .map(|(key, record)| (Symbol::new(key), record))
+        .collect())
+}
+
+pub(crate) fn save_reviews(dir: &Path, path: &Path, reviews: &Reviews) -> anyhow::Result<()> {
+    let repr: BTreeMap<String, &ReviewRecord> = reviews
+        .iter()
+        .map(|(key, record)| (key.to_string(), record))
+        .collect();
+    save_versioned(
+        dir,
+        path,
+        REVIEWS_STEM,
+        REVIEWS_FORMAT,
+        REVIEWS_VERSION,
+        &repr,
+        "review records",
+    )
+}
+
 pub(crate) fn write_atomic(
     dir: &Path,
     path: &Path,
@@ -291,9 +492,15 @@ pub(crate) fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
     for entry in read.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let ours = [RESULTS_STEM, PASSES_STEM, crate::frontend::FRONTEND_STEM]
-            .iter()
-            .any(|stem| name.starts_with(&format!("{stem}.")));
+        let ours = [
+            RESULTS_STEM,
+            PASSES_STEM,
+            OBLIGATIONS_STEM,
+            REVIEWS_STEM,
+            crate::frontend::FRONTEND_STEM,
+        ]
+        .iter()
+        .any(|stem| name.starts_with(&format!("{stem}.")));
         if !ours || !name.ends_with(TEMP_SUFFIX) {
             continue;
         }

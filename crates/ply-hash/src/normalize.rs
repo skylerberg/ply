@@ -38,6 +38,9 @@ pub(crate) mod tag {
     pub const REF_INDEX: u8 = 4;
     pub const FREE: u8 = 5;
     pub const FREE_QUALIFIED: u8 = 9;
+    /// Only ever written by a [`super::Normalizer::by_name`] encoding, which no
+    /// definition hash is derived from.
+    pub const REF_NAME: u8 = 12;
     pub const CTOR: u8 = 6;
     pub const TY_PARAM: u8 = 7;
     pub const ROW_PARAM: u8 = 8;
@@ -53,6 +56,8 @@ pub(crate) mod tag {
     pub const VARIANT: u8 = 25;
     pub const OP: u8 = 26;
     pub const TYPE: u8 = 27;
+    pub const LAW: u8 = 28;
+    pub const SPEC: u8 = 29;
 
     pub const TY_CON: u8 = 30;
     pub const TY_FN: u8 = 31;
@@ -142,29 +147,42 @@ pub type HashTable = FxHashMap<usize, DefHash>;
 /// encoded. See [`crate::effect_order`].
 pub type EffectIndex = FxHashMap<usize, u32>;
 
-pub struct Normalizer<'a> {
+/// `'a` is the AST's lifetime and `'t` the tables'. They are separate because
+/// the effect enumeration a second pass runs against is built *from* the first
+/// pass, so it cannot outlive the walk that produced it.
+pub struct Normalizer<'a, 't> {
     index: &'a ProgramIndex<'a>,
     /// Which module's bodies are being walked. It decides what a name denotes
     /// and nothing else: no byte written below depends on it.
     module: usize,
-    hashes: &'a HashTable,
-    component: &'a ComponentIndices,
-    effects: &'a EffectIndex,
+    hashes: &'t HashTable,
+    component: &'t ComponentIndices,
+    effects: &'t EffectIndex,
     out: Vec<u8>,
     refs: Vec<NodeId>,
     seen: Vec<bool>,
     values: Vec<&'a Symbol>,
     ty_params: Vec<&'a Symbol>,
     row_params: Vec<&'a Symbol>,
+    /// Encode a reference as the referent's program-wide **name** rather than
+    /// its hash. This is the identity of a claim *as a sentence*: it moves when
+    /// the sentence is rewritten and stays put when the definitions it mentions
+    /// are re-implemented, which is what lets `ply review` separate "the
+    /// implementation moved" from "the claim moved".
+    ///
+    /// No definition, test or law hash is ever encoded this way — a hash that
+    /// referred to its dependencies by name would reintroduce exactly the
+    /// name-dependence content addressing exists to remove.
+    refs_by_name: bool,
 }
 
-impl<'a> Normalizer<'a> {
+impl<'a, 't> Normalizer<'a, 't> {
     pub fn new(
         index: &'a ProgramIndex<'a>,
         module: usize,
-        hashes: &'a HashTable,
-        component: &'a ComponentIndices,
-        effects: &'a EffectIndex,
+        hashes: &'t HashTable,
+        component: &'t ComponentIndices,
+        effects: &'t EffectIndex,
     ) -> Self {
         Normalizer {
             index,
@@ -178,7 +196,14 @@ impl<'a> Normalizer<'a> {
             values: Vec::new(),
             ty_params: Vec::new(),
             row_params: Vec::new(),
+            refs_by_name: false,
         }
+    }
+
+    /// Encode references by name instead of by hash. See [`Self::refs_by_name`].
+    pub fn by_name(mut self) -> Self {
+        self.refs_by_name = true;
+        self
     }
 
     /// The normalized bytes, and the definitions they reference in first-mention
@@ -236,6 +261,12 @@ impl<'a> Normalizer<'a> {
         if !self.seen[node.0] {
             self.seen[node.0] = true;
             self.refs.push(node);
+        }
+        if self.refs_by_name {
+            self.tag(tag::REF_NAME);
+            let name = self.index.nodes[node.0].name.clone();
+            self.strv(&name);
+            return;
         }
         if let Some(&ix) = self.component.get(&node.0) {
             self.tag(tag::REF_INDEX);
@@ -409,6 +440,52 @@ impl<'a> Normalizer<'a> {
         self.tag(tag::TEST);
         self.boolv(d.nondet);
         self.expr(&d.body);
+    }
+
+    /// A law's binder *types* are part of its identity — they are what the
+    /// claim quantifies over — while their names are levels like any other
+    /// binder, and the label is erased exactly as a test's is.
+    pub fn law_def(&mut self, d: &'a LawDef) {
+        self.tag(tag::LAW);
+        self.len(d.binders.len());
+        for b in &d.binders {
+            self.type_expr(&b.ty);
+        }
+        for b in &d.binders {
+            self.values.push(&b.name.name);
+        }
+        self.opt(d.guard.as_ref(), Self::expr);
+        self.expr(&d.body);
+    }
+
+    /// One `requires` or `ensures`, in the scope its owner gives it: the
+    /// owner's generics and parameters, plus `result` for an `ensures` —
+    /// introduced **beside** the parameters, which is what makes a parameter
+    /// named `result` a duplicate rather than a shadow.
+    ///
+    /// Neither the owner's signature nor its hash is written here: the hash is
+    /// the first field of [`crate::spec_hash`], where it belongs, and it already
+    /// covers the signature. What this stream carries is the claim alone.
+    pub fn spec_clause(&mut self, owner: &'a FnDef, clause: &'a SpecClause) {
+        let index = self.index;
+        self.tag(tag::SPEC);
+        self.out.push(clause.kind.tag());
+        self.len(owner.generics.types.len());
+        self.len(owner.generics.effects.len());
+        for g in &owner.generics.types {
+            self.ty_params.push(&g.name);
+        }
+        for g in &owner.generics.effects {
+            self.row_params.push(&g.name);
+        }
+        self.len(owner.params.len());
+        for p in &owner.params {
+            self.values.push(&p.name.name);
+        }
+        if clause.kind == SpecKind::Ensures {
+            self.values.push(&index.result);
+        }
+        self.expr(&clause.expr);
     }
 
     fn type_expr(&mut self, t: &'a TypeExpr) {

@@ -5,10 +5,12 @@
 //! part of this file: if it disagrees with `ply-eval` by one, the corpus does
 //! not pass and the generator refuses to write it.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub type DefId = usize;
 pub type ModuleId = usize;
+pub type SpecimenId = usize;
 
 /// `prim::clamp`'s modulus. Every generated body funnels through it, which is
 /// what keeps a value in a range where no intermediate can overflow `Int`.
@@ -77,6 +79,37 @@ impl Atom {
 
 pub type Footprint = BTreeSet<Atom>;
 
+/// What the generator built a claim to be discharged by.
+///
+/// The prover is free to do better or worse than this, and a measurement is
+/// worth having in both directions: a `proved` where the generator expected
+/// sampling is worth a second look, and a sampled result where it expected a
+/// decision is reach the prover does not have. It is an expectation, never an
+/// assertion — nothing here may be read back as a tier.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Intent {
+    /// Settled statically: linear arithmetic, a split over a constructor set, a
+    /// ground evaluation or a finite enumeration.
+    Decided,
+    /// Reaches a recursive definition or a builtin the prover has no rule for,
+    /// so the strongest honest answer is a case report.
+    Sampled,
+    /// The owner performs an effect nothing supplies a handler for, so the
+    /// obligation cannot be attempted at all.
+    Gap,
+}
+
+/// The claim attached to an ordinary generated definition.
+///
+/// One `requires` and one `ensures`, so that "obligations" and "definitions
+/// carrying an obligation" differ by exactly the specimens below — a measurement
+/// pricing discharge per obligation should not have to divide first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Claim {
+    pub intent: Intent,
+}
+
 /// A shape drives both the emitted source and the reference evaluator, so the
 /// two cannot drift apart.
 #[derive(Clone, Debug)]
@@ -92,6 +125,8 @@ pub struct Def {
     pub footprint: Footprint,
     pub weight: u32,
     pub public: bool,
+    /// `Some` at whatever density [`crate::CorpusSpec::spec_fraction`] asks for.
+    pub claim: Option<Claim>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -350,12 +385,80 @@ impl ConcurrentTest {
     }
 }
 
+/// A definition written for its obligation rather than for its call graph.
+///
+/// The ordinary generated bodies all funnel through `prim::clamp`, whose `%` is
+/// outside the proved fragment on purpose, so every claim about one of them is
+/// sampled. A corpus of nothing but sampled obligations measures one column of
+/// the tier table and calls it a distribution. These are the other columns.
+#[derive(Clone, Debug)]
+pub struct Specimen {
+    pub id: SpecimenId,
+    pub module: ModuleId,
+    pub name: String,
+    pub kind: SpecimenKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SpecimenKind {
+    /// `x * a + b`, with a postcondition that is the same claim rearranged, so
+    /// closing it is linear arithmetic rather than syntactic identity.
+    Linear { a: i64, b: i64 },
+    /// A split over the module's own two-constructor status type. Both arms are
+    /// literals, so every branch closes and the split is over the constructor
+    /// set rather than the value space.
+    Status,
+    /// A walk down a list, calling itself. A member of a recursive component is
+    /// never unfolded — that is where induction would be needed and there is
+    /// none — so a claim about it is sampled however simple it looks.
+    Length,
+}
+
+impl SpecimenKind {
+    pub fn intent(self) -> Intent {
+        match self {
+            SpecimenKind::Linear { .. } | SpecimenKind::Status => Intent::Decided,
+            SpecimenKind::Length => Intent::Sampled,
+        }
+    }
+}
+
+/// A standalone claim. Labelled like a test, so nothing can reference it.
+#[derive(Clone, Debug)]
+pub struct Law {
+    pub module: ModuleId,
+    pub label: String,
+    pub kind: LawKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LawKind {
+    /// No binders: a domain of one point, decided by evaluating it.
+    Ground { a: i64, b: i64 },
+    /// Two `Bool` binders, so the domain is four points and enumerating it is a
+    /// decision rather than a sample.
+    Finite,
+    /// Over a [`SpecimenKind::Length`] definition, so it is sampled.
+    Length { specimen: SpecimenId },
+}
+
+impl LawKind {
+    pub fn intent(self) -> Intent {
+        match self {
+            LawKind::Ground { .. } | LawKind::Finite => Intent::Decided,
+            LawKind::Length { .. } => Intent::Sampled,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Corpus {
     pub modules: Vec<Module>,
     pub defs: Vec<Def>,
     pub tests: Vec<Test>,
     pub concurrent: Vec<ConcurrentTest>,
+    pub specimens: Vec<Specimen>,
+    pub laws: Vec<Law>,
     pub tables: Vec<String>,
     pub regions: Vec<String>,
     /// `counter` resource labels, one per shard a concurrent test can use.
@@ -494,6 +597,40 @@ impl Corpus {
 
     pub fn concurrent_in(&self, module: ModuleId) -> impl Iterator<Item = &ConcurrentTest> {
         self.concurrent.iter().filter(move |t| t.module == module)
+    }
+
+    pub fn specimens_in(&self, module: ModuleId) -> impl Iterator<Item = &Specimen> {
+        self.specimens.iter().filter(move |s| s.module == module)
+    }
+
+    pub fn laws_in(&self, module: ModuleId) -> impl Iterator<Item = &Law> {
+        self.laws.iter().filter(move |l| l.module == module)
+    }
+
+    /// Every obligation the corpus carries, by what the generator built it to be
+    /// discharged by. A `requires` is not one: it filters the domain of the
+    /// `ensures` beside it rather than making a claim of its own.
+    pub fn obligations_by_intent(&self) -> [usize; 3] {
+        let mut out = [0usize; 3];
+        let mut count = |intent: Intent| match intent {
+            Intent::Decided => out[0] += 1,
+            Intent::Sampled => out[1] += 1,
+            Intent::Gap => out[2] += 1,
+        };
+        for claim in self.defs.iter().filter_map(|d| d.claim) {
+            count(claim.intent);
+        }
+        for specimen in &self.specimens {
+            count(specimen.kind.intent());
+        }
+        for law in &self.laws {
+            count(law.kind.intent());
+        }
+        out
+    }
+
+    pub fn specified_defs(&self) -> usize {
+        self.defs.iter().filter(|d| d.claim.is_some()).count()
     }
 }
 

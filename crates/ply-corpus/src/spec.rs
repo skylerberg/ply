@@ -45,6 +45,19 @@ pub struct CorpusSpec {
     /// reduction has nothing to prune.
     #[serde(default)]
     pub conflict_density: f64,
+    /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
+    /// The claim is one every generated body satisfies by construction, so the
+    /// corpus is green at any density, and the density is the axis a measurement
+    /// varies to price discharge against definition count. Zero leaves a corpus
+    /// with no obligations at all, which is what every measurement before M8
+    /// wants and what a manifest written before M8 deserializes to.
+    #[serde(default)]
+    pub spec_fraction: f64,
+    /// Definitions per module written for their obligation rather than for their
+    /// call graph, so that the tier distribution spans the table instead of
+    /// landing in one bucket. Each contributes one law as well.
+    #[serde(default)]
+    pub specimens_per_module: usize,
 }
 
 impl Default for CorpusSpec {
@@ -65,6 +78,8 @@ impl Default for CorpusSpec {
             tasks_per_test: 3,
             steps_per_task: 2,
             conflict_density: 0.5,
+            spec_fraction: 0.0,
+            specimens_per_module: 0,
         }
     }
 }
@@ -110,6 +125,9 @@ impl CorpusSpec {
         }
         if !(0.0..=1.0).contains(&self.conflict_density) {
             bail!("`--conflict-density` must be between 0 and 1");
+        }
+        if !(0.0..=1.0).contains(&self.spec_fraction) {
+            bail!("`--spec-fraction` must be between 0 and 1");
         }
         Ok(())
     }
@@ -207,6 +225,22 @@ mod tests {
         );
     }
 
+    /// A manifest written before M8 has no `spec_fraction`, and deserializing
+    /// one must produce a corpus with no obligations rather than a default
+    /// density nobody asked for.
+    #[test]
+    fn a_spec_written_before_m8_deserializes_to_a_corpus_with_no_obligations() {
+        let spec: CorpusSpec = serde_json::from_str(
+            r#"{"seed":1,"modules":2,"defs_per_module":3,"tests":1,"depth":1,
+                "tables":2,"regions":1,"effect_fraction":0.3,"nondet_fraction":0.0,
+                "hub_modules":1,"max_weight":64}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.spec_fraction, 0.0);
+        assert_eq!(spec.specimens_per_module, 0);
+        spec.validate().unwrap();
+    }
+
     #[test]
     fn out_of_range_fractions_are_rejected() {
         let spec = CorpusSpec {
@@ -224,5 +258,15 @@ mod tests {
             ..CorpusSpec::default()
         };
         assert!(spec.validate().is_err());
+        let spec = CorpusSpec {
+            spec_fraction: 1.2,
+            ..CorpusSpec::default()
+        };
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("--spec-fraction")
+        );
     }
 }

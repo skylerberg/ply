@@ -159,6 +159,7 @@ fn func(name: &str, params: &[&str], body: Expr) -> Item {
         params: params.iter().map(|p| param(p)).collect(),
         ret: None,
         effects: None,
+        spec: Vec::new(),
         body,
         span: Span::DUMMY,
     }))
@@ -300,6 +301,7 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                 params: vec![typed_param("u", ty)],
                 ret: Some(ty_con("String", vec![])),
                 effects: None,
+                spec: Vec::new(),
                 body: e(ExprKind::Match {
                     scrutinee: Box::new(var("u")),
                     arms: vec![
@@ -618,6 +620,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
                 tail: None,
                 span: Span::DUMMY,
             }),
+            spec: Vec::new(),
             body: int(0),
             span: Span::DUMMY,
         }))]
@@ -951,6 +954,7 @@ fn an_absent_annotation_differs_from_a_written_one() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -972,6 +976,7 @@ fn a_generic_parameter_is_positional_not_named() {
             params: vec![typed_param("x", used[0]), typed_param("y", used[1])],
             ret: None,
             effects: None,
+            spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
         }))]
@@ -996,6 +1001,7 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -1012,6 +1018,7 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -1805,4 +1812,276 @@ test "double doubles" {
     assert_eq!(out.defs.len(), 1);
     assert_eq!(out.tests.len(), check.tests.len());
     assert_eq!(out, hash_ast(&parsed_module).unwrap());
+}
+
+/// A spec is a claim *about* a definition, so its key has to move when the
+/// definition does. A key that omitted the owner would leave a discharged
+/// `ensures` discharged after its body was rewritten — a cached proof of
+/// something no longer true, which is the permissive-direction failure M8 must
+/// not ship.
+#[test]
+fn a_spec_key_moves_when_its_definition_does() {
+    let owner = DefHash([1; 32]);
+    let rewritten = DefHash([2; 32]);
+    let clause = b"normalized";
+    assert_ne!(
+        spec_hash(owner, SpecKind::Ensures, 0, clause),
+        spec_hash(rewritten, SpecKind::Ensures, 0, clause),
+    );
+}
+
+/// The clause's own structure, its position among its siblings, and which kind
+/// of clause it is are all part of what is being claimed, so each separates two
+/// obligations. Reordering two `ensures` clauses therefore re-runs both, which
+/// is correct: the index is what names them.
+#[test]
+fn a_spec_key_separates_the_clause_from_its_siblings() {
+    let owner = DefHash([1; 32]);
+    let base = spec_hash(owner, SpecKind::Ensures, 0, b"normalized");
+    assert_ne!(base, spec_hash(owner, SpecKind::Ensures, 1, b"normalized"));
+    assert_ne!(base, spec_hash(owner, SpecKind::Requires, 0, b"normalized"));
+    assert_ne!(base, spec_hash(owner, SpecKind::Ensures, 0, b"other"));
+}
+
+/// Domain-tagged, so no clause can ever produce the hash of some definition's
+/// own normalized bytes and read a test's result as its own.
+#[test]
+fn a_spec_key_cannot_collide_with_a_definition_hash() {
+    let owner = DefHash([1; 32]);
+    assert_ne!(spec_hash(owner, SpecKind::Ensures, 0, b""), owner);
+    assert_ne!(
+        spec_hash(owner, SpecKind::Ensures, 0, b"x"),
+        DefHash::of(b"x")
+    );
+}
+
+/// A spec is a claim *about* a definition, not part of it, so the normalizer
+/// erases it exactly as it erases names, spans and `pub`. Writing one therefore
+/// changes no definition hash, moves no test hash, and rebuilds nothing — the
+/// same sentence as "renaming a function selects zero tests", and true for the
+/// same reason.
+#[test]
+fn writing_a_spec_or_a_law_changes_no_definition_hash_and_no_test_hash() {
+    const BARE: &str = r#"
+fn apply_debit(balance: Int, amount: Int) -> Int = balance - amount
+
+fn settle(balance: Int, amount: Int) -> Int = apply_debit(balance, amount)
+
+test "the ledger settles" {
+  assert_eq(settle(10, 3), 7)
+}
+"#;
+    let bare = parsed(BARE);
+    assert_eq!(bare.defs.len(), 2);
+    assert_eq!(bare.tests.len(), 1);
+
+    for variant in [
+        // added
+        r#"
+fn apply_debit(balance: Int, amount: Int) -> Int
+  requires amount > 0
+= balance - amount
+
+fn settle(balance: Int, amount: Int) -> Int = apply_debit(balance, amount)
+
+test "the ledger settles" {
+  assert_eq(settle(10, 3), 7)
+}
+"#,
+        // edited, and a second clause on a second definition
+        r#"
+fn apply_debit(balance: Int, amount: Int) -> Int
+  requires amount > 0
+  ensures result <= balance
+= balance - amount
+
+fn settle(balance: Int, amount: Int) -> Int
+  ensures result <= balance
+= apply_debit(balance, amount)
+
+test "the ledger settles" {
+  assert_eq(settle(10, 3), 7)
+}
+"#,
+        // a standalone law naming both definitions
+        r#"
+fn apply_debit(balance: Int, amount: Int) -> Int = balance - amount
+
+fn settle(balance: Int, amount: Int) -> Int = apply_debit(balance, amount)
+
+law "settling is a debit"
+  forall (b: Int, n: Int) where n > 0 {
+    settle(b, n) == apply_debit(b, n)
+  }
+
+test "the ledger settles" {
+  assert_eq(settle(10, 3), 7)
+}
+"#,
+    ] {
+        let with_spec = parsed(variant);
+        assert_eq!(with_spec.defs, bare.defs, "definition hashes moved");
+        assert_eq!(with_spec.decls, bare.decls);
+        assert_eq!(with_spec.tests, bare.tests, "a test would be re-run");
+
+        // A law is an item of its own, so it brings its own reference entry —
+        // which is what `Laws::of` reads to decide the definitions it covers.
+        // What must not move is any entry that was already there: a law
+        // constrains what it names without becoming part of it.
+        for (name, deps) in &bare.deps {
+            assert_eq!(with_spec.deps.get(name), Some(deps), "`{name}` moved");
+            assert_eq!(with_spec.closure.get(name), bare.closure.get(name));
+        }
+        let added: Vec<&str> = with_spec
+            .deps
+            .keys()
+            .filter(|name| !bare.deps.contains_key(*name))
+            .map(|name| name.as_str())
+            .collect();
+        let expected: Vec<&str> = if variant.contains("law ") {
+            vec!["settling is a debit"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(added, expected);
+    }
+}
+
+/// The claim gets its own hash, which covers the definition's — so editing an
+/// implementation re-opens its obligations, while editing the claim moves
+/// nothing at all. That asymmetry is exactly the asymmetry review has.
+#[test]
+fn an_obligation_key_covers_the_implementation_and_the_clause() {
+    const SOURCE: &str = r#"
+fn apply_debit(balance: Int, amount: Int) -> Int
+  requires amount > 0
+  ensures result <= balance
+= balance - amount
+"#;
+    let base = parsed(SOURCE);
+    let clauses = base.specs[&Symbol::new("apply_debit")].clone();
+    assert_eq!(clauses.len(), 2, "one key per clause, requires included");
+    assert_ne!(clauses[0], clauses[1]);
+
+    // The implementation moved: every obligation on it re-opens. A key that
+    // omitted the owner's hash would leave a discharged `ensures` discharged
+    // after its definition was rewritten.
+    let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
+    assert_ne!(rewritten.defs[&Symbol::new("apply_debit")], base.defs[&Symbol::new("apply_debit")]);
+    assert_ne!(rewritten.specs[&Symbol::new("apply_debit")], clauses);
+
+    // The claim moved and the implementation did not: the definition's hash is
+    // untouched, and only the clause that changed gets a new key.
+    let restated = parsed(&SOURCE.replace("result <= balance", "result - balance <= 0"));
+    assert_eq!(restated.defs, base.defs);
+    assert_eq!(restated.specs[&Symbol::new("apply_debit")][0], clauses[0]);
+    assert_ne!(restated.specs[&Symbol::new("apply_debit")][1], clauses[1]);
+
+    // The index is in the key, so reordering two clauses re-opens both.
+    let reordered = parsed(
+        r#"
+fn apply_debit(balance: Int, amount: Int) -> Int
+  ensures result <= balance
+  requires amount > 0
+= balance - amount
+"#,
+    );
+    assert_eq!(reordered.defs, base.defs);
+    assert!(reordered.specs[&Symbol::new("apply_debit")].iter().all(|k| !clauses.contains(k)));
+}
+
+/// The complement of the key above, and the whole of what `ply review` asks: a
+/// claim's *sentence* moves when the sentence is rewritten and stays put when
+/// the implementation under it is.
+///
+/// Both halves matter and they fail in opposite directions. If a sentence moved
+/// with its implementation, ADR 0007 §9.2's *implementation changed · spec
+/// unchanged* row — the cheapest review in the system — would be unreachable and
+/// every body edit would send a reviewer back to the diff. If it did not move
+/// when the claim was rewritten, a rewritten claim would report "spec unchanged"
+/// and the reviewer would never read it.
+#[test]
+fn a_claims_sentence_moves_with_the_claim_and_not_with_the_implementation() {
+    const SOURCE: &str = r#"
+fn apply_debit(balance: Int, amount: Int) -> Int
+  requires amount > 0
+  ensures result <= balance
+= balance - amount
+
+law "a debit never raises the balance"
+  forall (b: Int, n: Int) where n > 0 {
+    apply_debit(b, n) <= b
+  }
+"#;
+    let base = parsed(SOURCE);
+    let name = Symbol::new("apply_debit");
+    let sentences = base.spec_texts[&name].clone();
+    assert_eq!(sentences.len(), 2);
+    assert_ne!(sentences[0], sentences[1]);
+    assert_eq!(base.law_texts.len(), 1);
+
+    // The implementation moved. Every obligation *key* re-opens — that is the
+    // test above — and no sentence moves, because neither the clauses nor the
+    // law were rewritten.
+    let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
+    assert_ne!(rewritten.defs[&name], base.defs[&name]);
+    assert_ne!(rewritten.specs[&name], base.specs[&name]);
+    assert_ne!(rewritten.laws, base.laws, "the law's key covers what it names");
+    assert_eq!(rewritten.spec_texts[&name], sentences);
+    assert_eq!(rewritten.law_texts, base.law_texts);
+
+    // The claim moved: exactly the rewritten clause's sentence moves.
+    let restated = parsed(&SOURCE.replace("result <= balance", "result - balance <= 0"));
+    assert_eq!(restated.defs, base.defs);
+    assert_eq!(restated.spec_texts[&name][0], sentences[0]);
+    assert_ne!(restated.spec_texts[&name][1], sentences[1]);
+    assert_eq!(restated.law_texts, base.law_texts);
+
+    // The law moved, and nothing else did.
+    let relawed = parsed(&SOURCE.replace("where n > 0", "where n > 1"));
+    assert_eq!(relawed.defs, base.defs);
+    assert_eq!(relawed.spec_texts[&name], sentences);
+    assert_ne!(relawed.law_texts, base.law_texts);
+
+    // A sentence is still a normalized encoding: reformatting is not a rewrite.
+    let reformatted = parsed(&SOURCE.replace("result <= balance", "result   <=   balance"));
+    assert_eq!(reformatted.spec_texts[&name], sentences);
+    assert_eq!(reformatted.law_texts, base.law_texts);
+}
+
+/// A law's identity is its binders, guard and body against the *hashes* of what
+/// it names — never their names, and never its own label.
+#[test]
+fn a_law_is_hashed_by_what_it_claims_rather_than_by_what_it_is_called() {
+    const SOURCE: &str = r#"
+fn debit(balance: Int, amount: Int) -> Int = balance - amount
+
+law "a debit lowers a balance"
+  forall (b: Int, n: Int) where n > 0 {
+    debit(b, n) <= b
+  }
+"#;
+    let base = parsed(SOURCE);
+    assert_eq!(base.laws.len(), 1);
+
+    let relabelled = parsed(&SOURCE.replace("a debit lowers a balance", "debits lower balances"));
+    assert_eq!(
+        relabelled.laws, base.laws,
+        "a law is labelled, not named: the label is namespace metadata"
+    );
+
+    let renamed = parsed(&SOURCE.replace("debit", "subtract"));
+    assert_eq!(
+        renamed.laws, base.laws,
+        "renaming a definition a law names changes no law hash"
+    );
+
+    let edited = parsed(&SOURCE.replace("balance - amount", "balance - amount - 0"));
+    assert_ne!(
+        edited.laws, base.laws,
+        "editing a definition a law names must re-open the law"
+    );
+
+    let rebound = parsed(&SOURCE.replace("forall (b: Int, n: Int)", "forall (x: Int, n: Int)").replace("debit(b, n) <= b", "debit(x, n) <= x"));
+    assert_eq!(rebound.laws, base.laws, "a binder is a level, not a name");
 }

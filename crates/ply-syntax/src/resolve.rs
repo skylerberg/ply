@@ -438,7 +438,8 @@ fn declarations_of(module: &Module) -> Declarations {
                     }
                 }
             }
-            Item::Test(_) => {}
+            // Neither declares a name a reference could reach.
+            Item::Test(_) | Item::Law(_) => {}
         }
     }
     out

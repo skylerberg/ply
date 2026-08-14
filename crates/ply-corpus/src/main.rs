@@ -33,6 +33,9 @@ enum Command {
     /// Price the search: interleavings pruned against unpruned, seeds to the
     /// first failure against sampling, and seeds per second.
     Sim(SimArgs),
+    /// Price the spec tier: where obligations land, why the ones that fell
+    /// short did, and what shrinking bought.
+    Prove(ProveArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -74,6 +77,15 @@ struct ShapeArgs {
     /// search collapses; 1.0 puts every task on one, so nothing prunes.
     #[arg(long, default_value_t = 0.5)]
     conflict_density: f64,
+    /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
+    /// This is the axis to vary when pricing discharge against definition count.
+    #[arg(long, default_value_t = 0.0)]
+    spec_fraction: f64,
+    /// Definitions per module written for their obligation, so that the tier
+    /// distribution spans the table instead of landing in one bucket. Each
+    /// contributes a law as well.
+    #[arg(long, default_value_t = 0)]
+    specimens_per_module: usize,
 }
 
 impl From<ShapeArgs> for CorpusSpec {
@@ -94,6 +106,8 @@ impl From<ShapeArgs> for CorpusSpec {
             tasks_per_test: a.tasks_per_test,
             steps_per_task: a.steps_per_task,
             conflict_density: a.conflict_density,
+            spec_fraction: a.spec_fraction,
+            specimens_per_module: a.specimens_per_module,
         }
     }
 }
@@ -223,6 +237,43 @@ fn simulate(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Args, Debug)]
+struct ProveArgs {
+    /// One or more `.ply` files or directories. Each is reported on its own row
+    /// so a generated corpus never averages with a written one.
+    #[arg(required = true)]
+    projects: Vec<PathBuf>,
+    #[arg(long, default_value_t = ply_prove::DEFAULT_CASES)]
+    cases: u32,
+    #[arg(long, default_value_t = ply_prove::DEFAULT_PROVE_BUDGET)]
+    prove_budget: u32,
+    #[arg(long, default_value_t = ply_prove::DEFAULT_SHRINK_BUDGET)]
+    shrink_budget: u32,
+    #[arg(long)]
+    json: bool,
+}
+
+fn prove(args: ProveArgs) -> Result<()> {
+    let plan = ply_prove::ProvePlan {
+        cases: args.cases,
+        prove_budget: args.prove_budget,
+        shrink_budget: args.shrink_budget,
+        ..ply_prove::ProvePlan::default()
+    }
+    .normalized();
+    let runs: Vec<ply_corpus::discharge::Discharged> = args
+        .projects
+        .iter()
+        .map(|p| ply_corpus::discharge::discharge(p, &plan))
+        .collect::<Result<_>>()?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+    } else {
+        print!("{}", ply_corpus::discharge::render(&runs));
+    }
+    Ok(())
+}
+
 fn measure(args: MeasureArgs) -> Result<()> {
     let engines: Vec<Engine> = match args.engine {
         EngineChoice::Treewalk => vec![Engine::Treewalk],
@@ -283,6 +334,7 @@ fn run() -> Result<()> {
         Command::Sweep(args) => sweep(args),
         Command::Measure(args) => measure(args),
         Command::Sim(args) => simulate(args),
+        Command::Prove(args) => prove(args),
     }
 }
 
@@ -336,6 +388,17 @@ fn generate_corpus(args: GenArgs) -> Result<()> {
             c.shards_per_test,
             c.contention,
             c.conflict_density
+        );
+    }
+    if manifest.specs.obligations > 0 {
+        let s = &manifest.specs;
+        println!(
+            "  {} definitions carry an obligation · {} do not",
+            s.specified_definitions, s.unspecified_definitions
+        );
+        println!(
+            "  {} obligations ({} laws) · built to be {} decided · {} sampled · {} gaps",
+            s.obligations, s.laws, s.decided, s.sampled, s.gaps
         );
     }
     println!(

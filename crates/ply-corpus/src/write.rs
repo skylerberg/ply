@@ -44,6 +44,30 @@ pub struct ConcurrencyProfile {
     pub contention: f64,
 }
 
+/// What the specified half of a corpus looks like, so a measurement can price
+/// discharge against definition count and report a tier distribution without
+/// re-deriving either from the source.
+///
+/// `decided` / `sampled` / `gaps` are what the **generator built** each
+/// obligation to be discharged by. They are an expectation to compare a run
+/// against, in both directions, and nothing here may be read back as a tier: a
+/// tier is computed from the evidence a discharge carries and from nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpecProfile {
+    /// Generated definitions carrying an `ensures`, specimens included.
+    pub specified_definitions: usize,
+    /// Definitions carrying none — the review surface the corpus is modelling.
+    pub unspecified_definitions: usize,
+    /// One per `ensures` clause and one per law. A `requires` is not an
+    /// obligation: it filters the domain of the clauses beside it.
+    pub obligations: usize,
+    pub laws: usize,
+    pub specimens: usize,
+    pub decided: usize,
+    pub sampled: usize,
+    pub gaps: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub spec: CorpusSpec,
@@ -55,6 +79,8 @@ pub struct Manifest {
     pub nondet_tests: usize,
     #[serde(default)]
     pub concurrency: ConcurrencyProfile,
+    #[serde(default)]
+    pub specs: SpecProfile,
     pub bytes: usize,
     pub distinct_resources: usize,
     pub mean_out_degree: f64,
@@ -156,6 +182,7 @@ fn manifest_for(
         tests: corpus.tests.len(),
         nondet_tests: corpus.tests.iter().filter(|t| t.nondet).count(),
         concurrency: profile(spec, corpus),
+        specs: spec_profile(corpus),
         bytes,
         distinct_resources: corpus.tables.len() + corpus.regions.len(),
         mean_out_degree: edges as f64 / corpus.defs.len().max(1) as f64,
@@ -179,6 +206,22 @@ fn profile(spec: &CorpusSpec, corpus: &Corpus) -> ConcurrencyProfile {
         shards_per_test: spec.shards_per_test(),
         conflict_density: spec.conflict_density,
         contention: mean(corpus.concurrent.iter().map(|t| t.contention()).sum()),
+    }
+}
+
+fn spec_profile(corpus: &Corpus) -> SpecProfile {
+    let [decided, sampled, gaps] = corpus.obligations_by_intent();
+    let specified = corpus.specified_defs() + corpus.specimens.len();
+    let definitions = corpus.defs.len() + corpus.specimens.len();
+    SpecProfile {
+        specified_definitions: specified,
+        unspecified_definitions: definitions - specified,
+        obligations: decided + sampled + gaps,
+        laws: corpus.laws.len(),
+        specimens: corpus.specimens.len(),
+        decided,
+        sampled,
+        gaps,
     }
 }
 

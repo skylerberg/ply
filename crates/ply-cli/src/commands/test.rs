@@ -1,6 +1,6 @@
 use super::common::{
-    IND, diagnostic_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
-    print_diagnostics, print_phases, print_warnings, report_load_error,
+    IND, build_pool, diagnostic_json, emit_json, exit_code, location, millis, once_each,
+    phases_json, plural, print_diagnostics, print_phases, print_warnings, report_load_error,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
@@ -376,32 +376,6 @@ fn scratch_failed(dir: &Path, cause: &str) -> Diagnostic {
     )
     .primary(Span::DUMMY, "the run needs somewhere to record results")
     .note("set TMPDIR to a writable directory, or drop `--no-cache`")
-}
-
-fn build_pool(
-    jobs: Option<u32>,
-    warnings: &mut Vec<Diagnostic>,
-) -> (Option<rayon::ThreadPool>, usize) {
-    let requested = jobs.unwrap_or(0) as usize;
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(requested)
-        .build()
-    {
-        Ok(pool) => {
-            let workers = pool.current_num_threads();
-            (Some(pool), workers)
-        }
-        Err(e) => {
-            warnings.push(
-                Diagnostic::warning(
-                    codes::RUNTIME_ERROR,
-                    format!("could not start {requested} worker threads: {e}"),
-                )
-                .note("the run continued on the default thread pool"),
-            );
-            (None, rayon::current_num_threads())
-        }
-    }
 }
 
 // --- Human output -----------------------------------------------------------
