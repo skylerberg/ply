@@ -156,6 +156,145 @@ a resource.
 
 ## M9 — Native codegen
 
+Deferred, but see W6: serving inverts the argument below, and the web track is
+what would pull this forward.
+
 Cranelift or LLVM backend. Deferred deliberately — the interpreter is not the
 bottleneck the language exists to solve, and a fast interpreter with a perfect
 cache beats a fast compiler with a cold one.
+
+---
+
+# Web track
+
+M0–M8 built a language that can prove things about programs that never leave
+memory. The web track is what it takes to serve an HTTP API, and the ordering is
+driven by one fact: **Ply currently has no I/O at all**. Not limited I/O — none.
+Every handler ever written for it is in-memory or simulated.
+
+So a postgres driver is not the first problem. The first problem is that the
+runtime's knowledge of what a computation can do is the foundation of every
+guarantee here, and reaching the host is by construction a hole in it.
+
+## W1 — The boundary, and one endpoint
+
+The smallest thing that answers the two questions deciding everything downstream.
+
+- The host effect boundary: a Rust-implemented handler for a Ply-declared effect,
+  with a declared footprint, a determinism flag, and at-most-one resumption
+- `ply hosts` — the trusted computing base, enumerable in one command
+- A production `task` handler over an async runtime. M7 built only the simulated
+  scheduler; real threads were explicitly out of scope
+- `Bytes`, and strings that survive contact with UTF-8
+- Minimal TCP, and an HTTP handler that returns a fixed response
+
+No database, no JSON, no routing. If the answers are bad this is small enough to
+throw away.
+
+**Exit:** a request served over a real socket; `ply hosts` lists every host
+handler with its footprint; `ply test` is hermetic without `--host` and says so;
+resuming a host continuation twice is a diagnostic; and **a measured per-request
+interpreter cost**, which is the number W6 turns on.
+
+`docs/adr/0008-host-effect-boundary.md`
+
+## W2 — Payloads
+
+- `Map` as a first-class type. Headers, query params, JSON objects and connection
+  pools all want one, and `List<(K,V)>` is not a substitute at request volume
+- Compile-time derivation over normalized definitions: `derive json for Order`
+- JSON encode and decode, derived rather than hand-written
+- A dictionary is a **record** — `JsonCodec<a> = {encode: .., decode: ..}` — which
+  Ply's structural records give for free and which is what a typeclass dictionary
+  elaborates to anyway
+- Framework signatures take explicit dictionaries — the elaborated form of a
+  typeclass constraint, so a resolution layer can be added later as sugar rather
+  than as a rewrite
+- Constraints checked at the **signature**, not at instantiation: `where
+  derivable(json, a)`. Bare reflection fails late, which is the expensive failure
+  for an agent; this repairs it without any dispatch machinery
+- `Float`, and a decimal type — `i64` cents is a decision you regret later
+
+Type-directed **dispatch** is deliberately not decided here. Derivation is the
+substrate under either candidate, so W2 proceeds without settling it; W3 and W4
+produce the evidence that does — how often a type is abstract at the point of
+dispatch in a real stack.
+
+**Exit:** an endpoint that parses a JSON body into an ADT and returns a JSON
+response, with the codec derived; and a law that decode-after-encode is identity,
+discharged at whatever tier it earns.
+
+`docs/adr/0010-generic-derivation.md`
+
+## W3 — A real server
+
+- HTTP/1.1 properly: streaming bodies, chunked encoding, keep-alive, timeouts
+- Routing, with the route table as ordinary data
+- TLS
+- Effect-set aliases, because a hundred endpoints with explicit rows is noise
+
+**Exit:** a multi-route service under load, with per-endpoint footprints visible
+in `ply check --types` — which is the first point where an endpoint's declared
+signature says which tables it touches.
+
+`docs/adr/0009-effect-set-aliases.md`
+
+## W4 — Postgres
+
+- Wire protocol, connection pool, prepared statements
+- **Transactions as handlers.** A transaction is a scoped handler over `db.*`
+  that commits or rolls back at the boundary, and because M6 gave real reified
+  continuations, a rollback is discarding the continuation rather than unwinding
+- An in-memory handler satisfying the same signature, and an M8 law asserting the
+  two agree
+
+**Exit:** a CRUD endpoint against real postgres; the same tests passing against
+the in-memory handler with no source change; and the agreement law discharged as
+`property` with its case count — the mock-drift claim every backend team makes
+and none of them check.
+
+## W5 — Operations
+
+- Observability as an effect, so tracing is handled rather than ambient
+- Config and secrets, with secrets typed so they cannot reach a log handler
+- Graceful shutdown and connection draining
+- Deployment: content addressing means a deploy could ship only the definitions
+  whose hashes changed. Nothing about this exists yet and it may not be worth it
+
+**Exit:** a service that can be deployed, observed, and shut down without losing
+in-flight requests.
+
+## W6 — Performance, and whether M9 comes forward
+
+M9 was deferred because execution was a few percent of a warm test run. Serving
+inverts that argument, and the control-stack machine costs four heap allocations
+per frame push.
+
+Most web APIs are I/O-bound, so an interpreter may well be fine — but that is a
+hypothesis, and W1 produces the number that tests it.
+
+**Exit:** request throughput and tail latency under real load, and a decision on
+M9 made from measurement rather than from the assumption that carried M0–M8.
+
+## What the web track is for
+
+Parity with other languages is not a reason to use this. These are:
+
+- **Mock drift becomes checkable.** W4's agreement law is the thing every team
+  asserts informally about its test doubles.
+- **An endpoint's footprint is inferred and exact.** Which tables a route
+  touches comes from the type, not a comment — giving exact test isolation and a
+  static answer to "what writes this table".
+- **Concurrent request races become findable.** M7 finds a check-then-act race in
+  two interleavings and returns a seed. Pointed at two requests hitting one row,
+  that is the bug class that otherwise surfaces in production at 3am.
+- **`ply review --changed` on an API** answers whether any endpoint's *specified*
+  behaviour moved, without reading the diff.
+
+## The risk that matters
+
+A host handler that misreports its footprint corrupts scheduling and isolation
+**silently** rather than loudly. Every dangerous defect found across seven
+audited milestones was a green result over unexplored space, never a crash. The
+host boundary is where that failure mode is easiest to reintroduce and hardest to
+detect, and it deserves harder adversarial review than anything built so far.
