@@ -244,6 +244,21 @@ pub mod codes {
     /// A `simulate` region inside a `simulate` region, lexically or through a
     /// call. Two schedulers means two notions of "runnable".
     pub const NESTED_SIMULATION: &str = "E0416";
+    /// A `requires`, `ensures` or `where` guard whose row is not empty, or a law
+    /// body whose row is not a subset of `{sim.read}`. A claim that can perform
+    /// effects can change what it observes.
+    pub const EFFECT_IN_SPEC: &str = "E0417";
+    /// A `forall` binder whose type cannot be quantified over: no generator
+    /// (`Cell`, `Task`), a function type with a non-empty row, or an effect-row
+    /// variable. A law nobody can check is a claim nobody will read.
+    pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
+    /// An obligation was refuted by a counterexample. The program's fault, and
+    /// attributed like any other failure.
+    pub const OBLIGATION_REFUTED: &str = "E0419";
+    /// The guard admitted no values, so the obligation is trivially valid and
+    /// says nothing. Always a defect in the spec: reporting it `proved` would
+    /// turn a typo in a guard into a proof of everything.
+    pub const VACUOUS_OBLIGATION: &str = "E0420";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -267,6 +282,11 @@ pub mod codes {
     pub const CACHE_UNREADABLE: &str = "W0601";
     pub const CACHE_CORRUPT: &str = "W0602";
     pub const CACHE_VERSION_CHANGED: &str = "W0603";
+    /// An obligation the system could not decide at any tier — an effect nothing
+    /// discharges, a parameter nothing can generate, an evaluation that raised.
+    /// A `W` because it is nobody's fault: it is a gap, it is counted, and it
+    /// leaves its definition uncovered.
+    pub const OBLIGATION_NOT_DISCHARGED: &str = "W0604";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -406,6 +426,10 @@ mod tests {
                 "E0415",
             ),
             ("NESTED_SIMULATION", codes::NESTED_SIMULATION, "E0416"),
+            ("EFFECT_IN_SPEC", codes::EFFECT_IN_SPEC, "E0417"),
+            ("UNQUANTIFIABLE_TYPE", codes::UNQUANTIFIABLE_TYPE, "E0418"),
+            ("OBLIGATION_REFUTED", codes::OBLIGATION_REFUTED, "E0419"),
+            ("VACUOUS_OBLIGATION", codes::VACUOUS_OBLIGATION, "E0420"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
@@ -417,6 +441,11 @@ mod tests {
                 "CACHE_VERSION_CHANGED",
                 codes::CACHE_VERSION_CHANGED,
                 "W0603",
+            ),
+            (
+                "OBLIGATION_NOT_DISCHARGED",
+                codes::OBLIGATION_NOT_DISCHARGED,
+                "W0604",
             ),
         ];
 

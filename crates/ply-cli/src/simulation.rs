@@ -6,9 +6,10 @@
 //! chosen mode is refused rather than ignored, and `--seed` names one
 //! interleaving and therefore excludes every flag that would widen the search.
 
-use crate::cli::SimOptions;
+use crate::cli::{ProveOptions, SimOptions};
 use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
+use ply_prove::{DEFAULT_CASES, DEFAULT_PROVE_BUDGET, DEFAULT_SHRINK_BUDGET, ProvePlan};
 
 /// The seeds a plan starts from, when the user did not say. `dpor` already
 /// enumerates equivalence classes from one seed, so a second explores the same
@@ -42,6 +43,24 @@ pub fn plan(options: &SimOptions) -> Plan {
         },
         steps: options.sim_steps.unwrap_or(DEFAULT_STEPS),
         path: Vec::new(),
+    }
+    .normalized()
+}
+
+/// What an obligation weaker than a proof is discharged against, and therefore
+/// cached under.
+///
+/// The simulation flags are folded in unchanged: a concurrency law is
+/// discharged by exactly the search ADR 0006 specifies, so widening
+/// `--sim-budget` re-opens a sampled law exactly as it re-runs a seeded test.
+pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan {
+    let roots = options.prove_roots.unwrap_or(1);
+    ProvePlan {
+        cases: options.prove_cases.unwrap_or(DEFAULT_CASES),
+        roots: (0..u64::from(roots)).collect(),
+        prove_budget: options.prove_budget.unwrap_or(DEFAULT_PROVE_BUDGET),
+        shrink_budget: options.shrink_budget.unwrap_or(DEFAULT_SHRINK_BUDGET),
+        sim: plan(simulation),
     }
     .normalized()
 }

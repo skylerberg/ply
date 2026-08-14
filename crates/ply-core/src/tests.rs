@@ -4,7 +4,7 @@
 
 use crate::infer::check_module;
 use crate::print::print_scheme;
-use crate::{CheckOutput, DefInfo};
+use crate::{CheckOutput, DefInfo, Footprint, Known, KnownDef};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::*;
 
@@ -253,6 +253,7 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
                 .collect(),
             ret: None,
             effects: None,
+            spec: Vec::new(),
             body,
             span: any(),
         },
@@ -2871,4 +2872,473 @@ fn the_simulation_fixtures_produce_the_codes_they_are_named_for() {
             render(&diags)
         );
     }
+}
+
+// Specs and laws. These parse real source: what is under test is the whole path
+// from the clause a person writes to the obligation the prover is handed.
+
+fn parsed(src: &str) -> Module {
+    ply_syntax::parse(SRC, src).unwrap_or_else(|d| panic!("should parse: {}", render(&d)))
+}
+
+fn check_src(src: &str) -> CheckOutput {
+    match check_module(&parsed(src)) {
+        Ok(out) => out,
+        Err(diags) => panic!("expected success, got: {}", render(&diags)),
+    }
+}
+
+fn check_src_err(src: &str) -> Vec<Diagnostic> {
+    match check_module(&parsed(src)) {
+        Ok(_) => panic!("expected failure, but the module checked"),
+        Err(diags) => diags,
+    }
+}
+
+const DB: &str =
+    "effect db {\n  read get[r](k: Int) -> Int\n  write put[r](k: Int, v: Int) -> Unit\n}\n";
+
+#[test]
+fn every_clause_is_its_own_obligation_in_source_order() {
+    let out = check_src(
+        "fn withdraw(a: Int, n: Int) -> Int\n\
+           requires n > 0\n\
+           ensures result == a - n\n\
+           requires n <= a\n\
+           ensures result <= a\n\
+         = a - n",
+    );
+    let spec = &def(&out, "withdraw").spec;
+    let shape: Vec<(&str, usize)> = spec.iter().map(|s| (s.kind.as_str(), s.index)).collect();
+    assert_eq!(
+        shape,
+        [
+            ("requires", 0),
+            ("ensures", 1),
+            ("requires", 2),
+            ("ensures", 3)
+        ]
+    );
+    assert!(spec.iter().all(|s| s.footprint.is_empty()));
+    assert!(spec.iter().all(|s| !s.span.is_dummy()));
+}
+
+#[test]
+fn attaching_a_spec_changes_no_footprint() {
+    let bare = format!("{DB}fn store(k: Int) -> Unit = db.put[users](k, 1)");
+    let specified =
+        format!("{DB}fn store(k: Int) -> Unit requires k > 0 ensures k > 0 = db.put[users](k, 1)");
+    let bare = check_src(&bare);
+    let specified = check_src(&specified);
+    assert_eq!(footprint(&bare, "store"), "{db.write[users]}");
+    assert_eq!(footprint(&specified, "store"), footprint(&bare, "store"));
+    assert_eq!(def(&specified, "store").spec.len(), 2);
+    assert!(
+        def(&specified, "store")
+            .spec
+            .iter()
+            .all(|s| s.footprint.is_empty())
+    );
+}
+
+#[test]
+fn a_test_that_calls_a_specified_definition_keeps_its_footprint() {
+    let out = check_src(&format!(
+        "{DB}fn store(k: Int) -> Unit requires k > 0 = db.put[users](k, 1)\n\
+         test \"stores\" {{ handle {{ store(1) }} with {{ db.put[users](k, v) -> () }} }}"
+    ));
+    assert_eq!(out.tests[0].footprint.to_string(), "{}");
+}
+
+#[test]
+fn a_clause_that_performs_an_effect_is_rejected() {
+    for (clause, phrase) in [
+        ("requires", "a `requires` clause"),
+        ("ensures", "an `ensures` clause"),
+    ] {
+        let diags = check_src_err(&format!(
+            "{DB}fn f(k: Int) -> Int {clause} db.get[users](k) > 0 = k"
+        ));
+        let d = only(&diags, codes::EFFECT_IN_SPEC);
+        assert!(d.message.starts_with(phrase), "{}", render(&diags));
+        assert!(
+            d.labels
+                .iter()
+                .any(|l| l.message.contains("db.read[users]")),
+            "{}",
+            render(&diags)
+        );
+        assert!(
+            d.notes.iter().any(|n| n.contains("post-state it caused")),
+            "{}",
+            render(&diags)
+        );
+    }
+}
+
+#[test]
+fn a_simulate_region_in_a_clause_is_rejected() {
+    for clause in ["requires", "ensures"] {
+        let diags = check_src_err(&format!("fn f() -> Int {clause} (simulate {{ true }}) = 1"));
+        let d = only(&diags, codes::EFFECT_IN_SPEC);
+        assert!(
+            d.labels.iter().any(|l| l.message.contains("sim.read")),
+            "{}",
+            render(&diags)
+        );
+    }
+}
+
+#[test]
+fn a_clause_whose_row_is_an_unsolved_tail_is_rejected() {
+    let diags = check_src_err("fn g<a | e>(f: () -> Bool / e) -> Int requires f() = 1");
+    let d = only(&diags, codes::EFFECT_IN_SPEC);
+    assert!(d.message.contains("not known to be empty"), "{}", d.message);
+}
+
+#[test]
+fn a_clause_that_is_not_bool_is_a_type_mismatch() {
+    let diags = check_src_err("fn f(x: Int) -> Int requires x = x");
+    only(&diags, codes::TYPE_MISMATCH);
+}
+
+#[test]
+fn result_is_bound_only_in_an_ensures() {
+    check_src("fn f(x: Int) -> Int ensures result >= x = x + 1");
+
+    let diags = check_src_err("fn f(x: Int) -> Int requires result > 0 = x");
+    let d = only(&diags, codes::UNKNOWN_NAME);
+    assert!(
+        d.notes
+            .iter()
+            .any(|n| n.contains("bound only in an `ensures`")),
+        "{}",
+        render(&diags)
+    );
+}
+
+#[test]
+fn a_parameter_named_result_collides_with_an_ensures() {
+    check_src("fn f(result: Int) -> Int = result");
+
+    let diags = check_src_err("fn f(result: Int) -> Int ensures result > 0 = result");
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert_eq!(d.labels.len(), 2, "{}", render(&diags));
+}
+
+#[test]
+fn a_law_carries_its_binders_its_guard_and_a_pure_footprint() {
+    let out = check_src(
+        "fn credited(a: Int, n: Int) -> Int = a + n\n\
+         fn debited(a: Int, n: Int) -> Int = a - n\n\
+         law \"credit and debit cancel\" forall (a: Int, n: Int) where n > 0 && n <= a {\n\
+           credited(debited(a, n), n) == a\n\
+         }",
+    );
+    assert_eq!(out.laws.len(), 1);
+    let law = &out.laws[0];
+    assert_eq!(law.name, "credit and debit cancel");
+    assert_eq!(law.key.as_str(), "credit and debit cancel");
+    assert_eq!(law.index, 0);
+    assert!(law.has_guard);
+    assert_eq!(law.footprint.to_string(), "{}");
+    let binders: Vec<String> = law
+        .binders
+        .iter()
+        .map(|b| format!("{}: {}", b.name, crate::print::print_type(&b.ty)))
+        .collect();
+    assert_eq!(binders, ["a: Int", "n: Int"]);
+}
+
+#[test]
+fn a_ground_law_has_no_binders_and_no_guard() {
+    let out = check_src("law \"one is one\" { 1 == 1 }");
+    let law = &out.laws[0];
+    assert!(law.binders.is_empty());
+    assert!(!law.has_guard);
+}
+
+#[test]
+fn a_law_quantifies_over_function_values() {
+    let out =
+        check_src("law \"f is a function\" forall (f: (Int) -> Int, x: Int) { f(x) == f(x) }");
+    let tys: Vec<String> = out.laws[0]
+        .binders
+        .iter()
+        .map(|b| crate::print::print_type(&b.ty))
+        .collect();
+    assert_eq!(tys, ["(Int) -> Int", "Int"]);
+}
+
+#[test]
+fn a_law_binder_may_carry_a_type_variable() {
+    let out = check_src("law \"length agrees\" forall (xs: List<a>) { len(xs) == len(xs) }");
+    assert_eq!(
+        crate::print::print_type(&out.laws[0].binders[0].ty),
+        "List<a>"
+    );
+}
+
+/// The prover reads a type variable as an uninterpreted sort, so a proof over it
+/// holds for every instantiation — which is only true if the body cannot pick one.
+#[test]
+fn a_law_body_cannot_instantiate_a_binders_type_variable() {
+    let diags = check_src_err("law \"pins a\" forall (x: a) { x == 1 }");
+    only(&diags, codes::TYPE_MISMATCH);
+}
+
+#[test]
+fn a_law_body_may_be_a_simulate_region() {
+    let out = check_src("law \"conserves\" forall (n: Int) { simulate { n == n } }");
+    assert_eq!(out.laws[0].footprint.to_string(), "{sim.read}");
+}
+
+/// A guard decides which values the law is a claim about, so a domain that
+/// depends on a seed would be a different domain per run.
+#[test]
+fn a_where_guard_may_not_carry_the_seed() {
+    let diags =
+        check_src_err("law \"seeded guard\" forall (n: Int) where (simulate { n > 0 }) { n == n }");
+    let d = only(&diags, codes::EFFECT_IN_SPEC);
+    assert!(d.message.contains("`where`"), "{}", d.message);
+}
+
+#[test]
+fn a_law_body_that_performs_an_ordinary_effect_is_rejected() {
+    let diags = check_src_err(&format!(
+        "{DB}law \"reads\" forall (n: Int) {{ db.get[users](n) == n }}"
+    ));
+    let d = only(&diags, codes::EFFECT_IN_SPEC);
+    assert!(d.message.contains("law body"), "{}", d.message);
+    assert!(
+        d.notes.iter().any(|n| n.contains("sim.read")),
+        "{}",
+        render(&diags)
+    );
+}
+
+#[test]
+fn a_law_cannot_quantify_over_a_handler() {
+    for src in [
+        "law \"any handler\" forall (h: Handler<Int>) { true }",
+        "law \"any handler\" forall (h: handler) { true }",
+    ] {
+        let diags = check_src_err(src);
+        let d = only(&diags, codes::UNQUANTIFIABLE_TYPE);
+        assert!(d.message.contains("a handler"), "{}", d.message);
+        assert!(
+            d.notes.iter().any(|n| n.contains("0007-specs.md §3.2")),
+            "{}",
+            render(&diags)
+        );
+        assert!(!has_code(&diags, codes::UNKNOWN_TYPE), "{}", render(&diags));
+    }
+}
+
+#[test]
+fn a_law_cannot_quantify_over_a_type_the_generator_cannot_inhabit() {
+    for (src, expected) in [
+        ("law \"c\" forall (c: Cell<Int>) { true }", "with_cell"),
+        ("law \"t\" forall (t: Task<Int>) { true }", "scheduler"),
+        (
+            "type Box = Wrap(Cell<Int>)\nlaw \"b\" forall (b: Box) { true }",
+            "with_cell",
+        ),
+    ] {
+        let diags = check_src_err(src);
+        let d = only(&diags, codes::UNQUANTIFIABLE_TYPE);
+        assert!(
+            d.labels.iter().any(|l| l.message.contains(expected)),
+            "{src}: {}",
+            render(&diags)
+        );
+    }
+}
+
+#[test]
+fn a_law_binder_may_not_carry_an_effect_row() {
+    let diags = check_src_err(&format!(
+        "{DB}law \"f\" forall (f: (Int) -> Int / {{db.read[users]}}) {{ true }}"
+    ));
+    let d = only(&diags, codes::UNQUANTIFIABLE_TYPE);
+    assert!(
+        d.labels.iter().any(|l| l.message.contains("db")),
+        "{}",
+        render(&diags)
+    );
+
+    let diags = check_src_err("law \"f\" forall (f: (Int) -> Int / e) { true }");
+    let d = only(&diags, codes::UNQUANTIFIABLE_TYPE);
+    assert!(
+        d.labels
+            .iter()
+            .any(|l| l.message.contains("effect variable")),
+        "{}",
+        render(&diags)
+    );
+    assert!(
+        !has_code(&diags, codes::UNBOUND_ROW_VAR),
+        "{}",
+        render(&diags)
+    );
+}
+
+#[test]
+fn two_laws_with_one_label_are_a_duplicate() {
+    let diags = check_src_err("law \"same\" { true }\nlaw \"same\" { false }");
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert_eq!(d.labels.len(), 2, "{}", render(&diags));
+}
+
+#[test]
+fn laws_are_indexed_in_program_order() {
+    let out = check_files(&[
+        ("a", "law \"first\" { true }\nlaw \"second\" { true }"),
+        ("b", "law \"third\" { true }"),
+    ]);
+    let keys: Vec<&str> = out.laws.iter().map(|l| l.key.as_str()).collect();
+    assert_eq!(keys, ["a.first", "a.second", "b.third"]);
+    assert_eq!(
+        out.laws.iter().map(|l| l.index).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+}
+
+/// Gate 2 skips re-inferring a body whose hash is unchanged, and a spec is
+/// erased from that hash — so a clause must be typed against the restored
+/// interface every run in which its file was parsed.
+#[test]
+fn a_restored_definition_still_has_its_clauses_typed() {
+    let src = "fn withdraw(a: Int, n: Int) -> Int requires n > 0 ensures result == a - n = a - n";
+    let program = parse_program(&[("ledger", src)]);
+    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let first = crate::check_program(&program, &resolved).expect("checks");
+
+    let known = Known {
+        defs: first
+            .defs
+            .iter()
+            .map(|(name, info)| {
+                (
+                    name.clone(),
+                    KnownDef {
+                        scheme: info.scheme.clone(),
+                        footprint: info.footprint.clone(),
+                    },
+                )
+            })
+            .collect(),
+        tests: Default::default(),
+    };
+    let restored =
+        crate::check_program_with(&program, &resolved, &known).expect("checks from interfaces");
+    let spec = &def(&restored, "ledger.withdraw").spec;
+    assert_eq!(spec.len(), 2);
+    assert!(spec.iter().all(|s| s.footprint.is_empty()));
+
+    // And the restored path still judges the clause, rather than accepting it
+    // because nothing constrained the types it was checked against.
+    let broken = "fn withdraw(a: Int, n: Int) -> Int ensures result == \"x\" = a - n";
+    let program = parse_program(&[("ledger", broken)]);
+    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let diags = crate::check_program_with(&program, &resolved, &known)
+        .expect_err("a clause comparing Int to String is a mismatch");
+    assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
+}
+
+/// The corpus is where the two purity rules meet real code: a clause's row is
+/// empty, and a law body's is empty or exactly the seed. Asserted against the
+/// values rather than against the comments that say so.
+#[test]
+fn every_law_and_clause_in_the_example_corpus_is_pure() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .expect("the example corpus is part of the repository")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    paths.sort();
+
+    let sources: Vec<(String, String)> = paths
+        .iter()
+        .map(|path| {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy();
+            let text = std::fs::read_to_string(path).expect("example is readable");
+            (name.to_string(), text)
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    let out = check_files(&files);
+
+    let clauses: usize = out.defs.values().map(|d| d.spec.len()).sum();
+    assert!(clauses > 0, "the corpus carries no `requires` or `ensures`");
+    assert!(!out.laws.is_empty(), "the corpus carries no law");
+
+    for info in out.defs.values() {
+        for clause in &info.spec {
+            assert!(
+                clause.footprint.is_empty(),
+                "`{}` clause #{} has footprint {}",
+                info.name,
+                clause.index,
+                clause.footprint
+            );
+        }
+    }
+    let seed = Footprint::from_atoms([crate::prelude::seed_atom()]);
+    for law in &out.laws {
+        assert!(
+            law.footprint.is_empty() || law.footprint == seed,
+            "law {:?} has footprint {}",
+            law.name,
+            law.footprint
+        );
+    }
+    assert!(
+        out.laws.iter().any(|l| l.footprint == seed),
+        "the corpus demonstrates no concurrency law"
+    );
+}
+
+#[test]
+fn a_clause_sees_the_types_the_body_forced_on_an_unannotated_signature() {
+    let out = check_src("fn f(x) ensures result > x = x + 1");
+    assert_eq!(sig(&out, "f"), "(Int) -> Int");
+    assert_eq!(def(&out, "f").spec.len(), 1);
+
+    let diags = check_src_err("fn f(x) ensures result == \"grown\" = x + 1");
+    only(&diags, codes::TYPE_MISMATCH);
+}
+
+#[test]
+fn a_clause_on_a_mutually_recursive_definition_is_typed() {
+    let out = check_src(
+        "fn even(n: Int) -> Bool requires n >= 0 = if n == 0 { true } else { odd(n - 1) }\n\
+         fn odd(n: Int) -> Bool ensures result == !even(n) = if n == 0 { false } else { even(n - 1) }",
+    );
+    assert_eq!(def(&out, "even").spec.len(), 1);
+    assert_eq!(def(&out, "odd").spec.len(), 1);
+}
+
+#[test]
+fn a_clause_and_a_law_may_name_an_imported_definition() {
+    let out = check_files(&[
+        ("base", "pub fn twice(n: Int) -> Int = n * 2"),
+        (
+            "app",
+            "import base (twice)\n\
+             fn quad(n: Int) -> Int ensures result == twice(twice(n)) = twice(twice(n))\n\
+             law \"quadrupling is doubling twice\" forall (n: Int) {\n\
+               quad(n) == twice(twice(n))\n\
+             }",
+        ),
+    ]);
+    assert_eq!(def(&out, "app.quad").spec.len(), 1);
+    assert_eq!(
+        out.laws[0].key.as_str(),
+        "app.quadrupling is doubling twice"
+    );
 }

@@ -324,6 +324,7 @@ pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
         params: params.iter().map(|p| param(p)).collect(),
         ret: None,
         effects: None,
+        spec: Vec::new(),
         body,
         span: sp(),
     }))

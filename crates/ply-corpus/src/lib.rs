@@ -6,6 +6,7 @@
 
 pub mod bench;
 pub mod build;
+pub mod discharge;
 pub mod emit;
 pub mod measure;
 pub mod model;
@@ -286,6 +287,155 @@ mod tests {
         assert_eq!(
             with_concurrency.groups, plain.groups,
             "four simulated tests changed the group count"
+        );
+    }
+
+    fn specified_spec(fraction: f64, specimens: usize) -> CorpusSpec {
+        CorpusSpec {
+            seed: 17,
+            modules: 5,
+            defs_per_module: 8,
+            tests: 16,
+            depth: 2,
+            spec_fraction: fraction,
+            specimens_per_module: specimens,
+            ..CorpusSpec::default()
+        }
+    }
+
+    fn front_of(spec: &CorpusSpec, dir: &std::path::Path) -> pipeline::Front {
+        let root = dir.join("corpus");
+        write::write(&root, spec, &generate(spec)).unwrap();
+        pipeline::front(&root).unwrap()
+    }
+
+    /// A corpus the compiler rejects is worthless, and a specified one is a
+    /// corpus the compiler has more to reject.
+    #[test]
+    fn a_specified_corpus_compiles_and_every_test_still_passes() {
+        for (fraction, specimens) in [(0.0, 3), (0.5, 3), (1.0, 0), (1.0, 4)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("corpus");
+            let spec = specified_spec(fraction, specimens);
+            write::write(&root, &spec, &generate(&spec)).unwrap();
+            let verified = verify(&root)
+                .unwrap_or_else(|e| panic!("density {fraction}/{specimens} fails: {e:#}"));
+            assert_eq!(verified.failed, 0);
+            assert_eq!(verified.passed, verified.tests);
+        }
+    }
+
+    /// The milestone's headline invariant, at whatever scale a corpus is
+    /// generated at: **writing a spec changes no definition hash**. It is the
+    /// same sentence as "renaming a function changes no definition hash" and it
+    /// is true for the same reason — a spec is a claim *about* a definition, so
+    /// the normalizer erases it.
+    ///
+    /// Checked against the real hasher over two corpora that differ in nothing
+    /// but their clauses, which is the only way to check it that a change to the
+    /// normalizer cannot quietly pass.
+    #[test]
+    fn raising_the_spec_density_changes_no_definition_hash() {
+        let bare = tempfile::tempdir().unwrap();
+        let specified = tempfile::tempdir().unwrap();
+        let bare = front_of(&specified_spec(0.0, 0), bare.path());
+        let specified = front_of(&specified_spec(1.0, 0), specified.path());
+
+        assert_eq!(bare.hashes.defs.len(), specified.hashes.defs.len());
+        for (name, hash) in &bare.hashes.defs {
+            assert_eq!(
+                specified.hashes.defs.get(name),
+                Some(hash),
+                "`{name}` moved when a clause was attached to it"
+            );
+        }
+        assert_eq!(bare.hashes.tests, specified.hashes.tests);
+    }
+
+    /// And the consequence that makes the invariant worth having: a spec edit
+    /// selects nothing. Run the bare corpus, then swap in the specified sources
+    /// over the same cache.
+    #[test]
+    fn attaching_a_spec_to_every_definition_selects_no_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let bare = specified_spec(0.0, 0);
+        write::write(&root, &bare, &generate(&bare)).unwrap();
+        verify(&root).unwrap();
+
+        // Written over the top rather than through `write::write`, which clears
+        // the directory and would take the cache the test is about with it.
+        for file in emit::emit(&generate(&specified_spec(1.0, 0))) {
+            std::fs::write(root.join(&file.path), &file.text).unwrap();
+        }
+
+        let front = pipeline::front(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+        let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
+        assert_eq!(
+            selection.to_run.len(),
+            nondet,
+            "a spec edit selected {} tests",
+            selection.to_run.len()
+        );
+    }
+
+    /// A claim is not an effect, so it cannot join a footprint, so it cannot
+    /// change which tests may run concurrently. If it could, attaching a spec
+    /// would be a scheduling change wearing a documentation disguise.
+    #[test]
+    fn attaching_a_spec_changes_no_footprint_and_no_concurrency_group() {
+        let bare = tempfile::tempdir().unwrap();
+        let specified = tempfile::tempdir().unwrap();
+        let bare = front_of(&specified_spec(0.0, 0), bare.path());
+        let specified = front_of(&specified_spec(1.0, 0), specified.path());
+
+        for (name, def) in &bare.check.defs {
+            let other = specified
+                .check
+                .defs
+                .get(name)
+                .expect("the same definitions");
+            assert_eq!(
+                def.footprint.to_string(),
+                other.footprint.to_string(),
+                "`{name}`'s footprint moved when a clause was attached"
+            );
+        }
+        for (a, b) in bare.check.tests.iter().zip(&specified.check.tests) {
+            assert_eq!(a.footprint.to_string(), b.footprint.to_string());
+            assert_eq!(a.nondet, b.nondet);
+        }
+    }
+
+    /// The counts a measurement reads back. `covered` is not among them on
+    /// purpose: whether a definition is covered depends on whether its obligation
+    /// **held**, which only a discharge can say.
+    #[test]
+    fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let spec = specified_spec(0.5, 3);
+        let corpus = generate(&spec);
+        let written = write::write(&root, &spec, &corpus).unwrap();
+        let specs = &written.manifest.specs;
+
+        assert_eq!(specs.specimens, corpus.specimens.len());
+        assert_eq!(specs.laws, corpus.laws.len());
+        assert_eq!(
+            specs.obligations,
+            specs.decided + specs.sampled + specs.gaps
+        );
+        assert_eq!(
+            specs.specified_definitions + specs.unspecified_definitions,
+            corpus.defs.len() + corpus.specimens.len()
+        );
+        assert!(specs.decided > 0 && specs.sampled > 0 && specs.gaps > 0);
+        assert_eq!(
+            write::read_manifest(&root).unwrap().specs,
+            *specs,
+            "the profile does not survive the manifest"
         );
     }
 

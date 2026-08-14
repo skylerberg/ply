@@ -11,7 +11,7 @@ mod tests;
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
-use ply_syntax::ast::{Mode, Module, ModuleName, Program};
+use ply_syntax::ast::{Mode, Module, ModuleName, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
 
 pub use print::{print_row, print_scheme, print_type};
@@ -61,6 +61,54 @@ pub struct CtorInfo {
     pub span: Span,
 }
 
+/// A `requires` or `ensures` clause that type-checked.
+///
+/// A spec is a claim *about* a definition rather than part of it, so it is
+/// erased by normalization and appears nowhere in [`DefInfo::footprint`]: adding
+/// one changes no definition hash, re-runs no test, and moves no test out of its
+/// concurrency group.
+#[derive(Clone, Debug)]
+pub struct SpecInfo {
+    pub kind: SpecKind,
+    /// Position among the owner's clauses, in source order. Part of the
+    /// obligation's cache key, so reordering two clauses re-runs both.
+    pub index: usize,
+    /// Always empty — a spec expression's row must be pure, or it could change
+    /// what it observes. Carried rather than assumed so that an audit asserts
+    /// on a value.
+    pub footprint: Footprint,
+    pub span: Span,
+}
+
+/// A `forall` binder, after its declared type is resolved.
+#[derive(Clone, Debug)]
+pub struct LawBinder {
+    pub name: Symbol,
+    pub ty: Type,
+    pub span: Span,
+}
+
+/// A standalone `law`. Labelled rather than named, like a [`TestInfo`], so
+/// nothing can reference it.
+#[derive(Clone, Debug)]
+pub struct LawInfo {
+    /// The declared label, as written. Not unique program-wide; `key` is.
+    pub name: String,
+    pub module: ModuleName,
+    /// `<module>.<label>`, what this law's hash and obligation are keyed by.
+    pub key: Symbol,
+    /// Position in [`CheckOutput::laws`].
+    pub index: usize,
+    /// Empty for a ground law, which is decided by evaluating it.
+    pub binders: Vec<LawBinder>,
+    pub has_guard: bool,
+    /// `{}`, or `{sim.read}` for a concurrency law — which is discharged by
+    /// exhaustive interleaving search rather than by a static argument.
+    /// Nothing else type-checks.
+    pub footprint: Footprint,
+    pub span: Span,
+}
+
 /// Everywhere in [`CheckOutput`], `name` is the program-wide name and equals
 /// this entry's key; `simple_name` is what the source wrote.
 #[derive(Clone, Debug)]
@@ -71,6 +119,10 @@ pub struct DefInfo {
     pub scheme: Scheme,
     /// Closed after solving. Empty for a pure function.
     pub footprint: Footprint,
+    /// `requires` / `ensures`, in source order. Never restored from a cached
+    /// interface: a spec is erased from the definition's hash, so a spec edit
+    /// does not move it and gate 2 would otherwise skip a clause that changed.
+    pub spec: Vec<SpecInfo>,
     pub span: Span,
 }
 
@@ -105,6 +157,7 @@ pub struct ModuleInfo {
 pub struct CheckOutput {
     pub defs: IndexMap<Symbol, DefInfo>,
     pub tests: Vec<TestInfo>,
+    pub laws: Vec<LawInfo>,
     pub effects: IndexMap<Symbol, EffectInfo>,
     pub ctors: IndexMap<Symbol, CtorInfo>,
     pub modules: IndexMap<Symbol, ModuleInfo>,

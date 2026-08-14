@@ -1,0 +1,89 @@
+// A concurrency law with a binder, which is `property` however exhaustive the
+// interleaving search was.
+//
+// This is `examples/bank.ply`'s guarded-settlement law with one `Int` quantified
+// instead of pinned at 60. The search still empties its frontier, so every
+// interleaving the scheduler could have chosen still ran, and `exhaustive: true`
+// is still true — and the honest tier is still `property`, because
+// `exhaustive: true` is a claim about **schedules** and this law also ranges
+// over 2⁶⁴ values of `amount`, of which a run sees two hundred.
+//
+// The two coverage claims are independent and `proved` needs both. Dropping the
+// second is the worst defect this milestone has available: it would print a
+// certificate over a domain nothing covered. A law with no binders has the value
+// domain covered for free, which is why the one in `examples/bank.ply` is proved
+// and this one is not.
+
+effect bank {
+  write credit[r](account: String, amount: Int) -> Unit
+  write take[r](account: String, amount: Int) -> Bool
+  write record[r](movement: Movement) -> Unit
+}
+
+type Account = { name: String, balance: Int }
+
+type Movement = { at: Int, from: String, to: String, amount: Int }
+
+fn balance_of(accounts: List<Account>, name: String) -> Int =
+  fold(accounts, 0, |acc, a: Account| if a.name == name { a.balance } else { acc })
+
+fn credited(accounts: List<Account>, name: String, amount: Int) -> List<Account> =
+  map(accounts, |a: Account|
+    if a.name == name { {name: a.name, balance: a.balance + amount} } else { a })
+
+fn total(accounts: List<Account>) -> Int =
+  fold(accounts, 0, |acc, a: Account| acc + a.balance)
+
+fn overdrawn(accounts: List<Account>) -> Int =
+  len(filter(accounts, |a: Account| a.balance < 0))
+
+fn opening() -> List<Account> = [
+  {name: "alice", balance: 100},
+  {name: "bob", balance: 50},
+  {name: "carol", balance: 50},
+]
+
+fn settle(from: String, to: String, amount: Int) -> Bool
+  / {bank.write[accounts], bank.write[journal], clock.read}
+  requires amount > 0
+  requires from != to {
+  if bank.take[accounts](from, amount) {
+    let at = clock.now();
+    bank.credit[accounts](to, amount);
+    bank.record[journal]({at: at, from: from, to: to, amount: amount});
+    true
+  } else {
+    false
+  }
+}
+
+// Conservation and non-negativity hold for every amount the guard admits and
+// under every order the two tasks can run in, so nothing here is flaky and the
+// only thing separating this from a proof is the domain of `amount`.
+law "no interleaving of two guarded settlements can overdraw the account"
+  forall (amount: Int) where amount > 0 && amount <= 100 {
+    with_cell[accounts](opening()) { ledger -> {
+    with_cell[journal]([]) { log -> {
+      handle {
+        simulate {
+          let a = task.spawn(|| settle("alice", "bob", amount));
+          let b = task.spawn(|| settle("alice", "carol", amount));
+          task.join(a);
+          task.join(b);
+          overdrawn(cell_get(ledger)) == 0 && total(cell_get(ledger)) == 200
+        }
+      } with {
+        bank.take[accounts](who, owed) ->
+          if balance_of(cell_get(ledger), who) < owed {
+            false
+          } else {
+            cell_set(ledger, credited(cell_get(ledger), who, -owed));
+            true
+          },
+        bank.credit[accounts](who, owed) ->
+          cell_set(ledger, credited(cell_get(ledger), who, owed)),
+        bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+      }
+    } }
+    } }
+  }

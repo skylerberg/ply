@@ -4,8 +4,10 @@
 pub mod cli;
 pub mod commands;
 pub mod driver;
+pub mod engine;
 pub mod load;
 pub mod migrate;
+pub mod obligations;
 pub mod simulation;
 pub mod style;
 
@@ -24,6 +26,8 @@ pub fn execute(cli: Cli) -> i32 {
     match &cli.command {
         Command::Check(args) => commands::check::execute(args, style),
         Command::Test(args) => commands::test::execute(args, style),
+        Command::Prove(args) => commands::prove::execute(args, style),
+        Command::Review(args) => commands::review::execute(args, style),
         Command::Run(args) => commands::run::execute(args, style),
         Command::Hash(args) => commands::hash::execute(args, style),
         Command::Cache(args) => match &args.action {

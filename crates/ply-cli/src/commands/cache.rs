@@ -55,6 +55,9 @@ pub fn stats(scope: &CacheScope, style: Style) -> i32 {
             "entries": stats.results,
             "definitions_seen": stats.definitions_seen,
             "results_bytes": stats.results_bytes,
+            "prover_version": ply_store::PROVER_VERSION,
+            "obligations": stats.obligations,
+            "reviews": stats.reviews,
             "frontend": {
                 "sources": stats.sources,
                 "definitions": stats.defs,
@@ -84,6 +87,14 @@ pub fn stats(scope: &CacheScope, style: Style) -> i32 {
         stats.definitions_seen,
         plural(stats.definitions_seen, "definition"),
         style.dim(&bytes(stats.results_bytes)),
+    );
+    println!(
+        "{IND}prover {} · {} discharged {} · {} accepted {}",
+        ply_store::PROVER_VERSION,
+        style.bold(&stats.obligations.to_string()),
+        plural(stats.obligations, "obligation"),
+        stats.reviews,
+        plural(stats.reviews, "review"),
     );
     println!(
         "{IND}front end {FRONTEND_VERSION} · {} {} · {} {} · {} {} · {} {}",

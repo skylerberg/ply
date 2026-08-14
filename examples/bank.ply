@@ -19,6 +19,22 @@
 // `settle` keeps, and `tests/fixtures/bank_race.ply` is `transfer` with that
 // property asserted: it passes under most seeds and fails under the ones that
 // let both checks run before either debit.
+//
+// The laws at the bottom are where that story stops being a test and becomes a
+// claim. Three are about values and are discharged the ordinary way. The last
+// has a `simulate` region for a body, so its row is `{sim.read}` — the one row a
+// law body may carry that is not empty — and it is discharged by running every
+// interleaving the scheduler could have chosen. It is reported `proved` only
+// when the search emptied its frontier *and* the value domain was covered, which
+// for a law with no binders is free. A law with even one `Int` binder over the
+// same region is `property`, because exhausting the schedules says nothing about
+// the 2⁶⁴ values that were not drawn.
+//
+// `transfer` and `settle` carry a `requires` and no `ensures`, and that is not
+// an oversight. A postcondition would have to say what the call did to
+// `bank[accounts]`, and a spec may not name mutable state — so the honest
+// artifact is a precondition that documents the domain, and a definition that
+// still counts as uncovered in `ply prove`'s first line.
 
 effect bank {
   read  balance[r](account: String) -> Int
@@ -34,9 +50,27 @@ type Movement = { at: Int, from: String, to: String, amount: Int }
 fn balance_of(accounts: List<Account>, name: String) -> Int =
   fold(accounts, 0, |acc, a: Account| if a.name == name { a.balance } else { acc })
 
+// One account, moved by one amount. Nothing here is recursive and nothing
+// performs, so both postconditions are inside the decidable fragment: the
+// projections reduce over the record literal and what is left is an identity in
+// linear arithmetic.
+//
+// The two `requires` are not decoration. `Int` is `i64` and `+` is checked, so
+// `account.balance + amount` *raises* at the boundary and there is no result for
+// a postcondition to be true of — a proof covering "every input satisfying the
+// guard" has to be a proof that every such input has an answer. Bounding the
+// domain is what makes both clauses claims about the whole of it; without them
+// the honest report is `unattempted`, and the prover says so rather than
+// certifying an identity over ℤ.
+fn adjusted(account: Account, amount: Int) -> Account
+  requires amount > -1000000000 && amount < 1000000000
+  requires account.balance > -1000000000 && account.balance < 1000000000
+  ensures result.name == account.name
+  ensures result.balance == account.balance + amount
+= {name: account.name, balance: account.balance + amount}
+
 fn credited(accounts: List<Account>, name: String, amount: Int) -> List<Account> =
-  map(accounts, |a: Account|
-    if a.name == name { {name: a.name, balance: a.balance + amount} } else { a })
+  map(accounts, |a: Account| if a.name == name { adjusted(a, amount) } else { a })
 
 fn total(accounts: List<Account>) -> Int =
   fold(accounts, 0, |acc, a: Account| acc + a.balance)
@@ -54,7 +88,9 @@ fn opening() -> List<Account> = [
 // not a property of one function — it is a property of what may run between its
 // performs, and that is what `simulate` gets to decide.
 fn transfer(from: String, to: String, amount: Int) -> Bool
-  / {bank.read[accounts], bank.write[accounts], bank.write[journal], clock.read} {
+  / {bank.read[accounts], bank.write[accounts], bank.write[journal], clock.read}
+  requires amount > 0
+  requires from != to {
   if bank.balance[accounts](from) < amount {
     false
   } else {
@@ -71,7 +107,9 @@ fn transfer(from: String, to: String, amount: Int) -> Bool
 // accounts, which is why conservation is asserted after every task has been
 // joined rather than in the middle of one.
 fn settle(from: String, to: String, amount: Int) -> Bool
-  / {bank.write[accounts], bank.write[journal], clock.read} {
+  / {bank.write[accounts], bank.write[journal], clock.read}
+  requires amount > 0
+  requires from != to {
   if bank.take[accounts](from, amount) {
     let at = clock.now();
     bank.credit[accounts](to, amount);
@@ -80,6 +118,86 @@ fn settle(from: String, to: String, amount: Int) -> Bool
   } else {
     false
   }
+}
+
+// Inside the decidable fragment. `adjusted` is not recursive, so it is unfolded
+// twice, records are equal field by field, and what is left is
+// `balance + n + (-n) == balance` in linear arithmetic — a claim about every
+// account and every amount the guard admits, not about the ones a generator
+// happened to draw.
+//
+// A law does not inherit the `requires` of the definitions it names — a
+// precondition is a filter on the clauses beside it and not a contract — so the
+// domain is restated here. It is the same bound and it is there for the same
+// reason: `-amount` at `i64::MIN` raises, and a claim covering an input that
+// raises is not covering it.
+law "a credit and a matching debit leave an account exactly as it was"
+  forall (account: Account, amount: Int)
+  where amount > -1000000000 && amount < 1000000000
+     && account.balance > -1000000000 && account.balance < 1000000000 {
+    adjusted(adjusted(account, amount), -amount) == account
+  }
+
+// `credited` maps over the list, and the prover has no definition for `map`, so
+// this is drawn rather than decided. It is still the claim worth writing: a
+// credit to a name nobody holds must not quietly move somebody else.
+law "crediting a name the bank does not hold moves nothing"
+  forall (accounts: List<Account>, name: String, amount: Int)
+  where len(filter(accounts, |a: Account| a.name == name)) == 0 {
+    credited(accounts, name, amount) == accounts
+  }
+
+// Conservation, as a claim about values rather than about schedules. The upper
+// bound in the guard is not accounting, it is arithmetic: `Int` is `i64` and the
+// value generator draws `i64::MAX` on every run, so a law that let an amount run
+// away would report a raised evaluation instead of a result.
+law "a movement between two accounts leaves the bank's total alone"
+  forall (amount: Int) where amount > 0 && amount <= 100 {
+    total(credited(credited(opening(), "alice", -amount), "bob", amount))
+      == total(opening())
+  }
+
+// The concurrency law. Its body is a `simulate` region, so its row is
+// `{sim.read}` — the one row a law body may carry that is not empty, because a
+// seed is an input rather than a nondeterminism. Discharging it is M7's search:
+// two tasks whose footprints do not conflict commute, so those orders are never
+// explored, and when the frontier empties the result is a proof over every
+// interleaving rather than a sample of them.
+//
+// It has no binders, so the value domain is covered for free and the exhaustive
+// search is the whole of the argument. Add one `Int` binder and the honest tier
+// drops to `property` however exhaustive the search was — the two coverage
+// claims are independent, and `tests/fixtures/concurrency_law_binder.ply` is
+// that same law with the binder, kept out of here so this file stays cheap to
+// prove.
+law "no interleaving of two guarded settlements can overdraw the account" {
+  with_cell[accounts](opening()) { ledger -> {
+  with_cell[journal]([]) { log -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| settle("alice", "bob", 60));
+        let b = task.spawn(|| settle("alice", "carol", 60));
+        task.join(a);
+        task.join(b);
+        overdrawn(cell_get(ledger)) == 0
+          && total(cell_get(ledger)) == 200
+          && balance_of(cell_get(ledger), "alice") == 40
+          && len(cell_get(log)) == 1
+      }
+    } with {
+      bank.take[accounts](who, amount) ->
+        if balance_of(cell_get(ledger), who) < amount {
+          false
+        } else {
+          cell_set(ledger, credited(cell_get(ledger), who, -amount));
+          true
+        },
+      bank.credit[accounts](who, amount) ->
+        cell_set(ledger, credited(cell_get(ledger), who, amount)),
+      bank.record[journal](m) -> cell_set(log, push(cell_get(log), m)),
+    }
+  } }
+  } }
 }
 
 test "a lone transfer moves the money and stops at the balance" {

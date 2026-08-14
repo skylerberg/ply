@@ -187,6 +187,10 @@ impl<'a> Machine<'a> {
                         name: t.name.as_str(),
                         body: &t.body,
                     }),
+                    // A law is not a global and not a test: `ply-prove`
+                    // evaluates its body through `eval_expr_for_test`, with
+                    // its binders bound to generated values.
+                    Item::Law(_) => {}
                 }
             }
         }
@@ -322,6 +326,26 @@ impl<'a> Machine<'a> {
 
     pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
         self.drive(lower(e), Env::empty(), 0)
+    }
+
+    /// An expression from `module`, with `bindings` already in scope.
+    ///
+    /// This is what a spec clause and a law body need and what
+    /// [`Machine::eval_expr_for_test`] cannot give them: a clause is written in
+    /// its own module, so its bare names resolve there and nowhere else, and its
+    /// binders are values the caller drew rather than anything the program
+    /// bound.
+    pub fn eval_expr_in(
+        &mut self,
+        e: &Expr,
+        module: usize,
+        bindings: &[(Symbol, Value)],
+    ) -> Result<Value, Diagnostic> {
+        let mut env = Env::empty();
+        for (name, value) in bindings {
+            env = env.bind(name.clone(), value.clone());
+        }
+        self.drive(lower(e), env, module)
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.

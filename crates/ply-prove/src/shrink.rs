@@ -1,0 +1,453 @@
+//! Shrinking a counterexample.
+//!
+//! M5 shrank the definition *set* to find a culprit. This shrinks the *inputs*
+//! to find a minimal witness, and its whole honesty is two requirements that are
+//! easy to get wrong and silent when they are:
+//!
+//! 1. **A shrunk value must still falsify the obligation.** Every candidate is
+//!    re-evaluated and only an actually-falsifying one is accepted. No
+//!    monotonicity of any kind is assumed — a property that fails at `[4, 9]`
+//!    and holds at `[4]` and at `[9]` is ordinary, not pathological.
+//! 2. **A shrunk value must still satisfy the guard.** A candidate outside the
+//!    guard's domain is not a smaller counterexample; it is a counterexample to
+//!    a different claim, and reporting one would name an input the obligation
+//!    never spoke about. It is rejected before the body is ever evaluated.
+//!
+//! **Termination is structural, not budgetary.** Every value has a saturating
+//! [`size`], a candidate is accepted only when its size is *strictly* smaller,
+//! and the walk is greedy — so the process terminates whatever the budget is,
+//! and `--shrink-budget` bounds wall clock rather than correctness.
+//!
+//! **The result is deterministic**, being a function of the original tuple, the
+//! obligation and the candidate order fixed below. Two runs over one refutation
+//! produce byte-identical bindings, which is what makes today's artifact
+//! diffable against yesterday's.
+
+#[cfg(test)]
+mod tests;
+
+use crate::property::{
+    HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
+};
+use ply_core::{Type, prelude};
+use ply_eval::{Value, Vector};
+use ply_span::{Diagnostic, Symbol};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// The property the original input had, and which every accepted candidate must
+/// still have.
+///
+/// A raising input is shrunk exactly as a falsifying one is: a spec that raises
+/// is not false, so it is a gap rather than a refutation, but a minimal raising
+/// input is worth what a minimal falsifying one is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    Falsifies,
+    Raises,
+}
+
+/// What the walk arrived at.
+#[derive(Debug)]
+pub struct Shrunk {
+    pub values: Vec<Value>,
+    /// Accepted steps. Zero means the first case drawn was already minimal, and
+    /// a reader can tell that from a lucky hit only because this number is here.
+    pub steps: u32,
+    /// Candidates actually evaluated, against `--shrink-budget`.
+    pub evaluations: u32,
+    /// For [`Target::Raises`], what the last accepted candidate raised.
+    pub diagnostic: Option<Diagnostic>,
+}
+
+/// Greedy descent: the first accepted candidate becomes the new value and the
+/// walk restarts.
+pub fn shrink(
+    values: &[Value],
+    types: &[Type],
+    world: &TypeWorld,
+    judge: &mut dyn Judge,
+    target: Target,
+    budget: u32,
+) -> Shrunk {
+    let mut current: Vec<Value> = values.to_vec();
+    let mut steps: u32 = 0;
+    let mut evaluations: u32 = 0;
+    let mut diagnostic: Option<Diagnostic> = None;
+
+    'restart: loop {
+        for index in 0..current.len() {
+            let Some(ty) = types.get(index) else { continue };
+            let here = size(&current[index], world);
+            for candidate in candidates(&current[index], ty, world) {
+                if size(&candidate, world) >= here {
+                    continue;
+                }
+                if evaluations >= budget {
+                    break 'restart;
+                }
+                let mut next = current.clone();
+                next[index] = candidate;
+                evaluations = evaluations.saturating_add(1);
+                let outcome = judge_case(judge, &next);
+                if outcome.matches(target) {
+                    if let Outcome::Raised(d) = outcome {
+                        diagnostic = Some(d);
+                    }
+                    current = next;
+                    steps = steps.saturating_add(1);
+                    continue 'restart;
+                }
+            }
+        }
+        break;
+    }
+
+    Shrunk {
+        values: current,
+        steps,
+        evaluations,
+        diagnostic,
+    }
+}
+
+/// A saturating structural measure, and the reason the walk terminates.
+///
+/// It is not a byte count. It is chosen so that every candidate order below
+/// descends it: a negative integer outweighs its absolute value so `-n` is
+/// progress, a constructor's position outweighs a nullary one so a lower-index
+/// variant is progress, and a character's code point counts so lowering it
+/// toward `'a'` is progress.
+pub fn size(value: &Value, world: &TypeWorld) -> u64 {
+    let mut total: u64 = 0;
+    let mut pending: Vec<&Value> = vec![value];
+    while let Some(v) = pending.pop() {
+        let here = match v {
+            Value::Int(n) => int_size(*n),
+            Value::Bool(b) => u64::from(*b),
+            Value::Unit => 0,
+            Value::Str(s) => s
+                .chars()
+                .fold(0u64, |acc, c| acc.saturating_add(1 + c as u64)),
+            Value::List(items) => {
+                pending.extend(items.iter());
+                items.len() as u64
+            }
+            Value::Record(fields) => {
+                pending.extend(fields.values());
+                0
+            }
+            Value::Ctor { name, args } => {
+                pending.extend(args.iter());
+                let index = world.ctor(name).map(|(_, i)| i).unwrap_or(0) as u64;
+                1u64.saturating_add(index).saturating_add(args.len() as u64)
+            }
+            // A closure this crate generated carries the size it was built with;
+            // anything else is left alone rather than guessed at.
+            Value::Closure(_) => fn_size(v).unwrap_or(1),
+            Value::Cell(_) | Value::Task(_) | Value::Continuation(_) => 0,
+        };
+        total = total.saturating_add(here);
+    }
+    total
+}
+
+/// `-5` is larger than `5`, which is what makes negating a negative a shrink.
+fn int_size(n: i64) -> u64 {
+    n.unsigned_abs()
+        .saturating_mul(2)
+        .saturating_add(u64::from(n < 0))
+}
+
+/// The smallest value of a type: the shrinker's floor, and what fills a field a
+/// candidate constructor has and the current value does not.
+pub fn minimal(ty: &Type, world: &TypeWorld) -> Result<Value, Ungeneratable> {
+    minimal_at(ty, world, 0)
+}
+
+fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungeneratable> {
+    if depth >= HARD_GEN_DEPTH {
+        return Err(Ungeneratable::TooDeep);
+    }
+    match ty {
+        Type::Var(_) => Ok(Value::Int(0)),
+        Type::Record(fields) => {
+            let mut out = BTreeMap::new();
+            for (name, field) in fields {
+                out.insert(name.clone(), minimal_at(field, world, depth + 1)?);
+            }
+            Ok(Value::Record(Arc::new(out)))
+        }
+        Type::Fn {
+            params,
+            ret,
+            effects,
+        } => {
+            if effects.tail.is_some() {
+                return Err(Ungeneratable::RowVariable);
+            }
+            if !effects.atoms.is_empty() {
+                return Err(Ungeneratable::Effectful(effects.clone()));
+            }
+            let value = minimal_at(ret, world, depth + 1)?;
+            Ok(const_fn(params.len(), value, world))
+        }
+        Type::Con(name, args) => match name.as_str() {
+            "Int" => Ok(Value::Int(0)),
+            "Bool" => Ok(Value::Bool(false)),
+            "String" => Ok(Value::str("")),
+            "Unit" => Ok(Value::Unit),
+            "List" => Ok(Value::list(Vec::new())),
+            "Cell" => Err(Ungeneratable::Cell),
+            _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
+            _ => {
+                let Some((variant, fields)) = shallowest(name, args, world) else {
+                    return Err(Ungeneratable::Uninhabited(name.clone()));
+                };
+                let mut out = Vec::with_capacity(fields.len());
+                for field in &fields {
+                    out.push(minimal_at(field, world, depth + 1)?);
+                }
+                Ok(Value::ctor(variant, out))
+            }
+        },
+    }
+}
+
+/// The variant a minimal value of `Con(name, args)` uses: fewest nested
+/// constructors, then lowest declaration index. Both halves matter — the first
+/// is what terminates, the second is what makes two runs agree.
+fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol, Vec<Type>)> {
+    let variants = world.variants(name)?;
+    variants
+        .iter()
+        .filter_map(|v| {
+            let fields = world.fields(name, v, args);
+            let usable = fields
+                .iter()
+                .all(|f| crate::property::generatable(f, world).is_ok());
+            (usable && v.depth.is_some()).then_some((v, fields))
+        })
+        .min_by_key(|(v, _)| (v.depth.unwrap_or(u64::MAX), v.index))
+        .map(|(v, fields)| (v.name.clone(), fields))
+}
+
+/// Candidates for one value, in the order two runs must agree on.
+///
+/// Order is the contract, not an implementation detail: the walk is greedy, so
+/// a different order is a different minimal witness and yesterday's artifact
+/// stops being diffable against today's.
+pub fn candidates(value: &Value, ty: &Type, world: &TypeWorld) -> Vec<Value> {
+    candidates_at(value, ty, world, 0)
+}
+
+fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec<Value> {
+    if depth >= HARD_GEN_DEPTH {
+        return Vec::new();
+    }
+    match (value, ty) {
+        (Value::Int(n), _) => int_candidates(*n),
+        (Value::Bool(true), _) => vec![Value::Bool(false)],
+        (Value::Bool(false), _) | (Value::Unit, _) => Vec::new(),
+        (Value::Str(s), _) => string_candidates(s),
+        (Value::List(items), _) => {
+            let elem = match ty {
+                Type::Con(name, args) if name.as_str() == "List" => {
+                    args.first().cloned().unwrap_or_else(Type::int)
+                }
+                _ => Type::int(),
+            };
+            list_candidates(items, &elem, world, depth)
+        }
+        (Value::Record(fields), Type::Record(types)) => {
+            let mut out = Vec::new();
+            for (name, field) in fields.iter() {
+                let Some(field_ty) = types.get(name) else {
+                    continue;
+                };
+                for candidate in candidates_at(field, field_ty, world, depth + 1) {
+                    let mut next = (**fields).clone();
+                    next.insert(name.clone(), candidate);
+                    out.push(Value::Record(Arc::new(next)));
+                }
+            }
+            out
+        }
+        (Value::Ctor { name, args }, Type::Con(ty_name, ty_args)) => {
+            ctor_candidates(name, args, ty_name, ty_args, ty, world, depth)
+        }
+        // Toward the constant function returning the smallest value of the
+        // return type, which is the family's floor, so a second application
+        // proposes the same value and the size test ends the walk.
+        (Value::Closure(_), Type::Fn { params, ret, .. }) => minimal(ret, world)
+            .map(|v| vec![const_fn(params.len(), v, world)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// `0`, then halving toward zero, then one step toward zero, then the positive
+/// of a negative.
+fn int_candidates(n: i64) -> Vec<Value> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<i64> = vec![0];
+    let mut half = n / 2;
+    while half != 0 {
+        out.push(half);
+        half /= 2;
+    }
+    if let Some(step) = n.checked_sub(n.signum()) {
+        out.push(step);
+    }
+    if n < 0
+        && let Some(positive) = n.checked_neg()
+    {
+        out.push(positive);
+    }
+    out.retain(|c| *c != n);
+    out.dedup();
+    out.into_iter().map(Value::Int).collect()
+}
+
+/// `""`, the two halves, then each character lowered toward `'a'`, left to
+/// right.
+fn string_candidates(s: &str) -> Vec<Value> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![Value::str("")];
+    if chars.len() >= 2 {
+        let mid = chars.len() / 2;
+        out.push(Value::str(chars[..mid].iter().collect::<String>()));
+        out.push(Value::str(chars[mid..].iter().collect::<String>()));
+    }
+    for (i, c) in chars.iter().enumerate() {
+        let code = *c as u32;
+        let floor = 'a' as u32;
+        if code <= floor {
+            continue;
+        }
+        let midpoint = floor + (code - floor) / 2;
+        for lowered in [floor, midpoint] {
+            if lowered == code {
+                continue;
+            }
+            let Some(lowered) = char::from_u32(lowered) else {
+                continue;
+            };
+            let mut next = chars.clone();
+            next[i] = lowered;
+            out.push(Value::str(next.into_iter().collect::<String>()));
+        }
+    }
+    out
+}
+
+/// `[]`, the two halves, each single element removed, then each element shrunk
+/// in place.
+fn list_candidates(
+    items: &Vector<Value>,
+    elem: &Type,
+    world: &TypeWorld,
+    depth: u32,
+) -> Vec<Value> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![Value::list(Vec::new())];
+    if items.len() >= 2 {
+        let mid = items.len() / 2;
+        out.push(Value::list(items[..mid].to_vec()));
+        out.push(Value::list(items[mid..].to_vec()));
+    }
+    for i in 0..items.len() {
+        let mut next = items.to_vec();
+        next.remove(i);
+        out.push(Value::list(next));
+    }
+    for i in 0..items.len() {
+        for candidate in candidates_at(&items[i], elem, world, depth + 1) {
+            let mut next = items.to_vec();
+            next[i] = candidate;
+            out.push(Value::list(next));
+        }
+    }
+    out
+}
+
+/// A recursive field, then a lower-index constructor, then each field shrunk in
+/// place.
+///
+/// Taking a recursive field first is what turns a deep tree into a shallow one
+/// in a step rather than in a thousand, and it is only sound because the field's
+/// type is the value's own — which is checked here rather than guessed from the
+/// shape.
+fn ctor_candidates(
+    ctor: &Symbol,
+    args: &Arc<Vec<Value>>,
+    ty_name: &Symbol,
+    ty_args: &[Type],
+    ty: &Type,
+    world: &TypeWorld,
+    depth: u32,
+) -> Vec<Value> {
+    let Some(variants) = world.variants(ty_name) else {
+        return Vec::new();
+    };
+    let Some(variant) = variants.iter().find(|v| &v.name == ctor) else {
+        return Vec::new();
+    };
+    let fields = world.fields(ty_name, variant, ty_args);
+    if fields.len() != args.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+
+    for (i, field) in fields.iter().enumerate() {
+        if field == ty {
+            out.push(args[i].clone());
+        }
+    }
+
+    for lower in variants.iter().filter(|v| v.index < variant.index) {
+        let wanted = world.fields(ty_name, lower, ty_args);
+        let mut used = vec![false; args.len()];
+        let mut filled = Vec::with_capacity(wanted.len());
+        let mut buildable = true;
+        for want in &wanted {
+            match fields
+                .iter()
+                .enumerate()
+                .find(|(j, have)| !used[*j] && *have == want)
+            {
+                Some((j, _)) => {
+                    used[j] = true;
+                    filled.push(args[j].clone());
+                }
+                None => match minimal(want, world) {
+                    Ok(v) => filled.push(v),
+                    Err(_) => {
+                        buildable = false;
+                        break;
+                    }
+                },
+            }
+        }
+        if buildable {
+            out.push(Value::ctor(lower.name.clone(), filled));
+        }
+    }
+
+    for (i, field) in fields.iter().enumerate() {
+        for candidate in candidates_at(&args[i], field, world, depth + 1) {
+            let mut next = (**args).clone();
+            next[i] = candidate;
+            out.push(Value::ctor(ctor.clone(), next));
+        }
+    }
+
+    out
+}

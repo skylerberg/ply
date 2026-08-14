@@ -26,6 +26,8 @@ mod diag;
 mod disk;
 pub mod frontend;
 mod idx;
+pub mod obligations;
+pub mod reviews;
 mod schema;
 
 #[cfg(test)]
@@ -44,6 +46,10 @@ pub use frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
     ImportEdge, Member, NameRef, SourceFingerprint, exports_digest, witness_holds,
 };
+pub use obligations::{
+    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule,
+};
+pub use reviews::ReviewRecord;
 pub use schema::fingerprint as schema_fingerprint;
 
 /// Bumping this invalidates every cached result in existence: a cache file
@@ -76,6 +82,19 @@ pub const RUNTIME_VERSION: &str = "0.5.0";
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
 pub const FRONTEND_VERSION: &str = "0.7.0";
+
+/// Bumping this re-attempts every obligation and re-runs **no test**.
+///
+/// Independent of [`RUNTIME_VERSION`] in both directions, which is the whole
+/// point of a second constant: a prover that learns a new rule must be able to
+/// upgrade a tier without invalidating a single test result, and a change to
+/// evaluation must invalidate test results without invalidating a proof that
+/// never ran a program.
+///
+/// Bump it for any change to the fragment, to a rule's meaning, to generation or
+/// shrinking, or to the on-disk shape of a [`CachedObligation`] — none of those
+/// moves an obligation's key, and all of them change what a cache hit claims.
+pub const PROVER_VERSION: &str = "0.1.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///
@@ -369,6 +388,8 @@ pub struct Store {
     entries: disk::Entries,
     definitions: disk::Definitions,
     passes: Passes,
+    obligations: Lazy<DefHash, CachedObligation>,
+    reviews: Lazy<Symbol, ReviewRecord>,
     dirty: bool,
     frontend_path: PathBuf,
     frontend_data_path: PathBuf,
@@ -458,6 +479,136 @@ impl Passes {
     }
 }
 
+/// A map read on its first question rather than at [`Store::open`].
+///
+/// The obligation cache and the review records are both in this shape for
+/// [`Passes`]' reason: a run that asks neither of them anything must not pay to
+/// parse either, and `Store::open` has a 5 ms budget at ten thousand
+/// definitions that predates all three files.
+struct Lazy<K: Ord, V> {
+    path: PathBuf,
+    stored: OnceLock<std::collections::BTreeMap<K, V>>,
+    /// This run's, which shadow anything on disk under the same key.
+    added: std::collections::BTreeMap<K, V>,
+    dirty: bool,
+    warnings: Mutex<Vec<Diagnostic>>,
+    load: fn(&Path) -> Result<std::collections::BTreeMap<K, V>, disk::LoadError>,
+    diagnose: fn(disk::LoadError, &Path) -> Diagnostic,
+}
+
+impl<K: Ord + Clone, V: Clone + PartialEq> Lazy<K, V> {
+    fn new(
+        path: PathBuf,
+        load: fn(&Path) -> Result<std::collections::BTreeMap<K, V>, disk::LoadError>,
+        diagnose: fn(disk::LoadError, &Path) -> Diagnostic,
+    ) -> Lazy<K, V> {
+        Lazy {
+            path,
+            stored: OnceLock::new(),
+            added: std::collections::BTreeMap::new(),
+            dirty: false,
+            warnings: Mutex::new(Vec::new()),
+            load,
+            diagnose,
+        }
+    }
+
+    /// A file that cannot be read is an **empty** map, never a partial one: the
+    /// only two answers either of these caches may give are "nothing recorded",
+    /// which costs work, and "what was recorded".
+    fn stored(&self) -> &std::collections::BTreeMap<K, V> {
+        self.stored.get_or_init(|| match (self.load)(&self.path) {
+            Ok(entries) => entries,
+            Err(disk::LoadError::Missing) => std::collections::BTreeMap::new(),
+            Err(e) => {
+                self.warnings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((self.diagnose)(e, &self.path));
+                std::collections::BTreeMap::new()
+            }
+        })
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self.added.get(key) {
+            Some(value) => Some(value),
+            None => self.stored().get(key),
+        }
+    }
+
+    /// Re-recording what is already on disk is not a write, so a run that
+    /// answered every question from the cache leaves the file alone.
+    fn put(&mut self, key: K, value: V) {
+        if self.get(&key) == Some(&value) {
+            return;
+        }
+        self.added.insert(key, value);
+        self.dirty = true;
+    }
+
+    fn all(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.stored()
+            .iter()
+            .filter(|(key, _)| !self.added.contains_key(*key))
+            .chain(self.added.iter())
+    }
+
+    fn len(&self) -> usize {
+        self.all().count()
+    }
+
+    /// Folds this run's entries into whatever is on disk, under the caller's
+    /// lock — so two concurrent runs cannot discard each other's work.
+    fn write(
+        &mut self,
+        dir: &Path,
+        save: fn(&Path, &Path, &std::collections::BTreeMap<K, V>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let mut merged = match (self.load)(&self.path) {
+            Ok(entries) => entries,
+            Err(disk::LoadError::Missing) => std::collections::BTreeMap::new(),
+            Err(e) => {
+                self.warnings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((self.diagnose)(e, &self.path));
+                std::collections::BTreeMap::new()
+            }
+        };
+        merged.extend(
+            self.added
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        save(dir, &self.path, &merged)?;
+        self.added.clear();
+        self.stored = OnceLock::from(merged);
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.added.clear();
+        self.stored = OnceLock::from(std::collections::BTreeMap::new());
+        self.dirty = false;
+    }
+
+    fn take_warnings(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.warnings.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn warnings(&self) -> Vec<Diagnostic> {
+        self.warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Pruned {
     pub sources: usize,
@@ -476,6 +627,8 @@ pub struct Compaction {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CacheStats {
     pub results: usize,
+    pub obligations: usize,
+    pub reviews: usize,
     pub definitions_seen: usize,
     pub sources: usize,
     pub defs: usize,
@@ -578,6 +731,8 @@ impl Store {
 
         let path = dir.join(disk::RESULTS_FILE);
         let passes_path = dir.join(disk::PASSES_FILE);
+        let obligations_path = dir.join(disk::OBLIGATIONS_FILE);
+        let reviews_path = dir.join(disk::REVIEWS_FILE);
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
         let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
         let (frontend, frontend_warnings) =
@@ -592,6 +747,16 @@ impl Store {
                 path: passes_path,
                 ..Passes::default()
             },
+            obligations: Lazy::new(
+                obligations_path,
+                disk::load_obligations,
+                disk::LoadError::into_obligations_diagnostic,
+            ),
+            reviews: Lazy::new(
+                reviews_path,
+                disk::load_reviews,
+                disk::LoadError::into_reviews_diagnostic,
+            ),
             dirty: false,
             frontend_path,
             frontend_data_path,
@@ -647,6 +812,45 @@ impl Store {
         self.passes.all().count()
     }
 
+    /// What an obligation was discharged with, under the key the caller decided
+    /// on. Two keys reach this map — the bare obligation key for a proof and
+    /// `prove_key(key, plan)` for everything weaker — and this store deliberately
+    /// does not know which is which: a claim about *which plan a discharge is
+    /// valid under* belongs beside the tier rule, in the crate that owns it.
+    pub fn obligation(&self, key: DefHash) -> Option<&CachedObligation> {
+        self.obligations.get(&key)
+    }
+
+    /// The caller owes the rule the type here cannot state: **only a `Held`
+    /// discharge is written**, and only under [`crate::obligations`]' key for
+    /// its tier. A refutation and a vacuity are errors that re-run until they go
+    /// green, exactly as a failing test does, and there is no [`CachedEvidence`]
+    /// that can spell either.
+    pub fn put_obligation(&mut self, key: DefHash, entry: CachedObligation) {
+        self.obligations.put(key, entry);
+    }
+
+    pub fn obligations_len(&self) -> usize {
+        self.obligations.len()
+    }
+
+    /// What a human last accepted for this definition, by program-wide name.
+    pub fn review_record(&self, name: &Symbol) -> Option<&ReviewRecord> {
+        self.reviews.get(name)
+    }
+
+    pub fn put_review_record(&mut self, name: Symbol, record: ReviewRecord) {
+        self.reviews.put(name, record);
+    }
+
+    pub fn review_records(&self) -> impl Iterator<Item = (&Symbol, &ReviewRecord)> {
+        self.reviews.all()
+    }
+
+    pub fn review_records_len(&self) -> usize {
+        self.reviews.len()
+    }
+
     /// Folds in whatever another process wrote since [`Store::open`], so two
     /// concurrent runs cannot silently discard each other's results.
     ///
@@ -655,7 +859,12 @@ impl Store {
     /// interleave frames, which is corruption, where a lost update is only a
     /// recheck.
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        if !self.dirty && !self.passes.dirty && !self.frontend.is_dirty() {
+        if !self.dirty
+            && !self.passes.dirty
+            && !self.obligations.dirty
+            && !self.reviews.dirty
+            && !self.frontend.is_dirty()
+        {
             return Ok(());
         }
         let lock = disk::Lock::acquire(&self.dir);
@@ -678,6 +887,9 @@ impl Store {
         // else first or a crash between the two loses every baseline.
         self.write_passes()?;
         self.write_results()?;
+        let dir = self.dir.clone();
+        self.obligations.write(&dir, disk::save_obligations)?;
+        self.reviews.write(&dir, disk::save_reviews)?;
 
         if self.frontend.is_dirty() {
             self.frontend
@@ -739,19 +951,27 @@ impl Store {
         Ok(())
     }
 
-    /// Discards both caches: results *and* the front end. `ply cache clear` has
-    /// to mean "prove everything again", and leaving cached types behind would
-    /// make it mean "run the tests again against types I am still assuming".
+    /// Discards every cache: results, obligations *and* the front end.
+    /// `ply cache clear` has to mean "prove everything again", and leaving
+    /// cached types behind would make it mean "run the tests again against types
+    /// I am still assuming".
+    ///
+    /// The **review records survive**, and that is not an oversight. Everything
+    /// else here is something a machine computed and can compute again; a
+    /// baseline is something a person accepted, and discarding it costs a
+    /// re-read of the whole project that no amount of CPU can give back.
     pub fn clear(&mut self) -> anyhow::Result<()> {
         self.entries.clear();
         self.definitions.clear();
         self.passes.clear();
+        self.obligations.clear();
         self.frontend.clear();
         self.warnings.clear();
         self.dirty = false;
         let _lock = disk::Lock::acquire(&self.dir);
         remove(&self.path, "result cache")?;
         remove(&self.passes.path, "pass records")?;
+        remove(&self.obligations.path, "obligation cache")?;
         remove(&self.frontend_path, "front-end cache")?;
         remove(&self.frontend_data_path, "front-end cache")?;
         remove(&self.dir.join(LEGACY_FRONTEND_FILE), "front-end cache")?;
@@ -812,6 +1032,8 @@ impl Store {
     pub fn warnings(&self) -> Vec<Diagnostic> {
         let mut warnings = self.warnings.clone();
         warnings.extend(self.passes.warnings());
+        warnings.extend(self.obligations.warnings());
+        warnings.extend(self.reviews.warnings());
         warnings.extend(self.frontend.warnings());
         warnings
     }
@@ -819,6 +1041,8 @@ impl Store {
     pub fn take_warnings(&mut self) -> Vec<Diagnostic> {
         let mut warnings = std::mem::take(&mut self.warnings);
         warnings.extend(self.passes.take_warnings());
+        warnings.extend(self.obligations.take_warnings());
+        warnings.extend(self.reviews.take_warnings());
         warnings.extend(self.frontend.take_warnings());
         warnings
     }
@@ -1025,12 +1249,17 @@ impl Store {
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             results: self.entries.len(),
+            obligations: self.obligations_len(),
+            reviews: self.review_records_len(),
             definitions_seen: self.definitions.len(),
             sources: self.sources_len(),
             defs: self.defs_len(),
             decls: self.decls_len(),
             bodies: self.bodies_len(),
-            results_bytes: file_bytes(&self.path) + file_bytes(&self.passes.path),
+            results_bytes: file_bytes(&self.path)
+                + file_bytes(&self.passes.path)
+                + file_bytes(&self.obligations.path)
+                + file_bytes(&self.reviews.path),
             index_bytes: file_bytes(&self.frontend_path),
             data_bytes: file_bytes(&self.frontend_data_path),
             garbage_bytes: Some(self.frontend.garbage_bytes()),
