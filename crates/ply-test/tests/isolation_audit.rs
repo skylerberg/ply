@@ -349,6 +349,7 @@ fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
             &mut store,
             EngineChoice::Both,
             ply_test::Search::of(&selection),
+            ply_test::Hosting::hermetic(),
         );
         assert_eq!(
             (report.passed, report.failed),

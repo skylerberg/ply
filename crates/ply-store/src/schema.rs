@@ -256,11 +256,19 @@ pub(crate) fn exemplars() -> Exemplars {
 /// even though every type declaration is untouched, which is exactly the drift
 /// a reader cannot otherwise detect.
 pub fn fingerprint() -> ContentHash {
+    fingerprint_at(BODY_ENCODING)
+}
+
+/// The digest as it would be under another generation of the body encoding.
+/// A new literal tag — `LIT_BYTES` was one — changes no type in this file, so
+/// the encoding generation is the only thing that carries it into the digest,
+/// and a test proves that rather than assuming it.
+fn fingerprint_at(body_encoding: u32) -> ContentHash {
     let e = exemplars();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ply-store schema v1");
     hasher.update(&FRONTEND_FORMAT.to_le_bytes());
-    hasher.update(&BODY_ENCODING.to_le_bytes());
+    hasher.update(&body_encoding.to_le_bytes());
     // The declared variant set as well as the values, so that a variant added
     // to a stored enum moves the digest at the point it is *named* rather than
     // only once an exemplar happens to reach it.
@@ -364,7 +372,7 @@ mod tests {
     /// schema changed: paste the digest the failure prints, and bump
     /// `FRONTEND_VERSION` — a build that reads an entry written under the old
     /// shape has no other way to know.
-    const PINNED: &str = "04c6012f3fa7f567453327171c573244a7a2eecc887a1a0ab444fffa26744bbc";
+    const PINNED: &str = "6ddd08943f01ad833c07f06662741d0b367af7fdd80105b0abe896c8796c5d1f";
 
     #[test]
     fn the_stored_schema_is_pinned() {
@@ -402,6 +410,18 @@ mod tests {
             unlisted.is_empty(),
             "{unlisted:?} is reached but not listed in COVERED"
         );
+    }
+
+    /// `Bytes` added a normalization tag and no stored type, so `BODY_ENCODING`
+    /// is the whole path by which it reaches this digest. If that path were
+    /// broken, a store written before `b"..."` existed would look current.
+    #[test]
+    fn the_digest_follows_the_body_encoding_generation() {
+        assert_ne!(
+            fingerprint_at(BODY_ENCODING),
+            fingerprint_at(BODY_ENCODING - 1)
+        );
+        assert_eq!(fingerprint_at(BODY_ENCODING), fingerprint());
     }
 
     #[test]

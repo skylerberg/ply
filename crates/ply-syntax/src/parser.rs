@@ -1136,6 +1136,13 @@ impl Parser {
                     span: start,
                 })
             }
+            TokenKind::Bytes(b) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Bytes(b)),
+                    span: start,
+                })
+            }
             TokenKind::Kw(Kw::True) => {
                 self.advance();
                 Ok(Expr {
@@ -1606,6 +1613,13 @@ impl Parser {
                 self.advance();
                 Ok(Pattern {
                     kind: PatternKind::Lit(Lit::Str(s)),
+                    span: start,
+                })
+            }
+            TokenKind::Bytes(b) => {
+                self.advance();
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Bytes(b)),
                     span: start,
                 })
             }

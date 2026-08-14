@@ -160,6 +160,10 @@ impl Footprint {
         self.0.iter()
     }
 
+    pub fn contains(&self, atom: &EffectAtom) -> bool {
+        self.0.contains(atom)
+    }
+
     pub fn union(&self, other: &Footprint) -> Footprint {
         Footprint(self.0.union(&other.0).cloned().collect())
     }
@@ -208,6 +212,9 @@ impl Type {
     }
     pub fn string() -> Type {
         Type::con("String")
+    }
+    pub fn bytes() -> Type {
+        Type::con("Bytes")
     }
     pub fn unit() -> Type {
         Type::con("Unit")

@@ -93,6 +93,13 @@ pub enum Answered {
     /// scheduler, so [`perform`] does the search and the split and hands over
     /// the pieces rather than deciding anything about tasks.
     Scheduler(Scheduled),
+    /// Nothing on the stack handles this. The host binding is the handler of
+    /// **last resort** — consulted only here, after the whole stack has been
+    /// walked innermost-first — so a `handle` or a `simulate` in scope shadows a
+    /// real socket by the ordinary rule and with no special case. The machine
+    /// holds the binding, so the request comes back untouched rather than being
+    /// resolved here.
+    Unhandled(Request),
 }
 
 /// A `task.*`, `clock.*` or `random.*` perform, split at its region's
@@ -222,7 +229,16 @@ pub fn perform_args(
 /// the whole of `op(x̄) -> e` being `op(x̄) resume κ -> κ(e)`.
 ///
 /// `W` is not a parameter. Capture and resumption do not touch the world.
-pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Answered, Diagnostic> {
+///
+/// `born` is the machine's at-most-once host-operation count, stamped onto
+/// every continuation this captures. It is what the linearity rule compares
+/// against later.
+pub fn perform(
+    stack: &Stack,
+    request: Request,
+    decl: OpDecl,
+    born: u64,
+) -> Result<Answered, Diagnostic> {
     let Request {
         effect,
         op,
@@ -233,12 +249,18 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Answered
     check_operation(decl, &effect, &op, resource.is_some(), span)?;
 
     let Some(found) = stack.find_handler(&effect, &op, resource.as_ref()) else {
-        return Err(err_unhandled(span, &effect, &op, resource.as_ref()));
+        return Ok(Answered::Unhandled(Request {
+            effect,
+            op,
+            resource,
+            args,
+            span,
+        }));
     };
     let (prompt, clause_at) = match found.target {
         Target::Ply { prompt, clause } => (prompt, clause),
         Target::Sim(region) => {
-            let (k, _region_stack) = stack.capture(found.segments);
+            let (k, _region_stack) = stack.capture(found.segments, born);
             return Ok(Answered::Scheduler(Scheduled {
                 region,
                 effect,
@@ -259,7 +281,7 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Answered
         ));
     }
 
-    let (k, below) = stack.capture(found.segments);
+    let (k, below) = stack.capture(found.segments, born);
     let mut scope = prompt.env.clone();
     for (p, v) in clause.params.iter().zip(args) {
         scope = scope.bind(p.clone(), v);
@@ -280,17 +302,37 @@ pub fn perform(stack: &Stack, request: Request, decl: OpDecl) -> Result<Answered
     )))
 }
 
+/// A resumption refused because replaying the control would replay an
+/// irreversible host operation. Carries the ordinal so the diagnostic can say
+/// which resumption it is; the machine holds the operation being protected and
+/// builds `E0426` from both.
+pub struct Replayed {
+    pub resumes: u32,
+}
+
 /// `Frame::Resume(k)` — hand a value to a captured continuation.
 ///
 /// The segments splice onto whatever stack is current, which may be a different
 /// stack from the one they were cut out of and may already carry a previous
 /// resumption's leftovers. Each captured segment carries its own prompt, so the
 /// handler is reinstalled by the act of resuming: handlers are deep.
-pub fn resume(stack: &Stack, k: &Continuation, value: Value) -> Transition {
-    Transition {
+///
+/// **Every** resumption in the language goes through here, which is why the
+/// linearity check is a parameter of this function rather than something its
+/// callers remember to do. A second resumption across a host operation is the
+/// one defect in this system that is silent and sends a packet twice, so it may
+/// not be reachable by adding a call site.
+pub fn resume(
+    stack: &Stack,
+    k: &Continuation,
+    value: Value,
+    host_ops: u64,
+) -> Result<Transition, Replayed> {
+    k.admit(host_ops).map_err(|resumes| Replayed { resumes })?;
+    Ok(Transition {
         stack: stack.resume(k),
         state: State::Return(value),
-    }
+    })
 }
 
 /// Applying a `Value::Continuation`. It takes exactly one argument — the value
@@ -388,9 +430,14 @@ fn err_cells_exhausted(span: Span) -> Diagnostic {
     .note("hoist the region out of the loop, or reuse one cell across the iterations")
 }
 
+/// `E0303`, and deliberately not `E0424`: this one means inference should have
+/// prevented the perform and did not, so it is a bug-catcher. A run that
+/// reaches the boundary with a host handler registered for the operation is a
+/// correctly-typed program in a hermetic run, which is the opposite situation
+/// and calls for the opposite response.
 #[cold]
 #[inline(never)]
-fn err_unhandled(
+pub fn err_unhandled(
     span: Span,
     effect: &Symbol,
     op: &Symbol,

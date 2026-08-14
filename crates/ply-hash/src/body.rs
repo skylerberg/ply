@@ -27,7 +27,7 @@ use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 /// The generation of the encoding below. A decoder refuses bytes written under
 /// any other value, because a stream this compact cannot tell a shape change
 /// from a plausible one.
-pub const BODY_ENCODING: u32 = 3;
+pub const BODY_ENCODING: u32 = 4;
 
 /// A definition that is its own strongly connected component: the payload is its
 /// normalized bytes and `blake3(payload)` is the key.
@@ -1305,6 +1305,10 @@ impl Decoder<'_> {
             tag::LIT_INT => Ok(Lit::Int(self.c.i64()?)),
             tag::LIT_BOOL => Ok(Lit::Bool(self.c.boolean()?)),
             tag::LIT_STR => Ok(Lit::Str(self.c.text()?.to_string())),
+            tag::LIT_BYTES => {
+                let len = self.c.u32()? as usize;
+                Ok(Lit::Bytes(self.c.bytes(len)?.to_vec()))
+            }
             tag::LIT_UNIT => Ok(Lit::Unit),
             other => Err(bad(format!("tag {other} is not a literal"))),
         }

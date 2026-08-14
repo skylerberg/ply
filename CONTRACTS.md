@@ -896,7 +896,8 @@ impl<'a> Interp<'a> {
   ruled this out; it is a bug-catcher, not a user-facing path.
 - Recursion depth must be bounded and produce a diagnostic, not a stack overflow.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `map`, `filter`, `fold`,
-  `range`, `int_to_string`, `string_concat`, `cell_get`, `cell_set`, `panic`.
+  `range`, `int_to_string`, `string_concat`, `cell_get`, `cell_set`, `panic`,
+  plus the `Bytes` and text builtins in the host-boundary section below.
   A failing `assert`/`assert_eq` is `ASSERTION_FAILED` with a structured
   expected/actual message.
 - An `Interp` must be usable from a worker thread. If `Value` holds `Rc`, keep
@@ -3197,3 +3198,851 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
   lists the four things that would change.
 - **Bounded integer arithmetic**, runtime contract checking, spec-derived code,
   refinement types, dependent types, and a `--coverage` flag.
+
+---
+
+## Host boundary
+
+`docs/adr/0008-host-effect-boundary.md` has the reasoning and
+`docs/adr/0011-w1-contract.md` the decisions; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was
+written after them.
+
+### The rule everything else follows from
+
+> Every guarantee Ply has rests on the runtime knowing what a computation can
+> do. A host handler is the one place that knowledge can be wrong, so a wrong
+> declaration is loud and a missing declaration is fatal — never the reverse.
+
+Three consequences decide everything below. **A host binding may not change what
+the front end computes**, or `ply check` answers differently under `--host` and
+every cache splits on a flag. **A host binding may not change what a green
+result means**, so a run that reached the host is never written to the result
+cache. **When the static picture and the dynamic one disagree the dynamic one
+wins and says so**, which is `E0427`.
+
+### `ply-eval::host` — the types the machine speaks
+
+A new module in `ply-eval`, carrying no runtime and no dependency on one, so the
+machine can dispatch to a host handler without `ply-eval` learning what a socket
+is. `ply-host` implements the traits; `ply-eval` only names them.
+
+```rust
+/// Which resource labels a registration serves.
+pub enum HostResource {
+    /// Exactly this label. `Resource::Singleton` for an operation declared
+    /// without `[r]`.
+    Only(Resource),
+    /// Every label the *program* uses with this operation. Resolved against
+    /// `CheckOutput` at bind time and never printed as `*`: a driver that claims
+    /// every table must list the tables it got.
+    Any,
+}
+
+/// Whether a handler may serve an effect the program did not declare `nondet`.
+/// Consulted at bind time and by `ply hosts`, and **nowhere in inference, in a
+/// cache key, or in the evaluator** — see `Determinism propagation` below.
+pub enum Determinism { Deterministic, Nondeterministic }
+
+/// Whether replaying this operation changes anything outside the program.
+pub enum Linearity {
+    /// A send, an insert, a charge. Bumps the machine's `host_ops` counter and
+    /// therefore closes multi-shot resumption over it.
+    AtMostOnce,
+    /// A clock read, a read of an immutable resource. Replay is harmless, so it
+    /// costs the linearity rule nothing.
+    Repeatable,
+}
+
+/// One registration: an `(effect, operation, resource)` triple, a determinism
+/// flag, a linearity obligation.
+pub struct HostOp {
+    pub effect: Symbol,
+    pub op: Symbol,
+    pub resource: HostResource,
+    pub determinism: Determinism,
+    pub linearity: Linearity,
+    /// May not run on the scheduler's thread; dispatched to `ply-host`'s pool
+    /// and answers `Pending` immediately.
+    pub blocking: bool,
+    /// The Rust path, as `ply hosts` prints it. The reviewable identity of a
+    /// member of the trusted computing base.
+    pub path: &'static str,
+}
+
+/// What a handler is called with. `atom` is the *resolved* atom — the concrete
+/// resource, never `Any` — so a handler never has to re-derive its own
+/// footprint.
+pub struct HostRequest<'a> {
+    pub atom: EffectAtom,
+    pub op: &'a HostOp,
+    pub args: &'a [Value],
+    pub span: Span,
+}
+
+pub enum HostAnswer {
+    /// Completed. Returned into the perform site along the ordinary
+    /// tail-resumptive path.
+    Value(Value),
+    /// Did not complete. The performing task leaves the enabled set until the
+    /// token resolves, exactly as `sim::Answer::Sleeping` parks one on a
+    /// deadline.
+    Pending(Pending),
+}
+
+/// Opaque to `ply-eval`: minted by a `HostRuntime`, polled by it, and never
+/// interpreted here.
+pub struct Pending { pub token: u64, pub label: &'static str }
+
+pub trait HostHandler: Send + Sync {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>)
+        -> Result<HostAnswer, Diagnostic>;
+}
+
+/// The one thing `ply-eval` needs from `ply-host`.
+pub trait HostRuntime {
+    /// `Ok(None)` when the token has not resolved. The scheduler polls; it never
+    /// spins, because `park` is what it calls when nothing is ready.
+    fn poll(&self, p: &Pending) -> Result<Option<Value>, Diagnostic>;
+    /// Wait until at least one outstanding token resolves. Called only with no
+    /// task enabled.
+    fn park(&self) -> Result<(), Diagnostic>;
+    /// Drive until this token resolves. The only place a Ply computation blocks
+    /// a real thread, and reached only outside a scheduler region.
+    fn block_on(&self, p: Pending) -> Result<Value, Diagnostic>;
+}
+```
+
+### Registration — `HostRegistry` and `HostBinding`
+
+```rust
+/// Built by one function in `ply-host`, so the trusted computing base is a list
+/// read top to bottom in one file. No attribute macro, no link-time registry, no
+/// global constructor.
+pub struct HostRegistry { .. }
+impl HostRegistry {
+    pub fn new() -> HostRegistry;
+    pub fn register(&mut self, op: HostOp, handler: Arc<dyn HostHandler>);
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn ops(&self) -> impl Iterator<Item = &HostOp>;
+    /// Resolve every registration against the program. Fails loudly; see the
+    /// codes below. `Any` resolving to no atom is **not** an error — a driver
+    /// linked into a program that never queries is idle, not wrong.
+    pub fn bind(self, check: &CheckOutput) -> Result<HostBinding, Vec<Diagnostic>>;
+    /// The listing `ply hosts` prints without `--host`: what *would* bind.
+    pub fn preview(&self, check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>>;
+}
+
+/// What a run actually has bound. `hermetic()` is the default everywhere.
+pub struct HostBinding { .. }
+impl HostBinding {
+    pub fn hermetic() -> HostBinding;
+    /// The registry is retained even when nothing is bound, so `E0424` can name
+    /// the handler that *would* have served the operation.
+    pub fn hermetic_with(registry: HostRegistry) -> HostBinding;
+    pub fn is_hermetic(&self) -> bool;
+    /// Every atom this binding serves. The set selection intersects a test's
+    /// footprint against, and it is exact rather than an upper bound.
+    pub fn footprint(&self) -> &Footprint;
+    pub fn serves(&self, atom: &EffectAtom) -> bool;
+    /// Whether any atom of a footprint reaches this binding: what `Reason::Host`
+    /// and `Isolation::Host` are decided by.
+    pub fn reaches(&self, footprint: &Footprint) -> bool;
+    /// The resolution the machine performs per `perform` that reached the
+    /// boundary. `None` in a hermetic run and for a triple nothing registered.
+    ///
+    /// **By the triple, never by the atom.** An `EffectAtom` carries no
+    /// operation, so `db.get[users]` and `db.peek[users]` are one atom and two
+    /// operations; a registry keyed by the atom reports those as `E0422` and
+    /// refuses a program that is merely ordinary.
+    pub fn resolve(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
+        -> Option<Bound<'_>>;
+    /// What a hermetic `E0424` names: the path that would have served this.
+    pub fn would_serve(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
+        -> Option<&'static str>;
+    pub fn listing(&self) -> &HostListing;
+}
+
+pub struct Bound<'a> {
+    pub atom: EffectAtom,
+    pub op: &'a HostOp,
+    pub handler: &'a Arc<dyn HostHandler>,
+}
+
+/// One row per resolved **triple**, ascending by `(effect, op, resource)`. Never
+/// one row per registration: an `Any` handler must not hide a resource behind a
+/// `*`.
+pub struct HostListing { pub rows: Vec<HostRow>, pub handlers: usize }
+pub struct HostRow {
+    pub effect: Symbol,
+    pub op: Symbol,
+    pub resource: Resource,
+    /// What this triple contributes to a footprint. Not a key.
+    pub atom: EffectAtom,
+    /// Which registration produced this row.
+    pub row: usize,
+    pub path: &'static str,
+    pub deterministic: bool,
+    pub linearity: Linearity,
+    pub blocking: bool,
+    /// Whether the *declaration* carries `nondet`. Printed so a reviewer can see
+    /// the pair that `E0423` checks.
+    pub declared_nondet: bool,
+}
+impl HostListing {
+    /// BLAKE3 over the canonical rows, domain-tagged `b"ply.hosts.1"`. Rendered
+    /// `b3:` plus the first twelve hex characters. The one line CI pins.
+    pub fn digest(&self) -> [u8; 32];
+    pub fn digest_short(&self) -> String;
+}
+```
+
+### The handler signature
+
+Two shapes, and which one is used is a property of the operation rather than of
+the run:
+
+- `HostAnswer::Value` — anything that cannot block: a clock read, a byte
+  operation, a non-blocking write that took the whole buffer. The machine
+  returns it into the perform site along the ordinary tail-resumptive path, so a
+  value-shaped host operation costs exactly what a Ply handler clause costs.
+- `HostAnswer::Pending` — anything that waits. The performing task leaves the
+  enabled set until `HostRuntime::poll` yields a value. Inside a scheduler
+  region this is `sim::Answer::Sleeping` with a token instead of a deadline and
+  the machine's handling is the same code. Outside one there is no scheduler to
+  park on, so the machine calls `HostRuntime::block_on`.
+
+`blocking: true` means the handler's *work* may not run on the scheduler's
+thread: it dispatches to `ply-host`'s pool and answers `Pending` immediately.
+`call` itself is always entered on the machine's thread, because a `Value` is not
+`Send` and nothing in `ply-eval` could hand the work elsewhere.
+
+**Enforced:** a `blocking: true` handler that answers `HostAnswer::Value` did the
+work on this thread, and that is `E0428` before the value reaches the perform
+site. **Not enforced, and not enforceable:** a handler that blocks while declared
+non-blocking stalls every task sharing its thread, with no budget, no watchdog
+and — since W1 defers cancellation — no way out. That half is a review
+obligation, and `ply hosts` prints the column so there is something to review.
+
+**A handler does not choose the code its failure is reported under.** Every `Err`
+from `HostHandler::call` is passed through `ply_eval::host::attribute`, which
+appends a note naming the handler path and the operation, and replaces a code in
+`RESERVED_CODES` with `E0502`. The reserved set is the codes that decide
+classification — `E0505`, `E0503`, `E0415` — plus the ones the boundary and the
+machine raise about their own state: `E0413`, `E0414`, `E0416`, `E0421`–`E0428`,
+`E0504`. Without the rewrite a handler could report its own failure as a defect
+in Ply, which sends the reader to file a bug against the language and suppresses
+the diagnosis that would have found the handler. `HostRuntime::poll`, `park` and
+`block_on` are **not** rewritten: their failures really are about the reactor's
+own invariants.
+
+### Linearity enforcement — implement exactly this
+
+```rust
+impl<'a> Machine<'a> {
+    /// At-most-once host operations answered in this entry point. Reset by
+    /// `reset()` with everything else, so a count never crosses an entry point.
+    pub fn host_ops(&self) -> u64;
+}
+
+impl Continuation {
+    /// `Machine::host_ops` when this continuation was captured.
+    pub fn born(&self) -> u64;
+    /// Resumptions so far, shared across clones — a `Continuation` is cloned by
+    /// `Rc`, and two clones are one continuation.
+    pub fn resumes(&self) -> u32;
+}
+```
+
+A resumption is refused with `E0426` exactly when
+
+```
+resumes > 1  &&  machine.host_ops > k.born
+```
+
+checked in `handler::resume` and in the `Frame::Resume` path, which are the two
+places a continuation is applied. `host_ops` is incremented **only** for
+`Linearity::AtMostOnce`, and only after the operation actually ran.
+
+In a hermetic run `host_ops` is zero for the life of the entry point, so **no
+existing multi-shot behaviour changes**. That is a required test.
+
+This over-approximates: it refuses a second resumption when an at-most-once host
+operation happened anywhere after the capture, including in another task or in
+the handler clause rather than inside the continuation. The precise rule needs a
+per-resumption liveness scope on the control stack — a new frame kind
+interacting with capture, splice, `Next::Leave` and task start — in the one part
+of the system where a defect is silent and sends a packet twice. Do not build
+it. If the false positive ever bites a real program, that is a contract
+amendment with a program attached.
+
+### Determinism propagation — the arrow points the other way
+
+> A handler registered `Determinism::Nondeterministic` requires its effect to be
+> declared `nondet` in Ply source. Otherwise `E0423`, at bind time.
+
+**E0412 does not change, inference does not change, and no cache key learns
+about a binding.** An effect with a real socket behind it is `nondet` in the
+source, which is where E0412 already looks, so a `det` test that reaches it
+fails to compile whether or not `--host` was passed. Adding `nondet` to a
+declaration is a source edit that moves the hashes it should move.
+
+A `Deterministic` handler is still not cacheable. The flag's entire content is
+"this handler may serve an effect the program did not declare `nondet`".
+
+The flag is read in exactly two places: `HostRegistry::bind`, and `HostListing`.
+
+### Hermetic by default
+
+`ply test` and `ply run` bind `HostBinding::hermetic_with(ply_host::registry())`.
+`--host` binds for real. There is no environment variable and no config file: a
+flag is the only thing that appears in the command a reviewer reads.
+
+**Reaching the boundary unbound is `E0424`, never `E0303`.** E0303 means
+inference should have prevented this and did not — a bug-catcher. E0424 means
+inference was right and the run was configured hermetically. The two call for
+opposite responses. The message names the operation, says `ply test` is
+hermetic, and names both remedies plus the handler that would have served it.
+
+**Selection under `--host`.** A test's footprint is an upper bound on what it
+performs, so the tests that can reach the host are exactly those whose footprint
+intersects `HostBinding::footprint()`. Those get `Reason::Host`: always run,
+never read from the cache, never written to it. Every other test is selected
+exactly as it would be hermetically. `--host` is **not** `--no-cache`, and a
+build that makes it one has made the hermetic default the expensive one.
+
+**The runtime is authoritative.** `Record::Host` is written from what actually
+happened. A test that was not predicted to reach the host and reached it anyway
+is `E0427`.
+
+**Bisection and hybrids are skipped** for a failing test that reached the host:
+`Skipped::Host`. M5 re-runs a failing test many times over mixed definition sets,
+and doing that to a test that sends packets sends them that many times. The
+suspect set still comes from hashes and is unaffected.
+
+Decided by what the runtime **did** — `Failure::host` is set from `HostUse`, not
+from the footprint prediction — and a refusal the handler *returned* counts, so a
+handler that acted and then failed is still a host-backed failure.
+`precheck(Gate { .. })` orders it after `defect` and **before** `nondet`: nearly
+every host-backed test is also `test/nondet`, and the two say different things.
+`nondet` says a hybrid's answer would be evidence about nothing; `host` says
+asking the question is itself an action on the world.
+
+`diagnose_failures` builds no `BodyHybrid` at all for such a failure, which is
+the second lock. The first is that `BodyHybrid::trial` constructs its machine
+with no binding and there is no path by which one reaches it — an accident that
+saved the packets before `Skipped::Host` existed, and one that a single
+`set_host_binding` call to "make bisection work under `--host`" would have
+undone.
+
+### World interaction
+
+```rust
+pub enum Isolation {
+    World,
+    Shared,
+    /// Reaches a bound host handler. Not world-isolated, because a socket cannot
+    /// be forked; counted separately so the `isolated: n of m` number stays
+    /// honest and `--explain` can say why.
+    Host,
+}
+impl Isolation {
+    /// A breaking change, deliberately rather than a second constructor beside
+    /// the old one: a caller that kept the one-argument form under `--host`
+    /// would report a host-backed test as trivially parallel.
+    pub fn of(footprint: &Footprint, hosts: &Footprint) -> Isolation;
+    /// `Host` is not `World`. Nothing else changes.
+    pub fn is_world(self) -> bool;
+}
+```
+
+Grouping is otherwise **unchanged**: a host atom is an ordinary contending atom,
+so readers-writers over `db.read[users]` still decides what runs beside what,
+which is what ADR 0008 §6 asks for and it needs no special case. `Parallelism`
+gains `host: usize`, counted over the same universe as `isolated` and `shared`.
+
+`--explain` prints `host` where it prints `world` or `shared`, and the summary
+line gains `host: 3 of 47 · not cached`.
+
+### `simulate` and the host are mutually exclusive
+
+A host operation reached from inside a `simulate` region is `E0425`. DPOR
+re-runs a test whole per interleaving; a region reaching a socket sends one
+packet per interleaving explored and then calls the result a proof over every
+interleaving.
+
+The check is one line in the machine: a `perform` that reaches the host binding
+with `!self.sims.is_empty()` is `E0425`. It cannot be a static check, because a
+`simulate` region and a host-backed perform may be arbitrarily far apart in the
+call graph and the row that connects them is discharged in between.
+
+**And the same refusal over the whole test**, because the search re-runs the
+*test* and not the region: an operation in the prefix or the suffix around a
+region is re-performed exactly as one inside it is, and `innermost_simulation` is
+empty in both places. The machine cannot derive that, so the runner states it:
+
+```rust
+impl<'a> Machine<'a> {
+    /// This entry point is one of several runs of the same test, so reaching
+    /// the host boundary is `E0425`. Stated per entry point by the caller
+    /// driving the search, like `set_declared_footprint`.
+    pub fn set_re_executed(&mut self, re_executed: bool);
+}
+
+impl Plan {
+    /// Whether running this plan can drive the entry point more than once. An
+    /// upper bound: a `Dpor` plan that turns out to have one interleaving is
+    /// still refused, because finding out costs the packet.
+    pub fn re_executes(&self) -> bool;
+}
+```
+
+`InterpExecutor::search` sets it from `plan.re_executes() ||
+search.measure_reduction` — `--simulation measure-reduction` runs the whole
+search a second time unpruned, which doubles whatever the first did. The refusal
+precedes the handler call, so the count is zero and not one.
+
+`--simulation once` explores a single interleaving and therefore does not
+re-execute, so a host-backed test may run under it. That is the "run it once
+without searching" answer, reached by a flag rather than by silently dropping the
+search.
+
+Opening a **production region** is exempt: `task.*` reaching the binding performs
+nothing outside the program, and the seeded and production schedulers already
+exclude each other three ways, so `E0416` is the specific answer there and
+refusing first would replace it with a vaguer one.
+
+### The scheduler seam
+
+There is **one** `Scheduler` type, `ply_eval::sched::Scheduler`, gaining:
+
+```rust
+pub enum Policy {
+    /// Choices from the trail's `sched` stream, time from the virtual clock,
+    /// steps recorded. What `simulate` installs.
+    Seeded,
+    /// The lowest-numbered ready task; `HostRuntime::park` when none is ready;
+    /// no steps recorded and no `Exploration` reported. What a host binding that
+    /// serves `task` installs.
+    Host,
+}
+impl Scheduler { pub fn policy(&self) -> Policy; }
+```
+
+A second `Scheduler` in `ply-host` is exactly the drift M7's design exists to
+prevent, and it is not to be written. `ply-host` supplies a `HostRuntime` and
+nothing else.
+
+A Ply task cannot move between OS threads — `Value` holds `Rc` and a `Machine`
+is single-threaded by construction — so the production scheduler is not one task
+per thread. Real threads are confined to the host runtime's reactor and blocking
+pool, where no Ply value ever goes.
+
+**The production region opens lazily**, at the first `task.*` perform that
+reaches the host binding, rooted at the stack it was performed on, carrying a
+`SimId` like any other region and closed by the same `close_regions` path.
+Opening one eagerly around every entry point makes every existing `simulate`
+nested and `E0416` under `--host`.
+
+**Mutual exclusion, three independent locks**, and no one of them is load-bearing
+alone:
+
+1. `task` is `nondet`, so a `det` test performing `task.*` unhandled is `E0412`
+   and never runs. Only a `test/nondet` can reach a production scheduler.
+2. `simulate` pushes `Delimiter::Sim` and `Stack::find_handler` walks the stack
+   innermost-first before the host binding is consulted at all, so a
+   `task.spawn` inside a region reaches the seeded scheduler always.
+3. Nothing binds without `--host`.
+
+The host binding is consulted **only when `Stack::find_handler` returns `None`**.
+It is the handler of last resort, it is not a `Delimiter`, and no `Continuation`
+ever contains it — which is what keeps capture, splice and `Next::Leave`
+untouched by this milestone.
+
+### The footprint check
+
+When the machine answers a perform from the host binding, it checks the
+performed atom against the declared footprint of the entry point being run:
+
+```rust
+impl<'a> Machine<'a> {
+    pub fn set_host_binding(&mut self, binding: Arc<HostBinding>);
+    /// The declared footprint of the entry point about to run. A host answer
+    /// whose atom is outside it is `E0427`.
+    pub fn set_declared_footprint(&mut self, footprint: Footprint);
+    /// What the run actually reached. `None` until a host handler answered.
+    pub fn host_use(&self) -> Option<&HostUse>;
+}
+
+/// What a run reached across the boundary. Reported, and the authority on
+/// whether a green verdict may be cached.
+pub struct HostUse { pub atoms: Footprint, pub operations: u64 }
+```
+
+`E0427` is `Status::Panicked`, `Failure::defect` is `true`, and it is **not**
+bisected — the same class as `E0503` and `E0415`, because the run knows two of
+its own answers disagree and nothing in the definition graph decides which was
+meant. `ply_test`'s defect predicate therefore reads
+`HOST_FOOTPRINT_ESCAPE` alongside `INTERNAL_ERROR` and the two divergence codes.
+
+**Every command that runs an entry point states the claim**, `ply test`
+included: `InterpExecutor::arm_footprint_check` is called before each test on all
+three machine paths — `Engines::Machine`, `Engines::Both`, and once per
+interleaving in `search`. It is restated per test rather than per worker, because
+one `Machine` serves many tests and a claim that outlived its entry point would
+judge the next test by the last one's row. A check nothing installs is not a
+defence: it was unarmed in `ply test` once, and a `det`, world-isolated test
+opened a real TCP listener and was reported green.
+
+This is a `BTreeSet` lookup per host operation, against a syscall. **What it
+defends is narrower than "a footprint that under-reports"**, and the difference
+decides how much the boundary is trusted for:
+
+- it catches a *program* footprint that under-reports — a `handle` discharges an
+  atom, and an atom names no operation, so a clause set covering some but not all
+  operations of an atom leaves the rest to reach the binding out of a row that no
+  longer mentions it;
+- it catches a binding that resolved an atom the program's own footprints never
+  enumerated (`err_unenumerated_atom`);
+- it **cannot** catch a handler that does more than its registration declared.
+  The atom compared is the one the registry computed and a handler has no way to
+  report a different one, so `db.read[users]` that also writes is recorded as a
+  read, reported as a read and *scheduled* as a read. Since ADR 0008 §6 makes
+  footprint conflict grouping the only isolation a host-backed test has, the
+  isolation of such a test is exactly as good as its registration's mode and
+  resource, and nothing checks either. `ply hosts` plus review is the whole
+  defence there.
+
+### `Bytes`
+
+```rust
+pub enum Value { /* ... */ Bytes(Arc<[u8]>) }
+pub enum Lit   { /* ... */ Bytes(Vec<u8>) }
+```
+
+`Arc<[u8]>` mirrors `Value::Str(Arc<str>)` exactly. Not `bytes::Bytes`: what
+that crate buys is cheap slicing of a shared buffer, which W3's streaming bodies
+want and W1 does not, and it would put a type carrying its own refcount
+semantics into the one enum the hygiene rules are written against. Slicing
+copies at W1.
+
+Surface syntax: `b"..."`, recognized in the lexer by `b` immediately followed by
+`"` with no space. Escapes are the string escapes plus `\xNN`; a source
+character above `U+007F` inside a `b"..."` is `UNEXPECTED_TOKEN` telling the
+author to write `\xNN`, because "the bytes of this literal" must not depend on
+the file's encoding.
+
+`Bytes` is a nullary builtin type constructor in `BUILTIN_TYPES`, and
+`Type::bytes()` beside `Type::string()`.
+
+Normalization tag `LIT_BYTES = 44`, length-prefixed raw bytes. A distinct tag
+from `LIT_STR` so `b"ab"` and `"ab"` are different definitions — they have
+different types and must not share a hash. `BODY_ENCODING` and
+`FRONTEND_VERSION` bump.
+
+Builtins, all pure, all monomorphic:
+
+| builtin | type | notes |
+| --- | --- | --- |
+| `bytes_len` | `(Bytes) -> Int` | |
+| `bytes_at` | `(Bytes, Int) -> Int` | `0..=255`; out of range is `RUNTIME_ERROR` |
+| `bytes_slice` | `(Bytes, Int, Int) -> Bytes` | half-open; out of range is `RUNTIME_ERROR`, never clamped |
+| `bytes_concat` | `(Bytes, Bytes) -> Bytes` | |
+| `bytes_of_string` | `(String) -> Bytes` | total, UTF-8 |
+| `bytes_is_utf8` | `(Bytes) -> Bool` | the check, so the partial path is avoidable |
+| `string_of_bytes` | `(Bytes) -> String` | `RUNTIME_ERROR` naming the byte offset of the first invalid sequence |
+| `string_of_bytes_lossy` | `(Bytes) -> String` | total, `U+FFFD` per invalid sequence |
+
+Ply has no `Result` in its prelude, so one partial conversion would be a
+landmine. Three builtins are the honest shape of the UTF-8 boundary.
+
+`++` stays `String`-only: overloading it needs type-directed dispatch, which W2
+explicitly declines to settle.
+
+`values_equal` compares `Bytes` by content and a `Bytes` is never equal to a
+`Str`. `Value::render` prints `b"..."` with non-printable bytes as `\xNN`,
+truncating past 32 bytes as a list does. `Value::type_name` is `"Bytes"`.
+
+Pattern matching is exact-literal only, which `PatternKind::Lit` already gives.
+Byte-slice patterns are not in W1.
+
+`Bytes` is **quantifiable** in a `forall`: `property.rs` generates length
+`0..=32` with uniform bytes, `shrink.rs` has minimal value `b""` and shrinks
+length before content. Leaving it ungeneratable would regress M8's guarantee on
+contact with a new primitive, which is the class of thing this project audits
+for.
+
+W2's derivation treats `Bytes` as a leaf.
+
+### Text
+
+`Bytes` is what a socket speaks; these are what a server does once it has
+decoded. All pure, all monomorphic, all in `ply-eval::builtins` beside the
+above.
+
+| builtin | type | notes |
+| --- | --- | --- |
+| `string_len` | `(String) -> Int` | characters |
+| `string_slice` | `(String, Int, Int) -> String` | half-open, in **characters**; out of range is `RUNTIME_ERROR`, never clamped |
+| `string_split` | `(String, String) -> List<String>` | an empty separator is `RUNTIME_ERROR` |
+| `string_trim` | `(String) -> String` | Unicode whitespace, both ends |
+| `string_lower` / `string_upper` | `(String) -> String` | full Unicode, locale-independent; the length may change |
+| `string_starts_with` / `string_ends_with` | `(String, String) -> Bool` | |
+| `string_contains` | `(String, String) -> Bool` | the check, so `string_find` is avoidable |
+| `string_find` | `(String, String) -> Int` | the **character** index; absent is `RUNTIME_ERROR` |
+
+**A `String` is indexed in characters and a `Bytes` in bytes**, everywhere and
+without exception, so no argument to a `String` builtin can name a position
+inside a character and "slicing that would split a character" cannot be
+expressed. The split is instead caught where it is actually made: a
+`bytes_slice` that cuts a multi-byte sequence produces a `Bytes` that
+`string_of_bytes` refuses, naming the offset. Truncating to a boundary, or
+substituting `U+FFFD`, would be the silent-wrong-answer shape — and
+`string_of_bytes_lossy` is there for a caller that genuinely wants the second.
+
+`string_find` and `string_contains` are the same pair as `string_of_bytes` and
+`bytes_is_utf8`, for the same reason: a `-1` sentinel is a value a careless
+program hands straight to `string_slice`, and the error then lands far from the
+mistake. `len` stays `(List<a>) -> Int` — a String's length is `string_len`
+until W2 settles type-directed dispatch.
+
+`string_trim`, `string_lower` and `string_upper` consult the Unicode tables in
+`std`, so their answers move if those tables do. A Rust toolchain upgrade is
+therefore a `RUNTIME_VERSION` bump, and this is the first place in the language
+where that is true.
+
+The prover treats every one of these as opaque; the total ones are in
+`TOTAL_BUILTINS`, and the six that refuse an input — `bytes_at`, `bytes_slice`,
+`string_slice`, `string_split`, `string_find`, `string_of_bytes` — deliberately
+are not.
+
+### `ply hosts`
+
+```
+ply hosts [PATH] [--host] [--json] [--digest]
+```
+
+One line per resolved triple, ascending by `(effect, op, resource)`. Exit `0`; a
+bind failure is exit `2` like any compile error.
+
+Both the operation and the atom are printed. The operation is the row's
+identity and says *what* was bound; the atom is what scheduling and isolation
+speak in, and deriving it in your head from a mode annotation in another file is
+not something a reviewer should have to do.
+
+```
+$ ply hosts --host
+   4 host handlers · 6 operations · trusted computing base
+
+   OPERATION           ATOM                HANDLER                    DET  LINEAR         BLOCKING
+   clock.now           clock.read          ply_host::clock::now       no   repeatable     no
+   db.get[orders]      db.read[orders]     ply_host::postgres::read   no   at-most-once   yes
+   db.get[users]       db.read[users]      ply_host::postgres::read   no   at-most-once   yes
+   db.put[orders]      db.write[orders]    ply_host::postgres::write  no   at-most-once   yes
+   net.send[socket]    net.write[socket]   ply_host::tcp::send        no   at-most-once   no
+   task.spawn          task.write          ply_host::task::scheduler  no   repeatable     no
+
+   digest: b3:4f19c0a8e2d3
+```
+
+Hermetic is a statement, not an empty listing — an empty listing is
+indistinguishable from a registry that failed to load:
+
+```
+$ ply hosts
+   hermetic — no host handler is bound
+
+   6 operations would bind under `--host`; run `ply hosts --host` to list them
+```
+
+`--digest` prints `b3:4f19c0a8e2d3` and nothing else, which is what a CI check
+pins. `--json` carries `schema_version: 1`, the `binding`, the `digest` and the
+rows with every column above.
+
+### `ply test` and `ply run` flags
+
+```
+--host        bind real host handlers. Off by default, and the default is the
+              point: a suite that silently acquires a live dependency is the
+              failure mode this language exists to prevent.
+```
+
+`ply test --json` bumps to `"schema_version": 4`: per test a `host` object of
+`atoms` and `operations`, absent — never zeroed — on a test that reached no host
+handler, and a top-level `"binding": "hermetic" | "host"` with the listing
+digest.
+
+`ply-test` gains:
+
+```rust
+pub enum Reason { /* ... */ Host }   // always runs, never cached, in either direction
+pub enum Record { /* ... */ Host }   // a green run that reached the host
+pub enum Skipped { /* ... */ Host }  // bisection refused: re-running replays I/O
+pub struct TestResult { /* ... */ pub host: Option<HostUse> }
+```
+
+`TestResult::green_but_uncached` includes `Record::Host`.
+
+### New diagnostic codes
+
+Added to `ply_span::codes`; existing numbers are unchanged, and the registry pin
+test covers all eight.
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0421 | `HOST_OPERATION_UNKNOWN` | a registration names an effect, operation or resource the program does not declare | the host author's |
+| E0422 | `HOST_HANDLER_CONFLICT` | two registrations claim one atom | the host author's |
+| E0423 | `HOST_DETERMINISM_MISMATCH` | a `nondet` handler for an effect not declared `nondet` | the host author's |
+| E0424 | `HERMETIC_BOUNDARY` | an operation reached the boundary with nothing bound | the program's |
+| E0425 | `HOST_IN_SIMULATION` | a host operation in a test the search re-runs — inside a `simulate` region, or in the prefix or suffix around one | the program's |
+| E0426 | `HOST_CONTINUATION_RESUMED` | a second resumption across an at-most-once host operation | the program's |
+| E0427 | `HOST_FOOTPRINT_ESCAPE` | a host answer whose atom is outside the entry point's declared footprint | **Ply's** |
+| E0428 | `HOST_BLOCKING_ANSWER` | a `blocking: true` handler answered a value inline instead of a pending token | the host author's |
+
+E0421–E0423 are raised by `HostRegistry::bind` before anything runs, so they are
+start-up failures with no span in user source; they carry the effect
+declaration's span as a secondary label when there is one to point at.
+
+E0424, E0425, E0426 and E0428 join `E0501`/`E0502`'s row: `Failure::defect` is
+`false` and they are attributed like any other failure — except that bisection is
+skipped for a failure the run reached the host to produce, which E0426 and E0428
+always are and E0424 and E0425 never are, because both of those refuse before the
+handler is called.
+
+E0427 joins `E0503`/`E0415`'s row: Ply's fault, `Status::Panicked`,
+`Skipped::Panicked`, no bisection.
+
+None of these eight may be raised by a host handler: they are in
+`RESERVED_CODES`, and a handler that returns one has its code rewritten to
+`E0502` with a note saying what it claimed.
+
+### Versions
+
+`RUNTIME_VERSION` bumps to `0.6.0`: `Value` gains a variant and the evaluator
+gains a dispatch path, and a cached `Pass` is a claim about what the evaluator
+did. `FRONTEND_VERSION` bumps to `0.8.0` and `BODY_ENCODING` bumps, for
+`Lit::Bytes` in the AST and `LIT_BYTES` in the normalizer. `PROVER_VERSION`
+bumps for the `Bytes` generator, which changes what a `property` discharge
+sampled.
+
+### Workspace
+
+One new crate, `ply-host`, and one new dependency:
+
+```toml
+ply-host = { path = "crates/ply-host" }
+tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync"] }
+```
+
+`rt-multi-thread` is deliberately absent: a work-stealing runtime is unusable
+here because nothing it would steal is `Send`. Tokio earns its place as the
+reactor and the timer wheel.
+
+Rejected, each with a reason: **mio** — tokio wraps it, and taking both means two
+reactors. **socket2** — buys socket options W1 does not set. **bytes** — see the
+`Bytes` section. **httparse** — W1's endpoint returns a fixed response and reads
+to the header terminator; a parser in the trusted computing base can wait until
+W3 needs one.
+
+The blocking pool is `std::thread` owned by `ply-host` rather than
+`tokio::task::spawn_blocking`, so its size is a declared, reviewable number
+instead of tokio's default of 512 — a number nobody chose, which decides how many
+real connections a runaway test can open.
+
+`ply-eval` gains **no** dependency. `ply-host` depends on `ply-eval`,
+`ply-core`, `ply-span` and tokio; `ply-test` and `ply-cli` depend on `ply-host`.
+
+### Required tests
+
+These are the ones whose absence would let W1 ship broken rather than merely
+incomplete.
+
+1. A registration for an effect the program does not declare is `E0421`, and the
+   message names the nearest declared operation.
+2. A registration for a declared effect but an undeclared operation is `E0421`.
+3. A registration for `Only(users)` where the program never says `[users]` is
+   `E0421`; an `Any` that resolves to nothing is **not** an error.
+4. Two registrations claiming one **triple** are `E0422`, naming both paths;
+   two operations of one effect sharing one **atom** — `db.get[users]` and
+   `db.peek[users]` — are two rows and not a conflict.
+5. A `Nondeterministic` handler for an effect without `nondet` is `E0423`,
+   pointing at the declaration.
+6. `Any` expands to exactly the resource labels the program uses, and `ply hosts`
+   prints one row per expanded atom and never a `*`.
+7. Binding an empty registry is a legal hermetic binding.
+8. **A binding changes no definition hash, no inferred row, and no E0412
+   verdict.** `ply check` output is byte-identical with and without `--host`.
+9. A `det` test performing a host-backed `nondet` operation is `E0412` at compile
+   time, with `--host` and without it, and does not run either way.
+10. A hermetic run reaching the boundary is `E0424` and names the handler that
+    would have served it.
+11. `--host` runs the test and it passes; the same test is `E0424` without it.
+12. A host operation inside a `simulate` region is `E0425`, whether the region is
+    lexically enclosing or reached through a call.
+13. `task.spawn` inside a `simulate` region reaches the seeded scheduler even
+    when a host `task` handler is bound — one interleaving per seed, replayable.
+14. `--host` on a corpus with no host atoms selects and caches **exactly** as
+    the hermetic run does: same selection, same cache writes.
+15. A test whose footprint intersects the binding's is `Reason::Host`, runs, and
+    writes no cache entry; a second `--host` run runs it again.
+16. A `--host` pass is not readable by a hermetic run and vice versa.
+17. **In a hermetic run `host_ops` is zero and every existing multi-shot test
+    behaves identically.** No M6 test changes.
+18. A continuation resumed twice across an `AtMostOnce` host operation is
+    `E0426`, and the real operation ran exactly once.
+19. The same program with the operation registered `Repeatable` resumes twice
+    and performs it twice, deliberately.
+20. A continuation captured *after* the last host operation resumes twice.
+21. A host handler answering an atom outside the entry point's declared
+    footprint is `E0427`, `Status::Panicked`, and is not bisected.
+22. A failing host-backed test reports `Skipped::Host` and still has its static
+    suspect set.
+23. `Isolation::of` returns `Host` for a footprint meeting the binding, `Shared`
+    for the same footprint under a hermetic binding, and the `isolated` count
+    excludes it.
+24. `--explain` reports a host-backed test as `host` and the trivially-parallel
+    count does not include it.
+25. `ply hosts --digest` is stable across runs and changes when any column of any
+    row changes — including `linearity` and `blocking` alone.
+26. `ply hosts` without `--host` says `hermetic` and still reports how many atoms
+    would bind.
+27. `b"ab"` and `"ab"` have different definition hashes.
+28. A `b"..."` literal with a non-ASCII source character is `UNEXPECTED_TOKEN`
+    telling the author to write `\xNN`.
+29. `bytes_of_string` after `string_of_bytes` is identity on valid UTF-8, and
+    `string_of_bytes` on an invalid sequence is `RUNTIME_ERROR` naming the byte
+    offset.
+30. `string_of_bytes_lossy` is total over every byte string the generator
+    produces.
+31. `bytes_slice` out of range is `RUNTIME_ERROR` rather than a clamp.
+32. A `forall (b: Bytes)` law is discharged rather than `E0418`, and its
+    counterexample shrinks toward `b""`.
+33. A `Bytes` pattern matches exactly and a `Bytes` never equals a `Str`.
+34. `--engine both` on a corpus containing `Bytes` reports no `E0503`.
+35. A production-scheduled run and a simulated one of the same program produce
+    the same value, and only the simulated one reports an `Exploration`.
+36. A `simulate` entered while a `Policy::Host` region is live is `E0416`.
+37. `HostAnswer::Pending` outside any scheduler region blocks and returns the
+    value; inside one it parks the task and another task runs meanwhile.
+38. `Store::open` at 10,000 definitions stays under 5ms with `Bytes` in the
+    encoding.
+
+Plus one `tests/fixtures/` entry per new code, as every milestone owes.
+
+### Not in W1
+
+- **Cancellation.** A `Pending` has no cancel path, so a task blocked on a host
+  operation blocks until it completes or the run ends. **This is the largest gap
+  in the milestone** and W3's timeouts need it closed.
+- **Backpressure and partial writes.** A socket write that takes part of a buffer
+  is the TCP handler's problem, not the boundary's.
+- **A host handler written in Ply.** The boundary is where Ply stops.
+- **Detecting a handler that does more than it answered.** `E0427` catches a
+  handler answering outside its registration. Nothing catches a handler that
+  opens a file behind Ply's back, and nothing in this design can.
+- **Making a host run replayable.** There is no recording layer, so a host-backed
+  failure has no seed and no repro command.
+- **Byte-slice patterns**, a `Map`, JSON, routing, TLS, a database.
+- **Multi-shot across the host by any mechanism.** The restriction is on the
+  boundary, not on the feature, and there is no flag to relax it.

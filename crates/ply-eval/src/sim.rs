@@ -386,6 +386,26 @@ impl Plan {
             .collect()
     }
 
+    /// Whether running this plan can drive the entry point more than once.
+    ///
+    /// The question a host-backed test turns on: a search re-runs a test whole
+    /// per interleaving, so anything irreversible in it happens once per run
+    /// this answers `true` for. [`SimMode::Once`] and [`SimMode::Random`] take
+    /// one interleaving per root, so they re-execute only when a caller widened
+    /// the root set; [`SimMode::Dpor`] explores up to `budget` per root.
+    ///
+    /// An upper bound, deliberately: a `Dpor` plan that turns out to have one
+    /// interleaving is still refused, because whether it has two is not known
+    /// until it has been run — and finding out costs the packet.
+    pub fn re_executes(&self) -> bool {
+        let plan = self.clone().normalized();
+        let per_root = match plan.mode {
+            SimMode::Once | SimMode::Random => 1,
+            SimMode::Dpor => u64::from(plan.budget),
+        };
+        plan.roots.len() as u64 * per_root > 1
+    }
+
     /// Covers every field, length-prefixed, so no two plans can serialize alike
     /// and the digest never depends on the struct's field order at a call site.
     pub fn digest(&self) -> [u8; 32] {

@@ -210,7 +210,10 @@ fn the_differential_tier_audit() {
         let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
         let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check);
         for obligation in &collected.obligations {
-            if prover.discharge_with(obligation, &ProvePlan::default()).tier() != Some(Tier::Proved)
+            if prover
+                .discharge_with(obligation, &ProvePlan::default())
+                .tier()
+                != Some(Tier::Proved)
             {
                 continue;
             }
@@ -220,8 +223,10 @@ fn the_differential_tier_audit() {
             // reject every drawn tuple and the proved path establishes its own
             // guard.
             if let Some(defect) = disagreement(&prover.resample(obligation, &wide)) {
-                panic!("`{}` is reported `proved` and a sampled run {defect} — a defect in Ply",
-                    obligation.owner);
+                panic!(
+                    "`{}` is reported `proved` and a sampled run {defect} — a defect in Ply",
+                    obligation.owner
+                );
             }
         }
     }
@@ -306,6 +311,42 @@ law "reverse is an involution"
     );
 }
 
+/// A new primitive that no generator reaches would make every `Bytes`-typed law
+/// `E0418` — an M8 guarantee quietly regressing on contact with W1, which is the
+/// class of thing this project audits for. So: a law over `Bytes` is attempted,
+/// and one that is false is refuted with a witness shrunk toward `b""`.
+#[test]
+fn a_law_over_bytes_is_quantifiable_and_shrinks_toward_the_empty_value() {
+    let dir = project(
+        r#"
+law "concatenation preserves length"
+  forall (a: Bytes, b: Bytes) {
+    bytes_len(bytes_concat(a, b)) == bytes_len(a) + bytes_len(b)
+  }
+
+law "every byte string is empty"
+  forall (b: Bytes) {
+    bytes_len(b) == 0
+  }
+"#,
+    );
+    let run = Run::of(dir.path());
+    assert_eq!(
+        run.tier("concatenation preserves length"),
+        Some(Tier::Property),
+        "`bytes_len` and `bytes_concat` are opaque to the fragment, so this samples"
+    );
+
+    let Discharge::Refuted(counterexample) = &run.find("every byte string is empty").1 else {
+        panic!("a false law over `Bytes` must be refuted, not skipped");
+    };
+    assert_eq!(counterexample.bindings.len(), 1);
+    assert_eq!(
+        counterexample.bindings[0].rendered, "b\"\\x00\"",
+        "the witness did not shrink toward `b\"\"`"
+    );
+}
+
 /// `/` and `%` are outside the fragment entirely, so `x / 2 * 2 == x` — which is
 /// false — is not proved. It is the exact defect this milestone must not ship.
 #[test]
@@ -343,7 +384,10 @@ law "a pure function is a function"
 "#,
     );
     let run = Run::of(dir.path());
-    assert_eq!(run.tier("a pure function is a function"), Some(Tier::Proved));
+    assert_eq!(
+        run.tier("a pure function is a function"),
+        Some(Tier::Proved)
+    );
     assert!(
         run.certificate("a pure function is a function")
             .rules
@@ -466,7 +510,10 @@ fn an_evaluation_that_raises_is_a_gap_rather_than_a_refutation() {
     let run = Run::of(&repo("tests/fixtures/obligation_not_discharged.ply"));
     let (_, discharge) = run.find("share");
     assert!(
-        matches!(discharge, Discharge::Unattempted(ply_prove::Gap::Raised { .. })),
+        matches!(
+            discharge,
+            Discharge::Unattempted(ply_prove::Gap::Raised { .. })
+        ),
         "{discharge:?}"
     );
 }
@@ -558,12 +605,21 @@ fn a_refutation_shrinks_to_the_same_value_twice() {
     assert!(!first.bindings.is_empty());
 
     let again = Run::of(&repo("tests/fixtures/refuted_law.ply"));
-    let Discharge::Refuted(second) = &again.find("settling a day's payments drops nothing").1 else {
+    let Discharge::Refuted(second) = &again.find("settling a day's payments drops nothing").1
+    else {
         unreachable!("just refuted");
     };
     assert_eq!(
-        first.bindings.iter().map(|b| b.rendered.clone()).collect::<Vec<_>>(),
-        second.bindings.iter().map(|b| b.rendered.clone()).collect::<Vec<_>>()
+        first
+            .bindings
+            .iter()
+            .map(|b| b.rendered.clone())
+            .collect::<Vec<_>>(),
+        second
+            .bindings
+            .iter()
+            .map(|b| b.rendered.clone())
+            .collect::<Vec<_>>()
     );
     assert_eq!(first.shrinks, second.shrinks);
 }
@@ -585,21 +641,24 @@ law "a batch never holds more than six entries"
 "#,
     );
     let run = Run::of(dir.path());
-    let Discharge::Refuted(counterexample) = &run.find("a batch never holds more than six").1 else {
+    let Discharge::Refuted(counterexample) = &run.find("a batch never holds more than six").1
+    else {
         panic!("the law is false for every list of seven");
     };
     let width = |bindings: &[ply_prove::Binding]| -> usize {
         bindings.iter().map(|b| b.rendered.chars().count()).sum()
     };
-    let (before, after) = (width(&counterexample.original), width(&counterexample.bindings));
+    let (before, after) = (
+        width(&counterexample.original),
+        width(&counterexample.bindings),
+    );
     assert!(counterexample.shrinks > 0, "the walk accepted nothing");
     assert!(
         after * 2 < before,
         "shrank from {before} rendered characters only to {after}"
     );
     assert_eq!(
-        counterexample.bindings[0].rendered,
-        "[0, 0, 0, 0, 0, 0, 0]",
+        counterexample.bindings[0].rendered, "[0, 0, 0, 0, 0, 0, 0]",
         "seven zeroes is the minimum: shorter satisfies the law and no element shrinks below 0"
     );
 }
@@ -640,11 +699,7 @@ fn each_postcondition_is_discharged_at_its_own_tier() {
         .collect();
     assert_eq!(
         tiers,
-        vec![
-            Some(Tier::Proved),
-            Some(Tier::Proved),
-            Some(Tier::Property)
-        ],
+        vec![Some(Tier::Proved), Some(Tier::Proved), Some(Tier::Property)],
         "one clause per obligation, or the pair would share the weaker label"
     );
 }
@@ -664,9 +719,10 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
             .join(", ")
     };
     match discharge {
-        Discharge::Refuted(counterexample) => {
-            Some(format!("refutes it at {}", rendered(&counterexample.bindings)))
-        }
+        Discharge::Refuted(counterexample) => Some(format!(
+            "refutes it at {}",
+            rendered(&counterexample.bindings)
+        )),
         Discharge::Unattempted(Gap::Raised {
             bindings,
             diagnostic,

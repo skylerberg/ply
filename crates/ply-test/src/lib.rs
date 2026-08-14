@@ -16,6 +16,7 @@ mod tests;
 
 use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
+use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{
     Engine, EngineChoice, Exploration, Interp, Machine, Plan, Race, Seed, World, compare_outcomes,
 };
@@ -29,12 +30,14 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use bisect::{
     Baseline, Bisection, Budget, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
-    DepEdges, Diff, EraTable, FusionReason, Hybrid, Mode, Ns, Regression, Renormalizer,
+    DepEdges, Diff, EraTable, FusionReason, Gate, Hybrid, Mode, Ns, Regression, Renormalizer,
     SearchStats, Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, bisect, diff,
     precheck,
 };
@@ -332,12 +335,17 @@ pub struct Failure {
     /// Ply's fault rather than the program's, so there is nothing in the
     /// definition graph to attribute it to.
     ///
-    /// Three things say so, and no fourth: the run watched the evaluator unwind,
-    /// the evaluator said `INTERNAL_ERROR`, or the two engines disagreed. Reading
-    /// it off `RUNTIME_ERROR` is what made a runaway recursion — a documented
-    /// limit, and as bisectable a regression as any assertion — report itself as
-    /// a defect in Ply and decline to be bisected.
+    /// Four things say so, and no fifth: the run watched the evaluator unwind,
+    /// the evaluator said `INTERNAL_ERROR`, the two engines disagreed, or a host
+    /// answer landed outside the entry point's declared footprint. Reading it off
+    /// `RUNTIME_ERROR` is what made a runaway recursion — a documented limit, and
+    /// as bisectable a regression as any assertion — report itself as a defect in
+    /// Ply and decline to be bisected.
     pub defect: bool,
+    /// This failing run reached a host handler, so re-running it acts on the
+    /// world again. Read off what the runtime did, never off the prediction
+    /// selection made from footprints.
+    pub host: bool,
     /// Definitions in this test's closure whose hash is not in the store —
     /// the suspects for this failure.
     pub suspects: Vec<Symbol>,
@@ -416,6 +424,17 @@ pub trait Executor: Sync {
     fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
         None
     }
+
+    /// What the last [`Executor::execute`] reached across the host boundary.
+    ///
+    /// `None` means it reached nothing, and it is the **authority** on whether
+    /// the pass may be cached — the footprint-based prediction decides only what
+    /// runs. Never a zeroed [`HostUse`]: "reached no host handler" and "reached
+    /// one that touched nothing" are different claims and the cache branches on
+    /// the difference.
+    fn host_use(&self, _worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
+        None
+    }
 }
 
 /// The search each test runs, and whether to measure what an unpruned one would
@@ -454,6 +473,53 @@ impl Search {
     }
 }
 
+/// What a run may reach outside the program.
+///
+/// Hermetic by default, and the default is the guarantee: a suite that acquires
+/// a live dependency without anyone deciding to is the failure mode this
+/// language exists to prevent, so binding a real handler is something a caller
+/// has to write down.
+///
+/// A hermetic binding is **not** an absent one. [`HostBinding::hermetic_with`]
+/// carries the registry without binding it, which is what lets the refusal be
+/// `E0424` — naming the handler that would have served the operation under
+/// `--host` — rather than `E0303`, which means inference should have prevented
+/// the perform and did not. The two call for opposite responses.
+#[derive(Default)]
+pub struct Hosting<'a> {
+    binding: Option<Arc<HostBinding>>,
+    /// A factory rather than a value, for the reason [`InterpExecutor::with_fixture`]
+    /// is one: a runtime handle belongs to the one thread its machine runs on,
+    /// and the runner has a machine per worker.
+    runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
+}
+
+impl<'a> Hosting<'a> {
+    /// Nothing bound and nothing to name. What every caller that does not
+    /// mention the host gets.
+    pub fn hermetic() -> Hosting<'a> {
+        Hosting::default()
+    }
+
+    /// The binding the run's machines get. Pass
+    /// `HostBinding::hermetic_with(registry)` to stay hermetic and still be able
+    /// to name what would have served a perform.
+    pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting<'a> {
+        self.binding = Some(binding);
+        self
+    }
+
+    /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on. Absent for a
+    /// hermetic run, where nothing can answer `Pending` in the first place.
+    pub fn with_runtime(
+        mut self,
+        runtime: &'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync),
+    ) -> Hosting<'a> {
+        self.runtime = Some(runtime);
+        self
+    }
+}
+
 pub struct InterpExecutor<'a> {
     pub program: &'a Program,
     pub resolved: &'a Resolved,
@@ -466,6 +532,7 @@ pub struct InterpExecutor<'a> {
     /// key that means the same thing in both.
     addresses: Vec<(Symbol, usize)>,
     fixture: Option<&'a (dyn Fn() -> World + Sync)>,
+    hosts: Hosting<'a>,
     engine: EngineChoice,
     search: Search,
 }
@@ -488,6 +555,11 @@ pub enum Engines<'a> {
 pub struct Worker<'a> {
     pub engines: Engines<'a>,
     exploration: Option<Exploration>,
+    /// What the last test reached across the host boundary. Held here rather
+    /// than read off `engines` because a searched test runs on a machine built
+    /// per interleaving, and reading the worker's own machine would answer with
+    /// whatever the *previous* test did.
+    host: Option<ply_eval::host::HostUse>,
 }
 
 impl<'a> Worker<'a> {
@@ -495,6 +567,7 @@ impl<'a> Worker<'a> {
         Worker {
             engines,
             exploration: None,
+            host: None,
         }
     }
 
@@ -531,6 +604,7 @@ impl<'a> InterpExecutor<'a> {
             check,
             addresses,
             fixture: None,
+            hosts: Hosting::hermetic(),
             engine: EngineChoice::default(),
             search: Search::default(),
         }
@@ -553,6 +627,13 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
+    /// What this run may reach outside the program. Hermetic unless said
+    /// otherwise, in every constructor and at every call site.
+    pub fn with_hosts(mut self, hosts: Hosting<'a>) -> Self {
+        self.hosts = hosts;
+        self
+    }
+
     /// The search every simulated test in this run performs. Installed on the
     /// machine per test rather than per worker, because a narrowed plan is a
     /// fact about one test.
@@ -566,13 +647,24 @@ impl<'a> InterpExecutor<'a> {
         if let Some(fixture) = self.fixture {
             interp.set_base_world(fixture());
         }
+        if let Some(binding) = &self.hosts.binding {
+            interp.set_host_binding(Arc::clone(binding));
+        }
         Box::new(interp)
     }
 
+    /// A machine, with the run's binding and — on this worker's own thread — its
+    /// own handle on the reactor.
     fn machine(&self) -> Box<Machine<'a>> {
         let mut machine = Machine::new(self.program, self.resolved, self.check);
         if let Some(fixture) = self.fixture {
             machine.set_base_world(fixture());
+        }
+        if let Some(binding) = &self.hosts.binding {
+            machine.set_host_binding(Arc::clone(binding));
+        }
+        if let Some(runtime) = self.hosts.runtime {
+            machine.set_host_runtime(runtime());
         }
         Box::new(machine)
     }
@@ -581,6 +673,26 @@ impl<'a> InterpExecutor<'a> {
         match self.addresses.get(index) {
             Some((module, ordinal)) => e.eval_test_in(module, *ordinal),
             None => e.eval_test(index),
+        }
+    }
+
+    /// State this entry point's footprint claim, so a host answer outside it is
+    /// `E0427` rather than a quiet uncached pass.
+    ///
+    /// Without this the check is inert in the one command that runs a corpus. A
+    /// footprint is an upper bound on what a test performs, so a host answer
+    /// outside it is the run observing its own two answers disagree — and it is
+    /// reachable without any dishonest handler: a `handle` whose clause set
+    /// covers some but not all operations of an atom discharges the atom out of
+    /// the row and leaves the uncovered operation to fall through to the
+    /// binding. That test is then scheduled as world-isolated over a footprint
+    /// that says it touches nothing, while it touches a socket.
+    ///
+    /// Restated per test because one `Machine` serves many of them: a claim that
+    /// outlived its entry point would judge the next test by the last one's row.
+    fn arm_footprint_check(&self, machine: &mut Machine<'a>, index: usize) {
+        if let Some(test) = self.check.tests.get(index) {
+            machine.set_declared_footprint(test.footprint.clone());
         }
     }
 
@@ -608,13 +720,38 @@ impl<'a> InterpExecutor<'a> {
     /// having no type-level account. A test is re-run, so its writes are re-done
     /// rather than un-done, and the monotone world survives. It costs re-doing
     /// whatever setup precedes the region, per interleaving.
-    fn search(&self, index: usize) -> (Result<(), Diagnostic>, Option<Exploration>) {
+    #[allow(clippy::type_complexity)]
+    fn search(
+        &self,
+        index: usize,
+    ) -> (
+        Result<(), Diagnostic>,
+        Option<Exploration>,
+        Option<ply_eval::host::HostUse>,
+    ) {
         let plan = self.search.plan_for(index);
+        // A search re-runs the test whole, so a host operation anywhere in it —
+        // not only inside the region — is performed once per interleaving.
+        // `measure_reduction` runs the whole search a second time, unpruned,
+        // which doubles it again.
+        let re_executed = plan.re_executes() || self.search.measure_reduction;
         let mut observed = true;
+        // Every interleaving's, unioned. A search re-runs the whole test per
+        // schedule, so an operation reached in one of them is one this run
+        // performed, and reporting only the last would let the cache believe a
+        // pass that a socket answered.
+        let mut host: Option<ply_eval::host::HostUse> = None;
         let mut interleaving = |seed: &Seed| {
             let mut machine = self.machine();
+            self.arm_footprint_check(machine.as_mut(), index);
+            machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);
             let outcome = self.run_one(machine.as_mut(), index);
+            if let Some(used) = machine.host_use() {
+                let into = host.get_or_insert_with(Default::default);
+                into.atoms = into.atoms.union(&used.atoms);
+                into.operations = into.operations.saturating_add(used.operations);
+            }
             match sim::interleaving_of(machine.as_ref(), &outcome) {
                 Some(interleaving) => interleaving,
                 // The verdict is still the run's own. An unobserved search must
@@ -639,7 +776,7 @@ impl<'a> InterpExecutor<'a> {
             Some(diagnostic) => Err(diagnostic),
             None => Ok(()),
         };
-        (outcome, observed.then_some(explored.exploration))
+        (outcome, observed.then_some(explored.exploration), host)
     }
 }
 
@@ -658,17 +795,41 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.exploration.clone()
     }
 
+    fn host_use(&self, worker: &Worker<'a>) -> Option<ply_eval::host::HostUse> {
+        worker.host.clone()
+    }
+
     fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         worker.exploration = None;
+        worker.host = None;
         if self.searches(index) {
-            let (outcome, exploration) = self.search(index);
+            let (outcome, exploration, host) = self.search(index);
             worker.exploration = exploration;
+            worker.host = host;
             return outcome;
         }
+        let outcome = self.execute_directly(worker, index);
+        // Only the machine can reach a host handler: the tree-walker refuses one
+        // as machine-only rather than driving it, so under `--engine both` there
+        // is one answer here and never two to reconcile.
+        worker.host = match &worker.engines {
+            Engines::Machine(m) | Engines::Both(_, m) => m.host_use().cloned(),
+            Engines::Treewalk(_) => None,
+        };
+        outcome
+    }
+}
+
+impl<'a> InterpExecutor<'a> {
+    fn execute_directly(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         match &mut worker.engines {
             Engines::Treewalk(i) => self.run_one(i.as_mut(), index),
-            Engines::Machine(m) => self.run_one(m.as_mut(), index),
+            Engines::Machine(m) => {
+                self.arm_footprint_check(m.as_mut(), index);
+                self.run_one(m.as_mut(), index)
+            }
             Engines::Both(i, m) => {
+                self.arm_footprint_check(m.as_mut(), index);
                 // Both are stepped even when the first has already failed: an
                 // engine that skipped a test is at a different point in the
                 // corpus, and every later comparison becomes meaningless.
@@ -884,6 +1045,7 @@ pub fn diagnose_failures(
             test_hash,
             nondet,
             defect: failure.defect,
+            host: failure.host,
             suspects: &failure.suspects,
             hashes,
             baseline: baseline.as_ref(),
@@ -910,6 +1072,13 @@ pub fn diagnose_failures(
         // through.
         let seed = failure.seed.clone();
         let mut builder = match (mixture, test_body, complete) {
+            // A host-backed failure gets no builder at all. `precheck` already
+            // refuses to search one, and this is the second lock: a trial is an
+            // evaluation of the failing test, and the run that failed reached
+            // the world outside the program. Nothing here may be reachable by
+            // threading a binding into the trials to "make bisection work under
+            // `--host`" — that is the change this arm exists to stop.
+            _ if failure.host => None,
             (Some(mixture), Some(test), true) => {
                 let hybrid = BodyHybrid::new(
                     store,
@@ -995,10 +1164,12 @@ pub fn run(
     store: &mut Store,
     engine: EngineChoice,
     search: Search,
+    hosts: Hosting<'_>,
 ) -> RunReport {
     let executor = InterpExecutor::new(program, resolved, check)
         .with_engine(engine)
-        .with_search(search);
+        .with_search(search)
+        .with_hosts(hosts);
     run_with(selection, check, hashes, store, &executor)
 }
 
@@ -1043,9 +1214,11 @@ pub fn run_with<E: Executor>(
             let test = &check.tests[index];
             let hash = test_hash(hashes, index);
             let seeded = is_seeded(&test.footprint);
-            let defect = executed.failure.as_ref().is_some_and(|d| {
-                executed.panicked || d.code == codes::INTERNAL_ERROR || is_divergence(d)
-            });
+            let host_backed = executed.host.is_some();
+            let defect = executed
+                .failure
+                .as_ref()
+                .is_some_and(|d| executed.panicked || is_defect(d));
             let status = match (&executed.failure, defect) {
                 (None, _) => Status::Passed,
                 (Some(_), false) => Status::Failed,
@@ -1058,8 +1231,12 @@ pub fn run_with<E: Executor>(
                 failed += 1;
                 let suspects = suspects_for(hashes, &test.key, &changed);
                 let mut attribution = Attribution::from_suspects(&suspects, hashes);
+                // The same order `precheck` applies, so a report nobody
+                // diagnosed says what a diagnosed one would have.
                 if defect {
                     attribution.bisection = Bisection::not_attempted(Skipped::Panicked);
+                } else if host_backed {
+                    attribution.bisection = Bisection::not_attempted(Skipped::Host);
                 } else if test.nondet {
                     attribution.bisection = Bisection::not_attempted(Skipped::Nondet);
                 }
@@ -1068,12 +1245,20 @@ pub fn run_with<E: Executor>(
                     key: test.key.clone(),
                     diagnostic: diagnostic.clone(),
                     defect,
+                    host: host_backed,
                     suspects,
                     assertion: None,
                     attribution,
                     seed: exploration.as_ref().and_then(|e| e.failure.clone()),
                     race: exploration.as_ref().and_then(|e| e.race.clone()),
                 });
+            } else if executed.host.is_some() {
+                // The runtime is authoritative: this run reached a socket, so
+                // its green verdict is a statement about that socket at that
+                // moment and about nothing the next run will face. Nothing is
+                // written, in either direction, whatever the prediction said.
+                passed += 1;
+                recorded = Some(Record::Host);
             } else {
                 passed += 1;
                 if !test.nondet
@@ -1215,6 +1400,9 @@ struct Executed {
     failure: Option<Diagnostic>,
     panicked: bool,
     exploration: Option<Exploration>,
+    /// What this test actually reached across the boundary, which decides
+    /// whether its pass may be written.
+    host: Option<ply_eval::host::HostUse>,
 }
 
 /// One worker per pool thread, built lazily so a group smaller than the pool
@@ -1254,12 +1442,14 @@ fn execute_group<E: Executor>(
             // After the unwind check: a worker whose invariants are unknown has
             // nothing to report about what it searched.
             let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
+            let host = worker.as_ref().and_then(|w| executor.host_use(w));
             out.push(Executed {
                 index,
                 duration,
                 failure,
                 panicked,
                 exploration,
+                host,
             });
         }
     });
@@ -1285,6 +1475,19 @@ fn execute_group<E: Executor>(
 /// observation to read them off.
 fn is_divergence(d: &Diagnostic) -> bool {
     d.code == codes::ENGINE_DIVERGENCE || d.code == codes::SIMULATION_DIVERGENCE
+}
+
+/// Ply's fault rather than the program's, read off the diagnostic.
+///
+/// `E0427` belongs here for the reason the divergence codes do: a host answer
+/// outside the entry point's declared footprint is the run knowing that two of
+/// its own answers disagree, and nothing in the definition graph decides which
+/// was meant. Bisecting it would name whichever definition the disagreement
+/// happened to run through — and the diagnostic's own last note already tells
+/// the reader this is Ply's fault, so classifying it as the program's would
+/// contradict the text the run prints.
+fn is_defect(d: &Diagnostic) -> bool {
+    d.code == codes::INTERNAL_ERROR || d.code == codes::HOST_FOOTPRINT_ESCAPE || is_divergence(d)
 }
 
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {

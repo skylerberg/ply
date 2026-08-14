@@ -94,6 +94,7 @@ impl Program {
             store,
             ply_eval::EngineChoice::Both,
             Search::of(selection),
+            crate::Hosting::hermetic(),
         )
     }
 

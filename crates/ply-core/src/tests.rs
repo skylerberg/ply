@@ -175,6 +175,10 @@ fn str_lit(v: &str) -> Expr {
     ex(ExprKind::Lit(Lit::Str(v.to_string())))
 }
 
+fn bytes_lit(v: &[u8]) -> Expr {
+    ex(ExprKind::Lit(Lit::Bytes(v.to_vec())))
+}
+
 fn net_effect() -> Item {
     effect_def(
         "net",
@@ -2781,6 +2785,75 @@ fn a_modules_own_clock_shadows_the_prelude() {
          fn f() -> Int = clock.now()\n",
     )]);
     assert_eq!(footprint(&out, "clock.f"), "{clock.clock.read}");
+}
+
+#[test]
+fn a_byte_literal_has_its_own_type_and_never_unifies_with_a_string() {
+    let out = check(vec![func("m", &[], bytes_lit(b"GET")).item()]);
+    assert_eq!(sig(&out, "m"), "() -> Bytes");
+
+    let mixed = check_err(vec![
+        func(
+            "m",
+            &[],
+            call("string_concat", vec![bytes_lit(b"a"), str_lit("b")]),
+        )
+        .item(),
+    ]);
+    only(&mixed, codes::TYPE_MISMATCH);
+}
+
+/// The whole surface at once: a signature that moved would otherwise be caught
+/// only by whichever downstream test happened to use it.
+#[test]
+fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
+    let expected = [
+        ("bytes_len", "(Bytes) -> Int"),
+        ("bytes_at", "(Bytes, Int) -> Int"),
+        ("bytes_slice", "(Bytes, Int, Int) -> Bytes"),
+        ("bytes_concat", "(Bytes, Bytes) -> Bytes"),
+        ("bytes_of_string", "(String) -> Bytes"),
+        ("bytes_is_utf8", "(Bytes) -> Bool"),
+        ("string_of_bytes", "(Bytes) -> String"),
+        ("string_of_bytes_lossy", "(Bytes) -> String"),
+        ("string_len", "(String) -> Int"),
+        ("string_slice", "(String, Int, Int) -> String"),
+        ("string_split", "(String, String) -> List<String>"),
+        ("string_trim", "(String) -> String"),
+        ("string_lower", "(String) -> String"),
+        ("string_upper", "(String) -> String"),
+        ("string_starts_with", "(String, String) -> Bool"),
+        ("string_ends_with", "(String, String) -> Bool"),
+        ("string_contains", "(String, String) -> Bool"),
+        ("string_find", "(String, String) -> Int"),
+    ];
+    // `fn probe_f() = f` returns the builtin itself, so the printed signature
+    // of the probe carries the builtin's whole type.
+    let items: Vec<Item> = expected
+        .iter()
+        .map(|(name, _)| func(&format!("probe_{name}"), &[], var(name)).item())
+        .collect();
+    let out = check(items);
+    for (name, ty) in expected {
+        assert_eq!(
+            sig(&out, &format!("probe_{name}")),
+            format!("() -> {ty}"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn the_bytes_type_is_a_builtin_and_cannot_be_redefined() {
+    let diags = check_err(vec![Item::Type(Box::new(TypeDef {
+        vis: Visibility::Private,
+        name: id("Bytes"),
+        params: vec![],
+        body: TypeDefBody::Alias(con("Int", vec![])),
+        span: any(),
+    }))]);
+    let d = only(&diags, codes::DUPLICATE_DEFINITION);
+    assert!(d.message.contains("builtin type"), "{}", d.message);
 }
 
 #[test]

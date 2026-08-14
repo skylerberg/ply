@@ -37,14 +37,12 @@
 //! [`super::Proof`] is issued until it has. Failing to discharge one is
 //! `Unknown` — the weaker tier — never a refutation.
 
+use super::RuleLog;
 use super::context::{Context, Unfoldable};
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
-use super::RuleLog;
 use ply_core::{CtorInfo, Scheme, TyVar, Type};
 use ply_span::Symbol;
-use ply_syntax::ast::{
-    BinOp, Expr, ExprKind, Lit, Param, Pattern, PatternKind, QName, Stmt, UnOp,
-};
+use ply_syntax::ast::{BinOp, Expr, ExprKind, Lit, Param, Pattern, PatternKind, QName, Stmt, UnOp};
 use std::collections::BTreeMap;
 
 /// The size past which unfolding stops. A bound on the term graph rather than
@@ -58,7 +56,28 @@ const MAX_TERMS: usize = 20_000;
 /// never sees the body of; `range` builds a list whose length is an argument;
 /// `assert`, `assert_eq` and `panic` exist to raise. Every one of those is
 /// absent, so a proof cannot rest on it terminating.
-const TOTAL_BUILTINS: &[&str] = &["len", "push", "int_to_string", "string_concat"];
+///
+/// Absent for the same reason: `bytes_at`, `bytes_slice`, `string_slice`,
+/// `string_split`, `string_find` and `string_of_bytes` all have inputs they
+/// refuse, so a call to one is not a value until its argument is known.
+const TOTAL_BUILTINS: &[&str] = &[
+    "len",
+    "push",
+    "int_to_string",
+    "string_concat",
+    "bytes_len",
+    "bytes_concat",
+    "bytes_of_string",
+    "bytes_is_utf8",
+    "string_of_bytes_lossy",
+    "string_len",
+    "string_trim",
+    "string_lower",
+    "string_upper",
+    "string_starts_with",
+    "string_ends_with",
+    "string_contains",
+];
 
 /// Where lowering left the decidable fragment, for measurement only.
 ///
@@ -389,6 +408,12 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Lit::Int(k) => self.terms.int_lit(*k),
             Lit::Bool(b) => self.terms.boolean(*b),
             Lit::Str(s) => self.terms.string(s.clone()),
+            // A fresh symbol rather than a reuse of `Node::Str`: sharing that
+            // node would make `b"ab"` and `"ab"` congruent, which is a wrong
+            // answer wearing a certificate. Costing completeness — two
+            // occurrences of one literal do not unify, so a claim about them
+            // reports `property` — is the safe direction.
+            Lit::Bytes(_) => self.terms.sym(Some(Type::bytes())),
             Lit::Unit => self.terms.unit(),
         }
     }
@@ -680,11 +705,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         Some(out)
     }
 
-    fn with_frame<T>(
-        &mut self,
-        frame: Vec<(Symbol, TermId)>,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
+    fn with_frame<T>(&mut self, frame: Vec<(Symbol, TermId)>, f: impl FnOnce(&mut Self) -> T) -> T {
         let mark = self.frames.len();
         self.frames.extend(frame);
         let out = f(self);
@@ -797,9 +818,10 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 // Only a flat pattern. A nested constructor would need the
                 // field's own outermost constructor decided as well, and
                 // guessing it is exactly what this milestone must not do.
-                if !args.iter().all(|a| {
-                    matches!(a.kind, PatternKind::Wildcard | PatternKind::Var(_))
-                }) {
+                if !args
+                    .iter()
+                    .all(|a| matches!(a.kind, PatternKind::Wildcard | PatternKind::Var(_)))
+                {
                     return None;
                 }
                 let sorts = field_sorts(ctor, scrutinee_sort);

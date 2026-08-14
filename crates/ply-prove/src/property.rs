@@ -275,7 +275,7 @@ impl TypeWorld {
             Type::Fn { ret, effects, .. } if effects.is_pure() => self.type_depth(ret),
             Type::Fn { .. } => None,
             Type::Con(name, _) => match name.as_str() {
-                "Int" | "Bool" | "String" | "Unit" => Some(0),
+                "Int" | "Bool" | "String" | "Bytes" | "Unit" => Some(0),
                 // The empty list needs nothing, whatever its element type is.
                 "List" => Some(0),
                 "Cell" => None,
@@ -413,7 +413,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             generatable(ret, world)
         }
         Type::Con(name, args) => match name.as_str() {
-            "Int" | "Bool" | "String" | "Unit" => Ok(()),
+            "Int" | "Bool" | "String" | "Bytes" | "Unit" => Ok(()),
             "List" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
@@ -524,6 +524,7 @@ impl Gen<'_> {
                 "Int" => self.int(),
                 "Bool" => Ok(Value::Bool(self.bool())),
                 "String" => Ok(self.string()),
+                "Bytes" => Ok(self.bytes()),
                 "Unit" => Ok(Value::Unit),
                 "List" => {
                     let elem = args.first().cloned().unwrap_or_else(Type::int);
@@ -581,6 +582,18 @@ impl Gen<'_> {
             out.push(GEN_ALPHABET[index] as char);
         }
         Value::str(out)
+    }
+
+    /// The whole byte range, unlike [`Generator::string`]'s alphabet: a `Bytes`
+    /// that never contains `0x00` or `0xff` is a `Bytes` whose laws are checked
+    /// over the cases that never break.
+    fn bytes(&mut self) -> Value {
+        let len = self.length();
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push((self.stream.next_u64() & 0xff) as u8);
+        }
+        Value::bytes(out)
     }
 
     fn list(&mut self, elem: &Type, depth: u32) -> Result<Value, Ungeneratable> {

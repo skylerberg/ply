@@ -373,6 +373,7 @@ fn once(root: &Path, engine: EngineChoice) -> Result<(Timings, Shape)> {
         &mut store,
         engine,
         ply_test::Search::of(&selection),
+        ply_test::Hosting::hermetic(),
     );
     timings.record(Phase::Execute, started.elapsed());
 

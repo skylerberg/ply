@@ -447,11 +447,17 @@ law \"a narrow window\" forall (xs: List<Int>, x: Int)
   where x > 1000000 && x < 1000010 { seen(push(xs, x), x) }
 ";
     let dir = project(SOURCE);
-    let out = ply(dir.path()).args(["prove", "--no-cache"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["prove", "--no-cache"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(0), "a gap is not a failure");
     let text = stdout_of(&out);
     assert!(text.contains("unattempted"), "{text}");
-    assert!(!text.contains("vacuous"), "the guard admits nine values: {text}");
+    assert!(
+        !text.contains("vacuous"),
+        "the guard admits nine values: {text}"
+    );
     assert!(
         text.contains("but it does admit a value"),
         "the report has to say which claim it is making: {text}"

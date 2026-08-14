@@ -13,18 +13,23 @@ use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower};
 use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
 use crate::env::Env;
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
+use crate::host::{
+    HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, Pending, attribute,
+    err_blocking_answered_inline, err_hermetic, err_host_in_search, operation_label,
+};
 use crate::interp::{
     OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
     err_unknown_name, literal, op_decl,
 };
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
 use crate::region::{self, Region, StepSite, Trail};
-use crate::sched::{Resumption, Turn};
+use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Value};
 use crate::world::World;
 use ply_core::CheckOutput;
+use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
     BinOp, Expr, FnDef, Item, Lit, Mode, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
@@ -133,6 +138,43 @@ pub struct Machine<'a> {
     trail: Trail,
     /// What this entry point's regions did, built once the last of them ended.
     record: Option<region::Record>,
+    /// The handler of last resort. Hermetic by default and everywhere, because
+    /// the default is the whole of the guarantee: a suite that acquires a live
+    /// dependency without anyone deciding to is the failure mode the language
+    /// exists to prevent.
+    binding: Arc<HostBinding>,
+    /// What answers a [`HostAnswer::Pending`]. Separate from the binding because
+    /// the binding is `Arc`-shared across the runner's worker threads while a
+    /// runtime is one thread's reactor handle, and because a value-shaped
+    /// handler — a clock read, a byte operation — never touches it.
+    runtime: Option<Rc<dyn HostRuntime>>,
+    /// At-most-once host operations answered in this entry point.
+    host_ops: u64,
+    /// What this entry point reached across the boundary, and the authority on
+    /// whether its green verdict may be cached.
+    host_use: HostUse,
+    /// The declared footprint of the entry point about to run. `None` means no
+    /// claim was made and nothing is checked against it — an evaluator driven
+    /// without a type-check pass has no row to check.
+    declared: Option<Footprint>,
+    /// Whether this entry point is one of several runs of the same test.
+    ///
+    /// A search re-runs a test **whole** per interleaving, so a host operation
+    /// anywhere in it — not only inside the region — is performed once per
+    /// schedule explored. Set by the caller driving the search, because only the
+    /// caller knows whether the plan it is about to run has more than one run in
+    /// it.
+    re_executed: bool,
+    /// The last at-most-once host operation answered, so `E0426` can name the
+    /// packet it is refusing to send twice.
+    last_linear: Option<HostMark>,
+}
+
+/// An at-most-once host operation that already happened, as `E0426` prints it.
+struct HostMark {
+    operation: String,
+    path: &'static str,
+    span: Span,
 }
 
 impl<'a> Machine<'a> {
@@ -218,6 +260,13 @@ impl<'a> Machine<'a> {
             entered_sims: 0,
             trail: Trail::new(Seed::default()),
             record: None,
+            binding: Arc::new(HostBinding::hermetic()),
+            runtime: None,
+            host_ops: 0,
+            host_use: HostUse::default(),
+            declared: None,
+            re_executed: false,
+            last_linear: None,
         }
     }
 
@@ -234,6 +283,74 @@ impl<'a> Machine<'a> {
     /// The atoms this engine performed at the last entry point.
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// Bind the host boundary. Absent this call a machine is hermetic, which is
+    /// what `ply test` and `ply run` want and what every test in this crate
+    /// gets.
+    pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
+        self.binding = binding;
+    }
+
+    /// The reactor a [`HostAnswer::Pending`] is polled on.
+    ///
+    /// Separate from [`set_host_binding`] rather than folded into it: a
+    /// `HostBinding` is shared across the runner's workers by `Arc` and so must
+    /// stay `Send + Sync`, while a runtime handle belongs to the one thread its
+    /// machine runs on. A handler that answers `Pending` with no runtime set is
+    /// a diagnostic rather than a hang.
+    ///
+    /// [`set_host_binding`]: Machine::set_host_binding
+    pub fn set_host_runtime(&mut self, runtime: Rc<dyn HostRuntime>) {
+        self.runtime = Some(runtime);
+    }
+
+    pub fn host_binding(&self) -> &HostBinding {
+        &self.binding
+    }
+
+    /// At-most-once host operations answered in this entry point. Zero for the
+    /// life of a hermetic run, which is why no existing multi-shot program
+    /// changes behaviour under W1.
+    pub fn host_ops(&self) -> u64 {
+        self.host_ops
+    }
+
+    /// The declared footprint of the entry point about to run. A host answer
+    /// whose atom is outside it is [`codes::HOST_FOOTPRINT_ESCAPE`] — the one
+    /// mechanical defence in the system against a footprint that under-reports.
+    ///
+    /// Set before the entry point and **not** cleared by the reset each entry
+    /// point performs: the claim is the caller's and the caller states it once
+    /// per test.
+    pub fn set_declared_footprint(&mut self, footprint: Footprint) {
+        self.declared = Some(footprint);
+    }
+
+    /// Declare that this entry point is one of several runs of the same test, so
+    /// that reaching the host boundary is [`codes::HOST_IN_SIMULATION`] rather
+    /// than a packet sent once per interleaving.
+    ///
+    /// The refusal a `simulate` region already carries, stated over the whole
+    /// test rather than over the region: the search re-runs a test whole, so an
+    /// operation in the prefix or the suffix around a region is re-performed
+    /// exactly as one inside it is. `Machine::innermost_simulation` cannot see
+    /// that — it is empty before the region is entered and after it closes — so
+    /// the fact has to come from the caller driving the search.
+    ///
+    /// Set per entry point by the caller, like [`set_declared_footprint`]; a
+    /// machine nobody tells is not re-executed.
+    ///
+    /// [`set_declared_footprint`]: Machine::set_declared_footprint
+    pub fn set_re_executed(&mut self, re_executed: bool) {
+        self.re_executed = re_executed;
+    }
+
+    /// What the last entry point reached across the boundary, or `None` when it
+    /// reached none. Never a zeroed record: "reached no host handler" and
+    /// "reached one that did nothing" are different claims about a cache entry.
+    pub fn host_use(&self) -> Option<&HostUse> {
+        (!self.host_use.is_empty()).then_some(&self.host_use)
     }
 
     /// Fix the interleaving the next entry point takes.
@@ -403,9 +520,10 @@ impl<'a> Machine<'a> {
                         self.trail.record_access(Access::Atom(atom));
                     }
                 }
-                match handler::perform(&self.stack, request, decl)? {
+                match handler::perform(&self.stack, request, decl, self.host_ops)? {
                     Answered::Handler(transition) => self.take(transition)?,
                     Answered::Scheduler(scheduled) => self.run_scheduled(scheduled)?,
+                    Answered::Unhandled(request) => self.perform_host(request)?,
                 }
                 Ok(Progress::Running)
             }
@@ -431,6 +549,9 @@ impl<'a> Machine<'a> {
         self.entered_sims = 0;
         self.trail = Trail::new(self.seed.clone());
         self.record = None;
+        self.host_ops = 0;
+        self.host_use = HostUse::default();
+        self.last_linear = None;
     }
 
     fn drive(&mut self, code: Code, env: Env, module: usize) -> Result<Value, Diagnostic> {
@@ -721,6 +842,257 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// A `perform` that walked the whole stack without finding a handler.
+    ///
+    /// This is the boundary, and it is reached only here: every `handle` and
+    /// every `simulate` delimiter was consulted first, innermost out, so a test
+    /// double in scope shadows a real socket by the ordinary rule rather than by
+    /// a special case. The binding is not a `Delimiter` and no `Continuation`
+    /// contains it, which is what keeps capture, splice and `Next::Leave`
+    /// untouched by this milestone.
+    fn perform_host(&mut self, request: Request) -> Result<(), Diagnostic> {
+        let Request {
+            effect,
+            op,
+            resource,
+            args,
+            span,
+        } = request;
+        let operation = operation_label(&effect, &op, resource.as_ref());
+        let would = self.binding.would_serve(&effect, &op, resource.as_ref());
+
+        // Before resolution and before the hermetic check, because this is the
+        // terminal answer: a region that reaches a socket cannot be repaired by
+        // `--host`, and a diagnostic that suggests a flag which will then refuse
+        // the program has cost the reader a round trip to learn nothing.
+        if would.is_some()
+            && let Some(region) = self.innermost_simulation()
+        {
+            return Err(err_host_in_simulation(span, &operation, region));
+        }
+
+        let Some(bound) = self.binding.resolve(&effect, &op, resource.as_ref()) else {
+            return Err(match would {
+                None => handler::err_unhandled(span, &effect, &op, resource.as_ref()),
+                Some(path) if self.binding.is_hermetic() => {
+                    let hermetic = err_hermetic(span, &operation, path);
+                    // E0424's second remedy is `--host`, and for a test the
+                    // search re-runs that flag leads straight to `E0425`. Saying
+                    // so here costs a line and saves the reader a round trip.
+                    match self.re_executed {
+                        true => hermetic.note(
+                            "`--host` would then refuse this: the search runs a seeded test whole once per interleaving, so a handler would answer it once per schedule",
+                        ),
+                        false => hermetic,
+                    }
+                }
+                Some(path) => err_unenumerated_atom(span, &operation, path),
+            });
+        };
+
+        // `task.*` is answered by opening a region rather than by calling a
+        // handler: a task is a suspended machine state, and a handler is handed
+        // argument values and a span. Lazily, per ADR 0011 §9 — a region opened
+        // around every entry point would make every existing `simulate` nested
+        // and `E0416` under `--host`.
+        if crate::sim::TASK_OPS.contains(&op.as_str()) && effect.as_str() == "task" {
+            return self.open_production_region(effect, op, args, span);
+        }
+
+        let atom = bound.atom.clone();
+        let declaration = bound.op.clone();
+        let handler = Arc::clone(bound.handler);
+
+        if let Some(declared) = &self.declared
+            && !declared.contains(&atom)
+        {
+            return Err(err_footprint_escape(
+                span,
+                &operation,
+                &atom,
+                declared,
+                declaration.path,
+            ));
+        }
+
+        // Outside every region and still re-executed. The search re-runs the
+        // whole test, so an operation in the prefix or the suffix around a
+        // region is performed once per interleaving exactly as one inside it is,
+        // and `innermost_simulation` cannot see that: it is empty before the
+        // region is entered and after it closes.
+        //
+        // Below the `task.*` branch on purpose. Opening a production region
+        // performs nothing outside the program, and the seeded and production
+        // schedulers already exclude each other in three independent ways
+        // (ADR 0011 §9) — `E0416` is the specific answer there, and refusing
+        // first would replace it with a vaguer one.
+        if self.re_executed {
+            return Err(err_host_in_search(span, &operation, declaration.path));
+        }
+
+        let runtime = self.runtime.clone();
+        let answered = {
+            let request = HostRequest {
+                atom: atom.clone(),
+                op: &declaration,
+                args: &args,
+                span,
+            };
+            match &runtime {
+                Some(rt) => handler.call(rt.as_ref(), &request),
+                None => handler.call(&Unbound, &request),
+            }
+        };
+
+        // The operation happened — a refusal included, because a handler that
+        // failed may have acted before it failed and nothing here can know. What
+        // is undecided is only when its answer arrives. Charged before the `?` so
+        // that a task parked on a token, and a run a handler refused, have both
+        // already spent their linearity: that is the direction which refuses a
+        // replay rather than allowing one, and it is what makes a failure a
+        // handler produced a *host-backed* failure that M5 must not re-run.
+        self.host_use.record(&atom);
+        if declaration.linearity.is_linear() {
+            self.host_ops = self.host_ops.saturating_add(1);
+            self.last_linear = Some(HostMark {
+                operation: operation.clone(),
+                path: declaration.path,
+                span,
+            });
+        }
+
+        // Every refusal is stamped with where it came from. A handler picks its
+        // own code, and several of the codes decide whether `ply test` reports a
+        // failure as the program's fault or as Ply's — so the classification is
+        // taken back here rather than left to each handler's good manners.
+        let answer = answered.map_err(|d| attribute(d, declaration.path, &operation, span))?;
+
+        let pending = match answer {
+            HostAnswer::Value(value) => {
+                // The declaration's structural half, and the only half of it
+                // anything can check: `blocking: true` says the work left this
+                // thread and a token is coming back, so a value is this thread
+                // having done the work while every task sharing it waited.
+                if declaration.blocking {
+                    return Err(err_blocking_answered_inline(
+                        span,
+                        &operation,
+                        declaration.path,
+                    ));
+                }
+                self.go_return(value);
+                return Ok(());
+            }
+            HostAnswer::Pending(pending) => pending,
+        };
+        let Some(rt) = runtime else {
+            return Err(err_no_runtime(span, &operation, pending, declaration.path));
+        };
+
+        // Inside a production region the performing task leaves the enabled set
+        // and the others keep running — which is the whole of ADR 0008 §8. Two
+        // tasks where one waits on bytes the other must send would otherwise
+        // deadlock on the thread, silently and with no diagnostic, because
+        // `block_on` holds the only thread either of them can run on.
+        if let Some(region) = self.host_region() {
+            let Some(segments) = self.stack.sim_depth() else {
+                return Err(err_task_lost_its_region(span, &operation));
+            };
+            let (k, _) = self.stack.capture(segments, self.host_ops);
+            let live = region_mut(&mut self.sims, region).expect("the region was just found");
+            live.sched.park_on_host(k, pending, span)?;
+            return self.schedule();
+        }
+
+        // Outside one a `Pending` has nowhere to park, so the machine drives the
+        // runtime until the token resolves. This is the one place in the
+        // language where a Ply computation blocks a real thread.
+        let value = rt.block_on(pending)?;
+        self.go_return(value);
+        Ok(())
+    }
+
+    /// The innermost live production region, if control is actually inside it.
+    ///
+    /// `holds_sim` and not merely "a region exists": a handler outside the region
+    /// may have discarded the continuation that carried its delimiter, and
+    /// parking a task on a scheduler control has left is a token nothing will
+    /// ever resume.
+    fn host_region(&self) -> Option<SimId> {
+        self.sims
+            .iter()
+            .rev()
+            .find(|region| region.sched.policy() == Policy::Host && self.stack.holds_sim(region.id))
+            .map(|region| region.id)
+    }
+
+    /// Opens the production region a `task.*` perform reached the binding at, or
+    /// answers into one already open.
+    ///
+    /// The region's root task is the computation already in progress — this
+    /// entire stack — so the region's value is the entry point's and there is
+    /// nothing under it to deliver onto. The perform that opened it is then
+    /// answered by [`Machine::run_scheduled`], the same path every later
+    /// `task.*` takes, rather than by a second implementation of what `spawn`
+    /// means.
+    fn open_production_region(
+        &mut self,
+        effect: Symbol,
+        op: Symbol,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        // A production region already live means control left its delimiter —
+        // `find_handler` would have answered otherwise — so the tasks it still
+        // holds will never run. Opening a second one would strand them.
+        if let Some(open) = self.sims.iter().find(|r| r.sched.policy() == Policy::Host) {
+            return Err(err_region_abandoned(open.span, &open.sched.unfinished()));
+        }
+        let Some(permit) = HostPolicy::of(&self.binding) else {
+            return Err(err_hermetic(
+                span,
+                &operation_label(&effect, &op, None),
+                self.binding
+                    .would_serve(&effect, &op, None)
+                    .unwrap_or("ply_host::sched::spawn"),
+            ));
+        };
+        let id = SimId(self.entered_sims);
+        self.entered_sims += 1;
+        let k = std::mem::take(&mut self.stack).into_task(id, self.host_ops);
+        let sched = Scheduler::production(id, span, permit).rooted_running()?;
+        self.sims.push(Region::production(id, sched, span));
+        self.run_scheduled(Scheduled {
+            region: id,
+            effect,
+            op,
+            args,
+            span,
+            k,
+        })
+    }
+
+    /// The span of the innermost live **seeded** region.
+    ///
+    /// A `Policy::Host` region is opened *by* the host binding at the first
+    /// `task.*` that reached it, so a host operation inside one is ordinary
+    /// rather than `E0425`. Only a `simulate` re-runs its body once per
+    /// interleaving, and only that is what makes reaching a socket from inside a
+    /// region a proof about packets it sent along the way.
+    fn innermost_simulation(&self) -> Option<Span> {
+        self.sims
+            .iter()
+            .rev()
+            .find(|region| region.sched.policy() == Policy::Seeded)
+            .map(|region| region.span)
+    }
+
+    /// `E0426`, built from what [`handler::resume`] refused and the operation
+    /// this machine is protecting.
+    fn err_replayed(&self, refused: handler::Replayed) -> Diagnostic {
+        err_continuation_resumed(self.current, refused.resumes, self.last_linear.as_ref())
+    }
+
     /// `simulate { body }` — install the seeded scheduler and give its root task
     /// the first step.
     ///
@@ -776,10 +1148,28 @@ impl<'a> Machine<'a> {
             span,
             k,
         } = scheduled;
-        if region_mut(&mut self.sims, region).is_none() {
+        let Some(live) = region_mut(&mut self.sims, region) else {
             return Err(err_task_escapes(span, &effect, &op));
+        };
+        // A `Sim` delimiter is found by operation name alone, which is right for
+        // a seeded region and too wide for a production one: it answers `task`
+        // and nothing else, so a `clock.now` inside it must go to the host
+        // binding rather than be given virtual time that starts at zero and only
+        // moves when every task is asleep. `k` is dropped rather than spliced —
+        // capture does not touch the stack it read — so the perform is exactly
+        // where it was.
+        if !live.sched.answers(effect.as_str(), op.as_str()) {
+            return self.perform_host(Request {
+                effect,
+                op,
+                resource: None,
+                args,
+                span,
+            });
         }
-        self.trail.end_step(span);
+        if live.sched.records_steps() {
+            self.trail.end_step(span);
+        }
         let live = region_mut(&mut self.sims, region).expect("the region was just found");
         let task = match live.sched.current() {
             Some(task) => task,
@@ -838,10 +1228,12 @@ impl<'a> Machine<'a> {
     /// A task's body returned to its own delimiter.
     fn finish_task(&mut self, region: SimId, value: Value) -> Result<(), Diagnostic> {
         let span = self.current;
-        if region_mut(&mut self.sims, region).is_none() {
+        let Some(live) = region_mut(&mut self.sims, region) else {
             return Err(err_task_escapes(span, "task", "return"));
+        };
+        if live.sched.records_steps() {
+            self.trail.end_step(span);
         }
-        self.trail.end_step(span);
         let live = region_mut(&mut self.sims, region).expect("the region was just found");
         live.sched.finish(value)?;
         self.schedule()
@@ -902,14 +1294,19 @@ impl<'a> Machine<'a> {
         self.trail.note_site(site);
     }
 
-    /// Give the next step to whichever task the seed names, or deliver the
-    /// region's value when every task has finished.
+    /// Give the next step to whichever task the seed names — or, in a production
+    /// region, to whichever is ready — or deliver the region's value when every
+    /// task has finished.
     ///
     /// Virtual time advances inside [`Scheduler::next`] and only there, and only
     /// with nothing enabled — which is why a simulated timeout can never fire
-    /// ahead of work that could still run.
+    /// ahead of work that could still run. A production region has no virtual
+    /// clock and takes neither the [`Trail`] nor the [`Clock`]: it records no
+    /// step, so it cannot fabricate an `Exploration` and cannot spend a seed's
+    /// choice sequence.
     ///
     /// [`Scheduler::next`]: crate::sched::Scheduler::next
+    /// [`Clock`]: crate::sim::Clock
     fn schedule(&mut self) -> Result<(), Diagnostic> {
         let Some(region) = self.sims.last_mut() else {
             return Err(Diagnostic::error(
@@ -918,17 +1315,38 @@ impl<'a> Machine<'a> {
             )
             .primary(self.current, "no `simulate` region is live here"));
         };
-        let turn = region
-            .sched
-            .next(region.handlers.clock_mut(), &mut self.trail)?;
+        let turn = match region.sched.policy() {
+            Policy::Seeded => region
+                .sched
+                .next(region.handlers.clock_mut(), &mut self.trail)?,
+            // The runtime is reached only with nothing enabled: a region whose
+            // tasks are all value-shaped never polls and never parks, so a
+            // machine bound without a reactor still schedules. One that does
+            // reach for a reactor gets `Unbound`'s diagnostic naming the
+            // omission, rather than a refusal to start over a reactor it would
+            // not have used.
+            Policy::Host => {
+                let runtime = self.runtime.clone();
+                let region = self.sims.last_mut().expect("the region is still live");
+                match &runtime {
+                    Some(rt) => region.sched.next_host(rt.as_ref())?,
+                    None => region.sched.next_host(&Unbound)?,
+                }
+            }
+        };
         let region = self.sims.last_mut().expect("the region is still live");
         match turn {
             Turn::Complete(value) => {
                 let region = self.sims.pop().expect("the region was just borrowed");
-                self.trail.leave(
-                    region.handlers.clock().now(),
-                    region.handlers.rand().drawn(),
-                );
+                // A production region's clock and stream were never drawn from,
+                // so handing them to the trail would report zeroes over whatever
+                // a seeded region earlier in the entry point actually reached.
+                if region.sched.records_steps() {
+                    self.trail.leave(
+                        region.handlers.clock().now(),
+                        region.handlers.rand().drawn(),
+                    );
+                }
                 self.stack = region.below;
                 self.go_return(value);
                 Ok(())
@@ -937,8 +1355,10 @@ impl<'a> Machine<'a> {
                 let (below, id) = (region.below.clone(), region.id);
                 match resumption {
                     Resumption::Enter => {
-                        let (body, env, module) =
-                            (region.body.clone(), region.env.clone(), region.module);
+                        let Some(body) = region.body.clone() else {
+                            return Err(err_lazy_region_entered(region.span));
+                        };
+                        let (env, module) = (region.env.clone(), region.module);
                         self.stack = below.push_sim(id);
                         self.go_eval(body, env, module);
                         Ok(())
@@ -948,7 +1368,8 @@ impl<'a> Machine<'a> {
                         self.apply(body, Vec::new(), span)
                     }
                     Resumption::Resume { k, value } => {
-                        let transition = handler::resume(&below, &k, value);
+                        let transition = handler::resume(&below, &k, value, self.host_ops)
+                            .map_err(|refused| self.err_replayed(refused))?;
                         self.take(transition)
                     }
                 }
@@ -981,7 +1402,8 @@ impl<'a> Machine<'a> {
                 _ => return Err(err_region_ended(self.current)),
             }
         }
-        let transition = handler::resume(&self.stack, k, value);
+        let transition = handler::resume(&self.stack, k, value, self.host_ops)
+            .map_err(|refused| self.err_replayed(refused))?;
         self.take(transition)
     }
 
@@ -1246,6 +1668,7 @@ impl<'a> Machine<'a> {
                 (Lit::Int(a), Value::Int(b)) => a == b,
                 (Lit::Bool(a), Value::Bool(b)) => a == b,
                 (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
+                (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
                 (Lit::Unit, Value::Unit) => true,
                 _ => false,
             },
@@ -1502,12 +1925,174 @@ fn err_region_ended(span: Span) -> Diagnostic {
     .note("resume such a continuation at most once, or install the handler inside the `simulate` region so the capture does not cross it")
 }
 
+/// A lazily opened region asked to evaluate a body it does not have.
+#[cold]
+#[inline(never)]
+fn err_lazy_region_entered(region: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a region opened at the host boundary was asked to enter a body",
+    )
+    .primary(
+        region,
+        "this region's root task is the computation that opened it, so it has no body",
+    )
+    .note("this is Ply's fault: report it with the program that produced it")
+}
+
+/// A task about to park on a host token whose region delimiter is not on its
+/// stack. Parking anyway is a token nothing will ever resume — a hang, which is
+/// the one shape a defect at this boundary must never take.
+#[cold]
+#[inline(never)]
+fn err_task_lost_its_region(span: Span, operation: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        format!("`{operation}` would park a task whose scheduler its control has already left"),
+    )
+    .primary(
+        span,
+        "performed here, outside the region that owns this task",
+    )
+    .note("a handler outside the region discarded the continuation that carried its delimiter")
+    .note("keep the `handle` inside the region, or resume the continuation it was given")
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     if n == 1 {
         format!("1 {one}")
     } else {
         format!("{n} {many}")
     }
+}
+
+/// The runtime a machine has when nobody gave it one.
+///
+/// A value-shaped handler — a clock read, a byte operation — never touches the
+/// runtime at all, so a machine with a binding and no reactor is a legitimate
+/// configuration and must not be a panic. One that *does* reach for a reactor
+/// gets a diagnostic naming the omission.
+struct Unbound;
+
+impl HostRuntime for Unbound {
+    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+        Err(err_unbound_runtime(&format!("poll `{pending}`")))
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Err(err_unbound_runtime("park"))
+    }
+
+    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
+        Err(err_unbound_runtime(&format!("block on `{pending}`")))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_unbound_runtime(what: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a host handler asked the runtime to {what}, and this run has no host runtime"),
+    )
+    .primary(Span::DUMMY, "no reactor is bound to this machine")
+    .note("`Machine::set_host_runtime` was never called, so only handlers that answer a value outright can run here")
+}
+
+/// A `HostAnswer::Pending` with no reactor to resolve it.
+#[cold]
+#[inline(never)]
+fn err_no_runtime(span: Span, operation: &str, pending: Pending, path: &'static str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("`{operation}` did not complete and this run has no host runtime to wait on it"),
+    )
+    .primary(span, "performed here")
+    .note(format!("`{path}` answered a pending `{pending}`"))
+    .note("`Machine::set_host_runtime` was never called; a handler that can answer `Pending` needs one")
+}
+
+/// `E0427` — a registration claims this operation, the run is bound, and the
+/// binding enumerated no atom for it.
+///
+/// The static picture and the dynamic one disagree: binding resolves an `Any`
+/// registration against the atoms the program's declared footprints contain, so
+/// reaching one they do not contain means a footprint under-reported. That is
+/// the failure mode the whole boundary is built around, so it is loud and it is
+/// Ply's fault rather than a quiet unbound pass.
+#[cold]
+#[inline(never)]
+fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_FOOTPRINT_ESCAPE,
+        format!("`{operation}` reached a bound host handler that this run never enumerated"),
+    )
+    .primary(span, "performed here")
+    .note(format!("`{path}` is registered for this operation, but binding resolved no atom for it against the program's declared footprints"))
+    .note("a footprint that does not contain an atom the program performs is a footprint that under-reports, and scheduling and isolation are decided from it")
+    .note("this is Ply's fault: report it with the program that produced it")
+}
+
+/// `E0427` — a host handler answered an atom outside the entry point's row.
+#[cold]
+#[inline(never)]
+fn err_footprint_escape(
+    span: Span,
+    operation: &str,
+    atom: &EffectAtom,
+    declared: &Footprint,
+    path: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_FOOTPRINT_ESCAPE,
+        format!("`{path}` answered `{atom}`, which is outside this entry point's declared footprint"),
+    )
+    .primary(span, format!("`{operation}` performed here"))
+    .note(format!("the entry point's declared footprint is {declared}"))
+    .note("scheduling and world isolation are decided from that footprint, so an operation outside it may have run beside work it conflicts with")
+    .note("this is Ply's fault: the run knows two of its own answers disagree and nothing in the definition graph decides which was meant")
+}
+
+/// `E0425` — a host operation reached from inside a `simulate` region.
+#[cold]
+#[inline(never)]
+pub(crate) fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_IN_SIMULATION,
+        format!("`{operation}` reached the host boundary from inside a `simulate` region"),
+    )
+    .primary(span, "performed here, against a real resource")
+    .secondary(region, "this region re-runs its body once per interleaving")
+    .note("the search runs the region whole for every schedule it explores, so this operation would be performed once per interleaving")
+    .note("and the result would then be reported as a proof over every interleaving")
+    .note("handle the operation with a test double inside the region, or hoist it out of the region entirely")
+}
+
+/// `E0426` — a second resumption across an at-most-once host operation.
+#[cold]
+#[inline(never)]
+fn err_continuation_resumed(span: Span, resumes: u32, last: Option<&HostMark>) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(
+        codes::HOST_CONTINUATION_RESUMED,
+        "this continuation is resumed again across a host operation",
+    )
+    .primary(span, format!("resumption {resumes} of one continuation"));
+    if let Some(mark) = last {
+        if !mark.span.is_dummy() {
+            diagnostic = diagnostic.secondary(
+                mark.span,
+                format!("`{}` was performed here, after the capture", mark.operation),
+            );
+        }
+        diagnostic = diagnostic.note(format!(
+            "`{}` is registered `at-most-once`, so replaying this control would perform it again",
+            mark.path
+        ));
+    }
+    diagnostic
+        .note("multi-shot resumption stays available for pure and in-memory handlers; the restriction is on the boundary, not on the feature")
+        .note("resume at most once across a host operation, or — only if replaying it really changes nothing outside the program — register the operation `Linearity::Repeatable`")
+        .note("the rule is conservative: it refuses when any at-most-once host operation happened after the capture, including in another task")
 }
 
 /// A scheduled operation whose region is gone: a `Task` or a continuation

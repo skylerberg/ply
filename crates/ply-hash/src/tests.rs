@@ -37,6 +37,10 @@ fn str_lit(v: &str) -> Expr {
     e(ExprKind::Lit(Lit::Str(v.to_string())))
 }
 
+fn bytes_lit(v: &[u8]) -> Expr {
+    e(ExprKind::Lit(Lit::Bytes(v.to_vec())))
+}
+
 fn call(func: Expr, args: Vec<Expr>) -> Expr {
     e(ExprKind::App {
         func: Box::new(func),
@@ -941,6 +945,63 @@ fn string_literals_cannot_be_confused_with_their_neighbours() {
         "f",
     );
     assert_ne!(a, b);
+}
+
+/// The two have different types and must not share a definition, which is the
+/// whole reason `LIT_BYTES` is a tag of its own rather than `LIT_STR` reused.
+#[test]
+fn a_byte_literal_never_hashes_as_the_string_with_the_same_characters() {
+    let s = hash_of(vec![func("f", &[], str_lit("ab"))], "f");
+    let b = hash_of(vec![func("f", &[], bytes_lit(b"ab"))], "f");
+    assert_ne!(s, b);
+}
+
+#[test]
+fn byte_literals_cannot_be_confused_with_their_neighbours() {
+    let joined = hash_of(
+        vec![func(
+            "f",
+            &[],
+            list(vec![bytes_lit(b"ab"), bytes_lit(b"c")]),
+        )],
+        "f",
+    );
+    let split = hash_of(
+        vec![func(
+            "f",
+            &[],
+            list(vec![bytes_lit(b"a"), bytes_lit(b"bc")]),
+        )],
+        "f",
+    );
+    assert_ne!(joined, split);
+
+    let empty = hash_of(vec![func("f", &[], bytes_lit(b""))], "f");
+    let nul = hash_of(vec![func("f", &[], bytes_lit(b"\0"))], "f");
+    assert_ne!(empty, nul);
+}
+
+/// A `b"..."` pattern is a `PatternKind::Lit` like any other, so this is really
+/// a check that the pattern path reaches the same tag the expression path does.
+#[test]
+fn a_byte_pattern_is_distinct_from_a_string_pattern() {
+    let arms = |l: Lit| {
+        vec![func(
+            "f",
+            &["v"],
+            e(ExprKind::Match {
+                scrutinee: Box::new(var("v")),
+                arms: vec![
+                    arm(pat(PatternKind::Lit(l)), int(1)),
+                    arm(pat(PatternKind::Wildcard), int(0)),
+                ],
+            }),
+        )]
+    };
+    assert_ne!(
+        hash_of(arms(Lit::Str("ab".to_string())), "f"),
+        hash_of(arms(Lit::Bytes(b"ab".to_vec())), "f")
+    );
 }
 
 #[test]
@@ -1967,7 +2028,10 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     // omitted the owner's hash would leave a discharged `ensures` discharged
     // after its definition was rewritten.
     let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
-    assert_ne!(rewritten.defs[&Symbol::new("apply_debit")], base.defs[&Symbol::new("apply_debit")]);
+    assert_ne!(
+        rewritten.defs[&Symbol::new("apply_debit")],
+        base.defs[&Symbol::new("apply_debit")]
+    );
     assert_ne!(rewritten.specs[&Symbol::new("apply_debit")], clauses);
 
     // The claim moved and the implementation did not: the definition's hash is
@@ -1987,7 +2051,11 @@ fn apply_debit(balance: Int, amount: Int) -> Int
 "#,
     );
     assert_eq!(reordered.defs, base.defs);
-    assert!(reordered.specs[&Symbol::new("apply_debit")].iter().all(|k| !clauses.contains(k)));
+    assert!(
+        reordered.specs[&Symbol::new("apply_debit")]
+            .iter()
+            .all(|k| !clauses.contains(k))
+    );
 }
 
 /// The complement of the key above, and the whole of what `ply review` asks: a
@@ -2026,7 +2094,10 @@ law "a debit never raises the balance"
     let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
     assert_ne!(rewritten.defs[&name], base.defs[&name]);
     assert_ne!(rewritten.specs[&name], base.specs[&name]);
-    assert_ne!(rewritten.laws, base.laws, "the law's key covers what it names");
+    assert_ne!(
+        rewritten.laws, base.laws,
+        "the law's key covers what it names"
+    );
     assert_eq!(rewritten.spec_texts[&name], sentences);
     assert_eq!(rewritten.law_texts, base.law_texts);
 
@@ -2082,6 +2153,10 @@ law "a debit lowers a balance"
         "editing a definition a law names must re-open the law"
     );
 
-    let rebound = parsed(&SOURCE.replace("forall (b: Int, n: Int)", "forall (x: Int, n: Int)").replace("debit(b, n) <= b", "debit(x, n) <= x"));
+    let rebound = parsed(
+        &SOURCE
+            .replace("forall (b: Int, n: Int)", "forall (x: Int, n: Int)")
+            .replace("debit(b, n) <= b", "debit(x, n) <= x"),
+    );
     assert_eq!(rebound.laws, base.laws, "a binder is a level, not a name");
 }

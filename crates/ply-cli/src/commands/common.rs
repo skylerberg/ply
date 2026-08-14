@@ -83,6 +83,37 @@ pub fn report_load_error(command: &str, err: &LoadError, json: bool, style: Styl
     EXIT_COMPILE_ERROR
 }
 
+/// A registration that does not match the program is the host author's bug, not
+/// the program's, and it is a start-up failure: nothing ran, so the report is
+/// diagnostics and the binding that was asked for. Exit `2`, like any other
+/// failure to get as far as running.
+pub fn report_bind_error(
+    command: &str,
+    diagnostics: &[Diagnostic],
+    sources: &SourceMap,
+    json: bool,
+    style: Style,
+) -> i32 {
+    if json {
+        emit_json(&json!({
+            "command": command,
+            "ok": false,
+            "exit_code": EXIT_COMPILE_ERROR,
+            "binding": "host",
+            "diagnostics": diagnostics_json(diagnostics, sources),
+        }));
+    } else {
+        print_diagnostics(diagnostics, sources, style);
+        let n = diagnostics.len();
+        eprintln!(
+            "{IND}{} ({n} {})",
+            style.red("no host handler was bound"),
+            plural(n, "error")
+        );
+    }
+    EXIT_COMPILE_ERROR
+}
+
 /// The one place a `--json` command writes to stdout, so "exactly one object and
 /// nothing else" is checkable by reading this file.
 pub fn emit_json(value: &Value) {

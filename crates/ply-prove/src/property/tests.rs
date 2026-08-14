@@ -137,6 +137,7 @@ fn every_ply_type_generates() {
         (Type::int(), |v| matches!(v, Value::Int(_))),
         (Type::bool(), |v| matches!(v, Value::Bool(_))),
         (Type::string(), |v| matches!(v, Value::Str(_))),
+        (Type::bytes(), |v| matches!(v, Value::Bytes(_))),
         (Type::unit(), |v| matches!(v, Value::Unit)),
         (Type::list(Type::int()), |v| matches!(v, Value::List(_))),
         (record, |v| matches!(v, Value::Record(_))),
@@ -212,6 +213,30 @@ fn the_integer_boundary_is_drawn_on_every_run() {
     for edge in EDGE_INTS {
         assert!(drawn.contains(&edge), "{edge} was never drawn: {drawn:?}");
     }
+}
+
+/// `Bytes` draws over the whole byte range and over the whole length range,
+/// unlike `String`'s alphabet: a generator that never produces `0x00` or `0xff`
+/// checks a law only over the cases that never break.
+#[test]
+fn bytes_generation_reaches_every_byte_and_the_empty_value() {
+    let world = TypeWorld::default();
+    let drawn = draw(&Type::bytes(), &world, 400);
+    let mut seen_len: BTreeSet<usize> = BTreeSet::new();
+    let mut low = false;
+    let mut high = false;
+    for value in &drawn {
+        let Value::Bytes(b) = value else {
+            panic!("expected Bytes, got {}", value.render());
+        };
+        seen_len.insert(b.len());
+        low |= b.iter().any(|byte| *byte < 0x10);
+        high |= b.iter().any(|byte| *byte > 0xf0);
+        assert!(b.len() <= 32, "a drawn Bytes is longer than the bound");
+    }
+    assert!(seen_len.contains(&0), "`b\"\"` was never drawn");
+    assert!(seen_len.len() > 4, "only {} lengths drawn", seen_len.len());
+    assert!(low && high, "the byte range was not covered");
 }
 
 #[test]

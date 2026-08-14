@@ -394,7 +394,10 @@ fn nothing_proved_here_is_refutable_by_sampling() {
                         .map(|b| format!("{} = {}", b.name, b.rendered))
                         .collect::<Vec<_>>()
                 ),
-                Discharge::Unattempted(Gap::Raised { diagnostic, bindings }) => panic!(
+                Discharge::Unattempted(Gap::Raised {
+                    diagnostic,
+                    bindings,
+                }) => panic!(
                     "`{}` is proved and a sampled run raises `{}` at {:?} — a defect in Ply",
                     obligation.owner,
                     diagnostic.message,

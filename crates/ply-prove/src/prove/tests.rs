@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::Rule;
-use ply_core::{CheckOutput, LawBinder, Type, TyVar};
+use ply_core::{CheckOutput, LawBinder, TyVar, Type};
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{Expr, Item, LawDef, Program, TypeExpr};
 use ply_syntax::resolve::Resolved;
@@ -237,7 +237,6 @@ fn a_quotient_is_a_value_only_where_its_divisor_is_not_zero() {
     not_proved(&f, "dividing by minus one is a function");
     proof(&f, "dividing a bounded value by minus one");
 }
-
 
 /// `x < y` over `Int` is `x + 1 <= y`, and reasoning with that is what decides
 /// `x < y && y < z ⟹ x < z - 1` — true over ℤ and not over ℚ. The rule has to
@@ -831,10 +830,7 @@ fn a_postcondition_without_the_definition_is_unknown() {
     let mut vars = BTreeMap::new();
     let account = resolve_type(
         &TypeExpr::Con {
-            name: ply_syntax::ast::QName::bare(ply_syntax::ast::Ident::new(
-                "Account",
-                Span::DUMMY,
-            )),
+            name: ply_syntax::ast::QName::bare(ply_syntax::ast::Ident::new("Account", Span::DUMMY)),
             args: Vec::new(),
             span: Span::DUMMY,
         },
@@ -1267,5 +1263,3 @@ fn the_audit_corpus_exercises_the_fragment() {
         .collect();
     assert!(missed.is_empty(), "{missed:?}");
 }
-
-

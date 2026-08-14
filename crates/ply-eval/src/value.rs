@@ -25,6 +25,11 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(Arc<str>),
+    /// Mirrors [`Value::Str`] exactly, deliberately: what `bytes::Bytes` buys is
+    /// cheap slicing of a shared buffer, which W3's streaming bodies want and
+    /// W1 does not, and it would put a type carrying its own refcount semantics
+    /// into the enum the hygiene rules are written against. Slicing copies.
+    Bytes(Arc<[u8]>),
     Unit,
     List(Vector<Value>),
     Record(Arc<BTreeMap<Symbol, Value>>),
@@ -104,6 +109,10 @@ impl Value {
         Value::Str(Arc::from(s.as_ref()))
     }
 
+    pub fn bytes(b: impl AsRef<[u8]>) -> Value {
+        Value::Bytes(Arc::from(b.as_ref()))
+    }
+
     pub fn list(items: Vec<Value>) -> Value {
         Value::List(Arc::new(items))
     }
@@ -127,6 +136,7 @@ impl Value {
             Value::Int(_) => "Int",
             Value::Bool(_) => "Bool",
             Value::Str(_) => "String",
+            Value::Bytes(_) => "Bytes",
             Value::Unit => "Unit",
             Value::List(_) => "List",
             Value::Record(_) => "record",
@@ -156,6 +166,13 @@ impl Value {
         match self {
             Value::Str(s) => Ok(s),
             other => Err(type_error(span, what, "String", other)),
+        }
+    }
+
+    pub fn as_bytes(&self, span: Span, what: &str) -> Result<&Arc<[u8]>, Diagnostic> {
+        match self {
+            Value::Bytes(b) => Ok(b),
+            other => Err(type_error(span, what, "Bytes", other)),
         }
     }
 
@@ -202,6 +219,16 @@ impl Value {
                 out.push('"');
                 out.push_str(&escape(s));
                 out.push('"');
+            }
+            Value::Bytes(b) => {
+                out.push_str("b\"");
+                for byte in b.iter().take(RENDER_MAX_ITEMS) {
+                    out.push_str(&escape_byte(*byte));
+                }
+                out.push('"');
+                if b.len() > RENDER_MAX_ITEMS {
+                    let _ = write!(out, " … {} more", b.len() - RENDER_MAX_ITEMS);
+                }
             }
             Value::Unit => out.push_str("()"),
             Value::List(items) => {
@@ -340,6 +367,20 @@ fn escape(s: &str) -> String {
     out
 }
 
+/// One byte, as `b"..."` writes it. Everything outside printable ASCII is
+/// `\xNN`, so a rendered literal is copy-pasteable back into source.
+fn escape_byte(b: u8) -> String {
+    match b {
+        b'\n' => "\\n".to_string(),
+        b'\t' => "\\t".to_string(),
+        b'\r' => "\\r".to_string(),
+        b'\\' => "\\\\".to_string(),
+        b'"' => "\\\"".to_string(),
+        0x20..=0x7e => (b as char).to_string(),
+        _ => format!("\\x{b:02x}"),
+    }
+}
+
 pub(crate) fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
@@ -376,6 +417,10 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
+        // Content, not identity, and never equal to a `Str`: the two have
+        // different types, and the falling-through `_ => false` arm is what says
+        // so.
+        (Value::Bytes(x), Value::Bytes(y)) => x == y,
         (Value::Unit, Value::Unit) => true,
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {

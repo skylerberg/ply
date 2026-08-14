@@ -778,6 +778,233 @@ fn two_mains_are_reported_rather_than_resolved_by_load_order() {
     assert_eq!(v["entry"], "two.main");
 }
 
+// --- hosts ------------------------------------------------------------------
+//
+// The listing is meant to be diffed in CI, so what is claimed here is stability
+// and exit codes rather than a particular set of handlers: which handlers exist
+// is `ply-host`'s decision, and a test that pinned them would fail on the day
+// one is legitimately added. What may not move is that hermetic is the default,
+// that the digest is a function of the trusted computing base and not of a flag,
+// and that a run says which binding produced it.
+
+#[test]
+fn hosts_defaults_to_hermetic_and_still_says_what_would_bind() {
+    let dir = project(GREEN);
+    let out = ply(dir.path()).arg("hosts").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout_of(&out);
+    assert!(text.contains("hermetic"), "got:\n{text}");
+    assert!(
+        text.contains("no host handler is bound"),
+        "an empty listing is indistinguishable from a registry that failed to load:\n{text}"
+    );
+    // Never a bare "nothing here": the reader has to be able to tell an empty
+    // trusted computing base from a binding that was simply not asked for.
+    assert!(text.lines().filter(|l| !l.trim().is_empty()).count() >= 2);
+}
+
+#[test]
+fn hosts_is_byte_identical_across_runs() {
+    let dir = project(GREEN);
+    let once = ply(dir.path()).args(["hosts", "--host"]).output().unwrap();
+    let twice = ply(dir.path()).args(["hosts", "--host"]).output().unwrap();
+    assert_eq!(once.status.code(), Some(0));
+    assert_eq!(stdout_of(&once), stdout_of(&twice));
+    assert!(stdout_of(&once).contains("trusted computing base"));
+    assert!(stdout_of(&once).contains("digest: b3:"));
+}
+
+/// The one line a CI check pins. It is a property of the registry and the
+/// program, so it may not depend on whether `--host` was passed — a digest that
+/// moved with a flag would pin nothing.
+#[test]
+fn hosts_digest_is_one_line_and_does_not_depend_on_the_flag() {
+    let dir = project(GREEN);
+    let bare = ply(dir.path())
+        .args(["hosts", "--digest"])
+        .output()
+        .unwrap();
+    let bound = ply(dir.path())
+        .args(["hosts", "--host", "--digest"])
+        .output()
+        .unwrap();
+    assert_eq!(bare.status.code(), Some(0));
+    let digest = stdout_of(&bare);
+    assert_eq!(digest.lines().count(), 1, "got:\n{digest}");
+    assert!(digest.starts_with("b3:"), "got: {digest}");
+    assert_eq!(digest, stdout_of(&bound));
+
+    let v = json_of(&ply(dir.path()).args(["hosts", "--json"]).output().unwrap());
+    assert_eq!(v["digest"], digest.trim());
+}
+
+#[test]
+fn hosts_json_is_one_object_carrying_the_binding_and_every_row() {
+    let dir = project(GREEN);
+    let v = json_of(&ply(dir.path()).args(["hosts", "--json"]).output().unwrap());
+    assert_eq!(v["command"], "hosts");
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["binding"], "hermetic");
+    assert!(v["hosts"].is_array());
+    assert_eq!(
+        v["operations"].as_u64().unwrap() as usize,
+        v["hosts"].as_array().unwrap().len(),
+        "the count and the rows are one claim"
+    );
+
+    let bound = json_of(
+        &ply(dir.path())
+            .args(["hosts", "--host", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(bound["binding"], "host");
+    // Only the binding moves: the trusted computing base is the same either way.
+    assert_eq!(bound["hosts"], v["hosts"]);
+    assert_eq!(bound["digest"], v["digest"]);
+}
+
+#[test]
+fn hosts_on_a_broken_program_is_a_compile_error_with_a_clean_stdout() {
+    let dir = project(BROKEN);
+    let out = ply(dir.path()).args(["hosts", "--host"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stdout_of(&out), "");
+    assert!(String::from_utf8(out.stderr).unwrap().contains("E0201"));
+}
+
+// --- `--host` on test and run -----------------------------------------------
+
+#[test]
+fn test_is_hermetic_without_the_flag_and_says_which_binding_it_used() {
+    let dir = project(GREEN);
+    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    assert_eq!(v["binding"], "hermetic");
+    assert_eq!(v["hosts"]["operations"], 0);
+    assert!(v["hosts"]["digest"].as_str().unwrap().starts_with("b3:"));
+    // Nothing is bound, so no test can reach a host handler, and every test is
+    // classified exactly as it was before W1.
+    assert_eq!(v["selection"]["host"], 0);
+    for test in v["selection"]["tests"].as_array().unwrap() {
+        assert_eq!(test["host"], false);
+        assert_ne!(test["isolation"], "host");
+    }
+}
+
+#[test]
+fn host_changes_the_binding_a_run_reports() {
+    let dir = project(GREEN);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["test", "--host", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["binding"], "host");
+    assert_eq!(
+        v["selection"]["isolated"].as_u64().unwrap()
+            + v["selection"]["shared"].as_u64().unwrap()
+            + v["selection"]["host"].as_u64().unwrap(),
+        v["selection"]["total"].as_u64().unwrap(),
+        "the three buckets have to partition the corpus"
+    );
+}
+
+/// Visible without `--json`: a person reading the terminal has to be able to see
+/// that this run reached outside itself.
+#[test]
+fn a_host_run_says_so_in_the_summary_a_person_reads() {
+    let dir = project(GREEN);
+    let bound = ply(dir.path()).args(["test", "--host"]).output().unwrap();
+    let text = stdout_of(&bound);
+    assert_eq!(bound.status.code(), Some(0));
+    assert!(text.contains("not cached"), "got:\n{text}");
+    assert!(text.contains("binding host"), "got:\n{text}");
+
+    // And silent when nothing was asked for, so the ordinary run reads exactly
+    // as it did before W1.
+    let hermetic = stdout_of(&ply(dir.path()).args(["test"]).output().unwrap());
+    assert!(!hermetic.contains("binding host"), "got:\n{hermetic}");
+}
+
+/// The trivially-parallel count is a claim, and a claim that grew when a socket
+/// was bound would be the over-claim ADR 0008 §6 exists to prevent.
+#[test]
+fn explain_never_reports_more_isolation_under_host_than_without_it() {
+    let dir = project(GREEN);
+    let counts = |extra: &[&str]| {
+        let mut args = vec!["test", "--json", "--explain", "--no-cache"];
+        args.extend_from_slice(extra);
+        let v = json_of(&ply(dir.path()).args(args).output().unwrap());
+        (
+            v["selection"]["isolated"].as_u64().unwrap(),
+            v["selection"]["host"].as_u64().unwrap(),
+        )
+    };
+    let (hermetic, _) = counts(&[]);
+    let (bound, host) = counts(&["--host"]);
+    assert!(
+        bound + host <= hermetic + host && bound <= hermetic,
+        "isolated grew under --host: {hermetic} -> {bound}"
+    );
+}
+
+#[test]
+fn run_is_hermetic_by_default_and_reports_its_binding() {
+    let dir = project(GREEN);
+    let v = json_of(&ply(dir.path()).args(["run", "--json"]).output().unwrap());
+    assert_eq!(v["binding"], "hermetic");
+    assert_eq!(v["value"], "42");
+
+    let v = json_of(
+        &ply(dir.path())
+            .args(["run", "--host", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["binding"], "host");
+    assert_eq!(
+        v["value"], "42",
+        "a binding may not change what a program computes"
+    );
+}
+
+/// Corollary 1 of ADR 0011, checked end to end: if a binding moved a hash, a
+/// row or an E0412 verdict, `ply check` would answer differently under `--host`
+/// and every cache in the system would split on a flag.
+#[test]
+fn a_binding_changes_nothing_the_front_end_computes() {
+    let dir = project(GREEN);
+    let hashes = |args: &[&str]| stdout_of(&ply(dir.path()).args(args).output().unwrap());
+    assert_eq!(hashes(&["hash", "--json"]), hashes(&["hash", "--json"]));
+
+    let hermetic = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    let bound = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--no-cache", "--host"])
+            .output()
+            .unwrap(),
+    );
+    let hashes_of = |v: &Value| {
+        v["selection"]["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["hash"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hashes_of(&hermetic), hashes_of(&bound));
+    assert_eq!(hermetic["selection"]["total"], bound["selection"]["total"]);
+}
+
 // --- hash -------------------------------------------------------------------
 
 #[test]

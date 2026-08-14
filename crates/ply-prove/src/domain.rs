@@ -118,7 +118,7 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(1),
             "Bool" => Some(2),
-            "Int" | "String" | "List" => None,
+            "Int" | "String" | "Bytes" | "List" => None,
             _ => {
                 if open.contains(name) {
                     return None;
@@ -150,15 +150,15 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(Value::Unit),
             "Bool" => Some(Value::Bool(index == 1)),
-            "Int" | "String" | "List" => None,
+            "Int" | "String" | "Bytes" | "List" => None,
             _ => {
                 let variants = world.variants(name)?;
                 let mut rest = index;
                 for variant in variants {
                     let fields = world.fields(name, variant, args);
-                    let size = fields.iter().try_fold(1u64, |acc, f| {
-                        acc.checked_mul(cardinality(f, world)?)
-                    })?;
+                    let size = fields
+                        .iter()
+                        .try_fold(1u64, |acc, f| acc.checked_mul(cardinality(f, world)?))?;
                     if rest < size {
                         return Some(Value::Ctor {
                             name: variant.name.clone(),
@@ -173,8 +173,7 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
         Type::Record(fields) => {
             let types: Vec<Type> = fields.values().cloned().collect();
             let values = tuple_at(&types, world, index)?;
-            let map: BTreeMap<Symbol, Value> =
-                fields.keys().cloned().zip(values).collect();
+            let map: BTreeMap<Symbol, Value> = fields.keys().cloned().zip(values).collect();
             Some(Value::Record(std::sync::Arc::new(map)))
         }
         Type::Var(_) | Type::Fn { .. } => None,
@@ -272,10 +271,14 @@ mod tests {
     #[test]
     fn a_product_beyond_the_bound_is_refused_rather_than_walked() {
         let world = kinds();
-        let wide: Vec<LawBinder> = (0..16).map(|i| binder(&format!("b{i}"), con("Kind"))).collect();
+        let wide: Vec<LawBinder> = (0..16)
+            .map(|i| binder(&format!("b{i}"), con("Kind")))
+            .collect();
         assert!(finite(&wide, &world).is_none(), "3^16 is past the bound");
 
-        let narrow: Vec<LawBinder> = (0..4).map(|i| binder(&format!("b{i}"), con("Kind"))).collect();
+        let narrow: Vec<LawBinder> = (0..4)
+            .map(|i| binder(&format!("b{i}"), con("Kind")))
+            .collect();
         assert_eq!(finite(&narrow, &world).map(|d| d.points), Some(81));
     }
 
@@ -311,5 +314,4 @@ mod tests {
         rendered.dedup();
         assert_eq!(rendered.len(), 6, "a point was visited twice");
     }
-
 }

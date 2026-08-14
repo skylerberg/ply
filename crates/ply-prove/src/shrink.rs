@@ -129,6 +129,9 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             Value::Str(s) => s
                 .chars()
                 .fold(0u64, |acc, c| acc.saturating_add(1 + c as u64)),
+            Value::Bytes(b) => b
+                .iter()
+                .fold(0u64, |acc, byte| acc.saturating_add(1 + u64::from(*byte))),
             Value::List(items) => {
                 pending.extend(items.iter());
                 items.len() as u64
@@ -196,6 +199,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             "Int" => Ok(Value::Int(0)),
             "Bool" => Ok(Value::Bool(false)),
             "String" => Ok(Value::str("")),
+            "Bytes" => Ok(Value::bytes([])),
             "Unit" => Ok(Value::Unit),
             "List" => Ok(Value::list(Vec::new())),
             "Cell" => Err(Ungeneratable::Cell),
@@ -250,6 +254,7 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
         (Value::Bool(true), _) => vec![Value::Bool(false)],
         (Value::Bool(false), _) | (Value::Unit, _) => Vec::new(),
         (Value::Str(s), _) => string_candidates(s),
+        (Value::Bytes(b), _) => bytes_candidates(b),
         (Value::List(items), _) => {
             let elem = match ty {
                 Type::Con(name, args) if name.as_str() == "List" => {
@@ -309,6 +314,31 @@ fn int_candidates(n: i64) -> Vec<Value> {
     out.retain(|c| *c != n);
     out.dedup();
     out.into_iter().map(Value::Int).collect()
+}
+
+/// Length before content, which is the order that makes a minimal witness
+/// readable: `b""`, then the two halves, then each byte lowered toward zero.
+fn bytes_candidates(b: &[u8]) -> Vec<Value> {
+    if b.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![Value::bytes([])];
+    if b.len() >= 2 {
+        let mid = b.len() / 2;
+        out.push(Value::bytes(&b[..mid]));
+        out.push(Value::bytes(&b[mid..]));
+    }
+    for (i, byte) in b.iter().enumerate() {
+        for lowered in [0, byte / 2] {
+            if lowered == *byte {
+                continue;
+            }
+            let mut next = b.to_vec();
+            next[i] = lowered;
+            out.push(Value::bytes(next));
+        }
+    }
+    out
 }
 
 /// `""`, the two halves, then each character lowered toward `'a'`, left to

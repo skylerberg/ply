@@ -1,10 +1,12 @@
 use super::common::{
-    IND, build_pool, diagnostic_json, emit_json, exit_code, location, millis, once_each,
-    phases_json, plural, print_diagnostics, print_phases, print_warnings, report_load_error,
+    IND, build_pool, diagnostic_json, diagnostics_json, emit_json, exit_code, location, millis,
+    once_each, phases_json, plural, print_diagnostics, print_phases, print_warnings,
+    report_bind_error, report_load_error,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
 use crate::driver;
+use crate::hosts::{self, Hosts, hosting};
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
 use ply_core::{CheckOutput, Footprint};
@@ -12,7 +14,7 @@ use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 use ply_store::Store;
 use ply_test::{
-    Bisection, Failure, Isolation, Reason, RunReport, Selection, Skipped, Status, Suspect,
+    Bisection, Failure, Isolation, Reason, Record, RunReport, Selection, Skipped, Status, Suspect,
     TestResult, Verdict,
 };
 use serde_json::{Value, json};
@@ -110,9 +112,23 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
         }
     }
 
+    // Before anything runs: a registration the program does not declare is the
+    // host author's bug, and a run that started anyway would touch a resource
+    // nobody could name. Hermetic resolves nothing, so a stale registry cannot
+    // stop a run that was never going to reach it.
+    let hosts = match Hosts::open(&loaded.check, args.host) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
         ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
+    // A factory rather than a handle: a reactor belongs to the thread its
+    // machine runs on, and the runner builds a machine per worker.
+    let runtime = hosts.runtime_factory();
     let mut run = || {
         ply_test::run(
             &plan.selection,
@@ -123,6 +139,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             &mut cache.store,
             engine,
             simulation.clone(),
+            hosting(&hosts, &runtime),
         )
     };
     let mut report = match &pool {
@@ -149,16 +166,119 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     warnings.extend(cache.store.take_warnings());
     let warnings = once_each(warnings);
 
+    let view = HostView::of(&hosts, &plan, &loaded.check, &report);
+    let ok = report.is_success() && view.escapes.is_empty();
+
     if args.json {
         emit_json(&report_json(
-            &loaded, &hashes, &plan, &report, args, workers, &warnings,
+            &loaded, &hashes, &plan, &report, args, workers, &warnings, &view, ok,
         ));
     } else {
         print_human(
-            &loaded, &hashes, &plan, &report, args, workers, &warnings, style,
+            &loaded, &hashes, &plan, &report, args, workers, &warnings, &view, style,
         );
     }
-    exit_code(report.is_success())
+    exit_code(ok)
+}
+
+/// What the binding contributed to this run, threaded through both projections
+/// so the human summary and `--json` cannot disagree about it.
+struct HostView<'a> {
+    hosts: &'a Hosts,
+    counts: hosts::Counts,
+    /// Tests the binding can reach whose passes were written to the result
+    /// cache. Empty in a correct run; see [`cache_escapes`].
+    escapes: Vec<Diagnostic>,
+}
+
+impl<'a> HostView<'a> {
+    fn of(hosts: &'a Hosts, plan: &Plan, check: &CheckOutput, report: &RunReport) -> HostView<'a> {
+        HostView {
+            hosts,
+            counts: counts(plan, check, hosts),
+            escapes: cache_escapes(report, check, hosts),
+        }
+    }
+
+    /// Whether this test can reach a bound host handler. A footprint is an upper
+    /// bound on what is performed, so this names every test that could and no
+    /// test that could not.
+    fn reaches(&self, check: &CheckOutput, index: usize) -> bool {
+        check
+            .tests
+            .get(index)
+            .is_some_and(|t| self.hosts.reaches(&t.footprint))
+    }
+}
+
+/// How the corpus splits once the binding is taken into account.
+///
+/// A hermetic run returns [`Parallelism`]'s own numbers untouched, which is why
+/// nothing about a run that binds nothing moves: `reaches` is false for every
+/// footprint, so the correction is the identity and the branch only avoids
+/// recomputing a denominator the runner already published.
+///
+/// [`Parallelism`]: ply_test::Parallelism
+fn counts(plan: &Plan, check: &CheckOutput, hosts: &Hosts) -> hosts::Counts {
+    let parallelism = &plan.selection.parallelism;
+    if hosts.is_hermetic() {
+        return hosts::Counts {
+            total: parallelism.total,
+            isolated: parallelism.isolated,
+            shared: parallelism.shared,
+            host: 0,
+        };
+    }
+    hosts::Counts::of(
+        hosts,
+        plan.visible
+            .iter()
+            .filter_map(|&index| Some((index, check.tests.get(index)?)))
+            .map(|(index, test)| {
+                let world = plan
+                    .selection
+                    .isolation_of(index)
+                    .unwrap_or_else(|| Isolation::of(&test.footprint))
+                    .is_world();
+                (&test.footprint, world)
+            }),
+    )
+}
+
+/// A test the binding can reach always runs and is never written to the cache,
+/// in either direction. The runner decides that; this checks it.
+///
+/// The check is here because the failure mode is silent and outlives the run
+/// that caused it: a cached pass earned over a real socket is believed by every
+/// later hermetic run, and nothing about that run would look wrong. One set
+/// lookup per result is a cheap price for turning it into a failure.
+fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<Diagnostic> {
+    if hosts.is_hermetic() {
+        return Vec::new();
+    }
+    report
+        .results
+        .iter()
+        .filter(|r| {
+            r.recorded.as_ref().is_some_and(Record::is_written)
+                && check
+                    .tests
+                    .get(r.index)
+                    .is_some_and(|t| hosts.reaches(&t.footprint))
+        })
+        .map(|r| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "`{}` can reach the host binding, and its pass was written to the result cache",
+                    r.name
+                ),
+            )
+            .note("a run that reached the host proves nothing about the next one, so it is never cached")
+            .note("run `ply cache clear`: an entry written here would be believed by a later hermetic run")
+            .note("this is Ply's fault — the runner and the binding disagree about what this test can do")
+        })
+        .collect()
 }
 
 /// A stored `Pass` is a claim about what the authoritative engine did, so a run
@@ -389,6 +509,7 @@ fn print_human(
     args: &TestArgs,
     workers: usize,
     warnings: &[Diagnostic],
+    view: &HostView<'_>,
     style: Style,
 ) {
     let selection = &plan.selection;
@@ -408,22 +529,44 @@ fn print_human(
             plural(workers, "worker")
         );
     }
-    let parallelism = &selection.parallelism;
-    if parallelism.total > 0 {
-        let shared = if parallelism.shared == 0 {
+    let counts = &view.counts;
+    if counts.total > 0 {
+        let shared = if counts.shared == 0 {
             String::new()
         } else {
             style.dim(&format!(
                 " · {} {} can contend",
-                parallelism.shared,
-                plural(parallelism.shared, "test")
+                counts.shared,
+                plural(counts.shared, "test")
             ))
         };
         println!(
             "{IND}{} {} of {}{shared}",
             style.bold("isolated"),
-            style.bold(&parallelism.isolated.to_string()),
-            parallelism.total,
+            style.bold(&counts.isolated.to_string()),
+            counts.total,
+        );
+    }
+    // A socket cannot be forked, so a host-backed test is not world-isolated and
+    // is never cached. Both facts are printed rather than left to be inferred
+    // from a smaller `isolated` count than the run had yesterday.
+    if !view.hosts.is_hermetic() {
+        println!(
+            "{IND}{} {} of {} · {}",
+            style.bold("host"),
+            style.bold(&counts.host.to_string()),
+            counts.total,
+            style.dim("not cached"),
+        );
+        let listing = view.hosts.listing();
+        println!(
+            "{IND}{}",
+            style.dim(&format!(
+                "binding host · {} {} · {}",
+                listing.rows.len(),
+                plural(listing.rows.len(), "operation"),
+                listing.digest_short(),
+            ))
         );
     }
     if let Some(line) = report.simulation.line() {
@@ -452,7 +595,7 @@ fn print_human(
     }
 
     if args.explain {
-        print_explain(loaded, hashes, plan, style);
+        print_explain(loaded, hashes, plan, view, style);
         print_phases(&loaded.frontend.phases, style);
     }
 
@@ -473,7 +616,12 @@ fn print_human(
     }
 
     println!();
-    print_summary(report, style);
+    print_summary(report, view.counts.host, style);
+
+    if !view.escapes.is_empty() {
+        println!();
+        print_warnings(&view.escapes, style);
+    }
 
     for failure in &report.failures {
         println!();
@@ -736,7 +884,10 @@ fn simulation_line(result: &TestResult) -> Option<String> {
     Some(parts.join(" · "))
 }
 
-fn print_summary(report: &RunReport, style: Style) {
+/// `host` is beside `cached` rather than only in the header, because the last
+/// line a person reads is where "0 cached" would otherwise look like selection
+/// working rather than a run that proved nothing it may keep.
+fn print_summary(report: &RunReport, host: usize, style: Style) {
     let failed = format!("{} failed", report.failed);
     let failed = if report.failed > 0 {
         style.red(&failed)
@@ -749,14 +900,25 @@ fn print_summary(report: &RunReport, style: Style) {
     } else {
         style.dim(&passed)
     };
+    let hosted = if host == 0 {
+        String::new()
+    } else {
+        style.dim(&format!(", {host} host-backed and not cached"))
+    };
     println!(
-        "{IND}{failed}, {passed}, {} cached ({:.2}s)",
+        "{IND}{failed}, {passed}, {} cached{hosted} ({:.2}s)",
         report.cached,
         report.duration.as_secs_f64()
     );
 }
 
-fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style) {
+fn print_explain(
+    loaded: &Loaded,
+    hashes: &HashOutput,
+    plan: &Plan,
+    view: &HostView<'_>,
+    style: Style,
+) {
     let check = &loaded.check;
     println!();
     for file in &loaded.frontend.files {
@@ -789,12 +951,9 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             .get(index)
             .map(|h| h.short())
             .unwrap_or_else(|| "-".repeat(12));
-        let isolation = plan
-            .selection
-            .isolation_of(index)
-            .unwrap_or_else(|| Isolation::of(&test.footprint));
+        let isolation = isolation_label(plan, view, check, index, &test.footprint);
         let shared = ply_test::shared_footprint(&test.footprint);
-        let atoms = if isolation.is_world() {
+        let atoms = if isolation == Isolation::World.as_str() {
             String::new()
         } else {
             format!(" {shared}")
@@ -813,7 +972,7 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
             style.dim(&hash),
             reason.as_str(),
             display_name(check, index, &test.name),
-            style.dim(&format!("isolation: {}{atoms}{engine}", isolation.as_str()))
+            style.dim(&format!("isolation: {isolation}{atoms}{engine}"))
         );
     }
 
@@ -841,16 +1000,25 @@ fn print_explain(loaded: &Loaded, hashes: &HashOutput, plan: &Plan, style: Style
     println!();
     println!("{IND}{}", style.dim("concurrency groups"));
     let parallelism = &plan.selection.parallelism;
+    let counts = &view.counts;
+    // A host-backed test is grouped by footprint conflict like any other — a
+    // host atom contends exactly as an in-memory one does — but it is never
+    // *free*, so it is named apart from the count that claims it is.
+    let hosted = if counts.host == 0 {
+        String::new()
+    } else {
+        format!(" · {} host-backed and never free", counts.host)
+    };
     println!(
         "{IND}  {}",
         style.dim(&format!(
-            "{} of {} world-isolated and free · {} {} for the {} shared {}",
-            parallelism.isolated,
-            parallelism.total,
+            "{} of {} world-isolated and free · {} {} for the {} shared {}{hosted}",
+            counts.isolated,
+            counts.total,
             parallelism.shared_groups,
             plural(parallelism.shared_groups, "group"),
-            parallelism.shared,
-            plural(parallelism.shared, "test"),
+            counts.shared,
+            plural(counts.shared, "test"),
         ))
     );
     for (g, group) in plan.selection.groups.iter().enumerate() {
@@ -931,6 +1099,27 @@ fn print_explain_search(plan: &Plan, check: &CheckOutput, style: Style) {
     }
 }
 
+/// `world`, `shared` or `host`.
+///
+/// `host` wins over both: world isolation is *inapplicable* to a computation
+/// that reaches a socket rather than merely unavailable to it, and reporting
+/// such a test as `world` is the over-claim ADR 0008 §6 exists to prevent.
+fn isolation_label(
+    plan: &Plan,
+    view: &HostView<'_>,
+    check: &CheckOutput,
+    index: usize,
+    footprint: &Footprint,
+) -> &'static str {
+    if view.reaches(check, index) {
+        return "host";
+    }
+    plan.selection
+        .isolation_of(index)
+        .unwrap_or_else(|| Isolation::of(footprint))
+        .as_str()
+}
+
 pub fn why(reason: Reason) -> &'static str {
     match reason {
         Reason::New => "this hash has never gone green, so nothing is known about it",
@@ -952,10 +1141,13 @@ fn report_json(
     args: &TestArgs,
     workers: usize,
     warnings: &[Diagnostic],
+    view: &HostView<'_>,
+    ok: bool,
 ) -> Value {
     let sources = &loaded.sources;
     let check = &loaded.check;
     let selection = &plan.selection;
+    let counts = &view.counts;
 
     let tests: Vec<Value> = plan
         .visible
@@ -975,10 +1167,11 @@ fn report_json(
                 "why": why(reason),
                 "group": selection.group_of(index),
                 "footprint": test.footprint.to_string(),
-                "isolation": selection
-                    .isolation_of(index)
-                    .unwrap_or_else(|| Isolation::of(&test.footprint))
-                    .as_str(),
+                "isolation": isolation_label(plan, view, check, index, &test.footprint),
+                // Whether this test's footprint meets the binding, and therefore
+                // whether it always runs and is never cached. False throughout a
+                // hermetic run.
+                "host": view.reaches(check, index),
                 "shared_atoms": ply_test::shared_footprint(&test.footprint)
                     .atoms()
                     .map(|a| a.to_string())
@@ -1041,8 +1234,8 @@ fn report_json(
             "rechecked": loaded.frontend.rechecked(),
             "phases": phases_json(&loaded.frontend.phases),
         }),
-        "ok": report.is_success(),
-        "exit_code": exit_code(report.is_success()),
+        "ok": ok,
+        "exit_code": exit_code(ok),
         "root": loaded.root.display().to_string(),
         "files": loaded.file_names(),
         "modules": loaded.modules().iter().map(|m| json!({
@@ -1051,6 +1244,11 @@ fn report_json(
         })).collect::<Vec<_>>(),
         "filter": args.filter,
         "no_cache": cache_bypassed(args),
+        // What this run could reach outside itself, and which trusted computing
+        // base it was reached with. A green artifact that does not say this is a
+        // green artifact whose meaning depends on a flag it did not record.
+        "binding": view.hosts.label(),
+        "hosts": view.hosts.summary_json(),
         "workers": workers,
         "options": {
             "bisect": args.bisect.as_str(),
@@ -1083,7 +1281,13 @@ fn report_json(
             "cached": selection.cached.len(),
             "filtered_out": plan.filtered_out,
             "groups": groups,
-            "isolated": selection.parallelism.isolated,
+            // Corrected for the binding: a host-backed test is counted under
+            // `host` and under neither of the other two, because it is not
+            // world-isolated and saying otherwise over-claims the number M6
+            // published. Identical to `parallelism` in a hermetic run.
+            "isolated": counts.isolated,
+            "shared": counts.shared,
+            "host": counts.host,
             "parallelism": selection.parallelism,
             "tests": tests,
         },
@@ -1095,7 +1299,9 @@ fn report_json(
         },
         "results": results,
         "failures": failures,
-        "diagnostics": Value::Array(Vec::new()),
+        // Not a warning: an entry that escaped here is believed by every later
+        // run, so it fails this one.
+        "diagnostics": diagnostics_json(&view.escapes, sources),
         "warnings": warnings.iter().map(|w| diagnostic_json(w, sources)).collect::<Vec<_>>(),
     })
 }
@@ -1276,6 +1482,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             store,
             ply_eval::EngineChoice::Both,
             ply_test::Search::of(selection),
+            ply_test::Hosting::hermetic(),
         )
     }
 
@@ -1285,6 +1492,23 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         let plan = Plan::new(selected, &loaded.check, filter);
         (dir, loaded, hashes, plan)
+    }
+
+    /// The artifact as `execute` builds it: the binding is opened the same way,
+    /// so a test can never assert about a shape the real command does not
+    /// produce.
+    fn json_report(
+        loaded: &Loaded,
+        hashes: &HashOutput,
+        plan: &Plan,
+        report: &RunReport,
+        args: &TestArgs,
+        workers: usize,
+    ) -> Value {
+        let hosts = Hosts::open(&loaded.check, args.host).expect("the fixture binds");
+        let view = HostView::of(&hosts, plan, &loaded.check, report);
+        let ok = report.is_success() && view.escapes.is_empty();
+        report_json(loaded, hashes, plan, report, args, workers, &[], &view, ok)
     }
 
     fn args_for(filter: Option<&str>) -> TestArgs {
@@ -1299,6 +1523,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect: When::Auto,
             bisect_budget: 64,
             trace: When::Auto,
+            host: false,
             engine: crate::cli::EngineArg::default(),
             simulation: crate::cli::SimOptions {
                 seed: None,
@@ -1552,7 +1777,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         );
         let report = run(&loaded, &plan.selection, &mut store);
 
-        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
+        let v = json_report(&loaded, &hashes, &plan, &report, &args_for(None), 4);
 
         assert_eq!(v["command"], "test");
         assert_eq!(v["ok"], false);
@@ -1602,7 +1827,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         );
         let report = run(&loaded, &plan.selection, &mut store);
 
-        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 1, &[]);
+        let v = json_report(&loaded, &hashes, &plan, &report, &args_for(None), 1);
         assert_eq!(v["schema_version"], 3);
 
         let f = &v["failures"][0];
@@ -1665,7 +1890,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             );
             let report = run(&loaded, &plan.selection, &mut store);
             serde_json::to_string(
-                &report_json(&loaded, &hashes, &plan, &report, &args_for(None), 1, &[])["failures"],
+                &json_report(&loaded, &hashes, &plan, &report, &args_for(None), 1)["failures"],
             )
             .unwrap()
         };
@@ -1714,7 +1939,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             &loaded.check,
             None,
         );
-        let v = report_json(&loaded, &hashes, &plan, &report, &args, 1, &[]);
+        let v = json_report(&loaded, &hashes, &plan, &report, &args, 1);
         assert_eq!(v["failures"][0]["culprit"]["verdict"], "not_attempted");
         assert_eq!(v["failures"][0]["culprit"]["skipped"], "not_requested");
         assert_eq!(v["options"]["bisect"], "never");
@@ -1856,7 +2081,7 @@ test \"stuck\" {
         let report = run(&loaded, &plan.selection, &mut store);
         assert_eq!(report.failed, 2);
 
-        let v = report_json(&loaded, &hashes, &plan, &report, &args_for(None), 4, &[]);
+        let v = json_report(&loaded, &hashes, &plan, &report, &args_for(None), 4);
         let keys: Vec<&str> = v["failures"]
             .as_array()
             .unwrap()
@@ -2033,6 +2258,154 @@ test \"stuck\" {
         let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert_eq!(selected.reason(0), Some(Reason::PreviousFailure));
         assert!(selected.to_run.contains(&0));
+    }
+
+    // --- The binding's effect on what a run reports -------------------------
+
+    /// A binding over the fixture's `db.all[users]`, which is the residual atom
+    /// of the two reading tests and of neither of the others. A registration
+    /// names the effect as its declaration writes it, so `db` rather than the
+    /// program-wide `m.db`.
+    fn bound(loaded: &Loaded) -> Hosts {
+        use crate::hosts::fixture::{deterministic, named, op, registry};
+        Hosts::bind(
+            registry(vec![deterministic(op(
+                "db",
+                "all",
+                named("users"),
+                ply_eval::host::Linearity::AtMostOnce,
+                false,
+                "ply_host::postgres::read",
+            ))]),
+            &loaded.check,
+            true,
+        )
+        .expect("the fixture binds")
+    }
+
+    /// A report over exactly these results. `RunReport` has no `Default`, and
+    /// giving it one would let a real caller forget a field.
+    fn report_over(results: Vec<TestResult>) -> RunReport {
+        RunReport {
+            passed: 0,
+            failed: 0,
+            cached: 0,
+            failures: Vec::new(),
+            duration: Duration::ZERO,
+            parallelism: ply_test::Parallelism::default(),
+            results,
+            warnings: Vec::new(),
+            simulation: ply_test::SimSummary::default(),
+        }
+    }
+
+    fn index_of(loaded: &Loaded, name: &str) -> usize {
+        loaded
+            .check
+            .tests
+            .iter()
+            .position(|t| t.name == name)
+            .unwrap()
+    }
+
+    /// The claim `--explain` publishes: a test that can reach a socket is not
+    /// world-isolated, and saying `world` about it would over-claim exactly the
+    /// number M6 introduced.
+    #[test]
+    fn a_host_backed_test_is_reported_as_host_rather_than_world() {
+        let (_dir, loaded, _h, plan) = plan_for(None);
+        let hosts = bound(&loaded);
+        let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
+        let label = |name: &str| {
+            let index = index_of(&loaded, name);
+            let footprint = &loaded.check.tests[index].footprint;
+            isolation_label(&plan, &view, &loaded.check, index, footprint)
+        };
+
+        assert_eq!(label("reads orders only"), "host");
+        assert_eq!(label("reads orders only again"), "host");
+        assert_eq!(label("writes users when asked"), "shared");
+        assert_eq!(label("pure arithmetic"), "world");
+
+        assert_eq!(view.counts.total, 4);
+        assert_eq!(view.counts.host, 2);
+        assert_eq!(view.counts.isolated, 1);
+        assert_eq!(view.counts.shared, 1);
+    }
+
+    /// The same corpus with nothing bound: every label and every count is what
+    /// it was before W1, which is what makes the hermetic default free.
+    #[test]
+    fn a_hermetic_run_reports_exactly_what_it_did_before() {
+        let (_dir, loaded, _h, plan) = plan_for(None);
+        let hosts = Hosts::open(&loaded.check, false).unwrap();
+        let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
+
+        for (index, test) in loaded.check.tests.iter().enumerate() {
+            let expected = plan
+                .selection
+                .isolation_of(index)
+                .unwrap_or_else(|| Isolation::of(&test.footprint));
+            assert_eq!(
+                isolation_label(&plan, &view, &loaded.check, index, &test.footprint),
+                expected.as_str()
+            );
+        }
+        let parallelism = &plan.selection.parallelism;
+        assert_eq!(view.counts.host, 0);
+        assert_eq!(view.counts.isolated, parallelism.isolated);
+        assert_eq!(view.counts.shared, parallelism.shared);
+        assert_eq!(view.counts.total, parallelism.total);
+        assert!(view.escapes.is_empty());
+    }
+
+    /// The failure mode this milestone is built around is a green result over
+    /// unexplored space, and a cached pass earned over a real socket is exactly
+    /// that: every later hermetic run believes it, and nothing about those runs
+    /// looks wrong. So it fails the run that produced it rather than warning.
+    #[test]
+    fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
+        let (_dir, loaded, hashes, plan) = plan_for(None);
+        let hosts = bound(&loaded);
+        let index = index_of(&loaded, "reads orders only");
+
+        let recorded = |index: usize| {
+            report_over(vec![TestResult {
+                index,
+                name: loaded.check.tests[index].name.clone(),
+                hash: hashes.tests.get(index).copied(),
+                group: 0,
+                duration: Duration::from_millis(1),
+                status: Status::Passed,
+                failure: None,
+                simulation: None,
+                recorded: Some(Record::Under(vec![hashes.tests[index]])),
+            }])
+        };
+
+        let escaped = recorded(index);
+        let view = HostView::of(&hosts, &plan, &loaded.check, &escaped);
+        assert_eq!(view.escapes.len(), 1, "{:?}", view.escapes);
+        assert_eq!(view.escapes[0].code, codes::INTERNAL_ERROR);
+        assert!(view.escapes[0].message.contains("reads orders only"));
+        assert!(
+            view.escapes[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("ply cache clear"))
+        );
+
+        // A test the binding cannot reach is cached exactly as it always was:
+        // `--host` is not a `--no-cache`, and a build that made it one would
+        // teach people not to run it.
+        let ordinary = recorded(index_of(&loaded, "pure arithmetic"));
+        let view = HostView::of(&hosts, &plan, &loaded.check, &ordinary);
+        assert!(view.escapes.is_empty());
+
+        // And hermetically the check costs nothing, because nothing is reachable.
+        let hermetic = Hosts::open(&loaded.check, false).unwrap();
+        let view = HostView::of(&hermetic, &plan, &loaded.check, &escaped);
+        assert!(view.escapes.is_empty());
     }
 
     /// Two structurally identical tests in different modules have the same

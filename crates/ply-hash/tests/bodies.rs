@@ -303,6 +303,22 @@ fn total(xs: List<Int>) -> Int = fold(xs, 0, |acc, x| acc + x)
 
 fn widen(n: Alias) -> Int = n
 
+fn verb(head: Bytes) -> Bytes = match head {
+  b"GET" -> b"GET",
+  b"\r\n\x00" -> b"",
+  _ -> bytes_slice(head, 0, bytes_len(head)),
+}
+
+fn head_text(head: Bytes) -> String =
+  if bytes_is_utf8(head) { string_of_bytes(head) } else { string_of_bytes_lossy(head) }
+
+test "a byte literal survives the body encoding" {
+  assert_eq(verb(b"GET"), b"GET");
+  assert_eq(verb(b"\r\n\x00"), b"");
+  assert_eq(head_text(bytes_of_string("é")), "é");
+  assert_eq(string_len(head_text(b"\xff")), 1)
+}
+
 test "handled effects are discharged" {
   with_cell[cache](0) { c ->
     handle {
@@ -356,7 +372,7 @@ fn every_item_kind_round_trips() {
             ItemKind::Fn,
         ]
     );
-    assert_eq!(rebuilt.test_keys.len(), 2);
+    assert_eq!(rebuilt.test_keys.len(), 3);
 }
 
 #[test]
