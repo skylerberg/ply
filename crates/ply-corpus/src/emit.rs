@@ -120,6 +120,21 @@ fn emit_module(corpus: &Corpus, module: &Module) -> String {
         s.push('\n');
     }
 
+    for specimen in corpus.specimens_in(module.id) {
+        s.push_str(&emit_specimen(corpus, specimen));
+        s.push('\n');
+    }
+
+    for law in corpus.laws_in(module.id) {
+        s.push_str(&emit_law(corpus, law));
+        s.push('\n');
+    }
+
+    if corpus.specimens_in(module.id).next().is_some() {
+        s.push_str(&emit_specimen_test(corpus, module));
+        s.push('\n');
+    }
+
     for test in corpus.tests.iter().filter(|t| t.module == module.id) {
         s.push_str(&emit_test(corpus, test));
         s.push('\n');
@@ -152,14 +167,36 @@ fn row(footprint: &Footprint) -> String {
     format!(" / {{{}}}", atoms.join(", "))
 }
 
+/// The largest argument a specified definition's precondition admits. Every
+/// generated body is linear in its arguments with literal coefficients under 10,
+/// and `clamp` bounds every intermediate, so an argument under this bound can
+/// never overflow `Int` however deep the call graph goes. Without it a
+/// postcondition would be checked at `i64::MAX` — which the value generator
+/// draws on every run, by design — and come back as a raised evaluation rather
+/// than as a claim.
+const ARG_BOUND: i64 = 1000;
+
+/// The `requires`/`ensures` pair a claim renders to, or nothing.
+fn clauses(def: &Def) -> String {
+    if def.claim.is_none() {
+        return String::new();
+    }
+    let mut domain = format!("x > 0 && x < {ARG_BOUND}");
+    if def.arity >= 2 {
+        domain.push_str(&format!(" && y > 0 && y < {ARG_BOUND}"));
+    }
+    format!("\n  requires {domain}\n  ensures result < {CLAMP} && result > -{CLAMP}")
+}
+
 pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
     let mut s = String::with_capacity(256);
     let visibility = if def.public { "pub " } else { "" };
     let head = format!(
-        "{visibility}fn {}({}) -> Int{}",
+        "{visibility}fn {}({}) -> Int{}{}",
         def.name,
         params(def.arity),
-        row(&def.footprint)
+        row(&def.footprint),
+        clauses(def)
     );
 
     let here = def.module;
@@ -197,7 +234,7 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
                 module.ctor_idle
             );
             if def.extras.is_empty() {
-                let _ = writeln!(s, "{head} =");
+                let _ = writeln!(s, "{}", assign(&head));
                 let _ = writeln!(s, "{}", indent(&arms, 2));
             } else {
                 let _ = writeln!(s, "{head} {{");
@@ -207,7 +244,7 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
             }
         }
         other => {
-            let _ = writeln!(s, "{head} =");
+            let _ = writeln!(s, "{}", assign(&head));
             let _ = writeln!(
                 s,
                 "  {}",
@@ -216,6 +253,16 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
         }
     }
     s
+}
+
+/// A spec clause ends a line, so the `=` that starts the body goes on the next
+/// one rather than trailing an `ensures`.
+fn assign(head: &str) -> String {
+    if head.contains('\n') {
+        format!("{head}\n=")
+    } else {
+        format!("{head} =")
+    }
 }
 
 fn combine(corpus: &Corpus, def: &Def, core: &str) -> String {
@@ -383,6 +430,77 @@ fn emit_test(corpus: &Corpus, test: &Test) -> String {
         "{keyword} \"{}\" {{\n{}\n}}\n",
         escape(&test.label),
         indent(&inner, 2)
+    )
+}
+
+/// A definition written for its obligation. Every one is pure, so nothing here
+/// can be a gap, and every one is small, so a reader can check by eye what the
+/// generator claims about the tier it should land at.
+fn emit_specimen(corpus: &Corpus, specimen: &Specimen) -> String {
+    let module = &corpus.modules[specimen.module];
+    match specimen.kind {
+        SpecimenKind::Linear { a, b } => format!(
+            "fn {}(x: Int) -> Int\n  ensures result - {b} == x * {a}\n= x * {a} + {b}\n",
+            specimen.name
+        ),
+        SpecimenKind::Status => format!(
+            "fn {}(s: {}) -> Int\n  ensures result == 1 || result == 0\n= match s {{\n    {}(_) -> 1,\n    {} -> 0,\n  }}\n",
+            specimen.name, module.status_type, module.ctor_ready, module.ctor_idle
+        ),
+        SpecimenKind::Length => format!(
+            "fn {name}(xs: List<Int>) -> Int\n  ensures result >= 0\n= match xs {{\n    [_, ..rest] -> 1 + {name}(rest),\n    _ -> 0,\n  }}\n",
+            name = specimen.name
+        ),
+    }
+}
+
+fn emit_law(corpus: &Corpus, law: &Law) -> String {
+    let body = match law.kind {
+        LawKind::Ground { a, b } => format!("{a} * 3 + {b} == {}", a * 3 + b),
+        LawKind::Finite => "(ready && paid) == !(!ready || !paid)".to_string(),
+        LawKind::Length { specimen } => {
+            format!("{}(xs) >= 0", corpus.specimens[specimen].name)
+        }
+    };
+    let binders = match law.kind {
+        LawKind::Ground { .. } => None,
+        LawKind::Finite => Some("forall (ready: Bool, paid: Bool)"),
+        LawKind::Length { .. } => Some("forall (xs: List<Int>)"),
+    };
+    let label = escape(&law.label);
+    match binders {
+        None => format!("law \"{label}\" {{\n  {body}\n}}\n"),
+        Some(binders) => {
+            format!("law \"{label}\"\n  {binders} {{\n    {body}\n  }}\n")
+        }
+    }
+}
+
+/// The specimens' own test. They carry no shape and no reference evaluation, so
+/// without this they would be the only definitions in a generated corpus that
+/// are compiled and never run — and "the corpus compiles" is not the bar this
+/// crate sets for itself.
+fn emit_specimen_test(corpus: &Corpus, module: &Module) -> String {
+    let mut body = Vec::new();
+    for specimen in corpus.specimens_in(module.id) {
+        match specimen.kind {
+            SpecimenKind::Linear { a, b } => {
+                body.push(format!("assert_eq({}(7), {})", specimen.name, 7 * a + b))
+            }
+            SpecimenKind::Status => body.push(format!(
+                "assert_eq({}({}(1)), 1);\nassert_eq({}({}), 0)",
+                specimen.name, module.ctor_ready, specimen.name, module.ctor_idle
+            )),
+            SpecimenKind::Length => body.push(format!(
+                "assert_eq({}([4, 5, 6]), 3);\nassert_eq({}([]), 0)",
+                specimen.name, specimen.name
+            )),
+        }
+    }
+    format!(
+        "test \"the specified definitions of {} return what their claims say\" {{\n{}\n}}\n",
+        module.name,
+        indent(&body.join(";\n"), 2)
     )
 }
 
@@ -560,13 +678,18 @@ fn escape(label: &str) -> String {
 /// which is the only kind of edit a benchmark can apply without invalidating
 /// the expected values baked into every test.
 pub fn wrap_body(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    let head = lines.next()?;
-    let body = lines.next()?;
-    if lines.next().is_some() || !head.ends_with('=') {
+    let lines: Vec<&str> = text.lines().collect();
+    let body = lines.last()?;
+    let head = lines.get(lines.len().checked_sub(2)?)?;
+    if !head.ends_with('=') {
         return None;
     }
-    Some(format!("{head}\n  prim::clamp({})\n", body.trim()))
+    let mut out: Vec<String> = lines[..lines.len() - 1]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+    out.push(format!("  prim::clamp({})", body.trim()));
+    Some(format!("{}\n", out.join("\n")))
 }
 
 #[cfg(test)]
@@ -797,5 +920,126 @@ mod tests {
     #[test]
     fn a_label_with_a_quote_in_it_cannot_break_out_of_the_string() {
         assert_eq!(escape(r#"a "b" \c"#), r#"a \"b\" \\c"#);
+    }
+
+    fn specified() -> Corpus {
+        generate(&CorpusSpec {
+            seed: 3,
+            modules: 4,
+            defs_per_module: 8,
+            tests: 10,
+            depth: 2,
+            spec_fraction: 0.6,
+            specimens_per_module: 3,
+            ..CorpusSpec::default()
+        })
+    }
+
+    /// One `requires` and one `ensures`, so a measurement pricing discharge per
+    /// obligation does not have to divide first. The precondition is what keeps
+    /// the postcondition checkable: without it the value generator draws
+    /// `i64::MAX`, the body overflows, and the obligation comes back as a raised
+    /// evaluation rather than as a claim.
+    #[test]
+    fn a_specified_definition_carries_exactly_one_clause_of_each_kind() {
+        let corpus = specified();
+        let mut specified_count = 0;
+        for def in &corpus.defs {
+            let text = emit_def(&corpus, def);
+            let expected = usize::from(def.claim.is_some());
+            assert_eq!(
+                text.matches("\n  requires ").count(),
+                expected,
+                "{}",
+                def.name
+            );
+            assert_eq!(
+                text.matches("\n  ensures ").count(),
+                expected,
+                "{}",
+                def.name
+            );
+            if def.claim.is_some() {
+                specified_count += 1;
+                assert!(
+                    text.contains(&format!("x > 0 && x < {ARG_BOUND}")),
+                    "{} has no bound on its argument\n{text}",
+                    def.name
+                );
+                assert_eq!(
+                    text.contains("y > 0"),
+                    def.arity >= 2,
+                    "{} bounds the wrong parameters",
+                    def.name
+                );
+            }
+        }
+        assert!(specified_count > 0);
+    }
+
+    /// The benchmark's edit sites are textual, so a clause between the header and
+    /// the body must not stop one being rewritten — otherwise raising the density
+    /// would quietly shrink the pool a hub edit is chosen from.
+    #[test]
+    fn a_clause_does_not_stop_a_one_line_body_being_rewritten() {
+        let corpus = specified();
+        let mut wrapped = 0;
+        for def in corpus.defs.iter().filter(|d| d.shape.is_one_liner()) {
+            let text = emit_def(&corpus, def);
+            let rewritten = wrap_body(&text).unwrap_or_else(|| {
+                panic!("`{}` is a one-liner but did not wrap:\n{text}", def.name)
+            });
+            assert!(rewritten.contains("prim::clamp("));
+            assert_eq!(
+                rewritten.matches("\n  ensures ").count(),
+                usize::from(def.claim.is_some()),
+                "rewriting `{}` disturbed its claim",
+                def.name
+            );
+            wrapped += 1;
+        }
+        assert!(wrapped > 0);
+    }
+
+    #[test]
+    fn a_specimen_states_its_claim_and_its_law_names_it() {
+        let corpus = specified();
+        assert!(!corpus.specimens.is_empty());
+        for specimen in &corpus.specimens {
+            let text = emit_specimen(&corpus, specimen);
+            assert_eq!(text.matches("\n  ensures ").count(), 1, "{text}");
+            assert!(
+                text.starts_with(&format!("fn {}(", specimen.name)),
+                "{text}"
+            );
+        }
+        for law in &corpus.laws {
+            let text = emit_law(&corpus, law);
+            assert!(
+                text.starts_with(&format!("law \"{}\"", law.label)),
+                "{text}"
+            );
+            if let LawKind::Length { specimen } = law.kind {
+                assert!(text.contains(&corpus.specimens[specimen].name), "{text}");
+            }
+        }
+    }
+
+    /// Specimens carry no shape and no reference evaluation, so without their own
+    /// test they would be the only generated definitions that are compiled and
+    /// never run.
+    #[test]
+    fn every_specimen_is_asserted_by_the_test_its_module_carries() {
+        let corpus = specified();
+        for module in &corpus.modules {
+            let text = emit_specimen_test(&corpus, module);
+            for specimen in corpus.specimens_in(module.id) {
+                assert!(
+                    text.contains(&format!("{}(", specimen.name)),
+                    "`{}` is never called by its module's test\n{text}",
+                    specimen.name
+                );
+            }
+        }
     }
 }

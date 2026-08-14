@@ -26,6 +26,8 @@ impl Cli {
     pub fn conflict(&self) -> Option<String> {
         match &self.command {
             Command::Test(args) => args.simulation.conflict(),
+            Command::Prove(args) => args.simulation.conflict(),
+            Command::Review(args) => args.simulation.conflict(),
             _ => None,
         }
     }
@@ -37,6 +39,11 @@ pub enum Command {
     Check(CheckArgs),
     /// Select, schedule and run the tests.
     Test(TestArgs),
+    /// Discharge every obligation and report the tier each was discharged at.
+    Prove(ProveArgs),
+    /// What changed, whether its specification changed, and whether its
+    /// obligations still hold.
+    Review(ReviewArgs),
     /// Evaluate `main`. A directory must hold exactly one.
     Run(RunArgs),
     /// Print the content hash of every definition.
@@ -284,6 +291,111 @@ pub struct TestArgs {
     /// result cache.
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
+
+    #[command(flatten)]
+    pub simulation: SimOptions,
+}
+
+/// What a run searches, and therefore what everything weaker than a proof is
+/// cached under. A proof is cached under none of it: it is a claim about every
+/// input satisfying the guard, so widening any of these cannot re-open it.
+#[derive(Args, Clone, Debug)]
+pub struct ProveOptions {
+    /// Candidate binder tuples drawn per root. Fewer than 25 *kept* can only
+    /// ever report `example`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub prove_cases: Option<u32>,
+
+    /// Generator roots. Each draws its own case set, so widening this widens
+    /// the search rather than repeating it.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub prove_roots: Option<u32>,
+
+    /// Static inference steps per obligation. A spent budget is inconclusive,
+    /// which reports `property` — never `proved` and never `refuted`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub prove_budget: Option<u32>,
+
+    /// Candidate *evaluations* a counterexample may be shrunk by — never
+    /// seconds, so two runs over one failure agree. Deliberately not part of any
+    /// cache key: it can only change a counterexample's minimality, and
+    /// failures are never cached.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub shrink_budget: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct ProveArgs {
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show where each discharge came from: the cache, a proof, or a search.
+    #[arg(long)]
+    pub explain: bool,
+
+    /// Neither read nor write the obligation cache: every obligation is
+    /// discharged again, and nothing this run establishes is remembered.
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Only consider obligations whose owner contains this substring.
+    #[arg(long, value_name = "SUBSTRING")]
+    pub filter: Option<String>,
+
+    /// Worker threads. Defaults to one per core. Every obligation is pure, so
+    /// no two contend and this changes only the wall clock.
+    #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub jobs: Option<u32>,
+
+    /// Neither read nor write the front-end cache.
+    #[arg(long)]
+    pub no_incremental: bool,
+
+    #[command(flatten)]
+    pub prove: ProveOptions,
+
+    #[command(flatten)]
+    pub simulation: SimOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewArgs {
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Report only what moved since the last accepted review. This is the
+    /// default; naming it is how a script says what it meant.
+    #[arg(long)]
+    pub changed: bool,
+
+    /// Record the current definitions and specifications as reviewed. Written
+    /// per definition, keyed by name, so that renaming one loses its baseline
+    /// and reports it as unreviewed rather than as unchanged.
+    #[arg(long, conflicts_with = "changed")]
+    pub accept: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Neither read nor write the obligation cache.
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Neither read nor write the front-end cache.
+    #[arg(long)]
+    pub no_incremental: bool,
+
+    #[command(flatten)]
+    pub prove: ProveOptions,
 
     #[command(flatten)]
     pub simulation: SimOptions,

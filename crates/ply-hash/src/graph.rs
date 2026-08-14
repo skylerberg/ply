@@ -10,7 +10,7 @@
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
-    EffectDef, FnDef, Ident, Item, Module, ModuleName, Program, QName, TestDef, TypeDef,
+    EffectDef, FnDef, Ident, Item, LawDef, Module, ModuleName, Program, QName, TestDef, TypeDef,
     TypeDefBody,
 };
 use ply_syntax::resolve::{Binding, Resolved};
@@ -46,11 +46,23 @@ pub struct TestNode<'a> {
     pub def: &'a TestDef,
 }
 
+/// A `law`, which is an item with a body and no name a reference could reach —
+/// so it is indexed beside the tests rather than among the definitions.
+#[derive(Clone, Debug)]
+pub struct LawNode<'a> {
+    /// `<module>.<label>`, which is what keeps two identically-labelled laws in
+    /// different modules distinct.
+    pub key: Symbol,
+    pub module: usize,
+    pub def: &'a LawDef,
+}
+
 /// One entry of the output order: modules in load order, items in source order.
 #[derive(Clone, Copy, Debug)]
 pub enum Entry {
     Def(NodeId),
     Test(usize),
+    Law(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +105,12 @@ pub struct ProgramIndex<'a> {
     pub modules: Vec<&'a Module>,
     pub nodes: Vec<Node<'a>>,
     pub tests: Vec<TestNode<'a>>,
+    pub laws: Vec<LawNode<'a>>,
     pub order: Vec<Entry>,
+    /// The binder an `ensures` clause introduces beside the parameters. Owned
+    /// here so the normalizer can push a reference to it onto its scope without
+    /// borrowing from itself.
+    pub result: Symbol,
     items: Vec<ModuleItems>,
     scopes: Vec<ScopeIndex>,
 }
@@ -170,6 +187,7 @@ impl<'a> ProgramIndex<'a> {
     ) -> Result<ProgramIndex<'a>, Vec<Diagnostic>> {
         let mut nodes: Vec<Node<'a>> = Vec::new();
         let mut tests: Vec<TestNode<'a>> = Vec::new();
+        let mut laws: Vec<LawNode<'a>> = Vec::new();
         let mut order: Vec<Entry> = Vec::new();
         let mut all_items: Vec<ModuleItems> = Vec::new();
         let mut diags = match resolved {
@@ -243,6 +261,17 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
+                    // A law hashes like a test: an item with a body, its own
+                    // discriminant, its binder types and guard and body
+                    // normalized together.
+                    Item::Law(d) => {
+                        order.push(Entry::Law(laws.len()));
+                        laws.push(LawNode {
+                            key: module.name.qualify(&Symbol::new(&d.name)),
+                            module: m,
+                            def: d,
+                        });
+                    }
                 }
             }
             all_items.push(items);
@@ -257,7 +286,9 @@ impl<'a> ProgramIndex<'a> {
             modules,
             nodes,
             tests,
+            laws,
             order,
+            result: Symbol::new("result"),
             items: all_items,
             scopes,
         })

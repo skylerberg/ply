@@ -377,7 +377,13 @@ impl Parser {
             TokenKind::Kw(
                 Kw::Import | Kw::Pub | Kw::Fn | Kw::Type | Kw::Effect | Kw::Nondet | Kw::Test
             )
-        )
+        ) || self.at_law_start()
+    }
+
+    /// `law` is contextual: it opens an item only when a quoted label follows,
+    /// so `fn law(..)` and a local named `law` keep their meaning.
+    fn at_law_start(&self) -> bool {
+        self.at_ident_text("law") && matches!(self.kind_at(1), TokenKind::Str(_))
     }
 
     fn recover_to_item(&mut self) {
@@ -457,9 +463,18 @@ impl Parser {
                 }
                 self.test_def().map(|d| Item::Test(Box::new(d)))
             }
-            _ => {
-                Err(self.error_here("an item: `fn`, `type`, `effect`, `nondet effect`, or `test`"))
+            _ if self.at_law_start() => {
+                if let Some(span) = pub_span {
+                    self.push(
+                        Diagnostic::error(codes::UNEXPECTED_TOKEN, "a `law` cannot be `pub`")
+                            .primary(span, "remove `pub`")
+                            .note("a law has no name another module could reference"),
+                    );
+                }
+                self.law_def().map(|d| Item::Law(Box::new(d)))
             }
+            _ => Err(self
+                .error_here("an item: `fn`, `type`, `effect`, `nondet effect`, `test`, or `law`")),
         }
     }
 
@@ -487,6 +502,8 @@ impl Parser {
             None
         };
 
+        let spec = self.spec_clauses()?;
+
         let body = if self.eat(&TokenKind::Eq) {
             self.expr()?
         } else if self.at(&TokenKind::LBrace) {
@@ -503,9 +520,91 @@ impl Parser {
             params,
             ret,
             effects,
+            spec,
             body,
             span,
         })
+    }
+
+    /// `requires` and `ensures` are contextual, recognized only between a `fn`
+    /// header and its body — where the grammar previously admitted nothing but
+    /// `=` and `{`, so no ordinary name loses its meaning.
+    fn spec_clauses(&mut self) -> PResult<Vec<SpecClause>> {
+        let mut out = Vec::new();
+        loop {
+            let kind = if self.at_ident_text("requires") {
+                SpecKind::Requires
+            } else if self.at_ident_text("ensures") {
+                SpecKind::Ensures
+            } else {
+                return Ok(out);
+            };
+            let start = self.advance();
+            // Parsed like an `if` condition: a `{` closes the clause and opens
+            // the function's block body, so `ensures p(x) { .. }` is a clause
+            // plus a body and never a record literal.
+            let expr = self.scrutinee()?;
+            let span = start.to(expr.span);
+            out.push(SpecClause { kind, expr, span });
+        }
+    }
+
+    fn law_def(&mut self) -> PResult<LawDef> {
+        let start = self.advance();
+        let (name, name_span) = match self.kind() {
+            TokenKind::Str(s) => {
+                let s = s.clone();
+                (s, self.advance())
+            }
+            _ => return Err(self.error_here("a quoted law label")),
+        };
+
+        let mut binders = Vec::new();
+        if self.at_ident_text("forall") {
+            self.advance();
+            let open = self.expect(&TokenKind::LParen, "`(` to start the `forall` binders")?;
+            binders = self.comma_list(&TokenKind::RParen, Self::binder)?;
+            let close = self.expect_close(&TokenKind::RParen, open, "`)` to close the binders")?;
+            if binders.is_empty() {
+                self.push(
+                    Diagnostic::error(codes::UNEXPECTED_TOKEN, "this `forall` binds nothing")
+                        .primary(open.to(close), "no binders")
+                        .note("drop the `forall`: a law with no binders is a ground claim"),
+                );
+                return Err(Bail);
+            }
+        }
+
+        let guard = if self.at_ident_text("where") {
+            self.advance();
+            Some(self.scrutinee()?)
+        } else {
+            None
+        };
+
+        let body = self.block_expr()?;
+        let span = start.to(body.span);
+        Ok(LawDef {
+            name,
+            name_span,
+            binders,
+            guard,
+            body,
+            span,
+        })
+    }
+
+    /// A binder's type is mandatory: inferring it would make a law's meaning
+    /// depend on how its body happened to be written.
+    fn binder(&mut self) -> PResult<Binder> {
+        let name = self.expect_ident("a binder name")?;
+        self.expect(
+            &TokenKind::Colon,
+            "`:` and a type — a `forall` binder must be annotated",
+        )?;
+        let ty = self.ty()?;
+        let span = name.span.to(ty.span());
+        Ok(Binder { name, ty, span })
     }
 
     fn param(&mut self) -> PResult<Param> {

@@ -738,6 +738,9 @@ impl Decoder<'_> {
             params,
             ret,
             effects,
+            // A spec is erased by normalization, so a body decoded from its hash
+            // carries none. A hybrid runs definitions, not claims about them.
+            spec: Vec::new(),
             body,
             span: Span::DUMMY,
         })

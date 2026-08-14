@@ -604,8 +604,21 @@ pub fn machine_only_clauses(program: &Program) -> Vec<Diagnostic> {
     for module in &program.modules {
         for item in &module.items {
             match item {
-                Item::Fn(d) => walk_expr(&d.body, &mut out),
+                Item::Fn(d) => {
+                    walk_expr(&d.body, &mut out);
+                    for clause in &d.spec {
+                        walk_expr(&clause.expr, &mut out);
+                    }
+                }
                 Item::Test(t) => walk_expr(&t.body, &mut out),
+                // A concurrency law's body *is* a `simulate` region, which is
+                // machine-only, so a law is exactly where this walk pays.
+                Item::Law(l) => {
+                    if let Some(guard) = &l.guard {
+                        walk_expr(guard, &mut out);
+                    }
+                    walk_expr(&l.body, &mut out);
+                }
                 Item::Type(_) | Item::Effect(_) => {}
             }
         }

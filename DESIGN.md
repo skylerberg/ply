@@ -277,11 +277,111 @@ with one flag — where wall-clock flakiness was none of those.
 
 `docs/adr/0006-deterministic-simulation.md` is the specification.
 
+## 7. Specs
+
+§1–§6 make the verification loop cheap. This section is the other half of the
+thesis: making the thing a human reads a **specification** rather than an
+implementation.
+
+A definition carries pre- and post-conditions, and a module carries standalone
+laws:
+
+```ply
+fn withdraw(acct: Account, amount: Int) -> Account
+  requires amount > 0
+  ensures result.balance == acct.balance - amount
+= ...
+
+law "credit and debit cancel"
+  forall (a: Account, n: Int) where n > 0 && n <= a.balance {
+    credited(debited(a, n), n) == a
+  }
+```
+
+**A spec expression is pure — an empty effect row.** A spec that can perform
+effects can change what it observes, and an obligation that mutates the world it
+is judging is meaningless. The one exception is a law whose body is a `simulate`
+region, whose row is `{sim.read}`; that is a claim about every interleaving and
+§6 is what discharges it.
+
+**A spec is a claim *about* a definition, not part of it.** Specs are erased by
+normalization, so writing one changes no definition hash and re-runs no test —
+the same sentence as "renaming a function re-runs no test", and true for the same
+reason. The *claim* gets its own hash, which covers the definition's, so an
+obligation invalidates when the implementation moves while the implementation
+does not invalidate when the claim moves. That asymmetry is exactly the asymmetry
+review has.
+
+### Tiers
+
+Each obligation is discharged at the strongest tier the system can **demonstrate**:
+
+| tier | what it claims |
+| --- | --- |
+| `proved` | a static argument covering **every** input satisfying the guard |
+| `property` | randomized cases, the count reported, shrinking on failure |
+| `example` | concrete cases, and no coverage claim |
+
+`proved` is a small, exactly-stated fragment — linear arithmetic over `Int`, case
+analysis over ADTs, structural equality and congruence closure, and unfolding of
+*non-recursive* definitions only. Recursion over unbounded data needs induction,
+which is not here, so `reverse(reverse(xs)) == xs` is `property` and should be.
+An inconclusive proof attempt reports `property`, never `proved`.
+
+> **A tier label is a truth claim.** Every prior milestone could produce a wrong
+> answer; only this one can produce a wrong answer wearing a certificate. When in
+> doubt, report the weaker tier.
+
+That is enforced structurally rather than by convention: there is no `tier` field
+anywhere. A tier is computed from the evidence a discharge carries, and the only
+evidence that computes to `proved` is a certificate naming the inference rules it
+used — which only the prover can construct.
+
+### Frame conditions are already inferred
+
+The classic tarpit of program verification is the frame problem: an `ensures`
+says what changed, and a caller needs to know what did not, so Dafny and Why3
+make the user write a `modifies` clause and then prove it. Ply has computed that
+set for every definition since §1 — it is the footprint, at resource granularity
+— and it is checked as an upper bound by inference rather than asserted by a
+user. So an `ensures` means *this holds of the result, and every resource outside
+the footprint's writes is unchanged*, and the second half is not an obligation at
+all. It is what the effect system has been paying for.
+
+Ply also needs no `old()`: it is a value language, so the pre-state of
+`withdraw(acct, amount)` is `acct`, still in scope and still exactly what it was.
+
+### Coverage is the honest number
+
+```
+   41 definitions · 18 carry an obligation · 23 do not
+   26 obligations · 7 proved · 16 property · 2 example · 1 unattempted
+```
+
+The count of definitions carrying no obligation is exactly the surface where
+review still costs what it costs today, so it is in the default output of `ply
+prove` and `ply review`, ahead of the results, and never behind a flag. Hiding it
+would turn an honest tool into a misleading one: a project with three proved
+obligations and four hundred unspecified definitions would print three green
+ticks and invite a reviewer to stop.
+
+`ply review --changed` is the artifact the milestone exists to produce. It
+reports, per changed definition, whether the implementation changed, whether the
+spec changed, and whether the obligations still hold — and the row that matters
+is *implementation changed, spec unchanged*, where the review is reading the
+obligations rather than the diff.
+
+**What this is not**: a general-purpose theorem prover, an SMT integration, or a
+termination checker. `requires` is a filter on the domain of the `ensures`
+clauses beside it, not a contract checked at every call site.
+
+`docs/adr/0007-specs.md` is the specification.
+
 ## Non-goals for the vertical slice
 
 Native codegen (the v0 evaluator is a tree-walking interpreter), multi-shot
 continuations, VM-level snapshot/fork, deterministic scheduling simulation, and
-spec-derived property tests are all deliberately deferred. See ROADMAP.md — each
-has a milestone, and the M0–M4 architecture is shaped so none of them requires a
-rewrite. §6 is M7 and describes what that milestone lands, not what the vertical
-slice ships.
+specs are all deliberately deferred. See ROADMAP.md — each has a milestone, and
+the M0–M4 architecture is shaped so none of them requires a rewrite. §6 is M7 and
+§7 is M8; both describe what those milestones land, not what the vertical slice
+ships.

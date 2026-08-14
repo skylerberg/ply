@@ -7,6 +7,25 @@
 // The `pub` items below are the ones `report` imports. Visibility is erased by
 // normalization, so adding or removing a `pub` changes no hash and re-runs no
 // test — it only changes what another module is allowed to name.
+//
+// The `requires` / `ensures` clauses and the `law` items are claims *about*
+// these definitions rather than parts of them, so they are erased by
+// normalization too: writing one changes no definition hash and re-runs none of
+// the tests below. What they buy is that a reviewer can read the claim instead
+// of the body. `ply prove` reports each at the strongest tier it can
+// demonstrate, and the difference between the tiers here is not stylistic:
+//
+//   `debit` and `credit` are not recursive, so a postcondition about them is
+//   decided outright — unfold, reduce the projection, close the arithmetic.
+//
+//   `balance` and `kind_of` recurse over a list. Deciding a claim about them in
+//   general needs induction, which this milestone does not have, so those land
+//   at `property` and the case count is the evidence. That is the honest label
+//   and no amount of unfolding changes it.
+//
+// A `requires` is a filter on the domain of the `ensures` clauses beside it. It
+// is documentation of a precondition, not something the compiler enforces at a
+// call site — read it that way.
 
 type Kind =
   | Asset
@@ -31,17 +50,32 @@ type Posted =
   | Accepted(List<Entry>)
   | Rejected(Int)
 
-fn debit(account: String, amount: Int) -> Posting =
-  {account: account, amount: amount}
+fn debit(account: String, amount: Int) -> Posting
+  requires amount > 0
+  ensures result.account == account
+  ensures result.amount == amount
+= {account: account, amount: amount}
 
-fn credit(account: String, amount: Int) -> Posting =
-  {account: account, amount: -amount}
+fn credit(account: String, amount: Int) -> Posting
+  requires amount > 0
+  ensures result.account == account
+  ensures result.amount == -amount
+= {account: account, amount: -amount}
 
 fn entry(date: Int, memo: String, postings: List<Posting>) -> Entry =
   {date: date, memo: memo, postings: postings}
 
-fn transfer(date: Int, memo: String, from: String, to: String, amount: Int) -> Entry =
-  entry(date, memo, [debit(to, amount), credit(from, amount)])
+// Each `ensures` is its own obligation with its own tier, which is why the two
+// about the header and the one about the postings are written apart: the first
+// two unfold `entry` and reduce to `date == date`, and the third goes through
+// `len`, which the prover has no definition for.
+fn transfer(date: Int, memo: String, from: String, to: String, amount: Int) -> Entry
+  requires amount > 0
+  requires from != to
+  ensures result.date == date
+  ensures result.memo == memo
+  ensures len(result.postings) == 2
+= entry(date, memo, [debit(to, amount), credit(from, amount)])
 
 fn sum_postings(ps: List<Posting>) -> Int =
   match ps {
@@ -68,6 +102,9 @@ fn post(ledger: List<Entry>, e: Entry) -> Posted =
     Off(off) -> Rejected(off),
   }
 
+fn mentions(ps: List<Posting>, account: String) -> Bool =
+  len(filter(ps, |p: Posting| p.account == account)) > 0
+
 fn account_total(ps: List<Posting>, account: String) -> Int =
   fold(ps, 0, |acc, p: Posting| if p.account == account { acc + p.amount } else { acc })
 
@@ -80,16 +117,27 @@ fn balance(ledger: List<Entry>, account: String) -> Int =
 fn trial_balance(ledger: List<Entry>) -> Int =
   fold(ledger, 0, |acc, e: Entry| acc + sum_postings(e.postings))
 
-fn kind_of(chart: List<Account>, code: String) -> Option<Kind> =
-  match chart {
+// `kind_of` recurses over the chart, so this postcondition is sampled rather
+// than decided: the prover never unfolds a recursive definition, because
+// stopping the unfolding at a general statement is what induction is for and
+// there is none here. Two hundred drawn charts is the evidence, and the report
+// says so.
+fn kind_of(chart: List<Account>, code: String) -> Option<Kind>
+  ensures (result == None) == (len(filter(chart, |a: Account| a.code == code)) == 0)
+= match chart {
     [a, ..rest] -> if a.code == code { Some(a.kind) } else { kind_of(rest, code) },
     _ -> None,
   }
 
 // Debits raise an asset or an expense and lower everything else, so a
 // presented figure is the raw balance times the account's normal sign.
-fn normal_sign(kind: Kind) -> Int =
-  match kind {
+//
+// `Kind` is a sum of five nullary constructors, so this is settled by splitting
+// on the constructor and evaluating five literals — a decision over the whole
+// domain rather than a sample of it.
+fn normal_sign(kind: Kind) -> Int
+  ensures result == 1 || result == -1
+= match kind {
     Asset -> 1,
     Expense -> 1,
     Liability -> -1,
@@ -97,6 +145,12 @@ fn normal_sign(kind: Kind) -> Int =
     Revenue -> -1,
   }
 
+// No postcondition, and the reason is worth naming rather than hiding: checking
+// one means calling `presented` over drawn journals, `Int` is `i64`, and the
+// generator draws `i64::MAX` on every run — so summing two drawn amounts raises
+// and the obligation would come back as a gap rather than as a claim. Laws over
+// journals this module *builds* are checkable; laws over journals a generator
+// hands it are not, until `Int` has a bounded semantics.
 pub fn presented(chart: List<Account>, ledger: List<Entry>, code: String) -> Option<Int> =
   match kind_of(chart, code) {
     Some(kind) -> Some(normal_sign(kind) * balance(ledger, code)),
@@ -139,6 +193,61 @@ pub fn journal() -> List<Entry> = [
   ]),
   transfer(20260125, "invoice #1 paid", "receivable", "cash", 90000),
 ]
+
+// The rules of the book, as claims rather than as examples of themselves. Each
+// one is keyed `ledger.<label>`, cannot be referenced, and is erased from every
+// definition hash — so the whole block below can be rewritten without selecting
+// a single test.
+
+// `debit` and `credit` are not in a recursive component, so both are unfolded,
+// the projections reduce over the record literals they were built from, and what
+// is left is `n + (-n) == 0` in linear arithmetic. The guard is not needed for
+// that — it is here because a law should speak about the domain the definitions
+// it names document, and both of them `requires amount > 0`.
+law "a debit and a credit of one amount cancel"
+  forall (account: String, amount: Int) where amount > 0 {
+    debit(account, amount).amount + credit(account, amount).amount == 0
+  }
+
+// The accounting rule itself, settled by splitting on `Kind`'s five
+// constructors. The split is over the constructor set rather than over the value
+// space, which is why it is exhaustive and why it terminates.
+law "an asset and an expense present as they are posted, and nothing else does"
+  forall (kind: Kind) {
+    (normal_sign(kind) == 1) == (kind == Asset || kind == Expense)
+  }
+
+// The general form of the test "an account nobody posted to is flat". `balance`
+// recurses over the journal, so this is checked at drawn journals and reported
+// as `property` with the count — not proved, and not pretending to be.
+law "an account no entry mentions has a flat balance"
+  forall (ledger: List<Entry>, account: String)
+  where len(filter(ledger, |e: Entry| mentions(e.postings, account))) == 0 {
+    balance(ledger, account) == 0
+  }
+
+// The invariant the whole design exists for, over an arbitrary run of transfers
+// rather than over the four in `journal()`.
+law "no run of transfers can unbalance a journal"
+  forall (amounts: List<Int>)
+  where len(filter(amounts, |n: Int| n <= 0)) == 0 {
+    trial_balance(map(amounts, |n: Int|
+      transfer(20260101, "recorded", "cash", "capital", n))) == 0
+  }
+
+// `post`'s comment says an entry that does not balance never lands. This is that
+// sentence, checkable.
+law "an entry that does not balance never lands"
+  forall (date: Int, memo: String, account: String, amount: Int) where amount > 0 {
+    post([], entry(date, memo, [debit(account, amount)])) == Rejected(amount)
+  }
+
+law "a balanced entry lands, and the ledger grows by exactly that entry"
+  forall (date: Int, memo: String, from: String, to: String, amount: Int)
+  where amount > 0 && from != to {
+    post(journal(), transfer(date, memo, from, to, amount))
+      == Accepted(push(journal(), transfer(date, memo, from, to, amount)))
+  }
 
 test "a transfer moves one amount between two accounts" {
   let e = transfer(20260104, "seed capital", "capital", "cash", 500000);

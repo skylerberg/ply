@@ -4,7 +4,10 @@ use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
 use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use crate::unify::{Fresh, Subst, UnifyError, unify, unify_row};
-use crate::{CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, ModuleInfo, OpInfo, TestInfo};
+use crate::{
+    CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, LawBinder, LawInfo, ModuleInfo, OpInfo,
+    SpecInfo, TestInfo,
+};
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
 use ply_syntax::ast::*;
@@ -15,6 +18,11 @@ use std::collections::BTreeSet;
 /// The effect under which `with_cell` regions publish their atoms. Reserved:
 /// a user `effect cell` would silently gain the power to observe region state.
 const CELL: &str = "cell";
+
+/// Bound in an `ensures` clause to the definition's return value, beside the
+/// parameters rather than inside them. Not a keyword: a definition with no
+/// `ensures` may still call a parameter `result`.
+const RESULT: &str = "result";
 
 const BUILTIN_TYPES: &[(&str, usize)] = &[
     ("Int", 0),
@@ -46,12 +54,15 @@ pub fn check_program_with(
     for &i in &resolved.order {
         c.module = i;
         c.check_fns(&program.modules[i]);
+        c.check_specs(&program.modules[i]);
     }
     // Load order, not dependency order: this position is the same index
-    // `HashOutput::tests` is built on, and that one walks the program.
+    // `HashOutput::tests` and `HashOutput::laws` are built on, and those walk
+    // the program.
     for (i, module) in program.modules.iter().enumerate() {
         c.module = i;
         c.check_tests(module);
+        c.check_laws(module);
     }
     c.check_comparisons();
     c.check_simulations();
@@ -61,6 +72,7 @@ pub fn check_program_with(
         Ok(CheckOutput {
             defs: c.defs,
             tests: c.tests,
+            laws: c.laws,
             effects: c.effects,
             ctors: c.ctors,
             modules: c.modules,
@@ -111,6 +123,7 @@ struct Checker<'a> {
     ctors: IndexMap<Symbol, CtorInfo>,
     defs: IndexMap<Symbol, DefInfo>,
     tests: Vec<TestInfo>,
+    laws: Vec<LawInfo>,
     modules: IndexMap<Symbol, ModuleInfo>,
     ty_params: FxHashMap<Symbol, Type>,
     row_params: FxHashMap<Symbol, RowVar>,
@@ -127,6 +140,72 @@ struct Checker<'a> {
     /// and the row of what it calls are both routinely unsolved while its own
     /// definition is still being walked.
     simulations: Vec<Simulation>,
+    /// What each definition carrying clauses has its clauses typed against.
+    /// Recorded where the signature is built rather than rebuilt in
+    /// [`Checker::check_specs`], so that a clause cannot report a second copy of
+    /// a signature error the body already reported.
+    spec_envs: FxHashMap<Symbol, SpecEnv>,
+    /// The clause being walked, so `result` outside an `ensures` can say where
+    /// it is bound instead.
+    spec_kind: Option<SpecKind>,
+}
+
+/// Where a spec expression sits, which decides both how it is named in a
+/// diagnostic and — the part that matters — what its row may carry.
+#[derive(Clone, Copy)]
+enum SpecSite {
+    Requires,
+    Ensures,
+    Where,
+    LawBody,
+}
+
+impl SpecSite {
+    fn of(kind: SpecKind) -> SpecSite {
+        match kind {
+            SpecKind::Requires => SpecSite::Requires,
+            SpecKind::Ensures => SpecSite::Ensures,
+        }
+    }
+
+    /// Only a law body has an exception, and it is exactly `{sim.read}`. A
+    /// pre/post condition is a claim about one call, not about a search, and
+    /// there is no seed at a call site to name; a guard decides which values the
+    /// law is a claim about, and a domain that depends on a seed is a different
+    /// domain per run.
+    fn allowed(self) -> BTreeSet<EffectAtom> {
+        match self {
+            SpecSite::LawBody => [prelude::seed_atom()].into(),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    fn phrase(self) -> &'static str {
+        match self {
+            SpecSite::Requires => "a `requires` clause",
+            SpecSite::Ensures => "an `ensures` clause",
+            SpecSite::Where => "a `where` guard",
+            SpecSite::LawBody => "a law body",
+        }
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            SpecSite::Requires => "`requires`",
+            SpecSite::Ensures => "`ensures`",
+            SpecSite::Where => "`where` guard",
+            SpecSite::LawBody => "law body",
+        }
+    }
+}
+
+/// The scope a definition's clauses see: its own parameters and result, and the
+/// generic names its annotations were written in.
+struct SpecEnv {
+    ty_params: FxHashMap<Symbol, Type>,
+    row_params: FxHashMap<Symbol, RowVar>,
+    params: Vec<Type>,
+    ret: Type,
 }
 
 /// One `simulate` region, as [`Checker::check_simulations`] revisits it.
@@ -153,6 +232,7 @@ impl<'a> Checker<'a> {
             ctors: IndexMap::new(),
             defs: IndexMap::new(),
             tests: Vec::new(),
+            laws: Vec::new(),
             modules: IndexMap::new(),
             ty_params: FxHashMap::default(),
             row_params: FxHashMap::default(),
@@ -161,6 +241,8 @@ impl<'a> Checker<'a> {
             performs: Vec::new(),
             comparisons: Vec::new(),
             simulations: Vec::new(),
+            spec_envs: FxHashMap::default(),
+            spec_kind: None,
         };
         c.install_prelude();
         c
@@ -630,7 +712,7 @@ impl<'a> Checker<'a> {
                     }
                     TypeDefBody::Alias(_) => Vec::new(),
                 },
-                Item::Effect(_) | Item::Test(_) => Vec::new(),
+                Item::Effect(_) | Item::Test(_) | Item::Law(_) => Vec::new(),
             };
             for (name, is_fn) in declared {
                 match seen.get(&name.name) {
@@ -1065,6 +1147,7 @@ impl<'a> Checker<'a> {
             }
             for (slot, &i) in comp.iter().enumerate() {
                 self.check_fn_body(fns[i], &sigs[slot]);
+                self.record_spec_env(fns[i], &names[slot], &sigs[slot]);
             }
             for sig in &sigs {
                 self.close_unreachable_row(sig);
@@ -1085,6 +1168,7 @@ impl<'a> Checker<'a> {
                         simple_name: def.name.name.clone(),
                         scheme,
                         footprint: Footprint(row.atoms),
+                        spec: Vec::new(),
                         span: def.span,
                     },
                 );
@@ -1114,8 +1198,17 @@ impl<'a> Checker<'a> {
             return false;
         }
         for (slot, &i) in comp.iter().enumerate() {
-            let entry = &self.known.defs[&names[slot]];
+            let entry = self.known.defs[&names[slot]].clone();
             let scheme = self.adopt(&entry.scheme);
+            // A spec is erased from the definition's hash, so a spec edit does
+            // not move it and gate 2 skips a definition whose clause is new.
+            // The clauses are typed anyway, against the restored interface.
+            if !fns[i].spec.is_empty() {
+                let sig = self.signature(fns[i]);
+                let published = instantiate(&scheme, &mut self.fresh);
+                let _ = unify(&mut self.subst, &mut self.fresh, &sig.fn_ty, &published);
+                self.record_spec_env(fns[i], &names[slot], &sig);
+            }
             self.env.bind_global(names[slot].clone(), scheme.clone());
             self.defs.insert(
                 names[slot].clone(),
@@ -1125,6 +1218,7 @@ impl<'a> Checker<'a> {
                     simple_name: fns[i].name.name.clone(),
                     scheme,
                     footprint: entry.footprint.clone(),
+                    spec: Vec::new(),
                     span: fns[i].span,
                 },
             );
@@ -1327,6 +1421,409 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+        }
+    }
+
+    fn record_spec_env(&mut self, def: &FnDef, name: &Symbol, sig: &Signature) {
+        if def.spec.is_empty() {
+            return;
+        }
+        self.spec_envs.insert(
+            name.clone(),
+            SpecEnv {
+                ty_params: sig.ty_params.clone(),
+                row_params: sig.row_params.clone(),
+                params: sig.params.clone(),
+                ret: sig.ret.clone(),
+            },
+        );
+    }
+
+    /// Clauses are typed after every definition in the module is published,
+    /// rather than beside the body they are attached to: a clause may name
+    /// anything the module can reach, while a body's SCC decides only what the
+    /// body itself reaches. Every module this one imports was checked earlier in
+    /// `Resolved::order`, so every name a clause can write is already bound.
+    ///
+    /// This pass runs whether or not gate 2 skipped the definition. A spec is
+    /// erased from the definition's hash, so a spec edit does not move it, and
+    /// skipping here would leave a new clause never typed.
+    fn check_specs(&mut self, module: &Module) {
+        for item in &module.items {
+            let Item::Fn(def) = item else { continue };
+            if def.spec.is_empty() {
+                continue;
+            }
+            let name = module.name.qualify(&def.name.name);
+            let Some(env) = self.spec_envs.remove(&name) else {
+                continue;
+            };
+            self.check_result_shadow(def);
+
+            let mut spec = Vec::with_capacity(def.spec.len());
+            for (index, clause) in def.spec.iter().enumerate() {
+                let footprint = self.check_clause(def, clause, &env);
+                spec.push(SpecInfo {
+                    kind: clause.kind,
+                    index,
+                    footprint,
+                    span: clause.span,
+                });
+            }
+            if let Some(info) = self.defs.get_mut(&name) {
+                info.spec = spec;
+            }
+        }
+        self.ty_params.clear();
+        self.row_params.clear();
+    }
+
+    fn check_clause(&mut self, def: &FnDef, clause: &SpecClause, env: &SpecEnv) -> Footprint {
+        self.ty_params = env.ty_params.clone();
+        self.row_params = env.row_params.clone();
+        self.performs.clear();
+
+        self.env.push();
+        for (p, t) in def.params.iter().zip(&env.params) {
+            self.env.bind(p.name.name.clone(), Scheme::mono(t.clone()));
+        }
+        if clause.kind == SpecKind::Ensures {
+            self.env
+                .bind(Symbol::new(RESULT), Scheme::mono(env.ret.clone()));
+        }
+        let outer = self.spec_kind.replace(clause.kind);
+        let (ty, row) = self.infer(&clause.expr);
+        self.spec_kind = outer;
+        self.env.pop();
+
+        self.expect(
+            clause.expr.span,
+            &Type::bool(),
+            &ty,
+            "a spec clause states a proposition",
+        );
+        let row = self.subst.resolve_row(&row);
+        self.check_spec_purity(SpecSite::of(clause.kind), clause.span, &row);
+        row.to_footprint()
+    }
+
+    /// `result` is introduced beside the parameters, so a definition that has
+    /// both is reported rather than silently resolved. Shadowing the parameter
+    /// would change what an existing postcondition means depending on a
+    /// parameter name; shadowing `result` would make the postcondition
+    /// unwritable with no diagnostic.
+    fn check_result_shadow(&mut self, def: &FnDef) {
+        let Some(ensures) = def.spec.iter().find(|c| c.kind == SpecKind::Ensures) else {
+            return;
+        };
+        for p in &def.params {
+            if p.name.name.as_str() != RESULT {
+                continue;
+            }
+            self.diags.push(
+                Diagnostic::error(
+                    codes::DUPLICATE_DEFINITION,
+                    format!("`{RESULT}` is bound twice on `{}`", def.name.name),
+                )
+                .primary(p.name.span, "this parameter is named `result`")
+                .secondary(ensures.span, "`ensures` binds `result` to the return value")
+                .note(
+                    "rename the parameter; a definition with no `ensures` may still call one \
+                     `result`",
+                ),
+            );
+        }
+    }
+
+    /// A spec expression's row must be empty. A claim that can perform an effect
+    /// can change what it observes, and an obligation that writes to the
+    /// resource it judges reports the post-state it caused.
+    ///
+    /// The one exception belongs to [`SpecSite::LawBody`], which may carry
+    /// `sim.read` — a read of an input no program can write, and the only way a
+    /// claim about every interleaving can be stated. It is structural rather
+    /// than a parameter so that a guard cannot be handed it by mistake.
+    fn check_spec_purity(&mut self, site: SpecSite, at: Span, row: &Row) {
+        let allowed = site.allowed();
+        for atom in row.atoms.difference(&allowed) {
+            let (span, direct) = match self.site_for(atom) {
+                Some(s) => (s.span, s.direct),
+                None => (at, false),
+            };
+            let performs = if direct { "performs" } else { "reaches" };
+            let mut d = Diagnostic::error(
+                codes::EFFECT_IN_SPEC,
+                format!("{} cannot perform an effect", site.phrase()),
+            )
+            .primary(span, format!("{performs} `{atom}`"))
+            .secondary(at, format!("this {} must be pure", site.short()))
+            .note(
+                "a claim that can perform an effect can change what it observes: an obligation \
+                 that writes to the resource it judges reports the post-state it caused",
+            )
+            .note("and a discharge evaluates it hundreds of times, against a world nothing set up");
+            for atom in &allowed {
+                d = d.note(format!(
+                    "a law body may carry `{atom}` — the seed a `simulate` region reads — and \
+                     nothing else"
+                ));
+            }
+            self.diags.push(d.note(format!(
+                "compute this with a pure function, or handle `{}` inside the definition and \
+                 state a claim about its result",
+                atom.effect
+            )));
+        }
+
+        if row.tail.is_some() {
+            let mut printer = Printer::new();
+            let shown = printer.row(row);
+            self.diags.push(
+                Diagnostic::error(
+                    codes::EFFECT_IN_SPEC,
+                    format!("the row of this {} is not known to be empty", site.short()),
+                )
+                .primary(at, format!("has row {shown}"))
+                .note(
+                    "an effect variable is pure for some instantiations and not for others, and a \
+                     claim has to hold for every one",
+                )
+                .note("call something whose row is closed and empty here"),
+            );
+        }
+    }
+
+    fn check_laws(&mut self, module: &Module) {
+        let mut labels: FxHashMap<&str, Span> = FxHashMap::default();
+        for item in &module.items {
+            let Item::Law(def) = item else { continue };
+            if let Some(&first) = labels.get(def.name.as_str()) {
+                self.diags.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_DEFINITION,
+                        format!("two laws are labelled {:?}", def.name),
+                    )
+                    .primary(def.name_span, "relabelled here")
+                    .secondary(first, "first labelled here")
+                    .note("a law is keyed `<module>.<label>`, so one label names one claim"),
+                );
+                continue;
+            }
+            labels.insert(def.name.as_str(), def.name_span);
+            self.check_law(module, def);
+        }
+    }
+
+    fn check_law(&mut self, module: &Module, def: &LawDef) {
+        self.ty_params.clear();
+        self.row_params.clear();
+        self.performs.clear();
+
+        // A binder's type may name a type variable, which is quantified over the
+        // law: the prover reads one as an uninterpreted sort, so a proof over it
+        // holds for every instantiation.
+        self.auto_ty_params = true;
+        let types: Vec<Type> = def.binders.iter().map(|b| self.law_binder(b)).collect();
+        self.auto_ty_params = false;
+        let sorts: Vec<TyVar> = self
+            .ty_params
+            .values()
+            .filter_map(|t| match t {
+                Type::Var(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        for v in sorts {
+            self.subst.mark_rigid_ty(v);
+        }
+
+        self.env.push();
+        for (b, t) in def.binders.iter().zip(&types) {
+            self.env.bind(b.name.name.clone(), Scheme::mono(t.clone()));
+        }
+
+        if let Some(guard) = &def.guard {
+            self.performs.clear();
+            let (ty, row) = self.infer(guard);
+            self.expect(
+                guard.span,
+                &Type::bool(),
+                &ty,
+                "a `where` guard states a proposition",
+            );
+            // Exactly pure, unlike the body: the guard decides which values the
+            // law is a claim about, and a domain that depends on a seed is a
+            // different domain per run.
+            let row = self.subst.resolve_row(&row);
+            self.check_spec_purity(SpecSite::Where, guard.span, &row);
+        }
+
+        self.performs.clear();
+        let (ty, row) = self.infer(&def.body);
+        self.expect(
+            def.body.span,
+            &Type::bool(),
+            &ty,
+            "a law states a proposition",
+        );
+        let row = self.subst.resolve_row(&row);
+        self.check_spec_purity(SpecSite::LawBody, def.body.span, &row);
+        self.env.pop();
+
+        let binders: Vec<LawBinder> = def
+            .binders
+            .iter()
+            .zip(&types)
+            .map(|(b, t)| LawBinder {
+                name: b.name.name.clone(),
+                ty: self.subst.resolve_ty(t),
+                span: b.span,
+            })
+            .collect();
+        self.laws.push(LawInfo {
+            name: def.name.clone(),
+            module: module.name.clone(),
+            key: module.name.qualify(&Symbol::new(&def.name)),
+            index: self.laws.len(),
+            binders,
+            has_guard: def.guard.is_some(),
+            footprint: row.to_footprint(),
+            span: def.span,
+        });
+        self.ty_params.clear();
+        self.row_params.clear();
+    }
+
+    /// A binder's type has to be one the generator can inhabit, or the law is a
+    /// claim nobody can ever check. Refused where it is written rather than
+    /// reported as a gap when it is discharged, because that is where the author
+    /// can still do something about it.
+    fn law_binder(&mut self, binder: &Binder) -> Type {
+        if let Some(span) = self.handler_mention(&binder.ty) {
+            self.handler_quantification(span);
+            return self.fresh.ty();
+        }
+        if let Some(reason) = written_row_reason(&binder.ty) {
+            self.unquantifiable(binder, reason);
+            return self.fresh.ty();
+        }
+        let ty = self.conv_type(&binder.ty);
+        if let Some(reason) = self.ungeneratable(&ty, &mut FxHashSet::default()) {
+            self.unquantifiable(binder, reason);
+        }
+        ty
+    }
+
+    fn unquantifiable(&mut self, binder: &Binder, reason: String) {
+        self.diags.push(
+            Diagnostic::error(
+                codes::UNQUANTIFIABLE_TYPE,
+                format!("`forall` cannot quantify over `{}`", binder.name.name),
+            )
+            .primary(binder.ty.span(), reason)
+            .note(
+                "a law over a type nothing can produce is a claim nothing can ever check, so it \
+                 is refused here rather than reported as a gap at discharge time",
+            ),
+        );
+    }
+
+    /// A handler is syntax rather than a value, so there is nothing for a binder
+    /// to range over. Recognised by the name it would have to be written under,
+    /// because the type it needs does not exist and the errors that absence
+    /// produces — an unknown type, or a stray type variable — say nothing about
+    /// why.
+    fn handler_mention(&self, te: &TypeExpr) -> Option<Span> {
+        let named = |name: &Symbol, span: Span| -> Option<Span> {
+            let handler = matches!(name.as_str(), "Handler" | "handler");
+            (handler && self.scope().get(Namespace::Type, name).is_none()).then_some(span)
+        };
+        match te {
+            TypeExpr::Unit { .. } => None,
+            TypeExpr::Var(id) => named(&id.name, id.span),
+            TypeExpr::Con { name, args, span } => name
+                .is_bare()
+                .then(|| named(name.symbol(), *span))
+                .flatten()
+                .or_else(|| args.iter().find_map(|a| self.handler_mention(a))),
+            TypeExpr::Fn { params, ret, .. } => params
+                .iter()
+                .chain([ret.as_ref()])
+                .find_map(|t| self.handler_mention(t)),
+            TypeExpr::Record { fields, .. } => {
+                fields.iter().find_map(|(_, t)| self.handler_mention(t))
+            }
+        }
+    }
+
+    fn handler_quantification(&mut self, span: Span) {
+        self.diags.push(
+            Diagnostic::error(
+                codes::UNQUANTIFIABLE_TYPE,
+                "`forall` cannot quantify over a handler",
+            )
+            .primary(span, "a handler is syntax, not a value")
+            .note(
+                "`handle body with { .. }` is an expression form: there is no type a handler \
+                 inhabits and no value for a binder to range over",
+            )
+            .note(
+                "docs/adr/0007-specs.md §3.2 records what a handler-parametric law would take — \
+                 a handler type, a `Value::Handler`, a normalization story and a generator — and \
+                 why the evidence such a law could produce is too weak to be worth it yet",
+            )
+            .note("quantify over the values the handler would answer with instead"),
+        );
+    }
+
+    /// Whether the generator can inhabit this type. Walks a user type's declared
+    /// fields as well as its arguments, so a record holding a `Cell` is refused
+    /// with the same message the `Cell` itself would get.
+    fn ungeneratable(&self, ty: &Type, seen: &mut FxHashSet<Symbol>) -> Option<String> {
+        match ty {
+            Type::Var(_) => None,
+            Type::Con(name, args) => {
+                if name.as_str() == "Cell" {
+                    return Some(
+                        "a `Cell` is created by `with_cell` and exists only inside its region"
+                            .to_string(),
+                    );
+                }
+                if name.as_str() == prelude::TASK_TYPE {
+                    return Some(
+                        "a `Task` is a key into the scheduler of the `simulate` region that \
+                         spawned it"
+                            .to_string(),
+                    );
+                }
+                if let Some(reason) = args.iter().find_map(|a| self.ungeneratable(a, seen)) {
+                    return Some(reason);
+                }
+                if !seen.insert(name.clone()) {
+                    return None;
+                }
+                self.ctors
+                    .values()
+                    .filter(|c| &c.type_name == name)
+                    .flat_map(|c| &c.fields)
+                    .find_map(|f| self.ungeneratable(f, seen))
+            }
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
+                if !effects.is_pure() {
+                    return Some(format!(
+                        "a function with row {effects} cannot be applied inside a pure body"
+                    ));
+                }
+                params
+                    .iter()
+                    .chain([ret.as_ref()])
+                    .find_map(|t| self.ungeneratable(t, seen))
+            }
+            Type::Record(fields) => fields.values().find_map(|f| self.ungeneratable(f, seen)),
         }
     }
 
@@ -2695,6 +3192,15 @@ impl<'a> Checker<'a> {
             format!("unknown name `{}`", q.symbol()),
         )
         .primary(q.span, "not found in this scope");
+        if q.is_bare()
+            && q.symbol().as_str() == RESULT
+            && self.spec_kind == Some(SpecKind::Requires)
+        {
+            d = d.note(
+                "`result` is bound only in an `ensures`: a precondition that could name the \
+                 result would be a claim about a value the call has not produced yet",
+            );
+        }
         if let Some(near) = self.nearest_name(q.symbol()) {
             d = d.note(format!("a name in scope looks similar: `{near}`"));
         }
@@ -2748,6 +3254,43 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Bool(_) => Type::bool(),
         Lit::Str(_) => Type::string(),
         Lit::Unit => Type::unit(),
+    }
+}
+
+/// A written effect row inside a `forall` binder's type, which the row
+/// conversion would otherwise report as an unbound row variable — a message
+/// about the generic list of a definition that is not there.
+fn written_row_reason(te: &TypeExpr) -> Option<String> {
+    match te {
+        TypeExpr::Var(_) | TypeExpr::Unit { .. } => None,
+        TypeExpr::Con { args, .. } => args.iter().find_map(written_row_reason),
+        TypeExpr::Record { fields, .. } => fields.iter().find_map(|(_, t)| written_row_reason(t)),
+        TypeExpr::Fn {
+            params,
+            ret,
+            effects,
+            ..
+        } => {
+            if let Some(row) = effects {
+                if row.tail.is_some() {
+                    return Some(
+                        "an effect variable has no binder here, and a law quantifies over values \
+                         rather than over rows"
+                            .to_string(),
+                    );
+                }
+                if let Some(atom) = row.atoms.first() {
+                    return Some(format!(
+                        "applying this inside the body would perform `{}`, and a law body is pure",
+                        atom.effect
+                    ));
+                }
+            }
+            params
+                .iter()
+                .chain([ret.as_ref()])
+                .find_map(written_row_reason)
+        }
     }
 }
 

@@ -5,6 +5,7 @@ pub mod bisect;
 pub mod diagnose;
 pub mod hybrid;
 pub mod key;
+pub mod obligation;
 pub mod report;
 pub mod schedule;
 pub mod sim;

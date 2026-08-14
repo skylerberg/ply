@@ -120,10 +120,39 @@ network effect, and finding races in Rust code.
 
 ## M8 — Specs
 
-Pre/post conditions and algebraic laws attached to definitions. The system
-discharges each obligation at the strongest tier it can: static proof where
-possible, property test where not, concrete example at the edges. The spec
-becomes the reviewable artifact.
+`requires` / `ensures` on a definition and standalone `law` declarations. A spec
+expression is pure — an empty effect row — so a claim cannot disturb what it
+judges. Specs are erased by normalization, so writing one changes no definition
+hash and re-runs no test; the claim gets its own hash, which covers the
+definition's.
+
+- Each obligation is discharged at the strongest tier the system can
+  **demonstrate**: `proved` (a static argument over every input satisfying the
+  guard), `property` (randomized cases, N reported, shrinking on failure),
+  `example` (concrete cases, no coverage claim)
+- The `proved` fragment is small and exactly stated: linear arithmetic over
+  `Int`, case analysis over ADTs, structural equality and congruence closure,
+  unfolding of *non-recursive* definitions only. An inconclusive attempt reports
+  `property`, never `proved`
+- A tier is derived from the evidence rather than asserted beside it — the only
+  evidence that computes to `proved` is a certificate naming its rules
+- A concurrency law is `proved` only when M7's search was `exhaustive` **and**
+  the value domain was covered too
+- Frame conditions come from footprints; there is no `modifies` clause, because
+  the effect system has inferred and checked that set since M2
+- Value shrinking lands here — M5 shrank the definition set, M8 shrinks the input
+- Coverage — the count of definitions carrying no obligation — is in the default
+  output of `ply prove` and `ply review`, never behind a flag
+
+**Exit:** `ply prove` reports every obligation with its tier, and a wrong
+`proved` is caught by a differential audit that re-samples every proved
+obligation; `ply review --changed` reports an implementation that moved under an
+unchanged spec as a review of the obligations rather than of the diff; and
+writing a spec selects zero tests.
+
+`docs/adr/0007-specs.md`. Not in M8: an SMT integration, induction, a termination
+checker, call-site precondition checking, or specifying what a definition does to
+a resource.
 
 ## M9 — Native codegen
 

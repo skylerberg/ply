@@ -118,6 +118,10 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Item::Test(t) => tests.push(TestSlot { module: m, def: t }),
+                    // A law is not a global and not a test: `ply-prove`
+                    // evaluates its body through `eval_expr_for_test`, with
+                    // its binders bound to generated values.
+                    Item::Law(_) => {}
                 }
             }
         }

@@ -316,6 +316,9 @@ pub enum Item {
     Type(Box<TypeDef>),
     Effect(Box<EffectDef>),
     Test(Box<TestDef>),
+    /// `law "label" forall (x: T) where g { body }`. Labelled like a `test`, so
+    /// nothing can reference it and it is never `pub`.
+    Law(Box<LawDef>),
 }
 
 impl Item {
@@ -325,16 +328,18 @@ impl Item {
             Item::Type(d) => d.span,
             Item::Effect(d) => d.span,
             Item::Test(d) => d.span,
+            Item::Law(d) => d.span,
         }
     }
 
-    /// `None` for a `test`, which has no name a reference could reach.
+    /// `None` for a `test` and a `law`, which have no name a reference could
+    /// reach.
     pub fn name(&self) -> Option<&Ident> {
         match self {
             Item::Fn(d) => Some(&d.name),
             Item::Type(d) => Some(&d.name),
             Item::Effect(d) => Some(&d.name),
-            Item::Test(_) => None,
+            Item::Test(_) | Item::Law(_) => None,
         }
     }
 
@@ -343,7 +348,7 @@ impl Item {
             Item::Fn(d) => d.vis,
             Item::Type(d) => d.vis,
             Item::Effect(d) => d.vis,
-            Item::Test(_) => Visibility::Private,
+            Item::Test(_) | Item::Law(_) => Visibility::Private,
         }
     }
 }
@@ -372,6 +377,78 @@ pub struct FnDef {
     /// The `/ {...}` annotation. When present it is the published signature and
     /// inference must produce a subset of it; when absent the row is inferred.
     pub effects: Option<RowExpr>,
+    /// `requires` / `ensures`, in source order. A spec is a claim *about* this
+    /// definition rather than part of it, so it is erased by normalization:
+    /// writing one changes no definition hash and re-runs no test. The claim
+    /// gets its own hash, which covers this definition's.
+    pub spec: Vec<SpecClause>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpecKind {
+    Requires,
+    Ensures,
+}
+
+impl SpecKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpecKind::Requires => "requires",
+            SpecKind::Ensures => "ensures",
+        }
+    }
+
+    /// Distinguishes the two in a spec hash. Part of a cache key, so it is
+    /// pinned rather than derived from the variant order.
+    pub fn tag(self) -> u8 {
+        match self {
+            SpecKind::Requires => 1,
+            SpecKind::Ensures => 2,
+        }
+    }
+}
+
+/// `requires amount > 0`, `ensures result.balance == acct.balance - amount`.
+///
+/// The expression's row must be empty: a claim that can perform effects can
+/// change what it observes. `result` is bound only in an `ensures`.
+#[derive(Clone, Debug)]
+pub struct SpecClause {
+    pub kind: SpecKind,
+    pub expr: Expr,
+    pub span: Span,
+}
+
+/// A `forall` binder. Its type is mandatory — inferring it would make a law's
+/// meaning depend on how its body happened to be written — so this is not a
+/// [`Param`].
+#[derive(Clone, Debug)]
+pub struct Binder {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// ```text
+/// law "credit and debit cancel"
+///   forall (a: Account, n: Int) where n > 0 && n <= a.balance {
+///     credited(debited(a, n), n) == a
+///   }
+/// ```
+///
+/// `guard`'s row must be empty. `body`'s row must be empty too, unless it is
+/// exactly `{sim.read}`, which makes this a concurrency law discharged by
+/// exhaustive interleaving search rather than by a static argument.
+#[derive(Clone, Debug)]
+pub struct LawDef {
+    pub name: String,
+    pub name_span: Span,
+    /// Empty for a ground law, which is a claim over a domain of one point and
+    /// is therefore decided by evaluating it.
+    pub binders: Vec<Binder>,
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }

@@ -58,6 +58,8 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
         defs: Vec::new(),
         tests: Vec::new(),
         concurrent: Vec::new(),
+        specimens: Vec::new(),
+        laws: Vec::new(),
         tables,
         regions,
         shards,
@@ -74,6 +76,9 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
     }
 
     mark_public(&mut corpus);
+    attach_claims(spec, &root, &mut corpus);
+    corpus.specimens = generate_specimens(spec, &corpus);
+    corpus.laws = generate_laws(&root, &corpus);
     corpus.tests = generate_tests(spec, &root, &corpus);
     corpus.concurrent = generate_concurrent_tests(spec, &root, &corpus);
     for test in &corpus.concurrent {
@@ -220,6 +225,7 @@ fn generate_module_defs(
             footprint,
             weight,
             public: false,
+            claim: None,
         });
         own.push(id);
     }
@@ -456,6 +462,104 @@ fn mark_public(corpus: &mut Corpus) {
     }
     for (def, is_public) in corpus.defs.iter_mut().zip(exported) {
         def.public = is_public;
+    }
+}
+
+/// Attaches a claim to a share of the definitions, keyed per definition so that
+/// raising the density adds claims rather than moving the ones already there.
+///
+/// The claim is that the result stays inside `prim::clamp`'s range, which every
+/// generated body satisfies because every one of them ends in a `clamp` — so a
+/// corpus is green at any density and the density is free to be the independent
+/// variable of a measurement. A definition that performs an effect nothing hands
+/// it a handler for still gets one: an obligation that cannot be attempted is a
+/// population a measurement needs, not one it should be spared.
+fn attach_claims(spec: &CorpusSpec, root: &Rng, corpus: &mut Corpus) {
+    if spec.spec_fraction <= 0.0 {
+        return;
+    }
+    for def in &mut corpus.defs {
+        let mut rng = root.fork(0x5000_0000 + def.id as u64);
+        if !rng.chance(spec.spec_fraction) {
+            continue;
+        }
+        let intent = if def.footprint.is_empty() {
+            Intent::Sampled
+        } else {
+            Intent::Gap
+        };
+        def.claim = Some(Claim { intent });
+    }
+}
+
+/// One specimen per index, cycling the three shapes, so a density of two puts a
+/// linear and a status specimen in every module and a density of three adds the
+/// recursive one. Nothing here is drawn: a tier distribution that moved with the
+/// seed would not be a distribution a measurement could compare across runs.
+fn generate_specimens(spec: &CorpusSpec, corpus: &Corpus) -> Vec<Specimen> {
+    let mut out = Vec::new();
+    for module in &corpus.modules {
+        for index in 0..spec.specimens_per_module {
+            let id = out.len();
+            let kind = match index % 3 {
+                0 => SpecimenKind::Linear {
+                    a: 2 + ((module.id + index) % 7) as i64,
+                    b: 1 + ((id * 7) % 40) as i64,
+                },
+                1 => SpecimenKind::Status,
+                _ => SpecimenKind::Length,
+            };
+            out.push(Specimen {
+                id,
+                module: module.id,
+                name: format!("{}_{id}", specimen_verb(kind)),
+                kind,
+            });
+        }
+    }
+    out
+}
+
+fn specimen_verb(kind: SpecimenKind) -> &'static str {
+    match kind {
+        SpecimenKind::Linear { .. } => "quote",
+        SpecimenKind::Status => "grade",
+        SpecimenKind::Length => "depth",
+    }
+}
+
+/// One law per specimen. A `Length` specimen gets a law over the same recursive
+/// definition, so the pair reports the same tier from a clause and from a law;
+/// the other two get a ground claim and a four-point one, which are the two ways
+/// a decision procedure closes something without reasoning about it at all.
+fn generate_laws(root: &Rng, corpus: &Corpus) -> Vec<Law> {
+    let mut out = Vec::with_capacity(corpus.specimens.len());
+    for specimen in &corpus.specimens {
+        let mut rng = root.fork(0x6000_0000 + specimen.id as u64);
+        let kind = match specimen.kind {
+            SpecimenKind::Linear { .. } => LawKind::Ground {
+                a: rng.between(2, 40),
+                b: rng.between(1, 90),
+            },
+            SpecimenKind::Status => LawKind::Finite,
+            SpecimenKind::Length => LawKind::Length {
+                specimen: specimen.id,
+            },
+        };
+        out.push(Law {
+            module: specimen.module,
+            label: format!("{} (case {})", law_phrase(kind), specimen.id),
+            kind,
+        });
+    }
+    out
+}
+
+fn law_phrase(kind: LawKind) -> &'static str {
+    match kind {
+        LawKind::Ground { .. } => "the arithmetic closes without running anything",
+        LawKind::Finite => "either flag settles the pair",
+        LawKind::Length { .. } => "a walk down a list never comes back negative",
     }
 }
 
@@ -892,6 +996,134 @@ mod tests {
                 def.public, expected,
                 "{} has the wrong visibility",
                 def.name
+            );
+        }
+    }
+
+    fn specified(fraction: f64, specimens: usize) -> CorpusSpec {
+        CorpusSpec {
+            spec_fraction: fraction,
+            specimens_per_module: specimens,
+            ..small()
+        }
+    }
+
+    #[test]
+    fn no_obligations_are_asked_for_by_default_and_none_are_generated() {
+        let corpus = generate(&small());
+        assert!(corpus.defs.iter().all(|d| d.claim.is_none()));
+        assert!(corpus.specimens.is_empty());
+        assert!(corpus.laws.is_empty());
+        assert_eq!(corpus.obligations_by_intent(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn the_density_asked_for_is_roughly_the_density_generated() {
+        for fraction in [0.25, 0.5, 1.0] {
+            let corpus = generate(&specified(fraction, 0));
+            let share = corpus.specified_defs() as f64 / corpus.defs.len() as f64;
+            assert!(
+                (share - fraction).abs() < 0.15,
+                "asked {fraction}, got {share}"
+            );
+        }
+        assert_eq!(generate(&specified(0.0, 0)).specified_defs(), 0);
+    }
+
+    /// A claim's stream is keyed by the definition it is attached to, so raising
+    /// the density adds claims rather than moving the ones already there. Without
+    /// it, two densities would be two different specified corpora and a
+    /// measurement across them would be comparing the wrong pair.
+    #[test]
+    fn raising_the_density_only_ever_adds_claims() {
+        let thin = generate(&specified(0.3, 0));
+        let thick = generate(&specified(0.9, 0));
+        for (lean, full) in thin.defs.iter().zip(&thick.defs) {
+            assert!(
+                lean.claim.is_none() || full.claim.is_some(),
+                "`{}` lost its claim when the density rose",
+                lean.name
+            );
+        }
+        assert!(thick.specified_defs() > thin.specified_defs());
+    }
+
+    /// An obligation on an effectful definition cannot be attempted — nothing
+    /// hands `ply prove` a handler — and a corpus that spared itself that
+    /// population would be measuring a tier distribution the real one does not
+    /// have.
+    #[test]
+    fn a_claim_on_an_effectful_definition_is_built_as_a_gap() {
+        let corpus = generate(&specified(1.0, 0));
+        let mut gaps = 0;
+        for def in &corpus.defs {
+            let claim = def.claim.expect("every definition is specified at 1.0");
+            let expected = if def.footprint.is_empty() {
+                Intent::Sampled
+            } else {
+                gaps += 1;
+                Intent::Gap
+            };
+            assert_eq!(claim.intent, expected, "{}", def.name);
+        }
+        assert!(gaps > 0, "no effectful definition carried a claim");
+    }
+
+    /// The tier distribution has to span the table, and it has to do so the same
+    /// way under every seed: a distribution that moved with the seed is not one a
+    /// measurement can compare two runs against.
+    #[test]
+    fn specimens_span_the_tiers_and_do_not_move_with_the_seed() {
+        let corpus = generate(&specified(0.0, 3));
+        assert_eq!(corpus.specimens.len(), 3 * corpus.modules.len());
+        assert_eq!(corpus.laws.len(), corpus.specimens.len());
+
+        let [decided, sampled, gaps] = corpus.obligations_by_intent();
+        assert_eq!(gaps, 0, "a specimen is pure, so none of them is a gap");
+        assert!(
+            decided > 0 && sampled > 0,
+            "{decided} decided, {sampled} sampled"
+        );
+
+        let other = generate(&CorpusSpec {
+            seed: 99,
+            ..specified(0.0, 3)
+        });
+        assert_eq!(
+            other.obligations_by_intent(),
+            corpus.obligations_by_intent()
+        );
+    }
+
+    #[test]
+    fn a_law_reports_the_intent_of_its_kind_and_names_a_specimen_that_exists() {
+        let corpus = generate(&specified(0.0, 3));
+        for law in &corpus.laws {
+            match law.kind {
+                LawKind::Length { specimen } => {
+                    let named = &corpus.specimens[specimen];
+                    assert_eq!(named.module, law.module);
+                    assert!(matches!(named.kind, SpecimenKind::Length));
+                    assert_eq!(law.kind.intent(), Intent::Sampled);
+                }
+                _ => assert_eq!(law.kind.intent(), Intent::Decided),
+            }
+        }
+    }
+
+    #[test]
+    fn every_specimen_and_law_is_named_apart_from_everything_else() {
+        let corpus = generate(&specified(0.5, 4));
+        let mut names: BTreeSet<&str> = corpus.defs.iter().map(|d| d.name.as_str()).collect();
+        for specimen in &corpus.specimens {
+            assert!(names.insert(&specimen.name), "{}", specimen.name);
+        }
+        let mut labels: BTreeSet<(ModuleId, &str)> = BTreeSet::new();
+        for law in &corpus.laws {
+            assert!(
+                labels.insert((law.module, law.label.as_str())),
+                "two laws in one module share `{}`",
+                law.label
             );
         }
     }

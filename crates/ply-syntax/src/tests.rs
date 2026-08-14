@@ -987,6 +987,13 @@ fn dump_item_body(i: &Item) -> String {
             if let Some(r) = &f.effects {
                 s.push_str(&format!(" / {}", dump_row(r)));
             }
+            for clause in &f.spec {
+                s.push_str(&format!(
+                    " ({} {})",
+                    clause.kind.as_str(),
+                    dump_expr(&clause.expr)
+                ));
+            }
             format!("{s} {})", dump_expr(&f.body))
         }
         Item::Type(t) => {
@@ -1034,6 +1041,21 @@ fn dump_item_body(i: &Item) -> String {
         Item::Test(t) => {
             let head = if t.nondet { "test/nondet" } else { "test" };
             format!("({head} {:?} {})", t.name, dump_expr(&t.body))
+        }
+        Item::Law(l) => {
+            let mut s = format!("(law {:?}", l.name);
+            if !l.binders.is_empty() {
+                let bs: Vec<_> = l
+                    .binders
+                    .iter()
+                    .map(|b| format!("({} {})", b.name.name, dump_ty(&b.ty)))
+                    .collect();
+                s.push_str(&format!(" (forall {})", bs.join(" ")));
+            }
+            if let Some(g) = &l.guard {
+                s.push_str(&format!(" (where {})", dump_expr(g)));
+            }
+            format!("{s} {})", dump_expr(&l.body))
         }
     }
 }
@@ -1782,6 +1804,171 @@ fn a_dangling_double_colon_is_a_diagnostic_with_a_real_span() {
             assert!(span.end as usize <= src.len(), "span past end for {src:?}");
         }
     }
+}
+
+#[test]
+fn spec_clauses_parse_in_any_order_and_any_number() {
+    assert_eq!(
+        dump(
+            "fn withdraw(a: Account, n: Int) -> Account\n\
+               requires n > 0\n\
+               ensures result.balance == a.balance - n\n\
+               requires n <= a.balance\n\
+               ensures result.id == a.id\n\
+             = a"
+        ),
+        "(fn withdraw ((a Account) (n Int)) -> Account \
+         (requires (> n 0)) \
+         (ensures (== (field result balance) (- (field a balance) n))) \
+         (requires (<= n (field a balance))) \
+         (ensures (== (field result id) (field a id))) a)"
+    );
+}
+
+#[test]
+fn spec_clauses_precede_a_block_body_too() {
+    assert_eq!(
+        dump("fn f(n: Int) -> Int requires n > 0 { n }"),
+        "(fn f ((n Int)) -> Int (requires (> n 0)) (block n))"
+    );
+}
+
+/// The `no_brace` flag: the `{` closes the clause and opens the body.
+#[test]
+fn a_clause_is_never_followed_by_a_record_literal() {
+    assert_eq!(
+        dump("fn f(x: Int) -> Int ensures p(x) { x }"),
+        "(fn f ((x Int)) -> Int (ensures (call p x)) (block x))"
+    );
+    assert_eq!(
+        dump("fn f(x: Int) -> Int ensures p({a: x}) = x"),
+        "(fn f ((x Int)) -> Int (ensures (call p (rec (a x)))) x)"
+    );
+}
+
+#[test]
+fn a_row_annotation_still_precedes_the_clauses() {
+    assert_eq!(
+        dump("fn f() -> Bool / {db.read[users]} ensures result = true"),
+        "(fn f () -> Bool / {db.read[users]} (ensures result) true)"
+    );
+}
+
+#[test]
+fn every_spec_word_is_contextual() {
+    for src in [
+        "fn requires(x: Int) = x",
+        "fn ensures(x: Int) = x",
+        "fn law(x: Int) = x",
+        "fn forall(x: Int) = x",
+        "fn result(x: Int) = x",
+        "fn f() = { let requires = 1; let ensures = 2; let law = 3; requires + ensures + law }",
+        "fn f() = { let forall = 1; let where = 2; forall + where }",
+        "fn f(result: Int) -> Int = result",
+        "fn f(law: Int, forall: Int) -> Int = law + forall",
+    ] {
+        ok(src);
+    }
+}
+
+#[test]
+fn a_law_carries_binders_a_guard_and_a_body() {
+    assert_eq!(
+        dump(
+            "law \"credit and debit cancel\"\n\
+               forall (a: Account, n: Int) where n > 0 && n <= a.balance {\n\
+                 credited(debited(a, n), n) == a\n\
+               }"
+        ),
+        "(law \"credit and debit cancel\" (forall (a Account) (n Int)) \
+         (where (&& (> n 0) (<= n (field a balance)))) \
+         (block (== (call credited (call debited a n) n) a)))"
+    );
+}
+
+#[test]
+fn a_law_may_have_no_guard_and_no_binders() {
+    assert_eq!(
+        dump(
+            "law \"reverse is an involution\" forall (xs: List<Int>) { reverse(reverse(xs)) == xs }"
+        ),
+        "(law \"reverse is an involution\" (forall (xs List<Int>)) \
+         (block (== (call reverse (call reverse xs)) xs)))"
+    );
+    assert_eq!(
+        dump("law \"empty reverses\" { reverse(nil()) == nil() }"),
+        "(law \"empty reverses\" (block (== (call reverse (call nil)) (call nil))))"
+    );
+}
+
+#[test]
+fn a_law_binder_may_be_function_typed() {
+    assert_eq!(
+        dump(
+            "law \"map fuses\" forall (xs: List<a>, f: (a) -> b, g: (b) -> c) { map(map(xs, f), g) == map(xs, |x| g(f(x))) }"
+        ),
+        "(law \"map fuses\" (forall (xs List<a>) (f (fn (a) -> b)) (g (fn (b) -> c))) \
+         (block (== (call map (call map xs f) g) (call map xs (lam ((x _)) (call g (call f x)))))))"
+    );
+}
+
+#[test]
+fn a_law_body_may_be_a_simulate_region() {
+    assert_eq!(
+        dump("law \"conserves\" forall (n: Int) { simulate { total() == n } }"),
+        "(law \"conserves\" (forall (n Int)) (block (simulate (block (== (call total) n)))))"
+    );
+}
+
+#[test]
+fn a_law_is_only_an_item_when_a_label_follows() {
+    let m = ok("fn f() = { let law = 1; law }\nlaw \"one\" { f() == 1 }");
+    assert_eq!(m.items.len(), 2);
+    assert!(matches!(m.items[1], Item::Law(_)));
+    assert!(m.items[1].name().is_none());
+    assert!(!m.items[1].visibility().is_public());
+}
+
+#[test]
+fn a_law_cannot_be_pub() {
+    let ds = errs("pub law \"one\" { f() == 1 }");
+    assert!(
+        ds.iter().any(|d| d.message.contains("cannot be `pub`")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn a_forall_binder_without_a_type_is_a_diagnostic() {
+    let ds = errs("law \"one\" forall (x) { x == x }");
+    assert!(
+        ds.iter().any(|d| d.message.contains("must be annotated")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn an_empty_forall_is_a_diagnostic() {
+    let ds = errs("law \"one\" forall () { true }");
+    assert!(
+        ds.iter().any(|d| d.message.contains("binds nothing")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn a_law_after_a_broken_definition_still_parses() {
+    let (m, ds) = parse_recovering(
+        SRC,
+        ModuleName::anonymous(),
+        "fn f( = 1\nlaw \"one\" { true }",
+    );
+    assert!(!ds.is_empty());
+    assert!(
+        m.items.iter().any(|i| matches!(i, Item::Law(_))),
+        "{:#?}",
+        m.items.len()
+    );
 }
 
 #[test]

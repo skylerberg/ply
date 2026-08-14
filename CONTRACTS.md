@@ -2526,3 +2526,674 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 - **Simulating a user-declared `nondet` effect.** There is no way to ask the
   language to simulate `http`. A user simulates their own effect by writing a
   handler, which is what handlers are for.
+
+---
+
+## Specs
+
+`docs/adr/0007-specs.md` has the reasoning; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was written
+after them.
+
+### The rule everything else follows from
+
+> A spec is a claim *about* a definition, not part of it. An obligation is
+> discharged at the strongest tier the system can **demonstrate**, and the tier is
+> derived from the evidence rather than asserted alongside it.
+
+And the rule that overrides every convenience below:
+
+> **A tier label is a truth claim.** Reporting `proved` for something that was
+> sampled is the worst defect this project can ship. When in doubt, report the
+> weaker tier.
+
+### `ply-syntax` — landed
+
+```
+fnDef      := "pub"? "fn" IDENT generics? "(" params ")" ("->" type)? ("/" row)?
+              specClause* ("=" expr | block)
+specClause := ("requires" | "ensures") expr
+lawDef     := "law" STRING ("forall" "(" binder,* ")")? ("where" expr)? block
+binder     := IDENT ":" type
+item       := "pub"? (fnDef | typeDef | effectDef) | testDef | lawDef
+```
+
+```rust
+pub enum Item {
+    Fn(Box<FnDef>), Type(Box<TypeDef>), Effect(Box<EffectDef>),
+    Test(Box<TestDef>),
+    /// `law "label" forall (x: T) where g { body }`. Labelled like a `test`,
+    /// never `pub`, and nothing can reference it.
+    Law(Box<LawDef>),
+}
+
+pub enum SpecKind { Requires, Ensures }
+
+pub struct SpecClause { pub kind: SpecKind, pub expr: Expr, pub span: Span }
+
+/// A `forall` binder. The type is mandatory, so this is not a `Param`.
+pub struct Binder { pub name: Ident, pub ty: TypeExpr, pub span: Span }
+
+pub struct LawDef {
+    pub name: String,
+    pub name_span: Span,
+    pub binders: Vec<Binder>,
+    pub guard: Option<Expr>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+pub struct FnDef { /* … */ pub spec: Vec<SpecClause>, /* … */ }
+```
+
+`requires`, `ensures`, `law`, `forall`, `where` and `result` are all **contextual**
+— `lexer::is_ident` stays true for every one, no `Kw` variant is added, and a
+program that already uses any of them as a name is unaffected. `law` is
+unambiguous at item position because nothing else starts an item with a bare
+identifier. A clause expression and a `where` guard are parsed with the parser's
+existing `no_brace` flag set, exactly as an `if` condition is, so
+`ensures p(x) { .. }` is a clause plus a block body and never a record literal.
+
+`Item::Law` returns `None` from `Item::name()` and `Visibility::Private` from
+`Item::visibility()`, exactly as `Item::Test` does. Two laws with one label in one
+module are `DUPLICATE_DEFINITION`.
+
+### `ply-core` — landed
+
+```rust
+pub struct SpecInfo {
+    pub kind: SpecKind,
+    /// Position among the owner's clauses, in source order. Part of the key.
+    pub index: usize,
+    /// Always empty. Carried rather than assumed so an audit asserts on a value.
+    pub footprint: Footprint,
+    pub span: Span,
+}
+
+pub struct LawBinder { pub name: Symbol, pub ty: Type, pub span: Span }
+
+pub struct LawInfo {
+    pub name: String,
+    pub module: ModuleName,
+    /// `<module>.<label>`, unique program-wide, as `TestInfo::key` is.
+    pub key: Symbol,
+    pub index: usize,
+    pub binders: Vec<LawBinder>,
+    pub has_guard: bool,
+    /// `{}`, or `{sim.read}` for a concurrency law. Nothing else type-checks.
+    pub footprint: Footprint,
+    pub span: Span,
+}
+
+pub struct DefInfo { /* … */ pub spec: Vec<SpecInfo>, /* … */ }
+pub struct CheckOutput { /* … */ pub laws: Vec<LawInfo>, /* … */ }
+```
+
+The purity rule, enforced here:
+
+```
+Γ, params ⊢ e : Bool / ρ                     ρ.is_pure()   (else E0417)   requires
+Γ, params, result : T ⊢ e : Bool / ρ         ρ.is_pure()   (else E0417)   ensures
+Γ, binders ⊢ g : Bool / ρ_g                  ρ_g.is_pure() (else E0417)   where
+Γ, binders ⊢ b : Bool / ρ_b            ρ_b ⊆ {sim.read}    (else E0417)   law body
+```
+
+`Row::is_pure()` is `atoms.is_empty() && tail.is_none()`; the tail matters,
+because a row variable is not pure for every instantiation. `{sim.read}` in a law
+body is the one exception and makes it a **concurrency law**; a `simulate` in a
+`requires`, an `ensures` or a `where` is `E0417`.
+
+`result` is bound in an `ensures` clause **beside** the parameters, not inside
+them: `result` in a `requires` is `UNKNOWN_NAME` with a note, and a parameter
+named `result` on a definition carrying an `ensures` is `DUPLICATE_DEFINITION`
+pointing at both. A definition with no `ensures` may still name a parameter
+`result`, which `examples/timeout.ply` relies on.
+
+A `forall` binder's type must be quantifiable: no `Cell<_>` or `Task<_>`, no
+function type with a non-empty row, no effect-row variable. Otherwise `E0418`.
+A type variable **is** allowed: the prover treats it as an uninterpreted sort and
+the property tier monomorphises it to `Int` and says so.
+
+**Attaching a spec changes no footprint.** `DefInfo::footprint`, `E0412`,
+`Isolation` and the cross-test conflict graph are all unaffected. Required test.
+
+### `ply-hash` — landed shape, implementation outstanding
+
+Specs and laws are **erased by normalization**, so:
+
+> Adding, editing or deleting a `requires`, an `ensures` or a `law` changes zero
+> definition hashes and selects zero tests.
+
+That is a headline invariant of the same shape as "renaming a function selects
+zero tests" and it is a required test. A law is nevertheless hashed like a test —
+its own item discriminant, its binder types, guard and body normalized together —
+because it is an item with a body.
+
+```rust
+pub struct HashOutput {
+    // …
+    /// Parallel to `CheckOutput::laws`.
+    pub laws: Vec<DefHash>,
+    /// Definition program-wide name -> one hash per clause, in source order.
+    pub specs: IndexMap<Symbol, Vec<DefHash>>,
+    /// The same clauses and laws, identified as *sentences*: references by
+    /// name, and no owner hash. Read only by the review baseline.
+    pub spec_texts: IndexMap<Symbol, Vec<DefHash>>,
+    pub law_texts: Vec<DefHash>,
+}
+
+spec_hash(owner, kind, index, clause) =
+    blake3( b"ply.spec.1" ‖ owner_def_hash ‖ kind_u8 ‖ index_le_u32
+          ‖ normalize(clause) )
+
+spec_text_hash(kind, index, clause) =
+    blake3( b"ply.spec.text.1" ‖ kind_u8 ‖ index_le_u32
+          ‖ normalize_by_name(clause) )
+```
+
+`owner_def_hash` is first and is not optional: a key that omitted it would leave
+a discharged `ensures` discharged after its definition was rewritten, which is a
+cached proof of something no longer true. That is the permissive-direction
+failure and it is the one that must not ship.
+
+`kind_u8` is 1 for `requires`, 2 for `ensures`. `normalize(clause)` is the
+ordinary body encoding: the owner's parameters and `result` become de Bruijn
+levels, a free reference contributes the referent's hash, names and spans are
+erased. `BODY_ENCODING` and `FRONTEND_VERSION` bump for the law discriminant.
+
+**`spec_texts` and `law_texts` answer a different question and must not be
+confused with the keys above.** An obligation key covers `owner_def_hash`, so it
+moves whenever the implementation moves — which is exactly what re-opens a proof
+about rewritten code. That makes it useless for review, where *did the claim
+change?* has to be answerable independently of *did the implementation change?*.
+A sentence hash therefore drops the owner and writes each reference as the
+referent's **name** rather than its hash, so it moves when the sentence is
+rewritten and stays put when the definitions it mentions are re-implemented.
+Nothing is selected, cached or discharged on a sentence hash; if it were, a
+definition's identity would depend on its dependencies' names and content
+addressing would be gone. Without the distinction, §9.2's *implementation
+changed · spec unchanged* row — the cheapest review in the system — is
+unreachable, because every body edit also reads as a spec edit.
+
+### `ply-store` — landed shape, implementation outstanding
+
+```rust
+/// Bumping this re-attempts every obligation and re-runs no test.
+pub const PROVER_VERSION: &str = "0.1.0";
+
+impl Store {
+    pub fn obligation(&self, key: DefHash) -> Option<Evidence>;
+    pub fn put_obligation(&mut self, key: DefHash, evidence: &Evidence);
+    pub fn review_record(&self, def: &Symbol) -> Option<&ReviewRecord>;
+    pub fn put_review_record(&mut self, def: Symbol, record: ReviewRecord);
+}
+
+/// `specs` holds *sentence* hashes — `HashOutput::spec_texts` for this
+/// definition's own clauses, plus `law_texts` for every law naming it directly.
+pub struct ReviewRecord { pub def_hash: DefHash, pub specs: Vec<DefHash> }
+```
+
+The store persists an **`Evidence`**, not a `Discharge`, and that is deliberate:
+`Evidence` has no variant for a refutation, a vacuity or a gap, so a cache that
+held one would not type-check. `Discharge` is not `Serialize` for the same
+reason — `ply-cli` projects it into the JSON artifact, exactly as it already
+projects `ply_test::Failure`.
+
+Two new files under `.ply-cache/`, `obligations.json` and `reviews.json`, both
+**read lazily on the first question** and neither at `Store::open` — ADR 0003's
+addendum measured what folding a per-item payload into `results.json` costs, and
+the answer was three times the open budget. The namespace is keyed on
+`(PROVER_VERSION, key)`, independent of `RUNTIME_VERSION`.
+
+`SourceFingerprint` gains `specs`, so a file gate 1 skipped still contributes its
+obligations. **Spec clauses are never skipped by gate 2**: a spec is erased from
+the definition's hash, so a spec edit does not move it, so a definition restored
+from `KnownDef` still has its clauses typed against the restored `Scheme`, every
+run in which its file was parsed.
+
+### `ply-prove` — landed
+
+A new crate. Depends on `ply-span`, `ply-syntax`, `ply-core`, `ply-hash` and
+`ply-eval`; nothing depends on it but `ply-cli`. It deliberately does **not**
+depend on `ply-test`: obligations are not tests, and every obligation is pure, so
+there is no conflict graph, no colouring, and every obligation is in group 0 for
+any number of them.
+
+```rust
+pub enum Tier { Example, Property, Proved }          // Ord: Example < Proved
+
+pub const MIN_PROPERTY_CASES: u32 = 25;
+pub const UNFOLD_DEPTH: u32 = 3;
+pub const ENUMERATION_BOUND: u64 = 4096;
+pub const GEN_DEPTH: u32 = 4;
+
+pub enum Rule {
+    GroundEvaluation,
+    ExhaustiveEnumeration { domain: Symbol, points: u64 },
+    LinearArithmetic,
+    Propositional,
+    CaseSplit { ty: Symbol, arms: u32 },
+    Congruence,
+    Injectivity,
+    Unfold { def: Symbol, depth: u32 },
+    /// The one certificate rule that comes from execution.
+    ExhaustiveInterleaving { interleavings: u32 },
+}
+
+pub struct Certificate {
+    pub rules: Vec<Rule>,
+    pub steps: u32,
+    /// A proof over an empty domain is not a proof. Always true on a `Held`.
+    pub guard_satisfiable: bool,
+    /// Type variables the proof left uninterpreted, so the claim is polymorphic.
+    pub sorts: Vec<Symbol>,
+}
+
+pub struct CaseReport {
+    pub generated: u32,
+    pub kept: u32,
+    pub rejected: u32,
+    pub roots: Vec<u64>,
+    /// Type variables monomorphised for generation, e.g. `a := Int`.
+    pub instantiations: Vec<(Symbol, Type)>,
+}
+
+pub enum Evidence { Proof(Certificate), Cases(CaseReport) }
+
+pub enum Discharge {
+    Held(Evidence),
+    Refuted(Counterexample),
+    Vacuous(Vacuity),
+    Unattempted(Gap),
+}
+```
+
+**There is no `tier` field anywhere.** `Evidence::tier()` computes it:
+
+```rust
+Evidence::Proof(_)                              => Tier::Proved
+Evidence::Cases(c) if c.kept >= MIN_PROPERTY_CASES => Tier::Property
+Evidence::Cases(_)                              => Tier::Example
+```
+
+so a component that wants to report `proved` must hand over a `Certificate`,
+which only the prover can construct and which names the rules it used. `Rule` is a
+closed enum, so a prover that grows a rule nobody sanctioned stops compiling
+before it fails an audit. This is the structural form of the overriding rule; it
+is not a convention and must not be softened into one.
+
+```rust
+pub enum Frame {
+    /// The footprint is empty: the result is a function of the arguments.
+    Pure,
+    /// Every resource outside this set is unchanged. Inferred, never written.
+    Writes(BTreeSet<(Symbol, Resource)>),
+}
+pub fn frame_of(footprint: &Footprint) -> Frame;
+
+pub struct Obligation {
+    pub key: DefHash,
+    /// `<module>.<def>` for a clause, `<module>.<label>` for a law.
+    pub owner: Symbol,
+    pub kind: ObligationKind,
+    pub span: Span,
+    pub frame: Frame,
+    pub binders: Vec<LawBinder>,
+    pub guarded: bool,
+    /// `{}` or `{sim.read}`.
+    pub footprint: Footprint,
+}
+pub enum ObligationKind { Ensures { index: usize }, Law }
+
+pub struct Counterexample {
+    pub bindings: Vec<Binding>,      // shrunk
+    pub original: Vec<Binding>,      // as generated
+    pub shrinks: u32,
+    pub root: u64,
+    pub case: u32,
+    pub race: Option<Race>,
+    pub sim_seed: Option<Seed>,
+}
+pub struct Binding { pub name: Symbol, pub ty: Type, pub rendered: String }
+
+pub struct Vacuity { pub guard: Span, pub kind: VacuityKind }
+pub enum VacuityKind { ProvedUnsatisfiable, NoCaseKept { generated: u32 } }
+
+pub enum Gap {
+    UnhandledEffect(Footprint),
+    Ungeneratable { param: Symbol, ty: Type },
+    Raised { bindings: Vec<Binding>, diagnostic: Diagnostic },
+    /// A full case budget kept nothing and the guard **does** admit a value, one
+    /// of which is carried. Added after an audit found `E0420` being reported —
+    /// as an error, failing the run — for guards that admit values a sampled run
+    /// merely never drew.
+    GuardNotSampled { generated: u32, witness: Vec<Binding> },
+}
+
+pub struct Coverage {
+    pub definitions: usize,
+    /// Carries an `ensures` that holds, or is named **directly** by a law that
+    /// holds. `requires` alone does not cover; a refuted, vacuous or
+    /// unattempted obligation covers nothing; reachability is not coverage.
+    pub covered: usize,
+    /// Program-wide names, sorted. The exact surface where review still costs
+    /// what it costs today.
+    pub uncovered: Vec<Symbol>,
+    pub by_tier: BTreeMap<Tier, usize>,
+}
+
+pub struct ProvePlan {
+    pub cases: u32,          // default 200
+    pub roots: Vec<u64>,     // ascending, deduplicated
+    pub prove_budget: u32,   // static inference steps per obligation, default 10_000
+    pub shrink_budget: u32,  // candidate evaluations, default 500 — NOT in the digest
+    pub sim: ply_eval::Plan, // for a concurrency law
+}
+impl ProvePlan { pub fn digest(&self) -> [u8; 32]; }
+
+pub fn prove_key(key: DefHash, plan: &ProvePlan) -> DefHash;
+pub fn result_key(key: DefHash, tier: Option<Tier>, plan: &ProvePlan) -> DefHash;
+```
+
+### What qualifies for `proved` — implement exactly this
+
+An obligation is `proved` iff a decision procedure over this fragment, and
+nothing outside it, answers **valid** for `guard ⟹ body` with every binder a
+fresh symbolic constant.
+
+1. **Linear integer arithmetic.** `+`, `-`, unary `-`, multiplication where at
+   least one factor is an integer **literal**, and the six comparisons. `x * y`
+   with both symbolic, `/` and `%` are **not** arithmetic — they are
+   uninterpreted terms. `x / 2 * 2 == x` must not be proved. The prover's terms
+   are mathematical integers, and rule 7 is what makes that a statement about
+   Ply rather than about ℤ. The `i64` boundary was previously a *disclosed
+   unsoundness* mitigated by the generator's `i64::MIN` / `i64::MAX` draws; that
+   mitigation could not fire — the static tier answers before any case is drawn,
+   and checked arithmetic surfaces the divergence as a raise rather than as a
+   refutation — so it is retracted.
+2. **Propositional structure**: `&&`, `||`, `!`, `if` at `Bool`, by case split.
+3. **Case analysis over ADTs**: split on the outermost constructor, fields become
+   fresh symbolic constants. Exhaustive and terminating for recursive types too,
+   because the split is over the constructor set rather than the value space —
+   which is exactly why it reaches depth 1 and no further.
+4. **Structural equality and congruence closure**: constructors injective and
+   distinct, record projection reducing, everything else an uninterpreted
+   function symbol closed under congruence.
+5. **Bounded unfolding**: a call to a definition that is **not** in a recursive
+   SCC may be inlined to depth `UNFOLD_DEPTH`. A member of a recursive SCC is
+   **never** unfolded. The SCC data is already computed by `ply-hash` for
+   component hashing.
+6. **Exhaustive enumeration** of a finite domain of at most `ENUMERATION_BOUND`
+   points, evaluated at every point. A type is finite iff its constructor graph is
+   acyclic and every field type is finite. Ground evaluation is this with one
+   point, and it is a proof.
+7. **Definedness**, which the six above are conditional on. A proof is issued
+   only once the prover has also decided that **every input satisfying the guard
+   has an answer**: each arithmetic result is in `[i64::MIN, i64::MAX]`, each
+   divisor is nonzero and not `(i64::MIN, -1)`, and every call this prover did
+   not inline is refused outright — a member of a recursive SCC is never inlined
+   and M8 has no termination checker, so `spin(x) == spin(x)` is a theorem about
+   a total symbol and not about `fn spin(x) = spin(x)`. The requirement is
+   conditioned on the path it was reached under, and a guard's own requirements
+   may not assume the guard. Failing to discharge one is `Unknown`, never a
+   refutation. ADR 0007 §5.1(g) is the full statement.
+
+Everything else is **inconclusive**, and:
+
+> An inconclusive attempt reports `property`. Never `proved` — and never
+> `Refuted` either: a model over uninterpreted symbols need not correspond to any
+> Ply value, so the static side proves or shrugs and the property tier does the
+> refuting, with a value it actually ran.
+
+Inconclusive covers a term outside the fragment, an unclosed case split, a spent
+`prove_budget`, and a refused unfolding.
+
+### The tier outcomes that are not tiers
+
+| outcome | when | code | exit |
+| --- | --- | --- | --- |
+| `Vacuous` | the prover showed the guard unsatisfiable, **or** a property run kept zero of a full case budget *and* a directed search over the guard's own literals also found no value it admits | E0420 | 1 |
+| `Unattempted(UnhandledEffect)` | checking an `ensures` means calling the definition, and its footprint needs a handler nothing supplies | W0604 | 0 |
+| `Unattempted(Ungeneratable)` | a parameter of a type the generator cannot inhabit | W0604 | 0 |
+| `Unattempted(Raised)` | an evaluation raised: a runtime error, a division by zero, the recursion limit. A spec that raises is not false | W0604 | 0 |
+| `Unattempted(GuardNotSampled)` | a full case budget kept nothing and the guard does admit a value, which is carried. The search missed the domain; the spec is not at fault | W0604 | 0 |
+
+A `Vacuous` obligation is always a defect in the spec: `guard ⟹ body` with an
+unsatisfiable guard is valid and says nothing, so a system that reported it
+`proved` would turn a typo into a proof of everything. An `Unattempted`
+obligation is a reported gap and does **not** fail the run — making it one would
+mean a spec could never be attached to an effectful definition — and it counts as
+**uncovered**.
+
+### Concurrency laws
+
+A law whose body's row is `{sim.read}` is discharged by execution. It is
+`proved` **iff every one of these holds**, and `property` otherwise:
+
+1. `plan.sim.mode == SimMode::Dpor`;
+2. `Exploration::exhaustive`;
+3. `!Exploration::exhausted`;
+4. `Exploration::failure.is_none()`;
+5. **and the value domain was covered**: no binders, or every binder's type is
+   finite and enumeration ran over all of them.
+
+Condition 5 is the one an implementer will drop and dropping it is this
+milestone's worst available defect: `exhaustive: true` is a claim about
+schedules, and a law over `n: Int` ranges over 2⁶⁴ values. The two coverage
+claims are independent and `proved` needs both. The certificate rule is
+`ExhaustiveInterleaving`, deliberately distinct so an audit can find every
+execution-derived proof and check it against 1–5.
+
+Everything else about the region is ADR 0006's, unchanged: machine-only under
+`--engine treewalk` (E0504), no nesting (E0416), no escaping `Task` (E0413),
+stuck is E0414, a divergent replay is E0415.
+
+### Caching
+
+| discharge | written under |
+| --- | --- |
+| `Held` at `Proved` | the bare obligation key |
+| `Held` at `Property` or `Example` | `prove_key(key, plan)`, and **never** the bare key |
+| `Refuted`, `Vacuous`, `Unattempted` | nothing |
+
+```
+prove_key(key, plan) = blake3( b"ply.prove.key.1" ‖ key
+                             ‖ cases_le_u32 ‖ prove_budget_le_u32
+                             ‖ roots_len_le_u32 ‖ roots_le_u64*
+                             ‖ sim_plan_digest )
+```
+
+`shrink_budget` is not in the digest: it can only change a counterexample's
+minimality, and failures are never cached.
+
+The asymmetry is the whole operational value of `proved`. A sampled discharge is
+a claim about the plan that sampled it, so reading it under a wider plan would
+let `--prove-cases 10` satisfy a run that asked for a thousand. A proof is a
+claim about all inputs satisfying the guard, so it is valid under every plan and
+costs nothing forever.
+
+### Generation and shrinking
+
+Generation is deterministic, from counter-mode BLAKE3, **keyed by the obligation
+as well as the root**:
+
+```
+draw(root, obligation_key, counter) =
+    blake3( b"ply.gen.stream.1" ‖ root_le_u64 ‖ obligation_key ‖ counter_le_u64 )[0..8]
+```
+
+Without the obligation in the key, adding a law would shift every later law's
+cases, so an unrelated edit would change which counterexample a failing
+obligation reports — ADR 0006 §4.2's argument for two separate streams, applied
+here.
+
+`Int` draws with edge bias including `0`, `1`, `-1`, `i64::MIN` and `i64::MAX`.
+`List` and `String` are length 0..16 biased small. An ADT draws a constructor by
+index and, past `GEN_DEPTH`, only constructors with no recursive field, so
+generation terminates. A function value is a member of a fixed family — the
+constants of the return type, plus a pure total derivation from the argument's
+rendering — every member printable, so a counterexample naming a function names
+something a reader can act on. A type variable is monomorphised to `Int` and
+recorded.
+
+Shrinking has a fixed candidate order per type (`Int` toward 0 by halving;
+`List` empty, halves, single removals, then elementwise; ADT toward a recursive
+field, then a lower-index constructor, then fieldwise; and so on), and two
+requirements that are the whole of its honesty:
+
+1. **A shrunk value must still falsify the obligation** — every candidate is
+   re-evaluated, and no monotonicity is assumed.
+2. **A shrunk value must still satisfy the guard** — a candidate outside the
+   domain is a counterexample to a different claim.
+
+Termination is structural: every type has a saturating `size(v) -> u64`, a
+candidate is accepted only if its size strictly decreases, and the walk is
+greedy. `--shrink-budget` bounds wall clock, never correctness. Two runs over one
+refutation produce byte-identical shrunk bindings, and `Counterexample::original`
+keeps the un-shrunk value because "shrank from 400 elements to `[0, 1]` in 11
+steps" is the sentence that says the space was searched.
+
+### `ply-cli`
+
+```
+ply prove [PATH]              discharge every obligation and report its tier
+ply review --changed          what changed, whether its spec changed, whether it still holds
+ply review --accept           record the current definition and spec hashes as reviewed
+```
+
+`ply prove` flags: `--json`, `--explain`, `--filter <substring>`, `--jobs <n>`,
+`--no-cache`, `--prove-cases <n>`, `--prove-roots <n>`, `--prove-budget <n>`,
+`--shrink-budget <n>`, plus `--sim`, `--sim-budget` and `--seed` for concurrency
+laws.
+
+Exit `0` when every obligation is `Held` or `Unattempted`; `1` on any `Refuted`
+or `Vacuous`; `2` on a compile error. `ply prove` **never calls
+`observe_definitions`** — ADR 0004 §4's rule: a definition exercised by an
+obligation has not been vindicated as a test subject.
+
+**Coverage is in the default output of both commands, ahead of the results, never
+behind a flag.**
+
+```
+$ ply prove
+   41 definitions · 18 carry an obligation · 23 do not
+   26 obligations · 7 proved · 16 property · 2 example · 1 unattempted   (0.42s)
+
+   ✓ proved     ledger.withdraw            ensures #0   linear arithmetic · 2 unfoldings · 41 steps
+   ✓ proved     "transfers conserve value"              exhaustive over 12 interleavings
+   ✓ property   ledger.fee                 ensures #0   200 cases · 0 rejected
+   ✓ example    ledger.settle              ensures #0   7 cases kept of 200 · guard rejected 193
+   ~ unattempted ledger.post               ensures #0   performs {db.write[accounts]}: no handler
+
+   ✗ refuted    "reverse is an involution"                            src/list.ply:41:1
+       forall (xs: List<Int>)  →  xs = [0, 1]
+       shrank from [4, 9, 2, 7, 1] in 6 steps · root 41 · case 118
+
+   1 refuted, 25 held (0.42s)
+```
+
+`ply review --changed` reports, per changed definition, whether the
+implementation changed, whether the spec changed, and whether the obligations
+still hold. The five rows are the milestone's argument:
+
+| implementation | spec | what a reviewer does |
+| --- | --- | --- |
+| changed | unchanged | read the obligations. **The cheapest review in the system.** |
+| unchanged | changed | read the spec diff, and nothing else. |
+| changed | changed | read both; the tier says how much the machine checked. |
+| unchanged | unchanged | nothing to review. |
+| either | **none** | read the implementation, exactly as today. |
+
+A row is reached only when the definition carries at least one obligation that
+**holds**. A definition whose only obligation is a gap falls to the last row and
+counts as unspecified: a claim the machine could not establish is not evidence,
+and the advice has to agree with the coverage line or one of them is lying.
+
+The baseline is what a human last **accepted**, not what a machine last ran, and
+`ReviewRecord` is keyed by the definition's program-wide **name** — the same trade
+ADR 0004 makes for `PassRecord`, because the key has to be the thing that does not
+move when a hash does. Renaming loses a baseline, which costs one re-read and
+never a false "unchanged".
+
+`--json` on both carries `"schema_version": 1`.
+
+### New diagnostic codes — landed
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0417 | `EFFECT_IN_SPEC` | a `requires`/`ensures`/`where` row is not empty, or a law body's row is not a subset of `{sim.read}` | the program's |
+| E0418 | `UNQUANTIFIABLE_TYPE` | a `forall` binder's type has no generator, is a function type with a non-empty row, or mentions an effect-row variable | the program's |
+| E0419 | `OBLIGATION_REFUTED` | a counterexample was found | the program's |
+| E0420 | `VACUOUS_OBLIGATION` | the guard admitted no values | the program's |
+| W0604 | `OBLIGATION_NOT_DISCHARGED` | `Unattempted`, with the `Gap` in the note | nobody's; it is a gap |
+
+Reused rather than invented: a non-`Bool` clause is `TYPE_MISMATCH`; `result` in
+a `requires` is `UNKNOWN_NAME` with a note; a parameter named `result` beside an
+`ensures`, and two laws with one label, are `DUPLICATE_DEFINITION`. E0419 and
+E0420 join `E0501`/`E0502`'s row: the program is at fault and `Failure::defect` is
+`false`.
+
+### Versions
+
+`PROVER_VERSION` starts at `0.1.0`. `FRONTEND_VERSION` and `BODY_ENCODING` bump
+for the law discriminant in the AST and the normalizer, and for `specs` in
+`SourceFingerprint`. `RUNTIME_VERSION` does **not** bump: the evaluator gains no
+semantics, because a spec is evaluated by the same machine running the same
+programs.
+
+### Required tests
+
+The ADR's numbering; fifty-six of them. These are the ones whose absence would
+let the milestone ship a wrong `proved` rather than merely an incomplete one:
+
+- **18**: `Discharge::tier()` returns `Proved` only for `Evidence::Proof`, and
+  no other constructor yields it.
+- **19**: every `Certificate` over the corpus names only fragment rules and has
+  `guard_satisfiable: true`.
+- **20**: a spent step budget reports `property`, never `proved` and never
+  `refuted`.
+- **21**: `x / 2 * 2 == x` is not proved.
+- **22**: `reverse(reverse(xs)) == xs` is `property` — a recursive definition is
+  never unfolded.
+- **33**: **the differential tier audit.** Every corpus obligation reported
+  `proved` survives 1,000 sampled cases across 8 roots; a refutation is a defect
+  in Ply, classified like E0415 and never bisected. This is `--engine both` for
+  the prover and it exists for the same reason.
+- **35**: a concurrency law with one `Int` binder is `property` even at
+  `exhaustive: true`.
+- **39**: a `property` discharge is never written under a bare obligation key.
+- **12**: adding, editing and deleting a spec each select zero tests and change
+  zero definition hashes.
+- **45–46**: a shrunk counterexample still falsifies **and** still satisfies the
+  guard, and two runs agree byte for byte.
+- **49–52**: coverage is in the default output, `requires` alone does not cover,
+  reachability is not coverage, and a refuted or unattempted obligation covers
+  nothing.
+
+Plus one `tests/fixtures/` entry per new code, as every milestone owes.
+
+### Not in M8
+
+- **A general-purpose theorem prover.** The fragment above is the whole of it.
+- **An SMT integration.** No Z3, no CVC5, no external solver, ever. A solver is a
+  trusted oracle whose version changes the answer, and a `proved` label must be
+  reproducible from the definition set alone — the argument that put counter-mode
+  BLAKE3 in ADR 0006 §4.2 instead of a PRNG crate.
+- **A termination checker.** An evaluation that hits `DEFAULT_MAX_CALLS` is
+  `Unattempted { Raised }`, never `proved` and never `refuted`.
+- **Induction**, well-founded recursion, lemmas or proof hints. This is what puts
+  every claim about a recursive definition over unbounded data at `property`, and
+  it is the largest restriction on reach.
+- **Quantifier alternation.** There is no `exists`.
+- **Call-site precondition checking.** `requires` is a **filter on the domain of
+  the `ensures` clauses beside it**, not a contract checked at every call. A
+  caller that violates one is not diagnosed. A reader of a Ply spec must not read
+  `requires` as "the compiler enforces this".
+- **Specifying effects.** An `ensures` cannot say what a definition did to a
+  resource, because a spec may not name mutable state. **This is the largest gap
+  in the milestone.** Closing it needs a pure term denoting a resource's contents
+  and a model of the resource behind it.
+- **Handler-parametric laws.** A handler is syntax, not a value; ADR 0007 §3.2
+  lists the four things that would change.
+- **Bounded integer arithmetic**, runtime contract checking, spec-derived code,
+  refinement types, dependent types, and a `--coverage` flag.

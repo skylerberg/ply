@@ -24,8 +24,8 @@
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use indexmap::IndexMap;
 use ply_core::{
-    CheckOutput, CtorInfo, DefInfo, EffectInfo, Footprint, Known, KnownDef, KnownTest, ModuleInfo,
-    OpInfo, TestInfo, check_program_with,
+    CheckOutput, CtorInfo, DefInfo, EffectInfo, Footprint, Known, KnownDef, KnownTest, LawInfo,
+    ModuleInfo, OpInfo, TestInfo, check_program_with,
 };
 use ply_hash::body::BodySet;
 use ply_hash::graph::NodeId;
@@ -832,22 +832,31 @@ impl<'s> Driver<'s> {
     /// module in load order, and the parsed program holds the parsed files in
     /// that same order, so the offsets line up by counting.
     fn test_hashes_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
+        self.item_hashes_of(i, &hashes.tests, |item| matches!(item, Item::Test(_)))
+    }
+
+    /// `HashOutput::laws` is parallel in the same way, and for the same reason.
+    fn law_hashes_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
+        self.item_hashes_of(i, &hashes.laws, |item| matches!(item, Item::Law(_)))
+    }
+
+    /// `HashOutput::law_texts` is parallel to `HashOutput::laws`.
+    fn law_texts_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
+        self.item_hashes_of(i, &hashes.law_texts, |item| matches!(item, Item::Law(_)))
+    }
+
+    fn item_hashes_of(
+        &self,
+        i: usize,
+        all: &[DefHash],
+        wanted: impl Fn(&Item) -> bool,
+    ) -> Vec<DefHash> {
         let mut offset = 0;
         for (j, file) in self.files.iter().enumerate() {
             let Some(ast) = &file.ast else { continue };
-            let count = ast
-                .items
-                .iter()
-                .filter(|i| matches!(i, Item::Test(_)))
-                .count();
+            let count = ast.items.iter().filter(|item| wanted(item)).count();
             if j == i {
-                return hashes
-                    .tests
-                    .iter()
-                    .skip(offset)
-                    .take(count)
-                    .copied()
-                    .collect();
+                return all.iter().skip(offset).take(count).copied().collect();
             }
             offset += count;
         }
@@ -917,6 +926,7 @@ impl<'s> Driver<'s> {
         let out = CheckOutput {
             defs: IndexMap::new(),
             tests: Vec::new(),
+            laws: Vec::new(),
             // The maps below are rebuilt file by file, and no file declares the
             // prelude effects, so they have to be seeded here or a run's
             // `CheckOutput` would answer that `clock` is not `nondet`.
@@ -928,6 +938,10 @@ impl<'s> Driver<'s> {
             defs: hashes.defs.clone(),
             decls: hashes.decls.clone(),
             tests: Vec::new(),
+            laws: Vec::new(),
+            specs: hashes.specs.clone(),
+            spec_texts: hashes.spec_texts.clone(),
+            law_texts: Vec::new(),
             deps: hashes.deps.clone(),
             closure: hashes.closure.clone(),
         };
@@ -1037,7 +1051,9 @@ impl<'s> Driver<'s> {
                         }
                     }
                 }
-                Item::Test(_) => {}
+                // Neither declares a name, so neither is reached: both are
+                // filtered out by `item.name()` above.
+                Item::Test(_) | Item::Law(_) => {}
             }
         }
         for test in checked.tests.iter().filter(|t| t.module == file.module) {
@@ -1047,7 +1063,19 @@ impl<'s> Driver<'s> {
                 ..test.clone()
             });
         }
+        // A law declares no name, so the loop above never reaches it, and its
+        // obligation would be silently absent from a run that read it — a claim
+        // nobody checked and nobody was told about.
+        for law in checked.laws.iter().filter(|l| l.module == file.module) {
+            let index = out.laws.len();
+            out.laws.push(LawInfo {
+                index,
+                ..law.clone()
+            });
+        }
         merged.tests.extend(self.test_hashes_of(i, hashes));
+        merged.laws.extend(self.law_hashes_of(i, hashes));
+        merged.law_texts.extend(self.law_texts_of(i, hashes));
     }
 
     /// A module gate 1 skipped. There is no AST at all: every name, span, type
@@ -1109,6 +1137,11 @@ impl<'s> Driver<'s> {
                             simple_name: simple,
                             scheme: cached.scheme.clone(),
                             footprint: cached.footprint.clone(),
+                            // Restored from `SourceFingerprint::specs` once the
+                            // store carries it; see CONTRACTS.md's Specs
+                            // section. A skipped file's clauses are
+                            // byte-identical to the ones whose hashes it holds.
+                            spec: Vec::new(),
                             span: entry.span.rebase(source),
                         },
                     );
@@ -1394,7 +1427,7 @@ impl<'s> Driver<'s> {
                         })
                         .collect(),
                 ),
-                Item::Test(_) => continue,
+                Item::Test(_) | Item::Law(_) => continue,
             };
             let deps = hashes.deps.get(&name).cloned().unwrap_or_default();
             fingerprint.defs.push(DefEntry {
@@ -1512,7 +1545,7 @@ impl<'s> Driver<'s> {
                             )
                         })
                     }),
-                    Item::Test(_) => None,
+                    Item::Test(_) | Item::Law(_) => None,
                 };
                 if let Some(entry) = entry {
                     out.push((*hash, entry));

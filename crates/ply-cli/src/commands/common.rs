@@ -139,6 +139,36 @@ pub fn plural(n: usize, word: &str) -> String {
     }
 }
 
+/// The worker pool a run installs. A pool that cannot be built is a warning and
+/// the default pool, never a failure: the number of threads changes the wall
+/// clock and nothing else, which is what `--jobs 1` and `--jobs 16` agreeing
+/// byte for byte means.
+pub fn build_pool(
+    jobs: Option<u32>,
+    warnings: &mut Vec<Diagnostic>,
+) -> (Option<rayon::ThreadPool>, usize) {
+    let requested = jobs.unwrap_or(0) as usize;
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(requested)
+        .build()
+    {
+        Ok(pool) => {
+            let workers = pool.current_num_threads();
+            (Some(pool), workers)
+        }
+        Err(e) => {
+            warnings.push(
+                Diagnostic::warning(
+                    ply_span::codes::RUNTIME_ERROR,
+                    format!("could not start {requested} worker threads: {e}"),
+                )
+                .note("the run continued on the default thread pool"),
+            );
+            (None, rayon::current_num_threads())
+        }
+    }
+}
+
 pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
