@@ -50,7 +50,10 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
         let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
         let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check);
         for obligation in &collected.obligations {
-            if prover.discharge_with(obligation, &ProvePlan::default()).tier() != Some(Tier::Proved)
+            if prover
+                .discharge_with(obligation, &ProvePlan::default())
+                .tier()
+                != Some(Tier::Proved)
             {
                 continue;
             }

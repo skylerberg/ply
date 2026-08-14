@@ -1,11 +1,14 @@
 use super::common::{
-    IND, diagnostic_json, emit_json, location, print_diagnostics, report_load_error,
+    IND, diagnostic_json, emit_json, location, plural, print_diagnostics, report_bind_error,
+    report_load_error,
 };
 use crate::cli::RunArgs;
+use crate::hosts::Hosts;
 use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 use ply_core::DefInfo;
+use ply_core::ty::Footprint;
 use ply_eval::{Engine, EngineChoice, Interp, Machine, Plan, Value as PlyValue, compare_answers};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use serde_json::{Value, json};
@@ -35,12 +38,38 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         }
     };
 
+    // After the entry point is known and before anything evaluates: a bad
+    // registration is a start-up failure, and a hermetic run resolves nothing at
+    // all, so the default path cannot be broken by a registry it never consults.
+    let hosts = match Hosts::open(&loaded.check, args.host) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+
     let name = entry.name.clone();
     let module = entry.module.to_string();
     let span = entry.span;
+    // The entry point's own row, which is what a host answer is checked
+    // against: an operation outside it is `E0427` rather than a socket touched
+    // over a footprint that under-reports.
+    let declared = loaded
+        .check
+        .defs
+        .get(&entry.name)
+        .map(|d| d.footprint.clone());
     let engine: EngineChoice = args.engine.into();
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    match evaluate(&loaded, engine, name.as_str(), span, &plan) {
+    match evaluate(
+        &loaded,
+        engine,
+        name.as_str(),
+        span,
+        &plan,
+        &hosts,
+        declared.as_ref(),
+    ) {
         Ok(value) => {
             let rendered = value.to_string();
             if args.json {
@@ -52,10 +81,13 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "files": loaded.file_names(),
                     "entry": name,
                     "module": module,
+                    "binding": hosts.label(),
+                    "hosts": hosts.summary_json(),
                     "value": rendered,
                     "diagnostics": Value::Array(Vec::new()),
                 }));
             } else {
+                print_binding(&hosts, style);
                 println!("{IND}{rendered}");
             }
             EXIT_OK
@@ -70,6 +102,8 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "files": loaded.file_names(),
                     "entry": name,
                     "module": module,
+                    "binding": hosts.label(),
+                    "hosts": hosts.summary_json(),
                     "value": Value::Null,
                     "diagnostics": [diagnostic_json(&diagnostic, &loaded.sources)],
                 }));
@@ -87,6 +121,25 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     }
 }
 
+/// What a `--host` run reached for, above the value it produced. Silent when
+/// nothing is bound, which is every run that did not ask: a line on every run
+/// would be noise, and the absence of one is not a claim.
+fn print_binding(hosts: &Hosts, style: Style) {
+    if hosts.is_hermetic() {
+        return;
+    }
+    let listing = hosts.listing();
+    println!(
+        "{IND}{}",
+        style.dim(&format!(
+            "binding host · {} {} · {}",
+            listing.rows.len(),
+            plural(listing.rows.len(), "operation"),
+            listing.digest_short(),
+        ))
+    );
+}
+
 /// Under `both`, the authoritative engine's answer is what `main` produced and
 /// the other engine's is only ever a reason to fail: a value the two disagree
 /// about must never be printed as if it were the program's.
@@ -96,9 +149,19 @@ fn evaluate(
     name: &str,
     span: Span,
     plan: &Plan,
+    hosts: &Hosts,
+    declared: Option<&Footprint>,
 ) -> Result<PlyValue, Diagnostic> {
     let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
+    interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+    machine.set_host_binding(hosts.binding());
+    if let Some(runtime) = hosts.runtime() {
+        machine.set_host_runtime(runtime);
+    }
+    if let Some(declared) = declared {
+        machine.set_declared_footprint(declared.clone());
+    }
     // `ply run` takes exactly one interleaving, the one its seed names:
     // exploration is a test-time activity, so there is nothing to search here.
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);

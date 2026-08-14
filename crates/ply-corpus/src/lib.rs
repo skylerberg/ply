@@ -12,6 +12,7 @@ pub mod measure;
 pub mod model;
 pub mod pipeline;
 pub mod rng;
+pub mod serve;
 pub mod simulate;
 pub mod spec;
 pub mod write;
@@ -58,6 +59,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
         &mut store,
         EngineChoice::Both,
         ply_test::Search::of(&selection),
+        ply_test::Hosting::hermetic(),
     );
 
     if report.failed > 0 {

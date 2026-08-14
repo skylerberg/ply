@@ -70,6 +70,9 @@ pub enum TokenKind {
     Ident(Symbol),
     Int(i64),
     Str(String),
+    /// `b"GET "`. Distinct from [`TokenKind::Str`] all the way down: the two
+    /// have different types and must not share a definition hash.
+    Bytes(Vec<u8>),
     Kw(Kw),
 
     LParen,
@@ -117,6 +120,7 @@ impl TokenKind {
             TokenKind::Ident(n) => format!("identifier `{n}`"),
             TokenKind::Int(v) => format!("integer `{v}`"),
             TokenKind::Str(_) => "string literal".to_string(),
+            TokenKind::Bytes(_) => "byte-string literal".to_string(),
             TokenKind::Kw(k) => format!("keyword `{}`", k.as_str()),
             TokenKind::Eof => "end of file".to_string(),
             other => format!("`{}`", other.punct_text()),
@@ -159,6 +163,7 @@ impl TokenKind {
             TokenKind::Ident(_)
             | TokenKind::Int(_)
             | TokenKind::Str(_)
+            | TokenKind::Bytes(_)
             | TokenKind::Kw(_)
             | TokenKind::Eof => "",
         }
@@ -242,6 +247,9 @@ impl<'a> Lexer<'a> {
             let Some(c) = self.peek() else { break };
             let kind = if c.is_ascii_digit() {
                 self.number()
+            } else if c == 'b' && self.peek2() == Some('"') {
+                self.bump();
+                self.bytes()
             } else if is_ident_start(c) {
                 self.ident()
             } else if c == '"' {
@@ -402,6 +410,117 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     out.push(c);
                 }
+            }
+        }
+    }
+
+    /// `b"..."`, entered with the `b` already consumed.
+    ///
+    /// A source character above `U+007F` is refused rather than encoded: the
+    /// bytes of this literal must not depend on how the file was saved, and
+    /// `\xNN` says what the author meant in any encoding.
+    fn bytes(&mut self) -> TokenKind {
+        let open = self.pos - 1;
+        self.bump();
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') => {
+                    self.error(
+                        codes::UNTERMINATED_STRING,
+                        "unterminated byte-string literal",
+                        self.span_from(open),
+                        "add a closing `\"`; a literal may not span a line break",
+                    );
+                    return TokenKind::Bytes(out);
+                }
+                Some('"') => {
+                    self.bump();
+                    return TokenKind::Bytes(out);
+                }
+                Some('\\') => {
+                    let esc_start = self.pos;
+                    self.bump();
+                    match self.bump() {
+                        Some('n') => out.push(b'\n'),
+                        Some('t') => out.push(b'\t'),
+                        Some('r') => out.push(b'\r'),
+                        Some('0') => out.push(0),
+                        Some('\\') => out.push(b'\\'),
+                        Some('"') => out.push(b'"'),
+                        Some('x') => out.push(self.hex_byte(esc_start)),
+                        Some(other) => {
+                            self.error(
+                                codes::UNEXPECTED_TOKEN,
+                                format!("unknown escape sequence `\\{other}`"),
+                                self.span_from(esc_start),
+                                "valid escapes are \\n \\t \\r \\0 \\\\ \\\" and \\xNN",
+                            );
+                        }
+                        None => {
+                            self.error(
+                                codes::UNTERMINATED_STRING,
+                                "unterminated byte-string literal",
+                                self.span_from(open),
+                                "add a closing `\"`",
+                            );
+                            return TokenKind::Bytes(out);
+                        }
+                    }
+                }
+                Some(c) if c.is_ascii() => {
+                    self.bump();
+                    out.push(c as u8);
+                }
+                Some(c) => {
+                    let start = self.pos;
+                    self.bump();
+                    // The file was read as UTF-8 or it did not parse at all, so
+                    // these are the bytes the author is looking at.
+                    let encoded: String = c
+                        .to_string()
+                        .bytes()
+                        .map(|b| format!("\\x{b:02x}"))
+                        .collect();
+                    self.error(
+                        codes::UNEXPECTED_TOKEN,
+                        format!(
+                            "`{c}` is not an ASCII character, so it has no place in `b\"...\"`"
+                        ),
+                        self.span_from(start),
+                        format!("write `{encoded}` instead"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two hex digits of a `\xNN`, with the backslash and `x` consumed.
+    ///
+    /// A malformed escape yields `0` and a diagnostic, and consumes only the
+    /// digits that were actually there, so lexing resumes inside the literal
+    /// rather than swallowing its closing quote.
+    fn hex_byte(&mut self, esc_start: usize) -> u8 {
+        let start = self.pos;
+        for _ in 0..2 {
+            match self.peek() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        let digits = &self.text[start..self.pos];
+        match u8::from_str_radix(digits, 16) {
+            Ok(b) if digits.len() == 2 => b,
+            _ => {
+                self.error(
+                    codes::UNEXPECTED_TOKEN,
+                    "`\\x` needs exactly two hex digits",
+                    self.span_from(esc_start),
+                    "write two hex digits, as in `\\x0d`",
+                );
+                0
             }
         }
     }
@@ -625,6 +744,77 @@ mod tests {
         let (toks, diags) = lex(SourceId(0), r#""a\qb""#);
         assert_eq!(diags.len(), 1);
         assert_eq!(toks[0].kind, TokenKind::Str("aqb".to_string()));
+    }
+
+    #[test]
+    fn a_byte_literal_takes_the_string_escapes_plus_hex() {
+        assert_eq!(
+            kinds(r#"b"GET \r\n\x00\xff\"\\""#),
+            vec![
+                TokenKind::Bytes(b"GET \r\n\x00\xff\"\\".to_vec()),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds(r#"b"""#),
+            vec![TokenKind::Bytes(Vec::new()), TokenKind::Eof]
+        );
+    }
+
+    /// The `b` prefix binds only when the quote is the very next character, so
+    /// an ordinary identifier called `b` keeps working.
+    #[test]
+    fn b_is_a_prefix_only_when_the_quote_follows_immediately() {
+        assert_eq!(
+            kinds("b \"x\""),
+            vec![
+                TokenKind::Ident(Symbol::new("b")),
+                TokenKind::Str("x".to_string()),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("bytes b"),
+            vec![
+                TokenKind::Ident(Symbol::new("bytes")),
+                TokenKind::Ident(Symbol::new("b")),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    /// The bytes of a literal may not depend on how the file was saved, so the
+    /// diagnostic hands back the exact escapes the author should have written.
+    #[test]
+    fn a_non_ascii_character_in_a_byte_literal_is_refused_with_its_escapes() {
+        let (toks, diags) = lex(SourceId(0), "b\"é\"");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, codes::UNEXPECTED_TOKEN);
+        assert!(diags[0].message.contains("not an ASCII character"));
+        assert!(
+            diags[0].labels[0].message.contains("\\xc3\\xa9"),
+            "{:?}",
+            diags[0].labels
+        );
+        assert_eq!(toks[0].kind, TokenKind::Bytes(Vec::new()));
+    }
+
+    #[test]
+    fn a_short_hex_escape_is_reported_without_swallowing_the_literal() {
+        let (toks, diags) = lex(SourceId(0), r#"b"\xg1" 7"#);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, codes::UNEXPECTED_TOKEN);
+        assert_eq!(toks[0].kind, TokenKind::Bytes(b"\0g1".to_vec()));
+        assert_eq!(toks[1].kind, TokenKind::Int(7));
+    }
+
+    #[test]
+    fn an_unterminated_byte_literal_reports_from_its_opening_quote() {
+        let d = diags_of("let s = b\"oops\nlet t = 1");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, codes::UNTERMINATED_STRING);
+        let span = d[0].primary_span().unwrap();
+        assert_eq!(span.start, 8);
     }
 
     #[test]

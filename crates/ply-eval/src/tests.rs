@@ -1273,6 +1273,329 @@ fn string_builtins_reject_non_strings() {
     );
 }
 
+/// The literal is ASCII in source, so the multi-byte character has to arrive as
+/// escapes; this is what a socket hands the program.
+const EURO: &[u8] = b"\xe2\x82\xac";
+
+#[track_caller]
+fn ok_render(e: Expr) -> String {
+    eval(e).unwrap().render()
+}
+
+#[test]
+fn bytes_length_indexing_and_slicing_are_in_bytes() {
+    assert_eq!(ok_render(callv("bytes_len", vec![bytes(EURO)])), "3");
+    assert_eq!(ok_render(callv("bytes_len", vec![bytes(b"")])), "0");
+    assert_eq!(
+        ok_render(callv("bytes_at", vec![bytes(EURO), int(0)])),
+        "226"
+    );
+    assert_eq!(
+        ok_render(callv("bytes_slice", vec![bytes(b"GET /x"), int(0), int(3)])),
+        "b\"GET\""
+    );
+    assert_eq!(
+        ok_render(callv("bytes_slice", vec![bytes(b"abc"), int(3), int(3)])),
+        "b\"\""
+    );
+    assert_eq!(
+        ok_render(callv("bytes_concat", vec![bytes(b"ab"), bytes(b"cd")])),
+        "b\"abcd\""
+    );
+}
+
+#[test]
+fn bytes_indexing_out_of_range_is_reported_rather_than_wrapped() {
+    for args in [
+        vec![bytes(b"abc"), int(3)],
+        vec![bytes(b"abc"), int(-1)],
+        vec![bytes(b""), int(0)],
+    ] {
+        let d = err(callv("bytes_at", args));
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("outside a value"), "{}", d.message);
+    }
+}
+
+/// A clamp is the failure this project exists to refuse: it turns an off-by-one
+/// into a shorter answer every later assertion agrees with.
+#[test]
+fn bytes_slice_out_of_range_is_refused_and_never_clamped() {
+    for (start, end) in [(0, 4), (2, 1), (-1, 2), (4, 4)] {
+        let d = err(callv(
+            "bytes_slice",
+            vec![bytes(b"abc"), int(start), int(end)],
+        ));
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "{start}..{end}");
+        assert!(
+            d.notes.iter().any(|n| n.contains("never clamped")),
+            "{:?}",
+            d.notes
+        );
+    }
+}
+
+#[test]
+fn a_utf8_string_survives_a_round_trip_through_bytes() {
+    let e = callv(
+        "string_of_bytes",
+        vec![callv("bytes_of_string", vec![string("héllo — ✓")])],
+    );
+    assert_eq!(ok_render(e), "\"héllo — ✓\"");
+    assert_eq!(
+        ok_render(callv(
+            "bytes_len",
+            vec![callv("bytes_of_string", vec![string("é")])]
+        )),
+        "2"
+    );
+}
+
+#[test]
+fn invalid_utf8_is_a_value_the_program_can_test_for() {
+    assert_eq!(ok_render(callv("bytes_is_utf8", vec![bytes(EURO)])), "true");
+    assert_eq!(
+        ok_render(callv("bytes_is_utf8", vec![bytes(b"\xff\xfe")])),
+        "false"
+    );
+    assert_eq!(ok_render(callv("bytes_is_utf8", vec![bytes(b"")])), "true");
+}
+
+/// The requirement stated as a program: cutting a multi-byte character in half
+/// is an error naming where, not a `U+FFFD` chosen on the program's behalf.
+#[test]
+fn a_slice_that_splits_a_character_fails_and_names_the_offset() {
+    let half = callv("bytes_slice", vec![bytes(EURO), int(0), int(2)]);
+    let d = err(callv("string_of_bytes", vec![half.clone()]));
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(d.message.contains("offset 0"), "{}", d.message);
+    assert!(
+        d.notes.iter().any(|n| n.contains("bytes_is_utf8")),
+        "{:?}",
+        d.notes
+    );
+
+    assert_eq!(
+        ok_render(callv("bytes_is_utf8", vec![half.clone()])),
+        "false"
+    );
+    assert_eq!(
+        ok_render(callv("string_of_bytes_lossy", vec![half])),
+        "\"�\""
+    );
+}
+
+#[test]
+fn string_of_bytes_names_the_offset_of_the_first_bad_sequence() {
+    let d = err(callv("string_of_bytes", vec![bytes(b"ok\xffmore")]));
+    assert!(d.message.contains("offset 2"), "{}", d.message);
+    assert_eq!(
+        ok_render(callv("string_of_bytes_lossy", vec![bytes(b"ok\xffmore")])),
+        "\"ok�more\""
+    );
+}
+
+/// Character indices, not byte offsets, so no argument can name a position
+/// inside a character.
+#[test]
+fn string_slice_counts_characters() {
+    let s = string("héllo");
+    assert_eq!(
+        ok_render(callv("string_slice", vec![s.clone(), int(0), int(2)])),
+        "\"hé\""
+    );
+    assert_eq!(
+        ok_render(callv("string_slice", vec![s.clone(), int(1), int(5)])),
+        "\"éllo\""
+    );
+    assert_eq!(
+        ok_render(callv("string_slice", vec![s.clone(), int(5), int(5)])),
+        "\"\""
+    );
+    let d = err(callv("string_slice", vec![s, int(0), int(6)]));
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(d.message.contains("characters"), "{}", d.message);
+}
+
+/// Characters, so it is the number `string_slice` indexes in; `bytes_len` of
+/// the encoding is the other number, and the two differ wherever text does.
+#[test]
+fn string_len_counts_characters_and_bytes_len_counts_bytes() {
+    assert_eq!(ok_render(callv("string_len", vec![string("héllo")])), "5");
+    assert_eq!(
+        ok_render(callv(
+            "bytes_len",
+            vec![callv("bytes_of_string", vec![string("héllo")])]
+        )),
+        "6"
+    );
+    assert_eq!(ok_render(callv("string_len", vec![string("")])), "0");
+}
+
+#[test]
+fn string_search_and_split_are_what_a_header_parser_needs() {
+    let header = string("Content-Type: text/plain");
+    assert_eq!(
+        ok_render(callv(
+            "string_split",
+            vec![string("a\r\nb\r\nc"), string("\r\n")]
+        )),
+        "[\"a\", \"b\", \"c\"]"
+    );
+    assert_eq!(
+        ok_render(callv("string_split", vec![string(""), string(",")])),
+        "[\"\"]"
+    );
+    assert_eq!(
+        ok_render(callv("string_trim", vec![string("  hi \r\n")])),
+        "\"hi\""
+    );
+    assert_eq!(
+        ok_render(callv(
+            "string_starts_with",
+            vec![header.clone(), string("Content-")]
+        )),
+        "true"
+    );
+    assert_eq!(
+        ok_render(callv(
+            "string_ends_with",
+            vec![header.clone(), string("plain")]
+        )),
+        "true"
+    );
+    assert_eq!(
+        ok_render(callv("string_contains", vec![header.clone(), string(": ")])),
+        "true"
+    );
+    assert_eq!(
+        ok_render(callv("string_find", vec![header, string(": ")])),
+        "12"
+    );
+}
+
+/// A character index rather than a byte offset, so it composes with
+/// `string_slice` over text that is not ASCII.
+#[test]
+fn string_find_indexes_characters_and_refuses_to_invent_a_sentinel() {
+    let s = string("héllo—world");
+    let found = callv("string_find", vec![s.clone(), string("world")]);
+    assert_eq!(ok_render(found.clone()), "6");
+    assert_eq!(
+        ok_render(callv("string_slice", vec![s.clone(), found, int(11)])),
+        "\"world\""
+    );
+
+    let d = err(callv("string_find", vec![s.clone(), string("nope")]));
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(
+        d.notes.iter().any(|n| n.contains("string_contains")),
+        "{:?}",
+        d.notes
+    );
+    assert_eq!(
+        ok_render(callv("string_contains", vec![s, string("nope")])),
+        "false"
+    );
+}
+
+#[test]
+fn an_empty_split_separator_is_refused_rather_than_guessed_at() {
+    let d = err(callv("string_split", vec![string("abc"), string("")]));
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(d.message.contains("empty"), "{}", d.message);
+}
+
+#[test]
+fn case_folding_is_full_unicode_and_may_change_the_length() {
+    assert_eq!(
+        ok_render(callv("string_lower", vec![string("ÉTÉ Straße")])),
+        "\"été straße\""
+    );
+    assert_eq!(
+        ok_render(callv("string_upper", vec![string("straße")])),
+        "\"STRASSE\""
+    );
+}
+
+#[test]
+fn a_bytes_pattern_matches_exactly_and_never_a_string() {
+    let e = match_(
+        bytes(b"GET"),
+        vec![
+            arm(pbytes(b"PUT"), int(1)),
+            arm(pbytes(b"GET"), int(2)),
+            arm(pvar("_x"), int(3)),
+        ],
+    );
+    assert_eq!(ok_render(e), "2");
+
+    let str_pattern = match_(
+        bytes(b"GET"),
+        vec![arm(pstr("GET"), int(1)), arm(pvar("_x"), int(2))],
+    );
+    assert_eq!(ok_render(str_pattern), "2");
+
+    assert_eq!(
+        ok_render(bin(BinOp::Eq, bytes(b"ab"), bytes(b"ab"))),
+        "true"
+    );
+    assert_eq!(
+        ok_render(bin(BinOp::Eq, bytes(b"ab"), string("ab"))),
+        "false"
+    );
+}
+
+/// Both engines run every test in this file, so this is really a claim about
+/// the machine and the tree-walker agreeing on a value neither had before.
+#[test]
+fn a_large_bytes_value_renders_truncated_rather_than_in_full() {
+    let big: Vec<u8> = (0..=255u8).collect();
+    let e = callv("bytes_len", vec![bytes(&big)]);
+    assert_eq!(ok_render(e), "256");
+    let rendered = eval(bytes(&big)).unwrap().render();
+    assert!(rendered.ends_with("… 224 more"), "{rendered}");
+    assert!(rendered.starts_with("b\"\\x00\\x01"), "{rendered}");
+}
+
+/// What an assertion failure prints has to be something the author can paste
+/// back into the source, or the diff is unusable for the one value whose
+/// contents are not readable on sight.
+#[test]
+fn every_rendered_byte_lexes_back_to_the_byte_it_came_from() {
+    let all: Vec<u8> = (0..=255u8).collect();
+    for chunk in all.chunks(32) {
+        let rendered = Value::bytes(chunk).render();
+        let (tokens, diags) = ply_syntax::lexer::lex(ply_span::SourceId(0), &rendered);
+        assert!(diags.is_empty(), "{rendered} did not lex: {diags:?}");
+        assert_eq!(
+            tokens[0].kind,
+            ply_syntax::lexer::TokenKind::Bytes(chunk.to_vec()),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn bytes_builtins_reject_a_string_argument() {
+    for name in [
+        "bytes_len",
+        "bytes_is_utf8",
+        "string_of_bytes",
+        "string_of_bytes_lossy",
+    ] {
+        assert_eq!(
+            err(callv(name, vec![string("x")])).code,
+            codes::RUNTIME_ERROR,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        err(callv("bytes_of_string", vec![bytes(b"x")])).code,
+        codes::RUNTIME_ERROR
+    );
+}
+
 #[test]
 fn cell_builtins_reject_non_cells() {
     assert_eq!(

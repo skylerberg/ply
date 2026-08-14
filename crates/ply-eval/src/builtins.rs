@@ -35,6 +35,24 @@ pub enum Builtin {
     Range,
     IntToString,
     StringConcat,
+    BytesLen,
+    BytesAt,
+    BytesSlice,
+    BytesConcat,
+    BytesOfString,
+    BytesIsUtf8,
+    StringOfBytes,
+    StringOfBytesLossy,
+    StringLen,
+    StringSlice,
+    StringSplit,
+    StringTrim,
+    StringLower,
+    StringUpper,
+    StringStartsWith,
+    StringEndsWith,
+    StringContains,
+    StringFind,
     CellGet,
     CellSet,
     Panic,
@@ -53,6 +71,24 @@ impl Builtin {
             "range" => Builtin::Range,
             "int_to_string" => Builtin::IntToString,
             "string_concat" => Builtin::StringConcat,
+            "bytes_len" => Builtin::BytesLen,
+            "bytes_at" => Builtin::BytesAt,
+            "bytes_slice" => Builtin::BytesSlice,
+            "bytes_concat" => Builtin::BytesConcat,
+            "bytes_of_string" => Builtin::BytesOfString,
+            "bytes_is_utf8" => Builtin::BytesIsUtf8,
+            "string_of_bytes" => Builtin::StringOfBytes,
+            "string_of_bytes_lossy" => Builtin::StringOfBytesLossy,
+            "string_len" => Builtin::StringLen,
+            "string_slice" => Builtin::StringSlice,
+            "string_split" => Builtin::StringSplit,
+            "string_trim" => Builtin::StringTrim,
+            "string_lower" => Builtin::StringLower,
+            "string_upper" => Builtin::StringUpper,
+            "string_starts_with" => Builtin::StringStartsWith,
+            "string_ends_with" => Builtin::StringEndsWith,
+            "string_contains" => Builtin::StringContains,
+            "string_find" => Builtin::StringFind,
             "cell_get" => Builtin::CellGet,
             "cell_set" => Builtin::CellSet,
             "panic" => Builtin::Panic,
@@ -72,6 +108,24 @@ impl Builtin {
             Builtin::Range => "range",
             Builtin::IntToString => "int_to_string",
             Builtin::StringConcat => "string_concat",
+            Builtin::BytesLen => "bytes_len",
+            Builtin::BytesAt => "bytes_at",
+            Builtin::BytesSlice => "bytes_slice",
+            Builtin::BytesConcat => "bytes_concat",
+            Builtin::BytesOfString => "bytes_of_string",
+            Builtin::BytesIsUtf8 => "bytes_is_utf8",
+            Builtin::StringOfBytes => "string_of_bytes",
+            Builtin::StringOfBytesLossy => "string_of_bytes_lossy",
+            Builtin::StringLen => "string_len",
+            Builtin::StringSlice => "string_slice",
+            Builtin::StringSplit => "string_split",
+            Builtin::StringTrim => "string_trim",
+            Builtin::StringLower => "string_lower",
+            Builtin::StringUpper => "string_upper",
+            Builtin::StringStartsWith => "string_starts_with",
+            Builtin::StringEndsWith => "string_ends_with",
+            Builtin::StringContains => "string_contains",
+            Builtin::StringFind => "string_find",
             Builtin::CellGet => "cell_get",
             Builtin::CellSet => "cell_set",
             Builtin::Panic => "panic",
@@ -83,14 +137,33 @@ impl Builtin {
         match self {
             Builtin::Assert => (1, 2),
             Builtin::Range => (1, 2),
-            Builtin::Len | Builtin::IntToString | Builtin::CellGet | Builtin::Panic => (1, 1),
+            Builtin::Len
+            | Builtin::IntToString
+            | Builtin::CellGet
+            | Builtin::Panic
+            | Builtin::BytesLen
+            | Builtin::BytesOfString
+            | Builtin::BytesIsUtf8
+            | Builtin::StringOfBytes
+            | Builtin::StringOfBytesLossy
+            | Builtin::StringLen
+            | Builtin::StringTrim
+            | Builtin::StringLower
+            | Builtin::StringUpper => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
             | Builtin::Map
             | Builtin::Filter
             | Builtin::StringConcat
-            | Builtin::CellSet => (2, 2),
-            Builtin::Fold => (3, 3),
+            | Builtin::CellSet
+            | Builtin::BytesAt
+            | Builtin::BytesConcat
+            | Builtin::StringSplit
+            | Builtin::StringStartsWith
+            | Builtin::StringEndsWith
+            | Builtin::StringContains
+            | Builtin::StringFind => (2, 2),
+            Builtin::Fold | Builtin::BytesSlice | Builtin::StringSlice => (3, 3),
         }
     }
 
@@ -112,6 +185,24 @@ impl Builtin {
             Builtin::Range,
             Builtin::IntToString,
             Builtin::StringConcat,
+            Builtin::BytesLen,
+            Builtin::BytesAt,
+            Builtin::BytesSlice,
+            Builtin::BytesConcat,
+            Builtin::BytesOfString,
+            Builtin::BytesIsUtf8,
+            Builtin::StringOfBytes,
+            Builtin::StringOfBytesLossy,
+            Builtin::StringLen,
+            Builtin::StringSlice,
+            Builtin::StringSplit,
+            Builtin::StringTrim,
+            Builtin::StringLower,
+            Builtin::StringUpper,
+            Builtin::StringStartsWith,
+            Builtin::StringEndsWith,
+            Builtin::StringContains,
+            Builtin::StringFind,
             Builtin::CellGet,
             Builtin::CellSet,
             Builtin::Panic,
@@ -240,6 +331,151 @@ pub fn call(
             Ok(Step::Done(Value::str(format!("{a}{b}"))))
         }
 
+        Builtin::BytesLen => {
+            let b = args[0].as_bytes(span, "`bytes_len`")?;
+            Ok(Step::Done(Value::Int(b.len() as i64)))
+        }
+
+        Builtin::BytesAt => {
+            let b = args[0].as_bytes(span, "`bytes_at`")?;
+            let i = args[1].as_int(span, "`bytes_at`")?;
+            match usize::try_from(i).ok().and_then(|i| b.get(i)) {
+                Some(byte) => Ok(Step::Done(Value::Int(i64::from(*byte)))),
+                None => Err(out_of_range(span, "bytes_at", i, b.len())),
+            }
+        }
+
+        Builtin::BytesSlice => {
+            let b = args[0].as_bytes(span, "`bytes_slice`")?;
+            let (start, end) =
+                range_args(&args[1], &args[2], b.len(), span, "bytes_slice", "bytes")?;
+            Ok(Step::Done(Value::bytes(&b[start..end])))
+        }
+
+        Builtin::BytesConcat => {
+            let a = args[0].as_bytes(span, "`bytes_concat`")?;
+            let b = args[1].as_bytes(span, "`bytes_concat`")?;
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            Ok(Step::Done(Value::bytes(out)))
+        }
+
+        Builtin::BytesOfString => {
+            let s = args[0].as_str(span, "`bytes_of_string`")?;
+            Ok(Step::Done(Value::bytes(s.as_bytes())))
+        }
+
+        Builtin::BytesIsUtf8 => {
+            let b = args[0].as_bytes(span, "`bytes_is_utf8`")?;
+            Ok(Step::Done(Value::Bool(std::str::from_utf8(b).is_ok())))
+        }
+
+        Builtin::StringOfBytes => {
+            let b = args[0].as_bytes(span, "`string_of_bytes`")?;
+            match std::str::from_utf8(b) {
+                Ok(s) => Ok(Step::Done(Value::str(s))),
+                Err(e) => Err(not_utf8(span, b, &e)),
+            }
+        }
+
+        Builtin::StringOfBytesLossy => {
+            let b = args[0].as_bytes(span, "`string_of_bytes_lossy`")?;
+            Ok(Step::Done(Value::str(String::from_utf8_lossy(b))))
+        }
+
+        // `len` is `(List<a>) -> Int`, so a String needs its own name until W2
+        // settles type-directed dispatch. Characters rather than bytes: it is
+        // the number that pairs with `string_slice`.
+        Builtin::StringLen => Ok(Step::Done(Value::Int(
+            args[0].as_str(span, "`string_len`")?.chars().count() as i64,
+        ))),
+
+        Builtin::StringSlice => {
+            let s = args[0].as_str(span, "`string_slice`")?;
+            let chars = s.chars().count();
+            let (start, end) = range_args(
+                &args[1],
+                &args[2],
+                chars,
+                span,
+                "string_slice",
+                "characters",
+            )?;
+            let from = char_offset(s, start);
+            let to = char_offset(s, end);
+            Ok(Step::Done(Value::str(&s[from..to])))
+        }
+
+        Builtin::StringSplit => {
+            let s = args[0].as_str(span, "`string_split`")?;
+            let sep = args[1].as_str(span, "`string_split`")?;
+            if sep.is_empty() {
+                return Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    "`string_split` needs a separator, and this one is empty",
+                )
+                .primary(span, "an empty separator matches everywhere and nowhere")
+                .note("pass the text that actually separates the parts, as in \"\\r\\n\""));
+            }
+            Ok(Step::Done(Value::list(
+                s.split(sep).map(Value::str).collect(),
+            )))
+        }
+
+        // These three read `std`'s Unicode tables, so their answers move if
+        // those tables do. A toolchain upgrade is therefore a
+        // `RUNTIME_VERSION` bump — a cached `Pass` is a claim about what the
+        // evaluator did, and this is the first thing in the language whose
+        // behaviour is not settled by this repository alone.
+        Builtin::StringTrim => Ok(Step::Done(Value::str(
+            args[0].as_str(span, "`string_trim`")?.trim(),
+        ))),
+
+        Builtin::StringLower => Ok(Step::Done(Value::str(
+            args[0].as_str(span, "`string_lower`")?.to_lowercase(),
+        ))),
+
+        Builtin::StringUpper => Ok(Step::Done(Value::str(
+            args[0].as_str(span, "`string_upper`")?.to_uppercase(),
+        ))),
+
+        Builtin::StringStartsWith => {
+            let s = args[0].as_str(span, "`string_starts_with`")?;
+            let prefix = args[1].as_str(span, "`string_starts_with`")?;
+            Ok(Step::Done(Value::Bool(s.starts_with(prefix))))
+        }
+
+        Builtin::StringEndsWith => {
+            let s = args[0].as_str(span, "`string_ends_with`")?;
+            let suffix = args[1].as_str(span, "`string_ends_with`")?;
+            Ok(Step::Done(Value::Bool(s.ends_with(suffix))))
+        }
+
+        Builtin::StringContains => {
+            let s = args[0].as_str(span, "`string_contains`")?;
+            let needle = args[1].as_str(span, "`string_contains`")?;
+            Ok(Step::Done(Value::Bool(s.contains(needle))))
+        }
+
+        Builtin::StringFind => {
+            let s = args[0].as_str(span, "`string_find`")?;
+            let needle = args[1].as_str(span, "`string_find`")?;
+            match s.find(needle) {
+                Some(at) => Ok(Step::Done(Value::Int(s[..at].chars().count() as i64))),
+                None => Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!(
+                        "`string_find` did not find {} in {}",
+                        Value::str(needle).render(),
+                        Value::str(s).render()
+                    ),
+                )
+                .primary(span, "this substring does not occur")
+                .note("guard with `string_contains`, which answers the same question as a `Bool`")),
+            }
+        }
+
         Builtin::CellGet => {
             let id = args[0].as_cell(span, "`cell_get`")?;
             match world.get(id) {
@@ -363,6 +599,80 @@ fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span
             span,
         },
     }
+}
+
+/// The half-open `[start, end)` of a slicing builtin, refused rather than
+/// clamped.
+///
+/// Clamping is what turns an off-by-one into a shorter answer that every later
+/// assertion agrees with, which is the silent-wrong-answer shape this project
+/// exists to refuse. `len` and `unit` are whatever the builtin indexes in:
+/// bytes for `bytes_slice`, characters for `string_slice`.
+fn range_args(
+    start: &Value,
+    end: &Value,
+    len: usize,
+    span: Span,
+    what: &str,
+    unit: &str,
+) -> Result<(usize, usize), Diagnostic> {
+    let start = start.as_int(span, &format!("`{what}`"))?;
+    let end = end.as_int(span, &format!("`{what}`"))?;
+    if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
+        return Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{what}` range {start}..{end} is outside a value of {len} {unit}"),
+        )
+        .primary(span, "this range does not fit")
+        .note(format!(
+            "a range must satisfy `0 <= start <= end <= {len}`; it is never clamped"
+        )));
+    }
+    Ok((start as usize, end as usize))
+}
+
+/// The byte offset of the `n`-th character boundary. `n` has already been
+/// checked against the character count, so the fallback is unreachable for a
+/// caller that went through [`range_args`].
+fn char_offset(s: &str, n: usize) -> usize {
+    s.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .nth(n)
+        .unwrap_or(s.len())
+}
+
+/// The offset is the first byte the decoder could not use, which is the number
+/// an author needs to find the truncation — a `Bytes` cut mid-character by
+/// `bytes_slice` reports the position of the character it cut.
+fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
+    let at = e.valid_up_to();
+    let what = match e.error_len() {
+        Some(n) => format!(
+            "{n} byte{} at offset {at} are not a UTF-8 sequence",
+            if n == 1 { "" } else { "s" }
+        ),
+        None => format!("a UTF-8 sequence starting at offset {at} is cut short"),
+    };
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`string_of_bytes` was given bytes that are not UTF-8: {what}"),
+    )
+    .primary(span, format!("byte {at} of {} is where it fails", b.len()))
+    .note("guard with `bytes_is_utf8`, or use `string_of_bytes_lossy` to accept U+FFFD")
+}
+
+#[cold]
+fn out_of_range(span: Span, what: &str, index: i64, len: usize) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` index {index} is outside a value of {len} bytes"),
+    )
+    .primary(span, "this index does not exist")
+    .note(format!(
+        "valid indices are `0` to `{}`",
+        len.saturating_sub(1)
+    ))
 }
 
 /// The `ASSERTION_FAILED` an agent reads to decide what to fix: both values in

@@ -301,6 +301,13 @@ impl Hybrid for BodyHybrid<'_> {
         // between the two cannot turn a reproduction into a `DifferentFailure`.
         let plan = self.plan.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
+            // Hermetic, always, whatever the run around it was configured with:
+            // a search asks this question up to `Budget::max_trials` times, and
+            // a binding threaded in here would answer each of them with a real
+            // packet. A host-backed failure never reaches a trial at all —
+            // `Skipped::Host` refuses it two levels up — and this is the reason
+            // there is no `set_host_binding` call to make that refusal
+            // load-bearing rather than merely tidy.
             let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
             seed_run(&mut machine, &plan.seeds()[0], plan.steps);
             machine.eval_test(index)

@@ -87,6 +87,51 @@ A corpus generated with `--concurrent-tests` at a chosen `--conflict-density` is
 what the reduction is measured against; `--tasks-per-test` and `--steps-per-task`
 are the two exponents the schedule count grows in.
 
+## What `serve` adds
+
+`bench`, `measure` and `sim` all price a *test* run, where execution is a few
+percent of the wall clock and the cache is the whole point. Serving inverts
+that: there is no front end on the request path, so the interpreter is the
+request path. `serve` is the number W6's decision on M9 turns on.
+
+```
+cargo run --release -p ply-corpus -- serve --repo . [--requests N] [--concurrency 1,8,32] [--json]
+```
+
+It needs no corpus. The program under measurement is `examples/hello.ply`
+itself, read from `--repo` and rewritten only in its port and connection count,
+so what is timed is the endpoint W1 shipped rather than a copy of it that can
+drift.
+
+Two tables. The first separates the layers of one request **by substitution
+rather than by instrumentation** — every rung runs the same endpoint and changes
+only what is underneath it, so a difference between two rows is that layer's
+cost and no timer inside the machine has to be trusted:
+
+| rung | under the endpoint | the layer it adds |
+| --- | --- | --- |
+| `answer` | nothing; a pure call | the HTTP parse and the response build |
+| `ply-handler` | a `handle` written in Ply | performing `net.*` and dispatching a clause |
+| `host-sim` | the `SimNet` host handler | the host boundary: resolve, footprint check, decode |
+| `host-tcp` | the `TcpHost` host handler | the socket and the blocking pool |
+| `rust-floor` | no Ply at all | the denominator: the same syscalls with no interpreter |
+
+`ply-handler` and `host-sim` serve the same operation sequence over the same
+connection count, which is what makes their difference ADR 0008 §5's twin
+comparison priced rather than a comparison of two different programs.
+
+The second drives the real `ply` binary over loopback from client threads and
+reports what a client observed — throughput and p50/p95/p99 — for the sequential
+endpoint, for a task-per-connection variant on the production scheduler, and for
+a Rust server answering the same bytes. Latency there is client-observed and
+includes the client, which is why the `rust-floor` row is on the same table
+rather than in prose.
+
+**One request is not one number.** The endpoint's cost is a function of head
+length — every scan folds over the buffer — so a `serve` table is only
+meaningful beside the request it was taken with. `REQUEST` is a 63-byte head;
+a browser sends five to ten times that.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

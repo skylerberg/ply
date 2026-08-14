@@ -54,6 +54,15 @@ pub enum Record {
     /// The test's footprint carries `sim.read` and the evaluator reported no
     /// search, so what actually ran is unknown.
     Unobserved,
+    /// The run reached a host handler, so its green verdict is a statement about
+    /// a socket at one moment and about nothing else.
+    ///
+    /// Decided by what the machine **did**, never by the prediction selection
+    /// made from footprints: the prediction drives which tests run, and this
+    /// drives the write. When the two disagree the run has observed a footprint
+    /// that under-reports, which is the failure mode the whole boundary is built
+    /// around, so it is reported rather than silently uncached.
+    Host,
 }
 
 impl Record {

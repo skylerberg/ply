@@ -124,6 +124,7 @@ fn the_floor_of_every_type_is_its_smallest_value() {
     assert_eq!(minimal(&Type::int(), &world).unwrap().render(), "0");
     assert_eq!(minimal(&Type::bool(), &world).unwrap().render(), "false");
     assert_eq!(minimal(&Type::string(), &world).unwrap().render(), "\"\"");
+    assert_eq!(minimal(&Type::bytes(), &world).unwrap().render(), "b\"\"");
     assert_eq!(minimal(&Type::unit(), &world).unwrap().render(), "()");
     assert_eq!(
         minimal(&Type::list(Type::int()), &world).unwrap().render(),
@@ -231,6 +232,14 @@ fn shrinking_reaches_a_genuinely_minimal_witness() {
                 _ => true,
             },
             "\"a\"",
+        ),
+        (
+            Type::bytes(),
+            |v| match &v[0] {
+                Value::Bytes(b) => b.is_empty(),
+                _ => true,
+            },
+            "b\"\\x00\"",
         ),
         // `false` is the only candidate `Bool` has, so a property that fails
         // only at `true` reports the value it failed at and shrinks no further.
@@ -808,5 +817,19 @@ fn a_candidate_order_is_fixed() {
     assert_eq!(
         rendered(&Value::str("bc"), &Type::string())[..3],
         ["\"\"".to_string(), "\"b\"".to_string(), "\"c\"".to_string()]
+    );
+    // Length first, then content: `b""`, the two halves, then each byte
+    // lowered toward zero.
+    assert_eq!(
+        rendered(&Value::bytes([2, 4]), &Type::bytes()),
+        [
+            "b\"\"",
+            "b\"\\x02\"",
+            "b\"\\x04\"",
+            "b\"\\x00\\x04\"",
+            "b\"\\x01\\x04\"",
+            "b\"\\x02\\x00\"",
+            "b\"\\x02\\x02\""
+        ]
     );
 }

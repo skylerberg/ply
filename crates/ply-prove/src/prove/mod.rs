@@ -67,7 +67,7 @@ mod tests;
 pub use context::Context;
 pub use lower::Blocker;
 
-use crate::{Certificate, Rule, DEFAULT_PROVE_BUDGET, UNFOLD_DEPTH};
+use crate::{Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
 use ply_core::{LawBinder, TyVar, Type};
 use ply_span::Symbol;
 use ply_syntax::ast::Expr;
@@ -186,8 +186,13 @@ pub enum Decision {
     /// obligation is `Vacuous` — `E0420`, an error — and never `proved`: a
     /// system that reported it proved would turn a typo in a guard into a proof
     /// of everything.
-    GuardUnsatisfiable { steps: u32 },
-    Unknown { reason: Reason, steps: u32 },
+    GuardUnsatisfiable {
+        steps: u32,
+    },
+    Unknown {
+        reason: Reason,
+        steps: u32,
+    },
 }
 
 impl Decision {
@@ -269,7 +274,13 @@ pub fn decide_and_diagnose(
         spent += budget - left;
         budget = left;
         if let Some(reason) = inconclusive(answer) {
-            return (Decision::Unknown { reason, steps: spent }, blockers);
+            return (
+                Decision::Unknown {
+                    reason,
+                    steps: spent,
+                },
+                blockers,
+            );
         }
     }
 
@@ -308,7 +319,13 @@ pub fn decide_and_diagnose(
     budget = left;
 
     if let Some(reason) = inconclusive(answer) {
-        return (Decision::Unknown { reason, steps: spent }, blockers);
+        return (
+            Decision::Unknown {
+                reason,
+                steps: spent,
+            },
+            blockers,
+        );
     }
 
     let guard_satisfiable = domain_inhabited(ctx, goal.binders)
@@ -319,8 +336,14 @@ pub fn decide_and_diagnose(
             // establish, and the caller must produce a kept case instead.
             Some(all) => {
                 let mut ignored = RuleLog::default();
-                let (answer, left) =
-                    run(&mut terms, ctx, &mut ignored, budget, limits, &[(all, false)]);
+                let (answer, left) = run(
+                    &mut terms,
+                    ctx,
+                    &mut ignored,
+                    budget,
+                    limits,
+                    &[(all, false)],
+                );
                 spent += budget - left;
                 answer == solve::Answer::Closed
             }

@@ -53,6 +53,33 @@ reviewable, and diffable in CI. A change to it is the change most worth a human'
 attention in the entire system, because it is the only place a guarantee can be
 lost silently.
 
+**What is and is not enforced, exactly.** ADR 0011 §7 adds a runtime check
+(`E0427`) and it is easy to over-read, so this ADR states its edges rather than
+leaving them implied:
+
+- **Enforced.** The atom a `perform` reached must be in the declared footprint of
+  the entry point that reached it. This catches a *program* footprint that
+  under-reports — a `handle` whose clause set covers some but not all operations
+  of an atom discharges the atom out of the row and leaves the rest to fall
+  through to the binding — and it catches a binding that resolved an atom the
+  program's own footprints never enumerated.
+- **Not enforced, and not enforceable.** A handler that does more than its
+  registration declared. The atom the runtime records is the one the *registry*
+  computed; a handler is handed that atom and has no way to report a different
+  one, so a `db.read[users]` handler that writes, or that opens a file, is
+  invisible to everything above the boundary. It is recorded as a read, reported
+  as a read, and **scheduled** as a read — which means two tests whose footprints
+  say `db.read[users]` are placed in one concurrency group and run beside each
+  other against a resource one of them is mutating.
+
+That second bullet is not a gap to be closed later; it is the trust this ADR
+buys the boundary with. Since §6 makes footprint conflict grouping the *only*
+isolation a host-backed test has, the honest statement of the residual risk is:
+**the isolation of a host-backed test is exactly as good as the registration's
+mode and resource, and nothing checks either.** `ply hosts` and review are the
+whole of the defence, which is why the listing prints the atom rather than
+leaving a reviewer to derive it.
+
 ### 3. Every host handler declares determinism, and non-determinism propagates
 
 A host handler registers as deterministic or not. A non-deterministic one makes
@@ -123,6 +150,24 @@ A blocking host handler stalls every task the scheduler owns. Host handlers are
 asynchronous at the boundary: an operation returns either a value or a pending
 token the scheduler polls, and a handler that must block runs on a dedicated
 pool rather than on a scheduler thread.
+
+**How much of that is enforced.** The machine calls every handler's `call` on its
+own thread — it cannot do otherwise, because a `Value` is not `Send` — so
+"running on a dedicated pool" is work the handler does for itself. What the
+boundary checks is the observable consequence of having done it: a handler
+registered `blocking: true` must answer `HostAnswer::Pending`. A value returned
+from `call` is this thread having done the work, and that is `E0428`.
+
+The opposite direction is not detectable and this ADR does not pretend it is: a
+handler registered `blocking: false` that blocks inside `call` stalls every task
+in the region and, under `ply test`, the worker thread. There is no step budget
+on that path, no timeout, and ADR 0011 defers cancellation, so the run hangs with
+nothing to read. The one blocking failure the runtime *can* see is a `Pending`
+inside a production region that never resolves, which the fruitless-park count
+and the deadlock check turn into a diagnostic.
+
+So `blocking` is half mechanical and half a review obligation, and the column
+`ply hosts` prints is the half that is review.
 
 ## Consequences
 

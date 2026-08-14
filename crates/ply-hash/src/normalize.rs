@@ -68,6 +68,9 @@ pub(crate) mod tag {
     pub const LIT_BOOL: u8 = 41;
     pub const LIT_STR: u8 = 42;
     pub const LIT_UNIT: u8 = 43;
+    /// A distinct tag from [`LIT_STR`], so `b"ab"` and `"ab"` are different
+    /// definitions. They have different types and must not share a hash.
+    pub const LIT_BYTES: u8 = 44;
 
     pub const E_LIT: u8 = 50;
     pub const E_VAR: u8 = 51;
@@ -836,6 +839,11 @@ impl<'a, 't> Normalizer<'a, 't> {
             Lit::Str(s) => {
                 self.tag(tag::LIT_STR);
                 self.strv(s);
+            }
+            Lit::Bytes(b) => {
+                self.tag(tag::LIT_BYTES);
+                self.len(b.len());
+                self.out.extend_from_slice(b);
             }
             Lit::Unit => self.tag(tag::LIT_UNIT),
         }

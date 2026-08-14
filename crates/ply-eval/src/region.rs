@@ -40,7 +40,11 @@ pub struct Region {
     /// spliced it over, and delivering the value onto the entry stack instead
     /// would silently drop everything the resuming clause still had pending.
     pub below: Stack,
-    pub body: Code,
+    /// What the root task evaluates. `None` for a region opened lazily at the
+    /// host boundary, whose root task is the computation already in progress and
+    /// which therefore has no body to enter: its root is resumed rather than
+    /// entered, so nothing ever reads this.
+    pub body: Option<Code>,
     pub env: Env,
     pub module: usize,
     pub span: Span,
@@ -64,9 +68,32 @@ impl Region {
             sched: Scheduler::new(id, span).with_step_budget(steps),
             handlers: Handlers::at(root, drawn),
             below,
-            body,
+            body: Some(body),
             env,
             module,
+            span,
+        }
+    }
+
+    /// A region the host binding opened, over a scheduler the caller built and
+    /// rooted.
+    ///
+    /// `below` is empty and not the stack the perform stood on: that stack *is*
+    /// the root task, so the region's value is the entry point's value and there
+    /// is nothing under it to deliver onto.
+    ///
+    /// It still carries [`Handlers`], and they are still unreachable:
+    /// [`Scheduler::answers`] says a production region answers `task` alone, so
+    /// `clock` and `random` never arrive here to be given virtual time.
+    pub fn production(id: SimId, sched: Scheduler, span: Span) -> Region {
+        Region {
+            id,
+            sched,
+            handlers: Handlers::at(0, 0),
+            below: Stack::new(),
+            body: None,
+            env: Env::empty(),
+            module: 0,
             span,
         }
     }

@@ -569,6 +569,10 @@ pub enum Lit {
     Int(i64),
     Bool(bool),
     Str(String),
+    /// `b"GET "`. ASCII plus `\xNN`: a source character above `U+007F` is
+    /// refused, because the bytes of this literal may not depend on the file's
+    /// encoding.
+    Bytes(Vec<u8>),
     Unit,
 }
 

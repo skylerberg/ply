@@ -127,13 +127,15 @@ impl Hybrid for Culprits {
     }
 }
 
-/// Which of the five preconditions hold. Grouped so a call site reads as the
-/// situation it is describing rather than as three bare booleans.
+/// Which of the preconditions hold. Grouped so a call site reads as the
+/// situation it is describing rather than as four bare booleans.
 #[derive(Clone, Copy)]
 struct Situation {
     baseline: bool,
     nondet: bool,
     defect: bool,
+    /// The failing run reached a host handler.
+    host: bool,
     /// Which way a missing hybrid builder is reported. Only reachable when the
     /// search would have had to run a mixture.
     absent: Skipped,
@@ -145,6 +147,7 @@ impl Default for Situation {
             baseline: true,
             nondet: false,
             defect: false,
+            host: false,
             absent: Skipped::NoBodies,
         }
     }
@@ -204,6 +207,7 @@ impl Case {
             test_hash: Some(hash(self.test_after)),
             nondet: situation.nondet,
             defect: situation.defect,
+            host: situation.host,
             suspects: &suspects,
             hashes: &hashes,
             baseline: situation.baseline.then_some(&base),
@@ -326,6 +330,7 @@ fn fusing_an_interface_change_with_its_caller_beats_discovering_it() {
             test_hash: Some(hash(case.test_after)),
             nondet: false,
             defect: false,
+            host: false,
             suspects: &suspects,
             hashes: &hashes,
             baseline: Some(&base),
@@ -505,6 +510,56 @@ fn a_panic_is_not_bisected() {
     assert_eq!(hybrid.trials, 0);
 }
 
+/// A host-backed failure runs no trial at all, and the suspect list survives.
+///
+/// Both halves are the contract. Every trial is a re-evaluation of the failing
+/// test, so a search over one that reached a socket would reach it once per
+/// candidate set; and the suspects come from hashes rather than from running, so
+/// the artifact degrades to its static half rather than to nothing.
+#[test]
+fn a_host_backed_failure_is_not_bisected_and_keeps_its_suspects() {
+    let case = Case::edits(&["a", "b"], &["a"]);
+    let mut hybrid = Culprits::new(&["a"]);
+    let out = case.run(
+        &Options::default(),
+        |_| {},
+        Some(&mut hybrid),
+        Situation {
+            host: true,
+            ..Situation::default()
+        },
+        None,
+    );
+    assert_eq!(out.bisection.verdict, Verdict::NotAttempted(Skipped::Host));
+    assert_eq!(hybrid.trials, 0, "a trial would have re-reached the host");
+    assert!(out.culprits().is_empty(), "a culprit was named anyway");
+    assert_eq!(
+        out.suspects
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>(),
+        [sym("a"), sym("b")],
+        "the static half of the artifact is still owed to the reader"
+    );
+    // And `--bisect always` does not talk it out of the refusal: the reason is
+    // an action on the world rather than a budget.
+    let out = case.run(
+        &Options {
+            bisect: Mode::Always,
+            ..Options::default()
+        },
+        |_| {},
+        Some(&mut hybrid),
+        Situation {
+            host: true,
+            ..Situation::default()
+        },
+        None,
+    );
+    assert_eq!(out.bisection.verdict, Verdict::NotAttempted(Skipped::Host));
+    assert_eq!(hybrid.trials, 0);
+}
+
 #[test]
 fn bisect_never_evaluates_nothing() {
     let case = Case::edits(&["a", "b"], &["a", "b"]);
@@ -668,6 +723,7 @@ fn two_runs_over_one_failure_agree_exactly() {
                 key: sym(KEY),
                 diagnostic: ply_span::Diagnostic::error(ply_span::codes::ASSERTION_FAILED, "x"),
                 defect: false,
+                host: false,
                 suspects: Vec::new(),
                 assertion: None,
                 attribution: out,
@@ -800,6 +856,7 @@ fn an_unanswerable_classification_is_stated_in_the_reason() {
             test_hash: Some(hash(case.test_after)),
             nondet: false,
             defect: false,
+            host: false,
             suspects: &suspects,
             hashes: &hashes,
             baseline: Some(&base),
@@ -854,6 +911,7 @@ fn a_culprit_outside_the_raw_suspect_set_is_added_to_it() {
             test_hash: Some(hash(201)),
             nondet: false,
             defect: false,
+            host: false,
             suspects: &[],
             hashes: &after,
             baseline: Some(&base),
@@ -897,6 +955,7 @@ fn failure_with(attribution: crate::Attribution) -> crate::Failure {
             "assertion failed: expected 0, found -5",
         ),
         defect: false,
+        host: false,
         suspects: Vec::new(),
         assertion: None,
         attribution,

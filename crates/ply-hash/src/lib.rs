@@ -313,8 +313,9 @@ fn hash_index(
     let mut test_hashes = Vec::with_capacity(index.tests.len());
     let mut test_refs = Vec::with_capacity(index.tests.len());
     for test in &index.tests {
-        let (bytes, refs) =
-            encode_item(&index, test.module, &scc, &hashes, |nz| nz.test_def(test.def));
+        let (bytes, refs) = encode_item(&index, test.module, &scc, &hashes, |nz| {
+            nz.test_def(test.def)
+        });
         test_hashes.push(DefHash::of(&bytes));
         test_refs.push(refs);
         if let Some(bodies) = bodies.as_deref_mut() {
@@ -424,7 +425,13 @@ fn encode_item_with<'a>(
     by_name: bool,
     encode: impl Fn(&mut Normalizer<'a, '_>),
 ) -> (Vec<u8>, Vec<NodeId>) {
-    let mut nz = Normalizer::new(index, module, scc.no_hashes, scc.no_component, scc.no_effects);
+    let mut nz = Normalizer::new(
+        index,
+        module,
+        scc.no_hashes,
+        scc.no_component,
+        scc.no_effects,
+    );
     encode(&mut nz);
     let refs = nz.finish().1;
     let mut order = Vec::new();
@@ -647,7 +654,13 @@ fn assemble(
             }
             Entry::Test(t) => {
                 let name = index.tests[t].key.clone();
-                let (deps, closure) = reached(&test_refs[t], index, &component_of, &component_closure, &name);
+                let (deps, closure) = reached(
+                    &test_refs[t],
+                    index,
+                    &component_of,
+                    &component_closure,
+                    &name,
+                );
                 record(&mut out, name, deps, closure);
             }
             // A law's references are what it is a claim *about*: `Laws::of`
@@ -656,7 +669,13 @@ fn assemble(
             // reach.
             Entry::Law(l) => {
                 let name = index.laws[l].key.clone();
-                let (deps, closure) = reached(&law_refs[l], index, &component_of, &component_closure, &name);
+                let (deps, closure) = reached(
+                    &law_refs[l],
+                    index,
+                    &component_of,
+                    &component_closure,
+                    &name,
+                );
                 record(&mut out, name, deps, closure);
             }
         }
@@ -673,10 +692,7 @@ fn reached(
     component_closure: &[BTreeSet<Symbol>],
     own: &Symbol,
 ) -> (Vec<Symbol>, BTreeSet<Symbol>) {
-    let deps = refs
-        .iter()
-        .map(|r| index.nodes[r.0].name.clone())
-        .collect();
+    let deps = refs.iter().map(|r| index.nodes[r.0].name.clone()).collect();
     let mut closure = BTreeSet::new();
     closure.insert(own.clone());
     for r in refs {

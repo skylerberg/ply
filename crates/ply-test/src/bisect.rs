@@ -773,25 +773,62 @@ impl Mode {
     }
 }
 
+/// What [`precheck`] decides from. A struct rather than four positional
+/// arguments because three of them are booleans and transposing two would
+/// silently change which answer a consumer is given.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate<'a> {
+    pub mode: Mode,
+    /// Ply failed rather than the program.
+    pub defect: bool,
+    /// The failing run reached a host handler, so re-running it acts on the
+    /// world again.
+    pub host: bool,
+    pub nondet: bool,
+    pub baseline: Option<&'a Baseline>,
+}
+
+impl<'a> Gate<'a> {
+    /// The hermetic gate: everything a caller with no host binding needs.
+    pub fn new(mode: Mode, defect: bool, nondet: bool, baseline: Option<&'a Baseline>) -> Gate<'a> {
+        Gate {
+            mode,
+            defect,
+            host: false,
+            nondet,
+            baseline,
+        }
+    }
+
+    pub fn hosted(mut self, host: bool) -> Gate<'a> {
+        self.host = host;
+        self
+    }
+}
+
 /// The order is the order the answers are worth: a consumer that reads
 /// `never_passed` stops looking for a bug in the cache, and one that reads
 /// `no_bodies` goes and un-prunes it.
-pub fn precheck(
-    mode: Mode,
-    defect: bool,
-    nondet: bool,
-    baseline: Option<&Baseline>,
-) -> Result<(), Skipped> {
-    if mode == Mode::Never {
+///
+/// `host` outranks `nondet` — which nearly every host-backed test also is —
+/// because the two say different things to a reader. `nondet` says a hybrid's
+/// answer would be evidence about nothing; `host` says asking the question is
+/// itself an action on the world, and that is the fact a consumer deciding
+/// whether to re-run needs.
+pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
+    if gate.mode == Mode::Never {
         return Err(Skipped::NotRequested);
     }
-    if defect {
+    if gate.defect {
         return Err(Skipped::Panicked);
     }
-    if nondet {
+    if gate.host {
+        return Err(Skipped::Host);
+    }
+    if gate.nondet {
         return Err(Skipped::Nondet);
     }
-    if baseline.is_none() {
+    if gate.baseline.is_none() {
         return Err(Skipped::NeverPassed);
     }
     Ok(())
@@ -953,6 +990,16 @@ pub enum Skipped {
     /// against, and a first-ever red test is a different situation from a
     /// regression.
     NeverPassed,
+    /// The failing run reached a host handler. Bisection re-runs a failing test
+    /// once per mixed definition set, and doing that to a test that sends
+    /// packets sends the packets that many times.
+    ///
+    /// Distinct from [`Skipped::Nondet`], which most host-backed tests also are:
+    /// that one says a hybrid's answer would prove nothing, this one says asking
+    /// the question at all is an action on the world. The suspect set is still
+    /// computed — it comes from hashes, not from running — so the artifact
+    /// degrades to its static half rather than to nothing.
+    Host,
     /// `test/nondet` outcomes are not a function of the definition set, so a
     /// hybrid's answer would not be evidence about anything.
     Nondet,
@@ -987,6 +1034,7 @@ impl Skipped {
         match self {
             Skipped::NotRequested => "not_requested",
             Skipped::NeverPassed => "never_passed",
+            Skipped::Host => "host",
             Skipped::Nondet => "nondet",
             Skipped::Panicked => "panicked",
             Skipped::NoChanges => "no_changes",
@@ -1000,6 +1048,9 @@ impl Skipped {
             Skipped::NotRequested => "bisection was not requested for this run",
             Skipped::NeverPassed => {
                 "this test has never passed, so there is no earlier definition set to compare against"
+            }
+            Skipped::Host => {
+                "this failure came from a run that reached a host handler, and bisecting it would re-run the test — and repeat whatever it did outside the program — once per candidate definition set"
             }
             Skipped::Nondet => {
                 "`test/nondet` is not a function of the definition set, so bisecting it would prove nothing"

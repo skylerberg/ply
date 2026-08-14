@@ -259,6 +259,56 @@ pub mod codes {
     /// says nothing. Always a defect in the spec: reporting it `proved` would
     /// turn a typo in a guard into a proof of everything.
     pub const VACUOUS_OBLIGATION: &str = "E0420";
+    /// A host registration names an effect, operation or resource the program
+    /// does not declare. Raised before anything runs: a handler bound to a
+    /// triple nothing declares is a footprint claim about nothing.
+    pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
+    /// Two host registrations claim one atom. Ambiguity here is a coin flip over
+    /// which real resource gets touched.
+    pub const HOST_HANDLER_CONFLICT: &str = "E0422";
+    /// A host handler declares itself nondeterministic for an effect the program
+    /// did not declare `nondet`. The declaration is the authority — a binding may
+    /// not change what inference computed, or `ply check` would answer
+    /// differently under `--host` and every cache would split on a flag.
+    pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
+    /// An operation reached the host boundary with nothing bound. Deliberately
+    /// not [`UNHANDLED_EFFECT`]: that one means inference should have prevented
+    /// this and did not, while this one means inference was right and the run was
+    /// configured hermetically. The two call for opposite responses.
+    pub const HERMETIC_BOUNDARY: &str = "E0424";
+    /// A host operation reached from a test the search re-runs — from inside a
+    /// `simulate` region, or from the prefix or suffix around one.
+    ///
+    /// The search re-runs a test **whole** per interleaving, so the hazard is not
+    /// confined to the region: an operation written beside it is performed once
+    /// per schedule explored and the total is then reported as a proof over all
+    /// of them. Both shapes are this code, because a consumer's response to them
+    /// is the same one.
+    pub const HOST_IN_SIMULATION: &str = "E0425";
+    /// A continuation was resumed a second time across an at-most-once host
+    /// operation. The second resumption would perform the operation again:
+    /// charge the card twice, send the packet twice, insert the row twice.
+    pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
+    /// A host handler answered an atom outside the declared footprint of the
+    /// entry point that reached it. Ply's fault rather than the program's — the
+    /// same class as [`ENGINE_DIVERGENCE`], because the run knows two of its own
+    /// answers disagree and nothing in the definition graph decides which was
+    /// meant.
+    ///
+    /// What it does and does not catch is worth being exact about, because the
+    /// check is easy to over-read. The atom compared is the one the *registry*
+    /// resolved, so this fires when the atom a `perform` reached is missing from
+    /// the entry point's row — an inference/registry disagreement, and a program
+    /// footprint that under-reports what the program itself performs. It cannot
+    /// fire on a handler that does more than its registration declared: a handler
+    /// never names an atom, so it cannot report one. See ADR 0008 §2.
+    pub const HOST_FOOTPRINT_ESCAPE: &str = "E0427";
+    /// A handler declared `blocking: true` answered a value inline instead of a
+    /// pending token. `blocking: true` means "this handler leaves the machine's
+    /// thread", and a value returned from `call` is the machine's own thread
+    /// having done the work — so the declaration and the behaviour disagree, and
+    /// the scheduler's account of which of its threads are free is wrong.
+    pub const HOST_BLOCKING_ANSWER: &str = "E0428";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -430,6 +480,34 @@ mod tests {
             ("UNQUANTIFIABLE_TYPE", codes::UNQUANTIFIABLE_TYPE, "E0418"),
             ("OBLIGATION_REFUTED", codes::OBLIGATION_REFUTED, "E0419"),
             ("VACUOUS_OBLIGATION", codes::VACUOUS_OBLIGATION, "E0420"),
+            (
+                "HOST_OPERATION_UNKNOWN",
+                codes::HOST_OPERATION_UNKNOWN,
+                "E0421",
+            ),
+            (
+                "HOST_HANDLER_CONFLICT",
+                codes::HOST_HANDLER_CONFLICT,
+                "E0422",
+            ),
+            (
+                "HOST_DETERMINISM_MISMATCH",
+                codes::HOST_DETERMINISM_MISMATCH,
+                "E0423",
+            ),
+            ("HERMETIC_BOUNDARY", codes::HERMETIC_BOUNDARY, "E0424"),
+            ("HOST_IN_SIMULATION", codes::HOST_IN_SIMULATION, "E0425"),
+            (
+                "HOST_CONTINUATION_RESUMED",
+                codes::HOST_CONTINUATION_RESUMED,
+                "E0426",
+            ),
+            (
+                "HOST_FOOTPRINT_ESCAPE",
+                codes::HOST_FOOTPRINT_ESCAPE,
+                "E0427",
+            ),
+            ("HOST_BLOCKING_ANSWER", codes::HOST_BLOCKING_ANSWER, "E0428"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),

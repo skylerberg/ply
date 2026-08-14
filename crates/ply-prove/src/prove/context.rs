@@ -14,11 +14,9 @@
 //! - **whether a definition is pure.** A body that performs is not a value the
 //!   fragment reasons about, so it is never unfolded either.
 
-use ply_core::{CheckOutput, CtorInfo, Type, TyVar};
+use ply_core::{CheckOutput, CtorInfo, TyVar, Type};
 use ply_span::Symbol;
-use ply_syntax::ast::{
-    Expr, ExprKind, FnDef, Item, Program, QName, Stmt, TypeDefBody,
-};
+use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, Program, QName, Stmt, TypeDefBody};
 use ply_syntax::resolve::{Namespace, Resolved};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -289,10 +287,8 @@ fn recursive_definitions(
 
     let mut recursive = BTreeSet::new();
     for component in tarjan(&edges) {
-        let cyclic = component.len() > 1
-            || component
-                .first()
-                .is_some_and(|&v| edges[v].contains(&v));
+        let cyclic =
+            component.len() > 1 || component.first().is_some_and(|&v| edges[v].contains(&v));
         if cyclic {
             for v in component {
                 recursive.insert(names[v].clone());
@@ -361,12 +357,7 @@ fn tarjan(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// local that shadows a definition still contributes an edge — which can only
 /// grow the recursive set, and a definition wrongly called recursive is one the
 /// prover declines to unfold.
-fn collect_references(
-    expr: &Expr,
-    module: usize,
-    resolved: &Resolved,
-    out: &mut BTreeSet<Symbol>,
-) {
+fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut BTreeSet<Symbol>) {
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
         match &e.kind {

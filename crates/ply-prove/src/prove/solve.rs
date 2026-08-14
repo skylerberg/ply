@@ -22,9 +22,9 @@
 //! is what the fragment's boundary looks like from the inside.
 
 use super::context::Context;
-use super::egraph::{conflict, shape_of, Classes};
+use super::egraph::{Classes, conflict, shape_of};
 use super::term::{Arm, ArmTest, CmpOp, Node, Poly, TermId, Terms};
-use super::{arith, RuleLog};
+use super::{RuleLog, arith};
 use crate::Rule;
 use ply_core::Type;
 use ply_span::Symbol;
@@ -147,8 +147,10 @@ impl<'a, 'p> Solver<'a, 'p> {
                     arms: ctors.len() as u32,
                 });
                 for (name, fields) in ctors {
-                    let args: Vec<TermId> =
-                        fields.into_iter().map(|sort| self.terms.sym(sort)).collect();
+                    let args: Vec<TermId> = fields
+                        .into_iter()
+                        .map(|sort| self.terms.sym(sort))
+                        .collect();
                     let sort = self.terms.sort(scrutinee).cloned();
                     let applied = self.terms.mk(Node::Ctor { name, args }, sort);
                     let mut child = branch.clone();
@@ -283,12 +285,9 @@ impl<'a, 'p> Solver<'a, 'p> {
                 args: args.iter().map(|a| find(*a)).collect(),
             },
             Node::List(items) => Node::List(items.iter().map(|i| find(*i)).collect()),
-            Node::Record(fields) => Node::Record(
-                fields
-                    .iter()
-                    .map(|(n, v)| (n.clone(), find(*v)))
-                    .collect(),
-            ),
+            Node::Record(fields) => {
+                Node::Record(fields.iter().map(|(n, v)| (n.clone(), find(*v))).collect())
+            }
             Node::Field { base, field } => Node::Field {
                 base: find(*base),
                 field: field.clone(),
@@ -426,7 +425,9 @@ impl<'a, 'p> Solver<'a, 'p> {
                     }
                     None => false,
                 },
-                Node::Match { scrutinee, arms } => self.reduce_match(branch, term, scrutinee, &arms),
+                Node::Match { scrutinee, arms } => {
+                    self.reduce_match(branch, term, scrutinee, &arms)
+                }
                 Node::Field { base, field } => match self.record_field(branch, base, &field) {
                     Some(value) => {
                         self.rules.note(Rule::Congruence);
@@ -888,10 +889,7 @@ impl<'a, 'p> Solver<'a, 'p> {
                     }
                 }
                 Node::Int(k) => {
-                    definitions.push((
-                        BTreeMap::from([(find(term), 1)]),
-                        -(*k as i128),
-                    ));
+                    definitions.push((BTreeMap::from([(find(term), 1)]), -(*k as i128)));
                 }
                 _ => {}
             }

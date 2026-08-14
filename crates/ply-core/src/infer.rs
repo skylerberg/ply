@@ -28,6 +28,7 @@ const BUILTIN_TYPES: &[(&str, usize)] = &[
     ("Int", 0),
     ("Bool", 0),
     ("String", 0),
+    ("Bytes", 0),
     ("Unit", 0),
     ("List", 1),
     ("Cell", 1),
@@ -492,6 +493,62 @@ impl<'a> Checker<'a> {
             (
                 "string_concat",
                 mono(vec![Type::string(), Type::string()], Type::string()),
+            ),
+            ("bytes_len", mono(vec![Type::bytes()], Type::int())),
+            (
+                "bytes_at",
+                mono(vec![Type::bytes(), Type::int()], Type::int()),
+            ),
+            (
+                "bytes_slice",
+                mono(vec![Type::bytes(), Type::int(), Type::int()], Type::bytes()),
+            ),
+            (
+                "bytes_concat",
+                mono(vec![Type::bytes(), Type::bytes()], Type::bytes()),
+            ),
+            ("bytes_of_string", mono(vec![Type::string()], Type::bytes())),
+            ("bytes_is_utf8", mono(vec![Type::bytes()], Type::bool())),
+            ("string_of_bytes", mono(vec![Type::bytes()], Type::string())),
+            (
+                "string_of_bytes_lossy",
+                mono(vec![Type::bytes()], Type::string()),
+            ),
+            // `len` is `(List<a>) -> Int` and Ply has no type-directed
+            // dispatch, so a String's length needs its own name.
+            ("string_len", mono(vec![Type::string()], Type::int())),
+            (
+                "string_slice",
+                mono(
+                    vec![Type::string(), Type::int(), Type::int()],
+                    Type::string(),
+                ),
+            ),
+            (
+                "string_split",
+                mono(
+                    vec![Type::string(), Type::string()],
+                    Type::list(Type::string()),
+                ),
+            ),
+            ("string_trim", mono(vec![Type::string()], Type::string())),
+            ("string_lower", mono(vec![Type::string()], Type::string())),
+            ("string_upper", mono(vec![Type::string()], Type::string())),
+            (
+                "string_starts_with",
+                mono(vec![Type::string(), Type::string()], Type::bool()),
+            ),
+            (
+                "string_ends_with",
+                mono(vec![Type::string(), Type::string()], Type::bool()),
+            ),
+            (
+                "string_contains",
+                mono(vec![Type::string(), Type::string()], Type::bool()),
+            ),
+            (
+                "string_find",
+                mono(vec![Type::string(), Type::string()], Type::int()),
             ),
             (
                 "panic",
@@ -3253,6 +3310,7 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Int(_) => Type::int(),
         Lit::Bool(_) => Type::bool(),
         Lit::Str(_) => Type::string(),
+        Lit::Bytes(_) => Type::bytes(),
         Lit::Unit => Type::unit(),
     }
 }

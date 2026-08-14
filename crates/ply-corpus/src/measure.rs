@@ -423,13 +423,13 @@ fn stack_cost(repeats: usize) -> Vec<StackPoint> {
                     call_site: Span::DUMMY,
                 });
             }
-            let (k, below) = stack.capture(1);
+            let (k, below) = stack.capture(1, 0);
 
             let iterations = 100_000;
             let capture = best_of(repeats, || {
                 let started = Instant::now();
                 for _ in 0..iterations {
-                    black_box(black_box(&stack).capture(1));
+                    black_box(black_box(&stack).capture(1, 0));
                 }
                 started.elapsed() / iterations
             });
