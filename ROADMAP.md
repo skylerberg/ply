@@ -204,7 +204,15 @@ interpreter cost**, which is the number W6 turns on.
   pools all want one, and `List<(K,V)>` is not a substitute at request volume
 - Compile-time derivation over normalized definitions: `derive json for Order`
 - JSON encode and decode, derived rather than hand-written
+- Framework signatures take explicit dictionaries — the elaborated form of a
+  typeclass constraint, so a resolution layer can be added later as sugar rather
+  than as a rewrite
 - `Float`, and a decimal type — `i64` cents is a decision you regret later
+
+Type-directed **dispatch** is deliberately not decided here. Derivation is the
+substrate under either candidate, so W2 proceeds without settling it; W3 and W4
+produce the evidence that does — how often a type is abstract at the point of
+dispatch in a real stack.
 
 **Exit:** an endpoint that parses a JSON body into an ADT and returns a JSON
 response, with the codec derived; and a law that decode-after-encode is identity,

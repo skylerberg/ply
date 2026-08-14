@@ -1,119 +1,186 @@
-# ADR 0010 — Generic derivation
+# ADR 0010 — Derivation now, dispatch deferred
 
-Status: proposed
+Status: partially accepted. Decisions 1–3 are settled; decision 4 names two
+candidates and the evidence that would choose between them.
 
 ## Context
 
 Ply has no typeclasses, traits, interfaces, or `derive`. There is no way to write
 one function that works for any type with a known encoding.
 
-For everything built so far this cost nothing — tests and specs are written
-against concrete types. A web API cannot avoid it. JSON encoding and decoding,
-SQL row mapping, equality, ordering, and hashing all want the same shape: given a
-type's structure, produce a function. Without a mechanism, every one of those is
-hand-written per type, and the hand-written version drifts from the type the
-moment someone adds a field.
+For M0–M8 this cost nothing — tests and specs are written against concrete types.
+A web API cannot avoid it. JSON encoding and decoding, SQL row mapping, equality
+and ordering all want the same shape: given a type's structure, produce a
+function. Without a mechanism, each is hand-written per type and drifts from the
+type the moment someone adds a field.
 
-This is a type-system decision, not a library gap, and it constrains every
-library on the web track. It should be settled before JSON is written, not after.
+### Two different things get confused here
 
-## Options considered
+Ply already has full **parametric** polymorphism. What it lacks is **ad-hoc**
+polymorphism — dispatch directed by a type. Much of what gets called "framework"
+needs only the first:
 
-**(a) Typeclasses.** Haskell-style, with inference-directed instance resolution.
-Most expressive: `fn respond<T: ToJson>(t: T) -> Response` works, and generic
-code composes. The cost is real — instance resolution interacts with
-Hindley-Milner in ways that get subtle fast, and Ply's inference already carries
-row-polymorphic effects. Coherence, overlapping instances, and orphan rules are
-each their own design argument. This is the largest addition to the type system
-since effects.
+| Framework piece | Needs |
+| --- | --- |
+| Routing, middleware chains | parametric — `(Request) -> Response` is concrete |
+| Connection pool `Pool<Conn>` | parametric |
+| Config, tracing, shutdown | neither |
+| `query<T: FromRow>` | **ad-hoc** |
+| `ok<T: ToJson>` | **ad-hoc** |
+| Generic cache, job payloads | **ad-hoc** |
 
-**(b) Structural interfaces.** Go-style: a type satisfies an interface if it has
-the right shape. Ply's records are already structural and its rows are already
-row-polymorphic, so this is less foreign than it sounds. But the thing being
-abstracted over here is *not* the shape of a value — it is the existence of a
-function for a type — and structural typing does not express that naturally.
+The ad-hoc requirement concentrates at the **serialization boundary** — row in,
+domain type, JSON out. Narrow as a surface, crossed by every endpoint.
 
-**(c) Compile-time reflection over normalized definitions.** `derive json for
-Order` generates an ordinary Ply function by walking `Order`'s structure at
-compile time.
+### Where the absence actually hurts
 
-## Decision
+Not at concrete call sites; there an explicit argument costs nothing:
 
-**(c), compile-time reflection.** Reasons, in order of weight:
+```ply
+let users = query("select * from users", [], user_from_row)
+```
 
-1. **The machinery already exists.** `ply-hash` normalizes every definition into
-   a canonical, name-erased, structurally complete form in order to hash it. That
-   is exactly the input a derivation needs, and it is already correct and already
-   tested.
+It hurts where a type is still abstract **inside a function's own body**:
 
-2. **The output is an ordinary definition.** A derived encoder is a function with
-   a hash, a footprint, a type, and a cache entry like any other. It participates
-   in content addressing, incremental checking, test selection and specs with no
-   new concepts. A typeclass dictionary participates in none of those without
-   further design.
+```ply
+fn cache_and_respond<a>(key: String, compute: () -> a) -> Response {
+  let v = compute();
+  ok(v)          // `a` is abstract here; there is nothing to resolve against
+}
+```
 
-3. **It matches the actual problem.** What the web track needs is *derivation* —
-   from a type's structure, produce a codec. It does not need ad-hoc polymorphism
-   in general. Adding the larger mechanism to get the smaller capability is the
-   trade this project has consistently declined.
+That case is rare in application code and common in framework code, which is why
+the answer depends on how much framework this project ends up carrying.
 
-4. **It composes with what is already here.** A derived function is subject to
-   M8 obligations, so `law "decode after encode is identity"` is expressible over
-   generated code.
+## Decisions
 
-### What it costs, stated plainly
-
-You can derive, but you cannot abstract over "any type that has an encoder."
-There is no `fn respond<T: ToJson>`. Instead the function is passed explicitly:
+### 1. Build derivation now — it is the substrate under either design
 
 ```ply
 derive json for Order
-
-fn respond<a>(value: a, encode: (a) -> Json) -> Response = ...
-
-respond(order, order_to_json)
+derive eq   for Order
+derive row  for Order
 ```
 
-That is manual dictionary-passing, and it is more verbose at every call site. The
-honest summary is that (c) buys simplicity and integration at the cost of
-ergonomics, and that if the verbosity proves intolerable in practice, (a) remains
-available later — derived functions are exactly the dictionaries a typeclass
-mechanism would need, so this is a step toward it rather than away.
+Generates ordinary Ply definitions by walking the type's structure at compile
+time, using the canonical normalized form `ply-hash` already computes for
+hashing. That machinery exists, is tested, and is exactly the right input.
 
-## Design
+This decision is independent of the dispatch question. Typeclass *instances* for
+records and ADTs should be derived rather than hand-written under any design, so
+derivation is not work that a later choice could strand.
+
+- Structural and total: walks records, ADT variants, lists, maps and primitives.
+  A type containing a function, a cell or a continuation cannot be derived, and
+  that is a compile error naming the field rather than a partial encoder.
+- Generated definitions are hashed from their generated form, so changing a type
+  changes its derived function's hash and re-selects its tests.
+- Derivers are fixed in v1: `json`, `eq`, `ord`, `row`. User-defined derivers are
+  out of scope — a deriver is a compiler plugin, with its own reproducibility and
+  trust questions.
+
+### 2. Framework signatures take explicit dictionaries
 
 ```ply
-derive json  for Order
-derive eq    for Order
-derive row   for Order          // SQL row mapping
+fn query<a>(sql: String, from_row: (Row) -> a) -> List<a> / {db.read[..]}
 ```
 
-- Generates `order_to_json : (Order) -> Json` and `order_from_json : (Json) ->
-  Result<Order, DecodeError>`, named by convention from the type and the deriver.
-- Derivation is **structural and total**: it walks records, ADT variants, lists
-  and primitives. A type containing a function, a cell, or a continuation cannot
-  be derived, and that is a compile error naming the offending field rather than
-  a partial encoder.
-- Generated definitions are hashed from their *generated* form, so a change to
-  the type changes the derived function's hash and re-selects its tests, exactly
-  as a hand-written one would.
-- Derivers are named and fixed in v1: `json`, `eq`, `ord`, `row`. User-defined
-  derivers are out of scope — a deriver is a compiler plugin, and the security and
-  reproducibility questions that raises deserve their own decision.
+This is deliberately the **elaborated form of a typeclass constraint**:
+
+```ply
+fn query<a: FromRow>(sql: String) -> List<a>              // constraint
+fn query<a>(sql: String, from_row: (Row) -> a) -> List<a> // what it compiles to
+```
+
+These are not competing designs at the signature level — the second is what the
+first becomes. Writing framework signatures in the elaborated form now is
+therefore forward-compatible: adding resolution later is a sugar layer that fills
+in an argument, not a rewrite. Nothing built against this is stranded.
+
+### 3. No ambient instances, whatever lands
+
+Pinned now, because it is the property that protects everything else. If a
+resolution layer is added, what it resolves against must be determined by what a
+module **imports** — no global instance table, no orphan instances, no ambient
+scope.
+
+This project's two worst defects were both a definition's meaning depending on
+something outside what it could see: the whole-program effect rank (M6), where
+adding an unrelated look-alike effect silently changed hashes in untouched
+modules, and multi-region `exhaustive: true` (M7), which asserted a proof over
+regions never examined. Instance resolution is the same shape of hazard, and
+lexical scoping is what defuses it — an instance dependency becomes an ordinary
+import edge, which the incremental front end already tracks.
+
+An earlier draft of this ADR claimed typeclasses were structurally incompatible
+with content addressing and the incremental front end. That was too strong. The
+incompatibility is with *global* instance scope specifically. With mandatory
+instance imports and elaboration performed before hashing, typeclasses and
+content addressing coexist.
+
+### 4. The resolution layer is deferred, with two candidates
+
+**(a) Elaboration at concrete call sites.** Where the type is concrete at the
+call, insert the canonical derived function. `respond(order)` elaborates to
+`respond(order, order_to_json)`. Resolution is local, runs before hashing, and
+ambiguity is a compile error rather than a silent pick. Handles application code;
+leaves abstract-in-body threading explicit.
+
+**(b) Lexically-scoped typeclasses.** Full dispatch, instances explicitly
+imported per decision 3, elaborated to dictionaries before hashing. Handles both
+cases, at the cost of instance resolution interacting with Hindley–Milner and
+row-polymorphic effect inference.
+
+**The evidence that decides it** is empirical and does not exist yet: how often is
+a type abstract at the point of dispatch in a real Ply web stack? After W3 and W4
+that is a number rather than a guess. If framework code is as large a fraction as
+expected, (b) is likely right.
+
+## The argument that carries the most weight
+
+Not verbosity. An agent writing `order_to_json` at a call site costs nothing, and
+verbosity was always the weakest argument for dispatch.
+
+**Coherence** is the real one. Typeclasses guarantee one canonical instance per
+(class, type). With explicit dictionaries, nothing prevents:
+
+```ply
+respond(order, order_to_json)       // module A
+respond(order, order_to_json_v2)    // module B, six months later
+```
+
+Both typecheck, the same type serializes two ways, and no one notices until a
+client breaks. Code generated at volume across many modules makes accidental
+inconsistency likelier, not less likely, and coherence is a type-system-level
+answer to it.
+
+Until a resolution layer lands, the partial answers are convention plus a lint —
+one derived codec per type, and a hand-written codec where a derived one exists
+is a warning — and M8, which makes divergence *statable* even though it cannot
+prevent it:
+
+```ply
+law "the two order encoders agree"
+  forall (o: Order) { order_to_json(o) == order_to_json_v2(o) }
+```
+
+Detection rather than prevention, which is weaker, and worth naming as weaker.
 
 ## Consequences
 
-JSON and SQL mapping stop drifting from their types, which is the concrete win.
-Generic library code becomes more verbose, which is the concrete cost.
+Derivation stops codecs drifting from their types, which is the concrete win, and
+W2 proceeds without the dispatch question being settled. Generic library code is
+more verbose until a resolution layer lands, and abstract-in-body dispatch must
+be threaded by hand in the interim.
 
-The thing to watch is generated-code volume: a derived codec per type across a
-large API is a lot of definitions, all of which are hashed, cached, and
-type-checked. The incremental front end should absorb it — 10,000 definitions
-check in 0.45s from scratch — but it is worth measuring rather than assuming,
-because derivation is exactly the feature that makes definition counts jump.
+Worth measuring rather than assuming: derived codecs inflate definition counts —
+500 types is 1,000 extra definitions, all hashed, cached and checked. The
+incremental front end should absorb it (10,000 definitions check from scratch in
+0.45 s), but derivation is exactly the feature that makes definition counts jump,
+and the cache is already the largest thing in a warm run.
 
 ## Not in this ADR
 
-User-defined derivers, typeclasses, and any form of implicit resolution. If (c)
-proves insufficient, the follow-on is (a), and this ADR should be revisited
-rather than extended.
+User-defined derivers. Conditional instances. Higher-kinded types. Any form of
+ambient or global resolution, which decision 3 rules out permanently rather than
+deferring.
