@@ -66,7 +66,7 @@ pub use schema::fingerprint as schema_fingerprint;
 /// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
 /// `string_upper` read `std`'s Unicode tables, which is the one thing the
 /// evaluator does that this repository does not decide.
-pub const RUNTIME_VERSION: &str = "0.6.0";
+pub const RUNTIME_VERSION: &str = "0.8.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -84,7 +84,7 @@ pub const RUNTIME_VERSION: &str = "0.6.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.8.0";
+pub const FRONTEND_VERSION: &str = "0.10.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
@@ -97,7 +97,7 @@ pub const FRONTEND_VERSION: &str = "0.8.0";
 /// Bump it for any change to the fragment, to a rule's meaning, to generation or
 /// shrinking, or to the on-disk shape of a [`CachedObligation`] — none of those
 /// moves an obligation's key, and all of them change what a cache hit claims.
-pub const PROVER_VERSION: &str = "0.2.0";
+pub const PROVER_VERSION: &str = "0.4.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///
@@ -398,6 +398,20 @@ pub struct Store {
     frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
     warnings: Vec<Diagnostic>,
+    stdlib: Stdlib,
+}
+
+/// The stdlib digest this cache was last written under.
+///
+/// Read on the first question rather than at [`Store::open`], because a run that
+/// never asks — every command that does not compile — should not pay a file read
+/// for it. It keys nothing: see [`disk::load_stdlib`].
+#[derive(Default)]
+struct Stdlib {
+    path: PathBuf,
+    stored: OnceLock<Option<String>>,
+    /// What this run wants recorded, once it differs from what is on disk.
+    pending: Option<String>,
 }
 
 /// The pass records, read on the first question rather than at
@@ -738,6 +752,7 @@ impl Store {
         let reviews_path = dir.join(disk::REVIEWS_FILE);
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
         let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
+        let stdlib_path = dir.join(disk::STDLIB_FILE);
         let (frontend, frontend_warnings) =
             frontend::Frontend::open(&frontend_path, &frontend_data_path);
         let mut store = Store {
@@ -765,6 +780,10 @@ impl Store {
             frontend_data_path,
             frontend,
             warnings: frontend_warnings,
+            stdlib: Stdlib {
+                path: stdlib_path,
+                ..Stdlib::default()
+            },
         };
         disk::sweep_stale_temps(&store.dir);
 
@@ -867,6 +886,7 @@ impl Store {
             && !self.obligations.dirty
             && !self.reviews.dirty
             && !self.frontend.is_dirty()
+            && self.stdlib.pending.is_none()
         {
             return Ok(());
         }
@@ -898,6 +918,10 @@ impl Store {
             self.frontend
                 .flush(&self.dir, &self.frontend_path, &self.frontend_data_path)?;
             let _ = std::fs::remove_file(self.dir.join(LEGACY_FRONTEND_FILE));
+        }
+        if let Some(digest) = self.stdlib.pending.take() {
+            disk::save_stdlib(&self.dir, &self.stdlib.path, &digest)?;
+            self.stdlib.stored = OnceLock::from(Some(digest));
         }
         Ok(())
     }
@@ -971,7 +995,12 @@ impl Store {
         self.frontend.clear();
         self.warnings.clear();
         self.dirty = false;
+        // Forgotten with the rest: after a clear there is nothing left for a
+        // moved stdlib to have invalidated, so warning about it would be noise.
+        self.stdlib.pending = None;
+        self.stdlib.stored = OnceLock::from(None);
         let _lock = disk::Lock::acquire(&self.dir);
+        remove(&self.stdlib.path, "stdlib digest")?;
         remove(&self.path, "result cache")?;
         remove(&self.passes.path, "pass records")?;
         remove(&self.obligations.path, "obligation cache")?;
@@ -1060,6 +1089,36 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The stdlib digest this cache was last written under, or `None` for a
+    /// cache no run has recorded one in.
+    ///
+    /// A caller compares it against `ply_std::digest_short()` and warns
+    /// `W0605 STDLIB_CHANGED` when the two differ. Nothing keys on it: a digest
+    /// in a cache key would invalidate a project on an edit to a `std` module it
+    /// never imports, which is the conservative selection Ply exists to beat.
+    pub fn stdlib_digest(&self) -> Option<String> {
+        self.stdlib
+            .pending
+            .clone()
+            .or_else(|| self.stdlib_stored().clone())
+    }
+
+    fn stdlib_stored(&self) -> &Option<String> {
+        self.stdlib
+            .stored
+            .get_or_init(|| disk::load_stdlib(&self.stdlib.path))
+    }
+
+    /// Records the digest this run compiled under. Writing is deferred to
+    /// [`Store::flush`] and skipped when nothing moved, so an unchanged compiler
+    /// touches no file.
+    pub fn set_stdlib_digest(&mut self, digest: String) {
+        if self.stdlib_stored().as_deref() == Some(digest.as_str()) {
+            return;
+        }
+        self.stdlib.pending = Some(digest);
     }
 
     pub fn frontend_path(&self) -> &Path {

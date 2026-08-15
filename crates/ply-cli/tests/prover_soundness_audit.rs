@@ -358,8 +358,9 @@ fn nothing_proved_here_is_refutable_by_sampling() {
          law \"score is positive\" forall (c: Color) { score(c) > 0 }",
         "law \"records are their fields\" forall (x: Int, y: Int) \
            { { a: x, b: y } == { b: y, a: x } }",
-        "type Option<a> = None | Some(a)\n\
-         fn or_else(o: Option<Int>, d: Int) -> Int = match o { None -> d, Some(v) -> v }\n\
+        // The prelude's `Option`, not a local one: declaring a second would be
+        // `E0105`, and a language with two `Option`s is worse than one with none.
+        "fn or_else(o: Option<Int>, d: Int) -> Int = match o { None -> d, Some(v) -> v }\n\
          law \"or_else is a function\" forall (o: Option<Int>, d: Int) \
            { or_else(o, d) == or_else(o, d) }",
     ];

@@ -217,11 +217,38 @@ pub mod codes {
     pub const DUPLICATE_IMPORT: &str = "E0110";
     pub const INVALID_MODULE_PATH: &str = "E0111";
     pub const AMBIGUOUS_ENTRY_POINT: &str = "E0112";
+    /// A project file whose path would name a module under a root the language
+    /// reserves — `std` today. The stdlib ships with the compiler and is found
+    /// by name, so a project module that could claim one of its names would
+    /// decide what `import std.json` means by where a file happens to sit.
+    pub const RESERVED_MODULE_NAME: &str = "E0113";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
     pub const NOT_A_FUNCTION: &str = "E0204";
     pub const NON_EXHAUSTIVE_MATCH: &str = "E0205";
+    /// A type has no derivation for the deriver asked for, and the diagnostic
+    /// names the field that blocks it rather than the type as a whole.
+    ///
+    /// Three shapes, one claim — `derivable(D, t)` does not hold: a `derive`
+    /// whose target contains a function, a cell, a task or a continuation; a
+    /// call site instantiating a `where derivable(D, a)` parameter with such a
+    /// type; and a `Map<k, v>` whose key type is not `derivable(ord, k)`.
+    pub const NOT_DERIVABLE: &str = "E0206";
+    /// A `derive` or a `where` clause naming something that is not one of the
+    /// derivers the language defines. Derivers are fixed; there are no
+    /// user-defined ones.
+    pub const UNKNOWN_DERIVER: &str = "E0207";
+    /// A `derive` in a module other than the one declaring its target type.
+    /// This is the orphan rule, and it is what makes "one canonical codec per
+    /// type" checkable from what a module can see rather than globally.
+    pub const ORPHAN_DERIVE: &str = "E0208";
+    /// `/` applied to `Decimal`. The exact quotient of two decimals is not in
+    /// general a decimal, so the operator would have to round — and a rounding
+    /// nobody wrote down is the defect the type exists to prevent. The
+    /// diagnostic names `decimal_div`, which takes the scale and the rounding
+    /// mode as arguments.
+    pub const DECIMAL_DIVISION: &str = "E0209";
     pub const UNBOUND_ROW_VAR: &str = "E0301";
     pub const EFFECT_NOT_PERMITTED: &str = "E0302";
     pub const UNHANDLED_EFFECT: &str = "E0303";
@@ -337,6 +364,12 @@ pub mod codes {
     /// A `W` because it is nobody's fault: it is a gap, it is counted, and it
     /// leaves its definition uncovered.
     pub const OBLIGATION_NOT_DISCHARGED: &str = "W0604";
+    /// The stdlib shipped with this compiler differs from the one the cache was
+    /// written under. Correctness needs no warning — a stdlib definition is
+    /// content-addressed like any other, so exactly the tests reaching a changed
+    /// one re-run — but an upgrade that silently re-runs work is a mystery, and
+    /// the warning is what turns it into a fact with a digest beside it.
+    pub const STDLIB_CHANGED: &str = "W0605";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -458,11 +491,16 @@ mod tests {
                 codes::AMBIGUOUS_ENTRY_POINT,
                 "E0112",
             ),
+            ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
             ("NOT_A_FUNCTION", codes::NOT_A_FUNCTION, "E0204"),
             ("NON_EXHAUSTIVE_MATCH", codes::NON_EXHAUSTIVE_MATCH, "E0205"),
+            ("NOT_DERIVABLE", codes::NOT_DERIVABLE, "E0206"),
+            ("UNKNOWN_DERIVER", codes::UNKNOWN_DERIVER, "E0207"),
+            ("ORPHAN_DERIVE", codes::ORPHAN_DERIVE, "E0208"),
+            ("DECIMAL_DIVISION", codes::DECIMAL_DIVISION, "E0209"),
             ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
             ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
             ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
@@ -525,6 +563,7 @@ mod tests {
                 codes::OBLIGATION_NOT_DISCHARGED,
                 "W0604",
             ),
+            ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
         ];
 
         for (name, code, expected) in registry {

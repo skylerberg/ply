@@ -115,16 +115,33 @@ impl TypeEnv {
 }
 
 pub fn instantiate(scheme: &Scheme, fresh: &mut Fresh) -> Type {
+    instantiate_with(scheme, fresh).0
+}
+
+/// [`instantiate`], and what each quantified type variable became, in the
+/// scheme's own order.
+///
+/// A `where derivable(D, a)` names its parameter by that position, because a
+/// name is exactly what a published interface may not depend on. A call site
+/// checking the constraint needs the argument the instantiation handed it, and
+/// this is the only place that knows.
+pub fn instantiate_with(scheme: &Scheme, fresh: &mut Fresh) -> (Type, Vec<Type>) {
     if scheme.ty_vars.is_empty() && scheme.row_vars.is_empty() {
-        return scheme.ty.clone();
+        return (scheme.ty.clone(), Vec::new());
     }
-    let tys: FxHashMap<TyVar, Type> = scheme.ty_vars.iter().map(|v| (*v, fresh.ty())).collect();
+    let args: Vec<Type> = scheme.ty_vars.iter().map(|_| fresh.ty()).collect();
+    let tys: FxHashMap<TyVar, Type> = scheme
+        .ty_vars
+        .iter()
+        .copied()
+        .zip(args.iter().cloned())
+        .collect();
     let rows: FxHashMap<RowVar, RowVar> = scheme
         .row_vars
         .iter()
         .map(|v| (*v, fresh.row_var()))
         .collect();
-    rename(&scheme.ty, &tys, &rows)
+    (rename(&scheme.ty, &tys, &rows), args)
 }
 
 /// [`instantiate`] onto variables the caller chose rather than fresh ones, so

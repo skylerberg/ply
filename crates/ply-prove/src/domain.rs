@@ -118,7 +118,11 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(1),
             "Bool" => Some(2),
-            "Int" | "String" | "Bytes" | "List" => None,
+            // `Float` and `Decimal` are finite sets of machine values and are
+            // still not enumerable: a proof by covering 2^64 points is not a
+            // proof anybody runs, and claiming a cardinality here would put the
+            // whole domain inside `ENUMERATION_BOUND`'s arithmetic.
+            "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
             _ => {
                 if open.contains(name) {
                     return None;
@@ -150,7 +154,7 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(Value::Unit),
             "Bool" => Some(Value::Bool(index == 1)),
-            "Int" | "String" | "Bytes" | "List" => None,
+            "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
             _ => {
                 let variants = world.variants(name)?;
                 let mut rest = index;

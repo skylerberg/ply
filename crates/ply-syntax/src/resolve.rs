@@ -438,8 +438,10 @@ fn declarations_of(module: &Module) -> Declarations {
                     }
                 }
             }
-            // Neither declares a name a reference could reach.
-            Item::Test(_) | Item::Law(_) => {}
+            // None declares a name a reference could reach. A `derive`'s
+            // generated definitions are appended as `Item::Fn` before this
+            // runs, and are declared by the arm above.
+            Item::Test(_) | Item::Law(_) | Item::Derive(_) => {}
         }
     }
     out

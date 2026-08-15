@@ -71,12 +71,13 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
     let hashes = loaded.hashes.clone();
-    let laws = Laws::of(&loaded.check, &hashes);
-    let collected = crate::obligations::collect(&loaded.program, &loaded.check, &hashes);
+    let scoped = crate::obligations::project_view(&loaded.check, args.std);
+    let laws = Laws::of(&scoped, &hashes);
+    let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
     warnings.extend(collected.warnings);
 
     if args.accept {
-        let accepted = obligation::accept(&loaded.check, &hashes, &laws, &mut store);
+        let accepted = obligation::accept(&scoped, &hashes, &laws, &mut store);
         if let Err(e) = store.flush() {
             warnings.push(
                 Diagnostic::error(codes::CACHE_UNREADABLE, format!("{e:#}"))
@@ -91,7 +92,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     }
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
-    let specified = obligation::specified(&loaded.check, &laws, &collected.obligations);
+    let specified = obligation::specified(&scoped, &laws, &collected.obligations);
     let (engine, engine_warning) = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
@@ -102,7 +103,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     warnings.extend(engine_warning);
     let mut proved = obligation::prove(
         collected.obligations,
-        &loaded.check,
+        &scoped,
         &laws,
         &mut store,
         &plan,
@@ -112,7 +113,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     warnings.append(&mut proved.warnings);
     let report = proved.report;
 
-    let review = obligation::review(&loaded.check, &hashes, &laws, &store, &report);
+    let review = obligation::review(&scoped, &hashes, &laws, &store, &report);
 
     if let Err(e) = store.flush() {
         warnings.push(

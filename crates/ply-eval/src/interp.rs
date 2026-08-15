@@ -4,7 +4,7 @@ use crate::handler::{OpDecl, check_operation, performed_atom};
 use crate::host::{HostBinding, err_hermetic, err_machine_only_host, operation_label};
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, grow};
 use crate::trace::Trace;
-use crate::value::{Closure, ClosureKind, Value, type_error, values_equal};
+use crate::value::{Closure, ClosureKind, Decimal, Value, type_error, values_equal};
 use crate::world::World;
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -90,7 +90,10 @@ impl<'a> Interp<'a> {
 
     fn build(program: &'a Program, resolved: &'a Resolved, check: Option<&'a CheckOutput>) -> Self {
         let mut globals = FxHashMap::default();
-        let mut ctors: FxHashMap<Symbol, usize> = FxHashMap::default();
+        // The prelude's first, so a module declaring its own `Some` overwrites
+        // it — the resolution order every other prelude name follows.
+        let mut ctors: FxHashMap<Symbol, usize> =
+            ply_core::prelude::ctor_arities().into_iter().collect();
         let mut ops = FxHashMap::default();
         let mut tests = Vec::new();
 
@@ -129,8 +132,10 @@ impl<'a> Interp<'a> {
                     Item::Test(t) => tests.push(TestSlot { module: m, def: t }),
                     // A law is not a global and not a test: `ply-prove`
                     // evaluates its body through `eval_expr_for_test`, with
-                    // its binders bound to generated values.
-                    Item::Law(_) => {}
+                    // its binders bound to generated values. A `derive` is not
+                    // one either — expansion has already appended the globals
+                    // it stands for.
+                    Item::Law(_) | Item::Derive(_) => {}
                 }
             }
         }
@@ -294,6 +299,18 @@ impl<'a> Interp<'a> {
             .map(|b| b.qualified.clone())
     }
 
+    /// The program-wide name a constructor reference denotes, falling back to
+    /// the prelude's — which no module declares, so nothing qualifies it. A
+    /// module that declares its own `Some` shadows the prelude's, exactly as one
+    /// declaring its own `len` does.
+    fn ctor_name(&self, q: &QName) -> Option<Symbol> {
+        match self.global(Namespace::Value, q) {
+            Some(name) => Some(name),
+            None if q.is_bare() && self.ctors.contains_key(q.symbol()) => Some(q.symbol().clone()),
+            None => None,
+        }
+    }
+
     fn enter(&mut self, name: Option<&Symbol>, span: Span) -> Result<(), Diagnostic> {
         if self.calls.len() >= self.max_calls {
             return Err(self.err_recursion_limit(span));
@@ -379,16 +396,9 @@ impl<'a> Interp<'a> {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let v = self.eval(operand, env)?;
-        match op {
-            UnOp::Neg => {
-                let i = v.as_int(operand.span, "negation")?;
-                match i.checked_neg() {
-                    Some(n) => Ok(Value::Int(n)),
-                    None => Err(err_overflow(span, "negation", i, 0)),
-                }
-            }
-            UnOp::Not => Ok(Value::Bool(!v.as_bool(operand.span, "`!`")?)),
-        }
+        // One implementation for both engines, so `--engine both` cannot report
+        // a divergence that is the two of them disagreeing about a `-0.0`.
+        crate::machine::apply_unary(op, &v, operand.span, span)
     }
 
     #[inline(never)]
@@ -590,13 +600,15 @@ impl<'a> Interp<'a> {
         {
             return Ok(v.clone());
         }
-        if let Some(name) = self.global(Namespace::Value, q) {
-            if let Some(v) = self.globals.get(&name) {
-                return Ok(v.clone());
-            }
-            if let Some(&arity) = self.ctors.get(&name) {
-                return Ok(ctor_value(&name, arity));
-            }
+        if let Some(name) = self.global(Namespace::Value, q)
+            && let Some(v) = self.globals.get(&name)
+        {
+            return Ok(v.clone());
+        }
+        if let Some(name) = self.ctor_name(q)
+            && let Some(&arity) = self.ctors.get(&name)
+        {
+            return Ok(ctor_value(&name, arity));
         }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
@@ -783,7 +795,7 @@ impl<'a> Interp<'a> {
             PatternKind::Var(id) => {
                 // A nullary constructor written bare is indistinguishable from a
                 // binder in the AST, so the constructor table decides.
-                let declared = self.global(Namespace::Value, &QName::bare(id.clone()));
+                let declared = self.ctor_name(&QName::bare(id.clone()));
                 match declared.as_ref().and_then(|name| self.ctors.get(name)) {
                     Some(0) => {
                         let ctor = declared.expect("a hit came from a resolved name");
@@ -796,20 +808,13 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            PatternKind::Lit(lit) => match (lit, value) {
-                (Lit::Int(a), Value::Int(b)) => a == b,
-                (Lit::Bool(a), Value::Bool(b)) => a == b,
-                (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
-                (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
-                (Lit::Unit, Value::Unit) => true,
-                _ => false,
-            },
+            PatternKind::Lit(lit) => lit_matches(lit, value),
             PatternKind::Ctor { name, args } => match value {
                 Value::Ctor {
                     name: vname,
                     args: vargs,
                 } => {
-                    let expected = self.global(Namespace::Value, name);
+                    let expected = self.ctor_name(name);
                     if expected.as_ref() != Some(vname) || vargs.len() != args.len() {
                         return Ok(false);
                     }
@@ -886,7 +891,41 @@ pub(crate) fn literal(lit: &Lit) -> Value {
         Lit::Bool(b) => Value::Bool(*b),
         Lit::Str(s) => Value::str(s),
         Lit::Bytes(b) => Value::bytes(b),
+        Lit::Float(f) => Value::Float(*f),
+        Lit::Decimal { mantissa, scale } => Value::Decimal(decimal_lit(*mantissa, *scale)),
         Lit::Unit => Value::Unit,
+    }
+}
+
+/// A `Decimal` literal's value.
+///
+/// Total because both producers of a `Lit::Decimal` already enforce the type's
+/// range — the lexer refuses a mantissa past 96 bits or a scale past 28, and the
+/// body decoder refuses the same bytes — so the fallback is a shape no stream
+/// this evaluator is handed can carry.
+pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
+    Decimal::try_from_i128_with_scale(mantissa, scale).unwrap_or(Decimal::ZERO)
+}
+
+/// A literal pattern against a value, shared by both engines so a `--engine
+/// both` divergence cannot be the two of them disagreeing about a NaN.
+///
+/// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing at all —
+/// including a NaN scrutinee. A pattern that answered otherwise would be a
+/// second equality on the type, and nobody wrote that one down.
+pub(crate) fn lit_matches(lit: &Lit, value: &Value) -> bool {
+    match (lit, value) {
+        (Lit::Int(a), Value::Int(b)) => a == b,
+        (Lit::Bool(a), Value::Bool(b)) => a == b,
+        (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
+        (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
+        (Lit::Float(a), Value::Float(b)) => a == b,
+        // By numeric value, matching `==`: a `1.50m` pattern matches `1.5m`.
+        (Lit::Decimal { mantissa, scale }, Value::Decimal(b)) => {
+            decimal_lit(*mantissa, *scale) == *b
+        }
+        (Lit::Unit, Value::Unit) => true,
+        _ => false,
     }
 }
 
@@ -952,15 +991,33 @@ pub(crate) fn strict_binary(
             let b = r.as_str(rspan, "`++`")?;
             Ok(Value::str(format!("{a}{b}")))
         }
+        // `Float` answers by IEEE, where `NaN < x` and `NaN >= x` are both
+        // false — so a comparison is not the negation of its converse. That is
+        // what the type says, and smoothing it over here would make the operator
+        // disagree with `==` on the same two values.
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            if let (Value::Float(a), Value::Float(b)) = (l, r) {
+                return Ok(Value::Bool(match op {
+                    BinOp::Lt => a < b,
+                    BinOp::Le => a <= b,
+                    BinOp::Gt => a > b,
+                    _ => a >= b,
+                }));
+            }
             let ordering = match (l, r) {
                 (Value::Int(a), Value::Int(b)) => a.cmp(b),
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
-                (Value::Int(_) | Value::Str(_), other) => {
+                (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
+                (Value::Int(_) | Value::Str(_) | Value::Decimal(_) | Value::Float(_), other) => {
                     return Err(type_error(rspan, "a comparison", l.type_name(), other));
                 }
                 (other, _) => {
-                    return Err(type_error(lspan, "a comparison", "Int or String", other));
+                    return Err(type_error(
+                        lspan,
+                        "a comparison",
+                        "Int, String, Float or Decimal",
+                        other,
+                    ));
                 }
             };
             Ok(Value::Bool(match op {
@@ -971,6 +1028,13 @@ pub(crate) fn strict_binary(
             }))
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            match (l, r) {
+                (Value::Float(a), Value::Float(b)) => return float_arithmetic(op, *a, *b, span),
+                (Value::Decimal(a), Value::Decimal(b)) => {
+                    return decimal_arithmetic(op, *a, *b, rspan, span);
+                }
+                _ => {}
+            }
             let a = l.as_int(lspan, "arithmetic")?;
             let b = r.as_int(rspan, "arithmetic")?;
             let (result, what) = match op {
@@ -992,6 +1056,85 @@ pub(crate) fn strict_binary(
             "internal error: a short-circuiting operator reached strict evaluation",
         )
         .primary(span, "please report this")),
+    }
+}
+
+/// IEEE-754, unmodified. There is no overflow error and no zero-divisor error:
+/// `1.0 / 0.0` is `Infinity` and `0.0 / 0.0` is `NaN`, and those are values the
+/// standard defines rather than failures. Refusing them would make `Float` a
+/// worse `Decimal` instead of a different type — and the cost is stated in the
+/// type, which is why nothing about a `Float` may be `proved`.
+fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diagnostic> {
+    Ok(Value::Float(match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => a / b,
+        BinOp::Rem => a % b,
+        _ => {
+            return Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "internal error: a non-arithmetic operator reached float arithmetic",
+            )
+            .primary(span, "please report this"));
+        }
+    }))
+}
+
+/// Exact, or a diagnostic. Never a silent wrap and never a silent rounding: a
+/// total that quietly lost a cent is the failure this type exists to prevent.
+///
+/// `/` never arrives — inference refuses it with `E0209`, because the exact
+/// quotient of two decimals is not in general a decimal and an operator would
+/// have to round. `%` does, and is exact: the *remainder* of a decimal division
+/// is a decimal even when the quotient is not.
+fn decimal_arithmetic(
+    op: BinOp,
+    a: Decimal,
+    b: Decimal,
+    rspan: Span,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    let (result, what) = match op {
+        BinOp::Add => (a.checked_add(b), "addition"),
+        BinOp::Sub => (a.checked_sub(b), "subtraction"),
+        // Exact while the result's scale fits, and half-to-even at scale 28
+        // otherwise. `checked_mul` is what applies that rule; a mantissa that
+        // leaves 96 bits is `None` and is reported rather than rounded.
+        BinOp::Mul => (a.checked_mul(b), "multiplication"),
+        BinOp::Rem => {
+            if b.is_zero() {
+                return Err(err_zero_divisor(rspan, "remainder"));
+            }
+            (a.checked_rem(b), "remainder")
+        }
+        BinOp::Div => {
+            return Err(Diagnostic::error(
+                codes::DECIMAL_DIVISION,
+                "`/` is not defined on `Decimal`",
+            )
+            .primary(span, "the exact quotient of two decimals is not a decimal")
+            .note("call `decimal_div(a, b, scale, HalfEven)` and say how to round"));
+        }
+        _ => {
+            return Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "internal error: a non-arithmetic operator reached decimal arithmetic",
+            )
+            .primary(span, "please report this"));
+        }
+    };
+    match result {
+        Some(d) => Ok(Value::Decimal(d)),
+        None => Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`Decimal` overflow in {what}"),
+        )
+        .primary(
+            span,
+            format!("{a} and {b} need more than 96 bits of mantissa"),
+        )
+        .note("`Decimal` is exact and bounded; it will not round to make room")),
     }
 }
 
@@ -1066,7 +1209,7 @@ pub(crate) fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>)
 
 #[cold]
 #[inline(never)]
-fn err_zero_divisor(span: Span, what: &str) -> Diagnostic {
+pub(crate) fn err_zero_divisor(span: Span, what: &str) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} by zero"))
         .primary(span, "this divisor is 0")
 }

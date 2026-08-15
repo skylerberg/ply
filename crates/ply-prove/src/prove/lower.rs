@@ -59,7 +59,10 @@ const MAX_TERMS: usize = 20_000;
 ///
 /// Absent for the same reason: `bytes_at`, `bytes_slice`, `string_slice`,
 /// `string_split`, `string_find` and `string_of_bytes` all have inputs they
-/// refuse, so a call to one is not a value until its argument is known.
+/// refuse, so a call to one is not a value until its argument is known. So do
+/// `bytes_index_of_from`, `bytes_index_of_byte`, `bytes_split`, `bytes_scan`
+/// and `bytes_scan_until`; `bytes_position` applies a function this module
+/// never sees the body of.
 const TOTAL_BUILTINS: &[&str] = &[
     "len",
     "push",
@@ -69,6 +72,9 @@ const TOTAL_BUILTINS: &[&str] = &[
     "bytes_concat",
     "bytes_of_string",
     "bytes_is_utf8",
+    "bytes_index_of",
+    "bytes_starts_with",
+    "bytes_ends_with",
     "string_of_bytes_lossy",
     "string_len",
     "string_trim",
@@ -77,6 +83,36 @@ const TOTAL_BUILTINS: &[&str] = &[
     "string_starts_with",
     "string_ends_with",
     "string_contains",
+    // `Map`. Every one of these is a function of its arguments with no input it
+    // refuses: a lookup answers an `Option` rather than raising, and removing an
+    // absent key is a no-op. Being total buys congruence and nothing else —
+    // there is no theory of arrays here, so `map_get(map_insert(m, k, v), k) ==
+    // Some(v)` is still `property` and must be.
+    //
+    // `map_fold` is absent, with `map`, `filter` and `fold`, because it applies
+    // a function this module never sees the body of.
+    "map_new",
+    "map_insert",
+    "map_get",
+    "map_contains",
+    "map_remove",
+    "map_len",
+    "map_keys",
+    "map_values",
+    "map_entries",
+    "map_of_entries",
+    "map_merge",
+    // The `Decimal` conversions with no input they refuse: each answers an
+    // `Option` or a total value rather than raising. `decimal_div` and
+    // `decimal_round` are deliberately absent — both refuse a scale outside
+    // `0..=28` and `decimal_div` refuses a zero divisor, so a call to either is
+    // not a value until its arguments are known.
+    "decimal_of_int",
+    "decimal_to_string",
+    "decimal_of_string",
+    "float_of_decimal",
+    "decimal_of_float",
+    "int_of_decimal",
 ];
 
 /// Where lowering left the decidable fragment, for measurement only.
@@ -107,12 +143,32 @@ pub enum Blocker {
     CoefficientRange,
     Lambda,
     StringConcat,
+    /// A `Float`-typed term anywhere in the graph. Not a completeness cost like
+    /// the others: it is the refusal that makes `Float` outside `proved`
+    /// structural rather than a rule somebody has to remember.
+    FloatTerm,
+    /// `Decimal` arithmetic or a `Decimal` ordering. The type's `==` is an
+    /// equivalence relation, so congruence over it is sound and `f(x) == f(x)`
+    /// is provable — but there is no theory of `+` here, so `x + 0m == x` is
+    /// `property`.
+    DecimalArithmetic,
     /// A `perform`, `handle`, `with_cell` or `simulate`. Only reachable in a
     /// concurrency law, whose row may carry `sim.read`.
     Region,
     /// A pattern the fragment declines to reduce, or a pattern guard.
     UndecidableMatchArm,
     DestructuringLet,
+}
+
+/// The numeric type an operator was applied at, when it was not `Int`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Numeric {
+    Float,
+    Decimal,
+}
+
+fn is_con(ty: &Type, name: &str) -> bool {
+    matches!(ty, Type::Con(n, args) if n.as_str() == name && args.is_empty())
 }
 
 pub struct Lowering<'a, 'p> {
@@ -135,6 +191,8 @@ pub struct Lowering<'a, 'p> {
     /// branch of an `if`, the right operand of a short-circuiting operator, and
     /// the guards a caller has already lowered.
     path: Vec<TermId>,
+    /// Whether a `Float` was met. See [`Lowering::float`].
+    float: bool,
 }
 
 impl<'a, 'p> Lowering<'a, 'p> {
@@ -156,7 +214,30 @@ impl<'a, 'p> Lowering<'a, 'p> {
             blockers: Vec::new(),
             requirements: Vec::new(),
             path: Vec::new(),
+            float: false,
         }
+    }
+
+    /// Records that a `Float` entered the obligation, which no proof survives.
+    ///
+    /// `==` on `Float` is not reflexive — `NaN != NaN` — and congruence closure
+    /// over a relation that is not reflexive is unsound, so there is no honest
+    /// way to run this fragment over the type at all. The refusal is
+    /// **structural**: lowering answers "unsupported" and
+    /// [`super::decide_and_diagnose`] returns before a solver runs, so the
+    /// certificate cannot be constructed rather than being constructed and then
+    /// discarded. A tier is computed from the evidence a discharge carries, and
+    /// this is what makes that sentence true for `Float`.
+    fn float(&mut self) {
+        if !self.float {
+            self.blocked(Blocker::FloatTerm);
+        }
+        self.float = true;
+    }
+
+    /// Whether anything lowered here puts a `Float` in the obligation.
+    pub fn unsupported(&self) -> bool {
+        self.float
     }
 
     fn blocked(&mut self, blocker: Blocker) {
@@ -280,6 +361,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
     /// Introduces the obligation's binders as symbolic constants, which is what
     /// makes the answer a statement about every input rather than about one.
     pub fn bind_symbolic(&mut self, name: &Symbol, ty: &Type) -> TermId {
+        if self.ctx.reaches_float(ty) {
+            self.float();
+        }
         let term = self.terms.sym(Some(ty.clone()));
         self.frames.push((name.clone(), term));
         term
@@ -414,6 +498,15 @@ impl<'a, 'p> Lowering<'a, 'p> {
             // occurrences of one literal do not unify, so a claim about them
             // reports `property` — is the safe direction.
             Lit::Bytes(_) => self.terms.sym(Some(Type::bytes())),
+            // No `Node::Float`, deliberately: two occurrences of `0.0` sharing
+            // a node would make them congruent, and congruence needs a
+            // reflexive `==`, which this type does not have. The obligation is
+            // refused whole, so what this term is does not matter.
+            Lit::Float(_) => {
+                self.float();
+                self.terms.sym(Some(Type::float()))
+            }
+            Lit::Decimal { mantissa, scale } => self.terms.decimal(*mantissa, *scale),
             Lit::Unit => self.terms.unit(),
         }
     }
@@ -444,6 +537,75 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.terms.mk(Node::Opaque(name), sort)
     }
 
+    /// Which non-`Int` numeric type an operator's operands have, by their
+    /// sorts. `None` is the `Int` path, which is what every operand had before
+    /// this milestone.
+    fn operand_type(&self, lhs: TermId, rhs: TermId) -> Option<Numeric> {
+        for side in [lhs, rhs] {
+            match self.terms.sort(side) {
+                Some(t) if is_con(t, "Float") => return Some(Numeric::Float),
+                Some(t) if is_con(t, "Decimal") => return Some(Numeric::Decimal),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// An operator at `Float` or `Decimal`: an uninterpreted symbol, and no
+    /// theory.
+    ///
+    /// `Decimal` arithmetic is additionally **undefined** here, and that is not
+    /// conservatism for its own sake: `+` on `Decimal` raises on mantissa
+    /// overflow, so `x + x == x + x` is not true of every input the way a
+    /// statement about a total function would be. Congruence over `Decimal`
+    /// *values* stays available — `f(x) == f(x)` is provable — which is exactly
+    /// the line ADR 0012 §4 draws.
+    fn non_int_operator(
+        &mut self,
+        op: BinOp,
+        lhs: TermId,
+        rhs: TermId,
+        numeric: Numeric,
+    ) -> TermId {
+        let comparison = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        match numeric {
+            Numeric::Float => self.float(),
+            Numeric::Decimal => {
+                self.blocked(Blocker::DecimalArithmetic);
+                if !comparison {
+                    self.undefined();
+                }
+            }
+        }
+        let symbol = match op {
+            BinOp::Add => term::ADD,
+            BinOp::Sub => term::SUB,
+            BinOp::Mul => term::MUL,
+            BinOp::Div => term::DIV,
+            BinOp::Rem => term::REM,
+            BinOp::Lt => term::LT,
+            BinOp::Le => term::LE,
+            BinOp::Gt => term::GT,
+            _ => term::GE,
+        };
+        let sort = if comparison {
+            Type::bool()
+        } else {
+            match numeric {
+                Numeric::Float => Type::float(),
+                Numeric::Decimal => Type::decimal(),
+            }
+        };
+        let head = self.terms.opaque(symbol, None);
+        self.terms.mk(
+            Node::App {
+                head,
+                args: vec![lhs, rhs],
+            },
+            Some(sort),
+        )
+    }
+
     fn lookup(&self, name: &Symbol) -> Option<TermId> {
         let floor = self.barriers.last().copied().unwrap_or(0);
         self.frames[floor..]
@@ -454,6 +616,26 @@ impl<'a, 'p> Lowering<'a, 'p> {
     }
 
     fn binary(&mut self, op: BinOp, lhs: TermId, rhs: TermId) -> TermId {
+        // `+`, `-`, `*`, `%`, `<` and friends are defined at three numeric
+        // types now, and everything below this point is the theory of exactly
+        // one of them. Folding a `Float` sum into a `Node::Lin` would put
+        // `x + y == y + x` over binary64 inside the fragment, which is a wrong
+        // `proved` assembled out of a correct rule applied at the wrong sort.
+        if matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+        ) && let Some(numeric) = self.operand_type(lhs, rhs)
+        {
+            return self.non_int_operator(op, lhs, rhs, numeric);
+        }
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 self.terms.force_int(lhs);
@@ -730,8 +912,10 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 // introduces stands for an unknown value rather than resolving
                 // past the binder to a definition of the same name.
                 _ => {
+                    let term = self.lower(value);
+                    let sort = self.terms.sort(term).cloned();
                     self.blocked(Blocker::DestructuringLet);
-                    self.bind_opaque(pat);
+                    self.bind_opaque(pat, sort.as_ref());
                 }
             }
         }
@@ -743,7 +927,18 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    fn bind_opaque(&mut self, pat: &Pattern) {
+    /// Binds every name a pattern introduces to a fresh symbol.
+    ///
+    /// `sort` is what the pattern was matched *against*, and it is taken only to
+    /// ask whether a `Float` is being let in without one: a binder pulled out of
+    /// a destructuring has no sort of its own, so it would otherwise reach the
+    /// arithmetic below as an operand of unknown type and be folded as an `Int`.
+    /// That is the one way a `Float` can enter the graph carrying no sort for
+    /// [`super::float_in`] to find.
+    fn bind_opaque(&mut self, pat: &Pattern, sort: Option<&Type>) {
+        if sort.is_some_and(|s| self.ctx.reaches_float(s)) {
+            self.float();
+        }
         for name in pattern_vars(pat) {
             let term = self.terms.sym(None);
             self.frames.push((name, term));
@@ -770,7 +965,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 Some(shape) => shape,
                 None => {
                     self.blocked(Blocker::UndecidableMatchArm);
-                    self.bind_opaque(&arm.pat);
+                    self.bind_opaque(&arm.pat, scrutinee_sort.as_ref());
                     (ArmTest::Undecidable, Vec::new())
                 }
             };

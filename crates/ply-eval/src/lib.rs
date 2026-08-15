@@ -25,6 +25,7 @@ pub mod host;
 mod interp;
 pub mod limit;
 pub mod machine;
+pub mod map;
 pub mod region;
 pub mod sched;
 pub mod sim;
@@ -61,7 +62,9 @@ pub use sim::{
     Wake,
 };
 pub use trace::Trace;
-pub use value::{Closure, ClosureKind, Value, Vector, first_difference, values_equal};
+pub use value::{
+    Closure, ClosureKind, Decimal, Map, Value, Vector, first_difference, values_equal,
+};
 pub use world::{CellId, Fixture, World};
 
 /// The default is the engine whose results are authoritative. Flipping it is a
@@ -151,5 +154,7 @@ impl EngineChoice {
 
 #[cfg(test)]
 mod build;
+#[cfg(test)]
+mod numerics;
 #[cfg(test)]
 mod tests;

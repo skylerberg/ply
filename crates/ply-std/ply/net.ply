@@ -1,9 +1,11 @@
-// The network effect, and the smallest program that uses all of it.
+// The network effect. `import std.net (net)` and the operations below are the
+// ones `ply_host::tcp` registers against.
 //
-// This file is the declaration `ply_host::tcp` registers against, exported as
-// `ply_host::tcp::DECLARATION`. A program that wants the TCP handler declares
-// `net` exactly like this; `HostRegistry::bind` answers E0421 if it does not,
-// naming the operation that drifted.
+// This module is the declaration and nothing else: a program that reaches a
+// socket imports it rather than copying it, so the signature the host binds to
+// and the signature the program performs are one text that cannot drift. An
+// operation renamed on either side is E0421 at bind time, naming the operation
+// that moved.
 //
 // `nondet` is load-bearing. It is what makes a `det` test that reaches a socket
 // E0412 at compile time, with `--host` and without it, and it is checked against
@@ -19,14 +21,14 @@
 // and returns is the *dynamic* one the host's socket table is keyed on. Two
 // sockets accepted at one source site share a label and therefore contend —
 // resource labels are ground identifiers in the source, so nothing else is
-// expressible in W1.
+// expressible yet.
 //
 // Every operation is `write`, `recv` included. A read consumes bytes from the
 // kernel's receive buffer, so two tasks reading one socket race exactly as two
 // writers do, and calling that a `read` would let the conflict graph run them
 // side by side.
 
-nondet effect net {
+pub nondet effect net {
   write listen[s](port: Int) -> Int
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int) -> Bytes
@@ -34,22 +36,34 @@ nondet effect net {
   write close[s](socket: Int) -> Unit
 }
 
-fn greeting() -> Bytes = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply"
-
 // A `recv` shorter than `max` is ordinary — TCP preserves the byte stream and
 // not the boundaries a peer wrote it in — and an empty answer means the peer is
 // done sending. Anything that needs a whole message loops.
-fn drain(c: Int, so_far: Bytes) -> Bytes / {net.write[conn]} = {
+pub fn drain(c: Int, so_far: Bytes) -> Bytes / {net.write[conn]} = {
   let chunk = net.recv[conn](c, 4096);
   if bytes_len(chunk) == 0 { so_far } else { drain(c, bytes_concat(so_far, chunk)) }
 }
 
-fn serve_once(port: Int) -> Int / {net.write[listener], net.write[conn]} = {
-  let l = net.listen[listener](port);
-  let c = net.accept[listener](l);
-  let request = drain(c, b"");
-  let sent = net.send[conn](c, greeting());
-  net.close[conn](c);
-  net.close[listener](l);
-  bytes_len(request) + sent
+fn head(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
+
+fn tail(queued: List<Bytes>) -> List<Bytes> = match queued { [_, ..rest] -> rest, _ -> [] }
+
+// A shipped module's tests are the compiler's, not a project's: `ply test` in a
+// project that imports this module does not select them and writes nothing about
+// them to that project's cache, because a project's test count must not change
+// with a compiler upgrade. `ply test --std` selects them, and the compiler's own
+// suite runs them.
+test "drain stops at end of stream rather than at the first short read" {
+  with_cell[inbox]([b"ab", b"c", b"", b"unread"]) { inbox -> {
+    handle {
+      assert_eq(drain(1, b""), b"abc")
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, tail(queued));
+        head(queued)
+      },
+    };
+    assert_eq(cell_get(inbox), [b"unread"])
+  } }
 }

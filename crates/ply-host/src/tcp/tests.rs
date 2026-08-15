@@ -11,21 +11,49 @@ use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::{Bound, HostBinding, Pending, Value};
 use ply_span::SourceId;
-use ply_syntax::ast::Mode;
+use ply_syntax::ast::{Mode, ModuleName};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
+/// A registration is resolved against the atoms the **program** performs, and
+/// the shipped declaration names no resource label on its own. So the fixture is
+/// the declaration plus a driver that performs every operation under the two
+/// labels these tests use — which is `examples/echo.ply` in miniature.
+const DRIVER: &str = "
+fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
+  let l = net.listen[listener](port);
+  let c = net.accept[listener](l);
+  let got = net.recv[conn](c, 16);
+  let sent = net.send[conn](c, payload);
+  net.close[conn](c);
+  net.close[listener](l);
+  bytes_len(got) + sent
+}
+";
+
+/// Checked under the module name it ships as, because an effect's name is
+/// qualified: the same text loaded anonymously declares `net` rather than
+/// `std.net.net` and would not bind, which is the drift [`EFFECT`] exists to
+/// pin.
+/// The shipped declaration and the driver, as one module: mutation tests edit
+/// this text so that a rename lands on both sides of it, which is the whole
+/// point of asserting that a rename is caught.
+fn fixture() -> String {
+    format!("{DECLARATION}{DRIVER}")
+}
+
 fn check(source: &str) -> CheckOutput {
-    let module = ply_syntax::parse(SourceId(0), source).expect("the declaration parses");
+    let module = ply_syntax::parse_module(SourceId(0), ModuleName::from_dotted(MODULE), source)
+        .expect("the declaration parses");
     ply_core::check_module(&module).expect("the declaration typechecks")
 }
 
 fn bind(net: Arc<dyn Net>) -> HostBinding {
     registry(net)
-        .bind(&check(DECLARATION))
+        .bind(&check(&fixture()))
         .expect("the declaration and the registration agree")
 }
 
@@ -83,7 +111,10 @@ fn the_declaration_binds_and_names_exactly_the_atoms_the_program_performs() {
         .atoms()
         .map(EffectAtom::to_string)
         .collect();
-    assert_eq!(atoms, ["net.write[conn]", "net.write[listener]"]);
+    assert_eq!(
+        atoms,
+        ["std.net.net.write[conn]", "std.net.net.write[listener]"]
+    );
 }
 
 /// The claim `ply hosts` puts in front of a reviewer. `Any` expands per label,
@@ -101,16 +132,16 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
     assert_eq!(
         rows,
         [
-            "net.accept[conn] net.write[conn] ply_host::tcp::accept",
-            "net.accept[listener] net.write[listener] ply_host::tcp::accept",
-            "net.close[conn] net.write[conn] ply_host::tcp::close",
-            "net.close[listener] net.write[listener] ply_host::tcp::close",
-            "net.listen[conn] net.write[conn] ply_host::tcp::listen",
-            "net.listen[listener] net.write[listener] ply_host::tcp::listen",
-            "net.recv[conn] net.write[conn] ply_host::tcp::recv",
-            "net.recv[listener] net.write[listener] ply_host::tcp::recv",
-            "net.send[conn] net.write[conn] ply_host::tcp::send",
-            "net.send[listener] net.write[listener] ply_host::tcp::send",
+            "std.net.net.accept[conn] std.net.net.write[conn] ply_host::tcp::accept",
+            "std.net.net.accept[listener] std.net.net.write[listener] ply_host::tcp::accept",
+            "std.net.net.close[conn] std.net.net.write[conn] ply_host::tcp::close",
+            "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
+            "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
+            "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
+            "std.net.net.recv[conn] std.net.net.write[conn] ply_host::tcp::recv",
+            "std.net.net.recv[listener] std.net.net.write[listener] ply_host::tcp::recv",
+            "std.net.net.send[conn] std.net.net.write[conn] ply_host::tcp::send",
+            "std.net.net.send[listener] std.net.net.write[listener] ply_host::tcp::send",
         ]
     );
 }
@@ -170,7 +201,7 @@ fn no_operation_claims_to_be_repeatable() {
 /// the cache key — ignorant of whether `--host` was passed.
 #[test]
 fn a_declaration_without_nondet_refuses_the_handler() {
-    let weakened = DECLARATION.replacen("nondet effect net", "effect net", 1);
+    let weakened = fixture().replacen("nondet effect net", "effect net", 1);
     let diagnostics = registry(Arc::new(TcpHost::new()))
         .bind(&check(&weakened))
         .expect_err("a socket cannot sit behind an effect that is not `nondet`");
@@ -187,7 +218,7 @@ fn a_declaration_without_nondet_refuses_the_handler() {
 /// the authority, so the two meeting is checked before anything runs.
 #[test]
 fn an_operation_renamed_in_the_source_is_refused_at_bind_time() {
-    let renamed = DECLARATION.replace("recv", "read_bytes");
+    let renamed = fixture().replace("recv", "read_bytes");
     let diagnostics = registry(Arc::new(TcpHost::new()))
         .bind(&check(&renamed))
         .expect_err("`net.recv` is no longer declared");

@@ -490,6 +490,53 @@ fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
     );
 }
 
+/// The one exception, and the reason it is safe: a declaration that ships with
+/// the compiler has a module fixed at compile time, so `ply_host::tcp` can name
+/// `std.net.net` exactly rather than matching whatever a program happens to
+/// spell `net`.
+///
+/// That is what stops a copied declaration from silently acquiring a real
+/// socket. The consumer's own `effect net` is a different capability, and it
+/// binds to nothing.
+#[test]
+fn a_registration_may_spell_a_program_wide_name_under_the_reserved_root() {
+    const DECL: &str = r#"
+pub nondet effect net {
+  write send[s](payload: Int) -> Int
+}
+
+pub fn out(x: Int) -> Int / {net.write[socket]} = net.send[socket](x)
+"#;
+
+    let shipped = qualified("std.net", DECL);
+    let binding = registry(vec![op("std.net.net", "send", named("socket"))])
+        .bind(&shipped)
+        .expect("a shipped declaration is named in full");
+    let rows = &binding.listing().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].effect.as_str(), "std.net.net");
+    assert_eq!(rows[0].atom.effect.as_str(), "std.net.net");
+
+    // The same text in a project module is a different capability. `Any` over an
+    // effect nothing declares is idle rather than wrong, so the honest evidence
+    // is that it resolves to no row at all.
+    let copied = qualified("app", DECL);
+    let binding = registry(vec![op("std.net.net", "send", HostResource::Any)])
+        .bind(&copied)
+        .expect("an unmatched `Any` registration is idle, not an error");
+    assert!(
+        binding.listing().rows.is_empty(),
+        "a copied declaration bound the shipped handler: {:?}",
+        binding.listing().rows
+    );
+
+    // And naming a specific resource says so, rather than binding quietly.
+    let diagnostics = registry(vec![op("std.net.net", "send", named("socket"))])
+        .bind(&copied)
+        .expect_err("`std.net.net` is not what `app` declares");
+    assert_eq!(codes_of(&diagnostics), [codes::HOST_OPERATION_UNKNOWN]);
+}
+
 /// Registering the program-wide name is the mistake the asymmetry above invites,
 /// and it has to be loud: `store.db` is not what any declaration writes, so it
 /// resolves to nothing.

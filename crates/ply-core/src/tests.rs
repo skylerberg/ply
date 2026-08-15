@@ -257,6 +257,8 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
                 .collect(),
             ret: None,
             effects: None,
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body,
             span: any(),
@@ -1310,24 +1312,9 @@ fn a_definition_used_before_it_is_written_still_generalizes() {
 
 #[test]
 fn sum_types_give_constructors_and_exhaustiveness() {
-    let option = Item::Type(Box::new(TypeDef {
-        vis: Visibility::Private,
-        name: id("Option"),
-        params: vec![id("a")],
-        body: TypeDefBody::Sum(vec![
-            VariantDef {
-                name: id("None"),
-                fields: vec![],
-                span: any(),
-            },
-            VariantDef {
-                name: id("Some"),
-                fields: vec![tvar("a")],
-                span: any(),
-            },
-        ]),
-        span: any(),
-    }));
+    // `Option` is the prelude's: `map_get` returns one and `decimal_of_string`
+    // returns one, so a builtin's type would otherwise mention a type the user
+    // has to declare. Redeclaring it here would be `E0105`.
     let arm = |kind: PatternKind, body: Expr| MatchArm {
         pat: Pattern { kind, span: any() },
         guard: None,
@@ -1357,7 +1344,6 @@ fn sum_types_give_constructors_and_exhaustiveness() {
         ],
     });
     let out = check(vec![
-        option.clone(),
         func("unwrap_or_zero", &["o"], full).item(),
         func("wrap", &[], call("Some", vec![int(3)])).item(),
     ]);
@@ -1376,7 +1362,7 @@ fn sum_types_give_constructors_and_exhaustiveness() {
             int(0),
         )],
     });
-    let diags = check_err(vec![option, func("partial", &["o"], partial).item()]);
+    let diags = check_err(vec![func("partial", &["o"], partial).item()]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
     assert!(
         d.labels[0].message.contains("Some"),
@@ -2000,8 +1986,16 @@ fn comparing_ordinary_values_stays_legal() {
 // Cross-module checking. These parse real source rather than building the AST,
 // because what is under test is how imports, `pub` and `::` reach inference.
 
+/// Parsed and expanded, in that order and never one without the other: the
+/// driver expands a `derive` before it resolves anything, so a harness that
+/// skipped it would check a program the compiler never sees and would report a
+/// generated definition as an unknown name.
+///
+/// Expansion failing is a defect in a fixture rather than a case under test —
+/// the derivers' own negative cases live in `ply-core/tests/derivation.rs`,
+/// against `ply_derive::expand_program` directly.
 fn parse_program(files: &[(&str, &str)]) -> Program {
-    Program {
+    let mut program = Program {
         modules: files
             .iter()
             .enumerate()
@@ -2010,7 +2004,14 @@ fn parse_program(files: &[(&str, &str)]) -> Program {
                     .unwrap_or_else(|d| panic!("`{name}` should parse: {}", render(&d)))
             })
             .collect(),
-    }
+    };
+    let diags = ply_derive::expand_program(&mut program);
+    assert!(
+        diags.is_empty(),
+        "expected every `derive` to expand: {}",
+        render(&diags)
+    );
+    program
 }
 
 fn check_files(files: &[(&str, &str)]) -> CheckOutput {
@@ -2423,10 +2424,15 @@ fn the_example_corpus_checks_as_one_program() {
             (name, text)
         })
         .collect();
-    let files: Vec<(&str, &str)> = sources
+    let mut files: Vec<(&str, &str)> = sources
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
+    // The example corpus imports `std.net`. `ply` pulls a shipped module in on
+    // demand; this harness has no import graph to walk, so it loads the set.
+    for (name, source) in ply_std::sources() {
+        files.push((name, source));
+    }
 
     let out = check_files(&files);
     assert_eq!(out.modules.len(), files.len());
@@ -2814,6 +2820,14 @@ fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
         ("bytes_concat", "(Bytes, Bytes) -> Bytes"),
         ("bytes_of_string", "(String) -> Bytes"),
         ("bytes_is_utf8", "(Bytes) -> Bool"),
+        ("bytes_index_of", "(Bytes, Bytes) -> Option<Int>"),
+        ("bytes_index_of_from", "(Bytes, Bytes, Int) -> Option<Int>"),
+        ("bytes_index_of_byte", "(Bytes, Int) -> Option<Int>"),
+        ("bytes_starts_with", "(Bytes, Bytes) -> Bool"),
+        ("bytes_ends_with", "(Bytes, Bytes) -> Bool"),
+        ("bytes_split", "(Bytes, Bytes) -> List<Bytes>"),
+        ("bytes_scan", "(Bytes, Int, Bytes, Int) -> Int"),
+        ("bytes_scan_until", "(Bytes, Int, Bytes, Int) -> Int"),
         ("string_of_bytes", "(Bytes) -> String"),
         ("string_of_bytes_lossy", "(Bytes) -> String"),
         ("string_len", "(String) -> Int"),
@@ -3340,10 +3354,13 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
             (name.to_string(), text)
         })
         .collect();
-    let files: Vec<(&str, &str)> = sources
+    let mut files: Vec<(&str, &str)> = sources
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
+    for (name, source) in ply_std::sources() {
+        files.push((name, source));
+    }
     let out = check_files(&files);
 
     let clauses: usize = out.defs.values().map(|d| d.spec.len()).sum();

@@ -1,3 +1,4 @@
+pub mod derivable;
 pub mod env;
 pub mod infer;
 pub mod prelude;
@@ -7,13 +8,16 @@ pub mod ty;
 pub mod unify;
 
 #[cfg(test)]
+mod numerics;
+#[cfg(test)]
 mod tests;
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
-use ply_syntax::ast::{Mode, Module, ModuleName, Program, SpecKind};
+use ply_syntax::ast::{Deriver, Mode, Module, ModuleName, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
 
+pub use derivable::{Adt, Blocked, Context as Derivability, Why, derivable, ordered};
 pub use print::{print_row, print_scheme, print_type};
 pub use ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 
@@ -109,6 +113,18 @@ pub struct LawInfo {
     pub span: Span,
 }
 
+/// A published `where derivable(D, a)`.
+///
+/// The parameter is named by its **position** in the scheme's quantified list
+/// rather than by the name the source wrote, for the same reason a hash carries
+/// a de Bruijn level: renaming a type parameter may not change an interface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DefConstraint {
+    pub deriver: Deriver,
+    /// Index into [`Scheme::ty_vars`].
+    pub param: usize,
+}
+
 /// Everywhere in [`CheckOutput`], `name` is the program-wide name and equals
 /// this entry's key; `simple_name` is what the source wrote.
 #[derive(Clone, Debug)]
@@ -119,6 +135,12 @@ pub struct DefInfo {
     pub scheme: Scheme,
     /// Closed after solving. Empty for a pure function.
     pub footprint: Footprint,
+    /// `where derivable(D, a)`, sorted and deduplicated exactly as the hash
+    /// encodes them. Part of the published signature: adding one narrows the
+    /// call sites this definition admits, so a caller checked against the
+    /// unconstrained form has to be rechecked, and gate 2 only rechecks a
+    /// definition whose dependency's hash moved.
+    pub constraints: Vec<DefConstraint>,
     /// `requires` / `ensures`, in source order. Never restored from a cached
     /// interface: a spec is erased from the definition's hash, so a spec edit
     /// does not move it and gate 2 would otherwise skip a clause that changed.

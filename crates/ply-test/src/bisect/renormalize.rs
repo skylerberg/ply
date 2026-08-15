@@ -9,19 +9,19 @@
 //! interface is unchanged" — are unsound, and a false `Derived` drops a real
 //! candidate and yields a confidently wrong culprit.
 //!
-//! ## Why this replicates part of `ply-hash`
+//! ## What this assembles, and what it borrows
 //!
 //! `ply_hash::hash_program` computes reference hashes itself, bottom up; there
-//! is no entry point that takes a hash table and applies it. The pieces it is
-//! built from — `ProgramIndex`, `Normalizer`, `tarjan`, `is_cyclic` — are all
-//! public, so the assembly is reproduced here rather than in `ply-hash`, which
-//! is being changed concurrently for ADR 0003. **This belongs upstream**: it is
-//! the same twenty lines twice, and a copy of a hashing algorithm that drifts is
-//! exactly the silent-wrongness this milestone cannot ship.
+//! is no entry point that takes a hash table and applies it, so the assembly —
+//! `ProgramIndex`, `tarjan`, `is_cyclic`, `Normalizer` — is reproduced here. The
+//! one piece that is *not* reproduced is cyclic-component hashing, which is
+//! `ply_hash::component_hashes`: a second copy of a refinement whose labels are
+//! load-bearing drifts silently, and a drifted copy stops witnessing rather than
+//! announcing itself.
 //!
-//! What makes the copy safe until then is the **witness**. Before classifying
-//! anything, every definition is re-normalized against the *current* hash table,
-//! which must reproduce the hash `ply-hash` published for it. A definition whose
+//! What keeps the rest safe is the **witness**. Before classifying anything,
+//! every definition is re-normalized against the *current* hash table, which
+//! must reproduce the hash `ply-hash` published for it. A definition whose
 //! witness fails is one this module does not understand, and it is never
 //! classified `Derived` — it stays a candidate, which costs a wider search and
 //! never a wrong answer. Drift therefore degrades the search instead of
@@ -287,7 +287,7 @@ impl<'a> Renormalizer<'a> {
                 None => EffectIndex::default(),
             };
             let computed: BTreeMap<usize, DefHash> = if component.iter().any(|&v| self.cyclic[v]) {
-                self.hash_component(component, &table, &effects)
+                ply_hash::component_hashes(&self.index, component, &table, &effects)
                     .into_iter()
                     .collect()
             } else {
@@ -310,8 +310,7 @@ impl<'a> Renormalizer<'a> {
         let effects = slots(self.orders.get(ci)?);
         if self.cyclic[v] {
             let component = self.components.get(ci)?;
-            return self
-                .hash_component(component, table, &effects)
+            return ply_hash::component_hashes(&self.index, component, table, &effects)
                 .into_iter()
                 .find(|(w, _)| *w == v)
                 .map(|(_, hash)| hash);
@@ -330,64 +329,6 @@ impl<'a> Renormalizer<'a> {
         let mut nz = Normalizer::new(&self.index, test.module, table, &alone, &effects);
         nz.test_def(test.def);
         Some(digest(&nz.finish().0))
-    }
-
-    /// Mutual recursion is hashed as a unit. Source position cannot supply a
-    /// member's index — moving a definition would change its hash — so
-    /// refinement does: re-encode until no class splits further.
-    fn hash_component(
-        &self,
-        component: &[usize],
-        table: &HashTable,
-        effects: &EffectIndex,
-    ) -> Vec<(usize, DefHash)> {
-        let encode = |classes: &ComponentIndices, v: usize| {
-            let node = &self.index.nodes[v];
-            let mut nz = Normalizer::new(&self.index, node.module, table, classes, effects);
-            nz.node(node.body);
-            nz.finish().0
-        };
-
-        let mut classes: ComponentIndices = component.iter().map(|&v| (v, 0u32)).collect();
-        let mut class_count = 1;
-        let mut encodings: Vec<Vec<u8>>;
-        loop {
-            encodings = component.iter().map(|&v| encode(&classes, v)).collect();
-
-            let mut distinct: Vec<&[u8]> = encodings.iter().map(Vec::as_slice).collect();
-            distinct.sort_unstable();
-            distinct.dedup();
-            classes = component
-                .iter()
-                .zip(&encodings)
-                .map(|(&v, e)| (v, distinct.binary_search(&e.as_slice()).unwrap_or(0) as u32))
-                .collect();
-
-            if distinct.len() == class_count || distinct.len() == component.len() {
-                break;
-            }
-            class_count = distinct.len();
-        }
-
-        let mut sorted: Vec<&[u8]> = encodings.iter().map(Vec::as_slice).collect();
-        sorted.sort_unstable();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-        for member in sorted {
-            bytes.extend_from_slice(&(member.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(member);
-        }
-        let component_hash = digest(&bytes);
-
-        component
-            .iter()
-            .map(|&v| {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&component_hash.0);
-                hasher.update(&classes[&v].to_le_bytes());
-                (v, DefHash(*hasher.finalize().as_bytes()))
-            })
-            .collect()
     }
 
     /// Re-normalizing against the hashes the program actually has must reproduce

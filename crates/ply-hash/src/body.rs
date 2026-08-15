@@ -27,7 +27,16 @@ use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 /// The generation of the encoding below. A decoder refuses bytes written under
 /// any other value, because a stream this compact cannot tell a shape change
 /// from a plausible one.
-pub const BODY_ENCODING: u32 = 4;
+///
+/// 6 is ADR 0012's 5 plus one: a cyclic component's payload is laid out in class
+/// order rather than sorted by bytes, and a generation-5 payload read as one
+/// would wire the cycle to whichever member happened to sort first.
+pub const BODY_ENCODING: u32 = 6;
+
+/// `Decimal`'s bounds, which are the type's rather than a policy: a sign, a
+/// 96-bit mantissa and a scale of `0..=28`.
+const MAX_DECIMAL_SCALE: u32 = 28;
+const MAX_DECIMAL_MANTISSA: u128 = (1u128 << 96) - 1;
 
 /// A definition that is its own strongly connected component: the payload is its
 /// normalized bytes and `blake3(payload)` is the key.
@@ -277,10 +286,16 @@ fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         let len = cursor.u32().ok()? as usize;
         members.push(cursor.bytes(len).ok()?.to_vec());
     }
-    if !cursor.done() || !members.windows(2).all(|w| w[0] <= w[1]) {
+    // Class order, not byte order: a member's position *is* its class, which is
+    // what lets a decoded intra-component reference name a member. Two equal
+    // entries would be two classes the hasher could not have separated, so they
+    // are corruption rather than a redundancy to fold away.
+    let mut distinct: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if !cursor.done() || distinct.len() != members.len() {
         return None;
     }
-    members.dedup();
     Some(members)
 }
 
@@ -628,6 +643,19 @@ impl<'a> Cursor<'a> {
         Ok(i64::from_le_bytes(raw))
     }
 
+    fn i128(&mut self) -> Decoded<i128> {
+        let raw: [u8; 16] = self.bytes(16)?.try_into().expect("sixteen bytes");
+        Ok(i128::from_le_bytes(raw))
+    }
+
+    /// The bit pattern, so a NaN payload and the sign of a zero survive the
+    /// round trip. Decoding through the numeric value would make two definitions
+    /// with distinct hashes decode to one.
+    fn float(&mut self) -> Decoded<f64> {
+        let raw: [u8; 8] = self.bytes(8)?.try_into().expect("eight bytes");
+        Ok(f64::from_bits(u64::from_le_bytes(raw)))
+    }
+
     fn boolean(&mut self) -> Decoded<bool> {
         match self.u8()? {
             0 => Ok(false),
@@ -716,6 +744,7 @@ impl Decoder<'_> {
         let annotations = self.repeat(count, |d| d.opt(Self::type_expr))?;
         let ret = self.opt(Self::type_expr)?;
         let effects = self.opt(Self::row)?;
+        let constraints = self.constraints()?;
 
         let params = annotations
             .into_iter()
@@ -738,11 +767,35 @@ impl Decoder<'_> {
             params,
             ret,
             effects,
+            constraints,
+            // Provenance, erased by normalization: a decoded definition cannot
+            // say whether a human or a `derive` wrote the form it decodes.
+            derived: None,
             // A spec is erased by normalization, so a body decoded from its hash
             // carries none. A hybrid runs definitions, not claims about them.
             spec: Vec::new(),
             body,
             span: Span::DUMMY,
+        })
+    }
+
+    /// Comes back sorted by `(parameter level, deriver)`, which is how the
+    /// normalizer wrote it and is one of the semantics-preserving rewrites a
+    /// decoded definition is only equal to its original up to.
+    fn constraints(&mut self) -> Decoded<Vec<Constraint>> {
+        let count = self.c.u32()?;
+        self.repeat(count, |d| {
+            d.c.expect(tag::CONSTRAINT, "a constraint")?;
+            let level = d.c.u32()?;
+            let tag = d.c.u8()?;
+            let deriver =
+                Deriver::from_tag(tag).ok_or_else(|| bad(format!("`{tag}` is not a deriver")))?;
+            Ok(Constraint {
+                deriver,
+                deriver_span: Span::DUMMY,
+                param: ident(ty_param_name(level)),
+                span: Span::DUMMY,
+            })
         })
     }
 
@@ -1308,6 +1361,21 @@ impl Decoder<'_> {
             tag::LIT_BYTES => {
                 let len = self.c.u32()? as usize;
                 Ok(Lit::Bytes(self.c.bytes(len)?.to_vec()))
+            }
+            tag::LIT_FLOAT => Ok(Lit::Float(self.c.float()?)),
+            tag::LIT_DECIMAL => {
+                let mantissa = self.c.i128()?;
+                let scale = self.c.u32()?;
+                // The lexer refuses these bounds, so no body this repository
+                // wrote can carry one — which is exactly why a stream that does
+                // is refused rather than turned into a value the evaluator would
+                // have to invent.
+                if scale > MAX_DECIMAL_SCALE || mantissa.unsigned_abs() > MAX_DECIMAL_MANTISSA {
+                    return Err(bad(format!(
+                        "mantissa {mantissa} at scale {scale} is not a `Decimal`"
+                    )));
+                }
+                Ok(Lit::Decimal { mantissa, scale })
             }
             tag::LIT_UNIT => Ok(Lit::Unit),
             other => Err(bad(format!("tag {other} is not a literal"))),

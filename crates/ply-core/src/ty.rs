@@ -216,11 +216,34 @@ impl Type {
     pub fn bytes() -> Type {
         Type::con("Bytes")
     }
+    /// IEEE-754 binary64. Deliberately distinct from [`Type::decimal`]: `==` on
+    /// this type is not reflexive, so nothing about it may be `proved`.
+    pub fn float() -> Type {
+        Type::con("Float")
+    }
+    /// Exact base-10, sign plus a 96-bit mantissa and a scale of `0..=28`. What
+    /// money is written in, and the only numeric type whose `==` is an
+    /// equivalence relation over its whole domain besides `Int`.
+    pub fn decimal() -> Type {
+        Type::con("Decimal")
+    }
     pub fn unit() -> Type {
         Type::con("Unit")
     }
     pub fn list(t: Type) -> Type {
         Type::Con(Symbol::new("List"), vec![t])
+    }
+    /// Iteration is ascending by key, always. The key type must be ordered —
+    /// `derivable(ord, k)` — which is what makes that order a function of the
+    /// value rather than of insertion history or a hasher's seed.
+    pub fn map(key: Type, value: Type) -> Type {
+        Type::Con(Symbol::new("Map"), vec![key, value])
+    }
+    pub fn option(t: Type) -> Type {
+        Type::Con(Symbol::new("Option"), vec![t])
+    }
+    pub fn result(ok: Type, err: Type) -> Type {
+        Type::Con(Symbol::new("Result"), vec![ok, err])
     }
 }
 

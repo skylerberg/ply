@@ -25,6 +25,28 @@ pub struct Collected {
     pub warnings: Vec<Diagnostic>,
 }
 
+/// A project's own view of a checked program: the definitions and laws declared
+/// by the modules that ship with the compiler removed.
+///
+/// The same rule and the same reason as `ply test`'s (ADR 0012 §1). A project's
+/// obligation count and the denominator of its coverage line must not move
+/// because the compiler was upgraded, for claims the project did not write and
+/// cannot fix; the stdlib's own laws are discharged by the compiler's suite.
+/// `--std` keeps them, for someone debugging the stdlib itself.
+///
+/// `LawInfo::index` is a position in the *unfiltered* list and is what
+/// `HashOutput::laws` is keyed by, so it is carried across untouched rather than
+/// renumbered.
+pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, CheckOutput> {
+    if std {
+        return std::borrow::Cow::Borrowed(check);
+    }
+    let mut scoped = check.clone();
+    scoped.defs.retain(|_, info| !ply_std::is_std(&info.module));
+    scoped.laws.retain(|law| !ply_std::is_std(&law.module));
+    std::borrow::Cow::Owned(scoped)
+}
+
 pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> Collected {
     let mut fns: HashMap<Symbol, &ply_syntax::ast::FnDef> = HashMap::new();
     for module in &program.modules {

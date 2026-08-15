@@ -6,7 +6,7 @@ use ply_core::{LawBinder, Row};
 use ply_span::{Span, Symbol};
 
 const ADTS: &str = r#"
-type Opt = None | Some(Int)
+type Opt = Nothing | Just(Int)
 type Tree = Leaf | Node(Tree, Int, Tree)
 "#;
 
@@ -130,7 +130,7 @@ fn the_floor_of_every_type_is_its_smallest_value() {
         minimal(&Type::list(Type::int()), &world).unwrap().render(),
         "[]"
     );
-    assert_eq!(minimal(&con("Opt"), &world).unwrap().render(), "None");
+    assert_eq!(minimal(&con("Opt"), &world).unwrap().render(), "Nothing");
     assert_eq!(minimal(&con("Tree"), &world).unwrap().render(), "Leaf");
 }
 

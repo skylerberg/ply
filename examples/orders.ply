@@ -1,0 +1,728 @@
+// A JSON endpoint whose wire format nobody wrote.
+//
+// `POST /orders` with an order, get a receipt back:
+//
+//     $ curl -sS localhost:8081/orders -d '
+//         {"customer":"ada","lines":[{"sku":"widget","qty":3,"unit_price":1.05}]}'
+//     {"tag":"Accepted","values":[{"customer":"ada","items":3,"total":3.15}]}
+//
+// Every byte of that response is generated. The four `derive json` lines below
+// are the whole codec: there is no hand-written encoder, no decoder, and no
+// field name repeated in a second place where it could drift from the type. A
+// field added to `Line` is a field in the wire format and in the tests that
+// reach it, in one edit.
+//
+// Three W2 pieces meet here, and the file is arranged so each is visible:
+//
+//   `import std.json` and `import std.net` — modules that ship with the
+//   compiler and are imported rather than copied. W1 had no way to say either
+//   sentence.
+//
+//   `derive json for Order` — a generated definition that hashes, caches and
+//   re-selects exactly like a hand-written one. Rename `Order` to `Purchase`
+//   and no test below re-runs; rename the variant `Rejected` and exactly the
+//   tests that reach it do, because that one is a protocol change.
+//
+//   `Decimal` — `unit_price` is money. Routing it through a `Float` would
+//   decode `1.05` to the nearest double and lose a hundredth of a cent on a
+//   large enough order, which no amount of care downstream recovers. `Decimal`
+//   is exact, and `total` below is an exact sum of exact products.
+//
+// This module declares no `main`: `examples/hello.ply` holds the only one, so
+// that `ply run examples` has an unambiguous entry point. `listen_and_serve` is
+// the entry a host binds, and `crates/ply-cli/tests/json_endpoint.rs` drives it
+// over a real socket.
+
+import std.net (net)
+import std.json
+
+// --- The payloads -----------------------------------------------------------
+
+// `qty` is an `Int` because a count is exact and bounded; `unit_price` is a
+// `Decimal` because money is exact and not binary. Both of those decisions are
+// in the type, so both are in the generated codec, and neither can be undone by
+// a caller.
+pub type Line = { sku: String, qty: Int, unit_price: Decimal }
+
+pub type Order = { customer: String, lines: List<Line> }
+
+pub type Receipt = { customer: String, items: Int, total: Decimal }
+
+// The answer, as a type rather than as a status code. A client reads the tag;
+// the status code below is derived from it, so the two cannot disagree.
+pub type Reply =
+  | Accepted(Receipt)
+  | Rejected(String)
+
+// The codecs. `derive` may only name a type this module declares — that is the
+// orphan rule, and it is what makes "one type, one encoding" checkable from
+// what a module can see. Each generated definition is
+// `fn <snake_case(Type)>_json() -> json::JsonCodec<Type>`, appended to this
+// module's items after every source item, and `Order`'s composes through
+// `line_json()` by name rather than inlining `Line`'s structure — so an edit to
+// `Line` moves `order_json`'s hash through the reference, and re-selects exactly
+// the tests that reach it.
+derive json for Line
+derive json for Order
+derive json for Receipt
+derive json for Reply
+
+// --- The business ------------------------------------------------------------
+
+// Exact, and refused rather than rounded. `*` on `Decimal` is exact whenever
+// the result fits scale 28, and `+` is exact or it raises — a total that
+// quietly lost a cent is the defect `Decimal` exists to prevent. `/` is not
+// written here and could not be: it is `E0209`.
+pub fn total(lines: List<Line>) -> Decimal =
+  fold(lines, 0m, |acc: Decimal, l: Line| acc + decimal_of_int(l.qty) * l.unit_price)
+
+pub fn items(lines: List<Line>) -> Int =
+  fold(lines, 0, |acc: Int, l: Line| acc + l.qty)
+
+pub fn receipt(o: Order) -> Receipt =
+  {customer: o.customer, items: items(o.lines), total: total(o.lines)}
+
+// The one place a request's meaning is decided. A decode failure is the
+// client's to fix, so its own message goes back to it — `$.lines[2].unit_price:
+// expected a number, found a string` names the field and the position, and is
+// built by `std.json` rather than by a string this file assembles.
+pub fn reply_for(body: Bytes) -> Reply =
+  match json::decode_bytes(body, order_json()) {
+    Ok(o) -> accept(o),
+    Err(e) -> Rejected(json::error_to_string(e)),
+  }
+
+fn accept(o: Order) -> Reply =
+  if len(o.lines) == 0 {
+    Rejected("an order needs at least one line")
+  } else if bad_line(o.lines) {
+    Rejected("every line needs a positive quantity")
+  } else {
+    Accepted(receipt(o))
+  }
+
+fn bad_line(lines: List<Line>) -> Bool =
+  fold(lines, false, |seen: Bool, l: Line| seen || l.qty <= 0)
+
+// --- The request --------------------------------------------------------------
+//
+// Bytes throughout. A request target and a header value are bytes on the wire
+// and a peer is free to send ones that are not UTF-8; decoding first would
+// either lose them to U+FFFD or fail on a request this endpoint is meant to
+// answer with a 400.
+//
+// Every scan below is a native byte builtin — one SIMD pass with an early exit
+// and no allocation per byte. Written as W1 wrote them, as a `fold` over
+// `range`, the header walk alone would box an `Int` per byte of every header
+// line for every header looked up.
+
+pub type Request = { method: Bytes, target: Bytes, length: Int }
+
+pub type Parsed =
+  | Complete(Request)
+  // The head has not ended. A parser cannot tell "still arriving" from "never
+  // coming"; the caller decides which it was.
+  | Incomplete
+  | Malformed(String)
+
+// The most head this endpoint will hold, and the most body. Not tuning: an
+// unbounded request is unbounded work bought with one packet, and W2 has no
+// cancellation to stop it with instead.
+pub fn max_head() -> Int = 4096
+
+pub fn max_body() -> Int = 65536
+
+pub fn max_chunks() -> Int = 64
+
+// The index just past the first CRLF CRLF, or -1 while the head is unfinished.
+// One `memmem` pass, stopping at the first occurrence.
+pub fn head_end(buf: Bytes) -> Int =
+  match bytes_index_of(buf, b"\r\n\r\n") {
+    Some(at) -> at + 4,
+    None -> -1,
+  }
+
+// The end of the line beginning at `i`, or the buffer's length when the line is
+// unterminated. Always in `0..=len`, so it can be handed straight to
+// `bytes_slice`.
+fn line_end(head: Bytes, i: Int) -> Int =
+  match bytes_index_of_from(head, b"\r\n", i) {
+    Some(at) -> at,
+    None -> bytes_len(head),
+  }
+
+fn trim(b: Bytes) -> Bytes = {
+  let start = bytes_scan(b, 0, b" \t", bytes_len(b));
+  let end = trim_end(b, bytes_len(b));
+  if start >= end { b"" } else { bytes_slice(b, start, end) }
+}
+
+fn trim_end(b: Bytes, end: Int) -> Int =
+  if end <= 0 {
+    0
+  } else if bytes_at(b, end - 1) == 32 || bytes_at(b, end - 1) == 9 {
+    trim_end(b, end - 1)
+  } else {
+    end
+  }
+
+// The first header whose name matches `lower` case-insensitively, searched from
+// the line beginning at `i`. HTTP field names are case-insensitive and `curl`,
+// a browser and a proxy each pick a different case, so comparing bytes directly
+// would answer correctly for whichever client the test used.
+fn header(head: Bytes, lower: Bytes, i: Int) -> Option<Bytes> = {
+  let end = line_end(head, i);
+  if end <= i {
+    None
+  } else {
+    match bytes_index_of_from(head, b":", i) {
+      Some(colon) -> header_at(head, lower, i, colon, end),
+      None -> None,
+    }
+  }
+}
+
+fn header_at(head: Bytes, lower: Bytes, i: Int, colon: Int, end: Int) -> Option<Bytes> =
+  if colon >= end {
+    header(head, lower, end + 2)
+  } else if lowercase(bytes_slice(head, i, colon)) == lower {
+    Some(trim(bytes_slice(head, colon + 1, end)))
+  } else {
+    header(head, lower, end + 2)
+  }
+
+// A field name is ASCII by the grammar, so the lossy decode cannot lose one:
+// a name carrying a byte that is not ASCII is not a name this endpoint matches
+// under any encoding.
+fn lowercase(b: Bytes) -> Bytes = bytes_of_string(string_lower(string_of_bytes_lossy(b)))
+
+// `None` when the header is absent, malformed, or larger than this endpoint
+// will read. All three are refused rather than clamped: a body length nobody
+// agrees on is a request that gets framed two ways.
+pub fn content_length(head: Bytes) -> Option<Int> =
+  match header(head, b"content-length", line_end(head, 0) + 2) {
+    Some(v) -> digits(v, 0, 0),
+    None -> None,
+  }
+
+fn digits(b: Bytes, i: Int, acc: Int) -> Option<Int> =
+  if i >= bytes_len(b) {
+    if i == 0 || acc > max_body() { None } else { Some(acc) }
+  } else if bytes_at(b, i) < 48 || bytes_at(b, i) > 57 {
+    None
+  } else {
+    digits(b, i + 1, acc * 10 + (bytes_at(b, i) - 48))
+  }
+
+pub fn parse(head: Bytes) -> Parsed =
+  if head_end(head) < 0 {
+    Incomplete
+  } else {
+    request_line(bytes_slice(head, 0, line_end(head, 0)), head)
+  }
+
+fn request_line(line: Bytes, head: Bytes) -> Parsed = {
+  let len = bytes_len(line);
+  let sp1 = bytes_scan_until(line, 0, b" ", len);
+  if sp1 >= len {
+    Malformed("a request line is `METHOD TARGET VERSION`")
+  } else {
+    let sp2 = bytes_scan_until(line, sp1 + 1, b" ", len);
+    if sp2 >= len {
+      Malformed("a request line is `METHOD TARGET VERSION`")
+    } else {
+      parts(
+        bytes_slice(line, 0, sp1),
+        bytes_slice(line, sp1 + 1, sp2),
+        bytes_slice(line, sp2 + 1, len),
+        head)
+    }
+  }
+}
+
+fn parts(method: Bytes, target: Bytes, version: Bytes, head: Bytes) -> Parsed =
+  if bytes_len(method) == 0 {
+    Malformed("a method is one or more uppercase ASCII letters")
+  } else if bytes_len(target) == 0 || bytes_at(target, 0) != 47 {
+    Malformed("this endpoint serves origin-form targets, which begin with `/`")
+  } else if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
+    Malformed("the version must be HTTP/1.1 or HTTP/1.0")
+  } else {
+    Complete({
+      method: method,
+      target: target,
+      length: match content_length(head) { Some(n) -> n, None -> 0 },
+    })
+  }
+
+// --- The response -------------------------------------------------------------
+
+// `Content-Length` counts bytes, and a client reads it to know where the body
+// ends. Building it from a character count would truncate every body outside
+// ASCII — on exactly the input a test written in English never has.
+pub fn respond(status: String, body: Bytes) -> Bytes =
+  bytes_concat(
+    bytes_of_string(
+      "HTTP/1.1 " ++ status ++ "\r\n"
+        ++ "Content-Type: application/json\r\n"
+        ++ "Content-Length: " ++ int_to_string(bytes_len(body)) ++ "\r\n"
+        ++ "Connection: close\r\n"
+        ++ "\r\n"),
+    body)
+
+// Even the failures are the derived encoding. A hand-assembled `{"error": ...}`
+// beside a generated success body is two formats a client has to know, and one
+// of them has no type.
+pub fn reply_response(reply: Reply) -> Bytes =
+  respond(status_of(reply), json::encode_bytes(reply, reply_json()))
+
+fn status_of(reply: Reply) -> String =
+  match reply {
+    Accepted(_) -> "200 OK",
+    Rejected(_) -> "400 Bad Request",
+  }
+
+// The endpoint, in one pure function: a head and a body in, bytes out. Nothing
+// here can reach a socket, so every test below it is `det` and cacheable.
+pub fn answer(head: Bytes, body: Bytes) -> Bytes =
+  match parse(head) {
+    Incomplete -> reply_response(Rejected("the request head never ended")),
+    Malformed(why) -> reply_response(Rejected(why)),
+    Complete(r) -> route(r, body),
+  }
+
+fn route(r: Request, body: Bytes) -> Bytes =
+  if r.target != b"/orders" {
+    respond("404 Not Found", json::encode_bytes(
+      Rejected("this endpoint serves `/orders`"), reply_json()))
+  } else if r.method != b"POST" {
+    respond("405 Method Not Allowed", json::encode_bytes(
+      Rejected("an order is posted"), reply_json()))
+  } else if bytes_len(body) < r.length {
+    reply_response(Rejected("the body was shorter than its `Content-Length`"))
+  } else {
+    reply_response(reply_for(bytes_slice(body, 0, r.length)))
+  }
+
+// --- The server ---------------------------------------------------------------
+
+// Read until the head ends, the peer stops talking, or one of the two bounds is
+// reached. A request split across packets is ordinary TCP, so it is read here
+// and tested below.
+pub fn read_head(c: Int, so_far: Bytes, left: Int) -> Bytes / {net.write[conn]} =
+  if left <= 0 || head_end(so_far) >= 0 || bytes_len(so_far) >= max_head() {
+    so_far
+  } else {
+    let chunk = net.recv[conn](c, max_head());
+    if bytes_len(chunk) == 0 {
+      so_far
+    } else {
+      read_head(c, bytes_concat(so_far, chunk), left - 1)
+    }
+  }
+
+// The body is framed by `Content-Length` and by nothing else: W2 has no chunked
+// transfer encoding, and a request that asks for one is answered from a body
+// this reads as empty rather than mis-framed.
+pub fn read_body(c: Int, so_far: Bytes, want: Int, left: Int) -> Bytes / {net.write[conn]} =
+  if left <= 0 || bytes_len(so_far) >= want {
+    so_far
+  } else {
+    let chunk = net.recv[conn](c, max_body());
+    if bytes_len(chunk) == 0 {
+      so_far
+    } else {
+      read_body(c, bytes_concat(so_far, chunk), want, left - 1)
+    }
+  }
+
+// One connection, start to finish. The first `recv` usually carries the body
+// too, so what was read past the head is kept rather than re-read — a second
+// `recv` for bytes already in hand would block against a client that has
+// finished sending and is waiting for its answer.
+pub fn serve_one(c: Int) -> Unit / {net.write[conn]} {
+  let raw = read_head(c, b"", max_chunks());
+  let out = answer_from(c, raw);
+  assert_eq(net.send[conn](c, out), bytes_len(out));
+  net.close[conn](c)
+}
+
+fn answer_from(c: Int, raw: Bytes) -> Bytes / {net.write[conn]} = {
+  let end = head_end(raw);
+  if end < 0 {
+    reply_response(Rejected("the request head never ended"))
+  } else {
+    let head = bytes_slice(raw, 0, end);
+    let want = match content_length(head) { Some(n) -> n, None -> 0 };
+    answer(head, read_body(c, bytes_slice(raw, end, bytes_len(raw)), want, max_chunks()))
+  }
+}
+
+pub fn serve(server: Int, count: Int) -> Int / {net.write[listener], net.write[conn]} =
+  if count <= 0 {
+    0
+  } else {
+    serve_one(net.accept[listener](server));
+    1 + serve(server, count - 1)
+  }
+
+pub fn listen_and_serve(port: Int, count: Int) -> Int
+  / {net.write[listener], net.write[conn]} {
+  let server = net.listen[listener](port);
+  let served = serve(server, count);
+  net.close[listener](server);
+  served
+}
+
+// --- Tests: the codec is the one the deriver wrote ----------------------------
+
+fn line(sku: String, qty: Int, price: Decimal) -> Line =
+  {sku: sku, qty: qty, unit_price: price}
+
+fn one_order() -> Order =
+  {customer: "ada", lines: [line("widget", 3, 1.05m), line("gasket", 2, 0.10m)]}
+
+// The wire format, written out once. If the deriver's output moves, this is
+// where it is noticed — and it is the same bytes a client is reading.
+//
+// A JSON object is a `Map<String, Json>`, so its keys come out ascending rather
+// than in the order the type declares them: `Line` declares `sku, qty,
+// unit_price` and encodes `qty, sku, unit_price`. That is the point rather than
+// an accident — a value has one canonical rendering, so a derived encoding is
+// byte-identical across runs and across `--engine both`, and re-encoding a
+// decoded document is stable. Declaration order still decides the *generated
+// definition*, which is why reordering two fields moves its hash.
+test "the derived encoding is canonical, so a key order is the map's" {
+  assert_eq(
+    json::encode_string(line("widget", 3, 1.05m), line_json()),
+    "{\"qty\":3,\"sku\":\"widget\",\"unit_price\":1.05}");
+  assert_eq(
+    json::encode_string(one_order(), order_json()),
+    "{\"customer\":\"ada\",\"lines\":["
+      ++ "{\"qty\":3,\"sku\":\"widget\",\"unit_price\":1.05},"
+      ++ "{\"qty\":2,\"sku\":\"gasket\",\"unit_price\":0.10}]}")
+}
+
+// A nullary variant is its tag as a string and one with fields is a tagged
+// object, so the two shapes never collide.
+test "a derived ADT encoding carries its tag" {
+  assert_eq(
+    json::encode_string(Rejected("no"), reply_json()),
+    "{\"tag\":\"Rejected\",\"values\":[\"no\"]}");
+  assert_eq(
+    json::encode_string(Accepted({customer: "ada", items: 1, total: 2.50m}), reply_json()),
+    "{\"tag\":\"Accepted\",\"values\":[{\"customer\":\"ada\",\"items\":1,\"total\":2.50}]}")
+}
+
+test "decoding is the inverse of encoding, for every payload in this file" {
+  assert_eq(
+    json::decode_string(json::encode_string(one_order(), order_json()), order_json()),
+    Ok(one_order()));
+  assert_eq(
+    json::decode_string(
+      json::encode_string(Accepted(receipt(one_order())), reply_json()), reply_json()),
+    Ok(Accepted(receipt(one_order()))))
+}
+
+// The generator draws the values; the codec has to survive all of them, not the
+// ones a test author would have thought to write.
+law "a receipt survives a round trip through its derived codec"
+  forall (r: Receipt) {
+    json::decode_bytes(json::encode_bytes(r, receipt_json()), receipt_json()) == Ok(r)
+  }
+
+law "an order survives a round trip through its derived codec"
+  forall (o: Order) {
+    json::decode_bytes(json::encode_bytes(o, order_json()), order_json()) == Ok(o)
+  }
+
+// --- Tests: the money -----------------------------------------------------------
+
+test "a total is an exact sum of exact products" {
+  assert_eq(total([line("widget", 3, 1.05m), line("gasket", 2, 0.10m)]), 3.35m);
+
+  // The sum a Float would have got wrong: 0.1 + 0.2 is not 0.3 in binary64, and
+  // it is exactly 0.3 here.
+  assert_eq(total([line("a", 1, 0.1m), line("b", 1, 0.2m)]), 0.3m);
+  assert_eq(total([]), 0m)
+}
+
+// Scale is preserved through the parse, the arithmetic and the render, so a
+// price quoted to the cent comes back quoted to the cent.
+test "a price keeps the scale it was quoted at" {
+  assert_eq(
+    json::decode_string("{\"sku\":\"a\",\"qty\":1,\"unit_price\":1.50}", line_json()),
+    Ok(line("a", 1, 1.50m)));
+  assert_eq(json::encode_string(line("a", 1, 1.50m), line_json()),
+    "{\"qty\":1,\"sku\":\"a\",\"unit_price\":1.50}");
+
+  // Equal in value, different in scale, and the renderer keeps what it was given.
+  assert(1.50m == 1.5m);
+  assert(json::encode_string(line("a", 1, 1.5m), line_json())
+    != json::encode_string(line("a", 1, 1.50m), line_json()))
+}
+
+// --- Tests: the endpoint ---------------------------------------------------------
+
+fn post(body: String) -> Bytes =
+  bytes_of_string(
+    "POST /orders HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+      ++ "Content-Length: " ++ int_to_string(bytes_len(bytes_of_string(body))) ++ "\r\n\r\n")
+
+fn answered(body: String) -> String =
+  string_of_bytes(answer(post(body), bytes_of_string(body)))
+
+fn body_of(response: String) -> String =
+  match string_find(response, "\r\n\r\n") {
+    at -> string_slice(response, at + 4, string_len(response)),
+  }
+
+test "a well-formed order is accepted and answered with a derived receipt" {
+  let out = answered("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"w\",\"qty\":3,\"unit_price\":1.05}]}");
+  assert(string_starts_with(out, "HTTP/1.1 200 OK\r\n"));
+  assert(string_contains(out, "Content-Type: application/json\r\n"));
+  assert_eq(body_of(out),
+    "{\"tag\":\"Accepted\",\"values\":[{\"customer\":\"ada\",\"items\":3,\"total\":3.15}]}")
+}
+
+// The client sent something the type does not describe, so the answer names the
+// path and the reason — both built by `std.json`, neither written here.
+test "a payload that does not fit the type is refused by field and reason" {
+  let out = answered("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"w\",\"qty\":\"three\",\"unit_price\":1.05}]}");
+  assert(string_starts_with(out, "HTTP/1.1 400 Bad Request\r\n"));
+  assert_eq(body_of(out),
+    "{\"tag\":\"Rejected\",\"values\":[\"$.lines[0].qty: expected a number, found a string\"]}");
+
+  assert_eq(
+    body_of(answered("{\"customer\":\"ada\"}")),
+    "{\"tag\":\"Rejected\",\"values\":[\"$.lines: this field is missing\"]}")
+}
+
+test "a body that is not JSON at all is refused with a byte offset" {
+  assert_eq(
+    body_of(answered("not json")),
+    "{\"tag\":\"Rejected\",\"values\":[\"$: expected `null` (at byte 0)\"]}");
+  assert_eq(
+    body_of(answered("")),
+    "{\"tag\":\"Rejected\",\"values\":[\"$: the input ended where a value was expected (at byte 0)\"]}")
+}
+
+// The type accepted the payload and the endpoint refused it. Both answers are
+// the same `Reply`, so a client parses one format whichever happened.
+test "an order with no lines, and one with a line nobody ordered, are both refused" {
+  assert_eq(
+    body_of(answered("{\"customer\":\"ada\",\"lines\":[]}")),
+    "{\"tag\":\"Rejected\",\"values\":[\"an order needs at least one line\"]}");
+  assert_eq(
+    body_of(answered("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"w\",\"qty\":0,\"unit_price\":1}]}")),
+    "{\"tag\":\"Rejected\",\"values\":[\"every line needs a positive quantity\"]}")
+}
+
+test "a header name matches whatever case the client sent it in" {
+  assert_eq(content_length(b"POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n"), Some(12));
+  assert_eq(content_length(b"POST / HTTP/1.1\r\ncontent-length:12\r\n\r\n"), Some(12));
+  assert_eq(content_length(b"POST / HTTP/1.1\r\nCONTENT-LENGTH:  12  \r\n\r\n"), Some(12));
+  assert_eq(content_length(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n"), Some(7));
+  assert_eq(content_length(b"POST / HTTP/1.1\r\n\r\n"), None);
+  assert_eq(content_length(b"POST / HTTP/1.1\r\nContent-Length: none\r\n\r\n"), None);
+
+  // A length this endpoint will not read is refused rather than clamped.
+  assert_eq(content_length(b"POST / HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n"), None)
+}
+
+// The request line is not the place a `Content-Length` can hide: a target that
+// contains a colon would otherwise be read as a header.
+test "the header walk starts after the request line" {
+  assert_eq(content_length(b"GET /a:content-length:9 HTTP/1.1\r\n\r\n"), None)
+}
+
+test "a route this endpoint does not serve is a 404 in the same format" {
+  let out = string_of_bytes(answer(
+    bytes_of_string("GET / HTTP/1.1\r\n\r\n"), b""));
+  assert(string_starts_with(out, "HTTP/1.1 404 Not Found\r\n"));
+  assert_eq(body_of(out),
+    "{\"tag\":\"Rejected\",\"values\":[\"this endpoint serves `/orders`\"]}");
+
+  let wrong = string_of_bytes(answer(bytes_of_string("GET /orders HTTP/1.1\r\n\r\n"), b""));
+  assert(string_starts_with(wrong, "HTTP/1.1 405 Method Not Allowed\r\n"));
+  assert_eq(body_of(wrong),
+    "{\"tag\":\"Rejected\",\"values\":[\"an order is posted\"]}")
+}
+
+test "a malformed request line is answered in the same format as everything else" {
+  let out = string_of_bytes(answer(bytes_of_string("GET /\r\n\r\n"), b""));
+  assert(string_starts_with(out, "HTTP/1.1 400 Bad Request\r\n"));
+  assert_eq(body_of(out),
+    "{\"tag\":\"Rejected\",\"values\":[\"a request line is `METHOD TARGET VERSION`\"]}")
+}
+
+// --- Tests: the server, over the simulated socket -------------------------------
+//
+// The same code the host binds, against an in-memory socket. Every test here is
+// `det` and cacheable, and only because these handlers discharge every `net`
+// atom the code under test can perform: leave one out and the test does not
+// become flaky, it fails to compile with `E0412`.
+
+fn first_chunk(queued: List<Bytes>) -> Bytes =
+  match queued { [first, ..] -> first, _ -> b"" }
+
+fn later_chunks(queued: List<Bytes>) -> List<Bytes> =
+  match queued { [_, ..rest] -> rest, _ -> [] }
+
+fn request_bytes(body: String) -> Bytes =
+  bytes_concat(post(body), bytes_of_string(body))
+
+fn ada() -> String = "{\"customer\":\"ada\",\"lines\":[{\"sku\":\"w\",\"qty\":3,\"unit_price\":1.05}]}"
+
+fn accepted() -> Bytes = answer(post(ada()), bytes_of_string(ada()))
+
+test "the simulated socket carries a posted order to its receipt" {
+  with_cell[inbox]([request_bytes(ada())]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      assert_eq(listen_and_serve(0, 1), 1)
+    } with {
+      net.listen[listener](p) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [accepted()])
+  } }
+  } }
+}
+
+// The case a single `recv` would have passed and a real network would have
+// failed: the head and the body arrive in three pieces, one of them splitting
+// the JSON mid-token.
+test "a request whose body arrives after its head is read whole" {
+  let whole = request_bytes(ada());
+  let cut1 = 40;
+  let cut2 = bytes_len(whole) - 12;
+  with_cell[inbox]([
+    bytes_slice(whole, 0, cut1),
+    bytes_slice(whole, cut1, cut2),
+    bytes_slice(whole, cut2, bytes_len(whole)),
+  ]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [accepted()]);
+    assert_eq(cell_get(inbox), [])
+  } }
+  } }
+}
+
+// The body is already in hand after the head, so nothing is read for it. A
+// second `recv` here would block against a client that has finished sending and
+// is waiting for its answer — the deadlock that only shows up over a real
+// socket, asserted here over a simulated one.
+test "a request that arrives in one packet costs exactly one read" {
+  with_cell[reads](0) { reads -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        cell_set(reads, cell_get(reads) + 1);
+        if cell_get(reads) == 1 { request_bytes(ada()) } else { b"" }
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(reads), 1);
+    assert_eq(cell_get(outbox), [accepted()])
+  } }
+  } }
+}
+
+test "a peer that says nothing is answered rather than waited on" {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> b"",
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox),
+      [respond("400 Bad Request", json::encode_bytes(
+        Rejected("the request head never ended"), reply_json()))])
+  } }
+}
+
+// A client that promises more body than it sends. The bound is what stops the
+// endpoint reading for it forever, and the answer says which of the two the
+// client got wrong.
+test "a body shorter than its Content-Length is refused rather than decoded" {
+  with_cell[reads](0) { reads -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      serve_one(3)
+    } with {
+      net.recv[conn](c, max) -> {
+        cell_set(reads, cell_get(reads) + 1);
+        if cell_get(reads) == 1 {
+          bytes_concat(post(ada()), bytes_of_string("{\"customer\""))
+        } else {
+          b""
+        }
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox),
+      [respond("400 Bad Request", json::encode_bytes(
+        Rejected("the body was shorter than its `Content-Length`"), reply_json()))])
+  } }
+  } }
+}
+
+test "each accepted connection is answered exactly once" {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      assert_eq(listen_and_serve(0, 3), 3)
+    } with {
+      net.listen[listener](p) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max) -> request_bytes(ada()),
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [accepted(), accepted(), accepted()])
+  } }
+}

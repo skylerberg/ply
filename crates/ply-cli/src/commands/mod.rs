@@ -6,4 +6,5 @@ pub mod hosts;
 pub mod prove;
 pub mod review;
 pub mod run;
+pub mod stdlib;
 pub mod test;

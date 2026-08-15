@@ -45,17 +45,21 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// The Ply declaration the registrations below are checked against.
+/// The Ply declaration the registrations below are checked against: the source
+/// of the module `std.net`, which ships with the compiler.
 ///
-/// A program that wants these handlers declares `net` exactly like this. It is a
-/// file rather than a string literal so that it is a thing the type checker sees
-/// — the tests parse and check it, and bind against the result, so a signature
-/// that drifts from the Rust table fails here rather than in someone's service.
-pub const DECLARATION: &str = include_str!("../ply/net.ply");
+/// A program that wants these handlers writes `import std.net (net)` rather than
+/// copying the declaration, so the signature the host binds to and the signature
+/// the program performs are one text that cannot drift.
+pub const DECLARATION: &str = ply_std::NET;
 
-/// The program-wide effect name. A `net` declared inside a module named `net` is
-/// `net.net` and will not bind; `E0421` says so and names what it found.
-pub const EFFECT: &str = "net";
+/// The module the declaration ships as, which is what qualifies [`EFFECT`].
+pub const MODULE: &str = "std.net";
+
+/// The program-wide effect name. Effect names are qualified (ADR 0001), so the
+/// `net` declared by `std.net` is `std.net.net`, and a program that declares its
+/// own `net` instead is `E0421` naming the operation it found.
+pub const EFFECT: &str = "std.net.net";
 
 /// The most bytes one `recv` allocates for, whatever `max` asks.
 ///

@@ -378,12 +378,20 @@ impl Parser {
                 Kw::Import | Kw::Pub | Kw::Fn | Kw::Type | Kw::Effect | Kw::Nondet | Kw::Test
             )
         ) || self.at_law_start()
+            || self.at_derive_start()
     }
 
     /// `law` is contextual: it opens an item only when a quoted label follows,
     /// so `fn law(..)` and a local named `law` keep their meaning.
     fn at_law_start(&self) -> bool {
         self.at_ident_text("law") && matches!(self.kind_at(1), TokenKind::Str(_))
+    }
+
+    /// `derive` is contextual for the same reason `law` is. Two identifiers in a
+    /// row cannot open any other item, so the deriver's name being wrong is
+    /// still reported as a bad `derive` rather than as an unrecognized item.
+    fn at_derive_start(&self) -> bool {
+        self.at_ident_text("derive") && matches!(self.kind_at(1), TokenKind::Ident(_))
     }
 
     fn recover_to_item(&mut self) {
@@ -473,9 +481,100 @@ impl Parser {
                 }
                 self.law_def().map(|d| Item::Law(Box::new(d)))
             }
-            _ => Err(self
-                .error_here("an item: `fn`, `type`, `effect`, `nondet effect`, `test`, or `law`")),
+            _ if self.at_derive_start() => {
+                if let Some(span) = pub_span {
+                    self.push(
+                        Diagnostic::error(codes::UNEXPECTED_TOKEN, "a `derive` cannot be `pub`")
+                            .primary(span, "remove `pub`")
+                            .note(
+                                "a generated definition takes the visibility of the type it is \
+                                 derived for, so a type you can name is a type you can encode",
+                            ),
+                    );
+                }
+                self.derive_def().map(|d| Item::Derive(Box::new(d)))
+            }
+            _ => Err(self.error_here(
+                "an item: `fn`, `type`, `effect`, `nondet effect`, `test`, `law`, or `derive`",
+            )),
         }
+    }
+
+    /// `derive json for Order`.
+    fn derive_def(&mut self) -> PResult<DeriveDef> {
+        let start = self.advance();
+        let name = self.expect_ident("a deriver name after `derive`")?;
+        let deriver = self.deriver(&name)?;
+        if !self.at_ident_text("for") {
+            return Err(self.error_here("`for` and the type to derive for"));
+        }
+        self.advance();
+        let target = self.expect_ident("the type to derive for, after `for`")?;
+        Ok(DeriveDef {
+            deriver,
+            deriver_span: name.span,
+            target,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// The derivers are fixed — there are no user-defined ones — so an
+    /// unrecognized name is reported here with the whole list rather than left
+    /// to fail as an unknown reference in generated code the user never wrote.
+    fn deriver(&mut self, name: &Ident) -> PResult<Deriver> {
+        match Deriver::from_name(name.name.as_str()) {
+            Some(d) => Ok(d),
+            None => {
+                let all: Vec<String> = Deriver::ALL.iter().map(|d| format!("`{d}`")).collect();
+                self.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_DERIVER,
+                        format!("`{}` is not a deriver", name.name),
+                    )
+                    .primary(name.span, "unknown deriver")
+                    .note(format!("the derivers are {}", all.join(", "))),
+                );
+                Err(Bail)
+            }
+        }
+    }
+
+    /// `where derivable(json, a), derivable(ord, k)`, between the effect row and
+    /// any `requires`. Contextual: the grammar admits nothing but `=`, `{`,
+    /// `requires` and `ensures` at this position, so no ordinary name loses its
+    /// meaning.
+    fn where_clause(&mut self) -> PResult<Vec<Constraint>> {
+        if !self.at_ident_text("where") {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        let mut out = Vec::new();
+        loop {
+            out.push(self.constraint()?);
+            if !self.eat(&TokenKind::Comma) {
+                return Ok(out);
+            }
+        }
+    }
+
+    fn constraint(&mut self) -> PResult<Constraint> {
+        let start = self.span();
+        if !self.at_ident_text("derivable") {
+            return Err(self.error_here("`derivable(<deriver>, <type parameter>)`"));
+        }
+        self.advance();
+        let open = self.expect(&TokenKind::LParen, "`(` after `derivable`")?;
+        let name = self.expect_ident("a deriver name")?;
+        let deriver = self.deriver(&name)?;
+        self.expect(&TokenKind::Comma, "`,` and the type parameter")?;
+        let param = self.expect_ident("the type parameter the constraint is about")?;
+        let close = self.expect_close(&TokenKind::RParen, open, "`)` to close `derivable`")?;
+        Ok(Constraint {
+            deriver,
+            deriver_span: name.span,
+            param,
+            span: start.to(close),
+        })
     }
 
     fn fn_def(&mut self, vis: Visibility) -> PResult<FnDef> {
@@ -502,6 +601,7 @@ impl Parser {
             None
         };
 
+        let constraints = self.where_clause()?;
         let spec = self.spec_clauses()?;
 
         let body = if self.eat(&TokenKind::Eq) {
@@ -520,6 +620,8 @@ impl Parser {
             params,
             ret,
             effects,
+            constraints,
+            derived: None,
             spec,
             body,
             span,
@@ -1129,6 +1231,20 @@ impl Parser {
                     span: start,
                 })
             }
+            TokenKind::Float(v) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Float(v)),
+                    span: start,
+                })
+            }
+            TokenKind::Decimal { mantissa, scale } => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Decimal { mantissa, scale }),
+                    span: start,
+                })
+            }
             TokenKind::Str(s) => {
                 self.advance();
                 Ok(Expr {
@@ -1598,14 +1714,42 @@ impl Parser {
                     span: start,
                 })
             }
-            TokenKind::Minus if matches!(self.kind_at(1), TokenKind::Int(_)) => {
+            TokenKind::Float(v) => {
                 self.advance();
-                let TokenKind::Int(v) = *self.kind() else {
-                    unreachable!()
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Float(v)),
+                    span: start,
+                })
+            }
+            TokenKind::Decimal { mantissa, scale } => {
+                self.advance();
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Decimal { mantissa, scale }),
+                    span: start,
+                })
+            }
+            // A negative literal is one pattern rather than an operator applied
+            // to one, because a pattern is not an expression and there is
+            // nothing to apply.
+            TokenKind::Minus
+                if matches!(
+                    self.kind_at(1),
+                    TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Decimal { .. }
+                ) =>
+            {
+                self.advance();
+                let lit = match self.kind().clone() {
+                    TokenKind::Int(v) => Lit::Int(-v),
+                    TokenKind::Float(v) => Lit::Float(-v),
+                    TokenKind::Decimal { mantissa, scale } => Lit::Decimal {
+                        mantissa: -mantissa,
+                        scale,
+                    },
+                    _ => unreachable!(),
                 };
                 let end = self.advance();
                 Ok(Pattern {
-                    kind: PatternKind::Lit(Lit::Int(-v)),
+                    kind: PatternKind::Lit(lit),
                     span: start.to(end),
                 })
             }

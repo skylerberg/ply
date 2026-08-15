@@ -1619,14 +1619,19 @@ fn panic_carries_its_message() {
 fn every_builtin_checks_its_argument_count() {
     for b in crate::Builtin::all() {
         let (min, max) = b.arity();
-        let too_few: Vec<Expr> = (0..min.saturating_sub(1)).map(|_| int(0)).collect();
-        let d = err(callv(b.name(), too_few));
-        assert_eq!(
-            d.code,
-            codes::ARITY_MISMATCH,
-            "{} accepted too few arguments",
-            b.name()
-        );
+        // `map_new` is nullary — Ply has no top-level constants, so the empty
+        // map is a call — and there is no such thing as too few arguments for
+        // one. The other leg still runs, so it is not exempt from the check.
+        if min > 0 {
+            let too_few: Vec<Expr> = (0..min - 1).map(|_| int(0)).collect();
+            let d = err(callv(b.name(), too_few));
+            assert_eq!(
+                d.code,
+                codes::ARITY_MISMATCH,
+                "{} accepted too few arguments",
+                b.name()
+            );
+        }
 
         let too_many: Vec<Expr> = (0..max + 1).map(|_| int(0)).collect();
         let d = err(callv(b.name(), too_many));

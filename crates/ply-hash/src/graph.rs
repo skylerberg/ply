@@ -272,6 +272,9 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
+                    // Expansion has already appended this derive's generated
+                    // definitions as `Item::Fn`, and those are the nodes.
+                    Item::Derive(_) => {}
                 }
             }
             all_items.push(items);

@@ -236,6 +236,8 @@ fn label(blocker: &Blocker) -> String {
         Blocker::Region => "perform, handle or simulate",
         Blocker::UndecidableMatchArm => "pattern outside the fragment",
         Blocker::DestructuringLet => "destructuring let",
+        Blocker::FloatTerm => "a Float term (never proved)",
+        Blocker::DecimalArithmetic => "Decimal arithmetic or ordering",
     }
     .to_string()
 }

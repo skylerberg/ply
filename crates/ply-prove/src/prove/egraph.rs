@@ -98,6 +98,9 @@ pub enum Shape<'a> {
     Int(i64),
     Bool(bool),
     Str(&'a str),
+    /// Already normalized by [`Terms::decimal`](super::term::Terms::decimal), so
+    /// two shapes differ exactly when the two values do.
+    Decimal(i128, u32),
     Ctor(&'a Node),
     List(usize),
     Record(&'a Node),
@@ -108,6 +111,7 @@ pub fn shape_of<'a>(terms: &'a Terms, t: TermId) -> Option<Shape<'a>> {
         Node::Int(k) => Some(Shape::Int(*k)),
         Node::Bool(b) => Some(Shape::Bool(*b)),
         Node::Str(s) => Some(Shape::Str(s)),
+        Node::Decimal { mantissa, scale } => Some(Shape::Decimal(*mantissa, *scale)),
         Node::Ctor { .. } => Some(Shape::Ctor(terms.node(t))),
         Node::List(items) => Some(Shape::List(items.len())),
         Node::Record(_) => Some(Shape::Record(terms.node(t))),
@@ -122,6 +126,7 @@ pub fn conflict(a: &Shape<'_>, b: &Shape<'_>) -> Option<bool> {
         (Shape::Int(x), Shape::Int(y)) => Some(x != y),
         (Shape::Bool(x), Shape::Bool(y)) => Some(x != y),
         (Shape::Str(x), Shape::Str(y)) => Some(x != y),
+        (Shape::Decimal(m1, s1), Shape::Decimal(m2, s2)) => Some((m1, s1) != (m2, s2)),
         (Shape::List(x), Shape::List(y)) => Some(x != y),
         (Shape::Ctor(Node::Ctor { name: x, .. }), Shape::Ctor(Node::Ctor { name: y, .. })) => {
             Some(x != y)

@@ -65,10 +65,24 @@ impl Kw {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `Eq` is deliberately absent: [`TokenKind::Float`] carries an `f64`, whose
+/// `==` is not reflexive. Nothing keys a collection on a token, and claiming an
+/// equivalence relation the payload does not have is how a NaN ends up compared
+/// two ways in two places.
+#[derive(Clone, PartialEq, Debug)]
 pub enum TokenKind {
     Ident(Symbol),
     Int(i64),
+    /// `1.5`, `1e9`. IEEE-754 binary64, and the value is what the source said
+    /// rounded once — the lexer does no arithmetic of its own.
+    Float(f64),
+    /// `1.50m`. Carried as mantissa and scale rather than as a decimal so that
+    /// this crate takes no numeric dependency; `1.50m` is `(150, 2)` and keeps
+    /// its trailing zero, because the scale is part of what the literal says.
+    Decimal {
+        mantissa: i128,
+        scale: u32,
+    },
     Str(String),
     /// `b"GET "`. Distinct from [`TokenKind::Str`] all the way down: the two
     /// have different types and must not share a definition hash.
@@ -119,6 +133,10 @@ impl TokenKind {
         match self {
             TokenKind::Ident(n) => format!("identifier `{n}`"),
             TokenKind::Int(v) => format!("integer `{v}`"),
+            TokenKind::Float(v) => format!("float `{v}`"),
+            TokenKind::Decimal { mantissa, scale } => {
+                format!("decimal `{}`", render_decimal(*mantissa, *scale))
+            }
             TokenKind::Str(_) => "string literal".to_string(),
             TokenKind::Bytes(_) => "byte-string literal".to_string(),
             TokenKind::Kw(k) => format!("keyword `{}`", k.as_str()),
@@ -162,12 +180,33 @@ impl TokenKind {
             TokenKind::PipePipe => "||",
             TokenKind::Ident(_)
             | TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Decimal { .. }
             | TokenKind::Str(_)
             | TokenKind::Bytes(_)
             | TokenKind::Kw(_)
             | TokenKind::Eof => "",
         }
     }
+}
+
+/// The digits a `(mantissa, scale)` pair stands for, with the scale's trailing
+/// zeros kept: `(150, 2)` is `1.50`. Shared by the lexer's diagnostics and by
+/// the AST's rendering so the two cannot print one literal two ways.
+pub fn render_decimal(mantissa: i128, scale: u32) -> String {
+    let sign = if mantissa < 0 { "-" } else { "" };
+    let digits = mantissa.unsigned_abs().to_string();
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let scale = scale as usize;
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale - digits.len() + 1), digits)
+    } else {
+        digits
+    };
+    let point = padded.len() - scale;
+    format!("{sign}{}.{}", &padded[..point], &padded[point..])
 }
 
 #[derive(Clone, Debug)]
@@ -311,18 +350,44 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn number(&mut self) -> TokenKind {
-        let start = self.pos;
-        let mut digits = String::new();
+    fn digits(&mut self, out: &mut String) {
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
-                digits.push(c);
+                out.push(c);
                 self.bump();
             } else if c == '_' {
                 self.bump();
             } else {
                 break;
             }
+        }
+    }
+
+    /// `1`, `1.5`, `1e9`, `1.50m`. Which of the three numeric types a literal
+    /// has is decided here and nowhere else: a fraction or an exponent makes it
+    /// a `Float`, an `m` suffix makes it a `Decimal`, and the bare form stays an
+    /// `Int`. The three have three types and three definition hashes, so a
+    /// literal that guessed would make `1` and `1.0` one definition.
+    fn number(&mut self) -> TokenKind {
+        let start = self.pos;
+        let mut whole = String::new();
+        self.digits(&mut whole);
+
+        let mut fraction = String::new();
+        // `..` is the range separator and `.` alone cannot open a field name, so
+        // a fraction is exactly a dot with a digit behind it.
+        let has_fraction =
+            self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit());
+        if has_fraction {
+            self.bump();
+            self.digits(&mut fraction);
+        }
+
+        let exponent = self.exponent();
+
+        if self.peek() == Some('m') && !self.text[self.pos + 1..].starts_with(is_ident_continue) {
+            self.bump();
+            return self.decimal(start, &whole, &fraction, exponent.is_some());
         }
 
         if self.peek().is_some_and(is_ident_start) {
@@ -337,22 +402,133 @@ impl<'a> Lexer<'a> {
             let suffix = self.text[suffix_start..self.pos].to_string();
             self.error(
                 codes::UNEXPECTED_TOKEN,
-                format!("invalid suffix `{suffix}` on integer literal"),
+                format!("invalid suffix `{suffix}` on a numeric literal"),
                 self.span_from(start),
-                "integer literals have no suffix; separate the name with a space",
+                "the only suffix is `m`, for a `Decimal`; separate a name with a space",
             );
         }
 
-        match digits.parse::<i64>() {
-            Ok(v) => TokenKind::Int(v),
+        if !has_fraction && exponent.is_none() {
+            return match whole.parse::<i64>() {
+                Ok(v) => TokenKind::Int(v),
+                Err(_) => {
+                    self.error(
+                        codes::UNEXPECTED_TOKEN,
+                        format!("integer literal `{whole}` does not fit in `Int`"),
+                        self.span_from(start),
+                        "`Int` is a 64-bit signed integer; use a smaller value",
+                    );
+                    TokenKind::Int(0)
+                }
+            };
+        }
+
+        let mut text = whole;
+        if has_fraction {
+            text.push('.');
+            text.push_str(&fraction);
+        }
+        if let Some(e) = &exponent {
+            text.push('e');
+            text.push_str(e);
+        }
+        // Rust's parser is correctly rounded and saturates to an infinity rather
+        // than failing, which is what IEEE says decimal-to-binary conversion
+        // does. Refusing an overflow here would make `Float` a type with a range
+        // the standard does not give it.
+        match text.parse::<f64>() {
+            Ok(v) => TokenKind::Float(v),
             Err(_) => {
                 self.error(
                     codes::UNEXPECTED_TOKEN,
-                    format!("integer literal `{digits}` does not fit in `Int`"),
+                    format!("`{text}` is not a floating-point literal"),
                     self.span_from(start),
-                    "`Int` is a 64-bit signed integer; use a smaller value",
+                    "write digits, an optional `.` fraction, and an optional `e` exponent",
                 );
-                TokenKind::Int(0)
+                TokenKind::Float(0.0)
+            }
+        }
+    }
+
+    /// The `e` of an exponent and its digits, consumed only when digits actually
+    /// follow: `1e9` is a float and `1 else` is two tokens.
+    fn exponent(&mut self) -> Option<String> {
+        if !matches!(self.peek(), Some('e' | 'E')) {
+            return None;
+        }
+        let rest = &self.text[self.pos + 1..];
+        let after_sign = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+        if !after_sign.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        self.bump();
+        let mut out = String::new();
+        if let Some(sign) = self.peek().filter(|c| *c == '+' || *c == '-') {
+            out.push(sign);
+            self.bump();
+        }
+        self.digits(&mut out);
+        Some(out)
+    }
+
+    /// `rust_decimal`'s domain, checked here so that every `Lit::Decimal` in the
+    /// AST is one the evaluator can build. The bounds are the type's, not a
+    /// policy: a 96-bit mantissa and a scale of `0..=28`.
+    fn decimal(
+        &mut self,
+        start: usize,
+        whole: &str,
+        fraction: &str,
+        had_exponent: bool,
+    ) -> TokenKind {
+        if had_exponent {
+            self.error(
+                codes::UNEXPECTED_TOKEN,
+                "a `Decimal` literal has no exponent",
+                self.span_from(start),
+                "write the digits out, or drop the `m` for a `Float`",
+            );
+            return TokenKind::Decimal {
+                mantissa: 0,
+                scale: 0,
+            };
+        }
+        const MAX_SCALE: u32 = 28;
+        const MAX_MANTISSA: i128 = (1i128 << 96) - 1;
+
+        let scale = fraction.len();
+        if scale > MAX_SCALE as usize {
+            self.error(
+                codes::UNEXPECTED_TOKEN,
+                format!("a `Decimal` literal has at most {MAX_SCALE} decimal places, not {scale}"),
+                self.span_from(start),
+                "round the literal, or use `Float`",
+            );
+            return TokenKind::Decimal {
+                mantissa: 0,
+                scale: 0,
+            };
+        }
+        let mut digits = String::with_capacity(whole.len() + fraction.len());
+        digits.push_str(whole);
+        digits.push_str(fraction);
+        let mantissa = digits.parse::<i128>().ok().filter(|m| *m <= MAX_MANTISSA);
+        match mantissa {
+            Some(mantissa) => TokenKind::Decimal {
+                mantissa,
+                scale: scale as u32,
+            },
+            None => {
+                self.error(
+                    codes::UNEXPECTED_TOKEN,
+                    "a `Decimal` literal has at most 96 bits of mantissa",
+                    self.span_from(start),
+                    "the largest is 79228162514264337593543950335",
+                );
+                TokenKind::Decimal {
+                    mantissa: 0,
+                    scale: 0,
+                }
             }
         }
     }

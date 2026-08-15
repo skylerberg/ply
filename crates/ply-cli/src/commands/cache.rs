@@ -150,7 +150,20 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
     // Compaction drops whatever the surviving files do not name, so a walk that
     // saw less than the whole project would delete work no error would report.
     let keep = match crate::load::ply_files(store.root()) {
-        Ok(keep) => keep,
+        // A shipped module has no file on disk, so the walk cannot see it, and
+        // its entry is live: this binary still ships it. Taken from what the
+        // store already holds rather than from the whole table, so a project
+        // that imports nothing from `std` keeps nothing extra and its
+        // `files_kept` still counts its own files.
+        Ok(mut keep) => {
+            keep.extend(
+                store
+                    .source_paths()
+                    .into_iter()
+                    .filter(|p| ply_std::is_pseudo_path(p)),
+            );
+            keep
+        }
         Err(e) => {
             let root = store.root().display().to_string();
             return fail(

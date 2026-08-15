@@ -947,6 +947,50 @@ test/nondet "clock moves forward" {
 }
 
 #[test]
+fn derive_item_parses() {
+    assert_eq!(
+        dump("type Order = {id: Int}\nderive json for Order"),
+        "(type Order = {id: Int})\n(derive json Order)"
+    );
+}
+
+#[test]
+fn derive_is_contextual_and_a_function_may_still_be_named_derive() {
+    assert_eq!(dump("fn derive(x) = x"), "(fn derive ((x _)) x)");
+}
+
+#[test]
+fn an_unknown_deriver_is_reported_with_the_whole_list() {
+    let d = errs("derive toml for Order");
+    assert_eq!(d[0].code, codes::UNKNOWN_DERIVER);
+    assert!(d[0].notes.iter().any(|n| n.contains("`json`")));
+}
+
+#[test]
+fn a_derive_cannot_be_pub() {
+    let d = errs("pub derive json for Order");
+    assert_eq!(d[0].code, codes::UNEXPECTED_TOKEN);
+}
+
+#[test]
+fn where_clauses_sit_between_the_row_and_the_spec() {
+    assert_eq!(
+        dump(
+            "fn respond<a>(v: a, c: Codec<a>) -> Response / {} \
+             where derivable(json, a), derivable(ord, a) requires true = v"
+        ),
+        "(fn respond <a> ((v a) (c Codec<a>)) -> Response / {} \
+         (derivable json a) (derivable ord a) (requires true) v)"
+    );
+}
+
+#[test]
+fn a_where_clause_naming_something_that_is_not_a_deriver_is_reported() {
+    let d = errs("fn f<a>(x: a) -> a where derivable(toml, a) = x");
+    assert_eq!(d[0].code, codes::UNKNOWN_DERIVER);
+}
+
+#[test]
 fn reformatting_does_not_change_the_parse() {
     let dense = "fn f(x:Int)->Int/{db.read[users]}={let y=x+1;y*2}";
     let loose = "fn f(x: Int) -> Int / { db.read[users] } = {\n  // a comment\n  let y = x + 1;\n  y * 2\n}";
@@ -997,6 +1041,9 @@ fn dump_item_body(i: &Item) -> String {
             }
             if let Some(r) = &f.effects {
                 s.push_str(&format!(" / {}", dump_row(r)));
+            }
+            for c in &f.constraints {
+                s.push_str(&format!(" (derivable {} {})", c.deriver, c.param.name));
             }
             for clause in &f.spec {
                 s.push_str(&format!(
@@ -1068,6 +1115,7 @@ fn dump_item_body(i: &Item) -> String {
             }
             format!("{s} {})", dump_expr(&l.body))
         }
+        Item::Derive(d) => format!("(derive {} {})", d.deriver, d.target.name),
     }
 }
 
@@ -1168,6 +1216,8 @@ fn dump_lit(l: &Lit) -> String {
         Lit::Bool(b) => b.to_string(),
         Lit::Str(s) => format!("{s:?}"),
         Lit::Bytes(b) => format!("b{b:?}"),
+        Lit::Float(v) => format!("{v:?}f"),
+        Lit::Decimal { mantissa, scale } => format!("{mantissa}e-{scale}m"),
         Lit::Unit => "unit".to_string(),
     }
 }

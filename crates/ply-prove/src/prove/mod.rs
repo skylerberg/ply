@@ -62,6 +62,8 @@ mod solve;
 mod term;
 
 #[cfg(test)]
+mod numerics;
+#[cfg(test)]
 mod tests;
 
 pub use context::Context;
@@ -254,7 +256,30 @@ pub fn decide_and_diagnose(
     let body = lowering.lower(goal.body);
     let blockers = lowering.blockers().to_vec();
     let requirements = lowering.requirements().to_vec();
+    let unsupported = lowering.unsupported();
     let mut terms = lowering.finish();
+
+    // The `Float` refusal, and it is deliberately here rather than at the end:
+    // no solver runs, so no `Proof` is constructed, so no `Certificate` can be
+    // built out of one. `==` on `Float` is not reflexive, and every rule below
+    // — congruence closure, the equality of a term with itself, the linear
+    // arithmetic — assumes it is. The second half of the condition is the belt
+    // to the lowering's braces: it asks the finished graph rather than trusting
+    // that every path into it remembered to say so.
+    if unsupported || float_in(ctx, &terms) {
+        let mut blockers = blockers;
+        if !blockers.contains(&Blocker::FloatTerm) {
+            blockers.push(Blocker::FloatTerm);
+        }
+        return (
+            Decision::Unknown {
+                reason: Reason::Open,
+                steps: 0,
+            },
+            blockers,
+        );
+    }
+
     let result_symbol = definition.map(|(symbol, _)| symbol);
     let definition = definition.map(|(symbol, value)| terms.eq(symbol, value));
 
@@ -360,6 +385,15 @@ pub fn decide_and_diagnose(
     )
 }
 
+/// Whether any term in the graph has a sort mentioning `Float`.
+///
+/// Over every term the interner ever built, not only the ones the goal still
+/// reaches: a `Float` that was folded away left its operands behind, and the
+/// question being asked is whether the obligation *mentioned* one.
+fn float_in(ctx: &Context<'_>, terms: &term::Terms) -> bool {
+    (0..terms.len()).any(|t| terms.sort(t).is_some_and(|s| ctx.reaches_float(s)))
+}
+
 /// Why an attempt stopped, or `None` when it closed.
 fn inconclusive(answer: solve::Answer) -> Option<Reason> {
     match answer {
@@ -458,6 +492,7 @@ fn children(node: &term::Node) -> Vec<term::TermId> {
         term::Node::Int(_)
         | term::Node::Bool(_)
         | term::Node::Str(_)
+        | term::Node::Decimal { .. }
         | term::Node::Unit
         | term::Node::Sym(_)
         | term::Node::Opaque(_) => Vec::new(),

@@ -12,13 +12,13 @@ use std::collections::BTreeMap;
 
 const SRC: SourceId = SourceId(0);
 
-struct Fixture {
+pub(super) struct Fixture {
     program: Program,
     resolved: Resolved,
     check: CheckOutput,
 }
 
-fn fixture(source: &str) -> Fixture {
+pub(super) fn fixture(source: &str) -> Fixture {
     let module = match ply_syntax::parse(SRC, source) {
         Ok(module) => module,
         Err(diagnostics) => panic!("parse: {:?}", messages(&diagnostics)),
@@ -44,11 +44,11 @@ fn messages(diagnostics: &[ply_span::Diagnostic]) -> Vec<String> {
 }
 
 impl Fixture {
-    fn context(&self) -> Context<'_> {
+    pub(super) fn context(&self) -> Context<'_> {
         Context::new(&self.program, &self.resolved, &self.check)
     }
 
-    fn law(&self, label: &str) -> &LawDef {
+    pub(super) fn law(&self, label: &str) -> &LawDef {
         self.program.modules[0]
             .items
             .iter()
@@ -89,7 +89,7 @@ fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
     }
 }
 
-fn binders(law: &LawDef) -> Vec<LawBinder> {
+pub(super) fn binders(law: &LawDef) -> Vec<LawBinder> {
     let mut vars = BTreeMap::new();
     law.binders
         .iter()
@@ -124,7 +124,7 @@ fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
 }
 
 #[track_caller]
-fn proof(fixture: &Fixture, label: &str) -> Proof {
+pub(super) fn proof(fixture: &Fixture, label: &str) -> Proof {
     match attempt(fixture, label) {
         Decision::Proved(proof) => proof,
         other => panic!("`{label}` was expected to be proved, got {other:?}"),
@@ -132,7 +132,7 @@ fn proof(fixture: &Fixture, label: &str) -> Proof {
 }
 
 #[track_caller]
-fn not_proved(fixture: &Fixture, label: &str) {
+pub(super) fn not_proved(fixture: &Fixture, label: &str) {
     if let Decision::Proved(proof) = attempt(fixture, label) {
         panic!("`{label}` must not be proved, but got a certificate: {proof:?}");
     }
@@ -1122,6 +1122,19 @@ law "true and false at once" forall (b: Bool) where b && !b { !b }
 law "one is two" forall (x: Int) where 1 == 2 { x != x }
 law "two weights at once" forall (s: Shade) where weight(s) == 1 && weight(s) == 3
   { s == s }
+
+// The numeric types, whose whole content in this audit is that a type arriving
+// is not evidence. Every `Float` entry below is `Refutable` — false at `NaN`,
+// including the reflexivity of `==` — so the audit asserts `Unknown` for each,
+// which is the structural refusal doing its job rather than a rule somebody
+// remembered to apply.
+law "a float equals itself" forall (x: Float) { x == x }
+law "a float sum commutes" forall (x: Float, y: Float) { x + y == y + x }
+law "a float is at least itself" forall (x: Float) { x >= x }
+law "a decimal equals itself" forall (x: Decimal) { x == x }
+law "two decimal scales are one value" forall (x: Int) { 1.5m == 1.50m }
+law "two decimals are two values" forall (x: Int) { 1.5m != 1.6m }
+law "a decimal zero is additive" forall (x: Decimal) { x + 0m == x }
 "#;
 
 fn corpus() -> Vec<(&'static str, Truth)> {
@@ -1149,6 +1162,13 @@ fn corpus() -> Vec<(&'static str, Truth)> {
         "a field is what was put in it",
         "every weight is positive",
         "no weight is four",
+        "a decimal equals itself",
+        "two decimal scales are one value",
+        "two decimals are two values",
+        // Exact and unable to overflow — adding zero needs no mantissa — so it
+        // is valid, and it is still not proved: there is no theory of `Decimal`
+        // arithmetic here and there is not meant to be.
+        "a decimal zero is additive",
     ];
     let partial = [
         "addition commutes",
@@ -1175,6 +1195,9 @@ fn corpus() -> Vec<(&'static str, Truth)> {
         "weights stop at two",
         "ordering skips two",
         "halving round trips",
+        "a float equals itself",
+        "a float sum commutes",
+        "a float is at least itself",
     ];
     let vacuous = [
         "between zero and one",
@@ -1250,7 +1273,11 @@ fn the_audit_corpus_exercises_the_fragment() {
         .collect();
     assert_eq!(
         undecided,
-        ["multiplication commutes", "a square is not negative"]
+        [
+            "multiplication commutes",
+            "a square is not negative",
+            "a decimal zero is additive"
+        ]
     );
 
     let missed: Vec<&str> = corpus()
