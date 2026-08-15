@@ -691,7 +691,10 @@ fn an_effect_named_only_by_a_deduplicated_atom_is_still_enumerated() {
     let one = parsed(TWO_EFFECTS);
     let swapped = parsed(
         &TWO_EFFECTS
-            .replace("effect x { write a() -> Unit }", "effect x { write q() -> Unit }")
+            .replace(
+                "effect x { write a() -> Unit }",
+                "effect x { write q() -> Unit }",
+            )
             .replace("x.a()", "x.q()"),
     );
     assert_ne!(

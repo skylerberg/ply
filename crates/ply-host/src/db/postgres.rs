@@ -36,6 +36,7 @@ use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_span::{Diagnostic, Span};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 /// What a resolved token still has to do.
 enum Next {
@@ -307,15 +308,63 @@ impl Postgres {
     /// run-level warning: a discarded connection is the run's own fault and does
     /// not change the entry point's verdict.
     pub fn end_entry_point(&self, machine: MachineId) -> Result<pool::DrainReport, Diagnostic> {
+        // Per entry point rather than per process, so the bound is the driver's
+        // own: this runs on the value path of every request, not only at a stop,
+        // and a run that is not stopping has no deadline to honour.
+        let config = self.reactor.config();
+        let bound = config.statement + config.connect;
         let leases = lock(&self.scopes).end_entry_point(machine);
         // This machine's tokens only. Clearing the table would resolve a
         // statement another entry point still has in flight to `E0505`, reported
         // as a defect in Ply against whichever definition happened to have posted
         // it.
         lock(&self.pending).retain(|_, next| next.owner().is_none_or(|o| o.0 != machine));
-        let mut report = self.reactor.drain(&leases)?;
+        let mut report = self.reactor.drain(&leases, bound)?;
         report.merge(self.reactor.take_discards());
         Ok(report)
+    }
+
+    /// Transaction scopes open right now, across every entry point.
+    ///
+    /// What the shutdown banner reports as "transactions open", and what a test
+    /// asserts a drain left behind. A count and not a list: what an operator
+    /// needs to know is that there were three, not which leases they were on.
+    pub fn open_scopes(&self) -> usize {
+        lock(&self.scopes).open_leases().len()
+    }
+
+    /// Step 1 of the process-level teardown: `ROLLBACK` every scope still open,
+    /// whichever entry point opened it, and **wait for the rollbacks**.
+    ///
+    /// Separate from [`close_pool`](Postgres::close_pool) because the sink is
+    /// flushed between them: a record naming a rolled-back transaction has to be
+    /// written by a run that still holds the connection that rolled it back.
+    ///
+    /// Waited for rather than left to the disconnect. Closing a connection with
+    /// a `BEGIN` still open does get the transaction aborted — by postgres, when
+    /// it notices — which is the same outcome by luck instead of by
+    /// construction, and on a server slow to notice it holds the row locks the
+    /// rest of a rolling restart is waiting on.
+    ///
+    /// **Nothing is committed.** Not the outermost scope of a body that had one
+    /// statement left, not a savepoint, not a scope whose every statement
+    /// succeeded. The client got no answer, so a retry is what fixes it — and a
+    /// retry cannot fix a committed half-transaction.
+    pub fn roll_back_open_scopes(&self, budget: Duration) -> Result<pool::DrainReport, Diagnostic> {
+        let leases = lock(&self.scopes).shutdown();
+        // Every pending answer, because there is no entry point left to hand one
+        // to: a token resolved after this would be a value nobody polls.
+        lock(&self.pending).clear();
+        let mut report = self.reactor.drain(&leases, budget)?;
+        report.merge(self.reactor.take_discards());
+        Ok(report)
+    }
+
+    /// Step 3: close the pool. Connections are closed rather than returned, and
+    /// one whose `ROLLBACK` failed is discarded — which is ADR 0014 §1.3's
+    /// existing rule and needs no new case.
+    pub fn close_pool(&self, budget: Duration) -> Result<pool::DrainReport, Diagnostic> {
+        self.reactor.shutdown(budget)
     }
 
     /// The statement text a control step runs, as a job on a connection.
@@ -538,3 +587,11 @@ impl Driver for NotConfigured {
 pub use sqlstate::{
     ACTIVE_TRANSACTION, NO_ACTIVE_TRANSACTION, PROGRAM_LIMIT_EXCEEDED, TRANSACTION_ABORTED,
 };
+
+/// What the shutdown coordinator asks the database for: one number, for one line
+/// of output and for the drain's own report. It answers and changes nothing.
+impl crate::signal::Transactions for Postgres {
+    fn open_scopes(&self) -> usize {
+        Postgres::open_scopes(self)
+    }
+}

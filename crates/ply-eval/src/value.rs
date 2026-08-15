@@ -84,6 +84,18 @@ pub enum Value {
     /// A captured continuation. Callable with exactly one argument — the value
     /// the `perform` it was captured at should have returned.
     Continuation(Rc<Continuation>),
+    /// A credential, and a **distinct variant** rather than a
+    /// `Ctor { name: "Secret", .. }`, which is the single most important line of
+    /// ADR 0015 §2: a `Ctor` is matchable, and `match s { Secret(plain) -> plain }`
+    /// would be a one-line escape from every guarantee below.
+    ///
+    /// Nothing in this file reads the payload except [`values_equal`], which
+    /// answers a `Bool` and prints nothing. [`Value::write`] never descends into
+    /// it, so every diff, panic payload, `--json` object, failure artifact and
+    /// `Diagnostic` that interpolates a value prints `Secret(****)` — that is one
+    /// line closing a dozen routes, and it is why it is a variant rather than a
+    /// wrapper a caller could forget to handle.
+    Secret(Arc<Value>),
 }
 
 pub struct Closure {
@@ -195,7 +207,12 @@ impl Value {
             Value::Cell(_) => "Cell",
             Value::Task(_) => "Task",
             Value::Continuation(_) => "continuation",
+            Value::Secret(_) => "Secret",
         }
+    }
+
+    pub fn secret(inner: Value) -> Value {
+        Value::Secret(Arc::new(inner))
     }
 
     pub fn as_int(&self, span: Span, what: &str) -> Result<i64, Diagnostic> {
@@ -381,9 +398,20 @@ impl Value {
             Value::Continuation(k) => {
                 let _ = write!(out, "<continuation {} frames>", k.frames());
             }
+            // Before the depth guard would matter and with no recursion into the
+            // payload, so the redaction is a property of this arm rather than of
+            // any bound: a `Secret` nested a thousand deep still prints this.
+            // Nothing is truncated because nothing is printed.
+            Value::Secret(_) => out.push_str(SECRET_REDACTED),
         }
     }
 }
+
+/// What a `Secret` renders as, everywhere, always. `ply-cli` and `ply-test`
+/// assert against this name rather than against the literal, so a change here
+/// cannot leave a stale expectation somewhere claiming the redaction still
+/// happens.
+pub const SECRET_REDACTED: &str = "Secret(****)";
 
 /// Drop glue recurses once per level of nesting, so a value deeper than the host
 /// stack aborts the process on the way *out* — the same hole [`values_equal`]
@@ -414,6 +442,7 @@ fn nests(v: &Value) -> bool {
         Value::Map(m) => !m.is_empty(),
         Value::Record(fields) => !fields.is_empty(),
         Value::Ctor { args, .. } => !args.is_empty(),
+        Value::Secret(inner) => nests(inner),
         _ => false,
     }
 }
@@ -443,6 +472,14 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
         Value::Map(m) => {
             let taken = std::mem::replace(m, Map::new());
             grow(move || drop(taken));
+        }
+        Value::Secret(inner) => {
+            if let Some(v) = Arc::get_mut(inner) {
+                let taken = std::mem::replace(v, Value::Unit);
+                if nests(&taken) {
+                    out.push(taken);
+                }
+            }
         }
         _ => {}
     }
@@ -516,6 +553,7 @@ fn discriminant(v: &Value) -> u8 {
         Value::Cell(_) => 12,
         Value::Task(_) => 13,
         Value::Continuation(_) => 14,
+        Value::Secret(_) => 15,
     }
 }
 
@@ -568,6 +606,16 @@ impl Ord for Value {
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
             (Value::Task(x), Value::Task(y)) => x.cmp(y),
+            // Unreachable from a well-typed program: `Map<Secret<a>, v>` is
+            // `E0206` because a key needs `derivable(ord, k)`, and `derive ord`
+            // and `compare_values` both refuse a `Secret`. It is defined by the
+            // payload rather than left `Equal` because this is Rust's total
+            // order, not the language's: `Equal` would collapse two distinct
+            // credentials into one slot of an `rpds` tree, and a wrong answer a
+            // defect elsewhere produced is worse than an order nothing can ask
+            // for. No Ply expression reaches it — [`secret_has_no_order`] is
+            // what every path a program can take passes through first.
+            (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
             (Value::Closure(_), Value::Closure(_))
             | (Value::Continuation(_), Value::Continuation(_)) => Ordering::Equal,
             // Unreachable: the discriminants matched, so the variants did.
@@ -592,6 +640,47 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+/// The refusal every path that would order a credential meets.
+///
+/// Equality over a credential leaks one bit per call; an ordering leaks a bit of
+/// *position* per call and recovers the whole value in a number of calls
+/// proportional to its length. That line — not taste — is why `derive eq`
+/// accepts a `Secret` field and `derive ord` refuses one, and why this exists as
+/// a backstop under both.
+///
+/// It lives beside [`Ord for Value`](Value#impl-Ord-for-Value) rather than at
+/// the call sites that need it because it is the *guard on that impl*: the two
+/// callers are [`compare_values`](crate::Builtin::CompareValues) and
+/// [`map::key`](crate::map::key), and every builtin that puts a key into a
+/// `Map` or looks one up goes through the second. A version of this that was
+/// invoked per builtin was invoked at four of the six, and the two it missed
+/// were a total ordering oracle over a plaintext.
+///
+/// The check is on the value itself rather than a walk of it: a `Secret` nested
+/// inside a compound key is refused by `derivable(ord, ·)` at compile time, and
+/// paying a recursive walk on every `map_insert` in every program to re-check
+/// what the type checker already decided is a cost the hot path should not
+/// carry.
+pub(crate) fn secret_has_no_order(v: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
+    if !matches!(v, Value::Secret(_)) {
+        return Ok(());
+    }
+    Err(Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` cannot order a `Secret`"),
+    )
+    .primary(span, "a credential has no order")
+    .note(
+        "an ordering over a credential leaks a bit of position per comparison and recovers the \
+         value in calls proportional to its length",
+    )
+    .note("use `secret_verify` to check a candidate, or `==` to compare two secrets")
+    .note(
+        "reaching this is a defect in Ply: `derivable(ord, Secret<a>)` is false, so a `Map` key \
+         and a `derive ord` over one are both `E0206` at compile time",
+    ))
+}
 
 pub(crate) fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagnostic {
     Diagnostic::error(
@@ -707,6 +796,25 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Task(x), Value::Task(y)) => x == y,
+        // The language's `==` over two credentials, and the reason `assert_eq`
+        // over a record holding one works while printing nothing. Constant time
+        // over the compared bytes, so the comparison itself is not the oracle;
+        // what a program then *does* with the `Bool` is one W5 neither creates
+        // nor closes (ADR 0015 §2.5 (4)).
+        //
+        // A `Secret` is never equal to a non-`Secret`: that pair falls through
+        // to `_ => false`, which is the same rule `Bytes` and `Str` meet under.
+        (Value::Secret(x), Value::Secret(y)) => {
+            return descend(span, depth, || match (&**x, &**y) {
+                (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),
+                (Value::Bytes(p), Value::Bytes(q)) => Ok(constant_time_eq(p, q)),
+                // No payload but a `String` is constructible — `secret_of_string`
+                // is the only introduction — so this arm is for a payload a
+                // later milestone adds, and it is structural rather than absent
+                // so that adding one cannot silently make two secrets unequal.
+                (p, q) => equal_at(p, q, span, depth + 1),
+            });
+        }
         (Value::Closure(_) | Value::Continuation(_), _)
         | (_, Value::Closure(_) | Value::Continuation(_)) => {
             return Err(Diagnostic::error(
@@ -718,6 +826,29 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         }
         _ => false,
     })
+}
+
+/// Byte equality whose running time is a function of the lengths and not of
+/// where the first difference is.
+///
+/// No early exit and no branch on a byte: the accumulator absorbs every
+/// position up to the longer length, and the length difference too, so a wrong
+/// guess one byte off costs exactly what a wrong guess in the last byte costs.
+/// [`std::hint::black_box`] is what stops an optimizer from reintroducing the
+/// early exit it can prove is equivalent.
+///
+/// What this does **not** buy is stated in ADR 0015 §2.5 (4): only the
+/// comparison is constant time. A caller that branches on the answer, traces on
+/// one arm, or loops over candidates is an oracle W5 does not close.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= u64::from(x ^ y);
+        diff = std::hint::black_box(diff);
+    }
+    diff == 0
 }
 
 /// Bounded exactly as [`values_equal`] is, and for the same reason. Past the

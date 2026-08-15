@@ -93,6 +93,7 @@ fn op(effect: &str, name: &str, resource: HostResource, linearity: Linearity) ->
         determinism: Determinism::Nondeterministic,
         linearity,
         blocking: false,
+        secrets: false,
         path: "audit::hostile",
     }
 }

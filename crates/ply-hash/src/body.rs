@@ -275,10 +275,66 @@ struct Unit {
     binder: Symbol,
 }
 
+/// A program-wide name per hash — `store.orders.place` — which is what a
+/// deployable artifact carries beside the bodies.
+///
+/// Supplying one restores the names a reconstruction would otherwise synthesize.
+/// That is not cosmetic: **a host handler is registered against an effect's
+/// program-wide name**, so a program rebuilt under synthesized names can bind
+/// nothing, and neither `--db-schema` nor `--config-schema` can name a function
+/// in it.
+pub type Namespace = BTreeMap<DefHash, Symbol>;
+
 struct Layout {
     units: Vec<Unit>,
     /// Hash -> (unit, class).
     by_hash: BTreeMap<DefHash, (usize, usize)>,
+}
+
+/// What a unit is called, once every unit is known.
+///
+/// All or nothing, deliberately. A mixture — some definitions under their own
+/// names, some under `d<hash16>` — would make the names in a diagnostic depend
+/// on which definitions happened to be nameable, which is exactly the kind of
+/// answer that varies with something a reader cannot see. So a namespace is used
+/// only when it names every definition consistently, and any conflict falls back
+/// to the synthesized naming that always works.
+fn naming(units: &[Unit], namespace: &Namespace) -> Option<Vec<(ModuleName, Vec<Symbol>)>> {
+    let mut out: Vec<(ModuleName, Vec<Symbol>)> = Vec::with_capacity(units.len());
+    // A qualifier is a module's last segment, so two modules sharing one cannot
+    // both be referred to from a third — the same ambiguity `import` has in
+    // source, and not one worth inventing a disambiguation for here.
+    let mut binders: BTreeMap<Symbol, ModuleName> = BTreeMap::new();
+    let mut taken: BTreeSet<Symbol> = BTreeSet::new();
+
+    for unit in units {
+        let mut module: Option<ModuleName> = None;
+        let mut simple = Vec::with_capacity(unit.hashes.len());
+        for hash in &unit.hashes {
+            let qualified = namespace.get(hash)?;
+            let (prefix, name) = qualified.as_str().rsplit_once('.')?;
+            let owner = ModuleName::from_dotted(prefix);
+            // A component's members are mutually recursive, so they were
+            // declared in one module; anything else did not come from a program.
+            if *module.get_or_insert_with(|| owner.clone()) != owner {
+                return None;
+            }
+            if !taken.insert(qualified.clone()) {
+                return None;
+            }
+            simple.push(Symbol::new(name));
+        }
+        let module = module?;
+        if binders
+            .entry(module.default_binder())
+            .or_insert_with(|| module.clone())
+            != &module
+        {
+            return None;
+        }
+        out.push((module, simple));
+    }
+    Some(out)
 }
 
 /// Unpacks the blob a component is hashed from: a count, then each member's
@@ -306,7 +362,7 @@ fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 impl Layout {
-    fn build(bodies: &BodySet) -> Result<Layout, Vec<Diagnostic>> {
+    fn build(bodies: &BodySet, namespace: &Namespace) -> Result<Layout, Vec<Diagnostic>> {
         let mut units: IndexMap<DefHash, Unit> = IndexMap::new();
         let mut diags = Vec::new();
 
@@ -370,6 +426,14 @@ impl Layout {
         let mut units: Vec<Unit> = units.into_values().collect();
         units.sort_by(|a, b| a.id.cmp(&b.id));
 
+        if let Some(naming) = naming(&units, namespace) {
+            for (unit, (module, names)) in units.iter_mut().zip(naming) {
+                unit.binder = module.default_binder();
+                unit.module = module;
+                unit.names = names;
+            }
+        }
+
         let mut by_hash: BTreeMap<DefHash, (usize, usize)> = BTreeMap::new();
         let mut names: BTreeMap<Symbol, DefHash> = BTreeMap::new();
         for (u, unit) in units.iter().enumerate() {
@@ -401,6 +465,22 @@ pub fn reconstruct(bodies: &BodySet) -> Result<Reconstruction, Vec<Diagnostic>> 
     reconstruct_relinked(bodies, &BTreeMap::new())
 }
 
+/// [`reconstruct`], under the names the definitions were built with rather than
+/// under synthesized ones.
+///
+/// This is what a deployed artifact uses, and it is not a nicety. A host handler
+/// is registered against an effect's *program-wide name* (`std.db.db`), and
+/// `--db-schema` and `--config-schema` name a function the same way, so a
+/// program rebuilt under `d<hash16>` can bind nothing and be configured by
+/// nothing. Bisection deliberately does not use this: a historical definition
+/// set has to be rebuildable without knowing what anything is called now.
+pub fn reconstruct_named(
+    bodies: &BodySet,
+    namespace: &Namespace,
+) -> Result<Reconstruction, Vec<Diagnostic>> {
+    reconstruct_with(bodies, &BTreeMap::new(), namespace)
+}
+
 /// [`reconstruct`], with every stored reference rewritten through `relink`
 /// before it is resolved.
 ///
@@ -419,16 +499,27 @@ pub fn reconstruct_relinked(
     bodies: &BodySet,
     relink: &BTreeMap<DefHash, DefHash>,
 ) -> Result<Reconstruction, Vec<Diagnostic>> {
-    let layout = Layout::build(bodies)?;
+    reconstruct_with(bodies, relink, &Namespace::new())
+}
+
+fn reconstruct_with(
+    bodies: &BodySet,
+    relink: &BTreeMap<DefHash, DefHash>,
+    namespace: &Namespace,
+) -> Result<Reconstruction, Vec<Diagnostic>> {
+    let layout = Layout::build(bodies, namespace)?;
     let mut missing: BTreeSet<DefHash> = BTreeSet::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
-    let mut modules: Vec<Module> = Vec::new();
+    // Keyed by name rather than pushed per unit: with a namespace restored, two
+    // units may belong to one module, and two `Module`s of one name is not a
+    // program.
+    let mut modules: IndexMap<ModuleName, Module> = IndexMap::new();
     let mut names: IndexMap<DefHash, Symbol> = IndexMap::new();
     let mut kinds: IndexMap<DefHash, ItemKind> = IndexMap::new();
 
     for (u, unit) in layout.units.iter().enumerate() {
         let mut items = Vec::with_capacity(unit.members.len());
-        let mut imports: BTreeSet<Symbol> = BTreeSet::new();
+        let mut imports: BTreeSet<ModuleName> = BTreeSet::new();
         let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
 
         for (class, encoding) in unit.members.iter().enumerate() {
@@ -457,21 +548,44 @@ pub fn reconstruct_relinked(
             }
         }
 
-        modules.push(Module {
-            name: unit.module.clone(),
-            source: Span::DUMMY.source,
-            imports: import_decls(&imports),
-            items,
-        });
+        // A module never imports itself, whatever a reference inside it asked
+        // for: a unit whose referent turned out to be a sibling in the same
+        // module contributed nothing to resolve.
+        imports.remove(&unit.module);
+        let module = modules
+            .entry(unit.module.clone())
+            .or_insert_with(|| Module {
+                name: unit.module.clone(),
+                source: Span::DUMMY.source,
+                imports: Vec::new(),
+                items: Vec::new(),
+            });
+        module.items.extend(items);
+        for decl in import_decls(&imports) {
+            if !module
+                .imports
+                .iter()
+                .any(|had| had.module_name() == decl.module_name())
+            {
+                module.imports.push(decl);
+            }
+        }
     }
+    let mut modules: Vec<Module> = modules.into_values().collect();
 
     let mut test_keys = Vec::with_capacity(bodies.tests.len());
     if !bodies.tests.is_empty() {
         let module = ModuleName::from_dotted(TEST_MODULE);
         let mut items = Vec::with_capacity(bodies.tests.len());
-        let mut imports: BTreeSet<Symbol> = BTreeSet::new();
-        let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
+        let mut imports: BTreeSet<ModuleName> = BTreeSet::new();
         for (i, body) in bodies.tests.iter().enumerate() {
+            // Per test, not per module. A slot is a de Bruijn level into *one
+            // component's* effect enumeration and each test is its own
+            // component, so two tests that reach different effect sets number
+            // them differently and neither is wrong. Sharing one map across the
+            // module reads that as one effect at two slots and refuses a corpus
+            // that is perfectly well formed.
+            let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
             let Some(Shape::Solo(bytes)) = body.shape() else {
                 diags.push(corrupt(format!(
                     "the body stored for test {i} is malformed"
@@ -590,11 +704,11 @@ impl Reconstruction {
     }
 }
 
-fn import_decls(binders: &BTreeSet<Symbol>) -> Vec<ImportDecl> {
-    binders
+fn import_decls(modules: &BTreeSet<ModuleName>) -> Vec<ImportDecl> {
+    modules
         .iter()
-        .map(|binder| ImportDecl {
-            path: vec![ident(binder.clone())],
+        .map(|module| ImportDecl {
+            path: module.segments().map(ident).collect(),
             kind: ImportKind::Module,
             span: Span::DUMMY,
         })
@@ -703,7 +817,7 @@ struct Decoder<'a> {
     values: u32,
     ty_params: u32,
     row_params: u32,
-    imports: &'a mut BTreeSet<Symbol>,
+    imports: &'a mut BTreeSet<ModuleName>,
     /// Effect hash -> the slot it was seen at. Two slots for one hash means the
     /// definition can tell two effects apart that share a declaration, which a
     /// hash-keyed store cannot reconstruct.
@@ -957,12 +1071,20 @@ impl Decoder<'_> {
             return QName::bare(ident(name.unwrap_or_else(|| short_name('d', hash))));
         };
         let target = name.unwrap_or_else(|| self.layout.units[unit].names[class].clone());
-        if unit == self.unit {
+        // Modules rather than units: with a namespace restored, two units may
+        // land in one module, and a module that imported itself to reach its own
+        // definition would not resolve.
+        let module = &self.layout.units[unit].module;
+        if self
+            .layout
+            .units
+            .get(self.unit)
+            .is_some_and(|own| &own.module == module)
+        {
             return QName::bare(ident(target));
         }
-        let binder = self.layout.units[unit].binder.clone();
-        self.imports.insert(binder.clone());
-        QName::qualified(ident(binder), ident(target))
+        self.imports.insert(module.clone());
+        QName::qualified(ident(self.layout.units[unit].binder.clone()), ident(target))
     }
 
     fn value_ref(&mut self) -> Decoded<QName> {

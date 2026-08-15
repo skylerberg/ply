@@ -3431,9 +3431,7 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
         "the corpus demonstrates no concurrency law"
     );
     assert!(
-        out.laws
-            .iter()
-            .any(|l| l.host && !l.footprint.is_empty()),
+        out.laws.iter().any(|l| l.host && !l.footprint.is_empty()),
         "the corpus demonstrates no `law/host`"
     );
 }

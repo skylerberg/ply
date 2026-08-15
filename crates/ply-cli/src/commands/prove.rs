@@ -10,8 +10,8 @@ use super::common::{
     IND, build_pool, diagnostic_json, diagnostics_json, emit_json, location, millis, once_each,
     plural, print_diagnostics, print_warnings, report_bind_error, report_load_error,
 };
-use crate::hosts::Hosts;
 use crate::cli::ProveArgs;
+use crate::hosts::Hosts;
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK, driver};
@@ -95,7 +95,28 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls, db, Some(&reach)) {
+    let (configuration, config_warnings) = match crate::config::Configuration::open(
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        args.host,
+        &args.config,
+    ) {
+        Ok(resolved) => resolved,
+        Err(diagnostics) => {
+            return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    warnings.extend(config_warnings);
+    let hosts = match Hosts::open(
+        &loaded.check,
+        args.host,
+        &args.tls.tls,
+        db,
+        configuration,
+        &args.trace,
+        Some(&reach),
+    ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);

@@ -24,8 +24,8 @@
 //!
 //! [`tcp::register`]: crate::tcp::register
 
-use super::value;
 use super::scope::{Access, Isolation, Owner};
+use super::value;
 use super::{Op, Scan, check_footprint};
 use ply_core::ty::{Footprint, Resource};
 use ply_eval::host::{HostAnswer, HostHandler, HostRegistry, HostRequest, HostRuntime};

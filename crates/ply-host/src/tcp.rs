@@ -158,6 +158,11 @@ impl Op {
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: self.waits() && net.waits(),
+            // A socket write takes `Bytes`, and `bytes_of_string` takes a
+            // `String`: no expression turns a `Secret` into either. W6's
+            // outbound client with a bearer token is the first operation that
+            // will want `true` here.
+            secrets: false,
             path: net.path(self),
         }
     }

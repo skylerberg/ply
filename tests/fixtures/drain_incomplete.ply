@@ -1,0 +1,74 @@
+// W0608: the drain deadline expired with connections still in flight.
+//
+// This program is correct and its tests pass. What produces the warning is the
+// *run's* configuration — a `--drain-ms` shorter than the work a request may
+// still be doing — which is why it is a warning attributed to no definition and
+// why it changes the exit code rather than the verdict:
+//
+//   $ ply run --host --drain-ms 300 drain_incomplete.ply
+//   ^C
+//   stopping    drain 300ms · 14 connections in flight · 3 transactions open
+//   warning[W0608]: the drain deadline expired
+//     = 6 connections abandoned with no response written
+//     = 3 transactions rolled back at teardown; nothing was committed
+//     = raise `--drain-ms` above the program's body_timeout_ms + write_timeout_ms
+//   exit 3
+//
+// Exit `3` and not `0`, because a rolling restart that reports success while
+// losing six requests per instance is the failure this code exists to make
+// visible. A deployment that sees `3` knows it lost requests; one that sees `0`
+// knows it did not.
+//
+// W5 has **no cancellation**, so a task still running at the deadline is not
+// cancelled, not unwound and not handed a 503: the process performs the pinned
+// teardown and exits, and the client sees a connection closed with no response.
+// A rolled-back transaction is not a lost request in the dangerous sense — the
+// database has no partial write and a retry fixes it. The outcome a retry cannot
+// fix is a committed half-transaction, and the teardown order is what makes that
+// unreachable.
+//
+// `--drain-ms` should exceed this program's own `body_timeout_ms +
+// write_timeout_ms`. The run cannot check that: `http::Limits` is a Ply value it
+// never sees, deliberately. Both numbers are in the start-up banner instead,
+// where they can be compared by eye.
+
+import std.net (net)
+import std.http
+
+pub fn limits() -> http::Limits = {
+  max_request_line: 8192,
+  max_header_bytes: 16384,
+  max_header_count: 64,
+  max_body: 65536,
+  max_chunk_size: 65536,
+  max_chunk_line: 4096,
+  max_trailer_bytes: 4096,
+  max_keep_alive: 100,
+  max_stream_chunks: 1024,
+  header_timeout_ms: 5000,
+  idle_timeout_ms: 5000,
+  // 30000 together, against a default `--drain-ms` of 30000: the two numbers a
+  // reader has to compare, in the two places they live.
+  body_timeout_ms: 15000,
+  write_timeout_ms: 15000,
+}
+
+fn serve(listener: Int, count: Int) -> Int / {net.write[conn], net.write[listener]} =
+  if count <= 0 {
+    0
+  } else {
+    let c = net.accept[listener](listener);
+    if c == 0 {
+      0
+    } else {
+      net.close[conn](c);
+      1 + serve(listener, count - 1)
+    }
+  }
+
+fn main() -> Int / {net.write[conn], net.write[listener]} = {
+  let l = net.listen[listener](8137);
+  let served = serve(l, 64);
+  net.close[listener](l);
+  served
+}

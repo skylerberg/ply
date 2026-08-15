@@ -16,12 +16,12 @@ mod support;
 use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
-use ply_host::db::scope::{Access, Isolation, Owner};
-use ply_host::db::{Driver, Postgres, Statement};
 use ply_host::db::pool::{self, Cleanup, Outcome, PoolConfig, Reactor};
+use ply_host::db::scope::{Access, Isolation, Owner};
 use ply_host::db::stmt::{self, Answer, Cache};
 use ply_host::db::types::{Datum, Json, Param};
 use ply_host::db::{self, Op};
+use ply_host::db::{Driver, Postgres, Statement};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -162,7 +162,9 @@ fn the_driver_speaks_to_a_real_postgres() {
     a_connection_dropped_mid_run_is_a_value_and_the_next_one_succeeds(&reactor, &cluster);
     the_driver_serves_a_transaction(&cluster);
 
-    let report = reactor.shutdown().expect("the reactor stops");
+    let report = reactor
+        .shutdown(std::time::Duration::from_secs(30))
+        .expect("the reactor stops");
     assert!(
         report.is_clean(),
         "the run left connections behind: {:?}",
@@ -634,8 +636,7 @@ fn ctor_of(value: &Value) -> String {
 }
 
 fn driver_count(db: &Postgres) -> i64 {
-    let value = driver_run(
-        db, Op::Query, "select count(*) from item", Vec::new());
+    let value = driver_run(db, Op::Query, "select count(*) from item", Vec::new());
     let Value::Ctor { name, args } = &value else {
         panic!("not an answer")
     };
@@ -691,7 +692,10 @@ fn the_driver_serves_a_transaction(cluster: &Cluster) {
         "the run left connections behind: {:?}",
         report.describe()
     );
-    let report = db.reactor().shutdown().expect("the reactor stops");
+    let report = db
+        .reactor()
+        .shutdown(std::time::Duration::from_secs(30))
+        .expect("the reactor stops");
     assert!(report.is_clean(), "{:?}", report.describe());
 }
 
@@ -699,7 +703,12 @@ fn a_committed_transaction_persists(db: &Postgres) {
     let before = driver_count(db);
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("it begins");
     assert_eq!(db.depth(ALONE), 1);
@@ -713,7 +722,12 @@ fn an_aborted_transaction_leaves_nothing(db: &Postgres) {
     let before = driver_count(db);
     settle(
         db,
-        db.begin(Isolation::Serializable, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::Serializable,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("it begins");
     driver_insert(db, "widget", 9);
@@ -729,13 +743,23 @@ fn a_nested_transaction_is_a_savepoint(db: &Postgres) {
     let before = driver_count(db);
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("the outer begins");
     driver_insert(db, "outer", 1);
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("the inner begins");
     assert_eq!(db.depth(ALONE), 2, "a nested begin is a savepoint");
@@ -755,12 +779,22 @@ fn a_nested_transaction_is_a_savepoint(db: &Postgres) {
 fn a_nested_level_that_disagrees_is_a_value(db: &Postgres) {
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("the outer begins");
     let answer = settle(
         db,
-        db.begin(Isolation::Serializable, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::Serializable,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("a refusal is a value, not a diagnostic");
     assert_eq!(ctor_of(&answer), "std.db.Failed");
@@ -777,7 +811,12 @@ fn a_nested_level_that_disagrees_is_a_value(db: &Postgres) {
 fn a_read_only_transaction_is_refused_by_the_server(db: &Postgres) {
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadOnly, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadOnly,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("it begins");
     let answer = driver_insert(db, "readonly", 1);
@@ -796,7 +835,12 @@ fn an_abandoned_scope_is_rolled_back_at_the_entry_point(db: &Postgres, cluster: 
     let before = driver_count(db);
     settle(
         db,
-        db.begin(Isolation::ReadCommitted, Access::ReadWrite, ALONE, Span::DUMMY),
+        db.begin(
+            Isolation::ReadCommitted,
+            Access::ReadWrite,
+            ALONE,
+            Span::DUMMY,
+        ),
     )
     .expect("it begins");
     driver_insert(db, "abandoned", 1);

@@ -253,7 +253,9 @@ fn an_exhausted_pool_is_e0437_after_the_acquire_deadline() {
     );
 
     reactor.release(held, Cleanup::Rollback).unwrap();
-    let report = reactor.drain(&[]).unwrap();
+    let report = reactor
+        .drain(&[], std::time::Duration::from_secs(30))
+        .unwrap();
     assert!(report.is_clean(), "{report:?}");
 }
 
@@ -336,7 +338,9 @@ fn a_connection_whose_transaction_was_abandoned_is_safe_to_reuse() {
     }
 
     // The scope is abandoned: nobody committed and nobody aborted.
-    let report = reactor.drain(&[held]).unwrap();
+    let report = reactor
+        .drain(&[held], std::time::Duration::from_secs(30))
+        .unwrap();
     assert_eq!(report.rolled_back, 1, "{report:?}");
     assert!(report.is_clean(), "the rollback succeeded: {report:?}");
     assert_eq!(reactor.status().checked_out, 0);
@@ -523,7 +527,9 @@ fn a_connection_whose_rollback_fails_is_discarded_rather_than_returned() {
     );
     assert!(killed.is_err(), "terminating the backend ends the session");
 
-    let report = reactor.drain(&[held]).unwrap();
+    let report = reactor
+        .drain(&[held], std::time::Duration::from_secs(30))
+        .unwrap();
     assert_eq!(
         report.discarded.len(),
         1,
@@ -693,7 +699,9 @@ fn a_drain_waits_for_work_in_flight_rather_than_dropping_it() {
         )
         .unwrap();
 
-    let report = reactor.drain(&[held]).unwrap();
+    let report = reactor
+        .drain(&[held], std::time::Duration::from_secs(30))
+        .unwrap();
     assert_eq!(
         FINISHED.load(AtomicOrdering::SeqCst),
         1,
@@ -733,13 +741,15 @@ fn shutdown_rolls_back_every_lease_and_stops_the_thread() {
     }
     assert_eq!(reactor.status().leases, 3);
 
-    let report = reactor.shutdown().unwrap();
+    let report = reactor
+        .shutdown(std::time::Duration::from_secs(30))
+        .unwrap();
     assert_eq!(report.rolled_back, 3, "{report:?}");
     assert!(report.is_clean(), "{report:?}");
 
     // Idempotent, and a stopped reactor refuses new work with a sentence rather
     // than a hang.
-    assert!(reactor.shutdown().is_ok());
+    assert!(reactor.shutdown(std::time::Duration::from_secs(30)).is_ok());
     let refused = reactor
         .borrow(span(), "`db.query`", simple("select 1"))
         .expect_err("a stopped reactor serves nothing");
@@ -769,7 +779,12 @@ fn statements_on_one_lease_run_one_at_a_time_and_in_order() {
     assert!(one.is_ok() && two.is_ok(), "{one:?} {two:?}");
 
     reactor.release(held, Cleanup::Rollback).unwrap();
-    assert!(reactor.drain(&[]).unwrap().is_clean());
+    assert!(
+        reactor
+            .drain(&[], std::time::Duration::from_secs(30))
+            .unwrap()
+            .is_clean()
+    );
 }
 
 /// A lease is released once. A statement performed after its scope closed has
@@ -831,7 +846,12 @@ fn a_lease_survives_the_statements_of_one_scope_without_waiting_for_the_pool() {
         assert!(answer.is_ok(), "{answer:?}");
     }
     reactor.release(held, Cleanup::Rollback).unwrap();
-    assert!(reactor.drain(&[]).unwrap().is_clean());
+    assert!(
+        reactor
+            .drain(&[], std::time::Duration::from_secs(30))
+            .unwrap()
+            .is_clean()
+    );
 }
 
 /// `park` is what the scheduler calls with nothing enabled, and it must not
@@ -954,7 +974,9 @@ fn a_scope_left_idle_past_the_idle_transaction_timeout_is_discarded_not_returned
     assert!(opened.is_ok(), "{opened:?}");
     std::thread::sleep(Duration::from_millis(900));
 
-    let report = reactor.drain(&[held]).unwrap();
+    let report = reactor
+        .drain(&[held], std::time::Duration::from_secs(30))
+        .unwrap();
     assert_eq!(
         report.discarded.len(),
         1,
@@ -1141,7 +1163,12 @@ fn many_threads_share_one_pool_without_losing_a_connection() {
                         );
                         assert!(answer.is_ok(), "{sql}: {answer:?}");
                     }
-                    assert!(reactor.drain(&[held]).unwrap().is_clean());
+                    assert!(
+                        reactor
+                            .drain(&[held], std::time::Duration::from_secs(30))
+                            .unwrap()
+                            .is_clean()
+                    );
 
                     let scopeless: Result<usize, String> = done(
                         reactor

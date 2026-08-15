@@ -49,7 +49,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 
@@ -63,6 +63,24 @@ pub const DEFAULT_STATEMENT_MS: u64 = 30_000;
 pub const DEFAULT_IDLE_TXN_MS: u64 = 30_000;
 /// `--db-connect-ms`: establishing a connection.
 pub const DEFAULT_CONNECT_MS: u64 = 5_000;
+
+/// The first token this reactor mints.
+///
+/// A composed [`HostRuntime`] routes a `Pending` by asking each facility
+/// whether it minted the token, and a facility answers by looking the token up
+/// in its own table. Two facilities counting from one therefore hand out the
+/// same number twice, and the *first* one asked answers yes about a token that
+/// is not its own — so the poll lands on the socket pool, finds an `accept`
+/// still waiting, and reports the query as unresolved forever. A hang, not a
+/// wrong answer, which is the shape this project audits for.
+///
+/// Disjoint ranges make the question unambiguous without a discriminator in
+/// `Pending`, which is `ply-eval`'s type and should not have to know how many
+/// facilities a host composes. The socket pool would have to mint 2^63
+/// operations to reach here.
+///
+/// [`HostRuntime`]: ply_eval::host::HostRuntime
+pub const FIRST_TOKEN: u64 = 1 << 63;
 
 /// A connection checked out of the pool, as the reactor's tasks hold it.
 pub type Connection = Object;
@@ -176,7 +194,9 @@ pub struct Opened {
 
 impl fmt::Debug for Opened {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Opened").field("lease", &self.lease).finish()
+        f.debug_struct("Opened")
+            .field("lease", &self.lease)
+            .finish()
     }
 }
 
@@ -439,7 +459,7 @@ impl Reactor {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             finished: Condvar::new(),
-            next_token: AtomicU64::new(1),
+            next_token: AtomicU64::new(FIRST_TOKEN),
             next_lease: AtomicU64::new(1),
             pool: pool.clone(),
         });
@@ -589,7 +609,7 @@ impl Reactor {
     /// diagnostic, or a spent budget. It waits for the leases named rather than
     /// for the whole reactor, because `ply test`'s workers share one pool and a
     /// drain that waited for every connection would serialise the run.
-    pub fn drain(&self, leases: &[LeaseId]) -> Result<DrainReport, Diagnostic> {
+    pub fn drain(&self, leases: &[LeaseId], budget: Duration) -> Result<DrainReport, Diagnostic> {
         let mut report = DrainReport::default();
         let (ack, acks) = std::sync::mpsc::channel();
         let mut posted = 0;
@@ -608,9 +628,14 @@ impl Reactor {
             posted += 1;
         }
         drop(ack);
-        let bound = self.config.statement + self.config.connect;
+        // The operator's deadline, never more. A cleanup that outlives it is a
+        // cleanup the drain has no time left for, and waiting on the *statement*
+        // timeout instead is how a one-second `--drain-ms` came to hold a
+        // process open for thirty.
+        let bound = (self.config.statement + self.config.connect).min(budget);
+        let until = Instant::now() + bound;
         for _ in 0..posted {
-            match acks.recv_timeout(bound) {
+            match acks.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(released) => {
                     report.rolled_back += 1;
                     if let Some(reason) = released.discarded {
@@ -656,7 +681,7 @@ impl Reactor {
     /// every connection, and join the thread.
     ///
     /// Idempotent, and called from [`Drop`] if a run never gets here.
-    pub fn shutdown(&self) -> Result<DrainReport, Diagnostic> {
+    pub fn shutdown(&self, budget: Duration) -> Result<DrainReport, Diagnostic> {
         let thread = {
             let mut held = self.thread.lock().unwrap_or_else(|e| e.into_inner());
             match held.take() {
@@ -665,11 +690,12 @@ impl Reactor {
             }
         };
         let (ack, acked) = std::sync::mpsc::channel();
-        let mut report = if self.send(Command::Stop { ack }).is_ok() {
+        let mut report = if self.send(Command::Stop { ack, budget }).is_ok() {
+            // The reactor's own `stop` is bounded by the same budget and answers
+            // inside it, so this is that plus room to hand the answer back
+            // rather than a second, longer deadline.
             acked
-                .recv_timeout(
-                    self.config.acquire.max(self.config.statement) + self.config.connect * 2,
-                )
+                .recv_timeout(budget + self.config.connect)
                 .unwrap_or_else(|_| DrainReport {
                     abandoned: 1,
                     ..DrainReport::default()
@@ -837,7 +863,11 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        // The last `Reactor` went without a `shutdown`, so there is no run's
+        // deadline to honour and the config-derived bound is the only one there
+        // has ever been.
+        let _ =
+            self.shutdown(self.config.acquire.max(self.config.statement) + self.config.connect * 2);
     }
 }
 
@@ -991,6 +1021,10 @@ enum Command {
     },
     Stop {
         ack: std::sync::mpsc::Sender<DrainReport>,
+        /// How long the whole stop has. The run's `--drain-ms`, not the
+        /// statement timeout: what bounds a shutdown is the deadline the
+        /// operator set for it.
+        budget: Duration,
     },
 }
 
@@ -1136,8 +1170,8 @@ async fn serve(
                     }
                 }
             }
-            Command::Stop { ack } => {
-                let report = stop(&config, &pool, &leases, &mut tasks).await;
+            Command::Stop { ack, budget } => {
+                let report = stop(&config, &pool, &leases, &mut tasks, budget).await;
                 let _ = ack.send(report);
                 return;
             }
@@ -1146,7 +1180,14 @@ async fn serve(
     // The last `Reactor` was dropped without a `shutdown`. Everything still
     // leased is abandoned by definition, so it is rolled back rather than
     // returned as-is.
-    let _ = stop(&config, &pool, &leases, &mut tasks).await;
+    let _ = stop(
+        &config,
+        &pool,
+        &leases,
+        &mut tasks,
+        config.acquire.max(config.statement) + config.connect,
+    )
+    .await;
 }
 
 /// Refuse new work, roll back every lease, wait for what is in flight, and
@@ -1161,6 +1202,7 @@ async fn stop(
     pool: &DeadPool,
     leases: &Leases,
     tasks: &mut JoinSet<()>,
+    budget: Duration,
 ) -> DrainReport {
     let mut report = DrainReport::default();
     let (ack, acks) = std::sync::mpsc::channel();
@@ -1177,10 +1219,14 @@ async fn stop(
     }
     drop(ack);
 
-    // Long enough that nothing still capable of finishing is cut off: a task in
+    // Long enough that nothing still capable of finishing is cut off — a task in
     // flight is either waiting for the pool (`acquire`) or waiting on the server
-    // (`statement`), and a cleanup after either is bounded by `connect`.
-    let bound = config.acquire.max(config.statement) + config.connect;
+    // (`statement`), and a cleanup after either is bounded by `connect` — and
+    // never longer than the stop's own budget. A task the budget cuts off is
+    // aborted, which drops its connection, which closes the socket, which is
+    // what makes the server abandon the statement holding the lock the rest of a
+    // rolling restart is waiting on.
+    let bound = (config.acquire.max(config.statement) + config.connect).min(budget);
     let waited =
         tokio::time::timeout(bound, async { while tasks.join_next().await.is_some() {} }).await;
     if waited.is_err() {
