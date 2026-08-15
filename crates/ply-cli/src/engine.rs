@@ -41,7 +41,10 @@ use ply_prove::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
+use ply_eval::host::{HostBinding, HostRuntime};
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// The discharger this build drives, and what the reader has to be told about
 /// it.
@@ -56,6 +59,7 @@ pub fn of<'a>(
     check: &'a CheckOutput,
     complete: bool,
     obligations: usize,
+    hosting: Option<Hosting<'a>>,
 ) -> (
     Box<dyn ply_test::obligation::Discharger + 'a>,
     Option<Diagnostic>,
@@ -71,7 +75,12 @@ pub fn of<'a>(
             (obligations > 0).then(incomplete),
         );
     }
-    (Box::new(Prover::new(program, resolved, check)), None)
+    let prover = Prover::new(program, resolved, check);
+    let prover = match hosting {
+        Some(hosting) => prover.with_hosting(hosting),
+        None => prover,
+    };
+    (Box::new(prover), None)
 }
 
 fn incomplete() -> Diagnostic {
@@ -146,6 +155,21 @@ pub struct Prover<'a> {
     ctx: prove::Context<'a>,
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
     laws: HashMap<Symbol, (usize, &'a LawDef)>,
+    /// What a `law/host` is discharged against. `None` in a hermetic run, which
+    /// makes every one of them `Gap::ReachesHost` rather than green.
+    ///
+    /// A **factory** for the runtime rather than a handle, for the reason
+    /// `ply test` uses one: obligations are discharged on a rayon pool, a
+    /// reactor handle belongs to the one thread its machine runs on, and each of
+    /// those machines needs an identity of its own so that two host laws in
+    /// flight are two scope stacks.
+    hosting: Option<Hosting<'a>>,
+}
+
+/// The binding and the reactor a `law/host` runs against.
+pub struct Hosting<'a> {
+    pub binding: Arc<HostBinding>,
+    pub runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
 }
 
 impl<'a> Prover<'a> {
@@ -176,7 +200,15 @@ impl<'a> Prover<'a> {
             ctx: prove::Context::new(program, resolved, check),
             defs,
             laws,
+            hosting: None,
         }
+    }
+
+    /// Bind the host, so that a `law/host` is attempted rather than reported as
+    /// a gap.
+    pub fn with_hosting(mut self, hosting: Hosting<'a>) -> Prover<'a> {
+        self.hosting = Some(hosting);
+        self
     }
 
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'a>> {
@@ -204,6 +236,17 @@ impl<'a> Prover<'a> {
 
     fn machine(&self) -> Machine<'a> {
         Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS)
+    }
+
+    /// The machine a `law/host`'s body runs on: the run's binding, and a reactor
+    /// minted for this thread.
+    fn host_machine(&self, hosting: &Hosting<'a>) -> Machine<'a> {
+        let mut machine = self.machine();
+        machine.set_host_binding(Arc::clone(&hosting.binding));
+        if let Some(factory) = hosting.runtime {
+            machine.set_host_runtime(factory());
+        }
+        machine
     }
 
     /// Step 1. Answers `proved`, `vacuous`, or "carry on".
@@ -321,6 +364,10 @@ impl<'a> Prover<'a> {
             return self.search_interleavings(obligation, &claim, plan);
         }
 
+        if obligation.host {
+            return self.discharge_host(obligation, &claim, plan);
+        }
+
         let witness = match self.attempt_static(obligation, &claim, plan) {
             Static::Proved(certificate) => return Discharge::Held(Evidence::Proof(certificate)),
             Static::Vacuous => {
@@ -380,6 +427,40 @@ impl<'a> Prover<'a> {
             },
             other => upgrade(other, witness),
         }
+    }
+
+    /// A `law/host`, discharged by running it.
+    ///
+    /// **The static tier and the finite enumeration are both skipped, and that is
+    /// structural rather than a convention.** Either would be a claim about every
+    /// value of the domain, and a claim about every value is exactly what a law
+    /// whose body reaches the world cannot make: the world is not a function of
+    /// the arguments. `property` is the ceiling and the tier says so.
+    ///
+    /// Under a hermetic run there is nothing to run it against, and the answer is
+    /// a gap naming the flag rather than a green tick.
+    fn discharge_host(
+        &self,
+        obligation: &Obligation,
+        claim: &Claim<'a>,
+        plan: &ProvePlan,
+    ) -> Discharge {
+        let Some(hosting) = &self.hosting else {
+            return Discharge::Unattempted(Gap::ReachesHost(obligation.footprint.clone()));
+        };
+        let mut cases = match self.cases(obligation, claim) {
+            Ok(cases) => cases,
+            Err(gap) => return Discharge::Unattempted(gap),
+        };
+        cases.machine = self.host_machine(hosting);
+        run_property(
+            obligation.key,
+            obligation.generated(),
+            &self.world,
+            plan,
+            claim.guard_span(obligation.span),
+            &mut cases,
+        )
     }
 
     /// A tuple of binder values the guard admits, found by evaluating the guard

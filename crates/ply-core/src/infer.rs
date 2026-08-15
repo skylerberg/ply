@@ -269,7 +269,7 @@ struct Numeric {
 
 /// Where a spec expression sits, which decides both how it is named in a
 /// diagnostic and — the part that matters — what its row may carry.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SpecSite {
     Requires,
     Ensures,
@@ -2392,6 +2392,12 @@ impl<'a> Checker<'a> {
                      nothing else"
                 ));
             }
+            if site == SpecSite::LawBody {
+                d = d.note(
+                    "a law whose body reaches the world is written `law/host`, which declares the \
+                     relaxation rather than taking it silently, and can never be `proved`",
+                );
+            }
             self.diags.push(d.note(format!(
                 "compute this with a pure function, or handle `{}` inside the definition and \
                  state a claim about its result",
@@ -2492,7 +2498,14 @@ impl<'a> Checker<'a> {
             "a law states a proposition",
         );
         let row = self.subst.resolve_row(&row);
-        self.check_spec_purity(SpecSite::LawBody, def.body.span, &row);
+        // A `law/host`'s body may carry any row: it says so in its own
+        // declaration, which is what makes it auditable. The guard above is
+        // unaffected — it stays pure whatever the law is, because a guard
+        // decides the domain and a guard that could act would be choosing which
+        // cases to be judged on.
+        if !def.host {
+            self.check_spec_purity(SpecSite::LawBody, def.body.span, &row);
+        }
         self.env.pop();
 
         let binders: Vec<LawBinder> = def
@@ -2512,6 +2525,7 @@ impl<'a> Checker<'a> {
             index: self.laws.len(),
             binders,
             has_guard: def.guard.is_some(),
+            host: def.host,
             footprint: row.to_footprint(),
             span: def.span,
         });

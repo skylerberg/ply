@@ -8,8 +8,9 @@
 
 use super::common::{
     IND, build_pool, diagnostic_json, diagnostics_json, emit_json, location, millis, once_each,
-    plural, print_diagnostics, print_warnings, report_load_error,
+    plural, print_diagnostics, print_warnings, report_bind_error, report_load_error,
 };
+use crate::hosts::Hosts;
 use crate::cli::ProveArgs;
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
@@ -78,12 +79,42 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
     let (obligations, filtered_out) = filter(collected.obligations, args.filter.as_deref());
 
+    // The row a `law/host` will enter, which is what decides whether this run
+    // needs a database at all: a file whose laws are all hermetic binds nothing,
+    // exactly as `ply test` binds nothing for a suite that installs the twin.
+    let reach = ply_core::ty::Footprint::from_atoms(
+        scoped
+            .laws
+            .iter()
+            .filter(|law| law.host)
+            .flat_map(|law| law.footprint.atoms().cloned()),
+    );
+    let db = match args.db.resolve(args.host) {
+        Ok(db) => db,
+        Err(diagnostics) => {
+            return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls, db, Some(&reach)) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let runtime = hosts.runtime_factory();
+    let hosting = args.host.then(|| crate::engine::Hosting {
+        binding: hosts.binding(),
+        runtime: runtime
+            .as_ref()
+            .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
+    });
     let (engine, engine_warning) = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
         loaded.complete,
         obligations.len(),
+        hosting,
     );
     warnings.extend(engine_warning);
     let (pool, _workers) = build_pool(args.jobs, &mut warnings);
@@ -363,6 +394,9 @@ pub(crate) fn gap_summary(gap: &Gap) -> String {
         Gap::Raised { diagnostic, .. } => format!("raised: {}", diagnostic.message),
         Gap::GuardNotSampled { generated, .. } => {
             format!("the guard kept none of {generated} cases, but it does admit a value")
+        }
+        Gap::ReachesHost(footprint) => {
+            format!("reaches the host ({footprint}); run `ply prove --host`")
         }
     }
 }

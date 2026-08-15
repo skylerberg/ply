@@ -335,6 +335,9 @@ pub struct TestArgs {
     #[command(flatten)]
     pub tls: TlsOptions,
 
+    #[command(flatten)]
+    pub db: crate::db::DbOptions,
+
     /// Also select the tests declared by the modules that ship with the
     /// compiler. Off by default: a project's test count must not change with a
     /// compiler upgrade, for tests the project did not write and cannot fix.
@@ -412,6 +415,21 @@ pub struct ProveArgs {
     /// must not change with a compiler upgrade.
     #[arg(long)]
     pub std: bool,
+
+    /// Bind the real host handlers, so that a `law/host` is attempted.
+    ///
+    /// Off by default, which is the point: under a hermetic run a `law/host` is
+    /// reported `W0604 unattempted` with the reason, never green. A law about a
+    /// database that never ran a database, reported as passing, is exactly the
+    /// green result over unexplored space this command exists to prevent.
+    #[arg(long)]
+    pub host: bool,
+
+    #[command(flatten)]
+    pub tls: TlsOptions,
+
+    #[command(flatten)]
+    pub db: crate::db::DbOptions,
 
     #[command(flatten)]
     pub prove: ProveOptions,
@@ -495,6 +513,9 @@ pub struct RunArgs {
 
     #[command(flatten)]
     pub tls: TlsOptions,
+
+    #[command(flatten)]
+    pub db: crate::db::DbOptions,
 }
 
 #[derive(Args, Debug)]
@@ -511,6 +532,9 @@ pub struct HostsArgs {
 
     #[command(flatten)]
     pub tls: TlsOptions,
+
+    #[command(flatten)]
+    pub db: crate::db::DbOptions,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long, conflicts_with = "digest")]

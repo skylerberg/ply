@@ -362,6 +362,76 @@ pub mod codes {
     /// certificate is unusable on the first handshake has already told a client
     /// it was listening.
     pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
+    /// `--host` bound the postgres driver and the run named no database, named
+    /// one that does not parse, asked for an `sslmode` W4 does not configure, or
+    /// named a server that could not be reached.
+    ///
+    /// The connection string is configured beside the run rather than written in
+    /// the program, for the reason [`TLS_CREDENTIAL_INVALID`] gives about a
+    /// private key: a password in a definition's hash is in a store designed
+    /// never to forget.
+    pub const DB_NOT_CONFIGURED: &str = "E0431";
+    /// Statement text the driver refuses before preparing it: more than one
+    /// statement, a construct the table scanner cannot account for, a parameter
+    /// or result type outside the pinned mapping, or a nondeterministic function
+    /// in the text where a parameter belongs.
+    ///
+    /// The scanner refuses rather than guessing because its answer is a
+    /// footprint. A construct it silently ignored would produce a row that
+    /// under-reports, which corrupts scheduling and isolation with a green
+    /// result rather than a red one.
+    pub const DB_STATEMENT_REFUSED: &str = "E0432";
+    /// The server refused to prepare a statement — syntax, an unknown relation,
+    /// an unknown column — or its result description has two columns of one name
+    /// or lacks a column the row codec requires.
+    ///
+    /// Not a `Failed` value like a constraint violation: this one is the same
+    /// every time and will never succeed on a retry, so making it a value would
+    /// invite a program to loop on it.
+    pub const DB_PREPARE_FAILED: &str = "E0433";
+    /// A statement touches a table outside the declared footprint of the entry
+    /// point that reached it — caught at prepare time from the declared
+    /// footprint the request carries, and again at answer time from the atoms
+    /// the handler reported it touched.
+    ///
+    /// Deliberately not [`HOST_FOOTPRINT_ESCAPE`], which is Ply's fault: there
+    /// the registry-resolved atom disagreed with the row, while here the
+    /// registry was right and the row is wrong, because the tables a statement
+    /// reaches are a function of its text rather than of the call site's label.
+    /// The program is at fault and it is attributed and bisected like any other
+    /// program failure.
+    ///
+    /// The answer-time half is a **detector and not a preventer**: scheduling
+    /// happened before the run, so the statement has already executed against a
+    /// table the scheduler believed nobody was touching. What it buys is that a
+    /// wrong row fails loudly on its first execution instead of quietly forever.
+    pub const DB_FOOTPRINT_UNDECLARED: &str = "E0434";
+    /// The live database differs from the schema the run named: a missing table
+    /// or column, a type outside the mapping, a nullability that disagrees, or a
+    /// missing constraint. Raised at bind time, before anything runs, because a
+    /// service that discovers its schema is wrong on the first request has
+    /// already told a client it was listening.
+    pub const DB_SCHEMA_MISMATCH: &str = "E0435";
+    /// A database operation performed by a task that does not own the open
+    /// transaction scope. Both alternatives are wrong: sharing the connection is
+    /// a protocol violation, since a postgres connection carries one
+    /// conversation, and quietly acquiring a second connection would put the
+    /// statement *outside* the transaction its author believed it was in.
+    pub const DB_TRANSACTION_SCOPE: &str = "E0436";
+    /// No connection became available within the acquire deadline.
+    ///
+    /// A diagnostic rather than a value, unlike every SQLSTATE the server
+    /// returns. A value is a thing a program is invited to swallow, and a
+    /// swallowed pool exhaustion is a service returning wrong answers under
+    /// exactly the load that produced it.
+    pub const DB_POOL_EXHAUSTED: &str = "E0437";
+    /// The live schema carries a trigger, a rewrite rule, or a referential
+    /// action that cascades — an effect that makes one statement touch a table
+    /// its own text never names, which no scanner can see and no row can report.
+    ///
+    /// Raised at bind time with no flag to suppress it. A flag that turns a
+    /// soundness check off is a flag whose default becomes the one nobody uses.
+    pub const DB_UNMODELLED_SIDE_EFFECT: &str = "E0438";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -396,6 +466,13 @@ pub mod codes {
     /// one re-run — but an upgrade that silently re-runs work is a mystery, and
     /// the warning is what turns it into a fact with a digest beside it.
     pub const STDLIB_CHANGED: &str = "W0605";
+    /// A host runtime could not hand every resource back when an entry point
+    /// ended: a transaction scope whose `ROLLBACK` failed, a connection closed
+    /// rather than returned to the pool, an operation still in flight when the
+    /// bound expired. A `W` because it is the run's own state rather than the
+    /// program's — the entry point's verdict is unchanged — and it is printed
+    /// because a pool that quietly refills is a pool nobody can size.
+    pub const HOST_TEARDOWN: &str = "W0606";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -584,6 +661,30 @@ mod tests {
                 codes::TLS_CREDENTIAL_INVALID,
                 "E0430",
             ),
+            ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
+            (
+                "DB_STATEMENT_REFUSED",
+                codes::DB_STATEMENT_REFUSED,
+                "E0432",
+            ),
+            ("DB_PREPARE_FAILED", codes::DB_PREPARE_FAILED, "E0433"),
+            (
+                "DB_FOOTPRINT_UNDECLARED",
+                codes::DB_FOOTPRINT_UNDECLARED,
+                "E0434",
+            ),
+            ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
+            (
+                "DB_TRANSACTION_SCOPE",
+                codes::DB_TRANSACTION_SCOPE,
+                "E0436",
+            ),
+            ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
+            (
+                "DB_UNMODELLED_SIDE_EFFECT",
+                codes::DB_UNMODELLED_SIDE_EFFECT,
+                "E0438",
+            ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
@@ -602,6 +703,7 @@ mod tests {
                 "W0604",
             ),
             ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
+            ("HOST_TEARDOWN", codes::HOST_TEARDOWN, "W0606"),
         ];
 
         for (name, code, expected) in registry {

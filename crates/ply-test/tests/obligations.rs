@@ -86,6 +86,7 @@ fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
             span: Span::DUMMY,
         }],
         guarded: false,
+        host: false,
         footprint: Footprint::empty(),
     }
 }
@@ -99,6 +100,7 @@ fn law(key: u8, label: &str) -> Obligation {
         frame: ply_prove::Frame::Pure,
         binders: Vec::new(),
         guarded: false,
+        host: false,
         footprint: Footprint::empty(),
     }
 }

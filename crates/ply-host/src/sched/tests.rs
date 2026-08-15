@@ -423,10 +423,13 @@ fn dispatching_a_task_perform_to_the_handler_is_refused() {
         .resolve(&Symbol::new("task"), &Symbol::new("spawn"), None)
         .expect("the triple is bound");
     let request = HostRequest {
+        machine: ply_eval::host::MachineId(1),
         atom: bound_op.atom.clone(),
         op: bound_op.op,
         args: &[],
         span: Span::DUMMY,
+        task: None,
+        declared: None,
     };
     let err = bound_op
         .handler

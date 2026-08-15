@@ -5318,3 +5318,876 @@ of a `Pending` token: deadlines removed the need rather than deferring it again,
 and a host operation with no deadline still blocks until it completes or the run
 ends. Graceful shutdown and connection draining (W5). More than 64 host
 operations in flight.
+
+---
+
+## Postgres
+
+`docs/adr/0014-w4-contract.md` has the reasoning; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was
+written after them.
+
+### The rule everything else follows from
+
+**A row says which tables.** The reason to put a database behind an effect is
+that an endpoint's declared signature names the tables it touches, and a driver
+that answers `db.write[db]` for every statement has thrown that away and kept
+only the ceremony. So the resource label is a table name, one statement's table
+set is **computed and checked** rather than asserted, and every mechanism below
+exists to keep the row honest when the thing that decides it — the SQL text — is
+a runtime value rather than a piece of syntax.
+
+### `std.db` — Ply source, the declaration
+
+`crates/ply-std/ply/db.ply`, module `std.db`, effect `std.db.db`. It ships with
+the compiler like `std.net`, so the signature the driver binds against and the
+signature the program performs are one text that cannot drift.
+
+```ply
+pub nondet effect db {
+  read  query[t](s: Stmt, ps: List<Param>)      -> Answer
+  write execute[t](s: Stmt, ps: List<Param>)    -> Answer
+  write returning[t](s: Stmt, ps: List<Param>)  -> Answer
+  write begin(level: Isolation, access: Access) -> Answer
+  write commit()                                -> Answer
+  write abort()                                 -> Answer
+  write rollback(reason: String)                -> Unit
+}
+
+pub type Isolation = ReadCommitted | RepeatableRead | Serializable
+pub type Access    = ReadWrite | ReadOnly
+pub type Stmt      = { sql: String }
+
+pub type Param = PNull | PInt(Int) | PBool(Bool) | PText(String) | PBytes(Bytes)
+               | PFloat(Float) | PNumeric(Decimal) | PJson(json::Json)
+               | PArray(List<Param>)
+pub type Cell  = CNull | CInt(Int) | CBool(Bool) | CText(String) | CBytes(Bytes)
+               | CFloat(Float) | CNumeric(Decimal) | CJson(json::Json)
+               | CArray(List<Cell>)
+pub type Row   = Map<String, Cell>
+
+pub type DbError = { code: String, constraint: String, detail: String }
+pub type Answer  = Rows(List<Row>) | Count(Int) | Failed(DbError)
+```
+
+`nondet` is load-bearing and is the same sentence `std.net` carries: a `det`
+test reaching an unhandled `db` operation is `E0412` with or without `--host`.
+The twin discharges the atoms, which is what makes a twin-backed test `det`,
+cached and hermetic.
+
+**A SQLSTATE is a value, never a diagnostic.** A unique violation, a foreign-key
+violation, a serialization failure, a connection that died mid-statement — each
+is `Failed(e)` the program matches on, by ADR 0013 §7.1's rule about a peer's
+misbehaviour. `DbError::detail` carries the server's prose for a person and
+**nothing ever compares it**; `code` and `constraint` are what a program and the
+agreement law read.
+
+### Transactions as handlers
+
+```ply
+pub type Rollback = { reason: String, error: Option<DbError> }
+pub fn transaction<a, e>(level: Isolation, access: Access,
+                         body: () -> a / {db.write | e})
+  -> Result<a, Rollback> / {db.write | e}
+pub fn sandbox<a, e>(body: () -> a / {db.write | e}) -> a / {db.write | e}
+pub fn is_retryable(e: DbError) -> Bool
+```
+
+`transaction` is a `handle` whose **only** clause is `db.rollback`, and that
+clause **does not resume**: its value is the value of the whole `handle`, so the
+rest of the body — the rest of the function, its callers up to the boundary, the
+statements it was about to issue — is the continuation and the continuation is
+dropped. Nothing unwinds and no frame runs an epilogue. Zero resumptions
+satisfies ADR 0008 §7's `resumes <= 1` trivially, so rollback needs no exemption
+from the linearity rule and no change to `handler::resume`'s check.
+
+The data operations are **not** intercepted. A Ply clause names a concrete
+`(operation, resource)` pair, so a transaction that intercepted them would need
+one clause per table per operation and could not be a library function; it does
+not need to, because a transaction is a scope and the only thing that must be
+scoped in Ply is the abort. The driver routes statements onto the open scope's
+connection from host-side state.
+
+`db.begin` is `Linearity::AtMostOnce`, so a continuation captured before a
+transaction opened cannot be resumed twice (`E0426`) — which is right, since the
+replay would issue a second `BEGIN` inside one.
+
+| exit | what happens |
+| --- | --- |
+| `commit()` | `COMMIT`; a deferred-constraint or serialization failure at commit is `Failed` and the scope closes rolled back |
+| `db.rollback(r)` | the clause discards the continuation and issues `ROLLBACK` |
+| the body **raises** | the raise propagates unchanged, nothing was committed, the scope is still open |
+| the entry point ends with a scope open | `HostRuntime::end_entry_point` rolls it back |
+
+**Two answers are deliberately not the bare server's, and both halves of W4 give
+the same one.**
+
+- A `commit()` of a transaction a statement already aborted is **`Failed`
+  with `25P02`**. Postgres answers that `COMMIT` with the command tag `ROLLBACK`
+  and no error, and `tokio_postgres::SimpleQueryMessage` does not carry the tag —
+  so a driver that asked only whether the server errored reports `Count(0)`, and
+  `transaction` evaluates to `Ok(value)` for a transaction whose every write is
+  gone. The first `Failed` inside a scope poisons it and the close answers this;
+  the twin does the same from the same flag.
+- A `commit()` or `abort()` with **no scope open** is `Failed` with `25P01`. The
+  server emits a `WARNING` and succeeds, and a warning is not a value a Ply
+  program can read — so matching it would mean telling a caller its writes are
+  durable when nothing was ever opened to hold them. The driver refuses locally
+  and sends nothing; the twin answers the same.
+
+A `Parse` inside an aborted block is `Failed` with `25P02` and **not** `E0433`:
+postgres refuses `Parse` as well as `Execute` there, so a statement whose text a
+connection has not cached would otherwise stop the run — and only for the
+statements that happened to miss the cache.
+
+```rust
+pub trait HostRuntime { /* ... */
+    /// Called by the machine on **every** exit path from an entry point — a
+    /// value, a diagnostic, or a spent budget — before it resets. The driver
+    /// rolls back every open scope and releases or discards its connections.
+    ///
+    /// `machine` is whose entry point ended. One `Postgres` serves the whole run
+    /// and every worker gets a `Facilities` over it, so a teardown that closed
+    /// everything would roll back a transaction another entry point is still
+    /// writing into.
+    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic>;
+}
+```
+
+**A transaction scope is owned by `(MachineId, Option<TaskId>)`, not by the task
+alone.** `Machine::performing_task` is `None` outside a production region, which
+every `ply test` entry point is, and the runner drives one machine per worker
+thread — so a table keyed on the task files every concurrently running entry
+point under one key: one reads the other's uncommitted rows, and either one's
+teardown ends the other's transaction. The scheduler cannot prevent it, because
+transaction control carries the singleton `db.write` and only serialises
+transaction-*opening* tests against each other.
+
+The pool manager is the second lock: a connection returned with a scope open is
+`ROLLBACK`ed on release, and one whose rollback fails is **closed and discarded
+rather than returned**. A recycled connection carrying an open transaction makes
+the next request read uncommitted rows of a request that already failed,
+invisibly from either.
+
+**Nesting is a savepoint**, not a refusal: `SAVEPOINT ply_sp_<depth>` /
+`RELEASE` / `ROLLBACK TO`, bounded at `db_max_savepoints` (16), over-depth is
+`Failed` with `54000`. Refusal was the alternative and is worse — a nested
+transaction is what a helper called both standalone and from a larger operation
+looks like, and refusing would make every such helper exist twice. A savepoint
+has no isolation level, so a nested `begin` whose `level` differs from the open
+scope's is `Failed` with `25001` naming both; a nested `ReadOnly` inside a
+`ReadWrite` is accepted and its narrowing is **documentation, not enforcement**,
+which is the only honest thing to say about it.
+
+`ReadUncommitted` is not offered: postgres implements it as read committed, and
+a name that promised dirty reads would be a name that lies. `access = ReadOnly`
+issues `SET TRANSACTION READ ONLY`, so a write inside it is `25006` **from the
+server** — a mechanical backstop on a read-only row, supplied by the one
+component that cannot be fooled by an annotation.
+
+`40001` and `40P01` are `Failed` and **W4 never retries**: only the program
+knows whether the body sent an email between two statements. A retry is a fresh
+call to `transaction`, not a second resumption, so it is outside the linearity
+rule entirely.
+
+A `db` operation from a task that does not own the open scope is **`E0436`**.
+Both alternatives are wrong: sharing the connection is a protocol violation, and
+quietly acquiring a second puts the statement outside the transaction its author
+believed it was in. `E0425` already refuses a host operation in a re-executed
+test, so a transaction is never explored by DPOR against real postgres — it is
+explored against the twin, which is pure Ply, and that is where the roadmap's
+"concurrent request races become findable" is actually delivered.
+
+### Footprint granularity — the interesting problem
+
+`db.query[items]` performs `(db, items, Read)`; `db.execute[items]` and
+`db.returning[items]` perform `(db, items, Write)`. The label is the statement's
+**principal table**, written at the call site, because resource labels are
+ground identifiers in the source and the language has nothing else.
+
+The transaction control operations take **no** resource, so their atom is the
+singleton `db.write`. Stated rather than discovered: every definition that opens
+a transaction carries it, so two tests that open transactions are serialised
+even over disjoint tables. It is also true — they contend for one pool, which is
+exactly the host state ADR 0008 §6 says cannot be forked. Read-only endpoints
+open no transaction and keep their concurrency. A program wanting finer
+granularity writes its own `handle` over `db.begin` with its own labels, as ADR
+0013 §2.4 says about `conn`.
+
+**A statement may touch more tables than its label names.** `select … from
+orders join items` performed as `db.query[orders]` records one atom and touches
+two, and nothing in the type system can see it because the SQL is a `String`.
+Two answers are refused — one-table-per-statement makes a join inexpressible,
+and a group label makes `db.write[db]` with more syllables — and the third is
+taken: **the driver reports what it touched, and the machine checks the report.**
+
+```rust
+/// A completed host operation.
+pub struct HostReply {
+    pub value: Value,
+    /// Every atom this operation touched **beyond** the one the registry
+    /// resolved. Empty for every handler whose footprint is a property of its
+    /// registration, which is every handler W1 and W3 shipped.
+    pub touched: Footprint,
+}
+impl HostReply {
+    /// The W1/W3 shape: a value, nothing touched beyond the resolved atom.
+    pub fn value(value: Value) -> HostReply;
+}
+
+pub enum HostAnswer { Reply(HostReply), Pending(Pending) }
+
+pub trait HostRuntime {
+    fn poll(&self, p: &Pending) -> Result<Option<HostReply>, Diagnostic>;
+    fn park(&self) -> Result<(), Diagnostic>;
+    fn block_on(&self, p: Pending) -> Result<HostReply, Diagnostic>;
+    fn end_entry_point(&self) -> Result<(), Diagnostic>;
+}
+
+pub struct HostRequest<'a> { /* ... */
+    /// The task that performed this operation. `None` outside a scheduler
+    /// region, which is one identity rather than an absence of one.
+    pub task: Option<TaskId>,
+    /// The declared footprint of the entry point that reached this operation,
+    /// so a handler that can compute its own footprint refuses instead of
+    /// acting.
+    pub declared: &'a Footprint,
+}
+```
+
+On every host answer the machine checks **each** atom of `touched` against the
+entry point's declared footprint and unions the set into `HostUse`. An atom
+outside it is **`E0434 DB_FOOTPRINT_UNDECLARED`** — the *program's* fault,
+attributed and bisected like any other program failure, as distinct from
+`E0427`, which keeps its meaning and stays Ply's fault.
+
+**`E0434` is a detector, not a preventer**, and that is said out loud:
+scheduling happened before the run, so by the time it fires the statement has
+executed against a table the scheduler thought nobody was touching. What it buys
+is that a wrong row fails loudly on its first execution instead of quietly
+forever — the difference that matters, given every dangerous defect this project
+has found was a green result over unexplored space.
+
+The preventer runs earlier: the driver computes the table set at **prepare**
+time, once per statement text, and refuses `E0434` from `HostRequest::declared`
+before a row moves. The machine's check on `touched` covers the case the
+driver's own scan got wrong. Neither closes ADR 0008 §2 — a handler that lies
+about `touched` is as invisible as one that lies about its registration — but
+together they close the case where the *honest* handler could not tell the
+truth, which W4's driver is the first handler in the system to have.
+
+**`ply_host::db::scan`** computes the set: a bounded scanner over the statement
+text, in Rust, in the TCB, disclosed by `ply hosts`. It recognises `SELECT` /
+`INSERT` / `UPDATE` / `DELETE` / `VALUES` / `WITH` and **refuses everything
+else** with `E0432` naming the byte offset — never an empty table set, so a
+defect is a refusal rather than a footprint that under-reports. Written in Ply
+was considered, as ADR 0013 did for HTTP framing, and refused for the one reason
+that differs: the driver needs the answer and is Rust, so a Ply copy would be
+two scanners, and the disagreement would be between the footprint a test
+observes and the footprint the scheduler was given.
+
+**The differential test is the evidence and postgres is the oracle**: over a
+generated corpus, `scan`'s set must be a **superset** of the relations
+`EXPLAIN (GENERIC_PLAN, FORMAT JSON)` reports. A superset, because the planner
+prunes and over-reporting costs concurrency rather than correctness.
+
+**What no scanner can see** — a trigger, a rewrite rule, a cascading referential
+action — is asked of the database at bind time. `bind` queries `pg_trigger`,
+`pg_rewrite` and `pg_constraint` over every table the program's atoms name, and
+an object reaching a table outside the atom it fires under is **`E0438`** before
+anything runs. There is no flag to suppress it: a flag that turns a soundness
+check off is a flag whose default becomes the one nobody uses.
+
+### The pool
+
+`deadpool-postgres` over `tokio-postgres`, driven by a **current-thread** tokio
+runtime on one OS thread owned by `ply_host::db::Reactor`. This resolves ADR
+0013 §9's open item — tokio was declared and unused; it is called now. No `Value`
+crosses to that thread: the reactor speaks postgres's types and conversion
+happens on the machine's thread inside `call` and `poll`. Every `db` operation is
+`blocking: true` and answers `Pending`.
+
+| knob | default | bounds |
+| --- | --- | --- |
+| `--db URL` | — | the database; `sslmode` must be `disable` or `prefer` |
+| `--db-pool` | 8 | connections |
+| `--db-acquire-ms` | 5000 | waiting for one |
+| `--db-statement-ms` | 30000 | server-side `statement_timeout` |
+| `--db-idle-txn-ms` | 30000 | server-side `idle_in_transaction_session_timeout` |
+| `--db-connect-ms` | 5000 | establishing a connection |
+| `--db-statement-cache` | 256 | prepared statements per connection |
+| `--db-schema` | — | `<module>.<fn>` returning a `Schema` to verify |
+
+The two server-side timeouts are set with `SET` at every checkout and are not
+optional: a statement with no timeout holds a pool slot until the server
+restarts and an idle transaction holds locks the rest of the service waits on,
+which is ADR 0013 §4's "a bound is part of the contract" applied to a second
+protocol.
+
+Acquisition is at `begin` for a transaction and per statement otherwise; a
+statement inside a scope reuses its connection and never waits. Release is at
+`commit` / `abort`, at `end_entry_point`, and immediately after a scope-less
+statement. **Exhaustion is `E0437`, a diagnostic and not a `Failed`** — a
+`Failed` is a value a program is invited to swallow, and a swallowed pool
+exhaustion is a service returning wrong answers under exactly the load that
+produced it. W5 owns backpressure and is where this becomes a shed request.
+Connect failure at bind is `E0431`; a database that restarts mid-run is `Failed`
+with `08006`, because that is a peer that went away.
+
+**The db reactor is not on `MAX_BLOCKING_OPERATIONS`.** An outstanding query
+costs a pending token and no blocking-pool thread, so 64 socket operations and 8
+queries can be in flight at once. A parked task leaves the enabled set and
+`park` waits for any token; `E0414` covers a state where none can resolve, and
+the acquire deadline is what keeps that honest — without it a pool smaller than
+the number of open scopes parks every task forever with nothing to read.
+
+**World isolation, bluntly.** Every db-backed test is `Isolation::Host`,
+excluded from `isolated: n of m`, never cached, never bisected — all of which
+exists already. **W4 does not give a test its own database**: no fork, no
+template, no schema-per-test, no truncation. A test's isolation is exactly
+footprint conflict grouping over tables plus whatever it does inside a `sandbox`.
+Two host-backed tests over disjoint tables therefore run concurrently against
+one database, which is correct only if the footprints above are honest — the
+sharpest place where they are load-bearing, and why a trigger is refused rather
+than warned about. `sandbox`'s limits are stated where it is defined: it does not
+isolate DDL, does not roll back a sequence's advance, does not isolate another
+connection, and cannot nest past the savepoint bound.
+
+### Statements and parameters
+
+Every data operation takes `(Stmt, List<Param>)` and the driver issues
+`Parse` / `Bind` / `Execute`, so parameters cross as typed binary values and are
+never part of the statement text. **No function anywhere in W4 interpolates,
+escapes or quotes a value into SQL**, and a program cannot express one because
+none exists to call.
+
+What that covers exactly: every value. What it does not: a program building
+statement text with `++`, because `stmt` takes a `String` and Ply cannot demand a
+literal. Two mechanical defences narrow it and neither is a proof — a `;` outside
+a string literal or dollar-quoted body is `E0432`, which removes stacked
+statements; and the scanner refuses what it cannot account for, so an injected
+fragment that changes the statement's shape is usually a refusal. Values are
+structurally safe; statement text is the program's own to get right, and W4
+makes a dynamic one loud rather than impossible.
+
+| Ply | parameter | result |
+| --- | --- | --- |
+| `Int` | `int8` | `int2`, `int4`, `int8` |
+| `Bool` | `bool` | `bool` |
+| `String` | `text` | `text`, `varchar`, `bpchar`, `name`, `uuid` |
+| `Bytes` | `bytea` | `bytea` |
+| `Float` | `float8` | `float4`, `float8` |
+| `Decimal` | `numeric` | `numeric` |
+| `Json` | `jsonb` | `json`, `jsonb` |
+| `List<a>` | `a[]`, one dimension | `a[]`, one dimension |
+| `Option<a>` | `a` or `NULL` | a nullable column of `a` |
+
+Anything outside the table is `E0432` at prepare, naming the postgres type and
+the column. At the edges, each a place a driver quietly loses data:
+
+- **`numeric` past scale 28 or 96 bits of mantissa is a decode failure**, never
+  a rounding — W2 §4's argument applied to the wire. `NaN` and `±Infinity`
+  `numeric` are failures too; substituting zero is the silent-wrong-answer shape.
+- An `Int` too large for an `int4` column is `22003` **from the server**, never a
+  truncation in the driver.
+- **One dimension only.** A multi-dimensional array, or one with a `NULL`
+  element, is a decode failure naming the column. `PArray` whose elements are not
+  all one non-null constructor is `E0432`; `PArray([])` is legal and takes its
+  element type from the parameter description.
+- **`Option<Option<a>>` is refused** wherever it appears, as ADR 0012 A1 refuses
+  it for `json` and for the same reason: two values, one wire form.
+- **No date, time, timestamp or interval type.** A column of one is `E0432`. A
+  `timestamptz` is `int8` microseconds and a `date` is `int4` days, in the
+  program's own schema, and the value comes from `clock.now()` **as a
+  parameter** — better than `now()` in the text, because it puts the
+  nondeterminism in the row where `E0412` can see it. `now()`,
+  `current_timestamp` and `random()` in statement text are `E0432`. A real gap,
+  stated rather than worked around.
+- **A duplicate result column name is `E0433`**: a `Row` is a `Map` and
+  `select a.id, b.id` would silently keep one.
+
+A statement is prepared per connection, keyed by text, LRU. Preparation is where
+the result description arrives, so the scan, the type check, the codec check and
+the footprint refusal all happen there — once per statement per connection, never
+per execution. `DISCARD ALL` is never issued (it would drop the cache the pool
+exists to amortise) and `DEALLOCATE` never (an evicted entry is closed by the
+protocol's `Close`). A prepare postgres refuses is **`E0433`** and not a
+`Failed`: it is the program's fault, it is the same every time, and it will never
+succeed on a retry, so a value would invite a loop on it.
+
+### `derive row`
+
+ADR 0010 named it and ADR 0012 §3 deferred it here "with the `Row` type it is a
+codec over".
+
+```ply
+pub type RowError = { column: String, expected: String, found: String }
+pub type RowCodec<a> = {
+  columns: List<String>,
+  decode:  (Row) -> Result<a, RowError>,
+  params:  (a) -> List<Param>,          // in `columns` order
+}
+```
+
+`derive row for Item` generates `fn item_row() -> RowCodec<Item>` under ADR 0012
+§3's naming, orphan, visibility, expansion-point, hashing and
+`E0505`-on-generated-body rules **unchanged**. Everything true of `json` is true
+of `row`. What it walks is narrower:
+
+- The target must be a **record**; an ADT is `E0206` naming the type, because a
+  row is flat and a sum has no columns.
+- A scalar leaf field is a column of that type; `Option<leaf>` is nullable;
+  `List<leaf>` is a one-dimensional array; `Option<Option<a>>` is `E0206`.
+- **A field that is none of those but is `derivable(json, ·)` is a `jsonb`
+  column** through that type's json codec. This is what lets `desk.ply`'s `Order`
+  — `lines: List<Line>`, `state: State` — derive at all, and it is where a reader
+  should notice W4 has no opinion about normalization: a program wanting
+  `order_lines` as its own table writes two codecs and two statements, and
+  `derive row` will not do a join for it.
+- Anything else is `E0206` naming the field, as `json` reports it.
+
+The column name is the **field name, unchanged** — no case mangling, no prefix.
+A rule that guessed would guess wrong once, silently. `columns` is in the record
+so the driver can check the result description against the codec at prepare time:
+a `select` missing a column the codec needs is `E0433` **before the first row**.
+
+Constraints are `where derivable(row, a)`, checked at the signature per ADR 0012
+§3, with the deriver tag added to `tag::CONSTRAINT`'s pinned enumeration.
+
+### The in-memory twin — Ply, and pure
+
+```ply
+pub type MemDb = { .. }                      // opaque: tables, sequences, scope stack
+pub fn open(s: Schema) -> MemDb
+pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> { db: MemDb, out: Answer }
+pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> { db: MemDb, out: Answer }
+pub fn commit_step(d: MemDb) -> { db: MemDb, out: Answer }
+pub fn abort_step(d: MemDb) -> { db: MemDb, out: Answer }
+```
+
+Rows are `Map<String, Cell>` and answers are `Answer`, so the twin and the driver
+produce values of one type by construction — ADR 0008 §5's "the same declared
+signature", structural rather than promised. A program installs it with an
+ordinary `handle` over a region-scoped cell, one clause per `(operation,
+resource)`, which is `desk.ply`'s existing shape with the clause bodies changed.
+The boilerplate is proportional to tables times operations and it is real; it is
+also what makes the discharge visible at the resource granularity the design is
+about.
+
+After `with_cell` discharges the cell's atoms a twin-backed test's row is
+**empty**: `det`, cached, hermetic without `--host`, and runnable inside
+`simulate` — which is what makes a check-then-act race between two requests on
+one row findable and replayable from a seed.
+
+**It executes the same `Stmt` text the driver does**, through its own scanner,
+because the scanner is where the divergences live and a twin taking a structured
+operation would never test it.
+
+Modelled: tables and columns from a `Schema`; rows in insertion order;
+`SELECT` with `WHERE` (comparisons, `AND`/`OR`/`NOT`, `IS NULL`, `IN`,
+`BETWEEN`, `LIKE`), `ORDER BY` with `ASC`/`DESC` and `NULLS FIRST`/`LAST`,
+`LIMIT`/`OFFSET`, `count(*)`; `INSERT … VALUES … [RETURNING]` with
+`DEFAULT nextval`; `UPDATE`/`DELETE … [RETURNING]`; `NOT NULL` (`23502`),
+`PRIMARY KEY`/`UNIQUE` (`23505`), `FOREIGN KEY` existence with `NO ACTION`
+(`23503`) and `CHECK` (`23514`), each naming its constraint; transactions and
+savepoints over a stack of snapshots, which a persistent `MemDb` makes a pointer
+copy; `22P02` and `22003` type errors; and **the failed-transaction state** —
+after a statement fails in a scope, every later statement is `25P02` until the
+scope ends or a savepoint below the failure is rolled back to. That last is the
+behaviour test doubles omit most often, it is the one that makes a suite pass and
+production fail, and it is required.
+
+**Not modelled, and it says so**: anything outside the list answers
+`Failed({code: "0A000", …})` — `feature_not_supported`, postgres's own SQLSTATE
+— naming the construct. It never guesses and never answers as though it executed,
+so a test reaching an unmodelled statement fails loudly, hermetically, in the run
+that introduced it. Named so nobody has to discover them: joins, subqueries,
+`GROUP BY`, `HAVING`, window functions, CTEs, set operations and every aggregate
+but `count(*)`; views, triggers, rules, `ON CONFLICT`, generated columns, partial
+and expression indexes; **isolation** — the twin is serial and cannot exhibit a
+phantom read, a lost update or a deadlock, so `RepeatableRead` and `Serializable`
+behave as serial execution and the law claims nothing about concurrency, which is
+the largest thing it does not model and the one a reader most assumes it does;
+**collation** — the twin orders `String` by W2's `Value` order, which is byte
+order, which is `C`, so any other database collation disagrees on `ORDER BY` over
+text; `numeric` past `Decimal`'s range, `float4` rounding, every locale-dependent
+function; and **sequences under rollback**, which postgres does not roll back and
+neither does the twin, deliberately, because matching the surprising behaviour is
+the job.
+
+### The agreement law — `law/host`
+
+An M8 law body's row must be a subset of `{sim.read}` or it is `E0417`, so the
+agreement law does not compile as the language stands. Relaxing `E0417` silently
+would let a law touch the world without saying so, which is the opposite of every
+other decision here, so the relaxation is **declared**, exactly as `test/nondet`
+declares a test's:
+
+```ply
+law/host "the memory engine agrees with postgres"
+  forall (ops: List<Op>) where well_formed(fixture(), ops) {
+    replay_memory(fixture(), ops) == replay_live(ops)
+  }
+```
+
+```rust
+pub struct LawDef { /* ... */
+    /// `law/host`: the body may carry a non-`{sim.read}` row. Never `proved`,
+    /// never cached, `unattempted` without `--host`. In the law's own hash,
+    /// written after `tag::LAW` exactly as `TestDef::nondet` is after
+    /// `tag::TEST`.
+    pub host: bool,
+}
+```
+
+- The **body** may carry any row. The **guard** may not: a `where` stays pure
+  under `E0417` unchanged, because a guard decides the domain and one that could
+  act would be choosing which cases to be judged on.
+- **Never `proved`, structurally**: the prover's lowering returns "unsupported"
+  for a body with a non-empty row, so the certificate cannot be constructed.
+  `property` is the ceiling and the tier says so.
+- **Never cached**, in either direction, as a host-backed test is not.
+- Hermetically — `ply prove`'s default — it is **`W0604`, `unattempted`**, with
+  the reason "reaches the host; run `ply prove --host`". Not skipped silently and
+  not green: a law about a database that never ran a database, reported as
+  passing, is precisely the green-result-over-unexplored-space this project
+  audits for.
+- A `law` without `/host` whose body carries a non-`{sim.read}` row is `E0417`
+  with its message amended to name `law/host` as the fix.
+
+```ply
+pub type Which  = Part | Bin
+pub type Col    = CSku | CPrice | CTag | CN | CId | CQty
+pub type Val    = VText(String) | VNum(Decimal) | VInt(Int) | VNull
+pub type Values = PartVals(String, Decimal, Option<String>, Option<Int>)
+                | BinVals(Int, Option<String>, Option<Int>)
+
+pub type Op = Insert(Values)
+            | Update({ table: Which, column: Col, to: Val, where_col: Col, eq: Val })
+            | Delete({ table: Which, where_col: Col, eq: Val })
+            | Select({ table: Which, order_by: Col, limit: Int })
+            | Count(Which)
+            | Begin(Isolation) | Commit | Abort
+
+pub fn render(fx: Schema, op: Op) -> { stmt: Stmt, params: List<Param> }
+pub fn well_formed(fx: Schema, ops: List<Op>) -> Bool     // pure guard
+```
+
+`Op` is an ordinary ADT, so M8's existing generator and shrinker cover it — no
+new generator and no new shrinking rule, which is what makes the law a required
+test rather than a project. **Both sides execute the rendered SQL**, so the
+twin's scanner is on the tested path; a structured op to the twin and SQL to the
+driver would have tested everything except where the bugs are.
+
+**The domain is in the type, and that is the difference between a law and a
+decoration.** An earlier draft wrote `table: String`, `order_by: String` and
+`values: List<Param>`; M8's generator draws a `String` from the whole of
+`String`, so a generated `Count` named the fixture's table with probability zero
+and a generated `Insert` was four parameters of the right types in the right
+order with probability near it. Measured against the live database: of two
+hundred draws under that shape, forty-two survived the guard and **not one of
+them contained a statement** — the postgres log for the whole run was four
+`BEGIN`s. A green law over that domain is evidence about `render`'s scope
+handling and nothing else. So what the guard used to reject is now
+unrepresentable, which is a widening of the claim rather than a narrowing of it,
+and `well_formed` is left with what a type cannot say: that the scope stack
+balances, that a column belongs to the table its operation names, that a value
+fits the column it is compared to, and that the table has a primary key.
+
+Comparison is `List<Answer>`: `Rows` in the order returned; `Failed` on **`code`
+and `constraint` only**, never `detail`, which is the single most important line
+here — a law comparing messages fails on a server upgrade and teaches everyone to
+ignore it; and the comparison stops at the first differing index, because a
+divergence at op 3 makes 4..n meaningless.
+
+**`render` ends every generated `ORDER BY` with the primary key**, and an
+`ORDER BY` alone is not enough. Postgres's bounded sort is a top-N heapsort whose
+output among equal keys is neither the heap order nor stable, so twelve rows
+sharing one `n` come back `b, c, a` there and `a, b, c` from the twin's stable
+insertion sort. Neither is wrong — SQL promises nothing about ties — so a law
+that compared them would be refuted by a case nobody could fix, which is worse
+than a gap. `well_formed` therefore admits only a table that has a primary key.
+
+**The live side is reset per case, by two ordinary `DELETE`s.** `replay_memory`
+builds a fresh `MemDb` per case and postgres does not forget between them, so
+without a reset the law is refuted at the second case by rows the first one
+committed. A sandbox transaction is refused for it: every generated `Begin` would
+become a savepoint, and a nested `begin` at a different isolation level is
+`25001`, so the harness's own scope would decide the claim. For the same reason
+the fixture's `bin.id` carries no sequence — postgres does not roll back
+`nextval` and the twin does not either, so a reset side would carry a position
+the twin restarts.
+
+A counterexample prints the shrunk op list **as Ply source a reader can paste
+into a test**, the two answers side by side at the first difference, a replay
+command that reproduces it exactly, and the tier line saying why `property` is
+the ceiling rather than leaving a reader to infer that a green `property` was the
+best available.
+
+**The law must be able to fail**, or it is decoration. Two injected divergences
+are required tests: a fixture database created with a non-`C` collation must be
+refuted on an `ORDER BY` over text, and a twin with the `25P02` state removed
+must be refuted — each shrunk to a minimal op list. It lives in
+`examples/agreement.ply` with a two-table fixture, **not** in `std.db`, because
+`ply test --std` and `ply prove --std` must not need a database to pass.
+
+### Schema, and migrations
+
+**A migration tool is out of scope**: no versions, no up and down, no ordering
+across deploys, no diffing a live database into a change script. A **schema is a
+value**, which is the part W4 needs, since the twin is built from one and the
+law's fixture has to exist.
+
+```ply
+pub type ColumnType = TInt | TBool | TText | TBytes | TFloat | TNumeric(Int, Int)
+                    | TJson | TArray(ColumnType)
+pub type Default    = DNone | DSequence(String) | DLiteral(Param)
+pub type Column     = { name: String, ty: ColumnType, nullable: Bool, default: Default }
+pub type ForeignKey = { name: String, columns: List<String>,
+                        references: String, refers_to: List<String> }
+pub type Check      = { name: String, expr: String }
+pub type Table      = { name: String, columns: List<Column>,
+                        primary_key: List<String>,
+                        unique: List<{name: String, columns: List<String>}>,
+                        foreign_keys: List<ForeignKey>, checks: List<Check> }
+pub type Schema     = { tables: List<Table> }
+
+pub fn create_schema(s: Schema) -> List<Stmt>     // pure: CREATE TABLE text
+pub fn drop_schema(s: Schema) -> List<Stmt>
+```
+
+Three places a schema has to exist, and how it gets there in each. **The twin**:
+`open(schema())`, nothing else involved. **A test or the law's fixture**: the
+harness executes `create_schema(schema())` against a database it created — the
+only path where the scanner accepts DDL, so a `CREATE TABLE` inside
+`db.execute[t]` is `E0432` like any other unrecognised statement. **A production
+database**: it already exists, and `--db-schema <module>.<fn>` names a nullary
+function returning a `Schema` that the driver materialises at bind time and diffs
+against `information_schema` and `pg_constraint`, reporting **`E0435`** for a
+missing table, a missing column, a mismatched type, a disagreeing nullability or
+a missing constraint, before anything runs.
+
+That third point is most of what a migration tool is bought for — the guarantee
+that the code and the database agree, checked at start-up rather than discovered
+at the first request — and W4 delivers it without owning the tool that changes
+the database. `--db-schema` is optional; without it a mismatch surfaces at
+prepare time as `E0433`, later and per statement and still loud.
+
+### `ply hosts`
+
+```
+$ ply hosts --host
+   9 host handlers · 14 operations · trusted computing base
+
+   OPERATION                 ATOM                  HANDLER                     DET  LINEAR         BLOCKING
+   db.begin                  db.write              ply_host::db::begin         no   at-most-once   yes
+   db.abort                  db.write              ply_host::db::abort         no   at-most-once   yes
+   db.commit                 db.write              ply_host::db::commit        no   at-most-once   yes
+   db.execute[items]         db.write[items]       ply_host::db::execute       no   at-most-once   yes
+   db.query[items]           db.read[items]        ply_host::db::query         no   at-most-once   yes
+   db.query[orders]          db.read[orders]       ply_host::db::query         no   at-most-once   yes
+   db.returning[orders]      db.write[orders]      ply_host::db::returning     no   at-most-once   yes
+   net.accept[listener]      net.write[listener]   ply_host::tcp::accept       no   at-most-once   yes
+   ...
+
+   database
+   server     PostgreSQL 18.3 · database desk · collation C · encoding UTF8
+   pool       8 connections · acquire 5000ms · statement 30000ms · idle-txn 30000ms
+   scanner    ply_host::db::scan · select insert update delete values with
+   schema     desk.schema · 2 tables · 11 columns · verified
+
+   digest: b3:7c02e9a41b6d
+```
+
+The `database` block exists for the same reason W3's `transport` block does: a
+fact the rows cannot carry and a reviewer must not have to derive. The
+**collation** is printed because it is the twin's largest silent divergence, and
+the **scanner** because it is a parser in the TCB. `db.rollback` does **not**
+appear — it is handled in Ply by `transaction` and never reaches the binding; if
+it appears, something bound it and that is a defect.
+
+The digest covers the operation rows, the pool numbers, the scanner's accepted
+statement set and the schema function's name. It does **not** cover the server
+version or the database name, by W3's argument about a certificate fingerprint: a
+CI check that broke on a minor server upgrade is one people learn to ignore. Both
+are printed and both are in `--json`.
+
+### Amendments to W1
+
+**`--engine both` degrades to one engine on a host-backed test, silently.** The
+obvious worry is wrong and the real one is quieter, so both are stated.
+`Engines::Both` does **not** execute a host operation twice: `Interp` holds the
+binding "only in order to *refuse* at it", so the tree-walker's arm ends at the
+first host operation with `err_machine_only_host` (`E0504`),
+`execute_directly` returns the machine's answer, and the insert happens once.
+Checked against the code rather than assumed; W4 changes nothing about it. What
+is wrong is the reporting: such a test gets **no differential audit at all** and
+the run still says `--engine both`, so the command whose purpose is "two engines
+agree" quietly means "one engine ran" for exactly the tests a database makes
+interesting. `--explain` now reports `engine: machine (host, not audited)`, the
+summary carries `audited: n of m`, and `--json` carries the same. This is
+`Isolation::Host` and `Skipped::Host`'s argument — declare the guarantee
+inapplicable where it cannot hold and keep the number honest — applied where W1
+left it implicit.
+
+**`end_entry_point` is called on every exit.** The hook is worthless unless it is
+called on the diagnostic and budget-exhaustion paths too. `InterpExecutor` calls
+it from one place per machine path, beside `arm_footprint_check`, and a required
+test asserts an entry point that raised inside a transaction left no open scope
+on the connection it used — asserted against `pg_stat_activity`, not against the
+driver's own bookkeeping.
+
+### Versions
+
+`RUNTIME_VERSION` to `0.10.0` — `HostAnswer`, `HostReply` and `HostRuntime`
+changed shape, the machine checks `touched` and calls `end_entry_point`.
+`FRONTEND_VERSION` to `0.12.0` — a new deriver (`row`), `LawDef::host`, and the
+`law/host` grammar; ADR 0012 §3's rule is that any change to a deriver bumps it.
+**`BODY_ENCODING` to `7`** — `law_def` writes a host flag after its tag, as
+`test_def` writes `nondet`. `PROVER_VERSION` to `0.5.0` — `law/host` is a new
+discharge mode with a new ceiling and a new unattempted reason.
+
+`BODY_ENCODING` moving is a one-time cost with a bounded blast radius and the
+required test pins the boundary: every law's hash moves once and re-discharges
+once, and **no non-law definition's normalized bytes change**, on the whole W3
+corpus, asserted byte-for-byte. A milestone that moved definition hashes for a
+law's sake would have got the layering wrong.
+
+### Workspace
+
+```toml
+tokio-postgres    = { version = "0.7.18", features = ["runtime"] }
+postgres-protocol = "0.6.12"
+deadpool-postgres = "0.14.1"
+tokio             = { version = "1.53.1", features = ["rt", "net", "time", "sync"] }
+rust_decimal      = { version = "1.42.1", features = ["db-tokio-postgres"] }
+```
+
+`ply-host` gains the first three and finally uses the fourth. `rt` and not
+`rt-multi-thread`: one current-thread runtime on one owned OS thread, because
+every connection's future is independent, the pool bounds the concurrency, and a
+work-stealing runtime would make the thread count a number nobody chose.
+`deadpool-postgres` rather than `bb8` or a hand-rolled pool — smallest of the
+three, its recycling hook is where rollback-on-release lives, and its size is a
+declared number. `postgres-protocol` is taken directly for `numeric` and array
+codecs, where `ToSql`/`FromSql` would otherwise need a Rust type per Ply type;
+`rust_decimal`'s `db-tokio-postgres` feature supplies the `numeric` conversion
+rather than a reimplementation. **No `sqlx`, `diesel` or `sea-orm`**: W4 ships no
+query builder and no ORM, and a crate whose whole value is one is a large
+dependency for a refused feature. **TLS to postgres is not configured**: `--db`
+accepts `sslmode=disable` and `sslmode=prefer` only, anything higher is `E0431`,
+and wiring rustls into `tokio-postgres` is a real TCB decision that belongs
+beside W5's secrets rather than here as an untested line.
+
+`ply-std` gains `std.db` and no dependency. `ply-eval` gains no dependency.
+
+### New diagnostic codes
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0431 | `DB_NOT_CONFIGURED` | `--host` binds the driver and no `--db` URL was given, or it is malformed, or the server is unreachable at bind time | the run's configuration |
+| E0432 | `DB_STATEMENT_REFUSED` | statement text W4 refuses: more than one statement; a construct the scanner cannot account for; a parameter or result type outside the mapping; `now()` / `random()` in the text | the program's |
+| E0433 | `DB_PREPARE_FAILED` | postgres refused to prepare, or the result description has a duplicate column name or lacks a column the codec requires | the program's |
+| E0434 | `DB_FOOTPRINT_UNDECLARED` | a statement touches a table outside the entry point's declared footprint — at prepare from `HostRequest::declared`, at answer from `HostReply::touched` | the program's |
+| E0435 | `DB_SCHEMA_MISMATCH` | the live database differs from the `Schema` the run named | the run's configuration |
+| E0436 | `DB_TRANSACTION_SCOPE` | a `db` operation from a task that does not own the open scope | the program's |
+| E0437 | `DB_POOL_EXHAUSTED` | no connection became available within `--db-acquire-ms` | the run's configuration |
+| E0438 | `DB_UNMODELLED_SIDE_EFFECT` | a trigger, rule, or cascading referential action reaching a table outside the atom it fires under | the run's configuration |
+
+E0431, E0435 and E0438 are raised by `bind`, before anything runs, like
+E0421–E0423, and **those three are the only ones that join `RESERVED_CODES`**
+(`[&str; 18]`). The other five join E0424's row: `Failure::defect` is `false`,
+they are attributed like any other failure, and bisection is skipped when the run
+reached the host to produce them. They are deliberately *not* reserved, because
+each is a refusal the driver is the only component in a position to compute — a
+statement's table set, a result description, the task holding a scope, a pool's
+occupancy — and reserving them would have `attribute` rewrite the driver's own
+diagnosis to `E0502` and send the reader hunting a defect in Ply. `attribute`
+still stamps each with the handler path. E0434 is raised from two places, the
+driver at prepare time and the machine at answer time, which is why the second
+must be the machine's own check rather than a rewrite of a handler's word.
+
+`E0417`'s message is amended to name `law/host`; no other existing code changes
+meaning.
+
+### Required tests
+
+The full list is ADR 0014 §13's; these are the ones whose absence would let W4
+ship broken rather than merely incomplete.
+
+1. A `db.rollback` deep inside a transaction discards the continuation: the
+   statements after it never execute and postgres shows no row.
+2. A body that raises propagates the raise, commits nothing, and leaves **no open
+   scope** — asserted against `pg_stat_activity`, not the driver's bookkeeping.
+3. Nesting is a savepoint: an inner rollback keeps the outer's writes; a nested
+   `begin` with a different level is `25001`; a `ReadOnly` write is `25006` from
+   the server.
+4. A continuation captured before `db.begin` and resumed twice is `E0426` and
+   `BEGIN` was issued once.
+5. A `db` operation from a task that does not own the open scope is `E0436`.
+6. A join across two tables declared with only one is `E0434` **at prepare**,
+   before a row is read; declared with both, it runs and records both atoms.
+7. `scan`'s table set is a **superset** of `EXPLAIN (GENERIC_PLAN, FORMAT JSON)`'s
+   relations over a generated corpus, with no exception; every refused construct
+   is `E0432` naming the offset.
+8. A trigger, rule or cascading action reaching outside its atom is `E0438` at
+   bind time.
+9. Two tests over disjoint tables run concurrently against one database; two over
+   a shared table with one writer do not.
+10. `'; drop table part; --` as a `PText` inserts that string and changes no
+    schema; the same bytes in `Stmt::sql` are `E0432`.
+11. Every row of the type mapping round-trips both ways; scale-29 `numeric`, a
+    `numeric` `NaN`, a 2-D array, a `NULL` array element and a `timestamptz`
+    column are each a named refusal and never a coerced value.
+12. `derive row for Order` puts `lines` and `state` in `jsonb` and round-trips
+    through a real table; an ADT target and a function field are each `E0206`.
+13. N executions of one statement issue one `Parse`, by a counting harness
+    against the protocol rather than by timing.
+14. `--db-pool 1` with two concurrent transactions is `E0437` naming the size —
+    not a hang. Both server-side timeouts are set at checkout, read back through
+    the same connection.
+15. A db operation in flight costs a pending token and **no**
+    `MAX_BLOCKING_OPERATIONS` slot.
+16. Every modelled clause of the twin has a `det`, hermetic, cached test,
+    including `25P02` and the sequence that does not roll back; every unmodelled
+    construct answers `0A000` naming it and never a result.
+17. `examples/desk.ply`'s suite passes against the twin and against postgres
+    **with no source change to any endpoint** — the exit criterion.
+18. A check-then-act race between two requests on one row is found by `simulate`
+    against the twin and replayed from its seed.
+19. The agreement law is `property` with its case count under `--host`, and
+    `W0604 unattempted` with a reason without it; a `law/host` is never `proved`
+    and the differential audit covers it.
+20. **The law finds an injected divergence**: a non-`C` collation is refuted on
+    `ORDER BY` over text, and a twin without the `25P02` state is refuted, each
+    shrunk to a minimal op list.
+21. `create_schema` output produces a database `--db-schema` verifies; a dropped
+    column, a changed type and a changed nullability are each `E0435`.
+22. Renaming a top-level function selects zero tests and moving a definition
+    between modules changes no hash, on a corpus with `db` rows, `derive row` and
+    a `law/host`; incremental and `--no-incremental` agree byte-for-byte.
+23. `--engine both` reports no `E0503`; a host-backed test performs its
+    statements **exactly once** across both arms and is reported `host, not
+    audited`, with `audited: n of m` excluding it.
+24. `E0412` still fires; `ply test` is hermetic without `--host`; an effect-set
+    alias and its expansion hash identically over `db` atoms; `Store::open` at
+    10,000 definitions stays under 5 ms; `ply prove` reports honest tiers and
+    `ply hosts --host` prints the `database` block.
+25. **No non-law definition's normalized bytes moved** across the
+    `BODY_ENCODING` bump, over the whole W3 corpus.
+
+Plus one `tests/fixtures/` entry per new code.
+
+### Not in W4
+
+Query building and ORMs — a statement is text and a row is a `Map`.
+Connection-level `LISTEN`/`NOTIFY`: a notification arrives outside any perform,
+which means outside any row, and there is nothing in the effect system for it to
+be. Replication, logical decoding and read replicas. `COPY`, in either direction.
+Cursors and streaming result sets — `query` materialises, and a result set larger
+than memory is a real limit W6 would measure before machinery. Migrations as a
+tool. Joins, aggregates and isolation phenomena **in the twin**, and therefore in
+the law, whose claim is over sequential operation sequences only. A date, time,
+timestamp or interval type. TLS to postgres. Automatic retry of a serialization
+failure. **A test database per test** — footprint conflict grouping and `sandbox`
+are the whole of the isolation, and they are less than a reader expects.

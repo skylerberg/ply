@@ -1,0 +1,769 @@
+// The agreement claim: for any generated operation sequence, `std.db`'s
+// in-memory twin and postgres produce the same answers.
+//
+// This is W4's headline deliverable and it is the reason the milestone is
+// interesting. Every backend team asserts informally that its test double
+// behaves like the database; none of them check. Here the two satisfy the same
+// declared signature by construction — `replay_memory` and `replay_live` have
+// the same result type because `std.db` defines `Answer` once — and this file
+// is where the equality between them stops being an argument.
+//
+// It is **not** in `std.db`, because `ply test --std` and `ply prove --std`
+// must not need a database to pass.
+//
+// ## What is here
+//
+// `render`, `well_formed`, `replay_memory` and `agree` are here, complete and
+// tested hermetically. `replay_live` performs the `db` atoms the driver answers.
+// The claim itself is the `law/host` below:
+//
+//     ply prove examples/agreement.ply --host --db postgres://…
+//
+// Without `--host` it is reported `W0604 unattempted` with the reason, which is
+// the honest answer for a run that never opened a database. The hermetic `law`s
+// beside it are claims about `replay_memory` alone and are **not** a substitute
+// for it; they are labelled as such where they are written.
+//
+// The transcript tests compare the twin against answers **recorded from a live
+// PostgreSQL 18.3** for the same statements. They are the evidence that `agree`
+// can fail: each is used once as recorded and once perturbed the way a real
+// divergence perturbs it.
+import std.db
+import std.db (db)
+
+// --- The fixture ------------------------------------------------------------
+//
+// Two tables, a primary key, a unique constraint, a foreign key, a not-null and
+// a check, whose only purpose is this claim.
+
+pub fn fixture() -> db::Schema = {tables: [part(), bin()]}
+
+pub fn part() -> db::Table = {
+  name: "part",
+  columns: [
+    db::column("sku", db::TText, false),
+    db::column("price", db::TNumeric(10, 4), false),
+    db::column("tag", db::TText, true),
+    db::column("n", db::TInt, true),
+  ],
+  primary_key: ["sku"],
+  unique: [{name: "part_tag_key", columns: ["tag"]}],
+  foreign_keys: [],
+  checks: [{name: "part_price_check", expr: "price >= 0"}],
+}
+
+// `id` is supplied by the operation rather than defaulted from a sequence, and
+// that is a decision about the *claim* rather than about the schema. Postgres
+// does not roll back `nextval` and the twin does not either (§5.3, deliberately)
+// — so a live side reset between cases would carry a sequence position the twin
+// restarts, and every `Select` over `bin` would diverge on `id` for a reason
+// that is not a defect in either. `std.db`'s own tests cover the sequence.
+pub fn bin() -> db::Table = {
+  name: "bin",
+  columns: [
+    db::column("id", db::TInt, false),
+    db::column("sku", db::TText, true),
+    db::column("qty", db::TInt, true),
+  ],
+  primary_key: ["id"],
+  unique: [],
+  foreign_keys: [{name: "bin_sku_fkey", columns: ["sku"],
+                  references: "part", refers_to: ["sku"]}],
+  checks: [{name: "bin_qty_check", expr: "qty >= 0"}],
+}
+
+// --- What is generated ------------------------------------------------------
+//
+// An ordinary ADT, so M8's existing generator quantifies over it and M8's
+// existing shrinker shrinks it. No new generator and no new shrinking rule,
+// which is what makes the law cheap enough to be a required test rather than a
+// project.
+//
+// `Savepoint`, `Release` and `RollbackTo` are `Begin`, `Commit` and `Abort`:
+// nesting *is* a savepoint (ADR 0014 §1.4), so there is one pair of operations
+// rather than two, and which one the server sees is the driver's decision from
+// its own scope depth. That is deliberate — a generator that chose between
+// `COMMIT` and `RELEASE` itself would be testing its own bookkeeping.
+pub type Op =
+  | Insert(Values)
+  | Update(UpdateOp)
+  | Delete(DeleteOp)
+  | Select(SelectOp)
+  | Count(Which)
+  | Begin(db::Isolation)
+  | Commit
+  | Abort
+
+// The fixture's two tables and every column of either, as constructors rather
+// than as strings.
+//
+// **This is a deviation from ADR 0014 §6.2, and it is the whole difference
+// between a law and a decoration.** §6.2 writes `table: String`,
+// `order_by: String` and `values: List<Param>`; M8's generator draws a `String`
+// from the whole of `String`, so a generated `Count({table: "…"})` names the
+// fixture's table with probability zero and a generated `Insert` is four
+// parameters of the right types in the right order with probability near it.
+// Measured against the live database: of two hundred draws under the §6.2 shape,
+// forty-two survived the guard and **not one of them contained a statement** —
+// the postgres log for the whole run was four `BEGIN`s. A green law over that
+// domain is evidence about `render`'s scope handling and nothing else.
+//
+// So the domain is in the *type*, which is where a property-based generator can
+// see it, and the guard is left with the one thing a type cannot say: that the
+// scope stack balances. What was rejected by the guard is now unrepresentable,
+// which is a widening of the claim rather than a narrowing of it.
+pub type Which = Part | Bin
+
+pub type Col = CSku | CPrice | CTag | CN | CId | CQty
+
+// The four parameter shapes the fixture's columns take. A generated `Val` is a
+// value some column of the fixture accepts, so `param_fits` rejects a *pairing*
+// rather than a shape nothing could ever use.
+pub type Val = VText(String) | VNum(Decimal) | VInt(Int) | VNull
+
+// A whole row of either table, in column order. Well-typed by construction: the
+// constructor decides the table, so there is no way to generate an `Insert`
+// whose value list is the wrong length or the wrong shape.
+pub type Values =
+  | PartVals(String, Decimal, Option<String>, Option<Int>)
+  | BinVals(Int, Option<String>, Option<Int>)
+
+pub type UpdateOp = { table: Which, column: Col, to: Val, where_col: Col, eq: Val }
+pub type DeleteOp = { table: Which, where_col: Col, eq: Val }
+pub type SelectOp = { table: Which, order_by: Col, limit: Int }
+
+pub fn table_name(w: Which) -> String = match w { Part -> "part", Bin -> "bin" }
+
+pub fn col_name(c: Col) -> String =
+  match c {
+    CSku -> "sku", CPrice -> "price", CTag -> "tag",
+    CN -> "n", CId -> "id", CQty -> "qty",
+  }
+
+pub fn val_param(v: Val) -> db::Param =
+  match v {
+    VText(s) -> db::PText(s),
+    VNum(d) -> db::PNumeric(d),
+    VInt(n) -> db::PInt(n),
+    VNull -> db::PNull,
+  }
+
+fn opt_text(o: Option<String>) -> db::Param =
+  match o { None -> db::PNull, Some(s) -> db::PText(s) }
+
+fn opt_int(o: Option<Int>) -> db::Param =
+  match o { None -> db::PNull, Some(n) -> db::PInt(n) }
+
+pub fn values_table(v: Values) -> Which =
+  match v { PartVals(_, _, _, _) -> Part, BinVals(_, _, _) -> Bin }
+
+pub fn values_params(v: Values) -> List<db::Param> =
+  match v {
+    PartVals(sku, price, tag, n) ->
+      [db::PText(sku), db::PNumeric(price), opt_text(tag), opt_int(n)],
+    BinVals(id, sku, qty) -> [db::PInt(id), opt_text(sku), opt_int(qty)],
+  }
+
+pub fn op_table(op: Op) -> Which =
+  match op {
+    Insert(v) -> values_table(v),
+    Update(o) -> o.table,
+    Delete(o) -> o.table,
+    Select(o) -> o.table,
+    Count(w) -> w,
+    Begin(_) -> Part,
+    Commit -> Part,
+    Abort -> Part,
+  }
+
+pub type Rendered = { stmt: db::Stmt, params: List<db::Param> }
+
+// One text, called once per op, handed to **both** sides unchanged. A
+// structured op given to the twin and SQL given to the driver would test
+// everything except the place the bugs are — the twin's own scanner.
+//
+// A `Select` always carries an `ORDER BY`, **and it ends with the primary key**.
+//
+// The first half is because neither system promises an order without one and
+// their unordered orders differ: postgres writes an updated row at the end of
+// the heap and the twin leaves it where it was.
+//
+// The second half is because an `ORDER BY` over a key with ties promises nothing
+// either, and that was believed to be enough. It is not: postgres's bounded sort
+// is a top-N heapsort whose output among equal keys is neither the heap order nor
+// stable, so twelve rows sharing one `n` come back `b, c, a` there and `a, b, c`
+// in the twin. Neither is wrong — SQL says nothing about ties — so a law that
+// compared them would be refuted by a case nobody could fix, which is worse than
+// a gap: a claim that fails for unfixable reasons is a claim everybody learns to
+// skip. Appending the primary key makes every generated order total, so the
+// comparison below is positional over an order both sides actually promise.
+pub fn render(fx: db::Schema, op: Op) -> Rendered =
+  match op {
+    Insert(v) -> {
+      let table = table_name(values_table(v));
+      let params = values_params(v);
+      {stmt: db::stmt("insert into " ++ table ++ " ("
+         ++ commas(column_names(fx, table)) ++ ") values ("
+         ++ commas(placeholders(len(params), 1)) ++ ")"),
+       params: params}
+    },
+    Update(o) -> {stmt: db::stmt("update " ++ table_name(o.table) ++ " set "
+                    ++ col_name(o.column) ++ " = $1 where "
+                    ++ col_name(o.where_col) ++ " = $2"),
+                  params: [val_param(o.to), val_param(o.eq)]},
+    Delete(o) -> {stmt: db::stmt("delete from " ++ table_name(o.table) ++ " where "
+                    ++ col_name(o.where_col) ++ " = $1"),
+                  params: [val_param(o.eq)]},
+    Select(o) -> {stmt: db::stmt("select " ++ commas(column_names(fx, table_name(o.table)))
+                    ++ " from " ++ table_name(o.table) ++ " order by " ++ order_clause(fx, o)
+                    ++ " limit " ++ int_to_string(o.limit)),
+                  params: []},
+    Count(w) -> {stmt: db::stmt("select count(*) from " ++ table_name(w)), params: []},
+    Begin(_) -> {stmt: db::stmt(""), params: []},
+    Commit -> {stmt: db::stmt(""), params: []},
+    Abort -> {stmt: db::stmt(""), params: []},
+  }
+
+// The generated key, and the primary key after it. A repeat is harmless — the
+// second comparison of a column against itself is always `0` — so this needs no
+// special case for the `Select` that already ordered by the key.
+fn order_clause(fx: db::Schema, o: SelectOp) -> String =
+  commas(concat_keys([col_name(o.order_by)], primary_key(fx, table_name(o.table))))
+
+fn primary_key(fx: db::Schema, name: String) -> List<String> =
+  match find_table(fx.tables, name) { None -> [], Some(t) -> t.primary_key }
+
+fn concat_keys(a: List<String>, b: List<String>) -> List<String> =
+  fold(b, a, |acc: List<String>, x: String| push(acc, x))
+
+fn column_names(fx: db::Schema, name: String) -> List<String> =
+  match find_table(fx.tables, name) {
+    None -> [],
+    Some(t) -> map(t.columns, |c: db::Column| c.name),
+  }
+
+fn find_table(ts: List<db::Table>, name: String) -> Option<db::Table> =
+  match ts {
+    [] -> None,
+    [h, ..t] -> if h.name == name { Some(h) } else { find_table(t, name) },
+  }
+
+fn placeholders(n: Int, from: Int) -> List<String> =
+  if n <= 0 { [] } else { push(placeholders(n - 1, from), "$" ++ int_to_string(from + n - 1)) }
+
+type Joined = { started: Bool, out: String }
+
+fn commas(xs: List<String>) -> String =
+  fold(xs, {started: false, out: ""}, |acc: Joined, x: String|
+    if acc.started { {started: true, out: acc.out ++ ", " ++ x} }
+    else { {started: true, out: x} }).out
+
+// --- The domain -------------------------------------------------------------
+//
+// A **pure** guard, and it must stay pure: a guard decides the domain, and a
+// guard that could act would be choosing which cases to be judged on. It
+// rejects sequences the claim has no opinion about — an unbalanced scope stack,
+// a nesting deeper than the driver's savepoint bound, a parameter whose type
+// does not match its column, a table or column the fixture does not have. A
+// guard that admitted those would make the law a claim about error messages.
+pub fn well_formed(fx: db::Schema, ops: List<Op>) -> Bool =
+  balanced(ops, 0) && fold(ops, true, |acc: Bool, o: Op| acc && typed(fx, o))
+
+fn balanced(ops: List<Op>, depth: Int) -> Bool =
+  match ops {
+    [] -> depth == 0,
+    [h, ..t] -> match h {
+      Begin(_) -> depth < db::max_savepoints() && balanced(t, depth + 1),
+      Commit -> depth > 0 && balanced(t, depth - 1),
+      Abort -> depth > 0 && balanced(t, depth - 1),
+      _ -> balanced(t, depth),
+    },
+  }
+
+// What the *type* cannot say: that a column belongs to the table the same
+// operation names, and that a value fits the column it is compared or assigned
+// to. An `Insert` needs nothing here — its constructor decides both.
+fn typed(fx: db::Schema, op: Op) -> Bool =
+  match op {
+    Insert(_) -> true,
+    Update(o) -> fits_column(fx, o.table, o.column, o.to)
+                 && fits_column(fx, o.table, o.where_col, o.eq),
+    Delete(o) -> fits_column(fx, o.table, o.where_col, o.eq),
+    // A generated `ORDER BY` may name any column of the table, because `render`
+    // appends the primary key. The key itself is required rather than assumed:
+    // a table without one has no total order to compare positionally against,
+    // and the law would be refuted by ties rather than by a defect.
+    Select(o) -> has_column(fx, o.table, o.order_by) && o.limit >= 0
+                 && len(primary_key(fx, table_name(o.table))) > 0,
+    Count(_) -> true,
+    Begin(_) -> true,
+    Commit -> true,
+    Abort -> true,
+  }
+
+fn fits_column(fx: db::Schema, table: Which, column: Col, v: Val) -> Bool =
+  match find_table(fx.tables, table_name(table)) {
+    None -> false,
+    Some(t) -> match find_column(t.columns, col_name(column)) {
+      None -> false,
+      Some(c) -> param_fits(c, val_param(v)),
+    },
+  }
+
+fn has_column(fx: db::Schema, table: Which, column: Col) -> Bool =
+  match find_table(fx.tables, table_name(table)) {
+    None -> false,
+    Some(t) -> match find_column(t.columns, col_name(column)) {
+      None -> false,
+      Some(_) -> true,
+    },
+  }
+
+fn find_column(cs: List<db::Column>, n: String) -> Option<db::Column> =
+  match cs {
+    [] -> None,
+    [h, ..t] -> if h.name == n { Some(h) } else { find_column(t, n) },
+  }
+
+// A `NULL` fits any column: whether it is refused is the not-null constraint's
+// business and the claim very much does have an opinion about that.
+fn param_fits(c: db::Column, v: db::Param) -> Bool =
+  match v {
+    db::PNull -> true,
+    db::PInt(_) -> match c.ty { db::TInt -> true, db::TNumeric(_, _) -> true, _ -> false },
+    db::PNumeric(_) -> match c.ty { db::TNumeric(_, _) -> true, _ -> false },
+    db::PText(_) -> match c.ty { db::TText -> true, _ -> false },
+    db::PBool(_) -> match c.ty { db::TBool -> true, _ -> false },
+    db::PFloat(_) -> match c.ty { db::TFloat -> true, _ -> false },
+    db::PBytes(_) -> match c.ty { db::TBytes -> true, _ -> false },
+    db::PJson(_) -> match c.ty { db::TJson -> true, _ -> false },
+    db::PArray(_) -> match c.ty { db::TArray(_) -> true, _ -> false },
+  }
+
+// --- The two sides ----------------------------------------------------------
+
+type Replay = { db: db::MemDb, out: List<db::Answer> }
+
+pub fn replay_memory(fx: db::Schema, ops: List<Op>) -> List<db::Answer> =
+  fold(ops, {db: db::open(fx), out: []}, |acc: Replay, o: Op| memory_step(fx, acc, o)).out
+
+fn memory_step(fx: db::Schema, acc: Replay, op: Op) -> Replay =
+  match op {
+    Begin(level) -> {
+      let r = db::begin_step(acc.db, level, db::ReadWrite);
+      {db: r.db, out: push(acc.out, r.out)}
+    },
+    Commit -> {
+      let r = db::commit_step(acc.db);
+      {db: r.db, out: push(acc.out, r.out)}
+    },
+    Abort -> {
+      let r = db::abort_step(acc.db);
+      {db: r.db, out: push(acc.out, r.out)}
+    },
+    _ -> {
+      let rendered = render(fx, op);
+      let r = db::step(acc.db, rendered.stmt, rendered.params);
+      {db: r.db, out: push(acc.out, r.out)}
+    },
+  }
+
+// The other side of the claim. It performs the `db` atoms the driver answers,
+// and the resource label is the table — which is the whole reason to put a
+// database behind an effect, and why this function's row names `part` and `bin`
+// rather than one `db`.
+//
+// A handler clause names a concrete `(operation, resource)` pair, so the table
+// is dispatched on here rather than passed: there is no way to write a perform
+// whose resource is a runtime value, and that restriction is what keeps the row
+// a truth claim.
+pub fn replay_live(ops: List<Op>) -> List<db::Answer>
+  / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin]} = {
+  reset_live();
+  fold(ops, [], |acc: List<db::Answer>, o: Op| push(acc, live_step(o)))
+}
+
+// The live side starts where `db::open(fixture())` starts, and it has to be said
+// out loud because ADR 0014 §6 does not say it: `replay_memory` builds a fresh
+// `MemDb` per case and postgres does not forget between them, so without this
+// the law is refuted at the second case by rows the first one committed — a
+// divergence that is an artefact of the harness rather than a defect in either
+// side.
+//
+// Two ordinary `DELETE`s rather than a transaction the harness rolls back. A
+// sandbox would make every generated `Begin` a savepoint, and `ScopeTable::begin`
+// refuses a nested `begin` at a different isolation level with `25001` — so the
+// harness's own scope would answer for a generated `Begin(Serializable)` that
+// the twin, with an empty stack, accepts. The reset would have decided the
+// claim.
+fn reset_live() -> Unit / {db.write[part], db.write[bin]} = {
+  db.execute[bin](db::stmt("delete from bin"), []);
+  db.execute[part](db::stmt("delete from part"), []);
+  ()
+}
+
+fn live_step(op: Op) -> db::Answer
+  / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin]} =
+  match op {
+    Begin(level) -> db.begin(level, db::ReadWrite),
+    Commit -> db.commit(),
+    Abort -> db.abort(),
+    Insert(v) -> live_write(values_table(v), render(fixture(), op)),
+    Update(o) -> live_write(o.table, render(fixture(), op)),
+    Delete(o) -> live_write(o.table, render(fixture(), op)),
+    Select(o) -> live_read(o.table, render(fixture(), op)),
+    Count(w) -> live_read(w, render(fixture(), op)),
+  }
+
+fn live_write(table: Which, r: Rendered) -> db::Answer
+  / {db.write[part], db.write[bin]} =
+  match table {
+    Part -> db.execute[part](r.stmt, r.params),
+    Bin -> db.execute[bin](r.stmt, r.params),
+  }
+
+fn live_read(table: Which, r: Rendered) -> db::Answer
+  / {db.read[part], db.read[bin]} =
+  match table {
+    Part -> db.query[part](r.stmt, r.params),
+    Bin -> db.query[bin](r.stmt, r.params),
+  }
+
+// --- The comparison ---------------------------------------------------------
+//
+// **`Failed` compares on `code` and `constraint` only.** `detail` is postgres's
+// prose, it moves between server versions and locales, and a law that compared
+// messages would fail on a server upgrade and would teach everyone to ignore
+// it. This is the single most important line in the comparison.
+//
+// The second most important is `numeric`. Ply's `==` on `Decimal` is by
+// *value*, so `1.00m == 1.0000m` — which means comparing two `Answer`s with
+// `==` would silently accept exactly the divergence ADR 0014 §6.3 uses as its
+// worked example, where the twin keeps a literal's scale and postgres returns
+// the column's. A `numeric` therefore compares as its rendered digits, which is
+// what a client sees and what the scale means.
+pub fn agree(memory: List<db::Answer>, live: List<db::Answer>) -> Bool =
+  match first_difference(memory, live, 0) { None -> true, Some(_) -> false }
+
+// The index of the first difference, because a divergence at op 3 makes ops
+// 4..n meaningless and a counterexample that reported all of them would bury
+// the one that matters.
+pub fn first_difference(memory: List<db::Answer>, live: List<db::Answer>, at: Int)
+  -> Option<Int> =
+  match memory {
+    [] -> match live { [] -> None, _ -> Some(at) },
+    [m, ..mt] -> match live {
+      [] -> Some(at),
+      [l, ..lt] -> if answers_agree(m, l) { first_difference(mt, lt, at + 1) } else { Some(at) },
+    },
+  }
+
+pub fn answers_agree(a: db::Answer, b: db::Answer) -> Bool =
+  match a {
+    db::Count(x) -> match b { db::Count(y) -> x == y, _ -> false },
+    db::Failed(x) -> match b {
+      db::Failed(y) -> x.code == y.code && x.constraint == y.constraint,
+      _ -> false,
+    },
+    db::Rows(xs) -> match b { db::Rows(ys) -> rows_agree(xs, ys), _ -> false },
+  }
+
+fn rows_agree(xs: List<db::Row>, ys: List<db::Row>) -> Bool =
+  match xs {
+    [] -> match ys { [] -> true, _ -> false },
+    [x, ..xt] -> match ys {
+      [] -> false,
+      [y, ..yt] -> row_agrees(x, y) && rows_agree(xt, yt),
+    },
+  }
+
+type Entry = { key: String, value: db::Datum }
+
+fn row_agrees(x: db::Row, y: db::Row) -> Bool =
+  map_len(x) == map_len(y)
+  && fold(map_entries(x), true, |acc: Bool, e: Entry|
+       acc && match map_get(y, e.key) {
+         None -> false,
+         Some(v) -> datum_agrees(e.value, v),
+       })
+
+fn datum_agrees(a: db::Datum, b: db::Datum) -> Bool =
+  match a {
+    db::CNumeric(x) -> match b {
+      db::CNumeric(y) -> decimal_to_string(x) == decimal_to_string(y),
+      _ -> false,
+    },
+    _ -> a == b,
+  }
+
+// --- The claim --------------------------------------------------------------
+//
+// `law/host` is the declaration that this body reaches the world. Everything
+// that follows from it is enforced somewhere else and none of it is convention:
+//
+//   - the **guard** stays pure under `E0417`, because a guard decides the domain
+//     and a guard that could act would be choosing which cases to be judged on;
+//   - it can never be `proved` — the static tier and the finite enumeration are
+//     both skipped, because either would be a claim about every value of the
+//     domain and the world is not a function of the arguments. `property` is the
+//     ceiling and `ply prove` prints the reason;
+//   - it is never cached, in either direction, exactly as a host-backed test is
+//     not;
+//   - under a hermetic run — which is `ply prove`'s default — it is reported
+//     `W0604 unattempted`, "reaches the host; run `ply prove --host`". Not
+//     skipped, and not green: a law about a database that never ran a database,
+//     reported as passing, is precisely the green result over unexplored space
+//     this project exists to audit for;
+//   - `law/host` is part of the law's own hash, so changing `law` to `law/host`
+//     is a different claim and re-discharges.
+law/host "the memory engine agrees with postgres"
+  forall (ops: List<Op>) where well_formed(fixture(), ops) {
+    agree(replay_memory(fixture(), ops), replay_live(ops))
+  }
+
+// --- What the hermetic run can claim ----------------------------------------
+//
+// These are `law`s rather than `law/host`s because they reach nothing. They are
+// about `replay_memory` and `render`, which is less than the agreement claim
+// and is not a substitute for it — stated here so that a reader who sees three
+// green laws does not conclude the database was checked.
+
+law "a replay answers exactly once per operation"
+  forall (ops: List<Op>) where well_formed(fixture(), ops) {
+    len(replay_memory(fixture(), ops)) == len(ops)
+  }
+
+law "a replay is a function of its operations"
+  forall (ops: List<Op>) where well_formed(fixture(), ops) {
+    agree(replay_memory(fixture(), ops), replay_memory(fixture(), ops))
+  }
+
+law "agreement is reflexive, which is the weakest thing that must hold"
+  forall (ops: List<Op>) where well_formed(fixture(), ops) {
+    match first_difference(replay_memory(fixture(), ops),
+                           replay_memory(fixture(), ops), 0) {
+      None -> true,
+      Some(_) -> false,
+    }
+  }
+
+// --- Recorded transcripts ---------------------------------------------------
+//
+// Answers **recorded from PostgreSQL 18.3** (`LC_COLLATE=C`, `ENCODING=UTF8`)
+// for the statements `render` produces for `collation_ops()` and
+// `aborted_ops()`. They are goldens rather than a live comparison, so they
+// cannot replace the law; what they establish is that `agree` distinguishes the
+// two answers a real divergence produces, which is ADR 0014 §6.4's requirement
+// that the claim be able to fail.
+//
+// One entry in each is **not** a recording and is marked as such: `Begin`,
+// `Commit` and `Abort` have no result set and no row count on the wire, so
+// `Count(0)` is the driver's convention for "the scope operation succeeded"
+// rather than something the server sent. It is the one place these transcripts
+// assert a value nobody observed, and the twin and the driver have to agree on
+// it by convention — which is exactly the kind of agreement W4 exists to
+// replace with a checked one.
+
+pub fn collation_ops() -> List<Op> = [
+  Insert(PartVals("B", 1m, None, None)),
+  Insert(PartVals("a", 1m, None, None)),
+  Select({table: Part, order_by: CSku, limit: 10}),
+]
+
+pub fn aborted_ops() -> List<Op> = [
+  Begin(db::ReadCommitted),
+  Insert(PartVals("a", 1m, None, None)),
+  Insert(PartVals("a", 2m, None, None)),
+  Count(Part),
+  Commit,
+  Count(Part),
+]
+
+fn row4(sku: String, price: Decimal) -> db::Row =
+  map_of_entries([{key: "sku", value: db::CText(sku)},
+                  {key: "price", value: db::CNumeric(price)},
+                  {key: "tag", value: db::CNull},
+                  {key: "n", value: db::CNull}])
+
+fn counted(n: Int) -> db::Answer =
+  db::Rows([map_of_entries([{key: "count", value: db::CInt(n)}])])
+
+// Under `C` collation `"B"` sorts before `"a"`, because `B` is 0x42 and `a` is
+// 0x61. Under `en_US` it does not, which is the injected divergence below.
+pub fn collation_transcript() -> List<db::Answer> = [
+  db::Count(1),
+  db::Count(1),
+  db::Rows([row4("B", 1.0000m), row4("a", 1.0000m)]),
+]
+
+pub fn aborted_transcript() -> List<db::Answer> = [
+  db::Count(0),
+  db::Count(1),
+  db::Failed({code: "23505", constraint: "part_pkey", detail: ""}),
+  db::Failed({code: "25P02", constraint: "", detail: ""}),
+  // The `COMMIT`. The bare server answers it with the command tag `ROLLBACK`
+  // and **no error**, and this is the one entry in either transcript where W4
+  // deliberately answers something else: `tokio_postgres` does not surface the
+  // tag, and a `Count(0)` here is `transaction` evaluating to `Ok(value)` for a
+  // transaction whose every write is gone. Both halves answer `25P02` from a
+  // flag the first `Failed` inside the scope set.
+  db::Failed({code: "25P02", constraint: "", detail: ""}),
+  counted(0),
+]
+
+// --- Tests ------------------------------------------------------------------
+
+test "render puts one statement and its parameters on both sides" {
+  let r = render(fixture(), Insert(PartVals("a", 1m, None, None)));
+  assert_eq(r.stmt.sql, "insert into part (sku, price, tag, n) values ($1, $2, $3, $4)");
+  assert_eq(len(r.params), 4);
+  assert_eq(render(fixture(), Select({table: Part, order_by: CSku, limit: 3})).stmt.sql,
+            "select sku, price, tag, n from part order by sku, sku limit 3");
+  assert_eq(render(fixture(), Count(Bin)).stmt.sql, "select count(*) from bin");
+  assert_eq(render(fixture(), Update({table: Part, column: CN, to: VInt(1),
+                                      where_col: CSku, eq: VText("a")})).stmt.sql,
+            "update part set n = $1 where sku = $2");
+  assert_eq(render(fixture(), Delete({table: Part, where_col: CSku,
+                                      eq: VText("a")})).stmt.sql,
+            "delete from part where sku = $1")
+}
+
+// The property the positional comparison rests on: every generated `ORDER BY`
+// ends with the table's primary key, so no generated order has a tie and neither
+// side is free to choose between equal rows.
+test "every generated select orders by a key with no ties" {
+  assert_eq(render(fixture(), Select({table: Part, order_by: CN, limit: 1})).stmt.sql,
+            "select sku, price, tag, n from part order by n, sku limit 1");
+  assert_eq(render(fixture(), Select({table: Bin, order_by: CQty, limit: 4})).stmt.sql,
+            "select id, sku, qty from bin order by qty, id limit 4");
+  // And a `Select` over a table with no primary key is outside the domain
+  // rather than compared on an order neither side promises.
+  assert(!well_formed({tables: [keyless()]}, [Select({table: Part, order_by: CSku, limit: 1})]))
+}
+
+// The fixture's `part`, stripped of its key. Named `part` so that `table_name`
+// finds it and the only thing missing is the total order.
+fn keyless() -> db::Table = {
+  name: "part",
+  columns: [db::column("sku", db::TText, true)],
+  primary_key: [],
+  unique: [],
+  foreign_keys: [],
+  checks: [],
+}
+
+test "well_formed rejects what the claim has no opinion about" {
+  assert(well_formed(fixture(), collation_ops()));
+  assert(well_formed(fixture(), aborted_ops()));
+  // an unbalanced scope stack
+  assert(!well_formed(fixture(), [Commit]));
+  assert(!well_formed(fixture(), [Begin(db::ReadCommitted)]));
+  assert(!well_formed(fixture(), [Begin(db::ReadCommitted), Commit, Abort]));
+  // a nesting deeper than the driver's savepoint bound
+  assert(!well_formed(fixture(), deep(db::max_savepoints() + 1)));
+  // a value whose type does not match the column it is assigned to
+  assert(!well_formed(fixture(), [Update({table: Part, column: CN, to: VText("x"),
+                                          where_col: CSku, eq: VText("a")})]));
+  // a column of the *other* table, which is the one thing the type cannot say
+  assert(!well_formed(fixture(), [Select({table: Part, order_by: CQty, limit: 1})]));
+  assert(!well_formed(fixture(), [Delete({table: Bin, where_col: CPrice, eq: VNum(1m)})]));
+  assert(!well_formed(fixture(), [Select({table: Part, order_by: CSku, limit: -1})]));
+  // and an `Insert` is well-typed by construction, which is the point of
+  // `Values` carrying the table rather than naming it
+  assert(well_formed(fixture(), [Insert(BinVals(1, Some("a"), None))]))
+}
+
+fn deep(n: Int) -> List<Op> =
+  if n <= 0 { [] } else { balanced_pair(deep(n - 1)) }
+
+fn balanced_pair(inner: List<Op>) -> List<Op> =
+  push(fold(inner, [Begin(db::ReadCommitted)], |acc: List<Op>, o: Op| push(acc, o)), Commit)
+
+test "the twin reproduces a transcript recorded from postgres" {
+  assert(agree(replay_memory(fixture(), collation_ops()), collation_transcript()));
+  assert(agree(replay_memory(fixture(), aborted_ops()), aborted_transcript()))
+}
+
+// ADR 0014 §6.4: a claim that cannot fail is decoration. Under a non-`C`
+// collation postgres returns `"a"` before `"B"` and the twin, which orders text
+// by byte, does not — so the comparison must report the difference at the
+// `Select` and not before it.
+test "a non-C collation is a refutation at the select and nowhere earlier" {
+  let injected = [
+    db::Count(1),
+    db::Count(1),
+    db::Rows([row4("a", 1.0000m), row4("B", 1.0000m)]),
+  ];
+  assert(!agree(replay_memory(fixture(), collation_ops()), injected));
+  assert_eq(first_difference(replay_memory(fixture(), collation_ops()), injected, 0), Some(2))
+}
+
+// The second injection: a twin without the failed-transaction state answers the
+// `count` after a failed statement instead of `25P02`, which is the omission
+// that makes a suite pass and production fail.
+test "a missing failed-transaction state is a refutation at the count" {
+  let injected = [
+    db::Count(0),
+    db::Count(1),
+    db::Failed({code: "23505", constraint: "part_pkey", detail: ""}),
+    counted(1),
+    db::Failed({code: "25P02", constraint: "", detail: ""}),
+    counted(0),
+  ];
+  assert(!agree(replay_memory(fixture(), aborted_ops()), injected));
+  assert_eq(first_difference(replay_memory(fixture(), aborted_ops()), injected, 0), Some(3))
+}
+
+// `detail` is postgres's prose and nothing compares it. A law that compared
+// messages would fail on a server upgrade and would teach everyone to ignore
+// it.
+test "a failure compares its code and its constraint and never its message" {
+  let a = db::Failed({code: "23505", constraint: "part_pkey", detail: "Key (sku)=(a) exists."});
+  let b = db::Failed({code: "23505", constraint: "part_pkey", detail: ""});
+  let c = db::Failed({code: "23505", constraint: "part_tag_key", detail: ""});
+  let d = db::Failed({code: "23514", constraint: "part_pkey", detail: ""});
+  assert(answers_agree(a, b));
+  assert(!answers_agree(a, c));
+  assert(!answers_agree(a, d))
+}
+
+// Ply's `==` on `Decimal` is by value, so `1.00m == 1.0000m` — and a comparison
+// that used it would accept the twin keeping a literal's scale where postgres
+// returns the column's, which is ADR 0014 §6.3's own worked counterexample.
+test "a numeric compares by its digits, because that is what its scale means" {
+  assert(1.00m == 1.0000m);
+  assert(!answers_agree(db::Rows([map_of_entries([{key: "p", value: db::CNumeric(1.00m)}])]),
+                        db::Rows([map_of_entries([{key: "p", value: db::CNumeric(1.0000m)}])])));
+  assert(answers_agree(db::Rows([map_of_entries([{key: "p", value: db::CNumeric(1.0000m)}])]),
+                       db::Rows([map_of_entries([{key: "p", value: db::CNumeric(1.0000m)}])])))
+}
+
+// The domain the law is actually quantified over, which is the number ADR 0014
+// §6.4's argument turns on: "the agreement law passes" is a statement about the
+// generator's reach and nothing else.
+//
+// Under §6.2's `Op` — `table: String`, `order_by: String`, `values:
+// List<Param>` — a generated sequence containing a *statement* the guard admits
+// was drawn zero times in two hundred, and the postgres log for a whole run was
+// four `BEGIN`s. With the domain in the type, the sequences below are inside it
+// by construction rather than by luck.
+test "the domain the law quantifies over contains statements" {
+  assert(well_formed(fixture(), [Insert(PartVals("a", 1m, Some("t"), Some(1)))]));
+  assert(well_formed(fixture(), [Insert(BinVals(1, Some("a"), Some(2)))]));
+  assert(well_formed(fixture(), [Update({table: Part, column: CPrice, to: VNum(2m),
+                                         where_col: CSku, eq: VText("a")})]));
+  assert(well_formed(fixture(), [Delete({table: Bin, where_col: CId, eq: VInt(1)})]));
+  assert(well_formed(fixture(), [Select({table: Bin, order_by: CQty, limit: 3})]));
+  assert(well_formed(fixture(), [Count(Bin)]));
+  // And every one of them renders to a statement the driver's scanner admits,
+  // which is the other half of "both sides execute the rendered SQL".
+  assert(string_contains(render(fixture(), Insert(BinVals(1, None, None))).stmt.sql,
+                         "insert into bin"));
+  assert(string_contains(render(fixture(), Count(Bin)).stmt.sql, "count(*) from bin"))
+}
+
+test "a difference in length is a difference at the shorter end" {
+  assert_eq(first_difference([db::Count(1)], [], 0), Some(0));
+  assert_eq(first_difference([], [db::Count(1)], 0), Some(0));
+  assert_eq(first_difference([db::Count(1)], [db::Count(1), db::Count(2)], 0), Some(1))
+}

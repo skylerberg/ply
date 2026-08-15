@@ -14,7 +14,7 @@ use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
 use crate::env::Env;
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::host::{
-    HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, Pending, attribute,
+    HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, MachineId, Pending, attribute,
     err_blocking_answered_inline, err_hermetic, err_host_in_search, operation_label,
 };
 use crate::interp::{
@@ -91,6 +91,11 @@ struct FnSlot<'a> {
 }
 
 pub struct Machine<'a> {
+    /// This machine's identity, which with the performing task is what a host
+    /// handler keys scoped state on. Minted per machine because `ply test` drives
+    /// one per worker thread and every one of them performs outside a scheduler
+    /// region — so the task alone files them all under a single owner.
+    id: MachineId,
     program: &'a Program,
     resolved: &'a Resolved,
     check: Option<&'a CheckOutput>,
@@ -168,6 +173,11 @@ pub struct Machine<'a> {
     /// The last at-most-once host operation answered, so `E0426` can name the
     /// packet it is refusing to send twice.
     last_linear: Option<HostMark>,
+    /// What the runtime reported while closing entry points. Warnings, never
+    /// failures, and cumulative across the machine's life rather than per entry
+    /// point: a connection discarded by the third test is still a fact about the
+    /// run when the tenth finishes.
+    teardown: Vec<Diagnostic>,
 }
 
 /// An at-most-once host operation that already happened, as `E0426` prints it.
@@ -243,6 +253,7 @@ impl<'a> Machine<'a> {
         }
 
         Machine {
+            id: MachineId::next(),
             program,
             resolved,
             check,
@@ -272,6 +283,7 @@ impl<'a> Machine<'a> {
             declared: None,
             re_executed: false,
             last_linear: None,
+            teardown: Vec::new(),
         }
     }
 
@@ -563,7 +575,42 @@ impl<'a> Machine<'a> {
         self.reset();
         self.state = State::Eval { code, env, module };
         let outcome = self.run();
-        self.close_regions(outcome)
+        let outcome = self.close_regions(outcome);
+        self.end_entry_point();
+        outcome
+    }
+
+    /// Hands the host runtime every exit path from an entry point.
+    ///
+    /// Below `close_regions` and above the caller, so it runs on the value path,
+    /// the diagnostic path and the spent-budget path alike — which is the whole
+    /// of its value, since the exit it exists for is the one where the program
+    /// stopped without reaching the operation that would have closed its scope.
+    ///
+    /// A failure here does not become the entry point's verdict. The program
+    /// asked for nothing and did nothing wrong: a connection whose `ROLLBACK`
+    /// failed is the run's own resource, and attributing it to whichever test was
+    /// running would send a reader looking for a defect in their program. It is
+    /// collected as a warning instead, and a caller that reports none is still
+    /// correct about the test.
+    fn end_entry_point(&mut self) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        if let Err(diagnostic) = runtime.end_entry_point(self.id) {
+            self.teardown.push(diagnostic);
+        }
+    }
+
+    /// What the host runtime reported while closing entry points, and forgotten
+    /// here.
+    ///
+    /// Never failures: see [`Machine::end_entry_point`]. Taken rather than
+    /// borrowed because one machine serves many entry points and a caller that
+    /// read without clearing would report the third test's discarded connection
+    /// again after the fourth.
+    pub fn take_teardown_warnings(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.teardown)
     }
 
     /// A failure abandons the region where it stands. The diagnostic gains the
@@ -942,6 +989,9 @@ impl<'a> Machine<'a> {
                 op: &declaration,
                 args: &args,
                 span,
+                machine: self.id,
+                task: self.performing_task(),
+                declared: self.declared.as_ref(),
             };
             match &runtime {
                 Some(rt) => handler.call(rt.as_ref(), &request),
@@ -1015,6 +1065,20 @@ impl<'a> Machine<'a> {
         let value = rt.block_on(pending)?;
         self.go_return(value);
         Ok(())
+    }
+
+    /// Who is performing, as a host handler holding scoped state has to key it.
+    ///
+    /// The innermost live region's running task, and `None` when control is
+    /// inside no region at all. `None` is an identity and not a gap: an entry
+    /// point that never spawned is one thread of control from start to finish,
+    /// and a scope it opened belongs to it.
+    fn performing_task(&self) -> Option<crate::sim::TaskId> {
+        let region = self.host_region()?;
+        self.sims
+            .iter()
+            .find(|live| live.id == region)
+            .and_then(|live| live.sched.current())
     }
 
     /// The innermost live production region, if control is actually inside it.

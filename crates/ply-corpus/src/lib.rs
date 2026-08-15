@@ -17,6 +17,7 @@ pub mod serve;
 pub mod simulate;
 pub mod spec;
 pub mod w3;
+pub mod w4;
 pub mod write;
 
 pub use spec::CorpusSpec;

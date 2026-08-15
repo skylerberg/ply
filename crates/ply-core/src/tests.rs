@@ -3206,6 +3206,40 @@ fn a_law_body_that_performs_an_ordinary_effect_is_rejected() {
     );
 }
 
+/// ADR 0014 §6.1. A law whose body reaches the world is written `law/host`,
+/// which declares the relaxation rather than taking it silently — and the
+/// diagnostic names the fix, because "a law body cannot perform an effect" with
+/// no way forward is a dead end.
+///
+/// The **guard** is unaffected in either form: a guard decides the domain, and a
+/// guard that could act would be choosing which cases to be judged on.
+#[test]
+fn a_law_host_relaxes_its_body_and_never_its_guard() {
+    let diags = check_src_err(&format!(
+        "{DB}law \"reads\" forall (n: Int) {{ db.get[users](n) == n }}"
+    ));
+    let d = only(&diags, codes::EFFECT_IN_SPEC);
+    assert!(
+        d.notes.iter().any(|n| n.contains("law/host")),
+        "the refusal must name the fix: {}",
+        render(&diags)
+    );
+
+    let out = check_src(&format!(
+        "{DB}law/host \"reads\" forall (n: Int) {{ db.get[users](n) == n }}"
+    ));
+    let law = &out.laws[0];
+    assert!(law.host);
+    assert_eq!(law.footprint.to_string(), "{db.read[users]}");
+
+    // The guard is still pure, whatever the law is.
+    let diags = check_src_err(&format!(
+        "{DB}law/host \"guarded\" forall (n: Int) where db.get[users](n) > 0 {{ n == n }}"
+    ));
+    let d = only(&diags, codes::EFFECT_IN_SPEC);
+    assert!(d.message.contains("`where`"), "{}", d.message);
+}
+
 #[test]
 fn a_law_cannot_quantify_over_a_handler() {
     for src in [
@@ -3383,16 +3417,24 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
     }
     let seed = Footprint::from_atoms([crate::prelude::seed_atom()]);
     for law in &out.laws {
+        // A `law/host` is the one law whose body may carry any row, and it says
+        // so in its own declaration. Every other one is `{}` or `{sim.read}`.
         assert!(
-            law.footprint.is_empty() || law.footprint == seed,
+            law.host || law.footprint.is_empty() || law.footprint == seed,
             "law {:?} has footprint {}",
             law.name,
             law.footprint
         );
     }
     assert!(
-        out.laws.iter().any(|l| l.footprint == seed),
+        out.laws.iter().any(|l| l.footprint == seed && !l.host),
         "the corpus demonstrates no concurrency law"
+    );
+    assert!(
+        out.laws
+            .iter()
+            .any(|l| l.host && !l.footprint.is_empty()),
+        "the corpus demonstrates no `law/host`"
     );
 }
 

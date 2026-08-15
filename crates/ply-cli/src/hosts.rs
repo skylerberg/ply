@@ -15,6 +15,7 @@
 //!   rather than the count quietly over-claiming.
 
 use crate::commands::common::plural;
+use crate::db::{self, Database, DbConfig};
 use ply_core::CheckOutput;
 use ply_core::ty::Footprint;
 use ply_eval::host::{HostBinding, HostListing, HostRegistry, HostRow, HostRuntime};
@@ -31,6 +32,23 @@ use std::sync::Arc;
 /// fills it, and it is the *only* thing that does: no command line, environment
 /// variable or file adds a member.
 pub fn registry() -> HostRegistry {
+    ply_host::registry()
+}
+
+/// The registry a listing over `check` is taken from.
+///
+/// The postgres driver is in it exactly when the program declares the effect it
+/// serves: a program with no database in it should print the trusted computing
+/// base it actually has, and one with a database should print the driver
+/// whether or not this invocation named a server to point it at.
+fn registry_for(check: &CheckOutput) -> HostRegistry {
+    if check
+        .effects
+        .values()
+        .any(|e| e.name.as_str() == ply_host::db::EFFECT)
+    {
+        return ply_host::registry_with_database();
+    }
     ply_host::registry()
 }
 
@@ -56,6 +74,15 @@ pub struct Hosts {
     /// it is bound. `--host` decides whether the TCB is *used*, never whether it
     /// exists.
     listing: HostListing,
+    /// What the run was told about its database. Held rather than consumed
+    /// because everything downstream — the `database` block, the digest, and
+    /// the sentence a report has to carry about having touched a real one —
+    /// reads it, and none of them may re-derive it from the command line.
+    db: Option<DbConfig>,
+    /// The `--db-schema` function, resolved against the program at start-up.
+    /// The *counts* are filled in by whichever command evaluates it; the name
+    /// is checked here, where a mistake is a start-up refusal.
+    schema: Option<db::schema::SchemaView>,
 }
 
 impl Hosts {
@@ -70,30 +97,112 @@ impl Hosts {
     /// nothing can reach `net.listen_tls`, and reading a private key for a run
     /// that will not use it is exactly the residual ADR 0008 §2 refuses to
     /// widen.
+    ///
+    /// `db` is the resolved `--db` / `PLY_DB_URL` configuration, and `reach` is
+    /// the row the run will actually enter — `main`'s for `ply run`, the union
+    /// of the tests' for `ply test`. `E0431` fires when that row names a `db`
+    /// atom and the run named nothing for it to open, which is narrower than
+    /// "the program mentions a database": an entry point that installs the twin
+    /// discharges every `db` atom in Ply and needs no server. A caller with no
+    /// entry point — `ply hosts`, which lists rather than runs — passes `None`
+    /// and the binding decides.
     pub fn open(
         check: &CheckOutput,
         host: bool,
         credentials: &[tls::CredentialSpec],
+        db: Option<DbConfig>,
+        reach: Option<&Footprint>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
-            let registry = ply_host::registry();
+            let registry = registry_for(check);
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
+                db: None,
+                schema: None,
             });
         }
-        let facilities = Arc::new(ply_host::Host::with_credentials(tls::Credentials::load(
-            credentials,
-        )?));
+        let material = tls::Credentials::load(credentials)?;
+        // Opened before the binding, and only when a `db` operation could
+        // actually reach it: the pool is a thread and a set of sockets, and
+        // starting one for a program that never performs a `db` operation would
+        // turn `--db` on an unrelated run into a connection failure. Which is
+        // also ADR 0014 §8's wording — `E0431` is for a run that *binds the db
+        // driver* — and it is why the connection is probed here rather than at
+        // the first statement: a service that discovers its database is
+        // unreachable on the first request has already told a client it was
+        // listening.
+        let facilities = Arc::new(match db.as_ref().filter(|_| reaches_db(check, reach)) {
+            Some(config) => {
+                let (url, bounds) = config.pool_config();
+                ply_host::Host::with_database(
+                    material,
+                    ply_host::db::PoolConfig {
+                        url: url.expose().to_string(),
+                        size: bounds.size,
+                        acquire: bounds.acquire,
+                        statement: bounds.statement,
+                        idle_txn: bounds.idle_txn,
+                        connect: bounds.connect,
+                        statements: bounds.statements,
+                    },
+                )
+                .map_err(|d| vec![d])?
+            }
+            None => ply_host::Host::with_credentials(material),
+        });
         let registry = facilities.registry();
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
+        let schema = db_schema(check, db.as_ref(), &listing, reach)?;
         Ok(Hosts {
             host: Some(facilities),
             binding: Arc::new(binding),
             listing,
+            db,
+            schema,
         })
+    }
+
+    /// The configuration a run was given, for the driver and for the report.
+    pub fn db(&self) -> Option<&DbConfig> {
+        self.db.as_ref()
+    }
+
+    /// The `database` block, or `None` for a run with no database in reach —
+    /// which is what keeps a W3 program's listing and digest what they were.
+    pub fn database(&self) -> Option<Database> {
+        Database::of(
+            Database::operations_of(&self.listing),
+            self.db.clone(),
+            // The server's version, database name, collation and encoding come
+            // from a live connection. Until `ply_host::db` reports them, the
+            // block says "not connected" rather than inventing a row.
+            None,
+            self.schema.clone(),
+        )
+    }
+
+    /// Whether this run reached a real database, which is the fact a report must
+    /// carry so that a green suite is not read as a hermetic one.
+    pub fn is_live_database(&self) -> bool {
+        self.database().is_some_and(|d| d.is_live())
+    }
+
+    /// Fill in the `--db-schema` function's table and column counts. Called by
+    /// whichever command has an evaluator; the name was already resolved at
+    /// start-up, so this can only add numbers and never change a verdict.
+    pub fn describe_schema(&mut self, shape: Option<db::schema::Shape>) {
+        if let Some(view) = &mut self.schema {
+            view.shape = shape;
+        }
+    }
+
+    /// The name `--db-schema` resolved to, for a command that wants to evaluate
+    /// it.
+    pub fn schema_function(&self) -> Option<&str> {
+        self.schema.as_ref().map(|view| view.name.as_str())
     }
 
     /// What the run has to say about TLS: the stack in the trusted computing
@@ -101,6 +210,15 @@ impl Hosts {
     /// exists.
     pub fn transport(&self) -> Option<Transport> {
         Transport::of(&self.listing, self.host.as_ref().map(|h| h.credentials()))
+    }
+
+    /// Every block the rows cannot carry, together, because they are printed
+    /// together and hashed together.
+    pub fn disclosures(&self) -> Disclosures {
+        Disclosures {
+            transport: self.transport(),
+            database: self.database(),
+        }
     }
 
     /// [`open`] against an explicit registry, for a test that needs to control
@@ -116,26 +234,45 @@ impl Hosts {
         check: &CheckOutput,
         host: bool,
     ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::bind_with(registry, check, host, None)
+    }
+
+    /// [`bind`], with a database configuration, for the tests that exercise the
+    /// checks `open` runs between the binding and the first evaluation.
+    ///
+    /// [`bind`]: Hosts::bind
+    #[cfg(test)]
+    pub fn bind_with(
+        registry: HostRegistry,
+        check: &CheckOutput,
+        host: bool,
+        db: Option<DbConfig>,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
+                db: None,
+                schema: None,
             });
         }
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
+        let schema = db_schema(check, db.as_ref(), &listing, None)?;
         Ok(Hosts {
             host: None,
             binding: Arc::new(binding),
             listing,
+            db,
+            schema,
         })
     }
 
     /// Everything the registry resolves to, bound or not: what `ply hosts`
     /// prints and what CI pins a digest of.
     pub fn preview(check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>> {
-        registry().preview(check)
+        registry_for(check).preview(check)
     }
 
     /// A reactor for one machine, on the thread that will drive it.
@@ -198,18 +335,21 @@ impl Hosts {
     /// only in `ply hosts` so that a run's artifact says which trusted computing
     /// base produced it.
     pub fn summary_json(&self) -> Value {
-        let transport = self.transport();
+        let disclosures = self.disclosures();
         let mut summary = json!({
             "handlers": self.listing.handlers,
             "operations": self.listing.rows.len(),
-            "digest": digest_short(&self.listing, transport.as_ref()),
+            "digest": digest_short(&self.listing, &disclosures),
         });
-        if let Some(transport) = &transport {
+        if let Some(transport) = &disclosures.transport {
             summary["transport"] = transport.json();
             // Not a Ply diagnostic: a client that speaks no TLS is not the
             // program's fault and is attributable to no definition. Silence
             // would be wrong, so it is counted and named.
             summary["handshakes"] = handshakes_json(&self.handshakes());
+        }
+        if let Some(database) = &disclosures.database {
+            summary["database"] = database.json();
         }
         summary
     }
@@ -221,6 +361,75 @@ impl Hosts {
             .map(|h| h.handshakes())
             .unwrap_or_default()
     }
+}
+
+/// Whether a `db` operation can reach the host boundary in this run.
+///
+/// Two questions, and both have to be yes. The program has to declare the
+/// effect at all — a run with `--db` over a program that never mentions a
+/// database opens nothing — and the row the run will enter has to still carry a
+/// `db` atom after every Ply handler in the way, which is what makes an entry
+/// point that installs the twin need no server.
+fn reaches_db(check: &CheckOutput, reach: Option<&Footprint>) -> bool {
+    let declared = check
+        .effects
+        .values()
+        .any(|e| e.name.as_str() == ply_host::db::EFFECT);
+    declared
+        && reach.is_none_or(|reach| {
+            reach
+                .atoms()
+                .any(|a| a.effect.as_str() == ply_host::db::EFFECT)
+        })
+}
+
+/// The three checks that stand between a binding and the first evaluation, and
+/// the `--db-schema` view they leave behind.
+///
+/// All of them are the run's configuration rather than the program's, and all of
+/// them are cheaper to answer here than at the first statement: a service told
+/// to reach a database it was never given the address of should not discover
+/// that after accepting a request.
+fn db_schema(
+    check: &CheckOutput,
+    config: Option<&DbConfig>,
+    listing: &HostListing,
+    reach: Option<&Footprint>,
+) -> Result<Option<db::schema::SchemaView>, Vec<Diagnostic>> {
+    if let Some(defect) = Database::rollback_bound(listing) {
+        return Err(vec![defect]);
+    }
+    let operations = Database::operations_of(listing);
+    let Some(config) = config else {
+        // The binding lists every `db` operation the *program* can reach, which
+        // is not the same question. An entry point that installs the twin
+        // discharges every one of them in Ply and publishes no `db` atom at all,
+        // and refusing it for want of a database it never opens would make the
+        // twin unusable — which is the milestone's whole point. So the reach the
+        // run will actually enter decides, and a caller that cannot say falls
+        // back to the binding.
+        let reached: Vec<String> = match reach {
+            Some(reach) => reach
+                .atoms()
+                .filter(|a| a.effect.as_str() == ply_host::db::EFFECT)
+                .map(|a| a.to_string())
+                .collect(),
+            None => operations.clone(),
+        };
+        if reached.is_empty() {
+            return Ok(None);
+        }
+        return Err(vec![db::missing(&reached)]);
+    };
+    let Some(name) = &config.schema else {
+        return Ok(None);
+    };
+    let resolved = db::schema::resolve(check, name).map_err(|d| vec![d])?;
+    Ok(Some(db::schema::SchemaView {
+        name: resolved.as_str().to_string(),
+        shape: None,
+        state: db::schema::State::Declared,
+    }))
 }
 
 /// What a `--host` run says about handshakes it refused.
@@ -239,6 +448,28 @@ pub fn handshake_lines(counts: &tls::HandshakeCounts) -> Vec<String> {
         lines.push(format!("  {n} {reason}"));
     }
     lines
+}
+
+/// The one line that says a run reached a real database.
+///
+/// It exists because every other number a run prints is about the program, and
+/// "these tests passed" read without it is read as "these tests passed
+/// hermetically" — which is the claim W4 makes it possible to be wrong about.
+/// Silent for every run that touched no database, which is every run that did
+/// not ask.
+pub fn database_line(hosts: &Hosts) -> Option<String> {
+    let database = hosts.database()?;
+    if !database.is_live() {
+        return None;
+    }
+    let config = database.config.as_ref()?;
+    Some(format!(
+        "database {} · {} {} · configured by {}",
+        config.url.redacted(),
+        database.operations.len(),
+        plural(database.operations.len(), "operation"),
+        config.source.as_str(),
+    ))
 }
 
 pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
@@ -444,19 +675,68 @@ impl Transport {
     }
 }
 
+/// The blocks `ply hosts` prints under the table: facts about the trusted
+/// computing base that no row can carry.
+///
+/// One type rather than two arguments because they are hashed together, and the
+/// order they are hashed in is what keeps a W3 program's digest where it was.
+#[derive(Default)]
+pub struct Disclosures {
+    pub transport: Option<Transport>,
+    pub database: Option<Database>,
+}
+
+impl Disclosures {
+    /// What a command that has no [`Hosts`] builds — `ply hosts` resolves the
+    /// listing without binding, so it assembles these itself.
+    pub fn of(
+        listing: &HostListing,
+        credentials: Option<&tls::Credentials>,
+        db: Option<DbConfig>,
+        schema: Option<db::schema::SchemaView>,
+    ) -> Disclosures {
+        Disclosures {
+            transport: Transport::of(listing, credentials),
+            database: Database::of(Database::operations_of(listing), db, None, schema),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.transport.is_none() && self.database.is_none()
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(transport) = &self.transport {
+            lines.extend(transport.lines());
+        }
+        if let Some(database) = &self.database {
+            lines.extend(database.lines());
+        }
+        lines
+    }
+}
+
 /// The one line a CI check pins against the trusted computing base.
 ///
-/// A program with no TLS in reach hashes exactly what it hashed before W3: the
-/// transport is folded in only when there is one, so no existing corpus's
-/// digest moves.
-pub fn digest_short(listing: &HostListing, transport: Option<&Transport>) -> String {
-    let Some(transport) = transport else {
+/// A program with no TLS and no database in reach hashes exactly what it hashed
+/// before W3: a block is folded in only when there is one, so no existing
+/// corpus's digest moves. A program with TLS and no database hashes exactly what
+/// W3 gave it, which is why the domain tag below keeps its W3 bytes.
+pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String {
+    if disclosures.is_empty() {
         return listing.digest_short();
-    };
+    }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(TRANSPORT_DOMAIN);
+    hasher.update(DISCLOSURE_DOMAIN);
     hasher.update(&listing.digest());
-    transport.hash_into(&mut hasher);
+    if let Some(transport) = &disclosures.transport {
+        transport.hash_into(&mut hasher);
+    }
+    if let Some(database) = &disclosures.database {
+        hasher.update(DATABASE_DOMAIN);
+        database.hash_into(&mut hasher);
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(15);
     out.push_str("b3:");
@@ -467,8 +747,16 @@ pub fn digest_short(listing: &HostListing, transport: Option<&Transport>) -> Str
 }
 
 /// Domain-separated from the row digest so that a listing with an empty
-/// transport can never collide with one that has none.
-const TRANSPORT_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
+/// disclosure can never collide with one that has none.
+///
+/// The bytes still say `transport` because W3 wrote them, and every plaintext
+/// TLS-capable program in an existing corpus would get a new digest if they
+/// changed — a diff that means nothing, on the one line a CI check pins.
+const DISCLOSURE_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
+
+/// Separates the database block from whatever precedes it, so that a
+/// transport-only listing and a database-only listing cannot collide.
+const DATABASE_DOMAIN: &[u8] = b"ply.hosts.database.v1\0";
 
 /// A fingerprint short enough to sit in the table beside the name it belongs
 /// to. `--json` carries the whole of it, because a reader comparing against
@@ -514,7 +802,7 @@ fn yes_no(flag: bool) -> String {
 
 /// Every line of `ply hosts --host`, without the indent, so the shape is
 /// testable without a terminal.
-pub fn listing_lines(listing: &HostListing, transport: Option<&Transport>) -> Vec<String> {
+pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<String> {
     let mut lines = vec![format!(
         "{} {} · {} {} · trusted computing base",
         listing.handlers,
@@ -552,12 +840,10 @@ pub fn listing_lines(listing: &HostListing, transport: Option<&Transport>) -> Ve
         lines.extend(rows.iter().map(line));
     }
 
-    if let Some(transport) = transport {
-        lines.extend(transport.lines());
-    }
+    lines.extend(disclosures.lines());
 
     lines.push(String::new());
-    lines.push(format!("digest: {}", digest_short(listing, transport)));
+    lines.push(format!("digest: {}", digest_short(listing, disclosures)));
     lines
 }
 
@@ -773,7 +1059,7 @@ fn stamp() -> Int / {clock.read} = clock.now()
             ]
         );
         assert_eq!(listing.handlers, 3);
-        let text = listing_lines(&listing, None).join("\n");
+        let text = listing_lines(&listing, &Disclosures::default()).join("\n");
         assert!(!text.contains('*'), "a resource was hidden:\n{text}");
     }
 
@@ -784,7 +1070,7 @@ fn stamp() -> Int / {clock.read} = clock.now()
     /// the reader is told, and every one of those passes a per-column check.
     #[test]
     fn the_table_is_exactly_the_shape_the_contract_specifies() {
-        let lines = listing_lines(&listing(), None);
+        let lines = listing_lines(&listing(), &Disclosures::default());
         let (rendered, digest) = lines.split_at(lines.len() - 1);
         assert_eq!(
             rendered.join("\n"),
@@ -808,7 +1094,10 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         let program = check(DB);
         let once = full().preview(&program).unwrap();
         let twice = full().preview(&program).unwrap();
-        assert_eq!(listing_lines(&once, None), listing_lines(&twice, None));
+        assert_eq!(
+            listing_lines(&once, &Disclosures::default()),
+            listing_lines(&twice, &Disclosures::default())
+        );
         assert_eq!(once.digest_short(), twice.digest_short());
         assert_eq!(rows_json(&once), rows_json(&twice));
     }
@@ -857,7 +1146,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         let empty = HostRegistry::new().preview(&check(DB)).unwrap();
         assert!(hermetic_lines(&empty)[2].contains("no host handler is compiled"));
         assert!(
-            listing_lines(&empty, None)
+            listing_lines(&empty, &Disclosures::default())
                 .iter()
                 .any(|l| l.contains("no host handler is compiled"))
         );
@@ -903,7 +1192,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     #[test]
     fn hermetic_is_the_default_and_reaches_nothing() {
         let program = check(DB);
-        let hosts = Hosts::open(&program, false, &[]).unwrap();
+        let hosts = Hosts::open(&program, false, &[], None, None).unwrap();
         assert!(hosts.is_hermetic());
         assert_eq!(hosts.label(), "hermetic");
         assert!(hosts.listing().is_empty());
@@ -940,7 +1229,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
 
         // The same corpus under a hermetic binding: the host column is empty and
         // every other number is what it was before W1.
-        let hermetic = Hosts::open(&program, false, &[]).unwrap();
+        let hermetic = Hosts::open(&program, false, &[], None, None).unwrap();
         let counts = Counts::of(
             &hermetic,
             [(&reads.footprint, true), (&pure, true), (&pure, false)],
@@ -950,10 +1239,159 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         assert_eq!(counts.shared, 1);
     }
 
+    // --- database -----------------------------------------------------------
+
+    /// A registry whose `db.*` resolve to the postgres driver's paths, which is
+    /// how a listing row is recognised as one.
+    fn postgres(op_name: &'static str, path: &'static str) -> HostRegistry {
+        registry(vec![op(
+            "db",
+            op_name,
+            HostResource::Any,
+            Linearity::AtMostOnce,
+            true,
+            path,
+        )])
+    }
+
+    fn configured(schema: Option<&str>) -> DbConfig {
+        crate::db::DbOptions {
+            url: Some("postgres://ply:hunter2@127.0.0.1:5433/desk".to_string()),
+            schema: schema.map(str::to_string),
+            ..crate::db::DbOptions::default()
+        }
+        .resolve_with(true, &|_| None)
+        .expect("the fixture URL parses")
+        .expect("--host and a URL yield a configuration")
+    }
+
+    /// The check `--db` exists for: a program that reaches postgres and a run
+    /// that named no database is a service that would discover it had nowhere to
+    /// connect after accepting a request.
+    #[test]
+    fn reaching_postgres_with_no_database_configured_is_refused_before_anything_runs() {
+        let program = check(DB);
+        let Err(diagnostics) =
+            Hosts::bind_with(postgres("get", "ply_host::db::query"), &program, true, None)
+        else {
+            panic!("a bound driver with no database must be E0431");
+        };
+        assert_eq!(diagnostics[0].code, ply_span::codes::DB_NOT_CONFIGURED);
+        assert!(
+            diagnostics[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("db.get[orders]")),
+            "the reader is not told which operations bound: {:?}",
+            diagnostics[0].notes
+        );
+    }
+
+    /// The complement, and the reason the check keys on the *binding*: an
+    /// HTTP-only program under `--host` binds no postgres handler and must not
+    /// be made to name a database it will never open.
+    #[test]
+    fn a_program_that_reaches_no_database_needs_none_and_discloses_none() {
+        let program = check(DB);
+        let hosts = Hosts::bind(full(), &program, true).expect("net and clock bind without a URL");
+        assert!(hosts.database().is_none());
+        assert!(!hosts.is_live_database());
+        assert!(hosts.disclosures().is_empty());
+        assert_eq!(
+            digest_short(hosts.listing(), &hosts.disclosures()),
+            hosts.listing().digest_short(),
+            "a program with no database in reach must hash what it hashed before W4"
+        );
+    }
+
+    #[test]
+    fn a_configured_run_says_it_reached_a_real_database_and_never_says_the_password() {
+        let program = check(DB);
+        let hosts = Hosts::bind_with(
+            postgres("get", "ply_host::db::query"),
+            &program,
+            true,
+            Some(configured(None)),
+        )
+        .expect("a bound driver with a database binds");
+        assert!(hosts.is_live_database());
+
+        let line = database_line(&hosts).expect("a live database is reported");
+        assert!(
+            line.contains("postgres://ply:****@127.0.0.1:5433/desk"),
+            "{line}"
+        );
+        assert!(line.contains("configured by --db"), "{line}");
+        assert!(!line.contains("hunter2"), "{line}");
+
+        let text = listing_lines(hosts.listing(), &hosts.disclosures()).join("\n");
+        assert!(
+            text.contains("ply_host::db::scan · select insert"),
+            "{text}"
+        );
+        assert!(text.contains("8 connections · acquire 5000ms"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(
+            !serde_json::to_string(&hosts.summary_json())
+                .unwrap()
+                .contains("hunter2"),
+            "the `--json` object carried the password"
+        );
+    }
+
+    /// ADR 0014 §1.1 handles `db.rollback` in Ply, inside `transaction`, so a
+    /// bound one would abort nothing and commit what the program meant to
+    /// discard. The failure is silent, so it is checked rather than trusted.
+    #[test]
+    fn a_bound_rollback_is_refused_as_a_defect_rather_than_listed() {
+        let program = check(
+            "nondet effect db {\n  write rollback[r](reason: Int) -> Int\n}\n\
+             fn f() -> Int / {db.write[orders]} = db.rollback[orders](1)\n",
+        );
+        let Err(diagnostics) = Hosts::bind_with(
+            postgres("rollback", "ply_host::db::abort"),
+            &program,
+            true,
+            Some(configured(None)),
+        ) else {
+            panic!("a bound rollback must be refused as a defect");
+        };
+        assert_eq!(diagnostics[0].code, ply_span::codes::INTERNAL_ERROR);
+        assert!(diagnostics[0].message.contains("db.rollback"));
+    }
+
+    #[test]
+    fn a_db_schema_naming_nothing_is_refused_with_what_the_program_does_have() {
+        let program = check(DB);
+        let Err(diagnostics) = Hosts::bind_with(
+            postgres("get", "ply_host::db::query"),
+            &program,
+            true,
+            Some(configured(Some("desk.schema"))),
+        ) else {
+            panic!("a schema function that does not exist must be refused");
+        };
+        assert_eq!(diagnostics[0].code, ply_span::codes::DB_NOT_CONFIGURED);
+        assert!(
+            diagnostics[0].notes.iter().any(|n| n.contains("E0433")),
+            "the reader is not told what dropping the flag costs: {:?}",
+            diagnostics[0].notes
+        );
+    }
+
     // --- transport ----------------------------------------------------------
 
     /// A registry whose `net.listen_tls` resolves to the real TLS handler, so
     /// the listing carries the row `Transport::of` keys on.
+    /// A W3-shaped disclosure: a transport and no database, which is what every
+    /// program in an existing corpus has and what the digest must not move for.
+    fn transport_only(transport: Transport) -> Disclosures {
+        Disclosures {
+            transport: Some(transport),
+            database: None,
+        }
+    }
+
     fn tls_registry() -> HostRegistry {
         registry(vec![op(
             "net",
@@ -986,9 +1424,12 @@ fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
     fn a_plaintext_program_reports_no_transport_and_keeps_its_digest() {
         let listing = listing();
         assert!(Transport::of(&listing, None).is_none());
-        assert_eq!(digest_short(&listing, None), listing.digest_short());
+        assert_eq!(
+            digest_short(&listing, &Disclosures::default()),
+            listing.digest_short()
+        );
         assert!(
-            !listing_lines(&listing, None)
+            !listing_lines(&listing, &Disclosures::default())
                 .join("\n")
                 .contains("transport")
         );
@@ -1013,7 +1454,7 @@ fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
                 "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one",
             ]
         );
-        let text = listing_lines(&listing, Some(&transport)).join("\n");
+        let text = listing_lines(&listing, &transport_only(transport)).join("\n");
         assert!(text.contains(tls::HANDLER), "{text}");
         assert!(text.contains("alpn http/1.1"), "{text}");
     }
@@ -1054,7 +1495,7 @@ fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
         let with = |credentials: Vec<CredentialView>| {
             digest_short(
                 &listing,
-                Some(&Transport {
+                &transport_only(Transport {
                     library: tls::LIBRARY,
                     version: tls::VERSION,
                     provider: tls::PROVIDER,

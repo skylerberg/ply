@@ -379,7 +379,7 @@ mod tests {
     /// schema changed: paste the digest the failure prints, and bump
     /// `FRONTEND_VERSION` — a build that reads an entry written under the old
     /// shape has no other way to know.
-    const PINNED: &str = "9d630e2a4c478b671b83b4eeb8aae91c0447591806d86f9915699173eb5cea12";
+    const PINNED: &str = "7091c9ad2872af85b47eef81d2cf6060b78401f57550cd008a52bd139223c40d";
 
     #[test]
     fn the_stored_schema_is_pinned() {

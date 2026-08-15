@@ -395,7 +395,11 @@ pub fn select(
         warnings: Vec::new(),
     };
     for (index, obligation) in obligations.iter().enumerate() {
-        let answer = if use_cache {
+        // A `law/host` is never read from the cache, in either direction and
+        // for the same reason a host-backed test is not: a green verdict that
+        // reached a real database is a claim about that database at that moment,
+        // and replaying it as a hit would report a discharge nothing performed.
+        let answer = if use_cache && !obligation.host {
             lookup(store, obligation.key, plan)
         } else {
             Answer::miss(Reason::Uncached)
@@ -466,7 +470,7 @@ pub fn prove(
         .map(|evidence| evidence.map(Discharge::Held))
         .collect();
     for (index, discharge) in fresh {
-        if use_cache {
+        if use_cache && !obligations[index].host {
             record(store, obligations[index].key, &discharge, &plan);
         }
         discharges[index] = Some(discharge);

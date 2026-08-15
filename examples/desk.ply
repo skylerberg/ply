@@ -1,48 +1,60 @@
-// The parts desk: a multi-route HTTP service whose types are its documentation.
+// The parts desk: a multi-route HTTP service, over postgres, whose types are its
+// documentation.
 //
 //     $ ply check --types examples/desk.ply     # the map below
-//     $ ply test examples/desk.ply              # 48 hermetic tests, no socket
-//     $ ply prove examples/desk.ply             # four laws about the table
+//     $ ply test examples/desk.ply              # 55 hermetic tests, no database
+//     $ ply prove examples/desk.ply             # seven laws, two of them proved
+//     $ examples/serve.sh --memory              # the service, with no database
+//     $ examples/same-tests.sh                  # W4's exit criterion, checked
 //
 // W3's exit criterion is that an endpoint's declared signature says which
-// resources it touches. That is what this file is for. Here is `ply check
-// --types`, with the rows exactly as it prints them and two record types
-// abbreviated: Ply's records are structural, so the real output writes
-// `{body: Bytes, headers: Map<String, List<String>>, status: Int}` wherever this
-// says `Response` and `{endpoint: Endpoint, method: Method, path: List<Segment>}`
-// wherever it says `Route<Endpoint>`. Nothing else is elided:
+// resources it touches; W4's is that the same endpoints run unchanged against a
+// real database and against an in-memory twin. That is what this file is for.
+// Here is `ply check --types`, with the rows exactly as it prints them and two
+// record types abbreviated: Ply's records are structural, so the real output
+// writes `{body: Bytes, headers: Map<String, List<String>>, status: Int}`
+// wherever this says `Response` and `{endpoint: Endpoint, method: Method, path:
+// List<Segment>}` wherever it says `Route<Endpoint>`. Nothing else is elided:
 //
 //   table         : () -> List<Route<Endpoint>>
 //   route_of      : (Method, String) -> Matched<Endpoint>
 //   health        : () -> Response
 //   docs          : (Map<String, String>) -> Response
-//   list_items    : () -> Response / {desk.store.read[items]}
-//   featured      : () -> Response / {desk.store.read[items]}
-//   get_item      : (Map<String, String>) -> Response / {desk.store.read[items]}
-//   list_orders   : () -> Response / {desk.store.read[orders]}
-//   get_order     : (Map<String, String>) -> Response / {desk.store.read[orders]}
-//   receipt       : (Map<String, String>) -> Reply / {desk.store.read[items],
-//                                                     desk.store.read[orders]}
+//   list_items    : () -> Response / {std.db.db.read[items]}
+//   featured      : () -> Response / {std.db.db.read[items]}
+//   get_item      : (Map<String, String>) -> Response / {std.db.db.read[items]}
+//   list_orders   : () -> Response / {std.db.db.read[orders]}
+//   get_order     : (Map<String, String>) -> Response / {std.db.db.read[orders]}
+//   receipt       : (Map<String, String>) -> Reply / {std.db.db.read[items],
+//                                                     std.db.db.read[orders]}
 //   place_order   : (Bytes) -> Response / {desk.log.write,
-//                                          desk.store.read[items],
-//                                          desk.store.write[items],
-//                                          desk.store.read[orders],
-//                                          desk.store.write[orders]}
+//                                          std.db.db.read[items],
+//                                          std.db.db.write[items],
+//                                          std.db.db.read[orders],
+//                                          std.db.db.write[orders],
+//                                          std.db.db.write}
 //   cancel_order  : (Map<String, String>) -> Response / {desk.log.write,
-//                                          desk.store.read[items],
-//                                          desk.store.write[items],
-//                                          desk.store.read[orders],
-//                                          desk.store.write[orders]}
+//                                          std.db.db.read[items],
+//                                          std.db.db.write[items],
+//                                          std.db.db.read[orders],
+//                                          std.db.db.write[orders],
+//                                          std.db.db.write}
 //
-// Read it as a map of the API to what the API does to what. `GET /items` cannot
-// write anything and cannot see the order book; `GET /orders/{id}` cannot see
-// the shelf; `health` and `docs` reach nothing at all; and `table` and
+// Read it as a map of the API to what the API does to which table. `GET /items`
+// cannot write anything and cannot see the order book; `GET /orders/{id}` cannot
+// see the shelf; `health` and `docs` reach no database at all; and `table` and
 // `route_of` are pure, so the part of a web framework that is hardest to test is
 // here a function over a value. None of those sentences is a comment that can go
 // stale — each is inferred from the body and checked against the annotation, and
 // deleting an annotation changes nothing but who is checked against whom.
 //
-// Two endpoints need the same five atoms, so those two are written `/ {Desk}` —
+// The bare `std.db.db.write` on the two writers is the transaction: `begin`,
+// `commit`, `abort` and `rollback` name no table, so their atom is the singleton
+// named for the effect, and carrying it is what says "this endpoint opens a
+// transaction" in the type. The five read-only rows do not carry it, which is
+// what says the reads never do.
+//
+// Two endpoints need the same six atoms, so those two are written `/ {Desk}` —
 // an `effect set`, which is an abbreviation for a row and never a widening of
 // one. Every other endpoint writes its atoms out, because at an endpoint the
 // difference between `read[items]` and `write[orders]` is the documentation and
@@ -51,21 +63,41 @@
 // `--explain` is what adds it back as provenance.
 
 import std.net (net, send_all)
+// Twice, and both are needed: the selective import binds the effect name, so
+// that a row can say `db.read[items]` and a perform can say `db.query[items]`,
+// and the plain import binds the module, so that a type can say `db::Answer`
+// and a call can say `db::transaction`. A selective import binds no module name
+// and a module import brings no effect into scope.
+import std.db
+import std.db (db)
 import std.json
 import std.http
 import std.router
 
 // --- The store ----------------------------------------------------------------
 //
-// W4 has the database. Until then the store is an effect with two resources —
-// `items` and `orders` — and the whole point of it being an effect is visible
-// in the rows above: an endpoint that reads the shelf cannot reach the order
-// book, and a test grants exactly the operations it expects to be used.
-
-effect store {
-  read  all[r]() -> List<a>
-  write save[r](rows: List<a>) -> Unit
-}
+// It is postgres. `std.db`'s resource label is a table name, so `items` and
+// `orders` are the same two resources W3's `effect store` had and the rows above
+// still say which tables an endpoint touches — which is the one property this
+// whole file exists to show, and the one that had to survive the swap.
+//
+// What did **not** survive, said plainly because a milestone that smoothed it
+// over would be lying about its own exit criterion: W3's comment on `run`
+// claimed that swapping its clauses for a Postgres handler would change that one
+// function and no other. That was false, and it was false for a reason worth
+// knowing. `store.all[items]()` handed back the whole table and `store.save`
+// took the whole table back; a database is not a variable, and an interface that
+// pretends it is has already thrown away the only things a database is for — a
+// statement, a transaction, a constraint. So every endpoint's *body* moved from
+// `store.all[items]()` to a statement, and every endpoint's *row* moved from
+// `desk.store.read[items]` to `std.db.db.read[items]`.
+//
+// What is true, and is the claim worth making, is one step weaker and one step
+// more useful: the **resources did not move**, so every row still names the same
+// tables, `ply check --types` still reads as a map of the API to what it touches,
+// and swapping the *twin* for postgres — `run_memory` for `run` — changes
+// nothing but which handler is installed. That last swap is W4's exit criterion,
+// and it is one function.
 
 // The desk's own audit trail. It takes no resource parameter, so its atom is
 // `log.write` — a singleton named for the effect — which is what a row wants for
@@ -74,22 +106,33 @@ effect log {
   write note(line: String) -> Unit
 }
 
-// Placing an order and cancelling one both read the shelf, write the shelf,
-// read the order book, write the order book and record a line. They perform
-// this set exactly — not a subset — which is what earns the abbreviation. An
-// alias wider than the body that carries it is legal and costs two things
-// (ADR 0013 §1.6): it widens the conflict graph, so tests that could have run
-// side by side are serialised, and it weakens every frame condition, since the
-// footprint is what an `ensures` promises nothing outside of. Neither cost is
-// paid here, and `ply check --types --explain` is where that claim is checked
-// rather than asserted: it prints a `declared, not performed` line for any
-// definition whose annotation is wider than its body, and prints none for this
-// file.
-effect set Desk = {
-  store.read[items], store.write[items],
-  store.read[orders], store.write[orders],
-  log.write,
+// Every atom a request can reach in the database and nothing else, so `run` can
+// say what it hands to the host and `run_memory` can say what its twin
+// discharges. `db.write` with no resource is the transaction control —
+// `begin`, `commit`, `abort` and `rollback` take no table, so their atom is the
+// singleton named for the effect. That is a real scheduling cost stated rather
+// than discovered: every definition that opens a transaction carries it, so any
+// two that do conflict even when their tables are disjoint. The read-only
+// endpoints open none and keep their concurrency, which is where most of a
+// service's parallelism is.
+effect set Store = {
+  db.read[items], db.write[items],
+  db.read[orders], db.write[orders],
+  db.write,
 }
+
+// Placing an order and cancelling one both read the shelf, write the shelf,
+// read the order book, write the order book, open a transaction and record a
+// line. They perform this set exactly — not a subset — which is what earns the
+// abbreviation. An alias wider than the body that carries it is legal and costs
+// two things (ADR 0013 §1.6): it widens the conflict graph, so tests that could
+// have run side by side are serialised, and it weakens every frame condition,
+// since the footprint is what an `ensures` promises nothing outside of. Neither
+// cost is paid here, and `ply check --types --explain` is where that claim is
+// checked rather than asserted: it prints a `declared, not performed` line for
+// any definition whose annotation is wider than its body, and prints none for
+// this file.
+effect set Desk = { Store, log.write }
 
 // --- What the desk sells --------------------------------------------------------
 
@@ -128,6 +171,288 @@ derive json for Order
 derive json for Placement
 derive json for Problem
 derive json for Health
+
+// The storage format. `Item` is four scalar columns; `Order` is three scalars
+// plus two a flat row cannot hold — `lines` is a `List<Line>` and `state` is a
+// sum — so both become `jsonb` columns encoded through the json codec above.
+//
+// That is W4 having no opinion about normalization, and it is worth noticing
+// rather than glossing: a desk that wanted `order_lines` as its own table writes
+// two codecs and two statements, and nothing here will write a join for it.
+//
+// **These two functions are written out because `derive row` does not exist
+// yet.** ADR 0014 §4.4 specifies it — `derive row for Item` generates exactly
+// `fn item_row() -> RowCodec<Item>`, by the field names, in field order, with
+// `Option<leaf>` nullable, `List<leaf>` an array and anything else that is
+// `derivable(json, ·)` a `jsonb` column — and when it lands the swap is: delete
+// `RowError`, `RowCodec`, the four cell readers and the two codecs below, put
+// `derive row for Item` and `derive row for Order` here, and change
+// `RowCodec<a>` to `RowCodec<a>` in the four signatures that name it.
+// Nothing else in this file refers to how a codec was made.
+//
+// `columns` is in the record because the driver checks a statement's result
+// description against it at prepare time: a column this file stopped selecting
+// is `E0433` before the first row arrives rather than a decode failure per row
+// afterwards. `params` writes them in the same order, which is what makes
+// `item_insert` below a four-parameter statement nobody has to keep in step.
+pub type RowError = { column: String, expected: String, found: String }
+
+pub type RowCodec<a> = {
+  columns: List<String>,
+  decode: (db::Row) -> Result<a, RowError>,
+  params: (a) -> List<db::Param>,
+}
+
+fn row_and_then<a, b>(r: Result<a, RowError>, f: (a) -> Result<b, RowError>)
+  -> Result<b, RowError> =
+  match r {
+    Ok(x) -> f(x),
+    Err(e) -> Err(e),
+  }
+
+fn wrong(k: String, want: String) -> RowError =
+  {column: k, expected: want, found: "another type"}
+
+fn text_at(r: db::Row, k: String) -> Result<String, RowError> =
+  match map_get(r, k) {
+    Some(db::CText(s)) -> Ok(s),
+    _ -> Err(wrong(k, "text")),
+  }
+
+fn int_at(r: db::Row, k: String) -> Result<Int, RowError> =
+  match map_get(r, k) {
+    Some(db::CInt(n)) -> Ok(n),
+    _ -> Err(wrong(k, "bigint")),
+  }
+
+fn numeric_at(r: db::Row, k: String) -> Result<Decimal, RowError> =
+  match map_get(r, k) {
+    Some(db::CNumeric(d)) -> Ok(d),
+    _ -> Err(wrong(k, "numeric")),
+  }
+
+// A `jsonb` column read back through the type's own json codec, which is what
+// makes the wire format and the storage format one text rather than two.
+fn json_at<a>(r: db::Row, k: String, c: json::JsonCodec<a>) -> Result<a, RowError> =
+  match map_get(r, k) {
+    Some(db::CJson(j)) ->
+      match (c.decode)(j) {
+        Ok(x) -> Ok(x),
+        Err(_) -> Err(wrong(k, "a well-formed " ++ k ++ " document")),
+      },
+    _ -> Err(wrong(k, "jsonb")),
+  }
+
+fn item_row() -> RowCodec<Item> = {
+  columns: ["sku", "name", "price", "on_hand"],
+  decode: |r: db::Row|
+    row_and_then(text_at(r, "sku"), |sku: String|
+    row_and_then(text_at(r, "name"), |name: String|
+    row_and_then(numeric_at(r, "price"), |price: Decimal|
+    row_and_then(int_at(r, "on_hand"), |on_hand: Int|
+      Ok({sku: sku, name: name, price: price, on_hand: on_hand}))))),
+  params: |i: Item|
+    [db::PText(i.sku), db::PText(i.name), db::PNumeric(i.price), db::PInt(i.on_hand)],
+}
+
+fn order_row() -> RowCodec<Order> = {
+  columns: ["id", "customer", "lines", "total", "state"],
+  decode: |r: db::Row|
+    row_and_then(int_at(r, "id"), |id: Int|
+    row_and_then(text_at(r, "customer"), |customer: String|
+    row_and_then(json_at(r, "lines", json::list_json(line_json())), |lines: List<Line>|
+    row_and_then(numeric_at(r, "total"), |total: Decimal|
+    row_and_then(json_at(r, "state", state_json()), |state: State|
+      Ok({id: id, customer: customer, lines: lines, total: total, state: state})))))),
+  params: |o: Order|
+    [db::PInt(o.id), db::PText(o.customer), lines_param(o.lines), db::PNumeric(o.total),
+     state_param(o.state)],
+}
+
+// --- The schema, which is a value ------------------------------------------------
+//
+// W4 ships no migration tool — no versions, no up and down, no diffing a live
+// database into a change script. What it ships is this: the schema is an
+// ordinary value, so the three places it has to exist cannot disagree.
+//
+//   1. the twin      `db::open(schema())`, and nothing touches a disk
+//   2. a fixture     `db::create_schema(schema())` is the `CREATE TABLE` text
+//   3. production    it is already there, and `--db-schema desk.schema` reads
+//                    `information_schema` at bind time and reports `E0435` for
+//                    every difference before a request is served
+//
+// The third is most of what a migration tool is actually bought for. A column
+// this file renamed and `examples/desk.sql` did not is a start-up refusal naming
+// the column, rather than a 500 on whichever route touched it first.
+//
+// `on_hand >= 0` is the desk's most important line. It is the mechanical
+// backstop under the drawdown below: even if the reservation were wrong, the one
+// component in the stack that cannot be fooled by an annotation refuses to let
+// the shelf go negative, and refuses it as a value the program reads (`23514`)
+// rather than as a crash.
+pub fn schema() -> db::Schema = {
+  tables: [
+    {
+      name: "items",
+      columns: [
+        {name: "sku", ty: db::TText, nullable: false, default: db::DNone},
+        {name: "name", ty: db::TText, nullable: false, default: db::DNone},
+        {name: "price", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone},
+        {name: "on_hand", ty: db::TInt, nullable: false, default: db::DNone},
+      ],
+      primary_key: ["sku"],
+      unique: [],
+      foreign_keys: [],
+      checks: [{name: "items_on_hand_is_not_negative", expr: "on_hand >= 0"}],
+    },
+    {
+      name: "orders",
+      columns: [
+        {name: "id", ty: db::TInt, nullable: false, default: db::DSequence("orders_id_seq")},
+        {name: "customer", ty: db::TText, nullable: false, default: db::DNone},
+        {name: "lines", ty: db::TJson, nullable: false, default: db::DNone},
+        {name: "total", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone},
+        {name: "state", ty: db::TJson, nullable: false, default: db::DNone},
+      ],
+      primary_key: ["id"],
+      unique: [],
+      foreign_keys: [],
+      checks: [],
+    },
+  ],
+}
+
+// --- The statements ---------------------------------------------------------------
+//
+// One `Stmt` per shape, named, so that the prepared-statement cache has a fixed
+// set of texts to key on and a reader can see the whole of what this service
+// asks a database for in one screen.
+//
+// **A value never becomes syntax.** Every parameter below crosses the wire in a
+// `Bind` message, typed; nothing here interpolates, formats, escapes or quotes a
+// value into SQL, and a program could not: no such function exists to call. A
+// `sku` of `'; drop table items; --` is stored as that string, and the same
+// bytes written into `Stmt::sql` would be `E0432` — one statement per `Stmt` is
+// checked, so the payload class that turns an injected fragment into a `DROP`
+// has nowhere to land.
+//
+// The column lists are written out rather than `select *`, because `derive row`
+// hands the driver a codec with a column list and the two are checked against
+// each other at prepare time: a column this file stopped selecting is `E0433`
+// before the first row arrives rather than a decode failure per row after it.
+
+fn items_all() -> db::Stmt =
+  db::stmt("select sku, name, price, on_hand from items order by sku")
+
+fn items_in_stock() -> db::Stmt =
+  db::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
+
+fn item_by_sku() -> db::Stmt =
+  db::stmt("select sku, name, price, on_hand from items where sku = $1")
+
+fn item_insert() -> db::Stmt =
+  db::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
+
+// The reservation, and the only interesting statement in the file. `on_hand =
+// $3` is the value this transaction read; the update takes effect only if the
+// row still holds it. A concurrent order that moved the shelf makes this affect
+// zero rows, and zero rows is what the caller turns into a rollback — which is
+// the difference between a desk that oversells under load and one that refuses
+// and says so.
+fn item_reserve() -> db::Stmt =
+  db::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
+
+fn orders_all() -> db::Stmt =
+  db::stmt("select id, customer, lines, total, state from orders order by id")
+
+fn order_by_id() -> db::Stmt =
+  db::stmt("select id, customer, lines, total, state from orders where id = $1")
+
+// The id is the database's. `derive row`'s `params` writes every column
+// including that one, so this insert writes its four by hand and reads the whole
+// row back through the derived codec — which is where `id` comes from and the
+// only place it could honestly come from.
+fn order_insert() -> db::Stmt =
+  db::stmt("insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
+    ++ " returning id, customer, lines, total, state")
+
+// No compare-and-set on `state`, and the reason is worth writing down because it
+// is a design decision the twin forced rather than a shortcut.
+//
+// `state` is a `jsonb` column — `derive row` cannot flatten a sum, so that is
+// what it becomes — and the twin **refuses to compare `jsonb`**: `0A000`, named,
+// rather than a guess. Postgres would have compared it happily, so a
+// `where .. and state = $3` here would be a statement the tests could not
+// execute, and a write path that only runs in production is the drift this whole
+// milestone is about measuring.
+//
+// So the guarantee is asked of the database instead, at `Serializable` (see
+// `cancel_order`): two cancels of one order cannot both see it open, and the
+// loser is `40001`, which `db::is_retryable` names as the server telling the
+// program to try again.
+fn order_cancel() -> db::Stmt =
+  db::stmt("update orders set state = $1 where id = $2")
+
+// --- Reading a result set ----------------------------------------------------------
+//
+// Three answers and three of them are handled, every time. `Failed` carries a
+// SQLSTATE, which is a value: a unique violation, a check violation and a
+// database that went away are all things this service answers a client about,
+// and a language that turned a constraint into a compiler-shaped failure would
+// have made the constraint unusable as a concurrency control.
+
+fn rows_of<a>(ans: db::Answer, c: RowCodec<a>) -> Result<List<a>, http::Response> =
+  match ans {
+    db::Rows(rows) -> decoded(rows, c),
+    db::Count(_) -> Err(problem(500, "unreadable answer", "a query answered a count")),
+    db::Failed(e) -> Err(unavailable(e)),
+  }
+
+fn decoded<a>(rows: List<db::Row>, c: RowCodec<a>) -> Result<List<a>, http::Response> =
+  fold(rows, Ok([]), |acc: Result<List<a>, http::Response>, r: db::Row|
+    match acc {
+      Err(p) -> Err(p),
+      Ok(xs) ->
+        match (c.decode)(r) {
+          Ok(x) -> Ok(push(xs, x)),
+          Err(e) -> Err(problem(500, "unreadable row",
+            e.column ++ ": expected " ++ e.expected ++ ", found " ++ e.found)),
+        },
+    })
+
+fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
+
+// A SQLSTATE the desk has no answer for. `23505` and `23514` are answered by the
+// endpoints that can provoke them; anything else is the database saying it could
+// not do the work, which is a 503 and not a 500 — the request was well formed
+// and asking again may work.
+fn unavailable(e: db::DbError) -> http::Response =
+  problem(503, "the store is unavailable", e.code)
+
+fn shelf() -> Result<List<Item>, http::Response> / {db.read[items]} =
+  rows_of(db.query[items](items_all(), []), item_row())
+
+fn book() -> Result<List<Order>, http::Response> / {db.read[orders]} =
+  rows_of(db.query[orders](orders_all(), []), order_row())
+
+fn order_row_of(id: Int) -> Result<Option<Order>, http::Response> / {db.read[orders]} =
+  match rows_of(db.query[orders](order_by_id(), [db::PInt(id)]), order_row()) {
+    Err(p) -> Err(p),
+    Ok(os) -> Ok(head_of(os)),
+  }
+
+// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value
+// built by the codec this file already derived. There is one encoding of a
+// `Line` in this program and it is the one on the wire.
+fn lines_param(lines: List<Line>) -> db::Param = {
+  let c = json::list_json(line_json());
+  db::PJson((c.encode)(lines))
+}
+
+fn state_param(s: State) -> db::Param = {
+  let c = state_json();
+  db::PJson((c.encode)(s))
+}
 
 // --- The business, which touches nothing ----------------------------------------
 
@@ -179,9 +504,11 @@ pub fn draw_down(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(she
 
 pub fn put_back(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, -1)
 
-pub fn next_id(orders: List<Order>) -> Int =
-  fold(orders, 1, |acc: Int, o: Order| if o.id < acc { acc } else { o.id + 1 })
-
+// There is no `next_id` here any more, and its absence is the point. W3 computed
+// the next order number by folding over the book, which is a check-then-act
+// between two requests and would have handed two customers one id. A sequence is
+// the database's answer to that and it is not a thing a program can get wrong,
+// so the id comes back out of the `INSERT` rather than going into it.
 pub fn order_by(orders: List<Order>, id: Int) -> Option<Order> =
   fold(orders, None, |found: Option<Order>, o: Order|
     if o.id == id { Some(o) } else { found })
@@ -301,36 +628,56 @@ pub fn docs(params: Map<String, String>) -> http::Response =
       },
   }
 
-pub fn list_items() -> http::Response / {store.read[items]} =
-  json_body(200, store.all[items](), json::list_json(item_json()))
+pub fn list_items() -> http::Response / {db.read[items]} =
+  match shelf() {
+    Err(r) -> r,
+    Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
+  }
 
 // Everything the shelf is short of. A second read-only endpoint over the same
 // resource, which is what makes it and `list_items` runnable side by side: two
 // reads of one resource do not conflict.
-pub fn featured() -> http::Response / {store.read[items]} =
-  json_body(200, filter(store.all[items](), |i: Item| i.on_hand > 0),
-    json::list_json(item_json()))
+//
+// The filter is the database's rather than this function's, which is the one
+// place a `WHERE` earns its keep here: a shelf of ten thousand parts sends the
+// rows that matched rather than the rows that exist.
+pub fn featured() -> http::Response / {db.read[items]} =
+  match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
+    Err(r) -> r,
+    Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
+  }
 
-pub fn get_item(params: Map<String, String>) -> http::Response / {store.read[items]} =
+pub fn get_item(params: Map<String, String>) -> http::Response / {db.read[items]} =
   match map_get(params, "sku") {
     None -> problem(400, "bad request", "no sku was captured"),
     Some(sku) ->
-      match item_named(store.all[items](), sku) {
-        Some(i) -> json_body(200, i, item_json()),
-        None -> problem(404, "no such item", sku),
+      match rows_of(db.query[items](item_by_sku(), [db::PText(sku)]), item_row()) {
+        Err(r) -> r,
+        Ok(rows) ->
+          match head_of(rows) {
+            Some(i) -> json_body(200, i, item_json()),
+            None -> problem(404, "no such item", sku),
+          },
       },
   }
 
-pub fn list_orders() -> http::Response / {store.read[orders]} =
-  json_body(200, store.all[orders](), json::list_json(order_json()))
+pub fn list_orders() -> http::Response / {db.read[orders]} =
+  match book() {
+    Err(r) -> r,
+    Ok(rows) -> json_body(200, rows, json::list_json(order_json())),
+  }
 
-pub fn get_order(params: Map<String, String>) -> http::Response / {store.read[orders]} =
+pub fn get_order(params: Map<String, String>) -> http::Response / {db.read[orders]} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
-      match order_by(store.all[orders](), id) {
-        Some(o) -> json_body(200, o, order_json()),
-        None -> problem(404, "no such order", int_to_string(id)),
+      match order_row_of(id) {
+        Err(r) -> r,
+        Ok(found) ->
+          match found {
+            Some(o) -> json_body(200, o, order_json()),
+            None -> problem(404, "no such order", int_to_string(id)),
+          },
       },
   }
 
@@ -343,62 +690,185 @@ fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> =
     None -> Err(problem(400, "bad order id", "an order id is one or more digits")),
   }
 
-// The two that need the whole desk. Written `/ {Desk}`, which expands to exactly
-// the five atoms each performs.
+// --- The two that are transactions --------------------------------------------------
+//
+// Placing an order writes two tables and must write both or neither: an order
+// row whose stock was never drawn is a promise the shelf cannot keep, and a
+// drawdown with no order is stock nobody can collect. So the body runs inside
+// `db::transaction`, and the interesting half is what happens when it must not
+// finish.
+//
+// **A rollback is the absence of a resumption.** `db.rollback` is performed
+// three calls deep, inside the walk over the skus the order draws on; its clause in
+// `db::transaction` does not resume, so the value of that clause is the value of
+// the whole `handle` and everything the body had left to do — the rest of the
+// reservation, the log line, the 201 it was about to build — is the continuation
+// and the continuation is dropped. Nothing unwinds. No frame runs an epilogue.
+// The order row that was already inserted goes away because `ROLLBACK` is what
+// the clause does before it answers, not because anything undid it in Ply.
+//
+// One thing does survive, and it is postgres's behaviour rather than a leak:
+// the id the discarded insert consumed is gone. A sequence does not roll back,
+// in postgres or in the twin, and a desk whose order numbers skip after a
+// refusal is telling the truth about that.
+
 pub fn place_order(body: Bytes) -> http::Response / {Desk} =
   match json::decode_bytes(body, placement_json()) {
     Err(e) -> problem(400, "malformed body", json::error_to_string(e)),
     Ok(p) -> placed(p),
   }
 
-fn placed(p: Placement) -> http::Response / {Desk} = {
-  let shelf = store.all[items]();
+// The two refusals that need no database are answered before one is opened, so
+// a malformed order costs no connection and no `BEGIN`.
+fn placed(p: Placement) -> http::Response / {Desk} =
   if len(p.lines) == 0 {
     problem(422, "empty order", "an order needs at least one line")
   } else if bad_qty(p.lines) {
     problem(422, "bad quantity", "every line needs a quantity above zero")
-  } else if len(unknown_skus(shelf, p.lines)) > 0 {
-    problem(404, "no such item", join(unknown_skus(shelf, p.lines)))
-  } else if len(short_skus(shelf, p.lines)) > 0 {
-    problem(409, "out of stock", join(short_skus(shelf, p.lines)))
   } else {
-    let orders = store.all[orders]();
-    let placement = {
-      id: next_id(orders),
-      customer: p.customer,
-      lines: p.lines,
-      total: total_of(shelf, p.lines),
-      state: Open,
-    };
-    store.save[items](draw_down(shelf, p.lines));
-    store.save[orders](push(orders, placement));
-    log.note("placed " ++ int_to_string(placement.id) ++ " for " ++ p.customer);
-    json_body(201, placement, order_json())
+    settled(db::transaction(db::ReadCommitted, db::ReadWrite, || placing(p)),
+            "out of stock")
   }
-}
 
-pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
-  match order_wanted(params) {
+fn placing(p: Placement) -> http::Response / {Desk} =
+  match shelf() {
     Err(r) -> r,
-    Ok(id) -> cancelling(id),
+    Ok(stock) ->
+      if len(unknown_skus(stock, p.lines)) > 0 {
+        problem(404, "no such item", join(unknown_skus(stock, p.lines)))
+      } else {
+        recorded(p, stock, total_of(stock, p.lines))
+      },
   }
 
-fn cancelling(id: Int) -> http::Response / {Desk} = {
-  let orders = store.all[orders]();
-  match order_by(orders, id) {
-    None -> problem(404, "no such order", int_to_string(id)),
-    Some(o) ->
-      match o.state {
-        Cancelled -> problem(409, "already cancelled", int_to_string(id)),
-        Open -> {
-          store.save[items](put_back(store.all[items](), o.lines));
-          store.save[orders](map(orders, |x: Order| if x.id == id { cancelled(x) } else { x }));
-          log.note("cancelled " ++ int_to_string(id));
-          json_body(200, cancelled(o), order_json())
+fn recorded(p: Placement, stock: List<Item>, total: Decimal) -> http::Response / {Desk} =
+  match rows_of(db.returning[orders](order_insert(),
+                  [db::PText(p.customer), lines_param(p.lines), db::PNumeric(total),
+                   state_param(Open)]),
+                order_row()) {
+    Err(r) -> r,
+    Ok(rows) ->
+      match head_of(rows) {
+        None -> problem(500, "unreadable answer", "an insert returned no row"),
+        Some(o) -> {
+          // The order exists in the transaction's view from here on. Every
+          // statement below can still discard it.
+          move_stock(stock, p.lines, 1);
+          log.note("placed " ++ int_to_string(o.id) ++ " for " ++ p.customer);
+          json_body(201, o, order_json())
         },
       },
   }
-}
+
+// One `UPDATE` per sku the order draws on, walked over the shelf rather than
+// over the order, so a sku named on two lines is one reservation of their sum —
+// which is how a desk avoids selling the same three widgets twice inside one
+// order. `sign` is `1` to draw the shelf down and `-1` to put it back, which is
+// exactly `moved`'s parameter: the statement and the pure function this file
+// tests move the shelf by one arithmetic, written once.
+fn move_stock(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
+  / {db.write[items], db.write} =
+  moving(filter(stock, |i: Item| taken(lines, i.sku) > 0), lines, sign)
+
+fn moving(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
+  / {db.write[items], db.write} =
+  match stock {
+    [i, ..rest] -> {
+      reserved(i, i.on_hand - sign * taken(lines, i.sku));
+      moving(rest, lines, sign)
+    },
+    _ -> (),
+  }
+
+// Three answers, and each one is a different thing to have happened.
+//
+//   `Count(1)`   the row still held what this transaction read; it is reserved
+//   `Count(0)`   somebody else moved it between the read and the write
+//   `Failed`     the shelf would have gone negative and `23514` refused it
+//
+// The last two are one answer to a client — the desk could not reserve this sku
+// — and they are deliberately not distinguished in the response. A stale
+// reservation and an empty shelf are both "ask again"; telling them apart would
+// leak the desk's concurrency control into its wire format, and the client's
+// action is the same either way.
+fn reserved(i: Item, to: Int) -> Unit / {db.write[items], db.write} =
+  match db.execute[items](item_reserve(),
+                          [db::PInt(to), db::PText(i.sku), db::PInt(i.on_hand)]) {
+    db::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
+    db::Failed(_) -> db.rollback(i.sku),
+    _ -> db.rollback(i.sku),
+  }
+
+// What `db::transaction` hands back, turned into a response. `Ok` carries
+// whatever the body computed. `Err` is a scope that ended some other way: with
+// an `error` it is the database refusing to open or to commit, and without one
+// it is this program's own `db.rollback`, whose `reason` is the sku it could not
+// move. A `Rollback` carries a `String` and nothing more, so a program that
+// wants a structured reason encodes one — the desk needs a sku and an `error`
+// name chosen by the caller, and that is the whole of its encoding.
+fn settled(out: Result<http::Response, db::Rollback>, error: String) -> http::Response =
+  match out {
+    Ok(r) -> r,
+    Err(rb) ->
+      match rb.error {
+        Some(e) -> unavailable(e),
+        None -> problem(409, error, rb.reason),
+      },
+  }
+
+// `Serializable`, and it is the only endpoint that asks for it. Cancelling reads
+// an order, decides on what it read, and writes two tables on the strength of
+// that decision — so under `ReadCommitted` two cancels of one order could both
+// read it open and both put the lines back, and the shelf would gain them twice.
+// The placement path defends itself with a compare-and-set it can write; this
+// one cannot (see `order_cancel`), so it asks the server, and the loser of the
+// race is `40001` rather than a second restock.
+pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
+  match order_wanted(params) {
+    Err(r) -> r,
+    Ok(id) -> settled(db::transaction(db::Serializable, db::ReadWrite, || cancelling(id)),
+                      "the shelf moved"),
+  }
+
+fn cancelling(id: Int) -> http::Response / {Desk} =
+  match order_row_of(id) {
+    Err(r) -> r,
+    Ok(found) ->
+      match found {
+        None -> problem(404, "no such order", int_to_string(id)),
+        Some(o) ->
+          match o.state {
+            Cancelled -> problem(409, "already cancelled", int_to_string(id)),
+            Open -> cancelled_now(o),
+          },
+      },
+  }
+
+// A `DELETE` that raced another one and lost affects no row here, because the
+// order it read is gone from under it; that answers 409 without a rollback —
+// nothing had been written, so there is nothing to discard and committing an
+// empty transaction is the honest end of it.
+fn cancelled_now(o: Order) -> http::Response / {Desk} =
+  match db.execute[orders](order_cancel(), [state_param(Cancelled), db::PInt(o.id)]) {
+    db::Count(n) ->
+      if n == 1 {
+        restocked(o)
+      } else {
+        problem(409, "already cancelled", int_to_string(o.id))
+      },
+    db::Failed(e) -> unavailable(e),
+    _ -> problem(500, "unreadable answer", "an update returned rows"),
+  }
+
+fn restocked(o: Order) -> http::Response / {Desk} =
+  match shelf() {
+    Err(r) -> r,
+    Ok(stock) -> {
+      move_stock(stock, o.lines, -1);
+      log.note("cancelled " ++ int_to_string(o.id));
+      json_body(200, cancelled(o), order_json())
+    },
+  }
 
 // --- The streamed receipt ---------------------------------------------------------
 //
@@ -478,17 +948,29 @@ pub type Reply =
   | Stream({ head: http::Response, cursor: Cursor })
 
 pub fn receipt(params: Map<String, String>) -> Reply
-  / {store.read[items], store.read[orders]} =
+  / {db.read[items], db.read[orders]} =
   match order_wanted(params) {
     Err(r) -> Buffered(r),
     Ok(id) ->
-      match order_by(store.all[orders](), id) {
-        None -> Buffered(problem(404, "no such order", int_to_string(id))),
-        Some(o) -> Stream({
-          head: text(200, b""),
-          cursor: cursor_for(o, store.all[items]()),
-        }),
+      match order_row_of(id) {
+        Err(r) -> Buffered(r),
+        Ok(found) ->
+          match found {
+            None -> Buffered(problem(404, "no such order", int_to_string(id))),
+            Some(o) -> streamed(o),
+          },
       },
+  }
+
+// The shelf is read before the head is written, because a cursor pulls prices
+// out of a list rather than out of the database: a receipt of ten thousand lines
+// costs one query and holds one line at a time, and a chunk producer that
+// queried per line would put the database inside `next_chunk`'s row and inside
+// the connection's write loop.
+fn streamed(o: Order) -> Reply / {db.read[items]} =
+  match shelf() {
+    Err(r) -> Buffered(r),
+    Ok(stock) -> Stream({head: text(200, b""), cursor: cursor_for(o, stock)}),
   }
 
 // Exhaustive by construction: add a variant to `Endpoint` without a route and
@@ -787,57 +1269,142 @@ pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
 
 // --- The desk, stocked and running ----------------------------------------------------
 //
-// The service cannot run until something answers `store` and `log`. W4 has the
-// database; until then the answer is two region-scoped cells, and the shape of
-// this function is the argument for putting the store behind an effect at all:
-// the handler discharges every `store` and `log` atom at the region boundary, so
-// `run` publishes `{net.write[conn], net.write[listener]}` and nothing else,
-// while every endpoint inside it still publishes exactly which resources it
-// touches. Swapping these clauses for a Postgres handler changes this function
-// and no other, and the endpoints' rows do not move because the resources did
-// not.
+// Three entry points, and the difference between them is the whole of W4's exit
+// criterion. `run` hands the `db` atoms to the host: nothing discharges them, so
+// they are in its published row, `ply hosts --host` prints a line per operation
+// and `ply_host::db` answers them out of a connection pool. `run_memory`
+// installs the twin — nine clauses over a `MemDb` in a region-scoped cell — and
+// publishes two `net` atoms and nothing else, which is what makes a test that
+// drives it `det`, cacheable and hermetic.
 //
-//     $ ply run examples/desk.ply --host        # after adding a `main` that calls this
+// Every definition above this line is identical between the two. That is the
+// claim, and it is checkable rather than asserted: the handler is the only thing
+// that moves, and `ply check --types` prints the same row for every endpoint
+// under either.
+//
+//     $ examples/serve.sh --memory              # no database at all
+//     $ examples/serve.sh --db postgres://localhost/desk
 //     $ curl -sS localhost:8137/items
 //     $ curl -sS localhost:8137/orders -d '{"customer":"ada","lines":[{"sku":"bolt","qty":4}]}'
 //     $ curl -sS --raw localhost:8137/orders/1/receipt
 //
-// There is no `main` here: `examples/hello.ply` holds the only one under
-// `examples/`, so that `ply run examples` has an unambiguous entry point.
-pub fn run(port: Int, count: Int) -> Int / {net.write[conn], net.write[listener]} =
-  with_cell[items](seed_shelf()) { shelf -> {
-  with_cell[orders](seed_orders()) { book -> {
-    handle {
-      listen_and_serve(port, count)
-    } with {
-      store.all[items]() -> cell_get(shelf),
-      store.save[items](rows) -> cell_set(shelf, rows),
-      store.all[orders]() -> cell_get(book),
-      store.save[orders](rows) -> cell_set(book, rows),
-      // W5 makes observability an effect with a handler of its own. Until then
-      // the trail is dropped here — at the boundary, in one place a reader can
-      // see, rather than by there being no trail in the endpoints.
-      log.note(line) -> (),
-    }
-  } }
-  } }
+// `main` runs the postgres one, because a service whose entry point was its test
+// double is a service nobody can start. `examples/desk.sql` is the schema it
+// expects and `--db-schema desk.schema` is what checks that claim before the
+// first request: this file is the authority and the database is verified against
+// it at bind time.
+pub fn run(port: Int, count: Int) -> Int
+  / {Desk, net.write[conn], net.write[listener]} =
+  listen_and_serve(port, count)
 
 // The same desk, over TLS, differing in one call.
 pub fn run_tls(port: Int, credential: String, count: Int) -> Int
+  / {Desk, net.write[conn], net.write[listener]} =
+  listen_and_serve_tls(port, credential, count)
+
+// The same desk, over a database that is a value. The twin is a set of pure
+// functions over a `MemDb`, so the whole of the mutable state is one
+// region-scoped cell and the four closures below are what put it there: take the
+// `MemDb` out, step it, put it back, answer.
+//
+// They are closures rather than functions because a cell cannot leave its
+// region — `cell_get` and `cell_set` must name the `with_cell` binder lexically
+// or it is `E0304`, so a `run(c, s, ps)` taking the cell as an argument is not
+// expressible in Ply. A closure over the binder is, and it is what keeps the
+// eleven clauses below one line each.
+//
+// The boilerplate is proportional to tables times operations and it is real. It
+// is also the point: a clause names one concrete `(operation, resource)` pair,
+// so this list *is* the capability grant, and a route that reached a table the
+// desk does not have would have no clause to be answered by.
+//
+// `db.rollback` is in the list and never fires. `db::transaction` handles it,
+// and the driver never binds it; a clause here is what catches a `db.rollback`
+// performed outside any transaction, which would otherwise be an unhandled
+// operation at run time. It cannot be a compile error: `rollback`, `begin`,
+// `commit` and `abort` are one atom, so the type system sees this handler
+// discharge `db.write` and has nothing left to say about which of the four
+// operations have clauses.
+pub fn run_memory(port: Int, count: Int) -> Int / {net.write[conn], net.write[listener]} =
+  memory_serving(port, "", count)
+
+// The twin over TLS, which is the same sentence `run_tls` is: the credential
+// decides the handshake and nothing else, and the eleven clauses below are
+// written once rather than once per transport.
+pub fn run_memory_tls(port: Int, credential: String, count: Int) -> Int
   / {net.write[conn], net.write[listener]} =
-  with_cell[items](seed_shelf()) { shelf -> {
-  with_cell[orders](seed_orders()) { book -> {
+  memory_serving(port, credential, count)
+
+fn memory_serving(port: Int, credential: String, count: Int) -> Int
+  / {net.write[conn], net.write[listener]} =
+  with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
+    let step = |s: db::Stmt, ps: List<db::Param>| {
+      let o = db::step(cell_get(c), s, ps);
+      cell_set(c, o.db);
+      o.out
+    };
+    let opened = |level: db::Isolation, access: db::Access| {
+      let o = db::begin_step(cell_get(c), level, access);
+      cell_set(c, o.db);
+      o.out
+    };
+    let committed = || {
+      let o = db::commit_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
+    let aborted = || {
+      let o = db::abort_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
     handle {
-      listen_and_serve_tls(port, credential, count)
+      if credential == "" {
+        listen_and_serve(port, count)
+      } else {
+        listen_and_serve_tls(port, credential, count)
+      }
     } with {
-      store.all[items]() -> cell_get(shelf),
-      store.save[items](rows) -> cell_set(shelf, rows),
-      store.all[orders]() -> cell_get(book),
-      store.save[orders](rows) -> cell_set(book, rows),
+      db.query[items](s, ps) -> step(s, ps),
+      db.execute[items](s, ps) -> step(s, ps),
+      db.returning[items](s, ps) -> step(s, ps),
+      db.query[orders](s, ps) -> step(s, ps),
+      db.execute[orders](s, ps) -> step(s, ps),
+      db.returning[orders](s, ps) -> step(s, ps),
+      db.begin(level, access) -> opened(level, access),
+      db.commit() -> committed(),
+      db.abort() -> aborted(),
+      db.rollback(reason) -> (),
       log.note(line) -> (),
     }
   } }
-  } }
+
+// The entry point, which is the postgres one.
+//
+// `ply run` passes no arguments, so the port and the connection count are
+// definitions rather than parameters — the same shape `examples/hello.ply` uses,
+// and for the same reason: a run of this program cannot differ from another in
+// what it refuses.
+//
+//     $ ply run examples/desk.ply --host \
+//         --db postgres://localhost/desk --db-schema desk.schema
+//
+// The row is the whole of what this program can reach, and it is seven atoms:
+// four tables-and-modes, the transaction control, and two sockets. The audit
+// trail is not among them, because it is discharged here — W5 makes
+// observability an effect with a handler of its own, and until then the one
+// place a reader has to look to find out what happens to the desk's log is this
+// clause.
+fn port() -> Int = 8137
+
+fn connections() -> Int = 64
+
+fn main() -> Int / {Store, net.write[conn], net.write[listener]} =
+  handle {
+    run(port(), connections())
+  } with {
+    log.note(line) -> (),
+  }
 
 // --- What the desk is stocked with ------------------------------------------------
 
@@ -851,6 +1418,57 @@ pub fn seed_orders() -> List<Order> = [
   {id: 1, customer: "ada", lines: [{sku: "bolt", qty: 10}], total: 4.00m, state: Open},
   {id: 2, customer: "grace", lines: [{sku: "gasket", qty: 2}], total: 4.50m, state: Cancelled},
 ]
+
+// A database with those rows in it, as a value.
+//
+// The seeds go in through the same statements the service uses, so the fixture
+// is not a second description of the schema: `item_row().params` is the derived
+// codec writing its four columns in its own order, and the orders are inserted
+// without their ids so the sequence hands out 1 and 2 and the next order placed
+// is 3. A fixture that wrote the ids and left the sequence at zero would make
+// the first placement collide with `ada`'s order, which is the kind of thing a
+// hand-built double never notices and a real database says immediately.
+//
+// `examples/desk.sql` seeds a real database with the same rows the same way, and
+// `--db-schema desk.schema` is what checks the two agree about the columns.
+pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb =
+  fold(orders, fold(shelf, db::open(schema()), |d: db::MemDb, i: Item|
+         stepped(d, item_insert(), item_row().params(i))),
+       |d: db::MemDb, o: Order|
+         stepped(d, order_insert(),
+           [db::PText(o.customer), lines_param(o.lines), db::PNumeric(o.total),
+            state_param(o.state)]))
+
+// A step whose answer must be a success. A seed the twin refused would otherwise
+// leave an empty table and a test asserting about nothing, which is the failure
+// shape this project exists to make impossible — so it is loud here instead.
+fn stepped(d: db::MemDb, s: db::Stmt, ps: List<db::Param>) -> db::MemDb = {
+  let out = db::step(d, s, ps);
+  match out.out {
+    db::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
+    _ -> out.db,
+  }
+}
+
+// What the twin holds, read back through the same statements an endpoint uses,
+// so an assertion about the store is an assertion about what a request would
+// see rather than about the twin's internals.
+pub fn shelf_of(d: db::MemDb) -> List<Item> = read_out(d, items_all(), item_row())
+
+pub fn book_of(d: db::MemDb) -> List<Order> = read_out(d, orders_all(), order_row())
+
+fn read_out<a>(d: db::MemDb, s: db::Stmt, c: RowCodec<a>) -> List<a> = {
+  let out = db::step(d, s, []);
+  match out.out {
+    db::Rows(rows) -> fold(rows, [], |acc: List<a>, r: db::Row|
+      match (c.decode)(r) {
+        Ok(x) -> push(acc, x),
+        Err(e) -> panic("a row would not decode: " ++ e.column),
+      }),
+    db::Failed(e) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
+    _ -> panic("a query answered a count"),
+  }
+}
 
 // --- Tests: the business, which needs no handler at all ----------------------------
 
@@ -954,10 +1572,86 @@ test "a Rest segment captures every remaining segment, joined" {
 
 // --- Tests: every route, hermetically -----------------------------------------------
 //
-// A handler is a capability grant. Each test below hands the code under test
-// exactly the operations that route's row says it may use, so a route that
-// reached for anything else would fail with `unhandled effect` rather than
-// quietly touching a resource the test never accounted for.
+// Every test below runs against the twin — `std.db`'s memory engine, which is
+// pure Ply over a `MemDb` value — and every one of them is `det`, cached and
+// hermetic. No port, no fixture directory, no `--host`, no teardown, and no
+// second implementation of the desk: the endpoints under test are the ones
+// `main` serves, and the statements they issue are executed rather than
+// intercepted, by a scanner that refuses what it does not model instead of
+// guessing at it.
+//
+// One thing changed shape when the store became a database, and it is worth
+// stating rather than discovering. W3's `effect store` was not `nondet`, so a
+// test could grant `store.all[items]` alone and let the four atoms it did not
+// grant sit unused in the row. `db` **is** `nondet`, so an ungranted `db` atom
+// in a `det` test's footprint is `E0412` at compile time — which means a test
+// that drives `app`, whose row is the whole desk, has to discharge the whole
+// desk. `against` below is that grant, written once.
+//
+// What was lost is a test that hands one route a subset of the store. What was
+// bought is that the subset is now *checked*: `list_items_reaches_one_table`
+// below grants `db.query[items]` and nothing else, and if `list_items` ever
+// reached the order book that test would stop compiling rather than start
+// failing.
+
+pub type Ran<a> = {
+  out: a,
+  shelf: List<Item>,
+  book: List<Order>,
+  trail: List<String>,
+}
+
+// The twin, installed. This is `run_memory`'s clause set with the log kept
+// instead of dropped, and it is the only place in the tests that names a `db`
+// operation: a test says what it drives and what it expects, and the handler is
+// one text rather than one per test.
+fn against<a | e>(d: db::MemDb, body: () -> a / {Desk | e}) -> Ran<a> / e =
+  with_cell[store](d) { c -> {
+  with_cell[trail]([]) { t -> {
+    let step = |s: db::Stmt, ps: List<db::Param>| {
+      let o = db::step(cell_get(c), s, ps);
+      cell_set(c, o.db);
+      o.out
+    };
+    let opened = |level: db::Isolation, access: db::Access| {
+      let o = db::begin_step(cell_get(c), level, access);
+      cell_set(c, o.db);
+      o.out
+    };
+    let committed = || {
+      let o = db::commit_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
+    let aborted = || {
+      let o = db::abort_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
+    let out = handle {
+      body()
+    } with {
+      db.query[items](s, ps) -> step(s, ps),
+      db.execute[items](s, ps) -> step(s, ps),
+      db.returning[items](s, ps) -> step(s, ps),
+      db.query[orders](s, ps) -> step(s, ps),
+      db.execute[orders](s, ps) -> step(s, ps),
+      db.returning[orders](s, ps) -> step(s, ps),
+      db.begin(level, access) -> opened(level, access),
+      db.commit() -> committed(),
+      db.abort() -> aborted(),
+      db.rollback(reason) -> (),
+      log.note(line) -> cell_set(t, push(cell_get(t), line)),
+    };
+    {out: out, shelf: shelf_of(cell_get(c)), book: book_of(cell_get(c)), trail: cell_get(t)}
+  } }
+  } }
+
+// The desk as `examples/desk.sql` seeds it.
+fn stock() -> db::MemDb = stocked(seed_shelf(), seed_orders())
+
+fn served_by(m: http::Method, path: String, body: Bytes) -> Ran<http::Response> =
+  against(stock(), || app(request(m, path, body)))
 
 fn request(m: http::Method, path: String, body: Bytes) -> http::Request = {
   method: m,
@@ -974,181 +1668,215 @@ fn request(m: http::Method, path: String, body: Bytes) -> http::Request = {
 fn body_string(r: http::Response) -> String = string_of_bytes(r.body)
 
 test "GET /health is pure and counts the table it is served from" {
-  let r = app(request(http::Get, "/health", b""));
-  assert_eq(r.status, 200);
-  assert_eq(json::decode_bytes(r.body, health_json()),
-    Ok({service: "parts desk", routes: 10}))
+  let r = served_by(http::Get, "/health", b"");
+  assert_eq(r.out.status, 200);
+  assert_eq(json::decode_bytes(r.out.body, health_json()),
+    Ok({service: "parts desk", routes: 10}));
+  // Pure means pure: the store this request was handed is the store it left.
+  assert_eq(r.shelf, seed_shelf());
+  assert_eq(r.book, seed_orders())
 }
 
 test "GET /docs serves a page, and names the pages when there is none" {
-  let ok = app(request(http::Get, "/docs/orders/cancelling", b""));
-  assert_eq(ok.status, 200);
-  assert_eq(body_string(ok),
+  let ok = served_by(http::Get, "/docs/orders/cancelling", b"");
+  assert_eq(ok.out.status, 200);
+  assert_eq(body_string(ok.out),
     "DELETE /orders/{id} puts the lines back on the shelf\n");
-  assert_eq(app(request(http::Get, "/docs/nothing", b"")).status, 404)
+  assert_eq(served_by(http::Get, "/docs/nothing", b"").out.status, 404)
 }
 
-test "GET /items reads the shelf and touches nothing else" {
-  handle {
-    let r = app(request(http::Get, "/items", b""));
-    assert_eq(r.status, 200);
-    assert_eq(json::decode_bytes(r.body, json::list_json(item_json())), Ok(seed_shelf()))
-  } with {
-    store.all[items]() -> seed_shelf(),
-  }
+// A handler is a capability grant, and this is the one place the grant is a
+// subset: `list_items` is called rather than routed, so its row is one atom and
+// one clause discharges it. `db` is `nondet`, so this test compiles only while
+// that stays true — a `list_items` that reached the order book would leave
+// `db.read[orders]` in a `det` test's footprint, which is `E0412` before
+// anything runs.
+test "list_items reaches one table, and the type is what says so" {
+  with_cell[store](stock()) { c -> {
+    handle {
+      let r = list_items();
+      assert_eq(r.status, 200);
+      assert_eq(json::decode_bytes(r.body, json::list_json(item_json())), Ok(seed_shelf()))
+    } with {
+      db.query[items](s, ps) -> {
+        let o = db::step(cell_get(c), s, ps);
+        cell_set(c, o.db);
+        o.out
+      },
+    }
+  } }
+}
+
+test "GET /items reads the shelf and answers it in sku order" {
+  let r = served_by(http::Get, "/items", b"");
+  assert_eq(r.out.status, 200);
+  assert_eq(json::decode_bytes(r.out.body, json::list_json(item_json())), Ok(seed_shelf()))
 }
 
 // The literal route, which shares a resource with `/items/{sku}` and a
 // footprint with it too: two reads of one resource do not conflict, so the two
 // tests below are placed in the same concurrency group and run side by side.
+//
+// The `WHERE` is the database's, so this asserts what the statement selected
+// rather than what a `filter` in Ply would have.
 test "GET /items/featured is the shelf minus what is out of stock" {
-  handle {
-    let r = app(request(http::Get, "/items/featured", b""));
-    assert_eq(r.status, 200);
-    assert_eq(
-      json::decode_bytes(r.body, json::list_json(item_json())),
-      Ok(filter(seed_shelf(), |i: Item| i.on_hand > 0)))
-  } with {
-    store.all[items]() -> push(seed_shelf(),
-      {sku: "flange", name: "flange", price: 1.00m, on_hand: 0}),
-  }
+  let flange = {sku: "flange", name: "flange", price: 1.00m, on_hand: 0};
+  let r = against(stocked(push(seed_shelf(), flange), []),
+                  || app(request(http::Get, "/items/featured", b"")));
+  assert_eq(r.out.status, 200);
+  assert_eq(json::decode_bytes(r.out.body, json::list_json(item_json())), Ok(seed_shelf()))
 }
 
 test "GET /items/{sku} answers the item, and 404s the one nobody stocks" {
-  handle {
-    assert_eq(app(request(http::Get, "/items/gasket", b"")).status, 200);
-    let missing = app(request(http::Get, "/items/sprocket", b""));
-    assert_eq(missing.status, 404);
-    assert_eq(json::decode_bytes(missing.body, problem_json()),
-      Ok({error: "no such item", detail: "sprocket"}))
-  } with {
-    store.all[items]() -> seed_shelf(),
-  }
+  assert_eq(served_by(http::Get, "/items/gasket", b"").out.status, 200);
+  let missing = served_by(http::Get, "/items/sprocket", b"");
+  assert_eq(missing.out.status, 404);
+  assert_eq(json::decode_bytes(missing.out.body, problem_json()),
+    Ok({error: "no such item", detail: "sprocket"}))
 }
 
-test "GET /orders reads the order book and cannot see the shelf" {
-  handle {
-    let r = app(request(http::Get, "/orders", b""));
-    assert_eq(r.status, 200);
-    assert_eq(json::decode_bytes(r.body, json::list_json(order_json())), Ok(seed_orders()))
-  } with {
-    store.all[orders]() -> seed_orders(),
-  }
+// A `sku` that would end a string literal if a value ever became syntax. It is a
+// parameter, so it is a `Bind` message and not part of the statement: the row
+// comes back not found and the tables are all still there.
+test "a sku that looks like an injection is a value and nothing else" {
+  let r = served_by(http::Get, "/items/'; drop table items; --", b"");
+  assert_eq(r.out.status, 404);
+  assert_eq(r.shelf, seed_shelf())
+}
+
+test "GET /orders reads the order book and answers it in id order" {
+  let r = served_by(http::Get, "/orders", b"");
+  assert_eq(r.out.status, 200);
+  assert_eq(json::decode_bytes(r.out.body, json::list_json(order_json())), Ok(seed_orders()))
 }
 
 test "GET /orders/{id:Int} answers one order, and an unparseable id routes nowhere" {
-  handle {
-    assert_eq(app(request(http::Get, "/orders/1", b"")).status, 200);
-    assert_eq(app(request(http::Get, "/orders/99", b"")).status, 404);
-    // Not a 400 from inside the endpoint: `seven` never parses, so no route
-    // matches and the answer comes from the table rather than from a check the
-    // handler had to remember to write.
-    let unrouted = app(request(http::Get, "/orders/seven", b""));
-    assert_eq(unrouted.status, 404);
-    assert_eq(json::decode_bytes(unrouted.body, problem_json()),
-      Ok({error: "no such route", detail: "/orders/seven"}))
-  } with {
-    store.all[orders]() -> seed_orders(),
-  }
+  assert_eq(served_by(http::Get, "/orders/1", b"").out.status, 200);
+  assert_eq(served_by(http::Get, "/orders/99", b"").out.status, 404);
+  // Not a 400 from inside the endpoint: `seven` never parses, so no route
+  // matches and the answer comes from the table rather than from a check the
+  // handler had to remember to write.
+  let unrouted = served_by(http::Get, "/orders/seven", b"");
+  assert_eq(unrouted.out.status, 404);
+  assert_eq(json::decode_bytes(unrouted.out.body, problem_json()),
+    Ok({error: "no such route", detail: "/orders/seven"}))
 }
 
+// The id is 3 because the sequence handed out 1 and 2 to the seeds, which is the
+// fixture going in through the same insert a request does rather than through a
+// side door that would have left the sequence at zero.
 test "POST /orders prices the lines, draws the shelf down and records a line" {
-  with_cell[items](seed_shelf()) { shelf -> {
-  with_cell[orders](seed_orders()) { book -> {
-  with_cell[trail]([]) { trail -> {
-    handle {
-      let r = app(request(http::Post, "/orders",
-        bytes_of_string("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}")));
-      assert_eq(r.status, 201);
-      assert_eq(json::decode_bytes(r.body, order_json()),
-        Ok({id: 3, customer: "hedy", lines: [{sku: "widget", qty: 2}],
-            total: 25.00m, state: Open}))
-    } with {
-      store.all[items]() -> cell_get(shelf),
-      store.save[items](rows) -> cell_set(shelf, rows),
-      store.all[orders]() -> cell_get(book),
-      store.save[orders](rows) -> cell_set(book, rows),
-      log.note(line) -> cell_set(trail, push(cell_get(trail), line)),
-    };
-    assert_eq(item_named(cell_get(shelf), "widget"),
-      Some({sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 1}));
-    assert_eq(len(cell_get(book)), 3);
-    assert_eq(cell_get(trail), ["placed 3 for hedy"])
-  } }
-  } }
-  } }
+  let r = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}"));
+  assert_eq(r.out.status, 201);
+  assert_eq(json::decode_bytes(r.out.body, order_json()),
+    Ok({id: 3, customer: "hedy", lines: [{sku: "widget", qty: 2}],
+        total: 25.00m, state: Open}));
+  assert_eq(item_named(r.shelf, "widget"),
+    Some({sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 1}));
+  assert_eq(len(r.book), 3);
+  assert_eq(r.trail, ["placed 3 for hedy"])
 }
 
+// The rollback, driven by a route rather than by a unit test. The order row was
+// inserted before the reservation was refused, and what makes it absent from the
+// book afterwards is that `db.rollback`'s clause never resumed: the `RETURNING`
+// happened, the `UPDATE` was refused by `on_hand >= 0`, and everything the body
+// had left to do — including the 201 — was the continuation and was dropped.
 test "an order the shelf cannot cover writes nothing and says which sku" {
-  with_cell[items](seed_shelf()) { shelf -> {
-  with_cell[orders](seed_orders()) { book -> {
-    handle {
-      let r = app(request(http::Post, "/orders",
-        bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}")));
-      assert_eq(r.status, 409);
-      assert_eq(json::decode_bytes(r.body, problem_json()),
-        Ok({error: "out of stock", detail: "widget"}));
+  let r = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}"));
+  assert_eq(r.out.status, 409);
+  assert_eq(json::decode_bytes(r.out.body, problem_json()),
+    Ok({error: "out of stock", detail: "widget"}));
+  assert_eq(r.shelf, seed_shelf());
+  assert_eq(r.book, seed_orders());
+  // Nothing was placed, so nothing was noted: the log line is part of the
+  // discarded continuation too.
+  assert_eq(r.trail, [])
+}
 
-      // The same refusal when the quantity is spread over two lines, which is
-      // the version a per-line check would have sold.
-      assert_eq(app(request(http::Post, "/orders", bytes_of_string(
-        "{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":2},"
-          ++ "{\"sku\":\"widget\",\"qty\":2}]}"))).status, 409)
-    } with {
-      store.all[items]() -> cell_get(shelf),
-      store.save[items](rows) -> cell_set(shelf, rows),
-      store.all[orders]() -> cell_get(book),
-      store.save[orders](rows) -> cell_set(book, rows),
-      log.note(line) -> (),
-    };
-    assert_eq(cell_get(shelf), seed_shelf());
-    assert_eq(cell_get(book), seed_orders())
-  } }
-  } }
+// The one thing a rollback does not undo, pinned so that nobody has to discover
+// it. A sequence is not transactional — in postgres or in the twin, which
+// reproduces the surprising behaviour deliberately — so the number the refused
+// order was given is gone and the next order placed is 4 rather than 3. A desk
+// whose order numbers skip after a refusal is telling the truth about that, and
+// a test that asserted `id == 3` here would be a test that only passes once
+// against a real database.
+test "a rolled-back placement consumes the order number it was given" {
+  let r = against(stock(), || {
+    assert_eq(app(request(http::Post, "/orders",
+      bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}"))).status,
+      409);
+    app(request(http::Post, "/orders",
+      bytes_of_string("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}")))
+  });
+  assert_eq(r.out.status, 201);
+  assert_eq(json::decode_bytes(r.out.body, order_json()),
+    Ok({id: 4, customer: "hedy", lines: [{sku: "widget", qty: 2}],
+        total: 25.00m, state: Open}));
+  assert_eq(len(r.book), 3)
+}
+
+// The same refusal when the quantity is spread over two lines, which is the
+// version a per-line check would have sold.
+test "two lines for one sku are one reservation, and are refused as one" {
+  let r = served_by(http::Post, "/orders", bytes_of_string(
+    "{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":2},"
+      ++ "{\"sku\":\"widget\",\"qty\":2}]}"));
+  assert_eq(r.out.status, 409);
+  assert_eq(r.shelf, seed_shelf());
+  assert_eq(r.book, seed_orders())
+}
+
+test "an order naming nothing on the shelf is refused before anything is written" {
+  let r = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"sprocket\",\"qty\":1}]}"));
+  assert_eq(r.out.status, 404);
+  assert_eq(json::decode_bytes(r.out.body, problem_json()),
+    Ok({error: "no such item", detail: "sprocket"}));
+  assert_eq(r.book, seed_orders())
 }
 
 test "a body that does not fit the type is refused by field and reason" {
-  handle {
-    let r = app(request(http::Post, "/orders",
-      bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":\"two\"}]}")));
-    assert_eq(r.status, 400);
-    assert_eq(json::decode_bytes(r.body, problem_json()),
-      Ok({error: "malformed body",
-          detail: "$.lines[0].qty: expected a number, found a string"}))
-  } with {
-    store.all[items]() -> seed_shelf(),
-  }
+  let r = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":\"two\"}]}"));
+  assert_eq(r.out.status, 400);
+  assert_eq(json::decode_bytes(r.out.body, problem_json()),
+    Ok({error: "malformed body",
+        detail: "$.lines[0].qty: expected a number, found a string"}));
+  // A body that never parsed opened no transaction, so there is nothing to
+  // roll back and nothing was.
+  assert_eq(r.book, seed_orders())
+}
+
+test "an empty order and a line with no quantity are refused without a transaction" {
+  let empty = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"ada\",\"lines\":[]}"));
+  assert_eq(empty.out.status, 422);
+  let zero = served_by(http::Post, "/orders",
+    bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":0}]}"));
+  assert_eq(zero.out.status, 422);
+  assert_eq(zero.shelf, seed_shelf())
 }
 
 test "DELETE /orders/{id} puts the lines back and cancels once" {
-  with_cell[items](seed_shelf()) { shelf -> {
-  with_cell[orders](seed_orders()) { book -> {
-  with_cell[trail]([]) { trail -> {
-    handle {
-      assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 200);
-      assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 409);
-      assert_eq(app(request(http::Delete, "/orders/99", b"")).status, 404)
-    } with {
-      store.all[items]() -> cell_get(shelf),
-      store.save[items](rows) -> cell_set(shelf, rows),
-      store.all[orders]() -> cell_get(book),
-      store.save[orders](rows) -> cell_set(book, rows),
-      log.note(line) -> cell_set(trail, push(cell_get(trail), line)),
-    };
-    assert_eq(item_named(cell_get(shelf), "bolt"),
-      Some({sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 510}));
-    assert_eq(cell_get(trail), ["cancelled 1"])
-  } }
-  } }
-  } }
+  let r = against(stock(), || {
+    assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 200);
+    assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 409);
+    assert_eq(app(request(http::Delete, "/orders/99", b"")).status, 404)
+  });
+  assert_eq(item_named(r.shelf, "bolt"),
+    Some({sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 510}));
+  assert_eq(r.trail, ["cancelled 1"])
 }
 
 test "a route nobody serves is 404 and a method nobody serves is 405 with Allow" {
-  let missing = app(request(http::Get, "/nowhere", b""));
-  assert_eq(missing.status, 404);
-  let wrong = app(request(http::Put, "/orders", b""));
-  assert_eq(wrong.status, 405);
-  assert_eq(map_get(wrong.headers, "allow"), Some(["GET, POST"]))
+  let missing = served_by(http::Get, "/nowhere", b"");
+  assert_eq(missing.out.status, 404);
+  let wrong = served_by(http::Put, "/orders", b"");
+  assert_eq(wrong.out.status, 405);
+  assert_eq(map_get(wrong.out.headers, "allow"), Some(["GET, POST"]))
 }
 
 // --- Tests: the streamed receipt ------------------------------------------------------
@@ -1163,34 +1891,47 @@ test "a receipt is produced one line at a time and ends" {
   assert_eq(len(chunks_of(c, [])), 3)
 }
 
+// Two clauses, and they are the two atoms `receipt`'s row names. A receipt that
+// wrote anything would have no clause to be answered by, and — because `db` is
+// `nondet` — would not have compiled into this `det` test in the first place.
 test "GET /orders/{id}/receipt streams, and a missing order does not" {
-  handle {
-    match receipt(map_of_entries([{key: "id", value: "1"}])) {
-      Stream(s) -> {
-        assert_eq(s.head.status, 200);
-        assert_eq(s.head.body, b"")
+  with_cell[store](stock()) { c -> {
+    handle {
+      match receipt(map_of_entries([{key: "id", value: "1"}])) {
+        Stream(s) -> {
+          assert_eq(s.head.status, 200);
+          assert_eq(s.head.body, b"")
+        },
+        Buffered(_) -> panic("an order that exists is streamed"),
+      };
+      match receipt(map_of_entries([{key: "id", value: "99"}])) {
+        Buffered(r) -> assert_eq(r.status, 404),
+        Stream(_) -> panic("an order that does not exist has nothing to stream"),
+      }
+    } with {
+      db.query[orders](s, ps) -> {
+        let o = db::step(cell_get(c), s, ps);
+        cell_set(c, o.db);
+        o.out
       },
-      Buffered(_) -> panic("an order that exists is streamed"),
-    };
-    match receipt(map_of_entries([{key: "id", value: "99"}])) {
-      Buffered(r) -> assert_eq(r.status, 404),
-      Stream(_) -> panic("an order that does not exist has nothing to stream"),
+      db.query[items](s, ps) -> {
+        let o = db::step(cell_get(c), s, ps);
+        cell_set(c, o.db);
+        o.out
+      },
     }
-  } with {
-    store.all[orders]() -> [ada_order()],
-    store.all[items]() -> seed_shelf(),
-  }
+  } }
 }
 
 // --- The whole service, over a simulated socket ---------------------------------------
 //
 // One function, and every test below it is a `det`, cacheable, hermetic test
 // over raw request bytes. `exchange` opens five region-scoped cells and hands
-// `serve_connection` a socket that is a list of chunks, a store that is two
-// cells and a log that is dropped — and because every atom the service can
-// perform is discharged here, `exchange`'s own row is empty. That is what makes
-// the service's framing behaviour testable with no port, no fixture directory
-// and no teardown.
+// `serve_connection` a socket that is a list of chunks and a store that is a
+// `MemDb` in a cell — and because every atom the service can perform is
+// discharged here, `exchange`'s own row is empty. That is what makes the
+// service's framing behaviour testable with no port, no database, no fixture
+// directory and no teardown.
 //
 // Dropping a whole atom is not a way to make these tests flaky: `net` is
 // `nondet`, so a `det` test that left `net.write[conn]` in its footprint is
@@ -1209,27 +1950,22 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
   with_cell[inbox](inbox) { queue -> {
   with_cell[outbox]([]) { sent -> {
   with_cell[closed](0) { closes -> {
-  with_cell[items](shelf) { stock -> {
-  with_cell[orders](book) { orders -> {
-    handle {
-      serve_connection(7, limits())
-    } with {
-      net.recv[conn](c, max, timeout_ms) -> {
-        let queued = cell_get(queue);
-        cell_set(queue, rest_of(queued));
-        Some(first_of(queued))
-      },
-      net.send[conn](c, payload, timeout_ms) -> {
-        cell_set(sent, push(cell_get(sent), payload));
-        Some(bytes_len(payload))
-      },
-      net.close[conn](c) -> cell_set(closes, cell_get(closes) + 1),
-      store.all[items]() -> cell_get(stock),
-      store.save[items](rows) -> cell_set(stock, rows),
-      store.all[orders]() -> cell_get(orders),
-      store.save[orders](rows) -> cell_set(orders, rows),
-      log.note(line) -> (),
-    };
+    let ran = against(stocked(shelf, book), || {
+      handle {
+        serve_connection(7, limits())
+      } with {
+        net.recv[conn](c, max, timeout_ms) -> {
+          let queued = cell_get(queue);
+          cell_set(queue, rest_of(queued));
+          Some(first_of(queued))
+        },
+        net.send[conn](c, payload, timeout_ms) -> {
+          cell_set(sent, push(cell_get(sent), payload));
+          Some(bytes_len(payload))
+        },
+        net.close[conn](c) -> cell_set(closes, cell_get(closes) + 1),
+      }
+    });
     {
       wrote: bytes_concat_all(cell_get(sent)),
       // How many *responses* were written, counted as the writes that begin with
@@ -1239,11 +1975,9 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
       // inside a refusal that quotes the version it refused.
       sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
       closes: cell_get(closes),
-      shelf: cell_get(stock),
-      book: cell_get(orders),
+      shelf: ran.shelf,
+      book: ran.book,
     }
-  } }
-  } }
   } }
   } }
   } }
@@ -1366,35 +2100,38 @@ test "a peer that opens a connection and says nothing is closed without a respon
 // whole of ADR 0013 §6.1, checked rather than asserted: the response bytes are
 // compared against the plaintext path's.
 //
-// The handler here grants sockets and nothing else, because `run` and `run_tls`
-// carry their own store: the cells inside them discharge every `store` and `log`
-// atom at the region boundary, which is why their published row is two `net`
-// atoms and why this test can drive the whole service with five clauses.
+// `run` and `run_tls` are the entry points `main` and `examples/serve.sh` use,
+// and they hand the `db` atoms to the host rather than discharging them — so
+// this harness installs the twin *around* them with `against` and grants sockets
+// itself. What is under test is therefore the deployed program and not a second
+// spelling of it.
 
 fn over_socket(inbox: List<Bytes>, tls: Bool) -> {wrote: Bytes, sent: Int} =
   with_cell[inbox](inbox) { queue -> {
   with_cell[outbox]([]) { sent -> {
-    handle {
-      assert_eq(if tls { run_tls(8443, "desk", 1) } else { run(8137, 1) }, 1)
-    } with {
-      net.listen[listener](port) -> 1,
-      net.listen_tls[listener](port, credential) -> {
-        assert_eq(credential, "desk");
-        1
-      },
-      net.accept[listener](l) -> 7,
-      net.close[listener](l) -> (),
-      net.recv[conn](c, max, timeout_ms) -> {
-        let queued = cell_get(queue);
-        cell_set(queue, rest_of(queued));
-        Some(first_of(queued))
-      },
-      net.send[conn](c, payload, timeout_ms) -> {
-        cell_set(sent, push(cell_get(sent), payload));
-        Some(bytes_len(payload))
-      },
-      net.close[conn](c) -> (),
-    };
+    against(stock(), || {
+      handle {
+        assert_eq(if tls { run_tls(8443, "desk", 1) } else { run(8137, 1) }, 1)
+      } with {
+        net.listen[listener](port) -> 1,
+        net.listen_tls[listener](port, credential) -> {
+          assert_eq(credential, "desk");
+          1
+        },
+        net.accept[listener](l) -> 7,
+        net.close[listener](l) -> (),
+        net.recv[conn](c, max, timeout_ms) -> {
+          let queued = cell_get(queue);
+          cell_set(queue, rest_of(queued));
+          Some(first_of(queued))
+        },
+        net.send[conn](c, payload, timeout_ms) -> {
+          cell_set(sent, push(cell_get(sent), payload));
+          Some(bytes_len(payload))
+        },
+        net.close[conn](c) -> (),
+      }
+    });
     {
       wrote: bytes_concat_all(cell_get(sent)),
       sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
@@ -1409,13 +2146,43 @@ test "the service answers the same bytes over a TLS listener as over a plain one
   assert(bytes_index_of(encrypted.wrote, b"\"sku\":\"gasket\"") != None)
 }
 
-// The store is stocked from `seed_shelf`, and a request that moves it moves the
-// cell inside `run` rather than anything this test can see — which is the point
-// of the region: nothing the service writes escapes the handler that granted it.
 test "a listener serves exactly the connections it was asked for" {
   let e = over_socket([bytes_concat(get_line("/health"), get_line("/orders"))], false);
   assert_eq(status_of(e.wrote), 200);
   assert_eq(e.sent, 2)
+}
+
+// The twin entry point, driven end to end with nothing granted but sockets.
+// Its row is two `net` atoms because the nine `db` clauses inside it discharge
+// every atom the desk can perform — which is the whole of what "the same tests
+// against the in-memory handler" means, stated as a type rather than as a
+// promise.
+test "run_memory serves the desk with no database bound and no host at all" {
+  with_cell[inbox]([bytes_concat(get_line("/items"), get_line("/orders"))]) { queue -> {
+  with_cell[outbox]([]) { sent -> {
+    handle {
+      assert_eq(run_memory(8137, 1), 1)
+    } with {
+      net.listen[listener](port) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = cell_get(queue);
+        cell_set(queue, rest_of(queued));
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        cell_set(sent, push(cell_get(sent), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[conn](c) -> (),
+    };
+    let wrote = bytes_concat_all(cell_get(sent));
+    assert_eq(len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))), 2);
+    assert(bytes_index_of(wrote, b"\"sku\":\"gasket\"") != None);
+    assert(bytes_index_of(wrote, b"\"customer\":\"ada\"") != None)
+  } }
+  } }
 }
 
 // --- One case per protocol refusal ---------------------------------------------------
@@ -1616,4 +2383,92 @@ pub fn buffered_receipt(o: Order) -> Bytes =
 law "a drawdown is undone exactly by putting the same lines back"
   forall (lines: List<Line>) {
     put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf()
+  }
+
+// --- Laws the store being a value makes possible ----------------------------------------
+//
+// A store that is a database is a store no law can quantify over: a claim about
+// what a request left behind would need a database per case, and a hundred cases
+// would be a hundred round trips against shared state that the next case can
+// see. A store that is a **value** is different in kind — `stocked` builds one,
+// `against` runs a request over it and hands back what the request could then
+// read, and the whole of it is pure. So the two sentences a service most wants
+// to be true of a write path are quantified rather than sampled.
+//
+// These are `law` and not `law/host`: their bodies discharge every `db` atom
+// through the twin, so their row is empty and `ply prove` can attempt them at
+// whatever tier they earn. What they say about **postgres** is exactly as strong
+// as the agreement between the twin and the driver — which is what the agreement
+// law is for, and is why that law is a deliverable rather than a demonstration.
+
+pub type Pick = Bolt | Gasket | Widget
+
+pub type Amount = One | Couple | Handful | Crate
+
+pub type Want = { pick: Pick, amount: Amount }
+
+fn sku_of(p: Pick) -> String =
+  match p { Bolt -> "bolt", Gasket -> "gasket", Widget -> "widget" }
+
+// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so
+// a generated order lands on both sides of the refusal rather than on one.
+fn qty_of(a: Amount) -> Int =
+  match a { One -> 1, Couple -> 2, Handful -> 5, Crate -> 40 }
+
+pub fn lines_of(ws: List<Want>) -> List<Line> =
+  map(ws, |w: Want| {sku: sku_of(w.pick), qty: qty_of(w.amount)})
+
+// Through the wire format, so the law covers the decode the endpoint does rather
+// than starting after it.
+pub fn placed_over(ws: List<Want>) -> Ran<http::Response> =
+  against(stocked(seed_shelf(), []),
+    || place_order(json::encode_bytes({customer: "ada", lines: lines_of(ws)},
+                                      placement_json())))
+
+// The claim a rollback is for. The `INSERT` ran, the `RETURNING` came back and
+// the order existed inside the transaction; what makes it absent afterwards is
+// that the reservation was refused and the continuation — the rest of the
+// placement, the log line, the 201 — was discarded rather than undone.
+pub fn refused_without_trace(ws: List<Want>) -> Bool = {
+  let r = placed_over(ws);
+  r.out.status == 409 && r.shelf == seed_shelf() && r.book == [] && r.trail == []
+}
+
+law "a placement the shelf cannot cover leaves no row behind"
+  forall (ws: List<Want>)
+  where len(ws) > 0 && len(short_skus(seed_shelf(), lines_of(ws))) > 0 {
+    refused_without_trace(ws)
+  }
+
+// And the other half, without which the first is satisfied by a desk that
+// refuses everything: what a placement that succeeds does to the shelf is
+// exactly `draw_down`, the pure function the tests above check on its own.
+pub fn committed_as_specified(ws: List<Want>) -> Bool = {
+  let r = placed_over(ws);
+  r.out.status == 201
+    && r.shelf == draw_down(seed_shelf(), lines_of(ws))
+    && len(r.book) == 1
+}
+
+law "a placement the shelf can cover moves the shelf by exactly the drawdown"
+  forall (ws: List<Want>)
+  where len(ws) > 0 && len(short_skus(seed_shelf(), lines_of(ws))) == 0 {
+    committed_as_specified(ws)
+  }
+
+// The statement and the predicate it replaced, over every id. `where id = $1` is
+// text this file cannot typecheck and `order_by` is a fold this file can; the
+// law is what says they are the same question.
+pub fn one_order_agrees(id: Int) -> Bool = {
+  let r = against(stock(), || app(request(http::Get, "/orders/" ++ int_to_string(id), b"")));
+  match order_by(seed_orders(), id) {
+    Some(o) -> r.out.status == 200
+      && json::decode_bytes(r.out.body, order_json()) == Ok(o),
+    None -> r.out.status == 404,
+  }
+}
+
+law "the route that finds one order finds what `order_by` names"
+  forall (id: Int) {
+    one_order_agrees(id)
   }

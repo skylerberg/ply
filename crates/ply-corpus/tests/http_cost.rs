@@ -69,7 +69,10 @@ impl Bench {
         let check = match ply_core::check_program(&program, &resolved) {
             Ok(check) => check,
             Err(d) => {
-                let errors: Vec<_> = d.iter().filter(|d| d.code.starts_with("E0") && d.severity == ply_span::Severity::Error).collect();
+                let errors: Vec<_> = d
+                    .iter()
+                    .filter(|d| d.code.starts_with("E0") && d.severity == ply_span::Severity::Error)
+                    .collect();
                 panic!("they check: {errors:#?}")
             }
         };
@@ -147,12 +150,7 @@ fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
     for pad in [0usize, 64, 256, 1024, 4096, 8192] {
         let head = long_value(pad);
         let per = bench.micros_per_call(&head, calls);
-        println!(
-            "  {:>8}  {:>10.2}  {:>8.2}",
-            head.len(),
-            per,
-            per / base
-        );
+        println!("  {:>8}  {:>10.2}  {:>8.2}", head.len(), per, per / base);
         worst = worst.max(per / base);
     }
     // A parser that scanned the buffer per field, or re-scanned from zero, would

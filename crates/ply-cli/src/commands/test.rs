@@ -1,7 +1,7 @@
 use super::common::{
-    IND, build_pool, diagnostic_json, diagnostics_json, emit_json, exit_code, location, millis,
-    once_each, phases_json, plural, print_diagnostics, print_phases, print_warnings,
-    report_bind_error, report_load_error,
+    IND, build_pool, describe_schema, diagnostic_json, diagnostics_json, emit_json, exit_code,
+    location, millis, once_each, phases_json, plural, print_diagnostics, print_phases,
+    print_warnings, report_bind_error, report_load_error,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
@@ -117,12 +117,31 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // host author's bug, and a run that started anyway would touch a resource
     // nobody could name. Hermetic resolves nothing, so a stale registry cannot
     // stop a run that was never going to reach it.
-    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls) {
+    let db = match args.db.resolve(args.host) {
+        Ok(db) => db,
+        Err(diagnostics) => {
+            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    // Every row this run can enter, which is the union of the tests'. A suite
+    // whose tests all install the twin discharges every `db` atom in Ply and
+    // needs no database, and refusing it for want of one would make the twin
+    // unusable — which is the milestone's whole point.
+    let reach = ply_core::ty::Footprint::from_atoms(
+        loaded
+            .check
+            .tests
+            .iter()
+            .flat_map(|t| t.footprint.atoms().cloned()),
+    );
+    let mut hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls, db, Some(&reach)) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
         }
     };
+    describe_schema(&loaded, &mut hosts);
+    let hosts = hosts;
 
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
@@ -583,17 +602,20 @@ fn print_human(
             style.dim("not cached"),
         );
         let listing = view.hosts.listing();
-        let transport = view.hosts.transport();
+        let disclosures = view.hosts.disclosures();
         println!(
             "{IND}{}",
             style.dim(&format!(
                 "binding host · {} {} · {}",
                 listing.rows.len(),
                 plural(listing.rows.len(), "operation"),
-                crate::hosts::digest_short(listing, transport.as_ref()),
+                crate::hosts::digest_short(listing, &disclosures),
             ))
         );
         for line in crate::hosts::handshake_lines(&view.hosts.handshakes()) {
+            println!("{IND}{}", style.dim(&line));
+        }
+        if let Some(line) = crate::hosts::database_line(view.hosts) {
             println!("{IND}{}", style.dim(&line));
         }
     }
@@ -644,7 +666,12 @@ fn print_human(
     }
 
     println!();
-    print_summary(report, view.counts.host, style);
+    print_summary(
+        report,
+        view.counts.host,
+        view.hosts.is_live_database(),
+        style,
+    );
 
     if !view.escapes.is_empty() {
         println!();
@@ -915,7 +942,11 @@ fn simulation_line(result: &TestResult) -> Option<String> {
 /// `host` is beside `cached` rather than only in the header, because the last
 /// line a person reads is where "0 cached" would otherwise look like selection
 /// working rather than a run that proved nothing it may keep.
-fn print_summary(report: &RunReport, host: usize, style: Style) {
+///
+/// `database` is beside it for the sharper version of the same argument: a
+/// green suite that reached postgres and a green suite that reached the twin
+/// are different claims, and the second one is the one a reader assumes.
+fn print_summary(report: &RunReport, host: usize, database: bool, style: Style) {
     let failed = format!("{} failed", report.failed);
     let failed = if report.failed > 0 {
         style.red(&failed)
@@ -931,7 +962,12 @@ fn print_summary(report: &RunReport, host: usize, style: Style) {
     let hosted = if host == 0 {
         String::new()
     } else {
-        style.dim(&format!(", {host} host-backed and not cached"))
+        let against = if database {
+            " against a real database"
+        } else {
+            ""
+        };
+        style.dim(&format!(", {host} host-backed{against} and not cached"))
     };
     println!(
         "{IND}{failed}, {passed}, {} cached{hosted} ({:.2}s)",
@@ -1533,7 +1569,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         args: &TestArgs,
         workers: usize,
     ) -> Value {
-        let hosts = Hosts::open(&loaded.check, args.host, &[]).expect("the fixture binds");
+        let hosts = Hosts::open(&loaded.check, args.host, &[], None, None).expect("the fixture binds");
         let view = HostView::of(&hosts, plan, &loaded.check, report);
         let ok = report.is_success() && view.escapes.is_empty();
         report_json(loaded, hashes, plan, report, args, workers, &[], &view, ok)
@@ -1553,6 +1589,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             trace: When::Auto,
             host: false,
             tls: crate::cli::TlsOptions::default(),
+            db: crate::db::DbOptions::default(),
             std: false,
             engine: crate::cli::EngineArg::default(),
             simulation: crate::cli::SimOptions {
@@ -2377,7 +2414,7 @@ test \"stuck\" {
     #[test]
     fn a_hermetic_run_reports_exactly_what_it_did_before() {
         let (_dir, loaded, _h, plan) = plan_for(None);
-        let hosts = Hosts::open(&loaded.check, false, &[]).unwrap();
+        let hosts = Hosts::open(&loaded.check, false, &[], None, None).unwrap();
         let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
 
         for (index, test) in loaded.check.tests.iter().enumerate() {
@@ -2442,9 +2479,84 @@ test \"stuck\" {
         assert!(view.escapes.is_empty());
 
         // And hermetically the check costs nothing, because nothing is reachable.
-        let hermetic = Hosts::open(&loaded.check, false, &[]).unwrap();
+        let hermetic = Hosts::open(&loaded.check, false, &[], None, None).unwrap();
         let view = HostView::of(&hermetic, &plan, &loaded.check, &escaped);
         assert!(view.escapes.is_empty());
+    }
+
+    /// The same corpus behind the postgres driver's own registration path, with
+    /// a database configured — which is the run W4 introduces and the one whose
+    /// cached pass would be believed by every later hermetic run.
+    ///
+    /// A `db` handler is not a special case of any of this and must not become
+    /// one: the check keys on "the binding reaches this footprint", so a driver
+    /// added to the trusted computing base inherits it. That is what this test
+    /// pins.
+    #[test]
+    fn a_database_backed_test_is_host_backed_never_cached_and_says_which_database() {
+        use crate::hosts::fixture::{deterministic, named, op, registry};
+        let (_dir, loaded, hashes, plan) = plan_for(None);
+        let config = crate::db::DbOptions {
+            url: Some("postgres://ply:hunter2@127.0.0.1:5433/desk".to_string()),
+            ..crate::db::DbOptions::default()
+        }
+        .resolve_with(true, &|_| None)
+        .expect("the fixture URL parses");
+        let hosts = Hosts::bind_with(
+            registry(vec![deterministic(op(
+                "db",
+                "all",
+                named("users"),
+                ply_eval::host::Linearity::AtMostOnce,
+                true,
+                "ply_host::db::query",
+            ))]),
+            &loaded.check,
+            true,
+            config,
+        )
+        .expect("the fixture binds");
+
+        assert!(hosts.is_live_database());
+        let line = crate::hosts::database_line(&hosts).expect("a live database is reported");
+        assert!(
+            line.contains("postgres://ply:****@127.0.0.1:5433/desk"),
+            "{line}"
+        );
+        assert!(!line.contains("hunter2"), "{line}");
+
+        let index = index_of(&loaded, "reads orders only");
+        let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
+        assert_eq!(view.counts.host, 2);
+        assert_eq!(
+            isolation_label(
+                &plan,
+                &view,
+                &loaded.check,
+                index,
+                &loaded.check.tests[index].footprint
+            ),
+            "host"
+        );
+
+        let recorded = report_over(vec![TestResult {
+            index,
+            name: loaded.check.tests[index].name.clone(),
+            hash: hashes.tests.get(index).copied(),
+            group: 0,
+            duration: Duration::from_millis(1),
+            status: Status::Passed,
+            failure: None,
+            simulation: None,
+            recorded: Some(Record::Under(vec![hashes.tests[index]])),
+        }]);
+        let view = HostView::of(&hosts, &plan, &loaded.check, &recorded);
+        assert_eq!(
+            view.escapes.len(),
+            1,
+            "a pass over a real database was kept"
+        );
+        assert_eq!(view.escapes[0].code, codes::INTERNAL_ERROR);
     }
 
     /// Two structurally identical tests in different modules have the same

@@ -730,12 +730,12 @@ fn duration_of(output: &str, name: &str) -> f64 {
             continue;
         };
         let field = rest.1.trim();
-        if let Some(ms) = field.strip_suffix("ms") {
-            if let Ok(value) = ms.trim().parse::<f64>() {
-                // A test that took under a millisecond is noise, not a
-                // measurement, and dividing by it would be too.
-                return value.max(0.05);
-            }
+        if let Some(ms) = field.strip_suffix("ms")
+            && let Ok(value) = ms.trim().parse::<f64>()
+        {
+            // A test that took under a millisecond is noise, not a measurement,
+            // and dividing by it would be too.
+            return value.max(0.05);
         }
     }
     panic!("`ply test` printed no duration for `{name}`\n\n{output}");

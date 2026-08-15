@@ -99,6 +99,9 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
         &loaded.check,
         loaded.complete,
         collected.obligations.len(),
+        // `ply review` reports what moved; it binds nothing, so a `law/host` is
+        // a gap here exactly as it is under a hermetic `ply prove`.
+        None,
     );
     warnings.extend(engine_warning);
     let mut proved = obligation::prove(

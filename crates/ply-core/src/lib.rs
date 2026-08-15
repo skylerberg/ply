@@ -106,9 +106,16 @@ pub struct LawInfo {
     /// Empty for a ground law, which is decided by evaluating it.
     pub binders: Vec<LawBinder>,
     pub has_guard: bool,
+    /// `law/host`: the body may carry any row, so this law reaches the world.
+    ///
+    /// It can never be `proved` — the prover's lowering refuses a body whose row
+    /// is non-empty, so the certificate cannot be constructed — it is never
+    /// cached, and under a hermetic run it is `W0604 unattempted` rather than
+    /// green.
+    pub host: bool,
     /// `{}`, or `{sim.read}` for a concurrency law — which is discharged by
-    /// exhaustive interleaving search rather than by a static argument.
-    /// Nothing else type-checks.
+    /// exhaustive interleaving search rather than by a static argument — or any
+    /// row at all when [`host`](LawInfo::host) is set.
     pub footprint: Footprint,
     pub span: Span,
 }

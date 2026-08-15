@@ -101,6 +101,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
                 frame: frame.clone(),
                 binders: binders.clone(),
                 guarded,
+                host: false,
                 footprint: clause.footprint.clone(),
             });
         }
@@ -123,6 +124,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
             frame: Frame::Pure,
             binders: law.binders.clone(),
             guarded: law.has_guard,
+            host: law.host,
             footprint: law.footprint.clone(),
         });
     }

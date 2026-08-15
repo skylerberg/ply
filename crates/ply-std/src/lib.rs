@@ -40,6 +40,12 @@ pub const ROOT: &str = "std";
 /// cached, so no discovered file can ever produce a key in this space.
 pub const PSEUDO_ROOT: &str = "<std>";
 
+/// The database effect and the values that cross it. Named so that
+/// `ply-host`'s postgres driver registers against the exact bytes this crate
+/// ships, for the reason [`NET`] gives: the signature the driver binds to and
+/// the signature the program performs are one text.
+pub const DB: &str = include_str!("../ply/db.ply");
+
 /// The JSON value, its parser and serializer, and the primitives a
 /// `derive json for T` composes out of.
 pub const JSON: &str = include_str!("../ply/json.ply");
@@ -63,6 +69,7 @@ pub const ROUTER: &str = include_str!("../ply/router.ply");
 /// `ply-host`'s registry a reviewable trusted computing base. Sorted by name and
 /// free of duplicates, which this crate's own suite checks rather than assumes.
 pub const MODULES: &[(&str, &str)] = &[
+    ("std.db", DB),
     ("std.http", HTTP),
     ("std.json", JSON),
     ("std.net", NET),

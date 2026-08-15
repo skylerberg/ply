@@ -624,11 +624,27 @@ pub struct Binder {
 ///
 /// `guard`'s row must be empty. `body`'s row must be empty too, unless it is
 /// exactly `{sim.read}`, which makes this a concurrency law discharged by
-/// exhaustive interleaving search rather than by a static argument.
+/// exhaustive interleaving search rather than by a static argument — or unless
+/// the law is declared `law/host`, which is [`host`](LawDef::host).
 #[derive(Clone, Debug)]
 pub struct LawDef {
     pub name: String,
     pub name_span: Span,
+    /// `law/host`: the **body** may carry any row, and the law is then a claim
+    /// about the world rather than about the program alone.
+    ///
+    /// Declared rather than inferred, for the reason every other relaxation in
+    /// this language is declared: a law that could touch the world without
+    /// saying so is the one shape a reader cannot audit. Three things follow
+    /// from it and each is enforced somewhere else — it can never be `proved`
+    /// (`ply-prove` refuses to lower a body whose row is non-empty), it is never
+    /// cached in either direction, and under a hermetic run it is reported
+    /// `W0604 unattempted` rather than green.
+    ///
+    /// The **guard** is unaffected: it stays pure under `E0417`, because a guard
+    /// decides the domain and a guard that could act would be choosing which
+    /// cases to be judged on.
+    pub host: bool,
     /// Empty for a ground law, which is a claim over a domain of one point and
     /// is therefore decided by evaluating it.
     pub binders: Vec<Binder>,

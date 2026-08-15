@@ -260,6 +260,7 @@ fn gap_label(gap: &Gap) -> &'static str {
         Gap::Ungeneratable { .. } => "ungeneratable parameter",
         Gap::Raised { .. } => "evaluation raised",
         Gap::GuardNotSampled { .. } => "guard not sampled",
+        Gap::ReachesHost(_) => "reaches the host",
     }
 }
 
