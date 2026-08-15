@@ -1082,6 +1082,7 @@ fn an_empty_selection_runs_nothing() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 0));
@@ -1103,6 +1104,7 @@ fn a_selected_test_left_out_of_every_group_is_still_run() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!(report.passed, 3, "no selected test may be silently skipped");
@@ -1124,6 +1126,7 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
     assert_eq!((report.passed, report.failed), (1, 0));
@@ -1221,6 +1224,7 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        out_of_scope: BTreeSet::new(),
     };
     let executor = PanickingExecutor { panic_on: 0 };
     let report = run_with(

@@ -8,12 +8,15 @@
 //! because a handler that quietly became repeatable is exactly the change a
 //! diff has to show.
 
-use super::common::{IND, diagnostics_json, emit_json, print_diagnostics, report_load_error};
+use super::common::{
+    IND, diagnostics_json, emit_json, print_diagnostics, report_bind_error, report_load_error,
+};
 use crate::cli::HostsArgs;
 use crate::hosts;
 use crate::load::load;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
+use ply_host::tls;
 use serde_json::{Value, json};
 
 /// The `--json` object's shape. Independent of `ply test`'s, because a consumer
@@ -48,13 +51,25 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         }
     };
 
+    // Loaded here rather than only under `--host`, because `ply hosts` is the
+    // command that answers "what does this run trust" and a credential that
+    // will not load is a run that will not start. `E0430` before anything else
+    // is printed, so a listing is never produced over material that is broken.
+    let credentials = match tls::Credentials::load(&args.tls.tls) {
+        Ok(credentials) => credentials,
+        Err(diagnostics) => {
+            return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let transport = hosts::Transport::of(&listing, Some(&credentials));
+
     if args.digest {
-        println!("{}", listing.digest_short());
+        println!("{}", hosts::digest_short(&listing, transport.as_ref()));
         return EXIT_OK;
     }
 
     if args.json {
-        emit_json(&json!({
+        let mut report = json!({
             "command": "hosts",
             "schema_version": SCHEMA_VERSION,
             "ok": true,
@@ -63,19 +78,23 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             "binding": if args.host { "host" } else { "hermetic" },
             "handlers": listing.handlers,
             "operations": listing.rows.len(),
-            "digest": listing.digest_short(),
+            "digest": hosts::digest_short(&listing, transport.as_ref()),
             // Present in both bindings. `binding` says what this run would use;
             // the rows say what exists, and an agent should not have to invoke
             // the command twice to learn both.
             "hosts": hosts::rows_json(&listing),
             "diagnostics": Value::Array(Vec::new()),
-        }));
+        });
+        if let Some(transport) = &transport {
+            report["transport"] = transport.json();
+        }
+        emit_json(&report);
         return EXIT_OK;
     }
 
     println!();
     let lines = if args.host {
-        hosts::listing_lines(&listing)
+        hosts::listing_lines(&listing, transport.as_ref())
     } else {
         hosts::hermetic_lines(&listing)
     };

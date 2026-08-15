@@ -5,16 +5,23 @@ use super::common::{
 use crate::cli::CheckArgs;
 use crate::driver;
 use crate::load::{Loaded, load, project_root};
+use crate::signature;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_core::print_scheme;
-use ply_span::Diagnostic;
+use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
 use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
 
 /// The contextual keyword a general clause is written with.
 const RESUME: &str = "resume";
+
+/// What every line of the `--types` block is printed at: `IND` plus the two
+/// spaces that put a definition under its module heading. Passed to the
+/// renderer so that a wrapped row respects the terminal's right edge rather
+/// than its own.
+const TYPES_INDENT: usize = IND.len() + 2;
 
 pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
@@ -39,13 +46,19 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
             report["ok"] = json!(false);
             report["exit_code"] = json!(EXIT_COMPILE_ERROR);
             report["diagnostics"] = Value::Array(rendered);
+            emit_json(&report);
+            return EXIT_COMPILE_ERROR;
+        }
+        // After `front_end` is recorded, so that completing the parse cannot
+        // rewrite the report of what the gates decided.
+        if args.explain {
+            if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
+                return report_load_error("check", &err, args.json, style);
+            }
+            attach_provenance(&mut report, &loaded);
         }
         emit_json(&report);
-        return if refused.is_empty() {
-            EXIT_OK
-        } else {
-            EXIT_COMPILE_ERROR
-        };
+        return EXIT_OK;
     }
 
     if !refused.is_empty() {
@@ -69,9 +82,52 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         print_explain(&loaded, style);
     }
     if args.types {
-        print_types(&loaded, style);
+        // Only now, so that `print_explain` above still reports the gates as
+        // they actually fired.
+        if args.explain
+            && let Err(err) = complete_parse(args, &mut loaded, store.as_mut())
+        {
+            return report_load_error("check", &err, args.json, style);
+        }
+        print_types(&loaded, args.explain, style);
     }
     EXIT_OK
+}
+
+/// Parses whatever gate 1 skipped.
+///
+/// `--explain`'s effect-set table and alias provenance are read from the AST, so
+/// a run that skipped a file would print less than a run that did not — and ADR
+/// 0013 §1.6 requires the reviewing command's bytes to be identical either way.
+/// The cheapest way to guarantee that is to make the output a function of the
+/// source rather than of what the cache held.
+///
+/// The store's own warnings are drained and dropped: this is a second read of
+/// files the first load already reported on, and a duplicate "the cache is
+/// unwritable" line tells the reader nothing new.
+fn complete_parse(
+    args: &CheckArgs,
+    loaded: &mut Loaded,
+    store: Option<&mut Store>,
+) -> Result<(), crate::load::LoadError> {
+    let missing: Vec<ModuleName> = loaded
+        .modules()
+        .iter()
+        .filter(|m| !loaded.has_ast(m.name))
+        .map(|m| m.name.clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    *loaded = match store {
+        Some(store) => {
+            let full = driver::load_to_evaluate(&args.path, store, &missing);
+            let _ = store.take_warnings();
+            full?
+        }
+        None => load(&args.path)?,
+    };
+    Ok(())
 }
 
 /// A program the chosen engine cannot express is not a program that checks,
@@ -177,7 +233,18 @@ fn print_explain(loaded: &Loaded, style: Style) {
 /// Grouped by module and printed with simple names: the module heading already
 /// carries the qualification, and repeating it on every line would bury the
 /// signatures the flag was asked for.
-fn print_types(loaded: &Loaded, style: Style) {
+///
+/// A definition's effect row is printed on its own wrapped line under the type
+/// rather than run onto the end of it. That is the whole of W3's exit criterion:
+/// a service has a hundred endpoints and each one's row is what says which
+/// resources it touches, so a row that scrolls off the right edge is a row
+/// nobody reads. A pure definition prints no row at all — the absence of a line
+/// says more than `{}` does.
+///
+/// `explain` adds the `effect set` table and, per definition, the alias its row
+/// was written with. The **expansion** is what the signature line prints, always
+/// and whatever the flag says: ADR 0013 §1.7's rule that the truth needs no flag.
+fn print_types(loaded: &Loaded, explain: bool, style: Style) {
     for module in loaded.modules() {
         let defs = loaded.defs_of(module.name);
         let tests = loaded.tests_of(module.name);
@@ -222,18 +289,46 @@ fn print_types(loaded: &Loaded, style: Style) {
             }
         }
 
+        let sets = if explain {
+            signature::effect_sets(
+                &loaded.program,
+                &loaded.resolved,
+                &loaded.check,
+                module.name,
+                &defs,
+            )
+        } else {
+            Vec::new()
+        };
+        for set in &sets {
+            println!();
+            for line in set.lines(TYPES_INDENT) {
+                println!("{IND}  {line}");
+            }
+        }
+        if !sets.is_empty() {
+            println!();
+        }
+
         let width = defs
             .iter()
             .map(|d| d.simple_name.as_str().chars().count())
             .max()
             .unwrap_or(0);
         for def in &defs {
-            println!(
-                "{IND}  {:width$} : {}",
+            for line in signature::definition_lines(
+                TYPES_INDENT,
+                width,
                 def.simple_name.as_str(),
-                print_scheme(&def.scheme),
-                width = width
-            );
+                &def.scheme,
+            ) {
+                println!("{IND}  {line}");
+            }
+            if explain {
+                for line in signature::provenance(def).lines(TYPES_INDENT) {
+                    println!("{IND}  {}", style.dim(&line));
+                }
+            }
         }
 
         for (_, test) in &tests {
@@ -244,6 +339,62 @@ fn print_types(loaded: &Loaded, style: Style) {
                 test.name,
                 style.dim(&test.footprint.to_string())
             );
+        }
+    }
+}
+
+/// Adds under `--explain` what the AST knows and the check output does not: the
+/// `effect set` table per module and, per definition, the sets its row named.
+///
+/// Only under `--explain`, and only after [`complete_parse`], so that these
+/// fields are either absent or a function of the source — never a function of
+/// which files gate 1 skipped.
+fn attach_provenance(report: &mut Value, loaded: &Loaded) {
+    if let Some(modules) = report["modules"].as_array_mut() {
+        for entry in modules {
+            let name = ModuleName::from_dotted(entry["name"].as_str().unwrap_or_default());
+            let defs = loaded.defs_of(&name);
+            let sets: Vec<Value> = signature::effect_sets(
+                &loaded.program,
+                &loaded.resolved,
+                &loaded.check,
+                &name,
+                &defs,
+            )
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "expansion": s.atoms,
+                    "used_by": s.used_by,
+                })
+            })
+            .collect();
+            entry["effect_sets"] = Value::Array(sets);
+        }
+    }
+
+    if let Some(defs) = report["definitions"].as_array_mut() {
+        for entry in defs {
+            let Some(def) = entry["name"]
+                .as_str()
+                .and_then(|n| loaded.check.defs.get(&Symbol::new(n)))
+            else {
+                continue;
+            };
+            entry["written_as"] = json!(
+                def.row_aliases
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+            );
+            entry["performed"] = json!(
+                def.performed
+                    .atoms()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+            );
+            entry["declared_not_performed"] = json!(signature::provenance(def).unperformed);
         }
     }
 }

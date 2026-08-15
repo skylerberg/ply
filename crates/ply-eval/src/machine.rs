@@ -237,7 +237,7 @@ impl<'a> Machine<'a> {
                     // its binders bound to generated values. A `derive` is not
                     // one either — expansion has already appended the globals
                     // it stands for.
-                    Item::Law(_) | Item::Derive(_) => {}
+                    Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
                 }
             }
         }

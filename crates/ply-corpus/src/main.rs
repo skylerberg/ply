@@ -42,6 +42,9 @@ enum Command {
     /// Price what W2 put on the request path: a derived JSON codec, `Map`, and
     /// what derivation costs the front end and the cache.
     Payload(PayloadArgs),
+    /// Price what W3 put on it: routing, real HTTP/1.1 framing, keep-alive and
+    /// TLS — and re-take W2's field-proportional cost sweep against the result.
+    W3(W3Args),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -372,6 +375,128 @@ fn serve(args: ServeArgs) -> Result<()> {
 }
 
 #[derive(Args, Debug)]
+struct W3Args {
+    /// The repository root, which is where `examples/desk.ply` is read from.
+    /// The service under measurement is the one W3 shipped, not a copy.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The `ply` binary the load tables drive. Defaults to this binary's
+    /// sibling, so a release measurement never silently serves from a debug
+    /// build.
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    /// Simultaneous client connections to sweep.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
+    concurrency: Vec<u32>,
+    /// Requests one connection carries in the throughput sweep.
+    #[arg(long, default_value_t = 32)]
+    per_conn: u32,
+    /// Requests per point in the throughput sweep, held about constant across
+    /// concurrencies so a p99 at one rests on as many samples as at another.
+    #[arg(long, default_value_t = 4000)]
+    requests_per_point: u32,
+    /// Requests per point in the keep-alive and TLS ladders, held constant
+    /// while the requests-per-connection rung varies.
+    #[arg(long, default_value_t = 3200)]
+    ladder_requests: u32,
+    /// Client threads in the keep-alive and TLS ladders.
+    #[arg(long, default_value_t = 8)]
+    ladder_concurrency: u32,
+    /// Requests per in-process point, for the per-route and shape tables.
+    #[arg(long, default_value_t = 2000)]
+    requests: u32,
+    /// Repeats per in-process point; the fastest is reported.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Also serve the task-per-connection variant, which is the same service
+    /// with a spawn in its accept loop.
+    #[arg(long)]
+    concurrent: bool,
+    /// Also re-take W2's single-endpoint load number on this machine, so the
+    /// comparison is one table rather than a figure quoted from a milestone ago.
+    #[arg(long)]
+    w2_baseline: bool,
+    /// Sections to drop, for a run pointed at one question.
+    #[arg(long)]
+    no_load: bool,
+    #[arg(long)]
+    no_shape: bool,
+    #[arg(long)]
+    no_tls: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn w3(args: W3Args) -> Result<()> {
+    use ply_corpus::w3;
+
+    let variant = if args.concurrent {
+        w3::Variant::TaskPerConn
+    } else {
+        w3::Variant::Sequential
+    };
+    let mut out = w3::Measurements {
+        aliases: Some(w3::aliases(&args.repo)?),
+        ..w3::Measurements::default()
+    };
+    if !args.no_shape {
+        out.stages = w3::stages(&args.repo, args.requests, args.repeats)?;
+        out.per_route = w3::per_route(&args.repo, args.requests, args.repeats)?;
+        out.shape = w3::shape(&args.repo, args.requests, args.repeats)?;
+    }
+    if !args.no_load {
+        let ply = match &args.ply {
+            Some(path) => path.clone(),
+            None => ply_corpus::serve::ply_binary()?,
+        };
+        out.routes = w3::routes(
+            &args.repo,
+            &ply,
+            variant,
+            &args.concurrency,
+            args.per_conn,
+            args.requests_per_point,
+        )?;
+        out.keep_alive = w3::keep_alive(
+            &args.repo,
+            &ply,
+            variant,
+            args.ladder_concurrency,
+            args.ladder_requests,
+        )?;
+        if !args.no_tls {
+            out.tls = w3::tls(
+                &args.repo,
+                &ply,
+                variant,
+                args.ladder_concurrency,
+                args.ladder_requests,
+            )?;
+        }
+        if args.w2_baseline {
+            for &concurrency in &args.concurrency {
+                out.w2_baseline.push(ply_corpus::serve::load(
+                    &args.repo,
+                    &ply,
+                    ply_corpus::serve::Shape::Concurrent,
+                    ply_corpus::serve::Parser::Native,
+                    0,
+                    concurrency,
+                    2000,
+                )?);
+            }
+        }
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", w3::render(&out));
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
 struct PayloadArgs {
     /// Line items per JSON payload. Forty is about four kilobytes, which is the
     /// size a real order body arrives at.
@@ -562,6 +687,7 @@ fn run() -> Result<()> {
         Command::Prove(args) => prove(args),
         Command::Serve(args) => serve(args),
         Command::Payload(args) => payload(args),
+        Command::W3(args) => w3(args),
     }
 }
 

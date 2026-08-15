@@ -625,6 +625,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
                         span: Span::DUMMY,
                     })
                     .collect(),
+                aliases: Vec::new(),
                 tail: None,
                 span: Span::DUMMY,
             }),

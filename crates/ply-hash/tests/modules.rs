@@ -72,7 +72,7 @@ fn hashes_ignoring_cycles(files: &[(&str, &str)]) -> HashOutput {
                         }
                     }
                 }
-                Item::Test(_) | Item::Law(_) | Item::Derive(_) => {}
+                Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
             }
         }
         for import in &module.imports {

@@ -18,6 +18,7 @@ use crate::commands::common::plural;
 use ply_core::CheckOutput;
 use ply_core::ty::Footprint;
 use ply_eval::host::{HostBinding, HostListing, HostRegistry, HostRow, HostRuntime};
+use ply_host::tls;
 use ply_span::Diagnostic;
 use serde_json::{Value, json};
 use std::rc::Rc;
@@ -62,16 +63,30 @@ impl Hosts {
     /// happens only when something is actually being bound: a stale
     /// registration is the host author's bug, and refusing to run a program's
     /// hermetic tests over it would make the hermetic path the fragile one.
-    pub fn open(check: &CheckOutput, host: bool) -> Result<Hosts, Vec<Diagnostic>> {
-        let facilities = Arc::new(ply_host::Host::new());
-        let registry = facilities.registry();
+    ///
+    /// `credentials` is loaded **before** the registry is built and before
+    /// anything runs, so an unreadable certificate is `E0430` at start-up
+    /// rather than a `500` on the first handshake. A hermetic run loads none:
+    /// nothing can reach `net.listen_tls`, and reading a private key for a run
+    /// that will not use it is exactly the residual ADR 0008 §2 refuses to
+    /// widen.
+    pub fn open(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &[tls::CredentialSpec],
+    ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
+            let registry = ply_host::registry();
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
             });
         }
+        let facilities = Arc::new(ply_host::Host::with_credentials(tls::Credentials::load(
+            credentials,
+        )?));
+        let registry = facilities.registry();
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
         Ok(Hosts {
@@ -79,6 +94,13 @@ impl Hosts {
             binding: Arc::new(binding),
             listing,
         })
+    }
+
+    /// What the run has to say about TLS: the stack in the trusted computing
+    /// base and the credentials it was configured with, or `None` when neither
+    /// exists.
+    pub fn transport(&self) -> Option<Transport> {
+        Transport::of(&self.listing, self.host.as_ref().map(|h| h.credentials()))
     }
 
     /// [`open`] against an explicit registry, for a test that needs to control
@@ -176,12 +198,58 @@ impl Hosts {
     /// only in `ply hosts` so that a run's artifact says which trusted computing
     /// base produced it.
     pub fn summary_json(&self) -> Value {
-        json!({
+        let transport = self.transport();
+        let mut summary = json!({
             "handlers": self.listing.handlers,
             "operations": self.listing.rows.len(),
-            "digest": self.listing.digest_short(),
-        })
+            "digest": digest_short(&self.listing, transport.as_ref()),
+        });
+        if let Some(transport) = &transport {
+            summary["transport"] = transport.json();
+            // Not a Ply diagnostic: a client that speaks no TLS is not the
+            // program's fault and is attributable to no definition. Silence
+            // would be wrong, so it is counted and named.
+            summary["handshakes"] = handshakes_json(&self.handshakes());
+        }
+        summary
     }
+
+    /// Handshakes this run completed and refused, with the reasons.
+    pub fn handshakes(&self) -> tls::HandshakeCounts {
+        self.host
+            .as_ref()
+            .map(|h| h.handshakes())
+            .unwrap_or_default()
+    }
+}
+
+/// What a `--host` run says about handshakes it refused.
+///
+/// Empty in every run that terminated none, so a plaintext server's summary is
+/// unchanged.
+pub fn handshake_lines(counts: &tls::HandshakeCounts) -> Vec<String> {
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "handshakes: {} completed, {} refused",
+        counts.completed, counts.refused
+    )];
+    for (reason, n) in &counts.reasons {
+        lines.push(format!("  {n} {reason}"));
+    }
+    lines
+}
+
+pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
+    json!({
+        "completed": counts.completed,
+        "refused": counts.refused,
+        "reasons": counts.reasons.iter().map(|(reason, n)| json!({
+            "reason": reason,
+            "count": n,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// What the test runner is told it may reach.
@@ -241,6 +309,186 @@ impl Counts {
     }
 }
 
+// --- transport --------------------------------------------------------------
+
+/// The TLS stack in the trusted computing base, and the credentials the run was
+/// configured with.
+///
+/// This block exists because `net.recv` and `net.send` serve both transports and
+/// the listing says `ply_host::tcp::recv` for each — that is the handler the
+/// registry resolves, and what routes a particular socket through rustls is
+/// which listener accepted it. A reader cannot infer "this program can serve
+/// TLS" from a row, so it is written down.
+pub struct Transport {
+    pub library: &'static str,
+    pub version: &'static str,
+    pub provider: &'static str,
+    pub versions: &'static [&'static str],
+    pub alpn: &'static [&'static str],
+    /// By name, ascending. Empty is a real state and is reported as one: a
+    /// program that can call `net.listen_tls` with nothing configured gets
+    /// `E0429` at the perform site, and a listing that said nothing about it
+    /// would leave the reader to find that out from a running server.
+    pub credentials: Vec<CredentialView>,
+}
+
+pub struct CredentialView {
+    pub name: String,
+    pub fingerprint: String,
+    pub certificates: usize,
+}
+
+impl Transport {
+    /// `Some` when this program can create a TLS listener, or when the run was
+    /// configured with credentials.
+    ///
+    /// Absent otherwise, and that is what keeps a plaintext program's listing
+    /// and digest byte-identical to what they were before TLS existed.
+    pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
+        let reachable = listing.rows.iter().any(|row| row.path == tls::HANDLER);
+        let configured = credentials.is_some_and(|c| !c.is_empty());
+        if !reachable && !configured {
+            return None;
+        }
+        Some(Transport {
+            library: tls::LIBRARY,
+            version: tls::VERSION,
+            provider: tls::PROVIDER,
+            versions: &tls::VERSIONS,
+            alpn: &tls::ALPN,
+            credentials: credentials
+                .into_iter()
+                .flat_map(|c| c.iter())
+                .map(|(name, credential)| CredentialView {
+                    name: name.to_string(),
+                    fingerprint: credential.fingerprint().to_string(),
+                    certificates: credential.certificates(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            String::new(),
+            "transport".to_string(),
+            format!(
+                "tls  {} {} · provider {} · {} · alpn {}",
+                self.library,
+                self.version,
+                self.provider,
+                self.versions.join(", "),
+                self.alpn.join(", "),
+            ),
+            String::new(),
+            "credentials".to_string(),
+        ];
+        if self.credentials.is_empty() {
+            lines.push(
+                "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one"
+                    .to_string(),
+            );
+            return lines;
+        }
+        let width = self
+            .credentials
+            .iter()
+            .map(|c| c.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for credential in &self.credentials {
+            lines.push(format!(
+                "{:width$}  {}  {} {}",
+                credential.name,
+                abbreviate(&credential.fingerprint),
+                credential.certificates,
+                plural(credential.certificates, "certificate"),
+            ));
+        }
+        lines
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "library": self.library,
+            "version": self.version,
+            "provider": self.provider,
+            "versions": self.versions,
+            "alpn": self.alpn,
+            "credentials": self.credentials.iter().map(|c| json!({
+                "name": c.name,
+                "fingerprint": c.fingerprint,
+                "certificates": c.certificates,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// What the digest covers: the credential *names*, the provider and the
+    /// library version.
+    ///
+    /// Deliberately **not** the certificate fingerprint. A CI check that broke
+    /// on every renewal is a CI check people learn to ignore, and a renewal is
+    /// an operational fact rather than a structural change to the trusted
+    /// computing base. Adding or removing a credential does move it, because
+    /// that is a structural change.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for text in [self.library, self.version, self.provider] {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        }
+        hasher.update(&(self.credentials.len() as u64).to_le_bytes());
+        for credential in &self.credentials {
+            hasher.update(&(credential.name.len() as u64).to_le_bytes());
+            hasher.update(credential.name.as_bytes());
+        }
+    }
+}
+
+/// The one line a CI check pins against the trusted computing base.
+///
+/// A program with no TLS in reach hashes exactly what it hashed before W3: the
+/// transport is folded in only when there is one, so no existing corpus's
+/// digest moves.
+pub fn digest_short(listing: &HostListing, transport: Option<&Transport>) -> String {
+    let Some(transport) = transport else {
+        return listing.digest_short();
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TRANSPORT_DOMAIN);
+    hasher.update(&listing.digest());
+    transport.hash_into(&mut hasher);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(15);
+    out.push_str("b3:");
+    for byte in &digest.as_bytes()[..6] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Domain-separated from the row digest so that a listing with an empty
+/// transport can never collide with one that has none.
+const TRANSPORT_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
+
+/// A fingerprint short enough to sit in the table beside the name it belongs
+/// to. `--json` carries the whole of it, because a reader comparing against
+/// what a CA issued needs every byte and a reader scanning the listing needs
+/// none of them.
+fn abbreviate(fingerprint: &str) -> String {
+    let (scheme, digits) = fingerprint.split_once(':').unwrap_or(("", fingerprint));
+    let short: String = digits.chars().take(12).collect();
+    let elided = if digits.chars().count() > 12 {
+        "…"
+    } else {
+        ""
+    };
+    if scheme.is_empty() {
+        format!("{short}{elided}")
+    } else {
+        format!("{scheme}:{short}{elided}")
+    }
+}
+
 // --- `ply hosts` ------------------------------------------------------------
 
 /// The row key and the atom, both, because the operation says *what* was bound
@@ -266,7 +514,7 @@ fn yes_no(flag: bool) -> String {
 
 /// Every line of `ply hosts --host`, without the indent, so the shape is
 /// testable without a terminal.
-pub fn listing_lines(listing: &HostListing) -> Vec<String> {
+pub fn listing_lines(listing: &HostListing, transport: Option<&Transport>) -> Vec<String> {
     let mut lines = vec![format!(
         "{} {} · {} {} · trusted computing base",
         listing.handlers,
@@ -304,8 +552,12 @@ pub fn listing_lines(listing: &HostListing) -> Vec<String> {
         lines.extend(rows.iter().map(line));
     }
 
+    if let Some(transport) = transport {
+        lines.extend(transport.lines());
+    }
+
     lines.push(String::new());
-    lines.push(format!("digest: {}", listing.digest_short()));
+    lines.push(format!("digest: {}", digest_short(listing, transport)));
     lines
 }
 
@@ -521,7 +773,7 @@ fn stamp() -> Int / {clock.read} = clock.now()
             ]
         );
         assert_eq!(listing.handlers, 3);
-        let text = listing_lines(&listing).join("\n");
+        let text = listing_lines(&listing, None).join("\n");
         assert!(!text.contains('*'), "a resource was hidden:\n{text}");
     }
 
@@ -532,7 +784,7 @@ fn stamp() -> Int / {clock.read} = clock.now()
     /// the reader is told, and every one of those passes a per-column check.
     #[test]
     fn the_table_is_exactly_the_shape_the_contract_specifies() {
-        let lines = listing_lines(&listing());
+        let lines = listing_lines(&listing(), None);
         let (rendered, digest) = lines.split_at(lines.len() - 1);
         assert_eq!(
             rendered.join("\n"),
@@ -556,7 +808,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         let program = check(DB);
         let once = full().preview(&program).unwrap();
         let twice = full().preview(&program).unwrap();
-        assert_eq!(listing_lines(&once), listing_lines(&twice));
+        assert_eq!(listing_lines(&once, None), listing_lines(&twice, None));
         assert_eq!(once.digest_short(), twice.digest_short());
         assert_eq!(rows_json(&once), rows_json(&twice));
     }
@@ -605,7 +857,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         let empty = HostRegistry::new().preview(&check(DB)).unwrap();
         assert!(hermetic_lines(&empty)[2].contains("no host handler is compiled"));
         assert!(
-            listing_lines(&empty)
+            listing_lines(&empty, None)
                 .iter()
                 .any(|l| l.contains("no host handler is compiled"))
         );
@@ -651,7 +903,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     #[test]
     fn hermetic_is_the_default_and_reaches_nothing() {
         let program = check(DB);
-        let hosts = Hosts::open(&program, false).unwrap();
+        let hosts = Hosts::open(&program, false, &[]).unwrap();
         assert!(hosts.is_hermetic());
         assert_eq!(hosts.label(), "hermetic");
         assert!(hosts.listing().is_empty());
@@ -688,7 +940,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
 
         // The same corpus under a hermetic binding: the host column is empty and
         // every other number is what it was before W1.
-        let hermetic = Hosts::open(&program, false).unwrap();
+        let hermetic = Hosts::open(&program, false, &[]).unwrap();
         let counts = Counts::of(
             &hermetic,
             [(&reads.footprint, true), (&pure, true), (&pure, false)],
@@ -696,5 +948,178 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         assert_eq!(counts.host, 0);
         assert_eq!(counts.isolated, 2);
         assert_eq!(counts.shared, 1);
+    }
+
+    // --- transport ----------------------------------------------------------
+
+    /// A registry whose `net.listen_tls` resolves to the real TLS handler, so
+    /// the listing carries the row `Transport::of` keys on.
+    fn tls_registry() -> HostRegistry {
+        registry(vec![op(
+            "net",
+            "listen_tls",
+            HostResource::Any,
+            Linearity::AtMostOnce,
+            false,
+            tls::HANDLER,
+        )])
+    }
+
+    const NET: &str = r#"
+nondet effect net {
+  write listen_tls[s](port: Int, credential: String) -> Int
+}
+
+fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
+"#;
+
+    fn tls_listing() -> HostListing {
+        tls_registry()
+            .preview(&check(NET))
+            .expect("the fixture binds")
+    }
+
+    /// A program that cannot create a TLS listener says nothing about TLS, and
+    /// its digest is what it was before W3 — which is the whole reason the
+    /// block is conditional rather than always printed.
+    #[test]
+    fn a_plaintext_program_reports_no_transport_and_keeps_its_digest() {
+        let listing = listing();
+        assert!(Transport::of(&listing, None).is_none());
+        assert_eq!(digest_short(&listing, None), listing.digest_short());
+        assert!(
+            !listing_lines(&listing, None)
+                .join("\n")
+                .contains("transport")
+        );
+    }
+
+    /// The TCB now contains a TLS stack. `net.recv` and `net.send` serve both
+    /// transports and the listing says `ply_host::tcp::recv` for each, so a
+    /// reader cannot infer this from a row — which is exactly why the block
+    /// exists rather than being left implicit in a handler path.
+    #[test]
+    fn a_program_that_can_listen_over_tls_discloses_the_stack_by_name() {
+        let listing = tls_listing();
+        let transport = Transport::of(&listing, None).expect("the tls handler is in the listing");
+        assert_eq!(
+            transport.lines(),
+            [
+                "",
+                "transport",
+                "tls  rustls 0.23.43 · provider ring · TLS 1.3, TLS 1.2 · alpn http/1.1",
+                "",
+                "credentials",
+                "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one",
+            ]
+        );
+        let text = listing_lines(&listing, Some(&transport)).join("\n");
+        assert!(text.contains(tls::HANDLER), "{text}");
+        assert!(text.contains("alpn http/1.1"), "{text}");
+    }
+
+    /// The `--json` object carries the whole fingerprint; the table carries
+    /// enough of it to recognise and not enough to push the columns out.
+    #[test]
+    fn a_credential_is_listed_by_name_and_fingerprint() {
+        let transport = Transport {
+            library: tls::LIBRARY,
+            version: tls::VERSION,
+            provider: tls::PROVIDER,
+            versions: &tls::VERSIONS,
+            alpn: &tls::ALPN,
+            credentials: vec![CredentialView {
+                name: "api".to_string(),
+                fingerprint: "sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5".to_string(),
+                certificates: 2,
+            }],
+        };
+        assert_eq!(
+            transport.lines().last().unwrap(),
+            "api  sha256:9f2c1a4e8b03…  2 certificates"
+        );
+        assert_eq!(
+            transport.json()["credentials"][0]["fingerprint"],
+            "sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5",
+            "the table abbreviates; the object must not"
+        );
+    }
+
+    /// ADR 0013 §6.4: a CI check that broke on every certificate renewal is a
+    /// CI check people learn to ignore. Adding or removing a credential is a
+    /// structural change to the trusted computing base and does move it.
+    #[test]
+    fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {
+        let listing = tls_listing();
+        let with = |credentials: Vec<CredentialView>| {
+            digest_short(
+                &listing,
+                Some(&Transport {
+                    library: tls::LIBRARY,
+                    version: tls::VERSION,
+                    provider: tls::PROVIDER,
+                    versions: &tls::VERSIONS,
+                    alpn: &tls::ALPN,
+                    credentials,
+                }),
+            )
+        };
+        let credential = |fingerprint: &str| CredentialView {
+            name: "api".to_string(),
+            fingerprint: fingerprint.to_string(),
+            certificates: 1,
+        };
+
+        let before = with(vec![credential("sha256:aaaa")]);
+        assert_eq!(
+            before,
+            with(vec![credential("sha256:bbbb")]),
+            "a renewed certificate is an operational fact, not a structural one"
+        );
+        assert_ne!(
+            before,
+            with(vec![
+                credential("sha256:aaaa"),
+                CredentialView {
+                    name: "admin".to_string(),
+                    fingerprint: "sha256:cccc".to_string(),
+                    certificates: 1,
+                }
+            ]),
+            "a second credential is a second thing the run can serve"
+        );
+        assert_ne!(before, with(Vec::new()));
+        assert_ne!(
+            before,
+            listing.digest_short(),
+            "a configured credential must not hash as if there were none"
+        );
+    }
+
+    /// A handshake failure is not the program's fault and not attributable to
+    /// any definition, so it is never a diagnostic — but silence would be
+    /// wrong, so it is counted with its reason.
+    #[test]
+    fn refused_handshakes_are_counted_and_named_rather_than_raised() {
+        assert!(handshake_lines(&tls::HandshakeCounts::default()).is_empty());
+        let counts = tls::HandshakeCounts {
+            completed: 7,
+            refused: 3,
+            reasons: vec![("no application protocol in common", 2), ("not tls", 1)],
+        };
+        assert_eq!(
+            handshake_lines(&counts),
+            [
+                "handshakes: 7 completed, 3 refused",
+                "  2 no application protocol in common",
+                "  1 not tls",
+            ]
+        );
+        let json = handshakes_json(&counts);
+        assert_eq!(json["refused"], 3);
+        assert_eq!(
+            json["reasons"][0]["reason"],
+            "no application protocol in common"
+        );
     }
 }

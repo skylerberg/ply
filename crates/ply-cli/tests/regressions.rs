@@ -207,3 +207,88 @@ fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
         warning.message
     );
 }
+
+/// `Stack::find_handler` selects a clause by `(effect, operation, resource)`.
+/// The duplicate-clause check was keyed on the *atom*, so a handler for
+/// `net.recv[conn]`, `net.send[conn]` and `net.close[conn]` — one atom, three
+/// operations, which is every serve loop in `std.http` — reported two of its
+/// three clauses unreachable. It was invisible on a clean run only because a
+/// successful check drops its warnings, so a user's unrelated typo turned into
+/// 22 warnings blaming the shipped stdlib.
+#[test]
+fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "app.ply",
+        "import std.net (net)\n\
+         pub fn touch(c: Int) -> Int / {net.write[conn]} = {\n\
+           let _ = net.recv[conn](c, 16, 1000);\n\
+           0\n\
+         }\n\
+         pub fn boom() -> Int = nope(1)\n\
+         test \"three operations, one atom\" {\n\
+           handle { assert_eq(touch(3), 0) } with {\n\
+             net.recv[conn](c, m, t) -> Some(b\"\"),\n\
+             net.send[conn](c, p, t) -> Some(bytes_len(p)),\n\
+             net.close[conn](c) -> (),\n\
+           }\n\
+         }\n",
+    );
+
+    let err = load(dir.path()).expect_err("`nope` is unknown");
+    let duplicates: Vec<&str> = err
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == codes::DUPLICATE_DEFINITION)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(
+        duplicates.is_empty(),
+        "no clause here is unreachable: {duplicates:?}"
+    );
+    assert_eq!(
+        err.diagnostics
+            .iter()
+            .filter(|d| d.severity == ply_span::Severity::Error)
+            .count(),
+        1,
+        "only `nope` is an error"
+    );
+}
+
+/// The other half: the same operation twice really is unreachable, and the
+/// warning names the operation rather than the atom, because the atom is not
+/// what the second clause lost to.
+#[test]
+fn the_same_operation_handled_twice_is_still_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "app.ply",
+        "import std.net (net)\n\
+         pub fn touch(c: Int) -> Int / {net.write[conn]} = {\n\
+           let _ = net.recv[conn](c, 16, 1000);\n\
+           0\n\
+         }\n\
+         pub fn boom() -> Int = nope(1)\n\
+         test \"one operation, twice\" {\n\
+           handle { assert_eq(touch(3), 0) } with {\n\
+             net.recv[conn](c, m, t) -> Some(b\"\"),\n\
+             net.recv[conn](c, m, t) -> Some(b\"x\"),\n\
+           }\n\
+         }\n",
+    );
+
+    let err = load(dir.path()).expect_err("`nope` is unknown");
+    let d = err
+        .diagnostics
+        .iter()
+        .find(|d| d.code == codes::DUPLICATE_DEFINITION)
+        .expect("the second clause is unreachable");
+    assert!(
+        d.message.contains("net.recv[conn]"),
+        "the operation is what was duplicated: {}",
+        d.message
+    );
+}

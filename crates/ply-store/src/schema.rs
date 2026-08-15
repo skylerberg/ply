@@ -221,6 +221,8 @@ pub(crate) fn exemplars() -> Exemplars {
             }],
         },
         def: CachedDef::new(scheme.clone(), footprint())
+            .performing(Footprint::empty())
+            .written_as(vec![sym("Web")])
             .witnessed_by(vec![NameRef::new("user.User", h(3))]),
         type_decl: CachedDecl::new(DeclBody::Type {
             arity: 1,
@@ -377,7 +379,7 @@ mod tests {
     /// schema changed: paste the digest the failure prints, and bump
     /// `FRONTEND_VERSION` — a build that reads an entry written under the old
     /// shape has no other way to know.
-    const PINNED: &str = "26cc2fb2e11173a642a005ad146df12bfef799d24f1b7ecbe7c7229b5b6681af";
+    const PINNED: &str = "9d630e2a4c478b671b83b4eeb8aae91c0447591806d86f9915699173eb5cea12";
 
     #[test]
     fn the_stored_schema_is_pinned() {

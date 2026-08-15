@@ -44,14 +44,30 @@ pub const PSEUDO_ROOT: &str = "<std>";
 /// `derive json for T` composes out of.
 pub const JSON: &str = include_str!("../ply/json.ply");
 
+/// HTTP/1.1 framing: the head parser, the body decoder, the response encoder and
+/// the serve loop. Ply rather than Rust, so `ply test` selects it exactly and a
+/// smuggling defect is a failing test rather than a line in the trusted
+/// computing base — ADR 0013 §2.
+pub const HTTP: &str = include_str!("../ply/http.ply");
+
 /// The network effect. Named so that `ply-host` can register against the exact
 /// bytes this crate ships without reaching across the workspace for a file.
 pub const NET: &str = include_str!("../ply/net.ply");
 
+/// Routing: the table as ordinary data, the pure function that matches over it,
+/// and the two checks a service asserts about the table's own shape. Imports
+/// `std.http` for `Method`; the edge never goes the other way.
+pub const ROUTER: &str = include_str!("../ply/router.ply");
+
 /// The trusted list, read top to bottom — the same property that makes
 /// `ply-host`'s registry a reviewable trusted computing base. Sorted by name and
 /// free of duplicates, which this crate's own suite checks rather than assumes.
-pub const MODULES: &[(&str, &str)] = &[("std.json", JSON), ("std.net", NET)];
+pub const MODULES: &[(&str, &str)] = &[
+    ("std.http", HTTP),
+    ("std.json", JSON),
+    ("std.net", NET),
+    ("std.router", ROUTER),
+];
 
 /// The source that ships for a module, or `None` if none does.
 pub fn source(module: &ModuleName) -> Option<&'static str> {
@@ -208,7 +224,7 @@ mod tests {
 
     #[test]
     fn a_module_that_does_not_ship_has_no_source() {
-        assert_eq!(source(&ModuleName::from_dotted("std.http")), None);
+        assert_eq!(source(&ModuleName::from_dotted("std.sql")), None);
         // The unqualified name is a project's to use, and never resolves here.
         assert_eq!(source(&ModuleName::from_dotted("net")), None);
         assert_eq!(source(&ModuleName::from_dotted("json")), None);

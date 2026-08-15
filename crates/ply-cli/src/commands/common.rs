@@ -73,7 +73,11 @@ pub fn report_load_error(command: &str, err: &LoadError, json: bool, style: Styl
         }));
     } else {
         print_diagnostics(&err.diagnostics, &err.sources, style);
-        let n = err.diagnostics.len();
+        let n = err
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
         eprintln!(
             "{IND}{} ({n} {})",
             style.red("compilation failed"),

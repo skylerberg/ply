@@ -21,14 +21,14 @@
 // copied. W1 copied it, and a copy is a signature that can drift from the one
 // the host binds to; this is one text, so it cannot.
 //
-// The names come in unqualified, so `net.recv[conn](c, max)` below is the
+// The names come in unqualified, so `net.recv[conn](c, max, ms)` below is the
 // effect `std.net.net` and every row reads exactly as it did. Loading is
 // demand-driven and the stdlib is not part of the project, so `ply run
 // examples/hello.ply` still loads this module alone plus what it imports.
 //
 // Every operation is a `write`, `recv` included, and every operation is
 // `nondet`; both are said in `std.net` itself, where the reasons live.
-import std.net (net)
+import std.net (net, send_all)
 
 // --- Requests ---------------------------------------------------------------
 //
@@ -178,26 +178,41 @@ fn answer(head: Bytes) -> Bytes =
 // --- The server -------------------------------------------------------------
 
 // How many chunks the endpoint will take before it gives up on a head that
-// never ends. W1 has no cancellation and no timeout — ADR 0011 calls that the
-// milestone's largest gap — so this count and `max_head` are the only two
-// things between a peer that dribbles one byte at a time and a thread that
-// never comes back.
+// never ends. W1 had neither cancellation nor a timeout, so this count and
+// `max_head` were the only two things between a peer that dribbles one byte at a
+// time and a thread that never comes back. W3 added the third: every blocking
+// `net` operation carries a deadline, as an argument rather than as a
+// cancellation, so a peer that sends *nothing* is now cut off by the clock and
+// this bound is what cuts off one that sends a byte at a time.
 fn max_chunks() -> Int = 16
+
+// Written down rather than defaulted, because `timeout_ms <= 0` is a runtime
+// error and a caller that wants no deadline has to write a large number where a
+// reader can see it.
+fn deadline_ms() -> Int = 5000
 
 // Read until the head ends, the peer stops talking, or one of those two bounds
 // is reached. A single `recv` is what `curl` produces essentially always, and
 // "essentially always" is the shape of every defect this project has found: a
 // request split across packets is ordinary TCP, so it is read here and tested
 // below.
+// `None` is a deadline and an empty `Some` is an ending. They are different
+// answers and this keeps them apart at the one place it matters: both stop the
+// loop, and the 400 below says the head never ended either way, but a caller
+// that could not tell them apart would have no way to say which to a peer that
+// asked.
 fn read_head(c: Int, so_far: Bytes, chunks_left: Int) -> Bytes / {net.write[conn]} =
   if chunks_left <= 0 || head_end(so_far) >= 0 || bytes_len(so_far) >= max_head() {
     so_far
   } else {
-    let chunk = net.recv[conn](c, max_head());
-    if bytes_len(chunk) == 0 {
-      so_far
-    } else {
-      read_head(c, bytes_concat(so_far, chunk), chunks_left - 1)
+    match net.recv[conn](c, max_head(), deadline_ms()) {
+      None -> so_far,
+      Some(chunk) ->
+        if bytes_len(chunk) == 0 {
+          so_far
+        } else {
+          read_head(c, bytes_concat(so_far, chunk), chunks_left - 1)
+        },
     }
   }
 
@@ -209,13 +224,14 @@ fn read_head(c: Int, so_far: Bytes, chunks_left: Int) -> Bytes / {net.write[conn
 // `Connection: close` and this `net.close` are one decision written twice, for
 // the peer and for the socket. W1 has no keep-alive.
 //
-// `net.send` answers how many bytes it took, and the handler's contract is that
-// it takes all of them — partial writes are W3's. The assertion is where that
-// contract is checked rather than assumed, because a short write that nobody
-// looked at is a truncated response the client reads as a complete one.
+// `send_all` loops over a partial write, which W1 asserted could not happen and
+// W3 handles instead: one `send` is free to take fewer bytes than it was given,
+// and a short write nobody looked at is a truncated response the client reads as
+// a complete one. `false` is a deadline or a dead peer, and either way the only
+// thing left to do with this connection is close it.
 fn serve_one(c: Int) -> Unit / {net.write[conn]} {
   let response = answer(read_head(c, b"", max_chunks()));
-  assert_eq(net.send[conn](c, response), bytes_len(response));
+  send_all(c, response, deadline_ms());
   net.close[conn](c)
 }
 
@@ -393,14 +409,14 @@ test "the simulated socket answers a well-formed request with the fixed 200" {
       net.listen[listener](p) -> 1,
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -418,14 +434,14 @@ test "a request split across packets is read to its terminator" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -442,14 +458,14 @@ test "a malformed request is answered 400 and the connection is closed" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
     };
@@ -468,14 +484,14 @@ test "a peer that says nothing gets a 400 rather than a hung thread" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -492,13 +508,13 @@ test "a head that never ends stops after `max_chunks` and answers 400" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         cell_set(reads, cell_get(reads) + 1);
-        b"Filler: xxxxxxxx\r\n"
+        Some(b"Filler: xxxxxxxx\r\n")
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -516,10 +532,10 @@ test "each accepted connection is answered exactly once" {
       net.listen[listener](p) -> 1,
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
-      net.recv[conn](c, max) -> get_root(),
-      net.send[conn](c, payload) -> {
+      net.recv[conn](c, max, timeout_ms) -> Some(get_root()),
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -534,8 +550,8 @@ test "serving no connections opens a listener and touches no socket" {
     net.listen[listener](p) -> 1,
     net.accept[listener](l) -> panic("nothing should be accepted"),
     net.close[listener](l) -> (),
-    net.recv[conn](c, max) -> panic("nothing should be read"),
-    net.send[conn](c, payload) -> panic("nothing should be sent"),
+    net.recv[conn](c, max, timeout_ms) -> panic("nothing should be read"),
+    net.send[conn](c, payload, timeout_ms) -> panic("nothing should be sent"),
     net.close[conn](c) -> panic("nothing should be closed"),
   }
 }

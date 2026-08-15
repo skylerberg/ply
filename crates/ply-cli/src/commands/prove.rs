@@ -220,6 +220,36 @@ pub(crate) fn outcome_of(discharge: &Discharge) -> &'static str {
     }
 }
 
+/// What an `ensures` gives up when its owner's declared row is wider than its
+/// body's.
+///
+/// The footprint is the frame condition: an `ensures` means *this holds of the
+/// result, and every resource outside the footprint's writes is unchanged*. An
+/// annotation wider than the body — which an `effect set` makes systematic,
+/// since one set is written for a whole service — therefore promises less about
+/// less, at the same tier and with no other sign that anything was lost. Here
+/// it is a scheduling cost nobody wrote down; on an obligation it is a weakened
+/// claim, so `ply prove --explain` names the atoms.
+fn weakened_frame(loaded: &Loaded, obligation: &Obligation) -> Vec<String> {
+    if obligation.kind == ObligationKind::Law {
+        return Vec::new();
+    }
+    let Some(def) = loaded.check.defs.get(&obligation.owner) else {
+        return Vec::new();
+    };
+    let slack = crate::signature::provenance(def);
+    if slack.unperformed.is_empty() {
+        return Vec::new();
+    }
+    crate::signature::fill(
+        "frame covers, body never touches: ",
+        "  ",
+        &slack.unperformed,
+        "",
+        crate::signature::WIDTH - IND.len() - 4,
+    )
+}
+
 pub(crate) fn owner_label(obligation: &Obligation, labels: &BTreeMap<Symbol, String>) -> String {
     match obligation.kind {
         ObligationKind::Ensures { index } => {
@@ -551,6 +581,9 @@ fn print_human(
                 "{IND}    {}",
                 style.dim(&format!("from: {}", reason.as_str()))
             );
+            for line in weakened_frame(loaded, obligation) {
+                println!("{IND}    {}", style.dim(&line));
+            }
         }
     }
 

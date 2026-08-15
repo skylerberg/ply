@@ -22,17 +22,23 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 /// the shipped declaration names no resource label on its own. So the fixture is
 /// the declaration plus a driver that performs every operation under the two
 /// labels these tests use — which is `examples/echo.ply` in miniature.
-const DRIVER: &str = "
+const DRIVER: &str = r#"
 fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen[listener](port);
   let c = net.accept[listener](l);
-  let got = net.recv[conn](c, 16);
-  let sent = net.send[conn](c, payload);
+  let got = net.recv[conn](c, 16, 5000);
+  let sent = net.send[conn](c, payload, 5000);
   net.close[conn](c);
   net.close[listener](l);
-  bytes_len(got) + sent
+  bytes_len(bytes_or_empty(got)) + int_or_zero(sent)
 }
-";
+
+fn bytes_or_empty(answer: Option<Bytes>) -> Bytes =
+  match answer { Some(bs) -> bs, None -> b"" }
+
+fn int_or_zero(answer: Option<Int>) -> Int =
+  match answer { Some(n) -> n, None -> 0 }
+"#;
 
 /// Checked under the module name it ships as, because an effect's name is
 /// qualified: the same text loaded anonymously declares `net` rather than
@@ -91,14 +97,31 @@ fn perform(
 }
 
 fn int(v: Value) -> i64 {
-    v.as_int(Span::DUMMY, "a test expectation")
+    inside(v)
+        .as_int(Span::DUMMY, "a test expectation")
         .expect("an Int answer")
 }
 
 fn bytes(v: Value) -> Vec<u8> {
-    v.as_bytes(Span::DUMMY, "a test expectation")
+    inside(v)
+        .as_bytes(Span::DUMMY, "a test expectation")
         .expect("a Bytes answer")
         .to_vec()
+}
+
+/// `recv` and `send` answer an `Option` since ADR 0013 §7.2, where `None` is a
+/// deadline. Every assertion below is about the value inside a `Some`; a `None`
+/// reaching one of them is a deadline that expired in a test that set the
+/// timeout to five seconds, which is a failure worth naming rather than
+/// unwrapping past.
+fn inside(v: Value) -> Value {
+    match &v {
+        Value::Ctor { name, args } if name.as_str() == "Some" => args[0].clone(),
+        Value::Ctor { name, .. } if name.as_str() == "None" => {
+            panic!("the operation answered `None`: its deadline expired")
+        }
+        _ => v,
+    }
 }
 
 // --- The registration -------------------------------------------------------
@@ -138,6 +161,11 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
             "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
+            // Its own line with its own path, which is the whole of how "this
+            // program can serve TLS" is disclosed: the row it contributes is an
+            // ordinary `net.write[..]`, so nothing else in the listing says it.
+            "std.net.net.listen_tls[conn] std.net.net.write[conn] ply_host::tls::listen",
+            "std.net.net.listen_tls[listener] std.net.net.write[listener] ply_host::tls::listen",
             "std.net.net.recv[conn] std.net.net.write[conn] ply_host::tcp::recv",
             "std.net.net.recv[listener] std.net.net.write[listener] ply_host::tcp::recv",
             "std.net.net.send[conn] std.net.net.write[conn] ply_host::tcp::send",
@@ -260,7 +288,7 @@ fn a_partial_read_leaves_the_rest_for_the_next_one() {
                 net.as_ref(),
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(3)],
+                vec![Value::Int(conn), Value::Int(3), Value::Int(5000)],
             )
             .expect("a read of an open connection"),
         );
@@ -296,7 +324,7 @@ fn a_second_read_takes_the_next_bytes_and_never_the_same_ones() {
                 net.as_ref(),
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(n)],
+                vec![Value::Int(conn), Value::Int(n), Value::Int(5000)],
             )
             .expect("a read of an open connection"),
         )
@@ -318,7 +346,7 @@ fn a_peer_that_stopped_sending_reads_empty_rather_than_failing() {
                 net.as_ref(),
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(64)],
+                vec![Value::Int(conn), Value::Int(64), Value::Int(5000)],
             )
             .expect("a read of an open connection"),
         )
@@ -347,7 +375,7 @@ fn a_closed_handle_is_a_diagnostic_rather_than_another_socket() {
         net.as_ref(),
         Op::Recv,
         "conn",
-        vec![Value::Int(conn), Value::Int(64)],
+        vec![Value::Int(conn), Value::Int(64), Value::Int(5000)],
     )
     .expect_err("the handle is gone");
     assert_eq!(again.code, codes::RUNTIME_ERROR);
@@ -368,7 +396,7 @@ fn an_absurd_read_bound_is_capped_rather_than_wrapped() {
             net.as_ref(),
             Op::Recv,
             "conn",
-            vec![Value::Int(conn), Value::Int(i64::MAX)],
+            vec![Value::Int(conn), Value::Int(i64::MAX), Value::Int(5000)],
         )
         .expect("a read of an open connection"),
     );
@@ -401,7 +429,7 @@ fn a_listener_and_a_connection_are_not_interchangeable() {
         net.as_ref(),
         Op::Recv,
         "listener",
-        vec![Value::Int(listener), Value::Int(8)],
+        vec![Value::Int(listener), Value::Int(8), Value::Int(5000)],
     )
     .expect_err("a listener has no bytes");
     assert_eq!(wrong_way.code, codes::RUNTIME_ERROR);
@@ -431,7 +459,7 @@ fn one_socket_under_two_labels_is_refused() {
         net.as_ref(),
         Op::Recv,
         "conn",
-        vec![Value::Int(conn), Value::Int(8)],
+        vec![Value::Int(conn), Value::Int(8), Value::Int(5000)],
     )
     .expect("the first use fixes the label");
 
@@ -440,7 +468,7 @@ fn one_socket_under_two_labels_is_refused() {
         net.as_ref(),
         Op::Recv,
         "listener",
-        vec![Value::Int(conn), Value::Int(8)],
+        vec![Value::Int(conn), Value::Int(8), Value::Int(5000)],
     )
     .expect_err("this socket is already `[conn]`");
     assert_eq!(relabelled.code, codes::RUNTIME_ERROR);
@@ -463,7 +491,7 @@ fn a_read_of_no_bytes_is_refused() {
         net.as_ref(),
         Op::Recv,
         "conn",
-        vec![Value::Int(conn), Value::Int(0)],
+        vec![Value::Int(conn), Value::Int(0), Value::Int(5000)],
     )
     .expect_err("a read wants at least one byte");
     assert_eq!(refused.code, codes::RUNTIME_ERROR);
@@ -517,7 +545,7 @@ fn a_loopback_connection_is_served_end_to_end() {
         net.as_ref(),
         Op::Send,
         "conn",
-        vec![Value::Int(conn), Value::bytes(RESPONSE)],
+        vec![Value::Int(conn), Value::bytes(RESPONSE), Value::Int(5000)],
     )
     .expect("a send"));
     assert_eq!(sent, RESPONSE.len() as i64);
@@ -556,7 +584,7 @@ fn a_real_partial_read_returns_what_it_can_and_the_rest_next_time() {
                 net.as_ref(),
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(3)],
+                vec![Value::Int(conn), Value::Int(3), Value::Int(5000)],
             )
             .expect("a read"),
         );
@@ -596,7 +624,7 @@ fn a_connection_closed_mid_read_reads_empty_rather_than_failing() {
                 net.as_ref(),
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(64)],
+                vec![Value::Int(conn), Value::Int(64), Value::Int(5000)],
             )
             .expect("a read of a peer that went away is empty, not an error"),
         );
@@ -707,7 +735,7 @@ fn serve_accepted(binding: &HostBinding, rt: &dyn HostRuntime, listener: i64) ->
         rt,
         Op::Send,
         "conn",
-        vec![Value::Int(conn), Value::bytes(RESPONSE)],
+        vec![Value::Int(conn), Value::bytes(RESPONSE), Value::Int(5000)],
     )
     .expect("a send"));
     close(binding, rt, conn, "conn");
@@ -747,7 +775,7 @@ fn read_to_end(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8
                 rt,
                 Op::Recv,
                 "conn",
-                vec![Value::Int(conn), Value::Int(4096)],
+                vec![Value::Int(conn), Value::Int(4096), Value::Int(5000)],
             )
             .expect("a read"),
         );
@@ -776,4 +804,176 @@ fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {
 fn open(binding: &HostBinding, rt: &dyn HostRuntime) -> (i64, i64) {
     let listener = listen(binding, rt);
     (listener, accept(binding, rt, listener))
+}
+
+// --- TLS, at the boundary ---------------------------------------------------
+//
+// What `ply_host::tls` does with a record layer is asserted in its own suite.
+// What is asserted here is the half that belongs to the boundary: the operation
+// binds, the credential is resolved at the perform site, the twin refuses the
+// same name the socket handler refuses, and a service whose listener is
+// `net.listen_tls` runs hermetically over the script with no change to its
+// source.
+
+/// The same shape as [`DRIVER`], with the one line that differs: the listener is
+/// created over TLS. Everything after it is byte-identical, which is the claim
+/// ADR 0013 §6.1 makes — a TLS connection is the same resource, read and written
+/// by the same code.
+const TLS_DRIVER: &str = r#"
+fn serve_tls(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
+  let l = net.listen_tls[listener](port, "api");
+  let c = net.accept[listener](l);
+  let got = net.recv[conn](c, 4096, 5000);
+  let sent = net.send[conn](c, payload, 5000);
+  net.close[conn](c);
+  net.close[listener](l);
+  bytes_len(unwrap_bytes(got)) + unwrap_int(sent)
+}
+
+fn unwrap_bytes(answer: Option<Bytes>) -> Bytes =
+  match answer { Some(bs) -> bs, None -> b"" }
+
+fn unwrap_int(answer: Option<Int>) -> Int =
+  match answer { Some(n) -> n, None -> 0 }
+"#;
+
+fn tls_fixture() -> String {
+    format!("{DECLARATION}{TLS_DRIVER}")
+}
+
+fn bind_tls(net: Arc<dyn Net>) -> HostBinding {
+    registry(net)
+        .bind(&check(&tls_fixture()))
+        .expect("the declaration and the registration agree")
+}
+
+/// `E0429` at the perform site, from both implementations, listing what the run
+/// was configured with — because the fix is a `--tls` argument rather than an
+/// edit to the program.
+#[test]
+fn a_credential_the_run_does_not_hold_is_refused_by_both_implementations() {
+    let socket = Arc::new(TcpHost::new());
+    let script = Arc::new(SimNet::new(Vec::new()));
+    let refusals = [
+        unconfigured(&bind_tls(socket.clone()), socket.as_ref()),
+        unconfigured(&bind_tls(script.clone()), script.as_ref()),
+    ];
+    for refused in refusals {
+        assert_eq!(refused.code, codes::TLS_CREDENTIAL_UNKNOWN);
+        assert!(refused.message.contains("`api`"), "{}", refused.message);
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|n| n.contains("no `--tls` credential")),
+            "{:?}",
+            refused.notes
+        );
+    }
+}
+
+fn unconfigured(binding: &HostBinding, rt: &dyn HostRuntime) -> Diagnostic {
+    perform(
+        binding,
+        rt,
+        Op::ListenTls,
+        "listener",
+        vec![Value::Int(0), Value::str("api")],
+    )
+    .expect_err("no credential was configured")
+}
+
+/// The twin resolves the credential it was configured with and then serves an
+/// ordinary listener: above the boundary a TLS connection carries the same
+/// decrypted bytes, so a service is exercised hermetically here without its
+/// source moving.
+#[test]
+fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
+    let net = Arc::new(SimNet::with_credentials(
+        vec![vec![REQUEST.to_vec()]],
+        vec!["api"],
+    ));
+    let binding = bind_tls(net.clone());
+    let listener = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::ListenTls,
+        "listener",
+        vec![Value::Int(0), Value::str("api")],
+    )
+    .expect("the credential this run was configured with"));
+    let conn = accept(&binding, net.as_ref(), listener);
+    let request = drain_tls(&binding, net.as_ref(), conn);
+    assert_eq!(request, REQUEST);
+    answer(&binding, net.as_ref(), conn);
+    assert_eq!(net.sent(conn), RESPONSE);
+
+    // The same script over a plaintext listener answers the same program, which
+    // is what "TLS is not a separate effect" means at this level.
+    let plain = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
+    let binding = bind_tls(plain.clone());
+    let listener = listen(&binding, plain.as_ref());
+    let other = accept(&binding, plain.as_ref(), listener);
+    assert_eq!(drain_tls(&binding, plain.as_ref(), other), request);
+    answer(&binding, plain.as_ref(), other);
+    assert_eq!(plain.sent(other), net.sent(conn));
+}
+
+/// `recv` until the peer stops sending, under the deadline every W3 read
+/// carries. `None` would be that deadline expiring, and a script never has one.
+fn drain_tls(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8> {
+    let mut got = Vec::new();
+    loop {
+        let answer = perform(
+            binding,
+            rt,
+            Op::Recv,
+            "conn",
+            vec![Value::Int(conn), Value::Int(4096), Value::Int(5_000)],
+        )
+        .expect("a read");
+        let chunk = bytes(sent_some(answer));
+        if chunk.is_empty() {
+            return got;
+        }
+        got.extend_from_slice(&chunk);
+    }
+}
+
+fn answer(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) {
+    let written = perform(
+        binding,
+        rt,
+        Op::Send,
+        "conn",
+        vec![Value::Int(conn), Value::bytes(RESPONSE), Value::Int(5_000)],
+    )
+    .expect("a send");
+    assert_eq!(int(sent_some(written)), RESPONSE.len() as i64);
+}
+
+/// The payload of a `Some`. `None` is a deadline, which nothing in these tests
+/// sets and which would be a defect if one arrived.
+fn sent_some(value: Value) -> Value {
+    match &value {
+        Value::Ctor { name, args } if name.as_str() == "Some" && args.len() == 1 => args[0].clone(),
+        other => panic!("expected `Some(..)`, got {other}"),
+    }
+}
+
+/// Without `--host`, `net.listen_tls` is `E0424` like every other host
+/// operation — and it must name the handler that would have served it, which is
+/// the TLS one rather than the plaintext listener's.
+#[test]
+fn a_hermetic_run_names_the_tls_handler_it_did_not_bind() {
+    let hermetic = HostBinding::hermetic_with(registry(Arc::new(TcpHost::new())));
+    assert!(hermetic.is_hermetic());
+    assert_eq!(
+        hermetic.would_serve(
+            &Symbol::new(EFFECT),
+            &Symbol::new("listen_tls"),
+            Some(&Symbol::new("listener")),
+        ),
+        Some(crate::tls::HANDLER)
+    );
 }

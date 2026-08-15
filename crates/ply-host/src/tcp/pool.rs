@@ -33,9 +33,15 @@ pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 /// crosses a thread.
 pub enum Done {
     Int(i64),
-    Bytes(Vec<u8>),
-    /// The operation failed. Rendered against the `perform`'s span by whoever
-    /// polls, so a socket error points at Ply source rather than at Rust.
+    /// `net.recv`'s answer. `None` is the deadline expiring and `Some` is what
+    /// the peer sent, empty when it has stopped sending — the one rule
+    /// `std.net` states once and everything above it reads.
+    MaybeBytes(Option<Vec<u8>>),
+    /// `net.send`'s answer, under the same rule.
+    MaybeInt(Option<i64>),
+    /// The operation failed in a way that is neither the peer's doing nor a
+    /// deadline. Rendered against the `perform`'s span by whoever polls, so a
+    /// host error points at Ply source rather than at Rust.
     Failed(String),
 }
 
@@ -217,13 +223,23 @@ fn take(state: &mut State, token: u64) -> Taken {
     };
     Taken::Ready(match done {
         Done::Int(i) => Ok(Value::Int(i)),
-        Done::Bytes(b) => Ok(Value::bytes(b)),
+        Done::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
+        Done::MaybeInt(n) => Ok(option(n.map(Value::Int))),
         Done::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("{what} failed: {message}"),
         )
         .primary(span, "this operation reached the host and the host refused")),
     })
+}
+
+/// The prelude's `Option`, built on the polling thread because a `Value` holds
+/// `Rc` and never crosses one.
+fn option(v: Option<Value>) -> Value {
+    match v {
+        Some(v) => Value::ctor("Some", vec![v]),
+        None => Value::ctor("None", Vec::new()),
+    }
 }
 
 #[cold]

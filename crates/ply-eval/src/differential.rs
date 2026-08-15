@@ -621,7 +621,7 @@ pub fn machine_only_clauses(program: &Program) -> Vec<Diagnostic> {
                 }
                 // A `derive` has no body of its own; its generated
                 // definitions are `Item::Fn`s and are walked above.
-                Item::Type(_) | Item::Effect(_) | Item::Derive(_) => {}
+                Item::Type(_) | Item::Effect(_) | Item::Derive(_) | Item::EffectSet(_) => {}
             }
         }
     }

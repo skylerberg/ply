@@ -205,6 +205,13 @@ struct Checker<'a> {
     /// variable appearing in one is implicitly quantified over the operation.
     auto_ty_params: bool,
     alias_stack: Vec<Symbol>,
+    /// Written atoms already refused, by span.
+    ///
+    /// An `effect set` is expanded by the parser, so one atom written once in a
+    /// set is spliced into every row that names it. Without this, an effect the
+    /// program does not declare produces one identical diagnostic per row —
+    /// pointing, correctly, at the one place there is to fix.
+    refused_atoms: FxHashSet<Span>,
     performs: Vec<PerformSite>,
     /// Operand types of `==` / `!=`, checked once the whole module is solved
     /// because the type at a comparison is often still a variable when it is
@@ -348,6 +355,7 @@ impl<'a> Checker<'a> {
             row_params: FxHashMap::default(),
             auto_ty_params: false,
             alias_stack: Vec::new(),
+            refused_atoms: FxHashSet::default(),
             performs: Vec::new(),
             comparisons: Vec::new(),
             map_keys: Vec::new(),
@@ -681,6 +689,13 @@ impl<'a> Checker<'a> {
             (
                 "bytes_concat",
                 mono(vec![Type::bytes(), Type::bytes()], Type::bytes()),
+            ),
+            // One allocation over the whole list. Folding `bytes_concat` across
+            // a read loop's answers copies the accumulated prefix once per read,
+            // which is quadratic in the size of a message a peer chooses.
+            (
+                "bytes_concat_all",
+                mono(vec![Type::list(Type::bytes())], Type::bytes()),
             ),
             ("bytes_of_string", mono(vec![Type::string()], Type::bytes())),
             ("bytes_is_utf8", mono(vec![Type::bytes()], Type::bool())),
@@ -1240,7 +1255,11 @@ impl<'a> Checker<'a> {
                     }
                     TypeDefBody::Alias(_) => Vec::new(),
                 },
-                Item::Effect(_) | Item::Test(_) | Item::Law(_) | Item::Derive(_) => Vec::new(),
+                Item::Effect(_)
+                | Item::Test(_)
+                | Item::Law(_)
+                | Item::Derive(_)
+                | Item::EffectSet(_) => Vec::new(),
             };
             for (name, is_fn) in declared {
                 match seen.get(&name.name) {
@@ -1552,7 +1571,13 @@ impl<'a> Checker<'a> {
     }
 
     fn conv_atom(&mut self, a: &AtomExpr) -> Option<EffectAtom> {
-        let effect = self.effect_name(&a.effect)?;
+        if self.refused_atoms.contains(&a.span) {
+            return None;
+        }
+        let Some(effect) = self.effect_name(&a.effect) else {
+            self.refused_atoms.insert(a.span);
+            return None;
+        };
         let resource = match &a.resource {
             Some(r) => Resource::Named(r.name.clone()),
             None => Resource::Singleton,
@@ -1582,6 +1607,7 @@ impl<'a> Checker<'a> {
                     dedup(known).join(", ")
                 )),
             );
+            self.refused_atoms.insert(a.span);
             return None;
         }
         Some(EffectAtom::new(effect, resource, a.mode))
@@ -1779,8 +1805,9 @@ impl<'a> Checker<'a> {
                     .bind_global(names[slot].clone(), Scheme::mono(sig.fn_ty.clone()));
                 sigs.push(sig);
             }
+            let mut performed = Vec::with_capacity(comp.len());
             for (slot, &i) in comp.iter().enumerate() {
-                self.check_fn_body(fns[i], &sigs[slot]);
+                performed.push(self.check_fn_body(fns[i], &sigs[slot]));
                 self.record_spec_env(fns[i], &names[slot], &sigs[slot]);
             }
             // After the whole component, not after each member: a caller in the
@@ -1815,6 +1842,8 @@ impl<'a> Checker<'a> {
                         simple_name: def.name.name.clone(),
                         scheme,
                         footprint: Footprint(row.atoms),
+                        performed: Footprint(self.subst.resolve_row(&performed[slot]).atoms),
+                        row_aliases: row_aliases(def),
                         constraints,
                         spec: Vec::new(),
                         span: def.span,
@@ -1875,6 +1904,8 @@ impl<'a> Checker<'a> {
                     simple_name: fns[i].name.name.clone(),
                     scheme,
                     footprint: entry.footprint.clone(),
+                    performed: entry.performed.clone(),
+                    row_aliases: row_aliases(fns[i]),
                     constraints,
                     spec: Vec::new(),
                     span: fns[i].span,
@@ -2103,7 +2134,9 @@ impl<'a> Checker<'a> {
         out
     }
 
-    fn check_fn_body(&mut self, def: &FnDef, sig: &Signature) {
+    /// Answers the row the body itself performed, which is the published row
+    /// only when there is no annotation to widen it.
+    fn check_fn_body(&mut self, def: &FnDef, sig: &Signature) -> Row {
         self.derived = def.derived.clone();
         self.scope = sig.scope;
         self.ty_params = sig.ty_params.clone();
@@ -2136,6 +2169,7 @@ impl<'a> Checker<'a> {
         self.row_params.clear();
         self.assumed.clear();
         self.derived = None;
+        body_row
     }
 
     /// A `/ {...}` annotation bounds the inferred row from above: everything the
@@ -3932,6 +3966,10 @@ impl<'a> Checker<'a> {
         let result_var = general.then(|| self.fresh.ty());
 
         let mut handled: BTreeSet<EffectAtom> = BTreeSet::new();
+        // Keyed on what `Stack::find_handler` dispatches on, which is the
+        // operation and not its atom. `net.recv[conn]`, `net.send[conn]` and
+        // `net.close[conn]` are one atom and three reachable clauses.
+        let mut selected: BTreeSet<(Symbol, Symbol, Resource)> = BTreeSet::new();
         let mut clause_rows = Row::empty();
         for clause in clauses {
             let Some((info, op_info)) = self.resolve_op(&clause.effect, &clause.op) else {
@@ -3965,12 +4003,22 @@ impl<'a> Checker<'a> {
                 continue;
             }
 
+            let key = (info.name.clone(), op_info.name.clone(), res.clone());
             let atom = EffectAtom::new(info.name.clone(), res, op_info.mode);
-            if !handled.insert(atom.clone()) {
+            handled.insert(atom);
+            if !selected.insert(key) {
                 self.diags.push(
                     Diagnostic::warning(
                         codes::DUPLICATE_DEFINITION,
-                        format!("`{atom}` is handled more than once"),
+                        format!(
+                            "`{}.{}{}` is handled more than once",
+                            info.name,
+                            op_info.name,
+                            match clause.resource.as_ref() {
+                                Some(r) => format!("[{}]", r.name),
+                                None => String::new(),
+                            }
+                        ),
                     )
                     .primary(clause.span, "this clause is unreachable")
                     .note("the first matching clause wins at run time"),
@@ -4568,6 +4616,16 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Decimal { .. } => Type::decimal(),
         Lit::Unit => Type::unit(),
     }
+}
+
+/// The `effect set` names this definition's row was written with, in source
+/// order. Only names a set could have: the parser has already refused a
+/// qualified one, so nothing here needs qualifying.
+fn row_aliases(def: &FnDef) -> Vec<Symbol> {
+    def.effects
+        .as_ref()
+        .map(|r| r.aliases.iter().map(|q| q.symbol().clone()).collect())
+        .unwrap_or_default()
 }
 
 /// A written effect row inside a `forall` binder's type, which the row

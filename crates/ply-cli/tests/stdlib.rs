@@ -591,9 +591,9 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
         dir.path(),
         "reader.ply",
         "import mine (net, drain)\n\
-         pub fn read_all(c: Int) -> Bytes / {net.write[conn]} = drain(c, b\"\")\n\
+         pub fn read_all(c: Int) -> Bytes / {net.write[conn]} = drain(c, b\"\", 1000)\n\
          test \"reads\" {\n\
-        \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m) -> b\"\" }\n\
+        \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n\
          }\n",
     );
     write(
@@ -609,7 +609,10 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
     write(
         dir.path(),
         "mine.ply",
-        &ply_std::NET.replace("net.recv[conn](c, 4096)", "net.recv[conn](c, 8192)"),
+        &ply_std::NET.replace(
+            "net.recv[conn](c, 4096, timeout_ms)",
+            "net.recv[conn](c, 8192, timeout_ms)",
+        ),
     );
     let after = load(dir.path()).unwrap();
 
@@ -771,5 +774,66 @@ fn a_shipped_modules_laws_are_not_a_projects() {
     assert!(
         all["coverage"]["definitions"].as_u64().unwrap() > 100,
         "{all:#}"
+    );
+}
+
+/// `observe_definitions` withholds every definition an unresolved test reached,
+/// and a shipped module's tests are never resolved without `--std` — so
+/// `std.router`'s and `std.http`'s definitions were never recorded, stayed
+/// permanently "changed", and landed in the suspect set of every failure in
+/// every project that imported them. ADR 0004 says the suspects are what
+/// *changed* since the last pass; 48 unchanged stdlib definitions and none of
+/// the two that moved is that promise inverted.
+#[test]
+fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = |literal: &str| {
+        format!(
+            "import std.router\n\
+             import std.http\n\
+             pub type Endpoint = Health | GetItem\n\
+             pub fn table() -> List<router::Route<Endpoint>> = [\n\
+               {{method: http::Get, path: router::pattern_of_string(\"/health\"), endpoint: Health}},\n\
+               {{method: http::Get, path: router::pattern_of_string(\"/items/{{sku}}\"), endpoint: GetItem}},\n\
+             ]\n\
+             pub fn slug(s: String) -> String = string_concat(\"{literal}\", s)\n\
+             pub fn hits(p: String) -> Bool =\n\
+               match router::route(table(), http::Get, p) {{\n\
+                 router::Found(_) -> true,\n\
+                 _ -> false,\n\
+               }}\n\
+             test \"the table routes an item\" {{ assert_eq(hits(slug(\"bolt\")), true) }}\n"
+        )
+    };
+
+    write(dir.path(), "app.ply", &source("/items/"));
+    let out = ply(dir.path()).arg("test").output().unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+
+    // One edit, to one definition the project owns.
+    write(dir.path(), "app.ply", &source("/goods/"));
+    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .unwrap_or_else(|e| panic!("{e}: {}", output(&out)));
+
+    let suspects: Vec<String> = v["failures"][0]["suspects"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failure with an attribution: {v}"))
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !suspects.is_empty(),
+        "the edit has to be attributed to something: {v}"
+    );
+    let shipped: Vec<&String> = suspects.iter().filter(|n| n.starts_with("std.")).collect();
+    assert!(
+        shipped.is_empty(),
+        "nothing under `std` moved, so nothing under `std` is a suspect: {shipped:?}"
+    );
+    assert_eq!(
+        v["failures"][0]["culprit"]["definitions"][0],
+        "app.slug",
+        "{v}"
     );
 }

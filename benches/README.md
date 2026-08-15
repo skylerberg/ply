@@ -174,6 +174,49 @@ count is fixed down a column while the byte count grows. A flat `µs/req` down
 that column means the cost is the fields; a rising one would mean a scan is
 still crossing the buffer per byte.
 
+## What `w3` adds
+
+`serve` prices one endpoint with no routing, no body and no connection reuse.
+`w3` prices the service W3 shipped — `examples/desk.ply`, ten routes, real
+HTTP/1.1 framing, keep-alive and TLS — and re-takes `serve`'s field-proportional
+sweep against it, because full framing is the thing most likely to have put a
+per-byte cost back on the request path.
+
+```
+cargo run --release -p ply-corpus -- w3 --repo . [--json]
+cargo run --release -p ply-corpus -- w3 --repo . --no-load          # the in-process half
+cargo run --release -p ply-corpus -- w3 --repo . --concurrent       # a task per connection
+cargo run --release -p ply-corpus -- w3 --repo . --w2-baseline      # W2's endpoint on the same machine
+```
+
+| section | question |
+| --- | --- |
+| routes | throughput and tail latency at each concurrency, over a mix of the read routes |
+| stages | where one request's time goes: the route table, the match, the framing, one endpoint, the encode |
+| per route | each of the ten routes on its own, so a mix has a decomposition rather than an average |
+| fields or bytes | three axes — header bytes at a fixed field count, header count, and body bytes |
+| keep-alive | the same work over one to a hundred requests per connection |
+| TLS | one route over both transports, with the handshake timed apart from the request |
+| aliases | `/ {Desk}` against its expansion, compared as hashes, as stored bytes and as footprints |
+
+Two things about the tables are load-bearing:
+
+**Read the handshake off the concurrency-1 rows.** `desk.ply` serves one
+connection at a time and the TLS handshake completes on the server's first
+`recv`, so a client that connected while the server was busy times the queue and
+not the cryptography.
+
+**The last request on every connection carries `Connection: close`.** That is
+what a client does, and it is also what keeps the run from exhausting the
+ephemeral port range: whichever peer closes first holds the port in `TIME_WAIT`
+for twice the segment lifetime, and a client opening a thousand connections a
+second cannot afford to be that peer.
+
+The load sections drive the real `ply` binary over loopback. The stages, per
+route and shape sections run in process over `SimNet`, because what they price
+is the parse, the route and the encode, and a syscall in the middle of that has
+a bigger variance than the thing being measured.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

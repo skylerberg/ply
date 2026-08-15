@@ -26,6 +26,14 @@
 //! Both go through [`register`], so the triples, the determinism flag, the
 //! linearity flag, the argument decoding and the domain checks are one
 //! implementation rather than two that agree today.
+//!
+//! `net.listen_tls` is here rather than behind a `tls` effect of its own,
+//! because a row claims which resources a computation touches and whether two
+//! computations contend, and encryption decides neither. What it does change is
+//! the trusted computing base, so it is registered with its own handler path —
+//! [`ply_host::tls::listen`] — and `ply hosts` prints it on its own line.
+//!
+//! [`ply_host::tls::listen`]: crate::tls::listen
 
 mod pool;
 mod sim;
@@ -44,6 +52,7 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// The Ply declaration the registrations below are checked against: the source
 /// of the module `std.net`, which ships with the compiler.
@@ -69,11 +78,12 @@ pub const EFFECT: &str = "std.net.net";
 /// host makes on a peer's word.
 pub const MAX_RECV: usize = 1 << 20;
 
-/// The five operations. Listen, accept, read, write, close, and nothing else:
-/// no TLS, no pooling, no keep-alive.
+/// The six operations. Listen, listen over TLS, accept, read, write, close, and
+/// nothing else: no pooling and no keep-alive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Listen,
+    ListenTls,
     Accept,
     Recv,
     Send,
@@ -81,11 +91,19 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 5] = [Op::Listen, Op::Accept, Op::Recv, Op::Send, Op::Close];
+    pub const ALL: [Op; 6] = [
+        Op::Listen,
+        Op::ListenTls,
+        Op::Accept,
+        Op::Recv,
+        Op::Send,
+        Op::Close,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::Listen => "listen",
+            Op::ListenTls => "listen_tls",
             Op::Accept => "accept",
             Op::Recv => "recv",
             Op::Send => "send",
@@ -97,6 +115,7 @@ impl Op {
     pub fn what(self) -> &'static str {
         match self {
             Op::Listen => "`net.listen`",
+            Op::ListenTls => "`net.listen_tls`",
             Op::Accept => "`net.accept`",
             Op::Recv => "`net.recv`",
             Op::Send => "`net.send`",
@@ -107,7 +126,12 @@ impl Op {
     fn arity(self) -> usize {
         match self {
             Op::Listen | Op::Accept | Op::Close => 1,
-            Op::Recv | Op::Send => 2,
+            Op::ListenTls => 2,
+            // The deadline is the third argument. ADR 0013 §7.2: a deadline on
+            // the operation needs one `setsockopt` inside a job that already
+            // owns the socket, where a cancellation would need a token registry
+            // and a race between the cancel and the completion.
+            Op::Recv | Op::Send => 3,
         }
     }
 
@@ -162,19 +186,38 @@ pub trait Net: Send + Sync {
     fn path(&self, op: Op) -> &'static str;
 
     fn listen(&self, at: &Resource, port: u16, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// The same listener, terminating TLS. `credential` names material the run
+    /// was configured with rather than carrying any of it, so a program that
+    /// serves TLS holds no key and its hashes carry none. One credential per
+    /// listener: SNI-based selection and mTLS are not in W3.
+    fn listen_tls(
+        &self,
+        at: &Resource,
+        port: u16,
+        credential: &str,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// `None` is the deadline expiring; `Some(b"")` is the peer having stopped
+    /// sending. Both are ordinary outcomes rather than diagnostics — a server
+    /// that died because a client reset a connection would not be a server.
     fn recv(
         &self,
         at: &Resource,
         conn: i64,
         max: usize,
+        timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
+    /// `None` is the deadline expiring; `Some(0)` is the peer being gone.
+    /// `Some(n)` may be short of the payload, which is what `std.net.send_all`
+    /// loops over.
     fn send(
         &self,
         at: &Resource,
         conn: i64,
         payload: &[u8],
+        timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
     fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
@@ -265,7 +308,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Register all five operations of `net` against `net`'s implementation.
+/// Register every operation of `net` against `net`'s implementation.
 ///
 /// One function for both implementations on purpose. ADR 0008 §5 wants a
 /// simulated twin that satisfies the same declared signature; the cheapest way
@@ -307,8 +350,13 @@ impl HostHandler for Operation {
         let at = &req.atom.resource;
         match self.op {
             Op::Listen => {
-                let port = port(req.args[0].as_int(span, "a port")?, span)?;
+                let port = port(self.op, req.args[0].as_int(span, "a port")?, span)?;
                 self.net.listen(at, port, span)
+            }
+            Op::ListenTls => {
+                let port = port(self.op, req.args[0].as_int(span, "a port")?, span)?;
+                let credential = req.args[1].as_str(span, "a credential name")?;
+                self.net.listen_tls(at, port, credential, span)
             }
             Op::Accept => {
                 let listener = req.args[0].as_int(span, "a socket handle")?;
@@ -317,12 +365,17 @@ impl HostHandler for Operation {
             Op::Recv => {
                 let conn = req.args[0].as_int(span, "a socket handle")?;
                 let max = bound(req.args[1].as_int(span, "a byte count")?, span)?;
-                self.net.recv(at, conn, max, span)
+                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
+                self.net.recv(at, conn, max, timeout, span)
             }
             Op::Send => {
                 let conn = req.args[0].as_int(span, "a socket handle")?;
                 let payload = Arc::clone(req.args[1].as_bytes(span, "a payload")?);
-                self.net.send(at, conn, &payload, span)
+                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
+                if payload.is_empty() {
+                    return Err(empty_payload(span));
+                }
+                self.net.send(at, conn, &payload, timeout, span)
             }
             Op::Close => {
                 let socket = req.args[0].as_int(span, "a socket handle")?;
@@ -332,13 +385,57 @@ impl HostHandler for Operation {
     }
 }
 
-fn port(port: i64, span: Span) -> Result<u16, Diagnostic> {
+/// A caller that wants no deadline passes a large one, and being made to write
+/// the number down is the point: an operation with no bound is a connection a
+/// peer can hold for the life of the run.
+fn deadline(op: Op, ms: i64, span: Span) -> Result<Duration, Diagnostic> {
+    if ms <= 0 {
+        return Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("{} was given a timeout of {ms} milliseconds", op.what()),
+        )
+        .primary(span, "a deadline must be positive")
+        .note("pass a large number for an operation that should not time out; there is no value that means `never`"));
+    }
+    Ok(Duration::from_millis(ms as u64))
+}
+
+/// What keeps `Some(0)` unambiguous: with an empty payload permitted, a caller
+/// could not tell "the peer is gone" from "there was nothing to write".
+#[cold]
+fn empty_payload(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        "`net.send` was given an empty payload",
+    )
+    .primary(span, "there is nothing to write")
+    .note("`send` answers `Some(0)` when the peer is gone, so an empty payload would be indistinguishable from one")
+}
+
+fn port(op: Op, port: i64, span: Span) -> Result<u16, Diagnostic> {
     u16::try_from(port).map_err(|_| {
         Diagnostic::error(
             codes::RUNTIME_ERROR,
-            format!("`net.listen` was given port {port}, which is not a TCP port"),
+            format!(
+                "{} was given port {port}, which is not a TCP port",
+                op.what()
+            ),
         )
         .primary(span, "a port is 1 to 65535, or 0 to be assigned one")
+    })
+}
+
+/// The loopback bind both listeners share, so that the two cannot come to
+/// differ about which interface a Ply program listens on. Loopback because
+/// neither operation takes an address, and a handler that bound `0.0.0.0` by
+/// default would put a program's responses on the network of whoever ran it.
+pub(crate) fn bind(what: &str, port: u16, span: Span) -> Result<std::net::TcpListener, Diagnostic> {
+    std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("{what} could not bind 127.0.0.1:{port}: {e}"),
+        )
+        .primary(span, "this listen reached the host and the host refused")
     })
 }
 

@@ -324,6 +324,12 @@ pub enum Item {
     /// those are what the rest of the pipeline sees. So every consumer that
     /// enumerates definitions is right to skip this variant.
     Derive(Box<DeriveDef>),
+    /// `effect set Web = {db.read[users], log.write}`. Declares nothing a
+    /// reference can reach: the parser has already expanded every row that
+    /// names it, so what survives here is provenance for `--explain`. Skipped
+    /// by every consumer that enumerates definitions, exactly as
+    /// [`Item::Derive`] is.
+    EffectSet(Box<EffectSetDef>),
 }
 
 impl Item {
@@ -335,18 +341,21 @@ impl Item {
             Item::Test(d) => d.span,
             Item::Law(d) => d.span,
             Item::Derive(d) => d.span,
+            Item::EffectSet(d) => d.span,
         }
     }
 
-    /// `None` for a `test`, a `law` and a `derive`, none of which have a name a
-    /// reference could reach. A `derive`'s generated definitions do, and they
-    /// are [`Item::Fn`]s of their own.
+    /// `None` for a `test`, a `law`, a `derive` and an `effect set`, none of
+    /// which have a name a reference could reach. A `derive`'s generated
+    /// definitions do, and they are [`Item::Fn`]s of their own; an `effect
+    /// set`'s name is consumed by the parser and lives in no namespace
+    /// `resolve` knows about.
     pub fn name(&self) -> Option<&Ident> {
         match self {
             Item::Fn(d) => Some(&d.name),
             Item::Type(d) => Some(&d.name),
             Item::Effect(d) => Some(&d.name),
-            Item::Test(_) | Item::Law(_) | Item::Derive(_) => None,
+            Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => None,
         }
     }
 
@@ -358,9 +367,53 @@ impl Item {
             Item::Fn(d) => d.vis,
             Item::Type(d) => d.vis,
             Item::Effect(d) => d.vis,
-            Item::Test(_) | Item::Law(_) | Item::Derive(_) => Visibility::Private,
+            Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {
+                Visibility::Private
+            }
         }
     }
+}
+
+/// `effect set Web = {db.read[users], log.write, Inner}`.
+///
+/// An abbreviation for a row, and nothing more. Its name is namespace metadata
+/// — erased by normalization — while its [`expansion`] enters a hash exactly as
+/// the row it stands for would, because that expansion is the published upper
+/// bound a caller is checked against.
+///
+/// A member is an **atom** or another set, never a whole effect. "Every atom of
+/// `db`" is every resource label anywhere in the program, so an unrelated table
+/// in an unrelated module would change the expansion — and therefore the
+/// declared row, and therefore the hash — of every definition annotated with
+/// this set, which is exactly the rule that nothing outside a definition's own
+/// reachable graph may enter its hash.
+///
+/// Sets are **module-local**: [`includes`] is a [`QName`] only so that a
+/// qualified reference can be refused with a diagnostic that says why. Gate 1
+/// skips a file whose raw bytes are unchanged, so a set expanding across a
+/// module boundary would let an edit in the declaring module leave a stale
+/// published row behind — a footprint that under-reports, which is a green
+/// result rather than a loud one.
+///
+/// [`expansion`]: EffectSetDef::expansion
+/// [`includes`]: EffectSetDef::includes
+#[derive(Clone, Debug)]
+pub struct EffectSetDef {
+    pub name: Ident,
+    /// Members written as atoms, in source order.
+    pub atoms: Vec<AtomExpr>,
+    /// Members naming another set, in source order.
+    pub includes: Vec<QName>,
+    /// Every atom this set denotes, after expanding `includes` transitively:
+    /// sorted and deduplicated by written form.
+    ///
+    /// Sorted rather than left in the order the members were written, so that
+    /// reordering them — or splitting one set into two — produces the same
+    /// expansion. That is what a reader diffing two `--explain` outputs sees,
+    /// and it is one fewer thing they have to know the row encoder fixes up
+    /// later.
+    pub expansion: Vec<AtomExpr>,
+    pub span: Span,
 }
 
 /// The derivations the language defines. Fixed: there are no user-defined
@@ -674,10 +727,23 @@ impl TypeExpr {
     }
 }
 
-/// A written effect row: `{db.read[users], clock.read | e}`.
+/// A written effect row: `{db.read[users], clock.read | e}`, or
+/// `{Web, random.read}` naming an [`EffectSetDef`].
+///
+/// `atoms` is always complete: [`crate::parse_module`] expands every set before
+/// it returns, so an unexpanded row never escapes the parser and no crate can
+/// forget to run the expander.
 #[derive(Clone, Debug)]
 pub struct RowExpr {
     pub atoms: Vec<AtomExpr>,
+    /// The `effect set`s this row was written with, in source order.
+    ///
+    /// Provenance for `--explain` and nothing else: **erased by
+    /// normalization**, so a row written `{Web}` and one written with `Web`'s
+    /// expansion are the same definition and share a hash. A qualified name is
+    /// representable only so that it can be refused with a diagnostic saying
+    /// sets are module-local.
+    pub aliases: Vec<QName>,
     pub tail: Option<Ident>,
     pub span: Span,
 }

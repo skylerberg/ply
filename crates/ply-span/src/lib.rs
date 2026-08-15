@@ -222,6 +222,20 @@ pub mod codes {
     /// by name, so a project module that could claim one of its names would
     /// decide what `import std.json` means by where a file happens to sit.
     pub const RESERVED_MODULE_NAME: &str = "E0113";
+    /// A row, or an `effect set` body, naming a set the module does not
+    /// declare. Also the qualified form `other::Web` and `pub effect set`,
+    /// because a set is private to the module that declares it and the three
+    /// have one fix.
+    ///
+    /// The restriction is what makes expansion a function of the file. Gate 1
+    /// skips a file whose raw bytes are unchanged, so a set expanding across a
+    /// module boundary would let an edit in the declaring module leave a stale
+    /// published row behind — a footprint that under-reports, which corrupts
+    /// scheduling and isolation silently rather than loudly.
+    pub const UNKNOWN_EFFECT_SET: &str = "E0114";
+    /// An `effect set` that contains itself, directly or through another.
+    /// Expansion is a fixed point and a cycle has none.
+    pub const EFFECT_SET_CYCLE: &str = "E0115";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -336,6 +350,18 @@ pub mod codes {
     /// having done the work — so the declaration and the behaviour disagree, and
     /// the scheduler's account of which of its threads are free is wrong.
     pub const HOST_BLOCKING_ANSWER: &str = "E0428";
+    /// `net.listen_tls` named a credential the binding does not hold. The
+    /// diagnostic lists the credentials the run was configured with, because
+    /// the fix is a `--tls` argument rather than an edit to the program.
+    pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
+    /// A `--tls` credential that does not load: the file is unreadable, the PEM
+    /// does not parse, it holds no certificate or no private key, or the key
+    /// does not match the leaf certificate.
+    ///
+    /// Raised at bind time, before anything runs. A server that discovers its
+    /// certificate is unusable on the first handshake has already told a client
+    /// it was listening.
+    pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -492,6 +518,8 @@ mod tests {
                 "E0112",
             ),
             ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
+            ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
+            ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
@@ -546,6 +574,16 @@ mod tests {
                 "E0427",
             ),
             ("HOST_BLOCKING_ANSWER", codes::HOST_BLOCKING_ANSWER, "E0428"),
+            (
+                "TLS_CREDENTIAL_UNKNOWN",
+                codes::TLS_CREDENTIAL_UNKNOWN,
+                "E0429",
+            ),
+            (
+                "TLS_CREDENTIAL_INVALID",
+                codes::TLS_CREDENTIAL_INVALID,
+                "E0430",
+            ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
