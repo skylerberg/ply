@@ -1,19 +1,20 @@
-use crate::env::{TypeEnv, generalize, instantiate};
+use crate::derivable::{Adt, Context as Derivability, Why, ordered};
+use crate::env::{TypeEnv, generalize, instantiate, instantiate_with};
 use crate::prelude;
 use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
 use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use crate::unify::{Fresh, Subst, UnifyError, unify, unify_row};
 use crate::{
-    CheckOutput, CtorInfo, DefInfo, EffectInfo, Known, LawBinder, LawInfo, ModuleInfo, OpInfo,
-    SpecInfo, TestInfo,
+    CheckOutput, CtorInfo, DefConstraint, DefInfo, EffectInfo, Known, LawBinder, LawInfo,
+    ModuleInfo, OpInfo, SpecInfo, TestInfo,
 };
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
 use ply_syntax::ast::*;
 use ply_syntax::resolve::{Namespace, Resolved, Scope, resolve};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The effect under which `with_cell` regions publish their atoms. Reserved:
 /// a user `effect cell` would silently gain the power to observe region state.
@@ -24,16 +25,28 @@ const CELL: &str = "cell";
 /// `ensures` may still call a parameter `result`.
 const RESULT: &str = "result";
 
-const BUILTIN_TYPES: &[(&str, usize)] = &[
+/// Names no `type` item may claim, with their arities. The prelude's ADTs are
+/// appended by [`builtin_types`] rather than repeated here, so the one table in
+/// `prelude` decides both what exists and what is reserved.
+const BUILTIN_TYPE_CONS: &[(&str, usize)] = &[
     ("Int", 0),
     ("Bool", 0),
     ("String", 0),
     ("Bytes", 0),
+    ("Float", 0),
+    ("Decimal", 0),
     ("Unit", 0),
     ("List", 1),
+    ("Map", 2),
     ("Cell", 1),
     (prelude::TASK_TYPE, 1),
 ];
+
+fn builtin_types() -> Vec<(&'static str, usize)> {
+    let mut out = BUILTIN_TYPE_CONS.to_vec();
+    out.extend(prelude::ADTS.iter().map(|a| (a.name, a.params.len())));
+    out
+}
 
 pub fn check_program_with(
     program: &Program,
@@ -65,7 +78,15 @@ pub fn check_program_with(
         c.check_tests(module);
         c.check_laws(module);
     }
+    // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
+    // Nothing here is generalized, so the position only has to be after every
+    // expression has been walked.
+    c.settle_numerics();
     c.check_comparisons();
+    c.check_map_keys();
+    c.check_constraints();
+    c.check_derives(program);
+    c.attribute_generated(program);
     c.check_simulations();
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(c.diags)
@@ -82,7 +103,13 @@ pub fn check_program_with(
 }
 
 pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let program = Program::single(module.clone());
+    let mut program = Program::single(module.clone());
+    // A `derive` is expanded before anything is resolved, here as in the
+    // driver: what resolution and inference see is ordinary definitions.
+    let diags = ply_derive::expand_program(&mut program);
+    if !diags.is_empty() {
+        return Err(diags);
+    }
     let resolved = resolve(&program)?;
     check_program_with(&program, &resolved, &Known::default())
 }
@@ -107,6 +134,46 @@ struct PerformSite {
     direct: bool,
 }
 
+/// A `Map` type as it was written or instantiated, with everything
+/// [`Checker::check_map_keys`] needs to judge it once the module is solved. The
+/// assumptions travel with the site because they belong to the signature the
+/// site sits in, and the check runs long after that signature is out of scope.
+struct MapKeySite {
+    span: Span,
+    scope: u32,
+    key: Type,
+    assumed: FxHashSet<TyVar>,
+    params: Vec<(TyVar, Symbol)>,
+}
+
+/// A reference that instantiated a parameter its callee constrained, with
+/// everything [`Checker::check_constraints`] needs once the module is solved.
+///
+/// The whole point of the constraint is that this is where the error lands: an
+/// agent that gets "`(Int) -> Int` has no JSON encoding" at the call it wrote
+/// fixes the call, and one that gets it from inside an expansion searches.
+struct ConstraintSite {
+    span: Span,
+    deriver: Deriver,
+    /// The type the constrained parameter was instantiated with.
+    ty: Type,
+    /// The callee, and where its signature is, for the secondary label.
+    callee: Symbol,
+    callee_span: Span,
+    /// The constraints in force at the call, so a body may assume its own.
+    assumed: FxHashSet<TyVar>,
+    /// The enclosing signature's type parameters, so "add `where derivable(json,
+    /// a)`" can name `a` rather than a variable number.
+    params: Vec<(TyVar, Symbol)>,
+}
+
+fn clone_adt(a: &Adt) -> Adt {
+    Adt {
+        params: a.params.clone(),
+        fields: a.fields.clone(),
+    }
+}
+
 /// Every map below is keyed by the program-wide name, so two modules may
 /// declare the same simple name without either one being rewritten.
 struct Checker<'a> {
@@ -128,6 +195,12 @@ struct Checker<'a> {
     modules: IndexMap<Symbol, ModuleInfo>,
     ty_params: FxHashMap<Symbol, Type>,
     row_params: FxHashMap<Symbol, RowVar>,
+    /// The type parameters the signature being checked declared `where
+    /// derivable(D, ·)` for, by deriver. A `Map` key that is one of the `ord`
+    /// ones is well-formed, and the body may assume it: that is what "checked
+    /// at the signature, not at the use" means, and it is why omitting the
+    /// clause is an error on the signature rather than a mystery at a call.
+    assumed: FxHashMap<Deriver, FxHashSet<TyVar>>,
     /// Effect operation signatures have no generic list of their own, so a type
     /// variable appearing in one is implicitly quantified over the operation.
     auto_ty_params: bool,
@@ -137,6 +210,30 @@ struct Checker<'a> {
     /// because the type at a comparison is often still a variable when it is
     /// first seen.
     comparisons: Vec<(Span, Type)>,
+    /// Every `Map` key type this run has seen written or instantiated, checked
+    /// once the module is solved for the same reason `comparisons` is: the key
+    /// is usually still a variable where the map first appears, and `Map<Float,
+    /// v>` is only visible once unification has pinned it.
+    map_keys: Vec<MapKeySite>,
+    /// Ticks once per definition, test and law. A deferred check dedupes on it
+    /// rather than on a span, because one bad type is usually recorded twice —
+    /// at the annotation that wrote it and at the call that instantiated it —
+    /// and two errors for one edit is two things to read and one thing to fix.
+    scope: u32,
+    /// The published `where` clauses of every definition checked so far,
+    /// including the ones restored from a cached interface. A call site is
+    /// checked against these, which is what makes the error local to the call
+    /// rather than to something the callee does three definitions deeper.
+    constraints: IndexMap<Symbol, Vec<DefConstraint>>,
+    /// Call sites instantiating a constrained parameter, judged once the module
+    /// is solved for the same reason `map_keys` is: the type argument at a call
+    /// is routinely still a variable when the call is first walked.
+    constrained_uses: Vec<ConstraintSite>,
+    /// Arithmetic and ordered comparisons whose operand type has yet to be
+    /// pinned to one of the three numeric types. Drained by
+    /// [`Checker::settle_numerics`] before the definition around them is
+    /// generalized.
+    numerics: Vec<Numeric>,
     /// `simulate` regions, checked for the same reason: a region's result type
     /// and the row of what it calls are both routinely unsolved while its own
     /// definition is still being walked.
@@ -149,6 +246,18 @@ struct Checker<'a> {
     /// The clause being walked, so `result` outside an `ensures` can say where
     /// it is bound instead.
     spec_kind: Option<SpecKind>,
+    /// Set while a definition a `derive` generated is being checked. A failure
+    /// inside one is Ply's problem to explain, not the user's to decode: the
+    /// body is not in the file and there is nothing at its span to edit.
+    derived: Option<Derived>,
+}
+
+/// One use of an operator that is defined at more than one numeric type, kept
+/// until the operand type is known.
+struct Numeric {
+    span: Span,
+    op: BinOp,
+    ty: Type,
 }
 
 /// Where a spec expression sits, which decides both how it is named in a
@@ -241,9 +350,16 @@ impl<'a> Checker<'a> {
             alias_stack: Vec::new(),
             performs: Vec::new(),
             comparisons: Vec::new(),
+            map_keys: Vec::new(),
+            scope: 0,
+            assumed: FxHashMap::default(),
+            constraints: IndexMap::new(),
+            constrained_uses: Vec::new(),
+            numerics: Vec::new(),
             simulations: Vec::new(),
             spec_envs: FxHashMap::default(),
             spec_kind: None,
+            derived: None,
         };
         c.install_prelude();
         c
@@ -342,6 +458,33 @@ impl<'a> Checker<'a> {
 
     /// Silent counterpart to [`Checker::global`], for the second look a
     /// diagnostic needs after the reference has already been resolved once.
+    /// The program-wide name a constructor reference denotes, falling back to
+    /// the prelude's — which no module declares, so nothing qualifies it.
+    ///
+    /// A module that declares its own `Some` shadows the prelude's, exactly as
+    /// one declaring its own `len` does.
+    ///
+    /// Reporting, through [`Checker::global`]: a qualified constructor that is
+    /// private is `E0107` and the prelude fallback must not swallow it.
+    fn ctor_name(&mut self, q: &QName) -> Option<Symbol> {
+        if let Some(name) = self.global(Namespace::Value, q) {
+            return Some(name);
+        }
+        self.prelude_ctor(q)
+    }
+
+    /// [`Checker::ctor_name`] without the diagnostic, for the passes that only
+    /// ask which constructor a pattern *covers*. The reference has already been
+    /// reported by the pass that bound it.
+    fn covered_ctor(&self, q: &QName) -> Option<Symbol> {
+        self.declared_value(q).or_else(|| self.prelude_ctor(q))
+    }
+
+    fn prelude_ctor(&self, q: &QName) -> Option<Symbol> {
+        let bare = q.is_bare().then(|| q.symbol().clone())?;
+        self.ctors.contains_key(&bare).then_some(bare)
+    }
+
     fn declared_value(&self, q: &QName) -> Option<Symbol> {
         if q.is_bare() {
             self.scope()
@@ -369,17 +512,49 @@ impl<'a> Checker<'a> {
         match self.resolved.lookup(self.module, ns, q) {
             Ok(binding) => Some(binding.qualified.clone()),
             Err(d) => {
-                self.diags.push(d);
+                let what = if ns == Namespace::Type {
+                    "type"
+                } else {
+                    "definition"
+                };
+                if !self.unresolved_in_derived(q, what) {
+                    self.diags.push(d);
+                }
                 None
             }
         }
     }
 
+    /// The prelude's ADTs, as constructors in the value namespace and entries in
+    /// `ctors`.
+    ///
+    /// They are registered exactly as a module's are, so exhaustiveness, pattern
+    /// binding, the property generator and the prover's case split all see them
+    /// through the paths they already use. Their program-wide name is the bare
+    /// one — no module declares them — which is the same convention the prelude's
+    /// effects and functions follow.
+    fn install_prelude_adts(&mut self) {
+        for (name, info) in prelude::ctors() {
+            self.env.bind_global(name.clone(), info.scheme.clone());
+            self.ctors.insert(name, info);
+        }
+    }
+
     fn install_prelude(&mut self) {
+        self.install_prelude_adts();
         let a = self.fresh.ty_var();
         let b = self.fresh.ty_var();
+        let c = self.fresh.ty_var();
         let e = self.fresh.row_var();
-        let (ta, tb, re) = (Type::Var(a), Type::Var(b), Row::open(e));
+        let (ta, tb, tc, re) = (Type::Var(a), Type::Var(b), Type::Var(c), Row::open(e));
+        // `map_fold`'s accumulator needs a third variable; `a` and `b` are the
+        // key and the value everywhere below, which is what keeps the twelve
+        // signatures readable side by side.
+        let map_ty = Type::map(ta.clone(), tb.clone());
+        let entry_ty = Type::Record(BTreeMap::from([
+            (Symbol::new("key"), ta.clone()),
+            (Symbol::new("value"), tb.clone()),
+        ]));
 
         let mono = |params: Vec<Type>, ret: Type| Scheme {
             ty_vars: vec![],
@@ -509,6 +684,80 @@ impl<'a> Checker<'a> {
             ),
             ("bytes_of_string", mono(vec![Type::string()], Type::bytes())),
             ("bytes_is_utf8", mono(vec![Type::bytes()], Type::bool())),
+            // The searching builtins. W1's request path scanned its head five
+            // times, each scan a `fold` over `range` that boxed an `Int` per
+            // byte and could not stop early; these are the same searches with
+            // the pass count and the allocation removed, which is an algorithm
+            // rather than a constant factor.
+            (
+                "bytes_index_of",
+                mono(
+                    vec![Type::bytes(), Type::bytes()],
+                    Type::option(Type::int()),
+                ),
+            ),
+            (
+                "bytes_index_of_from",
+                mono(
+                    vec![Type::bytes(), Type::bytes(), Type::int()],
+                    Type::option(Type::int()),
+                ),
+            ),
+            (
+                "bytes_index_of_byte",
+                mono(vec![Type::bytes(), Type::int()], Type::option(Type::int())),
+            ),
+            (
+                "bytes_starts_with",
+                mono(vec![Type::bytes(), Type::bytes()], Type::bool()),
+            ),
+            (
+                "bytes_ends_with",
+                mono(vec![Type::bytes(), Type::bytes()], Type::bool()),
+            ),
+            (
+                "bytes_split",
+                mono(
+                    vec![Type::bytes(), Type::bytes()],
+                    Type::list(Type::bytes()),
+                ),
+            ),
+            // The byte class is a `Bytes` of its members rather than an enum,
+            // so it is totally general with no closed set to extend and the
+            // membership bitmap costs the set's length rather than the
+            // buffer's.
+            (
+                "bytes_scan",
+                mono(
+                    vec![Type::bytes(), Type::int(), Type::bytes(), Type::int()],
+                    Type::int(),
+                ),
+            ),
+            (
+                "bytes_scan_until",
+                mono(
+                    vec![Type::bytes(), Type::int(), Type::bytes(), Type::int()],
+                    Type::int(),
+                ),
+            ),
+            (
+                "bytes_position",
+                poly(
+                    vec![],
+                    vec![e],
+                    vec![
+                        Type::bytes(),
+                        Type::int(),
+                        Type::Fn {
+                            params: vec![Type::int()],
+                            ret: Box::new(Type::bool()),
+                            effects: re.clone(),
+                        },
+                    ],
+                    Type::option(Type::int()),
+                    re.clone(),
+                ),
+            ),
             ("string_of_bytes", mono(vec![Type::bytes()], Type::string())),
             (
                 "string_of_bytes_lossy",
@@ -550,6 +799,213 @@ impl<'a> Checker<'a> {
                 "string_find",
                 mono(vec![Type::string(), Type::string()], Type::int()),
             ),
+            // The canonical total order over values, which is the order `Map`
+            // iterates in. `derive ord` produces a dictionary that calls this
+            // rather than a walk of its own, because two definitions of one
+            // type's order are two things that can disagree — and the one a map
+            // uses is not negotiable.
+            (
+                "compare",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    Type::Con(Symbol::new("Ordering"), vec![]),
+                    Row::empty(),
+                ),
+            ),
+            // The same order, under a name a module may not declare — see
+            // [`is_reserved_builtin`]. `derive ord` emits *this* call, because
+            // a generated body that named `compare` would name whatever the
+            // deriving module bound to it, and a dictionary built out of that
+            // is the second order §2 rests on not existing.
+            (
+                "compare_values",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    Type::Con(Symbol::new("Ordering"), vec![]),
+                    Row::empty(),
+                ),
+            ),
+            // `Map`. Every `k` carries `derivable(ord, k)`, which is not in the
+            // `Scheme` — it is checked where a concrete key type appears, by
+            // `check_map_keys`, because a constraint on a *builtin* has no
+            // signature the user can read the requirement off.
+            (
+                "map_new",
+                poly(vec![a, b], vec![], vec![], map_ty.clone(), Row::empty()),
+            ),
+            (
+                "map_insert",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone(), ta.clone(), tb.clone()],
+                    map_ty.clone(),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_get",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone(), ta.clone()],
+                    Type::option(tb.clone()),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_contains",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone(), ta.clone()],
+                    Type::bool(),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_remove",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone(), ta.clone()],
+                    map_ty.clone(),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_len",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone()],
+                    Type::int(),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_keys",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone()],
+                    Type::list(ta.clone()),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_values",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone()],
+                    Type::list(tb.clone()),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_entries",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone()],
+                    Type::list(entry_ty.clone()),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_of_entries",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![Type::list(entry_ty)],
+                    map_ty.clone(),
+                    Row::empty(),
+                ),
+            ),
+            (
+                "map_merge",
+                poly(
+                    vec![a, b],
+                    vec![],
+                    vec![map_ty.clone(), map_ty.clone()],
+                    map_ty.clone(),
+                    Row::empty(),
+                ),
+            ),
+            // The only impure one, and only because it threads its function's
+            // row. It visits entries in ascending key order, so a fold over a
+            // map is a function of the map's contents rather than of how it was
+            // built — which is what makes a seeded replay take the same branch.
+            (
+                "map_fold",
+                poly(
+                    vec![a, b, c],
+                    vec![e],
+                    vec![
+                        map_ty,
+                        tc.clone(),
+                        Type::Fn {
+                            params: vec![tc.clone(), ta.clone(), tb.clone()],
+                            ret: Box::new(tc.clone()),
+                            effects: re.clone(),
+                        },
+                    ],
+                    tc,
+                    re.clone(),
+                ),
+            ),
+            // The scale and the rounding mode are arguments because `/` on
+            // `Decimal` is `E0209`: an operator would have to round, and a
+            // rounding nobody wrote down is the defect the type exists to
+            // prevent. Here it is written down.
+            (
+                "decimal_div",
+                mono(
+                    vec![
+                        Type::decimal(),
+                        Type::decimal(),
+                        Type::int(),
+                        Type::con("Rounding"),
+                    ],
+                    Type::decimal(),
+                ),
+            ),
+            (
+                "decimal_round",
+                mono(
+                    vec![Type::decimal(), Type::int(), Type::con("Rounding")],
+                    Type::decimal(),
+                ),
+            ),
+            ("decimal_of_int", mono(vec![Type::int()], Type::decimal())),
+            (
+                "int_of_decimal",
+                mono(
+                    vec![Type::decimal(), Type::con("Rounding")],
+                    Type::option(Type::int()),
+                ),
+            ),
+            (
+                "float_of_decimal",
+                mono(vec![Type::decimal()], Type::float()),
+            ),
+            (
+                "decimal_of_float",
+                mono(vec![Type::float()], Type::option(Type::decimal())),
+            ),
+            (
+                "decimal_of_string",
+                mono(vec![Type::string()], Type::option(Type::decimal())),
+            ),
+            (
+                "decimal_to_string",
+                mono(vec![Type::decimal()], Type::string()),
+            ),
             (
                 "panic",
                 poly(
@@ -563,6 +1019,21 @@ impl<'a> Checker<'a> {
         ];
         for (name, scheme) in entries {
             self.env.bind_global(Symbol::new(name), scheme);
+        }
+
+        // The two builtins with a `where` clause. `Float` has no total order the
+        // language can honour — `NaN != NaN`, so a key would have no position
+        // the next lookup could find it at — and this is what refuses it at the
+        // call rather than letting `total_cmp` answer where a program can see it
+        // disagree with `==`.
+        for name in ["compare", "compare_values"] {
+            self.constraints.insert(
+                Symbol::new(name),
+                vec![DefConstraint {
+                    deriver: Deriver::Ord,
+                    param: 0,
+                }],
+            );
         }
 
         // `cell_get` / `cell_set` are handled as call forms rather than schemes:
@@ -599,7 +1070,7 @@ impl<'a> Checker<'a> {
                 self.duplicate(&def.name, prev.span, "type");
                 continue;
             }
-            if BUILTIN_TYPES
+            if builtin_types()
                 .iter()
                 .any(|(b, _)| *b == def.name.name.as_str())
             {
@@ -769,7 +1240,7 @@ impl<'a> Checker<'a> {
                     }
                     TypeDefBody::Alias(_) => Vec::new(),
                 },
-                Item::Effect(_) | Item::Test(_) | Item::Law(_) => Vec::new(),
+                Item::Effect(_) | Item::Test(_) | Item::Law(_) | Item::Derive(_) => Vec::new(),
             };
             for (name, is_fn) in declared {
                 match seen.get(&name.name) {
@@ -904,12 +1375,13 @@ impl<'a> Checker<'a> {
         let args: Vec<Type> = args.iter().map(|a| self.conv_type(a)).collect();
 
         if name.is_bare()
-            && let Some((_, arity)) = BUILTIN_TYPES
+            && let Some((_, arity)) = builtin_types()
                 .iter()
                 .find(|(b, _)| *b == name.symbol().as_str())
+                .copied()
         {
-            if args.len() != *arity {
-                self.arity_error(span, name.symbol(), *arity, args.len(), "type arguments");
+            if args.len() != arity {
+                self.arity_error(span, name.symbol(), arity, args.len(), "type arguments");
                 return self.fresh.ty();
             }
             if name.symbol().as_str() == "Cell" {
@@ -919,7 +1391,9 @@ impl<'a> Checker<'a> {
                 let region = self.fresh.ty();
                 return Type::Con(Symbol::new("Cell"), vec![region, args[0].clone()]);
             }
-            return Type::Con(name.symbol().clone(), args);
+            let built = Type::Con(name.symbol().clone(), args);
+            self.note_map_keys(span, &built);
+            return built;
         }
 
         let Some(qualified) = self.global(Namespace::Type, name) else {
@@ -979,6 +1453,9 @@ impl<'a> Checker<'a> {
     }
 
     fn unknown_type(&mut self, name: &QName) {
+        if self.unresolved_in_derived(name, "type") {
+            return;
+        }
         let mut d = Diagnostic::error(
             codes::UNKNOWN_TYPE,
             format!("unknown type `{}`", name.symbol()),
@@ -992,6 +1469,41 @@ impl<'a> Checker<'a> {
             ));
         }
         self.diags.push(d);
+    }
+
+    /// A reference a *generated* body emits that does not resolve.
+    ///
+    /// Reported as `E0206` against the `derive`, never as a bare `E0101`
+    /// pointing at source the user never wrote. It means one of two things and
+    /// the note says which: a field's type has no derivation of its own, or the
+    /// module cannot see the deriver's runtime module.
+    fn unresolved_in_derived(&mut self, q: &QName, what: &str) -> bool {
+        let Some(derived) = self.derived.clone() else {
+            return false;
+        };
+        let d = Diagnostic::error(
+            codes::NOT_DERIVABLE,
+            format!(
+                "`{}` cannot be derived for `{}`",
+                derived.deriver, derived.target
+            ),
+        )
+        .primary(
+            q.span,
+            format!("the generated body needs the {what} `{q}`, which is not in scope"),
+        )
+        .note(format!(
+            "a derivation composes through named types by calling their own dictionaries, \
+             so every field type needs `derive {} for` it in the module that declares it",
+            derived.deriver
+        ))
+        .note(format!(
+            "`{}` is what `derive {} for <that type>` generates",
+            q.symbol(),
+            derived.deriver
+        ));
+        self.diags.push(d);
+        true
     }
 
     /// A module that exports this name, so a missing `import` reads as a missing
@@ -1130,6 +1642,22 @@ impl<'a> Checker<'a> {
             format!("unknown effect `{}`", q.symbol()),
         )
         .primary(q.span, "not declared");
+        // `d.encode(x)` is `effect.op(args)` by the grammar, and a dictionary is
+        // a record of functions, so the language's central idiom for one reads
+        // as a perform. Nothing here can tell them apart without scope, but this
+        // can say which one the user meant.
+        if q.is_bare() && self.env.depth_of(q.symbol()).is_some() {
+            self.diags.push(
+                d.note(format!(
+                    "`{}` is a value in scope, so this looks like a field call rather than a \
+                     perform: write `({}.<field>)(..)` to call a function held in a record",
+                    q.symbol(),
+                    q.symbol()
+                ))
+                .note("`a.b(c)` is an effect operation; parentheses make it a field access"),
+            );
+            return;
+        }
         d = if known.is_empty() {
             d.note("declare it with `effect <name> { .. }`")
         } else {
@@ -1145,7 +1673,38 @@ impl<'a> Checker<'a> {
         self.diags.push(d);
     }
 
+    /// A `derive` whose definitions are not in `items` means expansion did not
+    /// run over this module.
+    ///
+    /// Nothing downstream can notice on its own: `Item::Derive` declares no
+    /// name, so every walker is right to skip it, and the result is a
+    /// definition that silently does not exist. One list, and this is what
+    /// checks that it is the list.
+    fn check_expanded(&mut self, module: &Module) {
+        for item in &module.items {
+            let Item::Derive(def) = item else { continue };
+            if expanded_here(module, def) {
+                continue;
+            }
+            self.diags.push(
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "`derive {} for {}` was never expanded",
+                        def.deriver, def.target.name
+                    ),
+                )
+                .primary(def.span, "no definition was generated for this")
+                .note(
+                    "this is a compiler bug: whatever loaded this module skipped derivation, \
+                     so a definition the program refers to does not exist",
+                ),
+            );
+        }
+    }
+
     fn check_fns(&mut self, module: &Module) {
+        self.check_expanded(module);
         let mut fns: Vec<&FnDef> = Vec::new();
         let mut index: FxHashMap<Symbol, usize> = FxHashMap::default();
         for item in &module.items {
@@ -1163,6 +1722,22 @@ impl<'a> Checker<'a> {
                     )
                     .primary(def.name.span, "cannot be redefined")
                     .note("region-scoped cell access is a call form, not an ordinary function"),
+                );
+                continue;
+            }
+            if def.name.name.as_str() == COMPARE_VALUES {
+                self.diags.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_DEFINITION,
+                        format!("`{COMPARE_VALUES}` is a builtin"),
+                    )
+                    .primary(def.name.span, "cannot be redefined")
+                    .note(
+                        "it is the order `Map` iterates in, and `derive ord` builds a dictionary \
+                         out of it — a module that could redefine it would give one type two \
+                         orders",
+                    )
+                    .note("`compare` is the same operation under a name you may shadow"),
                 );
                 continue;
             }
@@ -1197,7 +1772,9 @@ impl<'a> Checker<'a> {
             }
             let mut sigs = Vec::new();
             for (slot, &i) in comp.iter().enumerate() {
+                self.derived = fns[i].derived.clone();
                 let sig = self.signature(fns[i]);
+                self.derived = None;
                 self.env
                     .bind_global(names[slot].clone(), Scheme::mono(sig.fn_ty.clone()));
                 sigs.push(sig);
@@ -1206,6 +1783,11 @@ impl<'a> Checker<'a> {
                 self.check_fn_body(fns[i], &sigs[slot]);
                 self.record_spec_env(fns[i], &names[slot], &sigs[slot]);
             }
+            // After the whole component, not after each member: a caller in the
+            // group can be what pins a callee's operand type, and defaulting one
+            // body at a time would decide `Int` before the other body said
+            // `Decimal`.
+            self.settle_numerics();
             for sig in &sigs {
                 self.close_unreachable_row(sig);
             }
@@ -1217,6 +1799,14 @@ impl<'a> Checker<'a> {
                 let scheme = generalize(&self.subst, &mut self.env, &sigs[slot].fn_ty);
                 let row = self.subst.resolve_row(&sigs[slot].published_row);
                 self.env.bind_global(names[slot].clone(), scheme.clone());
+                // The clauses are read against the signature's own parameters,
+                // which `signature` left in `ty_params` and `check_fn_body`
+                // restored.
+                self.ty_params = sigs[slot].ty_params.clone();
+                let constraints = self.published_constraints(def, &scheme);
+                self.ty_params.clear();
+                self.constraints
+                    .insert(names[slot].clone(), constraints.clone());
                 self.defs.insert(
                     names[slot].clone(),
                     DefInfo {
@@ -1225,6 +1815,7 @@ impl<'a> Checker<'a> {
                         simple_name: def.name.name.clone(),
                         scheme,
                         footprint: Footprint(row.atoms),
+                        constraints,
                         spec: Vec::new(),
                         span: def.span,
                     },
@@ -1259,14 +1850,23 @@ impl<'a> Checker<'a> {
             let scheme = self.adopt(&entry.scheme);
             // A spec is erased from the definition's hash, so a spec edit does
             // not move it and gate 2 skips a definition whose clause is new.
-            // The clauses are typed anyway, against the restored interface.
-            if !fns[i].spec.is_empty() {
+            // The clauses are typed anyway, against the restored interface. A
+            // `where` clause is *not* erased, but it is read from the same
+            // source the interface was published from, so it is recovered here
+            // rather than stored: a caller that changed must be checked against
+            // the constraints its callee actually declares, and a callee whose
+            // file was skipped is one no parsed module can reach.
+            let mut constraints = Vec::new();
+            if !fns[i].spec.is_empty() || !fns[i].constraints.is_empty() {
                 let sig = self.signature(fns[i]);
-                let published = instantiate(&scheme, &mut self.fresh);
+                let (published, args) = instantiate_with(&scheme, &mut self.fresh);
                 let _ = unify(&mut self.subst, &mut self.fresh, &sig.fn_ty, &published);
+                constraints = self.recovered_constraints(fns[i], &sig, &args);
                 self.record_spec_env(fns[i], &names[slot], &sig);
             }
             self.env.bind_global(names[slot].clone(), scheme.clone());
+            self.constraints
+                .insert(names[slot].clone(), constraints.clone());
             self.defs.insert(
                 names[slot].clone(),
                 DefInfo {
@@ -1275,6 +1875,7 @@ impl<'a> Checker<'a> {
                     simple_name: fns[i].name.name.clone(),
                     scheme,
                     footprint: entry.footprint.clone(),
+                    constraints,
                     spec: Vec::new(),
                     span: fns[i].span,
                 },
@@ -1334,6 +1935,7 @@ impl<'a> Checker<'a> {
     }
 
     fn signature(&mut self, def: &FnDef) -> Signature {
+        self.scope += 1;
         self.ty_params.clear();
         self.row_params.clear();
         for p in &def.generics.types {
@@ -1346,6 +1948,8 @@ impl<'a> Checker<'a> {
             self.subst.mark_rigid_row(v);
             self.row_params.insert(p.name.clone(), v);
         }
+        self.assumed = self.constraints_in_force(&def.constraints);
+        self.check_where(def);
         let params: Vec<Type> = def
             .params
             .iter()
@@ -1372,12 +1976,139 @@ impl<'a> Checker<'a> {
             ret,
             declared,
             published_row: row,
+            scope: self.scope,
         }
     }
 
+    /// The parameters a signature declared derivable, by deriver, as the type
+    /// variables they became. A clause naming something the generic list does
+    /// not bind contributes nothing here — that is [`Checker::check_where`]'s
+    /// business, and swallowing it here would turn one error into two.
+    fn constraints_in_force(
+        &self,
+        constraints: &[Constraint],
+    ) -> FxHashMap<Deriver, FxHashSet<TyVar>> {
+        let mut out: FxHashMap<Deriver, FxHashSet<TyVar>> = FxHashMap::default();
+        for c in constraints {
+            if let Some(Type::Var(v)) = self.ty_params.get(&c.param.name) {
+                out.entry(c.deriver).or_default().insert(*v);
+            }
+        }
+        out
+    }
+
+    fn assumed(&self, deriver: Deriver) -> FxHashSet<TyVar> {
+        self.assumed.get(&deriver).cloned().unwrap_or_default()
+    }
+
+    /// The type parameters of the signature being walked, so a diagnostic can
+    /// name the one a missing clause is about.
+    fn rigid_params(&self) -> Vec<(TyVar, Symbol)> {
+        self.ty_params
+            .iter()
+            .filter_map(|(name, t)| match t {
+                Type::Var(v) => Some((*v, name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `where` clause naming a parameter the signature does not bind. The
+    /// grammar admits only an identifier, so this is the whole of what can go
+    /// wrong with one.
+    fn check_where(&mut self, def: &FnDef) {
+        for c in &def.constraints {
+            if self.ty_params.contains_key(&c.param.name) {
+                continue;
+            }
+            let bound: Vec<String> = def
+                .generics
+                .types
+                .iter()
+                .map(|g| format!("`{}`", g.name))
+                .collect();
+            let mut d = Diagnostic::error(
+                codes::UNKNOWN_TYPE,
+                format!(
+                    "`{}` is not a type parameter of this signature",
+                    c.param.name
+                ),
+            )
+            .primary(c.param.span, "not bound by the generic list");
+            d = if bound.is_empty() {
+                d.note(format!(
+                    "`{}` takes no type parameters, and a constraint on a concrete type is \
+                     either already true or already an error",
+                    def.name.name
+                ))
+            } else {
+                d.note(format!("this signature binds {}", bound.join(", ")))
+            };
+            self.diags.push(d);
+        }
+    }
+
+    /// The same, for a definition restored from a cached interface: the scheme
+    /// came back with quantified variables of its own, and unifying it with the
+    /// signature just built is what says which of them each parameter is.
+    fn recovered_constraints(
+        &mut self,
+        def: &FnDef,
+        sig: &Signature,
+        args: &[Type],
+    ) -> Vec<DefConstraint> {
+        let mut out = Vec::new();
+        for c in &def.constraints {
+            let Some(Type::Var(v)) = sig.ty_params.get(&c.param.name) else {
+                continue;
+            };
+            let found = args
+                .iter()
+                .position(|a| matches!(self.subst.resolve_ty(a), Type::Var(w) if w == *v));
+            if let Some(param) = found {
+                out.push(DefConstraint {
+                    deriver: c.deriver,
+                    param,
+                });
+            }
+        }
+        out.sort_by_key(|c| (c.param, c.deriver.tag()));
+        out.dedup();
+        out
+    }
+
+    /// The published form of a signature's `where` clauses: the deriver and the
+    /// position of the parameter in the generalized scheme.
+    ///
+    /// Sorted and deduplicated, exactly as the hash encodes them, so that
+    /// reordering two clauses or writing one twice publishes the same interface
+    /// as writing them once in the other order.
+    fn published_constraints(&self, def: &FnDef, scheme: &Scheme) -> Vec<DefConstraint> {
+        let mut out: Vec<DefConstraint> = def
+            .constraints
+            .iter()
+            .filter_map(|c| {
+                let Some(Type::Var(v)) = self.ty_params.get(&c.param.name) else {
+                    return None;
+                };
+                let param = scheme.ty_vars.iter().position(|q| q == v)?;
+                Some(DefConstraint {
+                    deriver: c.deriver,
+                    param,
+                })
+            })
+            .collect();
+        out.sort_by_key(|c| (c.param, c.deriver.tag()));
+        out.dedup();
+        out
+    }
+
     fn check_fn_body(&mut self, def: &FnDef, sig: &Signature) {
+        self.derived = def.derived.clone();
+        self.scope = sig.scope;
         self.ty_params = sig.ty_params.clone();
         self.row_params = sig.row_params.clone();
+        self.assumed = self.constraints_in_force(&def.constraints);
         self.performs.clear();
 
         self.env.push();
@@ -1403,6 +2134,8 @@ impl<'a> Checker<'a> {
         }
         self.ty_params.clear();
         self.row_params.clear();
+        self.assumed.clear();
+        self.derived = None;
     }
 
     /// A `/ {...}` annotation bounds the inferred row from above: everything the
@@ -1654,6 +2387,7 @@ impl<'a> Checker<'a> {
         let mut labels: FxHashMap<&str, Span> = FxHashMap::default();
         for item in &module.items {
             let Item::Law(def) = item else { continue };
+            self.scope += 1;
             if let Some(&first) = labels.get(def.name.as_str()) {
                 self.diags.push(
                     Diagnostic::error(
@@ -1889,6 +2623,7 @@ impl<'a> Checker<'a> {
         let mut position = 0;
         for item in &module.items {
             let Item::Test(def) = item else { continue };
+            self.scope += 1;
             let cached = known
                 .and_then(|slots| slots.get(position))
                 .and_then(Option::as_ref);
@@ -2095,7 +2830,14 @@ impl<'a> Checker<'a> {
                 match self.env.lookup(&key.name) {
                     Some(scheme) => {
                         let scheme = scheme.clone();
-                        (instantiate(&scheme, &mut self.fresh), Row::empty())
+                        let (ty, args) = instantiate_with(&scheme, &mut self.fresh);
+                        // There is no map literal, so a map value comes from a
+                        // reference — a builtin or a user function — or from a
+                        // written annotation. Noting both is what makes the key
+                        // check total without a walk over every solved type.
+                        self.note_map_keys(q.span, &ty);
+                        self.note_constraints(q.span, &key.name, &args);
+                        (ty, Row::empty())
                     }
                     None => {
                         self.unknown_name(q);
@@ -2106,10 +2848,18 @@ impl<'a> Checker<'a> {
 
             ExprKind::Unary { op, operand } => {
                 let (t, row) = self.infer(operand);
-                let want = match op {
-                    UnOp::Neg => Type::int(),
-                    UnOp::Not => Type::bool(),
-                };
+                if let UnOp::Neg = op {
+                    // Negation is the only way to write `-0.0`, so it settles at
+                    // whichever numeric type its operand has, exactly as a
+                    // binary operator does.
+                    self.numerics.push(Numeric {
+                        span: e.span,
+                        op: BinOp::Sub,
+                        ty: t.clone(),
+                    });
+                    return (t, row);
+                }
+                let want = Type::bool();
                 self.expect(operand.span, &want, &t, "operand of a unary operator");
                 (want, row)
             }
@@ -2298,14 +3048,36 @@ impl<'a> Checker<'a> {
         let (lt, lrow) = self.infer(lhs);
         let (rt, rrow) = self.infer(rhs);
         let row = self.join(e.span, lrow, rrow);
-        let (operand, result) = match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                (Some(Type::int()), Type::int())
+        // Three numeric types, and no type-directed dispatch to pick between
+        // them, so the operand type is unified across the two sides here and
+        // *which* of the three it is is settled once the enclosing definition
+        // has been inferred. Deciding it at the node would read `x + 1.0` as
+        // `Int` arithmetic on the way to the right operand.
+        let arithmetic = matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+        );
+        let ordered = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        if arithmetic || ordered {
+            let context = if arithmetic {
+                "both operands of an arithmetic operator have one type"
+            } else {
+                "both sides of a comparison must have one type"
+            };
+            if self.expect(rhs.span, &lt, &rt, context) {
+                self.numerics.push(Numeric {
+                    span: e.span,
+                    op,
+                    ty: lt.clone(),
+                });
             }
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => (Some(Type::int()), Type::bool()),
+            return (if arithmetic { lt } else { Type::bool() }, row);
+        }
+
+        let (operand, result) = match op {
             BinOp::And | BinOp::Or => (Some(Type::bool()), Type::bool()),
             BinOp::Concat => (Some(Type::string()), Type::string()),
-            BinOp::Eq | BinOp::Ne => (None, Type::bool()),
+            _ => (None, Type::bool()),
         };
         match operand {
             Some(want) => {
@@ -2323,6 +3095,471 @@ impl<'a> Checker<'a> {
             }
         }
         (result, row)
+    }
+
+    /// Decides which numeric type each `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>`
+    /// or `>=` was applied at, now that the definition around it has been
+    /// inferred.
+    ///
+    /// **Called before generalization, and that is the point.** An operand type
+    /// nothing pinned defaults to `Int`; leaving it open would publish
+    /// `fn add(a, b) = a + b` as `<t>(t, t) -> t`, a signature whose body works
+    /// at three types and whose declaration claims every one.
+    fn settle_numerics(&mut self) {
+        for entry in std::mem::take(&mut self.numerics) {
+            let ty = self.subst.resolve_ty(&entry.ty);
+            let name = match &ty {
+                Type::Var(_) => {
+                    let _ = unify(&mut self.subst, &mut self.fresh, &ty, &Type::int());
+                    continue;
+                }
+                Type::Con(name, args) if args.is_empty() => name.clone(),
+                _ => {
+                    self.numeric_mismatch(&entry, &ty);
+                    continue;
+                }
+            };
+            match (name.as_str(), entry.op) {
+                ("Int" | "Float", _) => {}
+                // The one place W2 refuses what every other language allows.
+                // The exact quotient of two decimals is not a decimal, so `/`
+                // would have to round — and a rounding nobody wrote down is the
+                // defect this type exists to prevent.
+                ("Decimal", BinOp::Div) => self.diags.push(
+                    Diagnostic::error(codes::DECIMAL_DIVISION, "`/` is not defined on `Decimal`")
+                        .primary(
+                            entry.span,
+                            "the exact quotient of two decimals is not a decimal",
+                        )
+                        .note(
+                            "an operator would have to round, and a rounding nobody wrote down is \
+                         the defect `Decimal` exists to prevent",
+                        )
+                        .note("call `decimal_div(a, b, 2, HalfEven)` and say how to round"),
+                ),
+                ("Decimal", _) => {}
+                _ => self.numeric_mismatch(&entry, &ty),
+            }
+        }
+    }
+
+    fn numeric_mismatch(&mut self, entry: &Numeric, ty: &Type) {
+        let mut printer = Printer::new();
+        let what = if matches!(entry.op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            "ordered comparison"
+        } else {
+            "arithmetic"
+        };
+        self.diags.push(
+            Diagnostic::error(
+                codes::TYPE_MISMATCH,
+                format!(
+                    "`{}` is not defined on `{}`",
+                    entry.op.text(),
+                    printer.ty(ty)
+                ),
+            )
+            .primary(entry.span, format!("{what} here"))
+            .note("`Int`, `Float` and `Decimal` are the numeric types"),
+        );
+    }
+
+    /// Notes every `Map` in `ty` so that [`Checker::check_map_keys`] can judge
+    /// its key type once the module is solved.
+    ///
+    /// Called where a type is *written* and where a scheme is *instantiated*,
+    /// which between them is every way a `Map` can enter a program: there is no
+    /// map literal, so a map value comes from a builtin or from an annotation
+    /// and from nowhere else.
+    fn note_map_keys(&mut self, span: Span, ty: &Type) {
+        fn walk(ty: &Type, out: &mut Vec<Type>) {
+            match ty {
+                Type::Con(name, args) => {
+                    if name.as_str() == "Map" && args.len() == 2 {
+                        out.push(args[0].clone());
+                    }
+                    args.iter().for_each(|a| walk(a, out));
+                }
+                Type::Fn { params, ret, .. } => {
+                    params.iter().for_each(|p| walk(p, out));
+                    walk(ret, out);
+                }
+                Type::Record(fields) => fields.values().for_each(|f| walk(f, out)),
+                Type::Var(_) => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(ty, &mut found);
+        if found.is_empty() {
+            return;
+        }
+        let params: Vec<(TyVar, Symbol)> = self
+            .ty_params
+            .iter()
+            .filter_map(|(name, t)| match t {
+                Type::Var(v) => Some((*v, name.clone())),
+                _ => None,
+            })
+            .collect();
+        for key in found {
+            self.map_keys.push(MapKeySite {
+                span,
+                scope: self.scope,
+                key,
+                assumed: self.assumed(Deriver::Ord),
+                params: params.clone(),
+            });
+        }
+    }
+
+    /// `derivable(D, T)` over the `derive`'s target as a **solved** type.
+    ///
+    /// The deriver's own walk runs before resolution, so it reads the field's
+    /// spelling and an alias is opaque to it: `type MyUnit = Unit` inside an
+    /// `Option` reaches `option_json(unit_json())`, which writes `Some(())` and
+    /// `None` as the same bytes, and the syntactic walk cannot see it. Here an
+    /// alias is already expanded, so the one predicate answers for both
+    /// spellings.
+    ///
+    /// Only for a target the deriver accepted — a `derive` it already refused
+    /// has its diagnostic, and a second one naming the same field is noise —
+    /// and only for a target with no parameters, whose instantiations are what
+    /// the generated signature's `where derivable(D, ·)` covers at the call
+    /// site.
+    fn check_derives(&mut self, program: &Program) {
+        let adts = self.adt_shapes();
+        let lookup = |name: &Symbol| adts.get(name).map(clone_adt);
+        let assumed = FxHashSet::default();
+        let mut diags = Vec::new();
+        for (i, module) in program.modules.iter().enumerate() {
+            for item in &module.items {
+                let Item::Derive(def) = item else { continue };
+                if !expanded_here(module, def) {
+                    continue;
+                }
+                self.module = i;
+                let Some(ty) = self.derive_target(module, &def.target.name) else {
+                    continue;
+                };
+                let cx = Derivability {
+                    adt: &lookup,
+                    assumed: &assumed,
+                };
+                let Err(blocked) = crate::derivable::derivable(def.deriver, &ty, &cx) else {
+                    continue;
+                };
+                let mut printer = Printer::new();
+                let blocker = printer.ty(&blocked.ty);
+                let mut d = Diagnostic::error(
+                    codes::NOT_DERIVABLE,
+                    format!(
+                        "`{}` cannot be derived for `{}`",
+                        def.deriver, def.target.name
+                    ),
+                )
+                .primary(def.span, format!("`{blocker}` has no {}", what(def.deriver)));
+                d = match blocked.why {
+                    Why::NullInsideOption => d
+                        .note(format!("`{blocker}` writes `None` and its payload alike"))
+                        .note(ply_derive::rules::NULL_IN_OPTION_NOTE),
+                    Why::FloatIsNotOrdered => {
+                        d.note("`Float` has no total order: `NaN` is not equal to itself")
+                    }
+                    Why::Function => d.note("a function has no encoding to derive"),
+                    Why::Handle(what) => d.note(format!(
+                        "a `{what}` names a location rather than a value, so it has no encoding"
+                    )),
+                    Why::Unconstrained(_) => continue,
+                };
+                diags.push(d.note(format!(
+                    "write the dictionary for `{}` by hand, or change the field",
+                    def.target.name
+                )));
+            }
+        }
+        self.diags.extend(diags);
+    }
+
+    /// The `derive` target as a solved type, for a target with no parameters.
+    ///
+    /// An alias body is converted here rather than read as `Type::Con`, and any
+    /// diagnostic that conversion produces is dropped: the declaration was
+    /// already converted where it is written, and reporting it twice would name
+    /// the `derive` for a mistake in the `type`.
+    fn derive_target(&mut self, module: &Module, target: &Symbol) -> Option<Type> {
+        let qualified = module.name.qualify(target);
+        let decl = self.types.get(&qualified).cloned()?;
+        if !decl.params.is_empty() {
+            return None;
+        }
+        let Some(alias) = decl.alias else {
+            return Some(Type::Con(qualified, Vec::new()));
+        };
+        let mark = self.diags.len();
+        let saved = std::mem::take(&mut self.ty_params);
+        self.alias_stack.push(qualified);
+        let owner = std::mem::replace(&mut self.module, decl.owner);
+        let expanded = self.conv_type(&alias);
+        self.module = owner;
+        self.alias_stack.pop();
+        self.ty_params = saved;
+        self.diags.truncate(mark);
+        Some(expanded)
+    }
+
+    /// Anything a generated definition failed on, other than a name it could not
+    /// see, is **Ply's** fault.
+    ///
+    /// Derivation is total and structural: if generation succeeded, checking
+    /// must succeed. The user did not write the body, cannot see it and cannot
+    /// fix it, so calling one of these their error would send them looking in
+    /// their own tree. This runs last so that it catches the deferred checks —
+    /// constraints, map keys, comparisons — as well as the direct ones, and it
+    /// keys on span because a generated definition's every span is its
+    /// `derive`'s.
+    fn attribute_generated(&mut self, program: &Program) {
+        let mut spans: FxHashSet<Span> = FxHashSet::default();
+        for module in &program.modules {
+            for item in &module.items {
+                if let Item::Fn(def) = item
+                    && def.derived.is_some()
+                {
+                    spans.insert(def.span);
+                }
+            }
+        }
+        if spans.is_empty() {
+            return;
+        }
+        for d in &mut self.diags {
+            if d.code == codes::NOT_DERIVABLE
+                || !d.primary_span().is_some_and(|s| spans.contains(&s))
+            {
+                continue;
+            }
+            let original = std::mem::replace(
+                &mut d.message,
+                String::from("a derived definition does not typecheck"),
+            );
+            d.code = codes::INTERNAL_ERROR;
+            d.notes.insert(
+                0,
+                format!("this is a compiler bug in the deriver: {original}"),
+            );
+            d.notes.push(String::from(
+                "derivation is total, so a generated body that fails to check is Ply's fault \
+                 rather than yours",
+            ));
+        }
+    }
+
+    /// Notes a reference that instantiated a parameter its callee constrained.
+    ///
+    /// Only a reference: a constraint is a claim about a type argument, and a
+    /// type argument is chosen exactly where a scheme is instantiated. A
+    /// recursive call inside the definition's own group is bound
+    /// monomorphically and instantiates nothing, which is right — it passes the
+    /// very parameter the clause is about.
+    fn note_constraints(&mut self, span: Span, callee: &Symbol, args: &[Type]) {
+        let Some(constraints) = self.constraints.get(callee) else {
+            return;
+        };
+        if constraints.is_empty() {
+            return;
+        }
+        let sites: Vec<ConstraintSite> = constraints
+            .iter()
+            .filter_map(|c| {
+                Some(ConstraintSite {
+                    span,
+                    deriver: c.deriver,
+                    ty: args.get(c.param)?.clone(),
+                    callee: callee.clone(),
+                    callee_span: self.defs.get(callee).map(|d| d.span).unwrap_or(span),
+                    assumed: self.assumed(c.deriver),
+                    params: self.rigid_params(),
+                })
+            })
+            .collect();
+        self.constrained_uses.extend(sites);
+    }
+
+    /// `where derivable(D, a)` at the call sites that instantiate `a`.
+    ///
+    /// This is the one axis on which structural reflection is genuinely worse
+    /// than typeclasses: an error deep inside an expansion is a search, and a
+    /// search inside an edit loop is what an agent pays for. There is no
+    /// resolution and no instance selection here — it is a predicate on a type,
+    /// checked at a boundary, which is C++'s concepts and nothing more.
+    fn check_constraints(&mut self) {
+        let sites = std::mem::take(&mut self.constrained_uses);
+        if sites.is_empty() {
+            return;
+        }
+        let adts = self.adt_shapes();
+        let lookup = |name: &Symbol| adts.get(name).map(clone_adt);
+        let mut reported: FxHashSet<(Span, String, u8)> = FxHashSet::default();
+        let mut diags = Vec::new();
+        for site in sites {
+            let ty = self.subst.resolve_ty(&site.ty);
+            let cx = Derivability {
+                adt: &lookup,
+                assumed: &site.assumed,
+            };
+            let Err(blocked) = crate::derivable::derivable(site.deriver, &ty, &cx) else {
+                continue;
+            };
+            // A flexible variable is a type argument nothing pinned rather than
+            // one that is wrong — the call is ambiguous, and whatever pins it
+            // later is what this check is about.
+            if let Why::Unconstrained(v) = blocked.why
+                && !self.subst.is_rigid_ty(v)
+            {
+                continue;
+            }
+            let mut printer = Printer::new();
+            let rendered = printer.ty(&ty);
+            if !reported.insert((site.span, rendered.clone(), site.deriver.tag())) {
+                continue;
+            }
+            let blocker = printer.ty(&blocked.ty);
+            let simple = simple_name(&site.callee);
+            let mut d = Diagnostic::error(
+                codes::NOT_DERIVABLE,
+                format!("`{rendered}` cannot be derived for `{}`", site.deriver),
+            )
+            .primary(
+                site.span,
+                format!("`{simple}` requires `derivable({}, ·)` here", site.deriver),
+            )
+            .secondary(
+                site.callee_span,
+                format!("`{simple}` declares the constraint on its signature"),
+            );
+            d = match blocked.why {
+                Why::Function => d.note(format!(
+                    "`{blocker}` is a function, and a function has no {}",
+                    what(site.deriver)
+                )),
+                Why::Handle(what) => d.note(format!(
+                    "a `{what}` names a location rather than a value, so it has no encoding"
+                )),
+                Why::FloatIsNotOrdered => d
+                    .note("`Float` has no total order: `NaN` is not equal to itself")
+                    .note("use `Decimal` for exact numbers"),
+                Why::NullInsideOption => d
+                    .note(format!("`{blocker}` writes `None` and its payload alike"))
+                    .note(ply_derive::rules::NULL_IN_OPTION_NOTE),
+                Why::Unconstrained(v) => {
+                    let name = site
+                        .params
+                        .iter()
+                        .find(|(p, _)| *p == v)
+                        .map(|(_, n)| n.to_string())
+                        .unwrap_or(blocker);
+                    d.note(format!(
+                        "add `where derivable({}, {name})` to the signature this call sits in; \
+                         the body may then assume it",
+                        site.deriver
+                    ))
+                }
+            };
+            diags.push(d);
+        }
+        self.diags.extend(diags);
+    }
+
+    /// A `Map` key type must be ordered — exactly `derivable(ord, k)`, the same
+    /// predicate `derive ord` walks.
+    ///
+    /// The whole reason `Map` is a language primitive rather than a library is
+    /// that its iteration order is canonical, and an order is only canonical if
+    /// every key it holds has one. `Float` is the case that makes this concrete:
+    /// `total_cmp` is a total order on the *Rust* value, and NaN still is not
+    /// equal to itself in the language, so a `Map<Float, v>` would be a lookup
+    /// that fails to find what it just inserted.
+    fn check_map_keys(&mut self) {
+        let sites = std::mem::take(&mut self.map_keys);
+        if sites.is_empty() {
+            return;
+        }
+        let adts = self.adt_shapes();
+        let lookup = |name: &Symbol| adts.get(name).map(clone_adt);
+        let mut reported: FxHashSet<(u32, String)> = FxHashSet::default();
+        let mut diags = Vec::new();
+        for site in sites {
+            let key = self.subst.resolve_ty(&site.key);
+            let cx = Derivability {
+                adt: &lookup,
+                assumed: &site.assumed,
+            };
+            let Err(blocked) = ordered(&key, &cx) else {
+                continue;
+            };
+            // An unsolved *flexible* variable is a key nothing pinned, not a key
+            // that is wrong: `let m = map_new(); map_len(m)` never names one.
+            // A rigid one came from a generic list, and that is the signature
+            // the constraint belongs on.
+            if let Why::Unconstrained(v) = blocked.why
+                && !self.subst.is_rigid_ty(v)
+            {
+                continue;
+            }
+            let mut printer = Printer::new();
+            let rendered = printer.ty(&key);
+            if !reported.insert((site.scope, rendered.clone())) {
+                continue;
+            }
+            let blocker = printer.ty(&blocked.ty);
+            let mut d = Diagnostic::error(
+                codes::NOT_DERIVABLE,
+                format!("`{blocker}` is not an ordered type, so it cannot be a `Map` key"),
+            )
+            .primary(site.span, format!("this map's key type is `{rendered}`"));
+            d = match blocked.why {
+                Why::FloatIsNotOrdered => d
+                    .note(
+                        "`Float` has no total order: `NaN` is not equal to itself, so a key \
+                         would have no position the next lookup could find it at",
+                    )
+                    .note("use `Decimal` for exact numbers, or key on something else"),
+                Why::Function => d.note("a function has no order to sort keys by"),
+                Why::Handle(what) => d.note(format!(
+                    "a `{what}` names a location rather than a value, so two of them have no order"
+                )),
+                // A `json` refusal, and this question is `ord`'s.
+                Why::NullInsideOption => d,
+                Why::Unconstrained(v) => {
+                    let name = site
+                        .params
+                        .iter()
+                        .find(|(p, _)| *p == v)
+                        .map(|(_, n)| n.to_string())
+                        .unwrap_or(blocker);
+                    d.note(format!(
+                        "add `where derivable(ord, {name})` to this signature; the body may then                          assume it"
+                    ))
+                }
+            };
+            diags.push(d);
+        }
+        self.diags.extend(diags);
+    }
+
+    /// Every sum type this run declared, flattened for
+    /// [`derivable`](crate::derivable::derivable). Built once per check rather
+    /// than per site: it is a scan of `ctors`, and a program with a thousand
+    /// constructors has no business paying for it per `Map`.
+    fn adt_shapes(&self) -> FxHashMap<Symbol, Adt> {
+        let mut out: FxHashMap<Symbol, Adt> = FxHashMap::default();
+        for ctor in self.ctors.values() {
+            let entry = out.entry(ctor.type_name.clone()).or_insert_with(|| Adt {
+                params: ctor.scheme.ty_vars.clone(),
+                fields: Vec::new(),
+            });
+            entry.fields.extend(ctor.fields.iter().cloned());
+        }
+        out
     }
 
     /// Equality is structural, and there is no structural equality on a
@@ -2765,18 +4002,22 @@ impl<'a> Checker<'a> {
             // return type; the tail-resumptive form is the one whose body has to
             // be something the perform site can receive.
             match (&clause.resume, &result_var) {
-                (Some(_), Some(result)) => self.expect(
-                    clause.body.span,
-                    result,
-                    &clause_ty,
-                    "a clause that binds a continuation returns the `handle`'s result",
-                ),
-                _ => self.expect(
-                    clause.body.span,
-                    &ret,
-                    &clause_ty,
-                    "a handler clause returns the operation's result",
-                ),
+                (Some(_), Some(result)) => {
+                    self.expect(
+                        clause.body.span,
+                        result,
+                        &clause_ty,
+                        "a clause that binds a continuation returns the `handle`'s result",
+                    );
+                }
+                _ => {
+                    self.expect(
+                        clause.body.span,
+                        &ret,
+                        &clause_ty,
+                        "a handler clause returns the operation's result",
+                    );
+                }
             }
             clause_rows = self.join(e.span, clause_rows, clause_row);
         }
@@ -3003,7 +4244,7 @@ impl<'a> Checker<'a> {
                         .clone()
                         .filter_map(|a| match &a.pat.kind {
                             PatternKind::Ctor { name, args } if args.iter().all(is_irrefutable) => {
-                                self.declared_value(name)
+                                self.covered_ctor(name)
                             }
                             _ => None,
                         })
@@ -3041,7 +4282,7 @@ impl<'a> Checker<'a> {
             }
             PatternKind::Ctor { name, args } => {
                 let info = self
-                    .global(Namespace::Value, name)
+                    .ctor_name(name)
                     .and_then(|qualified| self.ctors.get(&qualified).cloned());
                 let Some(info) = info else {
                     if name.is_bare() || self.declared_value(name).is_some() {
@@ -3177,10 +4418,14 @@ impl<'a> Checker<'a> {
         a.union(&b)
     }
 
-    fn expect(&mut self, span: Span, expected: &Type, found: &Type, context: &str) {
+    /// Whether the two unified, so a caller can stop rather than report a second
+    /// diagnostic about a type the first one already explained.
+    fn expect(&mut self, span: Span, expected: &Type, found: &Type, context: &str) -> bool {
         if let Err(e) = unify(&mut self.subst, &mut self.fresh, expected, found) {
             self.report_unify(&e, span, context);
+            return false;
         }
+        true
     }
 
     fn report_unify(&mut self, err: &UnifyError, span: Span, context: &str) {
@@ -3244,6 +4489,9 @@ impl<'a> Checker<'a> {
     }
 
     fn unknown_name(&mut self, q: &QName) {
+        if self.unresolved_in_derived(q, "definition") {
+            return;
+        }
         let mut d = Diagnostic::error(
             codes::UNKNOWN_NAME,
             format!("unknown name `{}`", q.symbol()),
@@ -3303,6 +4551,11 @@ struct Signature {
     ret: Type,
     declared: Option<Row>,
     published_row: Row,
+    /// The `Checker::scope` this signature was built under. A body is the same
+    /// definition as its signature, and the two are walked in separate passes
+    /// over a mutually recursive group, so the body restores it rather than
+    /// taking whatever the counter reached in between.
+    scope: u32,
 }
 
 fn lit_type(l: &Lit) -> Type {
@@ -3311,6 +4564,8 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Bool(_) => Type::bool(),
         Lit::Str(_) => Type::string(),
         Lit::Bytes(_) => Type::bytes(),
+        Lit::Float(_) => Type::float(),
+        Lit::Decimal { .. } => Type::decimal(),
         Lit::Unit => Type::unit(),
     }
 }
@@ -3356,12 +4611,41 @@ fn is_cell_builtin(name: &Symbol) -> bool {
     matches!(name.as_str(), "cell_get" | "cell_set")
 }
 
+/// The builtin a generated `OrdDict` is built out of, reserved so that no module
+/// can supply it.
+pub const COMPARE_VALUES: &str = "compare_values";
+
 fn encloses(outer: Span, inner: Span) -> bool {
     !outer.is_dummy()
         && !inner.is_dummy()
         && outer.source == inner.source
         && outer.start <= inner.start
         && inner.end <= outer.end
+}
+
+/// The last segment of a program-wide name, which is what the source wrote.
+fn simple_name(name: &Symbol) -> &str {
+    name.as_str().rsplit('.').next().unwrap_or(name.as_str())
+}
+
+/// Whether expansion produced a definition for this `derive`.
+fn expanded_here(module: &Module, def: &DeriveDef) -> bool {
+    module.items.iter().any(|i| match i {
+        Item::Fn(f) => f
+            .derived
+            .as_ref()
+            .is_some_and(|d| d.deriver == def.deriver && d.target == def.target.name),
+        _ => false,
+    })
+}
+
+/// What a deriver is about, for "a function has no …".
+fn what(deriver: Deriver) -> &'static str {
+    match deriver {
+        Deriver::Json => "JSON encoding",
+        Deriver::Eq => "structural equality",
+        Deriver::Ord => "order",
+    }
 }
 
 fn supplied(n: usize) -> String {

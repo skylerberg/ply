@@ -1,0 +1,87 @@
+// The smallest program that uses every operation of `std.net`, and the only
+// user of `std.net`'s `drain`.
+//
+// `hello.ply` is the endpoint; this is the demonstration that the effect is
+// importable and that a program written against it is ordinary code. It shipped
+// inside the declaration file in W1, which was the wrong place: a module that
+// declares a boundary should not also hold a program that crosses it.
+//
+// It declares no `main`, so `ply run examples` still has exactly one entry
+// point.
+
+import std.net (net, drain)
+
+fn greeting() -> Bytes = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply"
+
+// Accept one connection, read until the peer stops talking, answer, and close.
+// The row is inferred and checked against the annotation: this cannot touch a
+// socket it did not name.
+pub fn serve_once(port: Int) -> Int / {net.write[listener], net.write[conn]} = {
+  let l = net.listen[listener](port);
+  let c = net.accept[listener](l);
+  let request = drain(c, b"");
+  let sent = net.send[conn](c, greeting());
+  net.close[conn](c);
+  net.close[listener](l);
+  bytes_len(request) + sent
+}
+
+fn first_chunk(queued: List<Bytes>) -> Bytes =
+  match queued {
+    [first, ..] -> first,
+    _ -> b"",
+  }
+
+fn later_chunks(queued: List<Bytes>) -> List<Bytes> =
+  match queued {
+    [_, ..rest] -> rest,
+    _ -> [],
+  }
+
+// `det` and cacheable, over an in-memory socket. The handlers discharge every
+// `net` atom this code can perform, which is the only reason a test over a
+// `nondet` effect compiles at all: leave one out and it is `E0412` rather than
+// a flake.
+test "the imported effect drives a whole connection over an in-memory socket" {
+  with_cell[inbox]([b"GET /", b" HTTP/1.1\r\n\r\n"]) { inbox -> {
+  with_cell[outbox]([]) { outbox -> {
+    handle {
+      assert_eq(serve_once(0), 18 + bytes_len(greeting()))
+    } with {
+      net.listen[listener](p) -> 1,
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+      net.send[conn](c, payload) -> {
+        cell_set(outbox, push(cell_get(outbox), payload));
+        bytes_len(payload)
+      },
+      net.close[conn](c) -> (),
+    };
+    assert_eq(cell_get(outbox), [greeting()]);
+    assert_eq(cell_get(inbox), [])
+  } }
+  } }
+}
+
+// `drain` stops at the first empty answer, which is EOF, rather than at a
+// short one: TCP preserves the byte stream and not the boundaries a peer wrote
+// it in, so a short `recv` says nothing about whether more is coming.
+test "drain reads to end of stream rather than to the first short chunk" {
+  with_cell[inbox]([b"a", b"bc", b"", b"never read"]) { inbox -> {
+    handle {
+      assert_eq(drain(3, b""), b"abc")
+    } with {
+      net.recv[conn](c, max) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, later_chunks(queued));
+        first_chunk(queued)
+      },
+    };
+    assert_eq(cell_get(inbox), [b"never read"])
+  } }
+}

@@ -48,6 +48,8 @@ pub enum Command {
     Run(RunArgs),
     /// List every host handler this binary can bind: the trusted computing base.
     Hosts(HostsArgs),
+    /// List the modules that ship with this compiler, and the digest over them.
+    Std(StdArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Read, reclaim or discard what the caches hold.
@@ -301,6 +303,12 @@ pub struct TestArgs {
     #[arg(long)]
     pub host: bool,
 
+    /// Also select the tests declared by the modules that ship with the
+    /// compiler. Off by default: a project's test count must not change with a
+    /// compiler upgrade, for tests the project did not write and cannot fix.
+    #[arg(long)]
+    pub std: bool,
+
     #[command(flatten)]
     pub simulation: SimOptions,
 }
@@ -366,6 +374,13 @@ pub struct ProveArgs {
     #[arg(long)]
     pub no_incremental: bool,
 
+    /// Also discharge the laws declared by the modules that ship with the
+    /// compiler, and count their definitions in the coverage line. Off by
+    /// default, for the reason `ply test --std` is: a project's obligation count
+    /// must not change with a compiler upgrade.
+    #[arg(long)]
+    pub std: bool,
+
     #[command(flatten)]
     pub prove: ProveOptions,
 
@@ -402,6 +417,11 @@ pub struct ReviewArgs {
     /// Neither read nor write the front-end cache.
     #[arg(long)]
     pub no_incremental: bool,
+
+    /// Also review the definitions the modules that ship with the compiler
+    /// declare. Off by default: a project reviews what it wrote.
+    #[arg(long)]
+    pub std: bool,
 
     #[command(flatten)]
     pub prove: ProveOptions,
@@ -462,6 +482,24 @@ pub struct HostsArgs {
     /// the trusted computing base.
     #[arg(long)]
     pub digest: bool,
+}
+
+/// `ply std` needs no project: the modules are compiled into the binary, so
+/// what it reports is a property of `ply` and of nothing on disk.
+#[derive(Args, Debug)]
+pub struct StdArgs {
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long, conflicts_with = "digest")]
+    pub json: bool,
+
+    /// Print `b3:...` and nothing else: the one line a CI check pins against
+    /// the stdlib, exactly as `ply hosts --digest` does for the host handlers.
+    #[arg(long)]
+    pub digest: bool,
+
+    /// Print each module's source instead of listing it.
+    #[arg(long, value_name = "MODULE")]
+    pub show: Option<String>,
 }
 
 #[derive(Args, Debug)]

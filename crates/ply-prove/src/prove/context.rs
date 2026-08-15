@@ -44,6 +44,9 @@ pub struct Context<'a> {
     /// The sum types with at least one value, by least fixed point. A type all
     /// of whose constructors recurse — `type Bad = Wrap(Bad)` — has none.
     inhabited_types: BTreeSet<Symbol>,
+    /// Every nominal type whose *declaration* reaches a `Float`, by least fixed
+    /// point over the constructors. See [`Context::reaches_float`].
+    float_types: BTreeSet<Symbol>,
     sort_names: BTreeMap<TyVar, Symbol>,
 }
 
@@ -81,6 +84,7 @@ impl<'a> Context<'a> {
 
         let recursive = recursive_definitions(&defs, resolved);
         let inhabited_types = inhabited_sum_types(check, &sums);
+        let float_types = float_reaching_types(check);
 
         Context {
             resolved,
@@ -89,8 +93,26 @@ impl<'a> Context<'a> {
             recursive,
             by_type: sums,
             inhabited_types,
+            float_types,
             sort_names: BTreeMap::new(),
         }
+    }
+
+    /// Whether a type reaches a `Float` — through its arguments, its fields, or
+    /// **its own declaration**.
+    ///
+    /// The declaration is the half a walk over the written type misses, and
+    /// missing it is a false `proved`: `type Money = Cents(Float)` is
+    /// `Type::Con("Money", [])`, nothing in it says `Float`, and the value it
+    /// quantifies over is still `Cents(NaN)` — at which `==` is false and every
+    /// rule here assumes it is true. `ply_core::derivable` answers this same
+    /// question over the same declarations, which is what refuses
+    /// `Map<Money, v>`; the two must not disagree.
+    ///
+    /// Over-approximates on a parameterised declaration — `type W<a> = W(Float,
+    /// a)` marks every `W<_>` — which costs completeness and never soundness.
+    pub fn reaches_float(&self, ty: &Type) -> bool {
+        reaches_float(ty, &self.float_types)
     }
 
     /// Names for the type variables a proof leaves as uninterpreted sorts. A
@@ -111,11 +133,20 @@ impl<'a> Context<'a> {
     /// The program-wide name a reference denotes, or `None` when it denotes
     /// nothing this crate can see — in which case the term becomes a fresh
     /// symbol rather than a guess.
+    /// The program-wide name a value reference denotes.
+    ///
+    /// A bare name no module declares falls back to the prelude's constructors,
+    /// which no module *can* declare. Without it a `match o { None -> .., Some(v)
+    /// -> .. }` reads `None` as a binder rather than a nullary constructor, the
+    /// arm becomes undecidable, and an obligation the fragment can decide comes
+    /// back `Unknown` — a weaker tier for a resolution failure, which is a cost
+    /// with no argument behind it.
     pub fn resolve_value(&self, module: usize, q: &QName) -> Option<Symbol> {
-        self.resolved
-            .lookup(module, Namespace::Value, q)
-            .ok()
-            .map(|b| b.qualified.clone())
+        if let Ok(binding) = self.resolved.lookup(module, Namespace::Value, q) {
+            return Some(binding.qualified.clone());
+        }
+        let bare = q.is_bare().then(|| q.symbol().clone())?;
+        self.check.ctors.contains_key(&bare).then_some(bare)
     }
 
     pub fn ctor(&self, name: &Symbol) -> Option<&'a CtorInfo> {
@@ -207,6 +238,13 @@ impl<'a> Context<'a> {
 /// analysis that missed a case, which is the one way this rule turns unsound.
 fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
     let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
+    // The prelude's ADTs are declared by the *language* rather than by a file,
+    // so the check below — which reads the program's `type` items — would drop
+    // them and refuse to split on an `Option`. Their declaration is no less
+    // complete for having no source: `prelude::ADTS` is the whole of it.
+    for adt in ply_core::prelude::ADTS {
+        declared.insert(Symbol::new(adt.name), adt.variants.len());
+    }
     for module in &program.modules {
         for item in &module.items {
             if let Item::Type(def) = item
@@ -217,6 +255,50 @@ fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) 
         }
     }
     sums.retain(|ty, ctors| declared.get(ty) == Some(&ctors.len()) && !ctors.is_empty());
+}
+
+fn reaches_float(ty: &Type, declared: &BTreeSet<Symbol>) -> bool {
+    match ty {
+        Type::Con(name, args) => {
+            (name.as_str() == "Float" && args.is_empty())
+                || declared.contains(name)
+                || args.iter().any(|a| reaches_float(a, declared))
+        }
+        Type::Fn { params, ret, .. } => {
+            params.iter().any(|p| reaches_float(p, declared)) || reaches_float(ret, declared)
+        }
+        Type::Record(fields) => fields.values().any(|f| reaches_float(f, declared)),
+        Type::Var(_) => false,
+    }
+}
+
+/// Every nominal type some constructor of which reaches a `Float`, as a least
+/// fixed point so that a chain — `type Rate = R(Float)`, `type Row = W(Rate)` —
+/// and a recursive declaration both settle.
+fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
+    let mut fields: BTreeMap<Symbol, Vec<&Type>> = BTreeMap::new();
+    for ctor in check.ctors.values() {
+        fields
+            .entry(ctor.type_name.clone())
+            .or_default()
+            .extend(ctor.fields.iter());
+    }
+    let mut found: BTreeSet<Symbol> = BTreeSet::new();
+    loop {
+        let mut grew = false;
+        for (type_name, fields) in &fields {
+            if found.contains(type_name) {
+                continue;
+            }
+            if fields.iter().any(|f| reaches_float(f, &found)) {
+                found.insert(type_name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            return found;
+        }
+    }
 }
 
 /// The sum types with at least one value: a type is inhabited once some

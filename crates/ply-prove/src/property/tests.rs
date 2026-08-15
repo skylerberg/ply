@@ -107,7 +107,7 @@ pub(crate) fn ints(values: &[Value]) -> Vec<i64> {
 
 const ADTS: &str = r#"
 type Color = Red | Green | Blue
-type Opt = None | Some(Int)
+type Opt = Nothing | Just(Int)
 type Tree = Leaf | Node(Tree, Int, Tree)
 type Pair<a> = MkPair(a, a)
 type Never = Forever(Never)

@@ -362,14 +362,14 @@ fn resolve(
             diagnostics.push(err_anonymous(op));
             continue;
         }
-        // By the declared name, resolved to the program's own. A registration
-        // cannot spell the program-wide name — it does not know the consumer's
-        // module — so this is where the two are joined, and where a program that
-        // declares the name twice is refused rather than served by a coin flip.
+        // By the declared name, resolved to the program's own, and where a
+        // program that declares the name twice is refused rather than served by
+        // a coin flip.
+        //
         let declarations: Vec<&EffectInfo> = check
             .effects
             .values()
-            .filter(|e| e.simple_name == op.effect)
+            .filter(|e| registration_names(&op.effect, &e.name, &e.simple_name))
             .collect();
         let effect = match declarations.as_slice() {
             // Nothing declares it. `Only` named a specific resource, so it is
@@ -457,6 +457,27 @@ fn resolve(
         Ok(rows.into_values().collect())
     } else {
         Err(diagnostics)
+    }
+}
+
+/// Whether a registration's `effect` names a given declaration.
+///
+/// A registration may spell a **program-wide** name only under the reserved
+/// stdlib root, and then it matches that declaration and nothing else. That is
+/// the one case where the registration side knows the module: `std.net` ships
+/// with the compiler, so `ply_host::tcp` can name `std.net.net` exactly, and a
+/// program's own `effect net` then cannot silently acquire a real socket.
+/// Anywhere else the module belongs to the consumer, a registration guessing at
+/// it is `E0421`, and the two meet on the declared name.
+///
+/// One function, because `resolve` and [`HostBinding::would_serve`] must agree:
+/// the second is a prediction of what the first would do, and a second matcher
+/// could drift from it.
+fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
+    if ply_std::is_reserved(registered.as_str()) {
+        registered == program_wide
+    } else {
+        registered == declared
     }
 }
 
@@ -694,9 +715,9 @@ impl HostBinding {
     /// from the binding, so it works precisely when nothing is bound.
     ///
     /// `effect` is program-wide and a registration's is as declared, so the two
-    /// meet on the declared name — the same rule [`bind`] resolves by, which is
-    /// what makes this an honest prediction of what `--host` would do rather
-    /// than a second matcher that can drift from it.
+    /// meet through [`registration_names`] — the same rule [`bind`] resolves by,
+    /// which is what makes this an honest prediction of what `--host` would do
+    /// rather than a second matcher that can drift from it.
     ///
     /// [`bind`]: HostRegistry::bind
     pub fn would_serve(
@@ -706,11 +727,11 @@ impl HostBinding {
         resource: Option<&Symbol>,
     ) -> Option<&'static str> {
         let wanted = resource_of(resource);
-        let declared = simple_name(effect.as_str());
+        let declared = Symbol::new(simple_name(effect.as_str()));
         self.entries
             .iter()
             .find(|(candidate, _)| {
-                candidate.effect.as_str() == declared
+                registration_names(&candidate.effect, effect, &declared)
                     && candidate.op == *op
                     && candidate.serves_label(&wanted)
             })

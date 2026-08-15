@@ -758,6 +758,14 @@ mod tests {
 
     /// If `capture` walked the segment it cut, the 100,000-frame row would cost
     /// four orders of magnitude more than the 8-frame one.
+    ///
+    /// The bound is a hundredfold rather than a fourfold, and the slack is
+    /// deliberate: two nanosecond measurements taken at different moments differ
+    /// by an order of magnitude under a loaded machine, and a tolerance tight
+    /// enough to catch that is a test about the scheduler. A hundredfold is
+    /// still **two orders of magnitude** below what walking the segment would
+    /// cost, so the hypothesis this test exists to refute is refuted with room
+    /// to spare.
     #[test]
     fn capture_and_resume_are_flat_in_the_frames_they_move() {
         let points = stack_cost(3);
@@ -765,8 +773,9 @@ mod tests {
         let large = points.last().expect("a last row");
         assert_eq!(large.captured_frames, 100_000);
         assert_eq!(large.segments, 1);
+        let flat = |slow: f64, fast: f64| slow < fast * 100.0 + 500.0;
         assert!(
-            large.capture_nanos < small.capture_nanos * 4.0 + 50.0,
+            flat(large.capture_nanos, small.capture_nanos),
             "capturing {} frames cost {} ns against {} ns for {}",
             large.pending_frames,
             large.capture_nanos,
@@ -774,7 +783,7 @@ mod tests {
             small.pending_frames
         );
         assert!(
-            large.resume_nanos < small.resume_nanos * 4.0 + 50.0,
+            flat(large.resume_nanos, small.resume_nanos),
             "splicing {} frames cost {} ns against {} ns for {}",
             large.pending_frames,
             large.resume_nanos,

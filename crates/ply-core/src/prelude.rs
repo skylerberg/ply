@@ -21,7 +21,7 @@
 //! that does not exist.
 
 use crate::ty::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
-use crate::{EffectInfo, OpInfo};
+use crate::{CtorInfo, EffectInfo, OpInfo};
 use indexmap::IndexMap;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{Mode, ModuleName};
@@ -50,6 +50,129 @@ pub const TASK_TYPE: &str = "Task";
 
 pub fn is_prelude_effect(name: &Symbol) -> bool {
     NAMES.contains(&name.as_str())
+}
+
+/// An ADT the language declares rather than a module.
+///
+/// `map_get` returns an `Option`, `decode` a `Result`, `compare` an `Ordering`
+/// and `decimal_div` takes a `Rounding`. A **builtin** whose type mentions a
+/// type the user has to import first is incoherent, so these are in scope
+/// everywhere and a user declaration of one is `E0105`.
+pub struct Adt {
+    pub name: &'static str,
+    pub params: &'static [&'static str],
+    /// `(constructor, the parameters its fields have)`. Every prelude field is
+    /// a bare parameter, so this table needs no notion of a type expression and
+    /// no declaration order to resolve one against.
+    pub variants: &'static [(&'static str, &'static [&'static str])],
+}
+
+/// Read top to bottom, like `ply-host`'s registry: the whole of what the
+/// language declares without a file. Order is the declaration order, and a
+/// constructor's position in it is its `index`, so appending is free and
+/// reordering is not.
+pub const ADTS: &[Adt] = &[
+    Adt {
+        name: "Option",
+        params: &["a"],
+        variants: &[("None", &[]), ("Some", &["a"])],
+    },
+    Adt {
+        name: "Result",
+        params: &["a", "e"],
+        variants: &[("Ok", &["a"]), ("Err", &["e"])],
+    },
+    Adt {
+        name: "Ordering",
+        params: &[],
+        variants: &[("Less", &[]), ("Equal", &[]), ("Greater", &[])],
+    },
+    // The six `decimal_div` and `decimal_round` take. Naming the mode is the
+    // whole point of refusing `/`: a rounding the caller did not write down is
+    // the defect `Decimal` exists to prevent.
+    Adt {
+        name: "Rounding",
+        params: &[],
+        variants: &[
+            ("HalfEven", &[]),
+            ("HalfUp", &[]),
+            ("Down", &[]),
+            ("Up", &[]),
+            ("Ceiling", &[]),
+            ("Floor", &[]),
+        ],
+    },
+];
+
+/// The prelude's constructors, keyed by program-wide name exactly as a module's
+/// are.
+///
+/// The quantified variables are fixed numbers rather than drawn from a run's
+/// counter, which is sound because every use goes through `instantiate` — the
+/// same reasoning [`effects`] is built on, and the reason both can be rebuilt by
+/// a caller that has no checker.
+pub fn ctors() -> IndexMap<Symbol, CtorInfo> {
+    let mut out = IndexMap::new();
+    for adt in ADTS {
+        let vars: Vec<TyVar> = (0..adt.params.len()).map(|i| TyVar(i as u32)).collect();
+        let result = Type::Con(
+            Symbol::new(adt.name),
+            vars.iter().map(|v| Type::Var(*v)).collect(),
+        );
+        for (index, (ctor, params)) in adt.variants.iter().enumerate() {
+            let fields: Vec<Type> = params
+                .iter()
+                .map(|p| {
+                    let slot = adt
+                        .params
+                        .iter()
+                        .position(|q| q == p)
+                        .expect("a variant's field names one of its type's parameters");
+                    Type::Var(vars[slot])
+                })
+                .collect();
+            let ty = if fields.is_empty() {
+                result.clone()
+            } else {
+                Type::Fn {
+                    params: fields.clone(),
+                    ret: Box::new(result.clone()),
+                    effects: Row::empty(),
+                }
+            };
+            let name = Symbol::new(*ctor);
+            out.insert(
+                name.clone(),
+                CtorInfo {
+                    name: name.clone(),
+                    // No module declares these, and the anonymous name qualifies
+                    // to itself, so the program-wide name is the written one.
+                    module: ModuleName::anonymous(),
+                    simple_name: name,
+                    type_name: Symbol::new(adt.name),
+                    index,
+                    arity: fields.len(),
+                    fields,
+                    scheme: Scheme {
+                        ty_vars: vars.clone(),
+                        row_vars: vec![],
+                        ty,
+                    },
+                    span: Span::DUMMY,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Every prelude constructor and its arity, in declaration order. What the
+/// evaluator needs to build a `Value::Ctor` without a `type` item to read.
+pub fn ctor_arities() -> Vec<(Symbol, usize)> {
+    ADTS.iter()
+        .flat_map(|adt| adt.variants)
+        .map(|(name, fields)| (Symbol::new(*name), fields.len()))
+        .collect()
 }
 
 /// `sim.read`: the seed dependency, in the type. `sim` is deliberately not

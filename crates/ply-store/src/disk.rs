@@ -21,6 +21,8 @@ pub(crate) const OBLIGATIONS_FILE: &str = "obligations.json";
 const OBLIGATIONS_STEM: &str = "obligations";
 pub(crate) const REVIEWS_FILE: &str = "reviews.json";
 const REVIEWS_STEM: &str = "reviews";
+pub(crate) const STDLIB_FILE: &str = "stdlib";
+const STDLIB_STEM: &str = "stdlib";
 
 /// Both new files are read on their first question rather than at
 /// `Store::open`, so neither is in the way of the open budget, and both are
@@ -299,6 +301,30 @@ pub(crate) fn save(dir: &Path, path: &Path, cache: &Cache) -> anyhow::Result<()>
         serde_json::to_vec_pretty(&file).context("could not serialize the result cache")?;
     bytes.push(b'\n');
     write_atomic(dir, path, RESULTS_STEM, &bytes, "result cache")
+}
+
+/// The stdlib digest this cache was last written under, as one line of text.
+///
+/// Its own file, and deliberately not a field of the result cache: it must
+/// survive a `RUNTIME_VERSION` bump, which discards that file whole. A compiler
+/// upgrade is exactly when both change, and losing the digest there would drop
+/// `W0605` at the only moment it has anything to say. Nothing keys on it — a
+/// digest in a cache key would invalidate a project on an edit to a `std` module
+/// it never imports.
+pub(crate) fn load_stdlib(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let line = text.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+pub(crate) fn save_stdlib(dir: &Path, path: &Path, digest: &str) -> anyhow::Result<()> {
+    write_atomic(
+        dir,
+        path,
+        STDLIB_STEM,
+        format!("{digest}\n").as_bytes(),
+        "stdlib digest",
+    )
 }
 
 pub(crate) fn load_passes(path: &Path) -> Result<Passes, LoadError> {

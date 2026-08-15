@@ -30,8 +30,10 @@ use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
 use ply_core::{Type, prelude};
-use ply_eval::{Value, Vector};
+use ply_eval::{Decimal, Value, Vector};
 use ply_span::{Diagnostic, Symbol};
+use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -126,6 +128,12 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             Value::Int(n) => int_size(*n),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
+            // Ordered so that every candidate below is a strict descent:
+            // toward zero, and positive before its negation. `NaN` and the
+            // infinities are the largest values there are, so a counterexample
+            // reaches a finite one whenever a finite one still fails.
+            Value::Float(f) => float_size(*f),
+            Value::Decimal(d) => decimal_size(*d),
             Value::Str(s) => s
                 .chars()
                 .fold(0u64, |acc, c| acc.saturating_add(1 + c as u64)),
@@ -135,6 +143,14 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             Value::List(items) => {
                 pending.extend(items.iter());
                 items.len() as u64
+            }
+            // Keys count as well as values: two maps with one entry each are
+            // ordered by what is in them, which is what makes removing an entry
+            // a strict shrink and replacing a key with a smaller one another.
+            Value::Map(entries) => {
+                pending.extend(entries.keys());
+                pending.extend(entries.values());
+                entries.size() as u64
             }
             Value::Record(fields) => {
                 pending.extend(fields.values());
@@ -153,6 +169,45 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
         total = total.saturating_add(here);
     }
     total
+}
+
+/// Finite values by magnitude, with a negative outweighing its absolute value,
+/// and everything non-finite above every finite value.
+fn float_size(f: f64) -> u64 {
+    if f.is_nan() {
+        return u64::MAX;
+    }
+    if f.is_infinite() {
+        return u64::MAX - 1;
+    }
+    let magnitude = f.abs();
+    // A `Float` spans more magnitudes than a `u64` counts, so the measure is
+    // over the exponent and the mantissa rather than over the value: it only has
+    // to order candidates, and a saturating cast would make every large float
+    // one size and stall the walk.
+    let bits = magnitude.to_bits();
+    bits.saturating_mul(2)
+        .saturating_add(u64::from(f.is_sign_negative()))
+}
+
+/// Magnitude, then whether there is a fraction at all, then the scale, then the
+/// sign — strictly layered, so each is a tiebreak on the one above it.
+///
+/// The mantissa is deliberately **not** the measure. `1.500m` halves to
+/// `0.750m`, whose mantissa is larger and whose value is smaller, so a measure
+/// over the mantissa would call the obvious shrink a growth and stall the walk
+/// at the first fraction it met.
+fn decimal_size(d: Decimal) -> u64 {
+    // The layers: a magnitude step is worth more than every tiebreak together,
+    // and having a fraction is worth more than the scale it is written at.
+    const MAGNITUDE: u64 = 64;
+    const FRACTION: u64 = 32;
+    let magnitude = d.trunc().abs().to_u64().unwrap_or(u64::MAX / MAGNITUDE);
+    magnitude
+        .saturating_mul(MAGNITUDE)
+        .saturating_add(if d.fract().is_zero() { 0 } else { FRACTION })
+        .saturating_add(u64::from(d.scale()))
+        .saturating_add(u64::from(d.is_sign_negative()))
 }
 
 /// `-5` is larger than `5`, which is what makes negating a negative a shrink.
@@ -197,11 +252,17 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
         }
         Type::Con(name, args) => match name.as_str() {
             "Int" => Ok(Value::Int(0)),
+            // `0.0`, not `-0.0`: the two are different values and the positive
+            // one is the floor.
+            "Float" => Ok(Value::Float(0.0)),
+            "Decimal" => Ok(Value::Decimal(Decimal::ZERO)),
             "Bool" => Ok(Value::Bool(false)),
             "String" => Ok(Value::str("")),
             "Bytes" => Ok(Value::bytes([])),
             "Unit" => Ok(Value::Unit),
             "List" => Ok(Value::list(Vec::new())),
+            // `map_new()`, which is the floor the contract names.
+            "Map" => Ok(Value::empty_map()),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
             _ => {
@@ -251,6 +312,8 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
     }
     match (value, ty) {
         (Value::Int(n), _) => int_candidates(*n),
+        (Value::Float(f), _) => float_candidates(*f),
+        (Value::Decimal(d), _) => decimal_candidates(*d),
         (Value::Bool(true), _) => vec![Value::Bool(false)],
         (Value::Bool(false), _) | (Value::Unit, _) => Vec::new(),
         (Value::Str(s), _) => string_candidates(s),
@@ -263,6 +326,15 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
                 _ => Type::int(),
             };
             list_candidates(items, &elem, world, depth)
+        }
+        (Value::Map(entries), _) => {
+            let (key, value) = match ty {
+                Type::Con(name, args) if name.as_str() == "Map" && args.len() == 2 => {
+                    (args[0].clone(), args[1].clone())
+                }
+                _ => (Type::int(), Type::int()),
+            };
+            map_candidates(entries, &key, &value, world, depth)
         }
         (Value::Record(fields), Type::Record(types)) => {
             let mut out = Vec::new();
@@ -314,6 +386,84 @@ fn int_candidates(n: i64) -> Vec<Value> {
     out.retain(|c| *c != n);
     out.dedup();
     out.into_iter().map(Value::Int).collect()
+}
+
+/// Toward `0.0`, and a specific value before a special one.
+///
+/// A `NaN` or an infinity offers `0.0` and nothing else: there is no halving
+/// that reaches a finite value from one, and a counterexample that still fails
+/// at `0.0` is the one worth reporting.
+fn float_candidates(f: f64) -> Vec<Value> {
+    if f == 0.0 && f.is_sign_positive() {
+        return Vec::new();
+    }
+    if !f.is_finite() {
+        return vec![Value::Float(0.0)];
+    }
+    let mut out: Vec<f64> = vec![0.0];
+    // The truncation is the point: a fraction shrinks to the whole number below
+    // it, which is what makes `0.30000000000000004` reach `0.0` in two steps.
+    let truncated = f.trunc();
+    if truncated != f {
+        out.push(truncated);
+    }
+    let mut half = f / 2.0;
+    for _ in 0..64 {
+        if half == 0.0 || !half.is_finite() {
+            break;
+        }
+        out.push(half);
+        half /= 2.0;
+    }
+    if f.is_sign_negative() {
+        out.push(-f);
+    }
+    // `!=` and not `total_cmp`, so `-0.0` is dropped against a `0.0` candidate
+    // and the walk cannot cycle between two values the language calls equal.
+    out.retain(|c| *c != f);
+    out.into_iter().map(Value::Float).collect()
+}
+
+/// Toward `0m`, and toward scale 0 — the trailing zeros go before the digits do,
+/// so a witness reads `1.5m` rather than `1.500000m`.
+///
+/// Nothing that *raises* the scale is offered, halving included: `0.75m / 2` is
+/// `0.375m`, which is a smaller value written at a longer scale, and admitting
+/// it would let the walk trade a digit of magnitude for a digit of precision
+/// forever.
+fn decimal_candidates(d: Decimal) -> Vec<Value> {
+    if d.is_zero() && d.scale() == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Decimal> = vec![Decimal::ZERO];
+    let normalized = d.normalize();
+    if normalized.scale() != d.scale() {
+        out.push(normalized);
+    }
+    // Truncation, shortest first: `12.345m` offers `12m`, then `12.3m`, then
+    // `12.34m`. Truncating never raises the magnitude and never raises the
+    // scale, which is what makes each one a descent.
+    for places in 0..d.scale() {
+        out.push(d.round_dp_with_strategy(places, RoundingStrategy::ToZero));
+    }
+    // Then the magnitude, which is what moves an integer witness.
+    let mut half = d;
+    for _ in 0..96 {
+        match half.checked_div(Decimal::TWO) {
+            Some(next) if !next.is_zero() && next.scale() <= d.scale() => {
+                half = next;
+                out.push(half);
+            }
+            _ => break,
+        }
+    }
+    if d.is_sign_negative() {
+        out.push(-d);
+    }
+    let here = decimal_size(d);
+    out.retain(|c| decimal_size(*c) < here);
+    out.dedup();
+    out.into_iter().map(Value::Decimal).collect()
 }
 
 /// Length before content, which is the order that makes a minimal witness
@@ -403,6 +553,51 @@ fn list_candidates(
             let mut next = items.to_vec();
             next[i] = candidate;
             out.push(Value::list(next));
+        }
+    }
+    out
+}
+
+/// The empty map, then each entry dropped, then each value shrunk, then each key
+/// shrunk.
+///
+/// Entries come out before values because that is the contract, and it is the
+/// right order for the same reason it is for a list: dropping an entry can end
+/// the walk in one step where shrinking a value inside it cannot. Keys go last
+/// because replacing one re-sorts the map, which is the most disruptive edit
+/// available and the least likely to still refute.
+fn map_candidates(
+    entries: &ply_eval::Map,
+    key: &Type,
+    value: &Type,
+    world: &TypeWorld,
+    depth: u32,
+) -> Vec<Value> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let pairs: Vec<(Value, Value)> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut out = vec![Value::empty_map()];
+    for i in 0..pairs.len() {
+        let mut next = pairs.clone();
+        next.remove(i);
+        out.push(Value::map(next));
+    }
+    for i in 0..pairs.len() {
+        for candidate in candidates_at(&pairs[i].1, value, world, depth + 1) {
+            let mut next = pairs.clone();
+            next[i].1 = candidate;
+            out.push(Value::map(next));
+        }
+    }
+    for i in 0..pairs.len() {
+        for candidate in candidates_at(&pairs[i].0, key, world, depth + 1) {
+            let mut next = pairs.clone();
+            next[i].0 = candidate;
+            out.push(Value::map(next));
         }
     }
     out

@@ -71,6 +71,14 @@ pub(crate) mod tag {
     /// A distinct tag from [`LIT_STR`], so `b"ab"` and `"ab"` are different
     /// definitions. They have different types and must not share a hash.
     pub const LIT_BYTES: u8 = 44;
+    /// The IEEE **bit pattern**, eight bytes. Not the numeric value: `0.0` and
+    /// `-0.0` are two definitions because `1.0 / -0.0` tells them apart, and a
+    /// NaN payload is part of what a program can observe through `to_bits`-like
+    /// arithmetic. Distinct from [`LIT_INT`] so `1` and `1.0` never share a hash.
+    pub const LIT_FLOAT: u8 = 45;
+    /// Mantissa then scale. The scale is kept, so `1.5m` and `1.50m` are two
+    /// definitions even though they are one value — the literal said which one.
+    pub const LIT_DECIMAL: u8 = 46;
 
     pub const E_LIT: u8 = 50;
     pub const E_VAR: u8 = 51;
@@ -104,6 +112,10 @@ pub(crate) mod tag {
     pub const ARM: u8 = 92;
     pub const CLAUSE: u8 = 93;
     pub const RETURN_CLAUSE: u8 = 94;
+    /// A `where derivable(D, a)`. Part of the published signature, so it is
+    /// kept; the parameter enters as its de Bruijn level, so renaming it moves
+    /// no hash.
+    pub const CONSTRAINT: u8 = 95;
 }
 
 pub(crate) fn binop_byte(op: BinOp) -> u8 {
@@ -378,10 +390,33 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
         self.opt(d.ret.as_ref(), Self::type_expr);
         self.opt(d.effects.as_ref(), Self::row);
+        self.constraints(&d.constraints);
         for p in &d.params {
             self.values.push(&p.name.name);
         }
         self.expr(&d.body);
+    }
+
+    /// Sorted and deduplicated, so that writing the same two constraints in the
+    /// other order is the same definition. A constraint naming a parameter this
+    /// signature does not bind is dropped: it is an error the checker reports,
+    /// and a hash may not depend on a name the definition cannot reach.
+    fn constraints(&mut self, cs: &'a [Constraint]) {
+        let mut levels: Vec<(u32, u8)> = cs
+            .iter()
+            .filter_map(|c| {
+                let level = self.ty_params.iter().rposition(|p| **p == c.param.name)?;
+                Some((level as u32, c.deriver.tag()))
+            })
+            .collect();
+        levels.sort_unstable();
+        levels.dedup();
+        self.len(levels.len());
+        for (level, deriver) in levels {
+            self.tag(tag::CONSTRAINT);
+            self.u32v(level);
+            self.tag(deriver);
+        }
     }
 
     fn type_def(&mut self, d: &'a TypeDef) {
@@ -844,6 +879,15 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.tag(tag::LIT_BYTES);
                 self.len(b.len());
                 self.out.extend_from_slice(b);
+            }
+            Lit::Float(f) => {
+                self.tag(tag::LIT_FLOAT);
+                self.out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            Lit::Decimal { mantissa, scale } => {
+                self.tag(tag::LIT_DECIMAL);
+                self.out.extend_from_slice(&mantissa.to_le_bytes());
+                self.out.extend_from_slice(&scale.to_le_bytes());
             }
             Lit::Unit => self.tag(tag::LIT_UNIT),
         }

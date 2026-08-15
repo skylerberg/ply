@@ -19,6 +19,9 @@
 // change.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(test)]
+mod numerics;
+
 pub mod concurrency;
 pub mod domain;
 pub mod key;

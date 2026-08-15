@@ -37,6 +37,14 @@ pub const MUL: &str = "(*)";
 pub const DIV: &str = "(/)";
 pub const REM: &str = "(%)";
 pub const CONCAT: &str = "(++)";
+/// The ordered comparisons, uninterpreted. [`Node::Cmp`] is over `Int` alone —
+/// its rules are linear-arithmetic rules — so a `Float` or `Decimal` comparison
+/// becomes an application of one of these instead of a `Cmp` the arithmetic
+/// would then reason about at the wrong sort.
+pub const LT: &str = "(<)";
+pub const LE: &str = "(<=)";
+pub const GT: &str = "(>)";
+pub const GE: &str = "(>=)";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CmpOp {
@@ -152,6 +160,20 @@ pub enum Node {
     Int(i64),
     Bool(bool),
     Str(String),
+    /// A `Decimal` literal, **normalized to its numeric value**: `1.5m` and
+    /// `1.50m` are one node.
+    ///
+    /// That normalization carries a soundness obligation rather than a
+    /// convenience. Two distinct literal nodes are treated as distinct *values*
+    /// by [`super::egraph::conflict`], so a representation that kept the scale
+    /// would let the prover certify `1.5m != 1.50m` — which is false, because
+    /// the language's `==` on `Decimal` compares numeric value. There is no
+    /// `Float` counterpart for the mirror-image reason: `==` on `Float` is not
+    /// reflexive, so no literal node for it can be sound at all.
+    Decimal {
+        mantissa: i128,
+        scale: u32,
+    },
     Unit,
     /// A `forall` binder, `result`, a constructor field exposed by a case
     /// split, or an opaque stand-in for a term outside the fragment.
@@ -182,7 +204,9 @@ pub enum Node {
     Not(TermId),
     And(TermId, TermId),
     Or(TermId, TermId),
-    /// Over `Int` only — the type system admits `< <= > >=` nowhere else.
+    /// Over `Int` only. `<` and its converses are defined at `Float` and
+    /// `Decimal` too, and those become an [`Node::App`] of [`LT`] and friends —
+    /// this node's rules are the linear arithmetic's, which is a theory of `Int`.
     Cmp {
         op: CmpOp,
         lhs: TermId,
@@ -291,6 +315,17 @@ impl Terms {
 
     pub fn string(&mut self, s: String) -> TermId {
         self.mk(Node::Str(s), Some(Type::string()))
+    }
+
+    /// Interned by numeric value: trailing zeros are stripped so that two
+    /// literals the language calls equal are one term. See [`Node::Decimal`].
+    pub fn decimal(&mut self, mantissa: i128, scale: u32) -> TermId {
+        let (mut mantissa, mut scale) = (mantissa, scale);
+        while scale > 0 && mantissa % 10 == 0 {
+            mantissa /= 10;
+            scale -= 1;
+        }
+        self.mk(Node::Decimal { mantissa, scale }, Some(Type::decimal()))
     }
 
     pub fn unit(&mut self) -> TermId {

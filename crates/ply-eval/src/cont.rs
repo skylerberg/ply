@@ -213,6 +213,28 @@ pub enum Frame {
         next: usize,
         span: Span,
     },
+
+    /// `map_fold`'s loop. It carries the entries it will visit rather than the
+    /// map, because the order is the contract: a resumption has to continue over
+    /// the same entries in the same ascending order, and a live cursor into a
+    /// persistent tree would let two resumptions of one capture disagree.
+    MapFoldStep {
+        f: Value,
+        entries: crate::map::Entries,
+        next: usize,
+        span: Span,
+    },
+
+    /// `bytes_position`'s loop. It is a frame for the same reason the three
+    /// above are, and it is the one byte builtin that pays a boxed `Int` and a
+    /// frame per byte examined — which is why the contract calls it the escape
+    /// hatch and points at `bytes_scan` first.
+    BytesPositionStep {
+        f: Value,
+        bytes: std::sync::Arc<[u8]>,
+        next: usize,
+        span: Span,
+    },
 }
 
 pub struct Prompt {

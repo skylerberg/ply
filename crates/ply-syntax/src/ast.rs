@@ -319,6 +319,11 @@ pub enum Item {
     /// `law "label" forall (x: T) where g { body }`. Labelled like a `test`, so
     /// nothing can reference it and it is never `pub`.
     Law(Box<LawDef>),
+    /// `derive json for Order`. Declares nothing itself: expansion walks the
+    /// target's structure and appends ordinary [`Item::Fn`]s to the module, and
+    /// those are what the rest of the pipeline sees. So every consumer that
+    /// enumerates definitions is right to skip this variant.
+    Derive(Box<DeriveDef>),
 }
 
 impl Item {
@@ -329,28 +334,141 @@ impl Item {
             Item::Effect(d) => d.span,
             Item::Test(d) => d.span,
             Item::Law(d) => d.span,
+            Item::Derive(d) => d.span,
         }
     }
 
-    /// `None` for a `test` and a `law`, which have no name a reference could
-    /// reach.
+    /// `None` for a `test`, a `law` and a `derive`, none of which have a name a
+    /// reference could reach. A `derive`'s generated definitions do, and they
+    /// are [`Item::Fn`]s of their own.
     pub fn name(&self) -> Option<&Ident> {
         match self {
             Item::Fn(d) => Some(&d.name),
             Item::Type(d) => Some(&d.name),
             Item::Effect(d) => Some(&d.name),
-            Item::Test(_) | Item::Law(_) => None,
+            Item::Test(_) | Item::Law(_) | Item::Derive(_) => None,
         }
     }
 
+    /// A `derive` carries no `pub` of its own: its generated definitions take
+    /// the target type's visibility, so a type you can name is a type you can
+    /// encode and the two cannot drift.
     pub fn visibility(&self) -> Visibility {
         match self {
             Item::Fn(d) => d.vis,
             Item::Type(d) => d.vis,
             Item::Effect(d) => d.vis,
-            Item::Test(_) | Item::Law(_) => Visibility::Private,
+            Item::Test(_) | Item::Law(_) | Item::Derive(_) => Visibility::Private,
         }
     }
+}
+
+/// The derivations the language defines. Fixed: there are no user-defined
+/// derivers, and `row` waits for W4's `Row` type rather than shipping as a
+/// codec over a type that does not exist.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Deriver {
+    Json,
+    Eq,
+    Ord,
+}
+
+impl Deriver {
+    pub const ALL: &'static [Deriver] = &[Deriver::Json, Deriver::Eq, Deriver::Ord];
+
+    pub fn from_name(name: &str) -> Option<Deriver> {
+        Some(match name {
+            "json" => Deriver::Json,
+            "eq" => Deriver::Eq,
+            "ord" => Deriver::Ord,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Deriver::Json => "json",
+            Deriver::Eq => "eq",
+            Deriver::Ord => "ord",
+        }
+    }
+
+    /// The dictionary type a derivation of this kind produces.
+    pub fn dictionary(self) -> &'static str {
+        match self {
+            Deriver::Json => "JsonCodec",
+            Deriver::Eq => "EqDict",
+            Deriver::Ord => "OrdDict",
+        }
+    }
+
+    /// Distinguishes derivers in a definition hash and in a stored body. Pinned
+    /// rather than derived from the variant order, which is a cache key nobody
+    /// should be able to move by sorting an enum.
+    pub fn tag(self) -> u8 {
+        match self {
+            Deriver::Json => 1,
+            Deriver::Eq => 2,
+            Deriver::Ord => 3,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Deriver> {
+        Some(match tag {
+            1 => Deriver::Json,
+            2 => Deriver::Eq,
+            3 => Deriver::Ord,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for Deriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `derive json for Order`.
+///
+/// The target is an [`Ident`] and not a [`QName`] on purpose: a `derive` may
+/// only name a type its own module declares. Without that rule two modules can
+/// each derive for one type and produce two names for one canonical encoding,
+/// which is the divergence ADR 0010 has no resolution layer to prevent.
+#[derive(Clone, Debug)]
+pub struct DeriveDef {
+    pub deriver: Deriver,
+    pub deriver_span: Span,
+    pub target: Ident,
+    pub span: Span,
+}
+
+/// `where derivable(json, a)` on a signature.
+///
+/// Checked at the **signature** rather than at instantiation, which is the one
+/// axis on which bare structural reflection is genuinely worse than typeclasses:
+/// an error deep inside an expansion is a search, and a search inside an edit
+/// loop is what an agent actually pays for.
+#[derive(Clone, Debug)]
+pub struct Constraint {
+    pub deriver: Deriver,
+    pub deriver_span: Span,
+    /// A type parameter of the enclosing signature. Never a concrete type: a
+    /// constraint on a type the compiler can already see is either trivially
+    /// true or an error, and neither is worth writing.
+    pub param: Ident,
+    pub span: Span,
+}
+
+/// What a generated definition was generated from. Provenance, so `--explain`
+/// and `ply check --types` can label it — and erased by normalization, because
+/// a hand-written definition byte-identical to a generated one is the same
+/// computation and must share its hash.
+#[derive(Clone, Debug)]
+pub struct Derived {
+    pub deriver: Deriver,
+    /// The target's simple name, as its `derive` wrote it.
+    pub target: Symbol,
 }
 
 /// Type parameters and effect-row parameters, written `<a, b | e>`.
@@ -377,6 +495,19 @@ pub struct FnDef {
     /// The `/ {...}` annotation. When present it is the published signature and
     /// inference must produce a subset of it; when absent the row is inferred.
     pub effects: Option<RowExpr>,
+    /// `where derivable(json, a), derivable(ord, k)`, written after the effect
+    /// row and before any `requires`.
+    ///
+    /// Part of the published signature and therefore **kept** by normalization,
+    /// unlike `spec`. Adding a constraint narrows the call sites the signature
+    /// admits, so a caller checked against the unconstrained form has to be
+    /// rechecked — and gate 2 only rechecks a definition whose dependency's
+    /// hash moved. Erasing this would leave that caller accepted against a
+    /// signature that no longer admits it.
+    pub constraints: Vec<Constraint>,
+    /// Set on a definition expansion generated from a `derive`, and `None` on
+    /// everything a human wrote. Provenance only: erased by normalization.
+    pub derived: Option<Derived>,
     /// `requires` / `ensures`, in source order. A spec is a claim *about* this
     /// definition rather than part of it, so it is erased by normalization:
     /// writing one changes no definition hash and re-runs no test. The claim
@@ -573,7 +704,49 @@ pub enum Lit {
     /// refused, because the bytes of this literal may not depend on the file's
     /// encoding.
     Bytes(Vec<u8>),
+    /// IEEE-754 binary64. Two of these are one definition iff their **bit
+    /// patterns** agree, which is why `0.0` and `-0.0` are two definitions and
+    /// why a normalizer that folded them would be wrong: `1.0 / -0.0` still
+    /// tells them apart.
+    Float(f64),
+    /// Sign and magnitude in `mantissa`, digits after the point in `scale`.
+    /// The scale is **kept**: `1.50m` is `(150, 2)` and `1.5m` is `(15, 1)`, so
+    /// the two are equal in value and differently hashed. Both consequences of
+    /// one decision, and both stated rather than smoothed over.
+    Decimal {
+        mantissa: i128,
+        scale: u32,
+    },
     Unit,
+}
+
+/// The shortest text that reads back as this `f64`, always distinguishable from
+/// an integer. `{}` on an `f64` is already shortest-round-tripping; what it does
+/// not do is keep `1` and `1.0` apart, and those are two types here.
+pub fn render_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Rust's `{}` is shortest-round-tripping in *digits* but always positional,
+    // so `1e300` comes back as three hundred and one characters. `{:e}` is the
+    // same value in the other notation; taking the shorter of the two is what
+    // "shortest" means, and positional wins a tie because it is the form
+    // somebody wrote.
+    let positional = format!("{f}");
+    let exponential = format!("{f:e}");
+    let text = if exponential.len() < positional.len() {
+        exponential
+    } else {
+        positional
+    };
+    if text.contains(['.', 'e', 'E']) {
+        text
+    } else {
+        format!("{text}.0")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -592,6 +765,28 @@ pub enum BinOp {
     And,
     Or,
     Concat,
+}
+
+impl BinOp {
+    /// The operator as it is written, for a diagnostic that quotes it.
+    pub fn text(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+            BinOp::Concat => "++",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -214,6 +214,11 @@ interpreter cost**, which is the number W6 turns on.
   derivable(json, a)`. Bare reflection fails late, which is the expensive failure
   for an agent; this repairs it without any dispatch machinery
 - `Float`, and a decimal type — `i64` cents is a decision you regret later
+- A **stdlib path**: `import std.json`, `import std.net`. W1 left the `net`
+  effect unimportable, and JSON would hit the same wall
+- **Byte-oriented builtins**, because W1's 5.41us per byte of request head is
+  five O(n) folds boxing an Int per byte with no early exit — an algorithm, not
+  a constant factor
 
 Type-directed **dispatch** is deliberately not decided here. Derivation is the
 substrate under either candidate, so W2 proceeds without settling it; W3 and W4
@@ -224,7 +229,7 @@ dispatch in a real stack.
 response, with the codec derived; and a law that decode-after-encode is identity,
 discharged at whatever tier it earns.
 
-`docs/adr/0010-generic-derivation.md`
+`docs/adr/0010-generic-derivation.md`, `docs/adr/0012-w2-contract.md`
 
 ## W3 — A real server
 

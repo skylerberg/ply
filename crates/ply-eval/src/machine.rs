@@ -32,7 +32,7 @@ use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
-    BinOp, Expr, FnDef, Item, Lit, Mode, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
+    BinOp, Expr, FnDef, Item, Mode, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
@@ -198,7 +198,10 @@ impl<'a> Machine<'a> {
         check: Option<&'a CheckOutput>,
     ) -> Machine<'a> {
         let mut fns = FxHashMap::default();
-        let mut ctors: FxHashMap<Symbol, usize> = FxHashMap::default();
+        // The prelude's first, so a module declaring its own `Some` overwrites
+        // it — the resolution order every other prelude name follows.
+        let mut ctors: FxHashMap<Symbol, usize> =
+            ply_core::prelude::ctor_arities().into_iter().collect();
         let mut ops = FxHashMap::default();
         let mut tests = Vec::new();
 
@@ -231,8 +234,10 @@ impl<'a> Machine<'a> {
                     }),
                     // A law is not a global and not a test: `ply-prove`
                     // evaluates its body through `eval_expr_for_test`, with
-                    // its binders bound to generated values.
-                    Item::Law(_) => {}
+                    // its binders bound to generated values. A `derive` is not
+                    // one either — expansion has already appended the globals
+                    // it stands for.
+                    Item::Law(_) | Item::Derive(_) => {}
                 }
             }
         }
@@ -1651,7 +1656,7 @@ impl<'a> Machine<'a> {
             PatternKind::Var(id) => {
                 // A nullary constructor written bare is indistinguishable from a
                 // binder in the AST, so the constructor table decides.
-                let declared = self.global(module, Namespace::Value, &QName::bare(id.clone()));
+                let declared = self.ctor_name(module, &QName::bare(id.clone()));
                 match declared.as_ref().and_then(|name| self.ctors.get(name)) {
                     Some(0) => {
                         let ctor = declared.expect("a hit came from a resolved name");
@@ -1664,20 +1669,13 @@ impl<'a> Machine<'a> {
                     }
                 }
             }
-            PatternKind::Lit(lit) => match (lit, value) {
-                (Lit::Int(a), Value::Int(b)) => a == b,
-                (Lit::Bool(a), Value::Bool(b)) => a == b,
-                (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
-                (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
-                (Lit::Unit, Value::Unit) => true,
-                _ => false,
-            },
+            PatternKind::Lit(lit) => crate::interp::lit_matches(lit, value),
             PatternKind::Ctor { name, args } => match value {
                 Value::Ctor {
                     name: vname,
                     args: vargs,
                 } => {
-                    let expected = self.global(module, Namespace::Value, name);
+                    let expected = self.ctor_name(module, name);
                     if expected.as_ref() != Some(vname) || vargs.len() != args.len() {
                         return Ok(false);
                     }
@@ -1742,13 +1740,15 @@ impl<'a> Machine<'a> {
         {
             return Ok(v.clone());
         }
-        if let Some(name) = self.global(module, Namespace::Value, q) {
-            if let Some(v) = self.definition(&name) {
-                return Ok(v);
-            }
-            if let Some(&arity) = self.ctors.get(&name) {
-                return Ok(ctor_value(&name, arity));
-            }
+        if let Some(name) = self.global(module, Namespace::Value, q)
+            && let Some(v) = self.definition(&name)
+        {
+            return Ok(v);
+        }
+        if let Some(name) = self.ctor_name(module, q)
+            && let Some(&arity) = self.ctors.get(&name)
+        {
+            return Ok(ctor_value(&name, arity));
         }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
@@ -1789,6 +1789,16 @@ impl<'a> Machine<'a> {
     /// A bare name goes straight to the module's scope rather than through
     /// [`Resolved::lookup`], because a miss there is the ordinary prelude case
     /// and building a diagnostic for every `len(..)` would not be free.
+    /// The program-wide name a constructor reference denotes, falling back to
+    /// the prelude's — which no module declares, so nothing qualifies it.
+    fn ctor_name(&self, module: usize, q: &QName) -> Option<Symbol> {
+        match self.global(module, Namespace::Value, q) {
+            Some(name) => Some(name),
+            None if q.is_bare() && self.ctors.contains_key(q.symbol()) => Some(q.symbol().clone()),
+            None => None,
+        }
+    }
+
     fn global(&self, module: usize, ns: Namespace, q: &QName) -> Option<Symbol> {
         if q.is_bare() {
             return self
@@ -2141,13 +2151,20 @@ pub(crate) fn apply_unary(
     span: Span,
 ) -> Result<Value, Diagnostic> {
     match op {
-        UnOp::Neg => {
-            let i = value.as_int(operand_span, "negation")?;
-            match i.checked_neg() {
-                Some(n) => Ok(Value::Int(n)),
-                None => Err(err_overflow(span, "negation", i, 0)),
+        // `-0.0` is a `Float` distinct from `0.0` and negation is how a program
+        // reaches it, so this arm is not decoration. Negating a `Decimal` is
+        // exact at every value the type holds.
+        UnOp::Neg => match value {
+            Value::Float(f) => Ok(Value::Float(-f)),
+            Value::Decimal(d) => Ok(Value::Decimal(-*d)),
+            _ => {
+                let i = value.as_int(operand_span, "negation")?;
+                match i.checked_neg() {
+                    Some(n) => Ok(Value::Int(n)),
+                    None => Err(err_overflow(span, "negation", i, 0)),
+                }
             }
-        }
+        },
         UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
     }
 }

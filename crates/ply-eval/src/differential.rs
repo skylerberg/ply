@@ -619,7 +619,9 @@ pub fn machine_only_clauses(program: &Program) -> Vec<Diagnostic> {
                     }
                     walk_expr(&l.body, &mut out);
                 }
-                Item::Type(_) | Item::Effect(_) => {}
+                // A `derive` has no body of its own; its generated
+                // definitions are `Item::Fn`s and are walked above.
+                Item::Type(_) | Item::Effect(_) | Item::Derive(_) => {}
             }
         }
     }

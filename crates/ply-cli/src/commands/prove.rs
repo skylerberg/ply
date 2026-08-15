@@ -67,14 +67,15 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let hashes = loaded.hashes.clone();
-    let laws = Laws::of(&loaded.check, &hashes);
+    let scoped = crate::obligations::project_view(&loaded.check, args.std);
+    let laws = Laws::of(&scoped, &hashes);
 
-    let collected = crate::obligations::collect(&loaded.program, &loaded.check, &hashes);
+    let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
     warnings.extend(collected.warnings);
     // Counted before the filter and before anything is discharged: "carries a
     // claim" is a fact about the program, not about what this run chose to look
     // at or managed to establish.
-    let specified = obligation::specified(&loaded.check, &laws, &collected.obligations);
+    let specified = obligation::specified(&scoped, &laws, &collected.obligations);
     let (obligations, filtered_out) = filter(collected.obligations, args.filter.as_deref());
 
     let (engine, engine_warning) = crate::engine::of(
@@ -89,7 +90,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     let discharge = || {
         obligation::prove(
             obligations,
-            &loaded.check,
+            &scoped,
             &laws,
             &mut store,
             &plan,
