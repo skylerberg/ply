@@ -799,6 +799,7 @@ mod tests {
                 })
                 .collect(),
             guarded: false,
+            host: false,
             footprint: Footprint::from_atoms([ply_core::EffectAtom::new(
                 "sim",
                 ply_core::Resource::Singleton,

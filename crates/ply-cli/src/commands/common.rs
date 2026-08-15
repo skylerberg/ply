@@ -118,6 +118,44 @@ pub fn report_bind_error(
     EXIT_COMPILE_ERROR
 }
 
+/// Fill in the table and column counts of the `--db-schema` function, for the
+/// `database` block.
+///
+/// The name was resolved at start-up and a failure to *evaluate* changes no
+/// verdict here: the counts are a fact the block prints, and the check that the
+/// live database agrees with the schema is the driver's at bind time. So a
+/// schema function that raises leaves the counts absent — printed as absent
+/// rather than as zero — instead of failing a run over a number.
+pub fn describe_schema(loaded: &crate::load::Loaded, hosts: &mut crate::hosts::Hosts) {
+    let Some(name) = hosts.schema_function().map(str::to_string) else {
+        return;
+    };
+    hosts.describe_schema(materialise_schema(loaded, &name));
+}
+
+/// Evaluate a resolved `--db-schema` function and read its size.
+///
+/// Shared by `ply hosts`, which resolves the name itself, and by every command
+/// that had [`Hosts::open`] resolve it — so there is one call that decides what
+/// the block's numbers mean.
+///
+/// [`Hosts::open`]: crate::hosts::Hosts::open
+pub fn materialise_schema(
+    loaded: &crate::load::Loaded,
+    name: &str,
+) -> Option<crate::db::schema::Shape> {
+    let def = loaded
+        .check
+        .defs
+        .values()
+        .find(|d| d.name.as_str() == name)?;
+    ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check)
+        .call(name, Vec::new(), def.span)
+        .ok()
+        .as_ref()
+        .and_then(crate::db::schema::shape_of)
+}
+
 /// The one place a `--json` command writes to stdout, so "exactly one object and
 /// nothing else" is checkable by reading this file.
 pub fn emit_json(value: &Value) {

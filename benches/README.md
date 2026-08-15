@@ -217,6 +217,45 @@ route and shape sections run in process over `SimNet`, because what they price
 is the parse, the route and the encode, and a syscall in the middle of that has
 a bigger variance than the thing being measured.
 
+## What `w4` adds
+
+`w3` prices a service whose store is a value in a cell. `w4` prices the one W4
+put a real postgres behind, and every section of it is a *substitution* rather
+than a total: a query against loopback postgres costs tens of microseconds of
+server and protocol time whatever issued it, so the only number that says
+anything about the language is the difference between two rows that differ in
+one layer.
+
+```
+cargo run --release -p ply-corpus -- w4 --db postgres://ply@127.0.0.1:5433/bench --no-load
+cargo run --release -p ply-corpus -- w4 --repo . --db postgres://ply@127.0.0.1:5433/desk \
+    --no-ops --no-sizes --no-pool          # the load half, against the desk's own schema
+```
+
+| section | question |
+| --- | --- |
+| `ops` | one statement through the boundary at several concurrencies, against the same statement issued by `tokio-postgres` with no Ply in the path, and against the twin |
+| `sizes` | one `order by … limit 1` against the rows it sorts, on the twin and on postgres — the axis a per-statement comparison hides |
+| `pool` | throughput against pool size, and what a pool smaller than the open scopes does |
+| `crud` | a route that hits the database against one that does not, over the real binary and a real socket, on both stores |
+
+Three things about it are load-bearing:
+
+**It manages no database.** `--db` names one this harness may create and drop a
+table called `part` in; the `crud` section additionally expects
+`examples/desk.sql` to have been loaded, because `--db-schema desk.schema` is
+passed and a start-up refusal is the point of that flag.
+
+**The twin's fixture is subtracted and printed.** `std.db`'s memory engine
+builds its tables through its own scanner, which costs tens of milliseconds and
+is setup rather than an operation. The `twin fixture` row is that cost and every
+`ply-twin` row has it removed.
+
+**`E0437` is a deadline and not a capacity check.** A pool of one with
+thirty-two open scopes completes, because acquisition queues; it refuses only
+when a caller waits longer than `--db-acquire-ms`. The exhaustion table prints
+both sides for that reason.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

@@ -503,8 +503,15 @@ impl<'a, 't> Normalizer<'a, 't> {
     /// A law's binder *types* are part of its identity — they are what the
     /// claim quantifies over — while their names are levels like any other
     /// binder, and the label is erased exactly as a test's is.
+    ///
+    /// The host flag is written **after the tag**, exactly where `test_def`
+    /// writes `nondet`, because a law that changed from `law` to `law/host` is a
+    /// different claim — the first says nothing outside the program decides it —
+    /// and it must re-discharge rather than reuse a certificate about a claim it
+    /// no longer makes.
     pub fn law_def(&mut self, d: &'a LawDef) {
         self.tag(tag::LAW);
+        self.boolv(d.host);
         self.len(d.binders.len());
         for b in &d.binders {
             self.type_expr(&b.ty);
@@ -618,26 +625,49 @@ impl<'a, 't> Normalizer<'a, 't> {
     /// is spliced in wherever the set is named, beside atoms written by hand.
     fn row(&mut self, r: &'a RowExpr) {
         self.tag(tag::ROW);
-        let mut atoms: Vec<(Vec<u8>, Vec<NodeId>)> = Vec::with_capacity(r.atoms.len());
+        let mut atoms: Vec<(Vec<u8>, &[u8], Vec<NodeId>)> = Vec::with_capacity(r.atoms.len());
         for a in &r.atoms {
             let outer = self.deferred.replace(Vec::new());
             let bytes = self.capture(|s| s.atom(a));
             let held = self.deferred.take().unwrap_or_default();
             self.deferred = outer;
-            atoms.push((bytes, held));
+            let tie = self
+                .index
+                .effect(self.module, &a.effect)
+                .and_then(|node| self.index.effect_sketch(node))
+                .unwrap_or_default();
+            atoms.push((bytes, tie, held));
         }
-        // Stable, and by the bytes alone: a `NodeId` is a source position, and
-        // breaking a tie with one would put the order of the file back into the
-        // hash. Two atoms that tie encode identically, so either order writes
-        // the same row.
-        atoms.sort_by(|a, b| a.0.cmp(&b.0));
-        atoms.dedup_by(|a, b| a.0 == b.0);
-        self.len(atoms.len());
-        for (bytes, held) in atoms {
+        // By the bytes, then by the declaration the atom's effect names. A
+        // `NodeId` is a source position and breaking a tie with one would put
+        // the order of the file back into the hash — but the bytes alone do not
+        // separate two atoms either, because the first pass runs with no hash
+        // table and writes every effect reference as `REF_SELF`. So
+        // `{x.write, y.write}` and `{y.write, x.write}` would number `x` and `y`
+        // in the order somebody typed, which is the one thing this sort exists
+        // to prevent. The declaration bytes are the referent's own and reach
+        // nothing the definition does not, so ordering by them keeps a slot a
+        // function of what the definition can see.
+        atoms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let distinct =
+            usize::from(!atoms.is_empty()) + atoms.windows(2).filter(|w| w[0].0 != w[1].0).count();
+        self.len(distinct);
+        // Every atom is mentioned, including one the dedup drops. The first pass
+        // runs with no hash table, so two atoms naming *different* effects at the
+        // same mode and resource encode alike there; dropping the second one's
+        // mention would leave an effect this definition reaches out of the
+        // enumeration entirely, and `effect_ref` would then write it as slot 0 —
+        // the slot of whichever effect the enumeration does begin with.
+        let mut previous: Option<Vec<u8>> = None;
+        for (bytes, _, held) in atoms {
             for node in held {
                 self.mention(node);
             }
+            if previous.as_deref() == Some(bytes.as_slice()) {
+                continue;
+            }
             self.out.extend_from_slice(&bytes);
+            previous = Some(bytes);
         }
         match &r.tail {
             None => self.tag(tag::NONE),

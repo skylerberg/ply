@@ -258,6 +258,10 @@ the in-memory handler with no source change; and the agreement law discharged as
 `property` with its case count — the mock-drift claim every backend team makes
 and none of them check.
 
+`docs/adr/0014-w4-contract.md`. Not in W4: query building, an ORM,
+connection-level `LISTEN`/`NOTIFY`, replication, migrations as a tool, cursors,
+a time type, and a database per test.
+
 ## W5 — Operations
 
 - Observability as an effect, so tracing is handled rather than ambient

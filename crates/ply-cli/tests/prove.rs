@@ -515,3 +515,69 @@ fn bounded(x: Int) -> Int
         "a definition whose only claim is a gap is one a reviewer still has to read"
     );
 }
+
+/// ADR 0014 §6.1: under a hermetic run — which is `ply prove`'s default — a
+/// `law/host` is reported `W0604 unattempted` with the reason, never green.
+///
+/// This is the shape of the failure the whole command exists to prevent, applied
+/// to itself: a law about a database that never ran a database, reported as
+/// passing, is a green result over unexplored space. The run still exits 0 —
+/// a gap is not a failure — and the definition stays uncovered, which is the
+/// honest reading of "nothing was checked".
+#[test]
+fn a_law_host_is_unattempted_under_a_hermetic_run_and_never_green() {
+    const SOURCE: &str = "\
+nondet effect db {
+  read get[r](key: Int) -> Int
+}
+
+fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
+
+law/host \"the store answers\" forall (k: Int) { lookup(k) == lookup(k) }
+
+law \"an ordinary claim\" forall (k: Int) { k == k }
+";
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["prove", "--no-cache"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "a gap is not a failure");
+    let text = stdout_of(&out);
+    assert!(text.contains("unattempted"), "{text}");
+    assert!(
+        text.contains("reaches the host"),
+        "the reader is not told why: {text}"
+    );
+    assert!(
+        text.contains("ply prove --host"),
+        "the reader is not told what to run: {text}"
+    );
+    assert!(
+        text.contains("1 unattempted"),
+        "the count has to carry it: {text}"
+    );
+    // And the law beside it is discharged as usual, so this is a claim about the
+    // one law rather than about the run.
+    assert!(text.contains("an ordinary claim"), "{text}");
+
+    let v = json_of(
+        &ply(dir.path())
+            .args(["prove", "--no-cache", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["summary"]["unattempted"], 1);
+    // A `law/host` can never be `proved`: the static tier and the finite
+    // enumeration are both skipped, because either would be a claim about every
+    // value and the world is not a function of the arguments. The law beside it
+    // is proved, which is what makes this a claim about the one law.
+    let hosted = v["obligations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["owner"].as_str().is_some_and(|s| s.contains("the store answers")))
+        .expect("the host law is reported");
+    assert_eq!(hosted["outcome"], "unattempted");
+    assert!(hosted["tier"].is_null(), "{hosted}");
+}

@@ -1,0 +1,51 @@
+// E0434: a statement touches a table the entry point never declared.
+//
+//   $ ply run --host --db postgres://localhost/desk \
+//       tests/fixtures/db_footprint_undeclared.ply
+//   E0434  `select .. from orders join parts ..` touches `parts`, which
+//          `main`'s footprint does not name
+//
+// This is the hole the milestone exists to close, and it is the only interesting
+// problem in it. The call site writes one resource label — `db.query[orders]`
+// says the statement is *about* orders — but the statement is a `String` and a
+// join touches two tables, so nothing in the type system can see the second one.
+//
+// Two locks, and they fire at different times for different reasons:
+//
+//   at prepare  the driver computes the statement's table set once per
+//               statement text and refuses against `HostRequest::declared`
+//               before a row is read. A **preventer**.
+//   at answer   the machine checks every atom of `HostReply::touched` against
+//               the declared footprint and unions it into `HostUse`. A
+//               **detector**: scheduling already happened, so by the time it
+//               fires the statement has run against a table the scheduler
+//               thought nobody was touching. What it buys is that a wrong row
+//               fails loudly on its first execution instead of quietly forever.
+//
+// The program's fault either way, and attributed and bisected like any other
+// program failure — as distinct from E0427, which is the registry's resolved
+// atom disagreeing with the row, and is Ply's.
+//
+// The fix is one line: declare `{db.read[orders], db.read[parts]}` and the same
+// statement runs and records both atoms. Widening the label to a group instead —
+// `db.read[orders_and_parts]` — is the answer W4 refuses, because the label
+// stops being a table and "which routes write this table" stops having an
+// answer.
+
+import std.db
+import std.db (db)
+
+fn joined() -> db::Stmt =
+  db::stmt("select o.id, p.sku from orders o join parts p on p.sku = o.sku"
+    ++ " order by o.id")
+
+// One atom, and the statement below touches two.
+fn line_items() -> db::Answer / {db.read[orders]} =
+  db.query[orders](joined(), [])
+
+fn main() -> Int / {db.read[orders]} =
+  match line_items() {
+    db::Rows(rows) -> len(rows),
+    db::Count(n) -> n,
+    db::Failed(_) -> -1,
+  }

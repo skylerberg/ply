@@ -832,8 +832,7 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
         "nothing under `std` moved, so nothing under `std` is a suspect: {shipped:?}"
     );
     assert_eq!(
-        v["failures"][0]["culprit"]["definitions"][0],
-        "app.slug",
+        v["failures"][0]["culprit"]["definitions"][0], "app.slug",
         "{v}"
     );
 }

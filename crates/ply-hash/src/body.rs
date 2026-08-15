@@ -31,7 +31,13 @@ use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 /// 6 is ADR 0012's 5 plus one: a cyclic component's payload is laid out in class
 /// order rather than sorted by bytes, and a generation-5 payload read as one
 /// would wire the cycle to whichever member happened to sort first.
-pub const BODY_ENCODING: u32 = 6;
+///
+/// 7 is `law_def` writing a host flag after its tag, as `test_def` writes
+/// `nondet`. The blast radius is bounded and the required test pins the
+/// boundary: **every law's hash moves once and re-discharges once, and no
+/// non-law definition's normalized bytes change at all.** A milestone that moved
+/// definition hashes for a law's sake would have got the layering wrong.
+pub const BODY_ENCODING: u32 = 7;
 
 /// `Decimal`'s bounds, which are the type's rather than a policy: a sign, a
 /// 96-bit mantissa and a scale of `0..=28`.
@@ -567,7 +573,6 @@ impl Reconstruction {
         if wrong.is_empty() {
             return Ok(());
         }
-
         let named: Vec<String> = wrong.iter().take(8).map(|h| h.short()).collect();
         Err(vec![
             corrupt(format!(

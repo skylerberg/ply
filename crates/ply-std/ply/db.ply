@@ -1,0 +1,3401 @@
+// The database effect. `import std.db` and the operations below are the ones
+// `ply_host::db` registers against.
+//
+// This module is the declaration and the transaction scope, and nothing else:
+// the signature the driver binds to and the signature the program performs are
+// one text that cannot drift. An operation renamed on either side is E0421 at
+// bind time, naming the operation that moved.
+//
+// **The resource label is a table.** That is the whole reason to put a database
+// behind an effect: an endpoint's declared signature names the tables it
+// touches, and a driver answering `db.write[db]` for every statement has thrown
+// that away and kept the ceremony. `db.query[items]` performs `(db, items,
+// Read)`; `db.execute[items]` and `db.returning[items]` perform `(db, items,
+// Write)`.
+//
+// `nondet` is load-bearing and it is the same sentence `std.net` carries: a
+// database's contents are not a function of the program's state, so a `det`
+// test reaching an unhandled `db` operation is E0412 at compile time whether or
+// not `--host` was passed.
+//
+// **A SQLSTATE is a value, never a diagnostic.** A unique violation, a
+// foreign-key violation, a serialization failure, a connection that died
+// mid-statement — all of them are `Failed(e)` the program matches on. A server
+// that dies because a row already existed is not a server, and a language that
+// turned every constraint into a compiler-shaped failure would make the
+// constraint unusable as a concurrency control.
+
+import std.json
+
+pub nondet effect db {
+  read  query[t](s: Stmt, ps: List<Param>)      -> Answer
+  write execute[t](s: Stmt, ps: List<Param>)    -> Answer
+  write returning[t](s: Stmt, ps: List<Param>)  -> Answer
+
+  // The transaction control operations take no resource, so their atom is the
+  // singleton `db.write`. That is a real scheduling cost, stated rather than
+  // discovered: every definition that opens a transaction carries `db.write`,
+  // so any two tests that open one conflict and are serialised even when their
+  // tables are disjoint. It is also true — they contend for the same pool.
+  // Read-only endpoints do not open transactions and keep their concurrency.
+  write begin(level: Isolation, access: Access) -> Answer
+  write commit()                                -> Answer
+  write abort()                                 -> Answer
+
+  // Performed anywhere inside a `transaction` body, arbitrarily deep, and
+  // handled by `transaction` rather than by the host: it never reaches a
+  // binding, and if `ply hosts` ever prints a row for it something has bound it
+  // and that is a defect.
+  write rollback(reason: String)                -> Unit
+}
+
+pub type Isolation = ReadCommitted | RepeatableRead | Serializable
+
+pub type Access = ReadWrite | ReadOnly
+
+pub type Stmt = { sql: String }
+
+pub fn stmt(sql: String) -> Stmt = { sql: sql }
+
+pub type Param =
+  | PNull
+  | PInt(Int) | PBool(Bool) | PText(String) | PBytes(Bytes)
+  | PFloat(Float) | PNumeric(Decimal) | PJson(json::Json)
+  | PArray(List<Param>)
+
+// One value out of one column. Spelled `Datum` rather than the contract's
+// `Cell`, which is the builtin type constructor a region-scoped cell has and
+// which no program may redefine (E0105); the constructors keep the contract's
+// names, so `CText` still reads as the cell that holds text.
+pub type Datum =
+  | CNull
+  | CInt(Int) | CBool(Bool) | CText(String) | CBytes(Bytes)
+  | CFloat(Float) | CNumeric(Decimal) | CJson(json::Json)
+  | CArray(List<Datum>)
+
+// Column name to value. A `Map`, so a row has one canonical form, two rows
+// built in different column orders are equal, and a golden test over a result
+// set is stable.
+pub type Row = Map<String, Datum>
+
+// The SQLSTATE the server returned and the object it named. **The message is
+// not here.** It is postgres's prose, it moves between server versions and
+// locales, and a twin that had to reproduce it would be reproducing English
+// rather than behaviour. `detail` carries it for a person and nothing compares
+// it.
+pub type DbError = {
+  code: String,
+  constraint: String,
+  detail: String,
+}
+
+pub type Answer =
+  | Rows(List<Row>)
+  | Count(Int)
+  | Failed(DbError)
+
+// --- Transactions -----------------------------------------------------------
+//
+// A transaction is a **scope**, and the only thing that must be scoped in Ply
+// is the abort. Note what does not appear below: a clause per table. A Ply
+// handler clause names a concrete `(operation, resource)` pair, so a
+// transaction that intercepted the data operations would need one clause per
+// table per operation and could not be a library function at all. It does not
+// need to — the data operations pass straight through to whatever handler is
+// below, and the driver routes them onto the open scope's connection because
+// the scope is host-side state.
+
+pub type Rollback = { reason: String, error: Option<DbError> }
+
+// `db.rollback` is performed anywhere inside the body, arbitrarily deep, and
+// its clause **does not resume**. The value of the clause is the value of the
+// whole `handle`, so everything the body had left to do — the rest of the
+// function, its callers up to here, the statements it was about to issue — is
+// the continuation, and the continuation is dropped on the floor. Nothing
+// unwinds, nothing is caught, no frame runs an epilogue.
+//
+// The continuation is bound and never called, and that is the point rather than
+// an oversight: `k` names the work being discarded. A rollback is `resumes = 0`,
+// which satisfies the host boundary's `resumes <= 1` trivially — so it needs no
+// exemption from the linearity rule and no change to the check, which is the
+// strongest evidence available that the restriction was the right one.
+//
+// Three of the four exits are here; the fourth is not, and cannot be. A body
+// that **raises** — an assertion, a spent step budget — propagates past this
+// `handle` unchanged with the scope still open, and the driver rolls it back
+// when the entry point ends.
+//
+// The body's row is `e` and not `{db.write | e}` as the contract writes it,
+// because a row unifies rather than subsumes: the second spelling would demand
+// that every body perform a transaction-control operation of its own, and a
+// body that only inserts would not typecheck against it. `{db.write | e}` is
+// what this function *carries*, which is the claim that matters at a call site.
+pub fn transaction<a | e>(level: Isolation, access: Access, body: () -> a / e)
+  -> Result<a, Rollback> / {db.write | e} =
+  handle {
+    match db.begin(level, access) {
+      Failed(err) -> Err({reason: "begin", error: Some(err)}),
+      _ -> {
+        let value = body();
+        match db.commit() {
+          Failed(err) -> Err({reason: "commit", error: Some(err)}),
+          _ -> Ok(value),
+        }
+      },
+    }
+  } with {
+    db.rollback(reason) resume k -> {
+      db.abort();
+      Err({reason: reason, error: None})
+    },
+  }
+
+// A transaction that always rolls back, whatever the body did. The body's value
+// comes out; its writes do not.
+//
+// What it does **not** isolate, stated where it is defined rather than
+// discovered on the second run: DDL; a sequence's advance, which postgres does
+// not roll back, so two sandboxed tests see different ids and a test asserting
+// `id == 1` is wrong on its second run; anything a *different* connection does;
+// and a nesting deeper than the driver's savepoint bound.
+//
+// A `begin` that failed is an assertion rather than a value, and that is the
+// one place this function is louder than `transaction`. Its result type is the
+// body's, so there is nothing to report a failure in — and a sandbox that
+// silently ran the body outside a transaction would write to the live database
+// and hand back a value indistinguishable from the sandboxed one.
+pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.write | e} = {
+  assert(opened(db.begin(ReadCommitted, ReadWrite)));
+  let value = body();
+  db.abort();
+  value
+}
+
+fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
+
+// A serialization failure and a deadlock are the two the server is telling the
+// program to try again. W4 never retries on the program's behalf: retrying means
+// re-running the body, and only the program knows whether the body sent an
+// email, charged a card or wrote a file between two statements. So the decision
+// is one `if` at a site that can see what it is repeating, and the retry is a
+// fresh call to `transaction` rather than a second resumption.
+pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
+
+
+// --- Tests ------------------------------------------------------------------
+//
+// A shipped module's tests are the compiler's, not a project's: `ply test` in a
+// project that imports this module does not select them and writes nothing
+// about them to that project's cache. `ply test --std` selects them, and the
+// compiler's own suite runs them.
+//
+// Every test here is `det`, hermetic and cached, because the handler each one
+// installs discharges every `db` atom it reaches. The handlers are journals
+// rather than databases — what is under test is the control flow of a scope,
+// and a journal is what makes "the statements after the rollback never ran" an
+// assertion about a list rather than a query against something.
+
+// A rollback raised two calls deep, which is the shape a real program writes:
+// the discard is not a lexical `return` and the site that raises it cannot see
+// the `handle` that answers it.
+fn charge(stock: Bool) -> Int / {db.write, db.write[items]} = {
+  db.execute[items](stmt("insert one"), []);
+  reserve(stock);
+  db.execute[items](stmt("insert three"), []);
+  3
+}
+
+fn reserve(stock: Bool) -> Unit / {db.write, db.write[items]} =
+  if stock {
+    db.execute[items](stmt("insert two"), []);
+    ()
+  } else {
+    db.rollback("no stock")
+  }
+
+test "a rollback discards the continuation the body had left" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || {
+        db.execute[items](stmt("insert one"), []);
+        db.rollback("out of stock");
+        db.execute[items](stmt("insert two"), []);
+        7
+      });
+      assert_eq(out, Err({reason: "out of stock", error: None}));
+      // `insert two` is absent because it was never reached, and `commit` is
+      // absent for the same reason: the `match` that would have committed is
+      // part of the continuation the clause discarded.
+      assert_eq(cell_get(j), ["begin", "insert one", "abort"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+test "a body that returns commits, and its value comes out" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(Serializable, ReadWrite, || {
+        db.execute[items](stmt("insert one"), []);
+        "done"
+      });
+      assert_eq(out, Ok("done"));
+      assert_eq(cell_get(j), ["begin", "insert one", "commit"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+// A `begin` that failed never ran the body, which is the difference between a
+// transaction that could not start and one that started and was abandoned: the
+// second leaves a scope for the driver to close and the first leaves nothing.
+test "a begin that fails runs no body and issues no abort" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || {
+        db.execute[items](stmt("insert one"), []);
+        7
+      });
+      assert_eq(out, Err({reason: "begin",
+                          error: Some({code: "53300", constraint: "",
+                                       detail: "too many clients already"})}));
+      assert_eq(cell_get(j), ["begin"])
+    } with {
+      db.begin(level, access) -> {
+        cell_set(j, push(cell_get(j), "begin"));
+        Failed({code: "53300", constraint: "", detail: "too many clients already"})
+      },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+// A commit that fails — a deferred constraint, a serialization failure at the
+// commit — is an `Err` carrying the SQLSTATE rather than a diagnostic, and the
+// scope is over either way.
+test "a commit that fails is an Err carrying the SQLSTATE" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(Serializable, ReadWrite, || {
+        db.execute[items](stmt("insert one"), []);
+        7
+      });
+      let retryable = match out {
+        Err(r) -> match r.error {
+          Some(e) -> is_retryable(e),
+          None -> false,
+        },
+        Ok(_) -> false,
+      };
+      assert(retryable);
+      assert_eq(cell_get(j), ["begin", "insert one", "commit"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> {
+        cell_set(j, push(cell_get(j), "commit"));
+        Failed({code: "40001", constraint: "", detail: "could not serialize access"})
+      },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+test "a rollback two calls deep discards its callers" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || charge(false));
+      assert_eq(out, Err({reason: "no stock", error: None}));
+      assert_eq(cell_get(j), ["begin", "insert one", "abort"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+test "the same body without the rollback runs to its end and commits" {
+  with_cell[journal]([]) { j ->
+    handle {
+      assert_eq(transaction(ReadCommitted, ReadWrite, || charge(true)), Ok(3));
+      assert_eq(cell_get(j), ["begin", "insert one", "insert two", "insert three",
+                              "commit"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+// Nesting is a savepoint, and what makes it expressible in Ply at all is that
+// the inner `transaction`'s `handle` is the innermost one: an inner rollback is
+// answered by the inner scope and the outer body carries on. The savepoint
+// itself is the driver's; this is the half that is the language's.
+test "an inner rollback leaves the outer transaction running" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || {
+        db.execute[items](stmt("outer one"), []);
+        let inner = transaction(ReadCommitted, ReadWrite, || {
+          db.execute[items](stmt("inner one"), []);
+          db.rollback("inner gave up");
+          db.execute[items](stmt("inner two"), []);
+          1
+        });
+        db.execute[items](stmt("outer two"), []);
+        inner
+      });
+      assert_eq(out, Ok(Err({reason: "inner gave up", error: None})));
+      assert_eq(cell_get(j), ["begin", "outer one", "begin", "inner one", "abort",
+                              "outer two", "commit"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+// The outer rollback is the other direction: an inner scope that committed is
+// discarded with everything else, because a released savepoint is not a commit.
+test "an outer rollback discards a committed inner scope" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || {
+        let inner = transaction(ReadCommitted, ReadWrite, || {
+          db.execute[items](stmt("inner one"), []);
+          1
+        });
+        db.rollback("the outer gave up");
+        inner
+      });
+      assert_eq(out, Err({reason: "the outer gave up", error: None}));
+      assert_eq(cell_get(j), ["begin", "begin", "inner one", "commit", "abort"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+test "sandbox runs the body, hands back its value and aborts" {
+  with_cell[journal]([]) { j ->
+    handle {
+      assert_eq(sandbox(|| {
+        db.execute[items](stmt("insert one"), []);
+        "kept"
+      }), "kept");
+      assert_eq(cell_get(j), ["begin", "insert one", "abort"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+// A rollback inside a sandbox is answered by the sandbox's caller, not by the
+// sandbox: `sandbox` installs no `handle`, because its result type is the
+// body's and there is no `Err` for it to produce.
+test "a sandbox nested in a transaction keeps the transaction's rollback" {
+  with_cell[journal]([]) { j ->
+    handle {
+      let out = transaction(ReadCommitted, ReadWrite, || sandbox(|| {
+        db.execute[items](stmt("insert one"), []);
+        db.rollback("give up");
+        2
+      }));
+      assert_eq(out, Err({reason: "give up", error: None}));
+      // The sandbox's own abort is part of the discarded continuation, so the
+      // scope it opened is closed by the transaction's abort and by the
+      // driver's teardown rather than by the sandbox.
+      assert_eq(cell_get(j), ["begin", "begin", "insert one", "abort"])
+    } with {
+      db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
+      db.commit() -> { cell_set(j, push(cell_get(j), "commit")); Count(0) },
+      db.abort() -> { cell_set(j, push(cell_get(j), "abort")); Count(0) },
+      db.execute[items](s, ps) -> { cell_set(j, push(cell_get(j), s.sql)); Count(1) },
+    }
+  }
+}
+
+test "is_retryable names the two the server is telling the program to try again" {
+  assert(is_retryable({code: "40001", constraint: "", detail: ""}));
+  assert(is_retryable({code: "40P01", constraint: "", detail: ""}));
+  assert(!is_retryable({code: "23505", constraint: "items_pkey", detail: ""}));
+  assert(!is_retryable({code: "25006", constraint: "", detail: ""}))
+}
+
+// --- A schema is a value --------------------------------------------------------
+//
+// A migration *tool* is out of scope — no versions, no up and down, no ordering
+// across deploys, no diffing a live database into a change script. A schema
+// value is the part that is needed: the twin has to be built from something and
+// a fixture has to exist.
+
+pub type ColumnType = TInt | TBool | TText | TBytes | TFloat | TNumeric(Int, Int) | TJson
+                    | TArray(ColumnType)
+
+pub type Default = DNone | DSequence(String) | DLiteral(Param)
+
+pub type Column = { name: String, ty: ColumnType, nullable: Bool, default: Default }
+
+pub type ForeignKey = { name: String, columns: List<String>,
+                        references: String, refers_to: List<String> }
+
+pub type Check = { name: String, expr: String }
+
+pub type Unique = { name: String, columns: List<String> }
+
+pub type Table = {
+  name: String, columns: List<Column>,
+  primary_key: List<String>, unique: List<Unique>,
+  foreign_keys: List<ForeignKey>, checks: List<Check>,
+}
+
+pub type Schema = { tables: List<Table> }
+
+// A savepoint stack deeper than this is a program that recursed, and the
+// program is what must stop, so exceeding it is `Failed` with `54000` rather
+// than a diagnostic.
+pub fn max_savepoints() -> Int = 16
+
+pub fn db_error(code: String, constraint: String, detail: String) -> DbError =
+  { code: code, constraint: constraint, detail: detail }
+
+pub fn column(name: String, ty: ColumnType, nullable: Bool) -> Column =
+  { name: name, ty: ty, nullable: nullable, default: DNone }
+
+pub fn column_default(name: String, ty: ColumnType, nullable: Bool, d: Default) -> Column =
+  { name: name, ty: ty, nullable: nullable, default: d }
+
+// --- The DDL a schema renders to ------------------------------------------------
+//
+// This is the one DDL the driver's scanner accepts, and it accepts it only from
+// the harness that creates a fixture. A `CREATE TABLE` handed to `db.execute`
+// is `E0432` like any other unrecognised statement, because DDL inside a
+// request handler is not a thing W4 has an opinion about how to schedule.
+
+pub fn create_schema(s: Schema) -> List<Stmt> =
+  fold(s.tables, sequence_statements(s), |acc: List<Stmt>, t: Table|
+    push(acc, stmt(create_table_sql(t))))
+
+pub fn drop_schema(s: Schema) -> List<Stmt> = {
+  let drops = fold(reverse_list(s.tables), [], |acc: List<Stmt>, t: Table|
+    push(acc, stmt("drop table if exists " ++ quote_ident(t.name) ++ " cascade")));
+  fold(sequence_names(s), drops, |acc: List<Stmt>, n: String|
+    push(acc, stmt("drop sequence if exists " ++ quote_ident(n))))
+}
+
+fn sequence_statements(s: Schema) -> List<Stmt> =
+  fold(sequence_names(s), [], |acc: List<Stmt>, n: String|
+    push(acc, stmt("create sequence " ++ quote_ident(n))))
+
+fn sequence_names(s: Schema) -> List<String> =
+  fold(s.tables, [], |acc: List<String>, t: Table|
+    fold(t.columns, acc, |inner: List<String>, c: Column|
+      match c.default {
+        DSequence(n) -> push(inner, n),
+        DNone -> inner,
+        DLiteral(_) -> inner,
+      }))
+
+fn create_table_sql(t: Table) -> String = {
+  let cols = map(t.columns, |c: Column| column_sql(c));
+  let pk = if len(t.primary_key) == 0 { [] } else {
+    ["primary key (" ++ comma(map(t.primary_key, |n: String| quote_ident(n))) ++ ")"]
+  };
+  let uq = map(t.unique, |u: Unique|
+    "constraint " ++ quote_ident(u.name) ++ " unique ("
+      ++ comma(map(u.columns, |n: String| quote_ident(n))) ++ ")");
+  let fks = map(t.foreign_keys, |f: ForeignKey|
+    "constraint " ++ quote_ident(f.name) ++ " foreign key ("
+      ++ comma(map(f.columns, |n: String| quote_ident(n))) ++ ") references "
+      ++ quote_ident(f.references) ++ " ("
+      ++ comma(map(f.refers_to, |n: String| quote_ident(n))) ++ ")");
+  let cks = map(t.checks, |c: Check|
+    "constraint " ++ quote_ident(c.name) ++ " check (" ++ c.expr ++ ")");
+  "create table " ++ quote_ident(t.name) ++ " ("
+    ++ comma(concat_lists(concat_lists(concat_lists(concat_lists(cols, pk), uq), fks), cks))
+    ++ ")"
+}
+
+fn column_sql(c: Column) -> String =
+  quote_ident(c.name) ++ " " ++ type_sql(c.ty)
+    ++ (if c.nullable { "" } else { " not null" })
+    ++ (match c.default {
+          DNone -> "",
+          DSequence(n) -> " default nextval('" ++ n ++ "')",
+          DLiteral(p) -> " default " ++ literal_sql(p),
+        })
+
+fn type_sql(t: ColumnType) -> String =
+  match t {
+    TInt -> "bigint",
+    TBool -> "boolean",
+    TText -> "text",
+    TBytes -> "bytea",
+    TFloat -> "double precision",
+    TNumeric(p, s) -> "numeric(" ++ int_to_string(p) ++ "," ++ int_to_string(s) ++ ")",
+    TJson -> "jsonb",
+    TArray(inner) -> type_sql(inner) ++ "[]",
+  }
+
+// Only in the `DEFAULT` clause of a `CREATE TABLE`, which is DDL a harness
+// writes and never a value a request supplied. Nothing else in this module
+// turns a value into syntax, and a default this cannot render is refused rather
+// than approximated.
+fn literal_sql(p: Param) -> String =
+  match p {
+    PNull -> "null",
+    PInt(n) -> int_to_string(n),
+    PBool(b) -> if b { "true" } else { "false" },
+    PText(s) -> "'" ++ join_with(string_split(s, "'"), "''") ++ "'",
+    PNumeric(d) -> decimal_to_string(d),
+    PFloat(_) -> "null",
+    PBytes(_) -> "null",
+    PJson(_) -> "null",
+    PArray(_) -> "null",
+  }
+
+fn quote_ident(s: String) -> String = "\"" ++ join_with(string_split(s, "\""), "\"\"") ++ "\""
+
+fn comma(pieces: List<String>) -> String = join_with(pieces, ", ")
+
+type Joined = { started: Bool, out: String }
+
+fn join_with(pieces: List<String>, sep: String) -> String =
+  fold(pieces, {started: false, out: ""}, |acc: Joined, p: String|
+    if acc.started { {started: true, out: acc.out ++ sep ++ p} }
+    else { {started: true, out: p} }).out
+
+// --- Lists, which the language gives one primitive for ---------------------------
+//
+// `push` appends; there is no concatenation, no prepend and no index. These
+// four are what the rest of this module builds out of, and they are quadratic
+// rather than linear. A statement's token list, a table's column list and a
+// result set are all small, so the bound that matters is the evaluator's call
+// budget rather than this.
+
+fn concat_lists<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+fn reverse_list<a>(xs: List<a>) -> List<a> =
+  fold(xs, [], |acc: List<a>, x: a| concat_lists([x], acc))
+
+fn nth<a>(xs: List<a>, i: Int) -> Option<a> =
+  match xs {
+    [] -> None,
+    [h, ..t] -> if i <= 0 { Some(h) } else { nth(t, i - 1) },
+  }
+
+fn last<a>(xs: List<a>) -> Option<a> =
+  match xs {
+    [] -> None,
+    [h] -> Some(h),
+    [_, ..t] -> last(t),
+  }
+
+fn drop_last<a>(xs: List<a>) -> List<a> =
+  match xs {
+    [] -> [],
+    [_] -> [],
+    [h, ..t] -> concat_lists([h], drop_last(t)),
+  }
+
+fn has_string(xs: List<String>, s: String) -> Bool =
+  fold(xs, false, |acc: Bool, x: String| acc || x == s)
+
+// --- The in-memory twin ---------------------------------------------------------
+//
+// A set of **pure functions over a `MemDb` value**, with no effects at all.
+// Rows are `Map<String, Datum>` and answers are `Answer`, so the twin and the
+// driver produce values of one type by construction — ADR 0008 §5's "the same
+// declared signature", made structural rather than promised.
+//
+// It executes the same `Stmt` text the driver does, through its own scanner,
+// which is the point: the scanner is where the divergences live, and a twin
+// that took a structured operation instead would never test it.
+//
+// **What it does not model, it refuses.** Anything outside the list below makes
+// `step` answer `Failed({code: "0A000", ..})` — `feature_not_supported`, the
+// SQLSTATE postgres itself uses — with the construct in `detail`. It never
+// guesses and never answers as though it executed. The named gaps, so that
+// nobody has to discover them:
+//
+//   - Joins, subqueries, `GROUP BY`, `HAVING`, window functions, CTEs, set
+//     operations, and every aggregate but `count(*)`. A `WHERE` is not a query
+//     planner and W4 does not ship one.
+//   - Views, triggers, rules, `ON CONFLICT`, generated columns, partial and
+//     expression indexes, and arithmetic anywhere in an expression.
+//   - **Isolation.** The twin is serial: one connection, one scope stack, no
+//     concurrency. It cannot exhibit a phantom read, a lost update, a
+//     serialization failure or a deadlock, so `RepeatableRead` and
+//     `Serializable` are accepted and behave as a serial execution. This is the
+//     largest thing it does not model and the one a reader is most likely to
+//     assume it does.
+//   - **Collation.** Text orders by `Value` order, which is byte order, which
+//     is `C`. Under any other database collation an `ORDER BY` over text
+//     disagrees, which is the divergence the agreement law's collation
+//     injection exists to demonstrate.
+//   - **Physical row order, and ties inside an `ORDER BY`.** Rows are kept in
+//     insertion order and an `UPDATE` leaves a row where it was; postgres writes
+//     a new tuple at the end of the heap. An `ORDER BY` over a key with ties does
+//     not close that, and this was believed to: postgres's bounded sort is a
+//     top-N heapsort whose output among equal keys is neither the heap order nor
+//     stable, so twelve rows sharing one `n` come back `b, c, a` there and
+//     `a, b, c` here. **SQL promises nothing about ties**, so neither answer is
+//     wrong and no twin can be made to agree. What closes it is ordering by a
+//     key that has none: `examples/agreement.ply`'s `render` appends the primary
+//     key to every generated `ORDER BY`, and `well_formed` admits nothing else.
+//   - **An ordinal `ORDER BY`.** `order by 1` names an output column by
+//     position. Resolving it needs the select list and the table's column order
+//     together, which is a second name resolution for a form nothing generates.
+//   - `numeric` beyond `Decimal`'s 96 bits and scale 28, `float4` rounding, and
+//     every locale-dependent function.
+//   - **Sequences under rollback.** Postgres does not roll back `nextval`, and
+//     neither does this — deliberately, because matching the surprising
+//     behaviour is the whole job.
+
+pub type MemTable = { def: Table, rows: List<Row> }
+
+// One entry per open scope. `tables` is the snapshot to restore on rollback — a
+// `List` and a `Map` share structure, so a snapshot is a pointer copy and a
+// rollback is dropping one.
+pub type Frame = { tables: List<MemTable>, failed: Bool, level: Isolation, access: Access }
+
+pub type MemDb = {
+  tables: List<MemTable>,
+  sequences: Map<String, Int>,
+  stack: List<Frame>,
+  failed: Bool,
+}
+
+pub type Outcome = { db: MemDb, out: Answer }
+
+pub fn open(s: Schema) -> MemDb = {
+  tables: map(s.tables, |t: Table| {def: t, rows: []}),
+  sequences: fold(sequence_names(s), map_new(), |acc: Map<String, Int>, n: String|
+    map_insert(acc, n, 0)),
+  stack: [],
+  failed: false,
+}
+
+fn memdb(tables: List<MemTable>, sequences: Map<String, Int>,
+         stack: List<Frame>, failed: Bool) -> MemDb =
+  {tables: tables, sequences: sequences, stack: stack, failed: failed}
+
+fn mark_failed(d: MemDb) -> MemDb =
+  if len(d.stack) == 0 { d } else { memdb(d.tables, d.sequences, d.stack, true) }
+
+fn fail(d: MemDb, e: DbError) -> Outcome = {db: mark_failed(d), out: Failed(e)}
+
+fn done(d: MemDb, a: Answer) -> Outcome = {db: d, out: a}
+
+// --- The SQLSTATEs the twin can produce -----------------------------------------
+
+fn unsupported(what: String) -> DbError = db_error("0A000", "", what)
+
+fn in_failed_txn() -> DbError =
+  db_error("25P02", "",
+    "current transaction is aborted, commands ignored until end of transaction block")
+
+fn undefined_table(n: String) -> DbError =
+  db_error("42P01", "", "relation \"" ++ n ++ "\" does not exist")
+
+fn undefined_column(n: String) -> DbError =
+  db_error("42703", "", "column \"" ++ n ++ "\" does not exist")
+
+fn read_only_txn(what: String) -> DbError =
+  db_error("25006", "", "cannot execute " ++ what ++ " in a read-only transaction")
+
+// --- Tokens ----------------------------------------------------------------------
+
+type Tok =
+  | TWord(String)     // an unquoted identifier or keyword, folded to lower case
+  | TQuoted(String)   // "an identifier", case preserved
+  | TStr(String)      // 'a literal'
+  | TNum(String)      // 12, or 1.50
+  | TParam(Int)       // $1
+  | TSym(String)
+
+fn sql_ws() -> Bytes = b" \t\r\n"
+fn sql_digits() -> Bytes = b"0123456789"
+fn ident_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
+fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+
+// `-1` is the end of the input, which is in no set. `bytes_index_of_byte`
+// refuses it rather than answering `None`, so the guard is here.
+fn in_set(set: Bytes, c: Int) -> Bool =
+  if c < 0 { false } else { match bytes_index_of_byte(set, c) { Some(_) -> true, None -> false } }
+
+fn byte_at(src: Bytes, i: Int) -> Int =
+  if i < 0 || i >= bytes_len(src) { -1 } else { bytes_at(src, i) }
+
+fn scan_set(src: Bytes, i: Int, set: Bytes) -> Int =
+  if i >= bytes_len(src) { bytes_len(src) } else { bytes_scan(src, i, set, bytes_len(src)) }
+
+fn lex_all(sql: String) -> Result<List<Tok>, DbError> = {
+  let src = bytes_of_string(sql);
+  if !bytes_is_utf8(src) {
+    Err(unsupported("statement text that is not valid UTF-8"))
+  } else {
+    lex(src, 0, [])
+  }
+}
+
+fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let j = scan_set(src, i, sql_ws());
+  let c = byte_at(src, j);
+  if c < 0 {
+    Ok(acc)
+  } else if c == 59 {
+    // One `Stmt` is one statement. The driver refuses a second with `E0432`
+    // before anything runs; the twin has only values, so it refuses it as one.
+    Err(unsupported("more than one statement in one `Stmt`"))
+  } else if c == 45 && byte_at(src, j + 1) == 45 {
+    lex(src, line_comment_end(src, j + 2), acc)
+  } else if c == 47 && byte_at(src, j + 1) == 42 {
+    match block_comment_end(src, j + 2, 1) {
+      None -> Err(unsupported("a block comment that is never closed")),
+      Some(end) -> lex(src, end, acc),
+    }
+  } else if in_set(ident_start(), c) {
+    let end = scan_set(src, j, ident_rest());
+    lex(src, end, push(acc, TWord(string_lower(string_of_bytes(bytes_slice(src, j, end))))))
+  } else if in_set(sql_digits(), c) {
+    lex_number(src, j, acc)
+  } else if c == 39 {
+    lex_string(src, j + 1, b"", acc)
+  } else if c == 34 {
+    lex_quoted(src, j + 1, b"", acc)
+  } else if c == 36 {
+    lex_param(src, j, acc)
+  } else {
+    lex_symbol(src, j, acc)
+  }
+}
+
+// A comment is whitespace. Ordinary SQL rather than a construct, and the twin
+// refusing it made every statement a program had annotated a `0A000`.
+fn line_comment_end(src: Bytes, i: Int) -> Int =
+  if i >= bytes_len(src) || byte_at(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
+
+// Postgres nests block comments, so a scan to the first `*/` would leave the
+// tail of an outer comment as statement text.
+fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> =
+  if depth == 0 { Some(i) }
+  else if i >= bytes_len(src) { None }
+  else if byte_at(src, i) == 47 && byte_at(src, i + 1) == 42 {
+    block_comment_end(src, i + 2, depth + 1)
+  } else if byte_at(src, i) == 42 && byte_at(src, i + 1) == 47 {
+    block_comment_end(src, i + 2, depth - 1)
+  } else {
+    block_comment_end(src, i + 1, depth)
+  }
+
+fn lex_number(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let whole = scan_set(src, i, sql_digits());
+  let end = if byte_at(src, whole) == 46 { scan_set(src, whole + 1, sql_digits()) } else { whole };
+  let after = byte_at(src, end);
+  if after == 101 || after == 69 {
+    Err(unsupported("a number in exponent notation"))
+  } else if in_set(ident_start(), after) {
+    Err(unsupported("a number followed by a letter"))
+  } else {
+    lex(src, end, push(acc, TNum(string_of_bytes(bytes_slice(src, i, end)))))
+  }
+}
+
+// `''` is an escaped quote, which is the only escape a standard-conforming
+// string has. `E'..'` and a dollar-quoted body are refused rather than parsed:
+// a twin that disagreed with postgres about where a literal *ended* would
+// disagree about the whole statement.
+fn lex_string(src: Bytes, i: Int, so_far: Bytes, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let stop = if i >= bytes_len(src) { bytes_len(src) }
+             else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
+  if stop >= bytes_len(src) {
+    Err(unsupported("a string literal with no closing quote"))
+  } else {
+    let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
+    if byte_at(src, stop + 1) == 39 {
+      lex_string(src, stop + 2, bytes_concat(piece, b"'"), acc)
+    } else {
+      lex(src, stop + 1, push(acc, TStr(string_of_bytes(piece))))
+    }
+  }
+}
+
+fn lex_quoted(src: Bytes, i: Int, so_far: Bytes, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let stop = if i >= bytes_len(src) { bytes_len(src) }
+             else { bytes_scan_until(src, i, b"\"", bytes_len(src)) };
+  if stop >= bytes_len(src) {
+    Err(unsupported("a quoted identifier with no closing quote"))
+  } else {
+    let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
+    if byte_at(src, stop + 1) == 34 {
+      lex_quoted(src, stop + 2, bytes_concat(piece, b"\""), acc)
+    } else {
+      lex(src, stop + 1, push(acc, TQuoted(string_of_bytes(piece))))
+    }
+  }
+}
+
+fn lex_param(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let end = scan_set(src, i + 1, sql_digits());
+  if end == i + 1 {
+    Err(unsupported("a dollar-quoted string, or a `$` that is not a parameter"))
+  } else {
+    match int_of_string(string_of_bytes(bytes_slice(src, i + 1, end))) {
+      None -> Err(unsupported("a parameter number too large to read")),
+      Some(n) -> lex(src, end, push(acc, TParam(n))),
+    }
+  }
+}
+
+fn lex_symbol(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+  let c = byte_at(src, i);
+  let d = byte_at(src, i + 1);
+  let two = if (c == 60 && d == 62) || (c == 33 && d == 61) { "<>" }
+            else if c == 60 && d == 61 { "<=" }
+            else if c == 62 && d == 61 { ">=" }
+            else { "" };
+  if two != "" {
+    lex(src, i + 2, push(acc, TSym(two)))
+  } else if c == 40 || c == 41 || c == 44 || c == 42 || c == 61 || c == 60 || c == 62
+            || c == 46 || c == 45 || c == 43 {
+    lex(src, i + 1, push(acc, TSym(string_of_bytes(bytes_slice(src, i, i + 1)))))
+  } else {
+    Err(unsupported("the token `" ++ string_of_bytes_lossy(bytes_slice(src, i, i + 1))
+                    ++ "` at byte " ++ int_to_string(i)))
+  }
+}
+
+fn int_of_string(s: String) -> Option<Int> =
+  match decimal_of_string(s) {
+    None -> None,
+    Some(d) -> int_of_decimal(d, Down),
+  }
+
+// --- The statement, as the twin understands it -----------------------------------
+
+// One item of a select list: the column it reads and the name it comes back
+// under. The two differ exactly when the statement writes `AS`, which is the
+// shape `E0433` tells a program to write when a join returns two columns of one
+// name — so a twin that refused it refused the driver's own remedy.
+type Target = { column: String, name: String }
+
+type Proj = PStar | PCols(List<Target>) | PCount(String)
+
+type Cmp = CmpEq | CmpNe | CmpLt | CmpLe | CmpGt | CmpGe
+
+type Expr =
+  | XCol(String)
+  | XParam(Int)
+  | XLit(Datum)
+  | XDefault
+  | XNot(Expr)
+  | XAnd(Expr, Expr)
+  | XOr(Expr, Expr)
+  | XCompare(Cmp, Expr, Expr)
+  | XIsNull(Expr, Bool)
+  | XIn(Expr, List<Expr>, Bool)
+  | XBetween(Expr, Expr, Expr, Bool)
+  | XLike(Expr, Expr, Bool)
+
+type OrderKey = { column: String, desc: Bool, nulls_first: Bool }
+
+type SelectQ = { source: String, proj: Proj, filter: Option<Expr>,
+                 order: List<OrderKey>, limit: Option<Expr>, offset: Option<Expr> }
+
+type InsertQ = { source: String, columns: List<String>, tuples: List<List<Expr>>,
+                 returning: Option<Proj> }
+
+type Assign = { column: String, value: Expr }
+
+type UpdateQ = { source: String, sets: List<Assign>, filter: Option<Expr>,
+                 returning: Option<Proj> }
+
+type DeleteQ = { source: String, filter: Option<Expr>, returning: Option<Proj> }
+
+type Query = QSelect(SelectQ) | QInsert(InsertQ) | QUpdate(UpdateQ) | QDelete(DeleteQ)
+
+type Cut<a> = { value: a, rest: List<Tok> }
+
+fn cut<a>(v: a, rest: List<Tok>) -> Cut<a> = {value: v, rest: rest}
+
+fn tok_word(ts: List<Tok>) -> String = match ts { [TWord(w), ..] -> w, _ -> "" }
+
+fn tok_sym(ts: List<Tok>) -> String = match ts { [TSym(s), ..] -> s, _ -> "" }
+
+fn rest_of(ts: List<Tok>) -> List<Tok> = match ts { [] -> [], [_, ..t] -> t }
+
+fn expected(what: String, ts: List<Tok>) -> DbError =
+  unsupported("expected " ++ what ++ ", found " ++ show_tok(ts))
+
+fn show_tok(ts: List<Tok>) -> String =
+  match ts {
+    [] -> "the end of the statement",
+    [TWord(w), ..] -> "`" ++ w ++ "`",
+    [TQuoted(w), ..] -> "`\"" ++ w ++ "\"`",
+    [TStr(_), ..] -> "a string literal",
+    [TNum(n), ..] -> "`" ++ n ++ "`",
+    [TParam(n), ..] -> "`$" ++ int_to_string(n) ++ "`",
+    [TSym(s), ..] -> "`" ++ s ++ "`",
+    // Unreachable: the six above are every constructor. The checker reasons
+    // about list length before it reasons about the head, so it asks anyway.
+    _ -> "a token",
+  }
+
+fn want_word(ts: List<Tok>, w: String) -> Result<List<Tok>, DbError> =
+  if tok_word(ts) == w { Ok(rest_of(ts)) } else { Err(expected("`" ++ w ++ "`", ts)) }
+
+fn want_sym(ts: List<Tok>, s: String) -> Result<List<Tok>, DbError> =
+  if tok_sym(ts) == s { Ok(rest_of(ts)) } else { Err(expected("`" ++ s ++ "`", ts)) }
+
+fn parse_name(ts: List<Tok>) -> Result<Cut<String>, DbError> =
+  match ts {
+    [TWord(w), ..t] -> Ok(cut(w, t)),
+    [TQuoted(w), ..t] -> Ok(cut(w, t)),
+    _ -> Err(expected("a name", ts)),
+  }
+
+// `t.c` names the column `c`. The twin has one table per statement, so the
+// qualifier is checked for being a name and then dropped — a qualifier naming
+// something else would need a join, and a join is refused.
+fn parse_colref(ts: List<Tok>) -> Result<Cut<String>, DbError> =
+  match parse_name(ts) {
+    Err(e) -> Err(e),
+    Ok(c) -> if tok_sym(c.rest) == "." { parse_name(rest_of(c.rest)) } else { Ok(c) },
+  }
+
+fn parse_expr_text(s: String) -> Result<Expr, DbError> =
+  match lex_all(s) {
+    Err(e) -> Err(e),
+    Ok(ts) -> match parse_or(ts) {
+      Err(e) -> Err(e),
+      Ok(c) -> if len(c.rest) == 0 { Ok(c.value) }
+               else { Err(expected("the end of the expression", c.rest)) },
+    },
+  }
+
+fn parse_or(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match parse_and(ts) { Err(e) -> Err(e), Ok(c) -> parse_or_more(c) }
+
+fn parse_or_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> =
+  if tok_word(c.rest) == "or" {
+    match parse_and(rest_of(c.rest)) {
+      Err(e) -> Err(e),
+      Ok(r) -> parse_or_more(cut(XOr(c.value, r.value), r.rest)),
+    }
+  } else { Ok(c) }
+
+fn parse_and(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match parse_not(ts) { Err(e) -> Err(e), Ok(c) -> parse_and_more(c) }
+
+fn parse_and_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> =
+  if tok_word(c.rest) == "and" {
+    match parse_not(rest_of(c.rest)) {
+      Err(e) -> Err(e),
+      Ok(r) -> parse_and_more(cut(XAnd(c.value, r.value), r.rest)),
+    }
+  } else { Ok(c) }
+
+fn parse_not(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  if tok_word(ts) == "not" {
+    match parse_not(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(c) -> Ok(cut(XNot(c.value), c.rest)),
+    }
+  } else {
+    match parse_primary(ts) { Err(e) -> Err(e), Ok(c) -> parse_pred_tail(c) }
+  }
+
+fn parse_pred_tail(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> = {
+  let w = tok_word(c.rest);
+  let s = tok_sym(c.rest);
+  if s == "=" || s == "<>" || s == "<" || s == "<=" || s == ">" || s == ">=" {
+    match parse_primary(rest_of(c.rest)) {
+      Err(e) -> Err(e),
+      Ok(r) -> Ok(cut(XCompare(cmp_of(s), c.value, r.value), r.rest)),
+    }
+  } else if w == "is" {
+    parse_is(c, rest_of(c.rest))
+  } else if w == "in" {
+    parse_in(c, false, rest_of(c.rest))
+  } else if w == "between" {
+    parse_between(c, false, rest_of(c.rest))
+  } else if w == "like" {
+    parse_like(c, false, rest_of(c.rest))
+  } else if w == "not" {
+    let after = rest_of(c.rest);
+    let w2 = tok_word(after);
+    if w2 == "in" { parse_in(c, true, rest_of(after)) }
+    else if w2 == "between" { parse_between(c, true, rest_of(after)) }
+    else if w2 == "like" { parse_like(c, true, rest_of(after)) }
+    else { Err(expected("`in`, `between` or `like` after `not`", after)) }
+  } else {
+    Ok(c)
+  }
+}
+
+fn cmp_of(s: String) -> Cmp =
+  if s == "=" { CmpEq }
+  else if s == "<>" { CmpNe }
+  else if s == "<" { CmpLt }
+  else if s == "<=" { CmpLe }
+  else if s == ">" { CmpGt }
+  else { CmpGe }
+
+fn parse_is(c: Cut<Expr>, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  if tok_word(ts) == "null" {
+    Ok(cut(XIsNull(c.value, true), rest_of(ts)))
+  } else if tok_word(ts) == "not" && tok_word(rest_of(ts)) == "null" {
+    Ok(cut(XIsNull(c.value, false), rest_of(rest_of(ts))))
+  } else {
+    Err(expected("`null` or `not null` after `is`", ts))
+  }
+
+fn parse_in(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match want_sym(ts, "(") {
+    Err(e) -> Err(e),
+    Ok(after) -> match parse_expr_list(after, []) {
+      Err(e) -> Err(e),
+      Ok(items) -> Ok(cut(XIn(c.value, items.value, negated), items.rest)),
+    },
+  }
+
+fn parse_expr_list(ts: List<Tok>, acc: List<Expr>) -> Result<Cut<List<Expr>>, DbError> =
+  match parse_or(ts) {
+    Err(e) -> Err(e),
+    Ok(c) -> {
+      let items = push(acc, c.value);
+      if tok_sym(c.rest) == "," { parse_expr_list(rest_of(c.rest), items) }
+      else { match want_sym(c.rest, ")") {
+               Err(e) -> Err(e),
+               Ok(after) -> Ok(cut(items, after)),
+             } }
+    },
+  }
+
+fn parse_between(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match parse_primary(ts) {
+    Err(e) -> Err(e),
+    Ok(lo) -> match want_word(lo.rest, "and") {
+      Err(e) -> Err(e),
+      Ok(after) -> match parse_primary(after) {
+        Err(e) -> Err(e),
+        Ok(hi) -> Ok(cut(XBetween(c.value, lo.value, hi.value, negated), hi.rest)),
+      },
+    },
+  }
+
+fn parse_like(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match parse_primary(ts) {
+    Err(e) -> Err(e),
+    Ok(p) -> if tok_word(p.rest) == "escape" {
+               Err(unsupported("`like ... escape`"))
+             } else {
+               Ok(cut(XLike(c.value, p.value, negated), p.rest))
+             },
+  }
+
+fn parse_primary(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  match ts {
+    [] -> Err(unsupported("the statement ended where a value was expected")),
+    [TParam(n), ..t] -> Ok(cut(XParam(n), t)),
+    [TStr(s), ..t] -> Ok(cut(XLit(CText(s)), t)),
+    [TNum(s), ..t] -> num_literal(s, false, t),
+    [TQuoted(w), ..t] -> parse_column_tail(w, t),
+    [TSym(s), ..t] ->
+      if s == "(" {
+        match parse_or(t) {
+          Err(e) -> Err(e),
+          Ok(c) -> match want_sym(c.rest, ")") {
+            Err(e) -> Err(e),
+            Ok(after) -> Ok(cut(c.value, after)),
+          },
+        }
+      } else if s == "-" {
+        match t { [TNum(n), ..t2] -> num_literal(n, true, t2),
+                  _ -> Err(expected("a number after `-`", t)) }
+      } else {
+        Err(expected("a value", ts))
+      },
+    [TWord(w), ..t] ->
+      if w == "null" { Ok(cut(XLit(CNull), t)) }
+      else if w == "true" { Ok(cut(XLit(CBool(true)), t)) }
+      else if w == "false" { Ok(cut(XLit(CBool(false)), t)) }
+      else if w == "default" { Ok(cut(XDefault, t)) }
+      else if w == "count" || w == "sum" || w == "avg" || w == "min" || w == "max" {
+        Err(unsupported("the aggregate `" ++ w ++ "` outside a bare `count(*)` projection"))
+      }
+      else if w == "select" { Err(unsupported("a subquery")) }
+      else { parse_column_tail(w, t) },
+    _ -> Err(expected("a value", ts)),
+  }
+
+fn parse_column_tail(name: String, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  if tok_sym(ts) == "." {
+    match parse_name(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(c) -> Ok(cut(XCol(c.value), c.rest)),
+    }
+  } else if tok_sym(ts) == "(" {
+    Err(unsupported("the function `" ++ name ++ "`"))
+  } else {
+    Ok(cut(XCol(name), ts))
+  }
+
+// A literal with a `.` is `numeric` and one without is `integer`, which is what
+// postgres does with an unadorned constant. The distinction is load-bearing:
+// `1` and `1.0` are different values in a result set and comparing them is
+// where the twin's arithmetic would diverge if it had any.
+fn num_literal(s: String, negative: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
+  let text = if negative { "-" ++ s } else { s };
+  if string_contains(s, ".") {
+    match decimal_of_string(text) {
+      None -> Err(unsupported("the numeric literal `" ++ text ++ "`")),
+      Some(d) -> Ok(cut(XLit(CNumeric(d)), ts)),
+    }
+  } else {
+    match int_of_string(text) {
+      None -> Err(unsupported("the integer literal `" ++ text ++ "`")),
+      Some(n) -> Ok(cut(XLit(CInt(n)), ts)),
+    }
+  }
+}
+
+// --- The statement parser --------------------------------------------------------
+
+fn parse_statement(sql: String) -> Result<Query, DbError> =
+  match lex_all(sql) {
+    Err(e) -> Err(e),
+    Ok(ts) -> match parse_query(ts) {
+      Err(e) -> Err(e),
+      Ok(c) -> if len(c.rest) == 0 { Ok(c.value) }
+               else { Err(expected("the end of the statement", c.rest)) },
+    },
+  }
+
+fn parse_query(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+  let w = tok_word(ts);
+  if w == "select" { parse_select(rest_of(ts)) }
+  else if w == "insert" { parse_insert(rest_of(ts)) }
+  else if w == "update" { parse_update(rest_of(ts)) }
+  else if w == "delete" { parse_delete(rest_of(ts)) }
+  else if w == "with" { Err(unsupported("a common table expression")) }
+  else if w == "values" { Err(unsupported("a bare `values` statement")) }
+  else { Err(expected("`select`, `insert`, `update` or `delete`", ts)) }
+}
+
+fn parse_select(ts: List<Tok>) -> Result<Cut<Query>, DbError> =
+  match parse_proj(ts) {
+    Err(e) -> Err(e),
+    Ok(p) -> match want_word(p.rest, "from") {
+      Err(e) -> Err(e),
+      Ok(after) -> match parse_name(after) {
+        Err(e) -> Err(e),
+        Ok(src) -> parse_select_tail(src.value, p.value, src.rest),
+      },
+    },
+  }
+
+fn parse_select_tail(source: String, proj: Proj, ts: List<Tok>) -> Result<Cut<Query>, DbError> =
+  match parse_where(ts) {
+    Err(e) -> Err(e),
+    Ok(w) -> match parse_order(w.rest) {
+      Err(e) -> Err(e),
+      Ok(o) -> match parse_limit_offset(o.rest) {
+        Err(e) -> Err(e),
+        Ok(lo) -> Ok(cut(QSelect({source: source, proj: proj, filter: w.value,
+                                  order: o.value, limit: lo.value.limit,
+                                  offset: lo.value.offset}), lo.rest)),
+      },
+    },
+  }
+
+fn parse_proj(ts: List<Tok>) -> Result<Cut<Proj>, DbError> =
+  if tok_sym(ts) == "*" {
+    Ok(cut(PStar, rest_of(ts)))
+  } else if tok_word(ts) == "count" {
+    match want_sym(rest_of(ts), "(") {
+      Err(e) -> Err(e),
+      Ok(a) -> match want_sym(a, "*") {
+        Err(_) -> Err(unsupported("`count` of anything but `*`")),
+        Ok(b) -> match want_sym(b, ")") {
+          Err(e) -> Err(e),
+          Ok(c) -> match parse_alias(c, "count") {
+            Err(e) -> Err(e),
+            Ok(a) -> Ok(cut(PCount(a.value), a.rest)),
+          },
+        },
+      },
+    }
+  } else {
+    parse_proj_columns(ts, [])
+  }
+
+fn parse_proj_columns(ts: List<Tok>, acc: List<Target>) -> Result<Cut<Proj>, DbError> =
+  match parse_colref(ts) {
+    Err(e) -> Err(e),
+    Ok(c) -> match parse_alias(c.rest, c.value) {
+      Err(e) -> Err(e),
+      Ok(a) -> {
+        let targets = push(acc, {column: c.value, name: a.value});
+        if tok_sym(a.rest) == "," {
+          parse_proj_columns(rest_of(a.rest), targets)
+        } else {
+          Ok(cut(PCols(targets), a.rest))
+        }
+      },
+    },
+  }
+
+// `AS name`, or the default when there is none. Only the explicit form: a bare
+// alias — `select sku s from part` — is legal SQL and is refused, because the
+// twin cannot tell it from a `from` this parser failed to reach and guessing
+// would make a typo silently rename a column.
+fn parse_alias(ts: List<Tok>, dflt: String) -> Result<Cut<String>, DbError> =
+  if tok_word(ts) == "as" {
+    match parse_name(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(n) -> Ok(cut(n.value, n.rest)),
+    }
+  } else {
+    Ok(cut(dflt, ts))
+  }
+
+fn parse_where(ts: List<Tok>) -> Result<Cut<Option<Expr>>, DbError> =
+  if tok_word(ts) == "where" {
+    match parse_or(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(c) -> Ok(cut(Some(c.value), c.rest)),
+    }
+  } else {
+    Ok(cut(None, ts))
+  }
+
+fn parse_order(ts: List<Tok>) -> Result<Cut<List<OrderKey>>, DbError> =
+  if tok_word(ts) == "order" {
+    match want_word(rest_of(ts), "by") {
+      Err(e) -> Err(e),
+      Ok(after) -> parse_order_keys(after, []),
+    }
+  } else {
+    Ok(cut([], ts))
+  }
+
+fn parse_order_keys(ts: List<Tok>, acc: List<OrderKey>) -> Result<Cut<List<OrderKey>>, DbError> =
+  match parse_colref(ts) {
+    Err(e) -> Err(e),
+    Ok(c) -> {
+      let dir = tok_word(c.rest);
+      let desc = dir == "desc";
+      let after_dir = if dir == "asc" || dir == "desc" { rest_of(c.rest) } else { c.rest };
+      match parse_nulls(after_dir, desc) {
+        Err(e) -> Err(e),
+        Ok(n) -> {
+          let keys = push(acc, {column: c.value, desc: desc, nulls_first: n.value});
+          if tok_sym(n.rest) == "," { parse_order_keys(rest_of(n.rest), keys) }
+          else { Ok(cut(keys, n.rest)) }
+        },
+      }
+    },
+  }
+
+// Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under
+// `DESC`, so that the default is "nulls sort as if larger than everything".
+fn parse_nulls(ts: List<Tok>, desc: Bool) -> Result<Cut<Bool>, DbError> =
+  if tok_word(ts) == "nulls" {
+    let w = tok_word(rest_of(ts));
+    if w == "first" { Ok(cut(true, rest_of(rest_of(ts)))) }
+    else if w == "last" { Ok(cut(false, rest_of(rest_of(ts)))) }
+    else { Err(expected("`first` or `last` after `nulls`", rest_of(ts))) }
+  } else {
+    Ok(cut(desc, ts))
+  }
+
+type Slice = { limit: Option<Expr>, offset: Option<Expr> }
+
+fn parse_limit_offset(ts: List<Tok>) -> Result<Cut<Slice>, DbError> =
+  match parse_one_bound(ts, "limit") {
+    Err(e) -> Err(e),
+    Ok(l) -> match parse_one_bound(l.rest, "offset") {
+      Err(e) -> Err(e),
+      Ok(o) -> Ok(cut({limit: l.value, offset: o.value}, o.rest)),
+    },
+  }
+
+fn parse_one_bound(ts: List<Tok>, word: String) -> Result<Cut<Option<Expr>>, DbError> =
+  if tok_word(ts) == word {
+    match parse_primary(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(c) -> Ok(cut(Some(c.value), c.rest)),
+    }
+  } else {
+    Ok(cut(None, ts))
+  }
+
+fn parse_insert(ts: List<Tok>) -> Result<Cut<Query>, DbError> =
+  match want_word(ts, "into") {
+    Err(e) -> Err(e),
+    Ok(a) -> match parse_name(a) {
+      Err(e) -> Err(e),
+      Ok(src) -> match parse_insert_columns(src.rest) {
+        Err(e) -> Err(e),
+        Ok(cols) -> match want_word(cols.rest, "values") {
+          Err(_) -> Err(unsupported("an `insert` whose source is not a `values` list")),
+          Ok(b) -> match parse_tuples(b, []) {
+            Err(e) -> Err(e),
+            Ok(tuples) -> match parse_returning(tuples.rest) {
+              Err(e) -> Err(e),
+              Ok(r) -> Ok(cut(QInsert({source: src.value, columns: cols.value,
+                                       tuples: tuples.value, returning: r.value}), r.rest)),
+            },
+          },
+        },
+      },
+    },
+  }
+
+fn parse_insert_columns(ts: List<Tok>) -> Result<Cut<List<String>>, DbError> =
+  if tok_sym(ts) == "(" { parse_name_list(rest_of(ts), []) } else { Ok(cut([], ts)) }
+
+fn parse_name_list(ts: List<Tok>, acc: List<String>) -> Result<Cut<List<String>>, DbError> =
+  match parse_name(ts) {
+    Err(e) -> Err(e),
+    Ok(c) -> {
+      let names = push(acc, c.value);
+      if tok_sym(c.rest) == "," { parse_name_list(rest_of(c.rest), names) }
+      else { match want_sym(c.rest, ")") {
+               Err(e) -> Err(e),
+               Ok(after) -> Ok(cut(names, after)),
+             } }
+    },
+  }
+
+fn parse_tuples(ts: List<Tok>, acc: List<List<Expr>>) -> Result<Cut<List<List<Expr>>>, DbError> =
+  match want_sym(ts, "(") {
+    Err(e) -> Err(e),
+    Ok(a) -> match parse_expr_list(a, []) {
+      Err(e) -> Err(e),
+      Ok(c) -> {
+        let tuples = push(acc, c.value);
+        if tok_sym(c.rest) == "," { parse_tuples(rest_of(c.rest), tuples) }
+        else { Ok(cut(tuples, c.rest)) }
+      },
+    },
+  }
+
+fn parse_returning(ts: List<Tok>) -> Result<Cut<Option<Proj>>, DbError> =
+  if tok_word(ts) == "returning" {
+    match parse_proj(rest_of(ts)) {
+      Err(e) -> Err(e),
+      Ok(c) -> match c.value {
+        PCount(_) -> Err(unsupported("`returning count(*)`")),
+        PStar -> Ok(cut(Some(c.value), c.rest)),
+        PCols(_) -> Ok(cut(Some(c.value), c.rest)),
+      },
+    }
+  } else {
+    Ok(cut(None, ts))
+  }
+
+fn parse_update(ts: List<Tok>) -> Result<Cut<Query>, DbError> =
+  match parse_name(ts) {
+    Err(e) -> Err(e),
+    Ok(src) -> match want_word(src.rest, "set") {
+      Err(e) -> Err(e),
+      Ok(a) -> match parse_assignments(a, []) {
+        Err(e) -> Err(e),
+        Ok(sets) -> if tok_word(sets.rest) == "from" {
+          Err(unsupported("`update ... from`"))
+        } else {
+          match parse_where(sets.rest) {
+            Err(e) -> Err(e),
+            Ok(w) -> match parse_returning(w.rest) {
+              Err(e) -> Err(e),
+              Ok(r) -> Ok(cut(QUpdate({source: src.value, sets: sets.value,
+                                       filter: w.value, returning: r.value}), r.rest)),
+            },
+          }
+        },
+      },
+    },
+  }
+
+fn parse_assignments(ts: List<Tok>, acc: List<Assign>) -> Result<Cut<List<Assign>>, DbError> =
+  match parse_name(ts) {
+    Err(e) -> Err(e),
+    Ok(n) -> match want_sym(n.rest, "=") {
+      Err(e) -> Err(e),
+      Ok(a) -> match parse_primary(a) {
+        Err(e) -> Err(e),
+        Ok(v) -> {
+          let sets = push(acc, {column: n.value, value: v.value});
+          if tok_sym(v.rest) == "," { parse_assignments(rest_of(v.rest), sets) }
+          else { Ok(cut(sets, v.rest)) }
+        },
+      },
+    },
+  }
+
+fn parse_delete(ts: List<Tok>) -> Result<Cut<Query>, DbError> =
+  match want_word(ts, "from") {
+    Err(e) -> Err(e),
+    Ok(a) -> match parse_name(a) {
+      Err(e) -> Err(e),
+      Ok(src) -> if tok_word(src.rest) == "using" {
+        Err(unsupported("`delete ... using`"))
+      } else {
+        match parse_where(src.rest) {
+          Err(e) -> Err(e),
+          Ok(w) -> match parse_returning(w.rest) {
+            Err(e) -> Err(e),
+            Ok(r) -> Ok(cut(QDelete({source: src.value, filter: w.value,
+                                     returning: r.value}), r.rest)),
+          },
+        }
+      },
+    },
+  }
+
+// --- Evaluating an expression ----------------------------------------------------
+//
+// Three-valued, because SQL is. A `WHERE` keeps a row only when its predicate
+// is *true*; unknown and false both drop it, and a `CHECK` passes on unknown
+// and fails only on false. Those two rules disagree, they are both postgres's,
+// and a twin that used one boolean for both would be wrong on every nullable
+// column.
+
+type Tri = TriTrue | TriFalse | TriUnknown
+
+fn tri_of(b: Bool) -> Tri = if b { TriTrue } else { TriFalse }
+
+fn is_null(v: Datum) -> Bool = match v { CNull -> true, _ -> false }
+
+fn tri_not(t: Tri) -> Tri =
+  match t { TriTrue -> TriFalse, TriFalse -> TriTrue, TriUnknown -> TriUnknown }
+
+fn tri_and(a: Tri, b: Tri) -> Tri =
+  match a {
+    TriFalse -> TriFalse,
+    TriTrue -> b,
+    TriUnknown -> match b { TriFalse -> TriFalse, _ -> TriUnknown },
+  }
+
+fn tri_or(a: Tri, b: Tri) -> Tri =
+  match a {
+    TriTrue -> TriTrue,
+    TriFalse -> b,
+    TriUnknown -> match b { TriTrue -> TriTrue, _ -> TriUnknown },
+  }
+
+pub fn param_datum(p: Param) -> Datum =
+  match p {
+    PNull -> CNull,
+    PInt(n) -> CInt(n),
+    PBool(b) -> CBool(b),
+    PText(s) -> CText(s),
+    PBytes(b) -> CBytes(b),
+    PFloat(f) -> CFloat(f),
+    PNumeric(d) -> CNumeric(d),
+    PJson(j) -> CJson(j),
+    PArray(xs) -> CArray(map(xs, |x: Param| param_datum(x))),
+  }
+
+fn datum_type(v: Datum) -> String =
+  match v {
+    CNull -> "unknown",
+    CInt(_) -> "bigint",
+    CBool(_) -> "boolean",
+    CText(_) -> "text",
+    CBytes(_) -> "bytea",
+    CFloat(_) -> "double precision",
+    CNumeric(_) -> "numeric",
+    CJson(_) -> "jsonb",
+    CArray(_) -> "array",
+  }
+
+fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> =
+  match e {
+    XLit(v) -> Ok(v),
+    XCol(n) -> match map_get(r, n) { None -> Err(undefined_column(n)), Some(v) -> Ok(v) },
+    XParam(n) -> match nth(ps, n - 1) {
+      None -> Err(db_error("42P02", "", "there is no parameter $" ++ int_to_string(n))),
+      Some(p) -> Ok(param_datum(p)),
+    },
+    XDefault -> Err(unsupported("`default` outside an `insert ... values` list")),
+    XNot(_) -> eval_bool_value(r, ps, e),
+    XAnd(_, _) -> eval_bool_value(r, ps, e),
+    XOr(_, _) -> eval_bool_value(r, ps, e),
+    XCompare(_, _, _) -> eval_bool_value(r, ps, e),
+    XIsNull(_, _) -> eval_bool_value(r, ps, e),
+    XIn(_, _, _) -> eval_bool_value(r, ps, e),
+    XBetween(_, _, _, _) -> eval_bool_value(r, ps, e),
+    XLike(_, _, _) -> eval_bool_value(r, ps, e),
+  }
+
+fn eval_bool_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> =
+  match eval_pred(r, ps, e) {
+    Err(er) -> Err(er),
+    Ok(t) -> Ok(match t { TriTrue -> CBool(true), TriFalse -> CBool(false), TriUnknown -> CNull }),
+  }
+
+fn eval_pred(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> =
+  match e {
+    XNot(x) -> match eval_pred(r, ps, x) { Err(er) -> Err(er), Ok(t) -> Ok(tri_not(t)) },
+    XAnd(a, b) -> match eval_pred(r, ps, a) {
+      Err(er) -> Err(er),
+      Ok(ta) -> match eval_pred(r, ps, b) { Err(er) -> Err(er), Ok(tb) -> Ok(tri_and(ta, tb)) },
+    },
+    XOr(a, b) -> match eval_pred(r, ps, a) {
+      Err(er) -> Err(er),
+      Ok(ta) -> match eval_pred(r, ps, b) { Err(er) -> Err(er), Ok(tb) -> Ok(tri_or(ta, tb)) },
+    },
+    XCompare(op, a, b) -> eval_compare(r, ps, op, a, b),
+    XIsNull(x, want) -> match eval_value(r, ps, x) {
+      Err(er) -> Err(er),
+      Ok(v) -> Ok(tri_of(if want { is_null(v) } else { !is_null(v) })),
+    },
+    XIn(x, items, negated) -> eval_in(r, ps, x, items, negated),
+    XBetween(x, lo, hi, negated) -> eval_between(r, ps, x, lo, hi, negated),
+    XLike(x, p, negated) -> eval_like(r, ps, x, p, negated),
+    XLit(_) -> eval_pred_of_value(r, ps, e),
+    XCol(_) -> eval_pred_of_value(r, ps, e),
+    XParam(_) -> eval_pred_of_value(r, ps, e),
+    XDefault -> Err(unsupported("`default` in a predicate")),
+  }
+
+fn eval_pred_of_value(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> =
+  match eval_value(r, ps, e) {
+    Err(er) -> Err(er),
+    Ok(v) -> match v {
+      CNull -> Ok(TriUnknown),
+      CBool(b) -> Ok(tri_of(b)),
+      _ -> Err(db_error("42804", "",
+        "argument of a condition must be boolean, not " ++ datum_type(v))),
+    },
+  }
+
+fn eval_compare(r: Row, ps: List<Param>, op: Cmp, a: Expr, b: Expr) -> Result<Tri, DbError> =
+  match eval_value(r, ps, a) {
+    Err(er) -> Err(er),
+    Ok(av) -> match eval_value(r, ps, b) {
+      Err(er) -> Err(er),
+      Ok(bv) -> match datum_cmp(av, bv) {
+        Err(er) -> Err(er),
+        Ok(o) -> match o {
+          None -> Ok(TriUnknown),
+          Some(c) -> Ok(tri_of(match op {
+            CmpEq -> c == 0,
+            CmpNe -> c != 0,
+            CmpLt -> c < 0,
+            CmpLe -> c <= 0,
+            CmpGt -> c > 0,
+            CmpGe -> c >= 0,
+          })),
+        },
+      },
+    },
+  }
+
+fn eval_in(r: Row, ps: List<Param>, x: Expr, items: List<Expr>, negated: Bool)
+  -> Result<Tri, DbError> =
+  match eval_value(r, ps, x) {
+    Err(er) -> Err(er),
+    Ok(v) -> match in_scan(r, ps, v, items, TriFalse) {
+      Err(er) -> Err(er),
+      Ok(t) -> Ok(if negated { tri_not(t) } else { t }),
+    },
+  }
+
+fn in_scan(r: Row, ps: List<Param>, v: Datum, items: List<Expr>, so_far: Tri)
+  -> Result<Tri, DbError> =
+  match items {
+    [] -> Ok(so_far),
+    [h, ..t] -> match eval_value(r, ps, h) {
+      Err(er) -> Err(er),
+      Ok(hv) -> match datum_cmp(v, hv) {
+        Err(er) -> Err(er),
+        Ok(o) -> match o {
+          None -> in_scan(r, ps, v, t, tri_or(so_far, TriUnknown)),
+          Some(c) -> if c == 0 { Ok(TriTrue) } else { in_scan(r, ps, v, t, so_far) },
+        },
+      },
+    },
+  }
+
+fn eval_between(r: Row, ps: List<Param>, x: Expr, lo: Expr, hi: Expr, negated: Bool)
+  -> Result<Tri, DbError> =
+  match eval_compare(r, ps, CmpGe, x, lo) {
+    Err(er) -> Err(er),
+    Ok(a) -> match eval_compare(r, ps, CmpLe, x, hi) {
+      Err(er) -> Err(er),
+      Ok(b) -> Ok(if negated { tri_not(tri_and(a, b)) } else { tri_and(a, b) }),
+    },
+  }
+
+fn eval_like(r: Row, ps: List<Param>, x: Expr, p: Expr, negated: Bool) -> Result<Tri, DbError> =
+  match eval_value(r, ps, x) {
+    Err(er) -> Err(er),
+    Ok(xv) -> match eval_value(r, ps, p) {
+      Err(er) -> Err(er),
+      Ok(pv) -> like_of(xv, pv, negated),
+    },
+  }
+
+fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> =
+  match xv {
+    CNull -> Ok(TriUnknown),
+    CText(s) -> match pv {
+      CNull -> Ok(TriUnknown),
+      CText(p) -> {
+        let hit = like_match(s, p, 0, 0);
+        Ok(tri_of(if negated { !hit } else { hit }))
+      },
+      _ -> Err(db_error("42883", "", "operator does not exist: text like " ++ datum_type(pv))),
+    },
+    _ -> Err(db_error("42883", "", "operator does not exist: " ++ datum_type(xv) ++ " like ...")),
+  }
+
+// `_` matches one **character**, which is what postgres does and what a
+// byte-indexed matcher gets wrong the moment a column holds anything outside
+// ASCII: `'ex' like '_x'` and `'\u00e9x' like '_x'` are both true there and only
+// the first was true here. Found by running this against a live server.
+fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool =
+  if pi >= string_len(p) {
+    si >= string_len(s)
+  } else {
+    let pc = string_slice(p, pi, pi + 1);
+    if pc == "%" {
+      like_star(s, p, si, pi + 1)
+    } else if pc == "_" {
+      if si >= string_len(s) { false } else { like_match(s, p, si + 1, pi + 1) }
+    } else if pc == "\\" {
+      if pi + 1 >= string_len(p) { false }
+      else if si < string_len(s) && string_slice(s, si, si + 1) == string_slice(p, pi + 1, pi + 2) {
+        like_match(s, p, si + 1, pi + 2)
+      } else { false }
+    } else if si < string_len(s) && string_slice(s, si, si + 1) == pc {
+      like_match(s, p, si + 1, pi + 1)
+    } else {
+      false
+    }
+  }
+
+fn like_star(s: String, p: String, si: Int, pi: Int) -> Bool =
+  if like_match(s, p, si, pi) { true }
+  else if si >= string_len(s) { false }
+  else { like_star(s, p, si + 1, pi) }
+
+fn ord_int(o: Ordering) -> Int = match o { Less -> -1, Equal -> 0, Greater -> 1 }
+
+fn sign_of(a: Int, b: Int) -> Int = if a < b { -1 } else if a > b { 1 } else { 0 }
+
+fn float_cmp(a: Float, b: Float) -> Int =
+  if a != a { if b != b { 0 } else { 1 } }
+  else if b != b { -1 }
+  else if a < b { -1 } else if a > b { 1 } else { 0 }
+
+fn decimal_cmp(a: Decimal, b: Decimal) -> Int =
+  if a < b { -1 } else if a > b { 1 } else { 0 }
+
+// `None` is SQL's unknown: a comparison with a `NULL` operand has no answer.
+// Mixed numeric types promote the way postgres's implicit casts do; anything
+// else is `42883`, the code postgres gives for an operator that does not exist
+// at those types.
+fn datum_cmp(a: Datum, b: Datum) -> Result<Option<Int>, DbError> =
+  match a {
+    CNull -> Ok(None),
+    CInt(x) -> match b {
+      CNull -> Ok(None),
+      CInt(y) -> Ok(Some(sign_of(x, y))),
+      CNumeric(y) -> Ok(Some(decimal_cmp(decimal_of_int(x), y))),
+      CFloat(y) -> Ok(Some(float_cmp(float_of_decimal(decimal_of_int(x)), y))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CNumeric(x) -> match b {
+      CNull -> Ok(None),
+      CNumeric(y) -> Ok(Some(decimal_cmp(x, y))),
+      CInt(y) -> Ok(Some(decimal_cmp(x, decimal_of_int(y)))),
+      CFloat(y) -> Ok(Some(float_cmp(float_of_decimal(x), y))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CFloat(x) -> match b {
+      CNull -> Ok(None),
+      CFloat(y) -> Ok(Some(float_cmp(x, y))),
+      CInt(y) -> Ok(Some(float_cmp(x, float_of_decimal(decimal_of_int(y))))),
+      CNumeric(y) -> Ok(Some(float_cmp(x, float_of_decimal(y)))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CText(x) -> match b {
+      CNull -> Ok(None),
+      CText(y) -> Ok(Some(ord_int(compare(x, y)))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CBool(x) -> match b {
+      CNull -> Ok(None),
+      CBool(y) -> Ok(Some(sign_of(if x { 1 } else { 0 }, if y { 1 } else { 0 }))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CBytes(x) -> match b {
+      CNull -> Ok(None),
+      CBytes(y) -> Ok(Some(ord_int(compare(x, y)))),
+      _ -> Err(no_operator(a, b)),
+    },
+    CJson(_) -> Err(unsupported("comparing `jsonb`")),
+    CArray(_) -> Err(unsupported("comparing an array")),
+  }
+
+fn no_operator(a: Datum, b: Datum) -> DbError =
+  db_error("42883", "",
+    "operator does not exist: " ++ datum_type(a) ++ " = " ++ datum_type(b))
+
+// --- Column types, and what a value has to become to be stored -------------------
+
+fn decimal_scale_of(d: Decimal) -> Int = {
+  let s = decimal_to_string(d);
+  if string_contains(s, ".") { string_len(s) - string_find(s, ".") - 1 } else { 0 }
+}
+
+fn zeros(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ "0")
+
+// A `numeric(p, s)` column stores exactly `s` fractional digits, so `1.00` in a
+// `numeric(10,4)` column comes back `1.0000`. Postgres rounds half away from
+// zero, which is `HalfUp` here.
+fn rescale(d: Decimal, s: Int) -> Option<Decimal> = {
+  let reduced = if decimal_scale_of(d) > s { decimal_round(d, s, HalfUp) } else { d };
+  let text = decimal_to_string(reduced);
+  let have = decimal_scale_of(reduced);
+  if have >= s { decimal_of_string(text) }
+  else if have == 0 { decimal_of_string(if s > 0 { text ++ "." ++ zeros(s) } else { text }) }
+  else { decimal_of_string(text ++ zeros(s - have)) }
+}
+
+fn strip_leading_zeros(s: String) -> String =
+  if string_len(s) > 1 && string_starts_with(s, "0") {
+    strip_leading_zeros(string_slice(s, 1, string_len(s)))
+  } else if s == "0" { "" } else { s }
+
+fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool = {
+  let text = decimal_to_string(d);
+  let unsigned = if string_starts_with(text, "-") { string_slice(text, 1, string_len(text)) }
+                 else { text };
+  let whole = if string_contains(unsigned, ".") {
+                string_slice(unsigned, 0, string_find(unsigned, "."))
+              } else { unsigned };
+  string_len(strip_leading_zeros(whole)) <= p - s
+}
+
+fn is_text(v: Datum) -> Bool = match v { CText(_) -> true, _ -> false }
+
+// A string literal in statement text is `unknown`-typed and postgres coerces
+// it, so a bad one is `22P02`. A parameter crosses the wire with a type, so a
+// wrong one is `42804` and the server refuses it before it looks at the bytes.
+// The two are different codes for what a reader would call one mistake, and
+// getting them the wrong way round is exactly the drift this twin measures.
+fn wrong_type(c: Column, v: Datum, from_param: Bool, want: String) -> DbError =
+  if !from_param && is_text(v) {
+    db_error("22P02", "", "invalid input syntax for type " ++ want)
+  } else {
+    db_error("42804", "", "column \"" ++ c.name ++ "\" is of type " ++ want
+             ++ " but expression is of type " ++ datum_type(v))
+  }
+
+fn coerce(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+  match v {
+    CNull -> Ok(CNull),
+    _ -> coerce_value(c, ty, v, from_param),
+  }
+
+// The name postgres prints for a column type, which is what a `22P02` and a
+// `42804` both have to name for a reader to find the column.
+pub fn type_name(ty: ColumnType) -> String =
+  match ty {
+    TInt -> "bigint",
+    TBool -> "boolean",
+    TText -> "text",
+    TBytes -> "bytea",
+    TFloat -> "double precision",
+    TNumeric(_, _) -> "numeric",
+    TJson -> "jsonb",
+    TArray(_) -> "array",
+  }
+
+// A string **in statement text** is `unknown`-typed: postgres resolves it
+// against the type it is being assigned or compared to and parses it there, so
+// `insert into part (price) values ('1')` stores `1.0000` and only a value that
+// does not parse is `22P02`. Answering `22P02` for the ones that *do* parse —
+// which is what never attempting the coercion amounts to — refuses statements
+// postgres executes, and it does so under the right code, which is the shape a
+// reader is least likely to look at twice.
+//
+// A parameter is not this. It crosses the wire with a type of its own, so the
+// wrong one is `42804` and the server refuses it before it looks at the bytes.
+fn coerce_value(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+  match v {
+    CText(s) -> if from_param { coerce_typed(c, ty, v, from_param) }
+                else { coerce_unknown(c, ty, s) },
+    _ -> coerce_typed(c, ty, v, from_param),
+  }
+
+fn coerce_unknown(c: Column, ty: ColumnType, s: String) -> Result<Datum, DbError> =
+  match unknown_datum(ty, s) {
+    None -> Err(bad_input(ty, s)),
+    Some(v) -> coerce_typed(c, ty, v, false),
+  }
+
+fn bad_input(ty: ColumnType, s: String) -> DbError =
+  db_error("22P02", "",
+    "invalid input syntax for type " ++ type_name(ty) ++ ": \"" ++ s ++ "\"")
+
+// What an `unknown` literal becomes at a given type, or `None` when postgres
+// would refuse the text. `bytea`, `jsonb` and an array are `None` rather than
+// parsed: their input syntaxes are their own grammars and the twin does not
+// carry one, so it refuses under the code postgres uses for text it cannot read.
+fn unknown_datum(ty: ColumnType, s: String) -> Option<Datum> =
+  match ty {
+    TInt -> match whole_of_string(s) { None -> None, Some(n) -> Some(CInt(n)) },
+    TBool -> unknown_bool(s),
+    TText -> Some(CText(s)),
+    TFloat -> match decimal_of_string(s) {
+      None -> None,
+      Some(d) -> Some(CFloat(float_of_decimal(d))),
+    },
+    TNumeric(_, _) -> match decimal_of_string(s) { None -> None, Some(d) -> Some(CNumeric(d)) },
+    TBytes -> None,
+    TJson -> None,
+    TArray(_) -> None,
+  }
+
+// `'2.6'::bigint` is a syntax error in postgres rather than a rounding: text is
+// read at the target type, and `bigint`'s input syntax has no fractional part.
+// The *assignment* cast from `numeric` does round, and that is `coerce_typed`.
+fn whole_of_string(s: String) -> Option<Int> =
+  match decimal_of_string(s) {
+    None -> None,
+    Some(d) -> match int_of_decimal(d, Down) {
+      None -> None,
+      Some(n) -> if decimal_of_int(n) == d { Some(n) } else { None },
+    },
+  }
+
+fn unknown_bool(s: String) -> Option<Datum> = {
+  let t = string_lower(s);
+  if t == "t" || t == "true" || t == "yes" || t == "on" || t == "1" { Some(CBool(true)) }
+  else if t == "f" || t == "false" || t == "no" || t == "off" || t == "0" { Some(CBool(false)) }
+  else { None }
+}
+
+fn coerce_typed(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+  match ty {
+    TInt -> match v {
+      CInt(_) -> Ok(v),
+      // Postgres's assignment cast: a `numeric` stored into a `bigint` column
+      // rounds **half away from zero**, so `2.5` is `3` and `-2.5` is `-3`.
+      // Refusing it instead makes ordinary `insert`s and `update`s — including
+      // `set n = price`, which is column to column — come back `Failed` for
+      // statements the server executes.
+      CNumeric(d) -> int_from_decimal(d),
+      _ -> Err(wrong_type(c, v, from_param, "bigint")),
+    },
+    TBool -> match v { CBool(_) -> Ok(v), _ -> Err(wrong_type(c, v, from_param, "boolean")) },
+    TText -> match v { CText(_) -> Ok(v), _ -> Err(wrong_type(c, v, from_param, "text")) },
+    TBytes -> match v { CBytes(_) -> Ok(v), _ -> Err(wrong_type(c, v, from_param, "bytea")) },
+    TJson -> match v { CJson(_) -> Ok(v), _ -> Err(wrong_type(c, v, from_param, "jsonb")) },
+    TFloat -> match v {
+      CFloat(_) -> Ok(v),
+      CInt(n) -> Ok(CFloat(float_of_decimal(decimal_of_int(n)))),
+      CNumeric(d) -> Ok(CFloat(float_of_decimal(d))),
+      _ -> Err(wrong_type(c, v, from_param, "double precision")),
+    },
+    TNumeric(p, s) -> match v {
+      CNumeric(d) -> numeric_into(c, d, p, s),
+      CInt(n) -> numeric_into(c, decimal_of_int(n), p, s),
+      _ -> Err(wrong_type(c, v, from_param, "numeric")),
+    },
+    TArray(inner) -> match v {
+      CArray(xs) -> coerce_elements(c, inner, xs, from_param, []),
+      _ -> Err(wrong_type(c, v, from_param, "array")),
+    },
+  }
+
+fn int_from_decimal(d: Decimal) -> Result<Datum, DbError> =
+  match int_of_decimal(decimal_round(d, 0, HalfUp), Down) {
+    None -> Err(db_error("22003", "", "bigint out of range")),
+    Some(n) -> Ok(CInt(n)),
+  }
+
+// The overflow is decided **before** the rescale, because a value whose integer
+// part is already wider than `p - s` cannot be made to fit by rounding it — and
+// `rescale` of one that wide runs out of `Decimal` and would answer `0A000`,
+// which is the twin refusing where postgres has an answer. Found by the
+// agreement law on `price = -79228162514264337593543950335` into a
+// `numeric(10,4)`: postgres `22003`, twin `0A000`.
+fn numeric_into(c: Column, d: Decimal, p: Int, s: Int) -> Result<Datum, DbError> =
+  if !numeric_fits(d, p, s) { Err(numeric_overflow(p, s)) } else {
+  match rescale(d, s) {
+    None -> Err(unsupported("a `numeric` outside `Decimal`'s 96 bits or scale 28")),
+    Some(r) -> if numeric_fits(r, p, s) {
+      Ok(CNumeric(r))
+    } else {
+      Err(numeric_overflow(p, s))
+    },
+  }
+  }
+
+fn numeric_overflow(p: Int, s: Int) -> DbError =
+  db_error("22003", "", "numeric field overflow: a field with precision "
+           ++ int_to_string(p) ++ ", scale " ++ int_to_string(s)
+           ++ " must round to an absolute value less than 10^" ++ int_to_string(p - s))
+
+fn coerce_elements(c: Column, inner: ColumnType, xs: List<Datum>, from_param: Bool,
+                   acc: List<Datum>) -> Result<Datum, DbError> =
+  match xs {
+    [] -> Ok(CArray(acc)),
+    [h, ..t] -> match h {
+      CNull -> Err(unsupported("an array with a NULL element")),
+      _ -> match coerce_value(c, inner, h, from_param) {
+        Err(e) -> Err(e),
+        Ok(v) -> coerce_elements(c, inner, t, from_param, push(acc, v)),
+      },
+    },
+  }
+
+// --- Tables, columns, and the constraint checks ----------------------------------
+
+fn find_table(ts: List<MemTable>, name: String) -> Option<MemTable> =
+  match ts {
+    [] -> None,
+    [h, ..t] -> if h.def.name == name { Some(h) } else { find_table(t, name) },
+  }
+
+fn put_table(ts: List<MemTable>, mt: MemTable) -> List<MemTable> =
+  map(ts, |x: MemTable| if x.def.name == mt.def.name { mt } else { x })
+
+fn find_column(cs: List<Column>, n: String) -> Option<Column> =
+  match cs {
+    [] -> None,
+    [h, ..t] -> if h.name == n { Some(h) } else { find_column(t, n) },
+  }
+
+fn index_of(xs: List<String>, s: String) -> Option<Int> = index_from(xs, s, 0)
+
+fn index_from(xs: List<String>, s: String, i: Int) -> Option<Int> =
+  match xs {
+    [] -> None,
+    [h, ..t] -> if h == s { Some(i) } else { index_from(t, s, i + 1) },
+  }
+
+fn cell_of(r: Row, n: String) -> Datum =
+  match map_get(r, n) { None -> CNull, Some(v) -> v }
+
+// A primary key column is not-null whether or not the schema says so, which is
+// what postgres does with `PRIMARY KEY`.
+fn not_null_here(def: Table, c: Column) -> Bool =
+  !c.nullable || has_string(def.primary_key, c.name)
+
+// The order is postgres's, checked against a live server rather than guessed:
+// not-null, then check, then unique, and referential integrity last because it
+// is an after-statement trigger rather than a constraint on the tuple.
+fn validate_row(def: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
+  match check_not_null(def, def.columns, row) {
+    Some(e) -> Some(e),
+    None -> match check_checks(def, def.checks, row) {
+      Some(e) -> Some(e),
+      None -> check_unique(def, rows, row, skip),
+    },
+  }
+
+fn check_not_null(def: Table, cs: List<Column>, row: Row) -> Option<DbError> =
+  match cs {
+    [] -> None,
+    [c, ..t] -> if not_null_here(def, c) && is_null(cell_of(row, c.name)) {
+      // Postgres reports a column here and no constraint, so `constraint` is
+      // empty. Filling it in with `<table>_<column>_not_null` would be a name
+      // the server never sends.
+      Some(db_error("23502", "", "null value in column \"" ++ c.name
+                    ++ "\" of relation \"" ++ def.name ++ "\" violates not-null constraint"))
+    } else { check_not_null(def, t, row) },
+  }
+
+// A `CHECK` passes when it is unknown and fails only when it is false, which is
+// the opposite of a `WHERE` and the reason `Tri` exists.
+fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> =
+  match cs {
+    [] -> None,
+    [c, ..t] -> match parse_expr_text(c.expr) {
+      Err(e) -> Some(e),
+      Ok(x) -> match eval_pred(row, [], x) {
+        Err(e) -> Some(e),
+        Ok(TriFalse) -> Some(db_error("23514", c.name,
+          "new row for relation \"" ++ def.name ++ "\" violates check constraint \""
+          ++ c.name ++ "\"")),
+        Ok(_) -> check_checks(def, t, row),
+      },
+    },
+  }
+
+fn check_unique(def: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
+  match unique_violation(def, rows, row, skip, def.primary_key, def.name ++ "_pkey") {
+    Some(e) -> Some(e),
+    None -> check_unique_list(def, def.unique, rows, row, skip),
+  }
+
+fn check_unique_list(def: Table, us: List<Unique>, rows: List<Row>, row: Row, skip: Int)
+  -> Option<DbError> =
+  match us {
+    [] -> None,
+    [u, ..t] -> match unique_violation(def, rows, row, skip, u.columns, u.name) {
+      Some(e) -> Some(e),
+      None -> check_unique_list(def, t, rows, row, skip),
+    },
+  }
+
+// Two NULLs are distinct in a unique index, so a key with any NULL in it never
+// collides. Postgres 15 added `NULLS NOT DISTINCT`; W4's `Schema` cannot say it
+// and this twin does not offer it.
+fn unique_violation(def: Table, rows: List<Row>, row: Row, skip: Int,
+                    cols: List<String>, name: String) -> Option<DbError> =
+  if len(cols) == 0 || key_has_null(row, cols) {
+    None
+  } else if collides(rows, row, cols, skip, 0) {
+    Some(db_error("23505", name, "duplicate key value violates unique constraint \""
+                  ++ name ++ "\""))
+  } else {
+    None
+  }
+
+fn key_has_null(row: Row, cols: List<String>) -> Bool =
+  fold(cols, false, |acc: Bool, c: String| acc || is_null(cell_of(row, c)))
+
+fn collides(rows: List<Row>, row: Row, cols: List<String>, skip: Int, i: Int) -> Bool =
+  match rows {
+    [] -> false,
+    [h, ..t] -> if i != skip && key_equal(h, row, cols) { true }
+                else { collides(t, row, cols, skip, i + 1) },
+  }
+
+fn key_equal(a: Row, b: Row, cols: List<String>) -> Bool =
+  fold(cols, true, |acc: Bool, c: String| acc && cell_of(a, c) == cell_of(b, c))
+
+// `NO ACTION`, which postgres checks at the end of the statement rather than
+// per row — so this is one pass over every foreign key in the schema after the
+// write has landed, and a violation restores the tables the statement started
+// with. Nothing cascades: `ON DELETE CASCADE` is a schema the driver refuses at
+// bind time with `E0438`, so a twin that implemented it would be modelling a
+// database W4 will not talk to.
+fn check_referential(ts: List<MemTable>) -> Option<DbError> = check_ref_from(ts, ts)
+
+fn check_ref_from(all: List<MemTable>, ts: List<MemTable>) -> Option<DbError> =
+  match ts {
+    [] -> None,
+    [h, ..t] -> match check_table_fks(all, h, h.def.foreign_keys) {
+      Some(e) -> Some(e),
+      None -> check_ref_from(all, t),
+    },
+  }
+
+fn check_table_fks(ts: List<MemTable>, mt: MemTable, fks: List<ForeignKey>) -> Option<DbError> =
+  match fks {
+    [] -> None,
+    [f, ..rest] -> match check_fk_rows(ts, mt.rows, f) {
+      Some(e) -> Some(e),
+      None -> check_table_fks(ts, mt, rest),
+    },
+  }
+
+fn check_fk_rows(ts: List<MemTable>, rows: List<Row>, f: ForeignKey) -> Option<DbError> =
+  match rows {
+    [] -> None,
+    [r, ..t] -> if key_has_null(r, f.columns) {
+      check_fk_rows(ts, t, f)
+    } else {
+      match find_table(ts, f.references) {
+        None -> Some(undefined_table(f.references)),
+        Some(parent) -> if parent_present(parent.rows, r, f) {
+          check_fk_rows(ts, t, f)
+        } else {
+          Some(db_error("23503", f.name,
+            "insert or update on table violates foreign key constraint \"" ++ f.name ++ "\""))
+        },
+      }
+    },
+  }
+
+fn parent_present(rows: List<Row>, child: Row, f: ForeignKey) -> Bool =
+  match rows {
+    [] -> false,
+    [p, ..t] -> if fk_matches(p, child, f) { true } else { parent_present(t, child, f) },
+  }
+
+fn fk_matches(parent: Row, child: Row, f: ForeignKey) -> Bool =
+  fk_pairs(parent, child, f.columns, f.refers_to)
+
+fn fk_pairs(parent: Row, child: Row, cs: List<String>, rs: List<String>) -> Bool =
+  match cs {
+    [] -> true,
+    [c, ..ct] -> match rs {
+      [] -> false,
+      [r, ..rt] -> cell_of(child, c) == cell_of(parent, r) && fk_pairs(parent, child, ct, rt),
+    },
+  }
+
+// --- Executing a statement -------------------------------------------------------
+
+// The shape of the answer follows the **statement**, not which of `query`,
+// `execute` or `returning` performed it: a `RETURNING` answers `Rows` and a
+// bare write answers `Count`. That is what makes a `returning` a schema change
+// turned into a plain `execute` a mismatch the program reads rather than a type
+// error at a call site that did not move.
+pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome =
+  if d.failed {
+    fail(d, in_failed_txn())
+  } else {
+    match parse_statement(s.sql) {
+      Err(e) -> fail(d, e),
+      Ok(q) -> exec(d, q, ps),
+    }
+  }
+
+fn exec(d: MemDb, q: Query, ps: List<Param>) -> Outcome =
+  match q {
+    QSelect(sq) -> exec_select(d, sq, ps),
+    QInsert(iq) -> if read_only(d) { fail(d, read_only_txn("INSERT")) }
+                   else { exec_insert(d, iq, ps) },
+    QUpdate(uq) -> if read_only(d) { fail(d, read_only_txn("UPDATE")) }
+                   else { exec_update(d, uq, ps) },
+    QDelete(dq) -> if read_only(d) { fail(d, read_only_txn("DELETE")) }
+                   else { exec_delete(d, dq, ps) },
+  }
+
+// The **outermost** scope decides, because a savepoint has no access mode. A
+// nested `ReadOnly` inside a `ReadWrite` is accepted and its statements are
+// still writable — postgres has no read-only savepoint — so the narrowing is
+// documentation and not enforcement, which is the only honest thing to say.
+fn read_only(d: MemDb) -> Bool =
+  match nth(d.stack, 0) {
+    None -> false,
+    Some(f) -> match f.access { ReadOnly -> true, ReadWrite -> false },
+  }
+
+// --- The plan --------------------------------------------------------------------
+//
+// Everything postgres decides **before it looks at a row**, and the reason it is
+// a pass of its own. A predicate evaluated per stored row makes every one of
+// these disappear exactly when no row is examined — on an empty table, which is
+// the state a test is most likely to start from — and makes some of them
+// disappear when a row *is* examined but the compared column is `NULL`, because
+// `datum_cmp` answers "unknown" before it looks at the operand types. Measured
+// against a live server, all four of these were `Rows([])` or `Count(0)` in the
+// twin:
+//
+//   select sku from part where nosuch = 1      42703
+//   delete from part where nosuch = $1         42703
+//   select sku, sku from part                  two columns, refused
+//   select sku from part where n = 'abc'       22P02, `n` bigint, every row NULL
+//
+// The last is the one that matters most: postgres resolves an `unknown`-typed
+// literal against the column on the other side of the operator when it plans,
+// so a literal that will not parse is refused there and no row is consulted.
+
+type Planned = { left: Expr, right: Expr }
+
+fn plan_filter(def: Table, f: Option<Expr>) -> Result<Option<Expr>, DbError> =
+  match f {
+    None -> Ok(None),
+    Some(e) -> match plan_expr(def, e) { Err(er) -> Err(er), Ok(x) -> Ok(Some(x)) },
+  }
+
+fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
+  match e {
+    XCol(n) -> match find_column(def.columns, n) {
+      None -> Err(undefined_column(n)),
+      Some(_) -> Ok(e),
+    },
+    XParam(_) -> Ok(e),
+    XLit(_) -> Ok(e),
+    XDefault -> Ok(e),
+    XNot(x) -> match plan_expr(def, x) { Err(er) -> Err(er), Ok(a) -> Ok(XNot(a)) },
+    XAnd(a, b) -> match plan_expr(def, a) {
+      Err(er) -> Err(er),
+      Ok(pa) -> match plan_expr(def, b) { Err(er) -> Err(er), Ok(pb) -> Ok(XAnd(pa, pb)) },
+    },
+    XOr(a, b) -> match plan_expr(def, a) {
+      Err(er) -> Err(er),
+      Ok(pa) -> match plan_expr(def, b) { Err(er) -> Err(er), Ok(pb) -> Ok(XOr(pa, pb)) },
+    },
+    XCompare(op, a, b) -> match plan_operands(def, a, b) {
+      Err(er) -> Err(er),
+      Ok(p) -> Ok(XCompare(op, p.left, p.right)),
+    },
+    XIsNull(x, want) -> match plan_expr(def, x) {
+      Err(er) -> Err(er),
+      Ok(a) -> Ok(XIsNull(a, want)),
+    },
+    XIn(x, items, negated) -> match plan_expr(def, x) {
+      Err(er) -> Err(er),
+      Ok(px) -> match plan_items(def, column_type_of(def, px), items, []) {
+        Err(er) -> Err(er),
+        Ok(pis) -> Ok(XIn(px, pis, negated)),
+      },
+    },
+    XBetween(x, lo, hi, negated) -> match plan_operands(def, x, lo) {
+      Err(er) -> Err(er),
+      Ok(a) -> match plan_operands(def, a.left, hi) {
+        Err(er) -> Err(er),
+        Ok(b) -> Ok(XBetween(b.left, a.right, b.right, negated)),
+      },
+    },
+    XLike(x, p, negated) -> match plan_expr(def, x) {
+      Err(er) -> Err(er),
+      Ok(px) -> match plan_expr(def, p) {
+        Err(er) -> Err(er),
+        Ok(pp) -> Ok(XLike(px, pp, negated)),
+      },
+    },
+  }
+
+// An `unknown` literal takes its type from the column on the other side of the
+// operator. Symmetric, because `1 = n` is as ordinary as `n = 1`.
+fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Planned, DbError> =
+  match plan_expr(def, a) {
+    Err(er) -> Err(er),
+    Ok(pa) -> match plan_expr(def, b) {
+      Err(er) -> Err(er),
+      Ok(pb) -> match column_type_of(def, pa) {
+        Some(ty) -> match retype(ty, pb) {
+          Err(er) -> Err(er),
+          Ok(nb) -> Ok({left: pa, right: nb}),
+        },
+        None -> match column_type_of(def, pb) {
+          Some(ty) -> match retype(ty, pa) {
+            Err(er) -> Err(er),
+            Ok(na) -> Ok({left: na, right: pb}),
+          },
+          None -> Ok({left: pa, right: pb}),
+        },
+      },
+    },
+  }
+
+fn plan_items(def: Table, ty: Option<ColumnType>, items: List<Expr>, acc: List<Expr>)
+  -> Result<List<Expr>, DbError> =
+  match items {
+    [] -> Ok(acc),
+    [h, ..t] -> match plan_expr(def, h) {
+      Err(er) -> Err(er),
+      Ok(ph) -> match ty {
+        None -> plan_items(def, ty, t, push(acc, ph)),
+        Some(want) -> match retype(want, ph) {
+          Err(er) -> Err(er),
+          Ok(rh) -> plan_items(def, ty, t, push(acc, rh)),
+        },
+      },
+    },
+  }
+
+fn column_type_of(def: Table, e: Expr) -> Option<ColumnType> =
+  match e {
+    XCol(n) -> match find_column(def.columns, n) { None -> None, Some(c) -> Some(c.ty) },
+    _ -> None,
+  }
+
+// Only a string literal is `unknown`: a parameter carries its own type across
+// the wire, and any other literal already has one.
+fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
+  match e {
+    XLit(v) -> match v {
+      CText(s) -> match ty {
+        TText -> Ok(e),
+        _ -> match unknown_datum(ty, s) { None -> Err(bad_input(ty, s)), Some(nv) -> Ok(XLit(nv)) },
+      },
+      _ -> Ok(e),
+    },
+    _ -> Ok(e),
+  }
+
+// A result set with two columns of one name, and a column the table does not
+// have: both are the statement's shape rather than a row's, so both are decided
+// here. The twin's own check used to live in `project_row`, which runs per row
+// and therefore never ran on an empty table.
+fn check_projection(def: Table, proj: Proj) -> Option<DbError> =
+  match proj {
+    PStar -> None,
+    PCount(_) -> None,
+    PCols(ns) -> check_result_columns(def, ns, []),
+  }
+
+fn check_result_columns(def: Table, ns: List<Target>, seen: List<String>) -> Option<DbError> =
+  match ns {
+    [] -> None,
+    [h, ..t] -> match find_column(def.columns, h.column) {
+      None -> Some(undefined_column(h.column)),
+      Some(_) -> if has_string(seen, h.name) {
+        Some(unsupported("a result set with two columns named `" ++ h.name ++ "`"))
+      } else {
+        check_result_columns(def, t, push(seen, h.name))
+      },
+    },
+  }
+
+fn check_returning(def: Table, r: Option<Proj>) -> Option<DbError> =
+  match r {
+    None -> None,
+    Some(p) -> check_projection(def, p),
+  }
+
+// --- select ----------------------------------------------------------------------
+
+fn exec_select(d: MemDb, q: SelectQ, ps: List<Param>) -> Outcome =
+  match find_table(d.tables, q.source) {
+    None -> fail(d, undefined_table(q.source)),
+    Some(mt) -> match plan_select(mt.def, q) {
+      Err(e) -> fail(d, e),
+      Ok(planned) -> match select_rows(mt.rows, ps, planned.filter, []) {
+        Err(e) -> fail(d, e),
+        Ok(rows) -> finish_select(d, mt, planned, ps, rows),
+      },
+    },
+  }
+
+fn plan_select(def: Table, q: SelectQ) -> Result<SelectQ, DbError> =
+  match check_projection(def, q.proj) {
+    Some(e) -> Err(e),
+    None -> match check_order_columns(def, q.order) {
+      Some(e) -> Err(e),
+      None -> match plan_filter(def, q.filter) {
+        Err(e) -> Err(e),
+        Ok(f) -> Ok({source: q.source, proj: q.proj, filter: f,
+                     order: q.order, limit: q.limit, offset: q.offset}),
+      },
+    },
+  }
+
+fn select_rows(rows: List<Row>, ps: List<Param>, filter: Option<Expr>, acc: List<Row>)
+  -> Result<List<Row>, DbError> =
+  match rows {
+    [] -> Ok(acc),
+    [h, ..t] -> match keeps(h, ps, filter) {
+      Err(e) -> Err(e),
+      Ok(k) -> select_rows(t, ps, filter, if k { push(acc, h) } else { acc }),
+    },
+  }
+
+fn keeps(r: Row, ps: List<Param>, filter: Option<Expr>) -> Result<Bool, DbError> =
+  match filter {
+    None -> Ok(true),
+    Some(e) -> match eval_pred(r, ps, e) {
+      Err(er) -> Err(er),
+      Ok(t) -> Ok(match t { TriTrue -> true, TriFalse -> false, TriUnknown -> false }),
+    },
+  }
+
+fn finish_select(d: MemDb, mt: MemTable, q: SelectQ, ps: List<Param>, rows: List<Row>)
+  -> Outcome =
+  match q.proj {
+    PCount(name) -> if len(q.order) > 0 || is_bound(q.limit) || is_bound(q.offset) {
+      fail(d, unsupported("`count(*)` with an `order by`, `limit` or `offset`"))
+    } else {
+      done(d, Rows([map_insert(map_new(), name, CInt(len(rows)))]))
+    },
+    PStar -> ordered_slice(d, mt, q, ps, rows, PStar),
+    PCols(ns) -> ordered_slice(d, mt, q, ps, rows, PCols(ns)),
+  }
+
+fn is_bound(e: Option<Expr>) -> Bool = match e { None -> false, Some(_) -> true }
+
+fn ordered_slice(d: MemDb, mt: MemTable, q: SelectQ, ps: List<Param>, rows: List<Row>,
+                 proj: Proj) -> Outcome =
+  match check_order_columns(mt.def, q.order) {
+    Some(e) -> fail(d, e),
+    None -> match sort_rows(rows, q.order, []) {
+      Err(e) -> fail(d, e),
+      Ok(sorted) -> slice_and_project(d, q, ps, sorted, proj),
+    },
+  }
+
+fn check_order_columns(def: Table, keys: List<OrderKey>) -> Option<DbError> =
+  match keys {
+    [] -> None,
+    [k, ..t] -> match find_column(def.columns, k.column) {
+      None -> Some(undefined_column(k.column)),
+      Some(_) -> check_order_columns(def, t),
+    },
+  }
+
+fn slice_and_project(d: MemDb, q: SelectQ, ps: List<Param>, rows: List<Row>, proj: Proj)
+  -> Outcome =
+  match eval_bound(ps, q.offset, 0, "2201X", "OFFSET") {
+    Err(e) -> fail(d, e),
+    Ok(off) -> match eval_bound(ps, q.limit, -1, "2201W", "LIMIT") {
+      Err(e) -> fail(d, e),
+      Ok(lim) -> {
+        let after = drop_n(rows, off);
+        let bounded = if lim < 0 { after } else { take_n(after, lim, []) };
+        match project_rows(bounded, proj, []) {
+          Err(e) -> fail(d, e),
+          Ok(out) -> done(d, Rows(out)),
+        }
+      },
+    },
+  }
+
+fn eval_bound(ps: List<Param>, e: Option<Expr>, dflt: Int, code: String, what: String)
+  -> Result<Int, DbError> =
+  match e {
+    None -> Ok(dflt),
+    Some(x) -> match eval_value(map_new(), ps, x) {
+      Err(er) -> Err(er),
+      Ok(v) -> match v {
+        CNull -> Ok(dflt),
+        CInt(n) -> if n < 0 {
+          Err(db_error(code, "", what ++ " must not be negative"))
+        } else { Ok(n) },
+        _ -> Err(db_error("42804", "", "argument of " ++ what ++ " must be integer")),
+      },
+    },
+  }
+
+fn drop_n<a>(xs: List<a>, n: Int) -> List<a> =
+  if n <= 0 { xs } else { match xs { [] -> [], [_, ..t] -> drop_n(t, n - 1) } }
+
+fn take_n<a>(xs: List<a>, n: Int, acc: List<a>) -> List<a> =
+  if n <= 0 { acc } else { match xs { [] -> acc, [h, ..t] -> take_n(t, n - 1, push(acc, h)) } }
+
+// Insertion sort, and stable by construction: a row goes after every row it
+// compares equal to.
+//
+// **Stability is not agreement.** Postgres promises no order between equal keys
+// and its bounded sort does not deliver one, so a tie is a case where the two
+// sides differ and neither is wrong. What the stability buys is that the twin's
+// own tests are reproducible; what makes the *law* well posed is that
+// `render` orders by a key with no ties.
+fn sort_rows(rows: List<Row>, keys: List<OrderKey>, acc: List<Row>)
+  -> Result<List<Row>, DbError> =
+  if len(keys) == 0 { Ok(concat_lists(acc, rows)) } else {
+    match rows {
+      [] -> Ok(acc),
+      [h, ..t] -> match insert_sorted(acc, h, keys, []) {
+        Err(e) -> Err(e),
+        Ok(next) -> sort_rows(t, keys, next),
+      },
+    }
+  }
+
+fn insert_sorted(sorted: List<Row>, r: Row, keys: List<OrderKey>, before: List<Row>)
+  -> Result<List<Row>, DbError> =
+  match sorted {
+    [] -> Ok(push(before, r)),
+    [h, ..t] -> match rows_cmp(r, h, keys) {
+      Err(e) -> Err(e),
+      Ok(c) -> if c < 0 { Ok(concat_lists(push(before, r), sorted)) }
+               else { insert_sorted(t, r, keys, push(before, h)) },
+    },
+  }
+
+fn rows_cmp(a: Row, b: Row, keys: List<OrderKey>) -> Result<Int, DbError> =
+  match keys {
+    [] -> Ok(0),
+    [k, ..t] -> match key_cmp(a, b, k) {
+      Err(e) -> Err(e),
+      Ok(c) -> if c == 0 { rows_cmp(a, b, t) } else { Ok(c) },
+    },
+  }
+
+// `NULLS FIRST` / `NULLS LAST` is absolute rather than relative to `DESC`, so
+// the null arms are outside the `desc` flip.
+fn key_cmp(a: Row, b: Row, k: OrderKey) -> Result<Int, DbError> = {
+  let av = cell_of(a, k.column);
+  let bv = cell_of(b, k.column);
+  if is_null(av) && is_null(bv) { Ok(0) }
+  else if is_null(av) { Ok(if k.nulls_first { -1 } else { 1 }) }
+  else if is_null(bv) { Ok(if k.nulls_first { 1 } else { -1 }) }
+  else {
+    match datum_cmp(av, bv) {
+      Err(e) -> Err(e),
+      Ok(o) -> match o {
+        None -> Ok(0),
+        Some(c) -> Ok(if k.desc { 0 - c } else { c }),
+      },
+    }
+  }
+}
+
+fn project_rows(rows: List<Row>, proj: Proj, acc: List<Row>) -> Result<List<Row>, DbError> =
+  match rows {
+    [] -> Ok(acc),
+    [h, ..t] -> match project_row(h, proj) {
+      Err(e) -> Err(e),
+      Ok(r) -> project_rows(t, proj, push(acc, r)),
+    },
+  }
+
+fn project_row(r: Row, proj: Proj) -> Result<Row, DbError> =
+  match proj {
+    PStar -> Ok(r),
+    PCount(_) -> Ok(r),
+    PCols(ns) -> project_cols(r, ns, map_new()),
+  }
+
+// A `Row` is a `Map`, so two output columns of one name would silently keep
+// one. The driver refuses that result description with `E0433`; the twin has
+// only values, so it refuses it as one.
+fn project_cols(r: Row, ns: List<Target>, acc: Row) -> Result<Row, DbError> =
+  match ns {
+    [] -> Ok(acc),
+    [h, ..t] -> match map_get(r, h.column) {
+      None -> Err(undefined_column(h.column)),
+      Some(v) -> project_cols(r, t, map_insert(acc, h.name, v)),
+    },
+  }
+
+// --- insert ----------------------------------------------------------------------
+
+type RowAcc = { seqs: Map<String, Int>, row: Row, err: Option<DbError> }
+
+type Build = { seqs: Map<String, Int>, rows: List<Row>, err: Option<DbError> }
+
+fn exec_insert(d: MemDb, q: InsertQ, ps: List<Param>) -> Outcome =
+  match find_table(d.tables, q.source) {
+    None -> fail(d, undefined_table(q.source)),
+    Some(mt) -> {
+      let cols = if len(q.columns) == 0 { map(mt.def.columns, |c: Column| c.name) }
+                 else { q.columns };
+      match check_column_list(mt.def, cols, []) {
+        Some(e) -> fail(d, e),
+        None -> match check_returning(mt.def, q.returning) {
+          Some(e) -> fail(d, e),
+          None -> insert_build(d, mt, cols, q, ps),
+        },
+      }
+    },
+  }
+
+fn check_column_list(def: Table, cols: List<String>, seen: List<String>) -> Option<DbError> =
+  match cols {
+    [] -> None,
+    [h, ..t] -> match find_column(def.columns, h) {
+      None -> Some(undefined_column(h)),
+      Some(_) -> if has_string(seen, h) {
+        Some(db_error("42701", "", "column \"" ++ h ++ "\" specified more than once"))
+      } else {
+        check_column_list(def, t, push(seen, h))
+      },
+    },
+  }
+
+// A sequence advanced while building a row stays advanced even when the row is
+// refused, because postgres's sequences are not transactional and a twin that
+// gave the id back would make the second run of a test disagree with the first.
+fn insert_build(d: MemDb, mt: MemTable, cols: List<String>, q: InsertQ, ps: List<Param>)
+  -> Outcome = {
+  let b = fold(q.tuples, {seqs: d.sequences, rows: [], err: None},
+               |acc: Build, exprs: List<Expr>| build_tuple(mt.def, cols, exprs, ps, acc));
+  let advanced = memdb(d.tables, b.seqs, d.stack, d.failed);
+  match b.err {
+    Some(e) -> fail(advanced, e),
+    None -> insert_rows(advanced, mt, b.rows, q),
+  }
+}
+
+fn build_tuple(def: Table, cols: List<String>, exprs: List<Expr>, ps: List<Param>, acc: Build)
+  -> Build =
+  match acc.err {
+    Some(_) -> acc,
+    None -> if len(exprs) != len(cols) {
+      {seqs: acc.seqs, rows: acc.rows,
+       err: Some(db_error("42601", "", "INSERT has "
+                 ++ (if len(exprs) > len(cols) { "more" } else { "fewer" })
+                 ++ " expressions than target columns"))}
+    } else {
+      collect_tuple(build_columns(def, def.columns, cols, exprs, ps,
+                                  {seqs: acc.seqs, row: map_new(), err: None}), acc)
+    },
+  }
+
+fn collect_tuple(built: RowAcc, acc: Build) -> Build =
+  match built.err {
+    Some(e) -> {seqs: built.seqs, rows: acc.rows, err: Some(e)},
+    None -> {seqs: built.seqs, rows: push(acc.rows, built.row), err: None},
+  }
+
+fn build_columns(def: Table, cs: List<Column>, cols: List<String>, exprs: List<Expr>,
+                 ps: List<Param>, acc: RowAcc) -> RowAcc =
+  match cs {
+    [] -> acc,
+    [c, ..rest] -> match acc.err {
+      Some(_) -> acc,
+      None -> build_columns(def, rest, cols, exprs, ps, build_column(c, cols, exprs, ps, acc)),
+    },
+  }
+
+fn build_column(c: Column, cols: List<String>, exprs: List<Expr>, ps: List<Param>, acc: RowAcc)
+  -> RowAcc =
+  match index_of(cols, c.name) {
+    None -> default_into(c, acc),
+    Some(i) -> match nth(exprs, i) {
+      None -> default_into(c, acc),
+      Some(e) -> match e {
+        XDefault -> default_into(c, acc),
+        _ -> store_value(c, eval_value(map_new(), ps, e), is_param(e), acc),
+      },
+    },
+  }
+
+fn is_param(e: Expr) -> Bool = match e { XParam(_) -> true, _ -> false }
+
+fn store_value(c: Column, r: Result<Datum, DbError>, from_param: Bool, acc: RowAcc) -> RowAcc =
+  match r {
+    Err(e) -> {seqs: acc.seqs, row: acc.row, err: Some(e)},
+    Ok(v) -> match coerce(c, c.ty, v, from_param) {
+      Err(e) -> {seqs: acc.seqs, row: acc.row, err: Some(e)},
+      Ok(cv) -> {seqs: acc.seqs, row: map_insert(acc.row, c.name, cv), err: None},
+    },
+  }
+
+fn default_into(c: Column, acc: RowAcc) -> RowAcc =
+  match c.default {
+    DNone -> {seqs: acc.seqs, row: map_insert(acc.row, c.name, CNull), err: None},
+    DLiteral(p) -> store_value(c, Ok(param_datum(p)), false, acc),
+    DSequence(n) -> {
+      let next = match map_get(acc.seqs, n) { None -> 1, Some(v) -> v + 1 };
+      {seqs: map_insert(acc.seqs, n, next),
+       row: map_insert(acc.row, c.name, CInt(next)), err: None}
+    },
+  }
+
+fn insert_rows(d: MemDb, mt: MemTable, rows: List<Row>, q: InsertQ) -> Outcome =
+  match append_rows(mt, rows) {
+    Err(e) -> fail(d, e),
+    Ok(mt2) -> {
+      let tables = put_table(d.tables, mt2);
+      match check_referential(tables) {
+        Some(e) -> fail(d, e),
+        None -> finish_write(memdb(tables, d.sequences, d.stack, d.failed),
+                             rows, q.returning, len(rows)),
+      }
+    },
+  }
+
+fn append_rows(mt: MemTable, rows: List<Row>) -> Result<MemTable, DbError> =
+  match rows {
+    [] -> Ok(mt),
+    [h, ..t] -> match validate_row(mt.def, mt.rows, h, -1) {
+      Some(e) -> Err(e),
+      None -> append_rows({def: mt.def, rows: push(mt.rows, h)}, t),
+    },
+  }
+
+fn finish_write(d: MemDb, rows: List<Row>, returning: Option<Proj>, count: Int) -> Outcome =
+  match returning {
+    None -> done(d, Count(count)),
+    Some(p) -> match project_rows(rows, p, []) {
+      Err(e) -> fail(d, e),
+      Ok(out) -> done(d, Rows(out)),
+    },
+  }
+
+// --- update ----------------------------------------------------------------------
+
+type Changed = { at: Int, row: Row }
+
+type UpAcc = { rows: List<Row>, changed: List<Changed>, at: Int, err: Option<DbError> }
+
+fn exec_update(d: MemDb, q: UpdateQ, ps: List<Param>) -> Outcome =
+  match find_table(d.tables, q.source) {
+    None -> fail(d, undefined_table(q.source)),
+    Some(mt) -> match plan_update(mt.def, q, ps) {
+      Err(e) -> fail(d, e),
+      Ok(planned) -> {
+        let acc = update_walk(mt.def, mt.rows, planned, ps,
+                              {rows: [], changed: [], at: 0, err: None});
+        match acc.err {
+          Some(e) -> fail(d, e),
+          None -> finish_update(d, mt, acc, planned),
+        }
+      },
+    },
+  }
+
+fn plan_update(def: Table, q: UpdateQ, ps: List<Param>) -> Result<UpdateQ, DbError> =
+  match check_returning(def, q.returning) {
+    Some(e) -> Err(e),
+    None -> match constant_sets(def, q.sets, ps) {
+      Some(e) -> Err(e),
+      None -> match plan_filter(def, q.filter) {
+        Err(e) -> Err(e),
+        Ok(f) -> Ok({source: q.source, sets: q.sets, filter: f, returning: q.returning}),
+      },
+    },
+  }
+
+// A `set` whose right-hand side is a constant — a literal or a bound parameter
+// — is coerced to the column's type when the statement is **planned**, so
+// `update part set price = 1000000` on a `numeric(10,4)` column is `22003`
+// even when the `where` matches nothing. Checked against a live server: the
+// twin walked the rows first and answered `Count(0)` for a statement postgres
+// refuses to plan.
+fn constant_sets(def: Table, sets: List<Assign>, ps: List<Param>) -> Option<DbError> =
+  match sets {
+    [] -> None,
+    [s, ..t] -> match find_column(def.columns, s.column) {
+      None -> Some(undefined_column(s.column)),
+      Some(c) -> match constant_of(s.value, ps) {
+        None -> constant_sets(def, t, ps),
+        Some(v) -> match coerce(c, c.ty, v, is_param(s.value)) {
+          Err(e) -> Some(e),
+          Ok(_) -> constant_sets(def, t, ps),
+        },
+      },
+    },
+  }
+
+fn constant_of(e: Expr, ps: List<Param>) -> Option<Datum> =
+  match e {
+    XLit(v) -> Some(v),
+    XParam(n) -> match nth(ps, n - 1) { None -> None, Some(p) -> Some(param_datum(p)) },
+    _ -> None,
+  }
+
+fn update_walk(def: Table, rows: List<Row>, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+  match rows {
+    [] -> acc,
+    [h, ..t] -> match acc.err {
+      Some(_) -> acc,
+      None -> update_walk(def, t, q, ps, update_one(def, h, q, ps, acc)),
+    },
+  }
+
+fn update_one(def: Table, r: Row, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+  match keeps(r, ps, q.filter) {
+    Err(e) -> {rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e)},
+    Ok(hit) -> if hit { update_hit(def, r, q, ps, acc) }
+               else { {rows: push(acc.rows, r), changed: acc.changed,
+                       at: acc.at + 1, err: None} },
+  }
+
+fn update_hit(def: Table, r: Row, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+  match apply_sets(def, r, q.sets, ps) {
+    Err(e) -> {rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e)},
+    Ok(nr) -> {rows: push(acc.rows, nr),
+               changed: push(acc.changed, {at: acc.at, row: nr}),
+               at: acc.at + 1, err: None},
+  }
+
+fn apply_sets(def: Table, r: Row, sets: List<Assign>, ps: List<Param>) -> Result<Row, DbError> =
+  match sets {
+    [] -> Ok(r),
+    [s, ..t] -> match find_column(def.columns, s.column) {
+      None -> Err(undefined_column(s.column)),
+      Some(c) -> match set_value(c, r, s.value, ps) {
+        Err(e) -> Err(e),
+        Ok(nr) -> apply_sets(def, nr, t, ps),
+      },
+    },
+  }
+
+// `set c = default` on a sequence column would have to consume a `nextval`, and
+// this twin threads sequences through `insert` only. Refusing is the honest
+// answer; guessing the old value back is the one that would pass a test and
+// lose a row in production.
+fn set_value(c: Column, r: Row, e: Expr, ps: List<Param>) -> Result<Row, DbError> =
+  match e {
+    XDefault -> match c.default {
+      DSequence(_) -> Err(unsupported("`set ... = default` on a sequence column")),
+      DNone -> Ok(map_insert(r, c.name, CNull)),
+      DLiteral(p) -> match coerce(c, c.ty, param_datum(p), false) {
+        Err(er) -> Err(er),
+        Ok(v) -> Ok(map_insert(r, c.name, v)),
+      },
+    },
+    _ -> match eval_value(r, ps, e) {
+      Err(er) -> Err(er),
+      Ok(v) -> match coerce(c, c.ty, v, is_param(e)) {
+        Err(er) -> Err(er),
+        Ok(cv) -> Ok(map_insert(r, c.name, cv)),
+      },
+    },
+  }
+
+fn finish_update(d: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQ) -> Outcome =
+  match validate_changed(mt.def, acc.rows, acc.changed) {
+    Some(e) -> fail(d, e),
+    None -> {
+      let tables = put_table(d.tables, {def: mt.def, rows: acc.rows});
+      match check_referential(tables) {
+        Some(e) -> fail(d, e),
+        None -> finish_write(memdb(tables, d.sequences, d.stack, d.failed),
+                             map(acc.changed, |c: Changed| c.row),
+                             q.returning, len(acc.changed)),
+      }
+    },
+  }
+
+fn validate_changed(def: Table, rows: List<Row>, cs: List<Changed>) -> Option<DbError> =
+  match cs {
+    [] -> None,
+    [h, ..t] -> match validate_row(def, rows, h.row, h.at) {
+      Some(e) -> Some(e),
+      None -> validate_changed(def, rows, t),
+    },
+  }
+
+// --- delete ----------------------------------------------------------------------
+
+type DelAcc = { rows: List<Row>, gone: List<Row>, err: Option<DbError> }
+
+fn exec_delete(d: MemDb, q: DeleteQ, ps: List<Param>) -> Outcome =
+  match find_table(d.tables, q.source) {
+    None -> fail(d, undefined_table(q.source)),
+    Some(mt) -> match plan_delete(mt.def, q) {
+      Err(e) -> fail(d, e),
+      Ok(q) -> {
+      let acc = delete_walk(mt.rows, q, ps, {rows: [], gone: [], err: None});
+      match acc.err {
+        Some(e) -> fail(d, e),
+        None -> {
+          let tables = put_table(d.tables, {def: mt.def, rows: acc.rows});
+          match check_referential(tables) {
+            Some(e) -> fail(d, e),
+            None -> finish_write(memdb(tables, d.sequences, d.stack, d.failed),
+                                 acc.gone, q.returning, len(acc.gone)),
+          }
+        },
+      }
+      },
+    },
+  }
+
+fn plan_delete(def: Table, q: DeleteQ) -> Result<DeleteQ, DbError> =
+  match check_returning(def, q.returning) {
+    Some(e) -> Err(e),
+    None -> match plan_filter(def, q.filter) {
+      Err(e) -> Err(e),
+      Ok(f) -> Ok({source: q.source, filter: f, returning: q.returning}),
+    },
+  }
+
+fn delete_walk(rows: List<Row>, q: DeleteQ, ps: List<Param>, acc: DelAcc) -> DelAcc =
+  match rows {
+    [] -> acc,
+    [h, ..t] -> match acc.err {
+      Some(_) -> acc,
+      None -> match keeps(h, ps, q.filter) {
+        Err(e) -> {rows: acc.rows, gone: acc.gone, err: Some(e)},
+        Ok(hit) -> delete_walk(t, q, ps,
+          if hit { {rows: acc.rows, gone: push(acc.gone, h), err: None} }
+          else { {rows: push(acc.rows, h), gone: acc.gone, err: None} }),
+      },
+    },
+  }
+
+// --- The scope stack -------------------------------------------------------------
+
+// **A `begin` the driver refuses does not abort the transaction it was nested
+// inside.** The refusals below are decided by the scope table and nothing
+// reaches the server, so there is nothing to have aborted — postgres itself
+// answers a `BEGIN` inside a transaction with a `WARNING` and no state change.
+// Marking the scope failed here made the *outer* `commit` `25P02` in the twin
+// and `Count(0)` in the driver, which the agreement law found in eight
+// operations.
+pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> Outcome =
+  if len(d.stack) == 0 {
+    done(memdb(d.tables, d.sequences,
+               [{tables: d.tables, failed: false, level: level, access: access}], false),
+         Count(0))
+  } else if d.failed {
+    fail_open(d, in_failed_txn())
+  } else if len(d.stack) > max_savepoints() {
+    fail_open(d, db_error("54000", "", "savepoint stack deeper than "
+                          ++ int_to_string(max_savepoints())))
+  } else {
+    match nth(d.stack, 0) {
+      None -> done(d, Count(0)),
+      Some(outer) -> if !same_isolation(outer.level, level) {
+        fail_open(d, db_error("25001", "", "the open transaction is "
+                  ++ isolation_name(outer.level) ++ " and this nested `begin` asks for "
+                  ++ isolation_name(level)))
+      } else if widens(outer.access, access) {
+        // A savepoint has no access mode, so a nested `begin` that asked to
+        // widen one is a call site saying a thing that does not happen. The
+        // driver refuses it in `ScopeTable::begin`; the twin refused nothing
+        // here, which made the one half of W4 accept what the other rejected.
+        fail_open(d, db_error("25001", "", "the open transaction is "
+                  ++ access_name(outer.access) ++ " and this nested `begin` asks for "
+                  ++ access_name(access) ++ "; a savepoint cannot widen what the transaction may do"))
+      } else {
+        done(memdb(d.tables, d.sequences,
+                   push(d.stack, {tables: d.tables, failed: false,
+                                  level: level, access: access}), d.failed),
+             Count(0))
+      },
+    }
+  }
+
+fn widens(outer: Access, inner: Access) -> Bool =
+  match outer {
+    ReadOnly -> match inner { ReadWrite -> true, ReadOnly -> false },
+    ReadWrite -> false,
+  }
+
+pub fn access_name(a: Access) -> String =
+  match a { ReadWrite -> "read write", ReadOnly -> "read only" }
+
+fn same_isolation(a: Isolation, b: Isolation) -> Bool =
+  match a {
+    ReadCommitted -> match b { ReadCommitted -> true, _ -> false },
+    RepeatableRead -> match b { RepeatableRead -> true, _ -> false },
+    Serializable -> match b { Serializable -> true, _ -> false },
+  }
+
+pub fn isolation_name(a: Isolation) -> String =
+  match a {
+    ReadCommitted -> "read committed",
+    RepeatableRead -> "repeatable read",
+    Serializable -> "serializable",
+  }
+
+// **A `COMMIT` on a transaction a statement already aborted is `25P02`, in both
+// halves of W4, and neither half is what the bare server does.**
+//
+// Postgres answers that `COMMIT` with the command tag `ROLLBACK` and no error,
+// so a driver that asked only whether the server errored reports a success for a
+// transaction whose every write is gone — and `std.db`'s `transaction` matches
+// only `Failed` on the commit, so the caller is told its writes are durable.
+// `tokio_postgres::SimpleQueryMessage` does not carry the tag, so the driver
+// remembers instead: the first `Failed` inside a scope poisons it and the close
+// answers this. The twin does the same, from the same flag, because the two have
+// to agree and because the answer a program can act on is the true one.
+//
+// Releasing a **savepoint** in that state is `25P02` from the server itself.
+pub fn commit_step(d: MemDb) -> Outcome =
+  match last(d.stack) {
+    None -> fail_open(d, no_transaction("`db.commit`")),
+    Some(frame) -> if len(d.stack) == 1 {
+      if d.failed {
+        {db: memdb(frame.tables, d.sequences, [], false), out: Failed(in_failed_txn())}
+      } else {
+        done(memdb(d.tables, d.sequences, [], false), Count(0))
+      }
+    } else if d.failed {
+      // A failed `commit` **closes and rolls back its scope**, which is what
+      // the driver does with a connection whose `COMMIT` the server refused.
+      // The transaction as a whole stays aborted — releasing a savepoint does
+      // not un-abort it — so the outer `commit` still discards everything, and
+      // that is what postgres does with the same three commands.
+      {db: memdb(frame.tables, d.sequences, drop_last(d.stack), true),
+       out: Failed(in_failed_txn())}
+    } else {
+      done(memdb(d.tables, d.sequences, drop_last(d.stack), d.failed), Count(0))
+    },
+  }
+
+pub fn abort_step(d: MemDb) -> Outcome =
+  match last(d.stack) {
+    None -> fail_open(d, no_transaction("`db.abort`")),
+    Some(frame) -> done(memdb(frame.tables, d.sequences, drop_last(d.stack), frame.failed),
+                        Count(0)),
+  }
+
+// A `commit` or an `abort` with nothing open, which is the one place W4's two
+// halves answered differently.
+//
+// Bare postgres emits a `WARNING` and succeeds; the driver refuses locally in
+// `ScopeTable::close` with `25P01` and never sends the command, and the twin
+// answered `Count(0)`. **The driver's answer is the one both keep**, and it is a
+// deliberate divergence from the server rather than an accident: `transaction`
+// reads only `Failed` on the commit, so a success for a transaction that never
+// existed is a caller told its writes are durable when nothing was ever opened
+// to hold them. The warning postgres emits is not a value a Ply program can
+// read, so matching the server here would mean discarding the only signal there
+// is.
+fn no_transaction(what: String) -> DbError =
+  db_error("25P01", "", what ++ " with no transaction open")
+
+// A failure with no open scope leaves the database where it was: there is no
+// transaction for it to poison, and the next statement is not `25P02`.
+fn fail_open(d: MemDb, e: DbError) -> Outcome = {db: d, out: Failed(e)}
+
+// --- The twin's own tests --------------------------------------------------------
+//
+// Every one is `det`, hermetic and cached: the twin performs no effect at all,
+// so there is nothing to handle and nothing to reach. What these do **not**
+// establish is agreement with postgres — that is `examples/agreement.ply`, and
+// the two are different claims. These pin the behaviour a reader can check by
+// eye; the law pins the behaviour only a server can settle.
+
+fn t_schema() -> Schema = {tables: [t_part(), t_bin()]}
+
+fn t_part() -> Table = {
+  name: "part",
+  columns: [
+    column("sku", TText, false),
+    column("price", TNumeric(10, 4), false),
+    column("tag", TText, true),
+    column("n", TInt, true),
+  ],
+  primary_key: ["sku"],
+  unique: [{name: "part_tag_key", columns: ["tag"]}],
+  foreign_keys: [],
+  checks: [{name: "part_price_check", expr: "price >= 0"}],
+}
+
+fn t_bin() -> Table = {
+  name: "bin",
+  columns: [
+    column_default("id", TInt, false, DSequence("bin_id_seq")),
+    column("sku", TText, true),
+    column("qty", TInt, true),
+  ],
+  primary_key: ["id"],
+  unique: [],
+  foreign_keys: [{name: "bin_sku_fkey", columns: ["sku"],
+                  references: "part", refers_to: ["sku"]}],
+  checks: [{name: "bin_qty_check", expr: "qty >= 0"}],
+}
+
+fn t_run(d: MemDb, sql: String, ps: List<Param>) -> Outcome = step(d, stmt(sql), ps)
+
+fn t_out(d: MemDb, sql: String, ps: List<Param>) -> Answer = t_run(d, sql, ps).out
+
+fn t_seed() -> MemDb = {
+  let a = t_run(open(t_schema()), "insert into part (sku, price, tag, n) values ($1,$2,$3,$4)",
+                [PText("a"), PNumeric(1m), PText("t1"), PInt(1)]);
+  let b = t_run(a.db, "insert into part (sku, price, tag, n) values ($1,$2,$3,$4)",
+                [PText("b"), PNumeric(2m), PText("t2"), PNull]);
+  t_run(b.db, "insert into part (sku, price, tag, n) values ($1,$2,$3,$4)",
+        [PText("c"), PNumeric(3m), PNull, PInt(3)]).db
+}
+
+fn t_code(a: Answer) -> String =
+  match a { Failed(e) -> e.code, Rows(_) -> "rows", Count(_) -> "count" }
+
+fn t_constraint(a: Answer) -> String =
+  match a { Failed(e) -> e.constraint, _ -> "" }
+
+fn t_skus(a: Answer) -> List<String> =
+  match a {
+    Rows(rs) -> map(rs, |r: Row| match cell_of(r, "sku") { CText(s) -> s, _ -> "?" }),
+    _ -> [],
+  }
+
+fn t_count(a: Answer) -> Int =
+  match a {
+    Rows(rs) -> match rs {
+      [r, ..] -> match cell_of(r, "count") { CInt(n) -> n, _ -> -1 },
+      _ -> -1,
+    },
+    _ -> -1,
+  }
+
+test "create_schema renders one statement per table and one per sequence" {
+  let sqls = map(create_schema(t_schema()), |s: Stmt| s.sql);
+  assert_eq(len(sqls), 3);
+  assert_eq(nth(sqls, 0), Some("create sequence \"bin_id_seq\""));
+  assert_eq(nth(sqls, 1), Some(
+    "create table \"part\" (\"sku\" text not null, \"price\" numeric(10,4) not null, " ++
+    "\"tag\" text, \"n\" bigint, primary key (\"sku\"), " ++
+    "constraint \"part_tag_key\" unique (\"tag\"), " ++
+    "constraint \"part_price_check\" check (price >= 0))"))
+}
+
+test "a where, an order by, a limit and an offset" {
+  let d = t_seed();
+  assert_eq(t_skus(t_out(d, "select sku from part order by sku", [])), ["a", "b", "c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part order by sku desc", [])), ["c", "b", "a"]);
+  assert_eq(t_skus(t_out(d, "select sku from part order by sku limit 2", [])), ["a", "b"]);
+  assert_eq(t_skus(t_out(d, "select sku from part order by sku limit 2 offset 1", [])),
+            ["b", "c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where price > 1 order by sku", [])),
+            ["b", "c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where sku in ('a','c') order by sku", [])),
+            ["a", "c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where price between 2 and 3 order by sku", [])),
+            ["b", "c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where tag like 't%' order by sku", [])),
+            ["a", "b"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where sku = 'zz' order by sku", [])), []);
+  assert_eq(t_count(t_out(d, "select count(*) from part", [])), 3)
+}
+
+// The rule a hand-written double gets wrong: a comparison with `NULL` is
+// unknown, and a `WHERE` keeps only what is true. `n <> 1` therefore drops the
+// row whose `n` is null rather than keeping it.
+test "a comparison with null is unknown, and a where keeps only what is true" {
+  let d = t_seed();
+  assert_eq(t_skus(t_out(d, "select sku from part where n = 1 order by sku", [])), ["a"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where n <> 1 order by sku", [])), ["c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where n is null order by sku", [])), ["b"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where not (n = 1) order by sku", [])), ["c"]);
+  assert_eq(t_skus(t_out(d, "select sku from part where n = 1 or tag = 't2' order by sku", [])),
+            ["a", "b"])
+}
+
+// `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC` is postgres's
+// default: nulls sort as if larger than everything.
+test "nulls order last under asc and first under desc, and the words override it" {
+  let d = t_seed();
+  assert_eq(t_skus(t_out(d, "select sku, n from part order by n, sku", [])), ["a", "c", "b"]);
+  assert_eq(t_skus(t_out(d, "select sku, n from part order by n desc, sku", [])),
+            ["b", "c", "a"]);
+  assert_eq(t_skus(t_out(d, "select sku, n from part order by n nulls first, sku", [])),
+            ["b", "a", "c"])
+}
+
+test "insert answers a count, and returning answers the rows" {
+  let d = open(t_schema());
+  assert_eq(t_out(d, "insert into part (sku, price) values ('a', 1)", []), Count(1));
+  assert_eq(t_out(d, "insert into part (sku, price) values ('a', 1), ('b', 2)", []), Count(2));
+  assert_eq(t_skus(t_out(d, "insert into part (sku, price) values ('a', 1) returning sku", [])),
+            ["a"])
+}
+
+test "a numeric column stores the column's scale and refuses what will not fit" {
+  let d = open(t_schema());
+  let r = t_run(d, "insert into part (sku, price) values ('a', $1) returning price",
+                [PNumeric(1.00m)]);
+  match r.out {
+    Rows(rs) -> match rs {
+      [row, ..] -> match cell_of(row, "price") {
+        CNumeric(v) -> assert_eq(decimal_to_string(v), "1.0000"),
+        _ -> assert(false),
+      },
+      _ -> assert(false),
+    },
+    _ -> assert(false),
+  };
+  assert_eq(t_code(t_out(d, "insert into part (sku, price) values ('a', 1.00005)", [])),
+            "count");
+  assert_eq(t_code(t_out(d, "insert into part (sku, price) values ('a', 1000000)", [])),
+            "22003")
+}
+
+// Postgres plans the coercion of a constant before it looks for a row, so this
+// is `22003` and not `Count(0)`.
+test "a constant that will not fit the column fails even when no row matches" {
+  let d = t_seed();
+  assert_eq(t_code(t_out(d, "update part set price = 1000000 where sku = 'zz'", [])), "22003");
+  assert_eq(t_out(d, "update part set price = 9 where sku = 'zz'", []), Count(0))
+}
+
+test "the four constraint classes carry the codes and the names postgres sends" {
+  let d = t_seed();
+  let dup = t_out(d, "insert into part (sku, price) values ('a', 1)", []);
+  assert_eq(t_code(dup), "23505");
+  assert_eq(t_constraint(dup), "part_pkey");
+  let tag = t_out(d, "insert into part (sku, price, tag) values ('z', 1, 't1')", []);
+  assert_eq(t_code(tag), "23505");
+  assert_eq(t_constraint(tag), "part_tag_key");
+  let nn = t_out(d, "insert into part (sku, price) values ('z', null)", []);
+  assert_eq(t_code(nn), "23502");
+  // Postgres reports a *column* for a not-null violation and no constraint.
+  assert_eq(t_constraint(nn), "");
+  let ck = t_out(d, "insert into part (sku, price) values ('z', -1)", []);
+  assert_eq(t_code(ck), "23514");
+  assert_eq(t_constraint(ck), "part_price_check");
+  let fk = t_out(d, "insert into bin (sku, qty) values ('zz', 1)", []);
+  assert_eq(t_code(fk), "23503");
+  assert_eq(t_constraint(fk), "bin_sku_fkey")
+}
+
+test "two nulls in a unique column do not collide" {
+  let d = t_seed();
+  assert_eq(t_out(d, "insert into part (sku, price, tag) values ('z', 1, null)", []), Count(1))
+}
+
+// A `CHECK` is the opposite of a `WHERE`: it passes when it is unknown.
+test "a check passes on unknown and fails only on false" {
+  let d = t_seed();
+  assert_eq(t_out(d, "insert into bin (sku, qty) values ('a', null)", []), Count(1));
+  assert_eq(t_code(t_out(d, "insert into bin (sku, qty) values ('a', -1)", [])), "23514")
+}
+
+test "a parent with a child cannot be deleted" {
+  let d0 = t_seed();
+  let d1 = t_run(d0, "insert into bin (sku, qty) values ('a', 1)", []).db;
+  assert_eq(t_code(t_out(d1, "delete from part where sku = 'a'", [])), "23503");
+  assert_eq(t_out(d1, "delete from part where sku = 'b'", []), Count(1))
+}
+
+test "a parameter carrying SQL is a value and never syntax" {
+  let d = open(t_schema());
+  let r = t_run(d, "insert into part (sku, price) values ($1, 1) returning sku",
+                [PText("'; drop table part; --")]);
+  assert_eq(t_skus(r.out), ["'; drop table part; --"]);
+  assert_eq(t_count(t_out(r.db, "select count(*) from part", [])), 1)
+}
+
+test "a committed scope is visible and an aborted one is not" {
+  let d0 = t_seed();
+  let b = begin_step(d0, ReadCommitted, ReadWrite);
+  let i = t_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
+  assert_eq(t_count(t_out(i.db, "select count(*) from part", [])), 4);
+  let c = commit_step(i.db);
+  assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 4);
+  let b2 = begin_step(c.db, ReadCommitted, ReadWrite);
+  let i2 = t_run(b2.db, "delete from part where sku = 'z'", []);
+  let a2 = abort_step(i2.db);
+  assert_eq(t_count(t_out(a2.db, "select count(*) from part", [])), 4)
+}
+
+// The state test doubles omit most often, and the one that makes a suite pass
+// and production fail.
+test "a statement that failed inside a scope makes every later one 25P02" {
+  let d0 = t_seed();
+  let b = begin_step(d0, ReadCommitted, ReadWrite);
+  let bad = t_run(b.db, "insert into part (sku, price) values ('a', 1)", []);
+  assert_eq(t_code(bad.out), "23505");
+  assert_eq(t_code(t_out(bad.db, "select count(*) from part", [])), "25P02");
+  // The server answers this `COMMIT` with the `ROLLBACK` tag and no error, and
+  // both halves of W4 answer `25P02` all the same: a `Count(0)` here is a caller
+  // told its writes are durable when every one of them is gone.
+  let c = commit_step(bad.db);
+  assert_eq(t_code(c.out), "25P02");
+  assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 3)
+}
+
+test "rolling back to a savepoint clears the failed state and the inner writes" {
+  let d0 = t_seed();
+  let b = begin_step(d0, ReadCommitted, ReadWrite);
+  let i = t_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
+  let sp = begin_step(i.db, ReadCommitted, ReadWrite);
+  let bad = t_run(sp.db, "insert into part (sku, price) values ('z', 2)", []);
+  assert_eq(t_code(bad.out), "23505");
+  let back = abort_step(bad.db);
+  assert_eq(t_count(t_out(back.db, "select count(*) from part", [])), 4);
+  let c = commit_step(back.db);
+  assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 4)
+}
+
+test "releasing a savepoint in an aborted transaction is 25P02 and commits nothing" {
+  let d0 = t_seed();
+  let b = begin_step(d0, ReadCommitted, ReadWrite);
+  let i = t_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
+  let sp = begin_step(i.db, ReadCommitted, ReadWrite);
+  let bad = t_run(sp.db, "insert into part (sku, price) values ('z', 2)", []);
+  let rel = commit_step(bad.db);
+  assert_eq(t_code(rel.out), "25P02");
+  // Releasing an aborted savepoint does not un-abort the transaction, so the
+  // outer commit is `25P02` too and it commits nothing.
+  let c = commit_step(rel.db);
+  assert_eq(t_code(c.out), "25P02");
+  assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 3)
+}
+
+test "a sequence is not rolled back" {
+  let d0 = t_seed();
+  let b = begin_step(d0, ReadCommitted, ReadWrite);
+  let i = t_run(b.db, "insert into bin (sku, qty) values ('a', 1) returning id", []);
+  assert_eq(i.out, Rows([map_insert(map_new(), "id", CInt(1))]));
+  let a = abort_step(i.db);
+  let j = t_run(a.db, "insert into bin (sku, qty) values ('a', 2) returning id", []);
+  assert_eq(j.out, Rows([map_insert(map_new(), "id", CInt(2))]))
+}
+
+test "a write in a read-only scope is 25006 and a nested begin at another level is 25001" {
+  let d0 = t_seed();
+  let ro = begin_step(d0, ReadCommitted, ReadOnly);
+  assert_eq(t_code(t_out(ro.db, "insert into part (sku, price) values ('z', 1)", [])), "25006");
+  assert_eq(t_count(t_out(ro.db, "select count(*) from part", [])), 3);
+  let rw = begin_step(d0, Serializable, ReadWrite);
+  let nested = begin_step(rw.db, ReadCommitted, ReadWrite);
+  assert_eq(t_code(nested.out), "25001")
+}
+
+test "the savepoint stack is bounded" {
+  assert_eq(t_code(t_deepen(begin_step(open(t_schema()), ReadCommitted, ReadWrite).db,
+                            max_savepoints() + 1).out), "54000")
+}
+
+fn t_deepen(d: MemDb, left: Int) -> Outcome = {
+  let r = begin_step(d, ReadCommitted, ReadWrite);
+  if left <= 1 { r } else { t_deepen(r.db, left - 1) }
+}
+
+// Every one of these is something the twin does not model. It answers `0A000`
+// with the construct named, never a result, so a test that reaches one fails in
+// the run that introduced it rather than passing on a wrong answer.
+test "what the twin does not model, it refuses by name" {
+  let d = t_seed();
+  let refused = [
+    "select p.sku from part p join bin b on p.sku = b.sku",
+    "select sku from part where sku in (select sku from bin)",
+    "select count(*), sku from part group by sku",
+    "select sum(n) from part",
+    "select sku from part union select sku from bin",
+    "with x as (select 1) select sku from part",
+    "insert into part (sku, price) values ('a', 1) on conflict do nothing",
+    "select sku from part; select 1 from part",
+    "create table t (a int)",
+    "select sku from part order by n + 1",
+    "select sku from part where tag like 'a%' escape '!'",
+    "select 1e3 from part",
+    "select now() from part",
+    // An ordinal `ORDER BY` names an output column by position, which needs the
+    // select list and the table's own column order together. §5.3 names it.
+    "select sku from part order by 1",
+  ];
+  assert_eq(map(refused, |s: String| t_code(t_out(d, s, []))),
+            map(refused, |s: String| "0A000"))
+}
+
+// Three shapes postgres accepts that the twin used to refuse under `0A000`.
+// None of them is on §5.3's list, each is ordinary SQL rather than a construct,
+// and the alias is the one that cost something: `E0433` tells a program to write
+// `select a.id as a_id, b.id as b_id` when a statement returns two columns of
+// one name, and that statement was a `0A000` in the twin.
+test "a comment and a result-column alias are ordinary SQL rather than a refusal" {
+  let d = t_seed();
+  assert_eq(t_code(t_out(d, "select sku from part -- trailing", [])), "rows");
+  assert_eq(t_code(t_out(d, "select /* leading */ sku from part order by sku", [])), "rows");
+  assert_eq(t_code(t_out(d, "select /* a /* nested */ one */ sku from part", [])), "rows");
+  // The alias is the name the row comes back under.
+  assert_eq(t_out(d, "select sku as ident from part order by sku", []),
+            Rows([map_insert(map_new(), "ident", CText("a")),
+                  map_insert(map_new(), "ident", CText("b")),
+                  map_insert(map_new(), "ident", CText("c"))]));
+  assert_eq(t_out(d, "select count(*) as c from part", []),
+            Rows([map_insert(map_new(), "c", CInt(3))]));
+  // And two targets that come back under one name are still refused, because a
+  // `Row` is a `Map` and one of them would silently win.
+  assert_eq(t_code(t_out(d, "select sku, sku from part", [])), "0A000");
+  assert_eq(t_code(t_out(d, "select sku as x, tag as x from part", [])), "0A000");
+  // An unclosed comment is a refusal rather than a statement that lost its tail.
+  assert_eq(t_code(t_out(d, "select sku from part /* never closed", [])), "0A000")
+}
+
+test "an unknown relation and an unknown column are named" {
+  let d = t_seed();
+  assert_eq(t_code(t_out(d, "select sku from nosuch order by sku", [])), "42P01");
+  assert_eq(t_code(t_out(d, "select nosuch from part", [])), "42703");
+  assert_eq(t_code(t_out(d, "select sku from part order by nosuch", [])), "42703")
+}
+
+test "a text parameter in an integer column is refused rather than coerced" {
+  let d = open(t_schema());
+  assert_eq(t_code(t_out(d, "insert into part (sku, price, n) values ('a', 1, $1)",
+                         [PText("x")])), "42804");
+  assert_eq(t_code(t_out(d, "insert into part (sku, price, n) values ('a', 1, 'x')", [])),
+            "22P02")
+}

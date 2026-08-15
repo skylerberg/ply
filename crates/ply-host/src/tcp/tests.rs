@@ -85,10 +85,13 @@ fn perform(
         )
         .expect("the registry serves this triple");
     let request = HostRequest {
+        machine: ply_eval::host::MachineId(1),
         atom: bound.atom.clone(),
         op: bound.op,
         args: &args,
         span: Span::DUMMY,
+        task: None,
+        declared: None,
     };
     match bound.handler.call(rt, &request)? {
         HostAnswer::Value(v) => Ok(v),

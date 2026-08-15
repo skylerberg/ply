@@ -834,3 +834,48 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
         }
     }
 }
+
+// --- `law/host` -------------------------------------------------------------
+
+/// ADR 0014 §6.1: `law/host` is part of the law's own hash, written after
+/// `tag::LAW` exactly as `TestDef::nondet` is written after `tag::TEST`.
+///
+/// A law that changes from `law` to `law/host` is a **different claim** — the
+/// first says nothing outside the program decides it — so it must re-discharge
+/// rather than reuse a certificate about a claim it no longer makes.
+///
+/// The second half is what bounds the blast radius of the `BODY_ENCODING` bump:
+/// no definition's hash moves for a law's sake.
+#[test]
+fn declaring_a_law_host_changes_the_law_and_no_definition() {
+    const PLAIN: &str = "\
+fn f(x: Int) -> Int = x + 1
+
+fn g(x: Int) -> Int = f(x) * 2
+
+law \"f grows\"
+  forall (x: Int) {
+    f(x) > x
+  }
+";
+    const HOSTED: &str = "\
+fn f(x: Int) -> Int = x + 1
+
+fn g(x: Int) -> Int = f(x) * 2
+
+law/host \"f grows\"
+  forall (x: Int) {
+    f(x) > x
+  }
+";
+    let before = hashes(PLAIN);
+    let after = hashes(HOSTED);
+    assert_ne!(
+        before.laws, after.laws,
+        "`law/host` is a different claim and must re-discharge"
+    );
+    assert_eq!(
+        before.defs, after.defs,
+        "a law's declaration moved a definition's hash"
+    );
+}

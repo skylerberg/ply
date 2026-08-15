@@ -66,7 +66,7 @@ pub use schema::fingerprint as schema_fingerprint;
 /// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
 /// `string_upper` read `std`'s Unicode tables, which is the one thing the
 /// evaluator does that this repository does not decide.
-pub const RUNTIME_VERSION: &str = "0.9.0";
+pub const RUNTIME_VERSION: &str = "0.10.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -84,7 +84,7 @@ pub const RUNTIME_VERSION: &str = "0.9.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.11.0";
+pub const FRONTEND_VERSION: &str = "0.12.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
@@ -97,7 +97,10 @@ pub const FRONTEND_VERSION: &str = "0.11.0";
 /// Bump it for any change to the fragment, to a rule's meaning, to generation or
 /// shrinking, or to the on-disk shape of a [`CachedObligation`] — none of those
 /// moves an obligation's key, and all of them change what a cache hit claims.
-pub const PROVER_VERSION: &str = "0.4.0";
+/// 0.5.0 is `law/host`: a new discharge mode, with a new ceiling — `property`,
+/// structurally, because the static tier and the finite enumeration are both
+/// skipped for a body whose row is non-empty — and a new unattempted reason.
+pub const PROVER_VERSION: &str = "0.5.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///

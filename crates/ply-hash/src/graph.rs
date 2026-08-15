@@ -113,6 +113,36 @@ pub struct ProgramIndex<'a> {
     pub result: Symbol,
     items: Vec<ModuleItems>,
     scopes: Vec<ScopeIndex>,
+    effect_sketches: FxHashMap<usize, Vec<u8>>,
+}
+
+/// Each effect declaration's own normalized bytes, written against empty tables
+/// so that they are a function of that declaration and of nothing else in the
+/// program. They are a tie-break and never a hash input, which is why they may
+/// be this coarse: a reference inside them is `REF_SELF`, so two effects whose
+/// operations differ only in the types they name sketch alike and fall back to
+/// the order they were written in.
+fn sketch_effects(index: &ProgramIndex<'_>) -> FxHashMap<usize, Vec<u8>> {
+    let no_hashes = crate::normalize::HashTable::default();
+    let no_component = crate::normalize::ComponentIndices::default();
+    let no_effects = crate::normalize::EffectIndex::default();
+    index
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.body, NodeBody::Effect(_)))
+        .map(|(v, node)| {
+            let mut nz = crate::normalize::Normalizer::new(
+                index,
+                node.module,
+                &no_hashes,
+                &no_component,
+                &no_effects,
+            );
+            nz.node(node.body);
+            (v, nz.finish().0)
+        })
+        .collect()
 }
 
 fn qualifier(q: &QName) -> Option<&Symbol> {
@@ -287,7 +317,7 @@ impl<'a> ProgramIndex<'a> {
         }
 
         let scopes = build_scopes(&modules, &all_items, resolved);
-        Ok(ProgramIndex {
+        let mut index = ProgramIndex {
             modules,
             nodes,
             tests,
@@ -296,7 +326,17 @@ impl<'a> ProgramIndex<'a> {
             result: Symbol::new("result"),
             items: all_items,
             scopes,
-        })
+            effect_sketches: FxHashMap::default(),
+        };
+        index.effect_sketches = sketch_effects(&index);
+        Ok(index)
+    }
+
+    /// The declaration bytes an effect reference is *ordered* by when the atom
+    /// bytes cannot separate two effects. Never written into a hash: see
+    /// [`crate::normalize::Normalizer::row`].
+    pub fn effect_sketch(&self, node: NodeId) -> Option<&[u8]> {
+        self.effect_sketches.get(&node.0).map(Vec::as_slice)
     }
 
     pub fn is_effect(&self, node: NodeId) -> bool {
