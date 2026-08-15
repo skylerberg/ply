@@ -112,6 +112,7 @@ fn op(effect: &str, name: &str) -> HostOp {
         determinism: Determinism::Nondeterministic,
         linearity: Linearity::AtMostOnce,
         blocking: false,
+        secrets: false,
         path: "test::send",
     }
 }

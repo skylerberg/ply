@@ -144,7 +144,9 @@ fn the_structural_codecs_are_composed_by_name() {
             "{JSON}type Wrap = {{a: Option<Int>, {field}}}\nderive json for Wrap"
         )));
         assert!(
-            refused.iter().any(|d| d.code == ply_span::codes::NOT_DERIVABLE),
+            refused
+                .iter()
+                .any(|d| d.code == ply_span::codes::NOT_DERIVABLE),
             "`{field}` composes a codec that writes `Some` and `None` alike: {refused:?}"
         );
     }

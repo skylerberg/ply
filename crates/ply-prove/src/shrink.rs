@@ -164,7 +164,11 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             // A closure this crate generated carries the size it was built with;
             // anything else is left alone rather than guessed at.
             Value::Closure(_) => fn_size(v).unwrap_or(1),
-            Value::Cell(_) | Value::Task(_) | Value::Continuation(_) => 0,
+            // A `Secret` is unreachable here: `forall (s: Secret<a>)` is `E0418`,
+            // so the generator never mints one and no counterexample holds one.
+            // Zero rather than a walk of the payload, because a shrinker that
+            // measured a credential would be a shrinker steering toward it.
+            Value::Cell(_) | Value::Task(_) | Value::Continuation(_) | Value::Secret(_) => 0,
         };
         total = total.saturating_add(here);
     }
@@ -265,6 +269,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             "Map" => Ok(Value::empty_map()),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
+            _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some((variant, fields)) = shallowest(name, args, world) else {
                     return Err(Ungeneratable::Uninhabited(name.clone()));

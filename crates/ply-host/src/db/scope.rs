@@ -499,7 +499,10 @@ impl ScopeTable {
         // `RELEASE SAVEPOINT` inside an aborted subtransaction does not clear the
         // failed state — only `ROLLBACK TO SAVEPOINT` does — so a commit carries
         // the poison outward and an abort drops it with the scope.
-        if poisoned && commit && let Some(outer) = held.open.last_mut() {
+        if poisoned
+            && commit
+            && let Some(outer) = held.open.last_mut()
+        {
             outer.poisoned = true;
         }
         if held.open.is_empty() {
@@ -544,6 +547,23 @@ impl ScopeTable {
     /// line and for a test that has to assert what is still open.
     pub fn open_leases(&self) -> Vec<LeaseId> {
         self.held.values().map(|held| held.lease).collect()
+    }
+
+    /// Every open scope, whichever entry point opened it, and the table left
+    /// empty.
+    ///
+    /// The process is stopping, so there is no entry point left to corrupt —
+    /// which is the one condition under which emptying the table is right, and
+    /// it is why this is a separate method from
+    /// [`end_entry_point`](ScopeTable::end_entry_point) rather than a flag on
+    /// it. Every lease it answers is `ROLLBACK`ed and **none is committed**: a
+    /// commit at a deadline commits a half-finished body, and the only thing
+    /// that knows whether a body finished is the body.
+    pub fn shutdown(&mut self) -> Vec<LeaseId> {
+        std::mem::take(&mut self.held)
+            .into_values()
+            .map(|held| held.lease)
+            .collect()
     }
 }
 

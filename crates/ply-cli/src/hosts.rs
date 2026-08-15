@@ -15,6 +15,7 @@
 //!   rather than the count quietly over-claiming.
 
 use crate::commands::common::plural;
+use crate::config::Configuration;
 use crate::db::{self, Database, DbConfig};
 use ply_core::CheckOutput;
 use ply_core::ty::Footprint;
@@ -41,15 +42,20 @@ pub fn registry() -> HostRegistry {
 /// serves: a program with no database in it should print the trusted computing
 /// base it actually has, and one with a database should print the driver
 /// whether or not this invocation named a server to point it at.
-fn registry_for(check: &CheckOutput) -> HostRegistry {
-    if check
+/// `trace` is the sink the run selected, and it decides the `HANDLER` column of
+/// every `trace` row. `None` for a run that binds nothing: a hermetic listing
+/// answers "what would bind", and naming a sink there would say a run writes
+/// records when no run is happening.
+fn registry_for(check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
+    let database = check
         .effects
         .values()
-        .any(|e| e.name.as_str() == ply_host::db::EFFECT)
-    {
-        return ply_host::registry_with_database();
+        .any(|e| e.name.as_str() == ply_host::db::EFFECT);
+    match trace {
+        Some(trace) => ply_host::registry_over(trace, database),
+        None if database => ply_host::registry_with_database(),
+        None => ply_host::registry(),
     }
-    ply_host::registry()
 }
 
 /// What a run has bound, and what it *could* have bound.
@@ -79,10 +85,21 @@ pub struct Hosts {
     /// the sentence a report has to carry about having touched a real one —
     /// reads it, and none of them may re-derive it from the command line.
     db: Option<DbConfig>,
+    /// What the run resolved its configuration to, held for the same reason
+    /// `db` is: the `configuration` block, the start-up banner and the digest
+    /// all read it, and none of them may re-derive it from the command line.
+    config: Configuration,
     /// The `--db-schema` function, resolved against the program at start-up.
     /// The *counts* are filled in by whichever command evaluates it; the name
     /// is checked here, where a mistake is a start-up refusal.
     schema: Option<db::schema::SchemaView>,
+    /// Where this run's records go and on which channels, when the program
+    /// records at all. `None` leaves the block and the digest where they were
+    /// for every program that never mentions `std.trace`.
+    observability: Option<Observability>,
+    /// The stop this run listens for. `None` under `ply test`, which binds no
+    /// signal handler with or without `--host`.
+    shutdown: Option<Shutdown>,
 }
 
 impl Hosts {
@@ -106,21 +123,67 @@ impl Hosts {
     /// discharges every `db` atom in Ply and needs no server. A caller with no
     /// entry point — `ply hosts`, which lists rather than runs — passes `None`
     /// and the binding decides.
+    ///
+    /// `config` is the run's resolved configuration. It arrives already
+    /// resolved because resolving it needs an evaluator — `--config-schema`
+    /// names a function — and because `E0441` and `E0442` have to be raised
+    /// before a socket is opened rather than beside one. A hermetic run passes
+    /// [`Configuration::default`], which opened no source at all.
+    ///
+    /// `trace` is the sink this run selected. It is never `None`: `--trace off`
+    /// is `ply_host::trace::discard`, a listed handler, because a row cannot be
+    /// conditional on a flag and an unregistered `trace` would be `E0424` at the
+    /// first event.
+    ///
+    /// [`Configuration::default`]: crate::config::Configuration
     pub fn open(
         check: &CheckOutput,
         host: bool,
         credentials: &[tls::CredentialSpec],
         db: Option<DbConfig>,
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
         reach: Option<&Footprint>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_stopping(check, host, credentials, db, config, trace, reach, None)
+    }
+
+    /// The same, for a run that listens for a stop.
+    ///
+    /// Only `ply run` passes one. `ply test` binds `trace`, `config`, `db` and
+    /// `net` and binds **no** signal handler, with or without `--host`: a test
+    /// that could be ended by the suite's own ctrl-C, or that observed a stop
+    /// another test requested, is a test whose verdict depends on the terminal.
+    /// The coordinator has to be here rather than attached afterwards because
+    /// the registry is built from the `Host`, and whether `signal` is bound or
+    /// withheld is decided there.
+    /// Eight arguments, and each is a different thing the run was configured
+    /// with. Bundling them into one struct would put the credentials, the
+    /// database, the configuration, the sink and the stop flag behind one name
+    /// and make what a caller supplies invisible at the call site — which is the
+    /// opposite of what a trusted computing base's entry point wants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_stopping(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &[tls::CredentialSpec],
+        db: Option<DbConfig>,
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
+        reach: Option<&Footprint>,
+        shutdown: Option<Arc<ply_host::signal::Shutdown>>,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
-            let registry = registry_for(check);
+            let registry = registry_for(check, None);
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
                 db: None,
+                config: Configuration::default(),
                 schema: None,
+                observability: None,
+                shutdown: None,
             });
         }
         let material = tls::Credentials::load(credentials)?;
@@ -133,36 +196,69 @@ impl Hosts {
         // the first statement: a service that discovers its database is
         // unreachable on the first request has already told a client it was
         // listening.
-        let facilities = Arc::new(match db.as_ref().filter(|_| reaches_db(check, reach)) {
-            Some(config) => {
-                let (url, bounds) = config.pool_config();
-                ply_host::Host::with_database(
-                    material,
-                    ply_host::db::PoolConfig {
-                        url: url.expose().to_string(),
-                        size: bounds.size,
-                        acquire: bounds.acquire,
-                        statement: bounds.statement,
-                        idle_txn: bounds.idle_txn,
-                        connect: bounds.connect,
-                        statements: bounds.statements,
-                    },
-                )
-                .map_err(|d| vec![d])?
+        let facilities = Arc::new(
+            match db.as_ref().filter(|_| reaches_db(check, reach)) {
+                Some(config) => {
+                    let (url, bounds) = config.pool_config();
+                    ply_host::Host::with_database(
+                        material,
+                        ply_host::db::PoolConfig {
+                            url: url.expose().to_string(),
+                            size: bounds.size,
+                            acquire: bounds.acquire,
+                            statement: bounds.statement,
+                            idle_txn: bounds.idle_txn,
+                            connect: bounds.connect,
+                            statements: bounds.statements,
+                        },
+                    )
+                    .map_err(|d| vec![d])?
+                }
+                None => ply_host::Host::with_credentials(material),
             }
-            None => ply_host::Host::with_credentials(material),
-        });
+            .configured(Arc::clone(&config.snapshot))
+            .traced(trace.open()),
+        );
+        let facilities = match shutdown {
+            Some(shutdown) => Arc::new(
+                Arc::try_unwrap(facilities)
+                    .unwrap_or_else(|_| unreachable!("the only `Arc` was just built"))
+                    .stopping_on(shutdown),
+            ),
+            None => facilities,
+        };
         let registry = facilities.registry();
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
         let schema = db_schema(check, db.as_ref(), &listing, reach)?;
+        let observability = Observability::of(&listing, facilities.tracing(), trace.level_name());
+        let stopping = facilities
+            .stop()
+            .and_then(|shutdown| Shutdown::of(&listing, shutdown));
         Ok(Hosts {
             host: Some(facilities),
             binding: Arc::new(binding),
             listing,
             db,
+            config,
             schema,
+            observability,
+            shutdown: stopping,
         })
+    }
+
+    /// What the run resolved its configuration to: the `configuration` block,
+    /// the banner's config line, and the digest's contribution.
+    pub fn configuration(&self) -> &Configuration {
+        &self.config
+    }
+
+    /// What the sink saw, for the line a stopping service prints. Counted by
+    /// the sink itself, so a run whose log looks empty can tell "nothing
+    /// happened" from "nothing was written". `None` for a hermetic run, which
+    /// has no sink to have counted anything.
+    pub fn trace_counts(&self) -> Option<ply_host::trace::Counts> {
+        self.host.as_ref().map(|host| host.tracing().counts())
     }
 
     /// The configuration a run was given, for the driver and for the report.
@@ -218,6 +314,9 @@ impl Hosts {
         Disclosures {
             transport: self.transport(),
             database: self.database(),
+            configuration: Some(self.config.clone()).filter(Configuration::is_opened),
+            observability: self.observability.clone(),
+            shutdown: self.shutdown,
         }
     }
 
@@ -254,7 +353,10 @@ impl Hosts {
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
                 db: None,
+                config: Configuration::default(),
                 schema: None,
+                observability: None,
+                shutdown: None,
             });
         }
         let binding = registry.bind(check)?;
@@ -265,14 +367,20 @@ impl Hosts {
             binding: Arc::new(binding),
             listing,
             db,
+            config: Configuration::default(),
             schema,
+            observability: None,
+            shutdown: None,
         })
     }
 
     /// Everything the registry resolves to, bound or not: what `ply hosts`
     /// prints and what CI pins a digest of.
-    pub fn preview(check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>> {
-        registry_for(check).preview(check)
+    pub fn preview(
+        check: &CheckOutput,
+        trace: Option<Arc<ply_host::trace::Trace>>,
+    ) -> Result<HostListing, Vec<Diagnostic>> {
+        registry_for(check, trace).preview(check)
     }
 
     /// A reactor for one machine, on the thread that will drive it.
@@ -675,6 +783,178 @@ impl Transport {
     }
 }
 
+/// Where a run's records go and on which channels.
+///
+/// The channel list is the resolved resource labels of the bound `trace` rows —
+/// a fact the listing already holds, computed nowhere else. `ply check --types`
+/// answers "which channels does this endpoint record on" per definition; this is
+/// the same answer for the whole program, which is the one an operator reads.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Observability {
+    sink: &'static str,
+    destination: &'static str,
+    /// `None` for `ply_host::trace::discard`. A level on a discarding sink is a
+    /// distinction with no consequence, and printing one would invite a reader
+    /// to believe `--trace off --trace-level debug` writes something.
+    level: Option<&'static str>,
+    channels: Vec<String>,
+}
+
+impl Observability {
+    /// `None` for a program that never mentions `std.trace`, which is what keeps
+    /// every W3 and W4 corpus's block and digest where they were.
+    fn of(
+        listing: &HostListing,
+        trace: &Arc<ply_host::trace::Trace>,
+        level: &'static str,
+    ) -> Option<Observability> {
+        let mut channels: Vec<String> = listing
+            .rows
+            .iter()
+            .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
+            .filter_map(|row| match &row.resource {
+                ply_core::ty::Resource::Named(name) => Some(name.as_str().to_string()),
+                ply_core::ty::Resource::Singleton => None,
+            })
+            .collect();
+        channels.sort();
+        channels.dedup();
+        if channels.is_empty() {
+            return None;
+        }
+        let sink = trace.sink_path();
+        Some(Observability {
+            sink,
+            destination: trace.sink_destination(),
+            level: (sink != ply_host::trace::DISCARD_PATH).then_some(level),
+            channels,
+        })
+    }
+
+    fn lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "sink       {} → {}{}",
+                self.sink,
+                self.destination,
+                self.level_suffix()
+            ),
+            format!("channels   {}", self.channels.join(" ")),
+            "spans      per-task stack · closed at end_entry_point".to_string(),
+        ]
+    }
+
+    /// The same three facts on one line, for the start-up banner.
+    pub fn banner(&self) -> String {
+        format!(
+            "{} → {}{} · channels {}",
+            self.sink,
+            self.destination,
+            self.level_suffix(),
+            self.channels.join(" "),
+        )
+    }
+
+    fn level_suffix(&self) -> String {
+        match self.level {
+            Some(level) => format!(" · level {level}"),
+            None => String::new(),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "sink": self.sink,
+            "destination": self.destination,
+            "level": self.level,
+            "channels": self.channels,
+        })
+    }
+
+    /// The sink's path, its level and the channel list. All three are structural:
+    /// a service that started writing to a different sink, or recording on a
+    /// channel nobody reviewed, is a change CI should break on.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for text in [self.sink, self.destination, self.level.unwrap_or("")] {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        }
+        hasher.update(&(self.channels.len() as u64).to_le_bytes());
+        for channel in &self.channels {
+            hasher.update(&(channel.len() as u64).to_le_bytes());
+            hasher.update(channel.as_bytes());
+        }
+    }
+}
+
+/// What a `SIGINT` or a `SIGTERM` does to this run.
+///
+/// `None` under `ply test`, which binds no signal handler with or without
+/// `--host`: a test that could be ended by the suite's own ctrl-C is a test
+/// whose verdict depends on the terminal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shutdown {
+    /// `SIGTERM` does not exist on Windows, so which signals a run listens for
+    /// is a fact printed rather than a surprise a deployment discovers.
+    signals: [Option<&'static str>; 2],
+    lead_ms: u128,
+    drain_ms: u128,
+}
+
+impl Shutdown {
+    /// `None` for a program that never mentions `std.signal`, which is what
+    /// keeps every W3 and W4 corpus's block and digest where they were.
+    fn of(listing: &HostListing, shutdown: &Arc<ply_host::signal::Shutdown>) -> Option<Shutdown> {
+        if !listing
+            .rows
+            .iter()
+            .any(|row| row.effect.as_str() == ply_host::signal::EFFECT)
+        {
+            return None;
+        }
+        let mut signals = [None, None];
+        for (slot, signal) in signals.iter_mut().zip(shutdown.signals()) {
+            *slot = Some(signal.name());
+        }
+        let bounds = shutdown.bounds();
+        Some(Shutdown {
+            signals,
+            lead_ms: bounds.lead.as_millis(),
+            drain_ms: bounds.drain.as_millis(),
+        })
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.signals.iter().flatten().copied().collect()
+    }
+
+    fn lines(&self) -> Vec<String> {
+        vec![format!(
+            "signals    {} · lead {}ms · drain {}ms · second signal exits 130/143",
+            self.names().join(" "),
+            self.lead_ms,
+            self.drain_ms,
+        )]
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "signals": self.names(),
+            "lead_ms": self.lead_ms,
+            "drain_ms": self.drain_ms,
+        })
+    }
+
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for name in self.names() {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.update(&(self.lead_ms as u64).to_le_bytes());
+        hasher.update(&(self.drain_ms as u64).to_le_bytes());
+    }
+}
+
 /// The blocks `ply hosts` prints under the table: facts about the trusted
 /// computing base that no row can carry.
 ///
@@ -684,25 +964,53 @@ impl Transport {
 pub struct Disclosures {
     pub transport: Option<Transport>,
     pub database: Option<Database>,
+    /// The run's configuration, when it opened any source. `None` for a
+    /// hermetic run, so that a W4 corpus's digest does not move for want of a
+    /// block it has nothing to put in.
+    pub configuration: Option<Configuration>,
+    pub observability: Option<Observability>,
+    pub shutdown: Option<Shutdown>,
 }
 
 impl Disclosures {
     /// What a command that has no [`Hosts`] builds — `ply hosts` resolves the
     /// listing without binding, so it assembles these itself.
+    #[allow(clippy::too_many_arguments)]
     pub fn of(
         listing: &HostListing,
         credentials: Option<&tls::Credentials>,
         db: Option<DbConfig>,
         schema: Option<db::schema::SchemaView>,
+        configuration: Option<Configuration>,
+        trace: Option<&Arc<ply_host::trace::Trace>>,
+        level: &'static str,
+        shutdown: Option<&Arc<ply_host::signal::Shutdown>>,
     ) -> Disclosures {
         Disclosures {
             transport: Transport::of(listing, credentials),
             database: Database::of(Database::operations_of(listing), db, None, schema),
+            configuration: configuration.filter(Configuration::is_opened),
+            observability: trace.and_then(|trace| Observability::of(listing, trace, level)),
+            shutdown: shutdown.and_then(|shutdown| Shutdown::of(listing, shutdown)),
         }
     }
 
+    /// Whether this contributes nothing to the digest.
+    ///
+    /// A configuration block counts only when it is *pinned* — when the run
+    /// named a `--config-schema`. The block is still printed for a run that
+    /// merely opened its sources; it is the digest that must not move, because
+    /// `--host` always reads the environment and a digest that moved for that
+    /// would move on every bound run of every existing program.
     pub fn is_empty(&self) -> bool {
-        self.transport.is_none() && self.database.is_none()
+        self.transport.is_none()
+            && self.database.is_none()
+            && self.observability.is_none()
+            && self.shutdown.is_none()
+            && !self
+                .configuration
+                .as_ref()
+                .is_some_and(Configuration::is_pinned)
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -712,6 +1020,21 @@ impl Disclosures {
         }
         if let Some(database) = &self.database {
             lines.extend(database.lines());
+        }
+        if let Some(configuration) = &self.configuration {
+            lines.push(String::new());
+            lines.push("configuration".to_string());
+            lines.extend(configuration.lines());
+        }
+        if let Some(observability) = &self.observability {
+            lines.push(String::new());
+            lines.push("observability".to_string());
+            lines.extend(observability.lines());
+        }
+        if let Some(shutdown) = &self.shutdown {
+            lines.push(String::new());
+            lines.push("shutdown".to_string());
+            lines.extend(shutdown.lines());
         }
         lines
     }
@@ -737,6 +1060,24 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
         hasher.update(DATABASE_DOMAIN);
         database.hash_into(&mut hasher);
     }
+    // The schema function's name and every key's name and shape, and none of
+    // the resolved values: a CI check that broke on a deployment's own
+    // configuration is a CI check people learn to ignore.
+    if let Some(configuration) = disclosures.configuration.as_ref().filter(|c| c.is_pinned()) {
+        hasher.update(CONFIGURATION_DOMAIN);
+        configuration.digest_into(&mut |text| {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        });
+    }
+    if let Some(observability) = &disclosures.observability {
+        hasher.update(OBSERVABILITY_DOMAIN);
+        observability.hash_into(&mut hasher);
+    }
+    if let Some(shutdown) = &disclosures.shutdown {
+        hasher.update(SHUTDOWN_DOMAIN);
+        shutdown.hash_into(&mut hasher);
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(15);
     out.push_str("b3:");
@@ -757,6 +1098,15 @@ const DISCLOSURE_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
 /// Separates the database block from whatever precedes it, so that a
 /// transport-only listing and a database-only listing cannot collide.
 const DATABASE_DOMAIN: &[u8] = b"ply.hosts.database.v1\0";
+
+/// Separates the configuration block from whatever precedes it, for the reason
+/// [`DATABASE_DOMAIN`] exists.
+const CONFIGURATION_DOMAIN: &[u8] = b"ply.hosts.configuration.v1\0";
+
+/// Separates the observability and shutdown blocks, for the reason
+/// [`DATABASE_DOMAIN`] exists.
+const OBSERVABILITY_DOMAIN: &[u8] = b"ply.hosts.observability.v1\0";
+const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 
 /// A fingerprint short enough to sit in the table beside the name it belongs
 /// to. `--json` carries the whole of it, because a reader comparing against
@@ -783,9 +1133,21 @@ fn abbreviate(fingerprint: &str) -> String {
 /// and the atom is what scheduling and isolation speak in. Deriving one from the
 /// other means reading a mode annotation in another file, which is not work a
 /// reviewer should do to answer "what can this program touch".
-const HEADERS: [&str; 6] = ["OPERATION", "ATOM", "HANDLER", "DET", "LINEAR", "BLOCKING"];
+///
+/// `SECRETS` is last and is the newest: it is the one column that says where
+/// ADR 0015 §2.1's claim stops being enforceable and starts being review, and a
+/// row that reads `yes` is the single most review-worthy line in the listing.
+const HEADERS: [&str; 7] = [
+    "OPERATION",
+    "ATOM",
+    "HANDLER",
+    "DET",
+    "LINEAR",
+    "BLOCKING",
+    "SECRETS",
+];
 
-fn cells(row: &HostRow) -> [String; 6] {
+fn cells(row: &HostRow) -> [String; 7] {
     [
         row.to_string(),
         row.atom.to_string(),
@@ -793,6 +1155,7 @@ fn cells(row: &HostRow) -> [String; 6] {
         yes_no(row.deterministic),
         row.linearity.as_str().to_string(),
         yes_no(row.blocking),
+        yes_no(row.secrets),
     ]
 }
 
@@ -815,7 +1178,7 @@ pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<St
     if listing.rows.is_empty() {
         lines.push(empty_note(listing));
     } else {
-        let rows: Vec<[String; 6]> = listing.rows.iter().map(cells).collect();
+        let rows: Vec<[String; 7]> = listing.rows.iter().map(cells).collect();
         // Widths from the content rather than from a guess, so a long Rust path
         // does not push the flag columns out of alignment. Every row is present
         // in every run, so the widths are as deterministic as the rows.
@@ -825,7 +1188,7 @@ pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<St
                 *width = (*width).max(cell.chars().count());
             }
         }
-        let line = |cells: &[String; 6]| {
+        let line = |cells: &[String; 7]| {
             let mut out = String::new();
             for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
                 if i + 1 == cells.len() {
@@ -899,6 +1262,11 @@ pub fn row_json(row: &HostRow) -> Value {
         "deterministic": row.deterministic,
         "linearity": row.linearity.as_json(),
         "blocking": row.blocking,
+        // Whether this operation may be handed a value containing a `Secret`.
+        // `false` on every W5 row: the check is landed with a user count of
+        // zero, because adding it after the first operation that needed it had
+        // already shipped is the wrong order.
+        "secrets": row.secrets,
         // The other half of the pair E0423 checks. A reviewer who sees only
         // `deterministic` cannot tell a handler that is honestly deterministic
         // from one serving an effect nobody marked `nondet`.
@@ -956,8 +1324,17 @@ pub(crate) mod fixture {
             determinism: Determinism::Nondeterministic,
             linearity,
             blocking,
+            secrets: false,
             path,
         }
+    }
+
+    /// The same registration, declared able to receive a credential. No W5
+    /// operation is, so the reporting of that column needs a fixture to have
+    /// anything but `no` to print.
+    pub(crate) fn receives_secrets(mut op: HostOp) -> HostOp {
+        op.secrets = true;
+        op
     }
 
     pub(crate) fn named(label: &str) -> HostResource {
@@ -984,7 +1361,7 @@ pub(crate) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{op, registry};
+    use super::fixture::{op, receives_secrets, registry};
     use super::*;
     use ply_core::ty::Resource;
     use ply_eval::host::{HostResource, Linearity};
@@ -1077,11 +1454,11 @@ fn stamp() -> Int / {clock.read} = clock.now()
             "\
 3 host handlers · 4 operations · trusted computing base
 
-OPERATION       ATOM              HANDLER                    DET  LINEAR        BLOCKING
-clock.now       clock.read        ply_host::clock::now       no   repeatable    no
-db.get[orders]  db.read[orders]   ply_host::postgres::read   no   at-most-once  yes
-db.get[users]   db.read[users]    ply_host::postgres::read   no   at-most-once  yes
-db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  yes
+OPERATION       ATOM              HANDLER                    DET  LINEAR        BLOCKING  SECRETS
+clock.now       clock.read        ply_host::clock::now       no   repeatable    no        no
+db.get[orders]  db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
+db.get[users]   db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
+db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
 "
         );
         assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
@@ -1129,6 +1506,44 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         assert_ne!(one, base);
         assert_ne!(one, linear, "linearity alone must move the digest");
         assert_ne!(one, blocks, "blocking alone must move the digest");
+
+        // The newest column, and the one whose value a reviewer most needs a
+        // diff for: a handler that quietly became able to receive a credential
+        // is where ADR 0015 §2.1's claim stops being enforceable.
+        let secrets = registry(vec![receives_secrets(op(
+            "clock",
+            "now",
+            HostResource::Only(Resource::Singleton),
+            Linearity::Repeatable,
+            false,
+            "ply_host::clock::now",
+        ))])
+        .preview(&program)
+        .unwrap();
+        assert_ne!(
+            one,
+            secrets.digest_short(),
+            "the secrets column alone must move the digest"
+        );
+        let text = listing_lines(&secrets, &Disclosures::default()).join("\n");
+        assert!(text.contains("SECRETS"), "{text}");
+        assert!(text.lines().any(|l| l.ends_with("yes")), "{text}");
+        assert_eq!(row_json(&secrets.rows[0])["secrets"], true);
+    }
+
+    /// Every registration this binary ships declares `secrets: false`. The check
+    /// is landed with a user count of zero, and this is the assertion that says
+    /// so — it is meant to fail the day W6 adds the first `true`, so that the
+    /// addition is a reviewed change rather than a silent one.
+    #[test]
+    fn no_shipped_registration_declares_that_it_may_receive_a_credential() {
+        let claiming: Vec<&str> = crate::hosts::registry()
+            .ops()
+            .chain(ply_host::registry_with_database().ops())
+            .filter(|op| op.secrets)
+            .map(|op| op.path)
+            .collect();
+        assert!(claiming.is_empty(), "{claiming:?}");
     }
 
     #[test]
@@ -1192,7 +1607,16 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     #[test]
     fn hermetic_is_the_default_and_reaches_nothing() {
         let program = check(DB);
-        let hosts = Hosts::open(&program, false, &[], None, None).unwrap();
+        let hosts = Hosts::open(
+            &program,
+            false,
+            &[],
+            None,
+            Configuration::default(),
+            &crate::trace::TraceOptions::silent(),
+            None,
+        )
+        .unwrap();
         assert!(hosts.is_hermetic());
         assert_eq!(hosts.label(), "hermetic");
         assert!(hosts.listing().is_empty());
@@ -1229,7 +1653,16 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
 
         // The same corpus under a hermetic binding: the host column is empty and
         // every other number is what it was before W1.
-        let hermetic = Hosts::open(&program, false, &[], None, None).unwrap();
+        let hermetic = Hosts::open(
+            &program,
+            false,
+            &[],
+            None,
+            Configuration::default(),
+            &crate::trace::TraceOptions::silent(),
+            None,
+        )
+        .unwrap();
         let counts = Counts::of(
             &hermetic,
             [(&reads.footprint, true), (&pure, true), (&pure, false)],
@@ -1388,7 +1821,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     fn transport_only(transport: Transport) -> Disclosures {
         Disclosures {
             transport: Some(transport),
-            database: None,
+            ..Disclosures::default()
         }
     }
 

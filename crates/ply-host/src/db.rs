@@ -172,6 +172,11 @@ impl Op {
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: true,
+            // A `Param` has no `PSecret` case, so a credential cannot be bound
+            // into a statement. A password that must reach postgres is
+            // configured beside the run and held in `ply_cli::db::Secret`; it
+            // never enters the program.
+            secrets: false,
             path: self.path(),
         }
     }

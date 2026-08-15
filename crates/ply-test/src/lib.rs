@@ -1527,8 +1527,15 @@ fn is_divergence(d: &Diagnostic) -> bool {
 /// happened to run through — and the diagnostic's own last note already tells
 /// the reader this is Ply's fault, so classifying it as the program's would
 /// contradict the text the run prints.
+///
+/// `E0439` belongs here for the same reason and one more: bisecting a credential
+/// that reached the boundary would re-run the program that carried it, once per
+/// candidate, against the handler that must not receive it.
 fn is_defect(d: &Diagnostic) -> bool {
-    d.code == codes::INTERNAL_ERROR || d.code == codes::HOST_FOOTPRINT_ESCAPE || is_divergence(d)
+    d.code == codes::INTERNAL_ERROR
+        || d.code == codes::HOST_FOOTPRINT_ESCAPE
+        || d.code == codes::SECRET_TO_HOST
+        || is_divergence(d)
 }
 
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {

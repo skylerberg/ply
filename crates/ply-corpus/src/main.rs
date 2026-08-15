@@ -49,6 +49,11 @@ enum Command {
     /// against the same statement with no Ply in the path, the pool, and a
     /// route that hits the database against one that does not.
     W4(W4Args),
+    /// Price what W5 put around it: a trace operation against the same loop
+    /// performing none, the service with only `--trace` moved, a drain with
+    /// requests in flight, what the deadline does to an open transaction, and
+    /// what a deploy ships.
+    W5(W5Args),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -611,6 +616,162 @@ fn w4(args: W4Args) -> Result<()> {
 }
 
 #[derive(Args, Debug)]
+struct W5Args {
+    /// The repository root, which is where `examples/desk.ply` is read from.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    /// The database the served sections run against. It must already hold the
+    /// desk's schema — `--db-schema desk.schema` refuses at bind time if not —
+    /// and the transaction section writes one order into it and expects the
+    /// teardown to take it away again.
+    #[arg(long)]
+    db: Option<String>,
+    /// Trace operations per point in the `events` table.
+    #[arg(long, default_value_t = 20_000)]
+    operations: u32,
+    /// Operations per twin point. Smaller because `std.trace`'s `Sink` appends
+    /// with `push` and is therefore quadratic in the records it holds, and a
+    /// twin lives inside one test holding tens of them.
+    #[arg(long, default_value_t = 200)]
+    twin_operations: u32,
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Client concurrencies in the `served` table.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
+    concurrency: Vec<u32>,
+    #[arg(long, default_value_t = 32)]
+    per_conn: u32,
+    #[arg(long, default_value_t = 3000)]
+    requests_per_point: u32,
+    /// Requests in flight when the signal arrives.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
+    in_flight: Vec<u32>,
+    #[arg(long, default_value_t = 5_000)]
+    drain_ms: u64,
+    /// How long a client holds its half-sent request before finishing it, in
+    /// the points whose drain is meant to complete.
+    #[arg(long, default_value_t = 500)]
+    hold_ms: u64,
+    /// The credential the served desk is configured with. A benchmark's key is
+    /// a fixture credential and is not a credential.
+    #[arg(long, default_value = "bench-key")]
+    api_key: String,
+    /// Serve the `served` table from the task-per-connection accept loop rather
+    /// than `examples/desk.ply`'s sequential one. A sequential server answers
+    /// one connection at a time, so a tail latency at concurrency 8 is a queue
+    /// rather than a service.
+    #[arg(long)]
+    concurrent: bool,
+    /// Sections to drop, for a run pointed at one question.
+    #[arg(long)]
+    no_events: bool,
+    #[arg(long)]
+    no_served: bool,
+    #[arg(long)]
+    no_drain: bool,
+    #[arg(long)]
+    no_transaction: bool,
+    #[arg(long)]
+    no_deploy: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn w5(args: W5Args) -> Result<()> {
+    use ply_corpus::w5;
+
+    let ply = match &args.ply {
+        Some(path) => path.clone(),
+        None => ply_corpus::serve::ply_binary()?,
+    };
+    let mut out = w5::Measurements::default();
+    if !args.no_events {
+        let dir = tempfile::tempdir().context("a temp dir for the file sink")?;
+        out.events = w5::events(
+            args.operations,
+            args.twin_operations,
+            args.repeats,
+            dir.path(),
+        )?;
+    }
+    if !args.no_deploy {
+        // One definition's body, and one that nothing in `desk.ply` reads at
+        // start-up, so the second build differs in exactly one leaf and its
+        // dependents rather than in the shape of the program.
+        out.deploy = Some(w5::deploy(
+            &args.repo,
+            &ply,
+            (
+                "fn store_reachable() -> db::Stmt = db::stmt(\"select count(*) from items\")",
+                "fn store_reachable() -> db::Stmt = db::stmt(\"select count(*) from orders\")",
+            ),
+        )?);
+    }
+    if let Some(url) = &args.db {
+        if !args.no_served {
+            out.served = w5::tracing(
+                &args.repo,
+                &ply,
+                url,
+                &[w5::Stack::Twin, w5::Stack::Postgres, w5::Stack::PostgresTls],
+                if args.concurrent {
+                    ply_corpus::w3::Variant::TaskPerConn
+                } else {
+                    ply_corpus::w3::Variant::Sequential
+                },
+                &[
+                    w5::Sinking::Off,
+                    w5::Sinking::JsonNull,
+                    w5::Sinking::JsonFile,
+                ],
+                &[
+                    ("health (no db)", "/health"),
+                    ("items (1 select)", "/items"),
+                ],
+                &args.concurrency,
+                args.per_conn,
+                args.requests_per_point,
+                &args.api_key,
+            )?;
+        }
+        if !args.no_drain {
+            out.drain = w5::drain(
+                &args.repo,
+                &ply,
+                url,
+                &args.in_flight,
+                args.drain_ms,
+                args.hold_ms,
+                &args.api_key,
+            )?;
+        }
+        if !args.no_transaction {
+            out.transaction = Some(w5::transaction_at_deadline(
+                &args.repo,
+                &ply,
+                url,
+                args.drain_ms,
+                &args.api_key,
+            )?);
+        }
+    } else if !(args.no_served && args.no_drain && args.no_transaction) {
+        anyhow::bail!(
+            "the `served`, `drain` and `transaction` sections need a database: pass `--db`, \
+             or drop them with `--no-served --no-drain --no-transaction`"
+        );
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", w5::render(&out));
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
 struct PayloadArgs {
     /// Line items per JSON payload. Forty is about four kilobytes, which is the
     /// size a real order body arrives at.
@@ -803,6 +964,7 @@ fn run() -> Result<()> {
         Command::Payload(args) => payload(args),
         Command::W3(args) => w3(args),
         Command::W4(args) => w4(args),
+        Command::W5(args) => w5(args),
     }
 }
 

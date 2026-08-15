@@ -40,6 +40,11 @@ pub const ROOT: &str = "std";
 /// cached, so no discovered file can ever produce a key in this space.
 pub const PSEUDO_ROOT: &str = "<std>";
 
+/// The configuration effect, the schema a run checks itself against before it
+/// binds, and the twin a test supplies values through. Named so that
+/// `ply-host`'s snapshot registers against the exact bytes this crate ships.
+pub const CONFIG: &str = include_str!("../ply/config.ply");
+
 /// The database effect and the values that cross it. Named so that
 /// `ply-host`'s postgres driver registers against the exact bytes this crate
 /// ships, for the reason [`NET`] gives: the signature the driver binds to and
@@ -65,15 +70,28 @@ pub const NET: &str = include_str!("../ply/net.ply");
 /// `std.http` for `Method`; the edge never goes the other way.
 pub const ROUTER: &str = include_str!("../ply/router.ply");
 
+/// The observability effect, its values, and the collecting twin a test
+/// substitutes for a sink. Named so that `ply-host`'s sink registers against the
+/// exact bytes this crate ships, for the reason [`NET`] gives.
+pub const TRACE: &str = include_str!("../ply/trace.ply");
+
+/// The stop signal, and the `Stop` twin a test handles it over. Named so that
+/// `ply-host`'s shutdown coordinator registers against the exact bytes this
+/// crate ships.
+pub const SIGNAL: &str = include_str!("../ply/signal.ply");
+
 /// The trusted list, read top to bottom — the same property that makes
 /// `ply-host`'s registry a reviewable trusted computing base. Sorted by name and
 /// free of duplicates, which this crate's own suite checks rather than assumes.
 pub const MODULES: &[(&str, &str)] = &[
+    ("std.config", CONFIG),
     ("std.db", DB),
     ("std.http", HTTP),
     ("std.json", JSON),
     ("std.net", NET),
     ("std.router", ROUTER),
+    ("std.signal", SIGNAL),
+    ("std.trace", TRACE),
 ];
 
 /// The source that ships for a module, or `None` if none does.

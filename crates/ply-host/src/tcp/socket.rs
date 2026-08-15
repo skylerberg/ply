@@ -22,6 +22,7 @@ use rustls::server::ServerConfig;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -31,6 +32,12 @@ enum Sock {
     Listener(Arc<TcpListener>, Option<Arc<ServerConfig>>),
     Stream(Arc<TcpStream>),
     Tls(Arc<tls::Session>),
+    /// A listener the drain closed. The handle stays in the table so that the
+    /// program's own `net.close` still succeeds — `examples/desk.ply` closes its
+    /// listener after the accept loop returns, and a shutdown that made that
+    /// line a diagnostic would be a shutdown the program had to be rewritten
+    /// for, which is exactly what ADR 0015 §4.3 claims it is not.
+    Finished,
 }
 
 /// An accepted connection, whichever transport carries it. `recv` and `send`
@@ -64,6 +71,9 @@ impl Sockets {
         match lock(&self.open).get(&handle) {
             Some(Sock::Listener(l, tls)) => Ok((Arc::clone(l), tls.clone())),
             Some(Sock::Stream(_) | Sock::Tls(_)) => Err(not_a_listener(handle, span)),
+            // Unreachable while `stop_accepting` sets its flag before it swaps
+            // any listener: `accept` reads the flag first and never gets here.
+            Some(Sock::Finished) => Err(not_a_listener(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
     }
@@ -73,9 +83,17 @@ impl Sockets {
         match lock(&self.open).get(&handle) {
             Some(Sock::Stream(s)) => Ok(Conn::Plain(Arc::clone(s))),
             Some(Sock::Tls(s)) => Ok(Conn::Tls(Arc::clone(s))),
-            Some(Sock::Listener(..)) => Err(not_a_stream(handle, span)),
+            Some(Sock::Listener(..) | Sock::Finished) => Err(not_a_stream(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
+    }
+
+    /// Accepted connections the program has not closed.
+    fn connections(&self) -> usize {
+        lock(&self.open)
+            .values()
+            .filter(|s| matches!(s, Sock::Stream(_) | Sock::Tls(_)))
+            .count()
     }
 }
 
@@ -94,6 +112,19 @@ pub struct TcpHost {
     /// listing what there is rather than a socket that speaks plaintext.
     credentials: Credentials,
     handshakes: Arc<Handshakes>,
+    /// Phase 2 of the drain. Read by `accept` before it looks a listener up, and
+    /// by the accept job before it hands back a connection it just took, so a
+    /// connection accepted in the instant the run stopped is closed rather than
+    /// half-served.
+    stopping: Arc<AtomicBool>,
+    /// `accept` operations parked on a pool thread. The drain dials the listener
+    /// once per round while this is non-zero, because a blocking `accept`
+    /// returns for a connection and for nothing else.
+    accepts: Arc<AtomicUsize>,
+    /// Where the listeners phase 2 closed were bound. Kept because the drain
+    /// dials them *after* it has closed them, and a `Finished` entry holds no
+    /// socket to ask.
+    closed_at: Mutex<Vec<SocketAddr>>,
 }
 
 impl Default for TcpHost {
@@ -116,6 +147,9 @@ impl TcpHost {
             pool: Pool::new(),
             credentials,
             handshakes: Arc::new(Handshakes::default()),
+            stopping: Arc::new(AtomicBool::new(false)),
+            accepts: Arc::new(AtomicUsize::new(0)),
+            closed_at: Mutex::new(Vec::new()),
         }
     }
 
@@ -149,6 +183,15 @@ impl TcpHost {
 
     pub fn outstanding(&self) -> usize {
         self.pool.outstanding()
+    }
+
+    /// Wait for at most `bound` for an outstanding operation to finish.
+    ///
+    /// What a drain parks on. An unbounded park would let one task waiting on a
+    /// `recv` that will not complete outlast the drain deadline the whole
+    /// shutdown is bounded by, and there would be nothing to read about it.
+    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
+        self.pool.park_until(bound)
     }
 
     fn waiting(
@@ -211,11 +254,30 @@ impl Net for TcpHost {
     /// service delivered by design; [`tls::Session::new`] does no I/O and the
     /// first `recv` or `send` completes the handshake.
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        // Before the lookup, because `stop_accepting` has already swapped the
+        // listener out. Through the pool rather than inline: `accept` registers
+        // `blocking: true`, so a value returned from `call` is `E0428` — a
+        // refusal the driver decided without waiting is still an answer that has
+        // to arrive as one.
+        if self.stopping.load(Ordering::Acquire) {
+            self.sockets.handles.check(listener, at, span)?;
+            return self.waiting(span, "accept", Op::Accept.what(), || Done::Int(0));
+        }
         let (listener, config) = self.sockets.listener(listener, at, span)?;
         let sockets = Arc::clone(&self.sockets);
         let handshakes = Arc::clone(&self.handshakes);
+        let stopping = Arc::clone(&self.stopping);
+        let accepts = Arc::clone(&self.accepts);
+        accepts.fetch_add(1, Ordering::AcqRel);
         self.waiting(span, "accept", Op::Accept.what(), move || {
-            match listener.accept() {
+            let done = match listener.accept() {
+                // A connection taken in the instant the run stopped accepting —
+                // the drain's own wake dial, or a client that raced it. Closed
+                // rather than served: the load balancer was given the lead phase
+                // to take this instance out, and half-serving a request that
+                // arrived after that is worse for the client than a closed
+                // connection it can retry elsewhere.
+                Ok(_) if stopping.load(Ordering::Acquire) => Done::Int(0),
                 // No label: `accept` names the listener's, and the connection's
                 // is whichever one the program first reads or writes it under.
                 Ok((stream, _)) => {
@@ -232,11 +294,17 @@ impl Net for TcpHost {
                 // from 1 and are never reused, so `0` is never a live socket.
                 // A peer that aborted between the SYN and the accept is that
                 // peer's business and not the accept loop's, so it is retried.
-                Err(e) if transient(&e) => {
-                    Done::Int(retry_accept(&listener, &sockets, &config, &handshakes))
-                }
+                Err(e) if transient(&e) => Done::Int(retry_accept(
+                    &listener,
+                    &sockets,
+                    &config,
+                    &handshakes,
+                    &stopping,
+                )),
                 Err(_) => Done::Int(0),
-            }
+            };
+            accepts.fetch_sub(1, Ordering::AcqRel);
+            done
         })
     }
 
@@ -330,9 +398,63 @@ impl Net for TcpHost {
                 s.close();
                 Ok(HostAnswer::Value(Value::Unit))
             }
-            Some(Sock::Listener(..)) => Ok(HostAnswer::Value(Value::Unit)),
+            Some(Sock::Listener(..) | Sock::Finished) => Ok(HostAnswer::Value(Value::Unit)),
             None => Err(unknown_handle(socket, span)),
         }
+    }
+}
+
+/// Phase 2 of the drain, as the coordinator reaches it.
+impl crate::signal::Accepting for TcpHost {
+    fn stop_accepting(&self) -> usize {
+        // The flag first and the swap second, so there is no instant in which a
+        // listener is gone and `accept` has not yet learnt to answer `0` — that
+        // window would be an `E0502` naming a handle the program is holding
+        // legitimately.
+        self.stopping.store(true, Ordering::Release);
+        let mut open = lock(&self.sockets.open);
+        let listeners: Vec<i64> = open
+            .iter()
+            .filter(|(_, s)| matches!(s, Sock::Listener(..)))
+            .map(|(handle, _)| *handle)
+            .collect();
+        let mut closed = Vec::new();
+        for handle in &listeners {
+            if let Some(Sock::Listener(l, _)) = open.get(handle)
+                && let Ok(address) = l.local_addr()
+            {
+                closed.push(address);
+            }
+            open.insert(*handle, Sock::Finished);
+        }
+        *lock(&self.closed_at) = closed;
+        // The descriptor closes when the last `Arc` of it drops, which is when
+        // the parked `accept` job returns — so the kernel stops queueing a
+        // moment after this rather than inside it. Stated because a claim of
+        // "closed" that is a moment early is a claim a reader would rely on.
+        listeners.len()
+    }
+
+    fn listening_at(&self) -> Vec<SocketAddr> {
+        let mut addresses: Vec<SocketAddr> = lock(&self.sockets.open)
+            .values()
+            .filter_map(|s| match s {
+                Sock::Listener(l, _) => l.local_addr().ok(),
+                _ => None,
+            })
+            .collect();
+        addresses.extend(lock(&self.closed_at).iter().copied());
+        addresses.sort();
+        addresses.dedup();
+        addresses
+    }
+
+    fn connections_in_flight(&self) -> usize {
+        self.sockets.connections()
+    }
+
+    fn accepts_in_flight(&self) -> usize {
+        self.accepts.load(Ordering::Acquire)
     }
 }
 
@@ -389,9 +511,14 @@ fn retry_accept(
     sockets: &Sockets,
     config: &Option<Arc<ServerConfig>>,
     handshakes: &Arc<Handshakes>,
+    stopping: &AtomicBool,
 ) -> i64 {
     for _ in 0..ACCEPT_RETRIES {
+        if stopping.load(Ordering::Acquire) {
+            return 0;
+        }
         match listener.accept() {
+            Ok(_) if stopping.load(Ordering::Acquire) => return 0,
             Ok((stream, _)) => {
                 let stream = Arc::new(stream);
                 // The listener's transport, not a plaintext default: a retry

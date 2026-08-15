@@ -139,6 +139,7 @@ fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
         // counter is armed for the rollback tests rather than dormant.
         linearity: Linearity::AtMostOnce,
         blocking: false,
+        secrets: false,
         path: "test::db",
     }
 }

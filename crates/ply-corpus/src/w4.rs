@@ -843,37 +843,46 @@ impl Store {
     }
 }
 
-/// `examples/desk.ply` as a project `ply run --host` can be pointed at, with
-/// its port, its connection budget and its store rewritten.
+/// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its
+/// store rewritten.
 ///
-/// Every rewrite asserts it found what it replaced. A silent miss would leave
-/// the harness measuring a program it guessed at, which is the failure mode
-/// `w3`'s own rewrites are written against.
-fn project(dir: &Path, service: &str, store: Store, port: u16, connections: u32) -> Result<()> {
-    let mut source = replace(
-        service,
-        "fn port() -> Int = 8137",
-        &format!("fn port() -> Int = {port}"),
-    )?;
-    source = replace(
-        &source,
-        "fn connections() -> Int = 64",
-        &format!("fn connections() -> Int = {connections}"),
-    )?;
-    if store == Store::Twin {
-        source = replace(
-            &source,
-            "fn main() -> Int / {Store, net.write[conn], net.write[listener]} =",
-            "fn main() -> Int / {net.write[conn], net.write[listener]} =",
+/// The port and the connection budget are **not** rewritten any more: W5 made
+/// both configuration, so they arrive as `--set DESK_PORT=` and `--set
+/// DESK_CONNECTIONS=` beside the run, which is one fewer thing this harness has
+/// to keep matching the example's source. Which store a service uses is not
+/// configuration, so that one is still a rewrite — and it asserts it found what
+/// it replaced, because a silent miss would leave the harness measuring a
+/// program it guessed at.
+fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
+    let source = if store == Store::Twin {
+        let narrowed = replace(
+            service,
+            "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {",
+            "fn main() -> Int / {config.read[server], config.read[credentials], net.write[conn], net.write[listener]} = {",
         )?;
-        source = replace(
-            &source,
-            "    run(port(), connections())",
-            "    run_memory(port(), connections())",
-        )?;
-    }
+        replace(
+            &narrowed,
+            "    run(port, count)",
+            "    run_memory(port, key, count)",
+        )?
+    } else {
+        service.to_string()
+    };
     std::fs::write(dir.join("desk.ply"), source)?;
     Ok(())
+}
+
+/// The `--set` arguments a served desk needs, now that its port, its budget and
+/// its credential are configuration rather than definitions.
+fn settings(port: u16, connections: u32) -> Vec<String> {
+    vec![
+        format!("DESK_PORT={port}"),
+        format!("DESK_CONNECTIONS={connections}"),
+        // A benchmark's key is a fixture credential and is not a credential;
+        // what it is here for is that `--config-schema desk.config` declares the
+        // key `required`, so a run without one refuses to start.
+        "DESK_API_KEY=bench-key".to_string(),
+    ]
 }
 
 fn replace(source: &str, from: &str, to: &str) -> Result<String> {
@@ -916,15 +925,17 @@ pub fn crud(
             let budget = concurrency * conns_per_thread * routes.len() as u32 + 1;
             let dir = tempfile::tempdir().context("a temp dir for the served project")?;
             let port = reserve_port()?;
-            project(dir.path(), &service, store, port, budget)?;
-            let mut server = match store {
-                Store::Twin => Server::start(ply, dir.path(), &[])?,
-                Store::Postgres => Server::start(
-                    ply,
-                    dir.path(),
-                    &["--db", url, "--db-schema", "desk.schema"],
-                )?,
-            };
+            project(dir.path(), &service, store)?;
+            let sets = settings(port, budget);
+            let mut args: Vec<&str> = vec!["--config-schema", "desk.config", "--trace", "off"];
+            for set in &sets {
+                args.push("--set");
+                args.push(set);
+            }
+            if store == Store::Postgres {
+                args.extend(["--db", url, "--db-schema", "desk.schema"]);
+            }
+            let mut server = Server::start(ply, dir.path(), &args)?;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             w3::wait_until_serving(&mut server, addr)?;
             for (name, path) in routes {

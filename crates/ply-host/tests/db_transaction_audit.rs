@@ -498,15 +498,8 @@ fn a_task_that_does_not_own_the_scope_is_refused(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
     begin(&db, Isolation::ReadCommitted, Access::ReadWrite);
-    let refused = perform(
-        &db,
-        Op::Query,
-        "t",
-        "select id from t",
-        Vec::new(),
-        SIBLING,
-    )
-    .expect_err("a statement from a task that owns no scope");
+    let refused = perform(&db, Op::Query, "t", "select id from t", Vec::new(), SIBLING)
+        .expect_err("a statement from a task that owns no scope");
     assert_eq!(refused.code, codes::DB_TRANSACTION_SCOPE);
 
     match db.commit(SIBLING, Span::DUMMY) {
@@ -1250,7 +1243,7 @@ fn driver(cluster: &Cluster, edit: impl FnOnce(&mut PoolConfig)) -> Postgres {
 fn finish(cluster: &Cluster, db: Postgres) {
     let _ = db.end_entry_point(ALONE.0);
     let _ = db.end_entry_point(OTHER.0);
-    let _ = db.reactor().shutdown();
+    let _ = db.reactor().shutdown(std::time::Duration::from_secs(30));
     assert_eq!(
         cluster.psql(
             "audit",
@@ -1265,7 +1258,7 @@ fn finish(cluster: &Cluster, db: Postgres) {
 fn finish_shared(cluster: &Cluster, db: Arc<Postgres>) {
     let _ = db.end_entry_point(ALONE.0);
     let _ = db.end_entry_point(OTHER.0);
-    let _ = db.reactor().shutdown();
+    let _ = db.reactor().shutdown(std::time::Duration::from_secs(30));
     assert_eq!(
         cluster.psql(
             "audit",

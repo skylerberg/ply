@@ -21,6 +21,7 @@ use ply_span::{Diagnostic, Span, codes};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// How many host operations may be waiting at once, across every socket.
 ///
@@ -175,6 +176,22 @@ impl Pool {
         Ok(())
     }
 
+    /// The same, for at most `bound`, and `Ok` whether or not anything resolved.
+    ///
+    /// What a drain parks on. The deadline that bounds a shutdown is checked
+    /// between scheduling decisions, so a park that waited for a token would let
+    /// one request blocked on a `recv` its peer will never answer outlast the
+    /// whole drain — and the run would sit there with nothing to read. Waiting
+    /// with nothing outstanding is legal here and not in [`Pool::park`]: during
+    /// a drain a wait for the deadline is the point rather than a deadlock.
+    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
+        let state = lock(&self.shared.state);
+        if state.done.is_empty() {
+            drop(wait_timeout(&self.shared.finished, state, bound));
+        }
+        Ok(())
+    }
+
     /// Drive until this token resolves.
     ///
     /// The only place a Ply computation blocks a real thread, reached when there
@@ -260,4 +277,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     condvar.wait(guard).unwrap_or_else(|e| e.into_inner())
+}
+
+fn wait_timeout<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    bound: Duration,
+) -> MutexGuard<'a, T> {
+    condvar
+        .wait_timeout(guard, bound)
+        .map(|(guard, _)| guard)
+        .unwrap_or_else(|e| e.into_inner().0)
 }

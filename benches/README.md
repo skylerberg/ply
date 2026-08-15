@@ -256,6 +256,52 @@ thirty-two open scopes completes, because acquisition queues; it refuses only
 when a caller waits longer than `--db-acquire-ms`. The exhaustion table prints
 both sides for that reason.
 
+## What `w5` adds
+
+`w3` priced HTTP and `w4` priced the database. `w5` prices what it takes to
+*operate* the result: a trace call, a stop, and a deploy.
+
+```
+cargo run --release -p ply-corpus -- w5 --no-served --no-drain --no-transaction
+cargo run --release -p ply-corpus -- w5 --repo . --concurrent \
+    --db postgres://ply@127.0.0.1:5433/desk
+```
+
+| section | question |
+| --- | --- |
+| `events` | one trace operation under each sink, against the same loop performing none |
+| `served` | the same routes under the same load with only `--trace` moved, over three stacks |
+| `drain` | how long a stop takes with N requests in flight, and what the deadline does to them |
+| `transaction` | whether a transaction open at the deadline commits, rolls back, or is lost |
+| `deploy` | the artifact's bytes, the binary's bytes, and what an incremental transfer would have saved |
+
+Four things about it are load-bearing:
+
+**`bare` is not a configuration a Ply service can be in.** There is no disabled
+path — a row cannot be conditional on a flag — so `bare` is
+`crates/ply-corpus/ply/w5.ply`'s loop with the `perform` *deleted*, which is what
+a level check at the call site buys every other language. The gap between it and
+`discard` is what a service pays, on every request, forever, for tracing it
+turned off, and it is the number ADR 0015 §1.4 owes rather than promises away.
+
+**The twin's row is taken at a smaller count, and the count is printed.**
+`std.trace`'s `Sink` appends with `push`, so holding N records is O(N²); a twin
+row taken at twenty thousand would be a number about list append. A twin lives
+inside one test holding tens of records, which is the size it is priced at.
+
+**A collecting sink never writes into a pipe.** A pipe nobody drains fills at
+64KiB and blocks the writer, so a server writing one JSON line per request into a
+piped stderr stops serving partway through a point. Every collecting row hands
+the run a file or `/dev/null`, and the `records` column is the lines that
+actually arrived.
+
+**The transaction section asserts against the database, never the driver.** A
+second session holds a row lock so the desk's `UPDATE` blocks with its `INSERT`
+already done, and the outcome is read from the table and from
+`pg_stat_activity`. The order *sequence* is read too, because a sequence is not
+transactional: without it, a table whose row count did not move is equally
+consistent with a transaction that never wrote anything.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

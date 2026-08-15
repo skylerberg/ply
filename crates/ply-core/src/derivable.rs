@@ -35,6 +35,10 @@ pub enum Why {
     /// An `Option` whose payload also encodes as the JSON document `null`, so
     /// `None` and `Some(..)` write the same bytes. `json` only.
     NullInsideOption,
+    /// A `Secret`, for every deriver but `eq`. The whole of ADR 0015 §2's
+    /// derivation rule, and the one refusal that exists to stop an *encoding*
+    /// rather than to admit the absence of one.
+    Secret(Deriver),
 }
 
 /// The type that has no derivation — the *field*, not the type it sits in, so a
@@ -133,6 +137,12 @@ fn con(
             return Err(Blocked {
                 ty: ty.clone(),
                 why: Why::Handle(what),
+            });
+        }
+        Shape::Refused(Refusal::Secret(deriver)) => {
+            return Err(Blocked {
+                ty: ty.clone(),
+                why: Why::Secret(deriver),
             });
         }
         Shape::Structural(_) => {

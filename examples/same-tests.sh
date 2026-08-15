@@ -26,6 +26,12 @@
 #      response — `orders` unchanged, and the sequence advanced anyway, because
 #      postgres does not roll back a sequence and neither does the twin.
 #
+# Since W5 both desks also authenticate `POST /orders`, so one credential is
+# exported below and both services are started with it. That is not incidental
+# to the claim: an API key resolved from configuration is a value the twin and
+# the driver see identically, so the write path is compared with the check in
+# front of it rather than around it.
+#
 # What this cannot be is one `test` block that runs against both. A Ply test
 # names its handler, so a test that installed the twin is a test that installed
 # the twin; the endpoints are what stay identical, and step 2 is how that is
@@ -109,6 +115,13 @@ psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/desk.sql"
 echo '   the same schema desk.schema describes; --db-schema is what checks that'
 echo
 
+# One credential for both services, exported before either starts. Without this
+# each `serve.sh` would generate its own and the two desks would refuse each
+# other's key — they would still *agree*, both answering 401, and the comparison
+# below would be green while covering nothing. Two services that agree because
+# neither did anything is the failure shape this whole script exists to catch.
+export DESK_API_KEY="${DESK_API_KEY:-same-tests-key}"
+
 serve() {
   local mode="$1" port="$2" log="$3"
   if [ "$mode" = memory ]; then
@@ -147,7 +160,7 @@ ask() {
     # stop: what the other side answered is the interesting half.
     if [ -n "$body" ]; then
       out="$(curl -sS -m 20 -w '\n%{http_code}' -X "$method" \
-        -H 'content-type: application/json' --data "$body" \
+        -H 'content-type: application/json' -H "x-api-key: $DESK_API_KEY" --data "$body" \
         "http://127.0.0.1:$port$path" 2>&1 || true)"
     else
       out="$(curl -sS -m 20 -w '\n%{http_code}' -X "$method" \
@@ -174,6 +187,7 @@ compared=0
 divergences=0
 
 ask GET /health
+ask GET /ready
 ask GET /docs/orders/placing
 ask GET /docs/nowhere
 ask GET /items
@@ -213,6 +227,7 @@ before_seq="$(seq_value)"
 before_widget="$(stock_of widget)"
 
 status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+  -H "x-api-key: $DESK_API_KEY" \
   --data '{"customer":"lise","lines":[{"sku":"bolt","qty":3}]}' \
   "http://127.0.0.1:$pg_port/orders")"
 after_commit_orders="$(count_orders)"
@@ -224,6 +239,7 @@ echo "   committed  201, orders $before_orders -> $after_commit_orders"
 before_orders="$after_commit_orders"
 before_seq="$(seq_value)"
 status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+  -H "x-api-key: $DESK_API_KEY" \
   --data '{"customer":"lise","lines":[{"sku":"widget","qty":99}]}' \
   "http://127.0.0.1:$pg_port/orders")"
 after_rollback_orders="$(count_orders)"

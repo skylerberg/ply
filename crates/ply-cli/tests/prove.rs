@@ -576,7 +576,11 @@ law \"an ordinary claim\" forall (k: Int) { k == k }
         .as_array()
         .unwrap()
         .iter()
-        .find(|o| o["owner"].as_str().is_some_and(|s| s.contains("the store answers")))
+        .find(|o| {
+            o["owner"]
+                .as_str()
+                .is_some_and(|s| s.contains("the store answers"))
+        })
         .expect("the host law is reported");
     assert_eq!(hosted["outcome"], "unattempted");
     assert!(hosted["tier"].is_null(), "{hosted}");

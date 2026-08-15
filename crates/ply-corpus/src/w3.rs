@@ -55,6 +55,12 @@ const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler a
 /// and this constant is where they do.
 const CREDENTIAL: &str = "desk";
 
+/// `main`'s declared row in `examples/desk.ply`, and the same row once the
+/// accept loop spawns.
+const MAIN_ROW: &str =
+    "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {";
+const MAIN_ROW_SPAWNING: &str = "fn main() -> Int / {Serving, config.read[server], task.write, net.write[conn], net.write[listener]} = {";
+
 /// How long a client waits on one response.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -163,7 +169,7 @@ impl Service {
     fn task_per_connection(&self) -> Result<String> {
         const OLD_SERVE: &str = "\
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Desk, net.write[conn], net.write[listener]} =
+  / {Serving, net.write[conn], net.write[listener]} =
   if count <= 0 {
     0
   } else {
@@ -177,7 +183,7 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
   }";
         const NEW_SERVE: &str = "\
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Desk, task.write, net.write[conn], net.write[listener]} =
+  / {Serving, task.write, net.write[conn], net.write[listener]} =
   if count <= 0 {
     0
   } else {
@@ -198,40 +204,37 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         // the start of a load run rather than a wrong number at the end of one.
         let widenings: [(&str, &str); 8] = [
             (
-                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Desk, net.write[conn], net.write[listener]} {",
-                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Desk, task.write, net.write[conn], net.write[listener]} {",
+                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} {",
+                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} {",
             ),
             (
-                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Desk, net.write[conn], net.write[listener]} {",
-                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Desk, task.write, net.write[conn], net.write[listener]} {",
+                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} {",
+                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} {",
             ),
             (
-                "pub fn run(port: Int, count: Int) -> Int\n  / {Desk, net.write[conn], net.write[listener]} =",
-                "pub fn run(port: Int, count: Int) -> Int\n  / {Desk, task.write, net.write[conn], net.write[listener]} =",
+                "pub fn run(port: Int, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} =",
+                "pub fn run(port: Int, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} =",
             ),
             (
-                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Desk, net.write[conn], net.write[listener]} =",
-                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Desk, task.write, net.write[conn], net.write[listener]} =",
+                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} =",
+                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} =",
             ),
             // The twin's entry points are the ones this harness drives, so they
             // are widened with the rest rather than left behind at the row the
             // sequential accept loop published.
             (
-                "pub fn run_memory(port: Int, count: Int) -> Int / {net.write[conn], net.write[listener]} =",
-                "pub fn run_memory(port: Int, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
+                "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
+                "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
             ),
             (
-                "pub fn run_memory_tls(port: Int, credential: String, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
-                "pub fn run_memory_tls(port: Int, credential: String, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
+                "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
+                "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
             ),
             (
-                "fn memory_serving(port: Int, credential: String, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
-                "fn memory_serving(port: Int, credential: String, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
+                "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
+                "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
             ),
-            (
-                "fn main() -> Int / {Store, net.write[conn], net.write[listener]} =",
-                "fn main() -> Int / {Store, task.write, net.write[conn], net.write[listener]} =",
-            ),
+            (MAIN_ROW, MAIN_ROW_SPAWNING),
         ];
         widenings
             .iter()
@@ -251,39 +254,35 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         // place rather than written beside it: two modules declaring `main` is
         // `E0112` and a directory is a whole program.
         let source = self.source(variant)?;
-        let row = match variant {
-            Variant::Sequential => "{Store, net.write[conn], net.write[listener]}",
-            Variant::TaskPerConn => "{Store, task.write, net.write[conn], net.write[listener]}",
+        let header = match variant {
+            Variant::Sequential => MAIN_ROW,
+            Variant::TaskPerConn => MAIN_ROW_SPAWNING,
+        };
+        let spawning = match variant {
+            Variant::Sequential => "",
+            Variant::TaskPerConn => "task.write, ",
         };
         // The twin, not postgres. This measures the cost of HTTP — parse,
         // route, encode, write — and a database on the other side of it would
         // put a query planner into the number. `run_memory` discharges every
-        // `db` atom against a `MemDb` in a region-scoped cell, so `Store` comes
-        // off the row and the run needs no `--db`. Over TLS there is no twin
-        // entry point that takes a credential name, so `run_memory_tls` is it.
+        // `db`, `trace`, `config` and `signal` atom against a value in a
+        // region-scoped cell, so the run needs no `--db`, no `--config-schema`
+        // and no credential — the entry point takes `None` and the desk refuses
+        // the one route that asks for a key, which no measured call is. Over
+        // TLS there is no twin entry point that takes a credential name, so
+        // `run_memory_tls` is it.
         let call = match transport {
-            Transport::Http => "run_memory(port(), connections())".to_string(),
-            Transport::Https => format!("run_memory_tls(port(), \"{CREDENTIAL}\", connections())"),
+            Transport::Http => format!("run_memory({port}, None, {connections})"),
+            Transport::Https => {
+                format!("run_memory_tls({port}, \"{CREDENTIAL}\", None, {connections})")
+            }
         };
-        let source = replace(
+        let source = replace_entry_point(
             &source,
-            &format!("fn main() -> Int / {row} ="),
-            &format!("fn main() -> Int / {} =", row.replacen("{Store, ", "{", 1)),
-        )?;
-        let source = replace(
-            &source,
-            "    run(port(), connections())",
-            &format!("    {call}"),
-        )?;
-        let source = replace(
-            &source,
-            "fn port() -> Int = 8137",
-            &format!("fn port() -> Int = {port}"),
-        )?;
-        let source = replace(
-            &source,
-            "fn connections() -> Int = 64",
-            &format!("fn connections() -> Int = {connections}"),
+            header,
+            &format!(
+                "fn main() -> Int / {{{spawning}net.write[conn], net.write[listener]}} =\n  {call}"
+            ),
         )?;
         std::fs::write(dir.join("desk.ply"), source)?;
         Ok(())
@@ -296,7 +295,8 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
     /// which must be one program.
     pub fn explicit_rows(&self) -> Result<(String, usize)> {
         const EXPANSION: &str = "db.read[items], db.write[items], \
-             db.read[orders], db.write[orders], db.write, log.write";
+             db.read[orders], db.write[orders], db.write, \
+             trace.write[orders], trace.write[items]";
         let mut out = String::with_capacity(self.server_only.len() + 4096);
         let mut rewritten = 0usize;
         let mut rest = self.server_only.as_str();
@@ -331,6 +331,32 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         }
         Ok((out, rewritten))
     }
+}
+
+/// The whole of `main`, from its declaration to the `}` that closes it,
+/// replaced by an entry point that drives the twin.
+///
+/// The body is bounded by the first `\n}\n` after the declaration rather than
+/// written out here: `main`'s body carries prose about where configuration is
+/// read, and a needle holding a paragraph would stop matching the first time
+/// somebody reworded it — which is the failure this whole harness is written to
+/// avoid.
+fn replace_entry_point(source: &str, header: &str, to: &str) -> Result<String> {
+    let at = source.find(header).with_context(|| {
+        format!(
+            "`examples/desk.ply` no longer contains:\n{header}\nthis harness rewrites its entry \
+             point and must be updated with it rather than measuring a program it guessed at"
+        )
+    })?;
+    let body = &source[at + header.len()..];
+    let close = body
+        .find("\n}\n")
+        .context("`desk.ply`'s `main` has no closing brace at column zero")?;
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..at]);
+    out.push_str(to);
+    out.push_str(&body[close + "\n}".len()..]);
+    Ok(out)
 }
 
 fn replace(source: &str, from: &str, to: &str) -> Result<String> {
@@ -432,7 +458,7 @@ impl Loaded {
             machine.set_declared_footprint(declared);
         }
         machine
-            .call(&name, vec![Value::Int(0), Value::Int(1)], Span::DUMMY)
+            .call(&name, twin_arguments(1), Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("the service raised: {}", d.message))?;
         Ok(sim.sent(2))
     }
@@ -465,11 +491,7 @@ impl Loaded {
         }
         let started = Instant::now();
         let served = machine
-            .call(
-                &name,
-                vec![Value::Int(0), Value::Int(connections as i64)],
-                Span::DUMMY,
-            )
+            .call(&name, twin_arguments(connections as i64), Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("the service raised: {}", d.message))?;
         let taken = started.elapsed();
         match served {
@@ -477,6 +499,17 @@ impl Loaded {
             other => bail!("the service answered {other} connections and was given {connections}"),
         }
     }
+}
+
+/// `desk::run_memory(port, api, count)` for a simulated network: port `0`,
+/// because `SimNet` answers whatever it is asked to listen on, and no API key,
+/// because no measured request presents one.
+fn twin_arguments(connections: i64) -> Vec<Value> {
+    vec![
+        Value::Int(0),
+        Value::ctor("None", Vec::new()),
+        Value::Int(connections),
+    ]
 }
 
 fn diagnostics(what: &str, diagnostics: &[ply_span::Diagnostic]) -> anyhow::Error {
@@ -1072,12 +1105,21 @@ impl Bench {
 /// Block until the server answers one real request over the real transport, so
 /// the first timed point does not race its typecheck.
 pub fn wait_until_serving(server: &mut Server, addr: SocketAddr) -> Result<()> {
+    wait_until_serving_over(server, addr, None)
+}
+
+/// The same over whichever transport the server was started with.
+pub fn wait_until_serving_over(
+    server: &mut Server,
+    addr: SocketAddr,
+    tls: Option<Arc<ClientConfig>>,
+) -> Result<()> {
     let plan = Plan {
         addr,
         calls: vec![call("health", "/health")],
         per_conn: 1,
         conns_per_thread: 1,
-        tls: None,
+        tls,
     };
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
@@ -1109,12 +1151,43 @@ pub fn load_point(
     per_conn: u32,
     conns_per_thread: u32,
 ) -> Result<LoadPoint> {
+    load_point_over(
+        server,
+        addr,
+        None,
+        variant,
+        label,
+        path,
+        concurrency,
+        per_conn,
+        conns_per_thread,
+    )
+}
+
+/// The same over whichever transport the server was started with.
+#[allow(clippy::too_many_arguments)]
+pub fn load_point_over(
+    server: &mut Server,
+    addr: SocketAddr,
+    tls: Option<Arc<ClientConfig>>,
+    variant: &'static str,
+    label: &'static str,
+    path: &str,
+    concurrency: u32,
+    per_conn: u32,
+    conns_per_thread: u32,
+) -> Result<LoadPoint> {
+    let transport = if tls.is_some() {
+        Transport::Https
+    } else {
+        Transport::Http
+    };
     let plan = Plan {
         addr,
         calls: vec![call(label, path)],
         per_conn,
         conns_per_thread,
-        tls: None,
+        tls,
     };
     let requests = plan.requests(concurrency);
     let (sample, taken) = run_plan(&plan, concurrency)?;
@@ -1127,7 +1200,7 @@ pub fn load_point(
     let seconds = taken.as_secs_f64();
     Ok(LoadPoint {
         variant,
-        transport: Transport::Http.label(),
+        transport: transport.label(),
         label: label.to_string(),
         concurrency,
         per_conn,
@@ -1140,22 +1213,22 @@ pub fn load_point(
         p99_micros: micros(Sample::percentile(&sample.latencies, 0.99)),
         max_micros: micros(Sample::percentile(&sample.latencies, 1.0)),
         connect_p50_micros: micros(Sample::percentile(&sample.connects, 0.50)),
-        handshake_p50_micros: 0.0,
-        handshake_p99_micros: 0.0,
+        handshake_p50_micros: micros(Sample::percentile(&sample.handshakes, 0.50)),
+        handshake_p99_micros: micros(Sample::percentile(&sample.handshakes, 0.99)),
     })
 }
 
 // --- TLS material -----------------------------------------------------------
 
-struct Material {
-    certificate: PathBuf,
-    key: PathBuf,
-    der: CertificateDer<'static>,
+pub struct Material {
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub der: CertificateDer<'static>,
 }
 
 /// Generated per run rather than checked in. A private key in a repository is a
 /// private key that leaks, and this one exists to exercise a handshake.
-fn credential(dir: &Path) -> Result<Material> {
+pub fn credential(dir: &Path) -> Result<Material> {
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .context("generating a self-signed certificate")?;
     let certificate = dir.join("desk.pem");
@@ -1172,7 +1245,7 @@ fn credential(dir: &Path) -> Result<Material> {
 /// A client that trusts exactly the certificate this run generated, so the
 /// handshake being measured is a real one rather than one with verification
 /// switched off.
-fn client_config(der: &CertificateDer<'static>) -> Result<ClientConfig> {
+pub fn client_config(der: &CertificateDer<'static>) -> Result<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.add(der.clone()).context("trusting the certificate")?;
     let mut config =
@@ -1967,11 +2040,34 @@ mod tests {
         assert!(concurrent.contains("task.spawn(|| serve_connection(c, l))"));
         // Everything below the accept loop is the same program.
         for shared in [
-            "pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Desk, net.write[conn]} = {",
-            "pub fn answer(req: http::Request) -> Reply / {Desk} =",
+            "pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Serving, net.write[conn]} = {",
+            "pub fn answer(req: http::Request) -> Reply / {Serving} =",
             "pub fn table() -> List<router::Route<Endpoint>> = [",
         ] {
             assert!(concurrent.contains(shared), "{shared}");
+        }
+    }
+
+    /// The served project has to be a program too, and it has to reach the twin
+    /// rather than postgres: a `main` still calling `run` would have a load run
+    /// refuse to start for want of a `--db` two minutes into its probe loop.
+    #[test]
+    fn the_served_project_typechecks_and_drives_the_twin() {
+        let service = Service::open(&repo()).unwrap();
+        for variant in [Variant::Sequential, Variant::TaskPerConn] {
+            for (transport, entry) in [
+                (Transport::Http, "run_memory(8137, None, 9)"),
+                (Transport::Https, "run_memory_tls(8137, \"desk\", None, 9)"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                service
+                    .project(dir.path(), variant, transport, 8137, 9)
+                    .unwrap();
+                let source = std::fs::read_to_string(dir.path().join("desk.ply")).unwrap();
+                assert!(source.contains(entry), "{entry} in {variant:?}");
+                assert!(!source.contains("config.get[server]"), "{variant:?}");
+                Loaded::parse(&source).expect("the served project typechecks");
+            }
         }
     }
 

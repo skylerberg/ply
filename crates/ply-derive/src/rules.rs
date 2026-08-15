@@ -32,6 +32,12 @@ pub const MAP: &str = "Map";
 
 pub const OPTION: &str = "Option";
 
+/// The credential type. Derivable for `eq` and for nothing else, which is not a
+/// taste: equality leaks one bit per call, an ordering leaks a bit of *position*
+/// per call and recovers the whole value in calls proportional to its length,
+/// and an encoding writes the value out whole.
+pub const SECRET: &str = "Secret";
+
 /// Whether a type constructor's JSON encoding can be the document `null`.
 ///
 /// `option_json` writes `None` as `null` and `Some(x)` as `encode(x)`, so an
@@ -54,8 +60,7 @@ pub fn null_in_option(inner: &str) -> String {
 
 /// The advice that goes with [`null_in_option`], stated once because two crates
 /// print it.
-pub const NULL_IN_OPTION_NOTE: &str =
-    "wrap the inner value in a record or a one-field variant — both are tagged, and a tagged \
+pub const NULL_IN_OPTION_NOTE: &str = "wrap the inner value in a record or a one-field variant — both are tagged, and a tagged \
      encoding has no `null` to collide with";
 
 /// Why a type constructor has no derivation. An enum rather than a string
@@ -67,6 +72,9 @@ pub enum Refusal {
     FloatIsNotOrdered,
     /// A `Cell` or a `Task`: a name for a location, not a value.
     Handle(&'static str),
+    /// A `Secret`, for every deriver but `eq`. The deriver is carried so the
+    /// sentence can name what the generated code would have done with it.
+    Secret(Deriver),
 }
 
 impl Refusal {
@@ -77,7 +85,37 @@ impl Refusal {
             Refusal::Handle(what) => {
                 format!("a `{what}` names a location rather than a value")
             }
+            Refusal::Secret(deriver) => String::from(secret_reason(deriver)),
         }
+    }
+
+    /// The advice that goes with a `Secret` refusal, stated once because two
+    /// crates print it.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Refusal::Secret(Deriver::Ord) => Some(
+                "an ordering over a credential leaks a bit of position per comparison and \
+                 recovers the value in calls proportional to its length; `derive eq` is \
+                 available, and `secret_verify` is the check a program actually wants",
+            ),
+            Refusal::Secret(_) => Some(
+                "move the `Secret` field out of the type being derived, or write the codec by \
+                 hand over the fields that are not credentials — there is no way to encode a \
+                 `Secret`, which is the guarantee",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// What a derivation of `deriver` would have had to do with a credential.
+fn secret_reason(deriver: Deriver) -> &'static str {
+    match deriver {
+        Deriver::Json => "a derived codec would write the credential into the document",
+        Deriver::Ord => "a credential has no order",
+        // Unreachable while `eq` is the one deriver a `Secret` satisfies, and
+        // total rather than a panic because `Refusal` is a plain data type.
+        Deriver::Eq => "a credential has no structural equality to derive",
     }
 }
 
@@ -98,6 +136,15 @@ pub fn shape(deriver: Deriver, name: &str) -> Shape {
         "Ordering" | "Rounding" => Shape::Structural(0),
         "Cell" => Shape::Refused(Refusal::Handle("Cell")),
         "Task" => Shape::Refused(Refusal::Handle("Task")),
+        // `eq` is a `Leaf` rather than `Structural(1)`: the payload is compared
+        // by the evaluator in constant time and no generated body ever names it,
+        // so requiring `derivable(eq, a)` of the payload would be a constraint on
+        // a type nothing can reach. Every other deriver — and every deriver added
+        // after this line — refuses, which is the direction that fails safe.
+        SECRET => match deriver {
+            Deriver::Eq => Shape::Leaf,
+            other => Shape::Refused(Refusal::Secret(other)),
+        },
         _ => Shape::Nominal,
     }
 }

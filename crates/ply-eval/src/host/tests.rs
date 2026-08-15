@@ -42,6 +42,7 @@ fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
         determinism: Determinism::Nondeterministic,
         linearity: Linearity::AtMostOnce,
         blocking: false,
+        secrets: false,
         path: "test::handler",
     }
 }

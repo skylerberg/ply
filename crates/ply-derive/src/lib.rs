@@ -270,7 +270,10 @@ impl<'a> Expander<'a> {
             .imports
             .iter()
             .any(|i| i.binder().is_some_and(|b| b.as_str() == binder))
-            || self.runtimes.values().any(|(p, _)| *p == format!("{binder}::"))
+            || self
+                .runtimes
+                .values()
+                .any(|(p, _)| *p == format!("{binder}::"))
         {
             binder.push('_');
         }
@@ -335,6 +338,9 @@ impl<'a> Expander<'a> {
             "`derive {} for {}` requires every field to be derivable",
             def.deriver, def.target.name
         ));
+        if let Some(note) = blocker.note {
+            d = d.note(note);
+        }
         if let Some(variant) = &blocker.variant {
             d = d.note(format!("the field is in variant `{variant}`"));
         }

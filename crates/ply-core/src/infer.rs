@@ -40,6 +40,9 @@ const BUILTIN_TYPE_CONS: &[(&str, usize)] = &[
     ("Map", 2),
     ("Cell", 1),
     (prelude::TASK_TYPE, 1),
+    // A builtin rather than a `std` record, because `type Secret<a> = {value: a}`
+    // is one field access from useless and a project could declare its own.
+    (crate::ty::SECRET, 1),
 ];
 
 fn builtin_types() -> Vec<(&'static str, usize)> {
@@ -1028,6 +1031,35 @@ impl<'a> Checker<'a> {
                     vec![],
                     vec![Type::string()],
                     ta.clone(),
+                    Row::empty(),
+                ),
+            ),
+            // The only introduction. It does not consume its argument — Ply is a
+            // value language — so containment starts where the `Secret` starts,
+            // which ADR 0015 §2.5 (2) states rather than hides.
+            (
+                SECRET_OF_STRING,
+                mono(vec![Type::string()], Type::secret(Type::string())),
+            ),
+            // The elimination, and it answers one bit. Constant-time over the
+            // compared bytes; not rate-limited, so a program that loops it over
+            // candidates recovers the value (§2.5 (3)).
+            (
+                SECRET_VERIFY,
+                mono(
+                    vec![Type::secret(Type::string()), Type::string()],
+                    Type::bool(),
+                ),
+            ),
+            // Presence is deliberately observable: an operator must be able to
+            // tell a missing credential from a wrong one.
+            (
+                SECRET_IS_EMPTY,
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![Type::secret(ta.clone())],
+                    Type::bool(),
                     Row::empty(),
                 ),
             ),
@@ -2635,6 +2667,16 @@ impl<'a> Checker<'a> {
                             .to_string(),
                     );
                 }
+                // A generator that minted credentials and a shrinker that
+                // printed counterexamples is a leak by construction, and the
+                // code for both already exists.
+                if name.as_str() == crate::ty::SECRET {
+                    return Some(
+                        "a `Secret` is a credential: quantifying over one would have the \
+                         generator mint credentials and the shrinker print counterexamples"
+                            .to_string(),
+                    );
+                }
                 if let Some(reason) = args.iter().find_map(|a| self.ungeneratable(a, seen)) {
                     return Some(reason);
                 }
@@ -3305,7 +3347,10 @@ impl<'a> Checker<'a> {
                         def.deriver, def.target.name
                     ),
                 )
-                .primary(def.span, format!("`{blocker}` has no {}", what(def.deriver)));
+                .primary(
+                    def.span,
+                    format!("`{blocker}` has no {}", what(def.deriver)),
+                );
                 d = match blocked.why {
                     Why::NullInsideOption => d
                         .note(format!("`{blocker}` writes `None` and its payload alike"))
@@ -3317,6 +3362,7 @@ impl<'a> Checker<'a> {
                     Why::Handle(what) => d.note(format!(
                         "a `{what}` names a location rather than a value, so it has no encoding"
                     )),
+                    Why::Secret(deriver) => secret_notes(d, deriver),
                     Why::Unconstrained(_) => continue,
                 };
                 diags.push(d.note(format!(
@@ -3498,6 +3544,7 @@ impl<'a> Checker<'a> {
                 Why::NullInsideOption => d
                     .note(format!("`{blocker}` writes `None` and its payload alike"))
                     .note(ply_derive::rules::NULL_IN_OPTION_NOTE),
+                Why::Secret(deriver) => secret_notes(d, deriver),
                 Why::Unconstrained(v) => {
                     let name = site
                         .params
@@ -3577,6 +3624,7 @@ impl<'a> Checker<'a> {
                 )),
                 // A `json` refusal, and this question is `ord`'s.
                 Why::NullInsideOption => d,
+                Why::Secret(deriver) => secret_notes(d, deriver),
                 Why::Unconstrained(v) => {
                     let name = site
                         .params
@@ -3937,8 +3985,8 @@ impl<'a> Checker<'a> {
     /// One code path for both kinds of operation: a user-declared one has no
     /// scheme, so its signature is built here with an empty row, and today's
     /// rule is this rule at that row.
-    fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
-        let scheme = match &op.scheme {
+    fn op_scheme(&self, op: &OpInfo) -> Scheme {
+        match &op.scheme {
             Some(scheme) => scheme.clone(),
             None => Scheme {
                 ty_vars: op_free_vars(op),
@@ -3949,8 +3997,60 @@ impl<'a> Checker<'a> {
                     effects: Row::empty(),
                 },
             },
-        };
+        }
+    }
+
+    /// A perform site's view of an operation: fresh variables the call is free
+    /// to pin, exactly as a call to a polymorphic function is.
+    fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
+        let scheme = self.op_scheme(op);
         match instantiate(&scheme, &mut self.fresh) {
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => (params, *ret, effects),
+            _ => unreachable!("operation schemes are always function types"),
+        }
+    }
+
+    /// A **handler clause's** view of the same operation: the operation's own
+    /// type variables are rigid, so the clause is checked once against every
+    /// instantiation a perform site could choose.
+    ///
+    /// This is not a refinement, it is the soundness of the construct. A row
+    /// carries atoms and no types, so a `handle` sees only that its body may
+    /// perform `db.read[t]` — never which `a` a perform three definitions deeper
+    /// unified the operation's `-> a` with. Instantiating the clause with
+    /// ordinary fresh variables therefore lets the *clause* choose a type
+    /// nothing ever unifies with the caller's: for `read fetch[k](s) -> a`, the
+    /// clause `fetch[k](s) -> s` answers a `Secret<String>` while
+    /// `vault.fetch[k](s)` at a site that wanted a `String` is happily typed
+    /// `String`, and `ply check` accepts a program that laundered a credential
+    /// into an unrelated type. Rigid variables are what say "for every `a`",
+    /// which is the obligation a clause actually carries.
+    ///
+    /// The cost, stated: an operation whose return type is a variable the
+    /// parameters do not determine can only be handled by a clause that produces
+    /// one from a parameter, and no clause can produce a `List<a>` out of
+    /// nothing. That is correct — such an operation is unsound, not merely
+    /// awkward — and `examples/store.ply` was rewritten to declare what each of
+    /// its tables holds rather than to rely on it.
+    fn instantiate_op_for_clause(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
+        let scheme = self.op_scheme(op);
+        let ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|_| self.fresh.ty_var()).collect();
+        let row_vars: Vec<RowVar> = scheme
+            .row_vars
+            .iter()
+            .map(|_| self.fresh.row_var())
+            .collect();
+        for v in &ty_vars {
+            self.subst.mark_rigid_ty(*v);
+        }
+        for v in &row_vars {
+            self.subst.mark_rigid_row(*v);
+        }
+        match crate::env::rename_scheme(&scheme, &ty_vars, &row_vars) {
             Type::Fn {
                 params,
                 ret,
@@ -3997,7 +4097,7 @@ impl<'a> Checker<'a> {
             // A prelude operation's own row is not the clause's to carry: the
             // clause receives the argument and whatever it does with it — call
             // the spawned body, or not — is already in the clause's own row.
-            let (params, ret, _) = self.instantiate_op(&op_info);
+            let (params, ret, _) = self.instantiate_op_for_clause(&op_info);
             if params.len() != clause.params.len() {
                 self.diags.push(
                     Diagnostic::error(
@@ -4073,12 +4173,19 @@ impl<'a> Checker<'a> {
                     );
                 }
                 _ => {
-                    self.expect(
+                    let ok = self.expect(
                         clause.body.span,
                         &ret,
                         &clause_ty,
                         "a handler clause returns the operation's result",
                     );
+                    // The one mismatch whose cause is not visible in the two
+                    // types: the operation is polymorphic, so the clause owes an
+                    // answer for *every* instantiation and the type it was
+                    // checked against is a variable it may not choose.
+                    if !ok && !op_free_vars(&op_info).is_empty() {
+                        self.note_universal_clause(&info, &op_info);
+                    }
                 }
             }
             clause_rows = self.join(e.span, clause_rows, clause_row);
@@ -4348,14 +4455,35 @@ impl<'a> Checker<'a> {
                     .and_then(|qualified| self.ctors.get(&qualified).cloned());
                 let Some(info) = info else {
                     if name.is_bare() || self.declared_value(name).is_some() {
-                        self.diags.push(
-                            Diagnostic::error(
-                                codes::UNKNOWN_NAME,
-                                format!("unknown constructor `{}`", name.symbol()),
-                            )
-                            .primary(name.span, "not found")
-                            .note("constructors come from a `type` declaration with variants"),
-                        );
+                        let mut d = Diagnostic::error(
+                            codes::UNKNOWN_NAME,
+                            format!("unknown constructor `{}`", name.symbol()),
+                        )
+                        .primary(name.span, "not found")
+                        .note("constructors come from a `type` declaration with variants");
+                        // A builtin type constructor has no `type` item to read,
+                        // so the general note above sends the reader looking for
+                        // a declaration that cannot exist. For `Secret` the
+                        // absence is the mechanism, and saying so is the whole
+                        // difference between a puzzle and an answer.
+                        if let Some((builtin, _)) = builtin_types()
+                            .iter()
+                            .find(|(b, _)| *b == name.symbol().as_str())
+                        {
+                            d = d.note(format!("`{builtin}` is a builtin type and declares none"));
+                            if *builtin == crate::ty::SECRET {
+                                d = d.note(
+                                    "that is deliberate: a pattern binding the payload would be a \
+                                     one-line escape from every guarantee `Secret` makes",
+                                )
+                                .note(
+                                    "use `secret_verify` to check a candidate, `secret_is_empty` \
+                                     to check presence, or hand the whole `Secret` to a handler \
+                                     clause",
+                                );
+                            }
+                        }
+                        self.diags.push(d);
                     }
                     return;
                 };
@@ -4482,6 +4610,32 @@ impl<'a> Checker<'a> {
 
     /// Whether the two unified, so a caller can stop rather than report a second
     /// diagnostic about a type the first one already explained.
+    /// Why a clause for a polymorphic operation cannot answer a concrete type.
+    ///
+    /// Attached to the mismatch rather than raised beside it, because there is
+    /// one mistake here and the reader needs one thing to read.
+    fn note_universal_clause(&mut self, info: &EffectInfo, op: &OpInfo) {
+        let Some(last) = self.diags.pop() else { return };
+        let written = self.as_written(&info.name);
+        self.diags.push(
+            last.note(format!(
+                "`{written}.{}` is declared with a type variable, so a clause for it has to answer \
+                 every type a perform site could ask for",
+                op.name
+            ))
+            .secondary(op.span, "declared here")
+            .note(
+                "a row carries atoms and no types, so the `handle` cannot see which type a perform \
+                 site picked — answering a concrete one would be a value of a type the caller \
+                 never asked for",
+            )
+            .note(
+                "declare the operation at the type it actually answers, or produce the result from \
+                 one of the clause's own parameters",
+            ),
+        );
+    }
+
     fn expect(&mut self, span: Span, expected: &Type, found: &Type, context: &str) -> bool {
         if let Err(e) = unify(&mut self.subst, &mut self.fresh, expected, found) {
             self.report_unify(&e, span, context);
@@ -4686,6 +4840,25 @@ fn is_cell_builtin(name: &Symbol) -> bool {
 /// The builtin a generated `OrdDict` is built out of, reserved so that no module
 /// can supply it.
 pub const COMPARE_VALUES: &str = "compare_values";
+
+/// The three builtins over [`ty::SECRET`](crate::ty::SECRET), and the whole of
+/// what a program may do with a credential. There is no `secret_expose`, no
+/// `secret_len` and no `String` in any return type, so the only plaintext that
+/// leaves is one a host operation was handed whole — which is `E0439`.
+pub const SECRET_OF_STRING: &str = "secret_of_string";
+pub const SECRET_VERIFY: &str = "secret_verify";
+pub const SECRET_IS_EMPTY: &str = "secret_is_empty";
+
+/// Why a derivation refused a `Secret`, in the wording all three call sites
+/// print. One function because three copies of a security claim are three things
+/// that can drift apart.
+fn secret_notes(mut d: Diagnostic, deriver: Deriver) -> Diagnostic {
+    d = d.note(ply_derive::rules::Refusal::Secret(deriver).reason());
+    match ply_derive::rules::Refusal::Secret(deriver).note() {
+        Some(note) => d.note(note),
+        None => d,
+    }
+}
 
 fn encloses(outer: Span, inner: Span) -> bool {
     !outer.is_dummy()

@@ -432,6 +432,53 @@ pub mod codes {
     /// Raised at bind time with no flag to suppress it. A flag that turns a
     /// soundness check off is a flag whose default becomes the one nobody uses.
     pub const DB_UNMODELLED_SIDE_EFFECT: &str = "E0438";
+    /// A host operation was handed a value containing a `Secret` and its
+    /// registration does not declare that it may receive one.
+    ///
+    /// Ply's fault in the sense [`HOST_FOOTPRINT_ESCAPE`] is: the boundary's own
+    /// account of itself disagrees with what crossed it. Above the boundary a
+    /// `Secret` cannot reach a log, a codec, a response or a diagnostic, because
+    /// no function that renders takes one; below it nothing is checkable at all,
+    /// so which operations may receive a credential is declared, printed by
+    /// `ply hosts`, and covered by its digest.
+    pub const SECRET_TO_HOST: &str = "E0439";
+    /// A configuration source the run named could not be read: a `--config`
+    /// file that is unreadable, a line that is not `KEY=VALUE`, an empty key, a
+    /// key that is not an identifier, or a `--set` of the same shape.
+    ///
+    /// The format is `KEY=VALUE` and not TOML or YAML because the effect
+    /// returns `Option<String>`: a format richer than the type it feeds is a
+    /// format whose extra structure is silently dropped.
+    pub const CONFIG_UNAVAILABLE: &str = "E0440";
+    /// A key the run's `--config-schema` marks `required` that no source
+    /// supplies. Raised at bind time, before anything runs, because a service
+    /// that discovers a credential is missing on its first request has already
+    /// told a client it was listening.
+    pub const CONFIG_MISSING: &str = "E0441";
+    /// A resolved configuration value that does not satisfy its declared shape.
+    /// The message names the key and the source that won, and **never the
+    /// value** when the shape is a secret.
+    pub const CONFIG_INVALID: &str = "E0442";
+    /// A deployable artifact that does not verify: the header, the section
+    /// table, the program digest, a definition body against the hash it is filed
+    /// under, or a reference to a hash the artifact does not carry.
+    ///
+    /// Every body is checked against its own key, so a corrupted transfer is a
+    /// refusal naming one definition rather than a plausible wrong program.
+    pub const ARTIFACT_INVALID: &str = "E0443";
+    /// An artifact built under a different `FRONTEND_VERSION`, `RUNTIME_VERSION`
+    /// or `BODY_ENCODING` than the binary loading it.
+    ///
+    /// Its own code rather than [`ARTIFACT_INVALID`] because the two call for
+    /// opposite responses: rebuild the artifact, versus transfer it again.
+    pub const ARTIFACT_VERSION: &str = "E0444";
+    /// `trace.exit` naming a span that is not open on the performing task's
+    /// stack — closed already, never opened, or opened by another task.
+    ///
+    /// Accepting it silently is how one request's timing lands under another
+    /// request's span. A span the program never closed is not this: it is closed
+    /// at teardown and reported [`SPAN_ABANDONED`].
+    pub const SPAN_UNBALANCED: &str = "E0445";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -473,6 +520,26 @@ pub mod codes {
     /// program's — the entry point's verdict is unchanged — and it is printed
     /// because a pool that quietly refills is a pool nobody can size.
     pub const HOST_TEARDOWN: &str = "W0606";
+    /// A configuration key supplied explicitly — by `--set` or by a `--config`
+    /// file — that the run's schema does not declare. Only the explicit
+    /// sources: an environment is full of names that have nothing to do with
+    /// this program, while a `--set` is something a person typed on purpose and
+    /// a typo in one is the classic silent deploy failure.
+    pub const CONFIG_UNDECLARED: &str = "W0607";
+    /// The drain deadline expired with connections still in flight. Names how
+    /// many were abandoned with no response written and how many transactions
+    /// were rolled back at teardown.
+    ///
+    /// A `W` because the run's own configuration is at fault rather than the
+    /// program, and the verdict is carried by the exit code instead: a
+    /// deployment must be able to tell a clean stop from one that dropped
+    /// requests.
+    pub const DRAIN_INCOMPLETE: &str = "W0608";
+    /// Spans were still open when an entry point ended, so teardown closed them
+    /// rather than the program. The program's fault and attributed like any
+    /// other failure, but not an error: the records are written either way, and
+    /// the `Abandoned` outcome on them is the signal.
+    pub const SPAN_ABANDONED: &str = "W0609";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -662,11 +729,7 @@ mod tests {
                 "E0430",
             ),
             ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
-            (
-                "DB_STATEMENT_REFUSED",
-                codes::DB_STATEMENT_REFUSED,
-                "E0432",
-            ),
+            ("DB_STATEMENT_REFUSED", codes::DB_STATEMENT_REFUSED, "E0432"),
             ("DB_PREPARE_FAILED", codes::DB_PREPARE_FAILED, "E0433"),
             (
                 "DB_FOOTPRINT_UNDECLARED",
@@ -674,17 +737,20 @@ mod tests {
                 "E0434",
             ),
             ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
-            (
-                "DB_TRANSACTION_SCOPE",
-                codes::DB_TRANSACTION_SCOPE,
-                "E0436",
-            ),
+            ("DB_TRANSACTION_SCOPE", codes::DB_TRANSACTION_SCOPE, "E0436"),
             ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
             (
                 "DB_UNMODELLED_SIDE_EFFECT",
                 codes::DB_UNMODELLED_SIDE_EFFECT,
                 "E0438",
             ),
+            ("SECRET_TO_HOST", codes::SECRET_TO_HOST, "E0439"),
+            ("CONFIG_UNAVAILABLE", codes::CONFIG_UNAVAILABLE, "E0440"),
+            ("CONFIG_MISSING", codes::CONFIG_MISSING, "E0441"),
+            ("CONFIG_INVALID", codes::CONFIG_INVALID, "E0442"),
+            ("ARTIFACT_INVALID", codes::ARTIFACT_INVALID, "E0443"),
+            ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
+            ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
@@ -704,6 +770,9 @@ mod tests {
             ),
             ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
             ("HOST_TEARDOWN", codes::HOST_TEARDOWN, "W0606"),
+            ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
+            ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
+            ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
         ];
 
         for (name, code, expected) in registry {

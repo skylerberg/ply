@@ -1,8 +1,10 @@
 //! The `ply` binary. Every command is two projections of the same run: lines for
 //! a person and, under `--json`, exactly one object on stdout for an agent.
 
+pub mod artifact;
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod db;
 pub mod driver;
 pub mod engine;
@@ -13,6 +15,7 @@ pub mod obligations;
 pub mod signature;
 pub mod simulation;
 pub mod style;
+pub mod trace;
 
 use cli::{CacheAction, Cli, Command};
 use style::Style;
@@ -23,6 +26,13 @@ pub const EXIT_FAILED: i32 = 1;
 /// The program did not get as far as running: a bad path, a syntax error, a
 /// type error.
 pub const EXIT_COMPILE_ERROR: i32 = 2;
+/// The drain deadline expired with requests still in flight.
+///
+/// Its own code and not [`EXIT_FAILED`], because a deployment must be able to
+/// tell a clean stop from one that dropped requests: a rolling restart that
+/// reports success while losing six requests per instance is the failure the
+/// whole drain exists to make visible. `0` means nothing was lost.
+pub const EXIT_DRAIN_INCOMPLETE: i32 = 3;
 
 pub fn execute(cli: Cli) -> i32 {
     let style = Style::detect(cli.color);
@@ -32,6 +42,7 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Prove(args) => commands::prove::execute(args, style),
         Command::Review(args) => commands::review::execute(args, style),
         Command::Run(args) => commands::run::execute(args, style),
+        Command::Build(args) => commands::build::execute(args, style),
         Command::Hosts(args) => commands::hosts::execute(args, style),
         Command::Std(args) => commands::stdlib::execute(args, style),
         Command::Hash(args) => commands::hash::execute(args, style),

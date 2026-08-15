@@ -1073,15 +1073,49 @@ impl Server {
     /// `extra` is appended to the fixed arguments — `--tls NAME=CERT,KEY` and
     /// nothing else so far.
     pub fn start(ply: &Path, dir: &Path, extra: &[&str]) -> Result<Server> {
+        Server::start_with(ply, dir, extra, Stdio::piped())
+    }
+
+    /// The same, with somewhere else for the trace sink to write.
+    ///
+    /// A pipe nobody drains fills at 64KiB and then blocks the writer, so a
+    /// server writing one JSON line per request into a piped stderr stops
+    /// serving partway through a load run and the number that comes out is the
+    /// pipe's rather than the sink's. Every point that measures a collecting
+    /// sink hands it a file or `/dev/null` instead.
+    pub fn start_with(ply: &Path, dir: &Path, extra: &[&str], stderr: Stdio) -> Result<Server> {
         let child = Command::new(ply)
             .args(["run", "--host", "--color", "never"])
             .args(extra)
             .current_dir(dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .with_context(|| format!("starting `{} run --host`", ply.display()))?;
         Ok(Server { child: Some(child) })
+    }
+
+    /// The process id, so a harness can deliver a signal to it. `None` once the
+    /// child has been reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
+    /// Block until the process exits, answering its status and everything it
+    /// wrote. Unlike [`Server::finish`] a non-zero status is a result rather
+    /// than an error: a drain that expired exits `3` on purpose.
+    pub fn wait(mut self, within: Duration) -> Result<(std::process::ExitStatus, String)> {
+        let deadline = Instant::now() + within;
+        loop {
+            let child = self.child.as_mut().expect("the server has not been reaped");
+            match child.try_wait()? {
+                Some(status) => return Ok((status, self.take())),
+                None if Instant::now() >= deadline => {
+                    bail!("the server was still running {within:?} after the signal")
+                }
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
     }
 
     /// The status if the server has already exited, which is what a probe loop

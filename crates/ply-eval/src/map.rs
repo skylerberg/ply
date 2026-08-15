@@ -44,16 +44,40 @@ pub(crate) fn new() -> Value {
     Value::empty_map()
 }
 
+/// The one gate every key passes through before [`Value::cmp`] sees it.
+///
+/// A `Map` orders its keys, and ordering a `Secret` recovers its plaintext in a
+/// number of comparisons proportional to its length — so this is where ADR 0015
+/// §2.2's runtime backstop lives: once, under the operations, rather than once
+/// per builtin at the call sites. The per-builtin version covered four of the
+/// six, and the two it missed — `map_of_entries` and `map_merge`, which reach
+/// `insert_mut` by a different route — were a total ordering oracle over a
+/// credential.
+fn key(k: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
+    crate::value::secret_has_no_order(k, what, span)
+}
+
+/// The only `insert_mut` in this module, so that adding a seventh map builder
+/// cannot reintroduce the gap: there is one place a key enters a `Map`.
+fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Diagnostic> {
+    key(&k, what, span)?;
+    m.insert_mut(k, v);
+    Ok(())
+}
+
 /// Replaces an equal key's entry, **key and value both** — the last write wins.
 /// Visible only where two equal keys are distinguishable, which is `Decimal`:
 /// inserting `1.5m` over `1.50m` leaves the key `1.5m`, so `map_keys` then
 /// renders `1.5` where it rendered `1.50`. The alternative costs a lookup on
 /// every insert to preserve a distinction nobody asked for.
 pub(crate) fn insert(m: &Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(Value::Map(m.as_map(span, "`map_insert`")?.insert(k, v)))
+    let mut out = m.as_map(span, "`map_insert`")?.clone();
+    put(&mut out, k, v, "map_insert", span)?;
+    Ok(Value::Map(out))
 }
 
 pub(crate) fn get(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
+    key(k, "map_get", span)?;
     Ok(match m.as_map(span, "`map_get`")?.get(k) {
         Some(v) => some(v.clone()),
         None => none(),
@@ -61,6 +85,7 @@ pub(crate) fn get(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic>
 }
 
 pub(crate) fn contains(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
+    key(k, "map_contains", span)?;
     Ok(Value::Bool(
         m.as_map(span, "`map_contains`")?.contains_key(k),
     ))
@@ -70,6 +95,7 @@ pub(crate) fn contains(m: &Value, k: &Value, span: Span) -> Result<Value, Diagno
 /// leaves a map with the property the caller asked for, and refusing would make
 /// every caller write the guard.
 pub(crate) fn remove(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
+    key(k, "map_remove", span)?;
     Ok(Value::Map(m.as_map(span, "`map_remove`")?.remove(k)))
 }
 
@@ -102,7 +128,7 @@ pub(crate) fn of_entries(list: &Value, span: Span) -> Result<Value, Diagnostic> 
     let mut out = Map::new();
     for item in items.iter() {
         let (k, v) = pair(item, span)?;
-        out.insert_mut(k, v);
+        put(&mut out, k, v, "map_of_entries", span)?;
     }
     Ok(Value::Map(out))
 }
@@ -136,7 +162,7 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
 pub(crate) fn merge(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
     let mut out = a.as_map(span, "`map_merge`")?.clone();
     for (k, v) in b.as_map(span, "`map_merge`")?.iter() {
-        out.insert_mut(k.clone(), v.clone());
+        put(&mut out, k.clone(), v.clone(), "map_merge", span)?;
     }
     Ok(Value::Map(out))
 }

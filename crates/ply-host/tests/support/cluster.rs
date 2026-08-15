@@ -197,6 +197,33 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        // `pg_ctl stop` rather than `Child::kill`, and the difference is not
+        // tidiness. A postmaster killed with `SIGKILL` never runs its exit hook,
+        // so the System V segment it holds for its own interlock outlives it —
+        // and macOS ships `SHMMNI` at 32, so thirty-odd cluster starts exhaust
+        // the machine's supply and every `initdb` afterwards fails with "could
+        // not create shared memory segment" until somebody runs `ipcrm` by hand.
+        // The kill below is the backstop for a server that will not stop.
+        if let Some(pg_ctl) = binary("pg_ctl") {
+            let stopped = Command::new(pg_ctl)
+                .args([
+                    "-D",
+                    self.directory.path().join("data").to_str().unwrap_or(""),
+                    "-m",
+                    "immediate",
+                    "-w",
+                    "-t",
+                    "20",
+                    "stop",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if stopped.is_ok_and(|s| s.success()) {
+                let _ = self.server.wait();
+                return;
+            }
+        }
         let _ = self.server.kill();
         let _ = self.server.wait();
     }

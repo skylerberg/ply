@@ -108,6 +108,13 @@ pub enum Builtin {
     CellGet,
     CellSet,
     Panic,
+    /// The only introduction of a [`Value::Secret`]. There is no elimination:
+    /// the three below answer a `Bool` or a `Secret`, never the payload's type,
+    /// so no plaintext leaves except by a host operation declaring it may
+    /// receive one.
+    SecretOfString,
+    SecretVerify,
+    SecretIsEmpty,
 }
 
 impl Builtin {
@@ -176,6 +183,9 @@ impl Builtin {
             "cell_get" => Builtin::CellGet,
             "cell_set" => Builtin::CellSet,
             "panic" => Builtin::Panic,
+            "secret_of_string" => Builtin::SecretOfString,
+            "secret_verify" => Builtin::SecretVerify,
+            "secret_is_empty" => Builtin::SecretIsEmpty,
             _ => return None,
         })
     }
@@ -245,6 +255,9 @@ impl Builtin {
             Builtin::CellGet => "cell_get",
             Builtin::CellSet => "cell_set",
             Builtin::Panic => "panic",
+            Builtin::SecretOfString => "secret_of_string",
+            Builtin::SecretVerify => "secret_verify",
+            Builtin::SecretIsEmpty => "secret_is_empty",
         }
     }
 
@@ -278,7 +291,9 @@ impl Builtin {
             | Builtin::FloatOfDecimal
             | Builtin::DecimalOfFloat
             | Builtin::DecimalOfString
-            | Builtin::DecimalToString => (1, 1),
+            | Builtin::DecimalToString
+            | Builtin::SecretOfString
+            | Builtin::SecretIsEmpty => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
             | Builtin::Map
@@ -303,7 +318,8 @@ impl Builtin {
             | Builtin::MapMerge
             | Builtin::Compare
             | Builtin::CompareValues
-            | Builtin::IntOfDecimal => (2, 2),
+            | Builtin::IntOfDecimal
+            | Builtin::SecretVerify => (2, 2),
             Builtin::Fold
             | Builtin::BytesSlice
             | Builtin::BytesIndexOfFrom
@@ -394,6 +410,9 @@ impl Builtin {
             Builtin::CellGet,
             Builtin::CellSet,
             Builtin::Panic,
+            Builtin::SecretOfString,
+            Builtin::SecretVerify,
+            Builtin::SecretIsEmpty,
         ]
     }
 }
@@ -750,15 +769,28 @@ pub fn call(
         // refused by `derivable(ord, ·)` at the signature, which is what keeps
         // `total_cmp` out of reach of a program that could observe it
         // disagreeing with `==`.
-        Builtin::Compare | Builtin::CompareValues => Ok(Step::Done(Value::ctor(
-            match args[0].cmp(&args[1]) {
-                std::cmp::Ordering::Less => "Less",
-                std::cmp::Ordering::Equal => "Equal",
-                std::cmp::Ordering::Greater => "Greater",
-            },
-            Vec::new(),
-        ))),
+        Builtin::Compare | Builtin::CompareValues => {
+            // The runtime backstop ADR 0015 §2.2 asks for. `derivable(ord, ·)`
+            // already refuses a `Secret` at both walks, so a well-typed program
+            // cannot arrive here; this is what a defect in either walk meets
+            // instead of an ordering oracle over a credential.
+            crate::value::secret_has_no_order(&args[0], b.name(), span)?;
+            crate::value::secret_has_no_order(&args[1], b.name(), span)?;
+            Ok(Step::Done(Value::ctor(
+                match args[0].cmp(&args[1]) {
+                    std::cmp::Ordering::Less => "Less",
+                    std::cmp::Ordering::Equal => "Equal",
+                    std::cmp::Ordering::Greater => "Greater",
+                },
+                Vec::new(),
+            )))
+        }
 
+        // Every one of these reaches a key through `map::key`, which is the one
+        // gate `Value::cmp` is behind. The check is not repeated here, because a
+        // backstop written once per call site is a backstop a seventh map
+        // builder forgets — which is exactly how `map_of_entries` and
+        // `map_merge` came to be an ordering oracle over a credential.
         Builtin::MapNew => Ok(Step::Done(map::new())),
         Builtin::MapInsert => Ok(Step::Done(map::insert(
             &args[0],
@@ -877,6 +909,46 @@ pub fn call(
                 Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
                     .primary(span, "`panic` called here"),
             )
+        }
+
+        // Does not consume its argument: Ply is a value language, so the
+        // plaintext is still in scope and can still be traced or returned.
+        // Containment starts here, and ADR 0015 §2.5 (2) says so out loud.
+        Builtin::SecretOfString => {
+            args[0].as_str(span, "`secret_of_string`")?;
+            Ok(Step::Done(Value::secret(args[0].clone())))
+        }
+
+        // One bit per call, constant time over the compared bytes, and not rate
+        // limited — a loop over candidates recovers the value, which is the
+        // program's to prevent (§2.5 (3)).
+        Builtin::SecretVerify => {
+            let Value::Secret(held) = &args[0] else {
+                return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
+            };
+            let candidate = args[1].as_str(span, "`secret_verify`")?;
+            let held = held.as_str(span, "`secret_verify`")?;
+            Ok(Step::Done(Value::Bool(crate::value::constant_time_eq(
+                held.as_bytes(),
+                candidate.as_bytes(),
+            ))))
+        }
+
+        // Presence, never the value. An operator must be able to tell a missing
+        // credential from a wrong one, and that is metadata.
+        Builtin::SecretIsEmpty => {
+            let Value::Secret(held) = &args[0] else {
+                return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
+            };
+            Ok(Step::Done(Value::Bool(match &**held {
+                Value::Str(s) => s.is_empty(),
+                Value::Bytes(b) => b.is_empty(),
+                // `secret_of_string` is the only introduction, so nothing else
+                // is constructible; a payload that is not a sequence has no
+                // emptiness, and answering `false` reports "a credential is
+                // present" rather than inventing one.
+                _ => false,
+            })))
         }
     }
 }
@@ -1789,7 +1861,12 @@ mod tests {
         let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();
         assert_eq!(empty, Value::bytes([]));
 
-        let pieces = Value::list(vec![bytes(b"GET "), bytes(b""), bytes(b"/x"), bytes(b" HTTP")]);
+        let pieces = Value::list(vec![
+            bytes(b"GET "),
+            bytes(b""),
+            bytes(b"/x"),
+            bytes(b" HTTP"),
+        ]);
         assert_eq!(
             done(Builtin::BytesConcatAll, vec![pieces]).unwrap(),
             Value::bytes(b"GET /x HTTP")
@@ -1798,7 +1875,11 @@ mod tests {
         let mut rng = Xorshift(0x00c0_ffee_0bad_f00d);
         for _ in 0..500 {
             let raw: Vec<Vec<u8>> = (0..rng.below(12))
-                .map(|_| (0..rng.below(9)).map(|_| b'a' + rng.below(4) as u8).collect())
+                .map(|_| {
+                    (0..rng.below(9))
+                        .map(|_| b'a' + rng.below(4) as u8)
+                        .collect()
+                })
                 .collect();
             let expected: Vec<u8> = raw.concat();
             let list = Value::list(raw.iter().map(|p| bytes(p)).collect());

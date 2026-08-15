@@ -134,7 +134,35 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             .iter()
             .flat_map(|t| t.footprint.atoms().cloned()),
     );
-    let mut hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls, db, Some(&reach)) {
+    // Before the binding, because a required key nothing supplies is the run's
+    // configuration and has nothing to do with what the registry resolves — and
+    // because a suite that discovers it is misconfigured after its first host
+    // test has already run that test against the wrong thing.
+    let (configuration, config_warnings) = match crate::config::Configuration::open(
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        args.host,
+        &args.config,
+    ) {
+        Ok(resolved) => resolved,
+        Err(diagnostics) => {
+            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    warnings.extend(config_warnings);
+    let mut hosts = match Hosts::open(
+        &loaded.check,
+        args.host,
+        &args.tls.tls,
+        db,
+        configuration,
+        // `ply test` discards, always: a suite asserts on its records through
+        // `std.trace`'s twin, and `--trace` on this command already names M5's
+        // definition trace.
+        &crate::trace::TraceOptions::silent(),
+        Some(&reach),
+    ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
@@ -1569,7 +1597,16 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         args: &TestArgs,
         workers: usize,
     ) -> Value {
-        let hosts = Hosts::open(&loaded.check, args.host, &[], None, None).expect("the fixture binds");
+        let hosts = Hosts::open(
+            &loaded.check,
+            args.host,
+            &[],
+            None,
+            crate::config::Configuration::default(),
+            &crate::trace::TraceOptions::silent(),
+            None,
+        )
+        .expect("the fixture binds");
         let view = HostView::of(&hosts, plan, &loaded.check, report);
         let ok = report.is_success() && view.escapes.is_empty();
         report_json(loaded, hashes, plan, report, args, workers, &[], &view, ok)
@@ -1590,6 +1627,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             host: false,
             tls: crate::cli::TlsOptions::default(),
             db: crate::db::DbOptions::default(),
+            config: crate::config::ConfigOptions::default(),
             std: false,
             engine: crate::cli::EngineArg::default(),
             simulation: crate::cli::SimOptions {
@@ -2414,7 +2452,16 @@ test \"stuck\" {
     #[test]
     fn a_hermetic_run_reports_exactly_what_it_did_before() {
         let (_dir, loaded, _h, plan) = plan_for(None);
-        let hosts = Hosts::open(&loaded.check, false, &[], None, None).unwrap();
+        let hosts = Hosts::open(
+            &loaded.check,
+            false,
+            &[],
+            None,
+            crate::config::Configuration::default(),
+            &crate::trace::TraceOptions::silent(),
+            None,
+        )
+        .unwrap();
         let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
 
         for (index, test) in loaded.check.tests.iter().enumerate() {
@@ -2479,7 +2526,16 @@ test \"stuck\" {
         assert!(view.escapes.is_empty());
 
         // And hermetically the check costs nothing, because nothing is reachable.
-        let hermetic = Hosts::open(&loaded.check, false, &[], None, None).unwrap();
+        let hermetic = Hosts::open(
+            &loaded.check,
+            false,
+            &[],
+            None,
+            crate::config::Configuration::default(),
+            &crate::trace::TraceOptions::silent(),
+            None,
+        )
+        .unwrap();
         let view = HostView::of(&hermetic, &plan, &loaded.check, &escaped);
         assert!(view.escapes.is_empty());
     }

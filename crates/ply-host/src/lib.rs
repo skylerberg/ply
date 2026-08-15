@@ -16,11 +16,14 @@
 // the same allow, for the same reason, that `ply-eval` and `ply-prove` carry.
 #![allow(clippy::arc_with_non_send_sync)]
 
+pub mod config;
 pub mod db;
 pub mod registry;
 pub mod sched;
+pub mod signal;
 pub mod tcp;
 pub mod tls;
+pub mod trace;
 
-pub use registry::{Host, registry, registry_with_database};
+pub use registry::{Host, registry, registry_over, registry_with_database};
 pub use tls::{CredentialSpec, Credentials, HandshakeCounts};

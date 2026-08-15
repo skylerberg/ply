@@ -18,6 +18,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_host::tls;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// The `--json` object's shape. Independent of `ply test`'s, because a consumer
 /// pinning a TCB is not the consumer reading a run.
@@ -32,7 +33,17 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
     // Resolved whether or not `--host` was passed: the TCB is a property of the
     // registry and the program, and a digest that moved when a flag moved would
     // pin nothing.
-    let listing = match hosts::Hosts::preview(&loaded.check) {
+    // The sink and the drain window this run was configured with, resolved
+    // whether or not `--host` was passed. The digest is a property of the
+    // registry, the program and the run's configuration — never of the flag
+    // that decides whether any of it is used, because a digest that moved with
+    // `--host` would pin nothing.
+    //
+    // Built here rather than listened on: `ply hosts` prints what a serving run
+    // would do at a signal and installs no handler of its own.
+    let trace = args.trace.open();
+    let shutdown = ply_host::signal::Shutdown::new(args.shutdown.bounds());
+    let listing = match hosts::Hosts::preview(&loaded.check, Some(Arc::clone(&trace))) {
         Ok(listing) => listing,
         Err(diagnostics) => {
             if args.json {
@@ -82,7 +93,33 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             );
         }
     };
-    let disclosures = hosts::Disclosures::of(&listing, Some(&credentials), db, schema);
+    // Resolved here for the reason the credentials and the connection string
+    // are: `ply hosts` answers "what does this run trust", and a required key
+    // nothing supplies is a run that will not start. The warnings are printed
+    // beside the listing rather than swallowed, because a `--set` the schema
+    // does not declare is the classic silent deploy failure.
+    let (configuration, config_warnings) = match crate::config::Configuration::open(
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        args.host,
+        &args.config,
+    ) {
+        Ok(resolved) => resolved,
+        Err(diagnostics) => {
+            return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let disclosures = hosts::Disclosures::of(
+        &listing,
+        Some(&credentials),
+        db,
+        schema,
+        Some(configuration),
+        Some(&trace),
+        args.trace.level_name(),
+        Some(&shutdown),
+    );
 
     if args.digest {
         println!("{}", hosts::digest_short(&listing, &disclosures));
@@ -112,6 +149,16 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         if let Some(database) = &disclosures.database {
             report["database"] = database.json();
         }
+        if let Some(configuration) = &disclosures.configuration {
+            report["configuration"] = configuration.to_json();
+        }
+        if let Some(observability) = &disclosures.observability {
+            report["observability"] = observability.json();
+        }
+        if let Some(shutdown) = &disclosures.shutdown {
+            report["shutdown"] = shutdown.json();
+        }
+        report["diagnostics"] = diagnostics_json(&config_warnings, &loaded.sources);
         emit_json(&report);
         return EXIT_OK;
     }
@@ -129,6 +176,10 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             println!("{IND}{line}");
         }
     }
+    // Rendered like the errors of its class rather than as a bare line: a
+    // `W0607` is the run's configuration at fault, exactly as `E0440` is, and a
+    // deploy check greps for the code.
+    print_diagnostics(&config_warnings, &loaded.sources, style);
     EXIT_OK
 }
 

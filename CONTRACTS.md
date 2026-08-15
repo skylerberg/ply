@@ -1615,6 +1615,25 @@ where `R` is the `handle` expression's result type — the return clause's body
 type, or the handled body's type when there is no return clause — and a
 tail-resumptive clause keeps `body_i : ret_i`.
 
+**`params_i` and `ret_i` instantiate the operation with its own type variables
+rigid**, which is the soundness of the construct rather than a refinement of it.
+A clause is written once and answers every perform site there will ever be, and a
+row carries atoms and no types — so a `handle` cannot see which `a` a perform
+three definitions deeper unified an `-> a` with. Instantiating the clause with
+ordinary fresh variables let the *clause* choose: for `read fetch[k](s:
+Secret<String>) -> a`, the clause `fetch[k](s) -> s` answered a `Secret<String>`
+while the perform site was typed `String`, which is general type confusion and
+was also the route a credential was laundered into a `Map` key and its plaintext
+read off the key order. Rigid variables say "for every `a`". `E0201` names the
+clause and points at the declaration.
+
+The cost is real and is not a bug: an operation whose return type is a variable
+its parameters do not determine can no longer be handled at all, because no
+clause can produce a `List<a>` out of nothing. Such an operation is unsound
+rather than awkward; `examples/store.ply` declared one and was rewritten to
+declare what each of its tables holds, with its resource labels and footprints
+unchanged.
+
 `ρ_κ` is solved as follows and an implementer must get both halves right:
 
 - **One `ρ_κ` per `handle`, not per clause.** Every clause's continuation is the
@@ -6191,3 +6210,859 @@ the law, whose claim is over sequential operation sequences only. A date, time,
 timestamp or interval type. TLS to postgres. Automatic retry of a serialization
 failure. **A test database per test** — footprint conflict grouping and `sandbox`
 are the whole of the isolation, and they are less than a reader expects.
+
+---
+
+## Operations
+
+`docs/adr/0015-w5-contract.md` has the reasoning; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was
+written after them.
+
+### The rule everything else follows from
+
+> A row says what a function records, and a type says where a credential cannot
+> go. A log, a configuration and a way to stop are ambient in every other
+> language, and ambient is what this one has spent eight milestones removing.
+
+Three consequences decide everything below. **A trace call is a `perform`,
+always** — a row cannot be conditional on a flag, so there is no disabled path
+that skips it and `--trace off` binds a listed handler rather than an empty
+registry. **The environment supplies a value and never causes a binding** — ADR
+0011's rule is untouched, and the snapshot is frozen at bind time so that
+`config.read` is honestly a read. **Teardown has one pinned order**, because a
+drain that commits a half-finished transaction is data loss rather than a mess.
+
+### `std.trace` — Ply source, the declaration
+
+`crates/ply-std/ply/trace.ply`, module `std.trace`, effect `std.trace.trace`.
+
+```ply
+pub type Level = Debug | Info | Warn | Error
+
+pub type Field =
+  | FInt(Int) | FBool(Bool) | FText(String)
+  | FFloat(Float) | FDecimal(Decimal) | FBytes(Bytes)
+  | FJson(json::Json)
+
+pub type Fields  = Map<String, Field>
+pub type Span    = { id: Int, channel: String }
+pub type Outcome = Ok | Failed(String) | Abandoned
+
+pub nondet effect trace {
+  write event[c](level: Level, name: String, fields: Fields)   -> Unit
+  write enter[c](name: String, fields: Fields)                 -> Span
+  write exit[c](span: Span, outcome: Outcome)                  -> Unit
+  write count[c](name: String, delta: Int, fields: Fields)     -> Unit
+  write gauge[c](name: String, value: Decimal, fields: Fields) -> Unit
+  write time[c](name: String, micros: Int, fields: Fields)     -> Unit
+}
+```
+
+`nondet` is load-bearing and is the sentence `std.net` and `std.db` carry: a
+production sink stamps a wall-clock timestamp and mints a span id, so a `det`
+test reaching an unhandled `trace` operation is `E0412` **at compile time**,
+with `--host` and without it. The twin is what makes such a test compile.
+
+**Six operations on one effect, not two effects.** Ply cannot abstract over two
+effects declaring the same operations (the W3 TLS argument), so a separate
+`metric` effect doubles every handler clause set in the system to draw a
+distinction no scheduling decision consults. The cost is stated: a function that
+only increments a counter carries `trace.write[c]`, which reads as "records on
+channel `c`", and that is true.
+
+**The resource is a channel and the call site writes it.**
+`trace.event[orders](..)` performs `(trace, orders, Write)`. `trace.write` as
+one singleton atom is refused: it would serialise every test that records
+anything, and it would make a row say "records" and nothing more, which is
+`db.write[db]` with a different noun. What it costs: **a channel label cannot be
+abstracted over**, so `std.trace` ships **no function that performs** — only
+value constructors, the twin, and the sink codec. Every perform is at its call
+site with its channel.
+
+`gauge` takes `Decimal` and not `Float`: `Float`'s `==` is not an equivalence
+relation and a gauge is a number a test asserts on.
+
+### Spans — implement exactly this
+
+The handler owns the stack, per task. Three of the four ways a computation
+leaves a span never run another line of it — a `db.rollback` discards the
+continuation, a raise propagates past, an entry point can simply end — so a
+program-maintained stack is wrong by construction.
+
+- `enter[c]` pushes onto the performing task's stack; `Span::id` ascends from 1
+  **per entry point** and is never reused within one. Per entry point rather
+  than per run because an id crosses back into the program — a `Span` is an
+  ordinary record so a program can put its id in a field — and a run-global
+  counter made a host-backed test's own answer a function of what a
+  footprint-disjoint test traced beside it (ADR 0015 §7). Correlating lines
+  across entry points is the record's `seq`, which stays run-global.
+- `exit[c](s, o)` closes `s` **and every span the same task opened above it**,
+  the latter with `Outcome::Abandoned`. Not a warning: a discarded continuation
+  is what a rollback *is*, and the `Abandoned` record is the useful signal.
+- `exit` naming a span that is closed, never opened, or opened by another task
+  **of the same entry point** is **`E0445 SPAN_UNBALANCED`**, naming both tasks
+  in the third case. Which of the three it is, is decided from the performing
+  entry point's own table: E0445 is attributed and bisected, so its text is what
+  a failure report carries, and a classification that consulted the run put
+  another test's `MachineId` into this test's report and changed with `--jobs`.
+- Whatever is still open when an entry point ends is closed `Abandoned` by
+  `end_entry_point` (ADR 0014 §1.3, doing a second job with no new mechanism)
+  and reported **`W0609 SPAN_ABANDONED`** with the count and the innermost name.
+
+### What a span costs when nothing is collecting
+
+There is no configuration under which a trace operation is not performed.
+`--trace off` binds `ply_host::trace::discard`, a listed member of the trusted
+computing base whose clause answers `Unit`; an empty registry would be `E0424`,
+which is correct and is not what "off" should mean.
+
+A disabled span costs exactly: the `Fields` map the call site built, one
+`perform`, and nothing else. "Nothing else" is designed rather than observed —
+**a call site never formats** (there is no operation taking a rendered message),
+**never reads a clock** (the sink stamps `ts`, which is also why a trace call
+does not drag `clock.read` into fifty endpoints' rows), and **never allocates a
+span record**. **Level filtering happens in the sink**, so `--trace-level warn`
+does not make a `Debug` event free — it makes it cost one perform and one map,
+and claiming otherwise would need a conditional row.
+
+The number is an exit criterion, not an argument: a benchmark reports the
+per-event and per-span cost under `discard`, under `json` and under the twin,
+and a counting harness — never a stopwatch — asserts zero clock calls and zero
+formatting.
+
+### The trace twin — Ply, and pure
+
+```ply
+pub type Kind = KEvent | KEnter | KExit | KCount | KGauge | KTime
+
+pub type Record = {
+  seq: Int, kind: Kind, level: Level, channel: String, name: String,
+  span: Int, parent: Int, fields: Fields, outcome: Outcome,
+  amount: Int, value: Decimal,
+}
+
+pub type Sink = { .. }        // opaque: records, the open stack, the next id
+
+pub fn sink() -> Sink
+pub fn event_step(s: Sink, c: String, l: Level, n: String, fs: Fields) -> Sink
+pub fn enter_step(s: Sink, c: String, n: String, fs: Fields) -> {sink: Sink, span: Span}
+pub fn exit_step(s: Sink, sp: Span, o: Outcome) -> {sink: Sink, ok: Bool}
+pub fn count_step(s: Sink, c: String, n: String, d: Int, fs: Fields) -> Sink
+pub fn gauge_step(s: Sink, c: String, n: String, v: Decimal, fs: Fields) -> Sink
+pub fn time_step(s: Sink, c: String, n: String, us: Int, fs: Fields) -> Sink
+
+pub fn drain(s: Sink) -> List<Record>     // closes every open span as Abandoned
+pub fn named(rs: List<Record>, n: String) -> List<Record>
+pub fn on_channel(rs: List<Record>, c: String) -> List<Record>
+pub fn counter_total(rs: List<Record>, n: String) -> Int
+pub fn open_spans(s: Sink) -> Int
+```
+
+`exit_step` answers `ok: false` where the bound driver answers `E0445`: a twin is
+a value and a value does not raise. After a `with_cell` region discharges the
+atoms a collecting test's row is **empty** — `det`, cached, hermetic — and it can
+assert on the exact records a request produced.
+
+**The `with_cell` belongs inside each test.** One collector around a suite is one
+shared cell, which is W4's pooled connection in a new costume.
+
+### `Secret` — the headline
+
+`Secret` is a **builtin type constructor of arity 1**, added to
+`BUILTIN_TYPE_CONS` beside `Cell` and `Task`, and
+
+```rust
+pub enum Value { /* ... */ Secret(Arc<Value>) }
+```
+
+is a **distinct variant**. Both halves are load-bearing. A
+`Value::Ctor { name: "Secret", .. }` would be matchable and
+`match s { Secret(p) -> p }` would be a one-line escape; `Secret` declares no
+constructors, so that pattern is `E0101` at resolution and **there is no pattern
+that binds the payload**. A `std`-level record type would be one field access
+from useless and a project could declare its own.
+
+```rust
+impl Type { pub fn secret(inner: Type) -> Type; }   // Con("Secret", vec![inner])
+```
+
+| builtin | type | notes |
+| --- | --- | --- |
+| `secret_of_string` | `(String) -> Secret<String>` | the only introduction |
+| `secret_verify` | `(Secret<String>, String) -> Bool` | constant time over the compared bytes; leaks one bit per call |
+| `secret_is_empty` | `(Secret<a>) -> Bool` | one bit, and the check a start-up wants |
+
+There is no `secret_expose`, no `secret_len`, no `secret_map`, no
+`secret_concat` and no `secret_slice`, and no `String` in any return type. Each
+would have to see the plaintext, and a function that sees it can return it.
+
+Evaluator behaviour, each closing a route that is otherwise total:
+
+- **`Value::render` is `Secret(****)`**, always. This closes the assertion diff,
+  the panic payload, `ply run`'s result line, M5's failure JSON, every
+  `Diagnostic` that interpolates a value, `--json`, and the result cache.
+- **`values_equal` compares two `Secret`s in constant time** and answers a
+  `Bool`; a `Secret` is never equal to a non-`Secret`. So `==` and `assert_eq`
+  work and neither prints anything.
+- **`compare_values` on a `Secret` is `E0502 RUNTIME_ERROR`** naming
+  `secret_verify`. Equality leaks one bit per call; an ordering leaks a bit of
+  position per call and recovers the value in calls proportional to its length.
+  That line is why `derive eq` accepts a `Secret` field and `derive ord` refuses
+  one, and the runtime refusal is the backstop for the path that reaches
+  `compare_values` without a derivation.
+- **`Map<Secret<a>, v>` is `E0206`**, because a `Map` key needs
+  `derivable(ord, k)`.
+- **The runtime backstop is one gate under `ply_eval::map`, not a check per
+  builtin.** Every key entering, leaving or being looked up in a `Map` passes
+  through it, and it is the only caller of `insert_mut` in that module. Written
+  per call site it was written at four of six: `map_of_entries` and `map_merge`
+  reach the tree by another route and were a total ordering oracle over a
+  plaintext, through a route ADR 0015 §2.3 lists as closed. A mitigation spelled
+  once per call site is one the next call site does not have.
+- **`Secret<a>` is not quantifiable**: a `forall` binder over one is `E0418`,
+  exactly as `Cell` and `Task` are. A generator that minted secrets and a
+  shrinker that printed counterexamples is a leak by construction.
+- **Derivation**: `derivable(json, ·)`, `derivable(ord, ·)` and
+  `derivable(row, ·)` are false for `Secret<a>` — `E0206 NOT_DERIVABLE`
+  **naming the field** — and `derivable(eq, ·)` holds. Asked twice of one
+  predicate, as ADR 0012 specifies: `ply_derive::walk`, and `ply_core`'s walk
+  over the *solved* type so `type Password = Secret<String>` is caught too.
+- `Value::type_name` is `"Secret"`. `Value::render` truncates nothing, because
+  it prints no payload.
+
+The claim, stated so it can be falsified:
+
+> No value of type `Secret<a>` can reach a trace field, a JSON document, a SQL
+> parameter, an HTTP response, a diagnostic message, an assertion diff, a panic
+> payload, a `--json` object, a definition hash, `frontend.dat` or the result
+> cache — because each is reached through a function, a derivation or an
+> evaluator path whose parameter type `Secret<a>` does not inhabit.
+
+What it does **not** prevent, and the list is not short: a credential written as
+a **source literal** (`secret_of_string("hunter2")` puts `"hunter2"` in a
+`Lit::Str`, which normalizes into the definition's bytes and lands in a store
+designed never to forget — **the largest hole, and nothing here closes it**); the
+plaintext the secret was built from, which is still in scope because Ply is a
+value language; `secret_verify` leaking one bit per call, unbounded and
+unrate-limited; timing outside the comparison, including a branch that traces on
+one arm; a host handler that receives one; **memory** — there is no zeroization,
+an `Arc<Value>` is not wiped, and a core dump has the plaintext; and a secret's
+*presence*, which is deliberately observable so that a missing credential is
+distinguishable from a wrong one.
+
+### `HostOp::secrets`, and `E0439`
+
+```rust
+pub struct HostOp {
+    /* ... */
+    /// Whether this operation may be handed a value containing a `Secret`.
+    /// Printed by `ply hosts` in its own column and covered by the digest.
+    pub secrets: bool,
+}
+```
+
+A `perform` whose arguments contain a `Value::Secret`, resolved to a
+registration with `secrets: false`, is **`E0439 SECRET_TO_HOST`** before the
+handler is called, naming the operation and the argument position. Ply's fault
+in the sense `E0427` is: `Status::Panicked`, `Failure::defect` true, not
+bisected. **In W5 no operation declares `secrets: true`**, so the column reads
+`no` on every row and the check is a tripwire — landed with a user count of
+zero, because adding it after the first operation that needed it had already
+shipped is the wrong order.
+
+The two credentials W5's own stack holds — the TLS key and the postgres password
+— are configured beside the run, never enter the program, and stay in
+`ply_cli::db::Secret` unchanged. Two mechanisms, two populations, one promise.
+
+### `std.config` — Ply source, the declaration
+
+```ply
+pub nondet effect config {
+  read get[k](key: String)    -> Option<String>
+  read secret[k](key: String) -> Option<Secret<String>>
+}
+
+pub type Shape = SText | SInt | SBool | SSecret
+pub type Key = { name: String, shape: Shape, required: Bool, default: Option<String> }
+pub type ConfigSpec = { keys: List<Key> }
+
+pub type Values = { plain: Map<String, String>, secret: Map<String, String> }
+pub fn values(plain: List<{key: String, value: String}>,
+              secret: List<{key: String, value: String}>) -> Values
+pub fn get_step(v: Values, key: String)    -> Option<String>
+pub fn secret_step(v: Values, key: String) -> Option<Secret<String>>
+```
+
+`read`, not `write`, and therefore never a conflict — sound only because the
+snapshot is frozen. **There is no `config.set`**; adding one would make the atom
+a write and serialise every test in a suite that reads one key. `nondet`, so a
+`det` test reaching configuration is `E0412` and must supply it. The resource is
+a namespace the call site writes, which buys no scheduling (reads never conflict)
+and buys the thing that matters: `ply check --types` says which definitions read
+configuration and which read **credentials**.
+
+`get` answers `Option` rather than raising — a missing key is a value the program
+matches on, ADR 0014 §0's rule for a second peer. The failure an operator
+actually suffers is caught at bind time instead.
+
+**Precedence**, highest first: `--set KEY=VALUE` (repeatable); `--config PATH`
+(repeatable, later files win); the process environment, by **exact** key with no
+prefix and no mangling; the spec's `default`.
+
+**The file format is `KEY=VALUE`, one per line.** `#` ends a line outside a
+value, blank lines are ignored, there is no quoting, interpolation, section or
+escape, and the value is the rest of the line with surrounding horizontal
+whitespace trimmed. A line without `=`, an empty key, or a key that is not
+`[A-Za-z_][A-Za-z0-9_.]*` is **`E0440 CONFIG_UNAVAILABLE`** naming the file and
+line. TOML, YAML and JSON are refused because the effect returns
+`Option<String>`: a format richer than the type it feeds is a format whose extra
+structure is silently dropped, and a parser in a trusted computing base is the
+line ADR 0013 says is worth a human's attention.
+
+**The environment is read exactly once**, at bind time, into an immutable
+`BTreeMap`, and `std::env::var` is never called at perform time. One line,
+carrying three properties: it makes `config.read` honestly a read, which makes
+two readers non-conflicting, which makes the conflict graph right; it stops one
+test's `setenv` reaching another; and it makes the snapshot a printable fact of
+the run.
+
+**Configuration may supply a value and may never cause a binding.** Without
+`--host` no source is opened whatever the environment holds, and `config.get` is
+`E0424` naming `ply_host::config::get`.
+
+`--config-schema <module>.<fn>` names a nullary function returning a
+`ConfigSpec`. At bind time the run materialises it and resolves every key:
+a `required` key nothing supplies is **`E0441 CONFIG_MISSING`** naming the key,
+its shape and the four places it looked; a value that is not of its `Shape` is
+**`E0442 CONFIG_INVALID`** naming the key and the winning source and **never the
+value when the shape is `SSecret`**; an **explicit** key — `--set` or `--config`
+only, never the environment — the spec does not declare is **`W0607
+CONFIG_UNDECLARED`**.
+
+With a spec, `get` on an `SSecret` key answers `None` and `secret` on any other
+key answers `None`; without one, both answer whatever the sources hold, so
+**§2's containment for configured values is exactly as strong as the spec** and a
+run with no `--config-schema` can read a password as a `String`.
+
+**Configuration is read at start-up and is a value thereafter.** No live reload:
+a source that can change mid-run is a nondeterminism every reader's row would
+have to carry, and two requests in one run seeing different values is a bug class
+with no repro. What may be configured is the identity and credentials of the
+peers a run talks to and the address it listens on; what may not is anything the
+program is *specified* in terms of — `http::Limits`, the route table, business
+rules — because those are what tests assert and a value that differs per
+environment is a value no test covers. Nothing enforces that line; what W5 offers
+is that it is **visible**, since a definition that reads configuration says so in
+its row and a `det` test handling no `config` is a proof that what it covered was
+the second kind.
+
+### `std.signal` and shutdown
+
+```ply
+pub nondet effect signal {
+  read stopping()    -> Bool
+  read deadline_ms() -> Int    // ms left in the drain; -1 when not draining
+}
+```
+
+No resource parameter, so the atom is the singleton `signal.read`. `deadline_ms`
+exists so a handler can shed rather than begin work it cannot finish.
+
+`ply_host::signal` registers with `tokio::signal` on the reactor thread the db
+driver already owns; the handler sets an atomic flag and does nothing else.
+
+| phase | what happens | bound by |
+| --- | --- | --- |
+| 0 | the flag is set; `signal.stopping()` answers `true` | — |
+| 1 | **lead** — accept keeps running so a readiness route can answer `503` | `--drain-lead-ms`, default `0` |
+| 2 | **stop accepting** — every `net.accept[s]` answers `0`; listeners close | immediate |
+| 3 | **drain** — in-flight connections finish their current request; keep-alive is not offered | `--drain-ms`, default `30000` |
+| 4 | **teardown** — the pinned order below | — |
+| 5 | **exit** — `0` clean, `3` if the deadline expired | — |
+
+A **second** identical signal exits immediately with `130`/`143` after one line
+naming what was abandoned. `SIGTERM` does not exist on Windows; `ctrl_c` is what
+binds there and `ply hosts --host` prints which signals the run listens for.
+
+**`examples/desk.ply` drains with no source change.** Its `serve` is a sequential
+accept loop that exits on `accept` answering `0`, phase 2 makes it answer `0`,
+and its in-flight count at the signal is exactly one — so it cannot lose a
+request. That is the exit criterion and it falls straight out of ADR 0013's
+decision that `accept` answers `0` rather than raising.
+
+**Teardown order is pinned**, and three of four steps are ordering-sensitive:
+
+1. `end_entry_point`, across drivers in this order:
+   1. **db** — every open scope is `ROLLBACK`ed, **never committed**. A commit at
+      a deadline commits a half-finished body, and only the body knows whether it
+      finished.
+   2. **trace** — every open span closed `Abandoned`. After db, so a span can
+      record the rollback.
+2. **flush the sink** — before the pool closes, so a trace naming a rolled-back
+   transaction is written before the connection that rolled it back is gone.
+3. **close the pool** — connections closed rather than returned; one whose
+   `ROLLBACK` failed is discarded, which is ADR 0014 §1.3 unchanged.
+4. exit.
+
+Any failure in 1–3 is `W0606 HOST_TEARDOWN` naming the driver and what it could
+not hand back. It changes no exit code.
+
+```rust
+pub trait HostRuntime {
+    /* ... */
+    /// Whether a stop has been requested. `park` returns when this becomes true
+    /// even with no token outstanding — otherwise an idle service never
+    /// observes a signal — and the deadlock check consults it so a park that
+    /// woke on a stop is not counted as fruitless. Read in exactly two places
+    /// in `ply-eval`, and nowhere in inference, a cache key or `Isolation`.
+    fn stopping(&self) -> bool;
+    /// Called once, after the last entry point, before the process exits. Runs
+    /// the pinned order above and answers what it managed. Never called from a
+    /// signal handler.
+    fn shutdown(&self, deadline: Duration) -> Shutdown;
+}
+
+pub struct Shutdown {
+    pub connections_abandoned: usize,
+    pub transactions_rolled_back: usize,
+    pub spans_abandoned: usize,
+    pub events_flushed: u64,
+    pub elapsed_ms: u64,
+    pub complete: bool,
+}
+```
+
+**A request still running at the deadline is not cancelled.** W5 adds no
+cancellation — ADR 0011 deferred it, ADR 0013 §7.2 argued deadlines sufficed for
+sockets, and that is still where it stands. The process tears down and exits, and
+the client sees a **connection closed with no response**, or a truncated one if
+bytes were written. `--drain-ms` should exceed the program's own
+`body_timeout_ms + write_timeout_ms`, which the run cannot check because `Limits`
+is a Ply value it never sees; both numbers are in the start-up banner so they can
+be compared by eye. A drain that expires is **`W0608 DRAIN_INCOMPLETE`** naming
+the connections abandoned and the transactions rolled back, and exits
+`EXIT_DRAIN_INCOMPLETE = 3`. A rolled-back transaction is not a lost request in
+the dangerous sense — the client got no answer and the database has no partial
+write, which a retry fixes; a committed half-transaction is what a retry cannot
+fix, and the teardown order is what makes it unreachable.
+
+**`signal` does not bind under `ply test`**, with or without `--host`. A test
+that could be ended by the suite's own `ctrl-C`, or that observes a stop another
+test requested, is a test whose verdict depends on the terminal. `E0424` names
+the twin. This is a deliberate asymmetry with `config`: a frozen read-only
+snapshot cannot couple two tests, and a stop flag set once ends every test after
+it.
+
+### The three new shared states
+
+W4 found a pooled connection coupling two tests the footprint graph believed were
+disjoint. Each of W5's three is a fresh chance to repeat it, so each has an
+account rather than a hope:
+
+| state | how it could couple two tests | what W5 does |
+| --- | --- | --- |
+| the trace sink | one process-wide sink; a test asserting on records sees another's | the atom is `trace.write[c]` — a **write**, per channel — so two tests on one channel are serialised by the existing conflict graph, and a per-test twin discharges the atom entirely. The defect to avoid is one `with_cell` around the suite |
+| the config snapshot | a `setenv` seen by another test; one key read twice differing | read **once**, at bind, into an immutable map; `std::env::var` is never called at perform time |
+| the stop flag | one stop ends every test after it | `signal` does not bind under `ply test` at all |
+
+**ADR 0008 §6 makes footprint conflict grouping the only isolation a host-backed
+test has**, so each is exactly as isolated as its registration's mode and
+resource and nothing checks either. Every test reaching any of them is
+`Isolation::Host` — counted separately, excluded from `isolated: n of m`, never
+cached, never bisected — and W5 adds no case to that machinery.
+
+### `ply build` and the `.plyx` artifact
+
+**W5 ships a whole-program artifact and no incremental transfer.** A deploy must
+ship a `ply` binary because the program is interpreted and every guarantee is the
+runtime's; the versions move most milestones, so the binary is the part that
+actually changes and it is orders of magnitude the larger. Shipping only changed
+definitions optimises the small side of a ratio nobody measured — so the required
+test prints **both** sizes and the exit criterion carries them, because a
+decision of this shape should be re-openable against a measurement. What
+incremental transfer would additionally need — a target-side agent, an
+authenticated channel, a negotiation, a rollback story, an atomic switch, a
+garbage-collection policy — is a product, and a half-built one is worse than
+none (ADR 0014 §7's sentence about migrations).
+
+What content addressing *is* worth, and nearly free because the store already
+does it, is identity and verification.
+
+```
+ply build [PATH] [-o FILE] [--entry NAME] [--config-schema NAME] [--db-schema NAME]
+          [--sources] [--digest] [--json]
+ply build --diff OLD.plyx [PATH]
+ply run FILE.plyx --host [...]
+```
+
+An artifact is **the transitive closure of its roots and nothing else**: the
+entry point, plus the start-up definitions the build names with
+`--config-schema` / `--db-schema`. A schema is a nullary function nothing in
+`main` calls, so an entry-point-only closure left it out and the deployed form
+lost `E0441 CONFIG_MISSING` and `E0435` — and, since without a spec `config.get`
+returns whatever the sources hold, could hand back a credential as an ordinary
+`String`. It carries definition bodies in `ply_hash::body`'s encoding keyed by
+`DefHash` (the bytes the store already holds, so `ply build` is a copy and not a
+second encoder), the namespace needed to resolve them, the entry point's name
+and hash, optionally the `SourceMap`, and the header. A start-up root is
+resolved by name on the deployed run, so what the artifact owes it is a `NAMES`
+entry and a body. **Tests, laws and specs are not in it** — a `test` is a
+definition nothing calls, so it is in no root's closure, and that falls out
+rather than being filtered. `ply build` prints the roots it shipped, and
+`startup none` when there are none; a name resolving to nothing is refused at
+build time.
+
+```
+header   0  magic        8    b"PLYPROG1"
+         8  format       u32  ARTIFACT_FORMAT = 1
+        12  flags        u32  bit 0: sources embedded
+        16  frontend     32   blake3(FRONTEND_VERSION)
+        48  runtime      32   blake3(RUNTIME_VERSION)
+        80  body_enc     u32  BODY_ENCODING
+        84  std          32   ply_std::digest()
+       116  entry        32   the entry point's DefHash
+       148  digest       32   below
+       180  sections     u32
+       184  reserved     u32  0
+       188  descriptors  sections × { kind u32, count u32, offset u64, bytes u64 }
+```
+
+| kind | section | record | sorted by |
+| --- | --- | --- | --- |
+| 1 | `BODIES` | `{ hash [32], len u32, bytes }` | hash |
+| 2 | `NAMES` | `{ name_off u32, name_len u32, hash [32] }` | name bytes |
+| 3 | `STRINGS` | the name blob | — |
+| 4 | `SOURCES` | present iff flag bit 0 | path |
+
+A target verifies **everything**, and each check answers a different question:
+every body against its own key — `blake3(bytes)`, or
+`blake3(component ‖ index_le_u32)` for a member of a component, which
+`ply_store::put_body` already refuses on — is **`E0443 ARTIFACT_INVALID`** naming
+the hash and offset, so a corrupted transfer is a per-definition refusal rather
+than a plausible wrong program; every reference resolving inside the artifact,
+also `E0443`; the header's versions against the running binary, which is
+**`E0444 ARTIFACT_VERSION`** and its own code because the responses are opposite
+(rebuild versus re-transfer), while a differing `ply_std::digest()` is `W0605`
+and not an error; and the digest, BLAKE3 domain-tagged `b"ply.program.1"` over
+the header from `sections` onward and every section payload in order, rendered
+`b3:` plus twelve hex characters by `ply build --digest`.
+
+**Two builds of one source tree produce byte-identical artifacts**, on any
+machine, from any directory, from a warm or a cold cache: bodies are normalized,
+sections are sorted, nothing carries a timestamp. Reproducible builds falling out
+of content addressing rather than being engineered, and a required test run twice
+from two roots.
+
+`ply build --diff` is the incremental story delivered as **information** rather
+than transport — added, changed, dropped and unchanged definition counts plus the
+endpoints reached by a changed one, which is a set difference over two hash sets
+and the reverse closure the graph already computes.
+
+What it costs: **a deployed artifact has no spans**, so a production diagnostic
+carries `Span::DUMMY` and a synthesized name (`d_<hash12>`, ADR 0003) unless it
+was built `--sources` — which puts the source text in whatever receives the
+artifact, a disclosure decision, which is why it is a flag, off, and covered by
+the digest. **No target-side inventory**: nothing tells a sender what a target
+already has, because nothing on the target answers. **No signing**: the digest
+establishes identity, not authenticity.
+
+### What an operator sees
+
+**Health and readiness are routes the program writes.** W5 adds no health effect
+and no built-in endpoint: a route table is ordinary data, so a framework-supplied
+`/healthz` would be a route not in `table()`, and two answers to "what does this
+service serve" is how a route and an authorization check come to disagree. What
+W5 supplies is the two facts a readiness route cannot otherwise compute, and the
+distinction — **liveness** is answerable with an empty row (`desk.ply`'s
+`health()` already is, and its `{}` is the proof it cannot be failed by a
+database outage), while **readiness** is `!signal.stopping()` and one
+`db.query[t](stmt("select 1"), [])`:
+
+```ply
+pub fn ready() -> http::Response / {signal.read, db.read[items]}
+```
+
+That row is the answer to "what does readiness actually verify", inferred rather
+than documented, and a readiness route whose row is `{}` checks nothing and
+`ply check --types` says so.
+
+**Structured output**: `ply_host::trace::json` writes one JSON object per line to
+**stderr**, and five rules are each a required test. stderr, never stdout,
+because every command's `--json` owns stdout and one interleaved line destroys
+the document. The program's fields are nested under `fields` **always**, even
+when empty, so a field named `level`, `ts` or `span` cannot shadow the envelope.
+`ts` is **epoch microseconds**, an integer, not RFC 3339 — Ply has no time type,
+a `timestamptz` is already `int8` microseconds by a program's own schema, and a
+calendar formatter in a trusted computing base is a dependency and a locale bug
+for a field every consumer re-formats; `--trace text` renders `+412.3ms` from the
+run's start, which needs no calendar either. **A `Secret` cannot appear**, and
+there is deliberately **no redaction pass** — a redaction pass is what W5 is
+replacing, and having one would invite someone to rely on it. A line is a single
+write, so two tasks cannot interleave one.
+
+```
+$ ply run examples/desk.ply --host --db ... --tls ... --config-schema desk.config
+   desk.run · ply 0.13.0 · program b3:91af0c33d7e2
+   hosts       12 handlers · 19 operations · digest b3:4f19c0a8e2d3
+   database    PostgreSQL 18.3 · desk · collation C · pool 8 · schema desk.schema verified
+   config      6 keys · 4 environment · 1 --set · 1 default · 2 secrets (values not shown)
+   trace       json → stderr · level info · channels db, http, items, orders
+   shutdown    signals INT TERM · lead 0ms · drain 30000ms
+   listening   0.0.0.0:8137 · tls desk · http/1.1
+
+   ^C
+   stopping    drain 30000ms · 1 connection in flight · 0 transactions open
+   drained     1 connection · 0 abandoned · 412ms
+   database    8 connections closed · 0 rolled back at teardown
+   trace       1284 events · 96 spans · 0 abandoned · flushed
+   desk.run    exit 0 · served 10429 requests · 4m12s
+```
+
+**Nothing is computed for the banner** — every number is a fact the run already
+holds. Secret values are absent; secret *keys* and their winning sources are in
+`ply hosts --json`, because an operator debugging "it used the wrong credential"
+needs to know which source won. A drain that expired prints `W0608` with the
+abandoned count and exits `3`, so a rolling restart that loses six requests per
+instance cannot report success.
+
+`ply hosts --host` gains a `SECRET` column on every row and three blocks —
+`configuration` (sources counted, the schema function, and the keys with values
+for non-secret ones and `****` for the rest, each with its winning source),
+`observability` (the sink's handler path, the resolved channel list, the span
+discipline) and `shutdown` (the signals, the two deadlines, the second-signal
+behaviour). The **digest covers** the `SECRET` column, the config schema
+function's name and its key names and shapes, the sink path, the channel list and
+the shutdown knobs; it does **not** cover resolved config values, the
+environment's size or the server version — ADR 0014 §11's rule, that a CI check
+which breaks on a deployment's own configuration is one people learn to ignore.
+
+`trace.*` is `Linearity::AtMostOnce` (replaying a continuation across an event
+writes it twice, and a duplicated span is a wrong answer about what happened);
+`config.*` and `signal.*` are `Repeatable`.
+
+### `ply` flags
+
+```
+ply run   [...] --trace <json|text|off>  --trace-level <debug|info|warn|error>
+                --config PATH  --set KEY=VALUE  --config-schema <module>.<fn>
+                --drain-ms N  --drain-lead-ms N
+ply test  [...] --trace <..>  --trace-level <..>  --config PATH  --set KEY=VALUE
+                --config-schema <module>.<fn>
+ply hosts [...]                                  (the three new blocks)
+ply build [PATH] [-o FILE] [--entry NAME] [--sources] [--digest] [--json]
+ply build --diff OLD.plyx [PATH]
+```
+
+`--trace` defaults to `json` under `ply run` and `off` under `ply test`;
+`--trace-level` defaults to `info`. `pub const EXIT_DRAIN_INCOMPLETE: i32 = 3;`
+joins `ply-cli`'s exit codes. `ply run --json` emits its object before the entry
+point starts and the trace lines follow on stderr.
+
+### New diagnostic codes — landed in `ply_span::codes`
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0439 | `SECRET_TO_HOST` | a host operation registered `secrets: false` was handed a value containing a `Secret` | **Ply's** |
+| E0440 | `CONFIG_UNAVAILABLE` | `--config` names an unreadable file, or a line or `--set` that is not `KEY=VALUE` | the run's configuration |
+| E0441 | `CONFIG_MISSING` | a `--config-schema` key marked `required` that no source supplies | the run's configuration |
+| E0442 | `CONFIG_INVALID` | a resolved value that does not satisfy its declared `Shape` | the run's configuration |
+| E0443 | `ARTIFACT_INVALID` | a `.plyx` whose header, digest, section table, body hash or reference closure does not verify | the run's configuration |
+| E0444 | `ARTIFACT_VERSION` | a `.plyx` built under a different `FRONTEND_VERSION`, `RUNTIME_VERSION` or `BODY_ENCODING` | the run's configuration |
+| E0445 | `SPAN_UNBALANCED` | `trace.exit` naming a span not open on the performing task's stack | the program's |
+| W0607 | `CONFIG_UNDECLARED` | a `--set` or `--config` key the schema does not declare | the run's configuration |
+| W0608 | `DRAIN_INCOMPLETE` | the drain deadline expired with connections in flight | the run's configuration |
+| W0609 | `SPAN_ABANDONED` | spans were still open when an entry point ended | the program's |
+
+E0439 joins `E0427`'s row — the machine's own verdict about the boundary,
+`Status::Panicked`, defect, never bisected. E0440–E0442 are raised by
+`HostRegistry::bind` before anything runs, like E0421–E0423 and E0431/E0435/E0438.
+E0443 and E0444 are raised by the artifact loader before any binding exists.
+**Those six join `RESERVED_CODES`, taking it from 18 to 24.** E0445 does **not**:
+it is a refusal the trace driver is the only component in a position to compute —
+which task holds which span — and reserving it would have `attribute` rewrite the
+driver's own diagnosis to `E0502` and send a reader looking for a defect in Ply.
+That is ADR 0014 §8's rule unchanged, and E0445 belongs with E0432–E0434, E0436
+and E0437. E0445 and W0609 are attributed and bisected like any other program
+failure; W0608 and W0606 are run-level and change no verdict.
+
+### Versions
+
+`RUNTIME_VERSION` to `0.11.0` — `Value::Secret`, three builtins, `render` /
+`values_equal` / `compare_values` changing on a variant, `HostRuntime::shutdown`
+and `stopping`, `HostOp::secrets`, `end_entry_point` closing spans; a cached
+`Pass` is a claim about what the evaluator did. `FRONTEND_VERSION` to `0.13.0` —
+`Secret` in `BUILTIN_TYPE_CONS`, the four derivability answers, and `E0418` for a
+`Secret` binder. **`BODY_ENCODING` stays at `7`** and **`PROVER_VERSION` stays at
+`0.5.0`**: no new normalization tag (a `Secret<String>` in a signature is
+`Type::Con`, which already encodes by name), and no existing obligation's
+discharge can change, because `Secret` is a new type no law could have mentioned.
+`ARTIFACT_FORMAT` is `1`. That `BODY_ENCODING` stays is a **required test**, not
+an observation: the whole W4 corpus normalizes byte-for-byte identically, and the
+front-end cache is discarded on the `FRONTEND_VERSION` bump while the **result
+cache is untouched**, so no test re-runs for a reason other than a source edit.
+
+### Workspace
+
+```toml
+tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync", "signal"] }
+```
+
+**One feature, and no new crate.** Rejected, each with a reason: **signal-hook**
+— tokio already owns a current-thread reactor on one OS thread, and a second
+signal mechanism in a trusted computing base is two things that can both claim
+`SIGTERM`. **tracing / tracing-subscriber / opentelemetry** — the sink is fifty
+lines of JSON writing, the effect is the interface, and a subscriber ecosystem's
+whole value is the ambient dispatch this milestone exists to remove; adopting one
+means two notions of a span, one of which is in no row. **toml / serde_yaml /
+figment** — the format is `KEY=VALUE` because the effect returns
+`Option<String>`. **chrono / time / jiff** — `ts` is epoch microseconds, two
+lines from `SystemTime`. **zeroize** — it would zero one `Arc<str>` while the
+evaluator copies values freely, which is a promise the runtime cannot keep and a
+badge it should not wear.
+
+`ply-std` gains `std.trace`, `std.config` and `std.signal` and no dependency;
+`ply-host` gains `trace.rs`, `config.rs`, `signal.rs`; `ply-cli` gains
+`commands/build.rs` and `artifact.rs`; `ply-eval` gains a `Value` variant, three
+builtins and two `HostRuntime` methods and **no dependency**.
+
+### Changes to `examples/desk.ply`
+
+`effect log` is **deleted** and its call sites become `trace.event[orders]` and
+`trace.event[items]`; `effect set Desk` loses `log.write` and gains
+`trace.write[orders]` and `trace.write[items]`. That moves the hashes of every
+definition annotated with `Desk` and everything reaching them, which is correct —
+the signature changed and selection is exact about it — and a required test
+asserts the definitions *not* reaching `trace` are untouched. A `ready()` route
+with the row `{signal.read, db.read[items]}` joins `health()` with the row `{}`.
+An API-key check on `POST /orders` reads `config.secret[credentials]` at start-up
+and compares with `secret_verify` — the only end-to-end `Secret<a>` in the
+repository. `run_memory` gains six `trace`, two `config` and one `signal` clause
+over three region-scoped cells and stays hermetic: its row is still
+`{net.write[conn], net.write[listener]}`. **Not changed**: `serve`,
+`serve_connection`, the framing, the route table, or any endpoint's behaviour.
+
+### Required tests
+
+The full list is ADR 0015 §12's; these are the ones whose absence would let W5
+ship broken rather than merely incomplete.
+
+1. Two channels do **not** conflict in the concurrency graph and two definitions
+   on one channel do; `ply check --types` prints `trace.write[orders]` with no
+   flag.
+2. A `det` test reaching an unhandled `trace` operation is `E0412` at compile
+   time, with `--host` and without it; a twin-backed tracing test's row is empty,
+   it is `det`, it is cached, and its second run is a hit.
+3. A `db.rollback` inside a span leaves it `Abandoned` in `drain`'s output with
+   every earlier record intact; a raise does the same and reports `W0609`.
+4. `trace.exit` on a span that is closed, never opened, or opened by another task
+   is `E0445`, naming both tasks in the third case.
+5. **The cost property**, by a counting harness and never a stopwatch: N events
+   under `discard` perform exactly N host operations, allocate exactly N `Fields`
+   maps, call `clock.now()` zero times and format zero strings — and the same for
+   `Debug` events under `--trace-level warn`. A published benchmark reports the
+   per-event and per-span cost under `discard`, `json` and the twin.
+6. Every route in the containment table is a compile error, one test each:
+   `Secret ++ String`, a `Secret` in a `Field`, in a `Param`, in
+   `bytes_of_string`, in `panic`, as a `Map` key, and `derive json` / `row` /
+   `ord` over a record holding one (`E0206` **naming the field**) while
+   `derive eq` succeeds.
+7. `match s { Secret(x) -> x }` is `E0101`; a failing `assert_eq` over a record
+   holding a `Secret` prints `Secret(****)` on both sides, and the same bytes
+   appear in `--json`, in the cached failure report and in `--explain`.
+8. **End to end on `desk.ply`**: a right key is accepted and a wrong one refused,
+   and the run's stderr, its `--json`, its `.ply-cache` directory and its
+   `frontend.dat` are searched for the credential's bytes and it appears in
+   **none** of them.
+9. `forall (s: Secret<String>)` is `E0418`; `compare_values` on a `Secret` is
+   `E0502` naming `secret_verify`; `secret_verify` shows no monotone step count
+   over mismatches at increasing positions.
+10. A host operation registered `secrets: false` handed a `Secret` is `E0439`,
+    `Status::Panicked`, not bisected; the `SECRET` column changing alone moves
+    the `ply hosts` digest.
+11. Precedence: one key from all four sources resolves to `--set`, and removing
+    sources in order walks it down to the default.
+12. The environment is read **once**: a `setenv` between two `config.get` calls
+    in one run does not change the second's answer. Two tests reading
+    configuration are in one concurrency group and run concurrently.
+13. `E0440` for an unreadable file, a line without `=`, an empty key and a
+    non-identifier key, each naming file and line; `E0441` naming the key and the
+    four sources; `E0442` for a bad `SInt`, and for a bad `SSecret` **without
+    printing the value**; `W0607` for a `--set` key the schema does not declare
+    and **not** for an environment key.
+14. `config.get` on an `SSecret` key answers `None` and `config.secret` on a
+    non-secret key answers `None`; a handler-supplied configuration is `det`,
+    cached and hermetic, and without it `E0424` names
+    `ply_host::config::get`.
+15. **`desk.ply` drains with no source change**: a signal mid-request lets it
+    complete, `accept` answers `0`, `serve` returns, the listener closes, exit
+    `0`.
+16. A transaction open at the deadline is **rolled back and never committed**,
+    asserted against `pg_stat_activity` and the table's contents rather than the
+    driver's bookkeeping; a trace record naming the rollback is written before
+    the pool closes.
+17. A second signal exits `130`/`143` immediately; an expired drain is `W0608`
+    with the abandoned count and exit `3`; a completed one is exit `0`.
+18. An **idle** service with no traffic and no outstanding token observes a
+    signal and exits — `park` returns on `stopping()` and `E0414` is not
+    reported. `--drain-lead-ms 2000` keeps accepting for two seconds while
+    `signal.stopping()` already answers `true`.
+19. `signal.stopping()` under `ply test --host` is `E0424` naming the twin, and
+    works under `ply run --host`.
+20. `ply build` twice from two different absolute roots, one cold cache and one
+    warm, produces **byte-identical** artifacts and the same digest; running the
+    artifact serves byte-identical responses over the full route table.
+21. A flipped bit, a truncation and a dangling reference are each `E0443` naming
+    the definition; a different `BODY_ENCODING` is `E0444` and not `E0443`; a
+    differing `ply_std::digest()` is `W0605` and the run proceeds.
+22. An artifact contains no `test`, no `law` and no span other than
+    `Span::DUMMY`; `--sources` changes the digest; `--diff`'s counts agree with
+    `ply hash` over the two trees; the artifact's and the binary's sizes are both
+    printed.
+23. A trace line goes to stderr and `ply run --json`'s stdout document parses
+    with trace output interleaved; a program field named `level`, `ts`, `span` or
+    `channel` appears under `fields` and shadows nothing; `--trace off` binds
+    `ply_host::trace::discard` and `ply hosts` lists it, while an **empty**
+    registry is `E0424`.
+24. The start-up banner's every number matches the corresponding
+    `ply hosts --json` field; the digest moves for the `SECRET` column, a config
+    key name or shape, the sink path, the channel list and a shutdown knob, and
+    does not move for a resolved config value, the environment's size or the
+    server version.
+25. Renaming a top-level function selects zero tests and moving a definition
+    between modules changes no hash, on a corpus with `trace`, `config`, `signal`
+    and `Secret` rows; incremental and `--no-incremental` agree byte-for-byte;
+    `E0412` still fires; `ply test` is hermetic without `--host`; bisection names
+    the correct culprit and `--engine both` reports no `E0503` with a `Secret`
+    round-tripping identically on both engines; a seeded race is found against
+    the twin **with tracing installed** and replayed exactly; an alias containing
+    `trace` and `config` atoms hashes as its expansion; `Store::open` at 10,000
+    definitions stays under 5 ms; `ply prove` reports honest tiers and
+    `ply hosts` prints the three new blocks.
+26. **No definition's normalized bytes moved** across the W5 change, over the
+    whole W4 corpus — `BODY_ENCODING` stays at `7` and this is what proves it.
+
+Plus one `tests/fixtures/` entry per new code.
+
+### Not in W5
+
+Metrics backends — no Prometheus, OTLP, StatsD or push gateway; `count`, `gauge`
+and `time` are records in a sink and a time series is a consumer's job. Log
+shipping — no rotation, syslog, network sink or batching; one JSON object per
+line on stderr and the supervisor owns the rest. Orchestration and autoscaling —
+no image, manifest, service discovery, rolling-restart controller or replica
+count. Distributed tracing propagation — W3 has no HTTP client, so there is no
+outbound context, and an inbound `traceparent` is a header, which is data.
+Sampling — the sink drops by level and nothing else, because a policy that
+silently discards is what this project audits for. **Cancellation**, still, which
+is what a request at the drain deadline costs and is the largest gap in the
+milestone for the second time. Live configuration reload. Incremental deploy
+transport, with the measurement that would re-open it. Artifact signing.
+Zeroization and every memory-level guarantee about a `Secret`. A `Secret` that
+survives concatenation, transformation or partial disclosure — no `secret_map`,
+`secret_concat` or `secret_slice`, because each would have to see the plaintext.
+**Rate limiting, backpressure and load shedding**: ADR 0014 §3.2 said W5 owns
+backpressure and W5 does not — `E0437 DB_POOL_EXHAUSTED` is still a diagnostic
+rather than a shed request, and turning it into a `503` needs a policy about
+which requests to refuse and a way to refuse one without ending the run. That is
+a promise W4 made that W5 is breaking, stated rather than quietly dropped.

@@ -753,3 +753,210 @@ fn reconstruction_is_deterministic() {
     );
     assert_eq!(first.names, second.names);
 }
+
+// --- reconstructing under the names a definition was written with ------------
+
+/// Everything the `Namespace` is for, in one program: two definitions in one
+/// module (so units have to be *merged* rather than each given a module of its
+/// own), a cross-module reference (so a dotted import path has to be rebuilt),
+/// and an effect (whose program-wide name is the thing a host handler is
+/// registered against, and the whole reason this exists).
+const NAMED: [(&str, &str); 2] = [
+    (
+        "store.wire",
+        r#"
+        pub effect audit { write emit[t](what: String) -> Unit }
+        pub type Note = { what: String }
+        pub fn note(what: String) -> Note = { what: what }
+        "#,
+    ),
+    (
+        "app",
+        r#"
+        import store.wire (audit, Note, note)
+        pub fn record(what: String) -> Note / {audit.write[log]} = {
+          audit.emit[log](what);
+          note(what)
+        }
+        fn main() -> String / {audit.write[log]} = record("x").what
+        "#,
+    ),
+];
+
+fn namespace(checked: &Checked) -> BTreeMap<DefHash, Symbol> {
+    checked
+        .hashes
+        .defs
+        .iter()
+        .chain(checked.hashes.decls.iter())
+        .map(|(name, hash)| (*hash, name.clone()))
+        .collect()
+}
+
+#[test]
+fn a_namespace_restores_the_names_and_the_modules() {
+    let original = compile(&NAMED.map(|(n, s)| (n, s)));
+    let names = namespace(&original);
+    let rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &names)
+        .expect("bodies should reconstruct");
+
+    for (hash, given) in &rebuilt.names {
+        assert_eq!(
+            Some(given),
+            names.get(hash),
+            "`{hash}` came back under a name the namespace did not give it"
+        );
+    }
+    // Module *order* is the units' — hash order, so a reconstruction is
+    // byte-identical run to run — but the set is the program's, which is the
+    // claim: five definitions came back as two modules rather than five.
+    let mut modules: Vec<String> = rebuilt
+        .program
+        .modules
+        .iter()
+        .map(|m| m.name.to_string())
+        .collect();
+    modules.sort();
+    assert_eq!(modules, ["app", "store.wire"], "units were not merged");
+
+    // And it is a program, not just a naming: it resolves, it typechecks, and
+    // every definition hashes back to the key its body was filed under.
+    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
+    assert!(check.defs.contains_key(&Symbol::new("app.main")));
+    assert!(
+        check
+            .effects
+            .values()
+            .any(|e| e.name.as_str() == "store.wire.audit")
+    );
+
+    let (again, _) = hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash");
+    for (name, hash) in original
+        .hashes
+        .defs
+        .iter()
+        .chain(original.hashes.decls.iter())
+    {
+        let now = again
+            .defs
+            .get(name)
+            .or_else(|| again.decls.get(name))
+            .unwrap_or_else(|| panic!("`{name}` is missing from the rebuilt program"));
+        assert_eq!(
+            now, hash,
+            "`{name}` was rebuilt into a different definition"
+        );
+    }
+}
+
+/// A namespace that cannot be applied consistently is not applied at all. A
+/// program named half one way and half the other would make the names in a
+/// diagnostic depend on which definitions happened to be nameable, which is an
+/// answer that varies with something a reader cannot see.
+#[test]
+fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
+    let original = compile(&NAMED.map(|(n, s)| (n, s)));
+    let full = namespace(&original);
+
+    for broken in [
+        // One definition missing.
+        {
+            let mut names = full.clone();
+            let victim = *names.keys().next().unwrap();
+            names.remove(&victim);
+            names
+        },
+        // Two definitions claiming one name.
+        full.keys().map(|h| (*h, Symbol::new("m.same"))).collect(),
+        // A name with no module to put it in.
+        full.keys().map(|h| (*h, Symbol::new("bare"))).collect(),
+    ] {
+        let rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &broken)
+            .expect("a namespace that cannot be used is not a broken artifact");
+        assert!(
+            rebuilt
+                .names
+                .values()
+                .all(|n| n.as_str().starts_with('m') && n.as_str().contains(".d")),
+            "a mixture was produced: {:?}",
+            rebuilt.names.values().take(4).collect::<Vec<_>>()
+        );
+        ply_syntax::resolve(&rebuilt.program).expect("the fallback still resolves");
+    }
+}
+
+/// Bisection's route is untouched: it deliberately reconstructs without a
+/// namespace, because a historical definition set has to be rebuildable without
+/// knowing what anything is called now.
+#[test]
+fn reconstruct_without_a_namespace_is_unchanged() {
+    let original = compile(&NAMED.map(|(n, s)| (n, s)));
+    let bare = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    assert!(
+        bare.names.values().all(|n| n.as_str().contains(".d")),
+        "{:?}",
+        bare.names.values().take(4).collect::<Vec<_>>()
+    );
+    assert_eq!(bare.program.modules.len(), original.bodies.len());
+}
+
+/// Two effect declarations that normalize identically are one hash, so a
+/// reconstruction cannot tell them apart — and the encoding only records that a
+/// definition *did* tell them apart when one component reached both. This pins
+/// where the line actually is, because `the_examples_reconstruct` walked into it.
+#[test]
+fn two_identical_effect_declarations_are_one_hash() {
+    let original = compile(&[
+        ("a", "pub effect one { read at() -> Int }"),
+        ("b", "pub effect two { read at() -> Int }"),
+    ]);
+    let one = original.hashes.decls[&Symbol::new("a.one")];
+    let two = original.hashes.decls[&Symbol::new("b.two")];
+    assert_eq!(
+        one, two,
+        "two byte-identical declarations must hash alike, or content addressing is not what it says"
+    );
+}
+
+/// A slot is a de Bruijn level into **one component's** effect enumeration, and
+/// each test is its own component. Two tests that reach different effect sets
+/// therefore number the effects they share differently, and neither is wrong.
+///
+/// Reading that as one effect at two slots — which a slot map shared across the
+/// whole reconstructed test module does — refuses a corpus that is perfectly
+/// well formed. `examples/` walked into it the moment a second effect reached
+/// some tests and not others, so this is the pin.
+#[test]
+fn two_tests_that_number_one_effect_differently_both_reconstruct() {
+    let original = compile(&[(
+        "m",
+        r#"
+        effect left  { read one() -> Int }
+        effect right { read two() -> Bool }
+
+        fn only_right() -> Bool / {right.read} = right.two()
+        fn both() -> Int / {left.read, right.read} =
+          if right.two() { left.one() } else { 0 }
+
+        test "the shared effect is alone here" {
+          handle { assert_eq(only_right(), true) } with { right.two() -> true }
+        }
+
+        test "and beside another one here" {
+          handle { assert_eq(both(), 7) } with { left.one() -> 7, right.two() -> true }
+        }
+        "#,
+    )]);
+
+    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
+    let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
+    assert_eq!(interp.test_count(), 2);
+    for index in 0..interp.test_count() {
+        interp
+            .eval_test(index)
+            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
+    }
+}

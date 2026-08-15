@@ -554,6 +554,16 @@ impl Scheduler {
             )));
         }
 
+        // Once per scheduling decision, and this is the only place the machine
+        // gives control back while a request is still running. W5 has no
+        // cancellation, so a drain that expired cannot hand the task a `503`;
+        // what it can do is stop scheduling before the task issues its next
+        // statement, which is what leaves the teardown a transaction to roll
+        // back rather than a half-finished body to commit.
+        if let Some(expired) = rt.drain_expired() {
+            return Err(expired);
+        }
+
         let mut fruitless = 0u32;
         let task = loop {
             if let Some(task) = self.first_ready() {
@@ -573,13 +583,27 @@ impl Scheduler {
                     _ => Err(self.internal("the region finished without its body returning")),
                 };
             }
-            if !self.waiting_on_host() {
+            // A stop turns "nothing can make progress" from a verdict into a
+            // wait: the listening sockets are being closed under the run, so an
+            // `accept` that was the only outstanding token has already resolved
+            // and the tasks below it are about to become ready. Calling this a
+            // deadlock would report `E0414` on the ordinary shutdown path.
+            if !self.waiting_on_host() && !rt.stopping() {
                 return Err(self.err_host_deadlock());
             }
             rt.park()?;
-            fruitless += 1;
-            if fruitless > FRUITLESS_PARKS {
-                return Err(self.err_park_made_no_progress());
+            if let Some(expired) = rt.drain_expired() {
+                return Err(expired);
+            }
+            // A park that woke on a stop resolved no token and is not fruitless:
+            // it is `park` doing the one thing that lets an idle service observe
+            // a signal at all, and counting it would report the runtime as
+            // broken for working.
+            if !rt.stopping() {
+                fruitless += 1;
+                if fruitless > FRUITLESS_PARKS {
+                    return Err(self.err_park_made_no_progress());
+                }
             }
         };
 
@@ -1999,6 +2023,7 @@ mod tests {
                 determinism: Determinism::Nondeterministic,
                 linearity: Linearity::AtMostOnce,
                 blocking: false,
+                secrets: false,
                 path: "test::handler",
             },
             Arc::new(Never),
@@ -2210,5 +2235,150 @@ mod tests {
         assert!(trail.choices().is_empty());
         assert!(!trail.entered());
         assert_eq!(trail.point(), 0);
+    }
+    /// A runtime that is stopping and has nothing outstanding.
+    ///
+    /// The shape of an idle service at a signal: the accept it was parked on has
+    /// resolved, no task is enabled and none is waiting on the host. Without
+    /// `stopping()` in the deadlock check this is `E0414` — a service reporting
+    /// that it deadlocked because someone pressed ctrl-C.
+    struct Stopping {
+        parks: std::cell::Cell<u32>,
+        expire_after: u32,
+    }
+
+    impl HostRuntime for Stopping {
+        fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
+            Ok(None)
+        }
+
+        fn park(&self) -> Result<(), Diagnostic> {
+            self.parks.set(self.parks.get() + 1);
+            Ok(())
+        }
+
+        fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+            Err(Diagnostic::error(codes::INTERNAL_ERROR, "not reached"))
+        }
+
+        fn stopping(&self) -> bool {
+            true
+        }
+
+        fn drain_expired(&self) -> Option<Diagnostic> {
+            (self.parks.get() >= self.expire_after)
+                .then(|| Diagnostic::warning(codes::DRAIN_INCOMPLETE, "the drain deadline expired"))
+        }
+    }
+
+    /// Two tasks each waiting for the other: nothing is enabled, nothing is
+    /// waiting on the host, and no virtual clock exists to advance. The exact
+    /// condition `err_host_deadlock` reports, and the one a stop has to turn
+    /// into a wait rather than a verdict.
+    fn deadlock(sched: &mut Scheduler) {
+        let other = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY);
+        sched
+            .join(suspended(), other, Span::DUMMY)
+            .expect("the root is running");
+        let Turn::Run { task, .. } = sched.next_host(&Idle).expect("the spawned task is enabled")
+        else {
+            panic!("expected the spawned task's first step");
+        };
+        assert_eq!(task, other);
+        sched
+            .join(suspended(), ROOT, Span::DUMMY)
+            .expect("the spawned task is running");
+    }
+
+    /// An idle service observes a signal and stops, and the deadlock check does
+    /// not report `E0414` on the way.
+    ///
+    /// The park is what makes this reachable at all: nothing is enabled, nothing
+    /// is waiting on a token, and the only thing that will ever change is the
+    /// drain running out. A run that called that a deadlock would tell an
+    /// operator their service was wedged every time it shut down cleanly.
+    #[test]
+    fn a_stopping_region_with_nothing_outstanding_drains_rather_than_deadlocking() {
+        let mut sched = production();
+        let Turn::Run { .. } = sched
+            .next_host(&Stopping {
+                parks: std::cell::Cell::new(0),
+                expire_after: 3,
+            })
+            .expect("the root is enabled")
+        else {
+            panic!("expected the root's step");
+        };
+        // The root blocks on a task that will never finish: nothing is enabled
+        // and nothing is waiting on the host, which is `err_host_deadlock`'s
+        // exact condition.
+        deadlock(&mut sched);
+
+        let runtime = Stopping {
+            parks: std::cell::Cell::new(0),
+            expire_after: 3,
+        };
+        let err = refused(
+            sched.next_host(&runtime),
+            "the drain deadline ends the region",
+        );
+        assert_eq!(
+            err.code,
+            codes::DRAIN_INCOMPLETE,
+            "a stopping region ends on its deadline, not on `E0414`: {}",
+            err.message
+        );
+        assert!(
+            runtime.parks.get() >= 3,
+            "the scheduler parked {} times before the deadline, so it never waited",
+            runtime.parks.get()
+        );
+    }
+
+    /// A park that woke on a stop resolved no token and is not fruitless. Without
+    /// the exemption a drain longer than `FRUITLESS_PARKS` bounded parks reports
+    /// the host runtime as broken for doing the one thing that lets an idle
+    /// service observe a signal.
+    #[test]
+    fn a_park_that_woke_on_a_stop_is_not_counted_as_fruitless() {
+        let mut sched = production();
+        let Turn::Run { .. } = sched
+            .next_host(&Stopping {
+                parks: std::cell::Cell::new(0),
+                expire_after: u32::MAX,
+            })
+            .expect("the root is enabled")
+        else {
+            panic!("expected the root's step");
+        };
+        deadlock(&mut sched);
+
+        let runtime = Stopping {
+            parks: std::cell::Cell::new(0),
+            expire_after: FRUITLESS_PARKS + 8,
+        };
+        let err = refused(sched.next_host(&runtime), "the drain deadline ends it");
+        assert_eq!(
+            err.code,
+            codes::DRAIN_INCOMPLETE,
+            "{} parks past the fruitless bound reported `{}` instead",
+            runtime.parks.get(),
+            err.code
+        );
+        assert!(runtime.parks.get() > FRUITLESS_PARKS);
+    }
+
+    /// The same region with no stop in progress *is* a deadlock, so the exemption
+    /// above is not a hole: what it turns off is the verdict for a run that is
+    /// stopping and nothing else.
+    #[test]
+    fn a_region_that_is_not_stopping_still_deadlocks() {
+        let mut sched = production();
+        let Turn::Run { .. } = sched.next_host(&Idle).expect("the root is enabled") else {
+            panic!("expected the root's step");
+        };
+        deadlock(&mut sched);
+        let err = refused(sched.next_host(&Idle), "nothing can make progress");
+        assert_eq!(err.code, codes::DEADLOCK);
     }
 }

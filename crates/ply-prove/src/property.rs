@@ -320,6 +320,7 @@ impl TypeWorld {
                 "List" | "Map" => Some(0),
                 "Cell" => None,
                 _ if name.as_str() == prelude::TASK_TYPE => None,
+                _ if name.as_str() == ply_core::ty::SECRET => None,
                 _ => self.types.get(name).and_then(|d| d.depth),
             },
         }
@@ -393,6 +394,11 @@ pub enum Ungeneratable {
     Cell,
     /// A task belongs to a `simulate` region, and a binder is not one.
     Task,
+    /// A credential. Refused twice: `E0418` at the binder is what a user sees,
+    /// and this is what a caller that reached the generator anyway gets — a
+    /// generator that minted credentials and a shrinker that printed
+    /// counterexamples is a leak by construction.
+    Secret,
     /// A function type with a non-empty row: applying it inside a spec would
     /// make the spec impure, so the binder would be unusable.
     Effectful(Row),
@@ -413,6 +419,9 @@ impl fmt::Display for Ungeneratable {
         match self {
             Ungeneratable::Cell => f.write_str("a `Cell` belongs to the region that opened it"),
             Ungeneratable::Task => f.write_str("a `Task` belongs to a `simulate` region"),
+            Ungeneratable::Secret => {
+                f.write_str("a `Secret` is a credential, and nothing may generate one")
+            }
             Ungeneratable::Effectful(row) => {
                 write!(f, "a function performing {row} cannot be applied in a spec")
             }
@@ -457,6 +466,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
+            _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some(decl) = world.types.get(name) else {
                     return Err(Ungeneratable::Unknown(name.clone()));
@@ -579,6 +589,7 @@ impl Gen<'_> {
                 }
                 "Cell" => Err(Ungeneratable::Cell),
                 _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
+                _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
                 _ => self.adt(name, args, depth),
             },
         }

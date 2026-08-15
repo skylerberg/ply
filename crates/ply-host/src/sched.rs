@@ -80,6 +80,11 @@ pub fn registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
                     determinism: Determinism::Nondeterministic,
                     linearity: Linearity::Repeatable,
                     blocking: false,
+                    // `spawn` is handed a closure and `join` a `Task`. A closure's
+                    // environment may hold a credential and the scheduler never
+                    // reads it: the body runs above the boundary, where every
+                    // other rule in ADR 0015 §2 still applies.
+                    secrets: false,
                     path: path_of(op),
                 },
                 Arc::new(Scheduled) as Arc<dyn HostHandler>,

@@ -17,6 +17,9 @@ pub struct Blocker {
     pub span: Span,
     /// Completes "…^^^^ {reason}".
     pub reason: String,
+    /// The advice this particular refusal carries, when the reason alone does
+    /// not say what to do instead.
+    pub note: Option<&'static str>,
     /// Named in the note when the blocking type sits inside a variant rather
     /// than a record field.
     pub variant: Option<String>,
@@ -27,8 +30,14 @@ impl Blocker {
         Blocker {
             span,
             reason: reason.into(),
+            note: None,
             variant: None,
         }
+    }
+
+    fn noted(mut self, note: Option<&'static str>) -> Blocker {
+        self.note = note;
+        self
     }
 
     /// A record field is blamed as a whole — `on_complete: (Order) -> Unit` —
@@ -77,7 +86,8 @@ pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
                 return Err(Blocker::new(
                     *span,
                     format!("{}, so `{simple}` has no derivation", refusal.reason()),
-                ));
+                )
+                .noted(refusal.note()));
             }
             if deriver == Deriver::Json
                 && simple == rules::OPTION

@@ -264,14 +264,46 @@ a time type, and a database per test.
 
 ## W5 — Operations
 
-- Observability as an effect, so tracing is handled rather than ambient
-- Config and secrets, with secrets typed so they cannot reach a log handler
-- Graceful shutdown and connection draining
-- Deployment: content addressing means a deploy could ship only the definitions
-  whose hashes changed. Nothing about this exists yet and it may not be worth it
+A log, a configuration and a way to stop are ambient in every other language, and
+ambient is what the previous eight milestones exist to remove.
+
+- **Observability as an effect**, with the resource label a *channel*, so a
+  function's row says which channels it records on exactly as it already says
+  which tables it touches. Metrics are operations on the same effect. There is no
+  disabled path that skips the perform — a row cannot be conditional on a flag —
+  so what a span costs when nothing is collecting is stated and measured rather
+  than promised away
+- **Typed secrets**, the headline: `Secret<a>` is a builtin type constructor with
+  no constructor pattern, no path to `String`, no `json` / `ord` / `row`
+  derivation, no generator and no rendering, so every route from a credential to
+  a log is a compile error. The routes that stay open — a source literal, the
+  plaintext it was built from, one bit per `secret_verify`, a host handler that
+  receives one, and memory — are enumerated, because a guarantee with an unstated
+  hole is worse than none
+- **Configuration** from `--set`, a `KEY=VALUE` file and the environment, in that
+  precedence, snapshotted **once** at bind time so `config.read` is honestly a
+  read; a `--config-schema` verified at start-up, exactly as W4 verifies a
+  database schema, so a missing credential is a refusal rather than a 3am 500
+- **Graceful shutdown**: stop accepting, drain, then a pinned teardown order —
+  roll back every open transaction, close every open span, flush the sink, close
+  the pool. W5 still has no cancellation, so a request live at the deadline sees
+  its connection closed with no response and the run exits `3`; that is stated,
+  not smoothed over
+- **Deployment**: `ply build` produces a whole-program `.plyx` — the entry
+  point's closure, every body verified against its own key, reproducible
+  byte-for-byte from any machine. Incremental *transfer* is refused with the
+  measurement that would re-open it; incremental *review* is kept, as
+  `ply build --diff`
 
 **Exit:** a service that can be deployed, observed, and shut down without losing
-in-flight requests.
+in-flight requests — with `examples/desk.ply`'s accept loop draining with **no
+source change**, a credential that appears in no log line, no cache entry and no
+definition hash, and two builds of one tree producing identical digests.
+
+`docs/adr/0015-w5-contract.md`. Not in W5: metrics backends, log shipping,
+orchestration, autoscaling, distributed tracing propagation, sampling,
+cancellation, live config reload, incremental deploy transport, artifact signing,
+zeroization, and — breaking a promise W4 made — backpressure and load shedding.
 
 ## W6 — Performance, and whether M9 comes forward
 

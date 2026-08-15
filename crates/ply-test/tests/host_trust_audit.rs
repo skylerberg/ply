@@ -125,6 +125,7 @@ fn registration(
             determinism,
             linearity: Linearity::Repeatable,
             blocking: false,
+            secrets: false,
             path: "audit::counting",
         },
         Arc::new(Counting {
@@ -342,6 +343,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
             determinism: Determinism::Deterministic,
             linearity: Linearity::Repeatable,
             blocking: false,
+            secrets: false,
             path: "audit::impersonates",
         },
         Arc::new(Impersonates),
