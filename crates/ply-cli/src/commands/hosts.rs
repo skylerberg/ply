@@ -61,10 +61,31 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    let transport = hosts::Transport::of(&listing, Some(&credentials));
+    // Resolved here for the same reason the credentials are: `ply hosts` is the
+    // command that answers "what does this run trust", and a connection string
+    // that will not parse is a run that will not start.
+    let db = match args.db.resolve(args.host) {
+        Ok(db) => db,
+        Err(diagnostics) => {
+            return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let schema = match schema_view(&loaded, db.as_ref()) {
+        Ok(schema) => schema,
+        Err(diagnostic) => {
+            return report_bind_error(
+                "hosts",
+                std::slice::from_ref(&diagnostic),
+                &loaded.sources,
+                args.json,
+                style,
+            );
+        }
+    };
+    let disclosures = hosts::Disclosures::of(&listing, Some(&credentials), db, schema);
 
     if args.digest {
-        println!("{}", hosts::digest_short(&listing, transport.as_ref()));
+        println!("{}", hosts::digest_short(&listing, &disclosures));
         return EXIT_OK;
     }
 
@@ -78,15 +99,18 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             "binding": if args.host { "host" } else { "hermetic" },
             "handlers": listing.handlers,
             "operations": listing.rows.len(),
-            "digest": hosts::digest_short(&listing, transport.as_ref()),
+            "digest": hosts::digest_short(&listing, &disclosures),
             // Present in both bindings. `binding` says what this run would use;
             // the rows say what exists, and an agent should not have to invoke
             // the command twice to learn both.
             "hosts": hosts::rows_json(&listing),
             "diagnostics": Value::Array(Vec::new()),
         });
-        if let Some(transport) = &transport {
+        if let Some(transport) = &disclosures.transport {
             report["transport"] = transport.json();
+        }
+        if let Some(database) = &disclosures.database {
+            report["database"] = database.json();
         }
         emit_json(&report);
         return EXIT_OK;
@@ -94,7 +118,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
 
     println!();
     let lines = if args.host {
-        hosts::listing_lines(&listing, transport.as_ref())
+        hosts::listing_lines(&listing, &disclosures)
     } else {
         hosts::hermetic_lines(&listing)
     };
@@ -106,6 +130,28 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         }
     }
     EXIT_OK
+}
+
+/// The `--db-schema` function, resolved and materialised.
+///
+/// `ply hosts` is the one command whose whole output is this block, so it pays
+/// for the evaluation that fills in the counts. A name that resolves to nothing
+/// is `E0431` here rather than at the first statement.
+fn schema_view(
+    loaded: &crate::load::Loaded,
+    db: Option<&crate::db::DbConfig>,
+) -> Result<Option<crate::db::schema::SchemaView>, ply_span::Diagnostic> {
+    let Some(name) = db.and_then(|c| c.schema.as_deref()) else {
+        return Ok(None);
+    };
+    let resolved = crate::db::schema::resolve(&loaded.check, name)?;
+    let name = resolved.as_str().to_string();
+    let shape = super::common::materialise_schema(loaded, &name);
+    Ok(Some(crate::db::schema::SchemaView {
+        name,
+        shape,
+        state: crate::db::schema::State::Declared,
+    }))
 }
 
 #[cfg(test)]

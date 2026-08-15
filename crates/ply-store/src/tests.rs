@@ -2147,7 +2147,7 @@ const PINNED_FINGERPRINT: &str = "02e7e6340261171838cb49303958e371ae61d01db72909
 const PINNED_DEF: &str = "edbd2fa35344f8a5fd38f3e745727cd96ca1d7c57255560c0064004b249c6aab";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
-const PINNED_BODY: &str = "a7b6ea731ed0e31bcbee6e4b7f8b0c3666406807ef11b62475861bdef4dd080d";
+const PINNED_BODY: &str = "adf0f67e207566df6efe0eb0ac42e091e3f554a4d7b36ec34cd37b8306f21900";
 
 /// The other direction, which the forward pin cannot show: bytes written by an
 /// earlier run of this version still decode to the same values, through the

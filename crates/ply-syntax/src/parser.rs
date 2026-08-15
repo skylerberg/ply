@@ -394,9 +394,13 @@ impl Parser {
     }
 
     /// `law` is contextual: it opens an item only when a quoted label follows,
-    /// so `fn law(..)` and a local named `law` keep their meaning.
+    /// so `fn law(..)` and a local named `law` keep their meaning. `law/host`
+    /// puts a `/` and a name between the two, exactly as `test/nondet` does.
     fn at_law_start(&self) -> bool {
-        self.at_ident_text("law") && matches!(self.kind_at(1), TokenKind::Str(_))
+        self.at_ident_text("law")
+            && (matches!(self.kind_at(1), TokenKind::Str(_))
+                || (matches!(self.kind_at(1), TokenKind::Slash)
+                    && matches!(self.kind_at(2), TokenKind::Ident(_))))
     }
 
     /// `derive` is contextual for the same reason `law` is. Two identifiers in a
@@ -749,6 +753,14 @@ impl Parser {
 
     fn law_def(&mut self) -> PResult<LawDef> {
         let start = self.advance();
+        let mut host = false;
+        if self.eat(&TokenKind::Slash) {
+            if !self.at_ident_text("host") {
+                return Err(self.error_here("`host` after `law/`"));
+            }
+            self.advance();
+            host = true;
+        }
         let (name, name_span) = match self.kind() {
             TokenKind::Str(s) => {
                 let s = s.clone();
@@ -785,6 +797,7 @@ impl Parser {
         Ok(LawDef {
             name,
             name_span,
+            host,
             binders,
             guard,
             body,

@@ -1,6 +1,6 @@
 use super::common::{
-    IND, diagnostic_json, emit_json, location, plural, print_diagnostics, report_bind_error,
-    report_load_error,
+    IND, describe_schema, diagnostic_json, emit_json, location, plural, print_diagnostics,
+    report_bind_error, report_load_error,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -41,24 +41,40 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     // After the entry point is known and before anything evaluates: a bad
     // registration is a start-up failure, and a hermetic run resolves nothing at
     // all, so the default path cannot be broken by a registry it never consults.
-    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls) {
-        Ok(hosts) => hosts,
+    // Before the binding, because a connection string that does not parse is
+    // the run's configuration and has nothing to do with what the registry
+    // resolves — and because a diagnostic about it must be raised by the one
+    // component that has never held the password as text.
+    let db = match args.db.resolve(args.host) {
+        Ok(db) => db,
         Err(diagnostics) => {
             return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-
-    let name = entry.name.clone();
-    let module = entry.module.to_string();
-    let span = entry.span;
-    // The entry point's own row, which is what a host answer is checked
-    // against: an operation outside it is `E0427` rather than a socket touched
-    // over a footprint that under-reports.
+    // The entry point's own row, which is what a host answer is checked against
+    // and what decides whether this run needs a database at all.
     let declared = loaded
         .check
         .defs
         .get(&entry.name)
         .map(|d| d.footprint.clone());
+    let mut hosts = match Hosts::open(
+        &loaded.check,
+        args.host,
+        &args.tls.tls,
+        db,
+        declared.as_ref(),
+    ) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    describe_schema(&loaded, &mut hosts);
+
+    let name = entry.name.clone();
+    let module = entry.module.to_string();
+    let span = entry.span;
     let engine: EngineChoice = args.engine.into();
     let plan = crate::simulation::run_plan(args.seed.as_ref());
     match evaluate(
@@ -129,17 +145,20 @@ fn print_binding(hosts: &Hosts, style: Style) {
         return;
     }
     let listing = hosts.listing();
-    let transport = hosts.transport();
+    let disclosures = hosts.disclosures();
     println!(
         "{IND}{}",
         style.dim(&format!(
             "binding host · {} {} · {}",
             listing.rows.len(),
             plural(listing.rows.len(), "operation"),
-            crate::hosts::digest_short(listing, transport.as_ref()),
+            crate::hosts::digest_short(listing, &disclosures),
         ))
     );
     for line in crate::hosts::handshake_lines(&hosts.handshakes()) {
+        println!("{IND}{}", style.dim(&line));
+    }
+    if let Some(line) = crate::hosts::database_line(hosts) {
         println!("{IND}{}", style.dim(&line));
     }
 }

@@ -444,6 +444,18 @@ pub trait Executor: Sync {
     fn host_use(&self, _worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
         None
     }
+
+    /// What the host runtime reported while closing the entry point, and
+    /// forgotten by the worker once read.
+    ///
+    /// Warnings, never failures, and never the test's verdict. A connection the
+    /// driver had to discard because its `ROLLBACK` failed is the *run's* own
+    /// resource: the program asked for nothing and did nothing wrong, and
+    /// attributing it to whichever test happened to be running would send a
+    /// reader looking for a defect in their own program.
+    fn teardown(&self, _worker: &mut Self::Worker) -> Vec<Diagnostic> {
+        Vec::new()
+    }
 }
 
 /// The search each test runs, and whether to measure what an unpruned one would
@@ -806,6 +818,16 @@ impl<'a> Executor for InterpExecutor<'a> {
 
     fn host_use(&self, worker: &Worker<'a>) -> Option<ply_eval::host::HostUse> {
         worker.host.clone()
+    }
+
+    /// Only the machine has a runtime to close anything on: the tree-walker
+    /// refuses a bound host operation rather than driving one, so there is never
+    /// a scope of its to hear about.
+    fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
+        match &mut worker.engines {
+            Engines::Machine(m) | Engines::Both(_, m) => m.take_teardown_warnings(),
+            Engines::Treewalk(_) => Vec::new(),
+        }
     }
 
     fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
@@ -1221,6 +1243,7 @@ pub fn run_with<E: Executor>(
 
         for executed in execute_group(executor, &live, check) {
             let index = executed.index;
+            warnings.extend(executed.teardown);
             let test = &check.tests[index];
             let hash = test_hash(hashes, index);
             let seeded = is_seeded(&test.footprint);
@@ -1413,6 +1436,9 @@ struct Executed {
     /// What this test actually reached across the boundary, which decides
     /// whether its pass may be written.
     host: Option<ply_eval::host::HostUse>,
+    /// What the host runtime reported while closing the entry point. A run-level
+    /// warning rather than part of the verdict.
+    teardown: Vec<Diagnostic>,
 }
 
 /// One worker per pool thread, built lazily so a group smaller than the pool
@@ -1453,6 +1479,10 @@ fn execute_group<E: Executor>(
             // nothing to report about what it searched.
             let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
             let host = worker.as_ref().and_then(|w| executor.host_use(w));
+            let teardown = worker
+                .as_mut()
+                .map(|w| executor.teardown(w))
+                .unwrap_or_default();
             out.push(Executed {
                 index,
                 duration,
@@ -1460,6 +1490,7 @@ fn execute_group<E: Executor>(
                 panicked,
                 exploration,
                 host,
+                teardown,
             });
         }
     });

@@ -45,6 +45,10 @@ enum Command {
     /// Price what W3 put on it: routing, real HTTP/1.1 framing, keep-alive and
     /// TLS — and re-take W2's field-proportional cost sweep against the result.
     W3(W3Args),
+    /// Price what W4 put behind it: a statement through the effect boundary
+    /// against the same statement with no Ply in the path, the pool, and a
+    /// route that hits the database against one that does not.
+    W4(W4Args),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -497,6 +501,116 @@ fn w3(args: W3Args) -> Result<()> {
 }
 
 #[derive(Args, Debug)]
+struct W4Args {
+    /// The repository root, which is where `examples/desk.ply` is read from for
+    /// the `crud` section.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The database every section runs against. This harness creates and drops
+    /// its own `part` table in it and touches nothing else, and the `crud`
+    /// section expects the desk's schema to be there already.
+    #[arg(long)]
+    db: String,
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    /// Concurrent tasks in the `ops` sweep.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16])]
+    concurrency: Vec<u32>,
+    /// Statements per point in the `ops` sweep.
+    #[arg(long, default_value_t = 400)]
+    operations: u32,
+    /// Table sizes the `sizes` section sweeps, in rows.
+    #[arg(long, value_delimiter = ',', default_values_t = [8u32, 32, 128, 512])]
+    rows: Vec<u32>,
+    /// Pool sizes the `pool` section sweeps.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 4, 8, 16])]
+    pool_sizes: Vec<usize>,
+    /// Connections the `ops` sweep's pool holds, held constant so its rows
+    /// differ in concurrency and not in two things at once.
+    #[arg(long, default_value_t = 16)]
+    pool: usize,
+    /// Repeats per point; the fastest is reported.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Client concurrencies in the `crud` section.
+    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
+    load_concurrency: Vec<u32>,
+    #[arg(long, default_value_t = 32)]
+    per_conn: u32,
+    #[arg(long, default_value_t = 3000)]
+    requests_per_point: u32,
+    /// Sections to drop, for a run pointed at one question.
+    #[arg(long)]
+    no_ops: bool,
+    #[arg(long)]
+    no_sizes: bool,
+    #[arg(long)]
+    no_pool: bool,
+    #[arg(long)]
+    no_load: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn w4(args: W4Args) -> Result<()> {
+    use ply_corpus::w4;
+
+    let mut out = w4::Measurements::default();
+    if !args.no_ops {
+        out.ops = w4::ops(
+            &args.db,
+            &args.concurrency,
+            args.operations,
+            args.pool,
+            args.repeats,
+        )?;
+    }
+    if !args.no_sizes {
+        out.sizes = w4::sizes(&args.db, &args.rows, 200, args.repeats)?;
+    }
+    if !args.no_pool {
+        out.pool = w4::pool(&args.db, &args.pool_sizes, 8, args.operations, args.repeats)?;
+        // A pool acquire is a *deadline*, not a capacity check: a pool of one
+        // with eight open scopes queues and completes if the deadline is
+        // generous, and refuses if it is not. Both rows are here because the
+        // first is the one a reader assumes is a failure and is not.
+        for (pool, concurrency, acquire) in [
+            (1, 8, 5000),
+            (1, 32, 5000),
+            (1, 32, 1),
+            (1, 32, 0),
+            (8, 32, 0),
+            (1, 8, 0),
+        ] {
+            out.exhaustion
+                .push(w4::exhaustion(&args.db, pool, concurrency, acquire)?);
+        }
+    }
+    if !args.no_load {
+        let ply = match &args.ply {
+            Some(path) => path.clone(),
+            None => ply_corpus::serve::ply_binary()?,
+        };
+        out.crud = w4::crud(
+            &args.repo,
+            &ply,
+            &args.db,
+            &[w4::Store::Twin, w4::Store::Postgres],
+            &args.load_concurrency,
+            args.per_conn,
+            args.requests_per_point,
+        )?;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", w4::render(&out));
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
 struct PayloadArgs {
     /// Line items per JSON payload. Forty is about four kilobytes, which is the
     /// size a real order body arrives at.
@@ -688,6 +802,7 @@ fn run() -> Result<()> {
         Command::Serve(args) => serve(args),
         Command::Payload(args) => payload(args),
         Command::W3(args) => w3(args),
+        Command::W4(args) => w4(args),
     }
 }
 

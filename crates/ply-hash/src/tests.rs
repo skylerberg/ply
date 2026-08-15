@@ -662,6 +662,50 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
     assert_ne!(a, different);
 }
 
+/// Two atoms of *different* effects at the same mode and with no resource are
+/// the case the sort cannot separate on bytes alone: the pass that numbers the
+/// effect slots runs with no hash table, so both encode as `REF_SELF`. Written
+/// order deciding the numbering would make an `effect set`'s expansion and the
+/// same atoms typed by hand two different definitions.
+const TWO_EFFECTS: &str = r#"
+effect x { write a() -> Unit }
+effect y { write b() -> Unit }
+fn both() -> Unit / {x.write, y.write} = { x.a(); y.b() }
+"#;
+
+#[test]
+fn reordering_two_atoms_the_first_pass_cannot_tell_apart_changes_no_hash() {
+    let forward = parsed(TWO_EFFECTS);
+    let backward = parsed(&TWO_EFFECTS.replace("{x.write, y.write}", "{y.write, x.write}"));
+    assert_eq!(
+        forward.defs[&Symbol::new("both")],
+        backward.defs[&Symbol::new("both")]
+    );
+}
+
+/// The same case, from the other side: an effect named only by an atom the
+/// dedup drops still has to reach the enumeration, or its reference is written
+/// as slot 0 — the slot of whichever effect the enumeration does begin with.
+#[test]
+fn an_effect_named_only_by_a_deduplicated_atom_is_still_enumerated() {
+    let one = parsed(TWO_EFFECTS);
+    let swapped = parsed(
+        &TWO_EFFECTS
+            .replace("effect x { write a() -> Unit }", "effect x { write q() -> Unit }")
+            .replace("x.a()", "x.q()"),
+    );
+    assert_ne!(
+        one.defs[&Symbol::new("both")],
+        swapped.defs[&Symbol::new("both")],
+        "editing the effect `both` reaches has to move it"
+    );
+    assert_ne!(
+        one.decls[&Symbol::new("x")],
+        one.decls[&Symbol::new("y")],
+        "two declarations that differ are two effects"
+    );
+}
+
 // ---- property 4: editing a body changes it and its dependents ----
 
 #[test]

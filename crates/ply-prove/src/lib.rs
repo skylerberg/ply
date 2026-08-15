@@ -292,6 +292,12 @@ pub enum Gap {
         generated: u32,
         witness: Vec<Binding>,
     },
+    /// A `law/host` under a hermetic run.
+    ///
+    /// Reported rather than skipped, and never green: a law about a database
+    /// that never ran a database, reported as passing, is precisely the "green
+    /// result over unexplored space" this project audits for.
+    ReachesHost(Footprint),
 }
 
 /// What became of one obligation.
@@ -402,7 +408,17 @@ pub struct Obligation {
     pub binders: Vec<LawBinder>,
     /// Whether a `requires` or a `where` narrows the domain.
     pub guarded: bool,
-    /// `{}`, or `{sim.read}` for a concurrency law.
+    /// `law/host`: the body reaches the world, and the law says so in its own
+    /// declaration.
+    ///
+    /// Three things follow and each is enforced separately: it can never be
+    /// `proved` (the static tier and the finite enumeration are both skipped,
+    /// because either would be a claim about every value rather than about the
+    /// ones that ran), it is never read from or written to the obligation cache,
+    /// and under a hermetic run it is [`Gap::ReachesHost`] rather than green.
+    pub host: bool,
+    /// `{}`, or `{sim.read}` for a concurrency law, or any row at all for a
+    /// `law/host`.
     pub footprint: Footprint,
 }
 
@@ -411,7 +427,7 @@ impl Obligation {
     /// and the only place a `proved` in this milestone does not come from a
     /// static argument.
     pub fn is_concurrency_law(&self) -> bool {
-        matches!(self.kind, ObligationKind::Law) && !self.footprint.is_empty()
+        matches!(self.kind, ObligationKind::Law) && !self.host && !self.footprint.is_empty()
     }
 
     /// The binders a run **draws values for**.
@@ -798,6 +814,7 @@ mod tests {
             frame: Frame::Pure,
             binders: Vec::new(),
             guarded: false,
+            host: false,
             footprint: Footprint::empty(),
         };
         let report = |discharge| ProveReport {

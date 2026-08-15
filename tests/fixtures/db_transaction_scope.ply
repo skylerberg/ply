@@ -1,0 +1,44 @@
+// E0436: a `db` operation performed by a task that does not own the open scope.
+//
+//   $ ply run --host --db postgres://localhost/desk \
+//       tests/fixtures/db_transaction_scope.ply
+//   E0436  this statement is in task 2; the open transaction belongs to task 1
+//
+// A scope belongs to the task that opened it, and the two answers this prevents
+// are both wrong. Sharing the connection is a protocol violation — a postgres
+// connection carries one conversation, and two tasks writing into it interleave
+// two conversations into one stream. Quietly acquiring a second connection is
+// worse: the statement would run *outside* the transaction its author believed
+// it was inside, so a body that rolled back would leave that one statement's
+// work committed.
+//
+// The program's fault, and the fix is one of two shapes: hand the work to the
+// task that owns the scope, or give the spawned task its own `transaction`.
+//
+// The complementary refusal already exists and is worth naming beside this one:
+// a host operation inside a `simulate` region is E0425, so a transaction is
+// never explored by partial-order reduction against a real database. It is
+// explored against the twin, which is pure Ply and can be forked — and that is
+// where a race between two requests on one row is actually found.
+
+import std.db
+import std.db (db)
+
+fn insert_one(sku: String) -> db::Answer / {db.write[parts]} =
+  db.execute[parts](db::stmt("insert into parts (sku) values ($1)"), [db::PText(sku)])
+
+// The spawned task performs a `db` operation while the parent's scope is open,
+// and the scope is not its.
+fn both() -> Unit / {db.write, db.write[parts], task.write} = {
+  let t = task.spawn(|| {
+    insert_one("elsewhere");
+    ()
+  });
+  insert_one("here");
+  task.join(t)
+}
+
+fn main() -> Int / {db.write, db.write[parts], task.write} = {
+  db::transaction(db::ReadCommitted, db::ReadWrite, || both());
+  0
+}

@@ -198,6 +198,38 @@ impl fmt::Display for HostOp {
     }
 }
 
+/// Which machine performed an operation.
+///
+/// One per [`Machine`], minted at construction and never reused, because a
+/// handler holding scoped state has to be able to tell two entry points apart
+/// and [`HostRequest::task`] cannot: every entry point outside a scheduler
+/// region reports `None`, and `ply test` runs the members of a non-conflicting
+/// concurrency group on rayon threads, each driving a machine of its own. Keyed
+/// on the task alone, two of those are one owner — one reads the other's
+/// uncommitted rows, and either one's teardown ends the other's transaction.
+///
+/// Process-wide rather than per-run, so that two runs in one process (the test
+/// suite's own shape) cannot collide either.
+///
+/// [`Machine`]: crate::machine::Machine
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct MachineId(pub u64);
+
+impl MachineId {
+    /// The next unused identity.
+    pub fn next() -> MachineId {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        MachineId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl fmt::Display for MachineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "machine #{}", self.0)
+    }
+}
+
 /// What a handler is called with.
 ///
 /// `atom` is the **resolved** atom — the concrete resource, never `Any` — so a
@@ -209,6 +241,35 @@ pub struct HostRequest<'a> {
     pub op: &'a HostOp,
     pub args: &'a [Value],
     pub span: Span,
+    /// The machine that performed this operation, which with [`task`] is the
+    /// whole identity a handler keys scoped state on. A handler that used only
+    /// the task would file every concurrently running entry point under one key.
+    ///
+    /// [`task`]: HostRequest::task
+    pub machine: MachineId,
+    /// The task that performed this operation. `None` outside a scheduler
+    /// region, which is **one identity rather than an absence of one**: an
+    /// entry point that never spawned is a single thread of control, and a
+    /// handler keying scoped state on the performer has to be able to name it.
+    ///
+    /// A handler that holds something scoped — an open transaction, a lock —
+    /// compares this against the identity that opened the scope, and a mismatch
+    /// is the case where a statement would silently run outside the scope its
+    /// author believed it was in.
+    pub task: Option<crate::sim::TaskId>,
+    /// The declared footprint of the entry point that reached this operation,
+    /// when the caller stated one.
+    ///
+    /// A handler whose true footprint is a function of a runtime value — a SQL
+    /// statement's table set is the only one in the system — can compute it and
+    /// **refuse instead of acting**. Every other handler's footprint is a
+    /// property of its registration, which the registry checked against the row
+    /// before the operation was dispatched, and those ignore this.
+    ///
+    /// `None` when the caller declared nothing. Then only the checks the handler
+    /// can make on its own apply, which is weaker and is stated rather than
+    /// hidden.
+    pub declared: Option<&'a Footprint>,
 }
 
 /// What a host handler answers a perform with.
@@ -264,6 +325,36 @@ pub trait HostRuntime {
     /// a real thread, and reached only outside a scheduler region, where there
     /// is nothing to park on.
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
+
+    /// Called on **every** exit path from an entry point — a value, a
+    /// diagnostic, or a spent budget — before the machine resets.
+    ///
+    /// It exists for the one thing a host handler can leave behind that the
+    /// machine cannot see: a scoped resource whose closing operation the program
+    /// never reached. A `transaction` body that raises propagates past the
+    /// `handle` that would have committed or aborted it, so the `BEGIN` is still
+    /// open on a connection that is about to go back to a pool — and the next
+    /// request reads uncommitted rows of a request that already failed,
+    /// invisibly from either. The driver rolls back every scope still open here
+    /// and releases or discards the connections holding them.
+    ///
+    /// The default is `Ok(())`, which is the true answer for a runtime that owns
+    /// no scoped state: W1's sockets are closed by the program or by the process
+    /// and there is nothing to unwind. A runtime that acquires something with a
+    /// close operation implements this, and a failure here does not change the
+    /// entry point's verdict — it is the run's own fault rather than the
+    /// program's, and reporting it as a failure would attribute a discarded
+    /// connection to whatever test happened to be running.
+    ///
+    /// `machine` is whose entry point ended. It is a parameter rather than
+    /// something a runtime knows about itself because the facilities behind a
+    /// runtime are shared across every worker in the run: a teardown that closed
+    /// *everything* would roll back a transaction another entry point is still
+    /// writing into, and neither of them would see it happen.
+    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
+        let _ = machine;
+        Ok(())
+    }
 }
 
 /// The trusted computing base, before it meets a program.
@@ -811,7 +902,15 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 /// A handler's own refusals are [`codes::RUNTIME_ERROR`], which is what
 /// [`attribute`] rewrites a reserved code to. The message, the labels and the
 /// notes survive; only the classification and the added note change.
-pub const RESERVED_CODES: [&str; 15] = [
+/// W4 adds only the three codes raised by `bind`, and deliberately not the five
+/// the postgres driver raises from inside `call`. `E0432`, `E0433`, `E0434`,
+/// `E0436` and `E0437` are refusals a handler is the only component in a
+/// position to compute — a statement's table set, a result description, the task
+/// holding a scope, a pool's occupancy — so reserving them would rewrite the
+/// driver's own diagnosis to `E0502` and send the reader looking for a defect in
+/// Ply. The rule is unchanged; it is the second group that they do not belong
+/// to, because they are not verdicts about the machine's state.
+pub const RESERVED_CODES: [&str; 18] = [
     codes::INTERNAL_ERROR,
     codes::ENGINE_DIVERGENCE,
     codes::SIMULATION_DIVERGENCE,
@@ -827,6 +926,9 @@ pub const RESERVED_CODES: [&str; 15] = [
     codes::HOST_CONTINUATION_RESUMED,
     codes::HOST_FOOTPRINT_ESCAPE,
     codes::HOST_BLOCKING_ANSWER,
+    codes::DB_NOT_CONFIGURED,
+    codes::DB_SCHEMA_MISMATCH,
+    codes::DB_UNMODELLED_SIDE_EFFECT,
 ];
 
 pub fn is_reserved_code(code: &str) -> bool {

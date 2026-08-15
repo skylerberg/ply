@@ -10,10 +10,17 @@
 //! read top to bottom. There is no attribute macro and no link-time registry: a
 //! member of the trusted computing base gets in by someone writing it down.
 
+// The db driver builds `Value`s to answer with, and `Value` pins `Arc` for its
+// shared payloads and `Rc` for shared code — so none of those `Arc`s can ever be
+// `Send`. That is `ply-eval`'s design rather than an oversight here, and this is
+// the same allow, for the same reason, that `ply-eval` and `ply-prove` carry.
+#![allow(clippy::arc_with_non_send_sync)]
+
+pub mod db;
 pub mod registry;
 pub mod sched;
 pub mod tcp;
 pub mod tls;
 
-pub use registry::{Host, registry};
+pub use registry::{Host, registry, registry_with_database};
 pub use tls::{CredentialSpec, Credentials, HandshakeCounts};

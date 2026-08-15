@@ -12,9 +12,10 @@
 //! catches one that opens a file behind Ply's back. `ply hosts` and review are
 //! the whole defence, which is why this file exists as a file.
 
+use crate::db::{self, Postgres};
 use crate::{sched, tcp};
 use ply_eval::Value;
-use ply_eval::host::{HostRegistry, HostRuntime, Pending};
+use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending};
 use ply_span::{Diagnostic, Span, codes};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,6 +33,13 @@ use std::sync::Arc;
 /// computing base without binding it — costs an allocation.
 pub struct Host {
     net: Arc<tcp::TcpHost>,
+    /// The database, when the run named one. `None` is a run with no `--db`,
+    /// which registers no `db` operation at all — so a program that performs one
+    /// is `E0424` naming the handler that *would* have served it, and a program
+    /// that performs none needs no database. That is what makes `E0431` fire
+    /// exactly when the driver is in the run and the run named nothing for it to
+    /// open.
+    db: Option<Arc<Postgres>>,
 }
 
 impl Default for Host {
@@ -55,7 +63,31 @@ impl Host {
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
             net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
+            db: None,
         }
+    }
+
+    /// The same facilities, plus a database.
+    ///
+    /// Starting the reactor is what raises `E0431` for a connection string
+    /// postgres will not accept, and it happens here — before `bind`, before
+    /// anything runs — because a service that discovers its database is
+    /// unreachable on the first request has already told a client it was
+    /// listening.
+    pub fn with_database(
+        credentials: crate::tls::Credentials,
+        config: db::PoolConfig,
+    ) -> Result<Host, Diagnostic> {
+        Ok(Host {
+            net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
+            db: Some(Arc::new(Postgres::start(config)?)),
+        })
+    }
+
+    /// The database this run was configured with, for the `database` block of
+    /// `ply hosts` and for a test that has to assert what a scope left open.
+    pub fn database(&self) -> Option<&Arc<Postgres>> {
+        self.db.as_ref()
     }
 
     /// What the run's `--host` summary reports about TLS: how many handshakes
@@ -91,6 +123,29 @@ impl Host {
             registry.register(op, handler);
         }
 
+        // `db.*` — six operations over a real postgres, and only when this run
+        // named one. Nondeterministic, at most once, and blocking: every one of
+        // them dispatches to the reactor thread and answers `Pending`, so an
+        // outstanding query costs a pending token and no blocking-pool thread.
+        // `db.rollback` is absent: `std.db`'s `transaction` handles it in Ply
+        // and it never reaches the boundary.
+        //
+        // Registered only when this run named a database, which is the one
+        // departure from "the registry is compiled in either way". The reason is
+        // `db.begin`, `db.commit` and `db.abort`: they take no table, so they
+        // register `HostResource::Only(Singleton)`, and `bind` makes an `Only`
+        // registration whose effect nothing declares `E0421` — correctly, since
+        // such a registration asserts the program has a resource it does not.
+        // Registering them into every program would therefore refuse every
+        // program that does not import `std.db`, which is most of them.
+        //
+        // `NotConfigured` is what serves a run that named a database the
+        // reactor could not be started for; the missing-`--db` case is `E0431`
+        // at bind, before anything runs.
+        if let Some(driver) = &self.db {
+            db::register(&mut registry, Arc::clone(driver) as Arc<dyn db::Driver>);
+        }
+
         registry
     }
 
@@ -102,6 +157,7 @@ impl Host {
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
         Rc::new(Facilities {
             net: Arc::clone(&self.net),
+            db: self.db.clone(),
         })
     }
 
@@ -121,6 +177,21 @@ pub fn registry() -> HostRegistry {
     Host::new().registry()
 }
 
+/// The same, plus the `db` operations, served by an implementation that refuses.
+///
+/// For a *listing* over a program that declares `std.db.db`: `ply hosts` answers
+/// "what does this run trust", and the postgres driver belongs in that answer
+/// whether or not this invocation named a database. It is separate from
+/// [`registry`] rather than folded into it because `db.begin`, `db.commit` and
+/// `db.abort` take no table, so they register `HostResource::Only`, and `bind`
+/// makes an `Only` registration whose effect nothing declares `E0421` —
+/// correctly. A caller therefore has to have looked at the program first.
+pub fn registry_with_database() -> HostRegistry {
+    let mut registry = registry();
+    db::register(&mut registry, Arc::new(db::postgres::NotConfigured));
+    registry
+}
+
 /// The runtime, routing each token to the facility that minted it.
 ///
 /// One facility today, and the routing is still worth writing: a token nobody
@@ -128,12 +199,18 @@ pub fn registry() -> HostRegistry {
 /// facility happened to be first. A boundary that hangs tells a reader nothing.
 struct Facilities {
     net: Arc<tcp::TcpHost>,
+    db: Option<Arc<Postgres>>,
 }
 
 impl HostRuntime for Facilities {
     fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
         if self.net.owns(pending) {
             return self.net.poll(pending);
+        }
+        if let Some(db) = &self.db
+            && db.owns(pending)
+        {
+            return db.poll(pending);
         }
         Err(err_unowned(pending))
     }
@@ -145,6 +222,11 @@ impl HostRuntime for Facilities {
         if self.net.outstanding() > 0 {
             return self.net.park();
         }
+        if let Some(db) = &self.db
+            && db.reactor().outstanding() > 0
+        {
+            return db.reactor().park();
+        }
         Err(err_nothing_outstanding())
     }
 
@@ -152,7 +234,40 @@ impl HostRuntime for Facilities {
         if self.net.owns(&pending) {
             return self.net.block_on(pending);
         }
+        if let Some(db) = &self.db
+            && db.owns(&pending)
+        {
+            return db.block_on(pending);
+        }
         Err(err_unowned(&pending))
+    }
+
+    /// Rolls back every transaction scope this entry point left open and
+    /// releases or discards the connections holding them.
+    ///
+    /// A connection returned to the pool with a transaction still open makes the
+    /// *next* request read uncommitted rows of a request that already failed,
+    /// and it is invisible from either request — which is why this runs on the
+    /// diagnostic and budget-exhaustion paths and not only on the value path.
+    ///
+    /// Every worker gets a `Facilities` over one shared `Postgres`, so `machine`
+    /// is what keeps this teardown to its own entry point: without it, a test
+    /// that never touched the database rolls back the transaction of one running
+    /// beside it.
+    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        let report = db.end_entry_point(machine)?;
+        match report.describe() {
+            None => Ok(()),
+            Some(why) => Err(Diagnostic::warning(
+                codes::HOST_TEARDOWN,
+                format!("the database driver could not hand every connection back: {why}"),
+            )
+            .note("the entry point's verdict is unchanged: this is the run's own state rather than the program's")
+            .note("the pool refills, and a connection it closed rather than returned is one that could not be rolled back")),
+        }
     }
 }
 
