@@ -1,0 +1,187 @@
+// Configuration as an effect. `import std.config (config)` and the two
+// operations below are the ones `ply_host::config` registers against.
+//
+// This module is the declaration, the schema a run checks itself against, and
+// the twin a test hands values through. Nothing here reads a file or an
+// environment: a program that wants a value performs `config.get`, and where
+// that value came from is the run's business rather than the program's.
+//
+// Three properties, each decided rather than inherited:
+//
+// `read`, not `write`, and therefore never a conflict. Two definitions that
+// read configuration are placed in one concurrency group and run beside each
+// other, which is sound only because the host reads its sources **once**, at
+// bind time, into an immutable map. There is no `config.set`, and adding one
+// would make the atom a write and serialise every test in a suite that reads a
+// single key.
+//
+// `nondet`. The environment is not a function of the program's state. So a
+// `det` test that reaches configuration is E0412 at compile time and has to
+// supply the values itself, which is what the twin at the bottom of this file
+// is for, and which is the point.
+//
+// The resource is a **namespace the call site writes** — `config.read[database]`,
+// `config.read[credentials]`. Since reads never conflict it buys no scheduling.
+// What it buys is that `ply check --types` says which definitions read
+// configuration and which read *credentials*, and the second is the row a
+// reviewer actually wants.
+//
+// `get` answers `Option` rather than raising because a missing key is a value
+// the program matches on. The failure an operator actually suffers — a service
+// that starts and then answers wrongly because a key was unset — is caught
+// earlier and elsewhere: `--config-schema` names a `ConfigSpec`, the run
+// resolves every key in it before anything is bound, and a missing required
+// key is E0441 at start-up rather than a `None` two hundred requests in.
+//
+// `secret` answers `Option<Secret<String>>` and there is no operation that
+// answers a credential as a `String`. That is the whole of this module's part
+// in the containment claim: a value that came from a `SSecret` key is a
+// `Secret` from the moment it crosses the boundary, so there is no window in
+// which it exists as an ordinary `String` for a trace field or a `++` to
+// reach. A run with no `--config-schema` has no `SSecret` keys and can read a
+// password with `config.get`, which is stated plainly rather than papered over.
+pub nondet effect config {
+  read get[k](key: String)    -> Option<String>
+  read secret[k](key: String) -> Option<Secret<String>>
+}
+
+// --- The schema a run checks itself against ---------------------------------
+
+// A key's type, as the run checks a resolved value against it. Four, because
+// four is what an `Option<String>` can be validated into without the format
+// growing structure the effect cannot return.
+pub type Shape = SText | SInt | SBool | SSecret
+
+// `default` is the lowest-precedence source: the command line, the `--config`
+// files and the environment all win over it, in that order.
+//
+// A `required` key with a `default` is not a contradiction and is not refused —
+// the default supplies it, so the requirement is met. What `required` buys is
+// the key with **no** default: nothing supplies it, and the run refuses to
+// start.
+pub type Key = {
+  name: String,
+  shape: Shape,
+  required: Bool,
+  default: Option<String>,
+}
+
+pub type ConfigSpec = { keys: List<Key> }
+
+pub fn spec(keys: List<Key>) -> ConfigSpec = { keys: keys }
+
+// A key a run may not start without.
+pub fn required(name: String, shape: Shape) -> Key =
+  { name: name, shape: shape, required: true, default: None }
+
+// A key whose absence is a `None` the program matches on.
+pub fn optional(name: String, shape: Shape) -> Key =
+  { name: name, shape: shape, required: false, default: None }
+
+// A key with a value when nothing else supplies one. Not `required`, because a
+// key with a default is supplied by definition.
+pub fn with_default(name: String, shape: Shape, value: String) -> Key =
+  { name: name, shape: shape, required: false, default: Some(value) }
+
+// --- The twin ---------------------------------------------------------------
+
+// What a test hands `config.get` and `config.secret`.
+//
+// Two maps rather than one, and that separation is load-bearing rather than
+// tidy: it is the twin's copy of the rule the host enforces from the schema —
+// `get` never answers a value a key declared `SSecret`, and `secret` never
+// answers one declared anything else. With a single map a fixture would be one
+// call site away from handing a credential back as a `String`, and a test that
+// passed under the twin would be testing something the run cannot do.
+pub type Values = { plain: Map<String, String>, secret: Map<String, String> }
+
+pub fn values(plain: List<{key: String, value: String}>,
+              secret: List<{key: String, value: String}>) -> Values =
+  { plain: map_of_entries(plain), secret: map_of_entries(secret) }
+
+// No values at all: every `get` is `None` and every `secret` is `None`. What a
+// test that asserts a program's behaviour with nothing configured installs.
+pub fn no_values() -> Values = { plain: map_new(), secret: map_new() }
+
+pub fn get_step(v: Values, key: String) -> Option<String> = map_get(v.plain, key)
+
+pub fn secret_step(v: Values, key: String) -> Option<Secret<String>> =
+  match map_get(v.secret, key) {
+    None -> None,
+    Some(text) -> Some(secret_of_string(text)),
+  }
+
+// A fixture's secret is a source literal by nature, and that is harmless: a
+// fixture credential is not a credential. What is not harmless is a *real*
+// credential written as a literal, because the literal enters the definition's
+// normalized bytes and lands in a store designed never to forget. A real one
+// comes from `config.secret`, and a value that came from configuration is in no
+// hash because it is in no definition.
+pub fn one_secret(key: String, value: String) -> Values =
+  values([], [{key: key, value: value}])
+
+pub fn one_value(key: String, value: String) -> Values =
+  values([{key: key, value: value}], [])
+
+// --- Tests ------------------------------------------------------------------
+
+// A shipped module's tests are the compiler's, not a project's: `ply test` in a
+// project that imports this module does not select them and writes nothing
+// about them to that project's cache, because a project's test count must not
+// change with a compiler upgrade. `ply test --std` selects them.
+
+test "a handled config read is det, hermetic and answers the fixture" {
+  let fixture = values([{key: "DESK_REGION", value: "eu"}], []);
+  handle {
+    assert_eq(config.get[server]("DESK_REGION"), Some("eu"));
+    assert_eq(config.get[server]("DESK_ABSENT"), None)
+  } with {
+    config.get[server](k) -> get_step(fixture, k),
+  }
+}
+
+// The rule the host enforces from the schema, checked on the twin so a fixture
+// cannot be the thing that breaks it.
+test "the twin never answers a secret through get, or a plain value through secret" {
+  let fixture = values([{key: "DESK_REGION", value: "eu"}],
+                       [{key: "DESK_API_KEY", value: "fixture-key"}]);
+  assert_eq(get_step(fixture, "DESK_API_KEY"), None);
+  assert_eq(secret_step(fixture, "DESK_REGION"), None);
+  assert_eq(get_step(fixture, "DESK_REGION"), Some("eu"))
+}
+
+// `assert_eq` over a `Secret` compares payloads and renders `Secret(****)` on
+// failure, so a fixture credential is never printed by a test that fails.
+test "a secret arrives as a Secret rather than a String" {
+  let fixture = one_secret("DESK_API_KEY", "fixture-key");
+  handle {
+    match config.secret[credentials]("DESK_API_KEY") {
+      None -> panic("the fixture supplies this key"),
+      Some(key) -> {
+        assert(secret_verify(key, "fixture-key"));
+        assert(!secret_verify(key, "fixture-ke"));
+        assert(!secret_is_empty(key))
+      },
+    }
+  } with {
+    config.secret[credentials](k) -> secret_step(fixture, k),
+  }
+}
+
+test "no_values answers nothing rather than failing" {
+  assert_eq(get_step(no_values(), "DESK_PORT"), None);
+  assert_eq(secret_step(no_values(), "DESK_API_KEY"), None)
+}
+
+test "a spec is ordinary data a run reads before it binds" {
+  let s = spec([
+    required("DESK_PORT", SInt),
+    required("DESK_API_KEY", SSecret),
+    with_default("DESK_REGION", SText, "eu"),
+    optional("DESK_DEBUG", SBool),
+  ]);
+  assert_eq(len(s.keys), 4);
+  assert_eq(required("DESK_PORT", SInt).default, None);
+  assert_eq(with_default("DESK_REGION", SText, "eu").required, false);
+  assert_eq(with_default("DESK_REGION", SText, "eu").default, Some("eu"))
+}

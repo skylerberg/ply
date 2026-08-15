@@ -133,6 +133,7 @@ fn registry(
             determinism,
             linearity: Linearity::AtMostOnce,
             blocking: false,
+            secrets: false,
             path: "audit::counting",
         },
         Arc::new(Counting {

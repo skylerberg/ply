@@ -45,8 +45,12 @@ pub enum Command {
     /// What changed, whether its specification changed, and whether its
     /// obligations still hold.
     Review(ReviewArgs),
-    /// Evaluate `main`. A directory must hold exactly one.
+    /// Evaluate `main`. A directory must hold exactly one; a `.plyx` file is a
+    /// built artifact and is run out of its own definitions.
     Run(RunArgs),
+    /// Write a deployable artifact: the transitive closure of one entry point,
+    /// identified by a digest and verifiable against it.
+    Build(BuildArgs),
     /// List every host handler this binary can bind: the trusted computing base.
     Hosts(HostsArgs),
     /// List the modules that ship with this compiler, and the digest over them.
@@ -220,6 +224,59 @@ pub struct TlsOptions {
     pub tls: Vec<CredentialSpec>,
 }
 
+/// What a `SIGINT` or a `SIGTERM` does to a serving run.
+///
+/// Both knobs are the *run's* rather than the program's, which is why they are
+/// flags and `http::Limits` is not: how long a deployment is willing to wait for
+/// its instances differs per deployment, while what a service refuses is what
+/// its tests assert on.
+///
+/// `--drain-ms` should exceed the program's own `body_timeout_ms +
+/// write_timeout_ms`. The run cannot check that — `Limits` is a Ply value it
+/// never sees — so both numbers are printed at start-up, where they can be
+/// compared by eye.
+#[derive(Args, Clone, Debug)]
+pub struct ShutdownOptions {
+    /// How long in-flight requests have to finish once the run stops accepting.
+    /// A drain that expires reports `W0608` and exits `3`.
+    #[arg(
+        long = "drain-ms",
+        value_name = "MS",
+        default_value_t = ply_host::signal::DEFAULT_DRAIN_MS,
+        requires = "host",
+    )]
+    pub drain_ms: u64,
+
+    /// How long accept keeps running after the signal, so a readiness route can
+    /// answer `503` and a load balancer can take the instance out before it
+    /// stops taking connections.
+    #[arg(
+        long = "drain-lead-ms",
+        value_name = "MS",
+        default_value_t = ply_host::signal::DEFAULT_LEAD_MS,
+        requires = "host",
+    )]
+    pub drain_lead_ms: u64,
+}
+
+impl Default for ShutdownOptions {
+    fn default() -> ShutdownOptions {
+        ShutdownOptions {
+            drain_ms: ply_host::signal::DEFAULT_DRAIN_MS,
+            drain_lead_ms: ply_host::signal::DEFAULT_LEAD_MS,
+        }
+    }
+}
+
+impl ShutdownOptions {
+    pub fn bounds(&self) -> ply_host::signal::Bounds {
+        ply_host::signal::Bounds {
+            lead: std::time::Duration::from_millis(self.drain_lead_ms),
+            drain: std::time::Duration::from_millis(self.drain_ms),
+        }
+    }
+}
+
 /// The shape is a usage error rather than `E0430`: a reader who mistyped the
 /// argument needs the form, and one whose PEM is broken needs the file.
 fn parse_credential(text: &str) -> Result<CredentialSpec, String> {
@@ -338,6 +395,9 @@ pub struct TestArgs {
     #[command(flatten)]
     pub db: crate::db::DbOptions,
 
+    #[command(flatten)]
+    pub config: crate::config::ConfigOptions,
+
     /// Also select the tests declared by the modules that ship with the
     /// compiler. Off by default: a project's test count must not change with a
     /// compiler upgrade, for tests the project did not write and cannot fix.
@@ -432,6 +492,12 @@ pub struct ProveArgs {
     pub db: crate::db::DbOptions,
 
     #[command(flatten)]
+    pub config: crate::config::ConfigOptions,
+
+    #[command(flatten)]
+    pub trace: crate::trace::TraceOptions,
+
+    #[command(flatten)]
     pub prove: ProveOptions,
 
     #[command(flatten)]
@@ -516,6 +582,73 @@ pub struct RunArgs {
 
     #[command(flatten)]
     pub db: crate::db::DbOptions,
+
+    #[command(flatten)]
+    pub config: crate::config::ConfigOptions,
+
+    #[command(flatten)]
+    pub trace: crate::trace::TraceOptions,
+
+    #[command(flatten)]
+    pub shutdown: ShutdownOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct BuildArgs {
+    /// A `.ply` file, or a project root: every `*.ply` under it is a module
+    /// named after its path relative to that root.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Where to write the artifact. Defaults to `<entry module>.plyx` in the
+    /// working directory.
+    #[arg(long, short = 'o', value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// The definition whose closure is shipped: a program-wide name
+    /// (`app.serve`) or a simple one. Defaults to `main`.
+    #[arg(long, value_name = "NAME")]
+    pub entry: Option<String>,
+
+    /// Ship the closure of this `--config-schema` function too, so the deployed
+    /// artifact can be run with the same flag and keeps `E0441 CONFIG_MISSING`.
+    ///
+    /// A schema is a nullary function nothing in the entry point's closure
+    /// calls, so without this it is not in the artifact and the deployed form
+    /// loses the start-up refusal §3.4 exists for.
+    #[arg(long = "config-schema", value_name = "MODULE.FN")]
+    pub config_schema: Option<String>,
+
+    /// Ship the closure of this `--db-schema` function too, so the deployed
+    /// artifact can be run with the same flag and keeps W4's schema
+    /// verification.
+    #[arg(long = "db-schema", value_name = "MODULE.FN")]
+    pub db_schema: Option<String>,
+
+    /// Embed the project's source text, so a diagnostic raised in production
+    /// carries a line number.
+    ///
+    /// Off, and a flag, because it is a disclosure decision: it puts the
+    /// program's source in whatever receives the artifact. It changes the
+    /// digest, so "was this built with sources" is answerable from the digest
+    /// alone.
+    #[arg(long)]
+    pub sources: bool,
+
+    /// Print `b3:...` and nothing else: the one line a deployment pins. Writes
+    /// no file.
+    #[arg(long, conflicts_with_all = ["json", "diff", "output"])]
+    pub digest: bool,
+
+    /// Report what this build changes relative to an artifact already deployed:
+    /// added, changed, dropped, unchanged, and what a change is reached by.
+    /// Writes no file.
+    #[arg(long, value_name = "OLD.plyx", conflicts_with = "output")]
+    pub diff: Option<PathBuf>,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -535,6 +668,18 @@ pub struct HostsArgs {
 
     #[command(flatten)]
     pub db: crate::db::DbOptions,
+
+    #[command(flatten)]
+    pub config: crate::config::ConfigOptions,
+
+    #[command(flatten)]
+    pub trace: crate::trace::TraceOptions,
+
+    /// The knobs the `shutdown` block prints. Accepted here and not only on
+    /// `ply run` because they are in the digest: a deployment that widened its
+    /// drain window changed what its trusted computing base does at a signal.
+    #[command(flatten)]
+    pub shutdown: ShutdownOptions,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long, conflicts_with = "digest")]

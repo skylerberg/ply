@@ -29,6 +29,7 @@
 //! decided proof or a covered domain.
 
 use ply_core::{CheckOutput, LawBinder};
+use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::{self, Finite};
@@ -41,7 +42,6 @@ use ply_prove::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
-use ply_eval::host::{HostBinding, HostRuntime};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;

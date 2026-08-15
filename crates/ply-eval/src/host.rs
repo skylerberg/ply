@@ -163,6 +163,20 @@ pub struct HostOp {
     /// undetectable — no budget on `call`, no watchdog, no cancellation in W1 —
     /// which is why the column is printed for a reviewer.
     pub blocking: bool,
+    /// Whether this operation may be handed a value containing a
+    /// [`Value::Secret`].
+    ///
+    /// Printed by `ply hosts` in its own column and covered by the listing's
+    /// digest, because a handler that receives a credential is the one place
+    /// above the boundary where ADR 0015 §2.1's claim stops being enforceable
+    /// and starts being review.
+    ///
+    /// Checked before the handler is called: a `perform` carrying a `Secret`
+    /// into a registration that declares `false` is [`codes::SECRET_TO_HOST`].
+    /// **In W5 no registration declares `true`**, so the check lands with a user
+    /// count of zero — which is the right order, because the alternative is
+    /// adding it after the first operation that needed it already shipped.
+    pub secrets: bool,
     /// The Rust path, as `ply hosts` prints it: the reviewable identity of a
     /// member of the trusted computing base.
     pub path: &'static str,
@@ -355,6 +369,97 @@ pub trait HostRuntime {
         let _ = machine;
         Ok(())
     }
+
+    /// Whether a stop has been requested.
+    ///
+    /// [`park`](HostRuntime::park) returns when this becomes true even with no
+    /// token outstanding, and the deadlock check consults it so that a park
+    /// which woke on a stop is not counted as fruitless. Without both, an idle
+    /// service — parked on an `accept` nobody is connecting to — never observes
+    /// a signal, and `ctrl-C` does nothing until the next request arrives.
+    ///
+    /// `ply-eval` reads it in exactly two places, the park loop and the deadlock
+    /// check, and nowhere else. It is not consulted by inference, by a cache key
+    /// or by isolation: a verdict that depended on when a signal arrived would
+    /// be a verdict that depends on the terminal.
+    fn stopping(&self) -> bool {
+        false
+    }
+
+    /// The refusal that ends the region when the drain deadline has passed, and
+    /// `None` while there is still time or no stop was requested.
+    ///
+    /// Checked once per scheduling decision, which is the only place the machine
+    /// gives control back while a request is still running. **W5 has no
+    /// cancellation**: the task is not unwound and is not handed a `503`, so the
+    /// honest thing the run can do is stop scheduling, tear down in the pinned
+    /// order — which rolls the task's open transaction back — and exit. The
+    /// client sees a connection closed with no response, which is the outcome a
+    /// retry can fix; a committed half-transaction is the one it cannot, and
+    /// that is what the ordering makes unreachable.
+    fn drain_expired(&self) -> Option<Diagnostic> {
+        None
+    }
+
+    /// Called once, after the last entry point, before the process exits.
+    ///
+    /// Distinct from [`end_entry_point`](HostRuntime::end_entry_point), which
+    /// runs per entry point and knows whose. This runs the process-level pinned
+    /// order — roll every open transaction back, close every open span, flush
+    /// the sink, close the pool — and answers what it managed.
+    ///
+    /// **Never called from a signal handler.** The handler sets a flag; this
+    /// runs on the machine's thread, after it has stopped running Ply code, so
+    /// nothing here races a statement the program is still issuing.
+    ///
+    /// `drain_ms` is a **bound and not a hint**. A teardown step that waits on a
+    /// peer — a `ROLLBACK` behind a statement the server has not finished —
+    /// waits for at most this long and then discards the connection, because
+    /// closing the socket is what aborts the statement and a stop that outlasts
+    /// the deadline the operator set is a stop that is not bounded at all.
+    fn shutdown(&self, drain_ms: u64) -> ShutdownReport {
+        let _ = drain_ms;
+        ShutdownReport::default()
+    }
+}
+
+/// What [`HostRuntime::shutdown`] managed, and what the run reports about it.
+///
+/// Every field is a fact the teardown already held. Nothing here is computed for
+/// the banner.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ShutdownReport {
+    /// Transaction scopes that were still open and were rolled back. **Never
+    /// committed**: a commit at a deadline commits a half-finished body, and the
+    /// only thing that knows whether a body finished is the body.
+    pub transactions_rolled_back: usize,
+    /// Connections closed rather than returned to the pool, and why.
+    pub connections_closed: Vec<String>,
+    /// Spans still open at teardown, closed with the `Abandoned` outcome.
+    pub spans_abandoned: usize,
+    /// Records the sink held when it was flushed, and `None` for a run with no
+    /// sink bound.
+    pub records_flushed: Option<usize>,
+    /// What the teardown could not hand back, as `W0606` renders it. Empty is a
+    /// clean teardown, which a run reports nothing about.
+    pub problems: Vec<String>,
+}
+
+impl ShutdownReport {
+    pub fn is_clean(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// Whether an entry point ended because the drain deadline expired rather than
+/// because the program failed.
+///
+/// The run's configuration is at fault — `--drain-ms` was below the program's
+/// own `body_timeout_ms + write_timeout_ms` — so it is not the program's
+/// verdict, is not attributed to a definition and is not bisected. What carries
+/// it is the exit code.
+pub fn is_drain_incomplete(d: &Diagnostic) -> bool {
+    d.code == codes::DRAIN_INCOMPLETE
 }
 
 /// The trusted computing base, before it meets a program.
@@ -365,6 +470,8 @@ pub trait HostRuntime {
 #[derive(Default)]
 pub struct HostRegistry {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
+    /// Indices of [`HostRegistry::entries`] this run declines to bind.
+    withheld: BTreeSet<usize>,
 }
 
 impl HostRegistry {
@@ -373,6 +480,24 @@ impl HostRegistry {
     }
 
     pub fn register(&mut self, op: HostOp, handler: Arc<dyn HostHandler>) {
+        self.entries.push((op, handler));
+    }
+
+    /// Register an operation the run knows how to serve and has decided not to.
+    ///
+    /// It is in the trusted computing base — [`HostBinding::would_serve`] names
+    /// its path — and it is in no listing, no footprint and no index, so a
+    /// perform that reaches it is `E0424` naming the handler that would have
+    /// served it under a run that bound it. That is a different sentence from
+    /// "nothing registers this", which is `E0303` and sends the reader looking
+    /// for a bug in inference.
+    ///
+    /// `signal` is the case it exists for. A stop flag set once ends every test
+    /// after it, so `ply test` binds none of it with or without `--host`, and
+    /// the diagnostic has to say that rather than pretend the operation is
+    /// unknown.
+    pub fn register_withheld(&mut self, op: HostOp, handler: Arc<dyn HostHandler>) {
+        self.withheld.insert(self.entries.len());
         self.entries.push((op, handler));
     }
 
@@ -397,7 +522,7 @@ impl HostRegistry {
     /// error — a driver linked into a program that never queries is idle, not
     /// wrong — and an empty registry is a legal hermetic binding.
     pub fn bind(self, check: &CheckOutput) -> Result<HostBinding, Vec<Diagnostic>> {
-        let rows = resolve(&self.entries, check)?;
+        let rows = resolve(&self.entries, &self.withheld, check)?;
         let footprint = Footprint::from_atoms(rows.iter().map(|r| r.atom.clone()));
         let atoms = rows.iter().map(|r| r.atom.clone()).collect();
         let index = rows
@@ -411,6 +536,7 @@ impl HostRegistry {
         };
         Ok(HostBinding {
             entries: self.entries,
+            withheld: self.withheld,
             listing,
             footprint,
             atoms,
@@ -425,7 +551,7 @@ impl HostRegistry {
     pub fn preview(&self, check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>> {
         Ok(HostListing {
             handlers: self.entries.len(),
-            rows: resolve(&self.entries, check)?,
+            rows: resolve(&self.entries, &self.withheld, check)?,
         })
     }
 }
@@ -439,6 +565,7 @@ impl HostRegistry {
 /// handlers that serve different things.
 fn resolve(
     entries: &[(HostOp, Arc<dyn HostHandler>)],
+    withheld: &BTreeSet<usize>,
     check: &CheckOutput,
 ) -> Result<Vec<HostRow>, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
@@ -447,6 +574,13 @@ fn resolve(
     let performed = performed_atoms(check);
 
     for (index, (op, _)) in entries.iter().enumerate() {
+        // A withheld registration is in no row, so it is in no listing, no
+        // footprint and no index: what a run declined to bind must not appear in
+        // the trusted computing base it prints, or the listing is the one thing
+        // in the system that lies about the boundary.
+        if withheld.contains(&index) {
+            continue;
+        }
         // A member of the trusted computing base that `ply hosts` cannot name is
         // a member no reviewer can find, which defeats the whole of the listing.
         if op.path.trim().is_empty() {
@@ -538,6 +672,7 @@ fn resolve(
                     deterministic: op.determinism.is_deterministic(),
                     linearity: op.linearity,
                     blocking: op.blocking,
+                    secrets: op.secrets,
                     declared_nondet: effect.nondet,
                 },
             );
@@ -615,6 +750,8 @@ pub struct HostRow {
     pub deterministic: bool,
     pub linearity: Linearity,
     pub blocking: bool,
+    /// [`HostOp::secrets`], carried through so the listing can print it.
+    pub secrets: bool,
     /// Whether the *declaration* carries `nondet`. Printed so a reviewer sees
     /// the pair `E0423` checks rather than half of it.
     pub declared_nondet: bool,
@@ -671,6 +808,7 @@ impl HostListing {
                 u8::from(row.deterministic),
                 u8::from(row.linearity.is_linear()),
                 u8::from(row.blocking),
+                u8::from(row.secrets),
                 u8::from(row.declared_nondet),
             ]);
         }
@@ -703,6 +841,10 @@ pub struct Bound<'a> {
 /// difference between a diagnostic a reader can act on and one they cannot.
 pub struct HostBinding {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
+    /// Indices of `entries` this run declined to bind. In `entries` so that
+    /// [`HostBinding::would_serve`] can still name the handler, and in nothing
+    /// else.
+    withheld: BTreeSet<usize>,
     listing: HostListing,
     footprint: Footprint,
     /// What [`HostBinding::serves`] answers: the atoms, for intersecting a
@@ -746,6 +888,7 @@ impl HostBinding {
     pub fn hermetic_with(registry: HostRegistry) -> HostBinding {
         HostBinding {
             entries: registry.entries,
+            withheld: registry.withheld,
             listing: HostListing::default(),
             footprint: Footprint::empty(),
             atoms: BTreeSet::new(),
@@ -817,16 +960,43 @@ impl HostBinding {
         op: &Symbol,
         resource: Option<&Symbol>,
     ) -> Option<&'static str> {
+        self.matching(effect, op, resource)
+            .map(|(_, candidate)| candidate.path)
+    }
+
+    /// Whether this run knows how to serve the operation and declined to.
+    ///
+    /// The difference between "nothing registers this" and "this run binds no
+    /// handler for it" is the whole of the diagnostic a reader acts on, and only
+    /// the binding can tell them apart.
+    pub fn withholds(
+        &self,
+        effect: &Symbol,
+        op: &Symbol,
+        resource: Option<&Symbol>,
+    ) -> Option<&'static str> {
+        self.matching(effect, op, resource)
+            .filter(|(index, _)| self.withheld.contains(index))
+            .map(|(_, candidate)| candidate.path)
+    }
+
+    fn matching(
+        &self,
+        effect: &Symbol,
+        op: &Symbol,
+        resource: Option<&Symbol>,
+    ) -> Option<(usize, &HostOp)> {
         let wanted = resource_of(resource);
         let declared = Symbol::new(simple_name(effect.as_str()));
         self.entries
             .iter()
-            .find(|(candidate, _)| {
+            .enumerate()
+            .find(|(_, (candidate, _))| {
                 registration_names(&candidate.effect, effect, &declared)
                     && candidate.op == *op
                     && candidate.serves_label(&wanted)
             })
-            .map(|(candidate, _)| candidate.path)
+            .map(|(index, (candidate, _))| (index, candidate))
     }
 }
 
@@ -910,7 +1080,7 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 /// driver's own diagnosis to `E0502` and send the reader looking for a defect in
 /// Ply. The rule is unchanged; it is the second group that they do not belong
 /// to, because they are not verdicts about the machine's state.
-pub const RESERVED_CODES: [&str; 18] = [
+pub const RESERVED_CODES: [&str; 21] = [
     codes::INTERNAL_ERROR,
     codes::ENGINE_DIVERGENCE,
     codes::SIMULATION_DIVERGENCE,
@@ -926,9 +1096,16 @@ pub const RESERVED_CODES: [&str; 18] = [
     codes::HOST_CONTINUATION_RESUMED,
     codes::HOST_FOOTPRINT_ESCAPE,
     codes::HOST_BLOCKING_ANSWER,
+    codes::SECRET_TO_HOST,
     codes::DB_NOT_CONFIGURED,
     codes::DB_SCHEMA_MISMATCH,
     codes::DB_UNMODELLED_SIDE_EFFECT,
+    // Raised by the artifact loader, before any binding exists — so a handler
+    // that answered with one would be claiming the program it is running failed
+    // to load, which is a verdict about the machine's own state rather than
+    // about anything the handler can see.
+    codes::ARTIFACT_INVALID,
+    codes::ARTIFACT_VERSION,
 ];
 
 pub fn is_reserved_code(code: &str) -> bool {
@@ -1049,6 +1226,45 @@ pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnost
         "handle `{operation}` in the test, or run `ply test --host`"
     ))
     .note(format!("`{path}` would serve this under `--host`"))
+}
+
+/// `E0424` — an operation this run knows how to serve and deliberately did not
+/// bind.
+///
+/// The same code as [`err_hermetic`] and for the same reason: inference was
+/// right, the row was legal, and the run was configured not to serve this. It is
+/// raised by the boundary rather than by a handler, which is what keeps it out
+/// of [`attribute`]'s rewrite — a handler may not mint a verdict about the
+/// machine's own state, and "this run bound nothing here" is one.
+///
+/// `ply test` withholds `signal`, with or without `--host`. A stop requested
+/// once ends every test after it, and a suite whose verdicts depend on the
+/// terminal is the shared-state coupling every other mechanism here exists to
+/// prevent.
+#[cold]
+#[inline(never)]
+pub fn err_withheld(
+    span: Span,
+    operation: &str,
+    effect: &Symbol,
+    path: &'static str,
+) -> Diagnostic {
+    let module = effect
+        .as_str()
+        .rsplit_once('.')
+        .map(|(module, _)| module.to_string())
+        .unwrap_or_else(|| effect.to_string());
+    Diagnostic::error(
+        codes::HERMETIC_BOUNDARY,
+        format!("`{operation}` reached the host boundary in a run that binds no handler for it"),
+    )
+    .primary(span, "no handler here, and this run bound none")
+    .note(format!(
+        "`{path}` serves this under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed"
+    ))
+    .note(format!(
+        "handle `{operation}` over `{module}`'s twin, which is what makes a test that reads it `det`, cached and hermetic"
+    ))
 }
 
 /// The tree-walker's refusal of a bound host operation.

@@ -1,0 +1,137 @@
+// The W5 measurement program: one loop, written once, run under four sinks.
+//
+// ADR 0015 §1.4 says what a span costs when nothing is collecting, and says it
+// is designed rather than observed. This program is what turns the design into a
+// number. Every rung below runs the *same* fold over the *same* list building
+// the *same* `Fields` map; the only difference between two rungs is which trace
+// operation is performed inside the closure and which handler answers it. So a
+// difference between two rows is that operation and nothing else, which is the
+// substitution discipline `w3` and `w4` already measure by.
+//
+// `bare` performs nothing at all and is the denominator. It is not a
+// configuration a Ply service can be in — there is no disabled path, because a
+// row cannot be conditional on a flag — and that is exactly why it is worth
+// measuring: the gap between `bare` and `discard` is what a Ply service pays for
+// tracing it turned off, and it is the number ADR 0015 §1.4 owes rather than
+// promises away.
+import std.trace
+import std.trace (trace)
+
+// The map a call site builds. Two fields, which is about what an endpoint
+// writes, and it is built by every rung including `bare`: the `Fields` map is
+// the program's cost and not the sink's, so charging it to tracing would
+// overstate what a sink costs.
+pub fn payload(i: Int) -> trace::Fields =
+  map_insert(map_insert(map_new(), "i", trace::FInt(i)), "sku", trace::FText("bolt"))
+
+// `map_len` is 2, so every rung answers `2 * n` and a harness that got a
+// different answer measured a loop that did not run.
+pub fn bare(n: Int) -> Int =
+  fold(range(0, n), 0, |acc: Int, i: Int| acc + map_len(payload(i)))
+
+pub fn events(n: Int) -> Int / {trace.write[bench]} =
+  fold(range(0, n), 0, |acc: Int, i: Int| {
+    trace.event[bench](trace::Info, "step", payload(i));
+    acc + 2
+  })
+
+// A `Debug` event, so the same loop can be run under `--trace-level warn`: the
+// sink drops it and the perform still happens, which is §1.4's claim that
+// filtering saves the sink's work and none of the call site's.
+pub fn debug_events(n: Int) -> Int / {trace.write[bench]} =
+  fold(range(0, n), 0, |acc: Int, i: Int| {
+    trace.event[bench](trace::Debug, "step", payload(i));
+    acc + 2
+  })
+
+// One `enter` and one `exit` per iteration: a span, which is what a request
+// opens and what §1.4 prices separately from an event.
+pub fn spans(n: Int) -> Int / {trace.write[bench]} =
+  fold(range(0, n), 0, |acc: Int, i: Int| {
+    let s = trace.enter[bench]("step", payload(i));
+    trace.exit[bench](s, trace::Ok);
+    acc + 2
+  })
+
+pub fn counters(n: Int) -> Int / {trace.write[bench]} =
+  fold(range(0, n), 0, |acc: Int, i: Int| {
+    trace.count[bench]("steps", 1, payload(i));
+    acc + 2
+  })
+
+// --- The twin ---------------------------------------------------------------
+//
+// The same three loops with the collecting handler installed, so the twin's cost
+// is measured against the bound sinks by running the identical definitions under
+// a different clause set. The `with_cell` is inside each entry point rather than
+// around the program, which is ADR 0015 §7's rule: a collector installed once
+// around a suite is one shared cell, and that is W4's pooled connection in a new
+// costume.
+//
+// Each of these publishes an empty row, which is the property the twin exists
+// for: after the handle, the loop is `det`, cacheable and hermetic.
+
+pub fn twin_events(n: Int) -> Int =
+  with_cell[collector](trace::sink()) { s ->
+    handle { events(n) } with {
+      trace.event[bench](l, nm, fs) ->
+        cell_set(s, trace::event_step(cell_get(s), "bench", l, nm, fs)),
+    }
+  }
+
+pub fn twin_spans(n: Int) -> Int =
+  with_cell[collector](trace::sink()) { s ->
+    handle { spans(n) } with {
+      trace.enter[bench](nm, fs) -> {
+        let out = trace::enter_step(cell_get(s), "bench", nm, fs);
+        cell_set(s, out.sink);
+        out.span
+      },
+      trace.exit[bench](sp, o) -> {
+        let out = trace::exit_step(cell_get(s), sp, o);
+        cell_set(s, out.sink);
+        if out.ok { () } else { panic("trace.exit named a span that is not open") }
+      },
+    }
+  }
+
+pub fn twin_counters(n: Int) -> Int =
+  with_cell[collector](trace::sink()) { s ->
+    handle { counters(n) } with {
+      trace.count[bench](nm, d, fs) ->
+        cell_set(s, trace::count_step(cell_get(s), "bench", nm, d, fs)),
+    }
+  }
+
+// The records the twin actually collected, so a harness can assert the loop
+// wrote what it claims rather than trusting a return value that would be the
+// same if every clause had done nothing.
+pub fn twin_event_records(n: Int) -> Int =
+  with_cell[collector](trace::sink()) { s -> {
+    handle { events(n) } with {
+      trace.event[bench](l, nm, fs) ->
+        cell_set(s, trace::event_step(cell_get(s), "bench", l, nm, fs)),
+    };
+    len(trace::drain(cell_get(s)))
+  } }
+
+// --- Tests ------------------------------------------------------------------
+//
+// A benchmark whose program stopped meaning what the harness thinks it means is
+// a wrong number rather than a failure, so the invariants the substitution rests
+// on are checked here and by `ply test` on this file.
+
+test "every rung does the same work and answers the same count" {
+  assert_eq(bare(64), 128);
+  assert_eq(twin_events(64), 128);
+  assert_eq(twin_spans(64), 128);
+  assert_eq(twin_counters(64), 128)
+}
+
+test "the twin collected one record per iteration" {
+  assert_eq(twin_event_records(50), 50)
+}
+
+test "a call site's field map is two entries, whatever the sink" {
+  assert_eq(map_len(payload(7)), 2)
+}

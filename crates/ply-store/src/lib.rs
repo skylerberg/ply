@@ -66,7 +66,17 @@ pub use schema::fingerprint as schema_fingerprint;
 /// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
 /// `string_upper` read `std`'s Unicode tables, which is the one thing the
 /// evaluator does that this repository does not decide.
-pub const RUNTIME_VERSION: &str = "0.10.0";
+/// 0.11.0 is W5: `Value::Secret` and the three builtins over it, `render`,
+/// `values_equal` and `compare_values` answering differently on a variant that
+/// did not exist, `HostRuntime::shutdown` and `stopping`, `HostOp::secrets`,
+/// and `end_entry_point` closing spans. Every one of those changes what a
+/// cached `Pass` is a claim about.
+/// 0.11.1 completes it: `map_of_entries` and `map_merge` refuse a `Secret` key
+/// rather than ordering it, and a span id is minted per entry point rather than
+/// per run — so a program that passed by reading an ordering oracle, or by
+/// observing an id another entry point moved, is not a program this evaluator
+/// passes.
+pub const RUNTIME_VERSION: &str = "0.11.1";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -84,7 +94,16 @@ pub const RUNTIME_VERSION: &str = "0.10.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.12.0";
+/// 0.13.0 is W5: `Secret` joins `BUILTIN_TYPE_CONS`, so a project's own
+/// `type Secret` becomes reserved; `derivable(json/ord/row, Secret<a>)` is
+/// false and `derivable(eq, ·)` is true, which changes what `E0206` fires on;
+/// and a `Secret` binder is `E0418`.
+/// 0.14.0 makes a handler clause for a polymorphic operation universally
+/// quantified: the operation's own type variables are rigid where the clause is
+/// checked, so a clause answering a concrete type for an operation declared
+/// `-> a` is `E0201` where it used to be accepted. A cached interface written
+/// before that is an interface for a program this front end refuses.
+pub const FRONTEND_VERSION: &str = "0.14.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///

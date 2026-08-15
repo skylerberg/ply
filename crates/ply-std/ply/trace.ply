@@ -1,0 +1,437 @@
+// The observability effect. `import std.trace (trace)` and the operations below
+// are the ones `ply_host::trace` registers against.
+//
+// This module is the declaration, the values that cross it, and a collecting
+// twin — and nothing else. The signature the sink binds to and the signature the
+// program performs are one text that cannot drift; an operation renamed on
+// either side is E0421 at bind time, naming the operation that moved.
+//
+// **The resource label is a channel.** That is the whole reason to put a log
+// behind an effect: a function's row says which channels it records on exactly
+// as it already says which tables it touches. `trace.event[orders](..)` performs
+// `(trace, orders, Write)`, so `ply check --types` answers "which routes record
+// on this channel" out of the type, beside "which routes write this table".
+//
+// A singleton `trace.write` was the alternative and it is refused. It would mean
+// every definition that records anything carries one atom, so any two tests that
+// record anything conflict and are serialised — `examples/desk.ply`'s fifty-five
+// tests would be very nearly one concurrency group — and it would make the row
+// say "records" and nothing more, which is `db.write[db]` with a different noun.
+//
+// What that granularity costs, stated where it is paid: **a channel label cannot
+// be abstracted over.** Labels are ground identifiers in the source, so a helper
+// `fn info(name, fs)` that records on its caller's channel is not expressible.
+// This module therefore ships **no function that performs**: only the value
+// constructors, the twin and the queries over it. Every perform is written at
+// its call site with its channel, which is what makes a handler's clause list a
+// capability grant rather than a formality.
+//
+// `nondet` is load-bearing and it is the same sentence `std.net` and `std.db`
+// carry. A production sink stamps a wall-clock timestamp and mints a span id;
+// neither is a function of the program's state. So a `det` test that reaches an
+// unhandled `trace` operation is E0412 at compile time, whether or not `--host`
+// was passed, and the only way to make such a test compile is to install a
+// collecting handler — which is the substitution this module exists to make
+// possible. A deterministic `trace` effect would let that test compile and then
+// fail at run time with E0424; a compile error is strictly better.
+//
+// **There is no disabled path.** A row cannot be conditional on a flag, so
+// `--trace off` does not remove the perform: it binds `ply_host::trace::discard`,
+// a listed member of the trusted computing base whose clause answers `Unit`.
+// What that costs is bounded and stated rather than promised away — the `Fields`
+// map the call site built, one perform, and nothing else. No call site formats,
+// none reads a clock, and none allocates a span record; rendering, timestamping
+// and level filtering are all the sink's.
+
+import std.json
+
+pub type Level = Debug | Info | Warn | Error
+
+// One structured value. There is no case that takes a pre-rendered message,
+// deliberately: a call site that formats pays for the formatting whether or not
+// anything is collecting, and rendering is the sink's job.
+pub type Field =
+  | FInt(Int) | FBool(Bool) | FText(String)
+  | FFloat(Float) | FDecimal(Decimal) | FBytes(Bytes)
+  | FJson(json::Json)
+
+// Column name to value, a `Map`, so two field sets built in different orders are
+// equal and a golden test over a trace line is stable.
+pub type Fields = Map<String, Field>
+
+// A span's identity. An ordinary record rather than an opaque handle: an id is
+// what correlates two lines in a log, so a program must be able to put one in a
+// field, and there is nothing to protect — a forged one is E0445 at the bound
+// driver and `ok: false` from the twin, which is a better answer than a type
+// nobody can write down.
+pub type Span = { id: Int, channel: String }
+
+// How a span ended. `Abandoned` is not a warning: a `db.rollback` discards the
+// continuation the body had left, so nothing runs the program's `exit`, and a
+// record marked `Abandoned` is the useful signal about what a dying request was
+// doing.
+pub type Outcome = Ok | Failed(String) | Abandoned
+
+// Six operations rather than two effects. Metrics live here and not on their
+// own effect: Ply has no polymorphism over effect *names*, so a second effect
+// would double every handler clause set in a program, and the distinction it
+// would draw is not one any scheduling decision consults — a counter and a span
+// are both appends to one sink.
+//
+// The cost is stated rather than hidden: a function that only increments a
+// counter carries `trace.write[c]`, which reads as "this function records on
+// channel `c`", and that is exactly true.
+//
+// `gauge` takes a `Decimal` and not a `Float`, because `Float`'s `==` is not an
+// equivalence relation and a gauge is a number a test asserts on.
+pub nondet effect trace {
+  write event[c](level: Level, name: String, fields: Fields)   -> Unit
+  write enter[c](name: String, fields: Fields)                 -> Span
+  write exit[c](span: Span, outcome: Outcome)                  -> Unit
+  write count[c](name: String, delta: Int, fields: Fields)     -> Unit
+  write gauge[c](name: String, value: Decimal, fields: Fields) -> Unit
+  write time[c](name: String, micros: Int, fields: Fields)     -> Unit
+}
+
+// --- The collecting twin ---------------------------------------------------------
+//
+// A set of **pure functions over a `Sink` value**, with no effects at all, so a
+// test that installs it over a region-scoped cell discharges every `trace` atom
+// it reaches: after the `with_cell`, the row is empty, the test is `det`, it is
+// cached, and it runs without `--host`. That a test can assert on the exact
+// records a request produced is how "what this endpoint records" becomes a
+// checked claim rather than a hope.
+//
+// **Where the collector goes matters.** The `with_cell` belongs inside each
+// test, not around a suite: a collector installed once around every test is one
+// shared cell, and two tests asserting on it are coupled exactly as W4's pooled
+// connection coupled two tests the footprint graph believed were disjoint.
+//
+// **One thread of control.** A `Sink` holds one open-span stack, so it models a
+// single task's nesting. The bound driver keeps a stack per performing task,
+// because two requests interleaving would otherwise land one's timing under the
+// other's span. A simulated program whose tasks each trace should give each task
+// a `Sink` of its own; a test that shares one across `task.spawn` sees the two
+// tasks' spans nest into each other, which is this value's limit rather than the
+// driver's behaviour.
+
+pub type Kind = KEvent | KEnter | KExit | KCount | KGauge | KTime
+
+// `span` is the span the record belongs to and `parent` is that span's parent,
+// for every kind: on a `KEnter` or a `KExit` that is the span itself, and on an
+// event or a metric it is whichever span was innermost when it was recorded. `0`
+// is "no span", which is unambiguous because ids ascend from 1.
+pub type Record = {
+  seq:     Int,
+  kind:    Kind,
+  level:   Level,
+  channel: String,
+  name:    String,
+  span:    Int,
+  parent:  Int,
+  fields:  Fields,
+  outcome: Outcome,
+  amount:  Int,
+  value:   Decimal,
+}
+
+// One span the sink has open, innermost first, so pushing and popping are both
+// at the head and closing a span that is not innermost is one walk.
+type Open = { id: Int, channel: String, name: String, parent: Int }
+
+pub type Sink = {
+  records: List<Record>,
+  open:    List<Open>,
+  next:    Int,
+}
+
+pub fn sink() -> Sink = {records: [], open: [], next: 1}
+
+// What `enter_step` answers: the sink to thread on and the span to hand back to
+// the program. A record rather than a pair, because the two halves are read at
+// different call sites and a positional pair reads wrongly at both.
+pub type Entered = { sink: Sink, span: Span }
+
+// What `exit_step` answers. `ok: false` is where the bound driver raises E0445 —
+// a twin is a value and a value does not raise, so the handler clause is what
+// turns `false` into whatever the program wants, and `std.trace` does not decide
+// it.
+pub type Exited = { sink: Sink, ok: Bool }
+
+pub fn event_step(s: Sink, c: String, l: Level, n: String, fs: Fields) -> Sink =
+  append(s, record(s, KEvent, l, c, n, innermost(s), fs, Ok, 0, 0m))
+
+pub fn count_step(s: Sink, c: String, n: String, d: Int, fs: Fields) -> Sink =
+  append(s, record(s, KCount, Info, c, n, innermost(s), fs, Ok, d, 0m))
+
+pub fn gauge_step(s: Sink, c: String, n: String, v: Decimal, fs: Fields) -> Sink =
+  append(s, record(s, KGauge, Info, c, n, innermost(s), fs, Ok, 0, v))
+
+pub fn time_step(s: Sink, c: String, n: String, us: Int, fs: Fields) -> Sink =
+  append(s, record(s, KTime, Info, c, n, innermost(s), fs, Ok, us, 0m))
+
+pub fn enter_step(s: Sink, c: String, n: String, fs: Fields) -> Entered = {
+  let opened = {id: s.next, channel: c, name: n, parent: current_id(s)};
+  let pushed = {records: s.records, open: cons(opened, s.open), next: s.next + 1};
+  {
+    sink: append(pushed, record(pushed, KEnter, Info, c, n, Some(opened), fs, Ok, 0, 0m)),
+    span: {id: opened.id, channel: c},
+  }
+}
+
+// Closes `sp` **and every span the same sink opened above it**, each of the
+// latter `Abandoned`. That is the ordinary rollback case: a discarded
+// continuation is what a rollback is, so the spans between the rollback and the
+// scope that answered it never ran their own `exit`, and there is nothing else
+// they could be.
+pub fn exit_step(s: Sink, sp: Span, o: Outcome) -> Exited =
+  if is_open(s.open, sp) {
+    {sink: close_through(s, sp.id, o), ok: true}
+  } else {
+    {sink: s, ok: false}
+  }
+
+// Closes every still-open span as `Abandoned`, then answers the records in `seq`
+// order. The one way records leave a `Sink`, so a hermetic test observes the
+// same records a bound run would write — a twin that left them open would be a
+// twin whose divergence from production is precisely in the failure path.
+pub fn drain(s: Sink) -> List<Record> = abandon_all(s).records
+
+pub fn open_spans(s: Sink) -> Int = len(s.open)
+
+pub fn named(rs: List<Record>, n: String) -> List<Record> =
+  filter(rs, |r: Record| r.name == n)
+
+pub fn on_channel(rs: List<Record>, c: String) -> List<Record> =
+  filter(rs, |r: Record| r.channel == c)
+
+pub fn counter_total(rs: List<Record>, n: String) -> Int =
+  fold(rs, 0, |acc: Int, r: Record|
+    match r.kind {
+      KCount -> if r.name == n { acc + r.amount } else { acc },
+      _ -> acc,
+    })
+
+// --- The twin's own machinery ----------------------------------------------------
+//
+// `push` appends and is the language's one list primitive, so a record list is
+// built in `seq` order and appending is quadratic over the run — the same trade
+// `std.db`'s twin states. A sink a test asserts on holds tens of records, and
+// the bound driver holds none at all: it writes each record and forgets it.
+
+fn cons<a>(x: a, xs: List<a>) -> List<a> =
+  fold(xs, push([], x), |acc: List<a>, y: a| push(acc, y))
+
+fn append(s: Sink, r: Record) -> Sink =
+  {records: push(s.records, r), open: s.open, next: s.next}
+
+fn record(s: Sink, k: Kind, l: Level, c: String, n: String, at: Option<Open>,
+          fs: Fields, o: Outcome, amount: Int, value: Decimal) -> Record =
+  {
+    seq: len(s.records) + 1,
+    kind: k,
+    level: l,
+    channel: c,
+    name: n,
+    span: match at { Some(open) -> open.id, None -> 0 },
+    parent: match at { Some(open) -> open.parent, None -> 0 },
+    fields: fs,
+    outcome: o,
+    amount: amount,
+    value: value,
+  }
+
+fn innermost(s: Sink) -> Option<Open> =
+  match s.open { [first, ..] -> Some(first), _ -> None }
+
+fn current_id(s: Sink) -> Int = match s.open { [first, ..] -> first.id, _ -> 0 }
+
+// The channel is compared as well as the id. A `Span` is an ordinary record, so
+// a program can build one, and a forged id that happens to collide with an open
+// span on another channel is the case this closes.
+fn is_open(os: List<Open>, sp: Span) -> Bool =
+  match os {
+    [] -> false,
+    [first, ..rest] ->
+      if first.id == sp.id { first.channel == sp.channel } else { is_open(rest, sp) },
+  }
+
+// Pops spans innermost-first, recording each, until `id` has been closed.
+fn close_through(s: Sink, id: Int, o: Outcome) -> Sink =
+  match s.open {
+    [] -> s,
+    [first, ..rest] -> {
+      let popped = {records: s.records, open: rest, next: s.next};
+      let outcome = if first.id == id { o } else { Abandoned };
+      let closed = append(popped,
+        record(popped, KExit, Info, first.channel, first.name, Some(first),
+               map_new(), outcome, 0, 0m));
+      if first.id == id { closed } else { close_through(closed, id, o) }
+    },
+  }
+
+fn abandon_all(s: Sink) -> Sink =
+  match s.open {
+    [] -> s,
+    [first, ..] -> abandon_all(close_through(s, first.id, Abandoned)),
+  }
+
+// --- Tests ------------------------------------------------------------------
+//
+// A shipped module's tests are the compiler's, not a project's: `ply test` in a
+// project that imports this module does not select them and writes nothing about
+// them to that project's cache, because a project's test count must not change
+// with a compiler upgrade. `ply test --std` selects them, and the compiler's own
+// suite runs them.
+//
+// Every test here is `det`, hermetic and cached: the handler each one installs
+// discharges every `trace` atom it reaches, which is the whole claim the twin
+// exists to support.
+
+fn one_field(k: String, v: Field) -> Fields = map_insert(map_new(), k, v)
+
+// The shape a test writes: one cell, one clause per operation, and the channel
+// written at every clause because a label is syntax.
+fn placed(sku: String) -> Unit / {trace.write[orders]} = {
+  let span = trace.enter[orders]("place_order", one_field("sku", FText(sku)));
+  trace.count[orders]("orders_placed", 1, map_new());
+  trace.exit[orders](span, Ok)
+}
+
+fn kinds(rs: List<Record>) -> List<Kind> = map(rs, |r: Record| r.kind)
+
+fn span_ids(rs: List<Record>) -> List<Int> = map(rs, |r: Record| r.span)
+
+fn parents(rs: List<Record>) -> List<Int> = map(rs, |r: Record| r.parent)
+
+fn outcomes(rs: List<Record>) -> List<Outcome> = map(rs, |r: Record| r.outcome)
+
+fn record_names(rs: List<Record>) -> List<String> = map(rs, |r: Record| r.name)
+
+test "a collecting handler discharges every atom this test reaches" {
+  with_cell[collector](sink()) { s -> {
+    handle {
+      placed("BOLT-1")
+    } with {
+      trace.enter[orders](n, fs) -> {
+        let out = enter_step(cell_get(s), "orders", n, fs);
+        cell_set(s, out.sink);
+        out.span
+      },
+      trace.exit[orders](sp, o) -> {
+        let out = exit_step(cell_get(s), sp, o);
+        cell_set(s, out.sink);
+        assert(out.ok)
+      },
+      trace.count[orders](n, d, fs) ->
+        cell_set(s, count_step(cell_get(s), "orders", n, d, fs)),
+    };
+    let rs = drain(cell_get(s));
+    assert_eq(kinds(rs), [KEnter, KCount, KExit]);
+    assert_eq(record_names(rs), ["place_order", "orders_placed", "place_order"]);
+    assert_eq(counter_total(rs, "orders_placed"), 1);
+    assert_eq(on_channel(rs, "items"), [])
+  } }
+}
+
+test "a span nested in a span links to its parent, and closing is innermost first" {
+  let outer = enter_step(sink(), "http", "request", map_new());
+  let inner = enter_step(outer.sink, "http", "query", map_new());
+  let closed_inner = exit_step(inner.sink, inner.span, Ok);
+  let closed_outer = exit_step(closed_inner.sink, outer.span, Ok);
+  assert(closed_inner.ok);
+  assert(closed_outer.ok);
+  let rs = drain(closed_outer.sink);
+  assert_eq(span_ids(rs), [1, 2, 2, 1]);
+  assert_eq(parents(rs), [0, 1, 1, 0]);
+  assert_eq(kinds(rs), [KEnter, KEnter, KExit, KExit]);
+  assert_eq(outcomes(rs), [Ok, Ok, Ok, Ok])
+}
+
+// An event recorded inside a span carries that span, so the record list alone
+// reconstructs the tree and the driver never has to write the tree down.
+test "an event inside a span carries the span it was recorded in" {
+  let outer = enter_step(sink(), "http", "request", map_new());
+  let noted = event_step(outer.sink, "http", Warn, "slow", map_new());
+  assert_eq(span_ids(drain(noted)), [1, 1, 1]);
+  assert_eq(map(named(drain(noted), "slow"), |r: Record| r.level), [Warn])
+}
+
+// The rollback case. Everything the body had left to do is the continuation, and
+// the continuation is dropped — so nothing runs the inner `exit`, and the twin
+// closes it `Abandoned` when the scope that answered the rollback closes its own.
+test "closing an outer span abandons the spans still open above it" {
+  let outer = enter_step(sink(), "orders", "place_order", map_new());
+  let inner = enter_step(outer.sink, "orders", "reserve", map_new());
+  let deeper = enter_step(inner.sink, "orders", "charge", map_new());
+  let closed = exit_step(deeper.sink, outer.span, Failed("rolled back"));
+  assert(closed.ok);
+  let rs = drain(closed.sink);
+  assert_eq(kinds(rs), [KEnter, KEnter, KEnter, KExit, KExit, KExit]);
+  assert_eq(span_ids(rs), [1, 2, 3, 3, 2, 1]);
+  assert_eq(outcomes(rs), [Ok, Ok, Ok, Abandoned, Abandoned, Failed("rolled back")])
+}
+
+test "a span nobody closed is drained as abandoned, innermost first" {
+  let outer = enter_step(sink(), "http", "request", map_new());
+  let inner = enter_step(outer.sink, "http", "query", map_new());
+  assert_eq(open_spans(inner.sink), 2);
+  let rs = drain(inner.sink);
+  assert_eq(kinds(rs), [KEnter, KEnter, KExit, KExit]);
+  assert_eq(span_ids(rs), [1, 2, 2, 1]);
+  assert_eq(outcomes(rs), [Ok, Ok, Abandoned, Abandoned])
+}
+
+// The three ways an `exit` names a span that is not open, and one answer for all
+// of them: `ok: false`, and a sink nothing was written to. Accepting it silently
+// is how one request's timing lands under another request's span.
+test "an exit naming a span that is not open answers false and records nothing" {
+  let opened = enter_step(sink(), "http", "request", map_new());
+  let closed = exit_step(opened.sink, opened.span, Ok);
+
+  let twice = exit_step(closed.sink, opened.span, Ok);
+  assert(!twice.ok);
+  assert_eq(len(drain(twice.sink)), 2);
+
+  let never = exit_step(closed.sink, {id: 41, channel: "http"}, Ok);
+  assert(!never.ok);
+
+  let elsewhere = exit_step(opened.sink, {id: opened.span.id, channel: "orders"}, Ok);
+  assert(!elsewhere.ok)
+}
+
+test "ids ascend and are never reused, across sibling spans" {
+  let first = enter_step(sink(), "http", "a", map_new());
+  let closed = exit_step(first.sink, first.span, Ok);
+  let second = enter_step(closed.sink, "http", "b", map_new());
+  assert_eq(first.span.id, 1);
+  assert_eq(second.span.id, 2);
+  assert_eq(second.span.channel, "http")
+}
+
+test "a metric is a record like any other, and a total is a fold over them" {
+  let s = count_step(sink(), "orders", "placed", 2, map_new());
+  let s2 = count_step(s, "orders", "placed", 3, map_new());
+  let s3 = gauge_step(s2, "orders", "shelf", 41.75m, map_new());
+  let s4 = time_step(s3, "orders", "place_order", 8213, map_new());
+  let rs = drain(s4);
+  assert_eq(counter_total(rs, "placed"), 5);
+  assert_eq(counter_total(rs, "nothing"), 0);
+  assert_eq(kinds(rs), [KCount, KCount, KGauge, KTime]);
+  assert_eq(map(named(rs, "shelf"), |r: Record| r.value), [41.75m]);
+  assert_eq(map(named(rs, "place_order"), |r: Record| r.amount), [8213])
+}
+
+test "fields survive as a map, so two sets built in different orders are equal" {
+  let one = map_insert(map_insert(map_new(), "sku", FText("BOLT-1")), "n", FInt(2));
+  let other = map_insert(map_insert(map_new(), "n", FInt(2)), "sku", FText("BOLT-1"));
+  let s = event_step(sink(), "orders", Info, "placed", one);
+  assert_eq(map(drain(s), |r: Record| r.fields), [other])
+}
+
+test "seq is the total order the sink hands records out in" {
+  let a = event_step(sink(), "http", Info, "one", map_new());
+  let b = count_step(a, "http", "two", 1, map_new());
+  let c = enter_step(b, "http", "three", map_new());
+  assert_eq(map(drain(c.sink), |r: Record| r.seq), [1, 2, 3, 4])
+}

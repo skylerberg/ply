@@ -45,7 +45,8 @@ pub use differential::{
 pub use env::Env;
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
-    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending,
+    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
+    is_drain_incomplete,
 };
 // `explore::Step` is deliberately not re-exported: `Step` at the root is the
 // builtin's, and one name for two things is worse than a qualified path.
@@ -63,7 +64,8 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Map, Value, Vector, first_difference, values_equal,
+    Closure, ClosureKind, Decimal, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
+    first_difference, values_equal,
 };
 pub use world::{CellId, Fixture, World};
 

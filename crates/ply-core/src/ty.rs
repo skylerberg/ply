@@ -245,7 +245,31 @@ impl Type {
     pub fn result(ok: Type, err: Type) -> Type {
         Type::Con(Symbol::new("Result"), vec![ok, err])
     }
+    /// A credential. Nothing in the language destructures one: it declares no
+    /// constructors, so no pattern binds the payload, and no builtin over it
+    /// returns the payload's type.
+    pub fn secret(inner: Type) -> Type {
+        Type::Con(Symbol::new(SECRET), vec![inner])
+    }
+
+    /// Whether a solved type mentions a `Secret` anywhere. What the
+    /// quantification check, the derivation walk and the `Map` key rule all ask.
+    pub fn mentions_secret(&self) -> bool {
+        match self {
+            Type::Con(name, args) => {
+                name.as_str() == SECRET || args.iter().any(Type::mentions_secret)
+            }
+            Type::Fn { params, ret, .. } => {
+                params.iter().any(Type::mentions_secret) || ret.mentions_secret()
+            }
+            Type::Record(fields) => fields.values().any(Type::mentions_secret),
+            Type::Var(_) => false,
+        }
+    }
 }
+
+/// The builtin type constructor W5 §2 is about.
+pub const SECRET: &str = "Secret";
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

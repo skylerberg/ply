@@ -9,9 +9,21 @@
 // the test did not grant, it fails with `unhandled effect` instead of quietly
 // touching a resource the test never accounted for.
 
+// One operation per row type rather than one polymorphic `all[table]() ->
+// List<a>`. A handler clause is checked once and answers every perform site
+// there will ever be, and a row carries atoms and no types — so a `handle`
+// cannot see which `a` a perform three definitions deeper picked, and a clause
+// answering `List<User>` for an operation declared `List<a>` would be handing a
+// caller a value of a type it never asked for. The resource labels are
+// unchanged, so the footprints below and the schedule read off them are exactly
+// what they were.
 effect db {
-  read  all[table]() -> List<a>
-  write save[table](rows: List<a>) -> Unit
+  read  all_users[table]() -> List<User>
+  read  all_orders[table]() -> List<Order>
+  read  all_items[table]() -> List<Item>
+  write save_users[table](rows: List<User>) -> Unit
+  write save_orders[table](rows: List<Order>) -> Unit
+  write save_items[table](rows: List<Item>) -> Unit
 }
 
 type User = { id: Int, email: String, active: Bool }
@@ -48,20 +60,20 @@ fn draw_down(shelf: List<Item>, sku: String, qty: Int) -> List<Item> =
 // --- Readers ----------------------------------------------------------------
 
 fn active_users() -> List<User> / {db.read[users]} =
-  filter(db.all[users](), |u: User| u.active)
+  filter(db.all_users[users](), |u: User| u.active)
 
 fn user_count() -> Int / {db.read[users]} =
-  len(db.all[users]())
+  len(db.all_users[users]())
 
 fn open_orders() -> List<Order> / {db.read[orders]} =
-  filter(db.all[orders](), |o: Order| !o.paid)
+  filter(db.all_orders[orders](), |o: Order| !o.paid)
 
 fn stock(sku: String) -> Int / {db.read[inventory]} =
-  on_hand(db.all[inventory](), sku)
+  on_hand(db.all_items[inventory](), sku)
 
 fn revenue() -> Int / {db.read[orders], db.read[inventory]} =
-  fold(db.all[orders](), 0, |acc, o: Order|
-    if o.paid { acc + line_total(price_of(db.all[inventory](), o.sku), o.qty) } else { acc })
+  fold(db.all_orders[orders](), 0, |acc, o: Order|
+    if o.paid { acc + line_total(price_of(db.all_items[inventory](), o.sku), o.qty) } else { acc })
 
 fn backordered() -> List<Order> / {db.read[orders], db.read[inventory]} =
   filter(open_orders(), |o: Order| stock(o.sku) < o.qty)
@@ -70,11 +82,11 @@ fn backordered() -> List<Order> / {db.read[orders], db.read[inventory]} =
 // signature is the union of the three branches.
 fn row_count(table: String) -> Int / {db.read[users], db.read[orders], db.read[inventory]} =
   if table == "users" {
-    len(db.all[users]())
+    len(db.all_users[users]())
   } else if table == "orders" {
-    len(db.all[orders]())
+    len(db.all_orders[orders]())
   } else {
-    len(db.all[inventory]())
+    len(db.all_items[inventory]())
   }
 
 // --- Writers ----------------------------------------------------------------
@@ -83,9 +95,9 @@ fn add_user(email: String) -> Int / {db.read[users], db.write[users]} {
   if email == "" {
     0
   } else {
-    let rows = db.all[users]();
+    let rows = db.all_users[users]();
     let id = next_id(map(rows, |u: User| u.id));
-    db.save[users](push(rows, {id: id, email: email, active: true}));
+    db.save_users[users](push(rows, {id: id, email: email, active: true}));
     id
   }
 }
@@ -94,11 +106,11 @@ fn deactivate(id: Int) -> Bool / {db.read[users], db.write[users]} {
   if id <= 0 {
     false
   } else {
-    let rows = db.all[users]();
+    let rows = db.all_users[users]();
     if len(filter(rows, |u: User| u.id == id && u.active)) == 0 {
       false
     } else {
-      db.save[users](map(rows, |u: User| if u.id == id { disabled(u) } else { u }));
+      db.save_users[users](map(rows, |u: User| if u.id == id { disabled(u) } else { u }));
       true
     }
   }
@@ -108,8 +120,8 @@ fn restock(sku: String, qty: Int) -> Unit / {db.read[inventory], db.write[invent
   if qty <= 0 {
     ()
   } else {
-    let shelf = db.all[inventory]();
-    db.save[inventory](map(shelf, |i: Item|
+    let shelf = db.all_items[inventory]();
+    db.save_items[inventory](map(shelf, |i: Item|
       if i.sku == sku { shelved(i, i.on_hand + qty) } else { i }))
   }
 }
@@ -120,28 +132,28 @@ fn reserve(sku: String, qty: Int) -> Bool / {db.read[inventory], db.write[invent
   } else if stock(sku) < qty {
     false
   } else {
-    db.save[inventory](draw_down(db.all[inventory](), sku, qty));
+    db.save_items[inventory](draw_down(db.all_items[inventory](), sku, qty));
     true
   }
 }
 
 fn mark_paid(id: Int) -> Bool / {db.read[orders], db.write[orders]} {
-  let rows = db.all[orders]();
+  let rows = db.all_orders[orders]();
   if len(filter(rows, |o: Order| o.id == id && !o.paid)) == 0 {
     false
   } else {
-    db.save[orders](map(rows, |o: Order| if o.id == id { settled(o) } else { o }));
+    db.save_orders[orders](map(rows, |o: Order| if o.id == id { settled(o) } else { o }));
     true
   }
 }
 
 fn archive_paid() -> Int / {db.read[orders], db.write[orders]} {
-  let rows = db.all[orders]();
+  let rows = db.all_orders[orders]();
   let keep = filter(rows, |o: Order| !o.paid);
   if len(keep) == len(rows) {
     0
   } else {
-    db.save[orders](keep);
+    db.save_orders[orders](keep);
     len(rows) - len(keep)
   }
 }
@@ -150,15 +162,15 @@ fn place_order(user: Int, sku: String, qty: Int) -> Bool
   / {db.read[users], db.read[orders], db.read[inventory], db.write[orders], db.write[inventory]} {
   if qty <= 0 {
     false
-  } else if len(filter(db.all[users](), |u: User| u.id == user && u.active)) == 0 {
+  } else if len(filter(db.all_users[users](), |u: User| u.id == user && u.active)) == 0 {
     false
   } else if stock(sku) < qty {
     false
   } else {
-    db.save[inventory](draw_down(db.all[inventory](), sku, qty));
-    let rows = db.all[orders]();
+    db.save_items[inventory](draw_down(db.all_items[inventory](), sku, qty));
+    let rows = db.all_orders[orders]();
     let id = next_id(map(rows, |o: Order| o.id));
-    db.save[orders](push(rows, {id: id, user: user, sku: sku, qty: qty, paid: false}));
+    db.save_orders[orders](push(rows, {id: id, user: user, sku: sku, qty: qty, paid: false}));
     true
   }
 }
@@ -216,7 +228,7 @@ test "active users exclude the deactivated ones" {
     assert_eq(len(active_users()), 2);
     assert_eq(user_count(), 3)
   } with {
-    db.all[users]() -> seed_users(),
+    db.all_users[users]() -> seed_users(),
   }
 }
 
@@ -224,7 +236,7 @@ test "open orders are the unpaid ones, oldest first" {
   handle {
     assert_eq(map(open_orders(), |o: Order| o.id), [2, 3])
   } with {
-    db.all[orders]() -> seed_orders(),
+    db.all_orders[orders]() -> seed_orders(),
   }
 }
 
@@ -232,8 +244,8 @@ test "revenue prices the paid orders off the shelf" {
   handle {
     assert_eq(revenue(), 500)
   } with {
-    db.all[orders]() -> seed_orders(),
-    db.all[inventory]() -> seed_shelf(),
+    db.all_orders[orders]() -> seed_orders(),
+    db.all_items[inventory]() -> seed_shelf(),
   }
 }
 
@@ -241,8 +253,8 @@ test "a backorder is an open order the shelf cannot cover" {
   handle {
     assert_eq(map(backordered(), |o: Order| o.sku), ["gasket"])
   } with {
-    db.all[orders]() -> seed_orders(),
-    db.all[inventory]() -> seed_shelf(),
+    db.all_orders[orders]() -> seed_orders(),
+    db.all_items[inventory]() -> seed_shelf(),
   }
 }
 
@@ -254,8 +266,8 @@ test "adding a user assigns the next free id" {
       assert_eq(add_user("hedy@example.com"), 4);
       assert_eq(user_count(), 4)
     } with {
-      db.all[users]() -> cell_get(table),
-      db.save[users](rows) -> cell_set(table, rows),
+      db.all_users[users]() -> cell_get(table),
+      db.save_users[users](rows) -> cell_set(table, rows),
     }
   }
 }
@@ -267,8 +279,8 @@ test "deactivating flips the flag once and then declines" {
       assert_eq(len(active_users()), 1);
       assert(!deactivate(2))
     } with {
-      db.all[users]() -> cell_get(table),
-      db.save[users](rows) -> cell_set(table, rows),
+      db.all_users[users]() -> cell_get(table),
+      db.save_users[users](rows) -> cell_set(table, rows),
     }
   }
 }
@@ -280,8 +292,8 @@ test "restocking adds to the shelf it names" {
       assert_eq(stock("gasket"), 12);
       assert_eq(stock("widget"), 10)
     } with {
-      db.all[inventory]() -> cell_get(shelf),
-      db.save[inventory](rows) -> cell_set(shelf, rows),
+      db.all_items[inventory]() -> cell_get(shelf),
+      db.save_items[inventory](rows) -> cell_set(shelf, rows),
     }
   }
 }
@@ -294,8 +306,8 @@ test "reserving draws the shelf down by exactly the quantity taken" {
       assert(reserve("widget", 6));
       assert_eq(stock("widget"), 0)
     } with {
-      db.all[inventory]() -> cell_get(shelf),
-      db.save[inventory](rows) -> cell_set(shelf, rows),
+      db.all_items[inventory]() -> cell_get(shelf),
+      db.save_items[inventory](rows) -> cell_set(shelf, rows),
     }
   }
 }
@@ -306,8 +318,8 @@ test "marking an order paid leaves its neighbours alone" {
       assert(mark_paid(2));
       assert_eq(map(open_orders(), |o: Order| o.id), [3])
     } with {
-      db.all[orders]() -> cell_get(table),
-      db.save[orders](rows) -> cell_set(table, rows),
+      db.all_orders[orders]() -> cell_get(table),
+      db.save_orders[orders](rows) -> cell_set(table, rows),
     }
   }
 }
@@ -319,8 +331,8 @@ test "archiving drops exactly the paid orders" {
       assert_eq(len(open_orders()), 2);
       assert_eq(archive_paid(), 0)
     } with {
-      db.all[orders]() -> cell_get(table),
-      db.save[orders](rows) -> cell_set(table, rows),
+      db.all_orders[orders]() -> cell_get(table),
+      db.save_orders[orders](rows) -> cell_set(table, rows),
     }
   }
 }
@@ -334,12 +346,12 @@ test "placing an order writes the order and the drawdown together" {
           assert_eq(stock("widget"), 7);
           assert_eq(len(open_orders()), 3)
         } with {
-          db.all[users]() -> cell_get(users_table),
-          db.save[users](rows) -> cell_set(users_table, rows),
-          db.all[orders]() -> cell_get(orders_table),
-          db.save[orders](rows) -> cell_set(orders_table, rows),
-          db.all[inventory]() -> cell_get(shelf),
-          db.save[inventory](rows) -> cell_set(shelf, rows),
+          db.all_users[users]() -> cell_get(users_table),
+          db.save_users[users](rows) -> cell_set(users_table, rows),
+          db.all_orders[orders]() -> cell_get(orders_table),
+          db.save_orders[orders](rows) -> cell_set(orders_table, rows),
+          db.all_items[inventory]() -> cell_get(shelf),
+          db.save_items[inventory](rows) -> cell_set(shelf, rows),
         }
       }
     }
@@ -352,7 +364,7 @@ test "reserving more than the shelf holds writes nothing" {
   handle {
     assert(!reserve("gasket", 5))
   } with {
-    db.all[inventory]() -> seed_shelf(),
+    db.all_items[inventory]() -> seed_shelf(),
   }
 }
 
@@ -360,7 +372,7 @@ test "deactivating a stranger writes nothing" {
   handle {
     assert(!deactivate(99))
   } with {
-    db.all[users]() -> seed_users(),
+    db.all_users[users]() -> seed_users(),
   }
 }
 
@@ -369,7 +381,7 @@ test "marking an unknown order paid writes nothing" {
     assert(!mark_paid(99));
     assert(!mark_paid(1))
   } with {
-    db.all[orders]() -> seed_orders(),
+    db.all_orders[orders]() -> seed_orders(),
   }
 }
 
@@ -377,7 +389,7 @@ test "archiving a table with nothing settled writes nothing" {
   handle {
     assert_eq(archive_paid(), 0)
   } with {
-    db.all[orders]() -> filter(seed_orders(), |o: Order| !o.paid),
+    db.all_orders[orders]() -> filter(seed_orders(), |o: Order| !o.paid),
   }
 }
 
@@ -390,7 +402,7 @@ test "an order for nobody stops at the user lookup" {
   handle {
     assert(!place_order(99, "widget", 1))
   } with {
-    db.all[users]() -> seed_users(),
+    db.all_users[users]() -> seed_users(),
   }
 }
 
@@ -398,8 +410,8 @@ test "an order the shelf cannot cover never reaches the orders table" {
   handle {
     assert(!place_order(1, "gasket", 5))
   } with {
-    db.all[users]() -> seed_users(),
-    db.all[inventory]() -> seed_shelf(),
+    db.all_users[users]() -> seed_users(),
+    db.all_items[inventory]() -> seed_shelf(),
   }
 }
 
@@ -407,7 +419,7 @@ test "counting users leaves the other two tables in the footprint" {
   handle {
     assert_eq(row_count("users"), 3)
   } with {
-    db.all[users]() -> seed_users(),
+    db.all_users[users]() -> seed_users(),
   }
 }
 
@@ -415,6 +427,6 @@ test "counting orders leaves the other two tables in the footprint" {
   handle {
     assert_eq(row_count("orders"), 3)
   } with {
-    db.all[orders]() -> seed_orders(),
+    db.all_orders[orders]() -> seed_orders(),
   }
 }

@@ -15,7 +15,7 @@ use crate::env::Env;
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::host::{
     HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, MachineId, Pending, attribute,
-    err_blocking_answered_inline, err_hermetic, err_host_in_search, operation_label,
+    err_blocking_answered_inline, err_hermetic, err_host_in_search, err_withheld, operation_label,
 };
 use crate::interp::{
     OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
@@ -491,8 +491,16 @@ impl<'a> Machine<'a> {
                 .note("this name is program-wide: `store.orders.place`, not `place`")
         })?;
         self.reset();
-        self.apply(f, args, span)?;
-        self.run()
+        // The same three lines [`Machine::drive`] ends with, and for the same
+        // reason: this is an entry point — it resets the world before it starts
+        // — so whatever a host handler is holding for it has to be handed back
+        // when it ends, on the diagnostic path as much as on the value path.
+        // `ply run` reaches `main` through here and through nothing else, so
+        // without this a `transaction` left open by `main` is never rolled back
+        // and a span left open by `main` is never closed.
+        let outcome = self.apply(f, args, span).and_then(|()| self.run());
+        self.end_entry_point();
+        outcome
     }
 
     /// One transition. Public so a stepper, a tracer and a fuel budget can each
@@ -938,6 +946,14 @@ impl<'a> Machine<'a> {
                         false => hermetic,
                     }
                 }
+                Some(path)
+                    if self
+                        .binding
+                        .withholds(&effect, &op, resource.as_ref())
+                        .is_some() =>
+                {
+                    err_withheld(span, &operation, &effect, path)
+                }
                 Some(path) => err_unenumerated_atom(span, &operation, path),
             });
         };
@@ -980,6 +996,19 @@ impl<'a> Machine<'a> {
         // first would replace it with a vaguer one.
         if self.re_executed {
             return Err(err_host_in_search(span, &operation, declaration.path));
+        }
+
+        // The last thing checked before the handler runs, because the whole
+        // point is that the credential has not crossed yet when this fires.
+        if !declaration.secrets
+            && let Some(position) = args.iter().position(carries_secret)
+        {
+            return Err(err_secret_to_host(
+                span,
+                &operation,
+                position,
+                declaration.path,
+            ));
         }
 
         let runtime = self.runtime.clone();
@@ -2125,6 +2154,53 @@ fn err_footprint_escape(
     .note(format!("the entry point's declared footprint is {declared}"))
     .note("scheduling and world isolation are decided from that footprint, so an operation outside it may have run beside work it conflicts with")
     .note("this is Ply's fault: the run knows two of its own answers disagree and nothing in the definition graph decides which was meant")
+}
+
+/// Whether a value handed across the boundary holds a credential anywhere.
+///
+/// A full walk rather than a top-level check, because the argument a handler
+/// receives is usually a record or a list and the credential is a field of it —
+/// which is exactly the shape a `config`-sourced password reaches an outbound
+/// request in. Bounded by the same host-stack growth every other walk over a
+/// `Value` uses, and paid only per host operation rather than per call.
+fn carries_secret(v: &Value) -> bool {
+    match v {
+        Value::Secret(_) => true,
+        Value::List(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
+        Value::Map(m) => crate::limit::grow(|| {
+            m.iter()
+                .any(|(k, v)| carries_secret(k) || carries_secret(v))
+        }),
+        Value::Record(fields) => crate::limit::grow(|| fields.values().any(carries_secret)),
+        Value::Ctor { args, .. } => crate::limit::grow(|| args.iter().any(carries_secret)),
+        _ => false,
+    }
+}
+
+/// `E0439` — a credential reached a host operation whose registration does not
+/// declare that it may receive one.
+///
+/// Ply's fault in the sense `E0427` is: the boundary's own account of itself
+/// disagrees with what crossed it. The argument's *position* is named and its
+/// value is not, which is the whole discipline of this milestone in one
+/// diagnostic.
+#[cold]
+#[inline(never)]
+fn err_secret_to_host(
+    span: Span,
+    operation: &str,
+    position: usize,
+    path: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(
+        codes::SECRET_TO_HOST,
+        format!("`{operation}` was handed a `Secret` in argument {}", position + 1),
+    )
+    .primary(span, "performed here")
+    .note(format!("`{path}` is registered `secrets: no`, so nothing above the boundary knows a credential can reach it"))
+    .note("below the boundary nothing is checkable: what a handler does with a credential is invisible to every guarantee this language makes")
+    .note("`ply hosts` prints the column; a handler that must receive one declares `secrets: true` there and becomes a reviewed member of the trusted computing base")
+    .note("this is Ply's fault: the registration and what crossed it disagree, and no definition in the program decides which was meant")
 }
 
 /// `E0425` — a host operation reached from inside a `simulate` region.

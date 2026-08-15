@@ -151,14 +151,15 @@ pub fn json(value: &Value, span: Span) -> Result<Json, Diagnostic> {
 /// text postgres wants.
 pub fn isolation(value: &Value, span: Span) -> Result<Isolation, Diagnostic> {
     match value {
-        Value::Ctor { name, .. } => match simple(name, super::MODULE).and_then(Isolation::from_ctor)
-        {
-            Some(level) => Ok(level),
-            None => Err(malformed(
-                &format!("an `Isolation`, and `{name}` is not one"),
-                span,
-            )),
-        },
+        Value::Ctor { name, .. } => {
+            match simple(name, super::MODULE).and_then(Isolation::from_ctor) {
+                Some(level) => Ok(level),
+                None => Err(malformed(
+                    &format!("an `Isolation`, and `{name}` is not one"),
+                    span,
+                )),
+            }
+        }
         other => Err(malformed(
             &format!("an `Isolation`, and this is {}", other.type_name()),
             span,
@@ -186,9 +187,10 @@ pub fn access(value: &Value, span: Span) -> Result<Access, Diagnostic> {
 
 pub fn answer(answer: &Answer) -> Value {
     match answer {
-        Answer::Rows(rows) => {
-            Value::ctor(ctor(super::MODULE, "Rows"), vec![Value::list(rows.iter().map(row).collect())])
-        }
+        Answer::Rows(rows) => Value::ctor(
+            ctor(super::MODULE, "Rows"),
+            vec![Value::list(rows.iter().map(row).collect())],
+        ),
         Answer::Count(n) => Value::ctor(ctor(super::MODULE, "Count"), vec![Value::Int(*n)]),
         Answer::Failed(e) => Value::ctor(ctor(super::MODULE, "Failed"), vec![error(e)]),
     }
