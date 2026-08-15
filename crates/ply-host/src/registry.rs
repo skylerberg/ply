@@ -42,9 +42,33 @@ impl Default for Host {
 
 impl Host {
     pub fn new() -> Host {
+        Host::with_credentials(crate::tls::Credentials::empty())
+    }
+
+    /// The same facilities, holding the TLS material this run was configured
+    /// with. Loading happens before this — [`Credentials::load`] is what raises
+    /// `E0430`, and it does so before anything runs, because a server that
+    /// discovers its certificate is unusable on the first handshake has already
+    /// told a client it was listening.
+    ///
+    /// [`Credentials::load`]: crate::tls::Credentials::load
+    pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
-            net: Arc::new(tcp::TcpHost::new()),
+            net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
         }
+    }
+
+    /// What the run's `--host` summary reports about TLS: how many handshakes
+    /// completed, how many were refused, and why.
+    pub fn handshakes(&self) -> crate::tls::HandshakeCounts {
+        self.net.handshakes()
+    }
+
+    /// The credentials this run was configured with, for the `transport` block
+    /// of `ply hosts`. By name and fingerprint: nothing here can hand back key
+    /// material.
+    pub fn credentials(&self) -> &crate::tls::Credentials {
+        self.net.credentials()
     }
 
     /// The trusted computing base of a run served by this `Host`.
@@ -55,8 +79,9 @@ impl Host {
     pub fn registry(&self) -> HostRegistry {
         let mut registry = HostRegistry::new();
 
-        // `net.*` — five operations over real sockets. Nondeterministic, at most
-        // once, and blocking wherever the operation waits on a peer.
+        // `net.*` — six operations over real sockets, one of them terminating
+        // TLS through `ply_host::tls`. Nondeterministic, at most once, and
+        // blocking wherever the operation waits on a peer.
         tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
 
         // `task.*` — the production scheduler. Repeatable, because spawning or

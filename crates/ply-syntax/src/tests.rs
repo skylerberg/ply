@@ -1116,7 +1116,26 @@ fn dump_item_body(i: &Item) -> String {
             format!("{s} {})", dump_expr(&l.body))
         }
         Item::Derive(d) => format!("(derive {} {})", d.deriver, d.target.name),
+        // The expansion, not the members as written: the expansion is what
+        // every row naming this set was given, and the members are a way of
+        // spelling it.
+        Item::EffectSet(d) => format!("(effect-set {} {})", d.name.name, dump_atoms(&d.expansion)),
     }
+}
+
+fn dump_atoms(atoms: &[AtomExpr]) -> String {
+    let atoms: Vec<_> = atoms
+        .iter()
+        .map(|a| {
+            let res = a
+                .resource
+                .as_ref()
+                .map(|r| format!("[{}]", r.name))
+                .unwrap_or_default();
+            format!("{}.{}{}", a.effect, a.mode.as_str(), res)
+        })
+        .collect();
+    format!("{{{}}}", atoms.join(", "))
 }
 
 fn dump_generics(g: &Generics) -> String {
@@ -1172,22 +1191,12 @@ fn dump_ty(t: &TypeExpr) -> String {
 }
 
 fn dump_row(r: &RowExpr) -> String {
-    let atoms: Vec<_> = r
-        .atoms
-        .iter()
-        .map(|a| {
-            let res = a
-                .resource
-                .as_ref()
-                .map(|r| format!("[{}]", r.name))
-                .unwrap_or_default();
-            format!("{}.{}{}", a.effect, a.mode.as_str(), res)
-        })
-        .collect();
+    let atoms = dump_atoms(&r.atoms);
+    let atoms = &atoms[1..atoms.len() - 1];
     match &r.tail {
-        None => format!("{{{}}}", atoms.join(", ")),
-        Some(t) if atoms.is_empty() => format!("{{| {}}}", t.name),
-        Some(t) => format!("{{{} | {}}}", atoms.join(", "), t.name),
+        None => format!("{{{atoms}}}"),
+        Some(t) if r.atoms.is_empty() => format!("{{| {}}}", t.name),
+        Some(t) => format!("{{{atoms} | {}}}", t.name),
     }
 }
 
@@ -2083,4 +2092,253 @@ fn each_input_to_parse_program_becomes_its_own_module() {
     assert_eq!(program.modules[1].items.len(), 1);
     assert_eq!(program.index_of(&ModuleName::from_dotted("b")), Some(1));
     assert!(program.find(&ModuleName::from_dotted("c")).is_none());
+}
+
+// ---------------------------------------------------------------- effect sets
+
+#[test]
+fn a_row_written_with_a_set_carries_the_sets_atoms() {
+    assert_eq!(
+        dump(
+            "effect set Web = {db.read[users], log.write}\n\
+             fn f() -> Int / {Web, clock.read} = 1"
+        ),
+        "(effect-set Web {db.read[users], log.write})\n\
+         (fn f () -> Int / {clock.read, db.read[users], log.write} 1)"
+    );
+}
+
+/// The alias survives beside the atoms it stood for: erased by normalization,
+/// so it moves no hash, and kept so `--explain` can say how the row was written.
+#[test]
+fn a_row_keeps_the_set_names_it_was_written_with() {
+    let m = ok("effect set Web = {log.write}\nfn f() -> Int / {Web, clock.read} = 1");
+    let Item::Fn(f) = &m.items[1] else {
+        panic!("expected a fn")
+    };
+    let row = f.effects.as_ref().expect("an annotated row");
+    let aliases: Vec<String> = row.aliases.iter().map(|q| q.to_string()).collect();
+    assert_eq!(aliases, ["Web"]);
+    assert_eq!(row.atoms.len(), 2);
+}
+
+#[test]
+fn a_set_may_name_another_set() {
+    assert_eq!(
+        dump(
+            "effect set Inner = {db.read[users]}\n\
+             effect set Web = {Inner, log.write}\n\
+             fn f() -> Int / {Web} = 1"
+        ),
+        "(effect-set Inner {db.read[users]})\n\
+         (effect-set Web {db.read[users], log.write})\n\
+         (fn f () -> Int / {db.read[users], log.write} 1)"
+    );
+}
+
+/// Declaration order is not dependency order, and expansion is a fixed point
+/// rather than a fold over the file.
+#[test]
+fn a_set_may_name_one_declared_after_it() {
+    assert_eq!(
+        dump(
+            "effect set Web = {Inner, log.write}\n\
+             effect set Inner = {db.read[users]}\n\
+             fn f() -> Int / {Web} = 1"
+        ),
+        "(effect-set Web {db.read[users], log.write})\n\
+         (effect-set Inner {db.read[users]})\n\
+         (fn f () -> Int / {db.read[users], log.write} 1)"
+    );
+}
+
+#[test]
+fn an_atom_reached_twice_appears_once_in_the_expansion() {
+    assert_eq!(
+        dump(
+            "effect set A = {db.read[users]}\n\
+             effect set B = {db.read[users], A, log.write}\n\
+             fn f() -> Int / {B} = 1"
+        ),
+        "(effect-set A {db.read[users]})\n\
+         (effect-set B {db.read[users], log.write})\n\
+         (fn f () -> Int / {db.read[users], log.write} 1)"
+    );
+}
+
+#[test]
+fn a_set_member_may_be_qualified_by_the_module_its_effect_came_from() {
+    assert_eq!(
+        dump("effect set Web = {store::db.read[users]}\nfn f() -> Int / {Web} = 1"),
+        "(effect-set Web {store::db.read[users]})\n\
+         (fn f () -> Int / {store::db.read[users]} 1)"
+    );
+}
+
+#[test]
+fn a_set_expands_inside_a_function_typed_parameter() {
+    assert_eq!(
+        dump(
+            "effect set Web = {log.write}\n\
+             fn run(f: () -> Int / {Web}) -> Int = f()"
+        ),
+        "(effect-set Web {log.write})\n\
+         (fn run ((f (fn () -> Int / {log.write}))) -> Int (call f))"
+    );
+}
+
+#[test]
+fn a_set_expands_inside_a_let_annotation() {
+    let m = ok("effect set Web = {log.write}\n\
+         fn f() -> Int { let g: () -> Int / {Web} = || 1; g() }");
+    let dumped = dump_module(&m);
+    assert!(dumped.contains("(fn () -> Int / {log.write})"), "{dumped}");
+}
+
+/// `effect set` is only a set when a name follows `set`; `effect set { .. }` is
+/// still an ordinary effect that happens to be called `set`.
+#[test]
+fn an_effect_may_still_be_named_set() {
+    assert_eq!(
+        dump("effect set {\n  read now() -> Int\n}"),
+        "(effect set (op read now () -> Int))"
+    );
+}
+
+/// A whole row that is a bare name is a row variable, as it always was.
+#[test]
+fn a_bare_row_is_still_a_row_variable() {
+    assert_eq!(
+        dump("effect set Web = {log.write}\nfn f<a | e>(x: a) -> a / e = x"),
+        "(effect-set Web {log.write})\n(fn f <a | e> ((x a)) -> a / {| e} x)"
+    );
+}
+
+#[test]
+fn a_row_naming_an_undeclared_set_is_refused() {
+    let ds = errs("fn f() -> Int / {Web} = 1");
+    assert_eq!(ds[0].code, codes::UNKNOWN_EFFECT_SET);
+    assert!(ds[0].message.contains("`Web`"), "{ds:#?}");
+}
+
+#[test]
+fn a_qualified_set_reference_is_refused_and_says_why() {
+    let ds = errs("fn f() -> Int / {shared::Web} = 1");
+    assert_eq!(ds[0].code, codes::UNKNOWN_EFFECT_SET);
+    assert!(
+        ds[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("module-local") || n.contains("declaring module")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn a_pub_effect_set_is_refused() {
+    let ds = errs("pub effect set Web = {log.write}\nfn f() -> Int / {Web} = 1");
+    assert_eq!(ds[0].code, codes::UNKNOWN_EFFECT_SET);
+    assert!(ds[0].message.contains("cannot be `pub`"), "{ds:#?}");
+}
+
+/// A member is an atom or another set, never a whole effect: "every atom of
+/// `db`" is every resource label anywhere in the program.
+#[test]
+fn a_set_naming_a_whole_effect_is_refused_with_the_reason() {
+    let ds = errs(
+        "effect db {\n  read all[t]() -> Int\n}\n\
+         effect set Web = {db}\n\
+         fn f() -> Int / {Web} = 1",
+    );
+    assert_eq!(ds[0].code, codes::UNKNOWN_EFFECT_SET);
+    assert!(
+        ds[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("member of a set is an atom")),
+        "{ds:#?}"
+    );
+    assert!(
+        ds[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("every resource label anywhere in the program")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn a_set_that_names_itself_is_refused() {
+    let ds = errs("effect set Web = {Web, log.write}\nfn f() -> Int / {Web} = 1");
+    assert_eq!(ds[0].code, codes::EFFECT_SET_CYCLE);
+    assert!(
+        ds[0].notes.iter().any(|n| n.contains("`Web` -> `Web`")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn a_cycle_through_another_set_is_refused_and_named_in_order() {
+    let ds = errs(
+        "effect set A = {B}\n\
+         effect set B = {C}\n\
+         effect set C = {A}\n\
+         fn f() -> Int / {A} = 1",
+    );
+    let cycle = ds
+        .iter()
+        .find(|d| d.code == codes::EFFECT_SET_CYCLE)
+        .unwrap_or_else(|| panic!("{ds:#?}"));
+    assert!(
+        cycle
+            .notes
+            .iter()
+            .any(|n| n.contains("`A` -> `B` -> `C` -> `A`")),
+        "{cycle:#?}"
+    );
+}
+
+#[test]
+fn two_sets_with_one_name_are_a_duplicate_definition() {
+    let ds = errs(
+        "effect set Web = {log.write}\n\
+         effect set Web = {db.read[users]}\n\
+         fn f() -> Int / {Web} = 1",
+    );
+    assert_eq!(ds[0].code, codes::DUPLICATE_DEFINITION);
+    assert!(ds[0].message.contains("effect set `Web`"), "{ds:#?}");
+}
+
+/// A set name lives in no namespace `resolve` knows about — expansion has erased
+/// it before `resolve` runs — so it collides with nothing.
+#[test]
+fn a_set_name_may_be_reused_by_a_type() {
+    let m = ok("type Web = Int\neffect set Web = {log.write}\nfn f() -> Int / {Web} = 1");
+    assert_eq!(m.items.len(), 3);
+}
+
+#[test]
+fn an_effect_set_cannot_carry_a_row_variable() {
+    let ds = errs("effect set Web = {log.write | e}\nfn f() -> Int / {Web} = 1");
+    assert!(
+        ds.iter().any(|d| d.message.contains("row variable")),
+        "{ds:#?}"
+    );
+}
+
+#[test]
+fn an_empty_effect_set_expands_to_nothing() {
+    assert_eq!(
+        dump("effect set None = {}\nfn f() -> Int / {None} = 1"),
+        "(effect-set None {})\n(fn f () -> Int / {} 1)"
+    );
+}
+
+#[test]
+fn a_trailing_comma_in_a_set_is_accepted() {
+    assert_eq!(
+        dump("effect set Web = {\n  db.read[users],\n  log.write,\n}\nfn f() -> Int / {Web} = 1"),
+        "(effect-set Web {db.read[users], log.write})\n\
+         (fn f () -> Int / {db.read[users], log.write} 1)"
+    );
 }

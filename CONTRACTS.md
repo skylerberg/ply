@@ -977,6 +977,36 @@ several entries; no match is `E0101`. All four take `--json`.
 `ply test` flags: `--json`, `--explain` (why each test was selected or skipped,
 and how groups were formed), `--no-cache`, `--filter <substring>`, `--jobs <n>`.
 
+`ply check --types` prints each definition's effect row on its own line under
+its type, wrapped at 80 columns and never at the terminal's width, so the output
+is diffable. A pure definition prints no row at all. The row is always the
+**expansion**: an `effect set` name appears nowhere without `--explain`.
+
+`ply check --types --explain` adds, per module, the `effect set` table — name,
+expansion, and how many definitions use it, directly or through another set —
+and, per definition, the sets its row was written with, the row its body
+performed, and the difference. Its bytes may not depend on the cache, so the run
+completes any parse gate 1 skipped before printing; the front-end report above
+it still says what the gates actually decided. `--json --explain` carries the
+same data as `effect_sets` per module and `written_as` / `performed` /
+`declared_not_performed` per definition, and those fields are absent without the
+flag rather than partially filled. `ply prove --explain` names the same
+difference for a definition carrying an obligation, where it is a weakened frame
+condition rather than a scheduling cost.
+
+`--tls NAME=CERT,KEY` is repeatable and accepted by `ply run`, `ply test` and
+`ply hosts`. It requires `--host`: credentials configure a binding, and one that
+would be silently ignored reads as a run that served TLS. A malformed argument
+is a usage error naming the form; material that does not load is `E0430` naming
+the file, before anything runs. `ply hosts --host` grows a `transport` block
+naming the TLS library, its provider, the protocol versions and the ALPN
+protocols whenever the listing resolves a TLS handler, and a `credentials` block
+naming each credential with an abbreviated fingerprint — `--json` carries the
+whole fingerprint. The digest covers the credential *names*, the provider and
+the library version, and not the fingerprint: a certificate renewal must not
+move it, and adding or removing a credential must. A program that reaches no TLS
+handler prints no transport block and its digest is unchanged.
+
 Default `PATH` is `.`; a directory means every `*.ply` under it, sorted, parsed
 as one module. Exit `0` on success, `1` on test failure, `2` on a compile error.
 Human output goes to stdout; `--json` emits one JSON object to stdout and nothing
@@ -3756,6 +3786,7 @@ Builtins, all pure, all monomorphic:
 | `bytes_at` | `(Bytes, Int) -> Int` | `0..=255`; out of range is `RUNTIME_ERROR` |
 | `bytes_slice` | `(Bytes, Int, Int) -> Bytes` | half-open; out of range is `RUNTIME_ERROR`, never clamped |
 | `bytes_concat` | `(Bytes, Bytes) -> Bytes` | |
+| `bytes_concat_all` | `(List<Bytes>) -> Bytes` | one allocation over the whole list; the empty list is `b""` |
 | `bytes_of_string` | `(String) -> Bytes` | total, UTF-8 |
 | `bytes_is_utf8` | `(Bytes) -> Bool` | the check, so the partial path is avoidable |
 | `string_of_bytes` | `(Bytes) -> String` | `RUNTIME_ERROR` naming the byte offset of the first invalid sequence |
@@ -4628,3 +4659,662 @@ returns an `Int` and raises when absent**, which is W1's shape from before the
 prelude had `Option`. The new byte builtins return `Option<Int>`. Changing
 `string_find` would move every hash that uses it for no behavioural gain, and a
 second name for one operation is worse than the inconsistency. W3 may unify them.
+
+---
+
+## A real server
+
+`docs/adr/0013-w3-contract.md` has the reasoning; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was
+written after them.
+
+### The rule everything else follows from
+
+The trusted computing base does not grow to hold a protocol. HTTP/1.1 framing
+is a pure function from bytes to a request, so `std.http` is **Ply source** —
+`ply test` selects it exactly, its row is `{}`, and every framing rule below is
+a hermetic `det` test rather than a line in `ply hosts` nobody can reach. TLS is
+the one exception, because writing cryptography here would be reckless, and it
+is the only place W3 adds to the TCB.
+
+### Effect-set aliases — AST landed in `ply-syntax::ast`
+
+```rust
+/// `effect set Web = { db.read[users], log.write, Inner }`.
+pub struct EffectSetDef {
+    pub name: Ident,
+    pub atoms: Vec<AtomExpr>,
+    pub includes: Vec<QName>,
+    /// Every atom this set denotes, after expanding `includes` transitively:
+    /// sorted and deduplicated by written form, so that reordering the members
+    /// or splitting one set into two produces the same expansion — which is
+    /// what `--explain` prints and what a reader diffs.
+    pub expansion: Vec<AtomExpr>,
+    pub span: Span,
+}
+
+pub enum Item { /* ... */ EffectSet(Box<EffectSetDef>) }
+
+pub struct RowExpr {
+    pub atoms: Vec<AtomExpr>,
+    /// The sets this row was written with, in source order. Provenance for
+    /// `--explain`, **erased by normalization**: a row written `{Web}` and one
+    /// written with `Web`'s expansion are one definition.
+    pub aliases: Vec<QName>,
+    pub tail: Option<Ident>,
+    pub span: Span,
+}
+```
+
+Grammar:
+
+```
+item        := "pub"? (fnDef | typeDef | effectDef) | testDef | lawDef
+             | deriveDef | effectSetDef
+effectSetDef:= "effect" "set" IDENT "=" "{" setMember,* "}"
+setMember   := atom | qname
+row         := "{" rowMember,* ("|" IDENT)? "}" | IDENT
+rowMember   := atom | qname
+```
+
+A row member is an atom when its identifier is followed by `.` and a set
+reference otherwise — one token of lookahead, no reserved word. A whole row that
+is a bare `IDENT` is still a row *variable*; a set is only ever written inside
+braces.
+
+- **A member is an atom, never a whole effect.** ADR 0009 §1's
+  `effect set Web = {db, http}` is refused. "Every atom of `db`" is every
+  resource label anywhere in the program, so an unrelated table in an unrelated
+  module would change the expansion — and therefore the declared row, and
+  therefore the hash — of every definition annotated with it, which is ADR 0012
+  corollary 1. A wildcard atom is refused for the same weight of reason: it
+  would put a non-ground shape into `EffectAtom`, which is what
+  `conflicts_with` and every scheduling decision are built on. Keeping members
+  atomic also keeps the resources visible where a reviewer reads the set, which
+  is the only mechanism ADR 0009's "over-broad alias" risk has.
+- **Sets are module-local.** Not `pub`, not importable; `other::Web` in a row is
+  `E0114`. Gate 1 skips a file whose bytes are unchanged, so a set expanding
+  across a module boundary would let an edit in the declaring module leave a
+  stale published row behind — a footprint that under-reports, which is a
+  **green** result. ADR 0013 §1.3 records the mechanism a sound cross-module
+  form would need (`ImportEdge::exports`, a `DefKind::EffectSet`, a fourth
+  namespace, and a hygiene rule for substituted effect names) so that it is a
+  deferral rather than an omission.
+- **Expansion happens inside `ply_syntax::parse_module`**, before it returns, so
+  an unexpanded `RowExpr` never escapes the parser and no crate can forget to
+  run it. It reads this module's own `effect set` items **and nothing else**,
+  which is what makes it a function of the file, which is what makes gate 1
+  right. It runs **before** `ply_derive::expand_module`.
+- `Item::EffectSet` declares no name a reference can reach and generates no
+  definition: `Item::name`, `Item::visibility`, `resolve::declarations_of`,
+  `graph`, `interp`, `machine`, `infer` and the driver all skip it, exactly as
+  they skip `Item::Derive`. A set name lives in no namespace `resolve` knows
+  about, so `effect set Web` beside `type Web` is legal.
+
+**The three properties.** An alias is annotation-only: expansion produces an
+ordinary `RowExpr`, `Checker::signature` converts it, and `check_upper_bound`
+checks the inferred row against it through the existing path. Nothing downstream
+sees an alias — scheduling, isolation, reduction, `E0412` and the cached
+footprint all speak in atoms. An `E0302` against an aliased signature quotes the
+**expansion** in its secondary label, never the name.
+
+**An alias name never enters a hash; its expansion enters exactly as the row it
+stands for would.** ADR 0009 §3's "regrouping which atoms it contains must
+change no definition hash" is superseded:
+
+| edit | hashes that move |
+| --- | --- |
+| declaring a set nothing uses; renaming one; reordering its members | none |
+| rewriting `/ {db.read[users], log.write}` as `/ {Web}` expanding to exactly that | **none** — the headline test |
+| changing which atoms a set contains | exactly the definitions annotated with it, and their transitive dependents |
+
+The last row is required rather than conceded. `Signature::published_row` is the
+declared row and `DefInfo::footprint` is what callers are inferred against, so
+widening a set widens a published bound — and gate 2 only rechecks a definition
+whose own hash moved. A set edit that moved no hash would leave a caller
+accepted against a signature that no longer admits it, and its stored footprint
+under-reporting what it can reach. Same argument as ADR 0012 §3's `where`
+clauses, same answer.
+
+`ply_hash::normalize::row` already sorts and deduplicates atoms, so both
+spellings write the same bytes. **`BODY_ENCODING` does not move**, and a corpus
+with no `effect set` hashing byte-identically to W2 is a required test.
+
+One correction was needed to make that true. `normalize::row` sorted the atoms'
+*bytes* but committed the references they mention in written order, and
+first-mention order is what numbers the effect slots those same bytes carry — so
+`/ {db.read[users], log.write}` and `/ {log.write, db.read[users]}` were two
+definitions, which contradicts both the function's own comment and the rule that
+reformatting is free. A row now holds its mentions back until the sort has run
+and commits them in sorted order. This is a defect that predates `effect set`
+and is visible without one; an alias only made it routine, since a set's
+expansion is spliced in wherever the set is named, beside atoms written by hand.
+No pinned hash in the workspace moved, because every one of them was already
+written in the order the sort produces.
+
+**What an over-broad alias costs, published rather than worried about.** A
+declared row wider than the inferred one is legal and an alias makes it
+systematic. Two mechanical costs follow: `DefInfo::footprint` is the declared
+row, so two endpoints sharing a set contend on every atom in it and the
+scheduler serialises tests that need not be; and DESIGN.md §7 makes the
+footprint the frame condition, so a wider row makes every `ensures` on that
+definition promise less. So:
+
+```rust
+pub struct DefInfo { /* ... */
+    /// The row inference computed for the body — always a subset of
+    /// `footprint`, and equal to it when the definition carries no annotation.
+    /// Provenance: in no hash, no cache key, no scheduling decision and no
+    /// determinism verdict.
+    pub performed: Footprint,
+    /// The `effect set` names this definition's row was written with, in source
+    /// order. Erased by normalization.
+    pub row_aliases: Vec<Symbol>,
+}
+pub struct KnownDef  { /* ... */ pub performed: Footprint }
+pub struct CachedDef { /* ... */ pub performed: Footprint, pub row_aliases: Vec<Symbol> }
+```
+
+Both are stored on `CachedDef`, because `DefInfo` is restored from it when gate
+1 skips a file and `ply check --types --explain` must print the same bytes warm
+and cold. A reviewing command whose output depends on what the cache held is a
+reviewing command that stops diffing against itself.
+
+`KnownDef` carries only `performed`. It is the gate-2 path, where the file *was*
+parsed and its `RowExpr::aliases` are right there — a stored copy would be a
+second answer to a question the AST already answers, and the two could disagree.
+
+**`ply check --types` prints the expansion, always, and never the alias** —
+ADR 0009 §4 in its strongest form, with the truth behind no flag at all.
+`--explain` adds the set table, the alias a row was written with, the body's
+inferred row, and the declared-but-not-performed difference. `ply prove` prints
+the same difference for a definition carrying an obligation, where it is a
+weakened claim rather than a scheduling cost.
+
+### HTTP/1.1 — `std.http`, Ply source
+
+```ply
+type Method  = Get | Head | Post | Put | Patch | Delete | Options | Other(String)
+type Version = Http10 | Http11
+type Headers = Map<String, List<String>>
+
+type Request = {
+  method: Method, target: String, path: String, query: String,
+  authority: String, version: Version,
+  headers: Headers, trailers: Headers, body: Bytes,
+}
+type Response = { status: Int, headers: Headers, body: Bytes }
+
+type Framing  = NoBody | Length(Int) | Chunked
+type Refusal  = { status: Int, reason: String }
+type Head     = { request: Request, framing: Framing, consumed: Int,
+                  keep_alive: Bool, expects_continue: Bool }
+type HeadResult = Incomplete | Parsed(Head) | Refused(Refusal)
+
+pub fn parse_head(buf: Bytes, limits: Limits) -> HeadResult        // row {}
+
+type BodyStep =
+  | Await({ state: BodyState, consumed: Int, out: Bytes })
+  | Complete({ consumed: Int, out: Bytes, trailers: Headers })
+  | Rejected(Refusal)
+pub fn body_start(framing: Framing, limits: Limits) -> BodyState   // row {}
+pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep         // row {}
+
+type BodyResult = Body({ bytes: Bytes, rest: Bytes, trailers: Headers })
+                | BodyRefused(Refusal)
+pub fn read_body(conn: Int, framing: Framing, buf: Bytes, limits: Limits)
+  -> BodyResult / {net.write[conn]}
+
+pub fn encode(method: Method, version: Version, keep_alive: Bool, r: Response) -> Bytes
+pub fn method_not_allowed(ms: List<Method>) -> Response        // the 405, with `Allow`
+pub fn respond_chunked<s | e>(
+  conn: Int, version: Version, r: Response, keep_alive: Bool, limits: Limits,
+  seed: s, produce: (s) -> Option<{ chunk: Bytes, next: s }> / e
+) -> Bool / {net.write[conn] | e}
+
+pub fn serve_connection<e>(conn: Int, limits: Limits, app: (Request) -> Response / e)
+  -> Unit / {net.write[conn] | e}
+pub fn serve<e>(listener: Int, limits: Limits, app: (Request) -> Response / e)
+  -> Unit / {net.write[listener], net.write[conn] | e}
+```
+
+Field names are lowercased on parse; a name may repeat, so the value is its
+field lines in order of appearance and **nothing is combined** — a comma-joined
+`set-cookie` is a different document. `Headers` is a `Map`, so its order is
+ascending and canonical and a golden test over response bytes is stable.
+
+`consumed` is where the body begins, so a pipelined second request is a slice
+rather than a re-parse. A streamed response needs no language feature, only a
+row variable: `produce` is an ordinary function with its own row.
+
+**Every connection `serve` handles shares the resource label `conn`**, because a
+resource label is a ground identifier in the source. Two connections therefore
+conflict — which costs nothing inside a run, since a production region schedules
+on real readiness, and does mean two *tests* that each serve a connection land
+in one concurrency group.
+
+### Framing — implement exactly this
+
+Every rule closes the connection, and every one is a required test.
+
+| # | input | answer |
+| --- | --- | --- |
+| 1 | a bare LF terminating a line, or a bare CR in the header block | 400 |
+| 2 | obs-fold (a line beginning SP/HTAB) | 400 |
+| 3 | whitespace between a field name and its colon | 400 |
+| 4 | a field name that is not a token, or a value with a CTL other than HTAB | 400 |
+| 5 | a method that is not a token | 400 |
+| 6 | authority-form target; `*` with anything but `OPTIONS` | 400 |
+| 6a | SP or HTAB anywhere in the request line beyond the two that split it | 400 |
+| 6b | a request target carrying a fragment (`#`), in either form | 400 |
+| 6c | an absolute-form target whose authority is empty or carries userinfo (`@`) | 400 |
+| 7 | no version in the request line | 400 |
+| 8 | `HTTP/x.y` other than 1.0 or 1.1 | 505 |
+| 9 | request line over `max_request_line` | 414 |
+| 10 | HTTP/1.1 with no `Host`, or with two | 400 |
+| 11 | **two `Content-Length` field lines, even with equal values**; `Content-Length: 5, 5` | 400 |
+| 12 | `Content-Length` that is not one or more ASCII digits | 400 |
+| 13 | `Content-Length` over `max_body` | 413, before a body byte is read |
+| 14 | **`Content-Length` and `Transfer-Encoding` both present** | 400, no body read |
+| 15 | `Transfer-Encoding` whose final coding is not `chunked` | 400 |
+| 16 | a transfer coding other than `chunked`, **including beside `chunked`** | 501 |
+| 17 | chunk size empty, non-hex, or over 16 hex digits | 400 |
+| 17a | a chunk size that does not fit in an `Int` | 413 |
+| 18 | chunk size over `max_chunk_size`; chunk data summing over `max_body` | 413 |
+| 19 | a chunk-size line over `max_chunk_line` | 400, without buffering past the bound |
+| 20 | a chunk not followed by CRLF | 400 |
+| 21 | header block over `max_header_bytes`, or over `max_header_count` | 431 |
+| 22 | the head not complete within `header_timeout_ms`, measured from its first byte | 408 |
+| 23 | the body not complete within `body_timeout_ms` | 408 |
+| 24 | `idle_timeout_ms` between requests | close, no response |
+
+Rule 15 is decided before rule 16, which is the one place their order is
+observable: `chunked, gzip` has no decidable length and is 400, while
+`gzip, chunked` is framed unambiguously and is 501 — accepting it would hand the
+handler undecoded `gzip` as `Request::body` with nothing saying so, and would
+leave an intermediary that honours the coding and a server that ignores it
+disagreeing about what the body was.
+
+Rule 17a is not a refinement of rule 17. Sixteen hex digits is sixty-four bits
+and `Int` is signed, so a size at or above `8000000000000000` overflows the
+accumulator — and an overflow is `E0502 RUNTIME_ERROR`, which is not a `Refusal`:
+it unwinds out of `body_step`, out of `serve_connection` and past the accept
+loop. The digit bound alone is therefore a remote kill, and the size is checked
+for representability before it is accumulated.
+
+Rules 6a, 6b and 6c each exist because the alternative is two readings of one
+target. RFC 9112 §11.2 names recovering from whitespace in the request line as a
+smuggling vector; a fragment is no part of a request-target and under
+absolute-form would otherwise *become* `Request::path`, which every consumer
+reads as beginning with `/`; and RFC 9110 §4.2.4 says to treat userinfo in an
+`http` URI from an untrusted source as an error, which a request-target is.
+
+Rules 11 and 14 are where W3 refuses what the RFC permits, and both refusals are
+the anti-smuggling ones: agreement between two `Content-Length` lines in *this*
+message says nothing about how a hop in front of the server picked one, and
+preferring `Transfer-Encoding` is correct only if every hop made the same choice.
+
+Under absolute-form the target's authority is the request's `authority` and
+`Host` is not consulted for it (RFC 9112 §3.2.2) — **both are exposed as data**,
+because whether a mismatch matters is the program's question, not the parser's.
+
+Chunk extensions are parsed for framing and discarded. **Trailers are exposed as
+`Request::trailers` and never merged into `headers`**: a trailer
+`content-length`, `transfer-encoding`, `host` or `authorization` changes no
+framing, routing or authorization decision. `Content-Encoding` is end to end and
+is passed through untouched; W3 decodes nothing.
+
+Keep-alive: 1.1 persistent unless `Connection: close`; 1.0 closes unless
+`Connection: keep-alive`; **never reused after any `Refusal`**; closed after
+`max_keep_alive` requests; **an unconsumed request body is drained to `max_body`
+and the connection closed past that**, because reading the next request out of
+an unread body is a smuggle the server performs on itself. Pipelined requests
+are answered in order by construction — one connection, one task, one carried
+buffer.
+
+`encode`: 1xx, 204 and 304 carry no body and no `Content-Length`; a `HEAD`
+response carries the `Content-Length` a `GET` would and no body; a `100
+Continue` is written before the body is read when the request declared
+`Expect: 100-continue`, and any other `Expect` is `417`. **A header name that is
+not a token, or a value containing CR or LF, is `E0502 RUNTIME_ERROR` naming the
+header** — never stripped, never escaped: that value came from the program, and
+silently sanitizing a response-splitting attempt leaves an attacker in partial
+control of a response nobody looked at.
+
+### Limits
+
+```ply
+type Limits = {
+  max_request_line:  Int,   //   8192
+  max_header_bytes:  Int,   //  65536
+  max_header_count:  Int,   //    100
+  max_body:          Int,   // 1048576
+  max_chunk_size:    Int,   // 1048576
+  max_chunk_line:    Int,   //   4096
+  max_trailer_bytes: Int,   //   8192
+  max_keep_alive:    Int,   //    100
+  max_stream_chunks: Int,   //   2048
+  header_timeout_ms: Int,   //   5000
+  body_timeout_ms:   Int,   //  30000
+  idle_timeout_ms:   Int,   //   5000
+  write_timeout_ms:  Int,   //  30000
+}
+pub fn default_limits() -> Limits
+```
+
+A record, because a limit set is data like a route table: quantifiable in a
+`forall`, derivable, printable. No global, no environment variable and no flag,
+so two runs of one program cannot differ in what they refuse. A field that is
+zero or negative is `E0502 RUNTIME_ERROR` at `serve`, naming it.
+
+`max_stream_chunks` is a bound on a *write*: the most chunks one
+`respond_chunked` may produce. It is here rather than in a constant because every
+bound a program runs under belongs in this record, and it is a bound at all
+because `stream_chunks` is a tail call charged against the evaluator's
+nested-call budget. Exhausting it **terminates the message** — the terminating
+chunk is written — and answers `false`, so the connection is not reused. A
+chunked response left framed and unterminated on a connection a caller keeps
+alive has its next response read as chunk data by the client, which is the
+response-side spelling of the framing disagreement §3 exists to prevent.
+
+**A deadline is enforced by dividing it, because Ply has no clock.** Rules 22 and
+23 measure from the first byte, and passing `header_timeout_ms` whole to each
+`net.recv` — which `ply_host::tcp::recv` turns into one `set_read_timeout` per
+syscall — restarts the deadline on every byte, leaving the read count as the only
+real bound: 2048 reads x 5000 ms is 2.8 hours on one socket, while `serve`, a
+sequential accept loop, accepts nothing else. So each read carries
+`timeout / max_reads()` and the budget is the number of slices, which bounds the
+whole message by its deadline. A slice expiring with no bytes is an ordinary
+read, not a refusal; the refusal is the budget running out. The wait for the
+first byte of a message on a *reused* connection is one read carrying the whole
+`idle_timeout_ms`, which is rule 24 and is a deadline before anything is being
+assembled.
+
+**The bound must cost the bound.** Every scan passes a `Limits`-derived `max` to
+`bytes_scan` / `bytes_scan_until`, and the read loop searches for the header
+terminator with `bytes_index_of_from` starting three bytes before the previous
+end rather than from zero. W2 made a request's cost proportional to fields
+rather than to bytes; a parser re-scanning the accumulated buffer per read
+restores O(n²) quietly, and the test for it is a counting harness, never a
+stopwatch.
+
+One new builtin, for the other direction — N reads concatenated pairwise is
+O(total²):
+
+| builtin | type | notes |
+| --- | --- | --- |
+| `bytes_concat_all` | `(List<Bytes>) -> Bytes` | pure; one allocation, O(total); the empty list is `b""` |
+
+**Cheap slicing of a shared `Bytes` is not in W3.** ADR 0011 §8 deferred the
+question here and the answer is no: with `bytes_concat_all` the read loop is
+O(total) once and the head/body split is one copy, so a slice representation
+buys a constant factor nothing has measured at the price of changing `Value`'s
+one enum and every path that matches on it. W6 has the measurement.
+
+### Routing — `std.router`, Ply source
+
+```ply
+type Segment  = Literal(String) | Param(String) | Rest(String)
+type Route<a> = { method: Method, path: List<Segment>, endpoint: a }
+type Matched<a> =
+  | NotFound
+  | MethodNotAllowed(List<Method>)                       // sorted, deduplicated
+  | Found({ endpoint: a, params: Map<String, String> })
+
+pub fn route<a>(table: List<Route<a>>, method: Method, path: String) -> Matched<a>
+pub fn conflicts<a>(table: List<Route<a>>) -> List<{ first: Int, second: Int }>
+pub fn well_formed<a>(table: List<Route<a>>) -> List<{ index: Int, reason: String }>
+```
+
+All three publish `{}`. `std.router` imports `std.http` for `Method`; the edge
+never goes the other way.
+
+**The endpoint is a tag, not a closure**, and the reason is not taste: `List` is
+homogeneous, a function type carries its row, and Ply has no subsumption — so a
+table of closures would force every handler to declare byte-identically the same
+row, which is the union of the whole service, which destroys exactly the
+per-endpoint legibility this milestone exists to produce. With a tag the program
+writes its own `match`, and that `match` is exhaustiveness-checked (`E0205`), so
+**a route in the table with no handler is a compile error**.
+
+Matching:
+
+- the path is the target up to the first `?`, split on `/`, with no empty first
+  segment for the leading `/`;
+- **empty segments are kept** — `/orders/` and `/a//b` are not normalized;
+  `normalize_path` exists and is a call the program makes. A silent
+  normalization is a second answer to "which path is this", and two answers is
+  how a route and an authorization check come to disagree;
+- **percent-decoding is per segment, after splitting**, so `%2F` decodes to a
+  `/` inside one segment and can never introduce a boundary. An invalid escape
+  is left as written;
+- **decoding costs the segment's length and never its square.** `route` reaches
+  `percent_decode` for every request before it has decided anything, so an
+  accumulator that copies — `push` onto a `List` does — makes k escapes cost
+  O(k²), which was 125.8 ms for a 7,681-byte path of escapes against 0.1 ms for
+  the same-length plain path, at a length the default `max_request_line` admits.
+  Decoding is one native split on `%`, one call per escape and one allocation for
+  the join; encoding is one native scan that answers for a segment needing none.
+  Neither recurses per escape, so neither can end a run at the interpreter's
+  nested-call limit. This is required test 26's cost property, for routing;
+- byte-exact and case-sensitive; `Rest` matches zero or more remaining segments
+  and must be last.
+
+Precedence is decided **segment by segment, left to right**: at the first
+position where two patterns differ in kind, `Literal` beats `Param` beats
+`Rest`. A remaining tie goes to the earlier entry — and is a defect, which
+`conflicts` reports so a service can write `test "the route table is
+unambiguous" { assert_eq(conflicts(table()), []) }`. That is what "the route
+table as ordinary data" is for: the property a framework enforces with a macro
+is here a value a test asserts.
+
+`MethodNotAllowed(ms)` carries the sorted, deduplicated methods that do match,
+and `std.http.method_not_allowed(ms)` builds the `405` with `Allow:` so a
+program cannot forget the RFC 9110 §15.5.6 MUST.
+
+### TLS
+
+**TLS is not a separate effect.** It is `net`, with one new operation.
+
+A separate `tls` effect with the same five operations makes every function that
+touches a socket exist twice, because Ply cannot abstract over two effects that
+declare the same operations — so `std.http` would fork, and two forks of a
+framing parser is two parsers that disagree. A row claims which resources are
+touched and whether two computations contend; a TLS connection and a plaintext
+one are the same resource and contend the same way. Encryption is a property of
+the transport, not of the resource.
+
+**So the row does not say whether a connection is encrypted; the listener
+does**, and `ply hosts` prints `net.listen_tls` as its own line — a fact in the
+TCB listing rather than an inference from a row.
+
+**The key never enters the program.** `listen_tls` takes a credential *name*:
+certificate bytes as a literal would put a private key into a definition hash
+and a store designed never to forget, and a file path would put a file read
+inside a `net` operation where nothing discloses it.
+
+```
+$ ply run service.ply --host --tls api=certs/api.pem,certs/api.key
+```
+
+Repeatable. PEM: a chain leaf-first, and a key in PKCS#8, PKCS#1 or SEC1.
+Everything loads and validates at **bind time, before anything runs**.
+
+- **The handshake is lazy — on the first `recv` or `send`, never inside
+  `accept`.** A handshake in `accept` means one client sending garbage takes
+  down the accept loop.
+- A failed handshake **closes that connection and nothing else**: `recv` answers
+  `Some(b"")` and `send` answers `Some(0)`, so the server's ordinary "peer went
+  away" path handles it. It is not a diagnostic — not the program's fault, not
+  Ply's, not attributable to a definition — and it is counted and reported in
+  the run's `--host` summary and in `--json`.
+- **ALPN offers exactly `http/1.1`.** A client offering only `h2` is refused at
+  handshake rather than served 1.1 bytes over a connection it will parse as
+  HTTP/2.
+- One credential per listener. No SNI selection, no mTLS, no resumption, no
+  OCSP.
+
+`ply hosts --host` gains a `transport` block naming the library, its version,
+its provider, the protocol versions and the ALPN offer, and a `credentials`
+block naming each credential with its certificate chain's SHA-256 fingerprint
+and length. **The digest covers the credential names, the provider and the
+library version, and not the fingerprint**: a CI check that broke on every
+renewal is a CI check people learn to ignore, while adding or removing a
+credential is a structural change to the TCB and does move it.
+
+### `net`, amended
+
+```ply
+pub nondet effect net {
+  write listen[s](port: Int) -> Int
+  write listen_tls[s](port: Int, credential: String) -> Int
+  write accept[s](listener: Int) -> Int
+  write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
+  write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
+  write close[s](socket: Int) -> Unit
+}
+pub fn send_all(conn: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[conn]}
+```
+
+**A peer's misbehaviour is not the program's error.** A reset, a broken pipe, an
+aborted connection and a failed handshake are ordinary outcomes — end of stream
+— not diagnostics that end the run. What stays a diagnostic is the program's
+fault: an unknown handle, a handle used under two labels, a port outside
+`1..=65535`, a non-positive read bound, a non-positive timeout, an empty `send`
+payload. `accept` answers `0` when the listener is finished; handles ascend from
+1 and are never reused, so `0` is never a live socket.
+
+**A deadline is an argument, not a cancellation.** ADR 0011 deferred
+cancellation and said W3's timeouts need it; they do not. A cancel path needs a
+token registry, a race between cancel and completion, a rule for what a
+cancelled operation returns and a decision about bytes already read; a deadline
+is one `setsockopt` inside a blocking job that already owns the socket.
+
+One rule: **`None` is a deadline; an empty `Some` is an ending.** `recv` →
+`None` timed out, `Some(b"")` peer stopped sending, `Some(bs)` those bytes.
+`send` → `None` timed out, `Some(0)` peer gone, `Some(n)` n written.
+`timeout_ms <= 0` and an empty `send` payload are each `RUNTIME_ERROR`, the
+second being what keeps `Some(0)` unambiguous. Programs call `send_all`.
+
+These signature changes move `std.net`'s hashes and everything reaching them,
+which is correct: the signature changed, and selection is exact about it.
+
+`MAX_BLOCKING_OPERATIONS` is unchanged at 64 — one real thread per waiting
+operation, so 64 socket operations in flight is the capacity of the W3 server.
+A number a reviewer can read; raising it or moving to a reactor is W5/W6 with a
+measurement.
+
+### Versions
+
+`RUNTIME_VERSION` to `0.9.0` — `bytes_concat_all`, and `net` handlers answering
+`Option` where they answered a bare value. `FRONTEND_VERSION` to `0.11.0` —
+`RowExpr::aliases`, `Item::EffectSet`, expansion inside the parser, and
+`DefInfo` / `KnownDef` / `CachedDef` gaining `performed` and `row_aliases`.
+**`BODY_ENCODING` stays at `6`** and `PROVER_VERSION` stays at `0.4.0`; a corpus
+with no `effect set` hashing byte-identically to W2 is a required test, not an
+observation.
+
+### Workspace
+
+```toml
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+rcgen = "0.14.9"      # dev-dependency of ply-host only
+```
+
+`0.23.43` is the latest stable 0.23; `cargo search` surfaces `0.24.0-dev.1`,
+which is a pre-release and must not be used. `ring` rather than `aws-lc-rs`
+because the latter needs a C toolchain and cmake on some platforms, and the
+provider is **installed explicitly** rather than taken from a default feature,
+so the one line that decides it is the line `ply hosts` names. `tokio-rustls` is
+**not** used: W1's sockets are blocking `std::net` on a pool `ply-host` owns, so
+`rustls::StreamOwned` is the fit and `tokio-rustls` would need an async socket
+layer nothing here has. While in that file — **`tokio` is a declared dependency
+of `ply-host` that no code uses**; remove it or use it, because a dependency in
+a trusted computing base that nothing calls is attention spent for nothing.
+
+`ply-std` gains `std.http` and `std.router` and no dependency; `ply-eval` gains
+one builtin and no dependency.
+
+### New diagnostic codes — landed
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0114 | `UNKNOWN_EFFECT_SET` | a row or a set names an `effect set` this module does not declare; a qualified set reference; `pub effect set` | the program's |
+| E0115 | `EFFECT_SET_CYCLE` | a set contains itself, directly or through another | the program's |
+| E0429 | `TLS_CREDENTIAL_UNKNOWN` | `net.listen_tls` named a credential the binding does not hold | the run's configuration |
+| E0430 | `TLS_CREDENTIAL_INVALID` | a `--tls` credential that does not load: unreadable, malformed PEM, no certificate, no key, or a key that does not match the leaf | the run's configuration |
+
+Two `effect set`s with one name in one module are `E0105`. **Nothing in the
+HTTP, limits or routing sections has a diagnostic code**, and that is the point
+of writing the protocol in Ply: a malformed request is a `400`, which is a
+`Response` value with no compiler involvement at all.
+
+### Required tests
+
+The full list is ADR 0013 §11's; these are the ones whose absence would let W3
+ship broken rather than merely incomplete.
+
+1. A definition written `/ {Web}` and one written with `Web`'s expansion have
+   **identical** `DefHash`es; renaming a set, reordering its members and
+   declaring an unused one each move no hash and select zero tests.
+2. Changing which atoms a set contains moves exactly the annotated definitions'
+   hashes and their dependents', and selects exactly the tests reaching them.
+3. A corpus with no `effect set` hashes byte-identically to W2.
+4. `ply check --types` prints the expansion and never the alias;
+   `--types --explain` prints the set table, the alias, the inferred row and the
+   declared-but-not-performed difference, with **identical bytes** whether gate 1
+   parsed the file or skipped it.
+5. `E0114` for an undeclared set, a qualified reference and `pub effect set`;
+   `E0115` naming a cycle in order; `E0105` for a duplicate set name.
+6. Framing rules 1–24 above, each its own test.
+7. **The anti-smuggling property**: over a generated corpus of adversarial
+   heads, every accepted head admits exactly one body length and its `consumed`
+   agrees with a reference table.
+8. **The cost property**: the W2 head-length sweep re-run against
+   `std.http.parse_head` over heads grown to 8 KB of fields the parser never
+   reads, flat in the head's length; and a counting harness showing no scan
+   examined more than its `Limits`-derived bound.
+9. A response header value containing CR or LF is `E0502` at `encode`, naming
+   the header.
+10. An unconsumed request body is drained to `max_body` and the connection
+    closed past it; the next request is never framed out of an unread body.
+11. `route`, `conflicts` and `well_formed` publish `{}`; precedence is literal
+    over parameter over wildcard left to right; a tie goes to the earlier entry
+    and `conflicts` reports it.
+12. `%2F` decodes after splitting and never introduces a boundary; `/orders` and
+    `/orders/` are different paths and both route.
+13. A `match` over the endpoint tag missing an arm is `E0205`.
+14. A request over TLS against an rcgen-generated certificate returns the same
+    bytes as the plaintext path **with no change to the service's source**; a
+    client offering only `h2` is refused at handshake.
+15. A failed handshake leaves the accept loop running and is counted; `E0429`
+    for an unconfigured credential, `E0430` before anything runs for one that
+    does not load, `E0424` for `net.listen_tls` without `--host`.
+16. `recv` → `None` is distinguishable from `Some(b"")`; a reset peer is end of
+    stream and not a diagnostic; `send_all` answers `false` rather than looping.
+17. Renaming a top-level function selects zero tests and moving a definition
+    between modules changes no hash, on a corpus with effect sets, a route table
+    and a TLS listener.
+18. Incremental and `--no-incremental` agree byte-for-byte across the full
+    mutation sequence, with `effect set` edits added.
+19. `--engine both` reports no `E0503`; `E0412` still fires; `ply test` is
+    hermetic without `--host` and says so; `Store::open` at 10,000 definitions
+    stays under 5 ms.
+
+Plus one `tests/fixtures/` entry per new code.
+
+### Not in W3
+
+A database (W4). Authentication, authorization, sessions and cookies. HTTP/2 and
+HTTP/3 — ALPN advertising only `http/1.1` is the honest form of not having them.
+A template language. Compression in either direction; `Content-Encoding` is
+passed through untouched. mTLS, SNI-based certificate selection, session
+resumption and OCSP. `Upgrade`, WebSockets and `CONNECT`; authority-form targets
+are `400`. Cross-module `effect set`s, and effect sets over row variables.
+Cheap slicing of a shared `Bytes` — ADR 0011 §8 deferred the question to W3 and
+the answer is no, with the measurement W6 would need to change it. Cancellation
+of a `Pending` token: deadlines removed the need rather than deferring it again,
+and a host operation with no deadline still blocks until it completes or the run
+ends. Graceful shutdown and connection draining (W5). More than 64 host
+operations in flight.

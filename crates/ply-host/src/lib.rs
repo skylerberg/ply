@@ -13,5 +13,7 @@
 pub mod registry;
 pub mod sched;
 pub mod tcp;
+pub mod tls;
 
 pub use registry::{Host, registry};
+pub use tls::{CredentialSpec, Credentials, HandshakeCounts};

@@ -687,8 +687,8 @@ fn bench_ply_handler(count: Int) -> Int =
     net.listen[listener](p) -> 1,
     net.accept[listener](l) -> 7,
     net.close[listener](l) -> (),
-    net.recv[conn](c, max) -> bench_request(),
-    net.send[conn](c, payload) -> bytes_len(payload),
+    net.recv[conn](c, max, timeout_ms) -> Some(bench_request()),
+    net.send[conn](c, payload, timeout_ms) -> Some(bytes_len(payload)),
     net.close[conn](c) -> (),
   }
 "#;
@@ -966,7 +966,7 @@ pub fn load(
     std::fs::write(dir.path().join("hello.ply"), source)?;
 
     let head: Arc<[u8]> = padded_head(headers).into();
-    let mut server = Server::start(ply, dir.path())?;
+    let mut server = Server::start(ply, dir.path(), &[])?;
     server.probe(port, &head)?;
 
     let client = Client::spawn(port, Arc::clone(&head), requests, concurrency);
@@ -1065,20 +1065,46 @@ pub fn load_floor(headers: usize, concurrency: u32, requests: u32) -> Result<Loa
 }
 
 /// `ply run --host`, killed however the harness leaves.
-struct Server {
+pub struct Server {
     child: Option<Child>,
 }
 
 impl Server {
-    fn start(ply: &Path, dir: &Path) -> Result<Server> {
+    /// `extra` is appended to the fixed arguments — `--tls NAME=CERT,KEY` and
+    /// nothing else so far.
+    pub fn start(ply: &Path, dir: &Path, extra: &[&str]) -> Result<Server> {
         let child = Command::new(ply)
             .args(["run", "--host", "--color", "never"])
+            .args(extra)
             .current_dir(dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("starting `{} run --host`", ply.display()))?;
         Ok(Server { child: Some(child) })
+    }
+
+    /// The status if the server has already exited, which is what a probe loop
+    /// checks before waiting again on a process that is gone.
+    pub fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let child = self.child.as_mut().expect("the server has not been reaped");
+        Ok(child.try_wait()?)
+    }
+
+    /// Everything the server wrote, consuming it. Only useful once it has
+    /// stopped or is about to be dropped.
+    pub fn output(&mut self) -> String {
+        self.take()
+    }
+
+    /// The server's output when it has died, and a note when it is still up —
+    /// so a failure message never blocks on a pipe belonging to a live process.
+    pub fn output_if_exited(&mut self) -> String {
+        match self.exited() {
+            Ok(Some(status)) => format!("the server exited {status}:\n{}", self.take()),
+            Ok(None) => "the server was still running".to_string(),
+            Err(e) => format!("the server could not be waited on: {e}"),
+        }
     }
 
     /// One real request, so the timed window starts at a server that has
@@ -1113,7 +1139,7 @@ impl Server {
     /// The server was asked for a fixed number of connections and has been given
     /// them, so it must return on its own. One that has to be killed has not
     /// demonstrated that the host operation returned into the program.
-    fn finish(mut self) -> Result<()> {
+    pub fn finish(mut self) -> Result<()> {
         let deadline = Instant::now() + STARTUP;
         loop {
             let child = self.child.as_mut().expect("the server has not been reaped");

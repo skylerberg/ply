@@ -45,6 +45,12 @@ pub enum Builtin {
     BytesAt,
     BytesSlice,
     BytesConcat,
+    /// One allocation over the whole list.
+    ///
+    /// A read loop that folds `bytes_concat` across N answers copies the
+    /// accumulated prefix N times, which is O(total²) — quadratic in the size of
+    /// a request an unauthenticated peer chooses. This copies each byte once.
+    BytesConcatAll,
     BytesOfString,
     BytesIsUtf8,
     BytesIndexOf,
@@ -121,6 +127,7 @@ impl Builtin {
             "bytes_at" => Builtin::BytesAt,
             "bytes_slice" => Builtin::BytesSlice,
             "bytes_concat" => Builtin::BytesConcat,
+            "bytes_concat_all" => Builtin::BytesConcatAll,
             "bytes_of_string" => Builtin::BytesOfString,
             "bytes_is_utf8" => Builtin::BytesIsUtf8,
             "bytes_index_of" => Builtin::BytesIndexOf,
@@ -189,6 +196,7 @@ impl Builtin {
             Builtin::BytesAt => "bytes_at",
             Builtin::BytesSlice => "bytes_slice",
             Builtin::BytesConcat => "bytes_concat",
+            Builtin::BytesConcatAll => "bytes_concat_all",
             Builtin::BytesOfString => "bytes_of_string",
             Builtin::BytesIsUtf8 => "bytes_is_utf8",
             Builtin::BytesIndexOf => "bytes_index_of",
@@ -254,6 +262,7 @@ impl Builtin {
             | Builtin::BytesLen
             | Builtin::BytesOfString
             | Builtin::BytesIsUtf8
+            | Builtin::BytesConcatAll
             | Builtin::StringOfBytes
             | Builtin::StringOfBytesLossy
             | Builtin::StringLen
@@ -336,6 +345,7 @@ impl Builtin {
             Builtin::BytesAt,
             Builtin::BytesSlice,
             Builtin::BytesConcat,
+            Builtin::BytesConcatAll,
             Builtin::BytesOfString,
             Builtin::BytesIsUtf8,
             Builtin::BytesIndexOf,
@@ -536,6 +546,19 @@ pub fn call(
             let mut out = Vec::with_capacity(a.len() + b.len());
             out.extend_from_slice(a);
             out.extend_from_slice(b);
+            Ok(Step::Done(Value::bytes(out)))
+        }
+
+        Builtin::BytesConcatAll => {
+            let pieces = args[0].as_list(span, "`bytes_concat_all`")?.clone();
+            let mut total = 0usize;
+            for piece in pieces.iter() {
+                total += piece.as_bytes(span, "`bytes_concat_all`")?.len();
+            }
+            let mut out = Vec::with_capacity(total);
+            for piece in pieces.iter() {
+                out.extend_from_slice(piece.as_bytes(span, "`bytes_concat_all`")?);
+            }
             Ok(Step::Done(Value::bytes(out)))
         }
 
@@ -1754,6 +1777,43 @@ mod tests {
         assert_eq!(
             split(b"aaaa", b"aa").unwrap().render(),
             "[b\"\", b\"\", b\"\"]"
+        );
+    }
+
+    /// ADR 0013 §4's builtin. The claim is the allocation count, and what is
+    /// asserted here is the observable half of it: the answer is the
+    /// concatenation, the empty list is `b""`, and a list holding anything but
+    /// `Bytes` is refused rather than skipped.
+    #[test]
+    fn concat_all_joins_every_piece_in_order() {
+        let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();
+        assert_eq!(empty, Value::bytes([]));
+
+        let pieces = Value::list(vec![bytes(b"GET "), bytes(b""), bytes(b"/x"), bytes(b" HTTP")]);
+        assert_eq!(
+            done(Builtin::BytesConcatAll, vec![pieces]).unwrap(),
+            Value::bytes(b"GET /x HTTP")
+        );
+
+        let mut rng = Xorshift(0x00c0_ffee_0bad_f00d);
+        for _ in 0..500 {
+            let raw: Vec<Vec<u8>> = (0..rng.below(12))
+                .map(|_| (0..rng.below(9)).map(|_| b'a' + rng.below(4) as u8).collect())
+                .collect();
+            let expected: Vec<u8> = raw.concat();
+            let list = Value::list(raw.iter().map(|p| bytes(p)).collect());
+            assert_eq!(
+                done(Builtin::BytesConcatAll, vec![list]).unwrap(),
+                Value::bytes(expected)
+            );
+        }
+
+        let mixed = Value::list(vec![bytes(b"a"), Value::Int(1)]);
+        assert_eq!(
+            done(Builtin::BytesConcatAll, vec![mixed])
+                .expect_err("an Int is not a piece")
+                .code,
+            codes::RUNTIME_ERROR
         );
     }
 

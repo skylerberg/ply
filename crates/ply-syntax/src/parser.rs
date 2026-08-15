@@ -10,6 +10,12 @@ use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 /// why has already been recorded.
 pub struct Bail;
 
+/// What one comma-separated member of `{..}` turned out to be.
+enum RowMember {
+    Atom(AtomExpr),
+    Set(QName),
+}
+
 type PResult<T> = Result<T, Bail>;
 
 /// Recursive descent walks the Rust stack, so nesting has to be capped before it
@@ -86,6 +92,10 @@ struct Parser {
     /// record or block expression. Reset by every opening delimiter.
     no_brace: bool,
     depth: u32,
+    /// Whether the file declared an `effect set` or named one in a row. A file
+    /// that did neither skips the expansion walk entirely, so the feature costs
+    /// nothing to a program that does not use it.
+    uses_effect_sets: bool,
 }
 
 impl Parser {
@@ -98,6 +108,7 @@ impl Parser {
             diags,
             no_brace: false,
             depth: 0,
+            uses_effect_sets: false,
         }
     }
 
@@ -267,15 +278,16 @@ impl Parser {
                 Err(Bail) => self.recover_to_item(),
             }
         }
-        (
-            Module {
-                name,
-                source,
-                imports,
-                items,
-            },
-            self.diags,
-        )
+        let mut module = Module {
+            name,
+            source,
+            imports,
+            items,
+        };
+        if self.uses_effect_sets {
+            crate::effect_set::expand(&mut module, &mut self.diags);
+        }
+        (module, self.diags)
     }
 
     /// Every `import` precedes every item, so the import table is complete
@@ -458,6 +470,27 @@ impl Parser {
         match self.kind() {
             TokenKind::Kw(Kw::Fn) => self.fn_def(vis).map(|d| Item::Fn(Box::new(d))),
             TokenKind::Kw(Kw::Type) => self.type_def(vis).map(|d| Item::Type(Box::new(d))),
+            _ if self.at_effect_set_start() => {
+                if let Some(span) = pub_span {
+                    self.push(
+                        Diagnostic::error(
+                            codes::UNKNOWN_EFFECT_SET,
+                            "an `effect set` cannot be `pub`",
+                        )
+                        .primary(span, "remove `pub`")
+                        .note(
+                            "an `effect set` may only be used in the module that declares it, so \
+                             there is nothing for `pub` to publish",
+                        )
+                        .note(
+                            "a set expanding across a module boundary would let an edit in the \
+                             declaring module leave a stale published row behind in a file whose \
+                             bytes never moved",
+                        ),
+                    );
+                }
+                self.effect_set_def().map(|d| Item::EffectSet(Box::new(d)))
+            }
             TokenKind::Kw(Kw::Effect) | TokenKind::Kw(Kw::Nondet) => {
                 self.effect_def(vis).map(|d| Item::Effect(Box::new(d)))
             }
@@ -495,9 +528,72 @@ impl Parser {
                 self.derive_def().map(|d| Item::Derive(Box::new(d)))
             }
             _ => Err(self.error_here(
-                "an item: `fn`, `type`, `effect`, `nondet effect`, `test`, `law`, or `derive`",
+                "an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, \
+                 or `derive`",
             )),
         }
+    }
+
+    /// `effect set Web = {..}`.
+    ///
+    /// `set` is contextual: `effect set { .. }` is still an effect named `set`,
+    /// because only the third token being an identifier too can open a set.
+    fn at_effect_set_start(&self) -> bool {
+        self.at(&TokenKind::Kw(Kw::Effect))
+            && matches!(self.kind_at(1), TokenKind::Ident(n) if n.as_str() == "set")
+            && matches!(self.kind_at(2), TokenKind::Ident(_))
+    }
+
+    fn effect_set_def(&mut self) -> PResult<EffectSetDef> {
+        self.uses_effect_sets = true;
+        let start = self.advance();
+        self.advance();
+        let name = self.expect_ident("a name for the effect set, after `effect set`")?;
+        self.expect(&TokenKind::Eq, "`=` after the effect set's name")?;
+        let open = self.expect(&TokenKind::LBrace, "`{` to open the effect set's members")?;
+
+        let mut atoms = Vec::new();
+        let mut includes = Vec::new();
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Pipe) {
+            if self.at_eof() {
+                return Err(self.unclosed(open, "`}` to close the effect set"));
+            }
+            match self.row_member("an effect atom, or the name of another `effect set`")? {
+                RowMember::Atom(a) => atoms.push(a),
+                RowMember::Set(q) => includes.push(q),
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        // A set denotes a ground set of atoms, so there is no tail to abstract
+        // over and `| e` here would have no meaning to give.
+        if self.at(&TokenKind::Pipe) {
+            let span = self.span();
+            self.push(
+                Diagnostic::error(
+                    codes::UNEXPECTED_TOKEN,
+                    "an `effect set` cannot carry a row variable",
+                )
+                .primary(span, "remove `| ..`")
+                .note(
+                    "a set abbreviates a fixed list of atoms; write the variable at the row that \
+                     names the set",
+                ),
+            );
+            return Err(Bail);
+        }
+        let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the effect set")?;
+
+        Ok(EffectSetDef {
+            name,
+            atoms,
+            includes,
+            // Filled by `effect_set::expand`, which needs every set in the file
+            // before it can resolve one.
+            expansion: Vec::new(),
+            span: start.to(close),
+        })
     }
 
     /// `derive json for Order`.
@@ -1026,11 +1122,18 @@ impl Parser {
         if self.at(&TokenKind::LBrace) {
             let open = self.advance();
             let mut atoms = Vec::new();
+            let mut aliases = Vec::new();
             while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Pipe) {
                 if self.at_eof() {
                     return Err(self.unclosed(open, "`}` to close the effect row"));
                 }
-                atoms.push(self.atom()?);
+                match self.row_member("an effect atom, or the name of an `effect set`")? {
+                    RowMember::Atom(a) => atoms.push(a),
+                    RowMember::Set(q) => {
+                        self.uses_effect_sets = true;
+                        aliases.push(q);
+                    }
+                }
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1044,21 +1147,36 @@ impl Parser {
                 self.expect_close(&TokenKind::RBrace, open, "`}` to close the effect row")?;
             return Ok(RowExpr {
                 atoms,
+                aliases,
                 tail,
                 span: start.to(close),
             });
         }
+        // A whole row that is a bare name is still a row *variable*: a set is
+        // only ever written inside braces, so `/ e` keeps the meaning it has.
         let tail = self.expect_ident("an effect row: `{..}` or a row variable")?;
         Ok(RowExpr {
             atoms: Vec::new(),
+            aliases: Vec::new(),
             span: tail.span,
             tail: Some(tail),
         })
     }
 
-    fn atom(&mut self) -> PResult<AtomExpr> {
-        let effect = self.qname("an effect name")?;
-        self.expect(&TokenKind::Dot, "`.` and then `read` or `write`")?;
+    /// One member of a row or of an `effect set`. A `.` after the name makes it
+    /// an atom and nothing else can; one token of lookahead decides it, so no
+    /// name is reserved and `effect set` needs no keyword of its own.
+    fn row_member(&mut self, what: &str) -> PResult<RowMember> {
+        let name = self.qname(what)?;
+        if !self.at(&TokenKind::Dot) {
+            return Ok(RowMember::Set(name));
+        }
+        self.advance();
+        Ok(RowMember::Atom(self.atom_rest(name)?))
+    }
+
+    /// The atom after its effect name and the `.` have been consumed.
+    fn atom_rest(&mut self, effect: QName) -> PResult<AtomExpr> {
         let mode = self.mode()?;
         let resource = if self.at(&TokenKind::LBracket) {
             let open = self.advance();

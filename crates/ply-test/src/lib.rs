@@ -110,6 +110,15 @@ pub struct Selection {
     /// plan. Only `random` decomposes, so only `random` ever narrows: sixty-four
     /// roots become a hundred and twenty-eight for the cost of sixty-four runs.
     pub narrowed: BTreeMap<usize, Plan>,
+    /// Test indices this run was never asked to decide: a shipped module's
+    /// tests without `--std`. They are not `filtered out` and not in `total`,
+    /// and — the part that matters — they withhold nothing from
+    /// [`Store::observe_definitions`]. A filter-dropped test still implicates
+    /// its closure, because the project chose not to run a test it owns; a
+    /// shipped test was never in the denominator, so leaving `std.http`'s
+    /// definitions permanently unrecorded would put all of them in every
+    /// suspect set for the life of the cache.
+    pub out_of_scope: BTreeSet<usize>,
 }
 
 impl Selection {
@@ -971,6 +980,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
         parallelism,
         plan,
         narrowed,
+        out_of_scope: BTreeSet::new(),
     }
 }
 
@@ -1586,6 +1596,7 @@ fn observe_definitions(
         .map(|r| r.index)
         .collect();
     let implicated: BTreeSet<&Symbol> = (0..check.tests.len())
+        .filter(|index| !selection.out_of_scope.contains(index))
         .filter(|index| {
             let green = selection.reason(*index) == Some(Reason::Cached);
             !green && !proven.contains(index)

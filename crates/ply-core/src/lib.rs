@@ -133,8 +133,31 @@ pub struct DefInfo {
     pub module: ModuleName,
     pub simple_name: Symbol,
     pub scheme: Scheme,
-    /// Closed after solving. Empty for a pure function.
+    /// The **published** row: the `/ {..}` annotation when there is one, and
+    /// the inferred row when there is not. Closed after solving, and empty for
+    /// a pure function. This is what callers are checked against, what the
+    /// scheduler builds the conflict graph from, and what the frame condition
+    /// of a spec is taken over.
     pub footprint: Footprint,
+    /// What row inference computed for the **body**. Always a subset of
+    /// [`DefInfo::footprint`], and equal to it for a definition with no
+    /// annotation.
+    ///
+    /// Provenance, and only that: it enters no hash, no cache key, no
+    /// scheduling decision and no determinism verdict. It exists so that the
+    /// cost of a declared row wider than the body's — which an `effect set`
+    /// makes systematic, since one set is written for a whole service and most
+    /// definitions touch a part of it — is published rather than left to be
+    /// discovered from an `isolated: n of m` number nobody wrote down.
+    pub performed: Footprint,
+    /// The `effect set`s this definition's row was written with, in source
+    /// order, by simple name.
+    ///
+    /// Namespace metadata like a module name or an import alias: erased by
+    /// normalization, so a row written `/ {Web}` and one written with `Web`'s
+    /// atoms are one definition with one hash. Carried so `--explain` can print
+    /// how the row was spelled beside what it means.
+    pub row_aliases: Vec<Symbol>,
     /// `where derivable(D, a)`, sorted and deduplicated exactly as the hash
     /// encodes them. Part of the published signature: adding one narrows the
     /// call sites this definition admits, so a caller checked against the
@@ -209,6 +232,12 @@ impl CheckOutput {
 pub struct KnownDef {
     pub scheme: Scheme,
     pub footprint: Footprint,
+    /// What the body performed when it was last walked. Restored rather than
+    /// recomputed, because the point of handing an interface over is that the
+    /// body is not walked at all — and `ply check --explain` must print the
+    /// same bytes on a warm run as on a cold one, or the reviewing command's
+    /// output is a function of what the cache held.
+    pub performed: Footprint,
 }
 
 #[derive(Clone, Debug)]

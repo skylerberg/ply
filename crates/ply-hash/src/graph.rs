@@ -273,8 +273,10 @@ impl<'a> ProgramIndex<'a> {
                         });
                     }
                     // Expansion has already appended this derive's generated
-                    // definitions as `Item::Fn`, and those are the nodes.
-                    Item::Derive(_) => {}
+                    // definitions as `Item::Fn`, and those are the nodes. An
+                    // `effect set` stands for no definition at all: the parser
+                    // expanded every row that named it.
+                    Item::Derive(_) | Item::EffectSet(_) => {}
                 }
             }
             all_items.push(items);

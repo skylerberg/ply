@@ -1,6 +1,7 @@
 use crate::style::ColorChoice;
 use clap::{Args, Parser, Subcommand};
 use ply_eval::Seed;
+use ply_host::tls::CredentialSpec;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -197,6 +198,34 @@ impl SimOptions {
     }
 }
 
+/// TLS credential material, configured beside the run and named from it.
+///
+/// The key never enters the program: `net.listen_tls` takes a credential
+/// *name*, so no certificate byte reaches a definition's hash or the
+/// content-addressed store, and a rotation moves nothing. Loaded and validated
+/// at bind time, before anything runs — a server that discovers its certificate
+/// is unusable on the first handshake has already told a client it was
+/// listening.
+#[derive(Args, Clone, Debug, Default)]
+pub struct TlsOptions {
+    /// TLS credential: `--tls api=certs/api.pem,certs/api.key`. Repeatable, one
+    /// credential per listener. PEM: a certificate chain leaf first, and a
+    /// private key in PKCS#8, PKCS#1 or SEC1.
+    #[arg(
+        long = "tls",
+        value_name = "NAME=CERT,KEY",
+        value_parser = parse_credential,
+        requires = "host",
+    )]
+    pub tls: Vec<CredentialSpec>,
+}
+
+/// The shape is a usage error rather than `E0430`: a reader who mistyped the
+/// argument needs the form, and one whose PEM is broken needs the file.
+fn parse_credential(text: &str) -> Result<CredentialSpec, String> {
+    CredentialSpec::parse(text)
+}
+
 /// A seed that parses loosely replays something other than what failed, so
 /// every form that is not canonical is refused with the two that are.
 fn parse_seed(text: &str) -> Result<Seed, String> {
@@ -302,6 +331,9 @@ pub struct TestArgs {
     /// handler always runs and is never cached.
     #[arg(long)]
     pub host: bool,
+
+    #[command(flatten)]
+    pub tls: TlsOptions,
 
     /// Also select the tests declared by the modules that ship with the
     /// compiler. Off by default: a project's test count must not change with a
@@ -460,6 +492,9 @@ pub struct RunArgs {
     /// it, never a silent syscall.
     #[arg(long)]
     pub host: bool,
+
+    #[command(flatten)]
+    pub tls: TlsOptions,
 }
 
 #[derive(Args, Debug)]
@@ -473,6 +508,9 @@ pub struct HostsArgs {
     /// Resolution — and therefore any registration error — happens either way.
     #[arg(long)]
     pub host: bool,
+
+    #[command(flatten)]
+    pub tls: TlsOptions,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long, conflicts_with = "digest")]
@@ -622,6 +660,55 @@ mod tests {
             },
             other => panic!("expected `cache`, got {other:?}"),
         }
+    }
+
+    /// The credential is `NAME=CERT,KEY` and is repeatable, one per listener.
+    #[test]
+    fn a_tls_credential_parses_into_its_name_and_its_two_files() {
+        let cli = Cli::parse_from([
+            "ply",
+            "run",
+            "--host",
+            "--tls",
+            "api=certs/api.pem,certs/api.key",
+            "--tls",
+            "admin=certs/admin.pem,certs/admin.key",
+        ]);
+        let args = match cli.command {
+            Command::Run(args) => args,
+            other => panic!("expected `run`, got {other:?}"),
+        };
+        let names: Vec<&str> = args.tls.tls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["api", "admin"]);
+        assert_eq!(args.tls.tls[0].certificate, PathBuf::from("certs/api.pem"));
+        assert_eq!(args.tls.tls[0].key, PathBuf::from("certs/api.key"));
+    }
+
+    /// A malformed credential is refused with the form rather than accepted and
+    /// discovered on the first handshake.
+    #[test]
+    fn a_credential_that_is_not_name_cert_key_is_refused_with_the_form() {
+        for bad in ["api", "api=only.pem", "=a.pem,b.key", "api=,b.key"] {
+            let err = Cli::try_parse_from(["ply", "run", "--host", "--tls", bad])
+                .expect_err("`{bad}` must not parse as a credential");
+            assert!(
+                err.to_string().contains("--tls NAME=CERT.pem,KEY.pem"),
+                "`{bad}` was refused without saying what to write: {err}"
+            );
+        }
+    }
+
+    /// Credentials configure a binding. Without `--host` there is no binding,
+    /// so a `--tls` that would be silently ignored is refused instead — the
+    /// same rule that keeps `--sim-budget` from being quietly dropped.
+    #[test]
+    fn tls_without_host_is_refused_rather_than_ignored() {
+        assert!(Cli::try_parse_from(["ply", "run", "--tls", "api=a.pem,b.key"]).is_err());
+        assert!(Cli::try_parse_from(["ply", "test", "--tls", "api=a.pem,b.key"]).is_err());
+        assert!(Cli::try_parse_from(["ply", "hosts", "--tls", "api=a.pem,b.key"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ply", "hosts", "--host", "--tls", "api=a.pem,b.key"]).is_ok()
+        );
     }
 
     #[test]

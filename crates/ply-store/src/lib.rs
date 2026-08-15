@@ -66,7 +66,7 @@ pub use schema::fingerprint as schema_fingerprint;
 /// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
 /// `string_upper` read `std`'s Unicode tables, which is the one thing the
 /// evaluator does that this repository does not decide.
-pub const RUNTIME_VERSION: &str = "0.8.0";
+pub const RUNTIME_VERSION: &str = "0.9.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -84,7 +84,7 @@ pub const RUNTIME_VERSION: &str = "0.8.0";
 /// normalization that leaves those shapes alone is not caught by anything, and
 /// is the case a contributor has to remember: the stale entry it leaves behind
 /// is a wrong *type*, which corrupts every hash keyed on it.
-pub const FRONTEND_VERSION: &str = "0.10.0";
+pub const FRONTEND_VERSION: &str = "0.11.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
