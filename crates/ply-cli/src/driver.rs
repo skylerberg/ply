@@ -881,6 +881,7 @@ impl<'s> Driver<'s> {
                     same_witness(&cached.names, witness).then(|| KnownDef {
                         scheme: cached.scheme.clone(),
                         footprint: cached.footprint.clone(),
+                        performed: cached.performed.clone(),
                     })
                 }),
                 _ => {
@@ -1241,9 +1242,9 @@ impl<'s> Driver<'s> {
                         }
                     }
                 }
-                // None declares a name, so none is reached: all three are
+                // None declares a name, so none is reached: all four are
                 // filtered out by `item.name()` above.
-                Item::Test(_) | Item::Law(_) | Item::Derive(_) => {}
+                Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
             }
         }
         for test in checked.tests.iter().filter(|t| t.module == file.module) {
@@ -1327,6 +1328,8 @@ impl<'s> Driver<'s> {
                             simple_name: simple,
                             scheme: cached.scheme.clone(),
                             footprint: cached.footprint.clone(),
+                            performed: cached.performed.clone(),
+                            row_aliases: cached.row_aliases.clone(),
                             // Restored from `SourceFingerprint::specs` once the
                             // store carries it; see CONTRACTS.md's Specs
                             // section. A skipped file's clauses are
@@ -1701,7 +1704,7 @@ impl<'s> Driver<'s> {
                         })
                         .collect(),
                 ),
-                Item::Test(_) | Item::Law(_) | Item::Derive(_) => continue,
+                Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => continue,
             };
             let deps = hashes.deps.get(&name).cloned().unwrap_or_default();
             fingerprint.defs.push(DefEntry {
@@ -1765,6 +1768,8 @@ impl<'s> Driver<'s> {
                     Item::Fn(_) => check.defs.get(&name).map(|d| {
                         Interface::Def(
                             CachedDef::new(d.scheme.clone(), d.footprint.clone())
+                                .performing(d.performed.clone())
+                                .written_as(d.row_aliases.clone())
                                 .witnessed_by(names),
                         )
                     }),
@@ -1819,7 +1824,7 @@ impl<'s> Driver<'s> {
                             )
                         })
                     }),
-                    Item::Test(_) | Item::Law(_) | Item::Derive(_) => None,
+                    Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => None,
                 };
                 if let Some(entry) = entry {
                     out.push((*hash, entry));

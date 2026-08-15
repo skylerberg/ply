@@ -18,6 +18,7 @@ use ply_test::{
     TestResult, Verdict,
 };
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
@@ -116,7 +117,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // host author's bug, and a run that started anyway would touch a resource
     // nobody could name. Hermetic resolves nothing, so a stale registry cannot
     // stop a run that was never going to reach it.
-    let hosts = match Hosts::open(&loaded.check, args.host) {
+    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
@@ -341,6 +342,13 @@ impl Plan {
         let matches = |t: &ply_core::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 
         let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
+        let out_of_scope: BTreeSet<usize> = check
+            .tests
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !in_scope(t))
+            .map(|(i, _)| i)
+            .collect();
         let visible: Vec<usize> = check
             .tests
             .iter()
@@ -397,6 +405,7 @@ impl Plan {
                 // the cache on which tests happened to be asked for.
                 plan: selection.plan,
                 narrowed: selection.narrowed,
+                out_of_scope,
             },
             visible,
         }
@@ -574,15 +583,19 @@ fn print_human(
             style.dim("not cached"),
         );
         let listing = view.hosts.listing();
+        let transport = view.hosts.transport();
         println!(
             "{IND}{}",
             style.dim(&format!(
                 "binding host · {} {} · {}",
                 listing.rows.len(),
                 plural(listing.rows.len(), "operation"),
-                listing.digest_short(),
+                crate::hosts::digest_short(listing, transport.as_ref()),
             ))
         );
+        for line in crate::hosts::handshake_lines(&view.hosts.handshakes()) {
+            println!("{IND}{}", style.dim(&line));
+        }
     }
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
@@ -1520,7 +1533,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         args: &TestArgs,
         workers: usize,
     ) -> Value {
-        let hosts = Hosts::open(&loaded.check, args.host).expect("the fixture binds");
+        let hosts = Hosts::open(&loaded.check, args.host, &[]).expect("the fixture binds");
         let view = HostView::of(&hosts, plan, &loaded.check, report);
         let ok = report.is_success() && view.escapes.is_empty();
         report_json(loaded, hashes, plan, report, args, workers, &[], &view, ok)
@@ -1539,6 +1552,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect_budget: 64,
             trace: When::Auto,
             host: false,
+            tls: crate::cli::TlsOptions::default(),
             std: false,
             engine: crate::cli::EngineArg::default(),
             simulation: crate::cli::SimOptions {
@@ -2363,7 +2377,7 @@ test \"stuck\" {
     #[test]
     fn a_hermetic_run_reports_exactly_what_it_did_before() {
         let (_dir, loaded, _h, plan) = plan_for(None);
-        let hosts = Hosts::open(&loaded.check, false).unwrap();
+        let hosts = Hosts::open(&loaded.check, false, &[]).unwrap();
         let view = HostView::of(&hosts, &plan, &loaded.check, &report_over(Vec::new()));
 
         for (index, test) in loaded.check.tests.iter().enumerate() {
@@ -2428,7 +2442,7 @@ test \"stuck\" {
         assert!(view.escapes.is_empty());
 
         // And hermetically the check costs nothing, because nothing is reachable.
-        let hermetic = Hosts::open(&loaded.check, false).unwrap();
+        let hermetic = Hosts::open(&loaded.check, false, &[]).unwrap();
         let view = HostView::of(&hermetic, &plan, &loaded.check, &escaped);
         assert!(view.escapes.is_empty());
     }

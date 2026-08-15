@@ -62,6 +62,8 @@ fn check_of(names: &[&str]) -> CheckOutput {
                 simple_name: Symbol::new(simple),
                 scheme: Scheme::mono(Type::int()),
                 footprint: Footprint::empty(),
+                performed: Footprint::empty(),
+                row_aliases: Vec::new(),
                 constraints: Vec::new(),
                 spec: Vec::new(),
                 span: Span::DUMMY,
@@ -163,8 +165,14 @@ impl Scripted {
         }
     }
 
+    /// Sorted, because `obligation::prove` discharges over a `par_iter` and the
+    /// arrival order is the thread pool's rather than the program's. Asserting
+    /// on it is a flaky test, which is the one thing this suite may not be.
+    /// *Which* obligations were asked is the claim; the order carries nothing.
     fn asked(&self) -> Vec<DefHash> {
-        self.asked.lock().unwrap().clone()
+        let mut asked = self.asked.lock().unwrap().clone();
+        asked.sort();
+        asked
     }
 }
 

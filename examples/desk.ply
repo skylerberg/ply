@@ -1,0 +1,1619 @@
+// The parts desk: a multi-route HTTP service whose types are its documentation.
+//
+//     $ ply check --types examples/desk.ply     # the map below
+//     $ ply test examples/desk.ply              # 48 hermetic tests, no socket
+//     $ ply prove examples/desk.ply             # four laws about the table
+//
+// W3's exit criterion is that an endpoint's declared signature says which
+// resources it touches. That is what this file is for. Here is `ply check
+// --types`, with the rows exactly as it prints them and two record types
+// abbreviated: Ply's records are structural, so the real output writes
+// `{body: Bytes, headers: Map<String, List<String>>, status: Int}` wherever this
+// says `Response` and `{endpoint: Endpoint, method: Method, path: List<Segment>}`
+// wherever it says `Route<Endpoint>`. Nothing else is elided:
+//
+//   table         : () -> List<Route<Endpoint>>
+//   route_of      : (Method, String) -> Matched<Endpoint>
+//   health        : () -> Response
+//   docs          : (Map<String, String>) -> Response
+//   list_items    : () -> Response / {desk.store.read[items]}
+//   featured      : () -> Response / {desk.store.read[items]}
+//   get_item      : (Map<String, String>) -> Response / {desk.store.read[items]}
+//   list_orders   : () -> Response / {desk.store.read[orders]}
+//   get_order     : (Map<String, String>) -> Response / {desk.store.read[orders]}
+//   receipt       : (Map<String, String>) -> Reply / {desk.store.read[items],
+//                                                     desk.store.read[orders]}
+//   place_order   : (Bytes) -> Response / {desk.log.write,
+//                                          desk.store.read[items],
+//                                          desk.store.write[items],
+//                                          desk.store.read[orders],
+//                                          desk.store.write[orders]}
+//   cancel_order  : (Map<String, String>) -> Response / {desk.log.write,
+//                                          desk.store.read[items],
+//                                          desk.store.write[items],
+//                                          desk.store.read[orders],
+//                                          desk.store.write[orders]}
+//
+// Read it as a map of the API to what the API does to what. `GET /items` cannot
+// write anything and cannot see the order book; `GET /orders/{id}` cannot see
+// the shelf; `health` and `docs` reach nothing at all; and `table` and
+// `route_of` are pure, so the part of a web framework that is hardest to test is
+// here a function over a value. None of those sentences is a comment that can go
+// stale — each is inferred from the body and checked against the annotation, and
+// deleting an annotation changes nothing but who is checked against whom.
+//
+// Two endpoints need the same five atoms, so those two are written `/ {Desk}` —
+// an `effect set`, which is an abbreviation for a row and never a widening of
+// one. Every other endpoint writes its atoms out, because at an endpoint the
+// difference between `read[items]` and `write[orders]` is the documentation and
+// an abbreviation would be hiding it. `ply check --types` prints the expansion
+// either way, with no flag: the alias name is nowhere in this output, and
+// `--explain` is what adds it back as provenance.
+
+import std.net (net, send_all)
+import std.json
+import std.http
+import std.router
+
+// --- The store ----------------------------------------------------------------
+//
+// W4 has the database. Until then the store is an effect with two resources —
+// `items` and `orders` — and the whole point of it being an effect is visible
+// in the rows above: an endpoint that reads the shelf cannot reach the order
+// book, and a test grants exactly the operations it expects to be used.
+
+effect store {
+  read  all[r]() -> List<a>
+  write save[r](rows: List<a>) -> Unit
+}
+
+// The desk's own audit trail. It takes no resource parameter, so its atom is
+// `log.write` — a singleton named for the effect — which is what a row wants for
+// something there is exactly one of.
+effect log {
+  write note(line: String) -> Unit
+}
+
+// Placing an order and cancelling one both read the shelf, write the shelf,
+// read the order book, write the order book and record a line. They perform
+// this set exactly — not a subset — which is what earns the abbreviation. An
+// alias wider than the body that carries it is legal and costs two things
+// (ADR 0013 §1.6): it widens the conflict graph, so tests that could have run
+// side by side are serialised, and it weakens every frame condition, since the
+// footprint is what an `ensures` promises nothing outside of. Neither cost is
+// paid here, and `ply check --types --explain` is where that claim is checked
+// rather than asserted: it prints a `declared, not performed` line for any
+// definition whose annotation is wider than its body, and prints none for this
+// file.
+effect set Desk = {
+  store.read[items], store.write[items],
+  store.read[orders], store.write[orders],
+  log.write,
+}
+
+// --- What the desk sells --------------------------------------------------------
+
+pub type Item = { sku: String, name: String, price: Decimal, on_hand: Int }
+
+pub type Line = { sku: String, qty: Int }
+
+pub type State = Open | Cancelled
+
+pub type Order = {
+  id: Int,
+  customer: String,
+  lines: List<Line>,
+  total: Decimal,
+  state: State,
+}
+
+// What a client posts to `/orders`. Deliberately not `Order`: the id, the total
+// and the state are the desk's to decide, and a request body that could carry
+// them is a request body that can lie about them.
+pub type Placement = { customer: String, lines: List<Line> }
+
+// One shape for every refusal, so a client parses one document whatever went
+// wrong. `error` is the stable tag a program branches on; `detail` is the
+// sentence a person reads.
+pub type Problem = { error: String, detail: String }
+
+pub type Health = { service: String, routes: Int }
+
+// The whole wire format, and nobody wrote it. A field added to `Line` is a field
+// in the codec, in the receipt and in the tests that reach it, in one edit.
+derive json for Item
+derive json for Line
+derive json for State
+derive json for Order
+derive json for Placement
+derive json for Problem
+derive json for Health
+
+// --- The business, which touches nothing ----------------------------------------
+
+pub fn item_named(shelf: List<Item>, sku: String) -> Option<Item> =
+  fold(shelf, None, |found: Option<Item>, i: Item|
+    if i.sku == sku { Some(i) } else { found })
+
+pub fn price_of(shelf: List<Item>, sku: String) -> Decimal =
+  match item_named(shelf, sku) {
+    Some(i) -> i.price,
+    None -> 0m,
+  }
+
+// `Decimal`, because money is exact and not binary. `*` is exact whenever the
+// result fits, `+` is exact or it raises, and `/` is not written here and could
+// not be — it is `E0209` without a rounding mode nobody has chosen.
+pub fn total_of(shelf: List<Item>, lines: List<Line>) -> Decimal =
+  fold(lines, 0m, |acc: Decimal, l: Line|
+    acc + decimal_of_int(l.qty) * price_of(shelf, l.sku))
+
+pub fn unknown_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
+  map(filter(lines, |l: Line| item_named(shelf, l.sku) == None), |l: Line| l.sku)
+
+// Summed per sku rather than checked per line, and walked over the shelf rather
+// than over the order, so a sku named twice is one draw on the shelf and is
+// reported once. Checking the lines apart is how a desk sells the same three
+// widgets twice inside one order — the drawdown below sums them either way.
+pub fn short_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
+  map(filter(shelf, |i: Item| i.on_hand < taken(lines, i.sku)), |i: Item| i.sku)
+
+// A quantity that is not positive is refused rather than clamped. A line of
+// `-5` would raise the shelf and lower the total, which is a discount a client
+// wrote for itself.
+pub fn bad_qty(lines: List<Line>) -> Bool =
+  fold(lines, false, |seen: Bool, l: Line| seen || l.qty <= 0)
+
+fn taken(lines: List<Line>, sku: String) -> Int =
+  fold(lines, 0, |n: Int, l: Line| if l.sku == sku { n + l.qty } else { n })
+
+fn moved(shelf: List<Item>, lines: List<Line>, sign: Int) -> List<Item> =
+  map(shelf, |i: Item| {
+    sku: i.sku,
+    name: i.name,
+    price: i.price,
+    on_hand: i.on_hand - sign * taken(lines, i.sku),
+  })
+
+pub fn draw_down(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, 1)
+
+pub fn put_back(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, -1)
+
+pub fn next_id(orders: List<Order>) -> Int =
+  fold(orders, 1, |acc: Int, o: Order| if o.id < acc { acc } else { o.id + 1 })
+
+pub fn order_by(orders: List<Order>, id: Int) -> Option<Order> =
+  fold(orders, None, |found: Option<Order>, o: Order|
+    if o.id == id { Some(o) } else { found })
+
+pub fn cancelled(o: Order) -> Order =
+  {id: o.id, customer: o.customer, lines: o.lines, total: o.total, state: Cancelled}
+
+// --- The route table, which is data ---------------------------------------------
+//
+// Not a macro, not a registry, not a list of closures. `List` is homogeneous and
+// a function type carries its row, so a table of handlers would force every
+// endpoint to declare byte-identically the same row — the union of the whole
+// service — which is exactly the per-endpoint legibility this file exists to
+// show. With a tag, `dispatch` writes the `match`, and that `match` is
+// exhaustiveness-checked: a route in the table with no handler is `E0205` rather
+// than a 500 at three in the morning.
+
+pub type Endpoint =
+  | Health
+  | Docs
+  | ListItems
+  | Featured
+  | GetItem
+  | ListOrders
+  | PlaceOrder
+  | GetOrder
+  | CancelOrder
+  | Receipt
+
+fn route(method: http::Method, pattern: String, e: Endpoint) -> router::Route<Endpoint> =
+  {method: method, path: router::pattern_of_string(pattern), endpoint: e}
+
+fn get(pattern: String, e: Endpoint) -> router::Route<Endpoint> =
+  route(http::Get, pattern, e)
+
+// `/items/featured` and `/items/{sku}` both match `/items/featured`, and the
+// literal wins — decided segment by segment, left to right, by the matcher and
+// not by the order of this list. `conflicts` reports any pair the matcher would
+// have had to break by position instead, and a law below says there are none.
+//
+// `{id:Int}` is a typed binder: the route does not match unless the segment
+// parses, and `router::int_param` reads it back with the same three functions
+// the match used, so "it matched" and "it reads back" cannot drift. A request
+// for `/orders/seven` therefore reaches no route at all and is a 404, rather
+// than reaching `get_order` and being turned into a 400 there.
+pub fn table() -> List<router::Route<Endpoint>> = [
+  get("/health", Health),
+  get("/docs/{..page}", Docs),
+  get("/items", ListItems),
+  get("/items/featured", Featured),
+  get("/items/{sku}", GetItem),
+  get("/orders", ListOrders),
+  route(http::Post, "/orders", PlaceOrder),
+  get("/orders/{id:Int}", GetOrder),
+  route(http::Delete, "/orders/{id:Int}", CancelOrder),
+  get("/orders/{id:Int}/receipt", Receipt),
+]
+
+// Pure, and that is the first thing `ply check --types` prints about this
+// service.
+pub fn route_of(method: http::Method, path: String) -> router::Matched<Endpoint> =
+  router::route(table(), method, path)
+
+// --- Responses ------------------------------------------------------------------
+
+fn field(name: String, value: String) -> {key: String, value: List<String>} =
+  {key: name, value: [value]}
+
+fn json_headers() -> http::Headers =
+  map_of_entries([field("content-type", "application/json")])
+
+// The dictionary is an argument. ADR 0010's elaborated form of a typeclass
+// constraint: a codec is a record of two functions, so a framework signature
+// takes the one the caller derived rather than resolving anything.
+fn json_body<a>(status: Int, x: a, codec: json::JsonCodec<a>) -> http::Response =
+  {status: status, headers: json_headers(), body: json::encode_bytes(x, codec)}
+
+fn problem(status: Int, error: String, detail: String) -> http::Response =
+  json_body(status, {error: error, detail: detail}, problem_json())
+
+fn text(status: Int, body: Bytes) -> http::Response = {
+  status: status,
+  headers: map_of_entries([field("content-type", "text/plain; charset=utf-8")]),
+  body: body,
+}
+
+fn join(xs: List<String>) -> String =
+  fold(xs, "", |acc: String, x: String| if acc == "" { x } else { acc ++ ", " ++ x })
+
+// --- The endpoints ---------------------------------------------------------------
+//
+// Each one writes its own row. That is the point of the table holding tags: the
+// rows below differ, and a reader can see which.
+
+// Pure. It reports how many routes the table holds, so a service that has grown
+// a route says so without anybody editing this function.
+pub fn health() -> http::Response =
+  json_body(200, {service: "parts desk", routes: len(table())}, health_json())
+
+// Also pure: the pages are definitions, not rows, so serving one touches
+// nothing. This is the `Rest` route, and its capture is every remaining segment
+// joined by `/` — which is why `docs/a/b` finds `a/b` and not `a`.
+fn pages() -> Map<String, String> =
+  map_of_entries([
+    {key: "index", value: "GET /items, GET /orders, POST /orders, DELETE /orders/{id}"},
+    {key: "orders/placing", value: "POST /orders with {\"customer\":..,\"lines\":[..]}"},
+    {key: "orders/cancelling", value: "DELETE /orders/{id} puts the lines back on the shelf"},
+  ])
+
+pub fn docs(params: Map<String, String>) -> http::Response =
+  match map_get(params, "page") {
+    None -> problem(404, "no such page", "the pages are: " ++ join(map_keys(pages()))),
+    Some(p) ->
+      match map_get(pages(), p) {
+        Some(body) -> text(200, bytes_of_string(body ++ "\n")),
+        None -> problem(404, "no such page", "the pages are: " ++ join(map_keys(pages()))),
+      },
+  }
+
+pub fn list_items() -> http::Response / {store.read[items]} =
+  json_body(200, store.all[items](), json::list_json(item_json()))
+
+// Everything the shelf is short of. A second read-only endpoint over the same
+// resource, which is what makes it and `list_items` runnable side by side: two
+// reads of one resource do not conflict.
+pub fn featured() -> http::Response / {store.read[items]} =
+  json_body(200, filter(store.all[items](), |i: Item| i.on_hand > 0),
+    json::list_json(item_json()))
+
+pub fn get_item(params: Map<String, String>) -> http::Response / {store.read[items]} =
+  match map_get(params, "sku") {
+    None -> problem(400, "bad request", "no sku was captured"),
+    Some(sku) ->
+      match item_named(store.all[items](), sku) {
+        Some(i) -> json_body(200, i, item_json()),
+        None -> problem(404, "no such item", sku),
+      },
+  }
+
+pub fn list_orders() -> http::Response / {store.read[orders]} =
+  json_body(200, store.all[orders](), json::list_json(order_json()))
+
+pub fn get_order(params: Map<String, String>) -> http::Response / {store.read[orders]} =
+  match order_wanted(params) {
+    Err(r) -> r,
+    Ok(id) ->
+      match order_by(store.all[orders](), id) {
+        Some(o) -> json_body(200, o, order_json()),
+        None -> problem(404, "no such order", int_to_string(id)),
+      },
+  }
+
+// `Some` for every route whose pattern declared `{id:Int}`, because nothing else
+// could have matched. The `None` branch is the one a route with a plain `{id}`
+// would reach, and it is written rather than assumed away.
+fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> =
+  match router::int_param(params, "id") {
+    Some(id) -> Ok(id),
+    None -> Err(problem(400, "bad order id", "an order id is one or more digits")),
+  }
+
+// The two that need the whole desk. Written `/ {Desk}`, which expands to exactly
+// the five atoms each performs.
+pub fn place_order(body: Bytes) -> http::Response / {Desk} =
+  match json::decode_bytes(body, placement_json()) {
+    Err(e) -> problem(400, "malformed body", json::error_to_string(e)),
+    Ok(p) -> placed(p),
+  }
+
+fn placed(p: Placement) -> http::Response / {Desk} = {
+  let shelf = store.all[items]();
+  if len(p.lines) == 0 {
+    problem(422, "empty order", "an order needs at least one line")
+  } else if bad_qty(p.lines) {
+    problem(422, "bad quantity", "every line needs a quantity above zero")
+  } else if len(unknown_skus(shelf, p.lines)) > 0 {
+    problem(404, "no such item", join(unknown_skus(shelf, p.lines)))
+  } else if len(short_skus(shelf, p.lines)) > 0 {
+    problem(409, "out of stock", join(short_skus(shelf, p.lines)))
+  } else {
+    let orders = store.all[orders]();
+    let placement = {
+      id: next_id(orders),
+      customer: p.customer,
+      lines: p.lines,
+      total: total_of(shelf, p.lines),
+      state: Open,
+    };
+    store.save[items](draw_down(shelf, p.lines));
+    store.save[orders](push(orders, placement));
+    log.note("placed " ++ int_to_string(placement.id) ++ " for " ++ p.customer);
+    json_body(201, placement, order_json())
+  }
+}
+
+pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
+  match order_wanted(params) {
+    Err(r) -> r,
+    Ok(id) -> cancelling(id),
+  }
+
+fn cancelling(id: Int) -> http::Response / {Desk} = {
+  let orders = store.all[orders]();
+  match order_by(orders, id) {
+    None -> problem(404, "no such order", int_to_string(id)),
+    Some(o) ->
+      match o.state {
+        Cancelled -> problem(409, "already cancelled", int_to_string(id)),
+        Open -> {
+          store.save[items](put_back(store.all[items](), o.lines));
+          store.save[orders](map(orders, |x: Order| if x.id == id { cancelled(x) } else { x }));
+          log.note("cancelled " ++ int_to_string(id));
+          json_body(200, cancelled(o), order_json())
+        },
+      },
+  }
+}
+
+// --- The streamed receipt ---------------------------------------------------------
+//
+// A body written as it is produced rather than built and then written. It needs
+// no language feature: `http::respond_chunked` takes a seed and a producer, the
+// producer is an ordinary function with its own row, and this one's row is `{}`
+// — so the streaming route publishes the two reads that found the order and
+// `net.write[conn]`, and nothing else.
+//
+// The cursor renders one line per pull rather than holding a rendered body, so a
+// receipt of ten thousand lines holds one line at a time and each pull costs the
+// shelf lookup rather than the receipt. That is the difference between streaming
+// and a list of chunks wearing streaming's clothes.
+
+pub type Phase = Opening | Lines | Done
+
+pub type Cursor = {
+  order: Order,
+  shelf: List<Item>,
+  pending: List<Line>,
+  phase: Phase,
+}
+
+pub fn cursor_for(o: Order, shelf: List<Item>) -> Cursor =
+  {order: o, shelf: shelf, pending: o.lines, phase: Opening}
+
+fn opening_line(o: Order) -> Bytes =
+  bytes_of_string(
+    "receipt for order " ++ int_to_string(o.id) ++ "\ncustomer: " ++ o.customer ++ "\n")
+
+fn item_line(shelf: List<Item>, l: Line) -> Bytes =
+  bytes_of_string(
+    "  " ++ int_to_string(l.qty) ++ " x " ++ l.sku
+      ++ " @ " ++ decimal_to_string(price_of(shelf, l.sku))
+      ++ " = " ++ decimal_to_string(decimal_of_int(l.qty) * price_of(shelf, l.sku)) ++ "\n")
+
+fn closing_line(o: Order) -> Bytes = bytes_of_string("total: " ++ decimal_to_string(o.total) ++ "\n")
+
+pub fn next_chunk(c: Cursor) -> Option<{chunk: Bytes, next: Cursor}> =
+  match c.phase {
+    Opening -> Some({
+      chunk: opening_line(c.order),
+      next: {order: c.order, shelf: c.shelf, pending: c.pending, phase: Lines},
+    }),
+    Lines ->
+      match c.pending {
+        [l, ..rest] -> Some({
+          chunk: item_line(c.shelf, l),
+          next: {order: c.order, shelf: c.shelf, pending: rest, phase: Lines},
+        }),
+        _ -> Some({
+          chunk: closing_line(c.order),
+          next: {order: c.order, shelf: c.shelf, pending: [], phase: Done},
+        }),
+      },
+    Done -> None,
+  }
+
+// What a buffered path would have sent. The law at the foot of the file says the
+// two agree for every order, which is the claim a streaming encoder has to earn
+// and almost never states.
+pub fn drained(c: Cursor) -> Bytes = bytes_concat_all(chunks_of(c, []))
+
+fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
+  match next_chunk(c) {
+    None -> acc,
+    Some(step) -> chunks_of(step.next, push(acc, step.chunk)),
+  }
+
+// --- Dispatch ---------------------------------------------------------------------
+
+// A buffered answer, or a head and a cursor the connection pulls. The two cases
+// are what lets one route stream while ten do not, without the ten having to
+// know a connection exists.
+pub type Reply =
+  | Buffered(http::Response)
+  | Stream({ head: http::Response, cursor: Cursor })
+
+pub fn receipt(params: Map<String, String>) -> Reply
+  / {store.read[items], store.read[orders]} =
+  match order_wanted(params) {
+    Err(r) -> Buffered(r),
+    Ok(id) ->
+      match order_by(store.all[orders](), id) {
+        None -> Buffered(problem(404, "no such order", int_to_string(id))),
+        Some(o) -> Stream({
+          head: text(200, b""),
+          cursor: cursor_for(o, store.all[items]()),
+        }),
+      },
+  }
+
+// Exhaustive by construction: add a variant to `Endpoint` without a route and
+// the table is one line short; add one without an arm here and it is `E0205`.
+pub fn dispatch(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply
+  / {Desk} =
+  match e {
+    Health -> Buffered(health()),
+    Docs -> Buffered(docs(params)),
+    ListItems -> Buffered(list_items()),
+    Featured -> Buffered(featured()),
+    GetItem -> Buffered(get_item(params)),
+    ListOrders -> Buffered(list_orders()),
+    PlaceOrder -> Buffered(place_order(req.body)),
+    GetOrder -> Buffered(get_order(params)),
+    CancelOrder -> Buffered(cancel_order(params)),
+    Receipt -> receipt(params),
+  }
+
+pub fn answer(req: http::Request) -> Reply / {Desk} =
+  if req.target == "*" {
+    // `OPTIONS *` asks about the server rather than about a path, so it is not
+    // routed. The methods are read off the table by `declared_methods`, which is
+    // what stops this answer falling behind the routes.
+    Buffered(server_options())
+  } else {
+    match route_of(routed_method(req.method), req.path) {
+      router::NotFound -> Buffered(problem(404, "no such route", req.path)),
+      router::MethodNotAllowed(ms) -> Buffered(method_not_allowed(ms)),
+      router::Found(m) -> dispatch(m.endpoint, req, m.params),
+    }
+  }
+
+// A `HEAD` is a `GET` whose response carries no body, and `http::encode` is what
+// drops it — computing the `Content-Length` the same request would have produced
+// under `GET`. Routing it as a `GET` is what makes that true of every route
+// rather than of the ones somebody remembered to add a second table entry for.
+fn routed_method(m: http::Method) -> http::Method =
+  match m {
+    http::Head -> http::Get,
+    _ -> m,
+  }
+
+fn server_options() -> http::Response = {
+  status: 204,
+  headers: map_of_entries([
+    field("allow",
+      join(map(router::declared_methods(table()), |m: http::Method| http::method_name(m)))),
+  ]),
+  body: b"",
+}
+
+// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and the methods come from the
+// matcher rather than from a list written here — sorted and deduplicated by
+// `route`, so the field cannot disagree with the table it was derived from.
+fn method_not_allowed(ms: List<http::Method>) -> http::Response = {
+  status: 405,
+  headers: map_of_entries([
+    field("content-type", "application/json"),
+    field("allow", join(map(ms, |m: http::Method| http::method_name(m)))),
+  ]),
+  body: json::encode_bytes(
+    {error: "method not allowed",
+     detail: "this path is served by " ++ join(map(ms, |m: http::Method| http::method_name(m)))},
+    problem_json()),
+}
+
+// Every route, buffered — the shape a test drives and the shape `http::serve`
+// would take as its `app`.
+pub fn app(req: http::Request) -> http::Response / {Desk} = collapse(answer(req))
+
+pub fn collapse(r: Reply) -> http::Response =
+  match r {
+    Buffered(response) -> response,
+    Stream(s) -> {status: s.head.status, headers: s.head.headers, body: drained(s.cursor)},
+  }
+
+// --- The connection ------------------------------------------------------------------
+//
+// `http::serve` serves nine of these ten routes as written, because its `app`
+// is `(Request) -> Response`. A streamed body is written as it is produced, so
+// the receipt route needs the connection — and ADR 0013 §2.4 is explicit that a
+// program wanting that writes its own loop. This is that loop, and nothing in it
+// re-implements HTTP: `read_head` accumulates, `parse_head` frames, `read_body`
+// decodes, `encode` writes a buffered response and `respond_chunked` writes a
+// streamed one. Two framing parsers that disagree is the failure §2 of the ADR
+// exists to prevent, and a service is not exempt from it.
+
+// The bounds this service runs under, written down. A record rather than a
+// global, an environment variable or a flag, so two runs of this program cannot
+// differ in what they refuse, and a test can quantify over them.
+pub fn limits() -> http::Limits = {
+  max_request_line: 8192,
+  max_header_bytes: 16384,
+  max_header_count: 64,
+  // A `Placement` is small. A megabyte would be a megabyte a peer can make the
+  // desk hold by sending one field.
+  max_body: 65536,
+  max_chunk_size: 65536,
+  max_chunk_line: 4096,
+  max_trailer_bytes: 4096,
+  max_keep_alive: 100,
+  // The receipt route streams a handful of chunks; this is far above it and far
+  // below the evaluator's nested-call bound, which `stream_chunks` spends one of
+  // per chunk.
+  max_stream_chunks: 1024,
+  // Equal on purpose: this loop passes one `Limits` to `read_head` for both the
+  // first read of a connection and the first read of a reused one, so the two
+  // bounds are the same number rather than two numbers that look the same.
+  // `std.http`'s own loop swaps the field instead, and can.
+  header_timeout_ms: 5000,
+  idle_timeout_ms: 5000,
+  body_timeout_ms: 15000,
+  write_timeout_ms: 15000,
+}
+
+pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Desk, net.write[conn]} = {
+  // A limit that is zero or negative is a configuration nobody meant, and it is
+  // refused here rather than turning into a service that answers 413 to
+  // everything.
+  http::check_limits(l);
+  turn(c, l, b"", l.max_keep_alive, false);
+  net.close[conn](c)
+}
+
+fn turn(c: Int, l: http::Limits, carried: Bytes, left: Int, reused: Bool) -> Unit
+  / {Desk, net.write[conn]} =
+  if left <= 0 {
+    ()
+  } else {
+    match http::read_head(c, carried, l, reused) {
+      // The peer went away. There is nothing to answer and nothing to say.
+      http::HeadClosed(_) -> (),
+      // An idle keep-alive connection is closed with no response: no request had
+      // started, so there is no request to answer. `read_head` decides it,
+      // because a head that *had* begun and then stalled is a 408 and deciding
+      // it here could not tell the two apart.
+      http::HeadIdle -> (),
+      http::HeadTimedOut ->
+        write_out(c, l, http::Get, http::Http11, false,
+          http::text_response(408, "the request head did not arrive\n")),
+      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left),
+    }
+  }
+
+fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
+  / {Desk, net.write[conn]} =
+  match http::parse_head(buf, l) {
+    // The head stopped mid-way with nothing more coming, or it ran past the
+    // bound without a terminator. Neither framed a message, and the two are
+    // different answers to the peer.
+    http::Incomplete ->
+      if complete {
+        write_out(c, l, http::Get, http::Http11, false,
+          http::text_response(400, "the request head never ended\n"))
+      } else {
+        write_out(c, l, http::Get, http::Http11, false,
+          http::text_response(431, "the request head never ended within the bound\n"))
+      },
+    // Every framing refusal closes the connection: what a refusal did not
+    // establish is exactly where the next message begins, so there is nothing
+    // to resynchronise to. That is why this branch never loops.
+    http::Refused(why) -> write_out(c, l, http::Get, http::Http11, false,
+      http::refusal_response(why)),
+    http::Parsed(h) -> continued(c, l, h, buf, left),
+  }
+
+fn continued(c: Int, l: http::Limits, h: http::Head, buf: Bytes, left: Int) -> Unit
+  / {Desk, net.write[conn]} = {
+  // A client that waits for a `100` it never gets is a hang, and a hang is the
+  // failure shape with nothing to read.
+  let told = if h.expects_continue {
+    send_all(c, http::continue_response(), l.write_timeout_ms)
+  } else {
+    true
+  };
+  if !told {
+    ()
+  } else {
+    // The body is read whatever the route does with it. An unread body is the
+    // next message's bytes as far as the connection is concerned, and framing
+    // the next request out of one is a smuggle the server performs on itself.
+    with_body(c, l, h, http::read_body(c, h.framing,
+      bytes_slice(buf, h.consumed, bytes_len(buf)), l), left)
+  }
+}
+
+fn with_body(c: Int, l: http::Limits, h: http::Head, body: http::BodyResult, left: Int) -> Unit
+  / {Desk, net.write[conn]} =
+  match body {
+    http::BodyTimedOut -> write_out(c, l, h.request.method, h.request.version, false,
+      http::text_response(408, "the request body did not arrive\n")),
+    http::BodyClosed -> (),
+    http::BodyRefused(why) -> write_out(c, l, h.request.method, h.request.version, false,
+      http::refusal_response(why)),
+    http::Body(got) -> answered(c, l, h, got, left),
+  }
+
+fn answered(c: Int, l: http::Limits, h: http::Head,
+            got: { bytes: Bytes, rest: Bytes, trailers: http::Headers }, left: Int) -> Unit
+  / {Desk, net.write[conn]} = {
+  let keep = h.keep_alive && left > 1;
+  let reply = answer(whole(h, got.bytes, got.trailers));
+  let wrote = match streamable(h.request.method, reply) {
+    Buffered(r) -> send_all(c, http::encode(h.request.method, h.request.version, keep, r),
+      l.write_timeout_ms),
+    // The one route that writes as it produces. `next_chunk`'s row is `{}`, so
+    // this call publishes `net.write[conn]` and nothing more than the reads that
+    // found the order.
+    Stream(s) -> http::respond_chunked(c, h.request.version, s.head, keep, l, s.cursor,
+      next_chunk),
+  };
+  if wrote && keep {
+    // Pipelined requests are answered in order by construction: one connection,
+    // one task, and the leftover buffer carried into the next turn.
+    turn(c, l, got.rest, left - 1, true)
+  } else {
+    ()
+  }
+}
+
+// A `HEAD` response carries no body, so there is nothing to stream: the cursor
+// is drained here and `http::encode` writes the `Content-Length` a `GET` would
+// have produced and no bytes after the head. Writing chunks to a `HEAD` is the
+// framing bug on the response side of the same coin as reading a body nobody
+// asked for.
+fn streamable(m: http::Method, r: Reply) -> Reply =
+  match m {
+    http::Head -> Buffered(collapse(r)),
+    _ -> r,
+  }
+
+// The head's request with the body and the trailers it was framed with.
+// Trailers stay in their own field: a trailer named `content-length`,
+// `transfer-encoding`, `host` or `authorization` changes nothing about framing,
+// routing or authorization, and merging them is a documented smuggling and
+// privilege-escalation route.
+fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request = {
+  method: h.request.method,
+  target: h.request.target,
+  path: h.request.path,
+  query: h.request.query,
+  authority: h.request.authority,
+  version: h.request.version,
+  headers: h.request.headers,
+  trailers: trailers,
+  body: body,
+}
+
+fn write_out(c: Int, l: http::Limits, m: http::Method, v: http::Version, keep: Bool,
+             r: http::Response) -> Unit / {net.write[conn]} = {
+  send_all(c, http::encode(m, v, keep, r), l.write_timeout_ms);
+  ()
+}
+
+pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
+  / {Desk, net.write[conn], net.write[listener]} =
+  if count <= 0 {
+    0
+  } else {
+    let c = net.accept[listener](listener);
+    if c == 0 {
+      0
+    } else {
+      serve_connection(c, l);
+      1 + serve(listener, l, count - 1)
+    }
+  }
+
+pub fn listen_and_serve(port: Int, count: Int) -> Int
+  / {Desk, net.write[conn], net.write[listener]} {
+  let listener = net.listen[listener](port);
+  let served = serve(listener, limits(), count);
+  net.close[listener](listener);
+  served
+}
+
+// The same service over TLS. Not one line above changes: TLS is the same `net`
+// effect over the same resource, because a row claims which resources a
+// computation touches and whether two computations contend — and an encrypted
+// connection and a plaintext one are the same resource contending the same way.
+// What says a listener is encrypted is this call and `ply hosts`, which prints
+// `net.listen_tls` on its own line with its own handler path.
+//
+// `credential` is a name. The certificate and the key are configured beside the
+// run — `ply run --host --tls desk=certs/desk.pem,certs/desk.key` — because
+// certificate bytes in the program would put a private key into a definition's
+// hash and into a store designed never to forget.
+pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
+  / {Desk, net.write[conn], net.write[listener]} {
+  let listener = net.listen_tls[listener](port, credential);
+  let served = serve(listener, limits(), count);
+  net.close[listener](listener);
+  served
+}
+
+// --- The desk, stocked and running ----------------------------------------------------
+//
+// The service cannot run until something answers `store` and `log`. W4 has the
+// database; until then the answer is two region-scoped cells, and the shape of
+// this function is the argument for putting the store behind an effect at all:
+// the handler discharges every `store` and `log` atom at the region boundary, so
+// `run` publishes `{net.write[conn], net.write[listener]}` and nothing else,
+// while every endpoint inside it still publishes exactly which resources it
+// touches. Swapping these clauses for a Postgres handler changes this function
+// and no other, and the endpoints' rows do not move because the resources did
+// not.
+//
+//     $ ply run examples/desk.ply --host        # after adding a `main` that calls this
+//     $ curl -sS localhost:8137/items
+//     $ curl -sS localhost:8137/orders -d '{"customer":"ada","lines":[{"sku":"bolt","qty":4}]}'
+//     $ curl -sS --raw localhost:8137/orders/1/receipt
+//
+// There is no `main` here: `examples/hello.ply` holds the only one under
+// `examples/`, so that `ply run examples` has an unambiguous entry point.
+pub fn run(port: Int, count: Int) -> Int / {net.write[conn], net.write[listener]} =
+  with_cell[items](seed_shelf()) { shelf -> {
+  with_cell[orders](seed_orders()) { book -> {
+    handle {
+      listen_and_serve(port, count)
+    } with {
+      store.all[items]() -> cell_get(shelf),
+      store.save[items](rows) -> cell_set(shelf, rows),
+      store.all[orders]() -> cell_get(book),
+      store.save[orders](rows) -> cell_set(book, rows),
+      // W5 makes observability an effect with a handler of its own. Until then
+      // the trail is dropped here — at the boundary, in one place a reader can
+      // see, rather than by there being no trail in the endpoints.
+      log.note(line) -> (),
+    }
+  } }
+  } }
+
+// The same desk, over TLS, differing in one call.
+pub fn run_tls(port: Int, credential: String, count: Int) -> Int
+  / {net.write[conn], net.write[listener]} =
+  with_cell[items](seed_shelf()) { shelf -> {
+  with_cell[orders](seed_orders()) { book -> {
+    handle {
+      listen_and_serve_tls(port, credential, count)
+    } with {
+      store.all[items]() -> cell_get(shelf),
+      store.save[items](rows) -> cell_set(shelf, rows),
+      store.all[orders]() -> cell_get(book),
+      store.save[orders](rows) -> cell_set(book, rows),
+      log.note(line) -> (),
+    }
+  } }
+  } }
+
+// --- What the desk is stocked with ------------------------------------------------
+
+pub fn seed_shelf() -> List<Item> = [
+  {sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 500},
+  {sku: "gasket", name: "copper gasket", price: 2.25m, on_hand: 12},
+  {sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 3},
+]
+
+pub fn seed_orders() -> List<Order> = [
+  {id: 1, customer: "ada", lines: [{sku: "bolt", qty: 10}], total: 4.00m, state: Open},
+  {id: 2, customer: "grace", lines: [{sku: "gasket", qty: 2}], total: 4.50m, state: Cancelled},
+]
+
+// --- Tests: the business, which needs no handler at all ----------------------------
+
+test "a total is an exact sum of exact products" {
+  assert_eq(total_of(seed_shelf(), [{sku: "bolt", qty: 10}]), 4.00m);
+  assert_eq(total_of(seed_shelf(), []), 0m);
+  assert_eq(
+    total_of(seed_shelf(), [{sku: "gasket", qty: 2}, {sku: "widget", qty: 1}]),
+    17.00m);
+
+  // The sum a Float would have got wrong.
+  assert_eq(
+    total_of([{sku: "a", name: "a", price: 0.1m, on_hand: 9},
+              {sku: "b", name: "b", price: 0.2m, on_hand: 9}],
+             [{sku: "a", qty: 1}, {sku: "b", qty: 1}]),
+    0.3m)
+}
+
+test "a line naming nothing on the shelf, and one the shelf cannot cover, are named back" {
+  assert_eq(unknown_skus(seed_shelf(), [{sku: "sprocket", qty: 1}]), ["sprocket"]);
+  assert_eq(unknown_skus(seed_shelf(), [{sku: "bolt", qty: 1}]), []);
+  assert_eq(short_skus(seed_shelf(), [{sku: "widget", qty: 4}]), ["widget"]);
+  assert_eq(short_skus(seed_shelf(), [{sku: "widget", qty: 3}]), [])
+}
+
+// Two lines for one sku are one draw on the shelf. Checked per line, three
+// widgets would cover two orders of two, and the drawdown would leave the shelf
+// holding minus one.
+test "two lines naming one sku are checked as one draw on the shelf" {
+  let doubled = [{sku: "widget", qty: 2}, {sku: "widget", qty: 2}];
+  assert_eq(short_skus(seed_shelf(), doubled), ["widget"]);
+  assert_eq(item_named(draw_down(seed_shelf(), doubled), "widget"),
+    Some({sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: -1}))
+}
+
+test "a quantity that is not positive is refused rather than clamped" {
+  assert(bad_qty([{sku: "bolt", qty: 0}]));
+  assert(bad_qty([{sku: "bolt", qty: 1}, {sku: "gasket", qty: -5}]));
+  assert(!bad_qty([{sku: "bolt", qty: 1}]));
+  assert(!bad_qty([]))
+}
+
+// A typed binder is the difference between a route that matches and one that
+// does not, so these are claims about the table's shape rather than about a
+// parser this file owns.
+test "an order id is a segment that parses as an Int, and nothing else routes" {
+  assert_eq(route_of(http::Get, "/orders/7"),
+    router::Found({endpoint: GetOrder, params: map_of_entries([{key: "id", value: "7"}])}));
+  assert_eq(route_of(http::Get, "/orders/seven"), router::NotFound);
+  assert_eq(route_of(http::Get, "/orders/+7"), router::NotFound);
+  assert_eq(route_of(http::Get, "/orders/7.0"), router::NotFound);
+  assert_eq(route_of(http::Get, "/orders/%D9%A7"), router::NotFound)
+}
+
+// --- Tests: the route table, which is a value ---------------------------------------
+
+test "the route table is unambiguous and well formed" {
+  assert_eq(router::conflicts(table()), []);
+  assert_eq(router::well_formed(table()), [])
+}
+
+test "a literal beats a parameter at the position they differ" {
+  assert_eq(route_of(http::Get, "/items/featured"),
+    router::Found({endpoint: Featured, params: map_new()}));
+  assert_eq(route_of(http::Get, "/items/bolt"),
+    router::Found({endpoint: GetItem, params: map_of_entries([{key: "sku", value: "bolt"}])}))
+}
+
+test "a path no route matches is NotFound, and one under another method names the methods" {
+  assert_eq(route_of(http::Get, "/nowhere"), router::NotFound);
+  assert_eq(route_of(http::Put, "/orders"),
+    router::MethodNotAllowed([http::Get, http::Post]));
+  assert_eq(route_of(http::Post, "/orders/1"), router::MethodNotAllowed([http::Delete, http::Get]))
+}
+
+// A trailing empty segment is kept rather than normalized away, so `/orders/` is
+// a two-segment path whose second segment is empty and matches neither route.
+// Two answers to "which path is this" is how a route and an authorization check
+// come to disagree.
+test "/orders and /orders/ are different paths" {
+  assert_eq(route_of(http::Get, "/orders"),
+    router::Found({endpoint: ListOrders, params: map_new()}));
+  assert_eq(route_of(http::Get, "/orders/"), router::NotFound);
+  assert_eq(router::normalize_path("/orders/"), "/orders")
+}
+
+// Percent-decoding happens per segment, after splitting, so `%2F` decodes to a
+// `/` inside one segment and can never introduce a boundary. This is the
+// path-traversal rule and it is worth its own test.
+test "a percent-encoded slash stays inside the segment it was written in" {
+  assert_eq(route_of(http::Get, "/items/a%2Fb"),
+    router::Found({endpoint: GetItem, params: map_of_entries([{key: "sku", value: "a/b"}])}))
+}
+
+test "a Rest segment captures every remaining segment, joined" {
+  assert_eq(route_of(http::Get, "/docs/orders/placing"),
+    router::Found({endpoint: Docs, params: map_of_entries([{key: "page", value: "orders/placing"}])}));
+  assert_eq(route_of(http::Get, "/docs"),
+    router::Found({endpoint: Docs, params: map_of_entries([{key: "page", value: ""}])}))
+}
+
+// --- Tests: every route, hermetically -----------------------------------------------
+//
+// A handler is a capability grant. Each test below hands the code under test
+// exactly the operations that route's row says it may use, so a route that
+// reached for anything else would fail with `unhandled effect` rather than
+// quietly touching a resource the test never accounted for.
+
+fn request(m: http::Method, path: String, body: Bytes) -> http::Request = {
+  method: m,
+  target: path,
+  path: path,
+  query: "",
+  authority: "localhost",
+  version: http::Http11,
+  headers: map_new(),
+  trailers: map_new(),
+  body: body,
+}
+
+fn body_string(r: http::Response) -> String = string_of_bytes(r.body)
+
+test "GET /health is pure and counts the table it is served from" {
+  let r = app(request(http::Get, "/health", b""));
+  assert_eq(r.status, 200);
+  assert_eq(json::decode_bytes(r.body, health_json()),
+    Ok({service: "parts desk", routes: 10}))
+}
+
+test "GET /docs serves a page, and names the pages when there is none" {
+  let ok = app(request(http::Get, "/docs/orders/cancelling", b""));
+  assert_eq(ok.status, 200);
+  assert_eq(body_string(ok),
+    "DELETE /orders/{id} puts the lines back on the shelf\n");
+  assert_eq(app(request(http::Get, "/docs/nothing", b"")).status, 404)
+}
+
+test "GET /items reads the shelf and touches nothing else" {
+  handle {
+    let r = app(request(http::Get, "/items", b""));
+    assert_eq(r.status, 200);
+    assert_eq(json::decode_bytes(r.body, json::list_json(item_json())), Ok(seed_shelf()))
+  } with {
+    store.all[items]() -> seed_shelf(),
+  }
+}
+
+// The literal route, which shares a resource with `/items/{sku}` and a
+// footprint with it too: two reads of one resource do not conflict, so the two
+// tests below are placed in the same concurrency group and run side by side.
+test "GET /items/featured is the shelf minus what is out of stock" {
+  handle {
+    let r = app(request(http::Get, "/items/featured", b""));
+    assert_eq(r.status, 200);
+    assert_eq(
+      json::decode_bytes(r.body, json::list_json(item_json())),
+      Ok(filter(seed_shelf(), |i: Item| i.on_hand > 0)))
+  } with {
+    store.all[items]() -> push(seed_shelf(),
+      {sku: "flange", name: "flange", price: 1.00m, on_hand: 0}),
+  }
+}
+
+test "GET /items/{sku} answers the item, and 404s the one nobody stocks" {
+  handle {
+    assert_eq(app(request(http::Get, "/items/gasket", b"")).status, 200);
+    let missing = app(request(http::Get, "/items/sprocket", b""));
+    assert_eq(missing.status, 404);
+    assert_eq(json::decode_bytes(missing.body, problem_json()),
+      Ok({error: "no such item", detail: "sprocket"}))
+  } with {
+    store.all[items]() -> seed_shelf(),
+  }
+}
+
+test "GET /orders reads the order book and cannot see the shelf" {
+  handle {
+    let r = app(request(http::Get, "/orders", b""));
+    assert_eq(r.status, 200);
+    assert_eq(json::decode_bytes(r.body, json::list_json(order_json())), Ok(seed_orders()))
+  } with {
+    store.all[orders]() -> seed_orders(),
+  }
+}
+
+test "GET /orders/{id:Int} answers one order, and an unparseable id routes nowhere" {
+  handle {
+    assert_eq(app(request(http::Get, "/orders/1", b"")).status, 200);
+    assert_eq(app(request(http::Get, "/orders/99", b"")).status, 404);
+    // Not a 400 from inside the endpoint: `seven` never parses, so no route
+    // matches and the answer comes from the table rather than from a check the
+    // handler had to remember to write.
+    let unrouted = app(request(http::Get, "/orders/seven", b""));
+    assert_eq(unrouted.status, 404);
+    assert_eq(json::decode_bytes(unrouted.body, problem_json()),
+      Ok({error: "no such route", detail: "/orders/seven"}))
+  } with {
+    store.all[orders]() -> seed_orders(),
+  }
+}
+
+test "POST /orders prices the lines, draws the shelf down and records a line" {
+  with_cell[items](seed_shelf()) { shelf -> {
+  with_cell[orders](seed_orders()) { book -> {
+  with_cell[trail]([]) { trail -> {
+    handle {
+      let r = app(request(http::Post, "/orders",
+        bytes_of_string("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}")));
+      assert_eq(r.status, 201);
+      assert_eq(json::decode_bytes(r.body, order_json()),
+        Ok({id: 3, customer: "hedy", lines: [{sku: "widget", qty: 2}],
+            total: 25.00m, state: Open}))
+    } with {
+      store.all[items]() -> cell_get(shelf),
+      store.save[items](rows) -> cell_set(shelf, rows),
+      store.all[orders]() -> cell_get(book),
+      store.save[orders](rows) -> cell_set(book, rows),
+      log.note(line) -> cell_set(trail, push(cell_get(trail), line)),
+    };
+    assert_eq(item_named(cell_get(shelf), "widget"),
+      Some({sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 1}));
+    assert_eq(len(cell_get(book)), 3);
+    assert_eq(cell_get(trail), ["placed 3 for hedy"])
+  } }
+  } }
+  } }
+}
+
+test "an order the shelf cannot cover writes nothing and says which sku" {
+  with_cell[items](seed_shelf()) { shelf -> {
+  with_cell[orders](seed_orders()) { book -> {
+    handle {
+      let r = app(request(http::Post, "/orders",
+        bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}")));
+      assert_eq(r.status, 409);
+      assert_eq(json::decode_bytes(r.body, problem_json()),
+        Ok({error: "out of stock", detail: "widget"}));
+
+      // The same refusal when the quantity is spread over two lines, which is
+      // the version a per-line check would have sold.
+      assert_eq(app(request(http::Post, "/orders", bytes_of_string(
+        "{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":2},"
+          ++ "{\"sku\":\"widget\",\"qty\":2}]}"))).status, 409)
+    } with {
+      store.all[items]() -> cell_get(shelf),
+      store.save[items](rows) -> cell_set(shelf, rows),
+      store.all[orders]() -> cell_get(book),
+      store.save[orders](rows) -> cell_set(book, rows),
+      log.note(line) -> (),
+    };
+    assert_eq(cell_get(shelf), seed_shelf());
+    assert_eq(cell_get(book), seed_orders())
+  } }
+  } }
+}
+
+test "a body that does not fit the type is refused by field and reason" {
+  handle {
+    let r = app(request(http::Post, "/orders",
+      bytes_of_string("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":\"two\"}]}")));
+    assert_eq(r.status, 400);
+    assert_eq(json::decode_bytes(r.body, problem_json()),
+      Ok({error: "malformed body",
+          detail: "$.lines[0].qty: expected a number, found a string"}))
+  } with {
+    store.all[items]() -> seed_shelf(),
+  }
+}
+
+test "DELETE /orders/{id} puts the lines back and cancels once" {
+  with_cell[items](seed_shelf()) { shelf -> {
+  with_cell[orders](seed_orders()) { book -> {
+  with_cell[trail]([]) { trail -> {
+    handle {
+      assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 200);
+      assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 409);
+      assert_eq(app(request(http::Delete, "/orders/99", b"")).status, 404)
+    } with {
+      store.all[items]() -> cell_get(shelf),
+      store.save[items](rows) -> cell_set(shelf, rows),
+      store.all[orders]() -> cell_get(book),
+      store.save[orders](rows) -> cell_set(book, rows),
+      log.note(line) -> cell_set(trail, push(cell_get(trail), line)),
+    };
+    assert_eq(item_named(cell_get(shelf), "bolt"),
+      Some({sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 510}));
+    assert_eq(cell_get(trail), ["cancelled 1"])
+  } }
+  } }
+  } }
+}
+
+test "a route nobody serves is 404 and a method nobody serves is 405 with Allow" {
+  let missing = app(request(http::Get, "/nowhere", b""));
+  assert_eq(missing.status, 404);
+  let wrong = app(request(http::Put, "/orders", b""));
+  assert_eq(wrong.status, 405);
+  assert_eq(map_get(wrong.headers, "allow"), Some(["GET, POST"]))
+}
+
+// --- Tests: the streamed receipt ------------------------------------------------------
+
+fn ada_order() -> Order =
+  {id: 1, customer: "ada", lines: [{sku: "bolt", qty: 10}], total: 4.00m, state: Open}
+
+test "a receipt is produced one line at a time and ends" {
+  let c = cursor_for(ada_order(), seed_shelf());
+  assert_eq(drained(c), bytes_of_string(
+    "receipt for order 1\ncustomer: ada\n  10 x bolt @ 0.40 = 4.00\ntotal: 4.00\n"));
+  assert_eq(len(chunks_of(c, [])), 3)
+}
+
+test "GET /orders/{id}/receipt streams, and a missing order does not" {
+  handle {
+    match receipt(map_of_entries([{key: "id", value: "1"}])) {
+      Stream(s) -> {
+        assert_eq(s.head.status, 200);
+        assert_eq(s.head.body, b"")
+      },
+      Buffered(_) -> panic("an order that exists is streamed"),
+    };
+    match receipt(map_of_entries([{key: "id", value: "99"}])) {
+      Buffered(r) -> assert_eq(r.status, 404),
+      Stream(_) -> panic("an order that does not exist has nothing to stream"),
+    }
+  } with {
+    store.all[orders]() -> [ada_order()],
+    store.all[items]() -> seed_shelf(),
+  }
+}
+
+// --- The whole service, over a simulated socket ---------------------------------------
+//
+// One function, and every test below it is a `det`, cacheable, hermetic test
+// over raw request bytes. `exchange` opens five region-scoped cells and hands
+// `serve_connection` a socket that is a list of chunks, a store that is two
+// cells and a log that is dropped — and because every atom the service can
+// perform is discharged here, `exchange`'s own row is empty. That is what makes
+// the service's framing behaviour testable with no port, no fixture directory
+// and no teardown.
+//
+// Dropping a whole atom is not a way to make these tests flaky: `net` is
+// `nondet`, so a `det` test that left `net.write[conn]` in its footprint is
+// `E0412` at compile time. Dropping one *operation* of a handled atom — the
+// `net.send` clause while keeping `net.recv` — is a run-time unhandled-effect
+// error instead, because a handler discharges an atom and those two are one
+// atom. That seam is real and this comment is where it is written down.
+
+type Exchange = { wrote: Bytes, sent: Int, closes: Int, shelf: List<Item>, book: List<Order> }
+
+fn first_of(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
+
+fn rest_of(queued: List<Bytes>) -> List<Bytes> = match queued { [_, ..rest] -> rest, _ -> [] }
+
+fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchange =
+  with_cell[inbox](inbox) { queue -> {
+  with_cell[outbox]([]) { sent -> {
+  with_cell[closed](0) { closes -> {
+  with_cell[items](shelf) { stock -> {
+  with_cell[orders](book) { orders -> {
+    handle {
+      serve_connection(7, limits())
+    } with {
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = cell_get(queue);
+        cell_set(queue, rest_of(queued));
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        cell_set(sent, push(cell_get(sent), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[conn](c) -> cell_set(closes, cell_get(closes) + 1),
+      store.all[items]() -> cell_get(stock),
+      store.save[items](rows) -> cell_set(stock, rows),
+      store.all[orders]() -> cell_get(orders),
+      store.save[orders](rows) -> cell_set(orders, rows),
+      log.note(line) -> (),
+    };
+    {
+      wrote: bytes_concat_all(cell_get(sent)),
+      // How many *responses* were written, counted as the writes that begin with
+      // a status line: `send_all` writes a buffered response in one, and
+      // `respond_chunked` writes a head and then chunks that begin with a hex
+      // size. Searching the joined bytes for a status line would count the one
+      // inside a refusal that quotes the version it refused.
+      sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
+      closes: cell_get(closes),
+      shelf: cell_get(stock),
+      book: cell_get(orders),
+    }
+  } }
+  } }
+  } }
+  } }
+  } }
+
+fn served(raw: Bytes) -> Exchange = exchange([raw], seed_shelf(), seed_orders())
+
+// The status of the first response written, or 0 when nothing was.
+fn status_of(raw: Bytes) -> Int =
+  match bytes_index_of(raw, b" ") {
+    None -> 0,
+    Some(sp) ->
+      match router::int_of_text(string_of_bytes_lossy(bytes_slice(raw, sp + 1,
+        if sp + 4 > bytes_len(raw) { bytes_len(raw) } else { sp + 4 }))) {
+        Some(n) -> n,
+        None -> 0,
+      },
+  }
+
+fn head_end(raw: Bytes) -> Int =
+  match bytes_index_of(raw, b"\r\n\r\n") { Some(at) -> at + 4, None -> bytes_len(raw) }
+
+fn get_line(path: String) -> Bytes =
+  bytes_of_string("GET " ++ path ++ " HTTP/1.1\r\nHost: desk.example\r\n\r\n")
+
+test "a request over the simulated socket is answered and the connection closed" {
+  let e = served(get_line("/health"));
+  assert_eq(status_of(e.wrote), 200);
+  assert_eq(e.closes, 1);
+  assert_eq(e.sent, 1)
+}
+
+// Pipelining is answered in order by construction: one connection, one task, and
+// the leftover buffer carried into the next turn. The bug this catches is a
+// server that frames the second request out of the first one's unread body.
+test "two pipelined requests are answered in order on one connection" {
+  let e = served(bytes_concat(get_line("/health"), get_line("/items")));
+  assert_eq(e.sent, 2);
+  assert_eq(e.closes, 1);
+  assert(bytes_index_of(e.wrote, b"\"service\":\"parts desk\"") != None);
+  assert(bytes_index_of(e.wrote, b"\"sku\":\"gasket\"") != None)
+}
+
+// A head split across three reads, one of the cuts falling inside the
+// terminator. This is the case a single `recv` passes and a real network fails,
+// and the carried three bytes in `Reading` are what make it pass here.
+test "a head whose terminator is split across two reads is still found" {
+  let whole = get_line("/health");
+  let cut = bytes_len(whole) - 2;
+  let e = exchange([bytes_slice(whole, 0, 12), bytes_slice(whole, 12, cut),
+                    bytes_slice(whole, cut, bytes_len(whole))], seed_shelf(), seed_orders());
+  assert_eq(status_of(e.wrote), 200);
+  assert_eq(e.sent, 1)
+}
+
+test "a posted order travels the whole connection and moves the store" {
+  let body = "{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"gasket\",\"qty\":2}]}";
+  let e = served(bytes_of_string(
+    "POST /orders HTTP/1.1\r\nHost: desk.example\r\nContent-Type: application/json\r\n"
+      ++ "Content-Length: " ++ int_to_string(bytes_len(bytes_of_string(body))) ++ "\r\n\r\n"
+      ++ body));
+  assert_eq(status_of(e.wrote), 201);
+  assert_eq(item_named(e.shelf, "gasket"),
+    Some({sku: "gasket", name: "copper gasket", price: 2.25m, on_hand: 10}));
+  assert_eq(len(e.book), 3)
+}
+
+// The streamed route over the socket: the response is chunked, and the bytes
+// between the chunk sizes are exactly what the buffered path would have sent.
+test "a receipt is written as chunks and ends with the terminating chunk" {
+  let e = served(get_line("/orders/1/receipt"));
+  assert_eq(status_of(e.wrote), 200);
+  assert(bytes_index_of(e.wrote, b"Transfer-Encoding: chunked\r\n") != None);
+  assert(bytes_index_of(e.wrote, b"Content-Length") == None);
+  assert(bytes_ends_with(e.wrote, b"0\r\n\r\n"));
+  // The chunk sizes are the only thing between the streamed bytes and the
+  // buffered ones, which is what the law at the foot of the file says.
+  assert(bytes_index_of(e.wrote, b"receipt for order 1\ncustomer: ada\n") != None);
+  assert(bytes_index_of(e.wrote, b"total: 4.00\n") != None)
+}
+
+// A HEAD is routed as the GET it mirrors, and `encode` is what drops the body:
+// the `Content-Length` is the one a GET would have produced, and not a byte of
+// body follows the head. The streamed route is drained rather than chunked,
+// because writing chunks to a HEAD is a framing bug on the response side.
+test "HEAD is answered like GET with the length it would have had and no body" {
+  let head = served(bytes_of_string("HEAD /items HTTP/1.1\r\nHost: d\r\n\r\n"));
+  let get = served(get_line("/items"));
+  // Byte for byte the GET's head — the same status, the same fields and the
+  // same `Content-Length` — and then nothing at all.
+  assert_eq(head.wrote, bytes_slice(get.wrote, 0, head_end(get.wrote)));
+  assert_eq(status_of(head.wrote), 200);
+  assert(bytes_index_of(head.wrote, bytes_of_string("Content-Length: "
+    ++ int_to_string(bytes_len(get.wrote) - head_end(get.wrote)))) != None);
+
+  let receipt = served(bytes_of_string("HEAD /orders/1/receipt HTTP/1.1\r\nHost: d\r\n\r\n"));
+  assert_eq(status_of(receipt.wrote), 200);
+  assert(bytes_index_of(receipt.wrote, b"Transfer-Encoding") == None);
+  assert(bytes_ends_with(receipt.wrote, b"\r\n\r\n"))
+}
+
+// `OPTIONS *` asks about the server rather than about a path, so it is not
+// routed at all — and its `Allow` is read off the table, so a route added below
+// changes this answer without anybody editing it.
+test "OPTIONS * answers the methods the table declares anywhere" {
+  let e = served(b"OPTIONS * HTTP/1.1\r\nHost: d\r\n\r\n");
+  assert_eq(status_of(e.wrote), 204);
+  assert(bytes_index_of(e.wrote, b"allow: DELETE, GET, POST\r\n") != None)
+}
+
+test "a peer that opens a connection and says nothing is closed without a response" {
+  let e = exchange([], seed_shelf(), seed_orders());
+  assert_eq(e.wrote, b"");
+  assert_eq(e.closes, 1)
+}
+
+// --- The same service over TLS ----------------------------------------------------
+//
+// Not one line of the service changes. TLS is the same `net` effect over the
+// same resource, so what differs is which listener was opened — which is the
+// whole of ADR 0013 §6.1, checked rather than asserted: the response bytes are
+// compared against the plaintext path's.
+//
+// The handler here grants sockets and nothing else, because `run` and `run_tls`
+// carry their own store: the cells inside them discharge every `store` and `log`
+// atom at the region boundary, which is why their published row is two `net`
+// atoms and why this test can drive the whole service with five clauses.
+
+fn over_socket(inbox: List<Bytes>, tls: Bool) -> {wrote: Bytes, sent: Int} =
+  with_cell[inbox](inbox) { queue -> {
+  with_cell[outbox]([]) { sent -> {
+    handle {
+      assert_eq(if tls { run_tls(8443, "desk", 1) } else { run(8137, 1) }, 1)
+    } with {
+      net.listen[listener](port) -> 1,
+      net.listen_tls[listener](port, credential) -> {
+        assert_eq(credential, "desk");
+        1
+      },
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = cell_get(queue);
+        cell_set(queue, rest_of(queued));
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        cell_set(sent, push(cell_get(sent), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[conn](c) -> (),
+    };
+    {
+      wrote: bytes_concat_all(cell_get(sent)),
+      sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
+    }
+  } }
+  } }
+
+test "the service answers the same bytes over a TLS listener as over a plain one" {
+  let encrypted = over_socket([get_line("/items")], true);
+  assert_eq(encrypted, over_socket([get_line("/items")], false));
+  assert_eq(status_of(encrypted.wrote), 200);
+  assert(bytes_index_of(encrypted.wrote, b"\"sku\":\"gasket\"") != None)
+}
+
+// The store is stocked from `seed_shelf`, and a request that moves it moves the
+// cell inside `run` rather than anything this test can see — which is the point
+// of the region: nothing the service writes escapes the handler that granted it.
+test "a listener serves exactly the connections it was asked for" {
+  let e = over_socket([bytes_concat(get_line("/health"), get_line("/orders"))], false);
+  assert_eq(status_of(e.wrote), 200);
+  assert_eq(e.sent, 2)
+}
+
+// --- One case per protocol refusal ---------------------------------------------------
+//
+// Every framing rule W3 refuses, driven end to end through this service rather
+// than through the parser alone: the status the peer is given, and the close.
+// `std.http` owns the rules; these are the regression coverage that the service
+// *answers* them — a parser that refuses and a server that then reads the next
+// request out of the refused message is still a smuggle.
+
+// The status the peer was given — and, for every case below rather than for the
+// ones a test author remembered, three properties that make a refusal a refusal:
+// exactly one response was written, the connection was closed, and neither the
+// shelf nor the order book moved. A connection reused after a refusal is a
+// connection two implementations disagree about the framing of, which is the
+// whole of the smuggling class.
+fn refused(raw: Bytes) -> Int = {
+  let e = served(raw);
+  assert_eq(e.sent, 1);
+  assert_eq(e.closes, 1);
+  assert_eq(e.shelf, seed_shelf());
+  assert_eq(e.book, seed_orders());
+  status_of(e.wrote)
+}
+
+test "Content-Length and Transfer-Encoding together are refused and nothing is read" {
+  let e = served(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
+  assert_eq(status_of(e.wrote), 400);
+  assert_eq(e.closes, 1);
+  assert_eq(e.sent, 1);
+  assert_eq(e.book, seed_orders())
+}
+
+test "two Content-Length lines are refused even when they agree" {
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"), 400);
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5, 5\r\n\r\nhello"), 400)
+}
+
+test "a Content-Length that is not one or more ASCII digits is refused" {
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: +5\r\n\r\nhello"), 400);
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length:  5x\r\n\r\nhello"), 400);
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 0x5\r\n\r\nhello"), 400)
+}
+
+test "a Content-Length past this service's max_body is refused before a body byte" {
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 99999999\r\n\r\n"), 413)
+}
+
+test "a transfer coding that is not chunked, and one that is not last, are refused" {
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: gzip\r\n\r\n"), 501);
+  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"), 400)
+}
+
+test "a bare LF terminator, an obs-fold and a space before a colon are each refused" {
+  assert_eq(refused(b"GET /health HTTP/1.1\nHost: d\r\n\r\n"), 400);
+  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost: d\r\n obsolete\r\n\r\n"), 400);
+  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost : d\r\n\r\n"), 400)
+}
+
+test "HTTP/1.1 with no Host, and with two, are each refused" {
+  assert_eq(refused(b"GET /health HTTP/1.1\r\n\r\n"), 400);
+  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), 400)
+}
+
+test "a version that is not 1.0 or 1.1 is 505, and no version at all is 400" {
+  assert_eq(refused(b"GET /health HTTP/2.0\r\nHost: d\r\n\r\n"), 505);
+  assert_eq(refused(b"GET /health\r\nHost: d\r\n\r\n"), 400)
+}
+
+test "an authority-form target and a lone asterisk under GET are each refused" {
+  assert_eq(refused(b"GET desk.example:80 HTTP/1.1\r\nHost: d\r\n\r\n"), 400);
+  assert_eq(refused(b"GET * HTTP/1.1\r\nHost: d\r\n\r\n"), 400)
+}
+
+test "a chunk size that is empty, not hex, or unterminated is refused" {
+  assert_eq(refused(bytes_concat(
+    b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n",
+    b"\r\nhello\r\n0\r\n\r\n")), 400);
+  assert_eq(refused(bytes_concat(
+    b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n",
+    b"zz\r\nhello\r\n0\r\n\r\n")), 400);
+  assert_eq(refused(bytes_concat(
+    b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n",
+    b"5\r\nhelloXX0\r\n\r\n")), 400)
+}
+
+// A trailer named `content-length` changes no framing decision and a trailer
+// named `authorization` never appears among the headers. Merging them is a
+// documented smuggling and privilege-escalation route.
+test "trailers arrive in their own field and are never merged into the headers" {
+  let e = served(bytes_concat(
+    b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n",
+    b"2\r\n{}\r\n0\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n"));
+  // The body was framed by the chunks and not by the trailer, so the desk saw
+  // `{}` and refused it as a `Placement` rather than as a framing error.
+  assert_eq(status_of(e.wrote), 400);
+  assert_eq(e.closes, 1)
+}
+
+test "a request line longer than this service will hold is 414" {
+  assert_eq(refused(bytes_concat(bytes_concat(b"GET /", filler(9000)),
+    b" HTTP/1.1\r\nHost: d\r\n\r\n")), 414)
+}
+
+test "more header bytes than this service will hold is 431" {
+  assert_eq(refused(bytes_concat(bytes_concat(b"GET /health HTTP/1.1\r\nHost: d\r\nX: ",
+    filler(20000)), b"\r\n\r\n")), 431)
+}
+
+fn filler(n: Int) -> Bytes = fill_to(b"", n)
+
+fn fill_to(so_far: Bytes, n: Int) -> Bytes =
+  if bytes_len(so_far) >= n {
+    so_far
+  } else {
+    fill_to(bytes_concat(so_far, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), n)
+  }
+
+// --- Laws the route table being data makes possible -------------------------------------
+
+// A route the matcher cannot reach is a line of documentation for something the
+// service does not do. The sample path is built from the pattern itself — a
+// captured segment becomes `:name`, and no literal in the table begins with a
+// colon — so this quantifies over every tag rather than over the paths a test
+// author remembered to write.
+fn sample_segment(s: router::Segment) -> String =
+  match s {
+    router::Literal(text) -> text,
+    router::Param(name) -> ":" ++ name,
+    router::Rest(name) -> ":" ++ name,
+    // A typed binder only matches a segment that parses, so the sample has to
+    // parse; no literal in the table is one of these three words.
+    router::Typed(binding) -> sample_of_kind(binding.kind),
+  }
+
+fn sample_of_kind(kind: router::ParamType) -> String =
+  match kind {
+    router::IntParam -> "7",
+    router::DecimalParam -> "7.5",
+    router::BoolParam -> "true",
+  }
+
+fn sample_path(path: List<router::Segment>) -> String =
+  fold(path, "", |acc: String, s: router::Segment| acc ++ "/" ++ sample_segment(s))
+
+fn sample_params(path: List<router::Segment>) -> Map<String, String> =
+  fold(path, map_new(), |acc: Map<String, String>, s: router::Segment|
+    match s {
+      router::Literal(_) -> acc,
+      router::Param(name) -> map_insert(acc, name, ":" ++ name),
+      router::Rest(name) -> map_insert(acc, name, ":" ++ name),
+      router::Typed(binding) -> map_insert(acc, binding.name, sample_of_kind(binding.kind)),
+    })
+
+fn route_for(t: List<router::Route<Endpoint>>, e: Endpoint) -> Option<router::Route<Endpoint>> =
+  fold(t, None, |found: Option<router::Route<Endpoint>>, r: router::Route<Endpoint>|
+    if r.endpoint == e { Some(r) } else { found })
+
+pub fn reachable(e: Endpoint) -> Bool =
+  match route_for(table(), e) {
+    None -> false,
+    Some(r) ->
+      router::route(table(), r.method, sample_path(r.path))
+        == router::Found({endpoint: e, params: sample_params(r.path)}),
+  }
+
+law "every endpoint the desk can dispatch is reachable through the table"
+  forall (e: Endpoint) {
+    reachable(e)
+  }
+
+// The property a framework enforces with a macro is here a value a law asserts.
+// A tie is broken by position in the list, which is a defect rather than a
+// feature, and `conflicts` is what names it.
+law "no two routes overlap ambiguously, and every pattern is well formed" {
+  conflicts_and_defects() == 0
+}
+
+pub fn conflicts_and_defects() -> Int =
+  len(router::conflicts(table())) + len(router::well_formed(table()))
+
+// The claim a streaming encoder has to earn and almost never states: the bytes
+// pulled out of the cursor are the bytes a buffered body would have held. It is
+// quantified over the order, so a line count the tests never tried is covered.
+law "a streamed receipt is byte-for-byte what a buffered one would have been"
+  forall (o: Order) {
+    drained(cursor_for(o, seed_shelf())) == buffered_receipt(o)
+  }
+
+pub fn buffered_receipt(o: Order) -> Bytes =
+  bytes_concat_all(push(push([opening_line(o)],
+    bytes_concat_all(map(o.lines, |l: Line| item_line(seed_shelf(), l)))),
+    closing_line(o)))
+
+// Drawing a shelf down and putting the same lines back is the identity, which is
+// what makes a cancellation safe to answer twice — the second one is refused by
+// `state`, and this says the first one moved exactly what it should have.
+law "a drawdown is undone exactly by putting the same lines back"
+  forall (lines: List<Line>) {
+    put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf()
+  }

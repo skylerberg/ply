@@ -14,15 +14,31 @@
 //! kernel's business, so a program that depends on the boundary is wrong against
 //! the real handler and the twin cannot save it. Only the byte stream is a
 //! shared claim.
+//!
+//! **A TLS listener is scripted exactly as a plaintext one is**, and that is the
+//! claim rather than a shortcut. Above the boundary a TLS connection is the same
+//! resource, read and written by the same code, carrying the same decrypted
+//! bytes — which is why TLS is not a separate effect — so a service whose
+//! listener is `net.listen_tls` is exercised hermetically here with no change to
+//! its source. What the twin does mirror is the *credential*: a name the run was
+//! not configured with is `E0429` on this side too, through the same
+//! [`Credentials`] the socket handler resolves against, because a test that
+//! could not reach that diagnostic would be a test of a different program.
 
 use super::{
     Handles, Net, Op, no_connection_scripted, not_a_listener, not_a_stream, unknown_handle,
 };
+use crate::tls;
 use ply_core::ty::Resource;
 use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
 use ply_span::{Diagnostic, Span, codes};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+fn some(v: Value) -> Value {
+    Value::ctor("Some", vec![v])
+}
 
 #[derive(Default)]
 struct SimState {
@@ -37,6 +53,11 @@ struct SimState {
 pub struct SimNet {
     state: Mutex<SimState>,
     handles: Handles,
+    /// The credential names this simulated run was configured with — the twin's
+    /// stand-in for what `--tls` gave the socket handler. Names only: a
+    /// simulated handshake would be a second TLS implementation, which is the
+    /// one thing ADR 0013 §6.1 refuses outright.
+    credentials: BTreeSet<String>,
 }
 
 impl SimNet {
@@ -44,6 +65,14 @@ impl SimNet {
     /// connection is the chunks `recv` answers with before it reports the peer
     /// is done.
     pub fn new(connections: Vec<Vec<Vec<u8>>>) -> SimNet {
+        SimNet::with_credentials(connections, Vec::<String>::new())
+    }
+
+    /// The same script, for a service whose listener is `net.listen_tls`.
+    pub fn with_credentials(
+        connections: Vec<Vec<Vec<u8>>>,
+        credentials: Vec<impl Into<String>>,
+    ) -> SimNet {
         SimNet {
             state: Mutex::new(SimState {
                 inbound: connections
@@ -53,7 +82,14 @@ impl SimNet {
                 ..SimState::default()
             }),
             handles: Handles::new(),
+            credentials: credentials.into_iter().map(Into::into).collect(),
         }
+    }
+
+    fn bind(&self, at: &Resource) -> i64 {
+        let handle = self.handles.open(Some(at));
+        lock(&self.state).listeners.push(handle);
+        handle
     }
 
     /// Everything the program wrote to a connection, in order. What a test
@@ -78,6 +114,7 @@ impl Net for SimNet {
     fn path(&self, op: Op) -> &'static str {
         match op {
             Op::Listen => "ply_host::tcp::sim::listen",
+            Op::ListenTls => "ply_host::tls::sim::listen",
             Op::Accept => "ply_host::tcp::sim::accept",
             Op::Recv => "ply_host::tcp::sim::recv",
             Op::Send => "ply_host::tcp::sim::send",
@@ -86,9 +123,27 @@ impl Net for SimNet {
     }
 
     fn listen(&self, at: &Resource, _port: u16, _span: Span) -> Result<HostAnswer, Diagnostic> {
-        let handle = self.handles.open(Some(at));
-        lock(&self.state).listeners.push(handle);
-        Ok(HostAnswer::Value(Value::Int(handle)))
+        Ok(HostAnswer::Value(Value::Int(self.bind(at))))
+    }
+
+    /// The credential is checked and then the listener is an ordinary one: the
+    /// bytes a program reads off a TLS connection are the bytes it reads off any
+    /// other, and the twin's whole job is to be that program's other binding.
+    fn listen_tls(
+        &self,
+        at: &Resource,
+        _port: u16,
+        credential: &str,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        if !self.credentials.contains(credential) {
+            return Err(tls::unknown_credential(
+                credential,
+                self.credentials.iter().map(String::as_str),
+                span,
+            ));
+        }
+        Ok(HostAnswer::Value(Value::Int(self.bind(at))))
     }
 
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
@@ -108,11 +163,16 @@ impl Net for SimNet {
         Ok(HostAnswer::Value(Value::Int(handle)))
     }
 
+    /// The twin never answers `None`. A deadline is a property of a socket and
+    /// a script has nothing to wait for, so a test that needs one writes a
+    /// `handle` clause that answers `None` — which is hermetic, `det` and
+    /// cacheable, where a simulated clock here would be neither.
     fn recv(
         &self,
         at: &Resource,
         conn: i64,
         max: usize,
+        _timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
         self.handles.check(conn, at, span)?;
@@ -123,12 +183,12 @@ impl Net for SimNet {
         // An exhausted script is a peer that has stopped sending, which is the
         // empty answer a real `recv` gives at end of stream.
         let Some(mut chunk) = chunks.pop_front() else {
-            return Ok(HostAnswer::Value(Value::bytes([])));
+            return Ok(HostAnswer::Value(some(Value::bytes([]))));
         };
         if chunk.len() > max {
             chunks.push_front(chunk.split_off(max));
         }
-        Ok(HostAnswer::Value(Value::bytes(chunk)))
+        Ok(HostAnswer::Value(some(Value::bytes(chunk))))
     }
 
     fn send(
@@ -136,6 +196,7 @@ impl Net for SimNet {
         at: &Resource,
         conn: i64,
         payload: &[u8],
+        _timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
         self.handles.check(conn, at, span)?;
@@ -148,7 +209,7 @@ impl Net for SimNet {
             .entry(conn)
             .or_default()
             .extend_from_slice(payload);
-        Ok(HostAnswer::Value(Value::Int(payload.len() as i64)))
+        Ok(HostAnswer::Value(some(Value::Int(payload.len() as i64))))
     }
 
     fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {

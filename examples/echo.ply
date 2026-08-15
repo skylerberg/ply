@@ -9,21 +9,33 @@
 // It declares no `main`, so `ply run examples` still has exactly one entry
 // point.
 
-import std.net (net, drain)
+import std.net (net, drain, send_all)
 
 fn greeting() -> Bytes = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply"
+
+// Every `net` operation that can block now carries a deadline, and it is an
+// argument rather than a cancellation: a deadline is one `setsockopt` inside a
+// job that already owns the socket, where a cancel path would need a token
+// registry and a race between the cancel and the completion. Being made to write
+// the number down is the point — `timeout_ms <= 0` is a runtime error, so a
+// caller that wants no deadline writes a large one where a reader can see it.
+fn deadline_ms() -> Int = 5000
 
 // Accept one connection, read until the peer stops talking, answer, and close.
 // The row is inferred and checked against the annotation: this cannot touch a
 // socket it did not name.
+//
+// `send_all` rather than `send`: one `send` is free to take fewer bytes than it
+// was given, and a short write nobody looked at is a truncated response the
+// client reads as a complete one. `false` is a deadline or a dead peer.
 pub fn serve_once(port: Int) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen[listener](port);
   let c = net.accept[listener](l);
-  let request = drain(c, b"");
-  let sent = net.send[conn](c, greeting());
+  let request = drain(c, b"", deadline_ms());
+  let sent = send_all(c, greeting(), deadline_ms());
   net.close[conn](c);
   net.close[listener](l);
-  bytes_len(request) + sent
+  if sent { bytes_len(request) + bytes_len(greeting()) } else { 0 }
 }
 
 fn first_chunk(queued: List<Bytes>) -> Bytes =
@@ -51,14 +63,14 @@ test "the imported effect drives a whole connection over an in-memory socket" {
       net.listen[listener](p) -> 1,
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -74,12 +86,12 @@ test "the imported effect drives a whole connection over an in-memory socket" {
 test "drain reads to end of stream rather than to the first short chunk" {
   with_cell[inbox]([b"a", b"bc", b"", b"never read"]) { inbox -> {
     handle {
-      assert_eq(drain(3, b""), b"abc")
+      assert_eq(drain(3, b"", deadline_ms()), b"abc")
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
     };
     assert_eq(cell_get(inbox), [b"never read"])

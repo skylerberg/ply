@@ -232,6 +232,7 @@ fn row(atoms: &[(&str, Mode, Option<&str>)], tail: Option<&str>) -> RowExpr {
                 span: any(),
             })
             .collect(),
+        aliases: Vec::new(),
         tail: tail.map(id),
         span: any(),
     }
@@ -2818,6 +2819,7 @@ fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
         ("bytes_at", "(Bytes, Int) -> Int"),
         ("bytes_slice", "(Bytes, Int, Int) -> Bytes"),
         ("bytes_concat", "(Bytes, Bytes) -> Bytes"),
+        ("bytes_concat_all", "(List<Bytes>) -> Bytes"),
         ("bytes_of_string", "(String) -> Bytes"),
         ("bytes_is_utf8", "(Bytes) -> Bool"),
         ("bytes_index_of", "(Bytes, Bytes) -> Option<Int>"),
@@ -3311,6 +3313,7 @@ fn a_restored_definition_still_has_its_clauses_typed() {
                     KnownDef {
                         scheme: info.scheme.clone(),
                         footprint: info.footprint.clone(),
+                        performed: info.performed.clone(),
                     },
                 )
             })

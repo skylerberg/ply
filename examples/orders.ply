@@ -33,7 +33,7 @@
 // the entry a host binds, and `crates/ply-cli/tests/json_endpoint.rs` drives it
 // over a real socket.
 
-import std.net (net)
+import std.net (net, send_all)
 import std.json
 
 // --- The payloads -----------------------------------------------------------
@@ -133,6 +133,13 @@ pub fn max_head() -> Int = 4096
 pub fn max_body() -> Int = 65536
 
 pub fn max_chunks() -> Int = 64
+
+// Every blocking `net` operation carries a deadline, and it is an argument
+// rather than a cancellation: one `setsockopt` inside a job that already owns
+// the socket, with no token registry and no race between a cancel and a
+// completion. `timeout_ms <= 0` is a runtime error, so a caller that wants no
+// deadline writes a large number down where a reader can see it.
+pub fn deadline_ms() -> Int = 5000
 
 // The index just past the first CRLF CRLF, or -1 while the head is unfinished.
 // One `memmem` pass, stopping at the first occurrence.
@@ -309,15 +316,21 @@ fn route(r: Request, body: Bytes) -> Bytes =
 // Read until the head ends, the peer stops talking, or one of the two bounds is
 // reached. A request split across packets is ordinary TCP, so it is read here
 // and tested below.
+// `None` is a deadline and an empty `Some` is an ending. Both stop this loop,
+// and the endpoint answers the same 400 to either, but they are different
+// answers and the parser keeps them apart rather than collapsing them here.
 pub fn read_head(c: Int, so_far: Bytes, left: Int) -> Bytes / {net.write[conn]} =
   if left <= 0 || head_end(so_far) >= 0 || bytes_len(so_far) >= max_head() {
     so_far
   } else {
-    let chunk = net.recv[conn](c, max_head());
-    if bytes_len(chunk) == 0 {
-      so_far
-    } else {
-      read_head(c, bytes_concat(so_far, chunk), left - 1)
+    match net.recv[conn](c, max_head(), deadline_ms()) {
+      None -> so_far,
+      Some(chunk) ->
+        if bytes_len(chunk) == 0 {
+          so_far
+        } else {
+          read_head(c, bytes_concat(so_far, chunk), left - 1)
+        },
     }
   }
 
@@ -328,11 +341,14 @@ pub fn read_body(c: Int, so_far: Bytes, want: Int, left: Int) -> Bytes / {net.wr
   if left <= 0 || bytes_len(so_far) >= want {
     so_far
   } else {
-    let chunk = net.recv[conn](c, max_body());
-    if bytes_len(chunk) == 0 {
-      so_far
-    } else {
-      read_body(c, bytes_concat(so_far, chunk), want, left - 1)
+    match net.recv[conn](c, max_body(), deadline_ms()) {
+      None -> so_far,
+      Some(chunk) ->
+        if bytes_len(chunk) == 0 {
+          so_far
+        } else {
+          read_body(c, bytes_concat(so_far, chunk), want, left - 1)
+        },
     }
   }
 
@@ -340,10 +356,14 @@ pub fn read_body(c: Int, so_far: Bytes, want: Int, left: Int) -> Bytes / {net.wr
 // too, so what was read past the head is kept rather than re-read — a second
 // `recv` for bytes already in hand would block against a client that has
 // finished sending and is waiting for its answer.
+// `send_all` loops over a partial write rather than asserting that there is
+// none: one `send` is free to take fewer bytes than it was given, and a short
+// write nobody looked at is a truncated response the client reads as a complete
+// one.
 pub fn serve_one(c: Int) -> Unit / {net.write[conn]} {
   let raw = read_head(c, b"", max_chunks());
   let out = answer_from(c, raw);
-  assert_eq(net.send[conn](c, out), bytes_len(out));
+  send_all(c, out, deadline_ms());
   net.close[conn](c)
 }
 
@@ -585,14 +605,14 @@ test "the simulated socket carries a posted order to its receipt" {
       net.listen[listener](p) -> 1,
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -617,14 +637,14 @@ test "a request whose body arrives after its head is read whole" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         let queued = cell_get(inbox);
         cell_set(inbox, later_chunks(queued));
-        first_chunk(queued)
+        Some(first_chunk(queued))
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -644,13 +664,13 @@ test "a request that arrives in one packet costs exactly one read" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         cell_set(reads, cell_get(reads) + 1);
-        if cell_get(reads) == 1 { request_bytes(ada()) } else { b"" }
+        if cell_get(reads) == 1 { Some(request_bytes(ada())) } else { Some(b"") }
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -665,10 +685,10 @@ test "a peer that says nothing is answered rather than waited on" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> b"",
-      net.send[conn](c, payload) -> {
+      net.recv[conn](c, max, timeout_ms) -> Some(b""),
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -687,17 +707,17 @@ test "a body shorter than its Content-Length is refused rather than decoded" {
     handle {
       serve_one(3)
     } with {
-      net.recv[conn](c, max) -> {
+      net.recv[conn](c, max, timeout_ms) -> {
         cell_set(reads, cell_get(reads) + 1);
         if cell_get(reads) == 1 {
-          bytes_concat(post(ada()), bytes_of_string("{\"customer\""))
+          Some(bytes_concat(post(ada()), bytes_of_string("{\"customer\"")))
         } else {
-          b""
+          Some(b"")
         }
       },
-      net.send[conn](c, payload) -> {
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };
@@ -716,10 +736,10 @@ test "each accepted connection is answered exactly once" {
       net.listen[listener](p) -> 1,
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
-      net.recv[conn](c, max) -> request_bytes(ada()),
-      net.send[conn](c, payload) -> {
+      net.recv[conn](c, max, timeout_ms) -> Some(request_bytes(ada())),
+      net.send[conn](c, payload, timeout_ms) -> {
         cell_set(outbox, push(cell_get(outbox), payload));
-        bytes_len(payload)
+        Some(bytes_len(payload))
       },
       net.close[conn](c) -> (),
     };

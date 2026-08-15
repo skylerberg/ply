@@ -189,6 +189,15 @@ pub struct Normalizer<'a, 't> {
     /// referred to its dependencies by name would reintroduce exactly the
     /// name-dependence content addressing exists to remove.
     refs_by_name: bool,
+    /// While a row's atoms are being encoded for sorting, the references they
+    /// mention are held here instead of joining [`Self::refs`].
+    ///
+    /// `refs` is in first-mention order and that order is what numbers the
+    /// effect slots an atom's encoding carries. A row is a set, so the order its
+    /// atoms were *written* in may not reach that numbering — or reordering an
+    /// annotation would move the definition's hash, which is the one thing the
+    /// sort below exists to prevent.
+    deferred: Option<Vec<NodeId>>,
 }
 
 impl<'a, 't> Normalizer<'a, 't> {
@@ -212,6 +221,7 @@ impl<'a, 't> Normalizer<'a, 't> {
             ty_params: Vec::new(),
             row_params: Vec::new(),
             refs_by_name: false,
+            deferred: None,
         }
     }
 
@@ -272,11 +282,21 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    fn node_ref(&mut self, node: NodeId) {
+    /// Records a reference in first-mention order, unless a row is holding its
+    /// mentions back until it knows the order its atoms sort into.
+    fn mention(&mut self, node: NodeId) {
+        if let Some(held) = &mut self.deferred {
+            held.push(node);
+            return;
+        }
         if !self.seen[node.0] {
             self.seen[node.0] = true;
             self.refs.push(node);
         }
+    }
+
+    fn node_ref(&mut self, node: NodeId) {
+        self.mention(node);
         if self.refs_by_name {
             self.tag(tag::REF_NAME);
             let name = self.index.nodes[node.0].name.clone();
@@ -588,16 +608,35 @@ impl<'a, 't> Normalizer<'a, 't> {
     /// A row is a set, so its atoms are sorted by their own encoding and
     /// deduplicated before being written: reordering an annotation is as free as
     /// reformatting it.
+    ///
+    /// The references an atom mentions are held back until the sort has run and
+    /// then committed in sorted order, because first-mention order is what
+    /// numbers the effect slots the atoms themselves carry. Committing them as
+    /// written would leave the sorted *bytes* canonical and the numbering inside
+    /// them decided by the order somebody typed — which is the same annotation
+    /// hashing two ways, and an `effect set` makes it routine: a set's expansion
+    /// is spliced in wherever the set is named, beside atoms written by hand.
     fn row(&mut self, r: &'a RowExpr) {
         self.tag(tag::ROW);
-        let mut atoms = Vec::with_capacity(r.atoms.len());
+        let mut atoms: Vec<(Vec<u8>, Vec<NodeId>)> = Vec::with_capacity(r.atoms.len());
         for a in &r.atoms {
-            atoms.push(self.capture(|s| s.atom(a)));
+            let outer = self.deferred.replace(Vec::new());
+            let bytes = self.capture(|s| s.atom(a));
+            let held = self.deferred.take().unwrap_or_default();
+            self.deferred = outer;
+            atoms.push((bytes, held));
         }
-        atoms.sort_unstable();
-        atoms.dedup();
+        // Stable, and by the bytes alone: a `NodeId` is a source position, and
+        // breaking a tie with one would put the order of the file back into the
+        // hash. Two atoms that tie encode identically, so either order writes
+        // the same row.
+        atoms.sort_by(|a, b| a.0.cmp(&b.0));
+        atoms.dedup_by(|a, b| a.0 == b.0);
         self.len(atoms.len());
-        for bytes in atoms {
+        for (bytes, held) in atoms {
+            for node in held {
+                self.mention(node);
+            }
             self.out.extend_from_slice(&bytes);
         }
         match &r.tail {

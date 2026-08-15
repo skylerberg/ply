@@ -72,8 +72,10 @@ fn check_types_prints_signatures_and_footprints() {
     let out = ply(dir.path()).args(["check", "--types"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = stdout_of(&out);
+    // W3 moved the row onto its own line under the type, because at a hundred
+    // endpoints a row run onto the end of a signature is a row nobody reads.
     assert!(
-        text.contains("rows : () -> List<Int> / {m.db.read[users]}"),
+        text.contains("     rows : () -> List<Int>\n            / {m.db.read[users]}\n"),
         "got:\n{text}"
     );
     assert!(text.contains("effect db"));

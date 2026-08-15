@@ -561,39 +561,26 @@ fn member(e: Member, depth: Int) -> Bytes =
 fn wrap(open: Bytes, inner: Bytes, close: Bytes) -> Bytes =
   bytes_concat(open, bytes_concat(inner, close))
 
-// `bytes_concat` copies, so folding one across k pieces copies the accumulated
-// prefix k times — quadratic, and unusable on a document of any size. Merging
-// adjacent pairs until one is left copies each byte once per pass and there are
-// log2(k) passes. There is no join builtin; if one lands, this is what it
-// replaces.
-type Merge = { out: List<Bytes>, held: Bytes, holding: Bool }
-
-fn join_all(pieces: List<Bytes>) -> Bytes =
-  match pieces {
-    [] -> b"",
-    [only] -> only,
-    _ -> join_all(merge_pass(pieces)),
-  }
-
-fn merge_pass(pieces: List<Bytes>) -> List<Bytes> =
-  merge_end(fold(pieces, {out: [], held: b"", holding: false}, |m: Merge, piece: Bytes|
-    if m.holding {
-      ({out: push(m.out, bytes_concat(m.held, piece)), held: b"", holding: false})
-    } else {
-      ({out: m.out, held: piece, holding: true})
-    }))
-
-fn merge_end(m: Merge) -> List<Bytes> = if m.holding { push(m.out, m.held) } else { m.out }
-
+// `bytes_concat_all` is one allocation over the whole list, which is what W3 added
+// it for. What was here before merged adjacent pairs until one piece was left,
+// and it was quadratic anyway: each pass accumulated with `push`, and `push`
+// copies the `List` it is given. An array of 4,000 numbers cost 233.8 ms to
+// serialize, and the number of elements in a response is a program's data.
+//
+// Interleaving the separator has the same shape and the same answer: map the
+// separator onto every piece but the first, then join once.
 fn join_with(pieces: List<Bytes>, sep: Bytes) -> Bytes =
-  join_all(fold(pieces, [], |acc: List<Bytes>, p: Bytes|
-    if len(acc) == 0 { [p] } else { push(push(acc, sep), p) }))
+  match pieces {
+    [first, ..rest] ->
+      bytes_concat(first, bytes_concat_all(map(rest, |p: Bytes| bytes_concat(sep, p)))),
+    [] -> b"",
+  }
 
 // --- The serializer: strings ------------------------------------------------
 
 fn quote(s: String) -> Bytes = {
   let raw = bytes_of_string(s);
-  bytes_concat(b"\"", bytes_concat(join_all(escape_runs(raw, 0, [])), b"\""))
+  bytes_concat(b"\"", bytes_concat(bytes_concat_all(escape_runs(raw, 0, [])), b"\""))
 }
 
 // The mirror of `string_chunks`: one native scan per run of bytes that need no
@@ -1006,7 +993,7 @@ fn b64_alphabet() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 fn b64_symbol(v: Int) -> Bytes = bytes_slice(b64_alphabet(), v, v + 1)
 
 pub fn base64_encode(raw: Bytes) -> String =
-  string_of_bytes(join_all(map(range(0, (bytes_len(raw) + 2) / 3), |g: Int| b64_group(raw, g * 3))))
+  string_of_bytes(bytes_concat_all(map(range(0, (bytes_len(raw) + 2) / 3), |g: Int| b64_group(raw, g * 3))))
 
 fn b64_group(raw: Bytes, i: Int) -> Bytes = {
   let n = bytes_len(raw);
@@ -1038,7 +1025,7 @@ pub fn base64_decode(text: String) -> Result<Bytes, DecodeError> = {
   if bytes_len(raw) % 4 != 0 {
     Err(decode_error("a base64 string's length must be a multiple of 4"))
   } else {
-    decode_map(b64_groups(raw, 0, []), |pieces: List<Bytes>| join_all(pieces))
+    decode_map(b64_groups(raw, 0, []), |pieces: List<Bytes>| bytes_concat_all(pieces))
   }
 }
 
@@ -1581,6 +1568,20 @@ fn collect_prices(ls: List<Json>, acc: List<Decimal>) -> Result<List<Decimal>, D
 // --- Tests: the round trip --------------------------------------------------
 
 fn stable(src: Bytes) -> Bool = to_bytes(parsed(src)) == src
+
+// A document's size is a program's data, and an encoder that accumulated with
+// `push` cost the square of it — an array of 4,000 numbers took 233.8 ms to
+// serialize where the same array now takes 19.5 ms. This is that path at a size
+// the old shape was already unusable at, asserted for what it produces rather
+// than for how long it took.
+test "a large array renders and parses back to itself" {
+  let big = Array(map(range(0, 2000), |i: Int| Number(decimal_of_int(i))));
+  let text = to_string(big);
+  assert_eq(string_len(text), 8891);
+  assert_eq(parse(bytes_of_string(text)), Ok(big));
+  let joined = Array(map(range(0, 500), |i: Int| Str("value")));
+  assert_eq(parse(to_bytes(joined)), Ok(joined))
+}
 
 test "rendering is canonical, so a rendered document parses to itself" {
   assert(stable(b"null"));

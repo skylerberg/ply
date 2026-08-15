@@ -239,18 +239,47 @@ pub fn exports_digest(exports: &[NameRef]) -> ContentHash {
 pub struct CachedDef {
     pub scheme: Scheme,
     pub footprint: Footprint,
+    /// What row inference computed for the body, which a declared row may be
+    /// wider than. Stored because gate 1 restores a skipped file's definitions
+    /// without walking a body, and `ply check --explain` must print the same
+    /// bytes warm as cold — otherwise the reviewing command's output is a
+    /// function of what the cache held.
+    ///
+    /// Provenance: it enters no hash, no cache key, no scheduling decision and
+    /// no determinism verdict.
+    #[serde(default)]
+    pub performed: Footprint,
+    /// The `effect set` names the row was written with, in source order. Also
+    /// provenance, and also stored so `--explain` does not depend on the cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_aliases: Vec<Symbol>,
     /// See [`witness_holds`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
 }
 
 impl CachedDef {
+    /// `performed` starts equal to `footprint`, which is what it is for a
+    /// definition with no annotation and the honest reading of "nothing narrower
+    /// is known".
     pub fn new(scheme: Scheme, footprint: Footprint) -> CachedDef {
         CachedDef {
             scheme,
+            performed: footprint.clone(),
             footprint,
+            row_aliases: Vec::new(),
             names: Vec::new(),
         }
+    }
+
+    pub fn performing(mut self, performed: Footprint) -> CachedDef {
+        self.performed = performed;
+        self
+    }
+
+    pub fn written_as(mut self, row_aliases: Vec<Symbol>) -> CachedDef {
+        self.row_aliases = row_aliases;
+        self
     }
 
     pub fn witnessed_by(mut self, names: Vec<NameRef>) -> CachedDef {
@@ -269,6 +298,8 @@ impl CachedDef {
         CachedDef {
             scheme: canonicalize_scheme(&self.scheme),
             footprint: self.footprint,
+            performed: self.performed,
+            row_aliases: self.row_aliases,
             names: canonical_names(self.names),
         }
     }

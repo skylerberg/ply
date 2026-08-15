@@ -360,6 +360,11 @@ pub(crate) fn encode_def(def: &CachedDef) -> Vec<u8> {
     put_names(&mut w, &def.names);
     put_scheme(&mut w, &def.scheme);
     put_footprint(&mut w, &def.footprint);
+    put_footprint(&mut w, &def.performed);
+    w.count(def.row_aliases.len());
+    for alias in &def.row_aliases {
+        w.symbol(alias);
+    }
     w.tag(tag::END);
     w.finish()
 }
@@ -371,11 +376,19 @@ pub(crate) fn decode_def(bytes: &[u8]) -> Decoded<CachedDef> {
     let names = get_names(&mut r)?;
     let scheme = get_scheme(&mut r)?;
     let footprint = get_footprint(&mut r)?;
+    let performed = get_footprint(&mut r)?;
+    let count = r.count(WHAT)?;
+    let mut row_aliases = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        row_aliases.push(r.symbol(WHAT)?);
+    }
     r.tag(tag::END, WHAT)?;
     r.end(WHAT)?;
     Ok(CachedDef {
         scheme,
         footprint,
+        performed,
+        row_aliases,
         names,
     })
 }

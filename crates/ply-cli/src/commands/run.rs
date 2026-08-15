@@ -41,7 +41,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     // After the entry point is known and before anything evaluates: a bad
     // registration is a start-up failure, and a hermetic run resolves nothing at
     // all, so the default path cannot be broken by a registry it never consults.
-    let hosts = match Hosts::open(&loaded.check, args.host) {
+    let hosts = match Hosts::open(&loaded.check, args.host, &args.tls.tls) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
@@ -129,15 +129,19 @@ fn print_binding(hosts: &Hosts, style: Style) {
         return;
     }
     let listing = hosts.listing();
+    let transport = hosts.transport();
     println!(
         "{IND}{}",
         style.dim(&format!(
             "binding host · {} {} · {}",
             listing.rows.len(),
             plural(listing.rows.len(), "operation"),
-            listing.digest_short(),
+            crate::hosts::digest_short(listing, transport.as_ref()),
         ))
     );
+    for line in crate::hosts::handshake_lines(&hosts.handshakes()) {
+        println!("{IND}{}", style.dim(&line));
+    }
 }
 
 /// Under `both`, the authoritative engine's answer is what `main` produced and

@@ -1130,6 +1130,10 @@ impl Decoder<'_> {
         })?;
         Ok(RowExpr {
             atoms,
+            // A decoded body is the normalized form, where an alias name was
+            // erased. There is nothing to restore and nothing that depended on
+            // it.
+            aliases: Vec::new(),
             tail,
             span: Span::DUMMY,
         })

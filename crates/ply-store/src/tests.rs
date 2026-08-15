@@ -2049,8 +2049,13 @@ fn pin_fingerprint() -> SourceFingerprint {
     }
 }
 
+/// `performed` is deliberately narrower than `footprint` and `row_aliases` is
+/// deliberately non-empty: a pin over a value that happened to take the default
+/// would not move when the field's encoding did.
 fn pin_def() -> CachedDef {
     CachedDef::new(counted_scheme(9, 4), footprint())
+        .performing(Footprint::empty())
+        .written_as(vec![ply_span::Symbol::new("Web")])
         .witnessed_by(vec![NameRef::new("user.User", hash(3))])
 }
 
@@ -2139,7 +2144,7 @@ fn the_front_end_entry_encoding_is_pinned() {
 }
 
 const PINNED_FINGERPRINT: &str = "02e7e6340261171838cb49303958e371ae61d01db729090dec71f8fa7896a003";
-const PINNED_DEF: &str = "6d1312f0f06072ba7f40f0b201b0a2f8005d0d0fe1d3b44c110f8b6b15a99644";
+const PINNED_DEF: &str = "edbd2fa35344f8a5fd38f3e745727cd96ca1d7c57255560c0064004b249c6aab";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
 const PINNED_BODY: &str = "a7b6ea731ed0e31bcbee6e4b7f8b0c3666406807ef11b62475861bdef4dd080d";
