@@ -47,6 +47,20 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The `std.*` modules one source names. A module that does not parse names
+/// nothing: the caller's own parse is what reports that.
+fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
+    let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
+        return Vec::new();
+    };
+    module
+        .imports
+        .iter()
+        .map(|i| i.module_name())
+        .filter(ply_std::is_std)
+        .collect()
+}
+
 /// A fixture is often a deliberately broken program, so anything that does not
 /// parse or resolve is not this test's business and is counted as skipped
 /// rather than failed.
@@ -60,11 +74,36 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         let id = map.add(path, text.clone());
         loaded.push((id, name, text));
     }
+    // Demand-driven, exactly as `ply`'s own loader is: a corpus that imports
+    // nothing from `std` gets nothing, so a one-file fixture stays the program
+    // it is rather than acquiring the stdlib's definitions and tests.
+    let mut next = 0;
+    while next < loaded.len() {
+        let (id, name, text) = &loaded[next];
+        next += 1;
+        let wanted = std_imports(*id, name, text);
+        for module in wanted {
+            if loaded.iter().any(|(_, n, _)| *n == module) {
+                continue;
+            }
+            let Some(source) = ply_std::source(&module) else {
+                continue;
+            };
+            let id = map.add(ply_std::pseudo_path(&module), source.to_string());
+            loaded.push((id, module, source.to_string()));
+        }
+    }
     let inputs: Vec<_> = loaded
         .iter()
         .map(|(id, name, text)| (*id, name.clone(), text.as_str()))
         .collect();
-    let program = parse_program(inputs).ok()?;
+    let mut program = parse_program(inputs).ok()?;
+    // A `derive` declares no name and every walker skips it, so a harness that
+    // forgets to expand runs a program whose generated definitions silently do
+    // not exist.
+    if !ply_derive::expand_program(&mut program).is_empty() {
+        return None;
+    }
     let resolved = resolve(&program).ok()?;
     Some((program, resolved))
 }

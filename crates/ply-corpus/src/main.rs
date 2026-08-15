@@ -39,6 +39,9 @@ enum Command {
     /// Price a request: what one costs per layer, and what the endpoint
     /// sustains under load. The number W6's decision on M9 turns on.
     Serve(ServeArgs),
+    /// Price what W2 put on the request path: a derived JSON codec, `Map`, and
+    /// what derivation costs the front end and the cache.
+    Payload(PayloadArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -264,26 +267,53 @@ struct ServeArgs {
     /// against the call budget, so a point costs `requests` nested calls.
     #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
     concurrency: Vec<u32>,
+    /// Filler header lines the client's request carries, per load point. Zero is
+    /// `curl`; eight is about what a browser sends, which is the length W1's
+    /// scans were quadratic-feeling on.
+    #[arg(long, value_delimiter = ',', default_values_t = [0usize])]
+    load_headers: Vec<usize>,
     /// Drop the per-request ladder, which is the slow half.
     #[arg(long)]
     no_ladder: bool,
     /// Drop the load table, which is the half that needs a built `ply`.
     #[arg(long)]
     no_load: bool,
+    /// Also measure the endpoint with W1's `fold`-based scans, so the byte
+    /// builtins' before and after are one table taken on one machine.
+    #[arg(long)]
+    baseline: bool,
     #[arg(long)]
     json: bool,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    let ladder = if args.no_ladder {
-        None
+    let parsers: &[ply_corpus::serve::Parser] = if args.baseline {
+        &[
+            ply_corpus::serve::Parser::W1Folds,
+            ply_corpus::serve::Parser::Native,
+        ]
     } else {
-        Some(ply_corpus::serve::ladder(
-            &args.repo,
-            args.ladder_requests,
-            args.repeats,
-        )?)
+        &[ply_corpus::serve::Parser::Native]
     };
+
+    let mut ladders = Vec::new();
+    let mut heads = Vec::new();
+    if !args.no_ladder {
+        for &parser in parsers {
+            ladders.push(ply_corpus::serve::ladder(
+                &args.repo,
+                parser,
+                args.ladder_requests,
+                args.repeats,
+            )?);
+            heads.extend(ply_corpus::serve::head_sweep(
+                &args.repo,
+                parser,
+                args.ladder_requests,
+                args.repeats,
+            )?);
+        }
+    }
 
     let mut load = Vec::new();
     if !args.no_load {
@@ -291,35 +321,145 @@ fn serve(args: ServeArgs) -> Result<()> {
             Some(path) => path.clone(),
             None => ply_corpus::serve::ply_binary()?,
         };
-        // The sequential endpoint is `examples/hello.ply` as written, and it
-        // serves one connection at a time however many arrive — so it is
-        // reported at concurrency 1 alone. Sweeping it would measure a queue.
-        load.push(ply_corpus::serve::load(
-            &args.repo,
-            &ply,
-            ply_corpus::serve::Shape::Sequential,
-            1,
-            args.requests,
-        )?);
-        for &concurrency in &args.concurrency {
-            load.push(ply_corpus::serve::load(
-                &args.repo,
-                &ply,
-                ply_corpus::serve::Shape::Concurrent,
-                concurrency,
-                args.requests,
-            )?);
-            load.push(ply_corpus::serve::load_floor(concurrency, args.requests)?);
+        for &headers in &args.load_headers {
+            for &parser in parsers {
+                // The sequential endpoint is `examples/hello.ply` as written,
+                // and it serves one connection at a time however many arrive —
+                // so it is reported at concurrency 1 alone. Sweeping it would
+                // measure a queue.
+                load.push(ply_corpus::serve::load(
+                    &args.repo,
+                    &ply,
+                    ply_corpus::serve::Shape::Sequential,
+                    parser,
+                    headers,
+                    1,
+                    args.requests,
+                )?);
+                for &concurrency in &args.concurrency {
+                    load.push(ply_corpus::serve::load(
+                        &args.repo,
+                        &ply,
+                        ply_corpus::serve::Shape::Concurrent,
+                        parser,
+                        headers,
+                        concurrency,
+                        args.requests,
+                    )?);
+                }
+            }
+            for &concurrency in &args.concurrency {
+                load.push(ply_corpus::serve::load_floor(
+                    headers,
+                    concurrency,
+                    args.requests,
+                )?);
+            }
         }
     }
 
-    let out = ply_corpus::serve::Measurements { ladder, load };
+    let out = ply_corpus::serve::Measurements {
+        ladders,
+        heads,
+        load,
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print!("{}", ply_corpus::serve::render(&out));
     }
     Ok(())
+}
+
+#[derive(Args, Debug)]
+struct PayloadArgs {
+    /// Line items per JSON payload. Forty is about four kilobytes, which is the
+    /// size a real order body arrives at.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 40, 200, 1000])]
+    lines: Vec<usize>,
+    /// Encodes and decodes per payload size.
+    #[arg(long, default_value_t = 200)]
+    iterations: u32,
+    /// `lines:pad` pairs for the table that separates a decode's per-field cost
+    /// from its per-byte one. The default holds the line count still and grows
+    /// one string field, which is the only way the two come apart.
+    #[arg(long, value_delimiter = ',', default_values_t = [
+        String::from("40:0"),
+        String::from("40:100"),
+        String::from("40:400"),
+        String::from("40:1600"),
+    ])]
+    shape: Vec<String>,
+    /// Entries per `Map` measurement.
+    #[arg(long, value_delimiter = ',', default_values_t = [16usize, 256, 4_096, 65_536])]
+    entries: Vec<usize>,
+    /// Type counts the derivation comparison is taken at.
+    #[arg(long, value_delimiter = ',', default_values_t = [50usize, 200, 500])]
+    types: Vec<usize>,
+    /// Types per module in that comparison.
+    #[arg(long, default_value_t = 10)]
+    types_per_module: usize,
+    /// Processes the `map_keys` order check spawns. Two is the minimum that can
+    /// see a per-process hasher seed at all.
+    #[arg(long, default_value_t = 4)]
+    processes: usize,
+    /// The `ply` binary the order check drives.
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Drop the derivation comparison, which is the slow half: it compiles and
+    /// runs six whole projects.
+    #[arg(long)]
+    no_derivation: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn payload(args: PayloadArgs) -> Result<()> {
+    let ply = match &args.ply {
+        Some(path) => path.clone(),
+        None => ply_corpus::payload::ply_binary()?,
+    };
+    let shape: Vec<(usize, usize)> = args
+        .shape
+        .iter()
+        .map(|s| parse_shape(s))
+        .collect::<Result<_>>()?;
+    let out = ply_corpus::payload::Measurements {
+        json: ply_corpus::payload::json_throughput(&args.lines, args.iterations, args.repeats)?,
+        shape: ply_corpus::payload::json_shape(&shape, args.iterations, args.repeats)?,
+        maps: ply_corpus::payload::map_ops(&args.entries, args.repeats)?,
+        order: Some(ply_corpus::payload::map_order(&ply, args.processes)?),
+        derivation: if args.no_derivation {
+            Vec::new()
+        } else {
+            ply_corpus::payload::derivation_cost(&args.types, args.types_per_module, args.repeats)?
+        },
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", ply_corpus::payload::render(&out));
+    }
+    Ok(())
+}
+
+/// `lines:pad` — the two numbers that have to move independently for the table
+/// to say anything.
+fn parse_shape(point: &str) -> Result<(usize, usize)> {
+    let (lines, pad) = point
+        .split_once(':')
+        .with_context(|| format!("`{point}` is not `lines:pad`"))?;
+    Ok((
+        lines
+            .trim()
+            .parse()
+            .with_context(|| format!("`{lines}` is not a number"))?,
+        pad.trim()
+            .parse()
+            .with_context(|| format!("`{pad}` is not a number"))?,
+    ))
 }
 
 #[derive(Args, Debug)]
@@ -421,6 +561,7 @@ fn run() -> Result<()> {
         Command::Sim(args) => simulate(args),
         Command::Prove(args) => prove(args),
         Command::Serve(args) => serve(args),
+        Command::Payload(args) => payload(args),
     }
 }
 

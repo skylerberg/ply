@@ -96,7 +96,12 @@ request path. `serve` is the number W6's decision on M9 turns on.
 
 ```
 cargo run --release -p ply-corpus -- serve --repo . [--requests N] [--concurrency 1,8,32] [--json]
+cargo run --release -p ply-corpus -- serve --repo . --baseline --load-headers 0,8
 ```
+
+`--baseline` adds W1's `fold`-based scans as a second column everywhere, so the
+before and after of the byte builtins are one table taken on one machine rather
+than a number quoted from a milestone ago.
 
 It needs no corpus. The program under measurement is `examples/hello.ply`
 itself, read from `--repo` and rewritten only in its port and connection count,
@@ -120,17 +125,54 @@ cost and no timer inside the machine has to be trusted:
 connection count, which is what makes their difference ADR 0008 §5's twin
 comparison priced rather than a comparison of two different programs.
 
-The second drives the real `ply` binary over loopback from client threads and
+The second is the head-length sweep, and it is what ADR 0012 §5's exit
+criterion is stated in: the same `answer` over heads grown by adding header
+lines the parser never reads, so every point parses the same three fields and
+differs only in how much buffer a scan crosses. The table prints the ratio it
+found at both ends rather than a pinned number, because the ratio is the claim
+and the machine is not: at 84 times the length W1's folds cost tens of times as
+much and the byte builtins cost about once as much. A `µs/byte` column that
+falls as the head grows is the claim — a request's cost is a function of fields
+parsed rather than of bytes received.
+
+The third drives the real `ply` binary over loopback from client threads and
 reports what a client observed — throughput and p50/p95/p99 — for the sequential
 endpoint, for a task-per-connection variant on the production scheduler, and for
 a Rust server answering the same bytes. Latency there is client-observed and
 includes the client, which is why the `rust-floor` row is on the same table
-rather than in prose.
+rather than in prose. `--load-headers` says how long a head the client sends at
+each point, and the column is printed: a load number taken at one head length
+says nothing about another under W1's scans, and very nearly everything under
+W2's.
 
-**One request is not one number.** The endpoint's cost is a function of head
-length — every scan folds over the buffer — so a `serve` table is only
+**One request is not one number.** The endpoint's cost was a function of head
+length while every scan folded over the buffer, so a `serve` table is only
 meaningful beside the request it was taken with. `REQUEST` is a 63-byte head;
-a browser sends five to ten times that.
+a browser sends five to ten times that, which is `--load-headers 8`.
+
+## What `payload` adds
+
+`serve` prices a request with no body. `payload` prices what W2 put on the path
+once there is one: a derived JSON codec, `Map`, and derivation's own cost to the
+front end and the cache.
+
+```
+cargo run --release -p ply-corpus -- payload [--lines 1,40,200] [--shape 40:0,40:1600] [--json]
+```
+
+| section | question |
+| --- | --- |
+| JSON | encode and decode megabytes per second through a *derived* codec, at payload sizes an endpoint receives |
+| shape | whether a decode is priced by the fields it visits or the bytes it crosses, with `json::parse` timed apart from the codec above it |
+| `Map` | insert, get, `map_keys` and `map_fold` at four sizes, with the `fold` scaffold subtracted **and printed** |
+| order | `map_keys` compared across separate processes and across three insertion orders |
+| derivation | two projects differing only in whether their types carry a `derive`: definition count, cache size, cold and warm check, cold and warm test |
+
+The shape table is the head sweep's question asked of a payload: `--shape
+lines:pad` holds the line count still and widens one string field, so the field
+count is fixed down a column while the byte count grows. A flat `µs/req` down
+that column means the cost is the fields; a rising one would mean a scan is
+still crossing the buffer per byte.
 
 ## Reproducing a corpus
 

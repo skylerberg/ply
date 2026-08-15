@@ -18,7 +18,7 @@ use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct Checked {
     hashes: HashOutput,
@@ -31,10 +31,14 @@ fn parse(files: &[(&str, &str)]) -> (Program, Resolved) {
         .iter()
         .enumerate()
         .map(|(i, (name, source))| (SourceId(i as u32), ModuleName::from_dotted(name), *source));
-    let program = match ply_syntax::parse_program(inputs) {
+    let mut program = match ply_syntax::parse_program(inputs) {
         Ok(program) => program,
         Err(diags) => panic!("program did not parse: {diags:#?}"),
     };
+    let diags = ply_derive::expand_program(&mut program);
+    if !diags.is_empty() {
+        panic!("program did not expand: {diags:#?}");
+    }
     let resolved = match ply_syntax::resolve(&program) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
@@ -434,16 +438,16 @@ fn self_recursion_round_trips() {
 }
 
 /// A mutually recursive component's bytes label each intra-component reference
-/// with the class the *previous* refinement round assigned, and a round that put
-/// every member in one class labels every reference `0`. Which member calls
-/// which is therefore not in the bytes, and cannot be, so reconstruction refuses
-/// rather than wiring the cycle to whichever member happens to sort first.
+/// with the class refinement assigned, and refinement runs to a *labelled* fixed
+/// point — so the label a reference mentions is the label its referent is filed
+/// under, and which member calls which is recoverable. This is the property the
+/// whole cycle encoding rests on: without it `f -> g, g -> h, h -> f` and
+/// `f -> h, h -> g, g -> f` would encode identically and collide.
 ///
-/// The bodies are still stored, still verify against their keys, and still make
-/// every definition that *references* the cycle reconstructable up to the point
-/// the cycle is reached.
+/// `verify` inside `reconstruct` is what proves the wiring, since a cycle wired
+/// the other way round re-hashes to the other member's key.
 #[test]
-fn a_mutually_recursive_component_is_refused_rather_than_miswired() {
+fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     let original = compile(&[(
         "m",
         r#"
@@ -461,13 +465,43 @@ fn a_mutually_recursive_component_is_refused_rather_than_miswired() {
     assert_ne!(a, b, "one payload, two class indices");
     assert!(a.verify(even) && b.verify(odd));
 
-    let diags =
-        reconstruct(&original.bodies).expect_err("a miswired cycle must not be handed back");
+    let (rebuilt, names) = rebuild(&original);
+    assert_eq!(rebuilt.hashes.defs.len(), 2);
+    assert_eq!(names.len(), 2);
+}
+
+/// Two three-cycles that differ only in the direction they are wired. Under a
+/// labelling the refinement stopped short of, every reference would read `class
+/// 0` and the two would be one definition set.
+#[test]
+fn two_cycles_wired_in_opposite_directions_do_not_collide() {
+    let clockwise = compile(&[(
+        "m",
+        r#"
+        fn f(n: Int) -> Int = g(n - 1) + 1
+        fn g(n: Int) -> Int = h(n - 1) + 2
+        fn h(n: Int) -> Int = f(n - 1) + 3
+        "#,
+    )]);
+    let widdershins = compile(&[(
+        "m",
+        r#"
+        fn f(n: Int) -> Int = h(n - 1) + 1
+        fn h(n: Int) -> Int = g(n - 1) + 3
+        fn g(n: Int) -> Int = f(n - 1) + 2
+        "#,
+    )]);
+
+    let one: BTreeSet<DefHash> = clockwise.hashes.defs.values().copied().collect();
+    let other: BTreeSet<DefHash> = widdershins.hashes.defs.values().copied().collect();
+    assert_eq!(one.len(), 3, "three distinguishable members");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == ply_span::codes::CACHE_CORRUPT)
+        one.is_disjoint(&other),
+        "the two wirings are different computations and must not share a hash"
     );
+
+    rebuild(&clockwise);
+    rebuild(&widdershins);
 }
 
 #[test]
@@ -641,10 +675,15 @@ fn the_examples_reconstruct() {
     files.sort();
     assert!(!files.is_empty(), "the examples moved");
 
-    let borrowed: Vec<(&str, &str)> = files
+    let mut borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
+    // The corpus imports `std.net`, which `ply` pulls in on demand; this
+    // harness has no import graph to walk, so it loads the shipped set.
+    for (name, source) in ply_std::sources() {
+        borrowed.push((name, source));
+    }
     assert_interfaces_survive(&borrowed);
 }
 

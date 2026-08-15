@@ -163,6 +163,8 @@ fn func(name: &str, params: &[&str], body: Expr) -> Item {
         params: params.iter().map(|p| param(p)).collect(),
         ret: None,
         effects: None,
+        constraints: Vec::new(),
+        derived: None,
         spec: Vec::new(),
         body,
         span: Span::DUMMY,
@@ -305,6 +307,8 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                 params: vec![typed_param("u", ty)],
                 ret: Some(ty_con("String", vec![])),
                 effects: None,
+                constraints: Vec::new(),
+                derived: None,
                 spec: Vec::new(),
                 body: e(ExprKind::Match {
                     scrutinee: Box::new(var("u")),
@@ -624,6 +628,8 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
                 tail: None,
                 span: Span::DUMMY,
             }),
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body: int(0),
             span: Span::DUMMY,
@@ -1015,6 +1021,8 @@ fn an_absent_annotation_differs_from_a_written_one() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
@@ -1037,6 +1045,8 @@ fn a_generic_parameter_is_positional_not_named() {
             params: vec![typed_param("x", used[0]), typed_param("y", used[1])],
             ret: None,
             effects: None,
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
@@ -1062,6 +1072,8 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
@@ -1079,6 +1091,8 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             params: vec![typed_param("x", "Int")],
             ret: None,
             effects: None,
+            constraints: Vec::new(),
+            derived: None,
             spec: Vec::new(),
             body: var("x"),
             span: Span::DUMMY,
@@ -2159,4 +2173,133 @@ law "a debit lowers a balance"
             .replace("debit(b, n) <= b", "debit(x, n) <= x"),
     );
     assert_eq!(rebound.laws, base.laws, "a binder is a level, not a name");
+}
+
+// ---- `where derivable(D, a)` is part of the published signature ----
+
+fn constrained(param: &str, constraints: &[(Deriver, &str)]) -> Vec<Item> {
+    vec![Item::Fn(Box::new(FnDef {
+        vis: Visibility::Private,
+        name: id("f"),
+        generics: Generics {
+            types: vec![id(param)],
+            effects: Vec::new(),
+        },
+        params: vec![param_of("x", TypeExpr::Var(id(param)))],
+        ret: Some(TypeExpr::Var(id(param))),
+        effects: None,
+        constraints: constraints
+            .iter()
+            .map(|(deriver, on)| Constraint {
+                deriver: *deriver,
+                deriver_span: Span::DUMMY,
+                param: id(on),
+                span: Span::DUMMY,
+            })
+            .collect(),
+        derived: None,
+        spec: Vec::new(),
+        body: var("x"),
+        span: Span::DUMMY,
+    }))]
+}
+
+fn param_of(name: &str, ty: TypeExpr) -> Param {
+    Param {
+        name: id(name),
+        ty: Some(ty),
+        span: Span::DUMMY,
+    }
+}
+
+/// Not a taste call. Gate 2 rechecks a definition only when its own hash moved,
+/// and a caller's hash moves only when a callee's does — so an erased constraint
+/// would leave a caller accepted against a signature that no longer admits it.
+#[test]
+fn adding_a_constraint_changes_the_definition_hash() {
+    let bare = hash_of(constrained("a", &[]), "f");
+    let json = hash_of(constrained("a", &[(Deriver::Json, "a")]), "f");
+    let ord = hash_of(constrained("a", &[(Deriver::Ord, "a")]), "f");
+
+    assert_ne!(
+        bare, json,
+        "a constraint is part of the published signature"
+    );
+    assert_ne!(json, ord, "which deriver is constrained is part of it too");
+}
+
+#[test]
+fn reordering_or_repeating_constraints_changes_no_hash() {
+    let one = hash_of(
+        constrained("a", &[(Deriver::Json, "a"), (Deriver::Ord, "a")]),
+        "f",
+    );
+    let other = hash_of(
+        constrained("a", &[(Deriver::Ord, "a"), (Deriver::Json, "a")]),
+        "f",
+    );
+    let repeated = hash_of(
+        constrained(
+            "a",
+            &[
+                (Deriver::Ord, "a"),
+                (Deriver::Json, "a"),
+                (Deriver::Ord, "a"),
+            ],
+        ),
+        "f",
+    );
+
+    assert_eq!(one, other, "constraints are a set, not a sequence");
+    assert_eq!(one, repeated, "a repeated constraint says nothing new");
+}
+
+#[test]
+fn renaming_a_constrained_type_parameter_changes_no_hash() {
+    let a = hash_of(constrained("a", &[(Deriver::Json, "a")]), "f");
+    let elem = hash_of(constrained("elem", &[(Deriver::Json, "elem")]), "f");
+    assert_eq!(a, elem, "a type parameter is a level, not a name");
+}
+
+/// A constraint the signature does not bind is an error the checker reports, and
+/// a hash may not depend on a name the definition cannot reach.
+#[test]
+fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
+    let bare = hash_of(constrained("a", &[]), "f");
+    let dangling = hash_of(constrained("a", &[(Deriver::Json, "b")]), "f");
+    assert_eq!(bare, dangling);
+}
+
+/// The decoder's half. A constraint is in the byte stream, so a body that lost
+/// one would decode into a definition with a different hash than the key it is
+/// filed under — which is the one thing a body may never do.
+#[test]
+fn a_constraint_survives_a_body_round_trip() {
+    let items = constrained("a", &[(Deriver::Ord, "a"), (Deriver::Json, "a")]);
+    let (hashes, bodies) = crate::hash_ast_with_bodies(&module(items)).expect("module should hash");
+    let rebuilt = crate::body::reconstruct(&bodies).expect("bodies should reconstruct");
+
+    let f = rebuilt
+        .program
+        .modules
+        .iter()
+        .flat_map(|m| &m.items)
+        .find_map(|item| match item {
+            Item::Fn(d) => Some(d),
+            _ => None,
+        })
+        .expect("the definition should come back");
+    assert_eq!(
+        f.constraints.iter().map(|c| c.deriver).collect::<Vec<_>>(),
+        [Deriver::Json, Deriver::Ord],
+        "constraints come back sorted, which is how they were written down"
+    );
+
+    let (again, _) = crate::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
+        .expect("rebuilt module should hash");
+    assert_eq!(
+        again.defs.values().collect::<Vec<_>>(),
+        hashes.defs.values().collect::<Vec<_>>(),
+        "a decoded definition hashes back to its key"
+    );
 }

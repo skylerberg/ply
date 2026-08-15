@@ -31,7 +31,7 @@ use crate::{
 };
 use ply_core::{CtorInfo, Row, TyVar, Type};
 use ply_core::{LawBinder, prelude};
-use ply_eval::{Closure, ClosureKind, Env, Value};
+use ply_eval::{Closure, ClosureKind, Decimal, Env, Value};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, QName};
@@ -53,12 +53,52 @@ pub const EDGE_CASES: u32 = 5;
 /// Drawn first, in this order, one per edge case index.
 pub const EDGE_INTS: [i64; 5] = [0, 1, -1, i64::MIN, i64::MAX];
 
+/// The `Float` edge, and the *whole* edge on purpose.
+///
+/// `NaN` first: it is the value that makes `==` non-reflexive, which is the
+/// single fact every restriction on this type follows from, and a generator that
+/// drew it rarely would let `forall (x: Float) { x == x }` pass a two-hundred
+/// case run. `-0.0` is here for the same reason — it is `==` to `0.0` and orders
+/// below it — and the infinities because `1.0 / 0.0` produces one.
+pub const EDGE_FLOATS: [f64; 8] = [
+    f64::NAN,
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::MAX,
+];
+
+/// How many `Decimal` edge points [`edge_decimal`] offers.
+const EDGE_DECIMAL_COUNT: usize = 6;
+
+/// The `Decimal` edge: zero at two scales, one, minus one, and the ends of the
+/// range where an exact addition overflows.
+fn edge_decimal(index: usize) -> Decimal {
+    match index {
+        0 => Decimal::ZERO,
+        1 => Decimal::ONE,
+        2 => -Decimal::ONE,
+        // `0.00m`, so the difference between a value and its scale is drawn.
+        3 => Decimal::new(0, 2),
+        4 => Decimal::MAX,
+        _ => Decimal::MIN,
+    }
+}
+
 /// Sixteen characters starting at `'a'`, because the shrinker lowers a character
 /// toward `'a'` and a character outside the alphabet would shrink into it.
 pub const GEN_ALPHABET: &[u8; 16] = b"abcdefghijklmnop";
 
 /// The longest `List` or `String` a draw produces.
 pub const MAX_GEN_LEN: u64 = 16;
+
+/// The most entries a generated `Map` holds. Shorter than [`MAX_GEN_LEN`]
+/// because a map costs two draws per entry and a counterexample with nine of
+/// them is not one anybody reads.
+pub const MAX_GEN_ENTRIES: usize = 8;
 
 /// An absolute ceiling on how deep generation may nest, independent of
 /// [`GEN_DEPTH`]. Past [`GEN_DEPTH`] a collection is drawn empty and an ADT
@@ -275,9 +315,9 @@ impl TypeWorld {
             Type::Fn { ret, effects, .. } if effects.is_pure() => self.type_depth(ret),
             Type::Fn { .. } => None,
             Type::Con(name, _) => match name.as_str() {
-                "Int" | "Bool" | "String" | "Bytes" | "Unit" => Some(0),
-                // The empty list needs nothing, whatever its element type is.
-                "List" => Some(0),
+                "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Some(0),
+                // The empty collection needs nothing, whatever it holds.
+                "List" | "Map" => Some(0),
                 "Cell" => None,
                 _ if name.as_str() == prelude::TASK_TYPE => None,
                 _ => self.types.get(name).and_then(|d| d.depth),
@@ -413,8 +453,8 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             generatable(ret, world)
         }
         Type::Con(name, args) => match name.as_str() {
-            "Int" | "Bool" | "String" | "Bytes" | "Unit" => Ok(()),
-            "List" => args.iter().try_for_each(|a| generatable(a, world)),
+            "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Ok(()),
+            "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
             _ => {
@@ -522,6 +562,8 @@ impl Gen<'_> {
             }
             Type::Con(name, args) => match name.as_str() {
                 "Int" => self.int(),
+                "Float" => Ok(Value::Float(self.float())),
+                "Decimal" => Ok(Value::Decimal(self.decimal())),
                 "Bool" => Ok(Value::Bool(self.bool())),
                 "String" => Ok(self.string()),
                 "Bytes" => Ok(self.bytes()),
@@ -529,6 +571,11 @@ impl Gen<'_> {
                 "List" => {
                     let elem = args.first().cloned().unwrap_or_else(Type::int);
                     self.list(&elem, depth)
+                }
+                "Map" => {
+                    let key = args.first().cloned().unwrap_or_else(Type::int);
+                    let value = args.get(1).cloned().unwrap_or_else(Type::int);
+                    self.map(&key, &value, depth)
                 }
                 "Cell" => Err(Ungeneratable::Cell),
                 _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
@@ -552,6 +599,51 @@ impl Gen<'_> {
                 }
             }
         }))
+    }
+
+    /// Finite values **and the specials**. A generator that never produced a
+    /// `NaN`, a `-0.0` or an infinity would make `property` a lie about the
+    /// type: those are exactly the values every `Float` law is wrong at, and
+    /// they are why nothing about a `Float` may be `proved`.
+    fn float(&mut self) -> f64 {
+        if let Some(i) = self.edge {
+            return EDGE_FLOATS[i as usize % EDGE_FLOATS.len()];
+        }
+        let selector = self.stream.next_u64() % 32;
+        if (selector as usize) < EDGE_FLOATS.len() {
+            return EDGE_FLOATS[selector as usize];
+        }
+        // A draw over the bit pattern would be almost all NaN; a draw over a
+        // bounded mantissa and a bounded exponent reaches both the ordinary
+        // scale a program works at and the ends of the range.
+        let mantissa = (self.stream.next_u64() >> 11) as f64;
+        let exponent = (self.stream.next_u64() % (1 + self.size.min(60))) as i32 - 30;
+        let sign = if self.stream.next_u64() & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        sign * mantissa * 2f64.powi(exponent)
+    }
+
+    /// Scale `0..=6` around zero, plus the ends of the range. Money is written
+    /// at two places and a rate at four, so the interesting cases are small
+    /// scales — and `MIN`/`MAX` are where an exact addition overflows, which is
+    /// the failure this type reports rather than hides.
+    fn decimal(&mut self) -> Decimal {
+        if let Some(i) = self.edge {
+            return edge_decimal(i as usize % EDGE_DECIMAL_COUNT);
+        }
+        let selector = self.stream.next_u64() % 32;
+        if (selector as usize) < EDGE_DECIMAL_COUNT {
+            return edge_decimal(selector as usize);
+        }
+        let scale = (self.stream.next_u64() % 7) as u32;
+        let bits = 8 + self.size.min(54);
+        let x = self.stream.next_u64();
+        let magnitude = ((x >> 1) & ((1u64 << bits) - 1)) as i64;
+        let mantissa = if x & 1 == 0 { magnitude } else { -magnitude };
+        Decimal::try_from_i128_with_scale(mantissa as i128, scale).unwrap_or(Decimal::ZERO)
     }
 
     fn bool(&mut self) -> bool {
@@ -607,6 +699,30 @@ impl Gen<'_> {
             items.push(self.value(elem, depth + 1)?);
         }
         Ok(Value::list(items))
+    }
+
+    /// At most [`MAX_GEN_ENTRIES`] entries, drawn from the key and value
+    /// generators. Duplicate keys collapse — later wins, exactly as
+    /// `map_insert` does — so a drawn length is an upper bound on the size, and
+    /// that is correct rather than a defect: a generator that rejected and
+    /// redrew until it had *n* distinct keys would loop forever on `Bool`.
+    ///
+    /// Leaving `Map` ungeneratable would regress M8's guarantee on contact with
+    /// a new primitive, which is the same argument, and the same required test,
+    /// as `Bytes` in W1.
+    fn map(&mut self, key: &Type, value: &Type, depth: u32) -> Result<Value, Ungeneratable> {
+        let len = if depth >= GEN_DEPTH {
+            0
+        } else {
+            self.length().min(MAX_GEN_ENTRIES)
+        };
+        let mut entries = Vec::with_capacity(len);
+        for _ in 0..len {
+            let k = self.value(key, depth + 1)?;
+            let v = self.value(value, depth + 1)?;
+            entries.push((k, v));
+        }
+        Ok(Value::map(entries))
     }
 
     fn adt(&mut self, name: &Symbol, args: &[Type], depth: u32) -> Result<Value, Ungeneratable> {

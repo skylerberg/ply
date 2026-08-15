@@ -232,6 +232,11 @@ struct FileState {
     parse: bool,
     recheck: bool,
     refusal: Refusal,
+    /// Embedded in the binary rather than discovered on disk. Only the pieces
+    /// that are genuinely about *provenance* branch on this — which module is a
+    /// project's entry point, whose tests a project's run selects — because a
+    /// stdlib definition is otherwise a definition like any other.
+    shipped: bool,
 }
 
 impl FileState {
@@ -242,6 +247,23 @@ impl FileState {
             .as_ref()
             .map(|f| f.defs.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Every module this file imports, whether or not it was parsed.
+    ///
+    /// A skipped file has no AST, and its fingerprint's import list is exactly
+    /// as trustworthy as the rest of it: nothing is read from a fingerprint
+    /// whose content hash did not already match the bytes on disk.
+    fn imports(&self) -> Vec<ModuleName> {
+        match &self.ast {
+            Some(ast) => ast.imports.iter().map(|i| i.module_name()).collect(),
+            None => self
+                .fingerprint
+                .iter()
+                .flat_map(|f| f.imports.iter())
+                .map(|edge| ModuleName::from_dotted(edge.module.as_str()))
+                .collect(),
+        }
     }
 }
 
@@ -302,6 +324,15 @@ impl<'s> Driver<'s> {
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
+                // `std` is reserved before anything else looks at the file.
+                // Reserving it is what removes every precedence question between
+                // a project and the stdlib: because no project module can be
+                // named `std.*`, what `import std.net` denotes cannot depend on
+                // where a file happens to sit.
+                Ok(module) if ply_std::is_reserved(module.as_str()) => {
+                    let diagnostic = ply_std::reserved_diagnostic(&file.path, module.as_str());
+                    diagnostics.push(anchor(diagnostic, &sources, source));
+                }
                 Ok(module) => files.push(FileState {
                     path: file.path.clone(),
                     module,
@@ -316,6 +347,7 @@ impl<'s> Driver<'s> {
                     parse: false,
                     recheck: false,
                     refusal: Refusal::None,
+                    shipped: false,
                 }),
                 Err(diagnostic) => diagnostics.push(anchor(diagnostic, &sources, source)),
             }
@@ -362,15 +394,26 @@ impl<'s> Driver<'s> {
     /// Gate 1's first condition, plus the two reasons a run can have that have
     /// nothing to do with whether the file changed.
     fn forced(&mut self) {
-        for file in &mut self.files {
-            file.refusal = match &file.fingerprint {
-                _ if self.mode == Mode::Full => Refusal::NotIncremental,
-                _ if self.needed.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
-                None => Refusal::NoFingerprint,
-                Some(f) if f.content_hash != file.content => Refusal::ContentChanged,
-                Some(_) => Refusal::None,
-            };
-            file.parse = file.refusal != Refusal::None;
+        for i in 0..self.files.len() {
+            let refusal = self.forced_refusal(&self.files[i]);
+            let file = &mut self.files[i];
+            file.parse = refusal != Refusal::None;
+            file.refusal = refusal;
+        }
+    }
+
+    /// The same decision for one file, so that a stdlib module pulled in after
+    /// [`forced`] has run reaches it by the same route rather than by a second
+    /// copy of the rule.
+    ///
+    /// [`forced`]: Driver::forced
+    fn forced_refusal(&self, file: &FileState) -> Refusal {
+        match &file.fingerprint {
+            _ if self.mode == Mode::Full => Refusal::NotIncremental,
+            _ if self.needed.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
+            None => Refusal::NoFingerprint,
+            Some(f) if f.content_hash != file.content => Refusal::ContentChanged,
+            Some(_) => Refusal::None,
         }
     }
 
@@ -408,7 +451,7 @@ impl<'s> Driver<'s> {
     fn close_over_imports(&mut self) -> Result<(), LoadError> {
         loop {
             self.parse_pending()?;
-            let mut added = false;
+            let mut added = self.pull_stdlib()?;
             for i in 0..self.files.len() {
                 if !self.files[i].parse {
                     continue;
@@ -439,6 +482,143 @@ impl<'s> Driver<'s> {
         }
     }
 
+    /// Loading is demand-driven: a module that ships with the compiler is pulled
+    /// out of the embedded table only when something already in the program
+    /// imports it, and then transitively.
+    ///
+    /// The consequence is the point. A program importing nothing from `std`
+    /// loads nothing, checks nothing extra, and has hashes byte-identical to
+    /// what it had before the stdlib existed.
+    ///
+    /// Returns whether anything was added, which is what makes the caller's
+    /// fixed point cover a stdlib module that imports another.
+    fn pull_stdlib(&mut self) -> Result<bool, LoadError> {
+        let mut diagnostics = Vec::new();
+        let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
+        let mut stale: Vec<(usize, Symbol)> = Vec::new();
+
+        for (i, file) in self.files.iter().enumerate() {
+            for imported in file.imports() {
+                // A shipped module may import only `std.*`. The user did not
+                // write it and cannot fix it, so calling it their error would
+                // send them looking in their own tree.
+                if file.shipped && !ply_std::is_std(&imported) {
+                    diagnostics.push(self.foreign_import(file, &imported));
+                    continue;
+                }
+                if !ply_std::is_std(&imported) || self.by_module.contains_key(imported.as_symbol())
+                {
+                    continue;
+                }
+                match (
+                    ply_std::source(&imported).is_some(),
+                    file.shipped,
+                    file.parse,
+                ) {
+                    (true, _, _) => {
+                        wanted.insert(imported.as_symbol().clone());
+                    }
+                    (false, true, _) => {
+                        diagnostics.push(self.foreign_import(file, &imported));
+                    }
+                    (false, _, true) => diagnostics.push(self.unknown_std(file, &imported)),
+                    // A skipped file naming a module this build no longer ships.
+                    // Parsing it again is what turns the fingerprint's bare
+                    // module name into a diagnostic with a span in it.
+                    (false, _, false) => stale.push((i, imported.as_symbol().clone())),
+                }
+            }
+        }
+        if !diagnostics.is_empty() {
+            return Err(LoadError {
+                sources: self.sources.clone(),
+                diagnostics,
+            });
+        }
+        for (i, imported) in stale {
+            self.files[i].parse = true;
+            self.files[i].refusal = Refusal::Import(imported);
+        }
+
+        let added = !wanted.is_empty();
+        for name in wanted {
+            self.add_shipped(ModuleName::from_dotted(name.as_str()));
+        }
+        Ok(added)
+    }
+
+    /// An embedded module, filed under its pseudo-path so that gate 1 needs no
+    /// new mechanism: its `content_hash` is over the embedded bytes, and a
+    /// compiler upgrade that changes those bytes refuses the skip exactly as an
+    /// edited file would.
+    fn add_shipped(&mut self, module: ModuleName) {
+        let Some(source) = ply_std::source(&module) else {
+            return;
+        };
+        let path = ply_std::pseudo_path(&module);
+        let id = self.sources.add(&path, source.to_string());
+        let text = self
+            .sources
+            .get(id)
+            .map(|f| f.text.clone())
+            .unwrap_or_else(|| "".into());
+        let fingerprint = match (self.mode, self.store.as_deref()) {
+            (Mode::Incremental, Some(store)) => store.fingerprint(&path),
+            _ => None,
+        };
+        let mut file = FileState {
+            path,
+            module,
+            source: id,
+            text,
+            content: ContentHash::of(source.as_bytes()),
+            fingerprint,
+            ast: None,
+            parse: false,
+            recheck: false,
+            refusal: Refusal::None,
+            shipped: true,
+        };
+        file.refusal = self.forced_refusal(&file);
+        file.parse = file.refusal != Refusal::None;
+        self.by_module
+            .insert(file.module.as_symbol().clone(), self.files.len());
+        self.files.push(file);
+    }
+
+    /// Where a file writes an import, or nothing when the file was skipped and
+    /// its import list came from a fingerprint. [`anchor`] then falls back to the
+    /// file's first line, which is a better answer than none.
+    fn import_span(&self, file: &FileState, imported: &ModuleName) -> Span {
+        file.ast
+            .as_ref()
+            .and_then(|ast| {
+                ast.imports
+                    .iter()
+                    .find(|i| &i.module_name() == imported)
+                    .map(|i| i.path_span())
+            })
+            .unwrap_or(Span::DUMMY)
+    }
+
+    fn unknown_std(&self, file: &FileState, imported: &ModuleName) -> Diagnostic {
+        let span = self.import_span(file, imported);
+        anchor(
+            ply_std::unknown_module(imported, span),
+            &self.sources,
+            file.source,
+        )
+    }
+
+    fn foreign_import(&self, file: &FileState, imported: &ModuleName) -> Diagnostic {
+        let span = self.import_span(file, imported);
+        anchor(
+            ply_std::foreign_import(&file.module, imported.as_symbol(), span),
+            &self.sources,
+            file.source,
+        )
+    }
+
     fn parse_pending(&mut self) -> Result<(), LoadError> {
         let mut diagnostics = Vec::new();
         let files = &mut self.files;
@@ -448,7 +628,14 @@ impl<'s> Driver<'s> {
                     continue;
                 }
                 match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
-                    Ok(module) => file.ast = Some(module),
+                    // Expansion is part of parsing a file: it reads that file's
+                    // own type declarations and nothing else, which is what lets
+                    // gate 1 key on raw file content and still be right about a
+                    // generated definition.
+                    Ok(mut module) => {
+                        diagnostics.append(&mut ply_derive::expand_module(&mut module));
+                        file.ast = Some(module);
+                    }
                     Err(mut d) => diagnostics.append(&mut d),
                 }
             }
@@ -928,10 +1115,11 @@ impl<'s> Driver<'s> {
             tests: Vec::new(),
             laws: Vec::new(),
             // The maps below are rebuilt file by file, and no file declares the
-            // prelude effects, so they have to be seeded here or a run's
-            // `CheckOutput` would answer that `clock` is not `nondet`.
+            // prelude's effects or ADTs, so they have to be seeded here or a
+            // run's `CheckOutput` would answer that `clock` is not `nondet` and
+            // that no value of `Option<Int>` can be generated.
             effects: ply_core::prelude::effects(),
-            ctors: IndexMap::new(),
+            ctors: ply_core::prelude::ctors(),
             modules: IndexMap::new(),
         };
         let merged = HashOutput {
@@ -979,8 +1167,10 @@ impl<'s> Driver<'s> {
         merged.closure = closure_of(&merged.deps);
         self.phases.restore += restoring.elapsed();
 
+        let stdlib = self.stdlib_notice(&merged);
         let writing = Instant::now();
         report.warnings = self.write_back(hashes, &bodies, &out);
+        report.warnings.splice(0..0, stdlib);
         self.phases.write_back += writing.elapsed();
         report.phases = self.phases;
 
@@ -1051,9 +1241,9 @@ impl<'s> Driver<'s> {
                         }
                     }
                 }
-                // Neither declares a name, so neither is reached: both are
+                // None declares a name, so none is reached: all three are
                 // filtered out by `item.name()` above.
-                Item::Test(_) | Item::Law(_) => {}
+                Item::Test(_) | Item::Law(_) | Item::Derive(_) => {}
             }
         }
         for test in checked.tests.iter().filter(|t| t.module == file.module) {
@@ -1142,6 +1332,12 @@ impl<'s> Driver<'s> {
                             // section. A skipped file's clauses are
                             // byte-identical to the ones whose hashes it holds.
                             spec: Vec::new(),
+                            // Needs `CachedDef` to carry them, which it does
+                            // not yet. Until it does, a call site in a parsed
+                            // file can be checked against a *skipped* callee's
+                            // signature with its `where` clauses missing, and
+                            // an `E0206` that should fire will not.
+                            constraints: Vec::new(),
                             span: entry.span.rebase(source),
                         },
                     );
@@ -1258,6 +1454,80 @@ impl<'s> Driver<'s> {
         }
     }
 
+    /// What a compiler upgrade did to this project, said once.
+    ///
+    /// Correctness needs nothing here: the stdlib is source, so a stdlib edit
+    /// moves exactly the hashes it should and selection stays exact. **The
+    /// digest is deliberately in no cache key** — a digest in the key would
+    /// invalidate a project on an edit to a `std` module it never imports, which
+    /// is precisely the conservative selection Ply exists to beat. This is
+    /// visibility, so that the work an upgrade caused is a number rather than a
+    /// mystery, and so that zero is reported as zero.
+    fn stdlib_notice(&self, merged: &HashOutput) -> Vec<Diagnostic> {
+        if self.mode != Mode::Incremental {
+            return Vec::new();
+        }
+        let Some(store) = self.store.as_deref() else {
+            return Vec::new();
+        };
+        let current = ply_std::digest_short();
+        let Some(previous) = store.stdlib_digest() else {
+            return Vec::new();
+        };
+        if previous == current {
+            return Vec::new();
+        }
+
+        // What the last run recorded for the shipped modules, against what they
+        // hash to now. A module this run did not load contributes nothing: its
+        // definitions are not in this program, so nothing here reaches them.
+        let mut moved: BTreeSet<Symbol> = BTreeSet::new();
+        for path in store.source_paths() {
+            if !ply_std::is_pseudo_path(&path) {
+                continue;
+            }
+            let Some(fingerprint) = store.fingerprint(&path) else {
+                continue;
+            };
+            for entry in &fingerprint.defs {
+                let now = merged
+                    .defs
+                    .get(&entry.name)
+                    .or_else(|| merged.decls.get(&entry.name));
+                if now != Some(&entry.hash) {
+                    moved.insert(entry.name.clone());
+                }
+            }
+        }
+
+        let reached = merged
+            .defs
+            .keys()
+            .chain(merged.decls.keys())
+            .filter(|name| {
+                merged
+                    .closure
+                    .get(*name)
+                    .is_some_and(|closure| closure.iter().any(|n| moved.contains(n)))
+            })
+            .count();
+
+        let what = match reached {
+            0 => "no definition this program reaches changed".to_string(),
+            1 => "1 definition this program reaches changed".to_string(),
+            n => format!("{n} definitions this program reaches changed"),
+        };
+        vec![
+            Diagnostic::warning(
+                codes::STDLIB_CHANGED,
+                format!("the modules that ship with `ply` moved: {previous} -> {current}"),
+            )
+            .note(what)
+            .note("a `std` definition hashes like any other, so only what a change reached re-runs")
+            .note("`ply std` lists the shipped modules and this digest"),
+        ]
+    }
+
     fn write_back(
         &mut self,
         hashes: &HashOutput,
@@ -1308,9 +1578,13 @@ impl<'s> Driver<'s> {
         for (i, fingerprint) in fingerprints {
             store.put_source(&paths[i], fingerprint);
         }
+        // `paths` already holds the pseudo-paths of the shipped modules this run
+        // loaded, so a `std` module the project stopped importing is pruned like
+        // any other file that left the program — correct, and recomputable.
         if whole_project {
             store.prune(&paths);
         }
+        store.set_stdlib_digest(ply_std::digest_short());
         match store.flush() {
             Ok(()) => Vec::new(),
             // A flush writes both caches and either half can be the one that
@@ -1427,7 +1701,7 @@ impl<'s> Driver<'s> {
                         })
                         .collect(),
                 ),
-                Item::Test(_) | Item::Law(_) => continue,
+                Item::Test(_) | Item::Law(_) | Item::Derive(_) => continue,
             };
             let deps = hashes.deps.get(&name).cloned().unwrap_or_default();
             fingerprint.defs.push(DefEntry {
@@ -1545,7 +1819,7 @@ impl<'s> Driver<'s> {
                             )
                         })
                     }),
-                    Item::Test(_) | Item::Law(_) => None,
+                    Item::Test(_) | Item::Law(_) | Item::Derive(_) => None,
                 };
                 if let Some(entry) = entry {
                     out.push((*hash, entry));

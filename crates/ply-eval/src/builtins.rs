@@ -15,13 +15,19 @@
 
 use crate::cont::Frame;
 use crate::interp::{Interp, arity_error};
-use crate::value::{Value, Vector, first_difference, type_error, values_equal};
+use crate::map;
+use crate::value::{Decimal, Value, Vector, first_difference, type_error, values_equal};
 use crate::world::{CellId, World};
 use ply_span::{Diagnostic, Span, codes};
+use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::ToPrimitive;
 use std::fmt;
 
 /// A list this long is a runaway `range`, not an intent.
 const MAX_RANGE_LEN: i64 = 10_000_000;
+
+/// `Decimal`'s scale bound, the type's rather than a policy.
+const MAX_DECIMAL_SCALE: u32 = 28;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Builtin {
@@ -41,6 +47,15 @@ pub enum Builtin {
     BytesConcat,
     BytesOfString,
     BytesIsUtf8,
+    BytesIndexOf,
+    BytesIndexOfFrom,
+    BytesIndexOfByte,
+    BytesStartsWith,
+    BytesEndsWith,
+    BytesSplit,
+    BytesScan,
+    BytesScanUntil,
+    BytesPosition,
     StringOfBytes,
     StringOfBytesLossy,
     StringLen,
@@ -53,6 +68,37 @@ pub enum Builtin {
     StringEndsWith,
     StringContains,
     StringFind,
+    MapNew,
+    MapInsert,
+    MapGet,
+    MapContains,
+    MapRemove,
+    MapLen,
+    MapKeys,
+    MapValues,
+    MapEntries,
+    MapOfEntries,
+    MapMerge,
+    MapFold,
+    DecimalDiv,
+    DecimalRound,
+    DecimalOfInt,
+    IntOfDecimal,
+    FloatOfDecimal,
+    DecimalOfFloat,
+    DecimalOfString,
+    DecimalToString,
+    Compare,
+    /// The same order as [`Builtin::Compare`], under a name a module may not
+    /// declare.
+    ///
+    /// `derive ord for T` generates a dictionary whose `compare` field is this
+    /// call. A bare `compare` would be an ordinary name, and ADR 0001 says a
+    /// module's own items shadow the prelude — so a module that happened to
+    /// declare `fn compare` would supply the order of every dictionary derived
+    /// in it, while `derivable(ord, T)` still called the type ordered. That is
+    /// the second order ADR 0012 §2 rests on not existing.
+    CompareValues,
     CellGet,
     CellSet,
     Panic,
@@ -77,6 +123,15 @@ impl Builtin {
             "bytes_concat" => Builtin::BytesConcat,
             "bytes_of_string" => Builtin::BytesOfString,
             "bytes_is_utf8" => Builtin::BytesIsUtf8,
+            "bytes_index_of" => Builtin::BytesIndexOf,
+            "bytes_index_of_from" => Builtin::BytesIndexOfFrom,
+            "bytes_index_of_byte" => Builtin::BytesIndexOfByte,
+            "bytes_starts_with" => Builtin::BytesStartsWith,
+            "bytes_ends_with" => Builtin::BytesEndsWith,
+            "bytes_split" => Builtin::BytesSplit,
+            "bytes_scan" => Builtin::BytesScan,
+            "bytes_scan_until" => Builtin::BytesScanUntil,
+            "bytes_position" => Builtin::BytesPosition,
             "string_of_bytes" => Builtin::StringOfBytes,
             "string_of_bytes_lossy" => Builtin::StringOfBytesLossy,
             "string_len" => Builtin::StringLen,
@@ -89,6 +144,28 @@ impl Builtin {
             "string_ends_with" => Builtin::StringEndsWith,
             "string_contains" => Builtin::StringContains,
             "string_find" => Builtin::StringFind,
+            "compare" => Builtin::Compare,
+            "compare_values" => Builtin::CompareValues,
+            "map_new" => Builtin::MapNew,
+            "map_insert" => Builtin::MapInsert,
+            "map_get" => Builtin::MapGet,
+            "map_contains" => Builtin::MapContains,
+            "map_remove" => Builtin::MapRemove,
+            "map_len" => Builtin::MapLen,
+            "map_keys" => Builtin::MapKeys,
+            "map_values" => Builtin::MapValues,
+            "map_entries" => Builtin::MapEntries,
+            "map_of_entries" => Builtin::MapOfEntries,
+            "map_merge" => Builtin::MapMerge,
+            "map_fold" => Builtin::MapFold,
+            "decimal_div" => Builtin::DecimalDiv,
+            "decimal_round" => Builtin::DecimalRound,
+            "decimal_of_int" => Builtin::DecimalOfInt,
+            "int_of_decimal" => Builtin::IntOfDecimal,
+            "float_of_decimal" => Builtin::FloatOfDecimal,
+            "decimal_of_float" => Builtin::DecimalOfFloat,
+            "decimal_of_string" => Builtin::DecimalOfString,
+            "decimal_to_string" => Builtin::DecimalToString,
             "cell_get" => Builtin::CellGet,
             "cell_set" => Builtin::CellSet,
             "panic" => Builtin::Panic,
@@ -114,6 +191,15 @@ impl Builtin {
             Builtin::BytesConcat => "bytes_concat",
             Builtin::BytesOfString => "bytes_of_string",
             Builtin::BytesIsUtf8 => "bytes_is_utf8",
+            Builtin::BytesIndexOf => "bytes_index_of",
+            Builtin::BytesIndexOfFrom => "bytes_index_of_from",
+            Builtin::BytesIndexOfByte => "bytes_index_of_byte",
+            Builtin::BytesStartsWith => "bytes_starts_with",
+            Builtin::BytesEndsWith => "bytes_ends_with",
+            Builtin::BytesSplit => "bytes_split",
+            Builtin::BytesScan => "bytes_scan",
+            Builtin::BytesScanUntil => "bytes_scan_until",
+            Builtin::BytesPosition => "bytes_position",
             Builtin::StringOfBytes => "string_of_bytes",
             Builtin::StringOfBytesLossy => "string_of_bytes_lossy",
             Builtin::StringLen => "string_len",
@@ -126,6 +212,28 @@ impl Builtin {
             Builtin::StringEndsWith => "string_ends_with",
             Builtin::StringContains => "string_contains",
             Builtin::StringFind => "string_find",
+            Builtin::Compare => "compare",
+            Builtin::CompareValues => "compare_values",
+            Builtin::MapNew => "map_new",
+            Builtin::MapInsert => "map_insert",
+            Builtin::MapGet => "map_get",
+            Builtin::MapContains => "map_contains",
+            Builtin::MapRemove => "map_remove",
+            Builtin::MapLen => "map_len",
+            Builtin::MapKeys => "map_keys",
+            Builtin::MapValues => "map_values",
+            Builtin::MapEntries => "map_entries",
+            Builtin::MapOfEntries => "map_of_entries",
+            Builtin::MapMerge => "map_merge",
+            Builtin::MapFold => "map_fold",
+            Builtin::DecimalDiv => "decimal_div",
+            Builtin::DecimalRound => "decimal_round",
+            Builtin::DecimalOfInt => "decimal_of_int",
+            Builtin::IntOfDecimal => "int_of_decimal",
+            Builtin::FloatOfDecimal => "float_of_decimal",
+            Builtin::DecimalOfFloat => "decimal_of_float",
+            Builtin::DecimalOfString => "decimal_of_string",
+            Builtin::DecimalToString => "decimal_to_string",
             Builtin::CellGet => "cell_get",
             Builtin::CellSet => "cell_set",
             Builtin::Panic => "panic",
@@ -137,6 +245,8 @@ impl Builtin {
         match self {
             Builtin::Assert => (1, 2),
             Builtin::Range => (1, 2),
+            // Ply has no top-level constants, so the empty map is a call.
+            Builtin::MapNew => (0, 0),
             Builtin::Len
             | Builtin::IntToString
             | Builtin::CellGet
@@ -149,7 +259,17 @@ impl Builtin {
             | Builtin::StringLen
             | Builtin::StringTrim
             | Builtin::StringLower
-            | Builtin::StringUpper => (1, 1),
+            | Builtin::StringUpper
+            | Builtin::MapLen
+            | Builtin::MapKeys
+            | Builtin::MapValues
+            | Builtin::MapEntries
+            | Builtin::MapOfEntries
+            | Builtin::DecimalOfInt
+            | Builtin::FloatOfDecimal
+            | Builtin::DecimalOfFloat
+            | Builtin::DecimalOfString
+            | Builtin::DecimalToString => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
             | Builtin::Map
@@ -158,19 +278,46 @@ impl Builtin {
             | Builtin::CellSet
             | Builtin::BytesAt
             | Builtin::BytesConcat
+            | Builtin::BytesIndexOf
+            | Builtin::BytesIndexOfByte
+            | Builtin::BytesStartsWith
+            | Builtin::BytesEndsWith
+            | Builtin::BytesSplit
             | Builtin::StringSplit
             | Builtin::StringStartsWith
             | Builtin::StringEndsWith
             | Builtin::StringContains
-            | Builtin::StringFind => (2, 2),
-            Builtin::Fold | Builtin::BytesSlice | Builtin::StringSlice => (3, 3),
+            | Builtin::StringFind
+            | Builtin::MapGet
+            | Builtin::MapContains
+            | Builtin::MapRemove
+            | Builtin::MapMerge
+            | Builtin::Compare
+            | Builtin::CompareValues
+            | Builtin::IntOfDecimal => (2, 2),
+            Builtin::Fold
+            | Builtin::BytesSlice
+            | Builtin::BytesIndexOfFrom
+            | Builtin::BytesPosition
+            | Builtin::StringSlice
+            | Builtin::MapInsert
+            | Builtin::MapFold
+            | Builtin::DecimalRound => (3, 3),
+            Builtin::BytesScan | Builtin::BytesScanUntil | Builtin::DecimalDiv => (4, 4),
         }
     }
 
     /// Calls user code, so [`call`] may answer [`Step::Apply`] rather than a
     /// value and the caller must be able to suspend.
     pub fn higher_order(self) -> bool {
-        matches!(self, Builtin::Map | Builtin::Filter | Builtin::Fold)
+        matches!(
+            self,
+            Builtin::Map
+                | Builtin::Filter
+                | Builtin::Fold
+                | Builtin::BytesPosition
+                | Builtin::MapFold
+        )
     }
 
     pub fn all() -> &'static [Builtin] {
@@ -191,6 +338,15 @@ impl Builtin {
             Builtin::BytesConcat,
             Builtin::BytesOfString,
             Builtin::BytesIsUtf8,
+            Builtin::BytesIndexOf,
+            Builtin::BytesIndexOfFrom,
+            Builtin::BytesIndexOfByte,
+            Builtin::BytesStartsWith,
+            Builtin::BytesEndsWith,
+            Builtin::BytesSplit,
+            Builtin::BytesScan,
+            Builtin::BytesScanUntil,
+            Builtin::BytesPosition,
             Builtin::StringOfBytes,
             Builtin::StringOfBytesLossy,
             Builtin::StringLen,
@@ -203,6 +359,28 @@ impl Builtin {
             Builtin::StringEndsWith,
             Builtin::StringContains,
             Builtin::StringFind,
+            Builtin::MapNew,
+            Builtin::MapInsert,
+            Builtin::MapGet,
+            Builtin::MapContains,
+            Builtin::MapRemove,
+            Builtin::MapLen,
+            Builtin::MapKeys,
+            Builtin::MapValues,
+            Builtin::MapEntries,
+            Builtin::MapOfEntries,
+            Builtin::MapMerge,
+            Builtin::MapFold,
+            Builtin::DecimalDiv,
+            Builtin::DecimalRound,
+            Builtin::DecimalOfInt,
+            Builtin::IntOfDecimal,
+            Builtin::FloatOfDecimal,
+            Builtin::DecimalOfFloat,
+            Builtin::DecimalOfString,
+            Builtin::DecimalToString,
+            Builtin::Compare,
+            Builtin::CompareValues,
             Builtin::CellGet,
             Builtin::CellSet,
             Builtin::Panic,
@@ -371,6 +549,74 @@ pub fn call(
             Ok(Step::Done(Value::Bool(std::str::from_utf8(b).is_ok())))
         }
 
+        Builtin::BytesIndexOf => {
+            let hay = args[0].as_bytes(span, "`bytes_index_of`")?;
+            let needle = args[1].as_bytes(span, "`bytes_index_of`")?;
+            Ok(Step::Done(position(find(hay, needle, 0))))
+        }
+
+        Builtin::BytesIndexOfFrom => {
+            let hay = args[0].as_bytes(span, "`bytes_index_of_from`")?;
+            let needle = args[1].as_bytes(span, "`bytes_index_of_from`")?;
+            let from = start_at(&args[2], hay.len(), span, "bytes_index_of_from")?;
+            Ok(Step::Done(position(find(hay, needle, from))))
+        }
+
+        Builtin::BytesIndexOfByte => {
+            let hay = args[0].as_bytes(span, "`bytes_index_of_byte`")?;
+            let byte = one_byte(&args[1], span, "bytes_index_of_byte")?;
+            Ok(Step::Done(position(memchr::memchr(byte, hay))))
+        }
+
+        Builtin::BytesStartsWith => {
+            let b = args[0].as_bytes(span, "`bytes_starts_with`")?;
+            let prefix = args[1].as_bytes(span, "`bytes_starts_with`")?;
+            Ok(Step::Done(Value::Bool(b.starts_with(prefix))))
+        }
+
+        Builtin::BytesEndsWith => {
+            let b = args[0].as_bytes(span, "`bytes_ends_with`")?;
+            let suffix = args[1].as_bytes(span, "`bytes_ends_with`")?;
+            Ok(Step::Done(Value::Bool(b.ends_with(suffix))))
+        }
+
+        Builtin::BytesSplit => {
+            let b = args[0].as_bytes(span, "`bytes_split`")?;
+            let sep = args[1].as_bytes(span, "`bytes_split`")?;
+            if sep.is_empty() {
+                return Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    "`bytes_split` needs a separator, and this one is empty",
+                )
+                .primary(span, "an empty separator matches everywhere and nowhere")
+                .note("pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`"));
+            }
+            let mut out = Vec::new();
+            let mut at = 0;
+            for found in memchr::memmem::find_iter(b, sep.as_ref()) {
+                out.push(Value::bytes(&b[at..found]));
+                at = found + sep.len();
+            }
+            out.push(Value::bytes(&b[at..]));
+            Ok(Step::Done(Value::list(out)))
+        }
+
+        Builtin::BytesScan => {
+            let b = args[0].as_bytes(span, "`bytes_scan`")?;
+            Ok(Step::Done(Value::Int(scan(&args, b, span, false)?)))
+        }
+
+        Builtin::BytesScanUntil => {
+            let b = args[0].as_bytes(span, "`bytes_scan_until`")?;
+            Ok(Step::Done(Value::Int(scan(&args, b, span, true)?)))
+        }
+
+        Builtin::BytesPosition => {
+            let b = args[0].as_bytes(span, "`bytes_position`")?.clone();
+            let from = start_at(&args[1], b.len(), span, "bytes_position")?;
+            Ok(next_position(args[2].clone(), b, from, span))
+        }
+
         Builtin::StringOfBytes => {
             let b = args[0].as_bytes(span, "`string_of_bytes`")?;
             match std::str::from_utf8(b) {
@@ -476,6 +722,48 @@ pub fn call(
             }
         }
 
+        // The order `Map` iterates in, so a derived `OrdDict` and a map's own
+        // key order are one order rather than two that can drift. `Float` is
+        // refused by `derivable(ord, ·)` at the signature, which is what keeps
+        // `total_cmp` out of reach of a program that could observe it
+        // disagreeing with `==`.
+        Builtin::Compare | Builtin::CompareValues => Ok(Step::Done(Value::ctor(
+            match args[0].cmp(&args[1]) {
+                std::cmp::Ordering::Less => "Less",
+                std::cmp::Ordering::Equal => "Equal",
+                std::cmp::Ordering::Greater => "Greater",
+            },
+            Vec::new(),
+        ))),
+
+        Builtin::MapNew => Ok(Step::Done(map::new())),
+        Builtin::MapInsert => Ok(Step::Done(map::insert(
+            &args[0],
+            args[1].clone(),
+            args[2].clone(),
+            span,
+        )?)),
+        Builtin::MapGet => Ok(Step::Done(map::get(&args[0], &args[1], span)?)),
+        Builtin::MapContains => Ok(Step::Done(map::contains(&args[0], &args[1], span)?)),
+        Builtin::MapRemove => Ok(Step::Done(map::remove(&args[0], &args[1], span)?)),
+        Builtin::MapLen => Ok(Step::Done(map::len(&args[0], span)?)),
+        Builtin::MapKeys => Ok(Step::Done(map::keys(&args[0], span)?)),
+        Builtin::MapValues => Ok(Step::Done(map::values(&args[0], span)?)),
+        Builtin::MapEntries => Ok(Step::Done(map::entries(&args[0], span)?)),
+        Builtin::MapOfEntries => Ok(Step::Done(map::of_entries(&args[0], span)?)),
+        Builtin::MapMerge => Ok(Step::Done(map::merge(&args[0], &args[1], span)?)),
+
+        Builtin::MapFold => {
+            let entries = map::fold_entries(&args[0], span)?;
+            Ok(map::next_fold(
+                args[2].clone(),
+                entries,
+                0,
+                args[1].clone(),
+                span,
+            ))
+        }
+
         Builtin::CellGet => {
             let id = args[0].as_cell(span, "`cell_get`")?;
             match world.get(id) {
@@ -493,6 +781,70 @@ pub fn call(
             }
         }
 
+        // `/` on `Decimal` is `E0209` precisely so that a division names its
+        // scale and its rounding mode here instead.
+        Builtin::DecimalDiv => {
+            let a = args[0].as_decimal(span, "`decimal_div`")?;
+            let b = args[1].as_decimal(span, "`decimal_div`")?;
+            let scale = decimal_scale(&args[2], span, "decimal_div")?;
+            let mode = rounding(&args[3], span, "decimal_div")?;
+            if b.is_zero() {
+                return Err(crate::interp::err_zero_divisor(span, "`decimal_div`"));
+            }
+            let quotient = a
+                .checked_div(b)
+                .ok_or_else(|| decimal_overflow(span, "division"))?;
+            Ok(Step::Done(Value::Decimal(
+                quotient.round_dp_with_strategy(scale, mode),
+            )))
+        }
+
+        Builtin::DecimalRound => {
+            let d = args[0].as_decimal(span, "`decimal_round`")?;
+            let scale = decimal_scale(&args[1], span, "decimal_round")?;
+            let mode = rounding(&args[2], span, "decimal_round")?;
+            Ok(Step::Done(Value::Decimal(
+                d.round_dp_with_strategy(scale, mode),
+            )))
+        }
+
+        // Total: every `Int` is a `Decimal`, at scale 0.
+        Builtin::DecimalOfInt => Ok(Step::Done(Value::Decimal(Decimal::from(
+            args[0].as_int(span, "`decimal_of_int`")?,
+        )))),
+
+        Builtin::IntOfDecimal => {
+            let d = args[0].as_decimal(span, "`int_of_decimal`")?;
+            let mode = rounding(&args[1], span, "int_of_decimal")?;
+            Ok(Step::Done(option(
+                d.round_dp_with_strategy(0, mode).to_i64().map(Value::Int),
+            )))
+        }
+
+        // Lossy and total, which is the honest pair: every `Decimal` has a
+        // nearest `f64`, and saying so beats an `Option` nobody can act on.
+        Builtin::FloatOfDecimal => {
+            let d = args[0].as_decimal(span, "`float_of_decimal`")?;
+            Ok(Step::Done(Value::Float(float_of_decimal(d))))
+        }
+
+        Builtin::DecimalOfFloat => {
+            let f = args[0].as_float(span, "`decimal_of_float`")?;
+            Ok(Step::Done(option(decimal_of_float(f).map(Value::Decimal))))
+        }
+
+        Builtin::DecimalOfString => {
+            let s = args[0].as_str(span, "`decimal_of_string`")?;
+            Ok(Step::Done(option(parse_decimal(s).map(Value::Decimal))))
+        }
+
+        // Round-trips `decimal_of_string` exactly, scale included: `1.50m`
+        // renders `1.50`, because the trailing zero is what the value carries.
+        Builtin::DecimalToString => {
+            let d = args[0].as_decimal(span, "`decimal_to_string`")?;
+            Ok(Step::Done(Value::str(d.to_string())))
+        }
+
         Builtin::Panic => {
             let message = match &args[0] {
                 Value::Str(s) => s.to_string(),
@@ -503,6 +855,114 @@ pub fn call(
                     .primary(span, "`panic` called here"),
             )
         }
+    }
+}
+
+/// `Some(v)` or `None`, the prelude's.
+fn option(v: Option<Value>) -> Value {
+    match v {
+        Some(v) => Value::ctor("Some", vec![v]),
+        None => Value::ctor("None", Vec::new()),
+    }
+}
+
+/// A `Rounding` argument as `rust_decimal`'s strategy.
+///
+/// The six are the prelude's constructors, and an argument that is not one of
+/// them is a runtime error rather than a default: silently choosing a rounding
+/// is exactly what refusing `/` was for.
+fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagnostic> {
+    let name = match v {
+        Value::Ctor { name, args } if args.is_empty() => name.as_str(),
+        other => return Err(type_error(span, &format!("`{what}`"), "Rounding", other)),
+    };
+    match name {
+        "HalfEven" => Ok(RoundingStrategy::MidpointNearestEven),
+        "HalfUp" => Ok(RoundingStrategy::MidpointAwayFromZero),
+        "Down" => Ok(RoundingStrategy::ToZero),
+        "Up" => Ok(RoundingStrategy::AwayFromZero),
+        "Ceiling" => Ok(RoundingStrategy::ToPositiveInfinity),
+        "Floor" => Ok(RoundingStrategy::ToNegativeInfinity),
+        other => Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{other}` is not a rounding mode"),
+        )
+        .primary(span, format!("`{what}` was given `{other}`"))
+        .note("the modes are `HalfEven`, `HalfUp`, `Down`, `Up`, `Ceiling` and `Floor`")),
+    }
+}
+
+/// A scale argument, refused outside `0..=28` rather than clamped: a scale the
+/// caller asked for and did not get is a rounding they did not write down.
+fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
+    let scale = v.as_int(span, &format!("`{what}`"))?;
+    u32::try_from(scale)
+        .ok()
+        .filter(|s| *s <= MAX_DECIMAL_SCALE)
+        .ok_or_else(|| {
+            Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("`{what}` needs a scale in 0..={MAX_DECIMAL_SCALE}, not {scale}"),
+            )
+            .primary(span, "`Decimal` holds at most 28 decimal places")
+        })
+}
+
+fn decimal_overflow(span: Span, what: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`Decimal` overflow in {what}"),
+    )
+    .primary(span, "the result needs more than 96 bits of mantissa")
+    .note("`Decimal` is exact and bounded; it will not round to make room")
+}
+
+/// The **shortest decimal that round-trips the float**, and `None` for NaN, an
+/// infinity, and anything outside `Decimal`'s range.
+///
+/// Shortest is the only defensible choice: any other is an arbitrary number of
+/// digits of a binary approximation, and `0.1` would decode as
+/// `0.1000000000000000055511151231257827` — technically the value, and not what
+/// anybody wrote. Rust's own `f64` formatting already produces exactly that
+/// shortest form, so this is a format and a parse rather than an algorithm.
+fn decimal_of_float(f: f64) -> Option<Decimal> {
+    if !f.is_finite() {
+        return None;
+    }
+    parse_decimal(&format!("{f}"))
+}
+
+/// The **nearest** `f64` to a decimal, which is what makes
+/// `float_of_decimal(decimal_of_float(f)) == f` for every `f` that has a
+/// `Decimal` at all.
+///
+/// Through the decimal's own digits rather than through `Decimal::to_f64`,
+/// which divides a mantissa by a power of ten in binary and is therefore off by
+/// an ulp or two for a value with a long scale — enough that a `Float` field's
+/// derived JSON codec silently changed the value it round-tripped. Rust's
+/// `f64` parser is correctly rounded, and `Decimal::to_string` is exact, so the
+/// pair is.
+fn float_of_decimal(d: Decimal) -> f64 {
+    d.to_string()
+        .parse::<f64>()
+        .unwrap_or_else(|_| d.to_f64().unwrap_or(f64::NAN))
+}
+
+/// The one decimal grammar, for `decimal_of_string` and for the shortest
+/// round-tripping form of a `Float` alike.
+///
+/// The two parsers are disjoint rather than layered: `from_str_exact` preserves
+/// the scale the text was written with, which is what makes `1.50` a different
+/// value from `1.5`, and it refuses an exponent; `from_scientific` requires one.
+/// Dispatching on `e` therefore never costs the trailing zero of a plain
+/// literal, and `1e3` — which JSON's grammar admits and which is well inside
+/// `Decimal`'s range — parses instead of being reported as out of range.
+/// Anything needing a scale past 28 or a mantissa past 96 bits is still `None`.
+fn parse_decimal(text: &str) -> Option<Decimal> {
+    if text.contains(['e', 'E']) {
+        Decimal::from_scientific(text).ok()
+    } else {
+        Decimal::from_str_exact(text).ok()
     }
 }
 
@@ -546,6 +1006,28 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
             next,
             span,
         } => next_fold(f, items, next, answer, span),
+
+        Frame::MapFoldStep {
+            f,
+            entries,
+            next,
+            span,
+        } => map::next_fold(f, entries, next, answer, span),
+
+        Frame::BytesPositionStep {
+            f,
+            bytes,
+            next,
+            span,
+        } => {
+            if answer.as_bool(span, "the predicate given to `bytes_position`")? {
+                // `next` is one past the byte the predicate was asked about,
+                // and the answer is that byte's index rather than the byte.
+                Step::Done(position(Some(next - 1)))
+            } else {
+                next_position(f, bytes, next, span)
+            }
+        }
 
         _ => return Err(not_a_builtin_step()),
     })
@@ -599,6 +1081,149 @@ fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span
             span,
         },
     }
+}
+
+fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span) -> Step {
+    let Some(byte) = bytes.get(next).copied() else {
+        return Step::Done(position(None));
+    };
+    Step::Apply {
+        callee: f.clone(),
+        args: vec![Value::Int(i64::from(byte))],
+        frame: Frame::BytesPositionStep {
+            f,
+            bytes,
+            next: next + 1,
+            span,
+        },
+    }
+}
+
+/// `Option<Int>`, the answer shape of every builtin that searches. `Some` and
+/// `None` are the prelude's constructors, so these names are program-wide and
+/// need no module.
+fn position(at: Option<usize>) -> Value {
+    match at {
+        Some(i) => Value::ctor("Some", vec![Value::Int(i as i64)]),
+        None => Value::ctor("None", Vec::new()),
+    }
+}
+
+/// An empty needle occurs at `from`, which is what `str::find` answers and what
+/// makes `bytes_index_of(b, b"")` `Some(0)` rather than a special case every
+/// caller has to write.
+fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
+}
+
+/// A 256-bit membership test built once per call, in time proportional to the
+/// set rather than to the buffer. This is the whole reason `bytes_scan` takes
+/// its byte class as a `Bytes` and still costs nothing per byte.
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    fn new(members: &[u8]) -> ByteSet {
+        let mut bits = [0u64; 4];
+        for &b in members {
+            bits[usize::from(b >> 6)] |= 1 << (b & 63);
+        }
+        ByteSet(bits)
+    }
+
+    fn contains(&self, b: u8) -> bool {
+        self.0[usize::from(b >> 6)] >> (b & 63) & 1 == 1
+    }
+}
+
+/// The bytes a bounded scan is allowed to look at: `max` of them at most, and
+/// never past the end. Returning the window rather than a pair of indices is
+/// what makes the budget structural — a scan cannot examine a byte it was not
+/// handed.
+fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
+    &hay[from..hay.len().min(from.saturating_add(max))]
+}
+
+/// Both bounded scans. `want` is whether it stops on a member of the set or on
+/// a non-member; the answer is the index it stopped at, or the end of the
+/// window when it did not, so a caller tells "the class ended" from "the budget
+/// ran out" by comparing against `from + max`.
+fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagnostic> {
+    let what = if want {
+        "bytes_scan_until"
+    } else {
+        "bytes_scan"
+    };
+    let from = start_at(&args[1], hay.len(), span, what)?;
+    let members = args[2].as_bytes(span, &format!("`{what}`"))?;
+    let max = budget(&args[3], span, what)?;
+    let window = scan_window(hay, from, max);
+
+    // `memchr` is SIMD and a bitmap loop is not, so a small set — which is
+    // every header delimiter a parser cares about — takes the fast path.
+    let found = match (want, members.as_ref()) {
+        // An empty class is never entered, so `bytes_scan_until` runs out the
+        // window and `bytes_scan` — which stops off the class — stops at once.
+        (true, []) => None,
+        (true, [a]) => memchr::memchr(*a, window),
+        (true, [a, b]) => memchr::memchr2(*a, *b, window),
+        (true, [a, b, c]) => memchr::memchr3(*a, *b, *c, window),
+        _ => {
+            let set = ByteSet::new(members);
+            window.iter().position(|&b| set.contains(b) == want)
+        }
+    };
+    Ok(match found {
+        Some(at) => (from + at) as i64,
+        None => (from + window.len()) as i64,
+    })
+}
+
+/// A position a search may start at. `len` itself is admissible — an empty
+/// window is a real answer — and anything else is refused rather than clamped,
+/// for the reason [`range_args`] gives.
+fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diagnostic> {
+    let from = v.as_int(span, &format!("`{what}`"))?;
+    match usize::try_from(from) {
+        Ok(from) if from <= len => Ok(from),
+        _ => Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{what}` start {from} is outside a value of {len} bytes"),
+        )
+        .primary(span, "this position does not exist")
+        .note(format!(
+            "a start must satisfy `0 <= from <= {len}`; it is never clamped"
+        ))),
+    }
+}
+
+/// The bound that stops a 20-megabyte header line from being a denial of
+/// service. Negative is refused rather than treated as zero: a caller that
+/// computed a negative budget has a bug, and answering `from` for it hides it.
+fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
+    let max = v.as_int(span, &format!("`{what}`"))?;
+    usize::try_from(max).map_err(|_| {
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{what}` was given a negative budget of {max}"),
+        )
+        .primary(span, "a scan cannot examine a negative number of bytes")
+        .note("pass `0` to examine nothing, or `bytes_len(b)` to leave it unbounded")
+    })
+}
+
+fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
+    let byte = v.as_int(span, &format!("`{what}`"))?;
+    u8::try_from(byte).map_err(|_| {
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{what}` was given {byte}, which is not a byte"),
+        )
+        .primary(span, "a byte is `0` to `255`")
+        .note("`bytes_at` answers in that range, and so does a byte literal's element")
+    })
 }
 
 /// The half-open `[start, end)` of a slicing builtin, refused rather than
@@ -806,6 +1431,749 @@ mod tests {
         }
     }
 
+    /// A builtin that cannot suspend, called the way an engine calls it.
+    fn done(b: Builtin, args: Vec<Value>) -> Result<Value, Diagnostic> {
+        let mut world = World::new();
+        match call(b, args, &mut world, Span::DUMMY)? {
+            Step::Done(v) => Ok(v),
+            Step::Apply { .. } => panic!("`{}` suspended", b.name()),
+        }
+    }
+
+    fn bytes(b: &[u8]) -> Value {
+        Value::bytes(b)
+    }
+
+    /// `Some(i)` or `None`, rendered, which is what a Ply program sees.
+    fn found(b: Builtin, args: Vec<Value>) -> String {
+        done(b, args).unwrap().render()
+    }
+
+    fn some(i: i64) -> String {
+        format!("Some({i})")
+    }
+
+    /// `Some(i)` as `i` and `None` as `-1`, which is the shape W1's folds
+    /// answered in and therefore the shape a comparison against them needs.
+    fn at(v: &Value) -> i64 {
+        match v {
+            Value::Ctor { args, .. } if !args.is_empty() => {
+                args[0].as_int(Span::DUMMY, "test").unwrap()
+            }
+            _ => -1,
+        }
+    }
+
+    /// Deterministic and dependency-free, so a failing case is a seed a reader
+    /// can reproduce rather than a number that moves between runs.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    // ------------------------------------------------------------ the searches
+
+    #[test]
+    fn index_of_covers_empty_absent_at_the_start_at_the_end_and_overlapping() {
+        let hay = bytes(b"aaabaaab");
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"")]),
+            some(0)
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![bytes(b""), bytes(b"")]),
+            some(0)
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![bytes(b""), bytes(b"a")]),
+            "None"
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"z")]),
+            "None"
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOf,
+                vec![hay.clone(), bytes(b"aaabaaabx")]
+            ),
+            "None",
+            "a needle longer than the haystack cannot occur"
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"aaa")]),
+            some(0)
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"aab")]),
+            some(1)
+        );
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"b")]),
+            some(3)
+        );
+
+        // Overlapping occurrences: `aa` sits at 0, 1, 4 and 5, and the first is
+        // the answer.
+        assert_eq!(
+            found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"aa")]),
+            some(0)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b"aa"), Value::Int(1)]
+            ),
+            some(1)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b"aa"), Value::Int(2)]
+            ),
+            some(4)
+        );
+    }
+
+    /// The index a `_from` search answers is absolute, so it feeds straight
+    /// back into `bytes_slice`. A relative one would be an off-by-`from` in
+    /// every caller that resumed a scan.
+    #[test]
+    fn index_of_from_answers_an_absolute_index_and_admits_the_end() {
+        let hay = bytes(b"GET / HTTP/1.1");
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b" "), Value::Int(0)]
+            ),
+            some(3)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b" "), Value::Int(4)]
+            ),
+            some(5)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b""), Value::Int(14)]
+            ),
+            some(14),
+            "an empty needle occurs where the search started, the end included"
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfFrom,
+                vec![hay.clone(), bytes(b" "), Value::Int(14)]
+            ),
+            "None"
+        );
+    }
+
+    #[test]
+    fn a_start_outside_the_buffer_is_named_rather_than_clamped() {
+        for (b, args) in [
+            (
+                Builtin::BytesIndexOfFrom,
+                vec![bytes(b"abc"), bytes(b"a"), Value::Int(4)],
+            ),
+            (
+                Builtin::BytesIndexOfFrom,
+                vec![bytes(b"abc"), bytes(b"a"), Value::Int(-1)],
+            ),
+            (
+                Builtin::BytesScan,
+                vec![bytes(b"abc"), Value::Int(9), bytes(b"a"), Value::Int(1)],
+            ),
+        ] {
+            let d = done(b, args).unwrap_err();
+            assert_eq!(d.code, codes::RUNTIME_ERROR, "{}", b.name());
+            assert!(
+                d.message.contains("outside a value of 3 bytes"),
+                "{}",
+                d.message
+            );
+        }
+    }
+
+    #[test]
+    fn index_of_byte_takes_a_byte_and_refuses_anything_else() {
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfByte,
+                vec![bytes(b"a\r\nb"), Value::Int(13)]
+            ),
+            some(1)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfByte,
+                vec![bytes(b"abc"), Value::Int(255)]
+            ),
+            "None"
+        );
+        for out_of_range in [-1, 256] {
+            let d = done(
+                Builtin::BytesIndexOfByte,
+                vec![bytes(b"abc"), Value::Int(out_of_range)],
+            )
+            .unwrap_err();
+            assert_eq!(d.code, codes::RUNTIME_ERROR);
+            assert!(d.message.contains("not a byte"), "{}", d.message);
+        }
+    }
+
+    /// Required test 36. A naive search is obviously correct and obviously
+    /// slow, which is exactly what a SIMD one should be checked against.
+    #[test]
+    fn index_of_agrees_with_a_naive_search_over_ten_thousand_pairs() {
+        fn naive(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+            if needle.is_empty() {
+                return Some(from);
+            }
+            (from..=hay.len().checked_sub(needle.len())?)
+                .find(|&i| &hay[i..i + needle.len()] == needle)
+        }
+
+        let mut rng = Xorshift(0x5eed_1234_9abc_def1);
+        for case in 0..10_000 {
+            // A three-letter alphabet, so needles hit often and overlap.
+            let hay: Vec<u8> = (0..rng.below(40))
+                .map(|_| b'a' + rng.below(3) as u8)
+                .collect();
+            let needle: Vec<u8> = (0..rng.below(4))
+                .map(|_| b'a' + rng.below(3) as u8)
+                .collect();
+            let from = if hay.is_empty() {
+                0
+            } else {
+                rng.below(hay.len() + 1)
+            };
+
+            assert_eq!(
+                done(Builtin::BytesIndexOf, vec![bytes(&hay), bytes(&needle)])
+                    .unwrap()
+                    .render(),
+                match naive(&hay, &needle, 0) {
+                    Some(i) => some(i as i64),
+                    None => "None".to_string(),
+                },
+                "case {case}: {hay:?} / {needle:?}"
+            );
+            assert_eq!(
+                done(
+                    Builtin::BytesIndexOfFrom,
+                    vec![bytes(&hay), bytes(&needle), Value::Int(from as i64)]
+                )
+                .unwrap()
+                .render(),
+                match naive(&hay, &needle, from) {
+                    Some(i) => some(i as i64),
+                    None => "None".to_string(),
+                },
+                "case {case}: {hay:?} / {needle:?} from {from}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------- prefix and suffix
+
+    #[test]
+    fn starts_with_and_ends_with_agree_with_the_empty_and_whole_cases() {
+        let b = bytes(b"HTTP/1.1");
+        for (builtin, hits, misses) in [
+            (
+                Builtin::BytesStartsWith,
+                [&b""[..], b"H", b"HTTP/1.1"],
+                [&b"HTTP/1.10"[..], b"T", b"1.1"],
+            ),
+            (
+                Builtin::BytesEndsWith,
+                [&b""[..], b"1", b"HTTP/1.1"],
+                [&b"0HTTP/1.1"[..], b"T", b"HTTP"],
+            ),
+        ] {
+            for hit in hits {
+                assert_eq!(
+                    done(builtin, vec![b.clone(), bytes(hit)]).unwrap().render(),
+                    "true",
+                    "{} {hit:?}",
+                    builtin.name()
+                );
+            }
+            for miss in misses {
+                assert_eq!(
+                    done(builtin, vec![b.clone(), bytes(miss)])
+                        .unwrap()
+                        .render(),
+                    "false",
+                    "{} {miss:?}",
+                    builtin.name()
+                );
+            }
+        }
+        assert_eq!(
+            done(Builtin::BytesStartsWith, vec![bytes(b""), bytes(b"")])
+                .unwrap()
+                .render(),
+            "true"
+        );
+    }
+
+    // ------------------------------------------------------------------ splits
+
+    #[test]
+    fn split_keeps_the_empty_pieces_a_join_needs_to_round_trip() {
+        let split =
+            |hay: &[u8], sep: &[u8]| done(Builtin::BytesSplit, vec![bytes(hay), bytes(sep)]);
+        assert_eq!(
+            split(b"a,b,c", b",").unwrap().render(),
+            "[b\"a\", b\"b\", b\"c\"]"
+        );
+        assert_eq!(split(b"", b",").unwrap().render(), "[b\"\"]");
+        assert_eq!(split(b",", b",").unwrap().render(), "[b\"\", b\"\"]");
+        assert_eq!(split(b"abc", b",").unwrap().render(), "[b\"abc\"]");
+        assert_eq!(
+            split(b"a\r\n\r\nb", b"\r\n").unwrap().render(),
+            "[b\"a\", b\"\", b\"b\"]"
+        );
+        // Non-overlapping, left to right: the second `aa` starts after the
+        // first one's last byte.
+        assert_eq!(
+            split(b"aaaa", b"aa").unwrap().render(),
+            "[b\"\", b\"\", b\"\"]"
+        );
+    }
+
+    /// Required test 39, both halves.
+    #[test]
+    fn split_round_trips_against_a_join_and_refuses_an_empty_separator() {
+        let mut rng = Xorshift(0xfeed_face_dead_b0d1);
+        for case in 0..2_000 {
+            let hay: Vec<u8> = (0..rng.below(30))
+                .map(|_| b'a' + rng.below(3) as u8)
+                .collect();
+            let sep: Vec<u8> = (0..1 + rng.below(3))
+                .map(|_| b'a' + rng.below(3) as u8)
+                .collect();
+            let split = done(Builtin::BytesSplit, vec![bytes(&hay), bytes(&sep)]).unwrap();
+            let Value::List(pieces) = &split else {
+                panic!("`bytes_split` answers a list");
+            };
+            let mut joined: Vec<u8> = Vec::new();
+            for (i, piece) in pieces.iter().enumerate() {
+                if i > 0 {
+                    joined.extend_from_slice(&sep);
+                }
+                let Value::Bytes(p) = piece else {
+                    panic!("`bytes_split` answers a list of Bytes");
+                };
+                joined.extend_from_slice(p);
+            }
+            assert_eq!(joined, hay, "case {case}: separator {sep:?}");
+        }
+
+        let d = done(Builtin::BytesSplit, vec![bytes(b"abc"), bytes(b"")]).unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("empty"), "{}", d.message);
+    }
+
+    // ------------------------------------------------------------ the scans
+
+    fn scan(b: Builtin, hay: &[u8], from: i64, set: &[u8], max: i64) -> Result<i64, Diagnostic> {
+        Ok(done(
+            b,
+            vec![bytes(hay), Value::Int(from), bytes(set), Value::Int(max)],
+        )?
+        .as_int(Span::DUMMY, "test")
+        .unwrap())
+    }
+
+    #[test]
+    fn a_scan_stops_on_the_class_and_the_other_stops_off_it() {
+        let head = b"GET /orders?id=7 HTTP/1.1";
+        let digits = b"0123456789";
+        let big = head.len() as i64;
+
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, head, 0, b" ", big).unwrap(),
+            3
+        );
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, head, 4, b" ", big).unwrap(),
+            16
+        );
+        assert_eq!(
+            scan(Builtin::BytesScan, head, 4, b"/ordes?=i", big).unwrap(),
+            15,
+            "the target's own bytes run out at the `7`"
+        );
+        assert_eq!(
+            scan(Builtin::BytesScan, head, 15, digits, big).unwrap(),
+            16,
+            "a digit run ends at the space after it"
+        );
+        assert_eq!(
+            scan(Builtin::BytesScan, head, 14, digits, big).unwrap(),
+            14,
+            "`=` is not a digit, so the scan stops where it started"
+        );
+
+        // The whole point of `bytes_scan` over a fold: the answer for a run
+        // that reaches the end is the end, not a sentinel.
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, head, 0, b"z", big).unwrap(),
+            big
+        );
+        assert_eq!(scan(Builtin::BytesScan, head, 0, b"", big).unwrap(), 0);
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, head, 0, b"", big).unwrap(),
+            big,
+            "an empty class is never entered"
+        );
+        assert_eq!(scan(Builtin::BytesScanUntil, b"", 0, b"a", 10).unwrap(), 0);
+        assert_eq!(scan(Builtin::BytesScan, head, big, b"a", big).unwrap(), big);
+    }
+
+    /// Every set size takes a different path — `memchr`, `memchr2`, `memchr3`,
+    /// then the bitmap — so the four have to agree with each other.
+    #[test]
+    fn every_set_size_takes_its_own_path_and_they_all_agree() {
+        fn naive(hay: &[u8], from: usize, set: &[u8], max: usize, want: bool) -> i64 {
+            let limit = hay.len().min(from + max);
+            for (i, b) in hay.iter().enumerate().take(limit).skip(from) {
+                if set.contains(b) == want {
+                    return i as i64;
+                }
+            }
+            limit as i64
+        }
+
+        let mut rng = Xorshift(0x0123_4567_89ab_cdef);
+        for case in 0..5_000 {
+            let hay: Vec<u8> = (0..rng.below(50))
+                .map(|_| b'a' + rng.below(6) as u8)
+                .collect();
+            let set: Vec<u8> = (0..rng.below(7))
+                .map(|_| b'a' + rng.below(6) as u8)
+                .collect();
+            let from = if hay.is_empty() {
+                0
+            } else {
+                rng.below(hay.len() + 1)
+            };
+            let max = rng.below(60);
+            for (builtin, want) in [(Builtin::BytesScan, false), (Builtin::BytesScanUntil, true)] {
+                assert_eq!(
+                    scan(builtin, &hay, from as i64, &set, max as i64).unwrap(),
+                    naive(&hay, from, &set, max, want),
+                    "case {case}: {} over {hay:?} from {from} set {set:?} max {max}",
+                    builtin.name()
+                );
+            }
+        }
+    }
+
+    /// Required test 37. The bound is structural rather than timed: the scan is
+    /// handed the window and cannot look outside it, so a marker placed one
+    /// byte past the budget is invisible however the search is implemented.
+    #[test]
+    fn a_scan_examines_at_most_max_bytes() {
+        for max in 0..40usize {
+            assert!(scan_window(&[0u8; 64], 3, max).len() <= max);
+            assert!(scan_window(&[0u8; 8], 3, max).len() <= max);
+        }
+
+        let mut hay = vec![b'a'; 1024];
+        hay[100] = b'!';
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, &hay, 0, b"!", 100).unwrap(),
+            100,
+            "the budget ran out exactly at the marker, which is one byte too far"
+        );
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, &hay, 0, b"!", 101).unwrap(),
+            100
+        );
+        assert_eq!(
+            scan(Builtin::BytesScanUntil, &hay, 0, b"!", 20).unwrap(),
+            20,
+            "a caller tells this from a hit by comparing against `from + max`"
+        );
+        assert_eq!(
+            scan(Builtin::BytesScan, &hay, 0, b"a", 7).unwrap(),
+            7,
+            "the same bound applies to the complement scan"
+        );
+    }
+
+    #[test]
+    fn a_negative_budget_is_a_bug_in_the_caller_and_is_named() {
+        let d = scan(Builtin::BytesScan, b"abc", 0, b"a", -1).unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("negative budget"), "{}", d.message);
+    }
+
+    // --------------------------------------------------------- the escape hatch
+
+    #[test]
+    fn position_finds_the_first_byte_its_predicate_accepts() {
+        let hay = bytes(b"abcXdef");
+        let is_upper = |args: &[Value]| {
+            let b = args[0].as_int(Span::DUMMY, "test").unwrap();
+            Value::Bool((65..=90).contains(&b))
+        };
+        assert_eq!(
+            drive(
+                Builtin::BytesPosition,
+                vec![hay.clone(), Value::Int(0), f()],
+                is_upper
+            )
+            .unwrap()
+            .render(),
+            some(3)
+        );
+        assert_eq!(
+            drive(
+                Builtin::BytesPosition,
+                vec![hay.clone(), Value::Int(4), f()],
+                is_upper
+            )
+            .unwrap()
+            .render(),
+            "None"
+        );
+        assert_eq!(
+            drive(
+                Builtin::BytesPosition,
+                vec![bytes(b""), Value::Int(0), f()],
+                |_| panic!("an empty buffer calls no predicate")
+            )
+            .unwrap()
+            .render(),
+            "None"
+        );
+    }
+
+    /// Required test 38. The whole reason this builtin exists beside the fold
+    /// it replaces: it stops.
+    #[test]
+    fn position_calls_its_predicate_once_for_a_match_at_the_start_of_a_megabyte() {
+        let mut calls = 0;
+        let out = drive(
+            Builtin::BytesPosition,
+            vec![Value::bytes(vec![7u8; 1 << 20]), Value::Int(0), f()],
+            |_| {
+                calls += 1;
+                Value::Bool(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(out.render(), some(0));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn position_reports_a_non_boolean_answer_rather_than_reading_past_it() {
+        let d = drive(
+            Builtin::BytesPosition,
+            vec![bytes(b"ab"), Value::Int(0), f()],
+            |_| Value::Int(1),
+        )
+        .unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("Bool"), "{}", d.message);
+    }
+
+    /// The property every builtin frame owes: a suspension point captured
+    /// inside it can be advanced more than once, and each resumption is its own
+    /// search.
+    #[test]
+    fn one_suspension_point_inside_position_can_be_resumed_twice() {
+        let mut world = World::new();
+        let start = call(
+            Builtin::BytesPosition,
+            vec![bytes(b"abc"), Value::Int(0), f()],
+            &mut world,
+            Span::DUMMY,
+        )
+        .unwrap();
+        let Step::Apply { frame, .. } = start else {
+            panic!("`bytes_position` suspends on its first byte");
+        };
+
+        let finish = |mut step: Step, fill: bool| loop {
+            match step {
+                Step::Done(v) => return v,
+                Step::Apply { frame, .. } => step = advance(frame, Value::Bool(fill)).unwrap(),
+            }
+        };
+        assert_eq!(
+            finish(advance(frame.clone(), Value::Bool(true)).unwrap(), false).render(),
+            some(0)
+        );
+        assert_eq!(
+            finish(advance(frame, Value::Bool(false)).unwrap(), true).render(),
+            some(1)
+        );
+    }
+
+    // ---------------------------------------------------- against what they replace
+
+    /// The fold-based `index_of` from W1's `examples/hello.ply`, verbatim in
+    /// Rust. The new builtins have to answer what it answered — the point of
+    /// the milestone is that they answer it in one pass instead of `n`.
+    #[test]
+    fn the_scans_agree_with_the_folds_they_replace() {
+        fn fold_index_of(hay: &[u8], byte: u8, from: usize) -> i64 {
+            // The fold's shape, kept: it visits every remaining byte even after
+            // it has the answer, which is the cost the builtins removed.
+            let mut found: i64 = -1;
+            for (i, &b) in hay.iter().enumerate().skip(from) {
+                if found < 0 && b == byte {
+                    found = i as i64;
+                }
+            }
+            found
+        }
+
+        fn fold_head_end(head: &[u8]) -> i64 {
+            let mut found: i64 = -1;
+            for i in 0..head.len().saturating_sub(3) {
+                if found < 0 && &head[i..i + 4] == b"\r\n\r\n" {
+                    found = (i + 4) as i64;
+                }
+            }
+            found
+        }
+
+        fn fold_all_upper(b: &[u8]) -> bool {
+            b.iter().all(|c| (65..=90).contains(c))
+        }
+
+        let mut rng = Xorshift(0xabcd_ef01_2345_6789);
+        for case in 0..5_000 {
+            let head: Vec<u8> = (0..rng.below(60))
+                .map(|_| [b'G', b'E', b'T', b' ', b'/', b'\r', b'\n', b'A'][rng.below(8)])
+                .collect();
+            let len = head.len() as i64;
+
+            // `bytes_index_of_byte`, absent as `None` rather than as `-1`.
+            let byte = b'\n';
+            let native = at(&done(
+                Builtin::BytesIndexOfByte,
+                vec![bytes(&head), Value::Int(i64::from(byte))],
+            )
+            .unwrap());
+            assert_eq!(
+                native,
+                fold_index_of(&head, byte, 0),
+                "case {case}: {head:?}"
+            );
+
+            // The same question through the bounded scan, whose "absent" is the
+            // end of the window rather than a sentinel.
+            let stopped = scan(Builtin::BytesScanUntil, &head, 0, &[byte], len).unwrap();
+            assert_eq!(
+                if stopped == len { -1 } else { stopped },
+                fold_index_of(&head, byte, 0),
+                "case {case}: {head:?}"
+            );
+
+            // `head_end`, which was the most expensive of the five folds.
+            let found = at(&done(
+                Builtin::BytesIndexOf,
+                vec![bytes(&head), bytes(b"\r\n\r\n")],
+            )
+            .unwrap());
+            let end = if found < 0 { -1 } else { found + 4 };
+            assert_eq!(end, fold_head_end(&head), "case {case}: {head:?}");
+
+            // `all_upper`, as a complement scan that reaches the end.
+            let upper = scan(
+                Builtin::BytesScan,
+                &head,
+                0,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                len,
+            )
+            .unwrap();
+            assert_eq!(upper == len, fold_all_upper(&head), "case {case}: {head:?}");
+        }
+    }
+
+    /// These are byte builtins and index in bytes, which is the whole reason a
+    /// request target is `Bytes`: a peer may send what is not UTF-8 at all. The
+    /// `String` pair indexes in characters, and the two answers differ on the
+    /// same text — so this pins the distinction rather than leaving a caller to
+    /// discover it on the first non-ASCII request.
+    #[test]
+    fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() {
+        let text = "héllo=wörld";
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOfByte,
+                vec![bytes(text.as_bytes()), Value::Int(i64::from(b'='))]
+            ),
+            some(6),
+            "`é` is two bytes, so the byte index is one past the character index"
+        );
+        assert_eq!(
+            done(Builtin::StringFind, vec![Value::str(text), Value::str("=")])
+                .unwrap()
+                .render(),
+            "5"
+        );
+
+        // A byte search may stop in the middle of a character, and the piece it
+        // cuts is refused by `string_of_bytes` rather than silently replaced.
+        let cut = done(
+            Builtin::BytesSlice,
+            vec![bytes(text.as_bytes()), Value::Int(0), Value::Int(2)],
+        )
+        .unwrap();
+        assert_eq!(
+            done(Builtin::BytesIsUtf8, vec![cut.clone()])
+                .unwrap()
+                .render(),
+            "false"
+        );
+        assert_eq!(
+            done(Builtin::StringOfBytes, vec![cut]).unwrap_err().code,
+            codes::RUNTIME_ERROR
+        );
+
+        // A multi-byte needle is matched whole, so a search never reports a
+        // position that splits one.
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOf,
+                vec![bytes(text.as_bytes()), bytes("ö".as_bytes())]
+            ),
+            some(8)
+        );
+        assert_eq!(
+            found(
+                Builtin::BytesIndexOf,
+                vec![bytes(text.as_bytes()), bytes(&"é".as_bytes()[1..])]
+            ),
+            some(2),
+            "a needle that is half a character still occurs where those bytes do"
+        );
+    }
+
     #[test]
     fn map_visits_every_element_in_order() {
         let mut seen = Vec::new();
@@ -949,13 +2317,18 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_three_callback_builtins_are_higher_order() {
+    fn exactly_the_callback_builtins_are_higher_order() {
         let names: Vec<&str> = Builtin::all()
             .iter()
             .filter(|b| b.higher_order())
             .map(|b| b.name())
             .collect();
-        assert_eq!(names, ["map", "filter", "fold"]);
+        let mut names = names;
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["bytes_position", "filter", "fold", "map", "map_fold"]
+        );
     }
 
     #[test]

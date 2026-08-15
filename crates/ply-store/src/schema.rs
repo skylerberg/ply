@@ -137,6 +137,11 @@ fn every_type() -> Type {
         params: vec![
             Type::Var(TyVar(0)),
             Type::Con(sym("List"), vec![Type::Var(TyVar(1))]),
+            // A two-argument `Con`, which no other exemplar reaches: `List` has
+            // one and `Map` is the first stored type whose arity the codec has
+            // to carry. It is here so the pin moves when `Map` arrives rather
+            // than only when something about `Type` itself does.
+            Type::map(Type::string(), Type::Var(TyVar(1))),
             Type::Record(BTreeMap::from([(sym("id"), Type::int())])),
         ],
         ret: Box::new(Type::Var(TyVar(0))),
@@ -372,7 +377,7 @@ mod tests {
     /// schema changed: paste the digest the failure prints, and bump
     /// `FRONTEND_VERSION` — a build that reads an entry written under the old
     /// shape has no other way to know.
-    const PINNED: &str = "6ddd08943f01ad833c07f06662741d0b367af7fdd80105b0abe896c8796c5d1f";
+    const PINNED: &str = "26cc2fb2e11173a642a005ad146df12bfef799d24f1b7ecbe7c7229b5b6681af";
 
     #[test]
     fn the_stored_schema_is_pinned() {

@@ -66,6 +66,91 @@ fn micros(d: Duration) -> f64 {
 
 // ------------------------------------------------------------------ endpoint
 
+/// Which implementation of the endpoint's three scans is under measurement.
+///
+/// W2's claim is that the byte builtins fixed an algorithm rather than a
+/// constant factor, and a claim of that shape needs a before as well as an
+/// after. W1's source is not in the tree any more, so [`Parser::W1Folds`] is a
+/// reconstruction rather than a checkout: the same `parse`, `request_line`,
+/// `parts` and `answer`, with `index_of`, `head_end` and `all_upper` written as
+/// W1 wrote them — a `fold` over `range` that boxes an `Int` per byte, calls a
+/// closure per byte, and cannot stop once it has the answer.
+///
+/// `crates/ply-corpus/tests/w1_baseline.rs` runs the example's own sixteen
+/// tests against the reconstruction, which is what makes it a twin rather than
+/// a guess: if the two parsers disagreed on any head the example tests, the
+/// comparison below would be between two different programs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Parser {
+    /// `bytes_index_of`, `bytes_scan` and `bytes_scan_until` — what W2 ships.
+    Native,
+    /// The `fold`-over-`range` scans W1 shipped.
+    W1Folds,
+}
+
+impl Parser {
+    pub fn label(self) -> &'static str {
+        match self {
+            Parser::Native => "native",
+            Parser::W1Folds => "w1-folds",
+        }
+    }
+
+    pub fn all() -> [Parser; 2] {
+        [Parser::W1Folds, Parser::Native]
+    }
+}
+
+/// The three scans, and what W1 wrote in their place.
+///
+/// Each pair is asserted to match by [`replace`], so a rewrite of the example
+/// that moved one of these functions stops the benchmark rather than silently
+/// measuring the native parser twice.
+const W1_SCANS: [(&str, &str); 3] = [
+    (
+        "\
+fn index_of(hay: Bytes, set: Bytes, from: Int) -> Int =
+  bytes_scan_until(hay, from, set, bytes_len(hay))",
+        "\
+fn index_of(hay: Bytes, set: Bytes, from: Int) -> Int =
+  fold(range(0, bytes_len(hay)), bytes_len(hay), |best: Int, i: Int|
+    if best < bytes_len(hay) || i < from || bytes_at(hay, i) != bytes_at(set, 0) {
+      best
+    } else {
+      i
+    })",
+    ),
+    (
+        "\
+fn head_end(head: Bytes) -> Int =
+  match bytes_index_of(head, b\"\\r\\n\\r\\n\") {
+    Some(at) -> at + 4,
+    None -> -1,
+  }",
+        "\
+fn head_end(head: Bytes) -> Int =
+  fold(range(0, bytes_len(head)), -1, |best: Int, i: Int|
+    if best >= 0 || i + 3 >= bytes_len(head) {
+      best
+    } else if bytes_at(head, i) == 13 && bytes_at(head, i + 1) == 10
+           && bytes_at(head, i + 2) == 13 && bytes_at(head, i + 3) == 10 {
+      i + 4
+    } else {
+      best
+    })",
+    ),
+    (
+        "\
+fn all_upper(b: Bytes) -> Bool =
+  bytes_scan(b, 0, b\"ABCDEFGHIJKLMNOPQRSTUVWXYZ\", bytes_len(b)) == bytes_len(b)",
+        "\
+fn all_upper(b: Bytes) -> Bool =
+  fold(range(0, bytes_len(b)), true, |ok: Bool, i: Int|
+    ok && bytes_at(b, i) >= 65 && bytes_at(b, i) <= 90)",
+    ),
+];
+
 /// `examples/hello.ply`, and the two definitions a measurement has to choose.
 ///
 /// The example is read rather than copied so that what is measured is the
@@ -107,13 +192,34 @@ impl Endpoint {
     }
 
     /// The server half plus the driver the in-process rungs call into.
-    pub fn benchable(&self) -> String {
-        format!("{}{PLY_HANDLER_DRIVER}", self.server_only)
+    pub fn benchable(&self, parser: Parser) -> Result<String> {
+        Ok(format!("{}{PLY_HANDLER_DRIVER}", self.scans(parser)?))
+    }
+
+    /// The example's whole source with the chosen scans in it, tests included.
+    /// This is what the twin test checks the reconstruction with.
+    pub fn whole(&self, parser: Parser) -> Result<String> {
+        Self::retarget(&self.source, parser)
+    }
+
+    fn scans(&self, parser: Parser) -> Result<String> {
+        Self::retarget(&self.server_only, parser)
+    }
+
+    fn retarget(source: &str, parser: Parser) -> Result<String> {
+        match parser {
+            Parser::Native => Ok(source.to_string()),
+            Parser::W1Folds => W1_SCANS
+                .iter()
+                .try_fold(source.to_string(), |acc, (from, to)| {
+                    replace(&acc, from, to)
+                }),
+        }
     }
 
     /// The example with a chosen port and connection count, tests included.
-    pub fn sequential(&self, port: u16, connections: u32) -> Result<String> {
-        settings(&self.source, port, connections)
+    pub fn sequential(&self, parser: Parser, port: u16, connections: u32) -> Result<String> {
+        settings(&self.whole(parser)?, port, connections)
     }
 
     /// The same endpoint with a task spawned per connection.
@@ -121,7 +227,7 @@ impl Endpoint {
     /// Only `serve` changes. `serve_one`, the parser and the response builder
     /// are the same definitions the sequential program runs, so the difference
     /// between the two is the scheduler and nothing else.
-    pub fn concurrent(&self, port: u16, connections: u32) -> Result<String> {
+    pub fn concurrent(&self, parser: Parser, port: u16, connections: u32) -> Result<String> {
         const OLD: &str = "\
 fn serve(server: Int, count: Int) -> Int / {net.write[listener], net.write[conn]} =
   if count <= 0 {
@@ -145,7 +251,7 @@ fn serve(server: Int, count: Int) -> Int
     task.join(t);
     1 + rest
   }";
-        let source = replace(&self.server_only, OLD, NEW)?;
+        let source = replace(&self.scans(parser)?, OLD, NEW)?;
         let source = replace(
             &source,
             "fn listen_and_serve(port: Int, count: Int) -> Int\n  / {net.write[listener], net.write[conn]} {",
@@ -215,6 +321,7 @@ pub struct Rung {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Ladder {
+    pub parser: &'static str,
     pub head_bytes: usize,
     pub rungs: Vec<Rung>,
     /// `host-tcp` over `rust-floor`: how many times a Ply request costs what
@@ -227,10 +334,10 @@ pub struct Ladder {
 
 /// The in-process ladder. One thread, the machine engine, no CLI, no child
 /// process, and the same endpoint under all five.
-pub fn ladder(repo: &Path, requests: u32, repeats: usize) -> Result<Ladder> {
+pub fn ladder(repo: &Path, parser: Parser, requests: u32, repeats: usize) -> Result<Ladder> {
     let endpoint = Endpoint::open(repo)?;
     let dir = tempfile::tempdir().context("a temp dir for the benchmark project")?;
-    std::fs::write(dir.path().join("hello.ply"), endpoint.benchable())?;
+    std::fs::write(dir.path().join("hello.ply"), endpoint.benchable(parser)?)?;
     let program = Program::load(dir.path())?;
 
     let answer = best_of(repeats, || program.answer_only(requests))?;
@@ -295,11 +402,92 @@ pub fn ladder(repo: &Path, requests: u32, repeats: usize) -> Result<Ladder> {
 
     let socket_layer = micros(tcp - sim) / requests as f64;
     Ok(Ladder {
+        parser: parser.label(),
         head_bytes: REQUEST.len(),
         over_floor: tcp.as_secs_f64() / floor.as_secs_f64(),
         interpreter_share: (total - socket_layer) / total,
         rungs,
     })
+}
+
+// ------------------------------------------------------------- head length
+
+/// One head length, and what `answer` cost over it.
+#[derive(Clone, Debug, Serialize)]
+pub struct HeadPoint {
+    pub parser: &'static str,
+    pub head_bytes: usize,
+    /// Header lines above the blank one. The request line is the only thing
+    /// this endpoint parses fields out of, so this number is padding: it grows
+    /// the buffer every scan crosses without giving the parser more to do.
+    pub headers: usize,
+    pub requests: u32,
+    pub per_request_micros: f64,
+    pub per_byte_micros: f64,
+    pub per_second: f64,
+}
+
+/// The exit criterion ADR 0012 §5 states: whether a request's cost is a
+/// function of how many bytes the head is or of how many fields were parsed.
+///
+/// W1's parser answered the first — five `fold`s over the whole buffer, each
+/// boxing an `Int` per byte — so `µs/byte` was flat and `µs/req` rose with the
+/// length. A parser whose scans are native answers the second, so `µs/req` is
+/// nearly flat and `µs/byte` falls as the head grows. Two columns, one table,
+/// and the shape of the curve is the claim rather than any single number.
+pub fn head_sweep(
+    repo: &Path,
+    parser: Parser,
+    requests: u32,
+    repeats: usize,
+) -> Result<Vec<HeadPoint>> {
+    let endpoint = Endpoint::open(repo)?;
+    let dir = tempfile::tempdir().context("a temp dir for the head sweep")?;
+    std::fs::write(dir.path().join("hello.ply"), endpoint.benchable(parser)?)?;
+    let program = Program::load(dir.path())?;
+
+    let mut out = Vec::new();
+    for headers in [0usize, 1, 2, 4, 8, 16, 32] {
+        let head = padded_head(headers);
+        // The endpoint refuses a head over `max_head`, and a sweep that
+        // measured the refusal path would be measuring a different program.
+        if head.len() > 2048 {
+            break;
+        }
+        // The fold parser is two orders of magnitude slower on a long head, so
+        // a sweep that gave it the native parser's request count would spend
+        // minutes proving something one tenth of them says.
+        let requests = match parser {
+            Parser::Native => requests,
+            Parser::W1Folds => (requests / 10).max(50),
+        };
+        let taken = best_of(repeats, || program.answer_over(&head, requests))?;
+        let per = micros(taken) / requests as f64;
+        out.push(HeadPoint {
+            parser: parser.label(),
+            head_bytes: head.len(),
+            headers,
+            requests,
+            per_request_micros: per,
+            per_byte_micros: per / head.len() as f64,
+            per_second: 1e6 / per,
+        });
+    }
+    Ok(out)
+}
+
+/// The benchmark request line with `headers` filler lines under it. The line
+/// itself never changes, so every head here parses exactly three fields and
+/// differs only in how much buffer the framing scan has to cross.
+pub fn padded_head(headers: usize) -> Vec<u8> {
+    let mut head = b"GET /hello HTTP/1.1\r\n".to_vec();
+    for i in 0..headers {
+        head.extend_from_slice(
+            format!("X-Pad-{i:02}: {}\r\n", "0123456789abcdef".repeat(3)).as_bytes(),
+        );
+    }
+    head.extend_from_slice(b"\r\n");
+    head
 }
 
 fn best_of(repeats: usize, mut run: impl FnMut() -> Result<Duration>) -> Result<Duration> {
@@ -330,8 +518,22 @@ impl Program {
         let id = sources.add(&path, text.clone());
         let name = ModuleName::from_relative_path(Path::new("hello.ply"))
             .map_err(|d| anyhow::anyhow!("{}", d.message))?;
-        let program = ply_syntax::parse_program([(id, name, text.as_str())])
+        // The endpoint imports `std.net`. `ply` pulls a shipped module in on
+        // demand; this loader has no import graph to walk, so it loads the set.
+        let mut inputs = vec![(id, name, text.as_str())];
+        for (module, source) in ply_std::sources() {
+            let module = ModuleName::from_dotted(module);
+            let id = sources.add(ply_std::pseudo_path(&module), source.to_string());
+            inputs.push((id, module, source));
+        }
+        let mut program = ply_syntax::parse_program(inputs)
             .map_err(|d| diagnostics("parsing the endpoint", &d))?;
+        // Before resolution, as the driver does: what resolution sees is
+        // ordinary definitions.
+        let expanded = ply_derive::expand_program(&mut program);
+        if !expanded.is_empty() {
+            return Err(diagnostics("expanding a `derive`", &expanded));
+        }
         let resolved = ply_syntax::resolve::resolve(&program)
             .map_err(|d| diagnostics("resolving the endpoint", &d))?;
         let check = ply_core::check_program(&program, &resolved)
@@ -369,9 +571,14 @@ impl Program {
     /// Rung 1. `answer(head)` — no effect performed, so nothing but the parse
     /// and the response build.
     fn answer_only(&self, requests: u32) -> Result<Duration> {
+        self.answer_over(REQUEST, requests)
+    }
+
+    /// The same rung over a chosen head, which is what the length sweep varies.
+    fn answer_over(&self, head: &[u8], requests: u32) -> Result<Duration> {
         let name = self.full("answer")?;
         let mut machine = self.machine();
-        let head = Value::bytes(REQUEST);
+        let head = Value::bytes(head);
         let started = Instant::now();
         for _ in 0..requests {
             machine
@@ -441,7 +648,7 @@ impl Program {
             machine.set_declared_footprint(declared);
         }
 
-        let client = Client::spawn(port, requests, 1);
+        let client = Client::spawn(port, REQUEST.into(), requests, 1);
         let started = Instant::now();
         let served = machine.call(
             &name,
@@ -516,7 +723,7 @@ fn rust_floor(requests: u32) -> Result<Duration> {
     let port = listener.local_addr()?.port();
     let response = floor_response();
 
-    let client = Client::spawn(port, requests, 1);
+    let client = Client::spawn(port, REQUEST.into(), requests, 1);
     let started = Instant::now();
     for _ in 0..requests {
         let (mut stream, _) = listener.accept()?;
@@ -606,7 +813,7 @@ impl Client {
     /// The threads start before the server is listening, so each connects in a
     /// retry loop up to [`STARTUP`]: a benchmark that raced the bind would
     /// report a connection refused as a server defect.
-    fn spawn(port: u16, requests: u32, concurrency: u32) -> Client {
+    fn spawn(port: u16, head: Arc<[u8]>, requests: u32, concurrency: u32) -> Client {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let concurrency = concurrency.max(1);
         let threads = (0..concurrency)
@@ -614,7 +821,8 @@ impl Client {
                 // The remainder goes to the low-numbered threads, so the total
                 // is exact whatever the two numbers are.
                 let mine = requests / concurrency + u32::from(i < requests % concurrency);
-                std::thread::spawn(move || one_client(addr, mine))
+                let head = Arc::clone(&head);
+                std::thread::spawn(move || one_client(addr, &head, mine))
             })
             .collect();
         Client { threads }
@@ -632,11 +840,11 @@ impl Client {
     }
 }
 
-fn one_client(addr: SocketAddr, requests: u32) -> Sample {
+fn one_client(addr: SocketAddr, head: &[u8], requests: u32) -> Sample {
     let mut sample = Sample::default();
     for _ in 0..requests {
         let started = Instant::now();
-        match exchange(addr) {
+        match exchange(addr, head) {
             Ok(()) => sample.latencies.push(started.elapsed()),
             Err(e) => sample.failures.push(e.to_string()),
         }
@@ -647,7 +855,7 @@ fn one_client(addr: SocketAddr, requests: u32) -> Sample {
 /// One request, one response, one connection. The endpoint answers `Connection:
 /// close` and closes, so end of stream is the end of the response and there is
 /// no framing to get wrong on this side.
-fn exchange(addr: SocketAddr) -> Result<()> {
+fn exchange(addr: SocketAddr, head: &[u8]) -> Result<()> {
     // Blocking `connect` on the fast path and `connect_timeout` only while
     // retrying. They are not the same syscall sequence: `connect_timeout` sets
     // the socket non-blocking and polls it, which costs a measurable fraction of
@@ -659,7 +867,7 @@ fn exchange(addr: SocketAddr) -> Result<()> {
     stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     stream.set_nodelay(true)?;
-    stream.write_all(REQUEST)?;
+    stream.write_all(head)?;
     stream.flush()?;
     // Sized up front: `read_to_end` over an empty `Vec` probes and grows, which
     // is three or four extra reads per request charged to a server that sent
@@ -714,6 +922,12 @@ impl Shape {
 pub struct LoadPoint {
     pub shape: Shape,
     pub server: &'static str,
+    /// Which scans the served endpoint uses. The floor has none, and says so.
+    pub parser: &'static str,
+    /// What the client sent. A load number is meaningless without it: the
+    /// endpoint's cost is a function of head length under W1's scans and very
+    /// nearly not under W2's, which is the whole comparison.
+    pub head_bytes: usize,
     pub concurrency: u32,
     pub requests: u32,
     pub seconds: f64,
@@ -734,6 +948,8 @@ pub fn load(
     repo: &Path,
     ply: &Path,
     shape: Shape,
+    parser: Parser,
+    headers: usize,
     concurrency: u32,
     requests: u32,
 ) -> Result<LoadPoint> {
@@ -743,16 +959,17 @@ pub fn load(
     // server is listening and answering, so the timed window starts at a warm
     // server rather than at a race with its typecheck.
     let source = match shape {
-        Shape::Sequential => endpoint.sequential(port, requests + 1)?,
-        Shape::Concurrent => endpoint.concurrent(port, requests + 1)?,
+        Shape::Sequential => endpoint.sequential(parser, port, requests + 1)?,
+        Shape::Concurrent => endpoint.concurrent(parser, port, requests + 1)?,
     };
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     std::fs::write(dir.path().join("hello.ply"), source)?;
 
+    let head: Arc<[u8]> = padded_head(headers).into();
     let mut server = Server::start(ply, dir.path())?;
-    server.probe(port)?;
+    server.probe(port, &head)?;
 
-    let client = Client::spawn(port, requests, concurrency);
+    let client = Client::spawn(port, Arc::clone(&head), requests, concurrency);
     let started = Instant::now();
     let sample = client.join()?;
     let seconds = started.elapsed().as_secs_f64();
@@ -762,6 +979,8 @@ pub fn load(
     Ok(LoadPoint {
         shape,
         server: shape.label(),
+        parser: parser.label(),
+        head_bytes: head.len(),
         concurrency,
         requests,
         seconds,
@@ -775,7 +994,7 @@ pub fn load(
 
 /// The same load against the Rust floor, so a concurrency sweep has a shape to
 /// be compared with rather than only a slope.
-pub fn load_floor(concurrency: u32, requests: u32) -> Result<LoadPoint> {
+pub fn load_floor(headers: usize, concurrency: u32, requests: u32) -> Result<LoadPoint> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let response = floor_response();
@@ -813,7 +1032,9 @@ pub fn load_floor(concurrency: u32, requests: u32) -> Result<LoadPoint> {
         })
     };
 
-    let client = Client::spawn(port, requests, concurrency);
+    let head: Arc<[u8]> = padded_head(headers).into();
+    let head_bytes = head.len();
+    let client = Client::spawn(port, head, requests, concurrency);
     let started = Instant::now();
     let sample = client.join()?;
     let seconds = started.elapsed().as_secs_f64();
@@ -830,6 +1051,8 @@ pub fn load_floor(concurrency: u32, requests: u32) -> Result<LoadPoint> {
     Ok(LoadPoint {
         shape: Shape::Concurrent,
         server: "rust-floor",
+        parser: "none",
+        head_bytes,
         concurrency,
         requests,
         seconds,
@@ -866,7 +1089,7 @@ impl Server {
     /// it would not have shown that a request comes back — which is the
     /// difference between a slow benchmark and one measuring a server that is
     /// about to fail every request.
-    fn probe(&mut self, port: u16) -> Result<()> {
+    fn probe(&mut self, port: u16, head: &[u8]) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let deadline = Instant::now() + STARTUP;
         loop {
@@ -877,7 +1100,7 @@ impl Server {
                     self.take()
                 );
             }
-            match exchange(addr) {
+            match exchange(addr, head) {
                 Ok(()) => return Ok(()),
                 Err(e) if Instant::now() >= deadline => {
                     bail!("nothing answering on {addr} after {STARTUP:?}: {e}")
@@ -952,17 +1175,22 @@ pub fn ply_binary() -> Result<PathBuf> {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurements {
-    pub ladder: Option<Ladder>,
+    /// One per parser measured, so the byte builtins' before and after sit on
+    /// one table taken on one machine in one run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ladders: Vec<Ladder>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heads: Vec<HeadPoint>,
     pub load: Vec<LoadPoint>,
 }
 
 pub fn render(m: &Measurements) -> String {
     let mut s = String::new();
 
-    if let Some(l) = &m.ladder {
+    for l in &m.ladders {
         s.push_str(&format!(
-            "per request — one thread, machine engine, a {}-byte head\n",
-            l.head_bytes
+            "per request — one thread, machine engine, a {}-byte head, the `{}` parser\n",
+            l.head_bytes, l.parser
         ));
         s.push_str(&format!(
             "  {:<12} {:>10} {:>10} {:>10} {:>7}  {}\n",
@@ -990,16 +1218,65 @@ pub fn render(m: &Measurements) -> String {
         s.push('\n');
     }
 
+    if !m.heads.is_empty() {
+        s.push_str("head length — `answer` alone, three fields parsed however long the head is\n");
+        s.push_str(&format!(
+            "  {:<10} {:>10} {:>8} {:>10} {:>10} {:>10}\n",
+            "parser", "head bytes", "headers", "µs/req", "µs/byte", "req/s"
+        ));
+        for p in &m.heads {
+            s.push_str(&format!(
+                "  {:<10} {:>10} {:>8} {:>10.2} {:>10.4} {:>10.0}\n",
+                p.parser,
+                p.head_bytes,
+                p.headers,
+                p.per_request_micros,
+                p.per_byte_micros,
+                p.per_second
+            ));
+        }
+        for parser in Parser::all() {
+            let of: Vec<&HeadPoint> = m
+                .heads
+                .iter()
+                .filter(|p| p.parser == parser.label())
+                .collect();
+            if let (Some(first), Some(last)) = (of.first(), of.last())
+                && first.head_bytes < last.head_bytes
+            {
+                s.push_str(&format!(
+                    "  {}: {:.0}x the bytes cost {:.2}x the time; proportional to length would be {:.0}x\n",
+                    parser.label(),
+                    last.head_bytes as f64 / first.head_bytes as f64,
+                    last.per_request_micros / first.per_request_micros,
+                    last.head_bytes as f64 / first.head_bytes as f64
+                ));
+            }
+        }
+        s.push('\n');
+    }
+
     if !m.load.is_empty() {
         s.push_str("under load — the `ply` binary over loopback, client-observed\n");
         s.push_str(&format!(
-            "  {:<14} {:>6} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
-            "server", "conns", "reqs", "req/s", "p50 µs", "p95 µs", "p99 µs", "max µs"
+            "  {:<14} {:<9} {:>5} {:>6} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+            "server",
+            "parser",
+            "head",
+            "conns",
+            "reqs",
+            "req/s",
+            "p50 µs",
+            "p95 µs",
+            "p99 µs",
+            "max µs"
         ));
         for p in &m.load {
             s.push_str(&format!(
-                "  {:<14} {:>6} {:>8} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}\n",
+                "  {:<14} {:<9} {:>5} {:>6} {:>8} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}\n",
                 p.server,
+                p.parser,
+                p.head_bytes,
                 p.concurrency,
                 p.requests,
                 p.per_second,
@@ -1022,20 +1299,95 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    /// The example's code with its `//` comments removed, so that a claim about
+    /// which builtins a variant *calls* is not answered by prose describing
+    /// them. String literals are tracked because a `//` inside one is code.
+    fn code_only(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        for line in source.lines() {
+            let bytes = line.as_bytes();
+            let mut in_string = false;
+            let mut cut = line.len();
+            let mut i = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if in_string => i += 1,
+                    b'"' => in_string = !in_string,
+                    b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                        cut = i;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out.push_str(&line[..cut]);
+            out.push('\n');
+        }
+        out
+    }
+
     /// The harness rewrites the example, and a rewrite that silently matched
     /// nothing would measure a server on the example's own port. Both variants
     /// are checked here rather than discovered as a hang.
+    /// The reconstruction has to be the same program with different scans, and
+    /// "different scans" is exactly three functions. A rewrite of the example
+    /// that moved one of them must stop the benchmark rather than let it
+    /// measure the native parser and label the column `w1-folds`.
+    #[test]
+    fn the_w1_reconstruction_replaces_every_scan_and_nothing_else() {
+        let endpoint = Endpoint::open(&repo()).unwrap();
+        let native = endpoint.benchable(Parser::Native).unwrap();
+        let folds = endpoint.benchable(Parser::W1Folds).unwrap();
+        let folds_code = code_only(&folds);
+        for builtin in [
+            "bytes_scan",
+            "bytes_index_of",
+            "bytes_starts_with",
+            "bytes_ends_with",
+            "bytes_split",
+            "bytes_position",
+        ] {
+            assert!(
+                !folds_code.contains(builtin),
+                "`{builtin}` survived the rewrite"
+            );
+        }
+        assert!(
+            code_only(&native).contains("bytes_scan"),
+            "the native variant stopped calling the builtins it is measuring"
+        );
+        for shared in [
+            "fn parse(head: Bytes) -> Parsed {",
+            "fn request_line(line: Bytes) -> Parsed {",
+            "fn answer(head: Bytes) -> Bytes =",
+            "fn response(status: String, body: String) -> Bytes =",
+        ] {
+            assert!(native.contains(shared), "{shared}");
+            assert!(folds.contains(shared), "{shared}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.ply"), &folds).unwrap();
+        Program::load(dir.path()).expect("the reconstructed endpoint typechecks");
+    }
+
     #[test]
     fn both_shapes_are_produced_from_the_example_and_typecheck() {
         let endpoint = Endpoint::open(&repo()).expect("the example is where it was");
-        for source in [
-            endpoint.sequential(19000, 3).unwrap(),
-            endpoint.concurrent(19001, 3).unwrap(),
-        ] {
-            assert!(source.contains("fn connections() -> Int = 3"));
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("hello.ply"), &source).unwrap();
-            Program::load(dir.path()).expect("the rewritten endpoint typechecks");
+        // Both parsers, because the load table serves the reconstruction too:
+        // W2's claim about requests per second needs a before taken the same
+        // way as its after, not a before quoted from a milestone ago.
+        for parser in Parser::all() {
+            for source in [
+                endpoint.sequential(parser, 19000, 3).unwrap(),
+                endpoint.concurrent(parser, 19001, 3).unwrap(),
+            ] {
+                assert!(source.contains("fn connections() -> Int = 3"));
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("hello.ply"), &source).unwrap();
+                Program::load(dir.path()).expect("the rewritten endpoint typechecks");
+            }
         }
     }
 
@@ -1045,8 +1397,8 @@ mod tests {
     #[test]
     fn the_concurrent_variant_changes_only_the_accept_loop() {
         let endpoint = Endpoint::open(&repo()).unwrap();
-        let sequential = endpoint.sequential(19002, 1).unwrap();
-        let concurrent = endpoint.concurrent(19002, 1).unwrap();
+        let sequential = endpoint.sequential(Parser::Native, 19002, 1).unwrap();
+        let concurrent = endpoint.concurrent(Parser::Native, 19002, 1).unwrap();
         assert!(concurrent.contains("task.spawn(|| serve_one(c))"));
         for shared in [
             "fn serve_one(c: Int) -> Unit / {net.write[conn]} {",

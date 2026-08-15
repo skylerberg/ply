@@ -10,6 +10,7 @@ pub mod discharge;
 pub mod emit;
 pub mod measure;
 pub mod model;
+pub mod payload;
 pub mod pipeline;
 pub mod rng;
 pub mod serve;

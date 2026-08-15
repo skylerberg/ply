@@ -118,12 +118,16 @@ impl Loaded {
     }
 
     /// Every definition named `main`, whatever module declares it.
+    ///
+    /// A `std` module is excluded: `main` is a project's, and a shipped module
+    /// that declared one would make `ply run` ambiguous in a directory the user
+    /// did not write.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
         self.check
             .defs
             .values()
-            .filter(|d| d.simple_name == main)
+            .filter(|d| d.simple_name == main && !ply_std::is_std(&d.module))
             .collect()
     }
 }

@@ -6,6 +6,8 @@ pub mod graph;
 pub mod normalize;
 
 #[cfg(test)]
+mod numerics;
+#[cfg(test)]
 mod tests;
 
 use indexmap::IndexMap;
@@ -13,7 +15,7 @@ use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::{Module, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use body::{BodySet, StoredBody};
@@ -516,6 +518,22 @@ fn slots(order: &[usize]) -> EffectIndex {
         .collect()
 }
 
+/// The hash each member of one strongly connected component gets, for a caller
+/// that has a hash table of its own to apply.
+///
+/// Exposed because `ply-test`'s renormalizer needs exactly this and had a copy of
+/// it: a duplicated hashing algorithm that drifts turns a bisection's `Edited`
+/// versus `Derived` question into a guess, and the drift is silent — the copy
+/// merely stops witnessing and the search widens.
+pub fn component_hashes(
+    index: &ProgramIndex<'_>,
+    component: &[usize],
+    hashes: &HashTable,
+    effects: &EffectIndex,
+) -> Vec<(usize, DefHash)> {
+    hash_component(index, component, hashes, effects).0
+}
+
 /// A cyclic component is hashed as a unit and each member identified by an index
 /// within it. Source position cannot supply that index — moving a definition
 /// would change its hash — so refinement does: start with every member in one
@@ -527,6 +545,16 @@ fn slots(order: &[usize]) -> EffectIndex {
 /// depth: `f(n) = g(n-1)` and `g(n) = f(n-1)` denote the same function and are
 /// interchangeable at every call site. They share an index, and so a hash —
 /// property 5 reaching inside a cycle, not a tie broken arbitrarily.
+///
+/// Two things make the bytes *usable* as well as canonical, and both are the same
+/// requirement said twice: **the label a reference mentions is the label its
+/// referent is filed under**. So the loop re-encodes once more after the partition
+/// settles, rather than shipping the round that produced the final split — a
+/// round that put every member in one class writes every reference as `class 0`,
+/// under which `f -> g, g -> h, h -> f` and `f -> h, h -> g, g -> f` are one
+/// definition set, which is both a collision and a cycle no decoder could rewire.
+/// And the payload is laid out **in class order** rather than sorted by bytes,
+/// so a member's index in it *is* its class with nothing to reconcile.
 fn hash_component(
     index: &ProgramIndex<'_>,
     component: &[usize],
@@ -538,35 +566,54 @@ fn hash_component(
         nz.node(index.nodes[v].body);
         nz.finish().0
     };
-
-    let mut classes: ComponentIndices = component.iter().map(|&v| (v, 0u32)).collect();
-    let mut class_count = 1;
-    let mut encodings: Vec<Vec<u8>>;
-    loop {
-        encodings = component.iter().map(|&v| encode(&classes, v)).collect();
-
+    let relabel = |encodings: &[Vec<u8>]| -> ComponentIndices {
         let mut distinct: Vec<&[u8]> = encodings.iter().map(Vec::as_slice).collect();
         distinct.sort_unstable();
         distinct.dedup();
-        classes = component
+        component
             .iter()
-            .zip(&encodings)
+            .zip(encodings)
             .map(|(&v, e)| (v, distinct.binary_search(&e.as_slice()).unwrap_or(0) as u32))
-            .collect();
+            .collect()
+    };
+    // Two labellings agree when they induce the same grouping. Comparing the
+    // *labels* instead would never terminate: relabelling a settled partition can
+    // permute its labels for ever, since each round ranks encodings that the
+    // previous round's labels changed.
+    let grouping = |classes: &ComponentIndices| -> Vec<Vec<usize>> {
+        let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for &v in component {
+            groups.entry(classes[&v]).or_default().push(v);
+        }
+        let mut out: Vec<Vec<usize>> = groups.into_values().collect();
+        out.sort();
+        out
+    };
 
-        // A round that splits nothing never will, and once every member is
-        // alone in its class there is nothing left to split.
-        if distinct.len() == class_count || distinct.len() == component.len() {
+    let mut classes: ComponentIndices = component.iter().map(|&v| (v, 0u32)).collect();
+    let mut encodings: Vec<Vec<u8>> = component.iter().map(|&v| encode(&classes, v)).collect();
+    loop {
+        let next = relabel(&encodings);
+        let settled = grouping(&next) == grouping(&classes);
+        classes = next;
+        encodings = component.iter().map(|&v| encode(&classes, v)).collect();
+        if settled {
             break;
         }
-        class_count = distinct.len();
     }
 
-    let mut sorted: Vec<&[u8]> = encodings.iter().map(Vec::as_slice).collect();
-    sorted.sort_unstable();
+    // One entry per class, in class order: members that share a class are
+    // interchangeable — the partition settled, so their encodings are equal —
+    // and storing one twice would leave the payload's indices and the members'
+    // classes disagreeing about how many there are.
+    let width = classes.values().copied().max().unwrap_or(0) as usize + 1;
+    let mut by_class: Vec<&[u8]> = vec![&[]; width];
+    for (&v, encoding) in component.iter().zip(&encodings) {
+        by_class[classes[&v] as usize] = encoding;
+    }
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-    for member in sorted {
+    bytes.extend_from_slice(&(by_class.len() as u32).to_le_bytes());
+    for member in by_class {
         bytes.extend_from_slice(&(member.len() as u32).to_le_bytes());
         bytes.extend_from_slice(member);
     }

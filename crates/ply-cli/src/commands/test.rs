@@ -64,7 +64,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // selection and never after it.
     let search = crate::simulation::plan(&args.simulation);
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
-    let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
+    let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
     // Evaluation needs an AST, and gate 1 may have skipped the file a selected
     // test lives in. Only those modules are re-parsed — with their imports, which
@@ -106,7 +106,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
                 loaded = full;
                 hashes = loaded.hashes.clone();
                 let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
-                plan = Plan::new(selected, &loaded.check, args.filter.as_deref());
+                plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
             }
             Err(err) => return report_load_error("test", &err, args.json, style),
         }
@@ -321,26 +321,41 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn new(selection: Selection, check: &CheckOutput, filter: Option<&str>) -> Plan {
-        let Some(needle) = filter else {
-            let visible = (0..check.tests.len()).collect();
+    /// `std_tests` is `--std`. A shipped module's tests are not a project's:
+    /// without this rule a project's test count changes with a compiler upgrade,
+    /// for tests the project did not write and cannot fix. They are checked by
+    /// the compiler's own suite instead.
+    pub fn new(
+        selection: Selection,
+        check: &CheckOutput,
+        filter: Option<&str>,
+        std_tests: bool,
+    ) -> Plan {
+        // Two separate questions. Scope decides which tests are this run's at
+        // all; the filter narrows within it. Only the second is reported as
+        // `filtered out`, because a shipped test was never in the denominator.
+        let in_scope = |t: &ply_core::TestInfo| std_tests || !ply_std::is_std(&t.module);
+        // Matched against `<module>.<label>` rather than the label alone, so
+        // `--filter store.` narrows to a module without a second flag, and a
+        // label substring still matches because the key contains the label.
+        let matches = |t: &ply_core::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
+
+        let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
+        let visible: Vec<usize> = check
+            .tests
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| in_scope(t) && matches(t))
+            .map(|(i, _)| i)
+            .collect();
+        if visible.len() == check.tests.len() {
             return Plan {
                 selection,
                 visible,
                 filtered_out: 0,
             };
-        };
+        }
 
-        // Matched against `<module>.<label>` rather than the label alone, so
-        // `--filter store.` narrows to a module without a second flag, and a
-        // label substring still matches because the key contains the label.
-        let visible: Vec<usize> = check
-            .tests
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.key.as_str().contains(needle))
-            .map(|(i, _)| i)
-            .collect();
         let keeps = |i: &usize| visible.binary_search(i).is_ok();
 
         let cached: Vec<_> = selection
@@ -366,7 +381,7 @@ impl Plan {
         );
 
         Plan {
-            filtered_out: check.tests.len() - visible.len(),
+            filtered_out: scoped - visible.len(),
             selection: Selection {
                 total: visible.len(),
                 cached,
@@ -1490,7 +1505,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let (dir, loaded, hashes) = fixture();
         let store = Store::open(dir.path()).unwrap();
         let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
-        let plan = Plan::new(selected, &loaded.check, filter);
+        let plan = Plan::new(selected, &loaded.check, filter, false);
         (dir, loaded, hashes, plan)
     }
 
@@ -1524,6 +1539,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect_budget: 64,
             trace: When::Auto,
             host: false,
+            std: false,
             engine: crate::cli::EngineArg::default(),
             simulation: crate::cli::SimOptions {
                 seed: None,
@@ -1625,6 +1641,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
                 ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
                 &loaded.check,
                 Some(needle),
+                false,
             )
         };
         assert_eq!(select("beta.").visible, vec![1]);
@@ -1644,7 +1661,10 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
         assert!(again.to_run.is_empty());
         assert_eq!(again.cached.len(), 4);
-        assert_eq!(Plan::new(again, &loaded.check, None).selection.total, 4);
+        assert_eq!(
+            Plan::new(again, &loaded.check, None, false).selection.total,
+            4
+        );
     }
 
     #[test]
@@ -1774,6 +1794,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
+            false,
         );
         let report = run(&loaded, &plan.selection, &mut store);
 
@@ -1824,6 +1845,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
+            false,
         );
         let report = run(&loaded, &plan.selection, &mut store);
 
@@ -1887,6 +1909,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
                 ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
                 &loaded.check,
                 None,
+                false,
             );
             let report = run(&loaded, &plan.selection, &mut store);
             serde_json::to_string(
@@ -1938,6 +1961,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             ),
             &loaded.check,
             None,
+            false,
         );
         let v = json_report(&loaded, &hashes, &plan, &report, &args, 1);
         assert_eq!(v["failures"][0]["culprit"]["verdict"], "not_attempted");
@@ -2077,6 +2101,7 @@ test \"stuck\" {
             ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
             &loaded.check,
             None,
+            false,
         );
         let report = run(&loaded, &plan.selection, &mut store);
         assert_eq!(report.failed, 2);

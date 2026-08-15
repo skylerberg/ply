@@ -14,37 +14,21 @@
 // accepts. Those are inferred, checked as an upper bound against the
 // annotation, and they are what a host handler binds against and what the
 // scheduler groups on — not comments that can go stale.
-//
-// One file on purpose: `ply run` on a file argument loads that module alone,
-// so a program with an `import` can only be run by directory, and a directory
-// may hold only one `main`.
 
 // --- The boundary -----------------------------------------------------------
 
-// Copied from `crates/ply-host/ply/net.ply`, which is what `ply_host::tcp`
-// registers against. An operation whose signature drifts from that file is
-// `E0421` at bind time, before anything runs, naming the one that moved — so
-// this block is a contract with the host and not a convenience.
+// The declaration `ply_host::tcp` registers against, imported rather than
+// copied. W1 copied it, and a copy is a signature that can drift from the one
+// the host binds to; this is one text, so it cannot.
 //
-// Every operation is a `write`, `recv` included, and that is not an oversight.
-// A mode is a claim about commutation: `recv` consumes bytes from the kernel's
-// receive buffer, so two tasks reading one socket race exactly as two writers
-// do, and calling it a read would let the conflict graph run them side by side.
-// Over-approximating costs parallelism; under-approximating costs correctness,
-// silently, which is the failure mode this milestone is built around.
+// The names come in unqualified, so `net.recv[conn](c, max)` below is the
+// effect `std.net.net` and every row reads exactly as it did. Loading is
+// demand-driven and the stdlib is not part of the project, so `ply run
+// examples/hello.ply` still loads this module alone plus what it imports.
 //
-// `nondet` is load-bearing too. ADR 0011 §4 points the determinism arrow at the
-// declaration: a handler registered `Nondeterministic` requires the word below,
-// so a `det` test that reaches a socket is `E0412` whether or not `--host` was
-// passed. What arrives on a socket is not a function of program state, and this
-// is where that is said.
-nondet effect net {
-  write listen[s](port: Int) -> Int
-  write accept[s](listener: Int) -> Int
-  write recv[s](conn: Int, max: Int) -> Bytes
-  write send[s](conn: Int, payload: Bytes) -> Int
-  write close[s](socket: Int) -> Unit
-}
+// Every operation is a `write`, `recv` included, and every operation is
+// `nondet`; both are said in `std.net` itself, where the reasons live.
+import std.net (net)
 
 // --- Requests ---------------------------------------------------------------
 //
@@ -76,34 +60,41 @@ type Parsed =
 // buffer, so an unbounded head is unbounded work bought with one packet.
 fn max_head() -> Int = 2048
 
-// Both scans fold over `range` rather than recursing. A tail call is charged
-// against the call budget like any other, so a byte-at-a-time recursion over a
-// 2 KiB head would sit a fifth of the way into the recursion limit for one
-// lookup. A fold's nesting is constant. It is also, measurably, where every
-// microsecond of this endpoint goes: see the note at the foot of the file.
+// Every scan here is a native byte builtin, and that is the whole of W2's
+// change to this file. W1 wrote each of them as a `fold` over `range`, which
+// materialized one boxed `Int` per byte, called a closure per byte, and could
+// not stop once it had found what it was looking for — so the endpoint's cost
+// was five passes over the head and 5.2 microseconds per byte of it. The
+// builtins below do the same searches in one SIMD pass each, with an early
+// exit and no allocation per byte. See the note at the foot of the file for
+// what that was worth.
 
-// The index of the first `byte` at or after `from`, or -1.
-fn index_of(hay: Bytes, byte: Int, from: Int) -> Int =
-  fold(range(from, bytes_len(hay)), -1, |found, i|
-    if found >= 0 { found } else if bytes_at(hay, i) == byte { i } else { found })
+// The index of the first byte of `set` at or after `from`, or `bytes_len(hay)`
+// when there is none. `bytes_scan_until` answers the end rather than a `-1`
+// sentinel, which is why the guards below compare against the length: an index
+// that is always in `0..=len` is one that can be handed straight to
+// `bytes_slice`.
+fn index_of(hay: Bytes, set: Bytes, from: Int) -> Int =
+  bytes_scan_until(hay, from, set, bytes_len(hay))
 
 // The index just past the first CRLF CRLF, or -1 while the head is unfinished.
 // This is the framing decision, and the only reason the endpoint knows a
 // request has arrived whole.
+//
+// One `memmem` pass with a skip table, stopping at the first occurrence. W1
+// wrote this as a fold that read four bytes per index and kept going after it
+// had the answer, which made the framing decision the most expensive thing the
+// endpoint did.
 fn head_end(head: Bytes) -> Int =
-  fold(range(0, bytes_len(head) - 3), -1, |found, i|
-    if found >= 0 {
-      found
-    } else if bytes_at(head, i) == 13 && bytes_at(head, i + 1) == 10
-           && bytes_at(head, i + 2) == 13 && bytes_at(head, i + 3) == 10 {
-      i + 4
-    } else {
-      found
-    })
+  match bytes_index_of(head, b"\r\n\r\n") {
+    Some(at) -> at + 4,
+    None -> -1,
+  }
 
+// A complement scan: it stops at the first byte that is *not* in the class, so
+// a method of only uppercase letters is one where it ran to the end.
 fn all_upper(b: Bytes) -> Bool =
-  fold(range(0, bytes_len(b)), true, |ok, i|
-    ok && bytes_at(b, i) >= 65 && bytes_at(b, i) <= 90)
+  bytes_scan(b, 0, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ", bytes_len(b)) == bytes_len(b)
 
 // Bytes throughout, never `String`. A request target is bytes on the wire and a
 // peer is free to send ones that are not UTF-8; decoding first would either
@@ -113,7 +104,7 @@ fn parse(head: Bytes) -> Parsed {
   if head_end(head) < 0 {
     Incomplete
   } else {
-    let lf = index_of(head, 10, 0);
+    let lf = index_of(head, b"\n", 0);
     if lf < 1 || bytes_at(head, lf - 1) != 13 {
       Malformed("the request line must end with CRLF")
     } else {
@@ -122,18 +113,25 @@ fn parse(head: Bytes) -> Parsed {
   }
 }
 
+// Absent is the line's length rather than `-1`, so each start below is already
+// in `0..=len` and `bytes_scan_until` never has to refuse one.
 fn request_line(line: Bytes) -> Parsed {
-  let sp1 = index_of(line, 32, 0);
-  let sp2 = index_of(line, 32, sp1 + 1);
-  if sp1 < 0 || sp2 < 0 {
+  let len = bytes_len(line);
+  let sp1 = index_of(line, b" ", 0);
+  if sp1 >= len {
     Malformed("a request line is `METHOD TARGET VERSION`")
-  } else if index_of(line, 32, sp2 + 1) >= 0 {
-    Malformed("a request line holds exactly two spaces")
   } else {
-    parts(
-      bytes_slice(line, 0, sp1),
-      bytes_slice(line, sp1 + 1, sp2),
-      bytes_slice(line, sp2 + 1, bytes_len(line)))
+    let sp2 = index_of(line, b" ", sp1 + 1);
+    if sp2 >= len {
+      Malformed("a request line is `METHOD TARGET VERSION`")
+    } else if index_of(line, b" ", sp2 + 1) < len {
+      Malformed("a request line holds exactly two spaces")
+    } else {
+      parts(
+        bytes_slice(line, 0, sp1),
+        bytes_slice(line, sp1 + 1, sp2),
+        bytes_slice(line, sp2 + 1, len))
+    }
   }
 }
 
@@ -542,17 +540,31 @@ test "serving no connections opens a listener and touches no socket" {
   }
 }
 
-// The number W1 owes W6, measured on a release build with the machine engine
-// and no socket involved, over a 35-byte head:
+// What the byte builtins were worth, from
+// `cargo run --release -p ply-corpus -- serve --repo .` — one thread, the
+// machine engine, over the benchmark's 63-byte head:
 //
-//   whole request, read loop included   1.05 ms   ~950 req/s per thread
-//   `answer` alone (parse and build)    0.56 ms
-//   one `head_end` over the head        0.105 ms  ~3.0 µs per byte examined
-//   building the response               0.010 ms
+//                                       W1's folds   these builtins
+//   `answer` alone (parse and build)        358 µs          48 µs
+//   a whole request over a real socket      714 µs         221 µs
+//   requests per second, one thread           1401           4528
+//   share of a request above the socket        86%            34%
 //
-// So the endpoint's cost is a function of head length and of almost nothing
-// else. `fold` over `range` materializes one boxed `Int` per byte, and the
-// three scans plus `head_end` twice in `read_head` are where the millisecond
-// goes; the response, nine string concatenations, is a rounding error. The
-// first lever is a native byte search, not a faster interpreter — which is a
-// real answer to W6's question and not the one M9 assumes.
+// The number that decides W6 is not the ratio, though. It is the shape: the
+// same `answer` over a head grown from 23 bytes to 1943 by adding header lines
+// the parser does not read.
+//
+//                    W1's folds        these builtins
+//     23 bytes           216 µs                 50 µs
+//   1943 bytes          8458 µs                 47 µs
+//
+// 84 times the bytes cost 39 times the time before and 0.95 times the time
+// now. A request's cost has stopped being a function of how long its head is
+// and become a function of how many fields were parsed out of it — which is
+// exactly the claim ADR 0012 §5 set as the exit criterion, and it is an
+// algorithm rather than a constant factor. A faster interpreter would have
+// divided the first column; it would not have flattened it.
+//
+// What remains above the socket is `handle` dispatch and the response build,
+// and the socket is now two thirds of a served request. That is the real
+// answer to W6's question, and it is not the one M9 assumes.

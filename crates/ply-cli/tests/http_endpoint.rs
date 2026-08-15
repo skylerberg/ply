@@ -339,22 +339,16 @@ fn without_the_flag_the_program_never_reaches_the_socket() {
 /// A test that reaches a socket, and the same project's whole cache lifecycle
 /// around it.
 ///
-/// The source declares `net` exactly as `crates/ply-host/ply/net.ply` does,
-/// because a signature that drifts is `E0421` at bind time and this test would
-/// then be asserting about a program that never bound rather than about one
-/// that ran.
+/// The source **imports** the declaration rather than copying it, which is what
+/// W2 made possible: a copy is a signature that can drift, and a drifted one is
+/// `E0421` at bind time, which would leave this test asserting about a program
+/// that never bound rather than about one that ran.
 fn reaching_test(port: u16) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let declaration =
-        std::fs::read_to_string(repo("crates/ply-host/ply/net.ply")).expect("the declaration");
-    let effect = declaration
-        .split_once("nondet effect net {")
-        .map(|(_, rest)| rest.split_once('}').expect("the block closes").0)
-        .expect("the declaration holds the effect");
     std::fs::write(
         dir.path().join("touch.ply"),
         format!(
-            "nondet effect net {{{effect}}}\n\
+            "import std.net (net)\n\
              \n\
              fn touch() -> Int / {{net.write[listener]}} {{\n\
              \x20 let l = net.listen[listener]({port});\n\

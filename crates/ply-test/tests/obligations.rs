@@ -62,6 +62,7 @@ fn check_of(names: &[&str]) -> CheckOutput {
                 simple_name: Symbol::new(simple),
                 scheme: Scheme::mono(Type::int()),
                 footprint: Footprint::empty(),
+                constraints: Vec::new(),
                 spec: Vec::new(),
                 span: Span::DUMMY,
             },

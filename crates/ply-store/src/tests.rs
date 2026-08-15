@@ -2142,7 +2142,7 @@ const PINNED_FINGERPRINT: &str = "02e7e6340261171838cb49303958e371ae61d01db72909
 const PINNED_DEF: &str = "6d1312f0f06072ba7f40f0b201b0a2f8005d0d0fe1d3b44c110f8b6b15a99644";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
-const PINNED_BODY: &str = "1f77f4f55f4c472d4f885283f0decead9da33634aded6133972c776a8b6d2d52";
+const PINNED_BODY: &str = "a7b6ea731ed0e31bcbee6e4b7f8b0c3666406807ef11b62475861bdef4dd080d";
 
 /// The other direction, which the forward pin cannot show: bytes written by an
 /// earlier run of this version still decode to the same values, through the
@@ -2705,4 +2705,50 @@ fn a_baseline_for_every_test_does_not_slow_the_open() {
             .pass_record(&Symbol::new("m4999.t4999 holds for a seeded fixture"))
             .is_some()
     );
+}
+
+/// The stdlib digest survives a reopen, and survives a `RUNTIME_VERSION` change
+/// — which is exactly why it is its own file rather than a field of the result
+/// cache. A compiler upgrade is when both move, and losing the digest there
+/// would drop `W0605` at the only moment it has anything to say.
+#[test]
+fn the_stdlib_digest_round_trips_and_is_written_only_when_it_moves() {
+    let root = TempRoot::new("stdlib-digest");
+    let mut store = root.open();
+    assert_eq!(store.stdlib_digest(), None, "a cold cache records nothing");
+
+    store.set_stdlib_digest("b3:aaaaaaaaaaaa".to_string());
+    store.flush().unwrap();
+    assert_eq!(
+        root.open().stdlib_digest().as_deref(),
+        Some("b3:aaaaaaaaaaaa")
+    );
+
+    // The same digest is not a write: an unchanged compiler must touch no file.
+    let path = root.path().join(CACHE_DIR_NAME).join("stdlib");
+    let before = fs::metadata(&path).unwrap().len();
+    let mut store = root.open();
+    store.set_stdlib_digest("b3:aaaaaaaaaaaa".to_string());
+    store.flush().unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), before);
+
+    let mut store = root.open();
+    store.set_stdlib_digest("b3:bbbbbbbbbbbb".to_string());
+    assert_eq!(
+        store.stdlib_digest().as_deref(),
+        Some("b3:bbbbbbbbbbbb"),
+        "a reader sees this run's digest before it is flushed"
+    );
+    store.flush().unwrap();
+    assert_eq!(
+        root.open().stdlib_digest().as_deref(),
+        Some("b3:bbbbbbbbbbbb")
+    );
+
+    // `ply cache clear` forgets it: after a clear there is nothing left for a
+    // moved stdlib to have invalidated.
+    let mut store = root.open();
+    store.clear().unwrap();
+    assert_eq!(store.stdlib_digest(), None);
+    assert_eq!(root.open().stdlib_digest(), None);
 }

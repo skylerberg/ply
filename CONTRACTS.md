@@ -464,8 +464,15 @@ Normalization, per DESIGN.md §3 — this is the crate's whole point, get it exa
 - `hash = blake3(bytes)`.
 - Mutually recursive definitions form an SCC (Tarjan). Hash the component with
   self-references replaced by component-local indices, then each member is
-  `blake3(component_hash ‖ index_le_u32)`. Order members by their position in the
-  source so the component hash is stable.
+  `blake3(component_hash ‖ index_le_u32)`. The index is **not** source position —
+  moving a definition would change its hash — but the class partition refinement
+  assigns: start with every member in one class, re-encode with each
+  intra-component reference written as the referent's current class, and split
+  until the partition settles, then re-encode once more so the labels the bytes
+  mention are the labels the members are filed under. The component's payload is
+  one encoding per class, laid out in class order. Stopping a round early would
+  leave every reference reading `class 0`, under which `f → g, g → h, h → f` and
+  `f → h, h → g, g → f` are one definition set.
 - A `test`'s hash covers its body, so it transitively covers everything it calls.
 
 These properties must hold, and there must be a test for each:
@@ -4046,3 +4053,578 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 - **Byte-slice patterns**, a `Map`, JSON, routing, TLS, a database.
 - **Multi-shot across the host by any mechanism.** The restriction is on the
   boundary, not on the feature, and there is no flag to relax it.
+
+---
+
+## Payloads
+
+`docs/adr/0012-w2-contract.md` has the reasoning; this section is the contract.
+**Where it disagrees with any section above, this section wins** — it was
+written after them.
+
+### The rule everything else follows from
+
+Every new thing W2 adds is a **value or a definition like any other**. A stdlib
+definition hashes like a project one, a derived definition hashes like a
+hand-written one, and a `Map` is a value whose canonical form is a function of
+its contents. Nothing here gets a private channel into a cache key, a hash, or
+an iteration order.
+
+### The stdlib — `ply-std`, a new crate
+
+`import std.json`. `std` is a **reserved first segment**: a project file whose
+path would derive a module name of `std` or `std.*` is `E0113
+RESERVED_MODULE_NAME` against the file. Reserving it removes any precedence
+question between the project and the stdlib.
+
+Sources live in `crates/ply-std/ply/*.ply` and are **embedded at compile time by
+an explicit `include_str!` table** in one file — not a directory scan, and not a
+path resolved at run time, which would make a program's hashes depend on the
+installation layout. There is no `--std-path`.
+
+```rust
+/// The module a name denotes, and the source that ships for it.
+pub fn source(module: &ModuleName) -> Option<&'static str>;
+pub fn modules() -> impl Iterator<Item = ModuleName>;
+/// The pseudo-path a module's fingerprint is keyed by: `<std>/json.ply`.
+pub fn pseudo_path(module: &ModuleName) -> PathBuf;
+/// BLAKE3 over the canonical list of `(module name, hash of source bytes)`.
+/// Raw bytes rather than a `ContentHash`, so this crate needs no `ply-store`.
+pub fn digest() -> [u8; 32];
+pub fn is_std(module: &ModuleName) -> bool;   // first segment is `std`
+```
+
+Loading is **demand-driven**: after the project's files are parsed, the loader
+walks the import graph and pulls in an `import std.x` no project module
+satisfies, transitively. A missing `std.x` is `E0106 UNKNOWN_MODULE` listing
+what exists. A program importing nothing from `std` loads nothing and has
+byte-identical hashes to what it has today.
+
+- A `std` module may import only `std.*`; anything else is `E0505
+  INTERNAL_ERROR`, because the user cannot have caused it or fix it.
+- `Loaded::entry_points` excludes `std` modules.
+- **A `std` module's tests are not selected by a project run** and write nothing
+  to a project's cache. `ply test --std` includes them; the compiler's own suite
+  loads the embedded set as one program and checks and runs it.
+- A stdlib definition **normalizes exactly as any other**: no `std` marker and no
+  stdlib version enters a hash. Copying a `std` source into a project therefore
+  produces identical `DefHash`es sharing its cache entries.
+- **The stdlib digest is in no cache key.** A digest in the key would invalidate
+  a project on an edit to a `std` module it never imports. The store records the
+  digest it was last written under and warns `W0605 STDLIB_CHANGED` once when it
+  differs, naming both digests and the count of reached definitions whose hash
+  moved — often zero, and the warning must say so.
+- Gate 1 needs no new mechanism: an embedded module's
+  `SourceFingerprint::content_hash` is over the **embedded source bytes** and its
+  store key is the pseudo-path. Gate 2 is unchanged. `prune`'s `keep` gains the
+  pseudo-paths the run loaded.
+
+`crates/ply-host/ply/net.ply` moves to `crates/ply-std/ply/net.ply` as module
+`std.net`; its demo functions move to `examples/`. The effect's program-wide name
+becomes `std.net.net`, which `ply_host::tcp`'s registration and `ply hosts` must
+use.
+
+`ply std [--json] [--digest]` lists the modules with definition counts and the
+digest; `--digest` prints `b3:` plus twelve hex characters and nothing else,
+exactly as `ply hosts --digest` does.
+
+### `Map`
+
+```rust
+pub enum Value { /* ... */ Map(RedBlackTreeMap<Value, Value>) }
+```
+
+`rpds::RedBlackTreeMap`, which `World` already uses, so **no new dependency**,
+and under the same `RcK` shared-pointer kind, so a `Value` stays thread-confined.
+Persistent: `map_insert` is O(log n) and a clone is a refcount bump.
+
+This requires `impl Ord for Value`, hand-written and **structural, total and
+deterministic**: variants by a pinned discriminant first; `Decimal` by numeric
+value; `Float` by `f64::total_cmp`; `List` lexicographically; `Record`
+field-name-ascending; `Ctor` by variant name then fields; and `Closure`, `Cell`,
+`Task`, `Continuation` by discriminant alone — never a panic and never a
+pointer, because one is banned on a reachable path and the other is not
+deterministic. Those cases are unreachable from a well-typed program.
+
+`values_equal` stays the language's equality and is **not** rewritten in terms
+of `cmp`; the two are checked against each other, which is what catches a
+divergence rather than hiding it. Rust's `==` on a `Value` therefore agrees with
+the language's everywhere except `Float` NaN, where `cmp` is `Equal` and
+`values_equal` is false — so a call site that means the language's equality must
+say so.
+
+**`map_keys` is ascending by that order, always.** Not insertion order, not hash
+order, not unspecified. Content addressing, the result cache, seeded replay and
+`--engine both` all assume a value has one canonical form, and every failure a
+hash-ordered map would produce is a green result or a red result over correct
+code.
+
+A key type must be **ordered**, which is exactly `derivable(ord, k)` — one
+predicate, shared with derivation. Ordered: `Int`, `Bool`, `String`, `Bytes`,
+`Unit`, `Decimal`, and structurally `List`, records, ADTs and `Map` over ordered
+types. Not ordered: `Float` (NaN makes `<` non-total), function types, `Cell`,
+`Task`. `Map<Float, v>` is `E0206 NOT_DERIVABLE`. For a type parameter the
+constraint is required at the **signature** — `where derivable(ord, k)` — and
+omitting it is `E0206` naming the clause to add.
+
+All pure except `map_fold`; every `k` carries `derivable(ord, k)`.
+
+| builtin | type |
+| --- | --- |
+| `map_new` | `() -> Map<k, v>` |
+| `map_insert` | `(Map<k, v>, k, v) -> Map<k, v>` |
+| `map_get` | `(Map<k, v>, k) -> Option<v>` |
+| `map_contains` | `(Map<k, v>, k) -> Bool` |
+| `map_remove` | `(Map<k, v>, k) -> Map<k, v>` |
+| `map_len` | `(Map<k, v>) -> Int` |
+| `map_keys` | `(Map<k, v>) -> List<k>` |
+| `map_values` | `(Map<k, v>) -> List<v>` |
+| `map_entries` | `(Map<k, v>) -> List<{key: k, value: v}>` |
+| `map_of_entries` | `(List<{key: k, value: v}>) -> Map<k, v>` |
+| `map_merge` | `(Map<k, v>, Map<k, v>) -> Map<k, v>` |
+| `map_fold` | `(Map<k, v>, b, (b, k, v) -> b / e) -> b / e` |
+
+`map_insert` replaces an equal key's entry, **key and value both** — the last
+write wins, which is visible only for `Decimal`, where `1.5m` inserted over
+`1.50m` leaves the key `1.5m`. `map_of_entries` and `map_merge` let the later
+side win, by the same rule. `map_remove`
+of an absent key is a no-op. `values_equal` compares length then entries in key
+order; `render` prints `{k: v, ...}` in key order, truncating past 32;
+`type_name` is `"Map"`. Quantifiable in a `forall`: 0..=8 entries, shrinking
+entries out before values, minimal `map_new()`. Opaque to the prover.
+
+**No map literal syntax in W2.**
+
+### Derivation — AST landed in `ply-syntax::ast`
+
+```rust
+pub enum Deriver { Json, Eq, Ord }
+impl Deriver {
+    pub const ALL: &'static [Deriver];
+    pub fn from_name(name: &str) -> Option<Deriver>;
+    pub fn as_str(self) -> &'static str;
+    pub fn dictionary(self) -> &'static str;   // "JsonCodec" | "EqDict" | "OrdDict"
+    pub fn tag(self) -> u8;                    // pinned: 1, 2, 3
+    pub fn from_tag(tag: u8) -> Option<Deriver>;
+}
+
+pub struct DeriveDef { pub deriver: Deriver, pub deriver_span: Span,
+                       pub target: Ident, pub span: Span }
+pub struct Constraint { pub deriver: Deriver, pub deriver_span: Span,
+                        pub param: Ident, pub span: Span }
+pub struct Derived { pub deriver: Deriver, pub target: Symbol }
+
+pub enum Item { /* ... */ Derive(Box<DeriveDef>) }
+pub struct FnDef { /* ... */ pub constraints: Vec<Constraint>,
+                             pub derived: Option<Derived> }
+```
+
+`Item::Derive` declares no name and generates no node: `Item::name`,
+`Item::visibility`, `resolve::declarations_of`, `graph`, `interp`, `machine` and
+the driver all skip it, and that is correct rather than a stub, because expansion
+has already appended the definitions it stands for.
+
+Grammar:
+
+```
+item       := "pub"? (fnDef | typeDef | effectDef) | testDef | lawDef | deriveDef
+deriveDef  := "derive" IDENT "for" IDENT
+fnDef      := "fn" IDENT generics? "(" params ")" ("->" type)? ("/" row)?
+              whereClause? specClause* ("=" expr | block)
+whereClause:= "where" constraint ("," constraint)*
+constraint := "derivable" "(" IDENT "," IDENT ")"
+```
+
+`where` sits between the effect row and any `requires`. Derivers are `json`,
+`eq`, `ord`; anything else is `E0207 UNKNOWN_DERIVER`. **`row` waits for W4**,
+with the `Row` type it is a codec over.
+
+```ply
+type JsonCodec<a> = { encode: (a) -> Json, decode: (Json) -> Result<a, DecodeError> }
+type EqDict<a>    = { eq: (a, a) -> Bool }
+type OrdDict<a>   = { compare: (a, a) -> Ordering }
+```
+
+- **Ply has no top-level value definitions**, so a derivation generates a
+  *function*: `fn order_json() -> JsonCodec<Order>`, and
+  `fn pair_json<x, y>(x: JsonCodec<x>, y: JsonCodec<y>) -> JsonCodec<Pair<x, y>>`
+  for a parameterized type, with the implied constraints.
+- **Naming**: `snake_case(TypeName) ++ "_" ++ deriver`. Snake case inserts `_`
+  before an uppercase following a lowercase or digit, and before the last
+  uppercase of a run followed by a lowercase. A collision is `E0105
+  DUPLICATE_DEFINITION` pointing at both `derive` lines.
+- `derive` carries no `pub`; a generated definition takes the **target type's**
+  visibility.
+- **Orphan rule**: a `derive` may only name a type its own module declares, else
+  `E0208 ORPHAN_DERIVE`. Two `derive json` for one type are `E0105`.
+- **Structural and total.** Leaves: `Int`, `Bool`, `String`, `Bytes`, `Unit`,
+  `Float`, `Decimal`. Structural: records, `List`, `Map`, ADTs, `Option`,
+  `Result`, aliases through their body. Refused: any function type, `Cell`,
+  `Task`, a continuation — `E0206 NOT_DERIVABLE` **naming the field**. `ord`
+  additionally refuses `Float`.
+- **`json` additionally refuses an `Option` whose payload also encodes as
+  `null`** — `Option<Unit>`, `Option<Option<a>>`, and either through an alias.
+  `option_json` writes `None` as `null` and `Some(x)` as `x`, so those two are
+  one document: `Some(())` decodes back as `None`, and as a `Map` key a
+  two-entry map decodes to one. Tagging the encoding instead would change the
+  wire format of every optional field, which is the case a payload actually has.
+  The refusal is asked twice, of one predicate: `ply_derive::walk` names the
+  field before a body is generated, and `ply_core`'s walk over the *solved* type
+  catches the spelling the syntactic one cannot see, because an alias is
+  expanded by then. The residual: an `Option<p>` under a type parameter `p`
+  instantiated at `Unit` is not refused — the constraint that would state it is
+  `derivable(json, p)` on `option_json`, which is about `p` rather than about
+  `Option<p>`, and the language has no way to say the second.
+- **`eq` and `ord` name nothing a module can claim.** `eq` emits the `==`
+  operator; `ord` emits `compare_values`, a **reserved** builtin — redefining it
+  is `E0105`. A bare `compare` would not do: ADR 0001 says a module's own items
+  shadow the prelude, so `fn compare` in the deriving module would silently
+  become the order of every dictionary derived in it while `derivable(ord, T)`
+  still called the type ordered — the second order §2 rests on not existing.
+  `compare` remains the same operation under a name a module may shadow.
+- **A `Map` key's wire form follows its type, not its spelling.**
+  `Map<String, v>` is a JSON object and every other `Map` is an array of pairs,
+  and the key is resolved through **this module's own parameterless aliases**
+  first: an alias is transparent to the checker, so `type Key = String` would
+  otherwise give one type two codecs that substitute for each other at every
+  call site and disagree about the protocol. Only this module's aliases, because
+  expansion must be a function of the file — gate 1 keys on raw file content, so
+  a cross-module alias entering the decision would leave a stale codec behind
+  when that module changed. A cross-module alias to `String` therefore still
+  gets the pair form.
+- **Composes through named types, never by inlining.** A `users::User` field
+  generates a call to `users::user_json()`, so `order_json`'s hash depends on
+  `user_json`'s. A generated reference that fails to resolve is reported as
+  `E0206` against the `derive` item, not as a bare `E0101`.
+- **Expansion runs after parse, before resolution**, purely syntactically.
+  Generated `FnDef`s are **appended to `Module::items`** after every source item,
+  in `derive` order — one list, because a second is a thing a walker can forget —
+  which leaves every `test` and `law` index untouched. Each carries
+  `derived: Some(..)`, which is **erased by normalization**.
+- **A generated definition that fails to typecheck is `E0505 INTERNAL_ERROR`**,
+  Ply's fault: derivation is total, the user did not write the body, and there is
+  nothing to attribute it to.
+- `DefEntry::span` is the `derive` item's `FileSpan`, and so is every span inside
+  the generated body.
+- **Any change to a deriver bumps `FRONTEND_VERSION`**, added to the list beside
+  normalization, inference, `Scheme`, `Footprint` and the prelude's signatures —
+  gate 1 keys on raw file content and would otherwise reuse a stale generated
+  definition. A golden pin test renders a fixture type's generated form and says
+  to bump.
+
+**Constraints are checked at the signature.** At a call site instantiating `a`
+with a concrete `T`, `derivable(D, T)` is checked and failure is `E0206` **at the
+call site** with the `where` clause as a secondary label; inside the body the
+constraint is assumed. A constraint on an unbound parameter is `E0102`.
+
+**Constraints are kept by normalization** — landed. `tag::CONSTRAINT = 95`, the
+parameter's de Bruijn level and the deriver's pinned tag, **sorted and
+deduplicated**; a constraint naming a parameter the signature does not bind
+contributes nothing. So adding a constraint moves the hash, reordering two does
+not, and renaming the parameter does not. The reason is soundness, not taste:
+gate 2 rechecks only a definition whose hash moved, so an erased constraint would
+leave a caller accepted against a signature that no longer admits it.
+
+### Numeric types
+
+`Float` is IEEE-754 binary64. `Decimal` is `rust_decimal::Decimal` — sign, a
+96-bit mantissa, scale `0..=28` — chosen over `bigdecimal` because it is
+**bounded**, which is what a value entering a hash and a cache key needs. `ryu`
+and `itoa` are rejected: Rust's own formatting already round-trips.
+
+```rust
+pub enum Lit   { /* ... */ Float(f64), Decimal { mantissa: i128, scale: u32 } }
+pub enum Value { /* ... */ Float(f64), Decimal(rust_decimal::Decimal) }
+```
+
+`Lit::Decimal` carries mantissa and scale so `ply-syntax` and `ply-hash` take no
+numeric dependency. Surface: `1.5` is a `Float`, `1.50m` a `Decimal`. A literal
+past the mantissa or scale limit is `E0001 UNEXPECTED_TOKEN` naming it.
+
+Normalization `LIT_FLOAT = 45` (the IEEE **bit pattern**) and `LIT_DECIMAL = 46`
+(mantissa then scale). `1`, `1.0` and `1m` are three definitions; `0.0` and
+`-0.0` are two. **A literal's scale is preserved**, so `1.50m` and `1.5m` are
+equal in value, differently hashed, and one map key whose retained form is the
+first inserted.
+
+Float: IEEE semantics unmodified — `1.0/0.0` is `Infinity`, `0.0/0.0` is `NaN`,
+neither is an error; `NaN != NaN`; rendering is shortest-round-trip **always with
+a `.0` or an exponent**; **encoding a non-finite `Float` as JSON is a
+`RUNTIME_ERROR`** naming the value; not an ordered key type and not derivable for
+`ord`.
+
+Decimal: `+` and `-` are exact or `RUNTIME_ERROR` on mantissa overflow — never a
+wrap and never a silent rounding; `*` is exact to scale 28 and otherwise rounds
+**half-to-even** there; `%` is exact and is therefore allowed where `/` is not,
+because the remainder of a decimal division is a decimal even when the quotient
+is not, and a zero divisor is `RUNTIME_ERROR`.
+**`/` is refused with `E0209 DECIMAL_DIVISION`**, naming `decimal_div`, because
+an operator would have to round and a rounding nobody wrote down is the defect
+the type exists to prevent.
+
+| builtin | type |
+| --- | --- |
+| `decimal_div` | `(Decimal, Decimal, Int, Rounding) -> Decimal` |
+| `decimal_round` | `(Decimal, Int, Rounding) -> Decimal` |
+| `decimal_of_int` | `(Int) -> Decimal` |
+| `int_of_decimal` | `(Decimal, Rounding) -> Option<Int>` |
+| `float_of_decimal` | `(Decimal) -> Float` |
+| `decimal_of_float` | `(Float) -> Option<Decimal>` |
+| `decimal_of_string` | `(String) -> Option<Decimal>` |
+| `decimal_to_string` | `(Decimal) -> String` |
+
+A scale outside `0..=28` is `RUNTIME_ERROR`. `decimal_of_float` yields the
+**shortest decimal that round-trips the float**.
+
+**The prelude gains four ADTs**, because a builtin whose type names a type the
+user must import is incoherent:
+
+```ply
+type Option<a>    = None | Some(a)
+type Result<a, e> = Ok(a) | Err(e)
+type Ordering     = Less | Equal | Greater
+type Rounding     = HalfEven | HalfUp | Down | Up | Ceiling | Floor
+```
+
+They join `BUILTIN_TYPES`, so a user `type Option<a>` becomes `E0105`. **This is
+a breaking change**: `examples/ledger.ply` and fixtures in `ply-syntax` and
+`ply-cli` declare their own `Option` and must be migrated as part of this work,
+not after it.
+
+**What this may not do to `proved`.** The linear-arithmetic fragment is over
+`Int` and does not extend.
+
+- **`Float` is excluded from `proved` entirely** — `==` is not reflexive, so
+  congruence closure over it is unsound. Any obligation whose term graph mentions
+  a `Float`-typed term is `property`, never `proved`, and this is a **structural
+  refusal**: lowering returns unsupported, so the certificate cannot be built.
+  "Mentions" is asked of the type's **declaration**, not of its written form:
+  `type Money = Cents(Float)` is `Type::Con("Money", [])` and nothing in it says
+  `Float`, while `Cents(NaN) == Cents(NaN)` is still false.
+  `ply_prove::prove::Context::reaches_float` is the least fixed point over
+  `CheckOutput::ctors`, so a chain, a recursive declaration and a container over
+  one all settle; it over-approximates a parameterised declaration, which costs
+  completeness and never soundness. `ply_core::derivable` answers the same
+  question over the same declarations — that is what refuses `Map<Money, v>` —
+  and the two may not disagree.
+- **`Decimal` may appear only as an uninterpreted term**: congruence and
+  structural equality are sound over it, arithmetic and ordering are not.
+- Generators: `Float` draws finite values **and the specials** — `0.0`, `-0.0`,
+  `±Infinity`, `NaN`, `±MIN`, `±MAX` — shrinking toward `0.0`; `Decimal` draws
+  scale `0..=6` plus `MIN`/`MAX`, shrinking toward `0m` and scale 0.
+- `PROVER_VERSION` bumps.
+
+**JSON.** `type Json = Null | Bool(Bool) | Number(Decimal) | Str(String) |
+Array(List<Json>) | Object(Map<String, Json>)`. `Number` holds a `Decimal` and
+**never an `f64`** — routing numbers through binary64 loses the hundredth of a
+cent that `Decimal` exists for — and `Object` is a `Map`, so key order is
+ascending and re-encoding is stable. **The limit**: a JSON number outside
+`Decimal`'s range or past 28 significant digits is a decode error naming the byte
+offset, and the document is rejected **whole** even where the codec would never
+have read that field.
+
+**`to_bytes` is bounded by the same `max_depth` `parse` is**, and raises past it
+naming the bound. The symmetry is the contract: an encoder that wrote what its
+own parser refuses is a codec whose encode is total where its decode is not, so
+a service persists or transmits a payload it can never read back and the failure
+surfaces at the consumer. An ADT level costs two JSON levels — an object wrapping
+a `values` array — so a derived codec over a recursive type reaches the bound at
+about half of `max_depth`.
+
+**`float_of_decimal` is the nearest `f64`**, computed through the decimal's own
+digits rather than through `Decimal::to_f64`, which divides a mantissa by a power
+of ten in binary and is off by an ulp for a long scale. That is what makes
+`float_of_decimal(decimal_of_float(f)) == f` for every `f` that has a `Decimal`
+at all, and therefore what makes a `Float` field's derived codec lossless on its
+whole domain. The domain is `decimal_of_float(f) != None`, and a law that guards
+on it is discharged as `property` — the finite-only mode a law can ask for. An
+*unguarded* round-trip law over a `Float`-bearing type is still `unattempted`,
+because the generator draws `NaN` deliberately and JSON has no non-finite
+literal; the gap names the value.
+
+### Byte-oriented builtins
+
+W1 measured 5.41 microseconds per byte of request head: five O(n) folds, each
+boxing a `Value::Int` per byte with no early exit. These fix the pass count.
+
+All pure except `bytes_position`. An out-of-range position is `RUNTIME_ERROR`,
+never clamped.
+
+| builtin | type | notes |
+| --- | --- | --- |
+| `bytes_index_of` | `(Bytes, Bytes) -> Option<Int>` | an empty needle is `Some(0)` |
+| `bytes_index_of_from` | `(Bytes, Bytes, Int) -> Option<Int>` | absolute index; `from` in `0..=len` |
+| `bytes_index_of_byte` | `(Bytes, Int) -> Option<Int>` | the byte is `0..=255` |
+| `bytes_starts_with` | `(Bytes, Bytes) -> Bool` | |
+| `bytes_ends_with` | `(Bytes, Bytes) -> Bool` | |
+| `bytes_split` | `(Bytes, Bytes) -> List<Bytes>` | an empty separator is `RUNTIME_ERROR` |
+| `bytes_scan` | `(Bytes, Int, Bytes, Int) -> Int` | first index at or after `from` **not** in the set |
+| `bytes_scan_until` | `(Bytes, Int, Bytes, Int) -> Int` | first index at or after `from` **in** the set |
+| `bytes_position` | `(Bytes, Int, (Int) -> Bool / e) -> Option<Int> / e` | the early-exiting find |
+
+`bytes_scan(b, from, set, max)` takes the byte class as a **`Bytes` of its
+members** — `b"0123456789"`, `b" \t"` — so there is no closed enum to extend, and
+returns `min(bytes_len(b), from + max)` when it did not stop, so the caller
+distinguishes a class ending from a budget running out. `max` is what stops a
+20-megabyte header line being a denial of service.
+
+Cost model, which is the point of the section:
+
+| builtin | time | allocation |
+| --- | --- | --- |
+| `bytes_index_of`, `..._from` | `memchr::memmem`, SIMD with a skip table | one `Value` for the `Option` |
+| `bytes_index_of_byte` | `memchr::memchr`, SIMD | one `Value` |
+| `bytes_starts_with`, `bytes_ends_with` | O(min(n, m)), exits at first mismatch | none |
+| `bytes_split` | O(n) over `memmem::find_iter` | one `Value::Bytes` **copy** per piece |
+| `bytes_scan`, `bytes_scan_until` | O(min(max, n − from)) over a 256-bit bitmap built in O(len(set)) | **none per byte** |
+| `bytes_position` | O(bytes examined) | one boxed `Int` and one frame **per byte examined** |
+
+`bytes_position` is the escape hatch: prefer `bytes_scan` wherever the predicate
+is a byte set, because `bytes_position` pays exactly the cost W1 measured,
+reduced by early exit rather than removed. `bytes_split` copies because
+`Value::Bytes` is `Arc<[u8]>` with no slicing, which ADR 0011 §8 deferred to W3.
+
+The prover treats every one of these as opaque. The total ones are in
+`TOTAL_BUILTINS`; `bytes_index_of_from`, `bytes_index_of_byte`, `bytes_split`,
+`bytes_scan`, `bytes_scan_until` and `bytes_position` refuse an input and are
+deliberately not.
+
+#### The re-measurement — **landed**
+
+`examples/hello.ply`'s parser is written with these, and
+`cargo run --release -p ply-corpus -- serve --repo .` is the number. One
+thread, the machine engine, the benchmark's 63-byte head:
+
+| | W1's folds | these builtins |
+| --- | --- | --- |
+| `answer` alone — parse and response build | 358 µs | 48 µs |
+| a whole request over a real socket | 714 µs | 221 µs |
+| requests per second, one thread | 1401 | 4528 |
+| share of a served request above the socket | 86% | 34% |
+
+The ratio is not the claim; the **shape** is. `serve` gained a head-length
+sweep — the same `answer` over heads grown from 23 bytes to 1943 by adding
+header lines the parser never reads, so every point parses the same three
+fields:
+
+| head | W1's folds | these builtins |
+| --- | --- | --- |
+| 23 bytes | 216 µs | 50 µs |
+| 1943 bytes | 8458 µs | 47 µs |
+
+84 times the bytes cost **39 times** the time before and **0.95 times** the
+time now. A request's cost has stopped being a function of how long its head is
+and become a function of how many fields were parsed out of it, which is the
+exit criterion ADR 0012 §5 states. A faster interpreter would have divided the
+first column; it would not have flattened it. What is left above the socket is
+`handle` dispatch and the response build, and the socket is now two thirds of a
+served request — which is the input W6 wanted and not the one M9 assumes.
+
+### Versions
+
+`RUNTIME_VERSION` to `0.7.0` — **landed** — (`Value` gains three variants and
+the evaluator gains the builtins above). `FRONTEND_VERSION` to `0.9.0` — **landed** — for
+`FnDef::constraints`, `Lit`'s two new variants, the prelude's four new types, and
+the derivers' output. `BODY_ENCODING` to `5` — **landed** — for
+`tag::CONSTRAINT`, `LIT_FLOAT` and `LIT_DECIMAL`. `PROVER_VERSION` to `0.3.0` for
+the new generators.
+
+### Workspace
+
+One new crate, `ply-std`, and two new dependencies:
+
+```toml
+ply-std = { path = "crates/ply-std" }
+memchr = "2.8.3"
+rust_decimal = "1.42.1"
+```
+
+`ply-eval` gains both. ADR 0011 said `ply-eval` gains no dependency; W2 reverses
+that for two crates whose entire content — a SIMD substring search, an exact
+decimal — would be foolish to write here, and neither brings a runtime, a
+reactor, or a value type that enters `Value`. `bigdecimal`, `ryu` and `itoa` were
+considered and rejected; the reasons are in the ADR. `ply-std` depends on
+`ply-span` and `ply-syntax` only.
+
+### New diagnostic codes — landed
+
+Added to `ply_span::codes`; existing numbers are unchanged and the registry pin
+test covers all six.
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0113 | `RESERVED_MODULE_NAME` | a project file whose module name would be `std` or under it | the program's |
+| E0206 | `NOT_DERIVABLE` | `derivable(D, t)` does not hold — at a `derive`, at a constrained call site, or at a `Map` key type | the program's |
+| E0207 | `UNKNOWN_DERIVER` | a `derive` or `where` naming something that is not a deriver | the program's |
+| E0208 | `ORPHAN_DERIVE` | a `derive` outside the module declaring its target | the program's |
+| E0209 | `DECIMAL_DIVISION` | `/` applied to `Decimal` | the program's |
+| W0605 | `STDLIB_CHANGED` | the cache was written under a different stdlib digest | nobody's |
+
+`E0206` covers three shapes because they are one claim and a consumer's response
+to all three is the same.
+
+### Required tests
+
+The full list is ADR 0012's; these are the ones whose absence would let W2 ship
+broken rather than merely incomplete.
+
+1. A program importing nothing from `std` has hashes byte-identical to before.
+2. Copying a `std` module's source into a project produces **identical**
+   `DefHash`es and shares its cache entries.
+3. Changing one `std` definition re-selects exactly the tests reaching it and no
+   others; changing none re-runs nothing.
+4. A project file at `std/json.ply` is `E0113`. A `std` module importing a
+   project module is `E0505`.
+5. `map_keys` is ascending over 10,000 random insertion permutations of one key
+   set.
+6. `Value::cmp(a, b) == Equal` iff `values_equal(a, b)` over the generator's
+   whole range, with the `Float` NaN exception asserted rather than excluded.
+7. Two maps built in different orders are `values_equal`, and a test asserting so
+   is cached under one order and read from cache under the other.
+8. `Map<Float, v>` is `E0206`; `Map<k, v>` under an unconstrained `k` is `E0206`
+   naming the clause to add, and adding it fixes it.
+9. **Renaming a derived type re-runs no test; renaming a variant re-runs exactly
+   the tests reaching it.** Both, on one corpus, in one test.
+10. Reordering two fields changes the generated definition's hash.
+11. A type with a function field is `E0206` naming the field.
+12. A generated definition and a hand-written one with the same normalized form
+    have the same hash.
+13. Adding a `where` clause changes the hash; reordering two does not; renaming
+    the constrained parameter does not. **Landed** in `ply-hash`.
+14. `where derivable(json, a)` fails at the **call site**, with the signature as a
+    secondary label.
+15. The deriver's golden output pin fails when the deriver changes and says to
+    bump `FRONTEND_VERSION`.
+16. `1`, `1.0` and `1m` are three definitions; `0.0` and `-0.0` are two.
+17. `total / count` on `Decimal` is `E0209` naming `decimal_div`; a `Decimal`
+    addition that overflows is `RUNTIME_ERROR` rather than a wrap or a rounding.
+18. **A law mentioning a `Float` is never `proved`**, including a trivially true
+    one, and the differential prover audit covers it.
+19. A JSON number that does not fit a `Decimal` is a decode error naming the byte
+    offset.
+20. `bytes_scan` never examines more than `max` bytes, asserted by a counting
+    harness rather than by timing; `bytes_position` calls its predicate once for a
+    match at index 0 of a megabyte buffer.
+21. `--engine both` on a corpus using every new builtin reports no `E0503`.
+22. `Store::open` at 10,000 definitions stays under 5 ms.
+23. Incremental and `--no-incremental` agree byte-for-byte over a corpus using
+    every W2 feature, across the full mutation sequence.
+24. Renaming a top-level function still selects zero tests, and moving a
+    definition between modules still changes no hash, on a corpus with
+    derivations and stdlib imports.
+
+Plus one `tests/fixtures/` entry per new code.
+
+### Not in W2
+
+Type-directed dispatch — ADR 0010 decision 6 stands, so `++` stays `String`-only
+and `len` stays `(List<a>) -> Int`. `derive row`, which lands in W4 with the
+`Row` type. User-defined derivers, conditional instances, higher-kinded types. A
+map literal. Byte-slice patterns and cheap slicing of a shared `Bytes`, both W3.
+A JSON number outside `Decimal`'s range. Top-level value definitions.
+
+And one wart, recorded rather than left to be rediscovered: **`string_find`
+returns an `Int` and raises when absent**, which is W1's shape from before the
+prelude had `Option`. The new byte builtins return `Option<Int>`. Changing
+`string_find` would move every hash that uses it for no behavioural gain, and a
+second name for one operation is worse than the inconsistency. W3 may unify them.
