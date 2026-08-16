@@ -54,6 +54,15 @@ enum Command {
     /// requests in flight, what the deadline does to an open transaction, and
     /// what a deploy ships.
     W5(W5Args),
+    /// Assemble the W6 report and apply the M9 criteria to it. The thresholds
+    /// live in `ply_corpus::w6::Criteria` and are not readable from the file,
+    /// so a measurement cannot supply the bar it is about to clear.
+    W6(W6Args),
+    /// Take the W6 ladder: nine rungs, each a pair of absolutes differing in
+    /// one substitution, plus the floor, the served total, the offering rows
+    /// and the engine substitution. Writes the measurement half of a
+    /// `ply_corpus::w6::Report`, which `w6` then judges.
+    W6Ladder(W6LadderArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -772,6 +781,276 @@ fn w5(args: W5Args) -> Result<()> {
 }
 
 #[derive(Args, Debug)]
+struct W6LadderArgs {
+    /// The repository root, which is where `examples/desk.ply` is read from.
+    /// The service under measurement is the one W5 shipped, not a copy.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The `ply` binary the served rungs drive. Defaults to this binary's
+    /// sibling, so a release measurement never serves from a debug build.
+    #[arg(long)]
+    ply: Option<PathBuf>,
+    /// The database the served rungs run against. It must already hold the
+    /// desk's schema: `--db-schema desk.schema` refuses at bind time if not.
+    #[arg(long)]
+    db: String,
+    /// Requests per in-process point, for the rungs taken over `SimNet`, over a
+    /// real listener and against the Rust floor.
+    #[arg(long, default_value_t = 2000)]
+    requests: u32,
+    /// Iterations of the in-Ply loop rungs 2, 3 and 4 are read off. One
+    /// `Machine::call` runs them all, so the twin's fixture is amortized rather
+    /// than landing inside a layer.
+    #[arg(long, default_value_t = 2000)]
+    iterations: u32,
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Client concurrencies the served sweep takes. The total is read off
+    /// whichever maximizes throughput.
+    #[arg(long, num_args = 1.., default_values_t = [1u32, 2, 4, 8, 16, 32])]
+    concurrency: Vec<u32>,
+    #[arg(long, default_value_t = 32)]
+    per_conn: u32,
+    #[arg(long, default_value_t = 3000)]
+    requests_per_point: u32,
+    /// The credential the served desk is configured with. A benchmark's key is
+    /// a fixture credential and is not a credential.
+    #[arg(long, default_value = "bench-key")]
+    api_key: String,
+    /// The machine the numbers were taken on, for the provenance line.
+    #[arg(long, default_value = "unnamed")]
+    machine: String,
+    /// The postgres version, for the same line.
+    #[arg(long)]
+    postgres: Option<String>,
+    /// Drop the served half, for a run pointed at the in-process rungs.
+    #[arg(long)]
+    no_served: bool,
+    /// Run one phase on its own and print what it cost per request, so a
+    /// sampling profiler sees that phase and nothing else. One of `sim`,
+    /// `socket`, `routed`, `endpoint`, `items`.
+    #[arg(long)]
+    only: Option<String>,
+    /// Rounds of `--only`, each of `--requests` requests.
+    #[arg(long, default_value_t = 1)]
+    rounds: usize,
+    /// Which accept loop the **ladder's** rungs and total are read off.
+    ///
+    /// ADR 0016 §1.6 pins `task-per-conn`, and the default here departs from it
+    /// for a measured reason: `task.spawn` opens a production region for the
+    /// life of the server, and `Machine::constant` refuses the constant memo
+    /// inside any open region — so a spawning service memoizes nothing. The
+    /// in-process rungs are `run_memory` over one connection at a time and do
+    /// memoize, so a ladder whose lower rungs spanned one regime and whose
+    /// total spanned the other would divide a memo-active numerator by a
+    /// memo-inert denominator. Both loops are measured either way, and the one
+    /// this is not set to becomes its own labelled offering rows.
+    #[arg(long, default_value = "sequential")]
+    accept: String,
+    /// Repeats of the sweep on the loop the ladder is *not* read off. It
+    /// contributes tail latency and throughput rows, which need no band.
+    #[arg(long, default_value_t = 1)]
+    other_repeats: usize,
+    /// Repeats of the whole served sweep. The rungs above the socket are
+    /// differences between served rows, and a difference between two numbers
+    /// taken once has no width.
+    #[arg(long, default_value_t = 3)]
+    served_repeats: usize,
+    /// Skip the constant memo's end-to-end pricing, which serves a second
+    /// variant of the service and roughly doubles the run.
+    #[arg(long)]
+    no_levers: bool,
+    /// Where to write the report. The default is stdout, so
+    /// `w6-ladder .. > benches/w6-ladder.json` reproduces the shipped file.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Where to write the raw in-process and served rows the report is read
+    /// off. Not part of the report, and not needed to re-take it.
+    #[arg(long)]
+    detail: Option<PathBuf>,
+    /// Write the control the constant memo's price is measured against —
+    /// `examples/desk.ply` with every nullary definition of its own given a
+    /// dead parameter — into this directory, and stop. A ratio is only as
+    /// checkable as the program on the other side of it.
+    #[arg(long)]
+    write_control: Option<PathBuf>,
+}
+
+fn w6_ladder(args: W6LadderArgs) -> Result<()> {
+    use ply_corpus::w6_run;
+    let ply = w6_run::ply_binary(args.ply.clone())?;
+    if let Some(dir) = &args.write_control {
+        let shipped = std::fs::read_to_string(args.repo.join("examples/desk.ply"))?;
+        std::fs::create_dir_all(dir.join("examples"))?;
+        let path = dir.join("examples/desk.ply");
+        std::fs::write(&path, w6_run::without_constants(&shipped))?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+    if let Some(phase) = &args.only {
+        let per = w6_run::only(&args.repo, phase, args.requests, args.rounds)?;
+        println!(
+            "{phase}: {per:.3}us per request over {} requests",
+            args.requests
+        );
+        return Ok(());
+    }
+    let stack = w6_run::in_process(&args.repo, args.requests, args.iterations, args.repeats)?;
+    let engines = w6_run::engines(&args.repo, args.requests, args.repeats)?;
+    if args.no_served {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "in_process": stack,
+                "engines": engines,
+            }))?
+        );
+        return Ok(());
+    }
+    let (variant, other) = match args.accept.as_str() {
+        "sequential" => (
+            ply_corpus::w3::Variant::Sequential,
+            ply_corpus::w3::Variant::TaskPerConn,
+        ),
+        "task-per-conn" => (
+            ply_corpus::w3::Variant::TaskPerConn,
+            ply_corpus::w3::Variant::Sequential,
+        ),
+        other => anyhow::bail!("`--accept {other}`: the loops are sequential and task-per-conn"),
+    };
+    let served = w6_run::served(
+        &args.repo,
+        &ply,
+        &args.db,
+        variant,
+        &args.concurrency,
+        args.per_conn,
+        args.requests_per_point,
+        &args.api_key,
+        args.served_repeats,
+    )?;
+    // The other loop, reported once, separately and labelled — which is what
+    // §1.6 asks of whichever loop the ladder is not read off.
+    let other_rows = w6_run::served(
+        &args.repo,
+        &ply,
+        &args.db,
+        other,
+        &args.concurrency,
+        args.per_conn,
+        args.requests_per_point,
+        &args.api_key,
+        args.other_repeats,
+    )?;
+    let mut levers = if args.no_levers {
+        w6_run::Levers::default()
+    } else {
+        let concurrency = w6_run::best(
+            &served,
+            ply_corpus::w5::Stack::PostgresTls.label(),
+            ply_corpus::w5::Sinking::JsonNull.label(),
+            "items (1 select)",
+        )
+        .map(|point| point.concurrency)
+        .unwrap_or(1);
+        w6_run::memo_lever(
+            &args.repo,
+            &ply,
+            &args.db,
+            variant,
+            other,
+            concurrency,
+            args.per_conn,
+            args.requests_per_point,
+            &args.api_key,
+            args.served_repeats,
+        )?
+    };
+    levers.allocations = w6_run::allocations(&args.repo, args.ply.clone())?;
+
+    let report = w6_run::report(
+        args.machine.clone(),
+        args.postgres.clone(),
+        &stack,
+        &served,
+        &other_rows,
+        engines,
+        &levers,
+    )?;
+    let text = serde_json::to_string_pretty(&report)?;
+    match &args.out {
+        Some(path) => std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("writing `{}`", path.display()))?,
+        None => println!("{text}"),
+    }
+    if let Some(path) = &args.detail {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "in_process": stack,
+                "served": served,
+                "other_accept_loop": other_rows,
+                "levers": levers,
+            }))?,
+        )
+        .with_context(|| format!("writing `{}`", path.display()))?;
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
+struct W6Args {
+    /// One or more measurement files. Each is a `ply_corpus::w6::Report`
+    /// fragment; later files win field by field, which is how the ladder agent
+    /// and the spike agent produce their halves independently.
+    #[arg(required = true)]
+    reports: Vec<PathBuf>,
+    /// Exit non-zero when the report is incomplete. The default prints the
+    /// audit and still renders, because a partial report is worth reading; CI
+    /// wants the other behaviour.
+    #[arg(long)]
+    strict: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn w6(args: W6Args) -> Result<()> {
+    let mut merged = serde_json::Map::new();
+    for path in &args.reports {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading `{}`", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("`{}` is not JSON", path.display()))?;
+        let serde_json::Value::Object(fields) = value else {
+            anyhow::bail!(
+                "`{}` is not a W6 report object; each file holds the fields it measured",
+                path.display()
+            );
+        };
+        merged.extend(fields);
+    }
+    let report: ply_corpus::w6::Report = serde_json::from_value(serde_json::Value::Object(merged))
+        .context("the merged measurements are not a W6 report")?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ply_corpus::w6::rendered(&report)?)?
+        );
+    } else {
+        print!("{}", ply_corpus::w6::render(&report));
+    }
+    let findings = report.audit();
+    if args.strict && !findings.is_empty() {
+        anyhow::bail!(
+            "{} section(s) of the W6 report are missing; --strict refuses an incomplete one",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
 struct PayloadArgs {
     /// Line items per JSON payload. Forty is about four kilobytes, which is the
     /// size a real order body arrives at.
@@ -965,6 +1244,8 @@ fn run() -> Result<()> {
         Command::W3(args) => w3(args),
         Command::W4(args) => w4(args),
         Command::W5(args) => w5(args),
+        Command::W6(args) => w6(args),
+        Command::W6Ladder(args) => w6_ladder(args),
     }
 }
 

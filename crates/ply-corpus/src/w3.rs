@@ -374,9 +374,9 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
 
 /// A checked service, callable with whatever answers `net`.
 pub struct Loaded {
-    program: ply_syntax::ast::Program,
-    resolved: ply_syntax::resolve::Resolved,
-    check: CheckOutput,
+    pub program: ply_syntax::ast::Program,
+    pub resolved: ply_syntax::resolve::Resolved,
+    pub check: CheckOutput,
 }
 
 impl Loaded {
@@ -411,7 +411,7 @@ impl Loaded {
         })
     }
 
-    fn full(&self, simple: &str) -> Result<String> {
+    pub fn full(&self, simple: &str) -> Result<String> {
         self.full_in("desk", simple)
     }
 
@@ -419,7 +419,7 @@ impl Loaded {
     /// the same simple one — `desk::limits` and `std.http::default_limits` are
     /// one edit apart from colliding — so the module is named rather than
     /// guessed at from whichever definition sorts first.
-    fn full_in(&self, module: &str, simple: &str) -> Result<String> {
+    pub fn full_in(&self, module: &str, simple: &str) -> Result<String> {
         self.check
             .defs
             .values()
@@ -429,7 +429,7 @@ impl Loaded {
     }
 
     /// One pure call, timed.
-    fn pure_call(&self, name: &str, args: Vec<Value>, calls: u32) -> Result<(Duration, Value)> {
+    pub fn pure_call(&self, name: &str, args: Vec<Value>, calls: u32) -> Result<(Duration, Value)> {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         let mut last = Value::Unit;
         let started = Instant::now();
@@ -445,7 +445,7 @@ impl Loaded {
     ///
     /// Handles ascend from 1 and the listener takes the first, so the one
     /// connection this opens is 2.
-    fn response_over_sim(&self, request: &[u8]) -> Result<Vec<u8>> {
+    pub fn response_over_sim(&self, request: &[u8]) -> Result<Vec<u8>> {
         let sim = Arc::new(SimNet::new(vec![vec![request.to_vec()]]));
         let net: Arc<dyn Net> = Arc::clone(&sim) as Arc<dyn Net>;
         let binding = ply_host::tcp::registry(net)
@@ -463,7 +463,7 @@ impl Loaded {
         Ok(sim.sent(2))
     }
 
-    fn footprint(&self, simple: &str) -> Option<Footprint> {
+    pub fn footprint(&self, simple: &str) -> Option<Footprint> {
         self.check
             .defs
             .values()

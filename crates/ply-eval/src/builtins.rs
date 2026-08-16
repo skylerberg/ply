@@ -990,7 +990,7 @@ fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagn
 /// A scale argument, refused outside `0..=28` rather than clamped: a scale the
 /// caller asked for and did not get is a rounding they did not write down.
 fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
-    let scale = v.as_int(span, &format!("`{what}`"))?;
+    let scale = int_arg(v, span, what)?;
     u32::try_from(scale)
         .ok()
         .filter(|s| *s <= MAX_DECIMAL_SCALE)
@@ -1241,6 +1241,40 @@ fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
     &hay[from..hay.len().min(from.saturating_add(max))]
 }
 
+/// The typed-argument readers the byte and decimal builtins use, quoting the
+/// operation's name only when the argument is the wrong type.
+///
+/// `v.as_int(span, &format!("`{what}`"))` builds that `String` on the success
+/// path, which is every call: W6 counted 540 such allocations per request, all
+/// of them for a message no request produced.
+fn int_arg(v: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        other => Err(crate::value::type_error(
+            span,
+            &format!("`{what}`"),
+            "Int",
+            other,
+        )),
+    }
+}
+
+fn bytes_arg<'a>(
+    v: &'a Value,
+    span: Span,
+    what: &str,
+) -> Result<&'a std::sync::Arc<[u8]>, Diagnostic> {
+    match v {
+        Value::Bytes(b) => Ok(b),
+        other => Err(crate::value::type_error(
+            span,
+            &format!("`{what}`"),
+            "Bytes",
+            other,
+        )),
+    }
+}
+
 /// Both bounded scans. `want` is whether it stops on a member of the set or on
 /// a non-member; the answer is the index it stopped at, or the end of the
 /// window when it did not, so a caller tells "the class ended" from "the budget
@@ -1252,7 +1286,7 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
         "bytes_scan"
     };
     let from = start_at(&args[1], hay.len(), span, what)?;
-    let members = args[2].as_bytes(span, &format!("`{what}`"))?;
+    let members = bytes_arg(&args[2], span, what)?;
     let max = budget(&args[3], span, what)?;
     let window = scan_window(hay, from, max);
 
@@ -1280,7 +1314,7 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
 /// window is a real answer — and anything else is refused rather than clamped,
 /// for the reason [`range_args`] gives.
 fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diagnostic> {
-    let from = v.as_int(span, &format!("`{what}`"))?;
+    let from = int_arg(v, span, what)?;
     match usize::try_from(from) {
         Ok(from) if from <= len => Ok(from),
         _ => Err(Diagnostic::error(
@@ -1298,7 +1332,7 @@ fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diag
 /// service. Negative is refused rather than treated as zero: a caller that
 /// computed a negative budget has a bug, and answering `from` for it hides it.
 fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
-    let max = v.as_int(span, &format!("`{what}`"))?;
+    let max = int_arg(v, span, what)?;
     usize::try_from(max).map_err(|_| {
         Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -1310,7 +1344,7 @@ fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
 }
 
 fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
-    let byte = v.as_int(span, &format!("`{what}`"))?;
+    let byte = int_arg(v, span, what)?;
     u8::try_from(byte).map_err(|_| {
         Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -1336,8 +1370,8 @@ fn range_args(
     what: &str,
     unit: &str,
 ) -> Result<(usize, usize), Diagnostic> {
-    let start = start.as_int(span, &format!("`{what}`"))?;
-    let end = end.as_int(span, &format!("`{what}`"))?;
+    let start = int_arg(start, span, what)?;
+    let end = int_arg(end, span, what)?;
     if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
         return Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -2409,6 +2443,7 @@ mod tests {
         let frame = Frame::Call {
             name: None,
             call_site: Span::DUMMY,
+            memo: false,
         };
         let d = advance(frame, Value::Unit).unwrap_err();
         assert_eq!(d.code, codes::INTERNAL_ERROR);

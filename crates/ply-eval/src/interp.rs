@@ -3,6 +3,7 @@ use crate::env::Env;
 use crate::handler::{OpDecl, check_operation, performed_atom};
 use crate::host::{HostBinding, err_hermetic, err_machine_only_host, operation_label};
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, grow};
+use crate::memo::{Lookup, Memo};
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Decimal, Value, type_error, values_equal};
 use crate::world::World;
@@ -50,6 +51,10 @@ pub struct Interp<'a> {
     check: Option<&'a CheckOutput>,
     /// Keyed by program-wide name, so two modules may declare one simple name.
     globals: FxHashMap<Symbol, Value>,
+    /// What a nullary pure definition evaluated to. The machine keeps the same
+    /// memo under the same rule, because a constant one engine remembers and
+    /// the other recomputes is two engines with two recursion budgets.
+    memo: Memo,
     ctors: FxHashMap<Symbol, usize>,
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
@@ -145,6 +150,7 @@ impl<'a> Interp<'a> {
             resolved,
             check,
             globals,
+            memo: Memo::default(),
             ctors,
             ops,
             tests,
@@ -643,6 +649,14 @@ impl<'a> Interp<'a> {
                         args.len(),
                     ));
                 }
+                let memo = match (params.is_empty(), &closure.name) {
+                    (true, Some(name)) => match self.memo.lookup(self.check, name) {
+                        Lookup::Known(value) => return Ok(value),
+                        Lookup::Remember => Some(name.clone()),
+                        Lookup::Ignore => None,
+                    },
+                    _ => None,
+                };
                 let mut scope = env.clone();
                 for (p, v) in params.iter().zip(args) {
                     scope = scope.bind(p.clone(), v);
@@ -661,6 +675,9 @@ impl<'a> Interp<'a> {
                     }
                 };
                 self.module = caller;
+                if let (Some(name), Ok(value)) = (&memo, &result) {
+                    self.memo.remember(name, value);
+                }
                 result
             }
             // Only a caller mixing the two engines' values reaches this, and

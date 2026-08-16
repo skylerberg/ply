@@ -19,6 +19,7 @@
 
 use crate::code::{Clause, Code, ReturnArm, Stmt};
 use crate::env::Env;
+use crate::pool::{self, Free, Link, Pooled};
 use crate::value::{Value, Vector};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, Ident, UnOp};
@@ -94,6 +95,10 @@ pub enum Frame {
     Call {
         name: Option<Symbol>,
         call_site: Span,
+        /// This call is the one evaluating a nullary pure definition for the
+        /// first time, so the value it receives is that definition's constant.
+        /// See [`crate::memo`].
+        memo: bool,
     },
 
     /// Hands the value it receives to a captured continuation. This is the
@@ -311,17 +316,18 @@ pub enum Target {
 /// `rpds::List` is the obvious alternative and costs two of each, since it
 /// boxes the value away from the link. A push and a pop are the machine's two
 /// most frequent steps.
-struct Chain<T> {
+///
+/// The link a pop retires is kept on [`crate::pool`]'s free list rather than
+/// returned to the allocator, and a push takes one from there. That is a
+/// memory-reuse change and not a representation change: the chain is still
+/// persistent, a segment is still shared by pointer, and capture is still O(1)
+/// in the frames it crosses.
+struct Chain<T: Pooled> {
     head: Option<Rc<Link<T>>>,
     len: usize,
 }
 
-struct Link<T> {
-    value: T,
-    next: Option<Rc<Link<T>>>,
-}
-
-impl<T> Chain<T> {
+impl<T: Pooled> Chain<T> {
     fn new() -> Chain<T> {
         Chain { head: None, len: 0 }
     }
@@ -337,10 +343,7 @@ impl<T> Chain<T> {
     fn push(mut self, value: T) -> Chain<T> {
         let len = self.len + 1;
         Chain {
-            head: Some(Rc::new(Link {
-                value,
-                next: self.head.take(),
-            })),
+            head: Some(pool::link(value, self.head.take())),
             len,
         }
     }
@@ -350,31 +353,33 @@ impl<T> Chain<T> {
         std::iter::from_fn(move || {
             let link = cur?;
             cur = link.next.as_deref();
-            Some(&link.value)
+            link.value.as_ref()
         })
     }
 }
 
-impl<T: Clone> Chain<T> {
+impl<T: Pooled + Clone> Chain<T> {
     /// Moves the head out when this chain is its only owner, which is every pop
     /// no captured continuation is sharing.
     fn pop_front(&mut self) -> Option<T> {
-        let node = self.head.take()?;
+        let mut node = self.head.take()?;
         self.len -= 1;
-        match Rc::try_unwrap(node) {
-            Ok(link) => {
-                self.head = link.next;
-                Some(link.value)
+        match Rc::get_mut(&mut node) {
+            Some(link) => {
+                let value = link.value.take();
+                self.head = link.next.take();
+                pool::give(node);
+                value
             }
-            Err(node) => {
+            None => {
                 self.head = node.next.clone();
-                Some(node.value.clone())
+                node.value.clone()
             }
         }
     }
 }
 
-impl<T> Clone for Chain<T> {
+impl<T: Pooled> Clone for Chain<T> {
     fn clone(&self) -> Chain<T> {
         Chain {
             head: self.head.clone(),
@@ -383,7 +388,7 @@ impl<T> Clone for Chain<T> {
     }
 }
 
-impl<T> Default for Chain<T> {
+impl<T: Pooled> Default for Chain<T> {
     fn default() -> Chain<T> {
         Chain::new()
     }
@@ -394,15 +399,36 @@ impl<T> Default for Chain<T> {
 /// unwinding recursively.
 ///
 /// [`DEFAULT_MAX_FRAMES`]: crate::machine::DEFAULT_MAX_FRAMES
-impl<T> Drop for Chain<T> {
+impl<T: Pooled> Drop for Chain<T> {
     fn drop(&mut self) {
         let mut cur = self.head.take();
-        while let Some(node) = cur {
-            match Rc::try_unwrap(node) {
-                Ok(mut link) => cur = link.next.take(),
-                Err(_) => break,
+        while let Some(mut node) = cur {
+            match Rc::get_mut(&mut node) {
+                Some(link) => {
+                    link.value = None;
+                    cur = link.next.take();
+                    pool::give(node);
+                }
+                None => break,
             }
         }
+    }
+}
+
+thread_local! {
+    static FRAME_LINKS: Free<Frame> = const { Free::new() };
+    static SEGMENT_LINKS: Free<Segment> = const { Free::new() };
+}
+
+impl Pooled for Frame {
+    fn free() -> &'static std::thread::LocalKey<Free<Frame>> {
+        &FRAME_LINKS
+    }
+}
+
+impl Pooled for Segment {
+    fn free() -> &'static std::thread::LocalKey<Free<Segment>> {
+        &SEGMENT_LINKS
     }
 }
 

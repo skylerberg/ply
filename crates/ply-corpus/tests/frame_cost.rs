@@ -53,6 +53,7 @@ fn call_frame() -> Frame {
     Frame::Call {
         name: None,
         call_site: Span::DUMMY,
+        memo: false,
     }
 }
 

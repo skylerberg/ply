@@ -177,7 +177,7 @@ still crossing the buffer per byte.
 ## What `w3` adds
 
 `serve` prices one endpoint with no routing, no body and no connection reuse.
-`w3` prices the service W3 shipped — `examples/desk.ply`, ten routes, real
+`w3` prices the service W3 shipped — `examples/desk.ply`, eleven routes, real
 HTTP/1.1 framing, keep-alive and TLS — and re-takes `serve`'s field-proportional
 sweep against it, because full framing is the thing most likely to have put a
 per-byte cost back on the request path.
@@ -193,7 +193,7 @@ cargo run --release -p ply-corpus -- w3 --repo . --w2-baseline      # W2's endpo
 | --- | --- |
 | routes | throughput and tail latency at each concurrency, over a mix of the read routes |
 | stages | where one request's time goes: the route table, the match, the framing, one endpoint, the encode |
-| per route | each of the ten routes on its own, so a mix has a decomposition rather than an average |
+| per route | each of the eleven routes on its own, so a mix has a decomposition rather than an average |
 | fields or bytes | three axes — header bytes at a fixed field count, header count, and body bytes |
 | keep-alive | the same work over one to a hundred requests per connection |
 | TLS | one route over both transports, with the handshake timed apart from the request |
@@ -301,6 +301,170 @@ already done, and the outcome is read from the table and from
 `pg_stat_activity`. The order *sequence* is read too, because a sequence is not
 transactional: without it, a table whose row count did not move is equally
 consistent with a transaction that never wrote anything.
+
+## What `w6` adds
+
+`serve`, `w3`, `w4` and `w5` each priced one milestone against the thing it
+replaced. None of them priced the **total**, and the total is what decides
+whether M9 comes forward. `w6` assembles the accumulated stack into one table
+and applies the criteria `docs/adr/0016-w6-performance.md` §2 pins.
+
+```
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder.json benches/w6-spike.json
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder.json benches/w6-spike.json --json
+```
+
+Those two files are the W6 run itself, kept in the repository: `w6-ladder.json`
+is the nine rungs, the engine substitution, the offerings, the limits and the
+alternatives, and `w6-spike.json` is the codegen spike's half. Neither contains a
+verdict or a threshold — a test asserts that a serialized report carries
+neither — so the decision printed above them is recomputed from
+`w6::Criteria::default()` on every run.
+
+It takes no measurement of its own. It merges one or more measurement files
+field by field — so the ladder run and the spike run produce their halves
+independently — assembles the ladder, applies the criteria, and prints the
+tables, the verdict and an audit of what the report still owes.
+
+**Nine rungs, each one substitution, each measured both ways.** A rung carries
+`with_micros` and `without_micros` taken in the same arena in the same run, so a
+layer is their difference and no timer inside the machine has to be trusted:
+
+| rung | `with` against `without` | the layer |
+| --- | --- | --- |
+| `call` | a function returning a constant, against not calling the machine | entering the interpreter at all |
+| `endpoint` | the route's handler over an in-memory store, against that constant | the route's own body, through its derived JSON encoder |
+| `framing` | `parse_head` and `encode` around it, against without | HTTP/1.1 framing |
+| `routing` | `table()` and `route_of()` above it, against without | the route table build, and one match |
+| `machine` | the whole `serve_one` over `SimNet`, against calling the pieces | recv, the handler walk, the perform, send, teardown |
+| `socket` | the real TCP host under the same loop, against `SimNet` | the socket, the reactor, the pending token |
+| `tls` | `--tls`, against plaintext | the TLS record layer, handshake excluded |
+| `database` | `run`, against `run_memory` | postgres, the wire, and the server |
+| `tracing` | `--trace json` to `/dev/null`, against `--trace off` | the sink |
+
+Four things about the table are load-bearing:
+
+**The residue is printed.** The total is *measured* end to end, not summed, and
+`total − Σ layers` gets its own row. Folding it into the nearest plausible layer
+would be claiming an attribution the measurement did not earn.
+
+**A positive residue is not credited to the interpreter, and a negative one
+is.** A positive residue is time no substitution separated, so leaving it out of
+the numerator makes the share a lower bound. A negative residue is the opposite
+fact — the layers sum to more than the request they were read against, which can
+only be the in-process arena over-counting against the served denominator — and
+leaving *that* out would leave the numerator inflated in the direction M9's case
+rests on. `Ladder::conservative_share` charges it back, and it is the share
+`decide` reads.
+
+**A negative layer is a result, not a rounding error.** It means the
+substitution did not isolate what it claimed to, and a ladder carrying one above
+5% of the total is `Undecided` rather than decided.
+
+**Every rung carries the worst of its repeats as well as the best.** A layer is
+a *difference* between two numbers, so a rung whose layer is 1% of either side
+carries both sides' noise; the band is printed beside the layer, a rung whose
+band spans zero is an audit finding rather than two printed decimals, and the
+interpreter share is printed as the range its own repeats produced. A share
+whose band falls on both sides of a criterion's bar is `Undecided`: that ladder
+answers whichever run was taken.
+
+**Every rung names the route it was taken on**, and so do the floor and the
+total. Two rungs on two routes have a difference that is a route change as well
+as a layer, and a `total / floor` whose two sides answer different bytes is not
+a multiple — so `Denominators` spells out what each side did and the audit
+reports a report that leaves them blank.
+
+**And the criteria are in code, not in the file.** `ply_corpus::w6::Criteria`
+holds the thresholds and `ply_corpus::w6::LEVERS` holds ADR 0016 §4's seven
+cheaper levers, which is what C3 — "every alternative in §4 is priced" — is
+checked against. Checking it against the file's own list made an empty list
+satisfy it vacuously, so deleting one field of the measurement file turned a
+deferral into an advance; the roster in code is why it cannot. A lever counts as
+priced only with a ratio **and** the sentence saying what the ratio is between,
+because `priced: true` is a boolean somebody can type. A `Report` still carries
+no criteria field and no verdict field, and a test asserts that a serialized one
+contains neither.
+
+### Taking the ladder
+
+`w6` judges a report; `w6-ladder` takes one.
+
+```
+cargo run --release -p ply-corpus -- w6-ladder \
+    --repo . --db postgres://ply@127.0.0.1:5439/desk \
+    --requests 512 --iterations 2000 --repeats 3 \
+    --concurrency 1 2 4 8 16 32 --per-conn 32 --requests-per-point 2500 \
+    --served-repeats 3 --machine "Apple M-series (macOS 24.6.0)" \
+    --postgres "PostgreSQL 18.3" --out benches/w6-ladder.json
+cargo run --release -p ply-corpus -- w6-ladder --no-served --only sim --requests 200000
+```
+
+**That command writes `benches/w6-ladder.json`** — the whole file, not a
+fragment of one: the nine rungs, the engine substitution, the offerings, the
+limits, the §4 roster with whatever this run priced of it, and the
+`not_measured` list. It used to emit a differently shaped document with an empty
+`alternatives` array, and the shipped file was assembled by hand around it; a
+contributor who followed the staleness guards' "re-take the ladder" would have
+dropped the evidence C3 is decided against. A file the command cannot reproduce
+is a file nobody can re-take.
+
+It runs two other binaries the way a reader would: `ply`, for the served rows,
+and `w6-alloc`, which counts what one request allocates. `w6-alloc` is its own
+binary because a counting `#[global_allocator]` is a whole-binary decision and
+`ply-corpus` is where the clocks are.
+
+Rungs 1–6 run in this process against `examples/desk.ply` with a driver
+appended; rungs 7–9 start the real binary with one flag moved. `--only` runs one
+phase on its own and prints what it cost, which is what a sampling profiler is
+pointed at. `--detail` writes the raw in-process and served rows beside the
+report. `benches/w6-ladder.json` is one such run, which `w6` renders and judges:
+
+```
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder.json benches/w6-spike.json
+```
+
+Five things about how the rungs are taken differ from the shape ADR 0016 §1.2
+sketches, and each is a measurement rather than a preference:
+
+**The endpoint rung is a memo hit, because `/health`'s whole body is a
+constant.** `health()` takes no parameters and performs nothing, so the constant
+memo evaluates it once per process and every later request reads the remembered
+value. That is what a served `/health` request really costs, so it is what the
+rung reports — and it is why the `/items` handler over the twin is measured
+beside the ladder, as the closest thing here to a route body's own cost.
+
+**Rungs 1–6 are taken on `/health`, not `/items`.** The ADR anticipates this: a
+pure call to the `/items` handler needs a store, and the only store available in
+process is `std.db`'s memory engine, which parses its SQL in Ply on every call.
+That scanner is on no served request path, so putting it inside the `endpoint`
+layer would price the twin. It is measured on its own instead — `w6_items` in
+the driver — and reported beside the ladder.
+
+**The `database` rung is `/items` against `/health` on one postgres binary**,
+not `run` against `run_memory`. For the same reason: the twin's `without` is
+dearer than the postgres `with`, so the ADR's substitution comes out negative
+and prices `std.db` rather than the database. Both numbers are taken.
+
+**Every rung reuses a connection for 32 requests**, as the served rows do. A
+rung that opened a connection per request carries an accept, a close and a
+`serve_connection` set-up per request that the total is not paying, and the
+difference lands in the residue as a negative number.
+
+**The ladder is read off the sequential accept loop, not the
+task-per-connection one ADR 0016 §1.6 pins.** `--accept sequential|task-per-conn`
+chooses, and it defaults to `sequential` for a measured reason: `task.spawn`
+opens a production region for the life of the server and the constant memo is
+refused inside any open region, so a spawning service memoizes nothing while the
+in-process rungs, which are one connection at a time, do. Reading a memo-active
+numerator against a memo-inert denominator would put the two arenas in different
+regimes. **Both** loops are swept on every run either way — the one the ladder is
+not read off becomes its own labelled offering rows, which is what §1.6 asks —
+and what the difference costs is a row in the limits. Both sides of every served
+rung come from the **same** concurrency, the one the total was read off, so a
+layer is one flag moved rather than one flag moved and two rows selected; and
+where the throughput curve is flat, the row is the lowest concurrency within 5%
+of the best rather than whichever point noise favoured.
 
 ## Reproducing a corpus
 
