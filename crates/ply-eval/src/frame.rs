@@ -142,7 +142,12 @@ impl Machine<'_> {
                 }
             }
 
-            Frame::Call { .. } => self.go_return(value),
+            Frame::Call { name, memo, .. } => {
+                if memo && let Some(name) = &name {
+                    self.remember_constant(name, &value);
+                }
+                self.go_return(value);
+            }
 
             Frame::Resume { k } => return self.resume_continuation(&k, value),
 

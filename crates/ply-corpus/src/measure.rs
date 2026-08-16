@@ -421,6 +421,7 @@ fn stack_cost(repeats: usize) -> Vec<StackPoint> {
                 stack = stack.push(Frame::Call {
                     name: None,
                     call_site: Span::DUMMY,
+                    memo: false,
                 });
             }
             let (k, below) = stack.capture(1, 0);

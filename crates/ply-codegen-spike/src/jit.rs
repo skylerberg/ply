@@ -1,0 +1,1132 @@
+//! The fragment of ADR 0016 §3.2, compiled with Cranelift.
+//!
+//! What is compiled natively: `Int` and `Bool` arithmetic, comparison, the
+//! short-circuiting operators, `if`, `let`, `block`, and `match` on literal
+//! patterns. What stays boxed: every value. What stays in the interpreter:
+//! every builtin, every effect, and every Ply function outside the compiled set.
+//!
+//! Anything else is **refused by name**. A spike that silently fell back to the
+//! interpreter for part of a body would report a ratio for a program it did not
+//! compile, which is the one failure mode that would make the number worthless.
+
+use crate::program::Loaded;
+use crate::rt::{self, Ctx};
+use anyhow::{Result, anyhow};
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind, types};
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::Context as ClifContext;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use ply_eval::code::{Arm, Stmt};
+use ply_eval::{Builtin, Code, NodeKind, Value, lower};
+use ply_span::Symbol;
+use ply_syntax::ast::{BinOp, Lit, PatternKind, QName, UnOp};
+use ply_syntax::resolve::Namespace;
+use std::collections::HashMap;
+
+/// A compiled function: `extern "C" fn(ctx, args) -> handle`.
+pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
+
+/// What the fragment refused, and where. Loud on purpose (§3.2).
+#[derive(Debug)]
+pub struct Refused {
+    pub function: String,
+    pub construct: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is outside the compiled fragment: {}",
+            self.function, self.construct
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Int,
+    Bool,
+    Boxed,
+}
+
+#[derive(Clone, Copy)]
+struct Val {
+    kind: Kind,
+    v: cranelift_codegen::ir::Value,
+}
+
+struct Helpers {
+    box_int: FuncId,
+    box_bool: FuncId,
+    unbox_int: FuncId,
+    unbox_bool: FuncId,
+    arith: FuncId,
+    overflow: FuncId,
+    no_match: FuncId,
+    lit: FuncId,
+    equal: FuncId,
+    builtin: FuncId,
+    ctor: FuncId,
+    record: FuncId,
+    call_machine: FuncId,
+}
+
+/// One compiled program, and the tables its runtime context needs.
+pub struct Compiled {
+    module: JITModule,
+    entries: HashMap<String, (FuncId, usize)>,
+    pub consts: Vec<Value>,
+    pub ctors: Vec<(Symbol, usize)>,
+    pub shapes: Vec<Vec<Symbol>>,
+    pub builtins: Vec<Builtin>,
+    pub targets: Vec<String>,
+    pub nodes: HashMap<String, usize>,
+    /// Nanoseconds spent in `cranelift`, from the first declaration to
+    /// `finalize_definitions`.
+    pub compile_nanos: u128,
+}
+
+impl Compiled {
+    pub fn entry(&self, name: &str) -> Option<Entry> {
+        let (id, _) = self.entries.get(name)?;
+        let ptr = self.module.get_finalized_function(*id);
+        Some(unsafe { std::mem::transmute::<*const u8, Entry>(ptr) })
+    }
+
+    pub fn arity(&self, name: &str) -> Option<usize> {
+        self.entries.get(name).map(|(_, a)| *a)
+    }
+
+    /// A context wired to this program's tables. One per thread of calls.
+    pub fn context(&self) -> Ctx {
+        let mut ctx = Ctx::new();
+        ctx.consts = self.consts.clone();
+        ctx.ctors = self.ctors.clone();
+        ctx.shapes = self.shapes.clone();
+        ctx.builtins = self.builtins.clone();
+        ctx.targets = self.targets.clone();
+        ctx
+    }
+}
+
+/// What the compiler is allowed to do beyond lowering the fragment.
+#[derive(Clone, Copy)]
+pub struct Opts {
+    /// Whether a `Str`, `Bytes` or nullary-constructor literal becomes a
+    /// constant in the code object. A real backend would; the interpreter
+    /// cannot, because a literal is a node it re-evaluates. Switching it off is
+    /// how the spike reports the two halves of its win separately.
+    pub fold_literals: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            fold_literals: true,
+        }
+    }
+}
+
+pub struct Jit {
+    module: JITModule,
+    opts: Opts,
+    consts: Vec<Value>,
+    ctors: Vec<(Symbol, usize)>,
+    shapes: Vec<Vec<Symbol>>,
+    builtins: Vec<Builtin>,
+    targets: Vec<String>,
+    funcs: HashMap<String, (FuncId, usize, usize)>,
+    helpers: Helpers,
+    nodes: HashMap<String, usize>,
+}
+
+fn helper_sig(module: &JITModule, params: usize, returns: bool) -> Signature {
+    let mut sig = module.make_signature();
+    for _ in 0..params {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    if returns {
+        sig.returns.push(AbiParam::new(types::I64));
+    }
+    sig
+}
+
+impl Jit {
+    /// Compiles `names` as one unit: a call between two of them is a direct
+    /// call, and a call to anything else is a trampoline.
+    pub fn compile(loaded: &'static Loaded, names: &[&str]) -> Result<Compiled> {
+        Jit::compile_with(loaded, names, Opts::default())
+    }
+
+    pub fn compile_with(
+        loaded: &'static Loaded,
+        names: &[&str],
+        opts: Opts,
+    ) -> Result<Compiled> {
+        let mut flags = settings::builder();
+        flags.set("use_colocated_libcalls", "false")?;
+        flags.set("is_pic", "false")?;
+        flags.set("opt_level", "speed")?;
+        let isa = cranelift_native::builder()
+            .map_err(|e| anyhow!("this host has no Cranelift backend: {e}"))?
+            .finish(settings::Flags::new(flags))?;
+        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        for (name, ptr) in rt::symbols() {
+            builder.symbol(name, ptr);
+        }
+        let mut module = JITModule::new(builder);
+
+        let started = std::time::Instant::now();
+        let helpers = Helpers {
+            box_int: declare(&mut module, "rt_box_int", 2, true)?,
+            box_bool: declare(&mut module, "rt_box_bool", 2, true)?,
+            unbox_int: declare(&mut module, "rt_unbox_int", 2, true)?,
+            unbox_bool: declare(&mut module, "rt_unbox_bool", 2, true)?,
+            arith: declare(&mut module, "rt_arith", 4, true)?,
+            overflow: declare(&mut module, "rt_overflow", 2, false)?,
+            no_match: declare(&mut module, "rt_no_match", 1, false)?,
+            lit: declare(&mut module, "rt_lit", 2, true)?,
+            equal: declare(&mut module, "rt_equal", 3, true)?,
+            builtin: declare(&mut module, "rt_builtin", 4, true)?,
+            ctor: declare(&mut module, "rt_ctor", 4, true)?,
+            record: declare(&mut module, "rt_record", 4, true)?,
+            call_machine: declare(&mut module, "rt_call_machine", 4, true)?,
+        };
+
+        let mut jit = Jit {
+            module,
+            opts,
+            consts: Vec::new(),
+            ctors: loaded.ctors(),
+            shapes: Vec::new(),
+            builtins: Vec::new(),
+            targets: Vec::new(),
+            funcs: HashMap::new(),
+            helpers,
+            nodes: HashMap::new(),
+        };
+
+        let mut bodies = Vec::new();
+        for name in names {
+            let (def, module_index) = loaded
+                .definition(name)
+                .ok_or_else(|| anyhow!("no definition named `{name}`"))?;
+            let mut sig = jit.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = jit
+                .module
+                .declare_function(&mangle(name), Linkage::Export, &sig)?;
+            jit.funcs
+                .insert((*name).to_string(), (id, def.params.len(), module_index));
+            let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
+            bodies.push(((*name).to_string(), params, lower(&def.body), module_index));
+        }
+
+        let mut clif = ClifContext::new();
+        let mut fctx = FunctionBuilderContext::new();
+        for (name, params, body, module_index) in &bodies {
+            jit.nodes.insert(name.clone(), count_nodes(body));
+            clif.clear();
+            let (id, _, _) = jit.funcs[name];
+            clif.func.signature = {
+                let mut sig = jit.module.make_signature();
+                sig.params.push(AbiParam::new(types::I64));
+                sig.params.push(AbiParam::new(types::I64));
+                sig.returns.push(AbiParam::new(types::I64));
+                sig
+            };
+            jit.define(&mut clif, &mut fctx, loaded, name, params, body, *module_index)?;
+            jit.module.define_function(id, &mut clif)?;
+        }
+        jit.module.finalize_definitions()?;
+        let compile_nanos = started.elapsed().as_nanos();
+
+        let entries = jit
+            .funcs
+            .iter()
+            .map(|(name, (id, arity, _))| (name.clone(), (*id, *arity)))
+            .collect();
+        Ok(Compiled {
+            module: jit.module,
+            entries,
+            consts: jit.consts,
+            ctors: jit.ctors,
+            shapes: jit.shapes,
+            builtins: jit.builtins,
+            targets: jit.targets,
+            nodes: jit.nodes,
+            compile_nanos,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn define(
+        &mut self,
+        clif: &mut ClifContext,
+        fctx: &mut FunctionBuilderContext,
+        loaded: &'static Loaded,
+        name: &str,
+        params: &[Symbol],
+        body: &Code,
+        module_index: usize,
+    ) -> Result<()> {
+        let mut builder = FunctionBuilder::new(&mut clif.func, fctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let ctx_ptr = builder.block_params(entry)[0];
+        let args_ptr = builder.block_params(entry)[1];
+
+        let failure = builder.create_block();
+
+        let mut scope = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let handle =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), args_ptr, (i * 8) as i32);
+            scope.push((
+                p.clone(),
+                Val {
+                    kind: Kind::Boxed,
+                    v: handle,
+                },
+            ));
+        }
+
+        let mut fx = Fx {
+            jit: self,
+            builder,
+            loaded,
+            ctx: ctx_ptr,
+            failure,
+            function: name.to_string(),
+            module_index,
+        };
+        let result = fx.expr(body, &mut scope)?;
+        let handle = fx.boxed(result);
+        fx.builder.ins().return_(&[handle]);
+
+        fx.builder.switch_to_block(failure);
+        let zero = fx.builder.ins().iconst(types::I64, 0);
+        fx.builder.ins().return_(&[zero]);
+
+        fx.builder.seal_all_blocks();
+        let config = fx.jit.module.target_config();
+        fx.builder.finalize(config);
+        Ok(())
+    }
+}
+
+fn declare(module: &mut JITModule, name: &str, params: usize, returns: bool) -> Result<FuncId> {
+    let sig = helper_sig(module, params, returns);
+    Ok(module.declare_function(name, Linkage::Import, &sig)?)
+}
+
+/// A JIT symbol may not collide with a runtime helper's, and a Ply name holds
+/// dots.
+fn mangle(name: &str) -> String {
+    format!("ply${}", name.replace('.', "$"))
+}
+
+fn count_nodes(code: &Code) -> usize {
+    let mut n = 1;
+    match &code.kind {
+        NodeKind::Lit(_) | NodeKind::Var(_) => {}
+        NodeKind::Unary { operand, .. } => n += count_nodes(operand),
+        NodeKind::Binary { lhs, rhs, .. } => n += count_nodes(lhs) + count_nodes(rhs),
+        NodeKind::Lambda { body, .. } => n += count_nodes(body),
+        NodeKind::App { func, args } => {
+            n += count_nodes(func);
+            n += args.iter().map(count_nodes).sum::<usize>();
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => n += count_nodes(cond) + count_nodes(then_branch) + count_nodes(else_branch),
+        NodeKind::Match { scrutinee, arms } => {
+            n += count_nodes(scrutinee);
+            for arm in arms.iter() {
+                n += count_nodes(&arm.body);
+                if let Some(g) = &arm.guard {
+                    n += count_nodes(g);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                n += match s {
+                    Stmt::Let { value, .. } => count_nodes(value),
+                    Stmt::Expr(e) => count_nodes(e),
+                };
+            }
+            if let Some(t) = tail {
+                n += count_nodes(t);
+            }
+        }
+        NodeKind::Record { fields } => n += fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>(),
+        NodeKind::Field { base, .. } => n += count_nodes(base),
+        NodeKind::List { items } => n += items.iter().map(count_nodes).sum::<usize>(),
+        NodeKind::Perform { args, .. } => n += args.iter().map(count_nodes).sum::<usize>(),
+        NodeKind::Handle { body, .. } => n += count_nodes(body),
+        NodeKind::WithCell { init, body, .. } => n += count_nodes(init) + count_nodes(body),
+        NodeKind::Simulate { body } => n += count_nodes(body),
+    }
+    n
+}
+
+/// What a name denotes, decided at compile time in the order
+/// `Machine::lookup` decides it at run time.
+enum Denotes {
+    Local(Val),
+    Compiled(FuncId, usize),
+    Machine(usize, usize),
+    Ctor(usize, usize),
+    Builtin(usize),
+    Constant(i64),
+}
+
+struct Fx<'a, 'b> {
+    jit: &'a mut Jit,
+    builder: FunctionBuilder<'b>,
+    loaded: &'static Loaded,
+    ctx: cranelift_codegen::ir::Value,
+    failure: cranelift_codegen::ir::Block,
+    function: String,
+    module_index: usize,
+}
+
+type Scope = Vec<(Symbol, Val)>;
+
+impl Fx<'_, '_> {
+    fn refuse<T>(&self, what: impl Into<String>) -> Result<T> {
+        Err(Refused {
+            function: self.function.clone(),
+            construct: what.into(),
+        }
+        .into())
+    }
+
+    fn intern(&mut self, value: Value) -> i64 {
+        self.jit.consts.push(value);
+        -(self.jit.consts.len() as i64)
+    }
+
+    /// After every call that can fail: one load and one branch, which is what a
+    /// real backend pays for a fallible runtime call too.
+    fn check(&mut self) {
+        let failed = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), self.ctx, 0);
+        let next = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(failed, self.failure, &[], next, &[]);
+        self.builder.switch_to_block(next);
+        self.builder.seal_block(next);
+    }
+
+    fn boxed(&mut self, val: Val) -> cranelift_codegen::ir::Value {
+        match val.kind {
+            Kind::Boxed => val.v,
+            Kind::Int => self.helper(self.jit.helpers.box_int, &[val.v]),
+            Kind::Bool => self.helper(self.jit.helpers.box_bool, &[val.v]),
+        }
+    }
+
+    fn as_int(&mut self, val: Val) -> cranelift_codegen::ir::Value {
+        match val.kind {
+            Kind::Int => val.v,
+            _ => {
+                let handle = self.boxed(val);
+                let v = self.helper(self.jit.helpers.unbox_int, &[handle]);
+                self.check();
+                v
+            }
+        }
+    }
+
+    fn as_bool(&mut self, val: Val) -> cranelift_codegen::ir::Value {
+        match val.kind {
+            Kind::Bool => val.v,
+            _ => {
+                let handle = self.boxed(val);
+                let v = self.helper(self.jit.helpers.unbox_bool, &[handle]);
+                self.check();
+                v
+            }
+        }
+    }
+
+    fn helper(
+        &mut self,
+        id: FuncId,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let func = self
+            .jit
+            .module
+            .declare_func_in_func(id, self.builder.func);
+        let mut all = vec![self.ctx];
+        all.extend_from_slice(args);
+        let call = self.builder.ins().call(func, &all);
+        self.builder.inst_results(call)[0]
+    }
+
+    fn helper_void(&mut self, id: FuncId, args: &[cranelift_codegen::ir::Value]) {
+        let func = self
+            .jit
+            .module
+            .declare_func_in_func(id, self.builder.func);
+        let mut all = vec![self.ctx];
+        all.extend_from_slice(args);
+        self.builder.ins().call(func, &all);
+    }
+
+    /// The argument array a call is handed: one stack slot, one store per
+    /// argument, and every value boxed at the boundary.
+    fn spill(&mut self, handles: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
+        let bytes = (handles.len().max(1) * 8) as u32;
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            3,
+        ));
+        for (i, h) in handles.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(types::I64, *h, slot, (i * 8) as i32);
+        }
+        self.builder.ins().stack_addr(types::I64, slot, 0)
+    }
+
+    fn denotation(&mut self, q: &QName, scope: &Scope) -> Result<Denotes> {
+        if q.is_bare()
+            && let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == q.symbol())
+        {
+            return Ok(Denotes::Local(*val));
+        }
+        let global = if q.is_bare() {
+            self.loaded
+                .resolved
+                .scopes
+                .get(self.module_index)
+                .and_then(|s| s.get(Namespace::Value, q.symbol()))
+                .map(|b| b.qualified.clone())
+        } else {
+            self.loaded
+                .resolved
+                .lookup(self.module_index, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.clone())
+        };
+        if let Some(name) = &global
+            && let Some((id, arity, _)) = self.jit.funcs.get(name.as_str())
+        {
+            return Ok(Denotes::Compiled(*id, *arity));
+        }
+        if let Some(name) = &global
+            && let Some((def, _)) = self.loaded.definition(name.as_str())
+        {
+            let index = match self.jit.targets.iter().position(|t| t == name.as_str()) {
+                Some(i) => i,
+                None => {
+                    self.jit.targets.push(name.to_string());
+                    self.jit.targets.len() - 1
+                }
+            };
+            return Ok(Denotes::Machine(index, def.params.len()));
+        }
+        let ctor = global.clone().or_else(|| {
+            if q.is_bare() && self.jit.ctors.iter().any(|(n, _)| n == q.symbol()) {
+                Some(q.symbol().clone())
+            } else {
+                None
+            }
+        });
+        if let Some(name) = ctor
+            && let Some(index) = self.jit.ctors.iter().position(|(n, _)| *n == name)
+        {
+            let arity = self.jit.ctors[index].1;
+            if arity == 0 {
+                let handle = self.intern(Value::ctor(name, Vec::new()));
+                return Ok(Denotes::Constant(handle));
+            }
+            return Ok(Denotes::Ctor(index, arity));
+        }
+        if q.is_bare()
+            && let Some(b) = Builtin::from_name(q.symbol())
+        {
+            let index = match self.jit.builtins.iter().position(|x| *x == b) {
+                Some(i) => i,
+                None => {
+                    self.jit.builtins.push(b);
+                    self.jit.builtins.len() - 1
+                }
+            };
+            return Ok(Denotes::Builtin(index));
+        }
+        self.refuse(format!("the name `{}` denotes nothing this spike knows", q.symbol()))
+    }
+
+    /// The representation an expression will produce, decided before its
+    /// branches are compiled so a join can be given a block parameter.
+    fn kind_of(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
+        Ok(match &code.kind {
+            NodeKind::Lit(Lit::Int(_)) => Kind::Int,
+            NodeKind::Lit(Lit::Bool(_)) => Kind::Bool,
+            NodeKind::Lit(_) => Kind::Boxed,
+            NodeKind::Var(q) => match self.denotation(q, scope)? {
+                Denotes::Local(v) => v.kind,
+                _ => Kind::Boxed,
+            },
+            NodeKind::Unary { op, .. } => match op {
+                UnOp::Not => Kind::Bool,
+                UnOp::Neg => Kind::Int,
+            },
+            NodeKind::Binary { op, .. } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::And | BinOp::Or => Kind::Bool,
+                BinOp::Concat => Kind::Boxed,
+            },
+            NodeKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let a = self.kind_of(then_branch, scope)?;
+                let b = self.kind_of(else_branch, scope)?;
+                if a == b { a } else { Kind::Boxed }
+            }
+            NodeKind::Block { stmts, tail } => match tail {
+                None => Kind::Boxed,
+                Some(t) => {
+                    let mut inner = scope.clone();
+                    for s in stmts.iter() {
+                        if let Stmt::Let { pat, value, .. } = s
+                            && let PatternKind::Var(name) = &pat.kind
+                        {
+                            let kind = self.kind_of(value, &inner)?;
+                            inner.push((
+                                name.name.clone(),
+                                Val {
+                                    kind,
+                                    v: cranelift_codegen::ir::Value::from_u32(0),
+                                },
+                            ));
+                        }
+                    }
+                    self.kind_of(t, &inner)?
+                }
+            },
+            _ => Kind::Boxed,
+        })
+    }
+
+    fn coerce(&mut self, val: Val, to: Kind) -> cranelift_codegen::ir::Value {
+        match to {
+            Kind::Boxed => self.boxed(val),
+            Kind::Int => self.as_int(val),
+            Kind::Bool => self.as_bool(val),
+        }
+    }
+
+    fn expr(&mut self, code: &Code, scope: &mut Scope) -> Result<Val> {
+        match &code.kind {
+            NodeKind::Lit(lit) => Ok(self.literal(lit)),
+
+            NodeKind::Var(q) => match self.denotation(q, scope)? {
+                Denotes::Local(v) => Ok(v),
+                Denotes::Constant(handle) => Ok(self.constant(handle)),
+                _ => self.refuse(format!(
+                    "`{}` is used as a value rather than called",
+                    q.symbol()
+                )),
+            },
+
+            NodeKind::Unary { op, operand } => {
+                let value = self.expr(operand, scope)?;
+                match op {
+                    UnOp::Not => {
+                        let b = self.as_bool(value);
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        let v = self.builder.ins().bxor(b, one);
+                        Ok(Val {
+                            kind: Kind::Bool,
+                            v,
+                        })
+                    }
+                    // `-x` is `Int`, `Float` or `Decimal` and this fragment
+                    // cannot tell which, so it refuses rather than guesses.
+                    UnOp::Neg => self.refuse("unary `-`"),
+                }
+            }
+
+            NodeKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, scope),
+
+            NodeKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let kind = {
+                    let a = self.kind_of(then_branch, scope)?;
+                    let b = self.kind_of(else_branch, scope)?;
+                    if a == b { a } else { Kind::Boxed }
+                };
+                let c = self.expr(cond, scope)?;
+                let c = self.as_bool(c);
+                let then_block = self.builder.create_block();
+                let else_block = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.builder
+                    .ins()
+                    .brif(c, then_block, &[], else_block, &[]);
+
+                self.builder.switch_to_block(then_block);
+                self.builder.seal_block(then_block);
+                let mut inner = scope.clone();
+                let t = self.expr(then_branch, &mut inner)?;
+                let t = self.coerce(t, kind);
+                self.builder.ins().jump(join, &[BlockArg::Value(t)]);
+
+                self.builder.switch_to_block(else_block);
+                self.builder.seal_block(else_block);
+                let mut inner = scope.clone();
+                let e = self.expr(else_branch, &mut inner)?;
+                let e = self.coerce(e, kind);
+                self.builder.ins().jump(join, &[BlockArg::Value(e)]);
+
+                self.builder.switch_to_block(join);
+                self.builder.seal_block(join);
+                Ok(Val {
+                    kind,
+                    v: self.builder.block_params(join)[0],
+                })
+            }
+
+            NodeKind::Block { stmts, tail } => {
+                let mut inner = scope.clone();
+                for s in stmts.iter() {
+                    match s {
+                        Stmt::Let { pat, value, .. } => {
+                            let v = self.expr(value, &mut inner)?;
+                            match &pat.kind {
+                                PatternKind::Var(name) => inner.push((name.name.clone(), v)),
+                                PatternKind::Wildcard => {}
+                                other => {
+                                    return self.refuse(format!(
+                                        "a `let` binding a {} pattern",
+                                        pattern_name(other)
+                                    ));
+                                }
+                            }
+                        }
+                        Stmt::Expr(e) => {
+                            self.expr(e, &mut inner)?;
+                        }
+                    }
+                }
+                match tail {
+                    Some(t) => self.expr(t, &mut inner),
+                    None => {
+                        let handle = self.intern(Value::Unit);
+                        Ok(self.constant(handle))
+                    }
+                }
+            }
+
+            NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, scope),
+
+            NodeKind::App { func, args } => self.app(func, args, scope),
+
+            NodeKind::Record { fields } => {
+                let mut names = Vec::with_capacity(fields.len());
+                let mut handles = Vec::with_capacity(fields.len());
+                for (name, value) in fields.iter() {
+                    let v = self.expr(value, scope)?;
+                    let h = self.boxed(v);
+                    names.push(name.clone());
+                    handles.push(h);
+                }
+                let shape = self.jit.shapes.len();
+                self.jit.shapes.push(names);
+                let ptr = self.spill(&handles);
+                let shape = self.builder.ins().iconst(types::I64, shape as i64);
+                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let v = self.helper(self.jit.helpers.record, &[shape, ptr, n]);
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
+
+            NodeKind::Lambda { .. } => self.refuse("a lambda"),
+            NodeKind::Field { .. } => self.refuse("a field access"),
+            NodeKind::List { .. } => self.refuse("a list literal"),
+            NodeKind::Perform { effect, op, .. } => {
+                self.refuse(format!("`perform {}.{}`", effect.symbol(), op))
+            }
+            NodeKind::Handle { .. } => self.refuse("a `handle`"),
+            NodeKind::WithCell { .. } => self.refuse("a `with cell`"),
+            NodeKind::Simulate { .. } => self.refuse("a `simulate`"),
+        }
+    }
+
+    /// A constant handle, as an immediate when folding is on and as a rebuilt
+    /// allocation when it is off.
+    fn constant(&mut self, handle: i64) -> Val {
+        let v = self.builder.ins().iconst(types::I64, handle);
+        if self.jit.opts.fold_literals {
+            return Val {
+                kind: Kind::Boxed,
+                v,
+            };
+        }
+        let v = self.helper(self.jit.helpers.lit, &[v]);
+        Val {
+            kind: Kind::Boxed,
+            v,
+        }
+    }
+
+    fn literal(&mut self, lit: &Lit) -> Val {
+        match lit {
+            Lit::Int(i) => Val {
+                kind: Kind::Int,
+                v: self.builder.ins().iconst(types::I64, *i),
+            },
+            Lit::Bool(b) => Val {
+                kind: Kind::Bool,
+                v: self.builder.ins().iconst(types::I64, i64::from(*b)),
+            },
+            other => {
+                let value = match other {
+                    Lit::Str(s) => Value::str(s),
+                    Lit::Bytes(b) => Value::bytes(b),
+                    Lit::Float(f) => Value::Float(*f),
+                    Lit::Decimal { mantissa, scale } => Value::Decimal(
+                        ply_eval::Decimal::try_from_i128_with_scale(*mantissa, *scale)
+                            .unwrap_or_default(),
+                    ),
+                    _ => Value::Unit,
+                };
+                let handle = self.intern(value);
+                self.constant(handle)
+            }
+        }
+    }
+
+    fn binary(&mut self, op: BinOp, lhs: &Code, rhs: &Code, scope: &mut Scope) -> Result<Val> {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let l = self.expr(lhs, scope)?;
+            let l = self.as_bool(l);
+            let rhs_block = self.builder.create_block();
+            let join = self.builder.create_block();
+            self.builder.append_block_param(join, types::I64);
+            let short = self.builder.ins().iconst(
+                types::I64,
+                i64::from(matches!(op, BinOp::Or)),
+            );
+            if matches!(op, BinOp::And) {
+                self.builder
+                    .ins()
+                    .brif(l, rhs_block, &[], join, &[BlockArg::Value(short)]);
+            } else {
+                self.builder
+                    .ins()
+                    .brif(l, join, &[BlockArg::Value(short)], rhs_block, &[]);
+            }
+            self.builder.switch_to_block(rhs_block);
+            self.builder.seal_block(rhs_block);
+            let mut inner = scope.clone();
+            let r = self.expr(rhs, &mut inner)?;
+            let r = self.as_bool(r);
+            self.builder.ins().jump(join, &[BlockArg::Value(r)]);
+            self.builder.switch_to_block(join);
+            self.builder.seal_block(join);
+            return Ok(Val {
+                kind: Kind::Bool,
+                v: self.builder.block_params(join)[0],
+            });
+        }
+
+        let l = self.expr(lhs, scope)?;
+        let r = self.expr(rhs, scope)?;
+        match op {
+            BinOp::Add | BinOp::Sub => {
+                let a = self.as_int(l);
+                let b = self.as_int(r);
+                let (v, carry) = if matches!(op, BinOp::Add) {
+                    self.builder.ins().sadd_overflow(a, b)
+                } else {
+                    self.builder.ins().ssub_overflow(a, b)
+                };
+                let overflowed = self.builder.create_block();
+                let ok = self.builder.create_block();
+                self.builder.ins().brif(carry, overflowed, &[], ok, &[]);
+                self.builder.switch_to_block(overflowed);
+                self.builder.seal_block(overflowed);
+                let what = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(matches!(op, BinOp::Sub)));
+                self.helper_void(self.jit.helpers.overflow, &[what]);
+                self.builder.ins().jump(self.failure, &[]);
+                self.builder.switch_to_block(ok);
+                self.builder.seal_block(ok);
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                })
+            }
+            BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                let a = self.as_int(l);
+                let b = self.as_int(r);
+                let code = match op {
+                    BinOp::Mul => 0,
+                    BinOp::Div => 1,
+                    _ => 2,
+                };
+                let code = self.builder.ins().iconst(types::I64, code);
+                let v = self.helper(self.jit.helpers.arith, &[code, a, b]);
+                self.check();
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                })
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let a = self.as_int(l);
+                let b = self.as_int(r);
+                let cc = match op {
+                    BinOp::Lt => IntCC::SignedLessThan,
+                    BinOp::Le => IntCC::SignedLessThanOrEqual,
+                    BinOp::Gt => IntCC::SignedGreaterThan,
+                    _ => IntCC::SignedGreaterThanOrEqual,
+                };
+                let v = self.builder.ins().icmp(cc, a, b);
+                let v = self.builder.ins().uextend(types::I64, v);
+                Ok(Val {
+                    kind: Kind::Bool,
+                    v,
+                })
+            }
+            BinOp::Eq | BinOp::Ne => {
+                let native = (l.kind == Kind::Int && r.kind == Kind::Int)
+                    || (l.kind == Kind::Bool && r.kind == Kind::Bool);
+                let v = if native {
+                    let cc = if matches!(op, BinOp::Eq) {
+                        IntCC::Equal
+                    } else {
+                        IntCC::NotEqual
+                    };
+                    let a = if l.kind == Kind::Int {
+                        self.as_int(l)
+                    } else {
+                        self.as_bool(l)
+                    };
+                    let b = if r.kind == Kind::Int {
+                        self.as_int(r)
+                    } else {
+                        self.as_bool(r)
+                    };
+                    let c = self.builder.ins().icmp(cc, a, b);
+                    self.builder.ins().uextend(types::I64, c)
+                } else {
+                    let a = self.boxed(l);
+                    let b = self.boxed(r);
+                    let eq = self.helper(self.jit.helpers.equal, &[a, b]);
+                    self.check();
+                    if matches!(op, BinOp::Eq) {
+                        eq
+                    } else {
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        self.builder.ins().bxor(eq, one)
+                    }
+                };
+                Ok(Val {
+                    kind: Kind::Bool,
+                    v,
+                })
+            }
+            BinOp::Concat => self.refuse("`++`"),
+            BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
+        }
+    }
+
+    fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
+        let NodeKind::Var(q) = &func.kind else {
+            return self.refuse("a call whose callee is an expression");
+        };
+        let denotes = self.denotation(q, scope)?;
+        let mut handles = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self.expr(a, scope)?;
+            let h = self.boxed(v);
+            handles.push(h);
+        }
+        let n = self
+            .builder
+            .ins()
+            .iconst(types::I64, handles.len() as i64);
+        let v = match denotes {
+            Denotes::Compiled(id, arity) => {
+                if arity != handles.len() {
+                    return self.refuse(format!(
+                        "`{}` is called with {} arguments and takes {arity}",
+                        q.symbol(),
+                        handles.len()
+                    ));
+                }
+                let ptr = self.spill(&handles);
+                let callee = self.jit.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
+                let v = self.builder.inst_results(call)[0];
+                self.check();
+                v
+            }
+            Denotes::Machine(index, arity) => {
+                if arity != handles.len() {
+                    return self.refuse(format!(
+                        "`{}` is called with {} arguments and takes {arity}",
+                        q.symbol(),
+                        handles.len()
+                    ));
+                }
+                let ptr = self.spill(&handles);
+                let index = self.builder.ins().iconst(types::I64, index as i64);
+                let v = self.helper(self.jit.helpers.call_machine, &[index, ptr, n]);
+                self.check();
+                v
+            }
+            Denotes::Builtin(index) => {
+                let ptr = self.spill(&handles);
+                let index = self.builder.ins().iconst(types::I64, index as i64);
+                let v = self.helper(self.jit.helpers.builtin, &[index, ptr, n]);
+                self.check();
+                v
+            }
+            Denotes::Ctor(index, arity) => {
+                if arity != handles.len() {
+                    return self.refuse(format!(
+                        "the constructor `{}` is applied to {} of its {arity} fields",
+                        q.symbol(),
+                        handles.len()
+                    ));
+                }
+                let ptr = self.spill(&handles);
+                let index = self.builder.ins().iconst(types::I64, index as i64);
+                self.helper(self.jit.helpers.ctor, &[index, ptr, n])
+            }
+            Denotes::Local(_) => return self.refuse("a call through a local binding"),
+            Denotes::Constant(_) => {
+                return self.refuse(format!("`{}` is not a function", q.symbol()));
+            }
+        };
+        Ok(Val {
+            kind: Kind::Boxed,
+            v,
+        })
+    }
+
+    fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], scope: &mut Scope) -> Result<Val> {
+        let value = self.expr(scrutinee, scope)?;
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        let mut next = self.builder.create_block();
+        self.builder.ins().jump(next, &[]);
+        for arm in arms {
+            if arm.guard.is_some() {
+                return self.refuse("a `match` arm with a guard");
+            }
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+            let body_block = self.builder.create_block();
+            let after = self.builder.create_block();
+            match &arm.pat.kind {
+                PatternKind::Wildcard => {
+                    self.builder.ins().jump(body_block, &[]);
+                }
+                PatternKind::Var(_) => {
+                    self.builder.ins().jump(body_block, &[]);
+                }
+                PatternKind::Lit(lit) => {
+                    let literal = self.literal(lit);
+                    let native = (literal.kind == Kind::Int && value.kind == Kind::Int)
+                        || (literal.kind == Kind::Bool && value.kind == Kind::Bool);
+                    let eq = if native {
+                        let a = if value.kind == Kind::Int {
+                            self.as_int(value)
+                        } else {
+                            self.as_bool(value)
+                        };
+                        let b = if literal.kind == Kind::Int {
+                            self.as_int(literal)
+                        } else {
+                            self.as_bool(literal)
+                        };
+                        self.builder.ins().icmp(IntCC::Equal, a, b)
+                    } else {
+                        let a = self.boxed(value);
+                        let b = self.boxed(literal);
+                        let eq = self.helper(self.jit.helpers.equal, &[a, b]);
+                        self.check();
+                        self.builder.ins().icmp_imm_s(IntCC::NotEqual, eq, 0)
+                    };
+                    self.builder.ins().brif(eq, body_block, &[], after, &[]);
+                }
+                other => {
+                    return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
+                }
+            }
+            self.builder.switch_to_block(body_block);
+            self.builder.seal_block(body_block);
+            let mut inner = scope.clone();
+            if let PatternKind::Var(name) = &arm.pat.kind {
+                inner.push((name.name.clone(), value));
+            }
+            let body = self.expr(&arm.body, &mut inner)?;
+            let body = self.boxed(body);
+            self.builder.ins().jump(join, &[BlockArg::Value(body)]);
+            next = after;
+        }
+        // Nothing matched. The machine raises here; so does this.
+        self.builder.switch_to_block(next);
+        self.builder.seal_block(next);
+        self.helper_void(self.jit.helpers.no_match, &[]);
+        self.builder.ins().jump(self.failure, &[]);
+
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(Val {
+            kind: Kind::Boxed,
+            v: self.builder.block_params(join)[0],
+        })
+    }
+}
+
+fn pattern_name(p: &PatternKind) -> &'static str {
+    match p {
+        PatternKind::Wildcard => "wildcard",
+        PatternKind::Var(_) => "binding",
+        PatternKind::Lit(_) => "literal",
+        PatternKind::Ctor { .. } => "constructor",
+        PatternKind::Record { .. } => "record",
+        PatternKind::List { .. } => "list",
+    }
+}

@@ -26,6 +26,8 @@ mod interp;
 pub mod limit;
 pub mod machine;
 pub mod map;
+mod memo;
+mod pool;
 pub mod region;
 pub mod sched;
 pub mod sim;

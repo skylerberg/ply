@@ -1065,18 +1065,21 @@ impl Relay {
 /// diagnostic here would stop a service for something a retry fixes.
 #[test]
 fn a_database_that_went_away_mid_run_is_a_value_and_the_next_request_reconnects() {
-    let Some(upstream) = url() else {
+    let Some(url) = url() else {
         return;
     };
-    let upstream = upstream
-        .rsplit_once('@')
-        .and_then(|(_, rest)| rest.split('/').next())
-        .expect("the test URL names a host and port")
-        .to_string();
+    let (credentials, rest) = url.rsplit_once('@').expect("the test URL names a host");
+    let (upstream, database) = rest.split_once('/').expect("the test URL names a database");
+    let (upstream, database) = (upstream.to_string(), database.to_string());
 
     let relay = Relay::start(&upstream, 0);
+    // Everything but the address comes from `PLY_TEST_DB`. A database name
+    // written here instead would be one this test alone requires to exist, so
+    // it would pass on the machine it was written on and skip nothing anywhere
+    // else — it would connect to nothing and fail at start-up.
+    let separator = if database.contains('?') { '&' } else { '?' };
     let mut config = PoolConfig::new(format!(
-        "postgresql://ply@127.0.0.1:{}/ply_pool?sslmode=disable&application_name=ply_relay",
+        "{credentials}@127.0.0.1:{}/{database}{separator}sslmode=disable&application_name=ply_relay",
         relay.port
     ));
     config.size = 1;

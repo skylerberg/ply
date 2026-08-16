@@ -76,7 +76,11 @@ pub use schema::fingerprint as schema_fingerprint;
 /// per run — so a program that passed by reading an ordering oracle, or by
 /// observing an id another entry point moved, is not a program this evaluator
 /// passes.
-pub const RUNTIME_VERSION: &str = "0.11.1";
+/// 0.11.2: both engines remember what a nullary pure definition evaluated to.
+/// No value moves — that is the argument for doing it — but the calls pending
+/// under a second reference to one do, so a test that recorded `E0502` at the
+/// recursion budget is not a test this evaluator still fails.
+pub const RUNTIME_VERSION: &str = "0.11.2";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///

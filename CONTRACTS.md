@@ -1730,6 +1730,61 @@ same way. A tail call is charged like any other: eliding it left a
 tail-recursive runaway unbounded on the machine while the tree-walker diagnosed
 it, which is ADR 0005 §7.1.
 
+### The constant memo — `ply-eval::memo`
+
+A definition with **no parameters**, an **empty published row** and no
+`where derivable(..)` constraint is a constant, and both engines evaluate it at
+most once per `Machine` or `Interp`. The rule reads the published row rather
+than the inferred body row: a definition annotated wider than it performs is
+left alone, because the annotation is the reviewable artifact and a rule that
+disagreed with it would be a rule nobody could check by reading a signature.
+
+Nothing about this is observable in a value, an atom, a trace or a world — that
+is the argument for doing it. One thing is: the calls pending underneath a
+second reference to a constant, which is why it is in this section and why it
+moved `RUNTIME_VERSION` to `0.11.2`. Both engines therefore have to keep the
+memo or neither may, or `--engine both` reports `E0503` on any program that
+reaches a constant from near the bound.
+
+Three rules make it exact:
+
+- **The first completed evaluation wins.** A body that captures a continuation
+  and hands it out can be re-entered later with a different resumption value;
+  that value is the resumption's and not the definition's, so a filled slot is
+  never overwritten.
+- **No memo inside an open region**, read or written. The reason is a
+  `simulate` region's: a pure definition may open its own `with_cell`, and an
+  allocation is an `Access::Alloc` the search depends on; skipping one would
+  change what a schedule records, which is what partial-order reduction and
+  seeded replay are read off. Outside a region a cell cannot escape the
+  `with_cell` that made it — `E0304` — so the allocation is unobservable and the
+  substitution is exact. **`Machine::constant` implements this as
+  `!self.sims.is_empty()`, which is wider than the reason**: a *production*
+  region — the one `task.spawn` opens and keeps open for the life of the
+  scheduler — keeps no trail and records no step, and it disables the memo
+  anyway. A service whose accept loop spawns therefore memoizes nothing, which
+  is measured below and is a defect rather than a rule.
+- **No `CheckOutput`, no memo.** `Machine::for_program` and
+  `Interp::for_program` evaluate without a check pass and have no published row
+  to read, so they remember nothing.
+
+`examples/desk.ply`'s `table()` is what this was measured on: eleven route
+patterns parsed from their strings, built once in `route_of` and again in
+`health`. Against a control that is the same service with its own nullary
+definitions given a dead parameter, with every response byte-identical between
+the two:
+
+- **In process, over the twin**, driven alternately in one process at best of 7
+  × 512 requests: `/health` **482.6µs → 264.0µs** (2,072 → 3,787 req/s, 1.83x)
+  and `/items` **903.9µs → 813.8µs** (1.11x).
+- **Served, the real binary over postgres over TLS with `--trace json`**, both
+  variants served alternately at concurrency 1, best of 3 (ADR 0016 §10.1, which
+  prices this as one of its seven cheaper levers): `/health` **466.6µs →
+  263.5µs** (1.77x) and `/items` **677.0µs → 589.4µs** (1.15x).
+- **On the task-per-connection accept loop, nothing:** `/health` 471.3µs against
+  470.6µs, `/items` 1,087.7µs against 1,090.6µs — 1.00x either way, because the
+  region the spawn opens has already disabled the memo for both variants.
+
 ### The tracer — `ply-eval::trace`
 
 ```rust
