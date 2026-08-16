@@ -1,0 +1,3 @@
+vec![
+  "/Users/skylerberg/.worktrees/ply/w6-performance/crates/ply-codegen-spike/target/release/build/cranelift-assembler-x64-d674e9ddd40efc91/out/assembler.rs".into(),
+]

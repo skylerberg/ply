@@ -5,6 +5,11 @@ M0–M4 are the vertical slice: the smallest system that proves the thesis end t
 end. M5+ are the milestones the slice's architecture is shaped to accept without
 a rewrite.
 
+**Status: M0–M8 and W1–W6 are complete.** The web track closed at W6 with a
+measured decision rather than a build. **M9 is the one milestone still deferred**,
+and W6 deferred it on a number that says what would reopen it — see the M9 and W6
+entries below.
+
 ---
 
 ## M0 — Foundation
@@ -156,21 +161,63 @@ a resource.
 
 ## M9 — Native codegen
 
-Deferred, but see W6: serving inverts the argument below, and the web track is
-what would pull this forward.
+**Still deferred — decided by W6 against criteria written before the numbers
+existed. The reason is not the one that carried this milestone through M0–M8.**
 
-Cranelift or LLVM backend. Deferred deliberately — the interpreter is not the
-bottleneck the language exists to solve, and a fast interpreter with a perfect
-cache beats a fast compiler with a cold one.
+The old reason was that the interpreter is not the bottleneck. In a *test* run
+that is still true and W6 re-measured it: at 10,000 definitions and 5,000 tests,
+execute is **3.3% of a warm run** (10.4ms of 310.7ms) and typecheck plus hash
+plus parse are 93%. In a *served* request it is less false than it looks, and
+W6 measured that too: the interpreter is **35% of a request** (209.3µs of
+592.6µs, after the ladder's own seam is charged against it), a Ply request costs
+**37.8x** the same syscalls answering the same bytes, and a Cranelift spike on
+`std.http.read_line` hit **11.67x** on its weakest input — which projects
+**1.48x** end to end by Amdahl, against a **1.55x** ceiling an infinitely fast
+backend would have.
+
+So three of the four criteria fail: the share is under the 50% C1 asks for, the
+projection is under the 1.50x C2 asks for, and **six of the seven cheaper levers
+are still unpriced**, which W6's criteria made independently sufficient on its
+own.
+
+**The seventh was priced, because it landed.** `ply-eval`'s constant memo
+evaluates a nullary pure definition once per process, which is ADR 0016 §4's
+"caching derived work" lever built rather than argued about: **1.77x on
+`/health` and 1.15x on `/items`**, end to end on the real binary against the
+same service with its constants disabled. That is the third time in this project
+that a cheap algorithmic change beat a predicted codegen win — and it is why the
+interpreter's share fell from the 67% W6's first take measured. Every cheaper
+lever that lands makes M9's case weaker.
+
+**What reopens it, computed rather than argued:** the share reaches 50% (it is
+35%), the projection reaches 1.50x (it is 1.48x), and the six unpriced levers in
+ADR 0016 §4 are priced with the best of them at or below **1.24x** end to end.
+Two of them carry bounds worth looking at first: the tree-walker beats the
+control-stack machine **2.73x** on the same pure request path, and one `/health`
+request makes **1,035 allocations and 0.124 MB** to produce a 107-byte response.
+
+**And what W6 measured that argues even the 1.48x is optimistic**, recorded so a
+future contributor re-measures rather than re-argues: compiling `read_line`
+alone and trampolining its two callees back into the machine gives **1.71x**, not
+11.67x — coverage is a cliff, not a slope. The spike's fragment accepts **141 of
+366** functions across `std.http`, `std.router` and `std.json`, refusing field
+accesses, constructor patterns, lambdas and list literals — which is what
+endpoints and derived codecs are made of. And `read_line`'s own directly
+measured end-to-end value is **1.02x**.
+
+`docs/adr/0016-w6-performance.md` §8–§11. The spike lives in
+`crates/ply-codegen-spike`, in its own workspace, depended on by nothing; ADR
+0016 §3.5 requires that closing W6 delete it, and its numbers survive in
+`benches/w6-spike.json`.
 
 ---
 
-# Web track
+# Web track — complete, W1 through W6
 
 M0–M8 built a language that can prove things about programs that never leave
-memory. The web track is what it takes to serve an HTTP API, and the ordering is
-driven by one fact: **Ply currently has no I/O at all**. Not limited I/O — none.
-Every handler ever written for it is in-memory or simulated.
+memory. The web track is what it takes to serve an HTTP API, and the ordering was
+driven by one fact true when it was written: **Ply had no I/O at all**. Not
+limited I/O — none. Every handler ever written for it was in-memory or simulated.
 
 So a postgres driver is not the first problem. The first problem is that the
 runtime's knowledge of what a computation can do is the foundation of every
@@ -242,7 +289,12 @@ discharged at whatever tier it earns.
 in `ply check --types` — which is the first point where an endpoint's declared
 signature says which tables it touches.
 
-`docs/adr/0009-effect-set-aliases.md`
+`docs/adr/0009-effect-set-aliases.md`, **amended by W6**: an alias may not name a
+whole effect and may not cross a module boundary. Both refusals are `E0114` and
+both exist for one reason the original ADR did not have — expansion has to be a
+function of the file, or an edit elsewhere leaves a stale published footprint
+behind a skipped recheck, which corrupts scheduling and isolation silently. The
+ADR showed the rejected form for three milestones; it no longer does.
 
 ## W4 — Postgres
 
@@ -305,17 +357,72 @@ orchestration, autoscaling, distributed tracing propagation, sampling,
 cancellation, live config reload, incremental deploy transport, artifact signing,
 zeroization, and — breaking a promise W4 made — backpressure and load shedding.
 
-## W6 — Performance, and whether M9 comes forward
+## W6 — Performance, and whether M9 comes forward — **done; the track closes here**
 
 M9 was deferred because execution was a few percent of a warm test run. Serving
 inverts that argument, and the control-stack machine costs four heap allocations
 per frame push.
 
-Most web APIs are I/O-bound, so an interpreter may well be fine — but that is a
-hypothesis, and W1 produces the number that tests it.
+The hypothesis this milestone was written to test was: *most web APIs are
+I/O-bound, so an interpreter may well be fine.* **The measurement says: not
+mostly, and it depends what you put on the path.** With a real postgres on it the
+database is 55% of a request — partly because `/items`' own JSON encode sits
+inside that rung — and the interpreter is 35%. There is not much I/O to hide
+behind above the database: the whole socket layer is 7.8%, TLS is 0.6% and
+tracing to JSON is 1.0%.
 
-**Exit:** request throughput and tail latency under real load, and a decision on
-M9 made from measurement rather than from the assumption that carried M0–M8.
+**Exit, met:** the accumulated stack in one table, throughput and tail latency
+under real load on both transports, both stores and both accept loops, and an M9
+verdict computed by `ply_corpus::w6::decide` from criteria pinned in code before
+any number existed. The measurement files are `benches/w6-ladder.json` and
+`benches/w6-spike.json`; neither contains a verdict, a test asserts that, and
+each is written by the command that takes it rather than by hand.
+
+The headline numbers, all on one machine in one run:
+
+| | |
+| --- | --- |
+| a request, end to end, TLS + postgres + tracing | **592.6µs** |
+| the same syscalls in Rust answering the same bytes | **15.7µs** — a Ply request is **37.8x** the floor, **16.8x** like for like on `/health` over plaintext |
+| what a reader gets, over postgres | **1,687–3,778 req/s on one core** |
+| p99 at concurrency 1 | **0.29–0.65ms** |
+| the interpreter's share | **35%**, after the ladder's negative residue is charged against it |
+| concurrency | buys nothing: `/health` 3,914 req/s at c=1 and 3,930 at c=32, p99 287µs → 252ms |
+| the constant memo, priced end to end | **1.77x** on `/health`, **1.15x** on `/items` — and **1.00x** on the accept loop that spawns, where the memo is inert |
+
+`docs/adr/0016-w6-performance.md` §8–§12. Not in W6, and held for the codegen
+backend: whatever the verdict, none was built. **Not held for "optimizing
+anything":** the constant memo landed in `ply-eval` between W6's two takes, which
+is one of ADR 0016 §4's own cheaper levers built rather than priced, and the
+ladder was re-taken on the tree that has it. Two obligations are still open: the
+spike crate has not been deleted, and the memo is refused inside any open region
+— so a service whose accept loop calls `task.spawn` memoizes nothing, measured at
+**1.00x against 1.77x** on the same route.
+
+## Where the web track landed
+
+Three things the track cost that its plan did not price, recorded here so the
+next reader inherits the corrections rather than rediscovering them:
+
+- **W3's claim that swapping the store touches one function was false.** A
+  database is not a variable; `store.all[items]()` handing back a whole table had
+  already thrown away the statement, the transaction and the constraint. Every
+  endpoint's body moved. What survived is the useful half and is the claim worth
+  making: the **resources** did not move, so every row still names the same
+  tables, and swapping the twin for postgres really is one function.
+- **The in-memory twin is slower than the database it stands in for** — in
+  process the twin's `/items` handler costs 544.6µs a call, 344.9µs of which is
+  `std.db`'s memory engine parsing its SQL in Ply, and every twin clause writes
+  its whole state back through a persistent map. The substitution ADR 0016
+  planned to price the database with therefore prices the twin, and the ladder
+  uses a route difference instead and says so. Test doubles being dearer than the
+  real thing is a real cost of "the double and the real thing share one
+  signature".
+- **W4 promised backpressure and load shedding; W5 broke that promise
+  explicitly** and W6 measured what it means: throughput is flat in concurrency
+  and latency grows linearly, so an overloaded Ply service queues rather than
+  sheds. With no cancellation either, a request live at the drain deadline loses
+  its connection with no response.
 
 ## What the web track is for
 
@@ -335,7 +442,15 @@ Parity with other languages is not a reason to use this. These are:
 ## The risk that matters
 
 A host handler that misreports its footprint corrupts scheduling and isolation
-**silently** rather than loudly. Every dangerous defect found across seven
-audited milestones was a green result over unexplored space, never a crash. The
-host boundary is where that failure mode is easiest to reintroduce and hardest to
-detect, and it deserves harder adversarial review than anything built so far.
+**silently** rather than loudly. Every dangerous defect found across the audited
+milestones was a green result over unexplored space, never a crash. The host
+boundary is where that failure mode is easiest to reintroduce and hardest to
+detect, and it deserved harder adversarial review than anything else in the
+track.
+
+It also arrived through a feature that looks like nothing. An `effect set` is
+"an abbreviation for a row", and letting one cross a module boundary would have
+let an edit in the declaring module leave a stale published footprint behind a
+skipped incremental recheck — an under-reporting footprint, which is exactly this
+failure. W3 refused it, and W6 rewrote ADR 0009 to say so, because the ADR still
+showed the form the implementation rejects.

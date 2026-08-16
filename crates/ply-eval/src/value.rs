@@ -9,6 +9,7 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, render_float};
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,6 +41,11 @@ pub type Map = RedBlackTreeMap<Value, Value>;
 
 const RENDER_MAX_ITEMS: usize = 32;
 const RENDER_MAX_DEPTH: usize = 16;
+
+thread_local! {
+    /// Indexed by [`Builtin`]'s discriminant. See [`Value::builtin`].
+    static BUILTIN_VALUES: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -183,11 +189,35 @@ impl Value {
         }
     }
 
+    /// One `Value` per builtin per thread, built on first reference.
+    ///
+    /// Resolving a prelude name is the machine's second most frequent
+    /// allocation: `bytes_len` in a loop built a fresh `Arc<Closure>` and a
+    /// fresh `Arc<str>` for its name on every mention, and W6 counted just over
+    /// a thousand of those per request. Sharing one is invisible to a program —
+    /// a `Closure` is immutable, and [`Value::cmp`] answers `Equal` for any two
+    /// closures, so there is no identity to observe — and it is thread-local
+    /// because a `Value` is thread-confined.
     pub fn builtin(b: Builtin) -> Value {
-        Value::Closure(Arc::new(Closure {
-            name: Some(Symbol::new(b.name())),
-            kind: ClosureKind::Builtin(b),
-        }))
+        let fresh = || {
+            Value::Closure(Arc::new(Closure {
+                name: Some(Symbol::new(b.name())),
+                kind: ClosureKind::Builtin(b),
+            }))
+        };
+        // `try_with`, because a value dropped during thread-local teardown can
+        // reach here after the cache is gone, and building a fresh one is the
+        // right answer there rather than an abort.
+        BUILTIN_VALUES
+            .try_with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let slot = b as usize;
+                if slot >= cache.len() {
+                    cache.resize(slot + 1, None);
+                }
+                cache[slot].get_or_insert_with(fresh).clone()
+            })
+            .unwrap_or_else(|_| fresh())
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -422,15 +452,36 @@ pub const SECRET_REDACTED: &str = "Secret(****)";
 /// children to an explicit worklist before the glue reaches them, so the glue
 /// only ever sees an emptied node. Scalars are left to the glue and cost
 /// nothing, which is why a list of integers still drops without allocating.
+/// The worklist [`Drop`] dismantles onto, kept between drops.
+///
+/// Held rather than rebuilt because a dismantle is one `Vec` growth per level of
+/// nesting and a request drops thousands of compounds. It is taken *out* of the
+/// cell for the duration, so a drop reached from inside a drop — the `Map` arm
+/// below frees through the glue — finds it empty and uses its own; two
+/// worklists are correct, one shared one would not be.
+///
+/// The capacity is not kept past what an ordinary value needs: a single
+/// pathological drop should not leave its peak reserved for the thread's life.
+const DISMANTLE_KEEP: usize = 256;
+
+thread_local! {
+    static DISMANTLE: std::cell::Cell<Vec<Value>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 impl Drop for Value {
     fn drop(&mut self) {
         if !nests(self) {
             return;
         }
-        let mut pending: Vec<Value> = Vec::new();
+        let mut pending: Vec<Value> = DISMANTLE
+            .try_with(std::cell::Cell::take)
+            .unwrap_or_default();
         take_children(self, &mut pending);
         while let Some(mut v) = pending.pop() {
             take_children(&mut v, &mut pending);
+        }
+        if pending.capacity() <= DISMANTLE_KEEP {
+            let _ = DISMANTLE.try_with(|slot| slot.set(pending));
         }
     }
 }

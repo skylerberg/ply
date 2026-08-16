@@ -22,6 +22,7 @@ use crate::interp::{
     err_unknown_name, literal, op_decl,
 };
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
+use crate::memo::{Lookup, Memo};
 use crate::region::{self, Region, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
@@ -108,6 +109,9 @@ pub struct Machine<'a> {
     /// traversal per worker per concurrency group — the single largest item in
     /// the machine's profile — for code no test in the group would run.
     lowered: FxHashMap<Symbol, Value>,
+    /// What a nullary pure definition evaluated to, so a service does not
+    /// rebuild its route table once per request.
+    memo: Memo,
     ctors: FxHashMap<Symbol, usize>,
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
@@ -259,6 +263,7 @@ impl<'a> Machine<'a> {
             check,
             fns,
             lowered: FxHashMap::default(),
+            memo: Memo::default(),
             ctors,
             ops,
             tests,
@@ -1611,6 +1616,17 @@ impl<'a> Machine<'a> {
                 args.len(),
             ));
         }
+        let memo = match (params.is_empty(), &closure.name) {
+            (true, Some(name)) => match self.constant(name) {
+                Lookup::Known(value) => {
+                    self.go_return(value);
+                    return Ok(());
+                }
+                Lookup::Remember => true,
+                Lookup::Ignore => false,
+            },
+            _ => false,
+        };
         let mut scope = env;
         for (p, v) in params.iter().zip(args) {
             scope = scope.bind(p.clone(), v);
@@ -1622,11 +1638,34 @@ impl<'a> Machine<'a> {
             Frame::Call {
                 name: closure.name.clone(),
                 call_site: span,
+                memo,
             },
             span,
         )?;
         self.go_eval(body, scope, module);
         Ok(())
+    }
+
+    /// The memo is not consulted inside a `simulate` region, and nothing is
+    /// written to it from one.
+    ///
+    /// A pure definition may open its own `with_cell` region, and an allocation
+    /// is an [`Access::Alloc`] the search depends on. Skipping one would change
+    /// what a schedule records, which is the one thing partial-order reduction
+    /// and seeded replay are read off. Outside a region there is no trail and a
+    /// cell cannot escape the `with_cell` that made it, so the allocation is
+    /// unobservable and the substitution is exact.
+    fn constant(&mut self, name: &Symbol) -> Lookup {
+        if !self.sims.is_empty() {
+            return Lookup::Ignore;
+        }
+        self.memo.lookup(self.check, name)
+    }
+
+    pub(crate) fn remember_constant(&mut self, name: &Symbol, value: &Value) {
+        if self.sims.is_empty() {
+            self.memo.remember(name, value);
+        }
     }
 
     pub(crate) fn call_builtin(
