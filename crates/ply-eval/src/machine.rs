@@ -1,6 +1,6 @@
 //! The control-stack machine.
 //!
-//! A configuration is `⟨S, K, W⟩` — state, [`Stack`], [`World`] — and [`step`]
+//! A configuration is `⟨S, K, W⟩` — state, [`Stack`], [`TaskRegions`] — and [`step`]
 //! is one transition of ADR 0005 §1.3. Nothing about a Ply computation lives on
 //! the native stack: a call costs one [`Frame::Call`] on the heap, which is what
 //! makes capturing a continuation O(one segment per enclosing handler) and what
@@ -8,6 +8,8 @@
 //!
 //! [`step`]: Machine::step
 
+use crate::arena::Arena;
+use crate::arena::RegionKind;
 use crate::builtins::{self, Builtin, Step};
 use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower, lower_fn};
 use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
@@ -27,9 +29,9 @@ use crate::rc::Own;
 use crate::region::{self, Region, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
+use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Value};
-use crate::world::World;
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -38,6 +40,7 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -116,10 +119,18 @@ pub struct Machine<'a> {
     ctors: FxHashMap<Symbol, usize>,
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
-    /// The world every entry point forks from, so one seeded world serves every
-    /// test in a run without any of them observing another's writes.
-    base_world: World,
-    world: World,
+    /// Where every cell this engine allocates lives, and the fixture every
+    /// entry point resets to — so one seeded fixture serves every test in a run
+    /// without any of them observing another's writes. ADR 0017 §1 and §5.
+    regions: TaskRegions,
+    /// Which of ADR 0017 §3's two kinds each region in this program is, computed
+    /// on the first region the machine actually opens.
+    ///
+    /// Lazily, for the reason `lowered` is lazy: it is a whole-program analysis
+    /// and a machine is built per worker per concurrency group, so a program
+    /// whose entry point opens no region must not pay for one. `/health` opens
+    /// none.
+    region_kinds: OnceCell<Rc<crate::region_kind::Regions>>,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
     stack: Stack,
@@ -268,8 +279,8 @@ impl<'a> Machine<'a> {
             ctors,
             ops,
             tests,
-            base_world: World::new(),
-            world: World::new(),
+            regions: TaskRegions::new(),
+            region_kinds: OnceCell::new(),
             trace: Trace::new(),
             stack: Stack::new(),
             state: State::Halt(Value::Unit),
@@ -406,15 +417,32 @@ impl<'a> Machine<'a> {
         self.check
     }
 
-    pub fn world(&self) -> &World {
-        &self.world
+    pub fn cells(&self) -> &Arena {
+        self.regions.arena()
     }
 
-    /// Every subsequent entry point forks from `world` rather than from an
-    /// empty one. A fixture built once is handed to every test this way.
-    pub fn set_base_world(&mut self, world: World) {
-        self.base_world = world;
-        self.world = self.base_world.fork();
+    pub fn cells_mut(&mut self) -> &mut Arena {
+        self.regions.arena_mut()
+    }
+
+    pub fn regions(&self) -> &TaskRegions {
+        &self.regions
+    }
+
+    /// The kind of the region opened at `span`, and `None` when that span opens
+    /// no region: one the inference never saw, or a `with_cell[r]` nested inside
+    /// the `with_region[r]` that already opened `r`.
+    pub fn region_kind(&self, span: Span) -> Option<RegionKind> {
+        self.region_kinds
+            .get_or_init(|| Rc::new(crate::region_kind::infer(self.program, self.resolved)))
+            .at(span)
+            .map(|region| region.kind)
+    }
+
+    /// Every subsequent entry point resets to this stack's fixture rather than
+    /// to an empty one. A fixture built once is handed to every test this way.
+    pub fn set_regions(&mut self, regions: TaskRegions) {
+        self.regions = regions;
     }
 
     pub fn test_count(&self) -> usize {
@@ -496,6 +524,15 @@ impl<'a> Machine<'a> {
                 .primary(span, "not defined in this program")
                 .note("this name is program-wide: `store.orders.place`, not `place`")
         })?;
+        // Before `reset`, so a refusal leaves the previous run's arena alone and
+        // the argument's slot is still describable. `reset` restores the
+        // fixture's generations, so a slot carried out of an earlier entry point
+        // resolves here and reads whatever this run put at that position —
+        // silently. See `escape`.
+        let boundary = crate::escape::Boundary::EntryPoint { name };
+        for arg in &args {
+            crate::escape::check(&boundary, arg, span)?;
+        }
         self.reset();
         // The same three lines [`Machine::drive`] ends with, and for the same
         // reason: this is an entry point — it resets the world before it starts
@@ -505,6 +542,12 @@ impl<'a> Machine<'a> {
         // without this a `transaction` left open by `main` is never rolled back
         // and a span left open by `main` is never closed.
         let outcome = self.apply(f, args, span).and_then(|()| self.run());
+        // The same close [`Machine::drive`] gives a test. Without it a `simulate`
+        // region reached through a named call is neither refused when it is
+        // abandoned nor reported to a search, so `Machine::simulated` answers
+        // `None` for a run that entered one.
+        let outcome = self.close_regions(outcome);
+        self.close_open_regions();
         self.end_entry_point();
         outcome
     }
@@ -551,7 +594,20 @@ impl<'a> Machine<'a> {
                         self.trail.record_access(Access::Atom(atom));
                     }
                 }
-                match handler::perform(&self.stack, request, decl, self.host_ops)? {
+                let answered = {
+                    let Machine {
+                        stack,
+                        regions,
+                        host_ops,
+                        ..
+                    } = &mut *self;
+                    // A closure rather than a value: a pin is an `Rc`
+                    // allocation, and `perform` only calls this for a capture
+                    // that can outlive the region it was taken in.
+                    let mut pin = || regions.pin();
+                    handler::perform(stack, request, decl, *host_ops, &mut pin)?
+                };
+                match answered {
                     Answered::Handler(transition) => self.take(transition)?,
                     Answered::Scheduler(scheduled) => self.run_scheduled(scheduled)?,
                     Answered::Unhandled(request) => self.perform_host(request)?,
@@ -573,7 +629,7 @@ impl<'a> Machine<'a> {
     /// this restores the world rather than unwinding anything.
     fn reset(&mut self) {
         self.stack = Stack::new();
-        self.world = self.base_world.fork();
+        self.regions.reset();
         self.trace.clear();
         self.state = State::Halt(Value::Unit);
         self.sims.clear();
@@ -590,8 +646,23 @@ impl<'a> Machine<'a> {
         self.state = State::Eval { code, env, module };
         let outcome = self.run();
         let outcome = self.close_regions(outcome);
+        self.close_open_regions();
         self.end_entry_point();
         outcome
+    }
+
+    /// Closes every region the entry point still had open.
+    ///
+    /// The stack goes first, and that is the load-bearing half: a diagnostic
+    /// abandons the stack rather than unwinding it, so a `Frame::Resume` left on
+    /// it holds a continuation, the continuation holds the pin it took at its
+    /// capture, and the close would retain a region nothing can reach any more.
+    /// The tree-walker has no stack to abandon and reclaims, so leaving this out
+    /// is a `--engine both` divergence on the failure path.
+    fn close_open_regions(&mut self) {
+        self.stack = Stack::new();
+        self.sims.clear();
+        self.regions.close_program_regions();
     }
 
     /// Hands the host runtime every exit path from an entry point.
@@ -913,6 +984,22 @@ impl<'a> Machine<'a> {
                     body,
                     &env,
                     module,
+                    span,
+                );
+                self.take(transition)?;
+            }
+
+            NodeKind::WithRegion { body } => {
+                let kind = self.region_kind(span);
+                let stack = self.stack.clone();
+                let transition = handler::enter_with_region(
+                    &mut self.regions,
+                    &stack,
+                    body,
+                    &env,
+                    module,
+                    kind,
+                    span,
                 );
                 self.take(transition)?;
             }
@@ -1033,6 +1120,11 @@ impl<'a> Machine<'a> {
             ));
         }
 
+        // Beside it, and for the same reason: a handler outlives every region
+        // the program opens, so a handle into one has not crossed yet when this
+        // fires.
+        crate::escape::check_arguments(&operation, declaration.path, &args, span)?;
+
         let runtime = self.runtime.clone();
         let answered = {
             let request = HostRequest {
@@ -1086,6 +1178,7 @@ impl<'a> Machine<'a> {
                         declaration.path,
                     ));
                 }
+                check_host_answer(&operation, declaration.path, &value, span)?;
                 self.go_return(value);
                 return Ok(());
             }
@@ -1105,6 +1198,9 @@ impl<'a> Machine<'a> {
                 return Err(err_task_lost_its_region(span, &operation));
             };
             let (k, _) = self.stack.capture(segments, self.host_ops);
+            // Parked until the host answers, which may be after every region
+            // open here has closed.
+            let k = k.pinned(self.regions.pin());
             let live = region_mut(&mut self.sims, region).expect("the region was just found");
             live.sched.park_on_host(k, pending, span)?;
             return self.schedule();
@@ -1114,6 +1210,7 @@ impl<'a> Machine<'a> {
         // runtime until the token resolves. This is the one place in the
         // language where a Ply computation blocks a real thread.
         let value = rt.block_on(pending)?;
+        check_host_answer(&operation, declaration.path, &value, span)?;
         self.go_return(value);
         Ok(())
     }
@@ -1311,7 +1408,9 @@ impl<'a> Machine<'a> {
                 // `spawn` publishes already says the enclosing handler
                 // discharges them.
                 let over = k.delimiters();
-                let id = live.sched.spawn(body, over, span);
+                let pin = self.regions.pin();
+                let live = region_mut(&mut self.sims, region).expect("the region was just found");
+                let id = live.sched.spawn(body, over, span, pin);
                 live.sched.suspend(k, Value::Task(id))?;
             }
             ("task", "join") => {
@@ -1361,23 +1460,24 @@ impl<'a> Machine<'a> {
 
     /// Puts a cell access into the current step's access set.
     ///
-    /// Two tests hold two worlds, so `ply_test::shared_footprint` may drop
-    /// `cell` atoms; two tasks in one simulated run hold **one** world, and a
-    /// dependence relation that drops them prunes away every shared-memory race
-    /// in the corpus while reporting a *larger* reduction for having done it.
+    /// Two tests hold two region stacks, so `ply_test::shared_footprint` may
+    /// drop `cell` atoms; two tasks in one simulated run share **one** stack,
+    /// and a dependence relation that drops them prunes away every shared-memory
+    /// race in the corpus while reporting a *larger* reduction for having done
+    /// it.
     fn record_cell_access(&mut self, b: Builtin, args: &[Value]) {
         let mode = match b {
             Builtin::CellGet => Mode::Read,
             Builtin::CellSet => Mode::Write,
             _ => return,
         };
-        let Some(Value::Cell(id)) = args.first() else {
+        let Some(Value::Cell(slot)) = args.first() else {
             return;
         };
         if self.sims.is_empty() {
             return;
         }
-        self.trail.record_access(Access::Cell { id: *id, mode });
+        self.trail.record_access(Access::Cell { id: *slot, mode });
         self.note_step_site(self.current);
     }
 
@@ -1387,7 +1487,7 @@ impl<'a> Machine<'a> {
     /// its own kind of access, dependent with every other allocation. Without it
     /// two tasks that each open a private `with_cell` look like tasks that touch
     /// nothing, and §6.1's soundness condition is false of them: run in the
-    /// other order they reach a *different world*, because the two ids are
+    /// other order they reach a *different arena*, because the two slots are
     /// swapped.
     pub(crate) fn record_alloc_access(&mut self) {
         if self.sims.is_empty() {
@@ -1692,7 +1792,7 @@ impl<'a> Machine<'a> {
         span: Span,
     ) -> Result<(), Diagnostic> {
         self.record_cell_access(b, &args);
-        let step = builtins::call(b, args, &mut self.world, span)?;
+        let step = builtins::call(b, args, self.regions.arena_mut(), span)?;
         self.run_builtin_step(step, span)
     }
 
@@ -1987,8 +2087,8 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    pub(crate) fn world_mut(&mut self) -> &mut World {
-        &mut self.world
+    pub(crate) fn regions_mut(&mut self) -> &mut TaskRegions {
+        &mut self.regions
     }
 
     /// The bound both engines share. The stack is a parameter because a splice
@@ -2244,6 +2344,28 @@ fn err_footprint_escape(
 /// which is exactly the shape a `config`-sourced password reaches an outbound
 /// request in. Bounded by the same host-stack growth every other walk over a
 /// `Value` uses, and paid only per host operation rather than per call.
+/// The host boundary crossed the other way.
+///
+/// A handler cannot have obtained a handle into the program's memory except by
+/// echoing one back, and no shipped registration declares a return type that
+/// could hold one — so this refuses a forgery rather than a shape a driver is
+/// entitled to produce. Wired at every route an answer takes: inline,
+/// [`HostRuntime::block_on`], and the scheduler's poll of a parked token.
+///
+/// [`HostRuntime::block_on`]: crate::host::HostRuntime::block_on
+pub(crate) fn check_host_answer(
+    operation: &str,
+    path: &'static str,
+    value: &Value,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    crate::escape::check(
+        &crate::escape::Boundary::HostAnswer { operation, path },
+        value,
+        span,
+    )
+}
+
 fn carries_secret(v: &Value) -> bool {
     match v {
         Value::Secret(_) => true,

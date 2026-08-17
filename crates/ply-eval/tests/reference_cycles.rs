@@ -81,11 +81,11 @@ test "a cell that reaches itself through a variant" {
 /// source, which is the only way to build the shape the type system refuses.
 #[test]
 fn the_detector_still_finds_the_shape_it_guards_against() {
-    use ply_eval::World;
+    use ply_eval::TaskRegions;
     use ply_span::Span;
 
-    let mut world = World::new();
-    let id = world.alloc(ply_eval::Value::Unit);
+    let mut regions = TaskRegions::new();
+    let id = regions.alloc_cell(ply_eval::Value::Unit);
     let held = ply_eval::Value::list(vec![ply_eval::Value::Cell(id)]);
 
     ply_eval::rc::reset();
@@ -93,7 +93,7 @@ fn the_detector_still_finds_the_shape_it_guards_against() {
     let _ = ply_eval::builtins::call(
         ply_eval::Builtin::CellSet,
         vec![ply_eval::Value::Cell(id), held],
-        &mut world,
+        &mut regions,
         Span::DUMMY,
     );
     assert_eq!(

@@ -6,7 +6,7 @@
 //! compared nothing — an all-skipped run and a clean run must not look alike.
 
 use ply_eval::differential::compare_tests;
-use ply_eval::{Interp, Machine, World};
+use ply_eval::{Fixture, Interp, Machine};
 use ply_span::SourceMap;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -152,7 +152,7 @@ fn the_two_engines_agree_on_every_corpus_on_disk() {
 
         let mut treewalk = Interp::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
-        let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         tests += report.compared;
         atoms += machine.trace().performs();
 
@@ -195,7 +195,7 @@ fn a_machine_only_fixture_is_counted_apart_from_what_was_compared() {
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
 
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 0, "{report}");
     assert_eq!(report.machine_only, 1, "{report}");
@@ -225,7 +225,7 @@ fn the_two_engines_agree_on_examples() {
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
 
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.compared >= files.len(), "{report}");
     assert!(report.is_clean(), "{report}");
 }

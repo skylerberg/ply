@@ -131,6 +131,15 @@ than opening a region of its own — so a cell is a value allocated in `r`, and
 `with_cell` written on its own is unchanged. A value branded `r` that would
 outlive the region is `E0446`, reported where it would escape.
 
+The brand is a type-level claim, so it stops where the types do. Three runtime
+boundaries hand a value somewhere no type is left to look at — a host operation's
+argument, the value a host handler or runtime answers with, and an argument
+handed to an entry point from outside the program — and a handle into a region
+reaching one of those is `E0449`, which names the handle, the route to it and the
+boundary. ADR 0017 §2's one deliberately open route, a continuation parked in an
+enclosing region's cell where a constructor's field type erases the brand, stays
+open; what `E0449` bounds is where the value it produces can then go.
+
 ## 3. Content addressing
 
 The unit of compilation is the **definition**, not the file or module.

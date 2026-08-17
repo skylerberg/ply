@@ -1080,7 +1080,7 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 /// driver's own diagnosis to `E0502` and send the reader looking for a defect in
 /// Ply. The rule is unchanged; it is the second group that they do not belong
 /// to, because they are not verdicts about the machine's state.
-pub const RESERVED_CODES: [&str; 21] = [
+pub const RESERVED_CODES: [&str; 22] = [
     codes::INTERNAL_ERROR,
     codes::ENGINE_DIVERGENCE,
     codes::SIMULATION_DIVERGENCE,
@@ -1097,6 +1097,11 @@ pub const RESERVED_CODES: [&str; 21] = [
     codes::HOST_FOOTPRINT_ESCAPE,
     codes::HOST_BLOCKING_ANSWER,
     codes::SECRET_TO_HOST,
+    // Raised by the machine about what crossed the boundary, in both
+    // directions. A handler that answered with it would be claiming the run
+    // handed it a handle into a region — a verdict about the machine's own
+    // memory, which is not a thing a handler is in a position to observe.
+    codes::REGION_ESCAPE_AT_BOUNDARY,
     codes::DB_NOT_CONFIGURED,
     codes::DB_SCHEMA_MISMATCH,
     codes::DB_UNMODELLED_SIDE_EFFECT,

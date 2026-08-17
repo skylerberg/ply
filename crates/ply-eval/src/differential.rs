@@ -9,15 +9,16 @@
 //!
 //! What is compared, per test: the `Result<(), Diagnostic>` field by field
 //! (code, severity, message, every label with its span, every note); the
-//! observed footprint, when both engines traced one; and the final world as the
-//! ordered `(CellId, rendered value)` sequence. Each answer names the first
-//! place the two disagreed, so a report says *where* rather than *that*.
+//! observed footprint, when both engines traced one; and the final cell arena
+//! as the ordered `(Slot, rendered value)` sequence. Each answer names the
+//! first place the two disagreed, so a report says *where* rather than *that*.
 
 use crate::Engine;
+use crate::arena::Arena;
 use crate::interp::Interp;
 use crate::machine::Machine;
+use crate::task_regions::Fixture;
 use crate::value::Value;
-use crate::world::World;
 use ply_core::ty::Footprint;
 use ply_span::{Diagnostic, Label, Severity, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, Item, Program, Stmt};
@@ -36,8 +37,12 @@ pub trait Evaluator {
     /// never parsed. A runner that has the module addresses uses this instead.
     fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic>;
     fn eval_expr(&mut self, e: &Expr) -> Result<Value, Diagnostic>;
-    fn world(&self) -> &World;
-    fn set_base_world(&mut self, world: World);
+    /// The run's cells, ascending by slot: the state the two engines must agree
+    /// on once a test has run.
+    fn cells(&self) -> &Arena;
+    /// The same arena, so the harness can ask it to journal what it reclaims.
+    fn cells_mut(&mut self) -> &mut Arena;
+    fn set_fixture(&mut self, fixture: &Fixture);
 
     /// The atoms actually performed, for an engine that traces. `None` means
     /// "not traced", which is not the same as "traced and empty": a consumer
@@ -83,12 +88,17 @@ impl Evaluator for Interp<'_> {
         self.eval_expr_for_test(e)
     }
 
-    fn world(&self) -> &World {
-        Interp::world(self)
+    fn cells(&self) -> &Arena {
+        Interp::cells(self)
     }
 
-    fn set_base_world(&mut self, world: World) {
-        Interp::set_base_world(self, world)
+    fn cells_mut(&mut self) -> &mut Arena {
+        Interp::cells_mut(self)
+    }
+
+    fn set_fixture(&mut self, fixture: &Fixture) {
+        let (regions, _) = fixture.open();
+        Interp::set_regions(self, regions);
     }
 
     fn observed_footprint(&self) -> Option<Footprint> {
@@ -125,12 +135,17 @@ impl Evaluator for Machine<'_> {
         self.eval_expr_for_test(e)
     }
 
-    fn world(&self) -> &World {
-        Machine::world(self)
+    fn cells(&self) -> &Arena {
+        Machine::cells(self)
     }
 
-    fn set_base_world(&mut self, world: World) {
-        Machine::set_base_world(self, world)
+    fn cells_mut(&mut self) -> &mut Arena {
+        Machine::cells_mut(self)
+    }
+
+    fn set_fixture(&mut self, fixture: &Fixture) {
+        let (regions, _) = fixture.open();
+        Machine::set_regions(self, regions);
     }
 
     fn observed_footprint(&self) -> Option<Footprint> {
@@ -154,8 +169,13 @@ pub enum Detail {
     /// Both accepted it and produced different values.
     Value,
     Footprint,
-    /// The worlds differ. `at` names the first cell they disagree on.
-    World {
+    /// The arenas differ. `at` names the first cell they disagree on.
+    Cells {
+        at: String,
+    },
+    /// The two runs reclaimed different cells, or reclaimed them in a different
+    /// order. `at` is the position in each run's reclamation journal.
+    Reclaimed {
         at: String,
     },
 }
@@ -167,7 +187,8 @@ impl Detail {
             Detail::Diagnostic { field } => format!("diagnostic {field}"),
             Detail::Value => "result value".to_string(),
             Detail::Footprint => "observed footprint".to_string(),
-            Detail::World { at } => format!("final world at {at}"),
+            Detail::Cells { at } => format!("final cell at {at}"),
+            Detail::Reclaimed { at } => format!("reclaimed cell #{at}"),
         }
     }
 }
@@ -289,6 +310,7 @@ pub fn compare_test(left: &mut dyn Evaluator, right: &mut dyn Evaluator, index: 
         .unwrap_or("<unnamed>")
         .to_string();
 
+    audit_state(left, right);
     let l = left.eval_test(index);
     let r = right.eval_test(index);
     if refused(&l) || refused(&r) {
@@ -298,6 +320,18 @@ pub fn compare_test(left: &mut dyn Evaluator, right: &mut dyn Evaluator, index: 
         Some(d) => Compared::Diverged(d),
         None => Compared::Agreed,
     }
+}
+
+/// Asks both arenas to record what their closes reclaim.
+///
+/// Without it the state half of this oracle is vacuous: a region hands its
+/// cells back at its lexical close, so a run that behaved leaves nothing to
+/// compare and two engines that disagreed about every write still agree about
+/// the empty arena afterwards. Cheap enough to leave on for an audit and off
+/// everywhere else — it clones each reclaimed value.
+pub fn audit_state(left: &mut dyn Evaluator, right: &mut dyn Evaluator) {
+    left.cells_mut().journal();
+    right.cells_mut().journal();
 }
 
 /// What one subject's audit produced. `Refused` is not agreement: only one
@@ -327,7 +361,8 @@ pub fn compare_outcomes(
 ) -> Option<Divergence> {
     outcome_divergence(l, r)
         .or_else(|| footprint_divergence(left, right))
-        .or_else(|| world_divergence(left.world(), right.world()))
+        .or_else(|| cells_divergence(left.cells(), right.cells()))
+        .or_else(|| reclaimed_divergence(left.cells(), right.cells()))
         .map(|(detail, a, b)| Divergence {
             subject: subject.to_string(),
             index,
@@ -355,7 +390,8 @@ pub fn compare_answers(
 
     first
         .or_else(|| footprint_divergence(left, right))
-        .or_else(|| world_divergence(left.world(), right.world()))
+        .or_else(|| cells_divergence(left.cells(), right.cells()))
+        .or_else(|| reclaimed_divergence(left.cells(), right.cells()))
         .map(|(detail, a, b)| Divergence {
             subject: subject.to_string(),
             index: None,
@@ -378,13 +414,17 @@ pub fn compare_expr(
 }
 
 /// The two evaluators must have been built over the same program, so that an
-/// index means the same test on both sides. `base` seeds each engine's world
-/// before the run and every test forks from it.
-pub fn compare_tests(left: &mut dyn Evaluator, right: &mut dyn Evaluator, base: &World) -> Report {
+/// index means the same test on both sides. `base` seeds each engine's region
+/// stack before the run and every test resets to it.
+pub fn compare_tests(
+    left: &mut dyn Evaluator,
+    right: &mut dyn Evaluator,
+    base: &Fixture,
+) -> Report {
     let mut report = Report::new(left.engine(), right.engine());
 
-    left.set_base_world(base.fork());
-    right.set_base_world(base.fork());
+    left.set_fixture(base);
+    right.set_fixture(base);
 
     let count = left.test_count();
     if count != right.test_count() {
@@ -508,46 +548,96 @@ fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Two worlds agree when they hold the same cells in the same order with the
-/// same rendered contents. `World::cells` is ascending by id, so the walk is
+/// Two arenas agree when they hold the same cells in the same order with the
+/// same rendered contents. `Arena::slots` is ascending by index, so the walk is
 /// deterministic and the first disagreement is a stable answer.
-fn world_divergence(left: &World, right: &World) -> Option<(Detail, String, String)> {
-    let mut a = left.cells();
-    let mut b = right.cells();
+///
+/// **By index, never by whole slot.** A slot's generation counts how often its
+/// position has been reclaimed, which is the engine's own history: two engines
+/// reach one state through different numbers of entry points — the tree-walker
+/// refuses a machine-only test before it resets — and comparing generations
+/// makes that a divergence in every program with a cell in it. What a program
+/// means is which cell holds what, and that is the index and the value.
+fn cells_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, String)> {
+    let mut a = left.slots();
+    let mut b = right.slots();
     loop {
         match (a.next(), b.next()) {
             (None, None) => return None,
-            (Some((id, v)), None) => {
+            (Some((slot, v)), None) => {
                 return Some((
-                    Detail::World { at: id.to_string() },
+                    Detail::Cells {
+                        at: slot.index().to_string(),
+                    },
                     v.render(),
                     "no such cell".to_string(),
                 ));
             }
-            (None, Some((id, v))) => {
+            (None, Some((slot, v))) => {
                 return Some((
-                    Detail::World { at: id.to_string() },
+                    Detail::Cells {
+                        at: slot.index().to_string(),
+                    },
                     "no such cell".to_string(),
                     v.render(),
                 ));
             }
             (Some((x, p)), Some((y, q))) => {
-                if x != y {
+                if x.index() != y.index() {
                     return Some((
-                        Detail::World {
-                            at: format!("{x} vs {y}"),
+                        Detail::Cells {
+                            at: format!("{} vs {}", x.index(), y.index()),
                         },
-                        x.to_string(),
-                        y.to_string(),
+                        x.index().to_string(),
+                        y.index().to_string(),
                     ));
                 }
                 let (p, q) = (p.render(), q.render());
                 if p != q {
-                    return Some((Detail::World { at: x.to_string() }, p, q));
+                    return Some((
+                        Detail::Cells {
+                            at: x.index().to_string(),
+                        },
+                        p,
+                        q,
+                    ));
                 }
             }
         }
     }
+}
+
+/// Two arenas agree about what they reclaimed when their journals are equal.
+///
+/// This is the half of the state oracle that survives reclamation: it compares
+/// every cell that ever existed, at the value it held when its region closed,
+/// rather than the ones a run happened to leave behind. Both journals are empty
+/// when nobody asked for one, and then this decides nothing — which is why
+/// [`audit_state`] is not optional for a caller that wants the oracle.
+fn reclaimed_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, String)> {
+    let (a, b) = (left.journalled(), right.journalled());
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        // By index and value, never by generation: a generation counts how many
+        // entry points a *position* has been through, and the tree-walker
+        // refuses a machine-only test before it resets, so the two engines reach
+        // the same state having reclaimed a different number of times.
+        if x.0.index() != y.0.index() || x.1.render() != y.1.render() {
+            return Some((
+                Detail::Reclaimed { at: i.to_string() },
+                format!("cell {} = {}", x.0.index(), x.1.render()),
+                format!("cell {} = {}", y.0.index(), y.1.render()),
+            ));
+        }
+    }
+    if a.len() != b.len() {
+        let at = a.len().min(b.len());
+        let show = |side: &[(crate::arena::Slot, Value)]| match side.get(at) {
+            Some((slot, v)) => format!("cell {} = {}", slot.index(), v.render()),
+            None => "nothing more".to_string(),
+        };
+        return Some((Detail::Reclaimed { at: at.to_string() }, show(a), show(b)));
+    }
+    None
 }
 
 /// The tree-walker's refusal of a `simulate` region.
@@ -732,7 +822,7 @@ mod tests {
         inner: Interp<'a>,
         /// Answers `eval_test` with this instead of running it.
         outcome: Option<Result<(), Diagnostic>>,
-        /// Allocated into the world after every test.
+        /// Allocated into the arena after every test.
         extra_cell: Option<Value>,
         footprint: Option<Footprint>,
     }
@@ -764,7 +854,7 @@ mod tests {
         fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
             let real = self.inner.eval_test(index);
             if let Some(extra) = self.extra_cell.clone() {
-                self.inner.world_mut().alloc(extra);
+                self.inner.cells_mut().alloc(extra);
             }
             match &self.outcome {
                 Some(forced) => forced.clone(),
@@ -780,12 +870,17 @@ mod tests {
             self.inner.eval_expr_for_test(e)
         }
 
-        fn world(&self) -> &World {
-            self.inner.world()
+        fn cells(&self) -> &Arena {
+            self.inner.cells()
         }
 
-        fn set_base_world(&mut self, world: World) {
-            self.inner.set_base_world(world)
+        fn cells_mut(&mut self) -> &mut Arena {
+            self.inner.cells_mut()
+        }
+
+        fn set_fixture(&mut self, fixture: &Fixture) {
+            let (regions, _) = fixture.open();
+            self.inner.set_regions(regions);
         }
 
         fn observed_footprint(&self) -> Option<Footprint> {
@@ -823,7 +918,7 @@ mod tests {
         let (program, resolved) = standalone(corpus());
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert_eq!(report.compared, 2);
         assert!(report.is_clean(), "{report}");
     }
@@ -838,7 +933,7 @@ mod tests {
         let mut right = Perturbed::new(&program, &resolved);
         right.outcome = Some(Ok(()));
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert_eq!(report.divergences.len(), 1);
         let d = &report.divergences[0];
         assert_eq!(d.detail, Detail::Verdict);
@@ -862,7 +957,7 @@ mod tests {
         drifted.notes[1] = "actual: 1".to_string();
         right.outcome = Some(Err(drifted));
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         let d = &report.divergences[0];
         assert_eq!(
             d.detail,
@@ -889,7 +984,7 @@ mod tests {
         drifted.labels[0].span = at(1, 2);
         right.outcome = Some(Err(drifted));
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert_eq!(
             report.divergences[0].detail,
             Detail::Diagnostic {
@@ -900,21 +995,21 @@ mod tests {
     }
 
     /// The case a verdict comparison alone would miss entirely: both engines
-    /// pass, and one of them left the world somewhere else.
+    /// pass, and one of them left its cells somewhere else.
     #[test]
-    fn a_world_that_differs_after_a_passing_test_is_caught_at_the_cell() {
+    fn an_arena_that_differs_after_a_passing_test_is_caught_at_the_cell() {
         let (program, resolved) = standalone(corpus());
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
         right.extra_cell = Some(Value::Int(99));
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         let d = report
             .divergences
             .first()
             .expect("an extra cell is a divergence");
         assert!(
-            matches!(&d.detail, Detail::World { at } if at == "#0"),
+            matches!(&d.detail, Detail::Cells { at } if at == "0"),
             "{:?}",
             d.detail
         );
@@ -923,21 +1018,19 @@ mod tests {
     }
 
     #[test]
-    fn a_world_whose_contents_differ_names_the_cell_and_both_values() {
+    fn an_arena_whose_contents_differ_names_the_cell_and_both_values() {
         let (program, resolved) = standalone(corpus());
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
-        let mut seeded = World::new();
-        seeded.alloc(Value::Int(0));
-        left.set_base_world(seeded.fork());
+        let seeded = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(0))));
 
         // `compare_tests` re-seeds both from its own base, so the divergence has
-        // to be injected through the engine rather than through the base world.
+        // to be injected through the engine rather than through the fixture.
         right.extra_cell = Some(Value::Int(7));
         let report = compare_tests(&mut left, &mut right, &seeded);
         let d = &report.divergences[0];
-        assert!(matches!(&d.detail, Detail::World { .. }), "{:?}", d.detail);
+        assert!(matches!(&d.detail, Detail::Cells { .. }), "{:?}", d.detail);
     }
 
     #[test]
@@ -946,7 +1039,7 @@ mod tests {
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert!(report.is_clean(), "{report}");
         assert_eq!(report.footprints_compared, 0);
     }
@@ -958,7 +1051,7 @@ mod tests {
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&smaller, &smaller_resolved);
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert_eq!(report.compared, 0);
         assert_eq!(report.divergences.len(), 1);
         assert_eq!(report.divergences[0].left, "2 tests");
@@ -981,7 +1074,7 @@ mod tests {
         let mut right = Perturbed::new(&program, &resolved);
         right.outcome = Some(Err(Diagnostic::error(codes::RUNTIME_ERROR, "boom")));
 
-        let report = compare_tests(&mut left, &mut right, &World::new());
+        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         let d = report.into_result().unwrap_err();
         assert_eq!(d.code, codes::ENGINE_DIVERGENCE);
         assert!(d.message.contains("treewalk"), "{}", d.message);
@@ -1119,7 +1212,7 @@ mod tests {
         let mut treewalk = Interp::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
 
-        let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         assert_eq!(report.compared, 8);
         assert!(report.is_clean(), "{report}");
     }
@@ -1153,14 +1246,14 @@ mod tests {
         )]);
         let mut treewalk = Interp::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
-        assert!(compare_tests(&mut treewalk, &mut machine, &World::new()).is_clean());
+        assert!(compare_tests(&mut treewalk, &mut machine, &Fixture::empty()).is_clean());
 
         let mut perturbed = Perturbed::new(&program, &resolved);
         perturbed.outcome = Some(Err(Diagnostic::error(
             super::codes::ASSERTION_FAILED,
             "assertion failed: expected 2, found 1",
         )));
-        let report = compare_tests(&mut treewalk, &mut perturbed, &World::new());
+        let report = compare_tests(&mut treewalk, &mut perturbed, &Fixture::empty());
         assert_eq!(
             report.divergences[0].detail,
             Detail::Diagnostic {
@@ -1182,17 +1275,20 @@ mod tests {
     }
 
     #[test]
-    fn a_seeded_base_world_reaches_both_engines() {
+    fn a_seeded_fixture_reaches_both_engines() {
         let (program, resolved) = standalone(vec![test_def("t", int(1))]);
         let mut left = Interp::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
-        let mut seeded = World::new();
-        let id = seeded.alloc(Value::str("fixture"));
+        let seeded = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::str("fixture"))));
+        let cell = seeded
+            .handle()
+            .as_cell(Span::DUMMY, "the fixture handle")
+            .expect("a cell");
 
         let report = compare_tests(&mut left, &mut right, &seeded);
         assert!(report.is_clean(), "{report}");
-        assert_eq!(left.world().get(id).unwrap().render(), "\"fixture\"");
-        assert_eq!(right.world().get(id).unwrap().render(), "\"fixture\"");
+        assert_eq!(left.cells().get(cell).unwrap().render(), "\"fixture\"");
+        assert_eq!(right.cells().get(cell).unwrap().render(), "\"fixture\"");
     }
 }

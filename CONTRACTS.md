@@ -419,6 +419,27 @@ Requirements:
   declared as a concrete `Cell` is `E0446` at the declaration: a variant's field
   types are converted once for the whole program, so a brand stored in one has
   nowhere to appear.
+- A handle into a region — a `Cell`, a `Task`, or a continuation, reached through
+  any data constructor, a `Secret`'s payload or a closure's captured environment
+  — that crosses a runtime boundary where no type is left to check is `E0449`,
+  raised by the evaluator and naming the handle, the route to it and the
+  boundary. Three boundaries are checked: a host operation's argument, the value
+  a host handler or runtime answers with (inline, `block_on` or a token the
+  scheduler resolves), and an argument handed to an entry point from outside the
+  program. `E0449` joins `RESERVED_CODES` — it is the machine's verdict about its
+  own memory, so a handler may not mint it. Both engines check at the same point
+  with the same message, or the refusal would itself be an `--engine both`
+  divergence. `ply_eval::escape` documents what every other boundary ADR 0017 §2
+  names does instead, and which one route stays open.
+- **A region's slots go back at its lexical close**, on both engines and for both
+  kinds. What the kind decides is a claim about that close rather than whether it
+  happens: a close no live continuation can reach truncates the arena, and one a
+  continuation captured across the region can still reach retains its slots until
+  that continuation dies (ADR 0017 §3, §4). Meaning is unchanged either way —
+  state is threaded, resumption *n* observes resumption *n−1*'s writes — because
+  reclamation is decided by reachability and not by the region kind. An entry
+  point's end closes whatever the run left open and abandons every claim, which
+  is what keeps one test's cells out of the next one's arena.
 - A `/ {...}` annotation is an upper bound: inference must produce a subset, and
   the annotation becomes the published signature. Violation is `EFFECT_NOT_PERMITTED`.
 - After solving, a definition's row must be closed. A surviving row variable in a
@@ -7196,20 +7217,23 @@ another test; the colouring is what pays for it now instead of the fork.
 ### The region a group runs in — `ply-test::region`
 
 ```rust
-pub struct GroupRegion { /* fixture: World, mark: u32 */ }
+// Every signature below was typed in `World` before R2 removed it: `build` took
+// `FnOnce() -> World`, `open` answered `World`, `close` took `&World`.
+pub struct GroupRegion { /* fixture: Fixture */ }
 
 impl GroupRegion {
     pub fn empty() -> GroupRegion;
     /// Runs the seed once, on the caller's thread. A worker lives for exactly
     /// one concurrency group, so "once per worker" is ADR 0017 §6's "once per
     /// group".
-    pub fn build(seed: impl FnOnce() -> World) -> GroupRegion;
+    pub fn build(seed: impl FnOnce(&mut TaskRegions) -> Value) -> GroupRegion;
     /// The boundary: below it is the group's, at or above it is the test's.
-    pub fn mark(&self) -> u32;
-    pub fn open(&self) -> World;
+    pub fn mark(&self) -> usize;
+    pub fn open(&self) -> (TaskRegions, Value);
     /// Discards what the test allocated; keeps what it wrote to the fixture.
-    pub fn close(&mut self, after: &World);
-    pub fn fixture(&self) -> &World;
+    /// Answers whether anything was reclaimed.
+    pub fn close(&mut self, after: &Arena) -> bool;
+    pub fn fixture(&self) -> &Fixture;
 }
 ```
 
@@ -7248,5 +7272,9 @@ that stopped being true is worse than one that was never printed. So:
 5. Verdicts, groups and `Parallelism` are identical at `--jobs 1` and
    `--jobs 8`.
 6. Adding *N* region-isolated tests changes the group count by zero.
-7. `open` is constant in the fixture's size, and one test's whole region cost
-   stays under rebuilding the fixture for it, at every size.
+7. `open` is **linear** in the fixture's size — it replays the fixture's slots
+   into a fresh arena, where `World::fork` cloned one pointer at ~1 ns. That is a
+   real regression against ADR 0005 and it is the price of dropping the
+   persistent world; state it rather than discovering it. What must still hold is
+   the weaker claim: one test's whole region cost stays under rebuilding the
+   fixture for it, at every size.

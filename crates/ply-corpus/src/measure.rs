@@ -8,8 +8,9 @@
 //!   separated from evaluation. `ply-test` builds a worker per rayon thread per
 //!   concurrency group, so a setup cost proportional to the program is charged
 //!   many times over and would otherwise be read as interpreter speed.
-//! - **fork** — `World::fork` against rebuilding the same fixture, which is the
-//!   ratio "build a fixture once, fork per test" is a claim about.
+//! - **fixture** — opening a region-scoped fixture against rebuilding it,
+//!   which is what is left of "build a fixture once, hand it to every test"
+//!   now that a region stack is not a persistent value.
 //! - **multi-shot** — resuming a continuation zero, one, two and four times,
 //!   beside direct measurements of `Stack::capture` and `Stack::resume` at
 //!   growing pending-frame counts. The end-to-end number cannot separate the
@@ -20,8 +21,9 @@
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
 use ply_core::Footprint;
+use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
-use ply_eval::{CellId, Engine, Env, Evaluator, Interp, Machine, Value, World};
+use ply_eval::{Engine, Env, Evaluator, Fixture, Interp, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -209,59 +211,87 @@ fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
     Ok(performs)
 }
 
-// ---------------------------------------------------------------------- fork
+// ------------------------------------------------------------------- fixture
 
+/// What ADR 0017 §6's region-scoped fixture costs, measured the way `fork`'s
+/// 1 ns was.
+///
+/// `fork` was a pointer clone at every fixture size, because state was a
+/// persistent map. A region stack is not a persistent value, so opening a
+/// fixture replays its allocations: O(the fixture) instead of O(1). These are
+/// the numbers that says what that is worth in nanoseconds rather than in
+/// asymptotics, and `rebuild_over_open` is what is left of the claim.
 #[derive(Clone, Debug, Serialize)]
-pub struct ForkPoint {
+pub struct FixturePoint {
     pub cells: usize,
-    pub fork_nanos: f64,
-    /// A fork a test then writes to, which is the path that pays for the
-    /// persistent map's copy-on-write.
-    pub fork_and_write_nanos: f64,
-    /// Building the same world by running the setup again — the alternative to
-    /// forking, and the denominator of the claim.
+    pub open_nanos: f64,
+    /// An opened fixture a test then writes to — a slot write, where the
+    /// persistent map paid for copy-on-write down a root-to-leaf path.
+    pub open_and_write_nanos: f64,
+    /// Building the same fixture by running the setup again — the alternative
+    /// to opening one, and the denominator of the claim.
     pub rebuild_nanos: f64,
-    pub rebuild_over_fork: f64,
-    pub rebuild_over_fork_and_write: f64,
+    pub rebuild_over_open: f64,
+    pub rebuild_over_open_and_write: f64,
 }
 
-/// Records rather than integers, so a copy is a copy of something.
-fn seeded(cells: usize) -> (World, Vec<CellId>) {
-    let mut world = World::new();
-    let ids = (0..cells)
-        .map(|i| {
-            world.alloc(Value::list(vec![
-                Value::Int(i as i64),
-                Value::str(format!("row {i}")),
-            ]))
-        })
-        .collect();
-    (world, ids)
+/// Records rather than integers, so a copy is a copy of something. The handle
+/// is the list of cells, so the write path names a cell the way a test would.
+fn seeded(cells: usize) -> Fixture {
+    Fixture::build(|regions| {
+        let handles = (0..cells)
+            .map(|i| {
+                Value::Cell(regions.alloc_cell(Value::list(vec![
+                    Value::Int(i as i64),
+                    Value::str(format!("row {i}")),
+                ])))
+            })
+            .collect();
+        Value::list(handles)
+    })
 }
 
-pub fn fork_cost(sizes: &[usize], repeats: usize) -> Vec<ForkPoint> {
+fn cells_of(handle: &Value) -> Vec<Slot> {
+    match handle {
+        Value::List(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Cell(slot) => Some(*slot),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn fixture_cost(sizes: &[usize], repeats: usize) -> Vec<FixturePoint> {
     sizes
         .iter()
         .map(|&cells| {
-            let (world, ids) = seeded(cells);
-            // Enough iterations that a nanosecond-scale operation is not being
-            // read off the clock's own resolution.
-            let iterations = 100_000;
+            let fixture = seeded(cells);
+            let slots = cells_of(fixture.handle());
+            // Enough iterations that a nanosecond-scale operation is not read
+            // off the clock's own resolution, and few enough that an O(n) open
+            // of a 10,000-cell fixture still finishes: the product is what is
+            // held roughly constant, not the count.
+            let iterations = (1_000_000 / (cells as u32 + 1)).max(16);
 
-            let fork = best_of(repeats, || {
+            let open = best_of(repeats, || {
                 let started = Instant::now();
                 for _ in 0..iterations {
-                    black_box(black_box(&world).fork());
+                    black_box(black_box(&fixture).open());
                 }
                 started.elapsed() / iterations
             });
 
-            let fork_write = best_of(repeats, || {
+            let open_write = best_of(repeats, || {
                 let started = Instant::now();
                 for i in 0..iterations {
-                    let mut forked = black_box(&world).fork();
-                    forked.set(ids[i as usize % ids.len()], Value::Int(-1));
-                    black_box(forked);
+                    let (mut regions, _) = black_box(&fixture).open();
+                    if !slots.is_empty() {
+                        regions.set(slots[i as usize % slots.len()], Value::Int(-1));
+                    }
+                    black_box(regions);
                 }
                 started.elapsed() / iterations
             });
@@ -272,13 +302,13 @@ pub fn fork_cost(sizes: &[usize], repeats: usize) -> Vec<ForkPoint> {
                 started.elapsed()
             });
 
-            ForkPoint {
+            FixturePoint {
                 cells,
-                fork_nanos: nanos(fork),
-                fork_and_write_nanos: nanos(fork_write),
+                open_nanos: nanos(open),
+                open_and_write_nanos: nanos(open_write),
                 rebuild_nanos: nanos(rebuild),
-                rebuild_over_fork: rebuild.as_secs_f64() / fork.as_secs_f64(),
-                rebuild_over_fork_and_write: rebuild.as_secs_f64() / fork_write.as_secs_f64(),
+                rebuild_over_open: rebuild.as_secs_f64() / open.as_secs_f64(),
+                rebuild_over_open_and_write: rebuild.as_secs_f64() / open_write.as_secs_f64(),
             }
         })
         .collect()
@@ -557,7 +587,7 @@ pub struct Measurements {
     pub throughput: Option<Throughput>,
     pub scheduling: Option<Scheduling>,
     pub store_open: Option<StoreOpen>,
-    pub fork: Vec<ForkPoint>,
+    pub fixture: Vec<FixturePoint>,
     pub multi_shot: Option<MultiShot>,
 }
 
@@ -595,16 +625,16 @@ pub fn render(m: &Measurements) -> String {
         s.push('\n');
     }
 
-    if !m.fork.is_empty() {
-        s.push_str("fork — one seeded world, per operation\n");
+    if !m.fixture.is_empty() {
+        s.push_str("fixture — one seeded region stack, per operation\n");
         s.push_str(&format!(
             "  {:>9} {:>12} {:>14} {:>14} {:>12}\n",
-            "cells", "fork ns", "fork+write ns", "rebuild ns", "rebuild/fork"
+            "cells", "open ns", "open+write ns", "rebuild ns", "rebuild/open"
         ));
-        for p in &m.fork {
+        for p in &m.fixture {
             s.push_str(&format!(
                 "  {:>9} {:>12.1} {:>14.1} {:>14.1} {:>11.0}x\n",
-                p.cells, p.fork_nanos, p.fork_and_write_nanos, p.rebuild_nanos, p.rebuild_over_fork
+                p.cells, p.open_nanos, p.open_and_write_nanos, p.rebuild_nanos, p.rebuild_over_open
             ));
         }
         s.push('\n');
@@ -740,20 +770,38 @@ mod tests {
         }
     }
 
+    /// The forkable world's version of this asserted that a fork of a
+    /// 10,000-cell fixture cost what a fork of a one-cell fixture did. That is
+    /// no longer true and asserting it would be asserting the design away: an
+    /// open replays the fixture's allocations.
+    ///
+    /// What is asserted instead is what is actually true, and it is narrower
+    /// than the claim it replaces. At one cell an open and a rebuild cost the
+    /// same, because both are dominated by standing up a region stack; the
+    /// advantage is in *not re-running the setup*, so it only appears once the
+    /// setup is doing work. The ratio is therefore asserted at the large end
+    /// and printed at both.
     #[test]
-    fn a_fork_does_not_get_dearer_as_the_world_grows() {
-        let points = fork_cost(&[1, 10_000], 3);
+    fn opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real() {
+        let points = fixture_cost(&[1, 10_000], 3);
         assert_eq!(points.len(), 2);
+        for p in &points {
+            println!(
+                "  {:>6} cells: open {:>10.1} ns, rebuild {:>10.1} ns ({:.2}x)",
+                p.cells, p.open_nanos, p.rebuild_nanos, p.rebuild_over_open
+            );
+        }
         assert!(
-            points[1].fork_nanos < points[0].fork_nanos * 20.0 + 100.0,
-            "forking a 10,000-cell world cost {} ns against {} ns for one cell",
-            points[1].fork_nanos,
-            points[0].fork_nanos
+            points[1].rebuild_over_open > 1.0,
+            "opening a 10,000-cell fixture cost {} ns against {} ns to rebuild it",
+            points[1].open_nanos,
+            points[1].rebuild_nanos
         );
         assert!(
-            points[1].rebuild_over_fork > 1000.0,
-            "rebuilding a 10,000-cell fixture was only {}x a fork",
-            points[1].rebuild_over_fork
+            points[1].open_nanos > points[0].open_nanos,
+            "an open is O(the fixture); a 10,000-cell one cost {} ns against {} ns for one cell",
+            points[1].open_nanos,
+            points[0].open_nanos
         );
     }
 

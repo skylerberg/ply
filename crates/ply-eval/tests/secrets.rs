@@ -192,14 +192,14 @@ fn the_comparison_is_over_the_whole_of_both_operands() {
 /// this is what a defect in either walk meets instead of an ordering oracle.
 #[test]
 fn compare_values_refuses_a_secret_at_run_time() {
-    let mut world = ply_eval::World::new();
+    let mut regions = ply_eval::TaskRegions::new();
     let d = ply_eval::builtins::call(
         ply_eval::Builtin::CompareValues,
         vec![
             Value::secret(Value::str("a")),
             Value::secret(Value::str("b")),
         ],
-        &mut world,
+        &mut regions,
         ply_span::Span::DUMMY,
     )
     .expect_err("a credential has no order");
@@ -215,7 +215,7 @@ fn compare_values_refuses_a_secret_at_run_time() {
 /// order. `Map<Secret<a>, v>` is `E0206`, so this too is a backstop.
 #[test]
 fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
-    let mut world = ply_eval::World::new();
+    let mut regions = ply_eval::TaskRegions::new();
     let key = Value::secret(Value::str("a"));
     for (builtin, args) in [
         (
@@ -235,7 +235,7 @@ fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
             vec![Value::empty_map(), key.clone()],
         ),
     ] {
-        let d = ply_eval::builtins::call(builtin, args, &mut world, ply_span::Span::DUMMY)
+        let d = ply_eval::builtins::call(builtin, args, &mut regions, ply_span::Span::DUMMY)
             .err()
             .unwrap_or_else(|| panic!("{} accepted a Secret key", builtin.name()));
         assert_eq!(d.code, codes::RUNTIME_ERROR, "{}", builtin.name());
@@ -531,14 +531,14 @@ test "confuse" {
 /// in either would arrive.
 #[test]
 fn map_of_entries_refuses_a_secret_key() {
-    let mut world = ply_eval::World::new();
+    let mut regions = ply_eval::TaskRegions::new();
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapOfEntries,
         vec![Value::list(vec![
             entry(Value::secret(Value::str("hunter2")), Value::Int(1)),
             entry(Value::secret(Value::str("hunter1")), Value::Int(0)),
         ])],
-        &mut world,
+        &mut regions,
         ply_span::Span::DUMMY,
     );
     let d = refused.expect_err("`map_of_entries` refuses a `Secret` key");
@@ -554,7 +554,7 @@ fn map_of_entries_refuses_a_secret_key() {
 /// the left through the same one place a key enters a `Map`.
 #[test]
 fn map_merge_refuses_a_secret_key() {
-    let mut world = ply_eval::World::new();
+    let mut regions = ply_eval::TaskRegions::new();
     // No map builtin will build the right-hand side, so it is assembled
     // directly: the gate is what `merge` has to apply, and this is the value a
     // defect elsewhere would hand it.
@@ -562,7 +562,7 @@ fn map_merge_refuses_a_secret_key() {
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapMerge,
         vec![Value::empty_map(), right],
-        &mut world,
+        &mut regions,
         ply_span::Span::DUMMY,
     );
     let d = refused.expect_err("`map_merge` refuses a `Secret` key");
@@ -610,8 +610,8 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
         ),
     ];
     for (builtin, args) in cases {
-        let mut world = ply_eval::World::new();
-        let refused = ply_eval::builtins::call(builtin, args, &mut world, ply_span::Span::DUMMY);
+        let mut regions = ply_eval::TaskRegions::new();
+        let refused = ply_eval::builtins::call(builtin, args, &mut regions, ply_span::Span::DUMMY);
         let d = refused
             .err()
             .unwrap_or_else(|| panic!("{builtin:?} accepted a `Secret` key"));

@@ -17,6 +17,7 @@
 //! *below* its own handler so that a clause performing the operation it handles
 //! reaches the next handler out rather than itself.
 
+use crate::arena::{Pin, RegionId};
 use crate::code::{Clause, Code, ReturnArm, Stmt};
 use crate::env::Env;
 use crate::pool::{self, Free, Link, Pooled};
@@ -190,6 +191,21 @@ pub enum Frame {
         body: Code,
         env: Env,
         module: usize,
+        /// The whole `with_cell` expression, which is the key
+        /// [`crate::region_kind`] filed its decision about this region under.
+        region: Span,
+    },
+
+    /// A region's lexical close. Pushed under the region's body, so it is
+    /// reached once the body has produced its value and — being below the
+    /// prompt of any `handle` the body installs — never inside a captured
+    /// segment.
+    ///
+    /// A clause that discards its continuation discards this frame with it and
+    /// the region is left open; `TaskRegions::reset` is what closes it then, and
+    /// an enclosing region's close absorbs it before that.
+    CloseRegion {
+        region: RegionId,
     },
 
     /// `map`, `filter` and `fold` call user code, so their loops are frames
@@ -629,6 +645,7 @@ impl Stack {
             calls,
             born,
             resumes: Rc::new(Cell::new(0)),
+            pin: None,
         }
     }
 
@@ -736,6 +753,7 @@ impl Stack {
                 calls,
                 born,
                 resumes: Rc::new(Cell::new(0)),
+                pin: None,
             },
             rest,
         )
@@ -780,9 +798,23 @@ pub struct Continuation {
     /// clones are one continuation, and a per-clone counter would let a second
     /// resumption launder itself through a `let k2 = k`.
     resumes: Rc<Cell<u32>>,
+    /// This continuation's claim on the regions that were open when it was
+    /// captured, so their lexical close retains their slots instead of handing
+    /// them back to a bump pointer this continuation can still read through —
+    /// ADR 0005 required test 6. Dropped with the continuation, which is what
+    /// makes the claim end when the continuation does.
+    pin: Option<Pin>,
 }
 
 impl Continuation {
+    /// Attaches the arena claim taken at this capture. Separate from
+    /// [`Stack::capture`] because a stack has no arena: only the machine driving
+    /// the capture holds one.
+    pub fn pinned(mut self, pin: Option<Pin>) -> Continuation {
+        self.pin = pin;
+        self
+    }
+
     pub fn frames(&self) -> usize {
         self.frames
     }
@@ -887,6 +919,7 @@ impl Clone for Continuation {
             calls: self.calls,
             born: self.born,
             resumes: Rc::clone(&self.resumes),
+            pin: self.pin.clone(),
         }
     }
 }

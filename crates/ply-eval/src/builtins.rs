@@ -13,11 +13,11 @@
 //! defect `crate::differential` exists to catch, and sharing the definition
 //! means the audit is comparing the machinery rather than two transcriptions.
 
+use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
 use crate::interp::{Interp, arity_error};
 use crate::map;
 use crate::value::{Decimal, Value, Vector, first_difference, type_error, values_equal};
-use crate::world::{CellId, World};
 use ply_span::{Diagnostic, Span, codes};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -473,13 +473,13 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     Ok(Step::Done(Value::list(copied)))
 }
 
-/// `world` is the current world, threaded rather than snapshotted: `cell_get`
-/// must observe every write made before this call, including one a handler
-/// clause made before resuming.
+/// `cells` is the run's live arena, threaded rather than snapshotted:
+/// `cell_get` must observe every write made before this call, including one a
+/// handler clause made before resuming.
 pub fn call(
     b: Builtin,
     args: Vec<Value>,
-    world: &mut World,
+    cells: &mut Arena,
     span: Span,
 ) -> Result<Step, Diagnostic> {
     let (min, max) = b.arity();
@@ -849,24 +849,24 @@ pub fn call(
         }
 
         Builtin::CellGet => {
-            let id = args[0].as_cell(span, "`cell_get`")?;
-            match world.get(id) {
+            let slot = args[0].as_cell(span, "`cell_get`")?;
+            match cells.get(slot) {
                 Some(v) => Ok(Step::Done(v.clone())),
-                None => Err(no_such_cell(span, id)),
+                None => Err(no_such_cell(span, slot)),
             }
         }
 
         Builtin::CellSet => {
-            let id = args[0].as_cell(span, "`cell_set`")?;
+            let slot = args[0].as_cell(span, "`cell_set`")?;
             // Reported rather than refused: refusing would change what a legal
             // program means, and ADR 0017 §4 accepts the leak and asks only that
             // it be said out loud.
-            crate::rc::cell_cycle(id, &args[1], span);
+            crate::rc::cell_cycle(slot, &args[1], span);
             let mut args = args;
-            if world.set(id, args.remove(1)) {
+            if cells.set(slot, args.remove(1)) {
                 Ok(Step::Done(Value::Unit))
             } else {
-                Err(no_such_cell(span, id))
+                Err(no_such_cell(span, slot))
             }
         }
 
@@ -1505,17 +1505,18 @@ pub fn assert_failure(message: Option<&Value>, span: Span) -> Diagnostic {
     diag
 }
 
-/// A cell that is not in the current world. Reachable only by carrying a value
-/// out of the world that made it, which no source program can express;
-/// reporting it beats reading a neighbouring cell's state.
+/// A cell whose region has closed. Reachable only by carrying a value out of
+/// the run that made it, which no source program can express; the generation in
+/// the slot is what turns it into this report rather than a read of whatever
+/// now lives at that position.
 #[cold]
-fn no_such_cell(span: Span, id: CellId) -> Diagnostic {
+fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("cell {id} does not belong to the world this code is running in"),
+        format!("cell {slot} does not belong to the region this code is running in"),
     )
     .primary(span, "this cell was made by a different run")
-    .note("please report this: a cell value escaped the world that allocated it")
+    .note("please report this: a cell value escaped the region that allocated it")
 }
 
 /// Only the three higher-order builtins suspend, so only their frames reach
@@ -1541,7 +1542,7 @@ impl Interp<'_> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        let mut step = call(b, args, self.world_mut(), span)?;
+        let mut step = call(b, args, self.cells_mut(), span)?;
         loop {
             match step {
                 Step::Done(v) => return Ok(v),
@@ -1565,6 +1566,7 @@ mod tests {
         bin, block, callv, clause, discard, effect_def, handle, int, lam, letv, list, perform,
         standalone, var, with_cell,
     };
+    use crate::task_regions::TaskRegions;
     use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
     fn ints(xs: &[i64]) -> Value {
@@ -1581,8 +1583,8 @@ mod tests {
         args: Vec<Value>,
         mut answer: impl FnMut(&[Value]) -> Value,
     ) -> Result<Value, Diagnostic> {
-        let mut world = World::new();
-        let mut step = call(b, args, &mut world, Span::DUMMY)?;
+        let mut cells = TaskRegions::new();
+        let mut step = call(b, args, cells.arena_mut(), Span::DUMMY)?;
         loop {
             match step {
                 Step::Done(v) => return Ok(v),
@@ -1596,8 +1598,8 @@ mod tests {
 
     /// A builtin that cannot suspend, called the way an engine calls it.
     fn done(b: Builtin, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        let mut world = World::new();
-        match call(b, args, &mut world, Span::DUMMY)? {
+        let mut cells = TaskRegions::new();
+        match call(b, args, cells.arena_mut(), Span::DUMMY)? {
             Step::Done(v) => Ok(v),
             Step::Apply { .. } => panic!("`{}` suspended", b.name()),
         }
@@ -2211,11 +2213,11 @@ mod tests {
     /// search.
     #[test]
     fn one_suspension_point_inside_position_can_be_resumed_twice() {
-        let mut world = World::new();
+        let mut cells = TaskRegions::new();
         let start = call(
             Builtin::BytesPosition,
             vec![bytes(b"abc"), Value::Int(0), f()],
-            &mut world,
+            cells.arena_mut(),
             Span::DUMMY,
         )
         .unwrap();
@@ -2440,11 +2442,11 @@ mod tests {
     /// recursion cannot do this, which is why `map` is a frame.
     #[test]
     fn one_suspension_point_inside_map_can_be_resumed_twice() {
-        let mut world = World::new();
+        let mut cells = TaskRegions::new();
         let start = call(
             Builtin::Map,
             vec![ints(&[1, 2, 3]), f()],
-            &mut world,
+            cells.arena_mut(),
             Span::DUMMY,
         )
         .unwrap();
@@ -2485,13 +2487,13 @@ mod tests {
     }
 
     #[test]
-    fn cell_builtins_read_and_write_the_world_they_are_given() {
-        let mut world = World::new();
-        let id = world.alloc(Value::Int(1));
+    fn cell_builtins_read_and_write_the_arena_they_are_given() {
+        let mut cells = TaskRegions::new();
+        let slot = cells.alloc_cell(Value::Int(1));
         let set = call(
             Builtin::CellSet,
-            vec![Value::Cell(id), Value::Int(2)],
-            &mut world,
+            vec![Value::Cell(slot), Value::Int(2)],
+            cells.arena_mut(),
             Span::DUMMY,
         )
         .unwrap();
@@ -2499,8 +2501,8 @@ mod tests {
 
         let got = call(
             Builtin::CellGet,
-            vec![Value::Cell(id)],
-            &mut world,
+            vec![Value::Cell(slot)],
+            cells.arena_mut(),
             Span::DUMMY,
         )
         .unwrap();
@@ -2510,15 +2512,25 @@ mod tests {
         assert_eq!(v.render(), "2");
     }
 
+    /// The generation is what makes this a report rather than a read of the cell
+    /// now living at that position: the stale slot and the live one share an
+    /// index and differ in generation.
     #[test]
-    fn a_cell_from_another_world_is_named_rather_than_silently_read() {
-        let mut other = World::new();
-        let id = other.alloc(Value::Int(1));
-        let mut world = World::new();
+    fn a_cell_from_another_region_stack_is_named_rather_than_silently_read() {
+        let mut other = TaskRegions::new();
+        other.alloc_cell(Value::Int(1));
+        other.reset();
+        let stale = other.alloc_cell(Value::Int(2));
+
+        let mut cells = TaskRegions::new();
+        let live = cells.alloc_cell(Value::Int(3));
+        assert_eq!(stale.index(), live.index());
+        assert_ne!(stale.generation(), live.generation());
+
         let d = call(
             Builtin::CellGet,
-            vec![Value::Cell(id)],
-            &mut world,
+            vec![Value::Cell(stale)],
+            cells.arena_mut(),
             Span::DUMMY,
         )
         .unwrap_err();
@@ -2558,7 +2570,7 @@ mod tests {
     }
 
     /// The suspension points are where a builtin is most likely to be handed a
-    /// stale world, so the handler both writes a cell and decides the answer
+    /// stale arena, so the handler both writes a cell and decides the answer
     /// from it: a builtin that carried its own copy would keep the count at 1
     /// and keep the wrong elements.
     #[test]

@@ -2,8 +2,8 @@ use crate::build::*;
 use crate::differential::compare_expr;
 use crate::interp::Interp;
 use crate::machine::{Machine, Progress};
+use crate::task_regions::Fixture;
 use crate::value::Value;
-use crate::world::World;
 use ply_span::{Diagnostic, Span, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
@@ -689,28 +689,31 @@ fn a_cell_round_trips_through_get_and_set() {
 }
 
 #[test]
-fn every_entry_point_forks_from_the_base_world() {
+fn every_entry_point_resets_to_the_fixture() {
     let (program, resolved) = standalone(Vec::new());
-    let mut base = World::new();
-    let seeded = base.alloc(Value::Int(7));
+    let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(7))));
+    let (regions, handle) = fixture.open();
+    let seeded = handle
+        .as_cell(ply_span::Span::DUMMY, "the fixture handle")
+        .expect("a cell");
 
     let mut machine = Machine::for_program(&program, &resolved);
-    machine.set_base_world(base);
+    machine.set_regions(regions);
 
     let read = with_cell("s", int(0), "c", callv("cell_get", vec![var("c")]));
     assert!(matches!(
         machine.eval_expr_for_test(&read),
         Ok(Value::Int(0))
     ));
-    assert!(matches!(machine.world().get(seeded), Some(Value::Int(7))));
+    assert!(matches!(machine.cells().get(seeded), Some(Value::Int(7))));
 
     // The second entry point must not see the first one's allocation.
-    let before = machine.world().len();
+    let before = machine.cells().live();
     assert!(matches!(
         machine.eval_expr_for_test(&read),
         Ok(Value::Int(0))
     ));
-    assert_eq!(machine.world().len(), before);
+    assert_eq!(machine.cells().live(), before);
 }
 
 #[test]

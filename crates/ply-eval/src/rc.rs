@@ -59,9 +59,9 @@
 //! today** — an argument that belongs to the type system rather than to this
 //! module, which is why it is a guard and a test rather than a deletion.
 
+use crate::arena::Slot;
 use crate::env::Env;
 use crate::value::Value;
-use crate::world::CellId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -176,7 +176,7 @@ thread_local! {
     static CYCLES: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
     /// The `(cell, site)` pairs already reported, so that one cycle is one
     /// warning however many times the write runs.
-    static SEEN: RefCell<Vec<(CellId, Span)>> = const { RefCell::new(Vec::new()) };
+    static SEEN: RefCell<Vec<(Slot, Span)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn bump(f: impl FnOnce(&mut Stats)) {
@@ -214,9 +214,9 @@ pub(crate) fn note_update(in_place: bool) {
 /// Evaluation order is deterministic, so this sequence is a function of the
 /// program and its seed like every other artifact the run produces.
 pub fn take_cycles() -> Vec<Diagnostic> {
-    // The suppression list goes with them: a cell id restarts at every fork, so
-    // the same `(cell, site)` pair in a later run is a second cycle rather than
-    // the first one again.
+    // The suppression list goes with them: a slot's position restarts at every
+    // entry point, so the same `(cell, site)` pair in a later run is a second
+    // cycle rather than the first one again.
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());
     CYCLES
         .try_with(|c| std::mem::take(&mut *c.borrow_mut()))
@@ -229,8 +229,8 @@ pub fn take_cycles() -> Vec<Diagnostic> {
 /// diagnostics say so where one is constructible. This is that place, and the
 /// honest account of what it covers is short:
 ///
-/// - A `Value` compound is an `Arc` and a [`Value::Cell`] is a **key** into the
-///   world rather than a pointer into it (ADR 0005 §2), so no cycle of `Arc`s is
+/// - A `Value` compound is an `Arc` and a [`Value::Cell`] is a **slot** in a
+///   region rather than a pointer into it, so no cycle of `Arc`s is
 ///   reachable from a Ply program: a closure's scope is captured before the
 ///   binding that would name the closure exists, and a top-level function is
 ///   resolved by name against an empty scope.
@@ -253,9 +253,9 @@ pub fn take_cycles() -> Vec<Diagnostic> {
 /// a handler storing a long list would otherwise pay a walk of that list per
 /// write. Past either bound the answer is "no cycle found", which under-reports
 /// rather than charging the program for the check.
-pub(crate) fn cell_cycle(id: CellId, value: &Value, span: Span) -> Option<Diagnostic> {
+pub(crate) fn cell_cycle(slot: Slot, value: &Value, span: Span) -> Option<Diagnostic> {
     let mut budget = CYCLE_WALK_BUDGET;
-    if !reaches_cell(value, id, 0, &mut budget) {
+    if !reaches_cell(value, slot, 0, &mut budget) {
         return None;
     }
     bump(|s| s.cycles += 1);
@@ -265,16 +265,16 @@ pub(crate) fn cell_cycle(id: CellId, value: &Value, span: Span) -> Option<Diagno
     let seen = SEEN
         .try_with(|c| {
             let mut seen = c.borrow_mut();
-            let known = seen.contains(&(id, span));
+            let known = seen.contains(&(slot, span));
             if !known {
-                seen.push((id, span));
+                seen.push((slot, span));
             }
             known
         })
         .unwrap_or(false);
     let d = Diagnostic::warning(
         codes::REFERENCE_CYCLE,
-        format!("cell {id} is being made to contain itself"),
+        format!("cell {slot} is being made to contain itself"),
     )
     .primary(span, "this value reaches the cell it is stored in")
     .note("reference counting does not collect cycles, so this cell and everything it reaches stay allocated for the rest of the run")
@@ -296,21 +296,21 @@ const CYCLE_WALK_BUDGET: u32 = 256;
 /// Depth-bounded exactly as `values_equal` is, and node-bounded on top of that:
 /// a value's shape is the program's to choose, and this walk spends both the
 /// host's stack and the program's time.
-fn reaches_cell(v: &Value, id: CellId, depth: usize, budget: &mut u32) -> bool {
+fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     if depth >= crate::limit::MAX_VALUE_DEPTH || *budget == 0 {
         return false;
     }
     *budget -= 1;
     let next = depth + 1;
     match v {
-        Value::Cell(other) => *other == id,
-        Value::List(xs) => xs.iter().any(|x| reaches_cell(x, id, next, budget)),
-        Value::Map(m) => m
-            .iter()
-            .any(|(k, x)| reaches_cell(k, id, next, budget) || reaches_cell(x, id, next, budget)),
-        Value::Record(fields) => fields.values().any(|x| reaches_cell(x, id, next, budget)),
-        Value::Ctor { args, .. } => args.iter().any(|x| reaches_cell(x, id, next, budget)),
-        Value::Secret(inner) => reaches_cell(inner, id, next, budget),
+        Value::Cell(other) => *other == slot,
+        Value::List(xs) => xs.iter().any(|x| reaches_cell(x, slot, next, budget)),
+        Value::Map(m) => m.iter().any(|(k, x)| {
+            reaches_cell(k, slot, next, budget) || reaches_cell(x, slot, next, budget)
+        }),
+        Value::Record(fields) => fields.values().any(|x| reaches_cell(x, slot, next, budget)),
+        Value::Ctor { args, .. } => args.iter().any(|x| reaches_cell(x, slot, next, budget)),
+        Value::Secret(inner) => reaches_cell(inner, slot, next, budget),
         _ => false,
     }
 }

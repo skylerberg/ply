@@ -506,6 +506,19 @@ pub mod codes {
     /// writes. Reinterpreting the annotation would leave a reader believing the
     /// cheap kind had been proved where it had only been asked for.
     pub const REGION_KIND_REFUSED: &str = "E0448";
+    /// A value reaching a runtime boundary carrying a handle into a region — a
+    /// `Cell`, a `Task` or a continuation — where no type is left for
+    /// [`REGION_ESCAPE`] to look at: a host operation's argument, a host
+    /// handler's answer, or an entry point's argument.
+    ///
+    /// Deliberately not [`REGION_ESCAPE`], which is a compile error the author
+    /// can fix by editing the expression it points at. This one fires while a
+    /// program runs, at a boundary a type does not cross, and the reader's next
+    /// move is different: ADR 0017 §2's open route — a continuation parked in an
+    /// enclosing region's cell, where a constructor's field type erases the
+    /// brand — is how a handle gets this far, so the fix is upstream of the
+    /// boundary rather than at it.
+    pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -789,6 +802,11 @@ mod tests {
             ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
             ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
             ("REGION_KIND_REFUSED", codes::REGION_KIND_REFUSED, "E0448"),
+            (
+                "REGION_ESCAPE_AT_BOUNDARY",
+                codes::REGION_ESCAPE_AT_BOUNDARY,
+                "E0449",
+            ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),

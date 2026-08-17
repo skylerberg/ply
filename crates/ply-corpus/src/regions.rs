@@ -2,7 +2,7 @@
 //!
 //! The claim to be priced is that tests which "share a resource label but have
 //! disjoint state" stop parallelizing once every test no longer gets its own
-//! forked [`World`](ply_eval::World). Today's headline — `isolated 176 of 186` —
+//! forked `World`. Today's headline — `isolated 176 of 186` —
 //! overstates it, because a pure test has an empty footprint and conflicts with
 //! nothing whether or not anything is forked.
 //!

@@ -226,7 +226,12 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(Value::Int(index as i64), Vec::new(), Span::DUMMY);
+                            let id = sched.spawn(
+                                Value::Int(index as i64),
+                                Vec::new(),
+                                Span::DUMMY,
+                                None,
+                            );
                             while script.len() <= id.0 as usize {
                                 script.push(0);
                                 pc.push(0);

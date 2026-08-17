@@ -18,7 +18,7 @@
 //! what a pass that stopped firing would look like from the outside.
 
 use ply_eval::rc;
-use ply_eval::{Machine, World};
+use ply_eval::{Machine, TaskRegions};
 use ply_span::SourceMap;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -173,7 +173,7 @@ fn the_elision_and_reuse_this_milestone_claims_are_printed_as_numbers() {
         };
         programs += 1;
         let mut machine = Machine::for_program(&program, &resolved);
-        machine.set_base_world(World::new());
+        machine.set_regions(TaskRegions::new());
         let before = rc::stats();
         for index in 0..machine.test_count() {
             // A fixture is often a deliberately failing program; what it

@@ -82,6 +82,12 @@ impl Env {
     /// Every live value the scope binds, innermost first. Shadowed bindings are
     /// included: a caller asking what the scope can *reach* has to see them.
     pub(crate) fn values(&self) -> impl Iterator<Item = &Value> {
+        self.bindings().map(|(_, value)| value)
+    }
+
+    /// [`Env::values`] with the name each value is bound under, for a caller
+    /// that has to say *which* binding it found something in.
+    pub(crate) fn bindings(&self) -> impl Iterator<Item = (&Symbol, &Value)> {
         let mut cur = self.head.as_deref();
         std::iter::from_fn(move || {
             while let Some(node) = cur {
@@ -89,7 +95,7 @@ impl Env {
                 if let Some(binding) = &node.value
                     && !binding.released
                 {
-                    return Some(&binding.value);
+                    return Some((&binding.name, &binding.value));
                 }
             }
             None

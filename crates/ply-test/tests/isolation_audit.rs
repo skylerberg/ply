@@ -26,7 +26,7 @@
 //! reachable.
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::{CellId, EngineChoice, Plan, Value, World};
+use ply_eval::{EngineChoice, Plan, TaskRegions, Value};
 use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
@@ -392,8 +392,8 @@ test "other writer" {{ db.log[audit](1) }}
 /// entry — because each test's first assertion is that its cell still holds the
 /// initial value only it wrote. It does not catch a region that merely grew,
 /// since the next test would then allocate a fresh id and pass anyway; that half
-/// is [`the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else`],
-/// which inspects the world instead of trusting the program.
+/// is [`the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else`],
+/// which inspects the arena instead of trusting the program.
 ///
 /// Run more than once because interference is a race, and once is a sample.
 #[test]
@@ -445,12 +445,19 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
 }
 
 /// The white-box half, and the strongest statement the audit can make about the
-/// region: after every test in the group, the world its worker holds contains
-/// exactly one cell — `#0`, holding that test's own last write. A region carried
-/// from a previous test would hold two, and one shared with a concurrent test
-/// would hold somebody else's number.
+/// region: after every test in the group, the arena its worker holds contains
+/// exactly one cell — slot index 0, holding that test's own last write. A region
+/// carried from a previous test would hold two, and one shared with a concurrent
+/// test would hold somebody else's number.
+///
+/// The slot's *generation* is deliberately not compared. It rises each time the
+/// worker reuses the index for a new entry point — which is what makes a
+/// `Value::Cell` from the last test read `None` rather than this test's cell —
+/// so it counts how many tests that worker has run and therefore moves with
+/// `--jobs`. [`a_slot_is_never_handed_to_two_tests_under_one_identity`] is where
+/// it is pinned as the property it is.
 #[test]
-fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
+fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     const TESTS: usize = 24;
     let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
@@ -465,6 +472,7 @@ fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
             &compiled.check,
         ),
         seen: Mutex::new(Vec::new()),
+        generations: Mutex::new(Vec::new()),
     };
     let report = ply_test::run_with(
         &selection,
@@ -482,8 +490,8 @@ fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
 
     let mut seen = executor.seen.into_inner().expect("no worker panicked");
     seen.sort_by_key(|(index, _, _)| *index);
-    let expected: Vec<(usize, Vec<String>, u32)> = (0..TESTS)
-        .map(|i| (i, vec![format!("#0={}", i * 8)], 0))
+    let expected: Vec<(usize, Vec<String>, usize)> = (0..TESTS)
+        .map(|i| (i, vec![format!("@0={}", i * 8)], 0))
         .collect();
     assert_eq!(
         seen, expected,
@@ -491,12 +499,14 @@ fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     );
 }
 
-/// Wraps the real executor to look at each worker's world the moment its test
+/// Wraps the real executor to look at each worker's arena the moment its test
 /// finishes — the only place from which one test's leftovers would be visible —
 /// and at the group's region, which is what must not have grown.
 struct Recording<'a> {
     inner: ply_test::InterpExecutor<'a>,
-    seen: Mutex<Vec<(usize, Vec<String>, u32)>>,
+    seen: Mutex<Vec<(usize, Vec<String>, usize)>>,
+    /// Slot 0's generation as each test left it, in completion order.
+    generations: Mutex<Vec<u32>>,
 }
 
 impl<'a> ply_test::Executor for Recording<'a> {
@@ -507,12 +517,23 @@ impl<'a> ply_test::Executor for Recording<'a> {
     }
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), ply_span::Diagnostic> {
+        // What the test's region reclaimed at its close, because that is where
+        // its cells are: a region hands its slots back at its lexical end and
+        // the arena afterwards holds only the group's fixture.
+        worker.cells_mut().journal();
         let outcome = self.inner.execute(worker, index);
         let cells = worker
-            .world()
             .cells()
-            .map(|(id, value)| format!("{id}={}", value.render()))
+            .journalled()
+            .iter()
+            .map(|(slot, value)| format!("@{}={}", slot.index(), value.render()))
             .collect();
+        if let Some((slot, _)) = worker.cells().journalled().first() {
+            self.generations
+                .lock()
+                .expect("no worker panicked")
+                .push(slot.generation());
+        }
         self.seen
             .lock()
             .expect("no worker panicked")
@@ -522,6 +543,57 @@ impl<'a> ply_test::Executor for Recording<'a> {
 }
 
 // ------------------------------------- 4. the fixture, and the job count
+
+/// The mechanism that makes a closed region unreadable rather than merely
+/// forgotten, on the real runner: one worker, so every test reuses slot index 0,
+/// and the generation at that index must rise every time.
+///
+/// A generation that repeated would hand two tests one slot identity, and a
+/// `Value::Cell` that outlived its test — the shape ADR 0005 §2 made a cell a
+/// key to prevent — would read the *next* test's cell instead of nothing.
+#[test]
+fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
+    const TESTS: usize = 16;
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    assert_eq!(selection.groups.len(), 1);
+
+    let executor = Recording {
+        inner: ply_test::InterpExecutor::new(
+            &compiled.program,
+            &compiled.resolved,
+            &compiled.check,
+        ),
+        seen: Mutex::new(Vec::new()),
+        generations: Mutex::new(Vec::new()),
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a one-worker pool");
+    let report = pool.install(|| {
+        ply_test::run_with(
+            &selection,
+            &compiled.check,
+            &compiled.hashes,
+            &mut store,
+            &executor,
+        )
+    });
+    assert_eq!((report.passed, report.failed), (TESTS, 0));
+
+    let generations = executor
+        .generations
+        .into_inner()
+        .expect("no worker panicked");
+    assert_eq!(generations.len(), TESTS);
+    assert!(
+        generations.windows(2).all(|w| w[1] > w[0]),
+        "slot 0's generation must rise at every entry point: {generations:?}"
+    );
+}
 
 /// ADR 0017 §6's fixture, at the runner: built once for the group, mutated in
 /// place by every test in it, and the test's own allocations closed on top.
@@ -580,7 +652,7 @@ struct Observation {
     index: usize,
     /// What the fixture cell held when this test opened the region.
     observed_at_open: i64,
-    mark: u32,
+    mark: usize,
     fixture_len: usize,
 }
 
@@ -598,24 +670,26 @@ impl ply_test::Executor for FixtureProbe {
 
     fn worker(&self) -> GroupRegion {
         self.built.fetch_add(1, Ordering::Relaxed);
-        GroupRegion::build(|| {
-            let mut world = World::new();
-            world.alloc(Value::Int(-1));
-            world
+        GroupRegion::build(|regions: &mut TaskRegions| {
+            Value::Cell(regions.alloc_cell(Value::Int(-1)))
         })
     }
 
     fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_span::Diagnostic> {
-        let mut world = region.open();
-        let observed_at_open = match world.get(CellId(0)) {
+        let (mut stack, handle) = region.open();
+        let seed = match handle {
+            Value::Cell(slot) => slot,
+            other => panic!("expected the fixture's handle, found {other:?}"),
+        };
+        let observed_at_open = match stack.get(seed) {
             Some(Value::Int(i)) => *i,
             other => panic!("the fixture cell is gone: {other:?}"),
         };
         for i in 0..4 {
-            world.alloc(Value::Int(i));
+            stack.alloc_cell(Value::Int(i));
         }
-        assert!(world.set(CellId(0), Value::Int(index as i64)));
-        region.close(&world);
+        assert!(stack.set(seed, Value::Int(index as i64)));
+        assert!(region.close(&stack), "the stack came from this region");
         self.seen
             .lock()
             .expect("no worker panicked")
@@ -627,6 +701,68 @@ impl ply_test::Executor for FixtureProbe {
             });
         Ok(())
     }
+}
+
+/// The same fixture at eight workers, which is where "built once per group" is
+/// not what the runner does and saying so would over-claim.
+///
+/// A region stack holds `Rc` and cannot cross a thread, so a group is served by
+/// one region **per worker**: *w* builds, not one, and the write chain restarts
+/// on each. The invariant that survives — and the only one the design needs — is
+/// that every worker's first test opens on the seed and no test ever opens on a
+/// value nothing wrote, with the region never growing by a test's own cells.
+///
+/// ADR 0008 §6's trap is a count that stops being true and is still printed;
+/// this is the same trap one level down, in a property a reader would otherwise
+/// assume from the word "group".
+#[test]
+fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
+    const TESTS: usize = 24;
+    const JOBS: usize = 8;
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    assert_eq!(selection.groups.len(), 1);
+
+    let executor = FixtureProbe::default();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(JOBS)
+        .build()
+        .expect("an eight-worker pool");
+    let report = pool.install(|| {
+        ply_test::run_with(
+            &selection,
+            &compiled.check,
+            &compiled.hashes,
+            &mut store,
+            &executor,
+        )
+    });
+    assert_eq!((report.passed, report.failed), (TESTS, 0));
+
+    let builds = executor.built.load(Ordering::Relaxed);
+    assert!(
+        (1..=JOBS).contains(&builds),
+        "a group is served by at most one region per worker: {builds} builds at {JOBS} jobs"
+    );
+
+    let seen = executor.seen.into_inner().expect("no worker panicked");
+    assert_eq!(seen.len(), TESTS);
+    for o in &seen {
+        assert_eq!(o.mark, 1, "the region's mark moved: {o:?}");
+        assert_eq!(o.fixture_len, 1, "the region grew by a test's own cells");
+        assert!(
+            o.observed_at_open == -1 || (0..TESTS as i64).contains(&o.observed_at_open),
+            "a test opened on a value no test and no seed ever wrote: {o:?}"
+        );
+    }
+    assert_eq!(
+        seen.iter().filter(|o| o.observed_at_open == -1).count(),
+        builds,
+        "exactly one test per worker opens on the seed, and the rest open on a \
+         previous test's write to that worker's own region"
+    );
 }
 
 /// W4's and W5's shared-state defects surfaced as a verdict that moved with the

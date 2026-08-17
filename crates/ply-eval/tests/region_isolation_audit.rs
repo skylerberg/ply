@@ -1,5 +1,6 @@
 //! Adversarial audit of the one property the milestone cannot be wrong about:
-//! **no two worlds derived from a common ancestor observe each other's writes.**
+//! **no two region stacks opened from one fixture observe each other's
+//! writes.**
 //!
 //! Everything else in Ply degrades gracefully when it is wrong — a slower
 //! schedule, a wider suspect set. This one does not: two tests that can see each
@@ -9,8 +10,9 @@
 //!
 //! Three layers, because a defect can hide in any of them:
 //!
-//! 1. [`World`] on its own — siblings, ancestors mutated mid-chain, the id
-//!    collision that makes carrying a value across a fork unsafe.
+//! 1. [`TaskRegions`] on its own — two stacks off one fixture, an entry point's
+//!    slots reclaimed under a slot somebody kept, and the index collision that
+//!    makes carrying a value between two stacks unsafe.
 //! 2. The machine on real source — a cell smuggled out of its region through
 //!    every carrier the language has, and a continuation resumed after the
 //!    region that made it returned.
@@ -18,7 +20,8 @@
 //!    because a test can only sample the executions somebody thought of.
 
 use ply_core::{CheckOutput, Footprint, check_program};
-use ply_eval::{CellId, Engine, Interp, Machine, Value, World};
+use ply_eval::arena::Slot;
+use ply_eval::{Engine, Fixture, Interp, Machine, TaskRegions, Value};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -78,7 +81,7 @@ impl Compiled {
         &self.check.tests[self.index_of(name)].footprint
     }
 
-    /// A world-isolation defect that only one engine has is still a defect, so
+    /// An isolation defect that only one engine has is still a defect, so
     /// nothing here is believed until both engines say it.
     fn run_both(&self, name: &str) -> Result<(), Diagnostic> {
         let index = self.index_of(name);
@@ -99,135 +102,188 @@ impl Compiled {
     }
 }
 
-fn int_of(world: &World, id: CellId) -> i64 {
-    match world.get(id) {
+fn int_of(regions: &TaskRegions, slot: Slot) -> i64 {
+    match regions.get(slot) {
         Some(Value::Int(i)) => *i,
-        other => panic!("expected an Int in {id}, found {other:?}"),
+        other => panic!("expected an Int in {slot}, found {other:?}"),
     }
 }
 
-// ------------------------------------------------- 1. the world on its own
+fn one_cell() -> Fixture {
+    Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(0))))
+}
 
-/// The headline property, stated over three siblings rather than two so that a
+fn cell_of(fixture: &Fixture) -> Slot {
+    fixture
+        .handle()
+        .as_cell(ply_span::Span::DUMMY, "the fixture handle")
+        .expect("the handle is a cell")
+}
+
+// ----------------------------------------- 1. the region stack on its own
+
+/// The headline property, stated over three stacks rather than two so that a
 /// defect that leaks in only one direction cannot hide behind symmetry.
 #[test]
-fn sibling_forks_writing_one_cell_never_read_each_others_value() {
-    let mut ancestor = World::new();
-    let shared = ancestor.alloc(Value::Int(0));
+fn stacks_opened_from_one_fixture_never_read_each_others_value() {
+    let fixture = one_cell();
+    let shared = cell_of(&fixture);
 
-    let mut forks: Vec<World> = (0..3).map(|_| ancestor.fork()).collect();
-    for (i, fork) in forks.iter_mut().enumerate() {
-        assert!(fork.set(shared, Value::Int(i as i64 + 1)));
+    let mut stacks: Vec<TaskRegions> = (0..3).map(|_| fixture.open().0).collect();
+    for (i, stack) in stacks.iter_mut().enumerate() {
+        assert!(stack.set(shared, Value::Int(i as i64 + 1)));
     }
     // Interleaved a second time: a defect that needs the writes to alternate
     // rather than run in a batch would survive the loop above.
-    for i in (0..forks.len()).rev() {
-        assert!(forks[i].set(shared, Value::Int(i as i64 + 10)));
-        for (j, other) in forks.iter().enumerate() {
+    for i in (0..stacks.len()).rev() {
+        assert!(stacks[i].set(shared, Value::Int(i as i64 + 10)));
+        for (j, other) in stacks.iter().enumerate() {
             let expected = if j >= i { j as i64 + 10 } else { j as i64 + 1 };
             assert_eq!(
                 int_of(other, shared),
                 expected,
-                "fork {j} after writing {i}"
+                "stack {j} after writing {i}"
             );
         }
     }
-    assert_eq!(int_of(&ancestor, shared), 0, "the ancestor is untouched");
+    assert_eq!(fixture.len(), 1, "the fixture itself is untouched");
+    assert_eq!(
+        int_of(&fixture.open().0, shared),
+        0,
+        "and still seeds a zero"
+    );
 }
 
-/// A write to a *shared ancestor* is the direction the persistent map makes
-/// least obvious: the descendants were forked before the write and hold the
-/// same tree nodes it path-copies.
+/// The direction the forkable world made least obvious was a write to a shared
+/// ancestor. A region stack has no ancestor to write to — the fixture is a seed
+/// rather than a live parent — so the equivalent attack is to open a stack,
+/// mutate it deeply, and check that the seed the next open produces did not
+/// move. Twelve stacks, so a defect that needs depth has room to show.
 #[test]
-fn a_write_to_an_ancestor_reaches_no_descendant_forked_before_it() {
+fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
     const DEPTH: usize = 12;
 
-    let mut root = World::new();
-    let cells: Vec<CellId> = (0..DEPTH).map(|_| root.alloc(Value::Int(-1))).collect();
+    let fixture = Fixture::build(|r| {
+        Value::list(
+            (0..DEPTH)
+                .map(|_| Value::Cell(r.alloc_cell(Value::Int(-1))))
+                .collect(),
+        )
+    });
+    let cells: Vec<Slot> = match fixture.handle() {
+        Value::List(items) => items
+            .iter()
+            .map(|v| {
+                v.as_cell(ply_span::Span::DUMMY, "a handle")
+                    .expect("a cell")
+            })
+            .collect(),
+        other => panic!("expected the handle list, found {other:?}"),
+    };
 
-    let mut chain = vec![root];
-    for level in 1..=DEPTH {
-        let next = chain[level - 1].fork();
-        chain.push(next);
-    }
-
-    // Mutate the middle of the chain *after* every descendant exists.
+    let mut stacks: Vec<TaskRegions> = (0..DEPTH).map(|_| fixture.open().0).collect();
     let mark = |level: usize, i: usize| (level * 100 + i) as i64;
     for level in [0usize, 3, 7] {
-        for (i, id) in cells.iter().enumerate() {
-            assert!(chain[level].set(*id, Value::Int(mark(level, i))));
+        for (i, slot) in cells.iter().enumerate() {
+            assert!(stacks[level].set(*slot, Value::Int(mark(level, i))));
         }
-        for (other, world) in chain.iter().enumerate() {
-            for (i, id) in cells.iter().enumerate() {
-                let seen = int_of(world, *id);
+        for (other, stack) in stacks.iter().enumerate() {
+            for (i, slot) in cells.iter().enumerate() {
+                let seen = int_of(stack, *slot);
                 let expected = if other == level { mark(level, i) } else { -1 };
                 assert_eq!(
                     seen, expected,
-                    "world {other} observed a write made to world {level}"
+                    "stack {other} observed a write made to stack {level}"
                 );
             }
         }
-        // Put it back, so the next round starts from a chain nobody has written.
-        for id in &cells {
-            assert!(chain[level].set(*id, Value::Int(-1)));
+        for slot in &cells {
+            assert!(stacks[level].set(*slot, Value::Int(-1)));
         }
+    }
+
+    for (i, slot) in cells.iter().enumerate() {
+        assert_eq!(int_of(&fixture.open().0, *slot), -1, "cell {i}");
     }
 }
 
-/// A fork taken *after* an earlier write inherits it; one taken before does
-/// not. The two together are what "copy-on-write" has to mean.
+/// An entry point's reset is the fork's replacement, and it has to mean both
+/// halves: the fixture comes back to what it was seeded as, and everything the
+/// entry point allocated on top of it is gone.
 #[test]
-fn a_fork_inherits_exactly_the_writes_made_before_it_was_taken() {
-    let mut base = World::new();
-    let c = base.alloc(Value::Int(0));
+fn a_reset_restores_the_seed_and_discards_what_the_entry_point_allocated() {
+    let fixture = one_cell();
+    let seeded = cell_of(&fixture);
+    let (mut regions, _) = fixture.open();
 
-    let before = base.fork();
-    base.set(c, Value::Int(1));
-    let after = base.fork();
-    base.set(c, Value::Int(2));
+    assert!(regions.set(seeded, Value::Int(1)));
+    let scratch = regions.alloc_cell(Value::Int(2));
+    assert_eq!(int_of(&regions, seeded), 1);
 
-    assert_eq!(int_of(&before, c), 0);
-    assert_eq!(int_of(&after, c), 1);
-    assert_eq!(int_of(&base, c), 2);
+    regions.reset();
+
+    assert_eq!(int_of(&regions, seeded), 0);
+    assert!(!regions.contains(scratch));
 }
 
-/// The hazard that makes every other test here necessary: two siblings hand out
-/// the same `CellId` for different cells, and reading a foreign id succeeds
-/// quietly instead of failing. Nothing detects a value that crossed a fork —
-/// which is why nothing may carry one, and why the machine's isolation has to
-/// be structural rather than checked.
+/// The hazard that makes every other test here necessary: two stacks opened
+/// from one fixture hand out the *same* slot for different cells, and reading a
+/// foreign slot succeeds quietly instead of failing. Nothing detects a value
+/// that crossed between two stacks — which is why nothing may carry one, and
+/// why the machine's isolation has to be structural rather than checked.
+///
+/// A slot is an index and a generation, and both stacks are fresh, so both
+/// generations are zero. The generation closes the *temporal* hole — a slot
+/// from a previous entry point, which
+/// `a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read`
+/// pins — and not this spatial one.
 #[test]
-fn a_foreign_id_is_answered_by_the_reading_world_and_never_by_its_owner() {
-    let base = World::new();
-    let mut a = base.fork();
-    let mut b = base.fork();
+fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
+    let fixture = Fixture::empty();
+    let (mut a, _) = fixture.open();
+    let (mut b, _) = fixture.open();
 
-    let in_a = a.alloc(Value::str("a's secret"));
-    let in_b = b.alloc(Value::str("b's secret"));
-    assert_eq!(in_a, in_b, "siblings reuse the ancestor's high-water mark");
+    let in_a = a.alloc_cell(Value::str("a's secret"));
+    let in_b = b.alloc_cell(Value::str("b's secret"));
+    assert_eq!(in_a, in_b, "two fresh stacks bump from the same floor");
 
     assert_eq!(a.get(in_b).map(Value::render).unwrap(), "\"a's secret\"");
     assert_eq!(b.get(in_a).map(Value::render).unwrap(), "\"b's secret\"");
-    assert!(base.get(in_a).is_none(), "the ancestor gained nothing");
 
     assert!(a.set(in_b, Value::str("clobbered")));
     assert_eq!(b.get(in_b).map(Value::render).unwrap(), "\"b's secret\"");
 }
 
-/// `with` is the persistent form, and the reason it refuses an id the world does
-/// not hold: inserting one would resurrect a key the allocator hands out later,
-/// and the two cells would alias inside a single world.
+/// What a slot buys that a `CellId` did not: a slot whose region has been
+/// reclaimed reads `None` on every run rather than aliasing whatever was
+/// allocated in its place. That is the half of the hazard above that *is*
+/// closed, and it is closed by the generation rather than by a check anyone has
+/// to remember to write.
 #[test]
-fn the_persistent_write_cannot_resurrect_an_id_from_a_sibling() {
-    let base = World::new();
-    let mut a = base.fork();
-    let stranger = a.alloc(Value::Int(1));
+fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor() {
+    let (mut regions, _) = Fixture::empty().open();
+    let stale = regions.alloc_cell(Value::str("the first run's secret"));
 
-    let b = base.fork().with(stranger, Value::Int(99));
+    regions.reset();
+    let fresh = regions.alloc_cell(Value::str("the second run's secret"));
 
-    assert!(!b.contains(stranger));
-    assert_eq!(b.high_water(), base.high_water());
-    assert_eq!(int_of(&a, stranger), 1);
+    assert_eq!(
+        stale.index(),
+        fresh.index(),
+        "the index was handed out again"
+    );
+    assert!(
+        regions.get(stale).is_none(),
+        "and the stale slot reads nothing"
+    );
+    assert!(
+        !regions.set(stale, Value::Int(0)),
+        "a write through it is refused"
+    );
+    assert_eq!(
+        regions.get(fresh).map(Value::render).unwrap(),
+        "\"the second run's secret\""
+    );
 }
 
 // ------------------------------------------- 2. the machine on real source
@@ -426,35 +482,40 @@ test "inside the region" {
     assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
 
-/// Two runs of one machine allocate the *same* ids, because each forks the same
-/// base world. That is the collision of
-/// `a_foreign_id_is_answered_by_the_reading_world_and_never_by_its_owner`,
+/// Two runs of one machine allocate at the *same* indices, because the entry
+/// point's reset hands the slots back. That is the collision of
+/// `a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner`,
 /// reached through the front door — so the second run must start from the seed
 /// and not from whatever the first left behind.
 #[test]
-fn a_second_run_of_one_machine_reuses_the_ids_and_none_of_the_state() {
+fn a_second_run_of_one_machine_reuses_the_indices_and_none_of_the_state() {
     let compiled = Compiled::new(ESCAPED);
     let mut machine = compiled.machine();
     let index = compiled.index_of("two regions in one test are two cells");
 
+    machine.cells_mut().journal();
     machine.eval_test(index).expect("the first run passes");
-    let first: Vec<(CellId, String)> = machine
-        .world()
+    let first: Vec<(u32, String)> = machine
         .cells()
-        .map(|(id, v)| (id, v.render()))
+        .journalled()
+        .iter()
+        .map(|(slot, v)| (slot.index(), v.render()))
         .collect();
-    assert_eq!(
-        first,
-        vec![(CellId(0), "3".into()), (CellId(1), "0".into())]
-    );
+    // Both regions reclaim index 0: the first hands it back at its close and
+    // the second bumps into the position it vacated.
+    assert_eq!(first, vec![(0, "3".into()), (0, "0".into())]);
 
     machine.eval_test(index).expect("the second run passes");
-    let second: Vec<(CellId, String)> = machine
-        .world()
+    let second: Vec<(u32, String)> = machine
         .cells()
-        .map(|(id, v)| (id, v.render()))
+        .journalled()
+        .iter()
+        .map(|(slot, v)| (slot.index(), v.render()))
         .collect();
-    assert_eq!(second, first, "the ids repeat and the values start over");
+    assert_eq!(
+        second, first,
+        "the indices repeat and the values start over"
+    );
 }
 
 /// A cell in a *constructor argument* used to be the one carrier the region
@@ -611,10 +672,15 @@ fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {
     let compiled = Compiled::new(RESUMED);
     let index = compiled.index_of("two resumptions write one cell in one world");
     let mut machine = compiled.machine();
+    machine.cells_mut().journal();
     machine
         .eval_test(index)
         .unwrap_or_else(|d| panic!("the threaded-world reading must hold: {d:#?}"));
-    assert_eq!(machine.world().len(), 1, "one region, one cell");
+    assert_eq!(
+        machine.cells().journalled().len(),
+        1,
+        "one region, one cell — reclaimed once, at its close"
+    );
 }
 
 /// A `with_cell` *inside* a handled body runs once per resumption, and each run
@@ -627,20 +693,27 @@ fn each_resumption_allocates_its_own_region_cell() {
     let compiled = Compiled::new(RESUMED);
     let index = compiled.index_of("each resumption allocates its own region cell");
     let mut machine = compiled.machine();
+    machine.cells_mut().journal();
     machine
         .eval_test(index)
         .unwrap_or_else(|d| panic!("each branch must get its own scratch cell: {d:#?}"));
     assert_eq!(
-        machine.world().len(),
+        machine.cells().stats().allocations,
         3,
-        "the tally, and one scratch cell per resumption — the world is monotone"
+        "the tally, and one scratch cell per resumption"
+    );
+    assert_eq!(
+        machine.cells().journalled().len(),
+        3,
+        "and every one of them went back at the close of the region that made it"
     );
 }
 
 /// A continuation parked in an enclosing region's cell and resumed after the
-/// region whose cell it reads has returned. The world is monotone, so this is a
-/// success rather than a dangling read — and the value it answers with is this
-/// run's, never a neighbour's.
+/// region whose cell it reads has returned. Both regions are `shared`, so their
+/// slots outlive their lexical close and this is a success rather than a
+/// dangling read — and the value it answers with is this run's, never a
+/// neighbour's.
 #[test]
 fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
     let compiled = Compiled::new(RESUMED);
@@ -648,32 +721,49 @@ fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
         .index_of("a continuation resumed after its region returned reads that region's cell");
 
     let mut machine = compiled.machine();
+    machine.cells_mut().journal();
     machine
         .eval_test(index)
         .unwrap_or_else(|d| panic!("resuming outside the region must succeed: {d:#?}"));
-    let first: Vec<String> = machine.world().cells().map(|(_, v)| v.render()).collect();
+    let first: Vec<String> = machine
+        .cells()
+        .journalled()
+        .iter()
+        .map(|(_, v)| v.render())
+        .collect();
 
     machine
         .eval_test(index)
         .unwrap_or_else(|d| panic!("the second run must also succeed: {d:#?}"));
-    let second: Vec<String> = machine.world().cells().map(|(_, v)| v.render()).collect();
+    let second: Vec<String> = machine
+        .cells()
+        .journalled()
+        .iter()
+        .map(|(_, v)| v.render())
+        .collect();
     assert_eq!(first, second, "the second run started from the seed again");
+    assert!(
+        !first.is_empty(),
+        "or the comparison above is between two empties"
+    );
 }
 
-/// The one place a value *can* cross two worlds is the host API: `call` resets
-/// the world and then accepts arguments the caller built during an earlier run.
-/// Nothing in the tree does that, and this pins the half of it the runtime can
-/// detect — an id the new world does not hold is named rather than read.
+/// The one place a value *can* cross two entry points is the host API: `call`
+/// resets the region stack and then accepts arguments the caller built during an
+/// earlier run. Nothing in the tree does that, and this pins the refusal.
 ///
 /// The carrier is a continuation parked in an enclosing region's cell, because
 /// that is the only one ADR 0017 §2's brand does not catch: the row is erased
 /// where the variant field's function type is declared.
 ///
-/// The other half is not detectable and must not be relied on: had the second
+/// Under the forkable world only half of this was detectable — had the second
 /// run already allocated `#0`, the resumed continuation would have read *that*
-/// cell and answered plausibly. A `CellId` carries no lineage, so "nothing
-/// carries a value across an entry point" is the invariant, not "the runtime
-/// will catch it".
+/// cell and answered plausibly, because a `CellId` carried no lineage. Two
+/// things close the other half now, and the entry point's boundary check gets
+/// there first: it refuses the argument as `E0449` before the run starts. The
+/// backstop behind it is the slot's generation, which the reset bumps, and
+/// `a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor`
+/// is where that is stated on its own.
 #[test]
 fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
     let compiled = Compiled::new(ESCAPED);
@@ -684,21 +774,17 @@ fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
         .expect("a continuation over the region's cell");
     let smuggled = machine
         .call("m.resume_it", vec![parked], ply_span::Span::DUMMY)
-        .expect_err("the second run has no cell #1");
+        .expect_err("the second run holds no slot the first one allocated");
 
-    assert_eq!(smuggled.code, ply_span::codes::INTERNAL_ERROR);
-    assert!(
-        smuggled.message.contains("does not belong to the world"),
-        "{smuggled:#?}"
-    );
+    assert_eq!(smuggled.code, ply_span::codes::REGION_ESCAPE_AT_BOUNDARY);
 }
 
 /// The teeth behind every "they never observed each other" assertion elsewhere:
-/// tests that fork one world all allocate their first cell at *the same key*.
+/// tests that reset one stack all allocate their first cell at *the same index*.
 /// Isolation is therefore doing real work rather than being an accident of two
-/// tests happening to name different ids.
+/// tests happening to name different slots.
 #[test]
-fn separate_tests_write_the_very_same_cell_id_in_their_own_worlds() {
+fn separate_tests_write_the_very_same_slot_index_in_their_own_entry_points() {
     let mut src = String::new();
     for i in 0..4 {
         src.push_str(&format!(
@@ -708,33 +794,34 @@ fn separate_tests_write_the_very_same_cell_id_in_their_own_worlds() {
     let compiled = Compiled::new(&src);
     let mut machine = compiled.machine();
 
+    machine.cells_mut().journal();
     for i in 0..4 {
         machine.eval_test(i).expect("the test passes");
-        let cells: Vec<(CellId, String)> = machine
-            .world()
+        let cells: Vec<(u32, String)> = machine
             .cells()
-            .map(|(id, v)| (id, v.render()))
+            .journalled()
+            .iter()
+            .map(|(slot, v)| (slot.index(), v.render()))
             .collect();
         assert_eq!(
             cells,
-            vec![(CellId(0), (i * 7).to_string())],
-            "every contender owns cell #0 and nobody else's value"
+            vec![(0, (i * 7).to_string())],
+            "every contender owns slot 0 and nobody else's value"
         );
     }
 }
 
-/// The base world is the fixture, and every entry point forks it. A test that
-/// writes must therefore leave the base exactly as it found it, or the *next*
-/// test inherits the write — the interference this milestone exists to make
-/// impossible.
+/// The fixture is what every entry point resets to. A test that writes must
+/// therefore leave it exactly as it found it, or the *next* test inherits the
+/// write — the interference this milestone exists to make impossible.
 #[test]
-fn a_seeded_base_world_survives_every_test_that_forks_it() {
+fn a_seeded_fixture_survives_every_test_that_opens_it() {
     let compiled = Compiled::new(ESCAPED);
-    let mut seed = World::new();
-    let seeded = seed.alloc(Value::Int(1_000));
+    let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(1_000))));
+    let seeded = cell_of(&fixture);
 
     let mut machine = compiled.machine();
-    machine.set_base_world(seed.fork());
+    machine.set_regions(fixture.open().0);
 
     for _ in 0..3 {
         for name in [
@@ -744,13 +831,17 @@ fn a_seeded_base_world_survives_every_test_that_forks_it() {
             let index = compiled.index_of(name);
             machine.eval_test(index).expect("the test passes");
             assert_eq!(
-                int_of(machine.world(), seeded),
+                int_of(machine.regions(), seeded),
                 1_000,
-                "{name} disturbed the seed it forked"
+                "{name} disturbed the seed it opened"
             );
         }
     }
-    assert_eq!(int_of(&seed, seeded), 1_000, "the base itself is untouched");
+    assert_eq!(
+        int_of(&fixture.open().0, seeded),
+        1_000,
+        "the fixture itself is untouched"
+    );
 }
 
 // --------------------------------------------------- 3. the types themselves
@@ -762,13 +853,17 @@ fn a_seeded_base_world_survives_every_test_that_forks_it() {
 /// `Value: !Send` is what makes the second half unrepresentable rather than
 /// merely unwritten.
 ///
-/// `rpds` is parameterized over the shared-pointer kind and `World` uses the
-/// `Rc` one, so a `World` that became `Send` would be a data race on a
-/// non-atomic refcount, not merely a scheduling surprise. If someone adds an
-/// `unsafe impl Send`, this fails.
+/// A `Value` holds `Rc` for its shared code and continuations, so a region
+/// stack that became `Send` would be a data race on a non-atomic refcount, not
+/// merely a scheduling surprise. If someone adds an `unsafe impl Send`, this
+/// fails.
 #[test]
-fn a_world_and_the_values_in_it_cannot_cross_a_thread() {
-    assert!(!is_send!(World), "World must stay thread-confined");
+fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
+    assert!(
+        !is_send!(TaskRegions),
+        "a region stack must stay thread-confined"
+    );
+    assert!(!is_send!(ply_eval::Arena));
     assert!(!is_send!(Value), "Value must stay thread-confined");
     assert!(!is_send!(ply_eval::Continuation));
     assert!(!is_send!(ply_eval::Stack));
@@ -777,7 +872,7 @@ fn a_world_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(!is_send!(Machine<'static>));
     assert!(!is_send!(Interp<'static>));
     // The sanity half: the probe reports `true` for something that is `Send`.
-    assert!(is_send!(CellId));
+    assert!(is_send!(Slot));
     assert!(is_send!(Engine));
 }
 

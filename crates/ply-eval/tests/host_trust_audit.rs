@@ -485,9 +485,15 @@ test/nondet "arithmetic on a host answer" { assert_eq(net.send[socket](1) + 1, 2
 /// A fabricated task handle is refused rather than used as an index.
 ///
 /// `Value::Task` is a key into a scheduler's table and `TaskId`'s field is
-/// public, so a handler can mint one for a task that does not exist. The
-/// scheduler answers `E0413` instead of indexing, which is the difference
-/// between a diagnostic and an out-of-bounds panic.
+/// public, so a handler can mint one for a task that does not exist.
+///
+/// It used to be the scheduler that caught this, answering `E0413` instead of
+/// indexing — a diagnostic rather than an out-of-bounds panic, but only for a
+/// forged handle the program went on to `join`. ADR 0017 §2's boundary check
+/// now refuses the answer itself, so the handle never enters the program and
+/// the refusal names the handler that minted it. `E0413` is unchanged and still
+/// what a *real* handle outliving its region gets; `simulation.rs` and
+/// `resumption_semantics_audit.rs` are where that is pinned.
 #[test]
 fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
     struct Fake;
@@ -517,27 +523,31 @@ test/nondet "a handle from nowhere" {
     entries.push((any("net", "send"), Arc::new(Fake)));
 
     let mut machine = compiled.bound(entries);
-    assert_eq!(
-        diagnostic(machine.eval_test(0)).code,
-        codes::TASK_ESCAPES_SCOPE
+    let d = diagnostic(machine.eval_test(0));
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{}", d.message);
+    assert!(d.message.contains("`Task`"), "{}", d.message);
+    assert!(
+        d.notes.iter().any(|n| n.contains("audit::hostile")),
+        "the handler that minted it is named: {:#?}",
+        d.notes
     );
 }
 
-/// The defence that does hold, and the one worth keeping: a world key cannot be
+/// The defence that does hold, and the one worth keeping: a cell cannot be
 /// written into a host operation's declared signature at all.
 ///
 /// A handler is `Send + Sync` and a `Value` is not, so nothing can be held in a
 /// handler's own fields — but a thread local can hold one, and the test runner
 /// reuses a worker thread across tests. If a `Cell` could cross the boundary, a
-/// handler could hand test *b* a key into test *a*'s world, and because a
-/// `CellId` is an integer index it would silently alias a live cell rather than
-/// dangle.
+/// handler could hand test *b* a slot into test *a*'s region stack, and two
+/// stacks bump from the same floor, so it would silently alias a live cell
+/// rather than dangle.
 ///
 /// It cannot, and by two independent checks: the region on a `Cell` has nothing
 /// to unify with in an operation's signature, and a closure carrying cell access
 /// carries a row an operation argument's declared row does not admit.
 #[test]
-fn a_world_key_cannot_cross_a_host_operations_signature() {
+fn a_cell_cannot_cross_a_host_operations_signature() {
     let cell = compile_error(
         r#"
 nondet effect net {

@@ -51,8 +51,13 @@ fn compile(source: &str) -> Compiled {
 /// left behind. Comparing the verdict alone would pass on a run whose world
 /// differed and whose assertions happened not to notice, which is the whole
 /// class of defect this file exists to catch.
+/// The state half of an outcome is what the run **reclaimed**, not what it left
+/// behind: a region hands its cells back at its lexical close, so the arena
+/// afterwards is empty on every schedule alike and an outcome built from it
+/// cannot tell two interleavings apart.
 fn observe(c: &Compiled, seed: &Seed) -> (Interleaving, String) {
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
+    machine.cells_mut().journal();
     machine.set_seed(seed.clone(), 10_000);
     let outcome = machine.eval_test(0);
     let verdict = match &outcome {
@@ -60,9 +65,10 @@ fn observe(c: &Compiled, seed: &Seed) -> (Interleaving, String) {
         Err(diagnostic) => format!("{} {}", diagnostic.code, diagnostic.message),
     };
     let world: Vec<String> = machine
-        .world()
         .cells()
-        .map(|(id, value)| format!("#{}={}", id.0, value.render()))
+        .journalled()
+        .iter()
+        .map(|(slot, value)| format!("#{}={}", slot.index(), value.render()))
         .collect();
     let record = machine
         .simulated()
@@ -657,10 +663,12 @@ test "a multi-shot handler with no region" {
 fn a_region_does_not_silently_swallow_a_second_resumption() {
     let control = compile(MULTI_SHOT_WITHOUT_A_REGION);
     let mut machine = Machine::new(&control.program, &control.resolved, &control.check);
+    machine.cells_mut().journal();
     machine.eval_test(0).expect("the control passes");
     let expected: Vec<String> = machine
-        .world()
         .cells()
+        .journalled()
+        .iter()
         .map(|(_, v)| v.render())
         .collect::<Vec<_>>();
     assert_eq!(

@@ -1,0 +1,410 @@
+//! The regions a *program* opens, on the evaluation path of both engines.
+//!
+//! `crates/ply-eval/tests/region_arena_cost.rs` and `region_reclamation_audit.rs`
+//! attack the allocator directly, and `region_kind_inference.rs` attacks the
+//! analysis. Neither says anything about whether an engine consults either one:
+//! R1 built the arena, the kinds and the pins and connected none of them, and
+//! the gap was found by a benchmark rather than by a report.
+//!
+//! So what is asserted here is the wiring itself:
+//!
+//! - a `with_cell` opens an arena scope of the kind [`ply_eval::region_kind`]
+//!   decided for **its own span**, which is what makes the analysis load-bearing
+//!   rather than decorative;
+//! - the scope closes at the region's lexical end, so a region in a loop costs
+//!   one slot rather than one per iteration;
+//! - a continuation captured across a region and still live **defers** that
+//!   close, so ADR 0005 required test 6 still reads its cell;
+//! - `with_region` opens one too, on both engines, having been lowered away to
+//!   its body until now;
+//! - a capture outside every program region takes no pin, because a pin is an
+//!   `Rc` allocation and `perform` is on the request path.
+
+use ply_core::{CheckOutput, check_program};
+use ply_eval::{Interp, Machine, RegionKind, Value};
+use ply_span::SourceId;
+use ply_syntax::ast::{ModuleName, Program};
+use ply_syntax::resolve::{Resolved, resolve};
+
+struct Compiled {
+    program: Program,
+    resolved: Resolved,
+    check: CheckOutput,
+}
+
+impl Compiled {
+    fn new(src: &str) -> Compiled {
+        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
+        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let resolved =
+            resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+        let check = check_program(&program, &resolved)
+            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        Compiled {
+            program,
+            resolved,
+            check,
+        }
+    }
+
+    fn index_of(&self, name: &str) -> usize {
+        self.check
+            .tests
+            .iter()
+            .position(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no test named {name:?}"))
+    }
+
+    fn regions(&self) -> ply_eval::region_kind::Regions {
+        ply_eval::region_kind::infer(&self.program, &self.resolved)
+    }
+}
+
+/// Regions every run opens before the program does: the fixture's, the entry
+/// region the stack was built with, and the one the entry point's reset opens in
+/// its place.
+const SCAFFOLD_REGIONS: u64 = 3;
+
+fn machine_stats(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
+    let index = compiled.index_of(name);
+    let mut machine = Machine::new(&compiled.program, &compiled.resolved, &compiled.check);
+    machine
+        .eval_test(index)
+        .unwrap_or_else(|d| panic!("{name:?} must run on the machine: {d:#?}"));
+    machine.cells().stats()
+}
+
+/// `None` where the tree-walker declines the program — a clause that binds a
+/// continuation is `E0504`, which is ADR 0005 required test 3 and not something
+/// this file may work around.
+fn treewalk_stats(compiled: &Compiled, name: &str) -> Option<ply_eval::arena::Stats> {
+    let index = compiled.index_of(name);
+    let mut treewalk = Interp::new(&compiled.program, &compiled.resolved, &compiled.check);
+    match treewalk.eval_test(index) {
+        Ok(()) => Some(treewalk.cells().stats()),
+        Err(d) if ply_eval::is_machine_only(&d) => None,
+        Err(d) => panic!("{name:?} must run on the tree-walker: {d:#?}"),
+    }
+}
+
+/// Both engines' figures, the tree-walker's omitted where it declined.
+fn stats(compiled: &Compiled, name: &str) -> Vec<(&'static str, ply_eval::arena::Stats)> {
+    let mut out = vec![("machine", machine_stats(compiled, name))];
+    if let Some(stats) = treewalk_stats(compiled, name) {
+        out.push(("treewalk", stats));
+    }
+    out
+}
+
+// -------------------------------------------- 1. the analysis is consulted
+
+const PURE: &str = r#"
+fn scratch(n: Int) -> Int = with_cell[r](n) { c -> { cell_set(c, cell_get(c) + 1); cell_get(c) } }
+
+test "a region with no capture anywhere near it" {
+  assert_eq(scratch(41), 42)
+}
+"#;
+
+/// The claim R1 could not make about `region_kind`: an engine asks it, and asks
+/// it about the span of the `with_cell` expression rather than about the body's.
+///
+/// A mismatch there is silent and total — `Regions::at` answers `None` for a
+/// span it never saw, every region opens no scope, and the arena goes back to
+/// being monotone with nothing to show it. The count is what catches it.
+#[test]
+fn a_with_cell_opens_the_scope_the_inference_decided_for_its_span() {
+    let compiled = Compiled::new(PURE);
+    let regions = compiled.regions();
+    assert_eq!(regions.len(), 1, "one `with_cell`, one region");
+    assert_eq!(
+        regions.iter().next().map(|r| r.kind),
+        Some(RegionKind::Unique),
+        "nothing in this program captures a continuation"
+    );
+
+    let engines = stats(&compiled, "a region with no capture anywhere near it");
+    assert_eq!(
+        engines.len(),
+        2,
+        "both engines run a program with no capture"
+    );
+    for (engine, stats) in engines {
+        assert_eq!(
+            stats.allocations, 1,
+            "{engine}: the cell is a bump in the arena"
+        );
+        assert_eq!(
+            stats.regions_opened,
+            SCAFFOLD_REGIONS + 1,
+            "{engine}: the `with_cell` opened a scope of its own"
+        );
+        assert_eq!(
+            stats.pins_taken, 0,
+            "{engine}: nothing captured, so nothing was pinned"
+        );
+    }
+}
+
+/// The engines must agree about the region structure, not merely about the
+/// answer: two engines that opened different scopes would reclaim at different
+/// points, and `--engine both` compares what each reclaimed.
+#[test]
+fn both_engines_open_the_same_regions_for_the_same_program() {
+    for source in [PURE, LOOPED, CAPTURED, PARKED, NESTED_REGION] {
+        let compiled = Compiled::new(source);
+        for index in 0..compiled.check.tests.len() {
+            let name = compiled.check.tests[index].name.clone();
+            let machine = machine_stats(&compiled, &name);
+            let Some(treewalk) = treewalk_stats(&compiled, &name) else {
+                continue;
+            };
+            assert_eq!(
+                (machine.regions_opened, machine.allocations),
+                (treewalk.regions_opened, treewalk.allocations),
+                "{name:?}: the two engines opened different regions"
+            );
+        }
+    }
+}
+
+// ------------------------------------------------ 2. the close is the point
+
+const LOOPED: &str = r#"
+fn once(n: Int) -> Int = with_cell[r](n) { c -> cell_get(c) }
+
+fn upto(n: Int) -> Int = if n == 0 { once(0) } else { once(n) + upto(n - 1) }
+
+test "a region per iteration" { assert_eq(upto(99), 4950) }
+"#;
+
+/// The shape ADR 0005 §2 charged one retained world entry per iteration for, and
+/// which R1's wiring still charged one arena slot per iteration for. A hundred
+/// regions, a hundred bumps, and never two slots live at once.
+#[test]
+fn a_region_in_a_loop_costs_one_slot_rather_than_one_per_iteration() {
+    let compiled = Compiled::new(LOOPED);
+    for (engine, stats) in stats(&compiled, "a region per iteration") {
+        assert_eq!(stats.allocations, 100, "{engine}");
+        assert_eq!(
+            stats.peak_live, 1,
+            "{engine}: each region closed before the next opened"
+        );
+        assert_eq!(
+            stats.closes_deferred, 0,
+            "{engine}: no capture, no deferral"
+        );
+    }
+}
+
+// ------------------------------- 3. a live continuation defers the close
+
+const CAPTURED: &str = r#"
+effect amb { read flip[coin]() -> Bool }
+
+test "two resumptions over one cell" {
+  with_cell[trace](0) { c -> {
+    let answer = handle {
+      let b = amb.flip[coin]();
+      cell_set(c, cell_get(c) + 1);
+      if b { 10 } else { 20 }
+    } with {
+      amb.flip[coin]() resume k -> k(true) + k(false),
+      return x -> x
+    };
+    assert_eq(answer, 30);
+    assert_eq(cell_get(c), 2)
+  } }
+}
+"#;
+
+/// The capture path pins. Zero pins over a program that captured a continuation
+/// would mean a region could be freed while a resumption can still read it,
+/// which is the one defect this milestone exists to make impossible.
+#[test]
+fn a_capture_inside_a_region_pins_it() {
+    let compiled = Compiled::new(CAPTURED);
+    let machine = machine_stats(&compiled, "two resumptions over one cell");
+    assert!(
+        machine.pins_taken > 0,
+        "the clause bound a continuation and nothing claimed the region"
+    );
+    assert_eq!(
+        machine.allocations, 1,
+        "one cell served both resumptions — ADR 0017 §3's two-resumption example"
+    );
+}
+
+const PARKED: &str = r#"
+effect amb { read flip[coin]() -> Bool }
+
+type Saved = Nothing | Just((Bool) -> Int)
+
+test "a continuation outlives the region whose cell it reads" {
+  with_cell[slot](Nothing) { s -> {
+    let inner = with_cell[log](7) { c ->
+      handle {
+        let b = amb.flip[coin]();
+        if b { cell_get(c) } else { 0 }
+      } with {
+        amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 },
+        return x -> x
+      }
+    };
+    assert_eq(inner, 0);
+    match cell_get(s) {
+      Just(k) -> assert_eq(k(true), 7),
+      Nothing -> assert(false)
+    }
+  } }
+}
+"#;
+
+/// ADR 0005 required test 6, at the reclamation event R2 added.
+///
+/// The `log` region closes lexically while a continuation parked in the
+/// enclosing region's cell can still read its slot. The close must **defer**;
+/// `assert_eq(k(true), 7)` inside the program is what would fail if it did not,
+/// and `closes_deferred` is what says the deferral is why it passed rather than
+/// an accident of the slot not having been reused yet.
+#[test]
+fn a_close_a_live_continuation_can_reach_is_deferred_rather_than_taken() {
+    let compiled = Compiled::new(PARKED);
+    let machine = machine_stats(
+        &compiled,
+        "a continuation outlives the region whose cell it reads",
+    );
+    assert!(machine.pins_taken > 0);
+    assert!(
+        machine.closes_deferred > 0,
+        "the inner region's close had to be deferred, or `k(true)` read a freed slot"
+    );
+}
+
+// --------------------------------------------------- 4. `with_region` itself
+
+const NESTED_REGION: &str = r#"
+fn doubled(n: Int) -> Int = with_region[r] {
+  with_cell[r](n) { c -> { cell_set(c, cell_get(c) * 2); cell_get(c) } }
+}
+
+test "a with_region around a cell of its own brand" { assert_eq(doubled(21), 42) }
+"#;
+
+/// `with_region` lowered to its body until now, on both engines, so nothing at
+/// run time distinguished it from the code inside it. It opens a scope now — and
+/// the `with_cell[r]` written inside it opens **none**, because ADR 0017 §1 makes
+/// a cell of an already-open brand a value allocated in that region.
+#[test]
+fn a_with_region_opens_one_region_and_the_cell_inside_it_opens_none() {
+    let compiled = Compiled::new(NESTED_REGION);
+    let regions = compiled.regions();
+    assert_eq!(
+        regions.len(),
+        1,
+        "the `with_cell[r]` shares the brand, so there is one region and not two"
+    );
+
+    let engines = stats(&compiled, "a with_region around a cell of its own brand");
+    assert_eq!(engines.len(), 2, "neither engine declines this program");
+    for (engine, stats) in engines {
+        assert_eq!(
+            stats.regions_opened,
+            SCAFFOLD_REGIONS + 1,
+            "{engine}: one region for `with_region` and none for the cell inside it"
+        );
+        assert_eq!(stats.allocations, 1, "{engine}");
+        assert_eq!(
+            stats.peak_live, 1,
+            "{engine}: and the cell went back at the region's close"
+        );
+    }
+}
+
+// ------------------------------------------------- 5. what a pin costs
+
+const NO_REGION: &str = r#"
+effect ask { read get[q]() -> Int }
+
+fn asked() -> Int = handle { ask.get[q]() + ask.get[q]() } with {
+  ask.get[q]() resume k -> k(3),
+}
+
+test "a capture outside every region" { assert_eq(asked(), 6) }
+"#;
+
+/// A pin is an `Rc` allocation and `handler::perform` is on the request path, so
+/// a program with no region of its own must not pay for one. `/health` is such a
+/// program: it performs and it opens nothing.
+#[test]
+fn a_capture_outside_every_program_region_takes_no_pin() {
+    let compiled = Compiled::new(NO_REGION);
+    let machine = machine_stats(&compiled, "a capture outside every region");
+    assert_eq!(
+        machine.regions_opened, SCAFFOLD_REGIONS,
+        "the program opened none of its own"
+    );
+    assert_eq!(
+        machine.pins_taken, 0,
+        "there is no lexical close for a pin to defer"
+    );
+}
+
+// -------------------------------------- 6. the entry point still resets
+
+/// The reset is what replaced `World::fork`, and a pin must not be able to
+/// outlive it: a continuation parked in a cell of the region that pins it is a
+/// cycle, and honouring it at the entry point's end would leak the run and let
+/// the next one read its slots.
+#[test]
+fn a_parked_continuation_does_not_survive_the_entry_point_that_made_it() {
+    let compiled = Compiled::new(PARKED);
+    let index = compiled.index_of("a continuation outlives the region whose cell it reads");
+    let mut machine = Machine::new(&compiled.program, &compiled.resolved, &compiled.check);
+
+    for _ in 0..3 {
+        machine.eval_test(index).expect("the test passes");
+        assert_eq!(
+            machine.cells().live(),
+            0,
+            "the entry point ended holding nothing"
+        );
+        assert_eq!(
+            machine.cells().retained_slots(),
+            0,
+            "and holding nothing on behalf of a continuation either"
+        );
+    }
+    assert_eq!(
+        machine.cells().stats().peak_live,
+        2,
+        "two regions live at once, never six across three runs"
+    );
+}
+
+/// A fixture cell is not a program region's, so it survives every entry point —
+/// the property `TaskRegions::reset` exists for, restated now that a lexical
+/// close reclaims.
+#[test]
+fn the_fixture_survives_what_the_regions_give_back() {
+    let compiled = Compiled::new(PURE);
+    let index = compiled.index_of("a region with no capture anywhere near it");
+    let fixture = ply_eval::Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(1_000))));
+    let (regions, handle) = fixture.open();
+    let slot = match handle {
+        Value::Cell(slot) => slot,
+        other => panic!("expected the fixture's handle, found {other:?}"),
+    };
+
+    let mut machine = Machine::new(&compiled.program, &compiled.resolved, &compiled.check);
+    machine.set_regions(regions);
+    for _ in 0..5 {
+        machine.eval_test(index).expect("the test passes");
+        assert_eq!(
+            machine.cells().get(slot).map(Value::render),
+            Some("1000".to_string()),
+            "the fixture's slot is below every region's mark"
+        );
+        assert_eq!(machine.cells().live(), 1, "and it is the only thing left");
+    }
+}
