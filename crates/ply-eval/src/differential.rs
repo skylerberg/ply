@@ -683,6 +683,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<Diagnostic>) {
             children.extend(return_clause.as_deref().map(|r| &r.body));
         }
         ExprKind::WithCell { init, body, .. } => children.extend([init.as_ref(), body.as_ref()]),
+        ExprKind::WithRegion { body, .. } => children.push(body),
         ExprKind::Simulate { body } => {
             out.push(machine_only_region(e.span));
             children.push(body);

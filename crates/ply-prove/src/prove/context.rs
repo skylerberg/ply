@@ -507,7 +507,7 @@ fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut
                 stack.push(init);
                 stack.push(body);
             }
-            ExprKind::Simulate { body } => stack.push(body),
+            ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => stack.push(body),
         }
     }
 }

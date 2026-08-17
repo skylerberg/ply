@@ -243,6 +243,10 @@ fn expr(e: &mut Expr, span: Span) {
             binder.span = span;
             expr(body, span);
         }
+        ExprKind::WithRegion { region, body } => {
+            region.span = span;
+            expr(body, span);
+        }
         ExprKind::Simulate { body } => expr(body, span),
     }
 }

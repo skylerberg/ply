@@ -425,6 +425,41 @@ fn with_cell_is_only_special_before_a_bracket() {
 }
 
 #[test]
+fn with_region_brands_a_block() {
+    assert_eq!(
+        expr("with_region[r] { with_cell[r](0) { c -> cell_get(c) } }"),
+        "(with_region [r] (block (with_cell [r] 0 c (call cell_get c))))"
+    );
+}
+
+#[test]
+fn regions_nest() {
+    assert_eq!(
+        expr("with_region[a] { with_region[b] { 1 } }"),
+        "(with_region [a] (block (with_region [b] (block 1))))"
+    );
+}
+
+/// Contextual exactly as `with_cell` is, so a program that already binds
+/// `with_region` as an ordinary name is unaffected.
+#[test]
+fn with_region_is_only_special_before_a_bracket() {
+    assert_eq!(expr("with_region"), "with_region");
+    assert_eq!(expr("with_region(1)"), "(call with_region 1)");
+    assert_eq!(expr("with_region + 1"), "(+ with_region 1)");
+}
+
+/// The body is a block, and `{` after `]` opens it even where a bare `{` would
+/// have opened the enclosing construct's.
+#[test]
+fn a_region_body_is_a_block_in_no_brace_position() {
+    assert_eq!(
+        expr("if with_region[r] { true } { 1 } else { 2 }"),
+        "(if (with_region [r] (block true)) (block 1) (block 2))"
+    );
+}
+
+#[test]
 fn simulate_takes_a_block_and_carries_no_seed() {
     assert_eq!(
         expr("simulate { let a = task.spawn(|| f()); task.join(a) }"),
@@ -669,6 +704,9 @@ fn every_diagnostic_carries_a_code_and_a_real_span() {
         "fn f() = handle",
         "fn f() = handle x with {",
         "fn f() = with_cell[r]",
+        "fn f() = with_region[r]",
+        "fn f() = with_region[] { 1 }",
+        "fn f() = with_region[r] 1",
         "fn f() = |x",
         "fn f() = [1,",
         "fn f() = f(1,",
@@ -1383,6 +1421,9 @@ fn dump_expr(e: &Expr) -> String {
             binder.name,
             dump_expr(body)
         ),
+        ExprKind::WithRegion { region, body } => {
+            format!("(with_region [{}] {})", region.name, dump_expr(body))
+        }
         ExprKind::Simulate { body } => format!("(simulate {})", dump_expr(body)),
     }
 }

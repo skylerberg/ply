@@ -330,12 +330,17 @@ handle    := "handle" expr "with" "{" hClause* retClause? "}"
 hClause   := IDENT "." IDENT ("[" IDENT "]")? "(" IDENT,* ")" "->" expr ","?
 retClause := "return" IDENT "->" expr ","?
 withCell  := "with_cell" "[" IDENT "]" "(" expr ")" "{" IDENT "->" expr "}"
+withRegion:= "with_region" "[" IDENT "]" block
 ```
 
 Precedence, loosest to tightest: `||`, `&&`, comparison (`== != < <= > >=`),
 `++` (string concat), `+ -`, `* / %`, unary `- !`, application / field access /
-indexing. `if`, `match`, `handle`, `with_cell`, lambda (`|x, y| expr`) are
-primary expressions.
+indexing. `if`, `match`, `handle`, `with_cell`, `with_region`, lambda
+(`|x, y| expr`) are primary expressions.
+
+`with_region` is **contextual**, recognized only immediately before a `[`,
+exactly as `with_cell` is. `lexer::is_ident("with_region")` stays true and no
+`Kw` is added, so a program that already binds the name is unaffected.
 
 Comments are `//` to end of line. Integers are decimal, optionally `_`
 separated. Strings are double-quoted with `\n \t \\ \" \r \0` escapes.
@@ -401,6 +406,19 @@ Requirements:
 - `with_cell[r](init) { c -> body }` binds `c : Cell<T>` and discharges
   `cell.read[r]` / `cell.write[r]` from the body's row. `cell_get` / `cell_set`
   are prelude builtins that perform those atoms.
+- `with_region[r] { body }` (ADR 0017 §1) opens a lexical allocation scope
+  branded `r` and discharges the same two atoms at *its* boundary. A
+  `with_cell[r]` written under a region of that name allocates **into** it: the
+  cell may outlive the `with_cell`'s own braces and is discharged and checked at
+  the region instead, which is why a `with_cell` written before regions existed
+  does not move. Two regions of one name in scope at once is `E0447`.
+- A value branded `r` that would outlive the region is `E0446`, reported where
+  it would escape. The check runs on **resolved** types, so an alias hides
+  nothing, and it reads a function's effect row as well as its shape, which is
+  how a closure that captured a branded value is caught. A variant field
+  declared as a concrete `Cell` is `E0446` at the declaration: a variant's field
+  types are converted once for the whole program, so a brand stored in one has
+  nowhere to appear.
 - A `/ {...}` annotation is an upper bound: inference must produce a subset, and
   the annotation becomes the published signature. Violation is `EFFECT_NOT_PERMITTED`.
 - After solving, a definition's row must be closed. A surviving row variable in a
@@ -1863,6 +1881,21 @@ non-authoritative one may neither read nor write one. Flipping the default is a
 `RUNTIME_VERSION` bump.
 
 `ply test` also prints `isolated: n of m` in its summary.
+
+**`--engine both` reports its own coverage.** The oracle cannot compare a test
+only one engine can run: a clause binding a continuation is `E0504` on the
+tree-walker (required test 3 below) and a searched test is replayed per
+interleaving on a machine built for the schedule. Both exclusions are correct;
+leaving them uncounted is not, because `0 failed, n passed` under two engines
+reads as two engines having agreed about *n* tests. So `RunReport` carries
+`audit: Option<AuditSummary>` — `{ compared, unaudited }` — and `TestResult`
+carries `audited: Option<bool>`, both **absent rather than zeroed** when no
+oracle ran. `ply test` prints `audited n of m · k ran on one engine only`, and
+`--json` carries the same under `audit` and `tests[].audited` (added within
+`schema_version` 4: nothing changed meaning and nothing left). The excluded
+tests are exactly the ones that bind a continuation or schedule a task, which is
+what a change to the memory model moves, so this is ADR 0017 §6's reporting rule
+applied to the oracle rather than to the schedule.
 
 ### Deleted with the machine
 
@@ -7121,3 +7154,99 @@ backpressure and W5 does not — `E0437 DB_POOL_EXHAUSTED` is still a diagnostic
 rather than a shed request, and turning it into a `503` needs a policy about
 which requests to refuse and a way to refuse one without ending the run. That is
 a promise W4 made that W5 is breaking, stated rather than quietly dropped.
+
+---
+
+## Test isolation under regions
+
+ADR 0017 §6. The forkable world is gone, so the exemption that rested on it is
+gone with it. `ply-test`'s scheduler and its report are what change.
+
+### `ply-test::schedule` — landed
+
+```rust
+/// Effects whose atoms name a region label. Exactly one at v0: the builtin
+/// `cell`. **Not an exemption** — it is how a report says *why* two tests
+/// contend, which is a fact a reader can act on by renaming one.
+pub const REGION_SCOPED: &[&str] = &["cell"];
+/// Effects whose atoms name an input no test can write. Exactly one: `sim`.
+/// The only exemption left, because a seed is handed to a test rather than
+/// shared between two, and no memory model changes that.
+pub const AMBIENT: &[&str] = &["sim"];
+
+pub fn is_region_scoped(atom: &EffectAtom) -> bool;
+pub fn contends(atom: &EffectAtom) -> bool;          // !is_ambient
+pub fn region_isolated(f: &Footprint) -> bool;       // was `world_isolated`
+pub fn shared_footprint(f: &Footprint) -> Footprint; // now drops ambient only
+/// Shared, and only over region labels: isolated under the forkable world and
+/// coloured now. Exactly what ADR 0017 §6 costs.
+pub fn contends_only_over_regions(f: &Footprint) -> bool;
+
+pub enum Isolation { Region, Shared }                // was `World | Shared`
+```
+
+`group_by_conflict` is unchanged in shape and colours `shared_footprint`s. What
+changed is the projection: a `cell` atom conflicts like any other atom, because
+a region closed at the end of a test is not a fork — two tests writing one label
+write one piece of state, and the group's fixture is mutated in place.
+
+**Meaning does not move.** A test's allocations still cannot be observed by
+another test; the colouring is what pays for it now instead of the fork.
+
+### The region a group runs in — `ply-test::region`
+
+```rust
+pub struct GroupRegion { /* fixture: World, mark: u32 */ }
+
+impl GroupRegion {
+    pub fn empty() -> GroupRegion;
+    /// Runs the seed once, on the caller's thread. A worker lives for exactly
+    /// one concurrency group, so "once per worker" is ADR 0017 §6's "once per
+    /// group".
+    pub fn build(seed: impl FnOnce() -> World) -> GroupRegion;
+    /// The boundary: below it is the group's, at or above it is the test's.
+    pub fn mark(&self) -> u32;
+    pub fn open(&self) -> World;
+    /// Discards what the test allocated; keeps what it wrote to the fixture.
+    pub fn close(&mut self, after: &World);
+    pub fn fixture(&self) -> &World;
+}
+```
+
+`InterpExecutor::with_fixture` builds one per worker; `Worker::region` exposes
+it. A searched test opens the region per interleaving and writes nothing back:
+a replayed test would otherwise apply its writes once per schedule, and which
+world the group ended with would depend on which interleaving ran last.
+
+In-place mutation is sound **because** of the colouring above: a group's members
+have pairwise non-conflicting footprints and a region label now conflicts, so no
+two tests in a group can name one piece of fixture state and the order they run
+in cannot decide a verdict.
+
+### Reporting — the ADR 0008 §6 trap, again
+
+A report that still says `world` after the world is gone is a lie, and a count
+that stopped being true is worse than one that was never printed. So:
+
+- `--explain` says `isolation: region` or `isolation: shared {atoms}`, and
+  appends `(region labels)` when every atom that made a test shared is one.
+- `Parallelism` gains `region_contended`: shared tests that contend *only* over
+  a region label. Printed on every run under `--explain`, and in `--json`.
+- `report::SCHEMA_VERSION` is **4**. `tests[].isolation` says `region`, and it
+  is a narrower claim than `world` was.
+
+### Required properties
+
+1. Two tests naming one region label are coloured apart; two tests naming
+   different labels are one group. The cost is the collisions, never the count.
+2. A group of tests on distinct labels runs concurrently and none of them
+   observes another's cells, over repeated rounds, under `--engine both`.
+3. After every test, the world its worker holds carries that test's writes and
+   nothing else, and the group's region is back at its mark.
+4. The group's fixture is built once, and test *k* opens the region on test
+   *k−1*'s write.
+5. Verdicts, groups and `Parallelism` are identical at `--jobs 1` and
+   `--jobs 8`.
+6. Adding *N* region-isolated tests changes the group count by zero.
+7. `open` is constant in the fixture's size, and one test's whole region cost
+   stays under rebuilding the fixture for it, at every size.

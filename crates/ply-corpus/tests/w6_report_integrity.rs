@@ -323,7 +323,10 @@ fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     };
     // Both sides are divided by their own `framing`, so a profile cancels.
     let (shipped_unit, fresh_unit) = (of(Layer::Framing), fresh.framed_micros);
-    assert!(shipped_unit > 0.0 && fresh_unit > 0.0, "a zero framing rung");
+    assert!(
+        shipped_unit > 0.0 && fresh_unit > 0.0,
+        "a zero framing rung"
+    );
 
     let mut stale = Vec::new();
     println!(
@@ -399,7 +402,10 @@ fn the_shipped_verdict_turns_on_c3() {
     let report = shipped();
     let ladder = report.ladder().expect("the shipped ladder assembles");
     let criteria = Criteria::default();
-    let spike = report.spike.as_ref().expect("the shipped report has a spike");
+    let spike = report
+        .spike
+        .as_ref()
+        .expect("the shipped report has a spike");
     let judged = spike.judge();
 
     assert!(judged.evidence, "C4: {:?}", judged.failures);
@@ -469,8 +475,7 @@ fn the_shipped_ladder_is_what_the_command_writes() {
         serde_json::to_string_pretty(&report).expect("a report serializes")
     );
     assert_eq!(
-        text,
-        written,
+        text, written,
         "`benches/w6-ladder.json` is not what `ply-corpus w6-ladder --out` writes, so it was \
          edited by a hand rather than taken by the harness — and the two staleness guards tell a \
          contributor to re-take it, which would silently drop whatever the hand added"

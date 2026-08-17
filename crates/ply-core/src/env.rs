@@ -76,6 +76,16 @@ impl TypeEnv {
         self.scopes.iter().flat_map(|s| s.schemes.values())
     }
 
+    /// The bindings the definition being checked introduced, globals excluded.
+    ///
+    /// A global is bound from a scheme that was generalized first, so its
+    /// variables are quantified and a later unification reaches a fresh copy
+    /// rather than the scheme — which is why the region escape check can ask
+    /// about locals alone and still see every binding a region could store into.
+    pub fn locals(&self) -> impl Iterator<Item = (&Symbol, &Scheme)> {
+        self.scopes.iter().skip(1).flat_map(|s| s.schemes.iter())
+    }
+
     /// The type and row variables still unsolved anywhere in scope — the ones
     /// [`generalize`] may not quantify.
     ///

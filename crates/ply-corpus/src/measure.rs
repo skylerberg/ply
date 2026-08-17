@@ -637,7 +637,7 @@ pub fn render(m: &Measurements) -> String {
 
     if let Some(sc) = &m.scheduling {
         s.push_str(&format!(
-            "scheduling — {} tests: {} world-isolated, {} shared\n",
+            "scheduling — {} tests: {} region-isolated, {} shared\n",
             sc.tests, sc.isolated, sc.shared
         ));
         s.push_str(&format!(

@@ -1,30 +1,40 @@
-//! An attack on the scheduler's new claim: that a test whose atoms are all
-//! world-backed conflicts with nothing, whatever else the corpus contains.
+//! An attack on the scheduler's claim under ADR 0017 §6: that a test's
+//! allocations live in a region closed when the test ends, so tests still
+//! cannot observe each other's allocations — while a region *label* two tests
+//! both write is one piece of state and colours them apart.
 //!
 //! The claim converts a correctness property into a scheduling decision, so if
 //! it is wrong it is wrong in the worst available way — two tests run at once,
-//! one of them fails on Tuesday, and the cache remembers the pass. Three things
+//! one of them fails on Tuesday, and the cache remembers the pass. Four things
 //! have to hold for it, and each gets an attack here:
 //!
-//! 1. Only real region state can produce a `cell` atom, so the exemption cannot
-//!    be spoofed by naming an effect `cell`.
-//! 2. An atom that is *not* world-backed keeps its edge, even when it sits in
-//!    the same footprint as one that is.
-//! 3. Tests the exemption puts in one group really cannot see each other — run
+//! 1. Only real region state can produce a `cell` atom, and only the builtin
+//!    `sim` can claim the one exemption that is left, so neither can be spoofed
+//!    by naming an effect after it.
+//! 2. Two tests naming one label are coloured apart, and two tests naming
+//!    different labels are not — the cost is the collisions, never the
+//!    population.
+//! 3. Tests the colouring puts in one group really cannot see each other — run
 //!    concurrently, on real threads, with every one of them writing the cell
 //!    that every other one also allocated at the same id.
+//! 4. The group's fixture is built once and mutated in place, the test's own
+//!    region closes on top of it, and a verdict does not move between one
+//!    worker and eight.
 //!
 //! Everything here goes through real inference: a footprint that was injected by
 //! the test proves the colouring and nothing about whether that footprint was
 //! reachable.
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::{EngineChoice, Plan, Value, World};
+use ply_eval::{CellId, EngineChoice, Plan, Value, World};
 use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
 use ply_syntax::resolve::Resolved;
-use ply_test::{Isolation, group_by_conflict, is_world_backed, shared_footprint, world_isolated};
+use ply_test::{
+    GroupRegion, Isolation, contends_only_over_regions, group_by_conflict, is_region_scoped,
+    region_isolated, shared_footprint,
+};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,29 +106,59 @@ impl Compiled {
     fn footprints(&self) -> Vec<&Footprint> {
         self.check.tests.iter().map(|t| &t.footprint).collect()
     }
+
+    fn scheduled(&self) -> Vec<(usize, Footprint)> {
+        self.footprints()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, (*f).clone()))
+            .collect()
+    }
 }
 
-/// Each test allocates its cell at the same id as every other one, smuggles a
-/// reader and a writer out of the region, and then checks every value it wrote.
-/// If two of them shared a world, `assert_eq` inside the test is what would say
-/// so — the audit is written in Ply, not in Rust assertions about Ply.
-fn contending_source(tests: usize) -> String {
+/// Each test allocates its cell at the same id as every other one, reads and
+/// writes it, and checks every value it wrote. If two of them shared a region,
+/// `assert_eq` inside the test is what would say so: the audit is written in
+/// Ply, not in Rust assertions about Ply.
+///
+/// The `cell` atoms reach the footprint through a **declared row** rather than
+/// through a cell smuggled out of its region. ADR 0017 §2 closed every carrier
+/// that used to take one out — a closure carrying it in its effect row was the
+/// last, and `ply-core/tests/region_escape_audit.rs` is where each is pinned —
+/// so a written annotation is now the only way a `cell` atom reaches a published
+/// footprint at all. The call sits *outside* the region on purpose: a region
+/// discharges its own label, so calling it inside would discharge the atoms the
+/// scheduling this file is about depends on.
+///
+/// `label` decides whether the corpus is a clique or an independent set, which
+/// is the difference between what ADR 0017 §6 costs and what it does not.
+fn contending_source(tests: usize, label: impl Fn(usize) -> String) -> String {
     let mut out = String::new();
+    let mut declared: Vec<String> = Vec::new();
     for i in 0..tests {
+        let label = label(i);
+        if !declared.contains(&label) {
+            out.push_str(&format!(
+                "\nfn touches_{label}(n: Int) -> Int / {{cell.read[{label}], \
+                 cell.write[{label}]}} = n\n"
+            ));
+            declared.push(label.clone());
+        }
         out.push_str(&format!(
             r#"
-test "contender {i}" {{
-  let ops = with_cell[table]({i}) {{ c -> {{get: || cell_get(c), put: |v| cell_set(c, v)}} }};
-  let get = ops.get;
-  let put = ops.put;
-  assert_eq(get(), {i});
-  put(get() * 7);
-  assert_eq(get(), {seven});
-  put(get() + {i});
-  assert_eq(get(), {eight})
+test "contender {label} {i}" {{
+  let seen = with_cell[{label}]({i}) {{ c -> {{
+    assert_eq(cell_get(c), {i});
+    cell_set(c, cell_get(c) * 7);
+    assert_eq(cell_get(c), {seven});
+    cell_set(c, cell_get(c) + {i});
+    cell_get(c)
+  }} }};
+  assert_eq(touches_{label}(seen), {eight})
 }}
 "#,
             i = i,
+            label = label,
             seven = i * 7,
             eight = i * 8,
         ));
@@ -126,41 +166,59 @@ test "contender {i}" {{
     out
 }
 
-// ------------------------------------------- 1. the exemption cannot be spoofed
+fn one_label(_: usize) -> String {
+    "table".to_string()
+}
 
-/// `is_world_backed` trusts one effect name. If a program could declare that
-/// name, it could claim the exemption for state the world knows nothing about —
-/// so the reservation is the load-bearing half of the rule, not a nicety.
+fn a_label_each(i: usize) -> String {
+    format!("table{i}")
+}
+
+// --------------------------------------- 1. neither name can be impersonated
+
+/// `is_region_scoped` and `is_ambient` both trust one effect name. The ambient
+/// one is an exemption a program could claim for state the language knows
+/// nothing about, and the region-scoped one is what a report blames a
+/// contention on, so both reservations are load-bearing rather than niceties.
 #[test]
-fn a_program_cannot_declare_the_effect_the_exemption_names() {
-    for name in ply_test::WORLD_BACKED {
+fn a_program_cannot_declare_either_effect_the_scheduler_names() {
+    for name in ply_test::REGION_SCOPED.iter().chain(ply_test::AMBIENT) {
         let diags = Compiled::rejected(&format!(
             r#"
 effect {name} {{
   write put[users](v: Int) -> Unit
 }}
 
-test "claim the exemption" {{
+test "claim the name" {{
   {name}.put[users](1)
 }}
 "#
         ));
         assert!(
             !diags.is_empty(),
-            "`effect {name}` must be refused, or the world-backed exemption is claimable"
+            "`effect {name}` must be refused, or the scheduler's classification is claimable"
         );
+        let said = diags
+            .iter()
+            .flat_map(|d| {
+                std::iter::once(d.message.clone())
+                    .chain(d.labels.iter().map(|l| l.message.clone()))
+                    .chain(d.notes.iter().cloned())
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
         assert!(
-            diags.iter().any(|d| d.message.contains("builtin")),
-            "the refusal must say the name is reserved: {diags:#?}"
+            said.contains("builtin") || said.contains("declared by the language"),
+            "the refusal must say the name belongs to the language: {said}"
         );
     }
 }
 
-/// The exemption is by exact effect name, so a neighbouring name gains nothing.
-/// Two tests that both write `cells.write[rows]` are two writers of one resource
-/// and must stay in separate groups.
+/// The classification is by exact effect name, so a neighbouring name gains
+/// nothing. Two tests that both write `cells.write[rows]` are two writers of one
+/// resource and must stay in separate groups.
 #[test]
-fn an_effect_whose_name_merely_resembles_the_builtin_is_not_exempt() {
+fn an_effect_whose_name_merely_resembles_the_builtin_is_not_region_scoped() {
     let compiled = Compiled::new(
         r#"
 effect cells {
@@ -172,32 +230,61 @@ test "one" { cells.put[rows](1) }
 test "two" { cells.put[rows](2) }
 "#,
     );
-    let footprints = compiled.footprints();
-    for f in &footprints {
-        assert!(
-            !world_isolated(f),
-            "`cells` must not be world-backed: {f:?}"
-        );
-        assert!(f.atoms().all(|a| !is_world_backed(a)));
+    for f in &compiled.footprints() {
+        assert!(!region_isolated(f), "`cells` names a real resource: {f:?}");
+        assert!(f.atoms().all(|a| !is_region_scoped(a)));
+        assert!(!contends_only_over_regions(f));
     }
-
-    let scheduled: Vec<(usize, Footprint)> = footprints
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (i, (*f).clone()))
-        .collect();
     assert_eq!(
-        group_by_conflict(&scheduled).len(),
+        group_by_conflict(&compiled.scheduled()).len(),
         2,
-        "two writers of one non-world resource must not share a group"
+        "two writers of one resource must not share a group"
     );
 }
 
-// ------------------------------------ 2. a real atom keeps its edge regardless
+// ------------------------------ 2. the cost is the collisions, not the count
 
-/// The exemption subtracts atoms; it never subtracts tests. A footprint that
-/// mixes a cell atom with a real one still conflicts through the real one, and
-/// the mixed test is `Shared` rather than `World`.
+/// ADR 0017 §6's lost case, reached by inference rather than by injection: six
+/// tests whose only atoms name one label are six colours wide, and every one of
+/// them is `shared` on the line `--explain` prints.
+#[test]
+fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
+    let compiled = Compiled::new(&contending_source(6, one_label));
+    let footprints = compiled.footprints();
+    assert!(
+        footprints.iter().all(|f| f.atoms().any(is_region_scoped)),
+        "the corpus must retain cell atoms, or it is not exercising anything"
+    );
+    assert!(footprints.iter().all(|f| !region_isolated(f)));
+    assert!(footprints.iter().all(|f| contends_only_over_regions(f)));
+    assert!(
+        footprints
+            .iter()
+            .all(|f| Isolation::of(f) == Isolation::Shared)
+    );
+
+    assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 6);
+}
+
+/// A label nobody else names conflicts with nothing, so losing the fork bought
+/// it nothing to lose. Counting the population that carries a `cell` atom rather
+/// than the collisions between them is the single easiest way to over-state what
+/// ADR 0017 costs.
+#[test]
+fn tests_on_distinct_region_labels_still_share_one_group() {
+    let compiled = Compiled::new(&contending_source(16, a_label_each));
+    assert!(
+        compiled
+            .footprints()
+            .iter()
+            .all(|f| contends_only_over_regions(f))
+    );
+    assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 1);
+}
+
+/// The classification subtracts atoms; it never subtracts tests. A footprint
+/// that mixes a region label with a real resource conflicts through both, and it
+/// is not reported as a contention a rename would fix.
 #[test]
 fn a_cell_atom_beside_a_real_one_does_not_launder_the_real_one() {
     let compiled = Compiled::new(
@@ -207,14 +294,16 @@ effect db {
   write put[users](v: Int) -> Unit
 }
 
+fn touches(n: Int) -> Int / {cell.read[table]} = n
+
 test "cell only" {
-  let read = with_cell[table](1) { c -> || cell_get(c) };
-  assert_eq(read(), 1)
+  let seen = with_cell[table](1) { c -> cell_get(c) };
+  assert_eq(touches(seen), 1)
 }
 
 test "cell and a real write" {
-  let read = with_cell[table](1) { c -> || cell_get(c) };
-  db.put[users](read())
+  let seen = with_cell[table](1) { c -> cell_get(c) };
+  db.put[users](touches(seen))
 }
 
 test "a real read" {
@@ -225,34 +314,42 @@ test "a real read" {
 
     let footprints = compiled.footprints();
     let isolation: Vec<Isolation> = footprints.iter().map(|f| Isolation::of(f)).collect();
-    assert_eq!(
-        isolation,
-        vec![Isolation::World, Isolation::Shared, Isolation::Shared]
+    assert_eq!(isolation, vec![Isolation::Shared; 3]);
+    assert!(contends_only_over_regions(footprints[0]));
+    assert!(
+        !contends_only_over_regions(footprints[1]),
+        "a test that also reaches `users` must not be blamed on its label"
     );
 
     let shared = shared_footprint(footprints[1]);
     let atoms: Vec<String> = shared.atoms().map(|a| a.to_string()).collect();
-    assert_eq!(atoms, vec!["db.write[users]".to_string()]);
+    assert_eq!(
+        atoms,
+        vec![
+            "cell.read[table]".to_string(),
+            "db.write[users]".to_string()
+        ]
+    );
     assert!(shared.conflicts_with(&shared_footprint(footprints[2])));
 
-    let scheduled: Vec<(usize, Footprint)> = footprints
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (i, (*f).clone()))
-        .collect();
-    let groups = group_by_conflict(&scheduled);
+    let groups = group_by_conflict(&compiled.scheduled());
     assert_eq!(groups.len(), 2, "{groups:?}");
     let group_of = |t: usize| groups.iter().position(|g| g.contains(&t)).unwrap();
     assert_ne!(group_of(1), group_of(2), "a writer and a reader of `users`");
-    assert_eq!(group_of(0), 0, "the isolated test is free in either group");
+    assert_eq!(
+        group_of(0),
+        group_of(1),
+        "a region label is readers-writers like any resource: two readers of \
+         `cell[table]` still share a group"
+    );
 }
 
 /// The colouring's own invariant, checked against the corpus rather than
-/// asserted about it: any two tests sharing a group either do not conflict at
-/// all, or conflict *only* through atoms the world backs. Anything else is the
-/// exemption having been widened by accident.
+/// asserted about it: no two tests sharing a group conflict at all. Under
+/// ADR 0005 this had an exemption carved out of it; there is nothing left to
+/// carve, which is the whole of what §6 changes here.
 #[test]
-fn every_pair_in_a_group_conflicts_at_most_through_world_backed_atoms() {
+fn no_pair_in_a_group_conflicts_at_all() {
     let source = format!(
         r#"
 effect db {{
@@ -268,61 +365,48 @@ test "real writer" {{ db.put[users](1) }}
 test "other writer" {{ db.log[audit](1) }}
 {}
 "#,
-        contending_source(6)
+        contending_source(6, |i| format!("table{}", i % 3))
     );
     let compiled = Compiled::new(&source);
-    let scheduled: Vec<(usize, Footprint)> = compiled
-        .footprints()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (i, (*f).clone()))
-        .collect();
+    let scheduled = compiled.scheduled();
 
     for group in group_by_conflict(&scheduled) {
         for (n, &a) in group.iter().enumerate() {
             for &b in &group[n + 1..] {
                 let (fa, fb) = (&scheduled[a].1, &scheduled[b].1);
-                if !fa.conflicts_with(fb) {
-                    continue;
-                }
                 assert!(
                     !shared_footprint(fa).conflicts_with(&shared_footprint(fb)),
-                    "tests {a} and {b} share a group and conflict outside the world: \
-                     {fa:?} vs {fb:?}"
+                    "tests {a} and {b} share a group and conflict: {fa:?} vs {fb:?}"
                 );
             }
         }
     }
 }
 
-// ----------------------------------- 3. the tests really cannot see each other
+// ------------------------ 3. tests in a group really cannot see each other
 
 /// The claim, executed: one group, real threads, every test writing the cell
 /// every other test also allocated at `#0`.
 ///
 /// What this catches on its own is a shared *value* — two tests reaching one
 /// entry — because each test's first assertion is that its cell still holds the
-/// initial value only it wrote. It does not catch a world that merely grew,
+/// initial value only it wrote. It does not catch a region that merely grew,
 /// since the next test would then allocate a fresh id and pass anyway; that half
 /// is [`the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else`],
 /// which inspects the world instead of trusting the program.
 ///
 /// Run more than once because interference is a race, and once is a sample.
 #[test]
-fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
+fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
-    let compiled = Compiled::new(&contending_source(TESTS));
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
 
-    assert!(
-        compiled.footprints().iter().all(|f| world_isolated(f)),
-        "the corpus must be world-isolated by inference, not by injection"
-    );
     assert!(
         compiled
             .footprints()
             .iter()
-            .any(|f| f.atoms().next().is_some()),
-        "and it must retain cell atoms, or it is not exercising the exemption"
+            .all(|f| f.atoms().any(is_region_scoped)),
+        "the corpus must retain cell atoms by inference, not by injection"
     );
 
     for round in 0..3 {
@@ -334,10 +418,9 @@ fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
         assert_eq!(
             selection.groups.len(),
             1,
-            "round {round}: {TESTS} contending tests must be one group"
+            "round {round}: {TESTS} tests on {TESTS} labels must be one group"
         );
-        assert_eq!(selection.parallelism.isolated, TESTS);
-        assert_eq!(selection.parallelism.shared_groups, 0);
+        assert_eq!(selection.parallelism.region_contended, TESTS);
         assert!(selection.parallelism.holds());
 
         let report = ply_test::run(
@@ -362,14 +445,14 @@ fn a_group_of_world_isolated_tests_running_at_once_never_observe_each_other() {
 }
 
 /// The white-box half, and the strongest statement the audit can make about the
-/// exemption: after every test in the group, the world its worker holds contains
-/// exactly one cell — `#0`, holding that test's own last write. A world carried
-/// from a previous test would hold two, and a world shared with a concurrent one
+/// region: after every test in the group, the world its worker holds contains
+/// exactly one cell — `#0`, holding that test's own last write. A region carried
+/// from a previous test would hold two, and one shared with a concurrent test
 /// would hold somebody else's number.
 #[test]
 fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     const TESTS: usize = 24;
-    let compiled = Compiled::new(&contending_source(TESTS));
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
@@ -398,18 +481,22 @@ fn the_world_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     );
 
     let mut seen = executor.seen.into_inner().expect("no worker panicked");
-    seen.sort_by_key(|(index, _)| *index);
-    let expected: Vec<(usize, Vec<String>)> = (0..TESTS)
-        .map(|i| (i, vec![format!("#0={}", i * 8)]))
+    seen.sort_by_key(|(index, _, _)| *index);
+    let expected: Vec<(usize, Vec<String>, u32)> = (0..TESTS)
+        .map(|i| (i, vec![format!("#0={}", i * 8)], 0))
         .collect();
-    assert_eq!(seen, expected);
+    assert_eq!(
+        seen, expected,
+        "a test whose region did not close would leave the mark above zero"
+    );
 }
 
 /// Wraps the real executor to look at each worker's world the moment its test
-/// finishes — the only place from which one test's leftovers would be visible.
+/// finishes — the only place from which one test's leftovers would be visible —
+/// and at the group's region, which is what must not have grown.
 struct Recording<'a> {
     inner: ply_test::InterpExecutor<'a>,
-    seen: Mutex<Vec<(usize, Vec<String>)>>,
+    seen: Mutex<Vec<(usize, Vec<String>, u32)>>,
 }
 
 impl<'a> ply_test::Executor for Recording<'a> {
@@ -429,58 +516,202 @@ impl<'a> ply_test::Executor for Recording<'a> {
         self.seen
             .lock()
             .expect("no worker panicked")
-            .push((index, cells));
+            .push((index, cells, worker.region().mark()));
         outcome
     }
 }
 
-/// The same corpus against a *seeded* base world, which is the fixture story:
-/// one world built once, forked per test. A test that could write through to the
-/// fixture would be the interference channel the fork exists to close, and every
-/// test asserting its own seed is what would catch it.
+// ------------------------------------- 4. the fixture, and the job count
+
+/// ADR 0017 §6's fixture, at the runner: built once for the group, mutated in
+/// place by every test in it, and the test's own allocations closed on top.
+///
+/// One worker, so the order is the corpus order and "test *k* opened the region
+/// on test *k−1*'s write" is a statement with a witness. The executor is a stub
+/// because the mechanism under test is the region rather than the evaluator —
+/// there is no source-level fixture to write this in Ply with.
 #[test]
-fn a_shared_fixture_is_forked_per_test_rather_than_shared_between_them() {
-    const TESTS: usize = 16;
-    let compiled = Compiled::new(&contending_source(TESTS));
+fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
+    const TESTS: usize = 12;
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    assert_eq!(selection.groups.len(), 1);
 
-    let built = AtomicUsize::new(0);
-    let fixture: &(dyn Fn() -> World + Sync) = &|| {
-        built.fetch_add(1, Ordering::Relaxed);
-        let mut world = World::new();
-        world.alloc(Value::list(vec![Value::str("seed")]));
-        world
+    let executor = FixtureProbe::default();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a one-worker pool");
+    let report = pool.install(|| {
+        ply_test::run_with(
+            &selection,
+            &compiled.check,
+            &compiled.hashes,
+            &mut store,
+            &executor,
+        )
+    });
+    assert_eq!((report.passed, report.failed), (TESTS, 0));
+
+    assert_eq!(
+        executor.built.load(Ordering::Relaxed),
+        1,
+        "one group and one worker is one fixture build"
+    );
+
+    let mut seen = executor.seen.into_inner().expect("no worker panicked");
+    seen.sort_by_key(|o| o.index);
+    for (n, o) in seen.iter().enumerate() {
+        assert_eq!(o.mark, 1, "the region's mark moved: {o:?}");
+        assert_eq!(o.fixture_len, 1, "the region grew by a test's own cells");
+        let expected = if n == 0 { -1 } else { seen[n - 1].index as i64 };
+        assert_eq!(
+            o.observed_at_open, expected,
+            "test {} did not open on the previous test's write",
+            o.index
+        );
+    }
+}
+
+#[derive(Debug)]
+struct Observation {
+    index: usize,
+    /// What the fixture cell held when this test opened the region.
+    observed_at_open: i64,
+    mark: u32,
+    fixture_len: usize,
+}
+
+/// A worker whose "test" reads the fixture, writes it, and allocates a cell of
+/// its own — the three things a real test does to a region, with nothing else in
+/// the way.
+#[derive(Default)]
+struct FixtureProbe {
+    built: AtomicUsize,
+    seen: Mutex<Vec<Observation>>,
+}
+
+impl ply_test::Executor for FixtureProbe {
+    type Worker = GroupRegion;
+
+    fn worker(&self) -> GroupRegion {
+        self.built.fetch_add(1, Ordering::Relaxed);
+        GroupRegion::build(|| {
+            let mut world = World::new();
+            world.alloc(Value::Int(-1));
+            world
+        })
+    }
+
+    fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_span::Diagnostic> {
+        let mut world = region.open();
+        let observed_at_open = match world.get(CellId(0)) {
+            Some(Value::Int(i)) => *i,
+            other => panic!("the fixture cell is gone: {other:?}"),
+        };
+        for i in 0..4 {
+            world.alloc(Value::Int(i));
+        }
+        assert!(world.set(CellId(0), Value::Int(index as i64)));
+        region.close(&world);
+        self.seen
+            .lock()
+            .expect("no worker panicked")
+            .push(Observation {
+                index,
+                observed_at_open,
+                mark: region.mark(),
+                fixture_len: region.fixture().len(),
+            });
+        Ok(())
+    }
+}
+
+/// W4's and W5's shared-state defects surfaced as a verdict that moved with the
+/// job count, so that is what the region model is checked against: one worker
+/// and eight, over a corpus that has colliding labels, disjoint labels and pure
+/// tests all at once.
+///
+/// The schedule is not what is being compared — a colouring is a pure function
+/// of the footprints and cannot move — but the verdicts under it, which is what
+/// a shared fixture or a region that failed to close would change.
+#[test]
+fn verdicts_do_not_move_between_one_worker_and_eight() {
+    let source = format!(
+        "{}{}{}",
+        contending_source(6, one_label),
+        contending_source(10, |i| format!("own{i}")),
+        (0..8)
+            .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
+            .collect::<String>()
+    );
+    let compiled = Compiled::new(&source);
+
+    let run_at = |jobs: usize| {
+        let root = TempRoot::new();
+        let mut store = root.store();
+        let selection =
+            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+        let groups = selection.groups.clone();
+        let parallelism = selection.parallelism;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .expect("the worker pool");
+        let report = pool.install(|| {
+            ply_test::run(
+                &selection,
+                &compiled.program,
+                &compiled.resolved,
+                &compiled.check,
+                &compiled.hashes,
+                &mut store,
+                EngineChoice::Both,
+                ply_test::Search::of(&selection),
+                ply_test::Hosting::hermetic(),
+            )
+        });
+        let mut verdicts: Vec<(usize, ply_test::Status, usize)> = report
+            .results
+            .iter()
+            .map(|r| (r.index, r.status, r.group))
+            .collect();
+        verdicts.sort_by_key(|v| v.0);
+        (groups, parallelism, report.passed, report.failed, verdicts)
     };
-    let executor =
-        ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
-            .with_fixture(fixture);
 
-    let report = ply_test::run_with(
-        &selection,
-        &compiled.check,
-        &compiled.hashes,
-        &mut store,
-        &executor,
+    let one = run_at(1);
+    let eight = run_at(8);
+
+    assert_eq!(
+        one.3, 0,
+        "the corpus must be green before it proves anything"
     );
     assert_eq!(
-        (report.passed, report.failed),
-        (TESTS, 0),
-        "{:#?}",
-        report.failures
+        one.0, eight.0,
+        "the colouring is a function of the footprints and may not move with --jobs"
     );
-    assert!(
-        built.load(Ordering::Relaxed) >= 1,
-        "the fixture factory runs per worker, on the worker's own thread"
+    assert_eq!(one.1, eight.1);
+    assert_eq!((one.2, one.3), (eight.2, eight.3));
+    assert_eq!(
+        one.4, eight.4,
+        "a verdict moved between one worker and eight"
+    );
+    assert_eq!(
+        one.0.len(),
+        6,
+        "six tests share `table`, so the corpus must need six rounds: {:?}",
+        one.0
     );
 }
 
-/// A world-isolated test may not create a group, for any corpus size. This is
+/// A region-isolated test may not create a group, for any corpus size. This is
 /// the number a project watches: adding isolated tests is free, and the group
-/// count is decided by the shared tests alone.
+/// count is decided by the tests that contend alone.
 #[test]
-fn adding_contending_isolated_tests_never_adds_a_group() {
+fn adding_isolated_tests_never_adds_a_group() {
     let shared = r#"
 effect db {
   read  get[users]() -> Int
@@ -494,12 +725,16 @@ test "real writer" { db.put[users](1) }
 
     let mut counts = Vec::new();
     for extra in [0usize, 1, 8, 64] {
-        let compiled = Compiled::new(&format!("{shared}{}", contending_source(extra)));
+        let pure: String = (0..extra)
+            .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
+            .collect();
+        let compiled = Compiled::new(&format!("{shared}{pure}"));
         let root = TempRoot::new();
         let store = root.store();
         let selection =
             ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
         assert_eq!(selection.parallelism.isolated, extra);
+        assert_eq!(selection.parallelism.region_contended, 0);
         assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);
         counts.push(selection.groups.len());
     }

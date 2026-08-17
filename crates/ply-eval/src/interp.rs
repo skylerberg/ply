@@ -386,6 +386,9 @@ impl<'a> Interp<'a> {
             ExprKind::WithCell {
                 init, binder, body, ..
             } => self.eval_with_cell(init, binder, body, env),
+            // See `code::lower_node`: a region is a claim about where a value
+            // lives, and nothing in this evaluator represents that yet.
+            ExprKind::WithRegion { body, .. } => self.eval(body, env),
             // Refused before the body runs, for the reason a general clause is:
             // running one unnamed interleaving would be a plausible wrong answer
             // and the result cache would keep it.
@@ -601,10 +604,21 @@ impl<'a> Interp<'a> {
     /// Locals, then the module's own items and its selective imports, then the
     /// prelude — the resolution order the whole language is specified in.
     fn lookup(&self, q: &QName, env: &Env) -> Result<Value, Diagnostic> {
+        // The tree-walker never releases a binding — it runs no reference
+        // counting — so a released slot here would be one the machine put in a
+        // scope this engine then read, which cannot happen and is reported
+        // rather than silently resolved to something else.
         if q.is_bare()
-            && let Some(v) = env.lookup(q.symbol())
+            && let Some(slot) = env.lookup(q.symbol())
         {
-            return Ok(v.clone());
+            return match slot {
+                crate::env::Slot::Live(v) => Ok(v.clone()),
+                crate::env::Slot::Released => Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("`{q}` was read after reference counting dropped it"),
+                )
+                .primary(q.span, "this binding was released before this read")),
+            };
         }
         if let Some(name) = self.global(Namespace::Value, q)
             && let Some(v) = self.globals.get(&name)

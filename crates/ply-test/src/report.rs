@@ -21,7 +21,19 @@ use std::time::Duration;
 ///
 /// v3 adds `failures[].seed`, `failures[].replay`, `failures[].race` and a
 /// per-test `simulation` object.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// v4 is ADR 0017 §6: `tests[].isolation` says `region` where it said `world`,
+/// and it means something narrower — a test whose footprint carries a region
+/// label is now `shared`, because the label is a name two tests can write and
+/// nothing forks their state apart any more. `parallelism.region_contended`
+/// counts the tests that moved. A consumer that kept reading `world` would read
+/// a claim the runner stopped making.
+///
+/// `audit` and `tests[].audited` were added within v4 and are not a bump:
+/// nothing changed meaning and nothing left. Both are absent rather than zeroed
+/// outside `--engine both`, so a consumer that has not been taught about them
+/// reads the run exactly as it did before.
+pub const SCHEMA_VERSION: u32 = 4;
 
 fn millis(d: Duration) -> f64 {
     (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
@@ -120,10 +132,24 @@ fn shared_atoms(footprint: &Footprint) -> Vec<String> {
         .collect()
 }
 
+/// A shared test is told which atoms made it shared, and — when every one of
+/// them is a region label — that the contention is one it can remove by
+/// renaming a label. Saying only `shared` about a test that used to be free
+/// would leave the cost of ADR 0017 §6 invisible on the line where it lands.
 fn explain_isolation(footprint: &Footprint) -> String {
     match Isolation::of(footprint) {
-        Isolation::World => "  isolation: world".to_string(),
-        Isolation::Shared => format!("  isolation: shared {}", shared_footprint(footprint)),
+        Isolation::Region => "  isolation: region".to_string(),
+        Isolation::Shared => {
+            let over_regions = if crate::contends_only_over_regions(footprint) {
+                " (region labels)"
+            } else {
+                ""
+            };
+            format!(
+                "  isolation: shared {}{over_regions}",
+                shared_footprint(footprint)
+            )
+        }
     }
 }
 
@@ -135,6 +161,16 @@ fn explain_parallelism(p: &Parallelism) -> Vec<String> {
         "isolated: {} of {} — {} can contend with another test",
         p.isolated, p.total, p.shared
     )];
+    // ADR 0008 §6: when a population stops being isolated, the report has to
+    // say so, or the trivially-parallel count over-claims by exactly the tests
+    // that moved.
+    if p.region_contended > 0 {
+        lines.push(format!(
+            "{} of the {} contend only over a region label; a region is closed per test, \
+             but a label two tests write is one piece of state",
+            p.region_contended, p.shared
+        ));
+    }
     if p.scheduled > 0 {
         lines.push(format!(
             "{} group(s) for {} selected test(s); the shared ones alone need {}",
@@ -166,6 +202,7 @@ impl RunReport {
             "isolated": self.parallelism.isolated,
             "parallelism": self.parallelism,
             "simulation": simulation_summary_json(&self.simulation),
+            "audit": self.audit,
             "tests": self.results.iter().map(test_json).collect::<Vec<_>>(),
             "failures": self.failures.iter().map(failure_json).collect::<Vec<_>>(),
             "warnings": self.warnings,
@@ -193,6 +230,7 @@ impl RunReport {
             ));
         }
         lines.extend(self.simulation.line());
+        lines.extend(self.audit.as_ref().and_then(|a| a.line()));
         for failure in &self.failures {
             lines.push(String::new());
             lines.push(failure.key.to_string());
@@ -306,6 +344,7 @@ fn test_json(result: &TestResult) -> Value {
         "diagnostic": result.failure,
         "simulation": result.simulation.as_ref().map(exploration_json),
         "cached": result.recorded.as_ref().map(|r| r.is_written()),
+        "audited": result.audited,
     })
 }
 

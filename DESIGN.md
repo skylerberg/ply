@@ -124,6 +124,13 @@ cannot escape (the ST-monad trick):
 with_cell[users](initial) { cell -> handle body() with { ... } }
 ```
 
+ADR 0017 generalizes that region to allocation. `with_region[r] { .. }` opens a
+lexical allocation scope whose brand `r` appears in the types of the values
+allocated in it, and a `with_cell[r]` written under one allocates into it rather
+than opening a region of its own — so a cell is a value allocated in `r`, and
+`with_cell` written on its own is unchanged. A value branded `r` that would
+outlive the region is `E0446`, reported where it would escape.
+
 ## 3. Content addressing
 
 The unit of compilation is the **definition**, not the file or module.

@@ -509,6 +509,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             walk_expr(init, f);
             walk_expr(body, f);
         }
+        ExprKind::WithRegion { body, .. } => walk_expr(body, f),
         ExprKind::Simulate { body } => walk_expr(body, f),
     })
 }

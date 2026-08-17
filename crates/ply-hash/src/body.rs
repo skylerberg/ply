@@ -1455,6 +1455,10 @@ impl Decoder<'_> {
                     body,
                 }
             }
+            tag::E_WITH_REGION => ExprKind::WithRegion {
+                region: ident(self.c.text()?),
+                body: Box::new(self.expr()?),
+            },
             tag::E_SIMULATE => ExprKind::Simulate {
                 body: Box::new(self.expr()?),
             },

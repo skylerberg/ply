@@ -379,8 +379,61 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
         text.contains("· {}"),
         "the group's defining footprint is missing:\n{text}"
     );
-    assert!(text.contains("isolation: world"), "got:\n{text}");
-    assert!(text.contains("world-isolated and free"), "got:\n{text}");
+    assert!(text.contains("isolation: region"), "got:\n{text}");
+    assert!(text.contains("region-isolated and free"), "got:\n{text}");
+}
+
+/// ADR 0017 §6 through ADR 0008 §6: a report that still said `world` after the
+/// world was gone would over-claim by exactly the tests that moved, so
+/// `--explain` names the contention *and* what kind it is.
+///
+/// The two tests here contend only because they name one region label, which is
+/// a contention their author can remove by renaming one. Saying `shared` and
+/// stopping would leave that indistinguishable from needing a database.
+#[test]
+fn explain_separates_a_region_label_contention_from_a_real_one() {
+    // The `cell` atoms reach the footprint through a written row: ADR 0017 §2
+    // closed every route that carried a cell out of its region, so an
+    // annotation is the only way one gets there. The call is outside the region
+    // because a region discharges its own label.
+    let dir = project(
+        "fn touches(n: Int) -> Int / {cell.read[table], cell.write[table]} = n\n\
+         test \"a\" {\n  \
+           let seen = with_cell[table](1) { c -> { cell_set(c, 2); cell_get(c) } };\n  \
+           assert_eq(touches(seen), 2)\n}\n\
+         test \"b\" {\n  \
+           let seen = with_cell[table](3) { c -> { cell_set(c, 4); cell_get(c) } };\n  \
+           assert_eq(touches(seen), 4)\n}\n\
+         test \"pure\" { assert_eq(1, 1) }\n",
+    );
+    let text = stdout_of(
+        &ply(dir.path())
+            .args(["test", "--explain"])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(
+        text.contains("isolation: shared {cell.read[table], cell.write[table]} (region labels)"),
+        "a label contention must say it is one:\n{text}"
+    );
+    assert!(text.contains("isolation: region"), "got:\n{text}");
+    assert!(
+        text.contains("1 of 3 region-isolated and free"),
+        "two writers of one label are not isolated any more:\n{text}"
+    );
+    assert!(
+        text.contains("2 of them only over a region label"),
+        "the cost of losing the fork is a number on every run:\n{text}"
+    );
+    assert!(
+        text.contains("group 1 ·"),
+        "two writers of one label may not share a group:\n{text}"
+    );
+
+    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    assert_eq!(v["selection"]["parallelism"]["region_contended"], 2);
+    assert_eq!(v["selection"]["parallelism"]["isolated"], 1);
 }
 
 /// The milestone's claim has to be a number a project can watch, on every run
@@ -420,7 +473,7 @@ fn a_run_reports_how_many_tests_cannot_disturb_another() {
         .iter()
         .find(|t| t["name"] == "pure")
         .expect("the pure test");
-    assert_eq!(pure["isolation"], "world");
+    assert_eq!(pure["isolation"], "region");
     assert_eq!(pure["shared_atoms"].as_array().unwrap().len(), 0);
 }
 
@@ -1554,13 +1607,13 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
 // --- the failure artifact ---------------------------------------------------
 
 #[test]
-fn test_json_carries_schema_version_three_and_a_ranked_suspect_object() {
+fn test_json_carries_schema_version_four_and_a_ranked_suspect_object() {
     let dir = project(RED);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v = json_of(&out);
 
-    assert_eq!(v["schema_version"], 3);
+    assert_eq!(v["schema_version"], 4);
     let f = &v["failures"][0];
     assert_eq!(f["key"], "m.balance never goes negative");
     assert_eq!(f["name"], "balance never goes negative");
@@ -2148,6 +2201,75 @@ fn engine_both_does_not_call_a_refusal_a_divergence() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
     assert!(!stdout_of(&out).contains("E0503"), "{}", stdout_of(&out));
+}
+
+/// …and says so, rather than letting a green run under two engines be read as
+/// two engines having agreed about it.
+///
+/// This is ADR 0017 §6's reporting rule applied to the oracle instead of to the
+/// schedule: the tests `--engine both` cannot audit are exactly the ones that
+/// bind a continuation, which is the construct a memory-model change moves, so a
+/// count that silently includes them over-claims in the one place it matters.
+#[test]
+fn engine_both_reports_the_tests_it_could_not_audit() {
+    let dir = project(MULTI_SHOT);
+    let out = ply(dir.path())
+        .args(["test", "--engine", "both", "--json", "--no-cache"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(v["audit"]["compared"], 0, "{v}");
+    assert_eq!(v["audit"]["unaudited"], 1, "{v}");
+    assert_eq!(v["results"][0]["audited"], false, "{v}");
+
+    let text = stdout_of(
+        &ply(dir.path())
+            .args(["test", "--engine", "both", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    assert!(text.contains("audited 0 of 1"), "{text}");
+    assert!(text.contains("ran on one engine only"), "{text}");
+}
+
+/// A test both engines ran is counted as audited, or the count would be a
+/// constant rather than a coverage.
+#[test]
+fn engine_both_counts_a_test_two_engines_ran() {
+    let dir = project("test \"plain\" { assert_eq(1 + 1, 2) }\n");
+    let v = json_of(
+        &ply(dir.path())
+            .args(["test", "--engine", "both", "--json", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["audit"]["compared"], 1, "{v}");
+    assert_eq!(v["audit"]["unaudited"], 0, "{v}");
+    assert_eq!(v["results"][0]["audited"], true, "{v}");
+}
+
+/// A run with one engine reports no coverage at all. Zero would be a claim that
+/// an oracle ran and covered nothing, which is a different and false statement.
+#[test]
+fn a_single_engine_run_reports_no_audit_coverage() {
+    let dir = project(MULTI_SHOT);
+    for engine in ["machine", "treewalk"] {
+        let v = json_of(
+            &ply(dir.path())
+                .args(["test", "--engine", engine, "--json", "--no-cache"])
+                .output()
+                .unwrap(),
+        );
+        assert!(v["audit"].is_null(), "engine {engine}: {v}");
+        assert!(v["results"][0]["audited"].is_null(), "engine {engine}: {v}");
+        let text = stdout_of(
+            &ply(dir.path())
+                .args(["test", "--engine", engine, "--no-cache"])
+                .output()
+                .unwrap(),
+        );
+        assert!(!text.contains("audited"), "engine {engine}: {text}");
+    }
 }
 
 #[test]

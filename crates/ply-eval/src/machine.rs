@@ -9,9 +9,9 @@
 //! [`step`]: Machine::step
 
 use crate::builtins::{self, Builtin, Step};
-use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower};
+use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower, lower_fn};
 use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
-use crate::env::Env;
+use crate::env::{Env, Slot};
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::host::{
     HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, MachineId, Pending, attribute,
@@ -23,6 +23,7 @@ use crate::interp::{
 };
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
 use crate::memo::{Lookup, Memo};
+use crate::rc::Own;
 use crate::region::{self, Region, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
@@ -696,8 +697,21 @@ impl<'a> Machine<'a> {
         match &code.kind {
             NodeKind::Lit(lit) => self.go_return(literal(lit)),
 
+            // The reference-counting pass says whether this is the last read of
+            // a binding of this scope. When it is, the value is moved out rather
+            // than cloned — the whole of what makes a uniquely-owned value
+            // reachable by the operation that could rewrite it. `env` is this
+            // arm's to drop, and `take_unique` refuses unless this scope is the
+            // only path to the binding, so an emptied binding is unobservable.
             NodeKind::Var(q) => {
-                let value = self.lookup(q, &env, module)?;
+                let mut env = env;
+                let value = match (code.own, q.is_bare()) {
+                    (Own::Owned, true) => match env.take_unique(q.symbol()) {
+                        Some(value) => value,
+                        None => self.lookup(q, &env, module)?,
+                    },
+                    _ => self.lookup(q, &env, module)?,
+                };
                 self.go_return(value);
             }
 
@@ -741,10 +755,11 @@ impl<'a> Machine<'a> {
             }
 
             NodeKind::App { func, args } => {
+                let carried = crate::rc::carry(&env, !args.is_empty());
                 self.push(
                     Frame::AppCallee {
                         args: args.clone(),
-                        env: env.clone(),
+                        env: carried,
                         module,
                         span,
                     },
@@ -797,12 +812,13 @@ impl<'a> Machine<'a> {
                 if fields.is_empty() {
                     self.go_return(Value::Record(Arc::new(BTreeMap::new())));
                 } else {
+                    let carried = crate::rc::carry(&env, fields.len() > 1);
                     self.push(
                         Frame::RecordField {
                             done: Vec::with_capacity(fields.len()),
                             fields: fields.clone(),
                             next: 1,
-                            env: env.clone(),
+                            env: carried,
                             module,
                         },
                         span,
@@ -826,12 +842,13 @@ impl<'a> Machine<'a> {
                 if items.is_empty() {
                     self.go_return(Value::list(Vec::new()));
                 } else {
+                    let carried = crate::rc::carry(&env, items.len() > 1);
                     self.push(
                         Frame::ListItem {
                             done: Vec::with_capacity(items.len()),
                             items: items.clone(),
                             next: 1,
-                            env: env.clone(),
+                            env: carried,
                             module,
                         },
                         span,
@@ -1576,8 +1593,8 @@ impl<'a> Machine<'a> {
                 env,
                 module,
             } => {
-                let (body, env, module) = (lower(body), env.clone(), *module);
                 let params: Vec<Symbol> = params.clone();
+                let (body, env, module) = (lower_fn(&params, body), env.clone(), *module);
                 self.enter_code(closure, &params, body, env, module, args, span)
             }
             ClosureKind::Ctor { name, arity } => {
@@ -1708,17 +1725,19 @@ impl<'a> Machine<'a> {
         module: usize,
     ) -> Result<(), Diagnostic> {
         if let Some(stmt) = stmts.get(next) {
-            let code = match stmt {
-                CodeStmt::Let { value, .. } => value.clone(),
-                CodeStmt::Expr(e) => e.clone(),
-            };
+            let code = stmt.code().clone();
+            // The continuation carries only what it still reads. The statement
+            // itself evaluates under the full scope, so this is a `drop` placed
+            // *before* the operation that could reuse what it frees rather than
+            // after it — which is the ordering the whole reuse story rests on.
+            let rest = scope.release(stmt.dead());
             let span = code.span;
             self.push(
                 Frame::BlockStep {
                     stmts,
                     next: next + 1,
                     tail,
-                    scope: scope.clone(),
+                    scope: rest,
                     module,
                 },
                 span,
@@ -1867,10 +1886,16 @@ impl<'a> Machine<'a> {
     /// Locals, then the module's own items and its selective imports, then the
     /// prelude — the resolution order the whole language is specified in.
     fn lookup(&mut self, q: &QName, env: &Env, module: usize) -> Result<Value, Diagnostic> {
-        if q.is_bare()
-            && let Some(v) = env.lookup(q.symbol())
-        {
-            return Ok(v.clone());
+        if q.is_bare() {
+            match env.lookup(q.symbol()) {
+                Some(Slot::Live(v)) => return Ok(v.clone()),
+                // The reference-counting pass called this binding dead and it
+                // was read anyway. Falling through would find an outer binding
+                // of the same name, or the prelude, and answer with a value
+                // nobody wrote — so it stops here, and it is Ply's fault.
+                Some(Slot::Released) => return Err(err_released(q, self.current)),
+                None => {}
+            }
         }
         if let Some(name) = self.global(module, Namespace::Value, q)
             && let Some(v) = self.definition(&name)
@@ -1896,17 +1921,17 @@ impl<'a> Machine<'a> {
             return Some(v.clone());
         }
         let slot = self.fns.get(name)?;
+        let params: Vec<Symbol> = slot
+            .def
+            .params
+            .iter()
+            .map(|p| p.name.name.clone())
+            .collect();
         let closure = Closure {
             name: Some(name.clone()),
             kind: ClosureKind::Code {
-                params: Rc::new(
-                    slot.def
-                        .params
-                        .iter()
-                        .map(|p| p.name.name.clone())
-                        .collect(),
-                ),
-                body: lower(&slot.def.body),
+                body: lower_fn(&params, &slot.def.body),
+                params: Rc::new(params),
                 env: Env::empty(),
                 module: slot.module,
             },
@@ -2128,6 +2153,23 @@ impl HostRuntime for Unbound {
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         Err(err_unbound_runtime(&format!("block on `{pending}`")))
     }
+}
+
+/// A binding the reference-counting pass dropped, read afterwards.
+///
+/// Ply's fault, not the program's, and loud on purpose: the alternative is a
+/// lookup that walks past the released binding, finds an outer one of the same
+/// name or a prelude item, and answers with a value the program never wrote.
+#[cold]
+#[inline(never)]
+fn err_released(q: &QName, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("`{q}` was read after reference counting dropped it"),
+    )
+    .primary(span, "this binding was released before this read")
+    .note("the last-use analysis in `ply_eval::rc` called this binding dead and something read it anyway")
+    .note("reaching this is a defect in Ply, not in the program: please report it with the definition that produced it")
 }
 
 #[cold]

@@ -107,7 +107,13 @@ pub const RUNTIME_VERSION: &str = "0.11.2";
 /// checked, so a clause answering a concrete type for an operation declared
 /// `-> a` is `E0201` where it used to be accepted. A cached interface written
 /// before that is an interface for a program this front end refuses.
-pub const FRONTEND_VERSION: &str = "0.14.0";
+/// 0.15.0 is ADR 0017's region surface: `with_region[r] { .. }` enters
+/// inference with a brand that the escape check reads off resolved types, a
+/// `with_cell[r]` written under a region of its name is discharged and checked
+/// at the region rather than at itself, and a variant field declared as a
+/// concrete `Cell` is `E0446` where it used to be accepted. A cached interface
+/// written before that is an interface for a program this front end refuses.
+pub const FRONTEND_VERSION: &str = "0.15.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///

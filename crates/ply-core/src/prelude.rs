@@ -48,6 +48,11 @@ pub const SIMULATED: &[&str] = &[TASK, CLOCK, RANDOM];
 /// `E0413`.
 pub const TASK_TYPE: &str = "Task";
 
+/// The operation that hands a value to another task. Named here because the
+/// region escape check has to recognize it: everything else a region can leak
+/// through shows up in a type, and this one shows up in an argument.
+pub const SPAWN_OP: &str = "spawn";
+
 pub fn is_prelude_effect(name: &Symbol) -> bool {
     NAMES.contains(&name.as_str())
 }

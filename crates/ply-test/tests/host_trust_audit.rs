@@ -181,7 +181,7 @@ fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>
 ///
 /// Readers-writers over footprints is what decides which tests may run beside
 /// which, and ADR 0008 §6 makes it the *only* isolation a host-backed test has —
-/// world isolation being inapplicable to a socket. So the conflict graph is the
+/// region isolation being inapplicable to a socket. So the conflict graph is the
 /// last line, and it is drawn entirely from a claim nothing verifies. Here both
 /// tests land in one group and are therefore free to run simultaneously against
 /// a resource that one of them is mutating.
@@ -480,7 +480,7 @@ fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_o
 /// binding.
 ///
 /// The test's declared footprint is then empty: it is `det`, it is scheduled as
-/// world-isolated and trivially parallel, and what it actually does is a
+/// region-isolated and trivially parallel, and what it actually does is a
 /// syscall. That is the failure mode ADR 0011 §7 arms E0427 against — the static
 /// picture and the dynamic one disagree — and it needs no dishonest handler at
 /// all, only a missing clause.

@@ -968,6 +968,19 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
+    /// `with_region[r] { body }`. A lexical allocation scope whose brand `r`
+    /// appears in the types of the values allocated in it, so that a value
+    /// cannot outlive the scope that allocated it.
+    ///
+    /// `with_cell[r]` is the special case where the value allocated is a cell:
+    /// written inside `with_region[r]` the cell belongs to the region and lives
+    /// as long as it does, and written on its own it opens a region of its own,
+    /// which is why no existing program moves.
+    WithRegion {
+        region: Ident,
+        body: Box<Expr>,
+    },
+
     /// `simulate { body }`. A `handle` with a fixed clause set: it installs the
     /// seeded scheduler over `task`, `clock` and `random`, and its own row gains
     /// `sim.read`, the seed dependency. There is no seed in the syntax — one
