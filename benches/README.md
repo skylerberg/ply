@@ -466,6 +466,53 @@ layer is one flag moved rather than one flag moved and two rows selected; and
 where the throughput curve is flat, the row is the lowest concurrency within 5%
 of the best rather than whichever point noise favoured.
 
+## What `regions` adds
+
+Every other section prices something that has been built. `regions` prices
+something that has not: ADR 0017 §6 removes the forkable world, and the one
+thing that costs is tests which parallelize today *because* each got its own
+world and would be grouped by footprint conflict without one.
+
+```
+cargo run --release -p ply-corpus -- regions examples --jobs 8
+cargo run --release -p ply-corpus -- regions <corpus>... --jobs 8 --json
+cargo run --release -p ply-corpus -- regions --hypothetical 176:1,176:8,176:176
+```
+
+It colours the same test set twice — once with the world-backed exemption
+`ply_test::shared_footprint` applies today, once without it — and reports the
+group count, the critical path and a modelled makespan for each.
+
+Four things about it are load-bearing:
+
+**Only `cell` moves.** `ply_test::WORLD_BACKED` is exactly `["cell"]`, so that
+exemption is the whole of what forking buys the scheduler. `AMBIENT` —
+`sim.read`, a seed — is a claim about inputs rather than about memory and stays
+exempt on both sides; dropping it too would report a loss ADR 0017 does not
+cause, and every simulated test in the corpus would be in the number.
+
+**The colouring is the runner's.** `regions::colour` is
+`ply_test::group_by_conflict` with the projection lifted out, and both a unit
+test and `tests/region_isolation_cost.rs` assert it reproduces that function
+exactly on the projection `ply-test` applies. On `examples/` it reproduces the
+five groups and the `[179, 1, 2, 2, 2]` sizes `ply test --explain` prints.
+
+**A group is a barrier.** `ply_test::run` finishes one group before starting the
+next and builds a worker per pool thread per group, so a schedule is not
+`sum / jobs` and an extra group is not free. `regions::makespan` replays the
+counter `execute_group` hands indices out on, and charges the worker.
+
+**The modelled absolute is low and the ratio is not.** Per-test durations are
+taken at one job, so they carry none of the contention eight concurrent workers
+put on the allocator; the modelled makespan runs 50–95% under the measured one
+and the run prints both. Both colourings are modelled from the same durations,
+so the error is in the absolutes and cancels out of the ratio between them.
+
+`--hypothetical cells:labels` appends a corpus that does not exist — `cells`
+tests carrying a `cell` atom spread over `labels` region labels — because the
+measured corpora carry none at all and a risk that is only ever reported as
+zero is a risk nobody can size.
+
 ## Reproducing a corpus
 
 A corpus is a pure function of its spec and seed, both recorded in the

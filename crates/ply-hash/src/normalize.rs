@@ -96,6 +96,7 @@ pub(crate) mod tag {
     pub const E_HANDLE: u8 = 63;
     pub const E_WITH_CELL: u8 = 64;
     pub const E_SIMULATE: u8 = 65;
+    pub const E_WITH_REGION: u8 = 66;
 
     pub const S_LET: u8 = 70;
     pub const S_EXPR: u8 = 71;
@@ -873,6 +874,11 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.expr(body);
                 self.values.truncate(mark);
             }
+            ExprKind::WithRegion { region, body } => {
+                self.tag(tag::E_WITH_REGION);
+                self.strv(&region.name);
+                self.expr(body);
+            }
             ExprKind::Simulate { body } => {
                 self.tag(tag::E_SIMULATE);
                 self.expr(body);
@@ -1076,6 +1082,7 @@ fn is_pure(e: &Expr) -> bool {
         | ExprKind::Perform { .. }
         | ExprKind::Handle { .. }
         | ExprKind::WithCell { .. }
+        | ExprKind::WithRegion { .. }
         | ExprKind::Simulate { .. } => false,
         ExprKind::Lit(_) | ExprKind::Var(_) => true,
         ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
@@ -1160,6 +1167,7 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
         ExprKind::WithCell {
             init, binder, body, ..
         } => names.contains(&binder.name) || mentions(init, names) || mentions(body, names),
+        ExprKind::WithRegion { body, .. } => mentions(body, names),
         ExprKind::Simulate { body } => mentions(body, names),
     })
 }

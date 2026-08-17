@@ -232,62 +232,180 @@ fn the_persistent_write_cannot_resurrect_an_id_from_a_sibling() {
 
 // ------------------------------------------- 2. the machine on real source
 
-const SMUGGLE: &str = r#"
-test "a closure carries the cell out of its region" {
-  let read = with_cell[log](41) { c -> || cell_get(c) };
-  assert_eq(read(), 41)
+/// The carriers that used to take a cell out of its region, and the one that
+/// still can.
+///
+/// A closure was the last one the region check did not inspect: it looked at the
+/// body's *type*, and a function type hid the cell in its effect row. ADR 0017
+/// §2 closed it, along with the record-of-closures, operation and store routes —
+/// `ply-core/tests/region_escape_audit.rs` is where each is pinned as an error.
+/// What is left is a *continuation* parked in an enclosing region's cell: its
+/// row is erased where the variant field's function type is declared, so no type
+/// downstream of the constructor mentions the region. That is ADR 0005 required
+/// test 6, it is a success rather than an error, and it is the carrier this
+/// section now attacks with.
+const ESCAPED: &str = r#"
+effect amb { read flip[coin]() -> Bool }
+
+type Saved = Nothing | Just((Bool) -> Int)
+
+fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
+  let inner = with_cell[log](41) { c ->
+    handle {
+      let b = amb.flip[coin]();
+      if b { cell_get(c) } else { 0 }
+    } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 }, return x -> x }
+  };
+  assert_eq(inner, 0);
+  cell_get(s)
+} }
+
+fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
+
+test "a continuation carries the cell out of its region" {
+  assert_eq(resume_it(parked()), 41)
 }
 
-test "a record of closures carries a readable and a writable view out" {
+test "two regions in one test are two cells" {
+  let bumped = with_cell[log](0) { c -> {
+    cell_set(c, cell_get(c) + 1);
+    cell_set(c, cell_get(c) + 1);
+    cell_set(c, cell_get(c) + 1);
+    cell_get(c)
+  } };
+  assert_eq(bumped, 3);
+  let fresh = with_cell[log](0) { c -> cell_get(c) };
+  assert_eq(fresh, 0)
+}
+"#;
+
+/// Every carrier ADR 0017 §2 names is refused, including the closure route it
+/// lists first among the ways this could go wrong. Each of these ran before the
+/// brand looked at a function type's effect row.
+#[test]
+fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
+    for (carrier, src) in [
+        (
+            "a closure",
+            r#"test "smuggle" {
+  let read = with_cell[log](41) { c -> || cell_get(c) };
+  assert_eq(read(), 41)
+}"#,
+        ),
+        (
+            "a record of closures",
+            r#"test "smuggle" {
   let ops = with_cell[log](1) { c -> {get: || cell_get(c), put: |v| cell_set(c, v)} };
   let get = ops.get;
   let put = ops.put;
   put(9);
   assert_eq(get(), 9)
-}
-
-test "a smuggled closure writes the world the test is running in" {
+}"#,
+        ),
+        (
+            "a closure that only writes",
+            r#"test "smuggle" {
   let bump = with_cell[log](0) { c -> || cell_set(c, cell_get(c) + 1) };
-  bump();
-  bump();
-  bump();
-  let read = with_cell[log](0) { c -> || cell_get(c) };
-  assert_eq(read(), 0)
+  bump()
+}"#,
+        ),
+    ] {
+        let diags = Compiled::rejected(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("escapes its")),
+            "{carrier} must not carry a cell out of its region: {diags:#?}"
+        );
+    }
 }
-"#;
 
-/// A closure is the one carrier the region check does not inspect: it looks at
-/// the body's *type*, and a function type hides the cell in its row. So this
-/// runs, and what it must not do is read anything but this run's own world.
+/// The one carrier left, run. What it must not do is read anything but this
+/// run's own world.
+///
+/// The continuation half is machine-only: the tree-walker refuses a clause that
+/// binds a continuation (`E0504`, ADR 0005 required test 3), so `--engine both`
+/// has nothing to say about it and this is the oracle instead.
 #[test]
-fn a_cell_smuggled_out_of_its_region_through_a_closure_reads_this_runs_world() {
-    let compiled = Compiled::new(SMUGGLE);
+fn a_cell_carried_out_through_a_continuation_reads_this_runs_world() {
+    let compiled = Compiled::new(ESCAPED);
+    let index = compiled.index_of("a continuation carries the cell out of its region");
     compiled
-        .run_both("a closure carries the cell out of its region")
-        .expect("the smuggled read answers the region's initial value");
+        .machine()
+        .eval_test(index)
+        .expect("the resumed read answers the region's initial value");
     compiled
-        .run_both("a record of closures carries a readable and a writable view out")
-        .expect("a smuggled write is visible to a smuggled read of the same cell");
-    compiled
-        .run_both("a smuggled closure writes the world the test is running in")
+        .run_both("two regions in one test are two cells")
         .expect("a second region is a second cell, not the first one again");
 }
 
-/// The escape is visible in the footprint, which is what the scheduler then
-/// exempts. Worth pinning: ADR 0005 §5 says a `cell` atom in a test's footprint
-/// needs a captured continuation, and a closure reaches it without one.
+/// A nullary definition with an empty published row is a constant and the
+/// evaluators memoize it. `parked` is one — `with_cell` discharges its own
+/// atoms, so its footprint is `{}` — and its *value* is a key into the world
+/// that ran it. Remembering it hands the next test a cell its own world never
+/// allocated, which is the cross-test interference this whole file exists to
+/// rule out.
+///
+/// `E0505` catches it when the id is absent. It would not catch it when the
+/// next run has already allocated that id, which is the same undetectable half
+/// `a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read`
+/// records — so the memo has to refuse the value rather than rely on the check.
 #[test]
-fn a_smuggled_cell_leaves_its_atom_in_the_tests_footprint() {
-    let compiled = Compiled::new(SMUGGLE);
+fn a_constant_whose_value_reaches_a_cell_is_not_remembered_across_tests() {
+    let compiled = Compiled::new(ESCAPED);
+    let mut machine = compiled.machine();
+    let index = compiled.index_of("a continuation carries the cell out of its region");
+    for run in 0..3 {
+        machine
+            .eval_test(index)
+            .unwrap_or_else(|d| panic!("run {run} must evaluate `parked` afresh: {d:#?}"));
+    }
+
+    // The sanity half: a constant whose value reaches no cell is still memoized,
+    // so this refuses the value rather than the rule.
+    let plain = Compiled::new(
+        r#"
+fn table() -> List<Int> = [1, 2, 3]
+
+test "a plain constant" { assert_eq(len(table()), 3) }
+"#,
+    );
+    let mut machine = plain.machine();
+    let index = plain.index_of("a plain constant");
+    machine.eval_test(index).expect("passes");
+    machine.eval_test(index).expect("and again");
+}
+
+/// A `cell` atom reaching a published footprint is what the scheduler colours
+/// on, and with every escape route closed a *written row* is the only way one
+/// gets there. ADR 0005 §5 said a `cell` atom in a footprint needed a captured
+/// continuation; it now needs an annotation, because the continuation's row is
+/// erased where the variant field is declared.
+#[test]
+fn a_declared_cell_atom_is_what_reaches_a_tests_footprint() {
+    let compiled = Compiled::new(
+        r#"
+fn touches(n: Int) -> Int / {cell.read[log]} = n
+fn writes(n: Int) -> Int / {cell.read[log], cell.write[log]} = n
+
+test "a read" {
+  let seen = with_cell[log](41) { c -> cell_get(c) };
+  assert_eq(touches(seen), 41)
+}
+
+test "a read and a write" {
+  let seen = with_cell[log](1) { c -> { cell_set(c, 9); cell_get(c) } };
+  assert_eq(writes(seen), 9)
+}
+"#,
+    );
     let atoms: Vec<String> = compiled
-        .footprint("a closure carries the cell out of its region")
+        .footprint("a read")
         .atoms()
         .map(|a| a.to_string())
         .collect();
     assert_eq!(atoms, vec!["cell.read[log]".to_string()]);
 
     let mixed: Vec<String> = compiled
-        .footprint("a record of closures carries a readable and a writable view out")
+        .footprint("a read and a write")
         .atoms()
         .map(|a| a.to_string())
         .collect();
@@ -295,19 +413,29 @@ fn a_smuggled_cell_leaves_its_atom_in_the_tests_footprint() {
         mixed,
         vec!["cell.read[log]".to_string(), "cell.write[log]".to_string()]
     );
+
+    // And a region discharges its own label: the same atoms performed inside the
+    // region never reach the footprint at all.
+    let discharged = Compiled::new(
+        r#"
+test "inside the region" {
+  with_cell[log](41) { c -> { cell_set(c, 9); assert_eq(cell_get(c), 9) } }
+}
+"#,
+    );
+    assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
 
 /// Two runs of one machine allocate the *same* ids, because each forks the same
 /// base world. That is the collision of
 /// `a_foreign_id_is_answered_by_the_reading_world_and_never_by_its_owner`,
 /// reached through the front door — so the second run must start from the seed
-/// and not from whatever the first left behind, even though the first run
-/// smuggled a live cell into a closure.
+/// and not from whatever the first left behind.
 #[test]
 fn a_second_run_of_one_machine_reuses_the_ids_and_none_of_the_state() {
-    let compiled = Compiled::new(SMUGGLE);
+    let compiled = Compiled::new(ESCAPED);
     let mut machine = compiled.machine();
-    let index = compiled.index_of("a smuggled closure writes the world the test is running in");
+    let index = compiled.index_of("two regions in one test are two cells");
 
     machine.eval_test(index).expect("the first run passes");
     let first: Vec<(CellId, String)> = machine
@@ -329,14 +457,19 @@ fn a_second_run_of_one_machine_reuses_the_ids_and_none_of_the_state() {
     assert_eq!(second, first, "the ids repeat and the values start over");
 }
 
-/// A cell in a *constructor argument* is not caught by the region check at all:
-/// the variant's field type holds the `Cell`, so the region's result type is
-/// `Held` and mentions no region. The escape therefore happens, and what has to
-/// hold is the same thing that holds for every other carrier — it is a key into
-/// the world this run owns.
+/// A cell in a *constructor argument* used to be the one carrier the region
+/// check could not see: the variant's field type holds the `Cell`, so the
+/// region's result type was `Held` and mentioned no region.
+///
+/// ADR 0017 §2 closes it, and it is closed at the **declaration** rather than at
+/// the escape. A variant's field types are converted once for the whole program,
+/// so the region argument a written `Cell<Int>` gets is a single variable that
+/// no scheme quantifies — there is no later point at which the brand could be
+/// looked at, which is why the hole existed and why refusing the declaration is
+/// what closes it.
 #[test]
-fn a_cell_in_a_constructor_argument_escapes_its_region_and_still_reads_its_own_world() {
-    let compiled = Compiled::new(
+fn a_cell_in_a_constructor_argument_is_refused_where_the_field_is_declared() {
+    let diags = Compiled::rejected(
         r#"
 type Held = Held(Cell<Int>)
 
@@ -346,23 +479,12 @@ test "a constructor carries the cell out of its region" {
 }
 "#,
     );
-    compiled
-        .run_both("a constructor carries the cell out of its region")
-        .expect("the region check does not see a cell inside a variant's field");
-
-    let mut machine = compiled.machine();
-    for _ in 0..2 {
-        machine.eval_test(0).expect("the test passes");
-        assert_eq!(
-            machine
-                .world()
-                .cells()
-                .map(|(_, v)| v.render())
-                .collect::<Vec<_>>(),
-            vec!["2".to_string()],
-            "each run wrote its own cell and inherited nothing"
-        );
-    }
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == ply_span::codes::REGION_ESCAPE),
+        "a declared `Cell` field is a brand with nowhere to appear: {diags:#?}"
+    );
 }
 
 /// The boundary of that hole: the region variable in a declared `Cell<T>` field
@@ -543,28 +665,26 @@ fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
 /// Nothing in the tree does that, and this pins the half of it the runtime can
 /// detect — an id the new world does not hold is named rather than read.
 ///
+/// The carrier is a continuation parked in an enclosing region's cell, because
+/// that is the only one ADR 0017 §2's brand does not catch: the row is erased
+/// where the variant field's function type is declared.
+///
 /// The other half is not detectable and must not be relied on: had the second
-/// run already allocated `#0`, the smuggled closure would have read *that* cell
-/// and answered plausibly. A `CellId` carries no lineage, so "nothing carries a
-/// value across an entry point" is the invariant, not "the runtime will catch
-/// it".
+/// run already allocated `#0`, the resumed continuation would have read *that*
+/// cell and answered plausibly. A `CellId` carries no lineage, so "nothing
+/// carries a value across an entry point" is the invariant, not "the runtime
+/// will catch it".
 #[test]
 fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
-    let compiled = Compiled::new(
-        r#"
-fn leak() = with_cell[log](11) { c -> |x: Int| cell_get(c) + x }
-
-fn use_it(f) = f(0)
-"#,
-    );
+    let compiled = Compiled::new(ESCAPED);
     let mut machine = compiled.machine();
 
-    let leaked = machine
-        .call("m.leak", vec![], ply_span::Span::DUMMY)
-        .expect("a closure over the region's cell");
+    let parked = machine
+        .call("m.parked", vec![], ply_span::Span::DUMMY)
+        .expect("a continuation over the region's cell");
     let smuggled = machine
-        .call("m.use_it", vec![leaked], ply_span::Span::DUMMY)
-        .expect_err("the second run has no cell #0");
+        .call("m.resume_it", vec![parked], ply_span::Span::DUMMY)
+        .expect_err("the second run has no cell #1");
 
     assert_eq!(smuggled.code, ply_span::codes::INTERNAL_ERROR);
     assert!(
@@ -609,7 +729,7 @@ fn separate_tests_write_the_very_same_cell_id_in_their_own_worlds() {
 /// impossible.
 #[test]
 fn a_seeded_base_world_survives_every_test_that_forks_it() {
-    let compiled = Compiled::new(SMUGGLE);
+    let compiled = Compiled::new(ESCAPED);
     let mut seed = World::new();
     let seeded = seed.alloc(Value::Int(1_000));
 
@@ -618,8 +738,8 @@ fn a_seeded_base_world_survives_every_test_that_forks_it() {
 
     for _ in 0..3 {
         for name in [
-            "a closure carries the cell out of its region",
-            "a smuggled closure writes the world the test is running in",
+            "a continuation carries the cell out of its region",
+            "two regions in one test are two cells",
         ] {
             let index = compiled.index_of(name);
             machine.eval_test(index).expect("the test passes");

@@ -850,12 +850,13 @@ mod tests {
     #[test]
     fn read_and_write_stay_identifiers() {
         assert_eq!(
-            kinds("read write return with_cell"),
+            kinds("read write return with_cell with_region"),
             vec![
                 TokenKind::Ident(Symbol::new("read")),
                 TokenKind::Ident(Symbol::new("write")),
                 TokenKind::Ident(Symbol::new("return")),
                 TokenKind::Ident(Symbol::new("with_cell")),
+                TokenKind::Ident(Symbol::new("with_region")),
                 TokenKind::Eof,
             ]
         );

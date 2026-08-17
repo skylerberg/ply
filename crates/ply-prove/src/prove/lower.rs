@@ -480,6 +480,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             ExprKind::Perform { .. }
             | ExprKind::Handle { .. }
             | ExprKind::WithCell { .. }
+            | ExprKind::WithRegion { .. }
             | ExprKind::Simulate { .. } => {
                 self.blocked(Blocker::Region);
                 self.terms.sym(None)

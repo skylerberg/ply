@@ -204,7 +204,7 @@ pub fn perform_args(
                 done,
                 args: Rc::clone(args),
                 next: next + 1,
-                env: env.clone(),
+                env: crate::rc::carry(env, next + 1 < args.len()),
                 module,
                 span,
             });

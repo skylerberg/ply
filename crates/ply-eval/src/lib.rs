@@ -13,6 +13,7 @@
 // intended design, not an oversight the lint should keep reporting.
 #![allow(clippy::arc_with_non_send_sync)]
 
+pub mod arena;
 pub mod builtins;
 pub mod code;
 pub mod cont;
@@ -28,13 +29,19 @@ pub mod machine;
 pub mod map;
 mod memo;
 mod pool;
+pub mod rc;
 pub mod region;
+pub mod region_kind;
 pub mod sched;
 pub mod sim;
 pub mod trace;
 mod value;
 pub mod world;
 
+// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the
+// allocator's own vocabulary and each of those names means something else
+// somewhere in this crate.
+pub use arena::{Arena, RegionKind};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Code, Node, NodeKind, lower};
 pub use cont::{
@@ -44,7 +51,7 @@ pub use differential::{
     Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
     is_machine_only, machine_only_clause, machine_only_clauses,
 };
-pub use env::Env;
+pub use env::{Env, Slot as ScopeSlot};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
@@ -59,6 +66,8 @@ pub use explore::{
 pub use interp::Interp;
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{DEFAULT_MAX_FRAMES, Machine, Progress};
+pub use rc::{Own, Stats as RcStats};
+pub use region_kind::Regions;
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
     Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,

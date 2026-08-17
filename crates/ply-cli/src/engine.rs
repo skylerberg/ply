@@ -930,7 +930,7 @@ impl Literals {
                     stack.push(init);
                     stack.push(body);
                 }
-                ExprKind::Simulate { body } => stack.push(body),
+                ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => stack.push(body),
             }
         }
     }

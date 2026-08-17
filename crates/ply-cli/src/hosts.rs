@@ -10,7 +10,7 @@
 //! - **Hermetic is the default and the flag is the only way out.** No
 //!   environment variable, no config file: a reviewer reads `--host` in the
 //!   command or the run reached nothing.
-//! - **A host-backed test is not world-isolated.** A socket cannot be forked, so
+//! - **A host-backed test is not isolated.** A socket lives outside every region, so
 //!   `--explain` says `host` and the trivially-parallel count excludes it,
 //!   rather than the count quietly over-claiming.
 
@@ -613,7 +613,7 @@ where
 ///
 /// `Parallelism` is computed from footprints alone, so under a real binding it
 /// counts a host-backed test as trivially parallel. It is not: a socket cannot
-/// be forked, world isolation does not apply, and footprint conflict grouping is
+/// be forked, region isolation does not apply, and footprint conflict grouping is
 /// the only isolation such a test has. Correcting the count here is the
 /// difference between an honest `isolated: n of m` and one that silently
 /// over-claims — which is the exact failure mode this milestone is built to
@@ -631,14 +631,14 @@ pub struct Counts {
 
 impl Counts {
     /// `tests` is every test the run reports on, paired with whether the raw
-    /// classification called it world-isolated.
+    /// classification called it region-isolated.
     pub fn of<'a>(hosts: &Hosts, tests: impl IntoIterator<Item = (&'a Footprint, bool)>) -> Counts {
         let mut counts = Counts::default();
-        for (footprint, world) in tests {
+        for (footprint, isolated) in tests {
             counts.total += 1;
             if hosts.reaches(footprint) {
                 counts.host += 1;
-            } else if world {
+            } else if isolated {
                 counts.isolated += 1;
             } else {
                 counts.shared += 1;
@@ -1626,7 +1626,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     }
 
     /// A footprint that meets the binding is host-backed and therefore not
-    /// world-isolated, however isolated its atoms would otherwise make it.
+    /// isolated, however isolated its atoms would otherwise make it.
     #[test]
     fn a_host_backed_test_leaves_the_trivially_parallel_count() {
         let program = check(DB);

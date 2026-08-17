@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use ply_corpus::bench;
 use ply_corpus::build::generate;
 use ply_corpus::measure;
+use ply_corpus::regions;
 use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write;
 use ply_eval::{Engine, EngineChoice};
@@ -63,6 +64,38 @@ enum Command {
     /// and the engine substitution. Writes the measurement half of a
     /// `ply_corpus::w6::Report`, which `w6` then judges.
     W6Ladder(W6LadderArgs),
+    /// Price ADR 0017 §6 before it is built: colour the same test set with and
+    /// without the world-backed exemption, and report what the second colouring
+    /// costs in groups, in critical path and in wall clock.
+    Regions(RegionsArgs),
+}
+
+#[derive(Args, Debug)]
+struct RegionsArgs {
+    /// Projects to analyse. Each is loaded the way `ply` loads one, so shipped
+    /// modules resolve and `examples/` works.
+    #[arg(required = false)]
+    roots: Vec<PathBuf>,
+    /// Workers the wall-clock columns are modelled at, and the pool the
+    /// measured suite number is taken in.
+    #[arg(long, default_value_t = 8)]
+    jobs: usize,
+    /// Hypothetical footprints, `cells:labels`, appended as their own rows.
+    /// The measured corpora carry no `cell` atom at all, so this is how the
+    /// risk is priced rather than asserted away.
+    #[arg(long, value_delimiter = ',')]
+    hypothetical: Vec<String>,
+    /// Tests carrying a contending resource atom in each hypothetical row.
+    #[arg(long, default_value_t = 10)]
+    hypothetical_shared: usize,
+    /// Pure tests in each hypothetical row.
+    #[arg(long, default_value_t = 165)]
+    hypothetical_pure: usize,
+    /// Include shipped modules' tests, as `ply test --std` does.
+    #[arg(long)]
+    std: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1246,7 +1279,45 @@ fn run() -> Result<()> {
         Command::W5(args) => w5(args),
         Command::W6(args) => w6(args),
         Command::W6Ladder(args) => w6_ladder(args),
+        Command::Regions(args) => regions(args),
     }
+}
+
+fn regions(args: RegionsArgs) -> Result<()> {
+    let mut costs = Vec::new();
+    for root in &args.roots {
+        let corpus = regions::measure(root, args.jobs, args.std)
+            .with_context(|| format!("measuring `{}`", root.display()))?;
+        eprintln!(
+            "{}: effects reaching a test footprint: {:?}",
+            root.display(),
+            regions::effects_present(&corpus.footprints)
+        );
+        costs.push(regions::analyse(&corpus, args.jobs));
+    }
+    for shape in &args.hypothetical {
+        let (cells, labels) = shape
+            .split_once(':')
+            .context("`--hypothetical` takes `cells:labels`")?;
+        let corpus = regions::hypothetical(regions::Hypothetical {
+            cell_tests: cells.parse().context("`--hypothetical` cell count")?,
+            labels: labels.parse().context("`--hypothetical` label count")?,
+            shared_tests: args.hypothetical_shared,
+            shared_labels: 3,
+            pure_tests: args.hypothetical_pure,
+            seed: 1,
+        });
+        costs.push(regions::analyse(&corpus, args.jobs));
+    }
+    if costs.is_empty() {
+        anyhow::bail!("nothing to analyse: pass a project root or `--hypothetical cells:labels`");
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&costs)?);
+    } else {
+        print!("{}", regions::render(&costs));
+    }
+    Ok(())
 }
 
 fn generate_corpus(args: GenArgs) -> Result<()> {

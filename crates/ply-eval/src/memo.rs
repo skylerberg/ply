@@ -10,14 +10,21 @@
 //! does not is a resource bound the two disagree on, and `--engine both` would
 //! be reporting the disagreement as `E0503`.
 //!
-//! Two rules keep it honest. The published row is what is read — the
+//! Three rules keep it honest. The published row is what is read — the
 //! reviewable artifact, not the inferred body row — so a definition annotated
 //! wider than it performs is left alone rather than quietly treated as pure.
-//! And the **first** completed evaluation wins: a value reached by resuming a
+//! The **first** completed evaluation wins: a value reached by resuming a
 //! continuation captured inside the body is a resumption's value, not the
-//! definition's.
+//! definition's. And the value has to be **world-independent**, which an empty
+//! row does not imply: `with_cell` discharges its own atoms, so a definition
+//! that allocates a cell and hands out something reaching it publishes `{}` and
+//! is a constant by the row rule while its value is a key into *this run's*
+//! world. Memoizing one hands the next test a cell its world never allocated —
+//! `E0505` when the id is not there and a silently wrong read when it is, which
+//! is the cross-test interference the whole isolation story rests on not
+//! happening.
 
-use crate::value::Value;
+use crate::value::{ClosureKind, Value};
 use ply_core::CheckOutput;
 use ply_span::Symbol;
 use rustc_hash::FxHashMap;
@@ -63,8 +70,54 @@ impl Memo {
 
     pub(crate) fn remember(&mut self, name: &Symbol, value: &Value) {
         if let Some(slot @ Slot::Pending) = self.slots.get_mut(name) {
-            *slot = Slot::Known(value.clone());
+            *slot = if world_independent(value, 0) {
+                Slot::Known(value.clone())
+            } else {
+                Slot::Never
+            };
         }
+    }
+}
+
+/// Whether the value means the same thing in a world it was not produced in.
+///
+/// A [`Value::Cell`] and a [`Value::Task`] are keys into the run that made them,
+/// so neither may be remembered; a closure is walked, because what it captured
+/// is what it can hand out later. Everything this cannot decide — a captured
+/// continuation, whose whole control stack would have to be walked, or a value
+/// nested deeper than the budget — answers `false`, which costs a re-evaluation
+/// and never a wrong read.
+fn world_independent(value: &Value, depth: u32) -> bool {
+    /// Deep enough for any value a constant plausibly builds, and finite so a
+    /// cyclic value (`reference_cycles.rs`) terminates rather than recursing.
+    const MAX_DEPTH: u32 = 64;
+
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    let deeper = depth + 1;
+    match value {
+        Value::Int(_)
+        | Value::Bool(_)
+        | Value::Float(_)
+        | Value::Decimal(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Unit => true,
+        Value::Cell(_) | Value::Task(_) | Value::Continuation(_) => false,
+        Value::List(items) => items.iter().all(|v| world_independent(v, deeper)),
+        Value::Map(map) => map
+            .iter()
+            .all(|(k, v)| world_independent(k, deeper) && world_independent(v, deeper)),
+        Value::Record(fields) => fields.values().all(|v| world_independent(v, deeper)),
+        Value::Ctor { args, .. } => args.iter().all(|v| world_independent(v, deeper)),
+        Value::Secret(inner) => world_independent(inner, deeper),
+        Value::Closure(closure) => match &closure.kind {
+            ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => true,
+            ClosureKind::Fn { env, .. } | ClosureKind::Code { env, .. } => {
+                env.values().all(|v| world_independent(v, deeper))
+            }
+        },
     }
 }
 

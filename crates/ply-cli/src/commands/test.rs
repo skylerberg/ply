@@ -283,12 +283,12 @@ fn counts(plan: &Plan, check: &CheckOutput, hosts: &Hosts) -> hosts::Counts {
             .iter()
             .filter_map(|&index| Some((index, check.tests.get(index)?)))
             .map(|(index, test)| {
-                let world = plan
+                let isolated = plan
                     .selection
                     .isolation_of(index)
                     .unwrap_or_else(|| Isolation::of(&test.footprint))
-                    .is_world();
-                (&test.footprint, world)
+                    .is_isolated();
+                (&test.footprint, isolated)
             }),
     )
 }
@@ -618,8 +618,8 @@ fn print_human(
             counts.total,
         );
     }
-    // A socket cannot be forked, so a host-backed test is not world-isolated and
-    // is never cached. Both facts are printed rather than left to be inferred
+    // A socket lives outside every region, so a host-backed test is not isolated
+    // and is never cached. Both facts are printed rather than left to be inferred
     // from a smaller `isolated` count than the run had yesterday.
     if !view.hosts.is_hermetic() {
         println!(
@@ -649,6 +649,22 @@ fn print_human(
     }
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
+    }
+    // `--engine both` is the differential oracle, and a green run under it reads
+    // as "two engines agreed about every test". They cannot agree about a test
+    // only one of them can run — a `resume` clause is E0504 on the tree-walker
+    // and a searched test is replayed per interleaving on the machine alone — so
+    // the coverage is printed beside the verdict rather than inferred from it.
+    if let Some(audit) = &report.audit
+        && let Some(line) = audit.line()
+    {
+        println!("{IND}{}", style.bold(&line));
+        if audit.unaudited > 0 {
+            println!(
+                "{IND}{}",
+                style.dim("the other engine refused those; no disagreement was possible")
+            );
+        }
     }
     if cache_bypassed(args) {
         let why = if args.no_cache {
@@ -1045,8 +1061,12 @@ fn print_explain(
             .unwrap_or_else(|| "-".repeat(12));
         let isolation = isolation_label(plan, view, check, index, &test.footprint);
         let shared = ply_test::shared_footprint(&test.footprint);
-        let atoms = if isolation == Isolation::World.as_str() {
+        let atoms = if isolation == Isolation::Region.as_str() {
             String::new()
+        } else if ply_test::contends_only_over_regions(&test.footprint) {
+            // A contention a rename would remove is worth distinguishing from
+            // one that needs a database.
+            format!(" {shared} (region labels)")
         } else {
             format!(" {shared}")
         };
@@ -1101,10 +1121,22 @@ fn print_explain(
     } else {
         format!(" · {} host-backed and never free", counts.host)
     };
+    // ADR 0008 §6 again, for the population ADR 0017 §6 moves: a contention a
+    // rename would remove reads differently from one that needs a database, and
+    // a report that did not separate them would leave the cost of losing the
+    // fork looking like ordinary shared state.
+    let regioned = if parallelism.region_contended == 0 {
+        String::new()
+    } else {
+        format!(
+            " · {} of them only over a region label",
+            parallelism.region_contended
+        )
+    };
     println!(
         "{IND}  {}",
         style.dim(&format!(
-            "{} of {} world-isolated and free · {} {} for the {} shared {}{hosted}",
+            "{} of {} region-isolated and free · {} {} for the {} shared {}{regioned}{hosted}",
             counts.isolated,
             counts.total,
             parallelism.shared_groups,
@@ -1193,7 +1225,7 @@ fn print_explain_search(plan: &Plan, check: &CheckOutput, style: Style) {
 
 /// `world`, `shared` or `host`.
 ///
-/// `host` wins over both: world isolation is *inapplicable* to a computation
+/// `host` wins over both: region isolation is *inapplicable* to a computation
 /// that reaches a socket rather than merely unavailable to it, and reporting
 /// such a test as `world` is the over-claim ADR 0008 §6 exists to prevent.
 fn isolation_label(
@@ -1305,6 +1337,9 @@ fn report_json(
                 // that never simulated anything.
                 "simulation": r.simulation.as_ref().map(ply_test::report::exploration_json),
                 "cached": r.recorded.as_ref().map(|record| record.is_written()),
+                // Absent outside `--engine both`, where there is no oracle whose
+                // coverage this could describe.
+                "audited": r.audited,
             })
         })
         .collect();
@@ -1367,6 +1402,10 @@ fn report_json(
             "exhausted": report.simulation.exhausted,
             "failed": report.simulation.failed,
         },
+        // What the differential oracle actually covered. Absent, never zeroed,
+        // when no oracle ran: a consumer cannot tell "compared nothing" from
+        // "there was nothing to compare with".
+        "audit": report.audit,
         "selection": {
             "total": selection.total,
             "selected": selection.to_run.len(),
@@ -1375,7 +1414,7 @@ fn report_json(
             "groups": groups,
             // Corrected for the binding: a host-backed test is counted under
             // `host` and under neither of the other two, because it is not
-            // world-isolated and saying otherwise over-claims the number M6
+            // isolated and saying otherwise over-claims the number M6
             // published. Identical to `parallelism` in a hermetic run.
             "isolated": counts.isolated,
             "shared": counts.shared,
@@ -1923,7 +1962,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     }
 
     #[test]
-    fn the_failure_artifact_carries_the_v3_shape_an_agent_branches_on() {
+    fn the_failure_artifact_carries_the_v4_shape_an_agent_branches_on() {
         let (dir, loaded, hashes) = project(&[(
             "ledger.ply",
             "fn balance() -> Int = 0 - 5\n\
@@ -1939,7 +1978,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let report = run(&loaded, &plan.selection, &mut store);
 
         let v = json_report(&loaded, &hashes, &plan, &report, &args_for(None), 1);
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
 
         let f = &v["failures"][0];
         assert_eq!(f["key"], "ledger.balance never goes negative");
@@ -2267,6 +2306,7 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: None,
+            audited: None,
         };
         let plain = result_line(&result, &result.name, 44, Style::plain());
         assert!(plain.starts_with("FAIL "));
@@ -2299,6 +2339,7 @@ test \"stuck\" {
                     ..Default::default()
                 }),
                 recorded: None,
+                audited: None,
             })
             .expect("a simulated test has a line")
         };
@@ -2331,6 +2372,7 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: None,
+            audited: None,
         };
         let column = |status| {
             result_line(&make(status), "n", 24, Style::plain())
@@ -2410,6 +2452,7 @@ test \"stuck\" {
             results,
             warnings: Vec::new(),
             simulation: ply_test::SimSummary::default(),
+            audit: None,
         }
     }
 
@@ -2423,7 +2466,7 @@ test \"stuck\" {
     }
 
     /// The claim `--explain` publishes: a test that can reach a socket is not
-    /// world-isolated, and saying `world` about it would over-claim exactly the
+    /// isolated, and saying `region` about it would over-claim exactly the
     /// number M6 introduced.
     #[test]
     fn a_host_backed_test_is_reported_as_host_rather_than_world() {
@@ -2439,7 +2482,7 @@ test \"stuck\" {
         assert_eq!(label("reads orders only"), "host");
         assert_eq!(label("reads orders only again"), "host");
         assert_eq!(label("writes users when asked"), "shared");
-        assert_eq!(label("pure arithmetic"), "world");
+        assert_eq!(label("pure arithmetic"), "region");
 
         assert_eq!(view.counts.total, 4);
         assert_eq!(view.counts.host, 2);
@@ -2503,6 +2546,7 @@ test \"stuck\" {
                 failure: None,
                 simulation: None,
                 recorded: Some(Record::Under(vec![hashes.tests[index]])),
+                audited: None,
             }])
         };
 
@@ -2605,6 +2649,7 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: Some(Record::Under(vec![hashes.tests[index]])),
+            audited: None,
         }]);
         let view = HostView::of(&hosts, &plan, &loaded.check, &recorded);
         assert_eq!(

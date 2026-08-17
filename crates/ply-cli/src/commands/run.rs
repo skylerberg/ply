@@ -168,6 +168,25 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         declared.as_ref(),
     );
 
+    // A cycle among escaped values is never collected (ADR 0017 §4), so the run
+    // that built one is the only place a reader can be told it is there. It is
+    // the program's own doing rather than the run's configuration, so it is
+    // reported whatever the entry point answered and it changes no exit code.
+    let mut config_warnings = config_warnings;
+    let cycles = ply_eval::rc::take_cycles();
+    if !cycles.is_empty() {
+        if args.json {
+            if let (Value::Array(items), Value::Array(more)) = (
+                &mut config_warnings,
+                crate::commands::common::diagnostics_json(&cycles, &loaded.sources),
+            ) {
+                items.extend(more);
+            }
+        } else {
+            print_diagnostics(&cycles, &loaded.sources, style);
+        }
+    }
+
     // After the entry point and before the process exits, on the machine's own
     // thread: roll every open transaction back, flush the sink, close the pool.
     // A signal handler never runs it — the handler sets a flag, and this is
