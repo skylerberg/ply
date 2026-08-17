@@ -561,18 +561,35 @@ where none can resolve. The pool acquire deadline is what keeps that check
 honest: without it, a pool smaller than the number of open scopes parks every
 task forever with nothing to report, and `E0437` turns a hang into a sentence.
 
-### 3.4 The pool and world isolation, stated bluntly
+### 3.4 The pool and test isolation, stated bluntly
 
 A pooled connection is shared state that crosses test boundaries. ADR 0008 §6
-says host effects are outside the forkable world, so:
+says host effects are outside whatever isolation mechanism the language has —
+the forkable world when this was written, region isolation since ADR 0017, and
+the conclusion is the same under both because a socket has neither. So:
 
-- Every test that reaches the db binding is `Isolation::Host`, counted
-  separately, excluded from `isolated: n of m`, never cached, and never
-  bisected. All of that exists already and W4 adds no case to it.
+- Every test that reaches the db binding is counted as **host**, excluded from
+  `isolated: n of m`, never cached, and never bisected. All of that exists
+  already and W4 adds no case to it.
+
+  *(Written `Isolation::Host` until the W6 documentation audit. There is no such
+  variant: `ply_test::schedule::Isolation` is `Region | Shared`, and the host
+  category is computed at the CLI by `ply_cli::hosts::Counts::of` asking
+  `Hosts::reaches(footprint)`. The property is exactly as stated — the
+  denominator of `isolated: n of m` cannot over-claim — and only the mechanism
+  moved. ADR 0011 §7 is where the promise of a variant was made and is corrected
+  in place.)*
 - **W4 does not give a test its own database.** A test's isolation is exactly
   two things: footprint conflict grouping over tables, and whatever the test
   does inside a transaction it rolls back. There is no fork, no template
   database, no schema-per-test and no truncation between tests.
+
+  A third thing was added later and is worth naming here because a reader
+  counting the defences would otherwise miss it: the pool resets **session**
+  state between borrowers, which closes five channels that footprint conflict
+  grouping cannot see at all. It is not per-test isolation — it is per checkout
+  — and it says nothing about table contents. §4.3 states what it issues and the
+  one residual it leaves open.
 - Two host-backed tests whose tables are disjoint therefore run *concurrently
   against one database*, which is correct only if §2's footprints are honest.
   This is the sharpest place in the system where §2 is load-bearing, and it is
@@ -681,8 +698,46 @@ connection, never per execution.
 
 `DEALLOCATE` is never issued; an evicted entry's server-side statement is closed
 by the protocol's `Close` message. `DISCARD ALL` is never issued either, because
-it would drop the cache the pool exists to amortise; connection reset is
-§1.3's rollback and nothing more.
+it would drop the cache the pool exists to amortise; ~~connection reset is
+§1.3's rollback and nothing more.~~
+
+> **Corrected against the code by the W6 documentation audit.** The refusal of
+> `DISCARD ALL` holds. "Connection reset is §1.3's rollback and nothing more"
+> does not, and it is the more consequential half of the sentence, because it
+> tells a reader that a recycled connection carries no session state — which is
+> the claim §3.4's isolation story rests on.
+>
+> What `ply_host::db::pool::session_sql` actually issues on recycle is six
+> statements, in this order:
+>
+> ```sql
+> ROLLBACK; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all();
+> CLOSE ALL; DISCARD TEMP;
+> ```
+>
+> `RESET ALL` runs before the two `SET`s §3.2 requires, which it would otherwise
+> undo. The five beyond `ROLLBACK` were added because a pooled connection is the
+> only thing two host-backed tests share, and each closes a channel that
+> footprint conflict grouping cannot see: a `search_path` one borrower set
+> deciding which relation an unqualified name resolves to for the next; a
+> session-level advisory lock held until the backend exits; a `LISTEN`
+> delivering a notification into a conversation that never asked; a temporary
+> table shadowing a real one; a `PREPARE`d name colliding with the next
+> borrower's. None of the five drops the statement cache, and the checkout is
+> already a round trip, so `DISCARD ALL`'s reason to be refused does not extend
+> to them.
+>
+> **One residual is deliberately left open** and belongs in this ADR rather than
+> only in a doc comment: a **SQL-level `PREPARE`d name is not reset.** It shares
+> `pg_prepared_statements` with the protocol-level statements the cache is built
+> from, so `DEALLOCATE ALL` would invalidate a cache the pool still believes is
+> live. The channel is closed at the scanner instead — `PREPARE` is not among
+> the statement shapes §2.4 admits — which means the defence is §2.4's
+> allow-list and not the reset, and a change to §2.4 that admitted `PREPARE`
+> would silently reopen it.
+>
+> `crates/ply-host/src/db/pool/tests.rs` asserts both directions: `DISCARD TEMP`
+> is present in the recycle string and `DISCARD ALL` is absent from it.
 
 A prepare that postgres refuses — a syntax error, an unknown relation, an
 unknown column — is **`E0433 DB_PREPARE_FAILED`** and not a `Failed`. It is the
@@ -1062,6 +1117,45 @@ changes the database, and says so.
 `--db-schema` is optional. Without it, a mismatch surfaces at prepare time as
 `E0433` — later, per statement, and still loud.
 
+> **Audit note (docs pass, 2026-08-17): point 3's second half did not ship, and
+> this ADR was the only place saying so.** `--db-schema <module>.<fn>` exists
+> as a flag (`crates/ply-cli/src/db.rs:541`), resolves the name against the
+> program, checks the return type is a `Schema`, evaluates it, and reads its
+> table and column counts (`crates/ply-cli/src/db.rs:664–870`,
+> `crates/ply-cli/src/commands/common.rs:121–136`). **It never connects to the
+> server to compare.** Grepping the whole tree for `information_schema` finds
+> only two test statements counting rows in `db_driver.rs:471` and
+> `db_transaction_audit.rs:909`, plus prose in this ADR, in
+> `tests/fixtures/db_schema_mismatch.ply` and in `examples/desk.ply:398`;
+> `pg_constraint` appears in prose only. **`E0435` is raised nowhere**: the
+> constant `codes::DB_SCHEMA_MISMATCH` has exactly three occurrences —
+> its definition and registry row in `crates/ply-span/src/lib.rs:414,787` and
+> its membership in `RESERVED_CODES` at `crates/ply-eval/src/host.rs:1106`.
+>
+> The implementation is honest about this where the ADR was not. `db.rs`
+> carries a two-state `schema::State` and comments the distinction itself:
+> *"`Declared` is the honest word for 'the program describes this and nothing
+> compared it to a server'. Printing `verified` there would be the green result
+> over unexplored space this project audits for."* (`crates/ply-cli/src/db.rs:733–737`).
+> `State::Verified` is constructed at exactly two sites, both inside `db.rs`'s
+> own `#[cfg(test)]` module (`db.rs:1437` and `db.rs:1519`). Both production
+> construction sites — `crates/ply-cli/src/hosts.rs:539` and
+> `crates/ply-cli/src/commands/hosts.rs:204` — pass `State::Declared`. So the
+> `ply hosts` block in §11 of this ADR, which shows
+> `schema     desk.schema · 2 tables · 11 columns · verified`, shows a line the
+> shipped binary cannot print; a real run ends that line `declared`. The
+> assertion at `db.rs:1449` that appears to check the `verified` rendering is
+> checking the renderer against a hand-built `State::Verified`, not against
+> anything a run produces.
+>
+> **What `--db-schema` is actually worth today**, so the next reader is not
+> misled twice: it is a start-up check that the *program* contains a
+> well-formed nullary `Schema` function of the name given, and it puts that
+> function's shape in `ply hosts`. It is not a check that the live database
+> matches. The fallback sentence above is therefore not a fallback — `E0433` at
+> prepare time is the **only** mismatch detection W4 shipped, with or without
+> the flag.
+
 ---
 
 ## 8. New diagnostic codes
@@ -1079,6 +1173,33 @@ changes the database, and says so.
 
 E0431, E0435 and E0438 are raised by `HostRegistry::bind`, before anything runs,
 like E0421–E0423.
+
+> **Audit note (docs pass, 2026-08-17): of those three, only E0431 is raised.**
+> `HostRegistry::bind` is `crates/ply-eval/src/host.rs:524`. Searching every
+> `.rs` file in `crates/` for `DB_SCHEMA_MISMATCH` and
+> `DB_UNMODELLED_SIDE_EFFECT` finds each exactly three times — the constant, the
+> registry row that makes `E0435`/`E0438` a stable published code, and the
+> `RESERVED_CODES` entry that stops a host handler from *impersonating* one.
+> None of the three is a raise site. So **E0435 and E0438 are registered and
+> reserved but never emitted**, and the two rows above describe intended
+> behaviour rather than shipped behaviour. E0432, E0433, E0434, E0436 and E0437
+> are all genuinely raised — see `crates/ply-host/src/db/scan.rs`,
+> `stmt.rs`, `scope.rs` and `pool.rs` respectively.
+>
+> **E0438 is the more serious of the two absences**, because it is the one
+> guarding the property ROADMAP.md's closing section calls "the risk that
+> matters". Nothing in the tree queries `pg_trigger`, `pg_rewrite` or a foreign
+> key's delete action — grepping `crates/` for `pg_trigger`, `pg_rewrite`,
+> `tgrelid`, `confdeltype` and `on delete cascade` returns **no matches at
+> all**. So §2.5's guarantee, that a schema object reaching outside the atom it
+> fires under is refused before anything runs, is not in force. A trigger or an
+> `ON DELETE CASCADE` on a production database today produces a footprint that
+> under-reports, silently, which is exactly the failure §2.5 names — and two
+> host-backed tests over apparently disjoint tables would be scheduled
+> concurrently on the strength of it. `tests/fixtures/db_unmodelled_side_effect.ply`
+> exists and documents the refusal in detail; running it produces no `E0438`.
+> This is a code gap, reported rather than fixed here, since this is a
+> documentation pass.
 
 E0432, E0433, E0434, E0436 and E0437 join E0424's row: `Failure::defect` is
 `false`, they are attributed like any other failure, and bisection is skipped
@@ -1236,9 +1357,10 @@ audited is overstated by however many of them there are.
 
 `ply test --explain` therefore reports such a test as `engine: machine (host,
 not audited)`, the summary line carries `audited: n of m`, and `--json` carries
-the same. This is `Isolation::Host` and `Skipped::Host`'s argument — declare the
+the same. This is the host-count and `Skipped::Host` argument — declare the
 guarantee inapplicable where it cannot hold, and keep the number honest —
-applied to the one place W1 left it implicit.
+applied to the one place W1 left it implicit. (The host count is
+`ply_cli::hosts::Counts`, not an `Isolation` variant; see §3.4.)
 
 ### 12.2 `end_entry_point` is called on every exit
 
@@ -1253,6 +1375,11 @@ on the connection it used.
 ## 13. Required tests
 
 The ones whose absence would let W4 ship broken rather than merely incomplete.
+
+> **Audit note (docs pass, 2026-08-17): read this list with §13.1 below.** Four
+> of these fifty are not enforced by anything (7, 14, 16, 41), and most of the
+> rest are enforced only by a harness that returns without asserting when the
+> machine has no postgres. §13.1 says which, and how to arm them.
 
 **Transactions**
 
@@ -1272,6 +1399,16 @@ The ones whose absence would let W4 ship broken rather than merely incomplete.
    server**, not from a check in the driver.
 7. A serialization failure under `Serializable` is `Failed` with `40001`,
    `is_retryable` is true, and a program-written retry succeeds.
+   **Unenforced in practice.** The only test asserting it is
+   `a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds`
+   (`crates/ply-host/src/db/scope/tests/live.rs:425`), which returns after
+   printing a skip line unless `PLY_PG_URL` is set. `PLY_PG_URL` is a
+   developer-supplied variable with no default anywhere in the repository, so
+   this skips on a bare checkout **even on a machine with postgres installed** —
+   unlike the `cluster::available()` tests, which start their own server.
+   Grepping `crates/` for `40001` outside `live.rs` returns nothing; the two
+   `Isolation::Serializable` uses in `db_driver.rs:726,793` are the nested
+   isolation-disagreement case (`25001`), not this one.
 8. A continuation captured before `db.begin` and resumed twice is `E0426`, and
    `BEGIN` was issued exactly once.
 9. A connection whose scope was abandoned is rolled back before it is reused,
@@ -1290,11 +1427,32 @@ The ones whose absence would let W4 ship broken rather than merely incomplete.
     undeclared atom is `E0434` and the atom is in the reported footprint.
 14. `scan`'s table set is a **superset** of `EXPLAIN (GENERIC_PLAN, FORMAT
     JSON)`'s relation set over a generated statement corpus, with no exception.
+    **This test does not exist.** `EXPLAIN` appears nowhere in any `.rs` file in
+    the repository except one sentence of prose in
+    `crates/ply-host/src/db/scan.rs`'s module doc, and `GENERIC_PLAN` appears
+    nowhere but that same sentence. There is no generated statement corpus for
+    it and no comparison against a planner. That sentence — *"that is why the
+    scanner is disclosed in `ply hosts` and why the differential test against
+    `EXPLAIN (GENERIC_PLAN)` exists"* — asserts a test that was never written,
+    and needs the same correction this entry does.
+    **What is enforced instead**, so the residual risk is stated rather than
+    implied: `crates/ply-host/src/db/scan/tests.rs` checks `scan` against
+    hand-written statements, and the *refusal* direction is well covered — a
+    construct the scanner cannot account for is `E0432` rather than an empty
+    table set. What is unchecked is the residual §2.4 names: a construct the
+    scanner **mis**-recognises, which can under-report a table without
+    refusing. That is the one class the `EXPLAIN` differential existed to
+    catch, and the one class nothing catches.
 15. Every refused construct in §2.4 is `E0432` naming the offset; a statement
     with a `;` outside a literal is `E0432`; a `;` inside a literal and inside a
     dollar-quoted body is not.
 16. A schema with a trigger, a rule, or an `ON DELETE CASCADE` reaching a table
     outside its atom is `E0438` at bind time, naming the object.
+    **No test, and nothing to test.** See the audit note under §8: `E0438` is
+    registered and reserved but raised nowhere, and no code queries
+    `pg_trigger`, `pg_rewrite` or a constraint's delete action. The fixture
+    `tests/fixtures/db_unmodelled_side_effect.ply` documents the refusal as
+    though it were live; it is not.
 17. Two tests over disjoint tables are placed in different concurrency groups
     and run concurrently against one database; two over a shared table with one
     writer are not.
@@ -1369,6 +1527,14 @@ The ones whose absence would let W4 ship broken rather than merely incomplete.
 41. `create_schema` output executes against real postgres and produces a
     database that `--db-schema` verifies; a dropped column, a changed type and a
     changed nullability are each `E0435` naming the difference.
+    **Half of this exists.** `create_schema`'s output does execute against a
+    real postgres — every `cluster::available()` harness in
+    `crates/ply-host/tests/` starts a cluster and runs its `SCHEMA` constant
+    through `psql`. The verification half does not: `--db-schema` performs no
+    comparison and `E0435` is emitted nowhere, so a dropped column, a changed
+    type and a changed nullability are today all detected at prepare time as
+    `E0433`, per statement, or not at all if no statement touches the column.
+    See the audit note under §7.
 42. A `CREATE TABLE` passed to `db.execute` is `E0432`.
 
 **Everything W4 must not regress**
@@ -1393,9 +1559,104 @@ The ones whose absence would let W4 ship broken rather than merely incomplete.
 
 Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 
----
+*Two of those fixtures document behaviour that does not exist:
+`tests/fixtures/db_schema_mismatch.ply` and
+`tests/fixtures/db_unmodelled_side_effect.ply` each open with a transcript of a
+diagnostic — `E0435` and `E0438` — that no run produces. See the audit notes
+under §7 and §8. The fixture files are correct as specifications of what those
+codes were reserved to mean; they are not evidence that the codes fire.*
 
-## Not in W4
+### 13.1 What a green `cargo test --workspace` actually proves here
+
+**Audit note, docs pass, 2026-08-17.** Every test above that needs a live
+database is behind one of two conditional skips, and both return `Ok` rather
+than failing when the dependency is absent. Both print a reason, which is
+honest — the point of recording them here is that *the reason is printed to
+stderr of a passing test*, so a CI summary, a `--quiet` run, or a reader
+looking at an exit code sees nothing.
+
+**Gate A — `cluster::available()`.** `crates/ply-host/tests/support/cluster.rs:38`:
+true only when both `initdb` and `postgres` are findable on `PATH` or under
+`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/lib/postgresql`. When false the
+test prints `skipped: this machine has no initdb/postgres, …` and returns.
+Six `#[test]` functions are behind it, and because each is deliberately one
+`#[test]` running many phases in sequence — the file headers explain why: so
+that `#[test]`s in one binary do not race for one cluster — the count of
+*claims* lost is far larger than the count of tests lost:
+
+| gate site | phases |
+| --- | --- |
+| `crates/ply-host/tests/db_transaction_audit.rs:205` `transactions_the_pool_and_parameters_under_adversarial_conditions` | **17** |
+| `crates/ply-host/tests/db_driver.rs:142` `the_driver_speaks_to_a_real_postgres` | 10, one of which (`the_driver_serves_a_transaction`) runs 6 more |
+| `crates/ply-host/tests/w5_drain_audit.rs:180` `the_drain_answers_its_remaining_questions` | 4 |
+| `crates/ply-host/tests/w5_shutdown.rs:132` `the_drain_never_commits_and_never_leaks` | 4 |
+| `crates/ply-host/tests/host_park.rs:99` `a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding` | 1 |
+| `crates/ply-host/tests/host_park.rs:164` `the_two_facilities_mint_tokens_that_cannot_collide` | 1 |
+
+Required tests depending on gate A: **1, 2, 3, 4, 5, 6, 9, 10, 12 (the
+`HostUse` half), 18, 19, 20, 25, 26, 27, 28, 29**, and W5's 28, 29, 30 and 31.
+Gate A is the well-behaved of the two: the harness starts its own `initdb`
+cluster in a temp directory on its own port, so on a machine with postgres
+installed it needs no configuration and does run. It ran on the audit machine.
+
+**Gate B — `PLY_PG_URL`.** `crates/ply-host/src/db/scope/tests/live.rs:101`, via
+the `live!` macro at `live.rs:216`. Exactly ten `#[test]`s, each opening with
+`live!(…)`, each returning after printing `skipped: PLY_PG_URL is unset, …`
+when the variable is absent. **Nothing in the repository sets it** — it appears
+in no `.cargo/config.toml`, no `build.rs` and no CI file — so unlike gate A
+this one skips on a stock checkout *even when postgres is installed and gate A
+is running*. It was unset on the audit machine while gate A's clusters were
+starting and passing.
+
+The ten are, at `live.rs` lines 231, 246, 265, 287, 298, 323, 345, 376, 394 and
+425: `a_committed_transaction_persists_and_the_connection_is_reusable`,
+`an_aborted_transaction_leaves_nothing_and_the_connection_is_reusable`,
+`a_body_that_raises_leaves_a_scope_that_end_entry_point_rolls_back`,
+`an_entry_point_that_ended_cleanly_leaves_end_entry_point_nothing_to_do`,
+`a_nested_rollback_discards_the_inner_writes_and_keeps_the_outer`,
+`a_released_savepoint_survives_until_the_outer_scope_decides`,
+`the_savepoint_bound_is_reachable_and_unwinds_in_order`,
+`a_write_inside_a_read_only_transaction_is_25006_from_the_server`,
+`a_failed_statement_poisons_the_scope_until_a_savepoint_below_it_is_rolled_back_to`
+and `a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds`.
+
+Most of them have a gate-A counterpart, so gate B being unset usually costs a
+second opinion rather than the only one — required test 6, for instance, is
+also `a_read_only_transaction_is_refused_by_the_server` at `db_driver.rs:811`,
+behind gate A. **Required test 7 is the exception**: its only enforcement
+anywhere in the repository is gate B's `a_serialization_failure_…`, so on a
+stock checkout nothing checks that a `40001` is a value, that `is_retryable` is
+true, or that a program-written retry succeeds. §12.2's `end_entry_point` claim
+is likewise gate-B-only in its live form.
+
+**To arm both:** install postgres so `initdb` is on `PATH` (gate A), and export
+`PLY_PG_URL` at a server the suite may create and drop scratch tables in (gate
+B), then `cargo test --workspace`. Absent either, the corresponding rows above
+are aspirations.
+
+**Measured, on the audit machine (macOS, postgres 18 via homebrew, `PLY_PG_URL`
+unset), so the difference between the two gates is on the record:**
+
+```
+$ cargo test -p ply-host --test db_transaction_audit -- --nocapture
+test transactions_the_pool_and_parameters_under_adversarial_conditions ... ok
+test result: ok. 1 passed; ... finished in 4.12s          # gate A open: a cluster really started
+
+$ cargo test -p ply-host --lib scope::tests::live -- --nocapture
+test db::scope::tests::live::a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds ... ok
+... 8 more ...
+test result: ok. 10 passed; 0 failed; ... finished in 0.00s   # gate B shut
+```
+
+**`10 passed ... in 0.00s` is the shape to recognise.** Ten tests asserted
+nothing, the reason went to stderr where a summary does not look, and the line
+a reader takes away says `passed`. That is the same reporting failure as `M7`'s
+`exhaustive: true` over regions never examined, arriving through a harness
+rather than through a search. The honest fix is not to delete the skip — a
+suite that silently acquires a live dependency is worse — but to make the
+absence *visible in the verdict*: `tier_audit.rs` shows the pattern, ending
+`assert!(audited >= 100, "only {audited} proofs were audited")` so that an
+audit which examined nothing goes red.
 
 - **Query building and ORMs.** No builder, no fluent API, no entity mapping, no
   lazy loading, no identity map. A statement is text and a row is a `Map`.

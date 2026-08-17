@@ -1,9 +1,20 @@
 # ADR 0010 — Derivation now, dispatch deferred
 
-Status: partially accepted. Decisions 1–5 are settled. Decision 6 names the two
-remaining candidates and the evidence that would choose between them. One further
-candidate was investigated and rejected; the reasoning is recorded so it does not
-get re-proposed.
+Status: partially accepted. Decisions 1–5 are settled and shipped in W2.
+Decision 6 names the two remaining candidates and the evidence that would choose
+between them; **that evidence was never taken, and W2 supplied different
+evidence pointing the other way** — see the amendment under decision 6 and the
+one under "The argument that carries the most weight". One further candidate was
+investigated and rejected; the reasoning is recorded so it does not get
+re-proposed.
+
+> **Amended by the W6 documentation audit.** Two things in this ADR stopped
+> being true and nothing said so. First, decision 6 says the deciding evidence
+> "does not exist yet" and that "after W3 and W4 that is a number rather than a
+> guess"; W3, W4, W5 and W6 have all shipped and no such number was produced —
+> not in ADR 0013, 0014, 0015 or 0016, and not in `benches/`. Second, the
+> coherence divergence this ADR treats as a distant risk arrived during W2
+> itself, twice, in a form this document did not anticipate.
 
 ## Context
 
@@ -213,6 +224,22 @@ a number rather than a guess. Rust's serde suggests the end state is both
 derivation and dispatch, so the live question is *which* resolution mechanism and
 *when* — not whether.
 
+> **The number was never taken.** W3, W4, W5 and W6 all shipped. ADR 0012's "Not
+> in W2" restated the plan verbatim — "the deciding evidence is how often a type
+> is abstract at the point of dispatch in a real stack, and W3 and W4 produce
+> it" — and then W3 and W4 did not produce it, W5 and W6 did not either, and no
+> later ADR mentions it. The web track closed at ADR 0016 with the question
+> exactly where this ADR left it.
+>
+> That is a **decision not taken**, not a decision made. It is recorded here so
+> that a future reader does not mistake the silence for a negative result. What
+> would settle it is unchanged and is now cheap, because a real stack exists to
+> count: the sites in `examples/` and `crates/ply-std/ply/` where a type is
+> abstract inside a function's own body at a point that wants an encoding. The
+> honest interim position is that W1 through W6 shipped a working service
+> without a resolution layer, which is weak evidence for (a) or for neither, and
+> no evidence at all about (b).
+
 ## Investigated and rejected: handlers as the dictionary-passing mechanism
 
 Ply has an implicit-passing mechanism no surveyed language has — the handler
@@ -294,6 +321,38 @@ respond(order, order_json_v2)    // module B, six months later
 Both typecheck, the same type serializes two ways, and no one notices until a
 client breaks. Code generated at volume across many modules makes accidental
 inconsistency likelier, not less likely.
+
+> **W2 found this, and the example above under-states it in three ways.** The
+> two instances are ADR 0012 §A4 and §A5, and both were caught by audit rather
+> than by a client breaking. What they change about this section:
+>
+> - **It does not need two modules.** §A4: `type Key = String` in *one* module
+>   made `Map<Key, Int>` and `Map<String, Int>` a single type with two wire
+>   formats, because §3 of ADR 0012 chose the object-vs-pair encoding from the
+>   key as *written* and an alias is transparent to the checker. Two codecs of
+>   one type, interchangeable at every call site, disagreeing about the
+>   protocol.
+> - **It does not need six months, or anyone writing a second codec.** §A5:
+>   `Expander::runtime_prefix` returned an empty prefix for a selective import,
+>   so under `import std.json (..)` a module that happened to define its own
+>   `int_json` or `string_json` supplied the leaves its own `derive json`
+>   composed with — without an `AMBIGUOUS_IMPORT`, and without anyone writing a
+>   codec twice. The divergence was introduced by the *deriver*.
+> - **It is not only about call sites.** Both defects are invisible at the call
+>   site, which is the property decision 3 leans on ("divergence is visible at
+>   the call site") when it argues explicit dictionaries are an acceptable
+>   interim. That argument is weaker than written: it holds for two dictionaries
+>   a human named, and not for two the same `derive` line produced.
+>
+> The fixes were not a resolution layer, and are worth stating because they are
+> what the interim actually rests on: ADR 0012 §3's orphan rule
+> (`E0208 ORPHAN_DERIVE`), a reserved `compare_values` builtin that no module can
+> shadow, the key resolved through this module's own parameterless aliases
+> before the wire form is chosen, and a synthesized `import std.json as <binder>`
+> so a generated body never writes a bare name. Coherence in W2 is bought by
+> making a derived definition unable to *name* a divergent leaf, not by
+> resolution — which is a fourth point on decision 6's design space that this
+> ADR did not have when it was written.
 
 Until a resolution layer lands, the partial answers are convention plus a lint —
 one derived codec per type, and a hand-written codec where a derived one exists

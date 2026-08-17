@@ -1,9 +1,26 @@
 # 5. The control stack and the world
 
-Status: accepted (types landed, machine outstanding)
+Status: accepted — **the machine landed and is the default engine**; §2's
+persistent forkable world is **superseded by ADR 0017**. §3's resumption
+semantics stand unchanged and are what ADR 0017 §3 was rewritten to preserve.
 Date: 2026-07-25
 Supersedes: DESIGN.md §2's "v0 restriction: tail-resumptive only", and the
 ST-monad reading of `with_cell`'s region.
+Superseded in part by: `docs/adr/0017-regions.md` (§2 only).
+
+> **Corrected by the W6 documentation audit.** This line read "types landed,
+> machine outstanding". `Engine::Machine` is `#[default]` in
+> `crates/ply-eval/src/lib.rs`, so the machine is not merely landed — it is the
+> engine every run uses unless told otherwise, and `Engine::Treewalk` is now the
+> fallback that refuses a `resume` binder with `E0504`.
+>
+> The status line also said nothing about §2 having been replaced. `ply_eval::world`
+> no longer exists: `World`, `World::fork`, `World::high_water` and
+> `set_base_world` are gone from `ply-eval`, and `Value::Cell` is a `Slot` in a
+> `TaskRegions` arena. What each of §2's operations became is stated inline in
+> §2 below. This matters because §2 is the section most likely to be read for a
+> cost model, and every cost in its table is now the cost of something that does
+> not exist.
 
 ## Context
 
@@ -269,12 +286,34 @@ because the machine never suspends inside one.
 
 ### 2. The world
 
+> **Superseded by ADR 0017.** Everything in this section landed and then was
+> removed. `ply_eval::world` does not exist in the tree; `World`, `World::fork`,
+> `World::high_water` and `set_base_world` are gone, and `Value::Cell` is a
+> `Slot` in a `TaskRegions` region stack
+> (`crates/ply-eval/src/task_regions.rs`). ADR 0017 §1 explains why the two are
+> mutually exclusive: Perceus-style in-place update fires only on a uniquely
+> owned value, and a design that forks worlds keeps reference counts high by
+> construction.
+>
+> The section is kept rather than deleted because it is the argument the
+> replacement had to preserve, and ADR 0017 §3 turns on getting that argument
+> right. The mapping, so a reader is not left to infer it:
+>
+> | this section | what replaced it |
+> | --- | --- |
+> | `World::fork` at an entry point, O(1) | `Fixture::open`, and `TaskRegions::reset` between entry points — whose doc comment names itself "the replacement for `World::fork` at an entry point" (`task_regions.rs`) |
+> | "a cell is a key, not a pointer" | still true, and now the key is an arena `Slot` rather than a `CellId` into a persistent map |
+> | "the world is monotone; an entry is never removed" | **false now.** A region's slots are reclaimed at its lexical close unless a continuation can still reach them, which is ADR 0017 §3's `unique` / `shared` split |
+> | `Isolation::World` | `Isolation::Region` (`crates/ply-test/src/schedule.rs`), and the cost of the change is ADR 0017 §6 |
+>
+> What did **not** move is §3. Read it as current.
+
 ```rust
 pub struct CellId(pub u32);
 pub struct World { /* RedBlackTreeMap<CellId, Value>, next: u32 */ }
 ```
 
-Landed in `ply_eval::world`, with these operations:
+As originally landed in `ply_eval::world`, with these operations:
 
 | operation | cost | note |
 | --- | --- | --- |

@@ -1,8 +1,20 @@
 # 7. Specs
 
-Status: accepted (the decision types, the AST and the diagnostics landed;
-everything that decides an obligation is outstanding)
+Status: accepted — **implemented**
 Date: 2026-08-13
+
+> **Corrected by the W6 documentation audit.** This line read "the decision
+> types, the AST and the diagnostics landed; everything that decides an
+> obligation is outstanding". Everything that decides one has since landed,
+> verified against the tree rather than against a later ADR: the prover is
+> `crates/ply-prove/src/prove/` (`lower.rs`, `egraph.rs`, `solve.rs`,
+> `arith.rs`, `term.rs`), the property engine is
+> `crates/ply-prove/src/property.rs`, the shrinker is
+> `crates/ply-prove/src/shrink.rs`, and `ply prove` is a real subcommand
+> (`Command::Prove` → `commands::prove::execute`). W2 then amended the prover's
+> `Float` rule — see ADR 0012 §A3 and §A6, which moved `PROVER_VERSION` to
+> `0.4.0` because an obligation over a hidden `Float` is now refused where it
+> was previously certified.
 Builds on: `0002-incremental-frontend.md` and `0003-cache-storage.md`, whose
 content-addressed front end is what makes an obligation discharge once ever;
 `0006-deterministic-simulation.md`, whose `exhaustive: true` is the only place a
@@ -1424,6 +1436,17 @@ The tier contract:
 33. **The differential tier audit**: every corpus obligation reported `proved`
     survives 1,000 sampled cases across 8 roots. A refutation **and a raise** are
     each classified as a defect in Ply.
+    *Enforced by `every_proof_a_generated_corpus_produces_survives_a_wide_sample`
+    (`crates/ply-corpus/tests/tier_audit.rs:26`), verified in the 2026-08-17
+    docs pass. It sweeps seeds 1..=6, re-samples at `cases: 1_000` over
+    `roots: 0..8`, and `disagreement` treats both `Discharge::Refuted` and
+    `Gap::Raised` as defects, which is the `i64`-versus-ℤ shape §5.1(a)
+    disclosed. **It also closes the M7 hole**: the run ends
+    `assert!(audited >= 100, "only {audited} proofs were audited")`, so an audit
+    that examined nothing is red rather than green — which is precisely the
+    defect M7 shipped when it reported `exhaustive: true` over regions never
+    examined. Worth copying anywhere else this project asserts a property over
+    a set it computed.*
 33a. §5.1(g): a claim valid over ℤ and raising at `i64::MAX` is not proved, and
     the same claim under a guard that bounds its arithmetic is. `x / y == x / y`
     is not proved and `where y > 0 { x / y == x / y }` is. An obligation over a

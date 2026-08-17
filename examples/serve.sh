@@ -35,10 +35,23 @@
 # guessed at.
 #
 # The database is created out of band, by `examples/desk.sql`. W4 ships a schema
-# as a value and refuses to ship a migration tool, so the guarantee it offers is
-# the other one — `--db-schema desk.schema` is passed on every run below, and the
-# driver refuses at bind time with `E0435` if the live database is not the one
-# `desk.ply` describes.
+# as a value and refuses to ship a migration tool. `--db-schema desk.schema` is
+# passed on every run below.
+#
+# CORRECTED (docs audit, 2026-08-17): this comment used to say the driver
+# "refuses at bind time with `E0435` if the live database is not the one
+# `desk.ply` describes". It does not, and never did. `E0435 DB_SCHEMA_MISMATCH`
+# is raised nowhere: `grep -rn 'E0435\|DB_SCHEMA_MISMATCH' crates/ --include='*.rs'`
+# returns five hits and none is a raise — `crates/ply-span/src/lib.rs:414`
+# defines the constant, `:787` registers it, `crates/ply-eval/src/host.rs:1106`
+# lists it as reserved, and `crates/ply-cli/src/artifact.rs:253` and
+# `crates/ply-cli/src/db.rs:539` are prose describing the check as future work.
+# What `--db-schema` actually does is resolve the name, check it is a nullary
+# function returning a `Schema`, evaluate it, and read its table and column
+# counts; it never opens a connection to compare. A mismatch surfaces later as
+# `E0433 DB_PREPARE_FAILED`, per statement, on first execution. README.md
+# §"What is missing" documents this correctly; this comment was not updated with
+# it, which made it the same never-armed-check defect W1 shipped.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

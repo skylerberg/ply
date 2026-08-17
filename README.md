@@ -21,27 +21,45 @@ it plainly.
 - [What is missing](#what-is-missing)
 
 Every number below was taken on one machine — Apple M-series, macOS 24.6.0,
-release profile, PostgreSQL 18.3 — and is reproducible from this repository. The
-serving numbers are one run, in `benches/w6-ladder.json` and
-`benches/w6-spike.json`, printed by `ply-corpus w6`; the loop numbers are another,
-from `ply-corpus gen` and `ply test`. Nothing here is quoted from an earlier
-milestone: the two files are written by the commands that took them, and two
-tests fail if the tree stops matching what they say.
+release profile, PostgreSQL 18.3. The serving numbers are one run, in
+`benches/w6-ladder.json` and `benches/w6-spike.json`, taken by `ply-corpus
+w6-ladder` and *rendered and judged* by `ply-corpus w6`; the loop numbers are
+another, from `ply-corpus gen` and `ply test`. The two files are written by the
+commands that took them, and two tests fail if the tree stops matching what they
+say — `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`
+and `w6_report_allocations::the_shipped_allocation_evidence_still_describes_this_request_path`.
+
+**Where a number here has been checked, this file says so.** A documentation
+audit re-ran what could be re-run without a postgres server, and the corrections
+are inline, marked, and keep the original claim beside the measurement rather
+than quietly dropping it. Two things a reader should know up front: the warm-loop
+`execute` figure was wrong by 12x and is corrected below, and the start-up
+database-schema check described under [What is missing](#what-is-missing) was
+never built. The serving profile and the throughput table reproduce exactly
+against the committed measurement files.
 
 ## The loop
 
 On a generated project of **200 modules, 10,000 definitions and 5,000 tests**
-(4.7 MB of source, 157 of the tests nondeterministic and therefore never
-cacheable):
+(4.64 MiB of source — 4,862,564 bytes, which the generator prints as 4748 KiB;
+"4.7 MB" here was neither the binary nor the decimal reading of it — 157 of the
+tests nondeterministic and therefore never cacheable):
 
 ```
 $ ply test                                  # empty cache
-   0 failed, 5000 passed, 0 cached                      0.86s wall
+   0 failed, 5000 passed, 0 cached                      2.60s wall
 
 $ ply test                                  # nothing changed
    selected 157 of 5000 (4843 cached)
-   0 failed, 157 passed, 4843 cached                    0.42s wall
+   0 failed, 157 passed, 4843 cached                    0.52s wall
 ```
+
+> **Corrected: the cold figure read `0.86s` and does not reproduce.** Measured
+> here with `/usr/bin/time` on the corpus below, after `ply cache clear`: **2.60s**
+> cold and **0.52s** warm. The counts — 5000, 157, 4843 — reproduce exactly, and
+> so does everything the front end does; it is the same `execute` under-reporting
+> the phase table below documents, and it moves the cold run by 3x. The warm
+> figure was close enough to stand (0.42s published, 0.52s measured).
 
 The 157 that ran are the nondeterministic tests, which run every time by
 construction. Now change something:
@@ -58,23 +76,61 @@ changes no definition's hash, so there is provably nothing to re-run, and the
 count is identical to changing nothing at all. Selecting *zero* deterministic
 tests after a rename is an invariant the test suite asserts, not a heuristic.
 
-And where a warm run's 311ms of work actually goes:
+And where a warm run's work goes. `ply-corpus bench` times **nine** phases; all
+nine are here, because a column that does not add up to its own total is the one
+thing a reader cannot check:
 
 | phase | ms | share |
 | --- | --- | --- |
-| typecheck | 157.5 | 50.7% |
-| hash | 73.1 | 23.5% |
-| parse | 58.5 | 18.8% |
-| **execute** | **10.4** | **3.3%** |
-| cache open | 1.9 | 0.6% |
-| select | 0.4 | 0.1% |
+| typecheck | 162.8 | 37.2% |
+| **execute** | **125.1** | **28.6%** |
+| hash | 77.5 | 17.7% |
+| parse | 60.0 | 13.7% |
+| discover, read, resolve | 9.3 | 2.1% |
+| cache open | 2.0 | 0.5% |
+| select | 0.5 | 0.1% |
+| **total** | **437.2** | |
 
-Two things follow, and the second is more interesting than the first. Running the
-tests is 3.3% of a warm loop, so a faster evaluator would buy almost nothing here
-— that is the argument that has kept native codegen deferred for nine milestones,
-and [Serving](#serving) is where it inverts. And opening a content-addressed
-store of 10,000 definitions costs 1.9ms, which is what lets the cache sit in the
-inner loop rather than be a build artifact.
+> **Corrected: the `execute` row was wrong by 12x, and it was the load-bearing
+> one.** This table used to publish `execute` at **10.4ms / 3.3%** against a
+> 311ms total, and to list only six of the nine phases. Re-taking it on the
+> documented corpus — `ply-corpus gen --out <dir> --seed 1 --modules 200
+> --defs-per-module 50 --tests 5000 --depth 6`, which reproduces byte-identically,
+> then `ply-corpus bench <dir> --repeats 3` twice — gives the numbers above (this
+> recipe omitted the **required** `--out` and `bench`'s positional corpus
+> argument, so as printed it failed with `error: the following required arguments
+> were not provided: --out <OUT>`; both are restored) (the two runs agreed to
+> within 3% on every row). **This is not a machine-speed artifact.** Every other
+> phase reproduced the published figure closely: parse 60.0 against 58.5,
+> typecheck 162.8 against 157.5, hash 77.5 against 73.1, cache open 2.0 against
+> 1.9, select 0.5 against 0.4 — and the three phases the old table omitted sum to
+> 9.3ms against the 9.2ms its own total implied. One row moved, by 12x, and the
+> total moved with it. The corrected 437ms total is also the one consistent with
+> the 0.52s warm wall clock measured above; 311ms never was.
+>
+> One caveat in the other direction, from `benches/README.md`: `bench` builds a
+> worker per pool thread per concurrency group, so its `execute` phase carries
+> setup charged per group and **over**-states interpreter time. The true cost of
+> running the tests is bounded below by that caveat and above by 28.6%; what it
+> is not is 3.3%. `ply-corpus measure` is the harness that separates the two.
+>
+> The selection table above this one reproduced exactly — 157, 157, 158, 613, and
+> 898 dependents.
+
+Two things follow, and the second is more interesting than the first. The front
+end still dominates a warm loop — typecheck, hash and parse are **68.6%** of it
+between them, against execute's 28.6% — so a faster evaluator buys less here than
+a faster type checker would. That is the shape of the argument that has kept
+native codegen deferred, and [Serving](#serving) is where it inverts. But it is a
+weaker argument than this file used to make: at the published 3.3% a faster
+evaluator was worth almost nothing, and at 28.6% it is worth something. The case
+for deferring M9 does not rest on this number — it rests on the *served* profile
+below, which is measured independently — and
+[ADR 0016](docs/adr/0016-w6-performance.md) is where the decision actually lives.
+
+And opening a content-addressed store of 10,000 definitions costs **2.0ms**,
+measured on both re-takes, which is what lets the cache sit in the inner loop
+rather than be a build artifact.
 
 ## Three ideas
 
@@ -105,21 +161,30 @@ the program does not compile — rather than the test failing on its 400th CI ru
 
 ```
 [E0412] Error: nondeterministic effect in a deterministic test
-   ╭─[ src/user.ply:8:13 ]
+   ╭─[ user.ply:8:13 ]
    │
  8 │   assert_eq(stamp(), stamp())
    │             ───┬───
-   │                ╰───── reaches `clock.read`, and `clock` is declared `nondet`
+   │                ╰───── reaches `user.clock.read`, and `user.clock` is declared `nondet`
+   │
+   ├─[ user.ply:8:13 ]
    │
  7 │ test "it stamps" {
    │      ─────┬─────
    │           ╰─────── test `it stamps` is deterministic
    │
-   │ Note 1: `clock.read` is performed inside something this expression calls
+   │ Note 1: `user.clock.read` is performed inside something this expression calls
+   │
    │ Note 2: handle it here, e.g. `handle <body> with { clock.now() -> <value> }`
-   │ Note 3: or declare this `test/nondet`, which opts out of the cache and
-   │         re-runs every time
+   │
+   │ Note 3: or declare this `test/nondet`, which opts out of the cache and re-runs every time
+───╯
+   compilation failed (1 error)
 ```
+
+That is transcribed from a run, not sketched — the atom and the effect are
+printed module-qualified (`user.clock.read`), which the earlier version of this
+block dropped.
 
 Handlers are what make that practical: swapping a real resource for an in-memory
 one is a language construct, not a mocking library, so the double and the real
@@ -137,10 +202,16 @@ schedule comes back as a seed that replays exactly.
 **Specs are the reviewable artifact, and their strength is derived.**
 `ply prove examples/desk.ply` reports 7 obligations over 180 definitions: 2
 `proved` (one exhaustive over 11 constructors, one by ground evaluation) and 5
-`property` with their case and rejection counts. There is no `tier` field
-anywhere — a tier is computed from the evidence, so a `proved` that was really a
-sample cannot be asserted. Coverage is in the default output: 167 of 180
-definitions carry no obligation, and it says so without a flag.
+`property` with their case and rejection counts. A tier is computed from the
+evidence rather than stored, so a `proved` that was really a sample cannot be
+asserted: `ply_prove` has no `tier` field and `Evidence::tier()` derives it. (This
+line used to say "there is no `tier` field anywhere", which one grep falsifies —
+the on-disk cache record `ply_store::obligations::CachedObligation` has a
+`pub tier: String`. It is not an authority: the reader recomputes the tier from
+the evidence and refuses the entry when the two disagree, so the label exists to
+make corruption *detectable*, not to be believed.) Coverage is in the default
+output: 167 of 180 definitions carry no obligation, and it says so without a
+flag.
 
 **The trusted computing base is one command.** `ply hosts examples/desk.ply`
 says `hermetic — no host handler is bound`, because tests do not reach the host
@@ -237,12 +308,22 @@ re-evaluated per call. Measured: disabling the memo by source substitution costs
 task-per-connection one, where there is nothing left to disable — the same
 service is 263.5µs a request sequentially and 470.6µs spawning.
 
-**A real browser's request head costs 1.5x a `curl`-sized one.** The throughput
-table above is taken with a 41-byte head. Measured separately, over the in-memory
-store at 40 concurrent connections: a two-field, 63-byte head costs 987.3µs per
-request and a thirteen-field, 569-byte browser head costs 1,472.4µs — 1,013 req/s
-against 679. Cost is proportional to *fields parsed* rather than to bytes
-received, which is the good regime; a browser simply sends more fields. A req/s
+**A real browser's request head costs about 1.5x a `curl`-sized one.** The
+throughput table above is taken with a 41-byte head. This page used to give that
+cost as four exact figures — "a two-field, 63-byte head costs 987.3µs per request
+and a thirteen-field, 569-byte browser head costs 1,472.4µs — 1,013 req/s against
+679", over the in-memory store at 40 concurrent connections. **Those four numbers
+have no source in this repository**: they are in no ADR, in neither
+`benches/*.json`, and no `ply-corpus` subcommand takes a sweep of that shape (the
+head sweeps are `serve --load-headers`, which is `examples/hello.ply` at 23 and
+503 bytes, and `w3`'s "fields or bytes" section, which is in-process). They are
+withdrawn here rather than re-stated, because the one thing this file promises is
+that its numbers are reproducible from this tree, and these were not. What
+survives them is the *shape*, which the head sweeps do show and which is the
+claim that matters: cost is proportional to **fields parsed** rather than to
+bytes received — `ply-corpus serve` reports 84x the head bytes costing 1.90x the
+time, a µs/byte column that falls from 1.92 to 0.043 as the head grows. That is
+the good regime; a browser is dearer simply because it sends more fields. A req/s
 number quoted without its head length is worth less than it looks, and that
 includes the one at the top of this file.
 
@@ -272,7 +353,28 @@ and the control-stack machine agree costs two runs, and the two are not the same
 speed: the tree-walker is 2.73x faster on the request path.
 
 **The request-path allocation count is large.** One `/health` request makes
-**1,035 allocations and 0.124 MB** to produce a 107-byte response.
+**1,122 allocations and 131,677 bytes** to produce a 107-byte response.
+
+> **Corrected (docs pass, 2026-08-17).** This sentence read **1,035 allocations
+> and 0.124 MB** in the present tense. That is W6's number and what the ladder
+> table above still renders, because that table is `benches/w6-ladder.json`, a
+> dated measurement file. This paragraph is not: it claims a current fact, and
+> R1/R2 moved it. Re-taken on the shipped tree:
+>
+> ```
+> $ ./target/release/w6-alloc --repo . --requests 200
+> {"allocations_per_request":1122.335,"bytes_per_request":131677.4,
+>  "requests":200,"response_bytes":107,"route":"/health"}
+> ```
+>
+> **1,122 against W6's 1,035 — the region milestone moved this the wrong way.**
+> ADR 0017 "What must be measured" §1 (`docs/adr/0017-regions.md:382` onward;
+> the 1,122 reading and its amortization are at `:428-440`) records
+> why: about 40 of the 87 are `region_kind::infer`, run once per `Machine` and
+> so amortizing to nothing over a server's lifetime, and the rest is arena
+> wiring on a route that allocates no cells. The point the paragraph is making
+> is unaffected — `/health`'s ~1,000 allocations are `Rc<Value>` boxes on the
+> framing, routing and encode path.
 
 **The profile has a −7.8% residue.** The layer table above sums to 638.96µs
 against a measured total of 592.64µs, because six of the rungs are taken in
@@ -292,12 +394,30 @@ hashing, no OAuth, no authorization model. Shipping an auth framework before
 there was a database or a secret type would have been shipping a shape nothing
 could implement correctly.
 
-**Migrations.** A schema is a value, and `--db-schema` materialises it, reads
-`information_schema` and `pg_constraint`, and refuses to start on any difference
-— which is most of what a migration tool is bought for. But there is no
-versioning, no up and down, no ordering across deploys and no diffing a live
-database into a change script. Calling that a migrations story would be
-generous.
+**Migrations — and the start-up schema check does not exist.** This paragraph
+used to read: "`--db-schema` materialises it, reads `information_schema` and
+`pg_constraint`, and refuses to start on any difference — which is most of what a
+migration tool is bought for." **That check was never built.** `--db-schema
+<module>.<fn>` is a real flag: it resolves the name against the program, checks
+the function is nullary and returns a `Schema`, evaluates it, and reads its table
+and column counts. It never opens a connection to compare. `information_schema`
+appears in this tree only in two test queries; `pg_constraint` appears in prose
+only. The error the refusal was named after, `E0435 DB_SCHEMA_MISMATCH`, is
+**raised nowhere** — the constant has three occurrences in the whole repository:
+its definition, its registry row, and its membership in a reserved-codes list.
+The code is more honest than this file was: `ply-cli`'s schema state is a
+two-valued `Declared | Verified` whose only `Verified` constructions are in unit
+tests, and whose comment reads *"`Declared` is the honest word for 'the program
+describes this and nothing compared it to a server'."*
+
+What you actually get is the fallback, and it is real: a statement whose shape
+the database disagrees with fails at **prepare** time with `E0433
+DB_PREPARE_FAILED`, raised from the driver's prepare path. That is per statement
+and on first execution — later and narrower than start-up, and it catches only
+the tables and columns your statements actually name. On top of that missing
+check there is also no versioning, no up and down, no ordering across deploys and
+no diffing a live database into a change script. There is no migrations story
+here at all.
 
 **HTTP/2 and HTTP/3.** ALPN advertises `http/1.1` and only `http/1.1`, which is
 the honest form of not having them. Every browser offers `h2` first. Also
@@ -335,8 +455,24 @@ M0–M8 and W1–W6 are complete: parse, typecheck with effect inference, conten
 addressing, evaluation on two engines, incremental testing, delta-debugged
 failures, multi-shot continuations, deterministic simulation, specs — and on top
 of that a web track that ends in a service you can deploy, observe and stop.
-`cargo test --workspace` runs 3,206 tests across 123 binaries; all pass, and the
-four marked `ignored` are timing benchmarks you run on purpose.
+
+Since then the **memory model** changed, which this section did not say. ADR 0017
+replaced ADR 0005's persistent forkable `World` with region-scoped bump arenas:
+`World` no longer exists as a type, cells are arena slots, and `with_region[r]`
+brands the values allocated in a scope so one escaping it is `E0446` at the
+escape site and one reaching a runtime boundary is `E0449`. That is why
+[DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
+
+`cargo test --workspace` runs **3,566 tests across 147 targets** (134 test
+binaries plus 13 doc-test suites); all pass on an unloaded machine. Four are
+marked `ignored`: three are timing benchmarks you run on purpose
+(`ply-corpus --test http_cost`) and the fourth is a doc-test, not a benchmark.
+Those counts were **3,206 across 123** here and had not been re-taken as the tree
+grew. One caveat the old sentence implied away: the `ignored` set is not the
+whole of the timing-sensitive suite —
+`ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+asserts on a wall-clock growth ratio and runs by default, and it failed for us on
+a machine that was busy compiling something else. On a quiet machine it passes.
 
 Read [DESIGN.md](DESIGN.md) for the language and the reasoning,
 [ROADMAP.md](ROADMAP.md) for what is built and what each milestone decided,

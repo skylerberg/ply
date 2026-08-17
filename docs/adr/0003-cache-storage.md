@@ -1,6 +1,17 @@
 # 3. Cache storage
 
-Status: accepted (interface landed, implementation outstanding)
+Status: accepted — **the format is implemented**; two items below are
+outstanding and are named in "Not done here".
+
+> **Corrected by the W6 documentation audit.** This line read "interface landed,
+> implementation outstanding" while this ADR's own "Not done here" section
+> already said the binary format, `ply_hash::body`, `ply cache compact` and
+> `ply cache inspect` "have all landed" — a document disagreeing with itself in
+> two places. The section is the one that matches the tree:
+> `crates/ply-store/src/idx.rs` carries both magics (`PLYFEIDX`, `PLYFEDAT`) and
+> both file names, and `ply cache compact` parses. What is still outstanding is
+> lazy materialization in the loader and a retention policy for the result
+> cache, and those are the two the status line now points at instead.
 
 ## Context
 
@@ -157,7 +168,8 @@ across 400 files, 12.75 MB as JSON — and timed them:
 | persist a one-definition change | 13–16 ms serialize + 12.75 MB write | 0.015 ms append + 0.3–0.5 ms index write |
 | `fsync` | 4–8 ms, and paid by both | 4–8 ms |
 
-`Store::open` at 0.21 ms is 25× inside the 5 ms budget, and the budget is what
+`Store::open` at 0.21 ms is 24× inside the 5 ms budget (this read "25×"; 5/0.21
+is 23.8), and the budget is what
 was measured against: the checksum is 0.2 ms per half-megabyte of index and
 scales linearly, so it is verified unconditionally rather than behind a size
 threshold.

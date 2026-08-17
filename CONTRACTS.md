@@ -191,9 +191,23 @@ pub struct Declarations {                      // per module, keyed by simple na
     pub effects: IndexMap<Symbol, Declared>,
 }
 pub struct Binding { pub qualified: Symbol, pub owner: usize, pub span: Span }
+/// Every name a module declares, as a `Binding`. Parallel to
+/// `Resolved::declarations`, and what a *qualified* lookup hands a reference
+/// back from — a `binder::name` denotes a declaration in another module, which
+/// is therefore in no scope at all.
+pub struct Bindings {
+    pub values: IndexMap<Symbol, Binding>,
+    pub types: IndexMap<Symbol, Binding>,
+    pub effects: IndexMap<Symbol, Binding>,
+}
 pub struct Scope {
     pub module: ModuleName,
     pub modules: IndexMap<Symbol, (usize, Span)>,   // binder -> module index
+    /// Modules this file imported names from **without** binding them as a
+    /// module, keyed by the binder such an import would not introduce. Kept only
+    /// so that `orders::place` after `import store.orders (place)` can say why
+    /// `orders` is not in scope.
+    pub selective: IndexMap<Symbol, (usize, Span)>,
     pub values: IndexMap<Symbol, Binding>,
     pub types: IndexMap<Symbol, Binding>,
     pub effects: IndexMap<Symbol, Binding>,
@@ -201,10 +215,13 @@ pub struct Scope {
 pub struct Resolved {
     pub scopes: Vec<Scope>,                    // parallel to Program::modules
     pub declarations: Vec<Declarations>,       // parallel to Program::modules
+    pub declared: Vec<Bindings>,               // parallel to Program::modules
     pub index: IndexMap<Symbol, usize>,        // module name -> module index
     pub order: Vec<usize>,                     // dependency-first; acyclic
 }
 impl Resolved {
+    pub fn scope(&self, module: usize) -> Option<&Scope>;
+    pub fn index_of(&self, name: &ModuleName) -> Option<usize>;
     pub fn lookup(&self, module: usize, ns: Namespace, q: &QName)
         -> Result<&Binding, Diagnostic>;
 }
@@ -233,9 +250,13 @@ impl<'a> Interp<'a> {
     pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Self;
 }
 
-// ply-test
+// ply-test — three later parameters have been appended; the shipped signature is
+// what is written here. `engine` came with the machine (`--engine`), `search`
+// with M7's plan and `hosts` with W1's binding, each of which a caller has to
+// state per run rather than per crate.
 pub fn run(selection: &Selection, program: &Program, resolved: &Resolved,
-           check: &CheckOutput, hashes: &HashOutput, store: &mut Store) -> RunReport;
+           check: &CheckOutput, hashes: &HashOutput, store: &mut Store,
+           engine: EngineChoice, search: Search, hosts: Hosting<'_>) -> RunReport;
 ```
 
 `CheckOutput` gained `modules: IndexMap<Symbol, ModuleInfo>`. `DefInfo`,
@@ -290,12 +311,19 @@ pub mod ast;      // written; do not modify
 pub mod lexer;
 pub mod parser;
 pub mod resolve;
+mod effect_set;   // private: W3's `effect set` expansion runs inside the parser
 
+// Re-exported from `parser` at the crate root.
 pub fn parse(source: SourceId, text: &str) -> Result<ast::Module, Vec<Diagnostic>>;
 pub fn parse_module(source: SourceId, name: ModuleName, text: &str)
     -> Result<ast::Module, Vec<Diagnostic>>;
 pub fn parse_program<'a>(inputs: impl IntoIterator<Item = (SourceId, ModuleName, &'a str)>)
     -> Result<ast::Program, Vec<Diagnostic>>;
+/// The recovering form: as many parse errors per run as it can find.
+pub fn parse_recovering(source: SourceId, name: ModuleName, text: &str)
+    -> (ast::Module, Vec<Diagnostic>);
+/// One expression, for a snippet and for `ply-test`'s own harness.
+pub fn parse_expr(source: SourceId, text: &str) -> Result<ast::Expr, Vec<Diagnostic>>;
 ```
 
 `parse` is `parse_module` under `ModuleName::anonymous()`. `parse_many` is gone;
@@ -351,6 +379,16 @@ than stopping at the first. Every node must carry a real span.
 ---
 
 ## ply-core
+
+Every struct in this block has grown fields since, each introduced by the section
+that added it: `module` / `simple_name` and `CheckOutput::modules` under Modules
+above; `OpInfo::scheme` under M7; `SpecInfo`, `LawInfo` and `CheckOutput::laws`
+under Specs; `DefInfo::performed` and `row_aliases` under W3. Two more are
+carried by no block and are recorded here: **`DefInfo::constraints:
+Vec<DefConstraint>`**, the `where derivable(D, a)` clauses sorted and
+deduplicated as the hash encodes them, which is part of the published signature;
+and **`ModuleInfo { name, source, items, imports }`**, the value of
+`CheckOutput::modules`. Every one of these structs also carries a `span`.
 
 ```rust
 pub mod ty;       // written; do not modify
@@ -458,6 +496,7 @@ per run.
 ```rust
 pub mod normalize;
 pub mod graph;
+pub mod body;     // the definition-body encoding; see Cache storage below
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct DefHash(pub [u8; 32]);
@@ -465,11 +504,16 @@ pub struct DefHash(pub [u8; 32]);
 impl DefHash {
     pub fn to_hex(&self) -> String;          // 64 chars
     pub fn short(&self) -> String;           // first 12 hex chars, for display
+    pub fn from_hex(s: &str) -> Option<DefHash>;   // exactly 64 chars, or None
 }
 impl std::fmt::Display for DefHash;          // == short()
 
 pub struct HashOutput {
     pub defs: IndexMap<Symbol, DefHash>,
+    /// `type` and `effect` declarations, which `defs` deliberately omits — only
+    /// a `fn` is a definition a test can be selected on. They are hashed all the
+    /// same, because a cached interface has to be keyed by one.
+    pub decls: IndexMap<Symbol, DefHash>,
     pub tests: Vec<DefHash>,                 // parallel to CheckOutput::tests
     /// Direct references, definition name -> names it mentions.
     pub deps: IndexMap<Symbol, Vec<Symbol>>,
@@ -777,7 +821,10 @@ pub const FRONTEND_FORMAT: u32;
 /// Covers every stored shape: `Type`, `Scheme`, `Footprint`, the fingerprint's
 /// fields, the declaration bodies, and `BODY_ENCODING`. Written into both file
 /// headers; a mismatch discards the front-end cache.
-pub fn schema_fingerprint() -> ContentHash;
+///
+/// It is declared as `ply_store::schema::fingerprint` and re-exported from the
+/// crate root under this name; both spellings are the same function.
+pub fn schema_fingerprint() -> ContentHash;   // == schema::fingerprint
 
 /// Version of the definition-body encoding, which lives in `ply-hash`.
 pub const BODY_ENCODING: u32;
@@ -914,6 +961,11 @@ sites anyway. Do not add callers.
 
 ## ply-eval
 
+**Superseded.** `Value` is stated in full under "The control stack and the world"
+below and grows again under W1, W2 and W5; `Cell(Rc<RefCell<Value>>)` in
+particular is gone, and `Interp::new` takes the three-argument form given under
+"Changed signatures" above. The block is the M2 record.
+
 ```rust
 pub enum Value {
     Int(i64), Bool(bool), Str(Arc<str>), Unit,
@@ -953,6 +1005,11 @@ impl<'a> Interp<'a> {
 ---
 
 ## ply-test
+
+**Superseded in three places.** `select` takes a fourth argument, a `Plan` — M7
+below, and the breaking change is deliberate. `run` takes the nine-argument form
+under "Changed signatures" above. `Failure` and `RunReport` are restated in full
+under "Machine-shaped failure" below. The block is the M2 record.
 
 ```rust
 pub struct Selection {
@@ -1141,8 +1198,16 @@ produce byte-identical artifacts.
 
 ```rust
 pub enum ChangeKind { Edited, Derived, Added, Removed }
+
+/// Which namespace a change is in. Added with `PassRecord::decls`, and for the
+/// same reason: a `fn` and a `type` may share a name, so a change set keyed by
+/// name alone silently drops one of them.
+pub enum Ns { Value, Decl }
+pub struct DefKey { pub name: Symbol, pub ns: Ns }
+
 pub struct Change {
     pub name: Symbol,
+    pub ns: Ns,
     pub before: Option<DefHash>, pub after: Option<DefHash>,
     pub kind: ChangeKind,
     /// Its published interface — canonicalized scheme and footprint — is the
@@ -1165,10 +1230,21 @@ impl DepEdges {
 }
 
 pub enum FusionReason { Independent, InterfaceChanged, Existence }
-pub struct Cluster { pub members: Vec<Symbol>, pub reason: FusionReason }
+pub struct Cluster {
+    pub members: Vec<Symbol>,
+    /// The same members with their namespaces, which is what a hybrid flips:
+    /// `members` deduplicates a name that is both a `fn` and a `type`.
+    pub keys: Vec<DefKey>,
+    pub reason: FusionReason,
+}
 
 pub struct Delta { pub test: Option<Change>, pub changes: Vec<Change>,
-                   pub clusters: Vec<Cluster> }
+                   pub clusters: Vec<Cluster>,
+                   /// Changes that could not be told apart from a hash that
+                   /// merely moved. Non-zero is the same disqualification an
+                   /// unresolved *trial* is: the answer may be right, but the
+                   /// run may not call it minimal.
+                   pub unclassified: usize }
 impl Delta {
     pub fn new(test: Option<Change>, changes: Vec<Change>, edges: &DepEdges) -> Delta;
     pub fn candidates(&self) -> usize;
@@ -1273,7 +1349,7 @@ replay sets `reproduced: false` and is reported rather than bisected.
 Everything on the stack ran; not everything that ran is on the stack. A
 definition that returned before the assertion has `ran: true` and `depth: None`.
 
-### Required of other crates — not yet implemented
+### Required of other crates — landed, with two shapes corrected
 
 ```rust
 // ply-store — the baseline. One record per test key, overwritten on each pass,
@@ -1281,13 +1357,21 @@ definition that returned before the assertion has `ran: true` and `depth: None`.
 pub struct PassRecord {
     pub test_hash: DefHash,
     pub closure: BTreeMap<Symbol, DefHash>,
+    /// The `type` and `effect` declarations, kept apart from `closure` because a
+    /// `fn` and a `type` may share a name: one map for both would record
+    /// whichever the writer preferred and drop the other, so an edit to the
+    /// loser would be invisible to every later bisection.
+    pub decls: BTreeMap<Symbol, DefHash>,
 }
 impl Store {
     pub fn pass_record(&self, key: &Symbol) -> Option<&PassRecord>;
     pub fn put_pass_record(&mut self, key: Symbol, record: PassRecord);
     /// Bodies, per ADR 0003 — name-erased and hash-linked, so a hybrid mixing
-    /// two namespaces needs no module layout invented for it.
-    pub fn body(&self, hash: DefHash) -> Option<&Definition>;
+    /// two namespaces needs no module layout invented for it. The stored type is
+    /// `DefBody` and the entry is materialized from a mapped byte range, so it
+    /// is answered by value: `Option<Arc<DefBody>>`, never `Option<&Definition>`.
+    /// "Cache storage" above is the authority on it.
+    pub fn body(&self, hash: DefHash) -> Option<Arc<DefBody>>;
 }
 ```
 
@@ -1401,7 +1485,10 @@ pub enum Value {
     Ctor { name: Symbol, args: Arc<Vec<Value>> },
     Closure(Arc<Closure>),
     /// A key into the `World`, not a pointer into it.
-    Cell(CellId),
+    Cell(CellId),                    // now `Cell(Slot)`; see "Test isolation
+                                     // under regions" below — ADR 0017 replaced
+                                     // the world with a region arena, and a
+                                     // `Slot` is an index plus a generation.
     /// Callable with exactly one argument — the value the `perform` it was
     /// captured at should have produced. Any other count is `ARITY_MISMATCH`.
     Continuation(Rc<Continuation>),
@@ -1409,8 +1496,12 @@ pub enum Value {
 
 impl Value {
     pub fn as_cell(&self, span: Span, what: &str) -> Result<CellId, Diagnostic>;
+    // now `-> Result<Slot, Diagnostic>`
 }
 ```
+
+`Value` has since grown `Float`, `Decimal`, `Bytes`, `Map`, `Task` and `Secret`;
+each is introduced by the milestone section that added it, below.
 
 `Cell(Rc<RefCell<Value>>)` is gone, and with it the "cell cannot be read while it
 is already borrowed" runtime error — a `RefCell` reentrancy failure cannot happen
@@ -1418,7 +1509,25 @@ to a map entry. `values_equal` compares cells by `CellId`, which is the same
 identity comparison `Rc::ptr_eq` gave. A `Continuation` compares like a closure:
 `RUNTIME_ERROR`, "cannot compare functions for equality".
 
-### `ply-eval::world` — landed
+### `ply-eval::world` — landed, then **deleted**
+
+> **Nothing in this subsection exists.** ADR 0017 replaced the persistent world
+> with a region arena, and the module, the type and the id all went with it.
+> There is no `ply_eval::world`, no `World` and no `CellId` in `crates/`. The
+> block below is kept as the record of what the milestone shipped and of what
+> each name became; "Test isolation under regions" at the end of this file is the
+> live contract. The mapping, in the file's usual form:
+>
+> - `ply_eval::world` → `ply_eval::arena` and `ply_eval::task_regions`
+> - `World` → `TaskRegions` / `Arena`  (`Fixture` is the seeded pair)
+> - `CellId` → `Slot`, an index **and a generation**, so a cell whose region has
+>   closed reads `None` instead of aliasing whatever was allocated in its place;
+>   `Display` is `"@7.0"`, not `"#7"`
+> - `World::fork` → the entry point's region reset; `GroupRegion::open`, which is
+>   linear in the fixture where `fork` was one pointer clone
+> - `World::high_water` → gone with the fork; nothing replaced it, because
+>   sibling forks are what it dated the ids against
+> - `World::cells` → `Arena::slots`
 
 ```rust
 pub struct CellId(pub u32);          // Display: "#7"
@@ -1452,6 +1561,15 @@ Handler-backed resources need no second map. A handler is a closure, its state i
 a cell, and the cell is in the world — so a fixture is a `(World, Value)` pair
 and forking it is `World::fork` plus a `Value` clone.
 
+**What replaced the two paragraphs above.** Sibling id collision is gone, because
+there are no siblings: one arena per entry point, slots handed out from a bump
+pointer, and a generation on each so a stale slot fails to resolve rather than
+aliasing. The fixture is still a pair — `ply_eval::Fixture`, a `TaskRegions` and
+a `Value`, reached through `ply_test::region::GroupRegion` — but opening it
+replays the fixture's slots into a fresh arena, which is **linear** where
+`World::fork` was one pointer clone. That regression is priced in "Test isolation
+under regions", required property 7.
+
 ### `ply-eval::code` — landed
 
 The AST lowered once per machine, with `Rc` on every node, so a frame can hold a
@@ -1484,7 +1602,11 @@ soon as the grammar below lands. It is the only place that has to learn about it
 ### `ply-eval::cont` — landed
 
 ```rust
-pub enum Frame { .. }                // 20 kinds; see the ADR's table
+pub enum Frame { .. }                // 23 kinds as shipped; the ADR's table
+                                     // describes the 20 M6 landed. The three
+                                     // added since are `CloseRegion` (ADR 0017)
+                                     // and the `MapFoldStep` / `BytesPositionStep`
+                                     // builtin steps.
 pub struct Prompt {
     pub clauses: Rc<Vec<Clause>>,
     /// Program-wide effect names, parallel to `clauses`, resolved where the
@@ -1528,14 +1650,21 @@ impl Stack {
         -> Option<Handled>;
     /// Cuts the innermost `segments` segments away. The returned stack is what
     /// the clause runs on; the continuation is what resuming puts back.
-    pub fn capture(&self, segments: usize) -> (Continuation, Stack);
+    ///
+    /// `born` is `Machine::host_ops` at the capture, stamped onto the
+    /// continuation for W1's linearity rule below — the parameter arrived with
+    /// the host boundary and is not optional.
+    pub fn capture(&self, segments: usize, born: u64) -> (Continuation, Stack);
     pub fn resume(&self, k: &Continuation) -> Stack;
+    /// The `Frame::Call`s pending, O(1) through push, pop, capture and splice.
+    pub fn calls(&self) -> usize;
 }
 
 pub struct Continuation { .. }       // Clone
 impl Continuation {
     pub fn frames(&self) -> usize;
     pub fn segments(&self) -> usize;
+    pub fn calls(&self) -> usize;
 }
 ```
 
@@ -1543,7 +1672,11 @@ impl Continuation {
 pending frame. That is the property that makes multi-shot affordable, and
 required test 15 pins it.
 
-### `ply-eval::machine` — not implemented
+### `ply-eval::machine` — landed
+
+Written "not implemented" when this section was drafted; the machine is the
+default engine as of `RUNTIME_VERSION` 0.4.0 and every entry point below exists.
+Two do not: see the note after the block.
 
 ```rust
 /// A resource limit on the heap the frames live on. Not the bound a runaway
@@ -1561,8 +1694,8 @@ impl<'a> Machine<'a> {
     pub fn with_max_calls(self, max: usize) -> Machine<'a>;
     /// The atoms this engine performed at the last entry point.
     pub fn trace(&self) -> &Trace;
-    pub fn set_base_world(&mut self, world: World);
-    pub fn world(&self) -> &World;
+    pub fn set_base_world(&mut self, world: World);   // deleted with `World`
+    pub fn world(&self) -> &World;                    // deleted with `World`
     pub fn test_count(&self) -> usize;
     pub fn test_name(&self, index: usize) -> Option<&'a str>;
     pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic>;
@@ -1574,6 +1707,15 @@ impl<'a> Machine<'a> {
     pub fn step(&mut self) -> Result<Progress, Diagnostic>;
 }
 ```
+
+`set_base_world` and `world` **do not exist**: they went with `World`. A machine's
+cell state is its `Arena`, seeded per entry point from a `Fixture` the runner
+holds — `ply_test::region::GroupRegion` above, and `Machine::cells`, which the
+`Evaluator` trait `--engine both` compares through also names.
+
+The machine has also grown entry points this block predates, each introduced
+where its milestone is: `set_seed` / `simulated` (M7), `set_host_binding` /
+`set_declared_footprint` / `set_re_executed` / `host_ops` / `host_use` (W1).
 
 The entry points mirror `Interp`'s exactly, which is what makes `Engine` a
 drop-in. The transition rules are ADR 0005 §1.3 and are normative — in
@@ -1693,22 +1835,35 @@ its value once, at the `perform`, and both resumptions receive it.
 model* — two tests get two worlds — not about two atoms, so it lives in the
 scheduler, below.
 
-### `ply-test` — not implemented
+### `ply-test` — landed, then renamed by ADR 0017
+
+Every name in this block was renamed when the forkable world went, and the
+**exemption it granted was withdrawn**. "Test isolation under regions" at the end
+of this file is the live contract; the mapping is annotated inline.
 
 ```rust
 /// Effects whose atoms name state living in a `World`. Exactly one at v0.
-pub const WORLD_BACKED: &[&str] = &["cell"];
+pub const WORLD_BACKED: &[&str] = &["cell"];   // now `REGION_SCOPED`, and no
+                                               // longer an exemption
 
-pub fn is_world_backed(atom: &EffectAtom) -> bool;
+pub fn is_world_backed(atom: &EffectAtom) -> bool;   // now `is_region_scoped`
 /// Every atom is world-backed. The empty footprint is world-isolated.
-pub fn world_isolated(f: &Footprint) -> bool;
+pub fn world_isolated(f: &Footprint) -> bool;        // now `region_isolated`,
+                                                     // widened to "no atom
+                                                     // contends" by M7
 /// The atoms that can conflict across tests: `f` minus its world-backed atoms.
-pub fn shared_footprint(f: &Footprint) -> Footprint;
+pub fn shared_footprint(f: &Footprint) -> Footprint; // now drops ambient only
 ```
 
 `group_by_conflict` colours `shared_footprint`s, not raw footprints. A
 world-backed atom conflicts with nothing across tests, because each test's cells
 are entries in its own forked world and no reference crosses.
+
+**That last sentence stopped being true.** There is no fork: a `cell` atom
+contends like any other atom now, and what buys the isolation is the colouring
+plus a region closed at the end of each test. `isolation: World | Shared` is
+`Isolation::Region | Shared`, and `Parallelism::region_contended` is the number
+this change costs, printed on every run so it cannot go unnoticed.
 
 Each worker forks the base world per test. `Selection` gains, and `RunReport`
 reports:
@@ -1719,7 +1874,8 @@ reports:
 Required properties, and they are the milestone's measurable claim rather than a
 slogan: every world-isolated test is in group 0 for any number of them; adding
 *N* world-isolated tests changes the group count by **zero**; the group count
-equals the colouring of the shared tests alone.
+equals the colouring of the shared tests alone. All three still hold, over
+`region_isolated` rather than over `world_isolated`.
 
 ### `ply-hash` — not implemented
 
@@ -1853,7 +2009,12 @@ compares, per test:
 - the `Result<(), Diagnostic>` by **full JSON serialization** — code, severity,
   message, every label with its span, every note. Not "both failed";
 - the observed footprint from the tracer;
-- the final world, as the `(CellId, rendered Value)` sequence from `World::cells`.
+- the final cell state, as the `(Slot, rendered Value)` sequence from
+  `Arena::slots` — `World::cells` when this was written — **and** the two arenas'
+  reclamation, which `differential::compare_outcomes` checks beside the contents.
+  Two engines that agree on every live cell and disagree about which slots came
+  back are two engines with different memory models, which is what ADR 0017 §3
+  makes a claim about.
 
 A mismatch **fails the run** with a diagnostic naming the test and both outcomes.
 Never a warning: a divergence between two evaluators of one language is made
@@ -1944,6 +2105,10 @@ innermost `Call` frames.
 over the shared-pointer kind so it uses `Rc` and non-atomic refcounts, matching
 the existing decision that an `Interp` is confined to one thread. It iterates in
 key order, which the byte-identical-artifact rule needs.
+
+The dependency stayed when the world went; what it backs now is `Value::Map`
+(`ply_eval::Map` is `rpds::RedBlackTreeMap<Value, Value>`, W2 below), for the
+same two reasons — a persistent map under `Rc`, iterated in key order.
 
 The control stack does **not** use `rpds::List`. Its links hold the frame
 inline, so pushing one costs a single allocation where `List` — which boxes the
@@ -2195,6 +2360,9 @@ impl Stream {
     /// `random.below` builtin turns into `RUNTIME_ERROR`.
     pub fn below(&mut self, n: u64) -> Option<u64>;
     pub fn drawn(&self) -> u64;
+    /// A stream resumed mid-sequence, for a replay that starts from a recorded
+    /// draw count rather than from zero.
+    pub fn at(root: u64, domain: Domain, counter: u64) -> Stream;
     /// Pure, so a replay can ask for draw `counter` without serving the ones
     /// before it.
     pub fn draw(root: u64, domain: Domain, counter: u64) -> u64;
@@ -2228,6 +2396,9 @@ impl Plan {
     pub fn random(roots: u32) -> Plan;
     pub fn normalized(self) -> Plan;
     pub fn seeds(&self) -> Vec<Seed>;
+    /// Whether running this plan can drive the entry point more than once. An
+    /// upper bound; W1's `E0425` is stated from it.
+    pub fn re_executes(&self) -> bool;
     /// Covers every field, length-prefixed. Two plans that search the same thing
     /// have the same digest, or the cache splits on the order a caller happened
     /// to write its flags in.
@@ -2236,23 +2407,26 @@ impl Plan {
 impl Default for Plan;   // Dpor, roots [0], DEFAULT_BUDGET, DEFAULT_STEPS
 
 /// One access a step made. Finer than a `Footprint` in exactly one place: a cell
-/// is a *location*, so it is keyed by `CellId` rather than by the `[r]` label
+/// is a *location*, so it is keyed by `Slot` rather than by the `[r]` label
 /// several cells may share.
 pub enum Access {
     Atom(EffectAtom),
-    Cell { id: CellId, mode: Mode },
-    /// A `with_cell` took the next id from the world's own counter. Allocation
-    /// has no location to name, so it is its own kind of access.
+    Cell { id: Slot, mode: Mode },      // was `id: CellId`, before ADR 0017
+    /// A `with_cell` took the next slot from the arena's bump pointer — the
+    /// world's own counter, before ADR 0017. Allocation has no location to name,
+    /// so it is its own kind of access.
     Alloc,
 }
 impl Access {
     /// Two `Atom`s by `EffectAtom::conflicts_with`; two `Cell`s iff the same
-    /// `CellId` and at least one is a `Write`; two `Alloc`s always, since they
+    /// `Slot` and at least one is a `Write`; two `Alloc`s always, since they
     /// take ids from one counter; anything else never.
     pub fn conflicts_with(&self, other: &Access) -> bool;
     pub fn is_write(&self) -> bool;
 }
-impl Display for Access;   // "db.write[users]", "cell.write[#7]" or "cell.alloc"
+impl Display for Access;   // "db.write[users]", "cell.write[@7.0]" or
+                           // "cell.alloc" — a `Slot` renders as index.generation,
+                           // where a `CellId` rendered "#7"
 
 pub struct StepFootprint { .. }
 impl StepFootprint {
@@ -2505,10 +2679,12 @@ pub fn writes_seed_keys(plan: &Plan) -> bool;
 pub fn result_key(test_hash: DefHash, seeded: bool, plan: &Plan) -> DefHash;
 ```
 
-`world_isolated` widened from "every atom is world-backed" to "no atom contends",
-because `sim.read` must not drop every simulated test out of the `isolated: n of
-m` number for no reason. `shared_footprint` drops ambient atoms with the
-world-backed ones. Both are landed, with tests.
+`world_isolated` — since renamed `region_isolated` — widened from "every atom is
+world-backed" to "no atom contends", because `sim.read` must not drop every
+simulated test out of the `isolated: n of m` number for no reason.
+`shared_footprint` dropped ambient atoms with the world-backed ones; under ADR
+0017 it drops **ambient only**, since a region label contends. Both are landed,
+with tests.
 
 ### `ply-test` — landed
 
@@ -2786,7 +2962,11 @@ pub struct LawInfo {
     pub index: usize,
     pub binders: Vec<LawBinder>,
     pub has_guard: bool,
-    /// `{}`, or `{sim.read}` for a concurrency law. Nothing else type-checks.
+    /// `law/host`, from `LawDef::host` — W4 below. Not in M8; carried here
+    /// because this block is otherwise the whole of the shipped struct.
+    pub host: bool,
+    /// `{}`, or `{sim.read}` for a concurrency law — or, when `host` is set, any
+    /// row at all. Nothing else type-checks.
     pub footprint: Footprint,
     pub span: Span,
 }
@@ -2885,23 +3065,32 @@ unreachable, because every body edit also reads as a spec edit.
 
 ```rust
 /// Bumping this re-attempts every obligation and re-runs no test.
-pub const PROVER_VERSION: &str = "0.1.0";
+/// M8 started it at `"0.1.0"`; it is `"0.5.0"` as shipped — see the Versions
+/// blocks below, the last of which is W4's `law/host`.
+pub const PROVER_VERSION: &str = "0.5.0";
 
 impl Store {
-    pub fn obligation(&self, key: DefHash) -> Option<Evidence>;
-    pub fn put_obligation(&mut self, key: DefHash, evidence: &Evidence);
+    /// The entry answers a borrow of a `CachedObligation`, not an `Evidence`:
+    /// the file carries the tier the discharging run *reported* alongside the
+    /// evidence, so that a label and an evidence telling different stories is
+    /// detectable rather than silently believed. The reader recomputes the tier
+    /// from the evidence and discards the entry when the two disagree.
+    pub fn obligation(&self, key: DefHash) -> Option<&CachedObligation>;
+    pub fn put_obligation(&mut self, key: DefHash, entry: CachedObligation);
     pub fn review_record(&self, def: &Symbol) -> Option<&ReviewRecord>;
     pub fn put_review_record(&mut self, def: Symbol, record: ReviewRecord);
 }
+
+pub struct CachedObligation { pub tier: String, pub evidence: CachedEvidence }
 
 /// `specs` holds *sentence* hashes — `HashOutput::spec_texts` for this
 /// definition's own clauses, plus `law_texts` for every law naming it directly.
 pub struct ReviewRecord { pub def_hash: DefHash, pub specs: Vec<DefHash> }
 ```
 
-The store persists an **`Evidence`**, not a `Discharge`, and that is deliberate:
-`Evidence` has no variant for a refutation, a vacuity or a gap, so a cache that
-held one would not type-check. `Discharge` is not `Serialize` for the same
+The store persists **evidence**, not a `Discharge`, and that is deliberate:
+`CachedEvidence` has no variant for a refutation, a vacuity or a gap, so a cache
+that held one would not type-check. `Discharge` is not `Serialize` for the same
 reason — `ply-cli` projects it into the JSON artifact, exactly as it already
 projects `ply_test::Failure`.
 
@@ -3430,6 +3619,9 @@ pub struct HostOp {
     /// May not run on the scheduler's thread; dispatched to `ply-host`'s pool
     /// and answers `Pending` immediately.
     pub blocking: bool,
+    /// Whether this operation may be handed a value containing a
+    /// `Value::Secret`. Added by W5, where `E0439` and the column are specified.
+    pub secrets: bool,
     /// The Rust path, as `ply hosts` prints it. The reviewable identity of a
     /// member of the trusted computing base.
     pub path: &'static str,
@@ -3488,6 +3680,14 @@ pub struct HostRegistry { .. }
 impl HostRegistry {
     pub fn new() -> HostRegistry;
     pub fn register(&mut self, op: HostOp, handler: Arc<dyn HostHandler>);
+    /// Registered, listed, and deliberately **not bound by this run**. W5's
+    /// `signal` is the case it exists for: a stop flag set once ends every test
+    /// after it, so `ply test` binds none of `signal` with or without `--host`.
+    /// A `perform` that reaches one is `E0424` with the *withheld* wording —
+    /// "this run binds no handler for it", a different sentence from "nothing
+    /// registers this", and the only one a reader can act on.
+    /// `HostBinding::withholds` is the lookup that tells the two apart.
+    pub fn register_withheld(&mut self, op: HostOp, handler: Arc<dyn HostHandler>);
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn ops(&self) -> impl Iterator<Item = &HostOp>;
@@ -3526,6 +3726,9 @@ impl HostBinding {
     /// What a hermetic `E0424` names: the path that would have served this.
     pub fn would_serve(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
         -> Option<&'static str>;
+    /// The path of a registration this run **withheld**, for the other `E0424`.
+    pub fn withholds(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
+        -> Option<&'static str>;
     pub fn listing(&self) -> &HostListing;
 }
 
@@ -3551,6 +3754,9 @@ pub struct HostRow {
     pub deterministic: bool,
     pub linearity: Linearity,
     pub blocking: bool,
+    /// `HostOp::secrets`, carried through so the listing can print it — W5
+    /// below, where the field is introduced and the digest widened to cover it.
+    pub secrets: bool,
     /// Whether the *declaration* carries `nondet`. Printed so a reviewer can see
     /// the pair that `E0423` checks.
     pub declared_nondet: bool,
@@ -3703,6 +3909,12 @@ undone.
 
 ### World interaction
 
+> **This subsection describes a design, not the code.** None of it shipped. The
+> block below is kept because the reasoning in it is still the reasoning, and
+> because a claim that was quietly deleted teaches nobody — but `Isolation` has
+> two variants and one constructor argument, and `Parallelism` has no `host`
+> field. What shipped is stated after the block.
+
 ```rust
 pub enum Isolation {
     World,
@@ -3722,13 +3934,35 @@ impl Isolation {
 }
 ```
 
+**As shipped**, in `ply_test::schedule`:
+
+```rust
+pub enum Isolation { Region, Shared }        // no `Host` variant
+impl Isolation {
+    pub fn of(footprint: &Footprint) -> Isolation;   // one argument; the binding
+                                                     // is not consulted
+    pub fn is_isolated(self) -> bool;                // there is no `is_world`
+    pub fn as_str(self) -> &'static str;
+}
+```
+
+`Parallelism` carries `total`, `isolated`, `shared`, `region_contended`,
+`scheduled`, `groups` and `shared_groups` — **no `host`**.
+
+The reporting the block above wanted does exist; it is computed one level up. The
+`host` count, the per-test `isolation: host` label and the
+`host: n of m · not cached` summary line are all built in
+`ply-cli`'s test command from `HostView::reaches(check, index)` — the test's
+footprint against the binding — and not from a `Parallelism` field or an
+`Isolation` variant. So the numbers a reviewer reads are the numbers this
+subsection promised, while `ply_test`'s own types know nothing about the host,
+and a second consumer of `ply_test` would have to recompute the correction. Both
+halves are worth knowing: the printed number is honest, and the library type is
+not the place it comes from.
+
 Grouping is otherwise **unchanged**: a host atom is an ordinary contending atom,
 so readers-writers over `db.read[users]` still decides what runs beside what,
-which is what ADR 0008 §6 asks for and it needs no special case. `Parallelism`
-gains `host: usize`, counted over the same universe as `isolated` and `shared`.
-
-`--explain` prints `host` where it prints `world` or `shared`, and the summary
-line gains `host: 3 of 47 · not cached`.
+which is what ADR 0008 §6 asks for and it needs no special case.
 
 ### `simulate` and the host are mutually exclusive
 
@@ -4034,21 +4268,46 @@ rows with every column above.
               failure mode this language exists to prevent.
 ```
 
-`ply test --json` bumps to `"schema_version": 4`: per test a `host` object of
-`atoms` and `operations`, absent — never zeroed — on a test that reached no host
-handler, and a top-level `"binding": "hermetic" | "host"` with the listing
-digest.
+`ply test --json` carries `"binding": "hermetic" | "host"` with the listing
+digest at the top level, and per test a boolean `"host"` — whether this test's
+footprint meets the binding — beside `"isolation"`, which reads `"host"` for such
+a test. **Not** a `host` object of `atoms` and `operations`: `HostUse` is held on
+the `Machine` and is not carried out to `TestResult`, so the per-test JSON says
+*that* a test reaches the host and not *what* it reached.
 
 `ply-test` gains:
 
 ```rust
-pub enum Reason { /* ... */ Host }   // always runs, never cached, in either direction
+pub enum Reason { /* ... */ Host }   // NOT SHIPPED — see below
 pub enum Record { /* ... */ Host }   // a green run that reached the host
 pub enum Skipped { /* ... */ Host }  // bisection refused: re-running replays I/O
-pub struct TestResult { /* ... */ pub host: Option<HostUse> }
+pub struct TestResult { /* ... */ pub host: Option<HostUse> }  // NOT SHIPPED
 ```
 
-`TestResult::green_but_uncached` includes `Record::Host`.
+**Two of those four did not land, and the gap is the read half of ADR 0011 §5.**
+
+- `Record::Host` and `Skipped::Host` exist and are the *write* half: a run that
+  reached a host handler records `Record::Host`, nothing is stored, and bisection
+  refuses. That half is implemented and tested.
+- There is no `Reason::Host`. `select` is
+  `select(check, hashes, store, plan)` — it takes no binding — so **no test is
+  ever selected because it can reach the host**. A host-reaching test runs today
+  only because `Reason::Nondet` covers it, and that covers it only because every
+  registration in `ply_host::registry` is `Determinism::Nondeterministic`. ADR
+  0011 §4 explicitly permits a `Deterministic` registration and §5 says such a
+  handler is "still not cacheable"; it is cacheable. A hermetic pass by a test
+  whose footprint reaches the binding is read back under `--host` and the test is
+  skipped without the host being consulted.
+  `crates/ply-test/tests/host_selection_audit.rs` pins that behaviour under a
+  `documents_` name so a fix shows up as a diff.
+- There is no `TestResult::host`. `Failure::host: bool` is what carries the fact
+  to a failing test, read off what the runtime did.
+
+`TestResult::green_but_uncached` is `Record::Exhausted | Record::Unobserved` and
+does **not** include `Record::Host`, so a green host-backed test is not announced
+as green-but-uncached in the summary. The `host: n of m · not cached` line under
+`--explain` is what says it instead, and that line is computed in `ply-cli` from
+the binding rather than from the report.
 
 ### New diagnostic codes
 
@@ -4674,7 +4933,28 @@ fields:
 84 times the bytes cost **39 times** the time before and **0.95 times** the
 time now. A request's cost has stopped being a function of how long its head is
 and become a function of how many fields were parsed out of it, which is the
-exit criterion ADR 0012 §5 states. A faster interpreter would have divided the
+exit criterion ADR 0012 §5 states.
+
+> **Audit note: ADR 0016 §0 reports this same sweep as 29.29x → 1.00x, and this
+> same request as 527.7µs → 109.8µs at 1,895 → 9,109 req/s.** Both documents
+> claim to be quoting W2. They cannot both be. This section is the one with a
+> rig attached, so it is the better of the two — but it is not confirmed either.
+> Re-running exactly the command named above
+> (`ply-corpus serve --repo . --baseline`) for the audit produced, on a slower
+> box: `answer` alone **316.1 µs → 23.8 µs**, a whole request over a real socket
+> **617.4 µs → 135.6 µs**, **1,620 → 7,372 req/s**, share above the socket
+> **78% → 32%**, and a head sweep the tool itself prints as **84x the bytes cost
+> 26.27x the time** under W1's folds and **0.93x** under the byte builtins.
+>
+> The absolute µs are machine-dependent and the audit's box is slower throughout,
+> so those are expected to move. The sweep *ratio* is not supposed to be — it is
+> a shape claim about an O(n) parser — and the three recorded values for it are
+> **39x** (here), **29.29x** (ADR 0016 §0) and **26.27x** (re-measured). Note
+> also that the tool computes that ratio itself, as last-row µs over first-row
+> µs; **39** is what this table's own two rows divide to (8458/216 = 39.2), so
+> this section is at least self-consistent, whereas ADR 0016's 29.29x has no
+> table under it anywhere. The qualitative claim — the second column is flat and
+> the first is not — reproduces on every take. A faster interpreter would have divided the
 first column; it would not have flattened it. What is left above the socket is
 `handle` dispatch and the response build, and the socket is now two thirds of a
 served request — which is the input W6 wanted and not the one M9 assumes.
@@ -5647,10 +5927,18 @@ orders join items` performed as `db.query[orders]` records one atom and touches
 two, and nothing in the type system can see it because the SQL is a `String`.
 Two answers are refused — one-table-per-statement makes a join inexpressible,
 and a group label makes `db.write[db]` with more syllables — and the third is
-taken: **the driver reports what it touched, and the machine checks the report.**
+taken: **the driver computes what a statement would touch and refuses before it
+runs it.** The design below went further — the driver would *report* what it
+touched and the machine would check the report — and that half did not ship.
+
+> **`HostReply` does not exist.** There is no such type anywhere in `crates/`,
+> `HostAnswer` still has the W1 variants, and `HostRuntime`'s three W1 methods
+> still answer a `Value`. What that costs is stated after the block: the
+> **preventer** landed and the **detector** did not, so the boundary is trusted
+> exactly as far as the driver's own SQL scan reaches.
 
 ```rust
-/// A completed host operation.
+/// A completed host operation. NOT SHIPPED.
 pub struct HostReply {
     pub value: Value,
     /// Every atom this operation touched **beyond** the one the registry
@@ -5663,46 +5951,74 @@ impl HostReply {
     pub fn value(value: Value) -> HostReply;
 }
 
-pub enum HostAnswer { Reply(HostReply), Pending(Pending) }
+pub enum HostAnswer { Reply(HostReply), Pending(Pending) }   // NOT SHIPPED
+```
+
+**As shipped**, in `ply_eval::host`:
+
+```rust
+pub enum HostAnswer { Value(Value), Pending(Pending) }   // unchanged since W1
 
 pub trait HostRuntime {
-    fn poll(&self, p: &Pending) -> Result<Option<HostReply>, Diagnostic>;
+    fn poll(&self, p: &Pending) -> Result<Option<Value>, Diagnostic>;
     fn park(&self) -> Result<(), Diagnostic>;
-    fn block_on(&self, p: Pending) -> Result<HostReply, Diagnostic>;
-    fn end_entry_point(&self) -> Result<(), Diagnostic>;
+    fn block_on(&self, p: Pending) -> Result<Value, Diagnostic>;
+    /// Takes the machine whose entry point ended, exactly as the block above
+    /// this section says it must — one `Postgres` serves the whole run.
+    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic>;
+    fn stopping(&self) -> bool;                       // W5
+    fn shutdown(&self, drain_ms: u64) -> ShutdownReport;   // W5
 }
 
 pub struct HostRequest<'a> { /* ... */
+    /// The machine that performed this operation. With `task`, the whole
+    /// identity a handler keys scoped state on.
+    pub machine: MachineId,
     /// The task that performed this operation. `None` outside a scheduler
     /// region, which is one identity rather than an absence of one.
     pub task: Option<TaskId>,
     /// The declared footprint of the entry point that reached this operation,
     /// so a handler that can compute its own footprint refuses instead of
-    /// acting.
-    pub declared: &'a Footprint,
+    /// acting. **`Option`**, not a bare reference: a caller that declared
+    /// nothing passes `None`, and then only the checks the handler can make on
+    /// its own apply.
+    pub declared: Option<&'a Footprint>,
 }
 ```
 
-On every host answer the machine checks **each** atom of `touched` against the
-entry point's declared footprint and unions the set into `HostUse`. An atom
-outside it is **`E0434 DB_FOOTPRINT_UNDECLARED`** — the *program's* fault,
-attributed and bisected like any other program failure, as distinct from
-`E0427`, which keeps its meaning and stays Ply's fault.
+The `touched` set is real but it never leaves `ply-host`: `db::check_footprint`
+computes it from the statement scan, raises `E0434 DB_FOOTPRINT_UNDECLARED`
+against `HostRequest::declared` **before** a connection is acquired, and hands it
+to the driver as `Statement::touched`. The machine's own footprint check is the
+W1 one — the *resolved* atom against the declared footprint, `E0427`, before
+dispatch — and `Machine::host_use` records that resolved atom and no other. So:
 
-**`E0434` is a detector, not a preventer**, and that is said out loud:
-scheduling happened before the run, so by the time it fires the statement has
-executed against a table the scheduler thought nobody was touching. What it buys
-is that a wrong row fails loudly on its first execution instead of quietly
-forever — the difference that matters, given every dangerous defect this project
-has found was a green result over unexplored space.
+- **`E0434` is a preventer and only a preventer.** It fires at prepare time, from
+  the scan, and refuses before a row moves. That is strictly better than the
+  detector for the case it covers.
+- **There is no detector behind it.** A handler that touches an atom its scan did
+  not predict is not caught by anything, and neither `HostUse` nor the report
+  will ever mention that atom. The class W1 already disclosed — "it cannot catch
+  a handler that does more than its registration declared" — is therefore still
+  open under W4, and the SQL scan is the whole of the defence rather than the
+  first of two. `crates/ply-host/src/db.rs`'s own doc comment on
+  `check_footprint` still describes the machine-side detector as though it
+  existed; it does not.
+- **`E0434` is the program's fault** — attributed and bisected like any other
+  program failure, as distinct from `E0427`, which keeps its meaning and stays
+  Ply's fault. That much is unchanged.
 
-The preventer runs earlier: the driver computes the table set at **prepare**
+The preventer: the driver computes the table set at **prepare**
 time, once per statement text, and refuses `E0434` from `HostRequest::declared`
-before a row moves. The machine's check on `touched` covers the case the
-driver's own scan got wrong. Neither closes ADR 0008 §2 — a handler that lies
-about `touched` is as invisible as one that lies about its registration — but
-together they close the case where the *honest* handler could not tell the
-truth, which W4's driver is the first handler in the system to have.
+before a row moves. The machine's check on `touched` was to have covered the case
+the driver's own scan got wrong; it does not exist, so **the scan is unbacked**
+and a scan that under-reports is undetected. Neither closes ADR 0008 §2 — a
+handler that lies about `touched` is as invisible as one that lies about its
+registration — and what the scan alone does close is the case where the *honest*
+handler could not tell the truth, which W4's driver is the first handler in the
+system to have. The differential test against postgres's own planner, below, is
+the only evidence the scan is right, and it is evidence gathered before the run
+rather than a check made during one.
 
 **`ply_host::db::scan`** computes the set: a bounded scanner over the statement
 text, in Rust, in the TCB, disclosed by `ply hosts`. It recognises `SELECT` /
@@ -5843,7 +6159,16 @@ protocol's `Close`). A prepare postgres refuses is **`E0433`** and not a
 `Failed`: it is the program's fault, it is the same every time, and it will never
 succeed on a retry, so a value would invite a loop on it.
 
-### `derive row`
+### `derive row` — **not implemented**
+
+`Deriver` has three variants as shipped — `Json`, `Eq`, `Ord`, tags 1, 2, 3 — and
+there is no `Row`. `derive row for Item` is a parse error naming the unknown
+deriver. What `examples/desk.ply` does instead is written out by hand, with a
+comment at its head saying so and naming this section as the specification the
+generated code would have satisfied: `RowError`, `RowCodec`, the cell readers and
+the two codecs are all Ply source in that file. Everything below is therefore the
+design, not the contract, and the reader should not expect to find it in
+`crates/ply-derive`.
 
 ADR 0010 named it and ADR 0012 §3 deferred it here "with the `Row` type it is a
 codec over".
@@ -6168,9 +6493,16 @@ driver's own bookkeeping.
 ### Versions
 
 `RUNTIME_VERSION` to `0.10.0` — `HostAnswer`, `HostReply` and `HostRuntime`
-changed shape, the machine checks `touched` and calls `end_entry_point`.
+changed shape, the machine checks `touched` and calls `end_entry_point`. Of those
+four, two happened: `HostRuntime` gained `end_entry_point(machine)` and the
+machine calls it. `HostAnswer` did not change shape, `HostReply` was never
+written, and the machine checks no `touched` — see "Footprint granularity" above.
+`RUNTIME_VERSION` moved anyway, and correctly: `end_entry_point` alone changes
+what a cached `Pass` is a claim about.
 `FRONTEND_VERSION` to `0.12.0` — a new deriver (`row`), `LawDef::host`, and the
 `law/host` grammar; ADR 0012 §3's rule is that any change to a deriver bumps it.
+The deriver did not land, so the bump was paid for `LawDef::host` and the grammar
+alone; `Deriver` still enumerates `Json`, `Eq`, `Ord`.
 **`BODY_ENCODING` to `7`** — `law_def` writes a host flag after its tag, as
 `test_def` writes `nondet`. `PROVER_VERSION` to `0.5.0` — `law/host` is a new
 discharge mode with a new ceiling and a new unattempted reason.
@@ -6216,7 +6548,7 @@ beside W5's secrets rather than here as an untested line.
 | E0431 | `DB_NOT_CONFIGURED` | `--host` binds the driver and no `--db` URL was given, or it is malformed, or the server is unreachable at bind time | the run's configuration |
 | E0432 | `DB_STATEMENT_REFUSED` | statement text W4 refuses: more than one statement; a construct the scanner cannot account for; a parameter or result type outside the mapping; `now()` / `random()` in the text | the program's |
 | E0433 | `DB_PREPARE_FAILED` | postgres refused to prepare, or the result description has a duplicate column name or lacks a column the codec requires | the program's |
-| E0434 | `DB_FOOTPRINT_UNDECLARED` | a statement touches a table outside the entry point's declared footprint — at prepare from `HostRequest::declared`, at answer from `HostReply::touched` | the program's |
+| E0434 | `DB_FOOTPRINT_UNDECLARED` | a statement touches a table outside the entry point's declared footprint — at prepare, from the scan against `HostRequest::declared`. The second site, "at answer from `HostReply::touched`", was specified and not built | the program's |
 | E0435 | `DB_SCHEMA_MISMATCH` | the live database differs from the `Schema` the run named | the run's configuration |
 | E0436 | `DB_TRANSACTION_SCOPE` | a `db` operation from a task that does not own the open scope | the program's |
 | E0437 | `DB_POOL_EXHAUSTED` | no connection became available within `--db-acquire-ms` | the run's configuration |
@@ -6729,18 +7061,41 @@ pub trait HostRuntime {
     /// Called once, after the last entry point, before the process exits. Runs
     /// the pinned order above and answers what it managed. Never called from a
     /// signal handler.
-    fn shutdown(&self, deadline: Duration) -> Shutdown;
+    ///
+    /// `drain_ms` is a **bound and not a hint**: a teardown step waiting on a
+    /// peer waits at most this long and then discards the connection, because
+    /// closing the socket is what aborts the statement.
+    fn shutdown(&self, drain_ms: u64) -> ShutdownReport;   // was `deadline:
+                                                           // Duration -> Shutdown`
 }
 
-pub struct Shutdown {
-    pub connections_abandoned: usize,
+/// The type is `ShutdownReport`; four of the six fields below are not the ones
+/// that shipped, and the reason each differs is that every field here is a fact
+/// the teardown already held rather than a number computed for the banner.
+pub struct ShutdownReport {
+    /// Transaction scopes rolled back. **Never committed** — a commit at a
+    /// deadline commits a half-finished body.
     pub transactions_rolled_back: usize,
+    /// Connections closed rather than returned to the pool, **and why**: a
+    /// count could not name the connection an operator has to go look at.
+    /// (Was `connections_abandoned: usize`.)
+    pub connections_closed: Vec<String>,
     pub spans_abandoned: usize,
-    pub events_flushed: u64,
-    pub elapsed_ms: u64,
-    pub complete: bool,
+    /// Records the sink held when it was flushed, and `None` for a run with no
+    /// sink bound — which a `0` could not be told apart from.
+    /// (Was `events_flushed: u64`.)
+    pub records_flushed: Option<usize>,
+    /// What the teardown could not hand back, as `W0606` renders it. Empty is a
+    /// clean teardown. (Replaces `complete: bool`; `is_clean()` is the boolean,
+    /// and it is derived from this rather than reported beside it.)
+    pub problems: Vec<String>,
 }
+impl ShutdownReport { pub fn is_clean(&self) -> bool; }
 ```
+
+`elapsed_ms` has no counterpart: nothing in the report is timed. The
+`"…ms since the signal"` line the operator sees is measured by the run's shutdown
+coordinator, which knows when the signal arrived and the report does not.
 
 **A request still running at the deadline is not cancelled.** W5 adds no
 cancellation — ADR 0011 deferred it, ADR 0013 §7.2 argued deadlines sufficed for
@@ -7010,6 +7365,21 @@ discharge can change, because `Secret` is a new type no law could have mentioned
 an observation: the whole W4 corpus normalizes byte-for-byte identically, and the
 front-end cache is discarded on the `FRONTEND_VERSION` bump while the **result
 cache is untouched**, so no test re-runs for a reason other than a source edit.
+
+**Two constants have moved since, and no Versions block above records them.**
+Read `ply_store`'s own doc comments, which do:
+
+| constant | as shipped | what moved it after W5 |
+| --- | --- | --- |
+| `RUNTIME_VERSION` | `0.11.2` | `0.11.1`: `map_of_entries` / `map_merge` refuse a `Secret` key rather than ordering it, and a span id is minted per entry point rather than per run. `0.11.2`: both engines memoize a nullary pure definition — no value moves, but the calls pending under a second reference to one do (see "The constant memo") |
+| `FRONTEND_VERSION` | `0.15.0` | `0.14.0`: a handler clause for a polymorphic operation is universally quantified, so a clause answering a concrete type for an operation declared `-> a` is `E0201` where it was accepted. `0.15.0`: ADR 0017's region surface — `with_region[r]`, the escape check on resolved types, and a variant field declared as a concrete `Cell` becoming `E0446` |
+| `PROVER_VERSION` | `0.5.0` | unchanged since W4 |
+| `BODY_ENCODING` | `7` | unchanged since W4 |
+| `FRONTEND_FORMAT` | `4` | — |
+
+Each of those last two `FRONTEND_VERSION` bumps is a front end that *refuses* a
+program the previous one accepted, which is the case the constant's own comment
+says nothing else catches.
 
 ### Workspace
 

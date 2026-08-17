@@ -1348,9 +1348,15 @@ review are the whole of the defence. W5's registrations are `trace.write[c]`
 (write, per channel), `config.read[k]` (read, per namespace) and nothing at all
 for `signal`, and those three choices are the substance of this table.
 
-Every test that reaches any of them is `Isolation::Host`: counted separately,
+Every test that reaches any of them is counted as **host**: counted separately,
 excluded from `isolated: n of m`, never cached, never bisected. W5 adds no case
 to that machinery.
+
+*(Written `Isolation::Host` until the W6 documentation audit. There is no such
+variant — `ply_test::schedule::Isolation` is `Region | Shared` — and the host
+category is `ply_cli::hosts::Counts`, computed from `Hosts::reaches(footprint)`.
+The property is unchanged; only the mechanism is. ADR 0011 §7 is where the
+variant was promised and is corrected in place.)*
 
 ---
 
@@ -1523,6 +1529,23 @@ The ones whose absence would let W5 ship broken rather than merely incomplete.
     `ply hosts` and changing it alone moves the digest.
 18. `secret_verify` compares in constant time: a harness over mismatches at
     increasing positions shows no monotone step count.
+    **The harness was never written; the property is argued from the source
+    instead.** What exists is `the_comparison_is_over_the_whole_of_both_operands`
+    (`crates/ply-eval/tests/secrets.rs:177`), and it asserts seven *answers* —
+    that `constant_time_eq` returns the right `bool` for equal inputs, for a
+    mismatch at the last byte, for a mismatch at the first byte, for a length
+    difference, and for the empty/NUL pair. It measures nothing and counts
+    nothing, so it would pass unchanged against an implementation with an early
+    `return false`. That is a weaker assertion than this entry claims.
+    **The property does hold by construction**, which is why this is a
+    documentation defect and not a security one:
+    `ply_eval::value::constant_time_eq` (`crates/ply-eval/src/value.rs:893–902`)
+    loops `0..a.len().max(b.len())`, ORs `x ^ y` into an accumulator, seeds that
+    accumulator with `a.len() ^ b.len()` so a length difference cannot be
+    short-circuited either, and passes it through `std::hint::black_box` each
+    iteration to stop the optimiser reintroducing an exit. There is no branch on
+    the data in the loop. Read the function rather than trusting this line: the
+    line was checked and the harness it names does not exist.
 
 **Configuration**
 
@@ -1553,6 +1576,13 @@ The ones whose absence would let W5 ship broken rather than merely incomplete.
 28. A transaction open at the deadline is **rolled back and never committed**,
     asserted against `pg_stat_activity` and against the table's contents, not
     against the driver's bookkeeping.
+    *Enforced by `an_open_transaction_at_shutdown_is_rolled_back`
+    (`crates/ply-host/tests/w5_shutdown.rs:159`), which does assert exactly
+    that, through `idle_in_transaction()` reading `pg_stat_activity` and
+    `rows()` reading the `ledger` table. It runs only behind ADR 0014 §13.1's
+    gate A: its enclosing `#[test]` at `w5_shutdown.rs:132` prints a skip line
+    and returns when the machine has no `initdb`/`postgres`. The same is true of
+    required tests 29 and 31, and of 30's live half.*
 29. Teardown order is the pinned one: a trace record naming the rollback is
     written before the pool closes, asserted from the captured stderr.
 30. A second signal exits `130`/`143` immediately, after printing what was
@@ -1628,6 +1658,49 @@ The ones whose absence would let W5 ship broken rather than merely incomplete.
 54. `Store::open` at 10,000 definitions stays under 5 ms.
 55. **No definition's normalized bytes moved** across the W5 change, over the
     whole W4 corpus — `BODY_ENCODING` stays at `7` and this is what proves it.
+
+### 12.1 What a green `cargo test --workspace` proves about the Shutdown block
+
+**Audit note, docs pass, 2026-08-17.** The shutdown tests sit behind three
+different conditional skips, one of which prints nothing at all. Recorded here
+because required tests 27 through 34 are the milestone's headline — "a service
+that can be deployed, observed, and shut down without losing in-flight
+requests" — and their enforcement is the most machine-dependent in the
+milestone.
+
+**Gate C — `#![cfg(unix)]`, and it is silent.**
+`crates/ply-cli/tests/w5_shutdown.rs:18` puts the whole file behind
+`#![cfg(unix)]`, so on a non-Unix host it is not compiled, not counted, and
+**not mentioned** — unlike gates A and B, which at least print a line. Eight
+`#[test]`s are in it, and they are the only ones that drive the real `ply`
+binary over a real socket and send it a real signal, which the file header
+correctly argues is the only way to answer the question at all. They cover
+required tests **27** (`a_request_in_flight_at_the_signal_gets_its_response_and_the_run_exits_zero`,
+line 227), **30** (`a_second_signal_exits_immediately_and_says_what_it_abandoned`,
+line 353), **31** (`a_drain_that_expires_reports_w0608_and_exits_three`,
+line 316), **33** (`signal_is_withheld_under_ply_test_and_names_the_twin`,
+line 416) and **34** (`during_the_lead_the_run_still_accepts_and_already_says_it_is_stopping`,
+line 380), plus `a_connection_opened_after_the_stop_gets_no_response`,
+`a_spawned_task_still_serving_at_the_signal_finishes_and_the_run_exits_zero`
+and `a_task_blocked_on_a_host_handler_does_not_outlast_the_drain`. The reason
+given for the gate is sound — `SIGTERM` is sent by shelling out to `kill`
+rather than taking a `libc` dependency — but the consequence is that on
+Windows the entire Shutdown block of this list is enforced by nothing and says
+so nowhere.
+
+**Gate A — `cluster::available()`**, documented in ADR 0014 §13.1. Required
+tests **28**, **29** and **31**'s live half run through
+`crates/ply-host/tests/w5_shutdown.rs:132` and
+`crates/ply-host/tests/w5_drain_audit.rs:180`, both of which print a skip line
+and return when the machine has no `initdb`/`postgres`.
+
+**Gate B — `PLY_PG_URL`**, also ADR 0014 §13.1. Not load-bearing for this
+block, but it is a third skip in the same subsystem and a reader counting
+gates should know there are three.
+
+So of required tests 27–34: **27, 30, 33 and 34** need a Unix host; **28 and
+29** need a Unix host *and* a local postgres; **31** needs both for its live
+half; **32** is the one that runs everywhere.
 
 Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 

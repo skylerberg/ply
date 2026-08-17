@@ -4,7 +4,23 @@ Status: accepted — implemented in W3, **amended by W6**. Decision 1 as first
 written allowed an alias to name a whole effect; the implementation refuses it,
 and W6 corrected this document rather than the code, because the reason the
 implementation found is better than the reason this ADR gave. The rejected form
-is no longer shown; see decision 1 and decision 5.
+is no longer shown except as the `E0114` example it now is; see decision 1 and
+decision 5.
+
+Amended by: `docs/adr/0013-w3-contract.md` §1.2 (a member is an atom, never a
+whole effect — the argument in full, including why a wildcard atom is not the
+alternative) and §1.3 (sets are module-local).
+
+> **Re-verified by the W6 documentation audit**, against the code rather than
+> against ADR 0013. Decisions 1, 5 and 6 all hold in
+> `crates/ply-syntax/src/effect_set.rs` and `parser.rs`: `Sets::unknown` emits
+> `E0114` with both notes decision 1 quotes verbatim and attaches them only when
+> the name is a declared *effect*; `Sets::lookup` emits `E0114` for a qualified
+> `other::Web`; the parser emits `E0114` for `pub effect set`; and
+> `Sets::find_cycles` emits `E0115` once per cycle, marking every set on it
+> `cyclic` so it contributes no atoms rather than looping. Decision 3 holds by
+> construction — `expand` splices atoms into the row and the set's name reaches
+> no later pass.
 
 ## Context
 

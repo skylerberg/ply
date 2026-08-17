@@ -1,8 +1,21 @@
 # 2. The incremental front end
 
-Status: accepted (interface landed, implementation outstanding). Its *storage* is
-superseded by ADR 0003 — the gates, the witness and the invalidation table below
-stand unchanged; "one file written atomically" does not.
+Status: accepted — **implemented**. Its *storage* is superseded by ADR 0003 —
+the gates, the witness and the invalidation table below stand unchanged; "one
+file written atomically" does not.
+
+> **Corrected by the W6 documentation audit.** This line read "interface landed,
+> implementation outstanding", and the "Not done here" section below still
+> listed the gates, `--explain`, `--no-incremental` and the equivalence test as
+> unimplemented. All four have shipped and were verified against the tree, not
+> against another document: both gates are `crates/ply-cli/src/driver.rs`
+> (its module doc states them in this ADR's own terms), `--no-incremental` is
+> `crates/ply-cli/src/cli.rs` on four subcommands and `Refusal::NotIncremental`
+> in the driver, and the equivalence test is
+> `crates/ply-cli/tests/incremental.rs`, which compares `DefHash`, `Scheme` and
+> `Footprint` by equality rather than alpha-equivalence and asserts that gate 1
+> actually fired before it credits an agreement. The one item below that is
+> still outstanding is name-erased schemes, and it is still deferred by choice.
 
 ## Context
 
@@ -190,7 +203,7 @@ blocks.
 | **Front end changed, evaluator did not** | `FRONTEND_VERSION` bumps; every fingerprint and interface is discarded and the *result* cache survives. | The two caches answer different questions. A change to inference invalidates a type; it does not invalidate a test that was proved by running the code. |
 | **Evaluator changed, front end did not** | `RUNTIME_VERSION` bumps; results are discarded and fingerprints survive. | The converse. Conflating them would mean every prelude tweak triggers a full recompile. |
 | **A changed file fails to parse or typecheck** | No fingerprint is written for it. Every other file's entries are untouched. | A cache must never record what a failed compile produced; the next run must re-derive it. |
-| **Interrupted run** | `sources`, `defs` and `decls` live in one file written atomically, so a crash leaves the previous consistent triple. | Split across two files, a crash between renames could pair a new fingerprint with an interface map that lacks the hashes it names. |
+| **Interrupted run** | ~~`sources`, `defs` and `decls` live in one file written atomically, so a crash leaves the previous consistent triple.~~ **Superseded by ADR 0003:** they live in `frontend.idx` (rewritten whole and atomically) over an append-only `frontend.dat`. The pairing is enforced by a `nonce` carried in both file headers rather than by single-file atomicity, and a torn append is *detected* by the frame length prefix and checksum. | Split across two files, a crash between renames could pair a new fingerprint with an interface map that lacks the hashes it names — which is why the nonce, not the file count, is what actually closes this case. |
 | **Two `ply` processes at once** | `defs` / `decls` union — they are content-keyed, so a foreign entry is as good as a local one. `sources` is last-writer-wins. | A `sources` entry is never trusted until its `content_hash` is checked against the bytes on disk, so a lost or foreign fingerprint costs a parse, never a wrong answer. |
 | **`ply check one.ply` in a large project** | Reads and writes the front-end cache for that one file and does **not** prune. | Pruning is scoped to a run that discovered every `.ply` file under the root. Pruning to a single-file run would delete the rest of the project's work — cheap-looking, and it would silently uncache everything on every partial invocation. |
 | **Reformatting, recommenting** | Content hash changes, so the file is parsed; every `DefHash` is unchanged, so gate 2 reuses every interface. | Gate 1 conservative, gate 2 exact — the intended division of labour. |
@@ -214,9 +227,12 @@ way round.
 
 ## Not done here
 
-This ADR lands the interface only: the `ply-store` API, its persistence, and the
-contract. The gates themselves, the `--explain` output, the `--no-incremental`
-flag and the equivalence test are not implemented.
+~~This ADR lands the interface only: the `ply-store` API, its persistence, and
+the contract. The gates themselves, the `--explain` output, the
+`--no-incremental` flag and the equivalence test are not implemented.~~
+
+**As written when this ADR landed, and no longer true.** All four shipped; see
+the status line for where each one is. What follows is what is still deferred.
 
 Deferred by choice:
 

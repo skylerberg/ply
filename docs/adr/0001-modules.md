@@ -1,9 +1,21 @@
 # ADR 0001 — Modules
 
-Status: accepted
+Status: accepted — **implemented**, and **amended by W2 in two places**: `std`
+is a reserved first path segment (ADR 0012 §1), and a small set of builtin names
+is reserved against the shadowing rule below (ADR 0012 §A5). Both are marked
+inline where they apply.
 Date: 2026-07-25
 Supersedes: the loader behaviour where `ply test <dir>` concatenated every
 `*.ply` file under the directory into one module.
+Amended by: `docs/adr/0012-w2-contract.md` §1 and §A5.
+
+> **Added by the W6 documentation audit.** This ADR's "Resolution order" and
+> "One file, one module" are the two rules the rest of the language is written
+> against, and W2 cut a hole in each without either being recorded here. The
+> `compare_values` amendment in particular exists because the unrestricted rule
+> below produced a real defect — a module defining `fn compare` supplied the
+> order of every dictionary derived in it — so the exception is load-bearing
+> rather than cosmetic.
 
 ## Context
 
@@ -34,6 +46,15 @@ is `INVALID_MODULE_PATH` (E0111), because a module name has to be writable in an
 
 The project root is the directory passed to `ply`, or the parent directory of a
 single named file.
+
+> **Amended by ADR 0012 §1.** `std` is a **reserved first segment**. A project
+> file whose path would derive a module name of `std` or `std.*` is
+> `E0113 RESERVED_MODULE_NAME` (`ply_span::codes::RESERVED_MODULE_NAME`),
+> reported against the file. `import std.json` names a module whose source ships
+> with the compiler — `crates/ply-std/ply/*.ply`, eight modules as of W5 — and
+> which therefore has no project root at all. This is the one exception to "a
+> module name is derived from a path under the root"; reserving the segment is
+> what makes it an exception rather than a precedence order.
 
 Source parsed with no root — a snippet handed to `ply_syntax::parse`, an editor
 scratch buffer — is the **anonymous module**: the empty dotted name. It cannot
@@ -101,6 +122,28 @@ For a **bare** name, first match wins:
    table per namespace.
 3. **Prelude builtins** (`len`, `map`, `assert`, …). Anything in step 2 shadows
    the prelude, which is also existing behaviour.
+
+> **Amended by ADR 0012 §A5: three builtins are reserved and step 2 cannot
+> shadow them.** Redefining `cell_get`, `cell_set` or `compare_values` is
+> `E0105 DUPLICATE_DEFINITION` at the definition
+> (`crates/ply-core/src/infer.rs`), not a shadowing.
+>
+> The reasons differ and both are worth stating, because "shadowing is always
+> allowed" is the rule a reader will otherwise carry into the next design.
+> `cell_get` / `cell_set` are *call forms* rather than ordinary functions: the
+> atom they perform names the region of their argument, which no row expressible
+> in `Row` can be polymorphic in, so there is no scheme for a module to shadow.
+> `compare_values` is reserved for a soundness reason found by audit rather than
+> by design — `derive ord` emits a body that calls it, ADR 0001's own rule made
+> a module's `fn compare` win, and a module that defined one silently supplied
+> the order of every dictionary derived in it: not reflexive, not antisymmetric,
+> disagreeing with the order `map_keys` iterates in, while `derivable(ord, T)`
+> still reported the type as ordered.
+>
+> The general shape is the one ADR 0012 §A5 names: **a generated body must not
+> write a name the generating module could bind.** `compare` remains shadowable
+> as the same operation under a name a module may claim, exactly as `len` is —
+> the reservation is on the name the deriver writes, not on the operation.
 
 A collision inside step 2 is an error rather than a silent shadowing:
 

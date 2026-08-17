@@ -1,6 +1,27 @@
 # ADR 0016 — W6: where the time goes, and whether M9 comes forward
 
-Status: accepted — **decided: keep deferring M9** (§10)
+Status: accepted — **decided: keep deferring M9** (§10). The verdict stands and
+has **not** been re-taken since ADR 0017 changed the representation it was
+measured against; see the note below.
+
+> **Added by the W6 documentation audit.** ADR 0017 landed after this document
+> and states in its own Consequences that "codegen's ceiling should be
+> re-measured after this lands, because ADR 0016's 1.05× was a verdict on the
+> old representation and this ADR changes exactly what made that ceiling low."
+> That re-measurement has not happened, so every number in §8 onward — `S`,
+> `k`, `E`, the ceiling — is a reading taken against the forkable world and a
+> `Machine` that no longer exist. The verdict is unchanged because none of the
+> four criteria moved in M9's favour; the *evidence* for it is one milestone
+> stale, and a reader should not treat §10's table as current.
+>
+> One thing ADR 0017 did do to §4's roster: it attacked "boxing on hot paths"
+> and reported the result. It is **still `priced: false`** in
+> `benches/w6-ladder.json`, correctly — ADR 0017 measured allocations per
+> request (1,035 → 1,082 → 1,122, i.e. *up*), and C3 requires an end-to-end
+> speedup on §1.6's served workload, which is a different measurement. So C3
+> still reads 1 of 7 priced, and `Decision::reopens_at` still composes the same
+> sentence. A future contributor pricing that lever should know the allocation
+> reading already exists and points the wrong way.
 
 W6 answers one question — *where does a request's time go now, and is native
 codegen the right next lever* — and it closes the web track. ADRs 0011 through
@@ -69,11 +90,74 @@ five milestones' machines is a table about five machines.
 
 | taken by | number | what it says |
 | --- | --- | --- |
-| M9's deferral | execution was **4.2%** of a warm 10,000-definition `ply test` run | in a *test* run the front end and the cache are the cost, and a faster evaluator moves nothing |
+| M9's deferral | execution was reported as **4.2%** of a warm 10,000-definition `ply test` run; re-measured, it is **~29%** (see the note below) | in a *test* run the front end and the cache are still the larger cost, but a faster evaluator moves more than nothing |
 | W1 | **72%** of a request was above the socket; **5.41µs per byte** of request head; **175–350 req/s** on a browser-sized request | serving inverts M9's argument: there is no front end on the request path, so the interpreter *is* the request path |
 | W1 | the host boundary cost **0.5µs** of a **601µs** request | the boundary ADR 0008 was most worried about is not a cost; it is a correctness surface |
 | W2 | a request went **527.7µs → 109.8µs**, **1,895 → 9,109 req/s**; over a head sweep **84x** the bytes went from costing **29.29x** the time to costing **1.00x** | the 5.41µs/byte was five O(n) folds boxing an `Int` per byte with no early exit — an algorithm, not a constant factor |
 | ADR 0005 | the control-stack machine costs **four heap allocations per frame push** | a lever that is neither codegen nor an algorithm |
+
+> **Audit note on the M9-deferral row: 4.2% is unsourced *and* contradicted by
+> measurement.** An earlier pass of this note enumerated every other row of the
+> table as sourced or unsourced and left this one out, which let §0's header
+> ("every number in this section was taken by the milestone named beside it")
+> read as re-verified for it. It was not. `grep -rn '4\.2%' --include='*.md' .`
+> finds the string exactly twice in the tree: here, and at ROADMAP.md:286
+> pointing back here. The audit re-took the warm-run profile on the documented
+> corpus — `ply-corpus gen --out <dir> --seed 1 --modules 200 --defs-per-module
+> 50 --tests 5000 --depth 6`, then `ply-corpus bench <dir> --repeats 3` — and
+> the `warm` scenario prints `execute 125.47 ms 29.2%` of a `total 429.04 ms`.
+> README.md publishes an independent take of the same scenario at **125.1ms of
+> 437.2ms, 28.6%**, and withdraws the sibling `10.4ms / 3.3%` it used to carry;
+> ROADMAP.md:270 records that withdrawal. Two takes agreeing at 28.6% and 29.2%
+> against a published 4.2% is a wrong row, not machine noise.
+>
+> One caveat in the interpreter's favour, from `benches/README.md`: `bench`
+> builds a worker per pool thread per concurrency group, so its `execute` phase
+> carries per-group setup and **over**-states interpreter time. The true share
+> is bounded above by ~29% and below by whatever `ply-corpus measure` separates
+> out. What it is not is 4.2%.
+>
+> **What this does and does not do to the decision.** It does not overturn it:
+> at ~29% the front end plus hash is still ~68% of a warm run, so the test-run
+> argument for deferring M9 survives in direction. It does mean §0's opening row
+> understates the evaluator's share in a test run by about 7x, and that the
+> decision should be argued from the *served* profile in §8.1 — measured by this
+> milestone, on this machine — rather than from this row.
+
+> **Audit note on the two W1 rows and the W2 row: most of those figures are not
+> recorded anywhere in this repository, and where the same measurement *is*
+> recorded elsewhere it disagrees with them.** The header above says "every
+> number in this section was taken by the milestone named beside it"; that is a
+> provenance claim, and it does not hold for these.
+>
+> - **Sourced:** `5.41µs per byte` (ADR 0012 §5 and CONTRACTS.md's byte-builtin
+>   section both carry it) and ADR 0005's `four heap allocations per frame push`.
+> - **Unsourced:** `72%` above the socket, `175–350 req/s`, the host boundary's
+>   `0.5µs` of a `601µs` request, and W2's `527.7µs → 109.8µs`,
+>   `1,895 → 9,109 req/s` and `29.29x`. Each of these strings occurs exactly
+>   once in the tree — here. ADR 0011, W1's own contract, contains **no numeric
+>   measurement at all**, so W1's own exit criterion ("a measured per-request
+>   interpreter cost") has no recorded value to quote.
+> - **Contradicted.** CONTRACTS.md's "The re-measurement — landed" records the
+>   same W2 before-and-after, with its rig named (`ply-corpus serve --repo .
+>   --baseline`, one thread, machine engine, 63-byte head), as **714µs → 221µs**
+>   for a whole request over a real socket, **1,401 → 4,528 req/s**, and a head
+>   sweep in which 84x the bytes cost **39x** the time before and **0.95x**
+>   after. That is a different pair and a different sweep ratio from this row's.
+>   Re-running that rig for the audit gave 617.4µs → 135.6µs, 1,620 → 7,372
+>   req/s, and the tool's own printed sweep ratios of **26.27x → 0.93x** — which
+>   sits nearer this row's 29.29x than CONTRACTS.md's 39x, so the two documents
+>   are not reconcilable by calling one of them the newer take.
+>
+> **This matters beyond bookkeeping, because `4.8x` is derived from it.** The
+> "W2 delivered 4.8x by attacking an algorithm" claim used in §2.3, §4 and §10.1
+> — and carried in `benches/w6-ladder.json`'s `alternatives` prose — is
+> 527.7 / 109.8. Computed instead from the pairs that *are* recorded, the same
+> lever is 3.23x (CONTRACTS.md's whole request) or 7.46x (its `answer` alone);
+> re-measured for the audit it is 4.55x and 13.3x respectively. 4.8x is inside
+> that spread, so the argument it supports survives — but it is one reading of an
+> unrecorded pair, not a milestone's published result, and §10.1 leans on it as
+> though it were the latter.
 
 What none of it says: **what the whole W5 stack costs.** W3 added framing,
 routing, keep-alive and TLS; W4 added a database; W5 added a sink, a
@@ -597,6 +681,20 @@ The spike itself is a `codegen-spike` feature of `ply-corpus` with
 `cranelift-codegen = { version = "0.134.3", optional = true }`. No other crate
 gains a dependency and no other crate learns the spike exists.
 
+> **Audit note (docs pass, 2026-08-17): this paragraph describes a plan, not
+> what shipped.** `ply-corpus` has no `codegen-spike` feature and no cranelift
+> dependency, optional or otherwise — checked by grepping
+> `crates/ply-corpus/Cargo.toml` for `cranelift`, which matches nothing. What
+> shipped is `crates/ply-codegen-spike`: a separate crate carrying its **own**
+> `[workspace]` table and five **non**-optional cranelift dependencies
+> (`cranelift-jit`, `-codegen`, `-frontend`, `-module`, `-native`, all
+> `0.134.3`). ROADMAP.md's M9 entry describes the shipped arrangement
+> correctly. The "no other crate learns the spike exists" half survives and is
+> in fact stronger than written: the shipped workspace's `members` list in the
+> root `Cargo.toml` does not name `ply-codegen-spike` at all, which is what
+> §3.5's "closing W6 deletes it with `rm -r`" depends on. The cost of that
+> isolation is stated in §7 below.
+
 `benches/README.md` gains a `w6` section describing the ladder, the criteria and
 what the report owes.
 
@@ -631,6 +729,8 @@ The ones whose absence would let W6 report a number that is not what it says.
 
 11. Fewer than three inputs, a disagreement on any input, and overlapping bands
     each make the spike not-evidence, and the failure names which.
+    *Enforced by `ply_corpus::w6::tests::a_spike_is_evidence_only_when_it_agreed_and_separated_on_enough_inputs`
+    (`crates/ply-corpus/src/w6.rs:2005`), which is in the workspace and runs.*
 12. The reported speedup is the minimum conservative ratio over the inputs.
 13. The spike refuses a function outside the §3.2 fragment, loudly, naming the
     construct — a spike that silently fell back to the interpreter for part of a
@@ -638,6 +738,44 @@ The ones whose absence would let W6 report a number that is not what it says.
 14. On its chosen function, over its whole input set, the spike's output equals
     the machine's — and equals the tree-walker's, so the comparison is against
     an evaluator that is already policed for divergence.
+
+> **Audit note (docs pass, 2026-08-17): 12, 13 and 14 are written, and
+> `cargo test --workspace` does not run any of them.** Tests 11–16 were listed
+> as one block on the assumption of §6's first paragraph — that the spike is a
+> feature of `ply-corpus`. It is not; it is `crates/ply-codegen-spike`, and
+> that crate declares its own `[workspace]`, so the shipping workspace's test
+> run walks straight past it. The split is:
+>
+> - **11, 15, 16** are pure functions of a `Ladder`/`Spike`/`Report` and live in
+>   `crates/ply-corpus/src/w6.rs`'s `tests` module. They run. 15 is
+>   `the_audit_names_every_section_the_report_owes` (`w6.rs:2310`); 16 is
+>   `a_report_renders_its_tables_and_recomputes_its_verdict` (`w6.rs:2349`).
+> - **12** is `the_reported_speedup_is_the_weakest_inputs`
+>   (`crates/ply-codegen-spike/tests/spike.rs:177`).
+> - **13** is `the_fragment_refuses_what_it_cannot_compile_and_names_it`
+>   (`spike.rs:142`), with `a_function_inside_the_fragment_is_compiled_rather_than_refused`
+>   (`spike.rs:164`) as its positive half.
+> - **14** is `the_compiled_function_answers_what_the_machine_answers`
+>   (`spike.rs:70`) plus `and_what_the_tree_walker_answers` (`spike.rs:80`).
+>
+> Running those three requires `cargo test` inside
+> `crates/ply-codegen-spike/`. **On the audit machine that command does not get
+> as far as compiling:** cranelift `0.134.3` and its transitive
+> `wasmtime-internal-core 47.0.3` declare `rust-version = 1.94.0` and the
+> installed toolchain is `rustc 1.93.1`, so cargo refuses resolution before any
+> test binary is built. The repository pins no `rust-toolchain.toml`, so
+> whichever toolchain a reader has is what decides.
+>
+> **What this means for the M9 verdict.** Required tests 12–14 are the ones
+> that make the spike's `11.67x` a number about a program that was actually
+> compiled rather than partly interpreted, so the spike half of the evidence in
+> §8–§11 is unverified by any suite a reader is likely to run. The ladder half
+> is unaffected: `benches/w6-ladder.json`, every share, the Amdahl projection
+> and `w6::decide` are exercised by `crates/ply-corpus/src/w6.rs` and by
+> `crates/ply-corpus/tests/w6_report_integrity.rs` inside the workspace. Note
+> also that the verdict does not turn on the spike's magnitude — §2's C2 fails
+> at 1.48x against 1.50x, and the six unpriced levers defer it independently —
+> so this gap weakens the *evidence for deferring*, not the deferral.
 
 **The report**
 
@@ -813,9 +951,26 @@ req/s at c=32, with p50 from 457µs to 13,736µs and p99 from 509µs to 26,944µ
 One machine is one core (§5), so concurrency is a queue on either loop; the
 spawning one merely spreads the waiting evenly.
 
-**And the two loops are not the same service.** The sequential loop is 1.6x
+> **Audit note: none of the ten numbers in the paragraph above are in
+> `benches/w6-ladder.json`.** The `w6-ladder` command sweeps
+> `--concurrency 1 2 4 8 16 32`, but the file it writes keeps only the
+> `offerings` array, and that array carries just eight rows — all at c=1 or c=2,
+> and none of them a `/health`-over-postgres row. `--detail` is documented to
+> write the raw served rows beside the report; no such file is in `benches/`.
+> One of the ten is at least derivable: 3,914 req/s is 1/255.52µs, the
+> `database` rung's `without_micros`. The other nine — 3,930, 287µs, 252ms,
+> 2,157, 2,254, 457µs, 13,736µs, 509µs, 26,944µs — are unsourced, and were not
+> reproduced by this audit, which had no postgres to point the sweep at. They
+> are also the operational claim README.md and ROADMAP.md repeat. Re-take them
+> with `--detail` and commit the rows, or the next reader has the same problem.
+
+**And the two loops are not the same service.** The sequential loop is 1.81x
 faster on `/health` — 3,914 req/s against 2,157 — for a measured reason that is
-new to this take and is in §8.5: a spawning service memoizes nothing.
+new to this take and is in §8.5: a spawning service memoizes nothing. (This
+sentence read "1.6x" until a documentation audit divided its own two operands:
+3,914 / 2,157 is 1.81, and the latency pair beside it in §8.5 — 470.6µs against
+263.5µs — is 1.79. Neither supports 1.6. The two throughputs themselves are not
+in `benches/w6-ladder.json`; see the note at the end of §8.3.)
 
 ### 8.4 Where the run departed from §1
 
@@ -863,7 +1018,7 @@ predicted:
 | **A request is 37.8x the syscalls under it.** | 592.6µs for `/items` over postgres over TLS with tracing, against a 15.68µs floor replaying the same 270-byte response over plaintext with no interpreter, no TLS and no database. Like for like — `/health` over plaintext against a floor replaying its 107 bytes — **16.8x** |
 | **A service whose accept loop spawns memoizes nothing.** `task.spawn` opens a production region for the life of the server, and `Machine::constant` refuses the memo inside any open region; the rule's stated reason is a `simulate` region's allocation trail, which a production region does not keep. | disabling the memo by source substitution costs **1.77x** on `/health` and **1.15x** on `/items` on the sequential loop, and **1.00x** and **1.00x** on the task-per-connection loop, where there is nothing left to disable: `/health` is 263.5µs sequential against 470.6µs spawning, on the same service |
 | **The in-memory twin is slower than the database it stands in for.** `std.db`'s memory engine parses its SQL in Ply on every call. | in process the twin's `/items` handler is 544.6µs a call and its scan alone is 344.9µs of that |
-| **`--engine both` costs more than two runs.** | the tree-walker is 2.73x faster on the request path, so `both` is about 1.4x a tree-walk run |
+| **`--engine both` costs more than two runs.** | the tree-walker is 2.73x faster on the request path, so `both` — 55.46µs + 151.58µs = 207.04µs — is **1.37x a machine run and 3.73x a tree-walk run**. (This cell read "about 1.4x a tree-walk run" until a documentation audit recomputed it from §8.2's two rows: 1.4x is the multiple against the *machine* run, which is the dearer of the two and therefore the flattering denominator. Against the tree-walk run named in the sentence it is 3.73x.) |
 | **The request path allocates far more times than it writes bytes.** | one `/health` request allocates **1,035 times and 0.124 MB** to produce a 107-byte response |
 | **The ladder's own residue is −7.8%.** | 592.6µs measured against 638.96µs attributed |
 | **No cancellation, no backpressure, no load shedding.** | no number; the absence is the statement |
@@ -929,6 +1084,27 @@ Re-taken on this tree: the constant memo reaches `line_stops()`, which
 | the same, literals rebuilt per evaluation | 11.05x | the same, to 2% |
 | **`read_line` alone, callees trampolined** | **1.71x** | 21.86µs → 12.60µs |
 | whole call graph, browser-sized head | 11.17x | 76.52µs → 5.96µs over 14 calls |
+
+**The two columns are not computed the same way, and a reader who divides the
+third gets a different number from the second.** `k` is the *minimum over the
+five inputs* (§9's rule, interpreter-best against spike-worst); `per request` is
+a *sum* over the 4 or 14 calls a head costs. So row 1's µs divide to 12.81x
+against its printed 11.67x, row 3's to 1.73x against 1.71x, and row 4's to
+12.84x against 11.17x. The stated `k` is the conservative one in each case,
+which is the right choice — but it is a different statistic from its own row's
+µs, and this table did not say so. (Audit note.)
+
+**Audit note on sourcing: only the first variant is in
+`benches/w6-spike.json`.** That file carries one `spike` object — five inputs,
+`nodes`, `compile_micros` — and its five inputs reproduce §9's table exactly
+(11.67x to 13.23x conservative, minimum 11.67x, all `agreed`). The other three
+variants here, and §9.2's census, are in no measurement file. ROADMAP.md's "its
+numbers survive in `benches/w6-spike.json`" is therefore true of the headline
+`k` and false of §9.1 and §9.2, including the **1.71x** that §10.3 calls one of
+the three measured reasons to doubt `E = 1.48`. The audit could not re-take
+them: `crates/ply-codegen-spike` does not build on the toolchain in this tree
+(cranelift 0.134.3 requires rustc 1.94.0; rustc 1.93.1 is installed), which is
+also worth knowing before §3.5's "closing W6 deletes it" is acted on.
 
 The second variant exists to answer "is this just constant folding?" — it is
 not; rebuilding every `Bytes`, `String` and nullary-constructor literal per
@@ -1056,8 +1232,13 @@ projection is the number M9's case rests on and a reader deserves its width:
 
 1. **`read_line`'s own end-to-end value is 1.02x.** Directly measured, not
    projected: it is 2.2% of a served request at a 63-byte head and 5.2% at a
-   browser-sized one, so compiling it perfectly buys **1.021x** and **1.050x**
-   respectively. It is 20.7% of `parse_head`.
+   browser-sized one, so compiling it **at the spike's own 11.67x** buys
+   **1.021x** and **1.050x** respectively. It is 20.7% of `parse_head`. (Audit
+   correction: this sentence said "compiling it *perfectly*", which is a
+   different and stronger calculation — at `k = ∞` the same two shares give
+   1.022x and 1.055x. The printed values are Amdahl at `k = 11.67`, so the
+   method and the number now agree. The correction moves the figures by less
+   than a thousandth and does not touch the argument.)
 2. **The fragment reaches 141 of 366 functions** (§9.2), and what it refuses is
    what endpoints and codecs are built from.
 3. **Coverage is not linear — it is a cliff.** 11.67x becomes **1.71x** the
