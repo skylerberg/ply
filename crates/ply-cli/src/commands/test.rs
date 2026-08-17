@@ -1223,11 +1223,11 @@ fn print_explain_search(plan: &Plan, check: &CheckOutput, style: Style) {
     }
 }
 
-/// `world`, `shared` or `host`.
+/// `region`, `shared` or `host`.
 ///
 /// `host` wins over both: region isolation is *inapplicable* to a computation
 /// that reaches a socket rather than merely unavailable to it, and reporting
-/// such a test as `world` is the over-claim ADR 0008 §6 exists to prevent.
+/// such a test as `region` is the over-claim ADR 0008 §6 exists to prevent.
 fn isolation_label(
     plan: &Plan,
     view: &HostView<'_>,

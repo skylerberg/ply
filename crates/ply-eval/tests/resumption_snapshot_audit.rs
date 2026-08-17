@@ -88,10 +88,20 @@ fn cells_after(src: &str, test: &str) -> Vec<String> {
         .position(|t| t.name == test)
         .unwrap_or_else(|| panic!("no test named {test:?}"));
     let mut machine = Machine::new(&program, &resolved, &checked);
+    // The reclamation journal, not the residue: a region hands its slots back at
+    // its close, so what a run leaves behind is empty whatever it wrote.
+    machine.cells_mut().journal();
     machine
         .eval_test(index)
         .unwrap_or_else(|d| panic!("{test:?} must run: {d:#?}"));
-    machine.world().cells().map(|(_, v)| v.render()).collect()
+    let mut cells: Vec<(u32, String)> = machine
+        .cells()
+        .journalled()
+        .iter()
+        .map(|(slot, v)| (slot.index(), v.render()))
+        .collect();
+    cells.sort_by_key(|(slot, _)| *slot);
+    cells.into_iter().map(|(_, v)| v).collect()
 }
 
 fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {

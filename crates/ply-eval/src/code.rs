@@ -3,7 +3,7 @@
 //!
 //! A frame has to name the expression it will evaluate next, and a closure has
 //! to name its body. Neither can be `&Expr` without a lifetime on [`Value`],
-//! which would spread through `World`, `Env` and every crate that holds an
+//! which would spread through `Env` and every crate that holds an
 //! evaluated value; and neither can be an owned `Expr`, because a frame is
 //! pushed per node and cloning a subtree per push is quadratic. `Rc` on every
 //! node is the representation that is cheap in both directions: `lower` runs
@@ -97,6 +97,9 @@ pub enum NodeKind {
         body: Code,
     },
     Simulate {
+        body: Code,
+    },
+    WithRegion {
         body: Code,
     },
 }
@@ -356,12 +359,12 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
         ExprKind::Simulate { body } => NodeKind::Simulate {
             body: lower_barrier(&[], body, live),
         },
-        // A region alters representation and cost, not meaning, and the
-        // representation it alters is not landed: there is nothing at run time
-        // that distinguishes the body from the region around it. Lowering to the
-        // body itself is what keeps the two engines from having to agree about a
-        // node that does nothing.
-        ExprKind::WithRegion { body, .. } => return lower_in(body, live),
+        // Kept as a node rather than lowered away: the machine opens an arena
+        // scope here and closes it at the body's end, and the span is the key
+        // `region_kind` filed its decision under.
+        ExprKind::WithRegion { body, .. } => NodeKind::WithRegion {
+            body: lower_in(body, live),
+        },
     };
     node(kind, e.span)
 }

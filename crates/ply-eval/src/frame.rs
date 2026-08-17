@@ -346,20 +346,38 @@ impl Machine<'_> {
                 body,
                 env,
                 module,
+                region,
                 ..
             } => {
                 let stack = self.stack().clone();
+                let kind = self.region_kind(region);
                 let transition = handler::open_cell(
-                    self.world_mut(),
+                    self.regions_mut(),
                     &binder,
                     &body,
                     &env,
                     module,
                     value,
                     stack,
+                    kind,
+                    region,
                 )?;
                 self.record_alloc_access();
                 return self.take(transition);
+            }
+
+            // The region's lexical close. Whether the slots go back is the
+            // arena's call, not this frame's: a continuation captured across the
+            // region and still alive holds a pin, and the close retains rather
+            // than truncates.
+            Frame::CloseRegion { region } => {
+                self.regions_mut().close_region(region);
+                // A close moves the shared bump pointer exactly as an
+                // allocation does, and two tasks whose closes the search thinks
+                // are independent reach two different arenas. `Access::Alloc` is
+                // what makes the pair dependent.
+                self.record_alloc_access();
+                self.go_return(value);
             }
 
             step @ (Frame::MapStep { .. }

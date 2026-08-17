@@ -268,7 +268,7 @@ fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
     a.set_seed(seed.clone(), 10_000);
     let first = a.eval_test(0);
     let steps_a = a.simulated().expect("a region ran").steps.clone();
-    let world_a = a.world().clone();
+    let cells_a: Vec<String> = a.cells().slots().map(|(_, v)| v.render()).collect();
 
     let mut b = compiled.machine();
     b.set_seed(seed, 10_000);
@@ -280,8 +280,7 @@ fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
         steps_a, steps_b,
         "the step sequence is a function of the seed"
     );
-    let cells_a: Vec<String> = world_a.cells().map(|(_, v)| v.render()).collect();
-    let cells_b: Vec<String> = b.world().cells().map(|(_, v)| v.render()).collect();
+    let cells_b: Vec<String> = b.cells().slots().map(|(_, v)| v.render()).collect();
     assert_eq!(
         cells_a, cells_b,
         "the final world is a function of the seed"
@@ -543,14 +542,16 @@ fn the_tree_walker_refuses_a_region() {
 fn the_world_a_region_wrote_survives_it() {
     let compiled = compile(OUTLIVES);
     let mut machine = compiled.machine();
+    machine.cells_mut().journal();
     machine.set_seed(Seed::default(), 10_000);
     machine.eval_test(0).expect("passes");
     assert!(
         machine
-            .world()
             .cells()
+            .journalled()
+            .iter()
             .any(|(_, v)| matches!(v, Value::Int(9))),
-        "the task's write is in the world the region left behind"
+        "the task's write is in the cell the region held when it closed"
     );
 }
 

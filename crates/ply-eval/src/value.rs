@@ -1,10 +1,10 @@
+use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::code::Code;
 use crate::cont::Continuation;
 use crate::env::Env;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sim::TaskId;
-use crate::world::CellId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, render_float};
 use rpds::RedBlackTreeMap;
@@ -35,8 +35,7 @@ pub type Vector<T> = Arc<Vec<T>>;
 /// implementation is not reachable from here: `rpds` keeps the entries sorted
 /// and hands out no other iteration order.
 ///
-/// `RcK`, the same shared-pointer kind [`World`](crate::world::World) uses, so a
-/// `Value` stays thread-confined exactly as it was.
+/// `RcK` rather than `ArcK`, so a `Value` stays thread-confined.
 pub type Map = RedBlackTreeMap<Value, Value>;
 
 const RENDER_MAX_ITEMS: usize = 32;
@@ -77,15 +76,15 @@ pub enum Value {
         args: Arc<Vec<Value>>,
     },
     Closure(Arc<Closure>),
-    /// A key into the [`World`](crate::world::World), not a pointer into it, so
-    /// that state is a value the machine threads rather than a location values
-    /// alias.
-    Cell(CellId),
+    /// A slot in the region that allocated it, not a pointer into it: an index
+    /// and a generation, so a cell whose region has closed reads `None` rather
+    /// than aliasing whatever was allocated in its place. ADR 0017 §1.
+    Cell(Slot),
     /// A handle on a task, and a key into its region's scheduler for the same
-    /// reason [`Value::Cell`] is one: a key cannot dangle, two keys cannot alias
-    /// across a fork, and identity is integer comparison. The scheduler dies
-    /// with its region, so a handle that outlives it is `E0413` rather than a
-    /// wrong answer.
+    /// reason [`Value::Cell`] is one: a key cannot dangle, two keys cannot
+    /// alias, and identity is integer comparison. The scheduler dies with its
+    /// region, so a handle that outlives it is `E0413` rather than a wrong
+    /// answer.
     Task(TaskId),
     /// A captured continuation. Callable with exactly one argument — the value
     /// the `perform` it was captured at should have returned.
@@ -301,9 +300,9 @@ impl Value {
         }
     }
 
-    pub fn as_cell(&self, span: Span, what: &str) -> Result<CellId, Diagnostic> {
+    pub fn as_cell(&self, span: Span, what: &str) -> Result<Slot, Diagnostic> {
         match self {
-            Value::Cell(id) => Ok(*id),
+            Value::Cell(slot) => Ok(*slot),
             other => Err(type_error(span, what, "Cell", other)),
         }
     }
@@ -419,8 +418,8 @@ impl Value {
                     None => write!(out, "<fn>"),
                 };
             }
-            Value::Cell(id) => {
-                let _ = write!(out, "<cell {id}>");
+            Value::Cell(slot) => {
+                let _ = write!(out, "<cell {slot}>");
             }
             Value::Task(id) => {
                 let _ = write!(out, "<task {id}>");

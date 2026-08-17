@@ -12,17 +12,18 @@
 //!   cuts the handler's own segment away, so a clause that performs the
 //!   operation it handles reaches the next handler out instead of catching
 //!   itself forever.
-//! - **The world is threaded, never snapshotted.** Nothing here reads or writes
-//!   a [`World`] except [`open_cell`], which allocates. A resumption therefore
-//!   observes the world as of the handler's call to `resume`, which is what
+//! - **State is threaded, never snapshotted.** Nothing here reads or writes the
+//!   cell arena except [`open_cell`], which allocates. A resumption therefore
+//!   observes the arena as of the handler's call to `resume`, which is what
 //!   makes a cell-backed state handler writable.
 
+use crate::arena::{Pin, RegionKind};
 use crate::code::{Clause, Code, ReturnArm};
 use crate::cont::{Continuation, Frame, Prompt, SimId, Stack, Target};
 use crate::env::Env;
 use crate::interp::arity_error;
+use crate::task_regions::TaskRegions;
 use crate::value::Value;
-use crate::world::World;
 use ply_core::ty::{EffectAtom, Resource};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Mode;
@@ -228,7 +229,12 @@ pub fn perform_args(
 /// A tail-resumptive clause gets a [`Frame::Resume`] pushed for it, which is
 /// the whole of `op(x̄) -> e` being `op(x̄) resume κ -> κ(e)`.
 ///
-/// `W` is not a parameter. Capture and resumption do not touch the world.
+/// The arena is not a parameter, and capture and resumption still do not read
+/// or write it. `pin` is the one thing it hands over: the claim a capture makes
+/// on every region open at it, taken by the caller — which is the only party
+/// holding an arena — and carried by whatever continuation this cuts out, so a
+/// region's lexical close can tell "no one can reach this" from "a continuation
+/// still can".
 ///
 /// `born` is the machine's at-most-once host-operation count, stamped onto
 /// every continuation this captures. It is what the linearity rule compares
@@ -238,6 +244,7 @@ pub fn perform(
     request: Request,
     decl: OpDecl,
     born: u64,
+    pin: &mut dyn FnMut() -> Option<Pin>,
 ) -> Result<Answered, Diagnostic> {
     let Request {
         effect,
@@ -261,6 +268,9 @@ pub fn perform(
         Target::Ply { prompt, clause } => (prompt, clause),
         Target::Sim(region) => {
             let (k, _region_stack) = stack.capture(found.segments, born);
+            // The scheduler holds this until it resumes the task, which may be
+            // after every region open here has closed.
+            let k = k.pinned(pin());
             return Ok(Answered::Scheduler(Scheduled {
                 region,
                 effect,
@@ -289,9 +299,28 @@ pub fn perform(
 
     let stack = match &clause.resume {
         Some(binder) => {
-            scope = scope.bind(binder.clone(), Value::Continuation(Rc::new(k)));
+            // A named continuation may be stored, returned or resumed after the
+            // regions open here have closed, so it claims them.
+            scope = scope.bind(
+                binder.clone(),
+                Value::Continuation(Rc::new(k.pinned(pin()))),
+            );
             below
         }
+        // A tail-resumptive clause takes no pin, and that is a claim about the
+        // stack rather than a saving: the only thing that will ever splice this
+        // continuation is the `Resume` frame pushed here, one frame above the
+        // `CloseRegion` frames of every region open at the capture. It is
+        // consumed before any of them runs, and it is reachable from nothing
+        // else — there is no binder for a clause body to store it through.
+        //
+        // Where the clause's own body performs an operation answered further
+        // out, the capture that answers *that* takes the segments this frame
+        // sits in, so a claim on these regions is made there if one is needed.
+        //
+        // It matters: `perform` is on the request path, a pin is an `Rc`, and
+        // tail-resumptive is what essentially every handler in the standard
+        // library is.
         None => below.pushed(Frame::Resume { k: Rc::new(k) }),
     };
     Ok(Answered::Handler(Transition::eval(
@@ -354,6 +383,7 @@ pub fn enter_with_cell(
     body: &Code,
     env: &Env,
     module: usize,
+    region: Span,
 ) -> Transition {
     let stack = stack.push(Frame::WithCellBody {
         resource: resource.clone(),
@@ -361,25 +391,42 @@ pub fn enter_with_cell(
         body: body.clone(),
         env: env.clone(),
         module,
+        region,
     });
     Transition::eval(stack, init, env.clone(), module)
 }
 
 /// `Frame::WithCellBody`.
 ///
-/// The region does nothing on the way out. The world is monotone, which is what
-/// lets a continuation captured inside the region be resumed after it returned
-/// and still read the cell instead of finding a hole.
+/// `kind` is what [`crate::region_kind::Regions`] decided about this span, and
+/// `None` says the span opens no region of its own — either the inference never
+/// saw it, or it is a `with_cell[r]` nested in a `with_region[r]` that already
+/// opened `r`. Opening nothing is the safe answer to both: the cell lands in the
+/// enclosing region and nothing reclaims it before that region's close.
+///
+/// When a region does open, a [`Frame::CloseRegion`] goes under the body. What
+/// that close does with the slots is decided by the pins a capture took, not by
+/// `kind` — see [`TaskRegions::close_region`].
+#[allow(clippy::too_many_arguments)]
 pub fn open_cell(
-    world: &mut World,
+    cells: &mut TaskRegions,
     binder: &Symbol,
     body: &Code,
     env: &Env,
     module: usize,
     initial: Value,
     stack: Stack,
+    kind: Option<RegionKind>,
+    region_span: Span,
 ) -> Result<Transition, Diagnostic> {
-    let Some(cell) = world.try_alloc(initial) else {
+    let stack = match kind {
+        Some(kind) => {
+            let region = cells.open_region(kind, region_span);
+            stack.push(Frame::CloseRegion { region })
+        }
+        None => stack,
+    };
+    let Some(cell) = cells.alloc(initial) else {
         return Err(err_cells_exhausted(body.span));
     };
     Ok(Transition::eval(
@@ -388,6 +435,30 @@ pub fn open_cell(
         env.bind(binder.clone(), Value::Cell(cell)),
         module,
     ))
+}
+
+/// `⟨Eval(with_region[r]{b}, ρ, m), K, W⟩` — the region with no cell in it.
+///
+/// `None` for `kind` is the inference never having seen this span, and then the
+/// body runs in the enclosing region exactly as it did before this construct
+/// opened anything.
+pub fn enter_with_region(
+    cells: &mut TaskRegions,
+    stack: &Stack,
+    body: &Code,
+    env: &Env,
+    module: usize,
+    kind: Option<RegionKind>,
+    region_span: Span,
+) -> Transition {
+    let stack = match kind {
+        Some(kind) => {
+            let region = cells.open_region(kind, region_span);
+            stack.push(Frame::CloseRegion { region })
+        }
+        None => stack.clone(),
+    };
+    Transition::eval(stack, body, env.clone(), module)
 }
 
 /// The declaration-level checks a `perform` makes before it looks at the stack.
@@ -420,12 +491,12 @@ pub fn check_operation(
 
 #[cold]
 #[inline(never)]
-fn err_cells_exhausted(span: Span) -> Diagnostic {
+pub(crate) fn err_cells_exhausted(span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        "this run has allocated every cell a world can hold",
+        "this run has allocated every cell an arena can hold",
     )
-    .primary(span, "this region has no id left to allocate")
+    .primary(span, "this region has no slot left to allocate")
     .note("nothing reclaims a cell within a run, so a `with_cell` in a hot loop retains one entry per iteration")
     .note("hoist the region out of the loop, or reuse one cell across the iterations")
 }

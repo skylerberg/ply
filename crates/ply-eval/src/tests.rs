@@ -667,11 +667,11 @@ fn the_tree_walker_refuses_a_clause_that_binds_a_continuation() {
     assert_eq!(d.code, codes::MACHINE_ONLY_CLAUSE);
     assert!(d.message.contains("`state.get`"), "{}", d.message);
     assert!(crate::is_machine_only(&d));
-    let untouched = treewalk.world().cells().all(|(_, v)| v.render() == "0");
+    let untouched = treewalk.cells().slots().all(|(_, v)| v.render() == "0");
     assert!(
         untouched,
-        "the refusal lands before the handled body runs, world was {:?}",
-        treewalk.world()
+        "the refusal lands before the handled body runs, the cells were {:?}",
+        treewalk.regions()
     );
 
     let mut machine = Machine::for_program(&program, &resolved);

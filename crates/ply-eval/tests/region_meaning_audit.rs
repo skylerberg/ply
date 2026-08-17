@@ -20,7 +20,7 @@
 
 use ply_core::check_program;
 use ply_eval::differential::compare_tests;
-use ply_eval::{Interp, Machine, Plan, Seed, World, explore};
+use ply_eval::{Fixture, Interp, Machine, Plan, Seed, explore};
 use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -47,7 +47,7 @@ fn holds(src: &str) {
     let (program, resolved) = load(src);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}\n--- program ---\n{src}");
 
     let (program, resolved) = load(src);
@@ -134,20 +134,19 @@ test "a tail-resumptive put is seen by the following get" {{
     ));
 }
 
-/// **ADR 0005 §3.2's "resumes twice", which is ADR 0017 §3's decisive example
-/// with the opposite expected answer.**
+/// **ADR 0005 §3.2's "resumes twice", which ADR 0017 §3 as amended requires the
+/// same answer for.**
 ///
-/// One threaded world: the first branch increments the cell to `1`, the second
+/// One threaded state: the first branch increments the cell to `1`, the second
 /// resumption starts from that and reaches `2`, so the total is `1 + 2*10 = 21`
 /// and the cell ends at `2`. Under snapshot-at-capture both branches see `0`,
 /// the total is `1 + 1*10 = 11` and the cell ends at `1`.
 ///
-/// ADR 0017 §3 requires the snapshot answer and calls the threaded one "wrong,
-/// not a permitted optimization". ADR 0005 §3.2 requires the threaded answer
-/// and calls the snapshot one a semantics that makes state handlers
-/// unwritable. Both numbers are asserted here so that whichever way this is
-/// settled, the decision is recorded as a change to this file rather than made
-/// silently by an implementation.
+/// The threaded numbers are the ones asserted. ADR 0017 §3's first draft asked
+/// for the snapshot ones and was retracted, because restoring the region at a
+/// resumption discards the clause's own write and makes every cell-backed state
+/// handler unwritable; a reader tempted to re-propose it should read the
+/// amendment rather than this file.
 #[test]
 fn two_resumptions_thread_one_state_rather_than_branching_it() {
     holds(
@@ -176,11 +175,11 @@ test "the second resumption starts from the first one's writes" {
 /// the shape ADR 0017 §3 writes its two-resumption example in.
 ///
 /// The cell is allocated before the capture, so one cell serves both
-/// resumptions and the machine confirms both write it: the total is `21` and
-/// the cell ends at `2`, exactly as when the region encloses the handler. This
-/// is the program `ply_eval::region_kind` used to answer `unique` for — an
-/// answer that would have skipped the snapshot and, under the reading ADR 0017
-/// §3 asked for, silently branched a region both resumptions share.
+/// resumptions and the machine confirms both write it: the total is `21`,
+/// exactly as when the region encloses the handler. This is the program
+/// `ply_eval::region_kind` used to answer `unique` for — a claim that the
+/// region's slots may go back to the bump pointer at its close, made about a
+/// region the enclosing handler resumes into twice.
 #[test]
 fn two_resumptions_thread_one_region_the_enclosing_handler_answers_for() {
     holds(

@@ -296,24 +296,83 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    what `benches/w6-ladder.json` publishes. Measured now:
 
    ```
-   $ cargo run --release -p ply-corpus --bin w6-alloc -- --repo . --requests 200
-   {"allocations_per_request":1083.79,"bytes_per_request":127869.23,
+   $ ./target/release/w6-alloc --repo . --requests 200
+   {"allocations_per_request":1081.78,"bytes_per_request":127801.79,
     "requests":200,"response_bytes":107,"route":"/health"}
    ```
 
-   **1,084 against 1,035: +4.7% allocations and +3.1% bytes, in the wrong
-   direction.** The reason is structural rather than a regression to hunt: the
-   arena is not wired to any evaluator. `ply_eval::arena` and
-   `ply_eval::region_kind` are referenced by nothing outside themselves and the
-   `pub use` in `lib.rs`; `ExprKind::WithRegion` lowers to its body; `World` is
-   still the memory model and `ply_test::region::GroupRegion::open()` is still
-   `self.fixture.fork()`. What did land and is wired is §4's Perceus reference
-   counting, and the drift is its bookkeeping.
+   **1,082 against 1,035: +4.5% allocations and +3.1% bytes, in the wrong
+   direction — and this reading is taken with the arena wired.** `World` is
+   gone, `Value::Cell` is a `Slot` in a `TaskRegions` arena, and
+   `ply_test::region::GroupRegion` no longer forks. The number moved by two
+   allocations, from 1,083.79 to 1,081.78.
 
-   Nothing in this ADR's headline is demonstrated until the arena is the cell
-   store. `crates/ply-eval/tests/region_arena_cost.rs::a_region_against_the_persistent_map_it_would_replace`
-   is the head-to-head that says what flipping it would buy, and it is a
-   projection, not a result.
+   So the hypothesis that making the arena the cell store would move this figure
+   is **falsified on this route**. `/health` allocates no cells: its body is a
+   nullary pure definition served from ADR 0016 §12.1's constant memo, and the
+   1,035 are `Rc<Value>` boxes on the request path — framing, routing, the JSON
+   encode — which a region model does not touch. Unboxed primitives and
+   monomorphization are what move them, and this ADR puts both in "Not in this
+   ADR".
+
+   What the arena *is* worth is visible where cells exist.
+   `crates/ply-eval/tests/region_arena_cost.rs::a_region_against_the_persistent_map_it_replaced`
+   is now a result rather than a projection: at 10,000 cells the persistent map
+   costs 20,000 allocations and 1.04 MB to build and 10,000 more to write every
+   cell; the region costs **0 to build, 0 to write and 0 to close**.
+
+   **The lexical close is now on the evaluation path, and it did not move this
+   number either.** Both engines ask `region_kind` for the kind of the region at
+   each `with_cell`'s own span, open an arena scope for it, and close it at its
+   lexical end; `ExprKind::WithRegion` is a `Code` node rather than lowered away;
+   and a capture that can outlive its region takes an `Arena::pin`, so the close
+   frees or defers according to whether a continuation can still reach the slots.
+   Measured the same way:
+
+   ```
+   $ ./target/release/w6-alloc --repo . --requests 200
+   {"allocations_per_request":1122.34,"bytes_per_request":131677.40, ...}
+   ```
+
+   **1,122 against 1,082, and all forty of them are one-time.** Taken at 200,
+   400 and 800 requests the delta halves exactly each time — +40.54, +20.27,
+   +10.14 — so the wiring costs **8,108 allocations once per `Machine` and
+   nothing per request**. That fixed cost is `region_kind::infer`, a whole-program
+   analysis run lazily at the first region a machine opens; a service opens three
+   at start-up and none per request. Published against a 200-request window it
+   reads as +3.9%; against 800 it reads as +0.9%; against a server's lifetime it
+   is nothing. It is still a cost this ADR did not predict, and the way to remove
+   it is to share one `Regions` across the machines built from one program rather
+   than to make the analysis cheaper.
+
+   So the hypothesis is falsified twice over on this route, once for the arena
+   and once for the close. `/health` opens no region per request and its 1,035
+   are boxes.
+
+   The **dynamic** split is where the milestone is worth something, and it is not
+   the static one. Over `examples/` and the `std` modules they import the static
+   split is **113 regions, 0 `unique`, 113 `shared`**, every one of them because
+   of a tail-resumptive clause
+   (`region_kind_inference.rs::the_split_over_the_repositorys_own_examples`) —
+   which under a design where `shared` meant "never reclaimed" would have said
+   the zero-cost claim buys nothing at all. It does not mean that, because the
+   two kinds are a claim about what a close will find rather than a decision
+   about whether one happens: running every test in `examples/` gives **709
+   region closes, 709 freed at the close and 0 deferred**, 348 slot bumps against
+   a peak of 6 live, 73 pins taken and 0 slots reclaimed late
+   (`region_reclamation_census.rs`). Every one of the 113 `shared` regions
+   reclaims at its close on every run of the corpus, because no continuation
+   captured across one ever outlives it there.
+
+   The refinement §3 leaves open — a tail-resumptive clause's continuation is
+   consumed by the `Resume` frame the machine pushes for it, so it cannot outlive
+   the region's close — is therefore worth **precision in a report and not
+   memory**, and it is deliberately not taken here. It is taken at the *capture*
+   instead, where it is a cost rather than a kind: a tail-resumptive clause takes
+   no pin, because the only thing that will ever splice its continuation is that
+   `Resume` frame, one frame above the `CloseRegion` frames of every region open
+   at the capture. Without that, `perform` allocated an `Rc` per operation and
+   the served request paid seven of them.
 
    `w6_report_allocations.rs` will not catch this drift: its band is a factor of
    two either way, deliberately, because it is a staleness guard on the report
@@ -321,8 +380,24 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    artifact.
 2. **The isolation cost** — how many of the 176 currently world-isolated tests
    newly serialize. The only real argument against this design.
+
+   **Zero, on this corpus.** `ply-corpus regions examples` colours the same 186
+   tests with and without the world-backed exemption and reports `5→5` groups,
+   a critical path of 20.2 ms either way and a modelled wall clock ratio of
+   `1.00x`. The reason is stated rather than celebrated: no test in `examples/`
+   carries a `cell` atom in its footprint at all, so the exemption was
+   exempting nothing. `--hypothetical cells:labels` is how the risk is priced
+   for a corpus that would.
 3. **Region-scoped fixture cost**, measured the way fork's 1 ns was, so
    "cheap" stays a fact rather than becoming a slogan.
+
+   `fixture_open_cost.rs`: opening a 10,000-cell fixture and writing one cell
+   costs **95.7 µs per test**, against `World::fork`'s 1 ns. At 100,000 cells an
+   open is 800 allocations and 4.45 MB. This is the price §6 says is paid, and
+   it is paid per test rather than per group. Every Ply program in this
+   repository opens an empty fixture, where it is nothing at all — which is also
+   why the number is a projection about a construct that is still not writable
+   in Ply.
 4. **`--engine both` agreement** across the change — and the size of the hole in
    it, stated rather than left implied.
 
@@ -330,8 +405,12 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    tree-walker refuses every clause that binds a continuation** (`E0504`, which
    is ADR 0005 required test 3). So `--engine both` audits nothing about
    multi-shot resumption, which is precisely the construct this ADR changes.
-   `ply test --explain` counts the gap: **11 of 186 example tests are
-   `machine-only`**, and they are the resumption tests.
+   `ply test examples/ --engine both --explain` counts the gap: **audited 166 of
+   186 · 20 ran on one engine only**. The 20 are the tests reaching a `resume`
+   binder or a `simulate` region; `simulated: 11 of 186` is the second of those
+   counts and is the figure an earlier draft of this list quoted as the whole of
+   the hole. On the generated corpus there is no hole: **audited 300 of 300**.
+   Zero divergences on both.
 
    A second and larger hole: both engines hold the same state representation, so
    a change to the memory model moves them together and the comparison stays

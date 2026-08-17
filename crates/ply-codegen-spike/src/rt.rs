@@ -25,7 +25,8 @@ pub struct Ctx {
     pub builtins: Vec<Builtin>,
     /// Program-wide names the machine trampoline calls, by index.
     pub targets: Vec<String>,
-    pub world: ply_eval::World,
+    /// The region stack the compiled fragment's cells live in. ADR 0017 §5.
+    pub regions: ply_eval::TaskRegions,
     pub diagnostic: Option<Diagnostic>,
     pub machine: Option<Box<Machine<'static>>>,
     pub builtin_calls: u64,
@@ -42,7 +43,7 @@ impl Ctx {
             shapes: Vec::new(),
             builtins: Vec::new(),
             targets: Vec::new(),
-            world: ply_eval::World::new(),
+            regions: ply_eval::TaskRegions::new(),
             diagnostic: None,
             machine: None,
             builtin_calls: 0,
@@ -204,7 +205,7 @@ pub extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64
     let b = ctx.builtins[index as usize];
     let args = args_of(ctx, args, n);
     ctx.builtin_calls += 1;
-    match ply_eval::builtins::call(b, args, &mut ctx.world, Span::DUMMY) {
+    match ply_eval::builtins::call(b, args, &mut ctx.regions, Span::DUMMY) {
         Ok(Step::Done(v)) => ctx.push(v),
         Ok(_) => {
             let d = error(format!("`{}` suspended, which the fragment excludes", b.name()));

@@ -4,7 +4,6 @@ use super::*;
 use crate::code::{Node, NodeKind, Stmt};
 use crate::differential;
 use crate::machine::{Machine, Progress};
-use crate::world::CellId;
 use crate::{Interp, build};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Ident, Item, Lit, Mode, Pattern, PatternKind, QName};
@@ -166,7 +165,9 @@ fn cell_set(cell: Code, value: Code) -> Code {
 /// in through `Machine::go_eval` rather than through `eval_expr_for_test`.
 struct Outcome {
     result: Result<Value, Diagnostic>,
-    world: World,
+    /// The run's cells, ascending by slot index — the order `Arena::slots`
+    /// hands them out, so two runs of one program compare byte for byte.
+    cells: Vec<Value>,
 }
 
 fn run(code: &Code) -> Outcome {
@@ -186,7 +187,7 @@ fn run_in(items: Vec<Item>, code: &Code) -> Outcome {
     };
     Outcome {
         result,
-        world: machine.world().clone(),
+        cells: machine.cells().slots().map(|(_, v)| v.clone()).collect(),
     }
 }
 
@@ -221,16 +222,15 @@ impl Outcome {
     }
 
     #[track_caller]
-    fn cell(&self, id: u32) -> i64 {
-        match self.world.get(CellId(id)) {
+    fn cell(&self, index: u32) -> i64 {
+        match self.cells.get(index as usize) {
             Some(Value::Int(i)) => *i,
-            other => panic!("cell #{id} holds {other:?}"),
+            other => panic!("cell {index} holds {other:?}"),
         }
     }
 
-    /// Ordered by id, so two runs of one program compare byte for byte.
-    fn cells(&self) -> Vec<(CellId, String)> {
-        self.world.cells().map(|(i, v)| (i, v.render())).collect()
+    fn cells(&self) -> Vec<String> {
+        self.cells.iter().map(Value::render).collect()
     }
 }
 
@@ -681,7 +681,11 @@ fn each_region_allocates_its_own_cell_and_the_world_keeps_both() {
 
     let run = run(&e);
     assert_eq!(run.rendered(), "[1, 2]");
-    assert_eq!(run.world.len(), 2, "the world is monotone across regions");
+    assert_eq!(
+        run.cells.len(),
+        2,
+        "a shared region's slots outlive its close, so both are still there"
+    );
     assert_eq!(run.cell(0), 1);
     assert_eq!(run.cell(1), 2);
 }
