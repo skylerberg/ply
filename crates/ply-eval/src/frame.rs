@@ -93,16 +93,25 @@ impl Machine<'_> {
                 span,
             } => {
                 if args.is_empty() {
+                    // Perceus' rule that decides whether anything is ever reused:
+                    // the scope the arguments were evaluated in is dead here, and
+                    // dropping it *before* the call is what leaves the callee
+                    // holding the only reference to what it was handed. Dropping
+                    // it after — which is what letting it fall out of scope does
+                    // — leaves every argument at a count of two for the whole
+                    // call, and no update is ever in place.
+                    drop(env);
                     return self.apply(value, Vec::new(), span);
                 }
                 let first = args[0].clone();
+                let carried = crate::rc::carry(&env, args.len() > 1);
                 self.push(
                     Frame::AppArgs {
                         callee: value,
                         done: Vec::with_capacity(args.len()),
                         args,
                         next: 1,
-                        env: env.clone(),
+                        env: carried,
                         module,
                         span,
                     },
@@ -122,16 +131,22 @@ impl Machine<'_> {
             } => {
                 done.push(value);
                 match args.get(next) {
-                    None => return self.apply(callee, done, span),
+                    None => {
+                        // See `AppCallee` above: the argument scope is dropped
+                        // before the call, not after it.
+                        drop(env);
+                        return self.apply(callee, done, span);
+                    }
                     Some(arg) => {
                         let arg = arg.clone();
+                        let carried = crate::rc::carry(&env, next + 1 < args.len());
                         self.push(
                             Frame::AppArgs {
                                 callee,
                                 done,
                                 args,
                                 next: next + 1,
-                                env: env.clone(),
+                                env: carried,
                                 module,
                                 span,
                             },
@@ -245,12 +260,13 @@ impl Machine<'_> {
                     }
                     Some((_, code)) => {
                         let code = code.clone();
+                        let carried = crate::rc::carry(&env, next + 1 < fields.len());
                         self.push(
                             Frame::RecordField {
                                 done,
                                 fields,
                                 next: next + 1,
-                                env: env.clone(),
+                                env: carried,
                                 module,
                             },
                             code.span,
@@ -282,12 +298,13 @@ impl Machine<'_> {
                     None => self.go_return(Value::list(done)),
                     Some(item) => {
                         let item = item.clone();
+                        let carried = crate::rc::carry(&env, next + 1 < items.len());
                         self.push(
                             Frame::ListItem {
                                 done,
                                 items,
                                 next: next + 1,
-                                env: env.clone(),
+                                env: carried,
                                 module,
                             },
                             item.span,

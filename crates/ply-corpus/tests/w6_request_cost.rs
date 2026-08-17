@@ -61,7 +61,9 @@ fn repo() -> PathBuf {
 #[test]
 fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let bench = loaded.full("w6_bench").expect("the driver declares w6_bench");
+    let bench = loaded
+        .full("w6_bench")
+        .expect("the driver declares w6_bench");
     let request = ply_corpus::w6_run::head();
 
     const N: u32 = 200;
@@ -78,18 +80,10 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
             .expect("the driver runs");
         let (_, allocs, bytes) = counted(|| {
             loaded
-                .pure_call(
-                    &bench,
-                    vec![Value::Int(mode), Value::Int(N as i64)],
-                    1,
-                )
+                .pure_call(&bench, vec![Value::Int(mode), Value::Int(N as i64)], 1)
                 .expect("the driver runs")
         });
-        rows.push((
-            name,
-            allocs as f64 / N as f64,
-            bytes as f64 / N as f64,
-        ));
+        rows.push((name, allocs as f64 / N as f64, bytes as f64 / N as f64));
     }
 
     let script: Vec<Vec<Vec<u8>>> = (0..N).map(|_| vec![request.clone()]).collect();
@@ -141,7 +135,9 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
 #[test]
 fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let items = loaded.full("w6_items").expect("the driver declares w6_items");
+    let items = loaded
+        .full("w6_items")
+        .expect("the driver declares w6_items");
 
     const N: u32 = 100;
     let mut rows = Vec::new();
@@ -174,7 +170,9 @@ fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
 #[test]
 fn entering_the_machine_allocates_a_bounded_amount() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let constant = loaded.full("w6_const").expect("the driver declares w6_const");
+    let constant = loaded
+        .full("w6_const")
+        .expect("the driver declares w6_const");
     loaded
         .pure_call(&constant, Vec::new(), 8)
         .expect("the driver runs");
@@ -199,7 +197,9 @@ fn entering_the_machine_allocates_a_bounded_amount() {
 #[test]
 fn both_engines_answer_the_request_path_alike() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let bench = loaded.full("w6_bench").expect("the driver declares w6_bench");
+    let bench = loaded
+        .full("w6_bench")
+        .expect("the driver declares w6_bench");
     let args = vec![Value::Int(3), Value::Int(16)];
     let mut interp = ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
     let tree = interp

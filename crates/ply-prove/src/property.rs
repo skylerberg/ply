@@ -961,7 +961,7 @@ pub(crate) fn fn_size(value: &Value) -> Option<u64> {
         return None;
     };
     match env.lookup(&Symbol::new(FN_SIZE)) {
-        Some(Value::Int(n)) => Some((*n).max(0) as u64),
+        Some(ply_eval::ScopeSlot::Live(Value::Int(n))) => Some((*n).max(0) as u64),
         _ => None,
     }
 }

@@ -70,10 +70,18 @@ fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Di
 /// inserting `1.5m` over `1.50m` leaves the key `1.5m`, so `map_keys` then
 /// renders `1.5` where it rendered `1.50`. The alternative costs a lookup on
 /// every insert to preserve a distinction nobody asked for.
-pub(crate) fn insert(m: &Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
-    let mut out = m.as_map(span, "`map_insert`")?.clone();
-    put(&mut out, k, v, "map_insert", span)?;
-    Ok(Value::Map(out))
+///
+/// Takes the map **by value**, so a caller that was its last owner hands over
+/// the tree rather than a second handle to it and `insert_mut` rewrites the
+/// nodes on the path instead of copying them. Borrowing here and cloning would
+/// guarantee two owners at the moment of the write, which is the shape that
+/// makes reference counting cost something and buy nothing.
+pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
+    match &mut m {
+        Value::Map(out) => put(out, k, v, "map_insert", span)?,
+        other => return Err(crate::value::type_error(span, "`map_insert`", "Map", other)),
+    }
+    Ok(m)
 }
 
 pub(crate) fn get(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
@@ -94,9 +102,15 @@ pub(crate) fn contains(m: &Value, k: &Value, span: Span) -> Result<Value, Diagno
 /// An absent key is a no-op rather than an error: removing what is not there
 /// leaves a map with the property the caller asked for, and refusing would make
 /// every caller write the guard.
-pub(crate) fn remove(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
+pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
     key(k, "map_remove", span)?;
-    Ok(Value::Map(m.as_map(span, "`map_remove`")?.remove(k)))
+    match &mut m {
+        Value::Map(out) => {
+            out.remove_mut(k);
+        }
+        other => return Err(crate::value::type_error(span, "`map_remove`", "Map", other)),
+    }
+    Ok(m)
 }
 
 pub(crate) fn len(m: &Value, span: Span) -> Result<Value, Diagnostic> {

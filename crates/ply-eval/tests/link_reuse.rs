@@ -11,7 +11,7 @@
 //! The counting allocator is why this is its own test binary: a
 //! `#[global_allocator]` is a whole-binary decision.
 
-use ply_eval::{Env, Frame, Next, Stack, Value};
+use ply_eval::{Env, Frame, Next, ScopeSlot, Stack, Value};
 use ply_span::{Span, Symbol};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -170,9 +170,8 @@ fn a_captured_scope_survives_the_scope_it_was_taken_from() {
     }
     drop(churn);
 
-    assert_eq!(
-        captured.lookup(&name),
-        Some(&Value::Int(7)),
+    assert!(
+        matches!(captured.lookup(&name), Some(ScopeSlot::Live(Value::Int(7)))),
         "the captured scope read a binding the pool had handed out again"
     );
 }

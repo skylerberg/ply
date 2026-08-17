@@ -17,7 +17,11 @@ fn sp() -> Span {
 }
 
 fn node(kind: NodeKind) -> Code {
-    Rc::new(Node { kind, span: sp() })
+    Rc::new(Node {
+        kind,
+        span: sp(),
+        own: crate::rc::Own::Borrowed,
+    })
 }
 
 fn int(i: i64) -> Code {
@@ -87,11 +91,15 @@ fn letv(name: &str, value: Code) -> Stmt {
         },
         value,
         span: sp(),
+        dead: crate::rc::no_dead(),
     }
 }
 
 fn discard(value: Code) -> Stmt {
-    Stmt::Expr(value)
+    Stmt::Expr {
+        code: value,
+        dead: crate::rc::no_dead(),
+    }
 }
 
 fn perform_(effect: &str, op: &str, resource: Option<&str>, args: Vec<Code>) -> Code {

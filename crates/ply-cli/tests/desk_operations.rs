@@ -342,7 +342,7 @@ fn the_desks_suite_is_hermetic_without_host_and_says_so() {
 
     let first = Run::of(&["test", "--explain", dir.path().to_str().unwrap()]);
     assert!(first.ok, "{}", first.all());
-    // Every one of the desk's tests is world-isolated, including the ones that
+    // Every one of the desk's tests is region-isolated, including the ones that
     // assert on trace records and the ones that supply a credential: the twins
     // are values in region-scoped cells, so nothing reaches the boundary and
     // nothing is `isolation: host`.

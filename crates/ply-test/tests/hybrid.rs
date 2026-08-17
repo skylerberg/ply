@@ -426,6 +426,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
         results: Vec::new(),
         warnings: Vec::new(),
         simulation: Default::default(),
+        audit: None,
     };
     let (_root, mut store) = passed(&before, "m.doubles");
     ply_test::diagnose_failures(

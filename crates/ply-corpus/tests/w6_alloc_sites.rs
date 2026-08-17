@@ -85,7 +85,9 @@ fn repo() -> PathBuf {
 #[test]
 fn the_request_paths_allocation_sites_are_ranked() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let bench = loaded.full("w6_bench").expect("the driver declares w6_bench");
+    let bench = loaded
+        .full("w6_bench")
+        .expect("the driver declares w6_bench");
     let request = ply_corpus::w6_run::head();
 
     for (mode, name) in [(1i64, "endpoint"), (2, "framing"), (3, "routing")] {
@@ -127,8 +129,12 @@ const CONCENTRATION_LIMIT: f64 = 0.50;
 
 fn report(name: &str, n: usize) {
     let total = TOTAL.with(Cell::get);
-    let mut rows: Vec<(String, usize, usize)> =
-        SITES.with(|s| s.borrow().iter().map(|(k, v)| (k.clone(), v.0, v.1)).collect());
+    let mut rows: Vec<(String, usize, usize)> = SITES.with(|s| {
+        s.borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.0, v.1))
+            .collect()
+    });
     rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     println!("\n== {name}: {} allocations per request", total / n);
     for (site, count, bytes) in rows.iter().take(25) {
@@ -139,7 +145,10 @@ fn report(name: &str, n: usize) {
             100.0 * *count as f64 / total as f64
         );
     }
-    assert!(total > 0, "`{name}` allocated nothing, so nothing was ranked");
+    assert!(
+        total > 0,
+        "`{name}` allocated nothing, so nothing was ranked"
+    );
     let counted: usize = rows.iter().map(|r| r.1).sum();
     assert_eq!(
         counted, total,

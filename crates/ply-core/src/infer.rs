@@ -91,6 +91,7 @@ pub fn check_program_with(
     c.check_derives(program);
     c.attribute_generated(program);
     c.check_simulations();
+    c.check_regions();
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(c.diags)
     } else {
@@ -248,6 +249,17 @@ struct Checker<'a> {
     /// and the row of what it calls are both routinely unsolved while its own
     /// definition is still being walked.
     simulations: Vec<Simulation>,
+    /// The `with_region[r]` scopes enclosing the expression being walked,
+    /// innermost last. `with_cell[r]` consults it to decide whether it opens a
+    /// region of its own or allocates into one that is already open.
+    open_regions: Vec<OpenRegion>,
+    /// Closed regions, checked by [`Checker::check_regions`] once the module is
+    /// solved.
+    regions: Vec<RegionSite>,
+    /// How many `simulate` regions enclose the expression being walked. A task
+    /// cannot outlive the scheduler that runs it, so a region that opened before
+    /// the enclosing `simulate` did is one a spawned task can outlive.
+    simulate_depth: u32,
     /// What each definition carrying clauses has its clauses typed against.
     /// Recorded where the signature is built rather than rebuilt in
     /// [`Checker::check_specs`], so that a clause cannot report a second copy of
@@ -328,6 +340,76 @@ struct SpecEnv {
     ret: Type,
 }
 
+/// A region scope while its body is being walked.
+struct OpenRegion {
+    name: Symbol,
+    source: RegionSource,
+    span: Span,
+    /// [`Checker::simulate_depth`] where the region opened. A `task.spawn`
+    /// reached at this same depth is scheduled by a `simulate` that started
+    /// before the region did and therefore outlives it.
+    simulate_depth: u32,
+    spawns: Vec<SpawnSite>,
+    handoffs: Vec<HandoffSite>,
+}
+
+/// How a region was written. ADR 0017 §1 makes both of these regions and the
+/// four escape checks run on both; what differs is only what the exit
+/// diagnostic says, because a bare `with_cell`'s escaping value is always the
+/// cell and has said so since before regions existed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionSource {
+    WithRegion,
+    WithCell,
+}
+
+/// One closed region — a `with_region[r]` or a `with_cell[r]` that opened one of
+/// its own — as [`Checker::check_regions`] revisits it.
+struct RegionSite {
+    name: Symbol,
+    source: RegionSource,
+    /// The region's name in the source, which is where `r` is said to open.
+    span: Span,
+    body_span: Span,
+    body_ty: Type,
+    /// Every position the body's value leaves through. All of them carry
+    /// `body_ty`; what the list buys is a label on the expression that produced
+    /// the value rather than on the whole region.
+    exits: Vec<Span>,
+    outer: Vec<OuterBinding>,
+    spawns: Vec<SpawnSite>,
+    handoffs: Vec<HandoffSite>,
+}
+
+/// A name that was in scope before a region opened, and where the region's body
+/// first mentions it. A brand reaching this type is a store into something that
+/// outlives the region.
+struct OuterBinding {
+    name: Symbol,
+    ty: Type,
+    site: Span,
+}
+
+/// An argument handed to `task.spawn` inside a region.
+struct SpawnSite {
+    span: Span,
+    ty: Type,
+}
+
+/// An argument handed to a user-declared operation inside a region.
+///
+/// The perform site and the handler instantiate the operation's signature
+/// separately, so a declared type variable in an argument position is a hole the
+/// brand falls through: the handler receives the value at a variable of its own
+/// and may store or return it, and no type there mentions the region. The type
+/// recorded is the argument's, at the site that wrote it.
+struct HandoffSite {
+    span: Span,
+    /// `sink.put`, for the diagnostic.
+    op: String,
+    ty: Type,
+}
+
 /// One `simulate` region, as [`Checker::check_simulations`] revisits it.
 struct Simulation {
     span: Span,
@@ -368,6 +450,9 @@ impl<'a> Checker<'a> {
             constrained_uses: Vec::new(),
             numerics: Vec::new(),
             simulations: Vec::new(),
+            open_regions: Vec::new(),
+            regions: Vec::new(),
+            simulate_depth: 0,
             spec_envs: FxHashMap::default(),
             spec_kind: None,
             derived: None,
@@ -1182,6 +1267,10 @@ impl<'a> Checker<'a> {
                 let ret = self.conv_type(&op.ret);
                 self.auto_ty_params = false;
                 self.ty_params.clear();
+                for (ty, written) in params.iter().zip(&op.params) {
+                    self.reject_declared_cell(ty, written.span(), &op.name.name, "a parameter");
+                }
+                self.reject_declared_cell(&ret, op.ret.span(), &op.name.name, "a result");
                 ops.insert(
                     op.name.name.clone(),
                     OpInfo {
@@ -1238,6 +1327,9 @@ impl<'a> Checker<'a> {
                     continue;
                 }
                 let fields: Vec<Type> = variant.fields.iter().map(|f| self.conv_type(f)).collect();
+                for (field, written) in fields.iter().zip(&variant.fields) {
+                    self.reject_declared_cell(field, written.span(), &variant.name.name, "a field");
+                }
                 let ty = if fields.is_empty() {
                     result.clone()
                 } else {
@@ -1270,6 +1362,43 @@ impl<'a> Checker<'a> {
             }
             self.ty_params.clear();
         }
+    }
+
+    /// A declaration whose type mentions a `Cell`, which is the one place a
+    /// brand can go where nothing can see it again.
+    ///
+    /// A variant's field types and an operation's signature are converted
+    /// **once**, when the declaration is collected, and the region argument a
+    /// written `Cell<T>` gets is a fresh variable that the surrounding scheme
+    /// does not quantify. So the first `with_cell[r]` value that reaches one
+    /// solves that single variable to `r` for the whole program, and the value's
+    /// own type is then the bare `Foo` — a brand with nowhere to appear, and
+    /// every escape through it invisible.
+    ///
+    /// Making the declaration generic in the cell keeps the brand in the type
+    /// argument, where every check in this file already looks, so that is what
+    /// the note says. Written through an alias it is the same refusal, because
+    /// the check is on the converted type rather than on what was spelled.
+    fn reject_declared_cell(&mut self, ty: &Type, span: Span, owner: &Symbol, what: &str) {
+        if !mentions_cell(ty) {
+            return;
+        }
+        self.diags.push(
+            Diagnostic::error(
+                codes::REGION_ESCAPE,
+                format!("`{owner}` declares {what} that mentions a `Cell`"),
+            )
+            .primary(span, "a declaration is outside every region there is")
+            .note(
+                "a declared type is fixed once for the whole program, so the region a cell that \
+                 reached it came from would be pinned by whichever value got there first, and no \
+                 later check could tell that the cell had outlived it",
+            )
+            .note(
+                "take the cell as a type parameter instead, so the region stays in the type \
+                 argument and the escape check can see it",
+            ),
+        );
     }
 
     /// Functions and constructors share one namespace, so one module cannot
@@ -3099,6 +3228,8 @@ impl<'a> Checker<'a> {
                 body,
             } => self.infer_with_cell(e, resource, init, binder, body),
 
+            ExprKind::WithRegion { region, body } => self.infer_with_region(region, body),
+
             ExprKind::Simulate { body } => self.infer_simulate(e, body),
         }
     }
@@ -3871,6 +4002,9 @@ impl<'a> Checker<'a> {
             self.expect(arg.span, want, got, "operation argument");
         }
 
+        self.note_spawn(&info, &op_info, args, &arg_tys);
+        self.note_handoff(&info, &op_info, args, &arg_tys);
+
         let atom = EffectAtom::new(info.name.clone(), res, op_info.mode);
         self.record(atom.clone(), e.span, true);
         // The operation's own row, which only a prelude operation has: it is how
@@ -4222,6 +4356,21 @@ impl<'a> Checker<'a> {
         (result_ty, row)
     }
 
+    /// ADR 0017 §1: a cell is a value allocated in `r`.
+    ///
+    /// Written inside `with_region[r]` the cell belongs to that region and is
+    /// discharged and checked there, so it may outlive this `{ .. }` and not the
+    /// region. Written on its own, `with_cell[r]` **is** the region — so it
+    /// opens one, files a [`RegionSite`] like any other, and is held to all four
+    /// of [`Checker::check_regions`]'s rules rather than only to the shape of
+    /// its own result type.
+    ///
+    /// That last part is the fix for the route ADR 0017 lists first among the
+    /// ways this could go wrong: a closure that captured the cell need not
+    /// mention it in its parameters or its result, only in its effect row, and
+    /// filing no site meant nothing ever looked at the row, at what the body
+    /// stored into an enclosing binding, at what it spawned, or at what it
+    /// handed to an operation.
     fn infer_with_cell(
         &mut self,
         e: &Expr,
@@ -4234,11 +4383,37 @@ impl<'a> Checker<'a> {
         let region = Type::con(&region_type_name(resource.name.as_str()));
         let cell = Type::Con(Symbol::new("Cell"), vec![region, init_ty]);
 
+        // A cell allocated into an enclosing region of the same brand belongs to
+        // that region: it opens nothing here and is checked at that region's
+        // boundary.
+        if self.region_is_open(&resource.name) {
+            self.env.push();
+            self.env.bind(binder.name.clone(), Scheme::mono(cell));
+            let (body_ty, body_row) = self.infer(body);
+            self.env.pop();
+            return (body_ty, self.join(e.span, init_row, body_row));
+        }
+
+        let outer = self.outer_bindings(body);
+        self.open_regions.push(OpenRegion {
+            name: resource.name.clone(),
+            source: RegionSource::WithCell,
+            span: resource.span,
+            simulate_depth: self.simulate_depth,
+            spawns: Vec::new(),
+            handoffs: Vec::new(),
+        });
+
         let mark = self.performs.len();
         self.env.push();
         self.env.bind(binder.name.clone(), Scheme::mono(cell));
         let (body_ty, body_row) = self.infer(body);
         self.env.pop();
+        let (spawns, handoffs) = self
+            .open_regions
+            .pop()
+            .map(|r| (r.spawns, r.handoffs))
+            .unwrap_or_default();
 
         let handled: BTreeSet<EffectAtom> = [
             EffectAtom::new(CELL, Resource::Named(resource.name.clone()), Mode::Read),
@@ -4247,27 +4422,452 @@ impl<'a> Checker<'a> {
         .into();
         self.discharge(mark..self.performs.len(), &handled);
 
-        // The region tag only discharges the cell's atoms if the cell cannot
-        // outlive it; a `Cell` in the result would carry atoms nothing can ever
-        // handle again.
-        let resolved = self.subst.resolve_ty(&body_ty);
-        if mentions_region(&resolved, resource.name.as_str()) {
-            let mut printer = Printer::new();
-            self.diags.push(
-                Diagnostic::error(
-                    codes::TYPE_MISMATCH,
-                    format!("the cell escapes its `with_cell[{}]` region", resource.name),
-                )
-                .primary(
-                    body.span,
-                    format!("this has type `{}`", printer.ty(&resolved)),
-                )
-                .note("read the cell inside the region and return the value instead"),
-            );
-        }
+        let mut exits = Vec::new();
+        region_exits(body, &mut exits);
+        let exits = exits.iter().map(|x| x.span).collect();
+
+        self.regions.push(RegionSite {
+            name: resource.name.clone(),
+            source: RegionSource::WithCell,
+            span: resource.span,
+            body_span: body.span,
+            body_ty: body_ty.clone(),
+            exits,
+            outer,
+            spawns,
+            handoffs,
+        });
 
         let row = self.join(e.span, init_row, body_row.without(&handled));
         (body_ty, row)
+    }
+
+    fn region_is_open(&self, name: &Symbol) -> bool {
+        self.open_regions.iter().any(|r| &r.name == name)
+    }
+
+    /// Files a `task.spawn` argument against every open `with_region[r]` the
+    /// spawned task could outlive. A region that opened *after* the enclosing
+    /// `simulate` is not one of them: that scheduler ends inside the region, and
+    /// so does every task it is running.
+    ///
+    /// A bare `with_cell[r]` is deliberately excluded. "A cell reaching a task
+    /// is how tasks share memory" is CONTRACTS §`simulate`'s rule and ADR 0005's
+    /// monotone world made it sound; refusing it would change what a landed
+    /// program means from "runs" to "does not compile", which ADR 0017's
+    /// governing property forbids. It is also safe under ADR 0017 §3 as amended:
+    /// a `task` operation anywhere in a region makes it `shared`
+    /// (`region_kind::Cause::Task`), and a `shared` region's slots outlive its
+    /// close for exactly this reason. `with_region` keeps the stricter rule
+    /// because it is new syntax with no program depending on the loose one.
+    fn note_spawn(&mut self, info: &EffectInfo, op: &OpInfo, args: &[Expr], tys: &[Type]) {
+        if info.name.as_str() != prelude::TASK || op.name.as_str() != prelude::SPAWN_OP {
+            return;
+        }
+        let depth = self.simulate_depth;
+        for region in &mut self.open_regions {
+            if region.simulate_depth < depth || region.source == RegionSource::WithCell {
+                continue;
+            }
+            for (arg, ty) in args.iter().zip(tys) {
+                region.spawns.push(SpawnSite {
+                    span: arg.span,
+                    ty: ty.clone(),
+                });
+            }
+        }
+    }
+
+    /// Files every argument of a user-declared operation against every open
+    /// region, because the handler that receives it can be installed anywhere —
+    /// including outside the region, or in another definition entirely.
+    ///
+    /// `task` is excluded because [`Checker::note_spawn`] already decides it more
+    /// precisely: the handler is the enclosing `simulate` and the region knows
+    /// whether that scheduler started inside it. `cell` never reaches here at
+    /// all — [`Checker::resolve_op`] refuses a written `cell.read[r]`, so the
+    /// only cell operations are the builtins the region itself discharges.
+    fn note_handoff(&mut self, info: &EffectInfo, op: &OpInfo, args: &[Expr], tys: &[Type]) {
+        if info.name.as_str() == prelude::TASK || self.open_regions.is_empty() {
+            return;
+        }
+        let name = format!("{}.{}", info.simple_name, op.name);
+        for region in &mut self.open_regions {
+            for (arg, ty) in args.iter().zip(tys) {
+                region.handoffs.push(HandoffSite {
+                    span: arg.span,
+                    op: name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+        }
+    }
+
+    /// ```text
+    /// Γ ⊢ body : T / ρ_b        no value branded `r` reaches an exit of `body`
+    /// ─────────────────────────────────────────────────────────────────────────
+    /// Γ ⊢ with_region[r] { body } : T / (ρ_b \ {cell.read[r], cell.write[r]})
+    /// ```
+    ///
+    /// The premise is not decidable here — a brand routinely reaches an exit
+    /// type only once the definition around the region has been solved — so the
+    /// region records what it would have to look at and
+    /// [`Checker::check_regions`] asks the question at the end of the run. The
+    /// row half is not deferrable, because the atoms have to be off the
+    /// `performs` list before the enclosing definition's row is judged.
+    fn infer_with_region(&mut self, region: &Ident, body: &Expr) -> (Type, Row) {
+        if let Some(open) = self
+            .open_regions
+            .iter()
+            .find(|r| r.name == region.name)
+            .map(|r| r.span)
+        {
+            self.diags.push(
+                Diagnostic::error(
+                    codes::REGION_ALREADY_OPEN,
+                    format!("region `{}` is already open here", region.name),
+                )
+                .primary(region.span, "a second region under the same name")
+                .secondary(
+                    open,
+                    format!("`{}` opens here and is still open", region.name),
+                )
+                .note(
+                    "the brand is the name, so the two regions' values would have one type and \
+                     closing the inner one would free what the outer one still holds",
+                )
+                .note("give the inner region a different name"),
+            );
+        }
+
+        let outer = self.outer_bindings(body);
+        self.open_regions.push(OpenRegion {
+            name: region.name.clone(),
+            source: RegionSource::WithRegion,
+            span: region.span,
+            simulate_depth: self.simulate_depth,
+            spawns: Vec::new(),
+            handoffs: Vec::new(),
+        });
+
+        let mark = self.performs.len();
+        let (body_ty, body_row) = self.infer(body);
+        let (spawns, handoffs) = self
+            .open_regions
+            .pop()
+            .map(|r| (r.spawns, r.handoffs))
+            .unwrap_or_default();
+
+        let handled: BTreeSet<EffectAtom> = [
+            EffectAtom::new(CELL, Resource::Named(region.name.clone()), Mode::Read),
+            EffectAtom::new(CELL, Resource::Named(region.name.clone()), Mode::Write),
+        ]
+        .into();
+        self.discharge(mark..self.performs.len(), &handled);
+
+        // Every exit carries the region's own result type — a branch, an arm, a
+        // `return` clause and a nested region's tail are all unified with it —
+        // so what the walk buys is the span to report at, not a second type.
+        let mut exits = Vec::new();
+        region_exits(body, &mut exits);
+        let exits = exits.iter().map(|x| x.span).collect();
+
+        self.regions.push(RegionSite {
+            name: region.name.clone(),
+            source: RegionSource::WithRegion,
+            span: region.span,
+            body_span: body.span,
+            body_ty: body_ty.clone(),
+            exits,
+            outer,
+            spawns,
+            handoffs,
+        });
+
+        let row = self.subst.resolve_row(&body_row).without(&handled);
+        (body_ty, row)
+    }
+
+    /// The bindings a region could store into: everything the definition being
+    /// checked has in scope when the region opens, paired with where each is
+    /// first named inside it.
+    ///
+    /// Only bindings whose type still has an unsolved variable are kept. A
+    /// binding already solved to a type with no variable in it cannot acquire a
+    /// brand, and keeping them all would make every region pay for the whole
+    /// enclosing scope.
+    ///
+    /// The global scope is excluded: a top-level scheme is generalized before it
+    /// is bound, so its variables are quantified and unification inside a region
+    /// reaches a fresh copy rather than the scheme itself.
+    fn outer_bindings(&mut self, body: &Expr) -> Vec<OuterBinding> {
+        let mut kept: Vec<(Symbol, Type)> = Vec::new();
+        for (name, scheme) in self.env.locals() {
+            let (mut tys, mut rows) = (BTreeSet::new(), BTreeSet::new());
+            self.subst.free_vars(&scheme.ty, &mut tys, &mut rows);
+            for v in &scheme.ty_vars {
+                tys.remove(v);
+            }
+            for v in &scheme.row_vars {
+                rows.remove(v);
+            }
+            if !tys.is_empty() || !rows.is_empty() {
+                kept.push((name.clone(), scheme.ty.clone()));
+            }
+        }
+        if kept.is_empty() {
+            return Vec::new();
+        }
+
+        let mut refs = Vec::new();
+        collect_refs(body, &mut refs);
+        let mut first: FxHashMap<&Symbol, Span> = FxHashMap::default();
+        for q in refs.iter().filter(|q| q.is_bare()) {
+            first.entry(q.symbol()).or_insert(q.span);
+        }
+
+        kept.into_iter()
+            .filter_map(|(name, ty)| {
+                first.get(&name).map(|span| OuterBinding {
+                    name,
+                    ty,
+                    site: *span,
+                })
+            })
+            .collect()
+    }
+
+    /// ADR 0017 §2, asked once the module is solved for the reason
+    /// [`Checker::check_simulations`] is asked then: the brand a value carries
+    /// is routinely still an unsolved variable while the region around it is
+    /// being walked, and a check that ran at the closing brace would answer
+    /// about a type that had not been decided yet.
+    fn check_regions(&mut self) {
+        for site in std::mem::take(&mut self.regions) {
+            self.check_region_exits(&site);
+            self.check_region_stores(&site);
+            self.check_region_spawns(&site);
+            self.check_region_handoffs(&site);
+        }
+    }
+
+    /// The value the region evaluates to. Reported at each position it leaves
+    /// through — a branch, an arm, a nested region's tail — rather than at the
+    /// whole body, so the label sits on the expression that produced it.
+    ///
+    /// Asked here rather than at the closing brace for the reason
+    /// [`Checker::check_regions`] gives: the brand a value carries is routinely
+    /// still an unsolved variable while the region is being walked, so the
+    /// question is asked once the module is solved and the type is resolved. W2
+    /// found the analogous hole reachable through a type alias precisely because
+    /// the check ran too early.
+    fn check_region_exits(&mut self, site: &RegionSite) {
+        let ty = self.subst.resolve_ty(&site.body_ty);
+        if !brand_in(&ty, site.name.as_str()) {
+            return;
+        }
+        if site.source == RegionSource::WithCell {
+            return self.report_escaping_cell(site, &ty);
+        }
+        let mut printer = Printer::new();
+        let shown = printer.ty(&ty);
+        let mut d = Diagnostic::error(
+            codes::REGION_ESCAPE,
+            format!(
+                "a value allocated in region `{}` escapes the region",
+                site.name
+            ),
+        );
+        let spans = if site.exits.is_empty() {
+            &[site.body_span][..]
+        } else {
+            &site.exits
+        };
+        for span in spans {
+            d = d.primary(*span, format!("this has type `{shown}`"));
+        }
+        d = d.secondary(
+            site.span,
+            format!(
+                "`{}` opens here, and everything allocated in it is freed at the region's `}}`",
+                site.name
+            ),
+        );
+        if carries_brand_in_row(&ty, site.name.as_str()) {
+            d = d.note(format!(
+                "the closure's row still carries `cell.read[{0}]` or `cell.write[{0}]`, so it \
+                 reads or writes a value the region frees",
+                site.name
+            ));
+        }
+        self.diags.push(d.note(format!(
+            "read the value inside the region and answer with something that does not mention \
+                 `{}`",
+            site.name
+        )));
+    }
+
+    /// The same escape out of a bare `with_cell[r]`, which has reported it under
+    /// [`codes::TYPE_MISMATCH`] since before `with_region` existed. The code and
+    /// the wording stay put; what changed is that `brand_in` now looks at a
+    /// function type's effect row, so a closure that carries the cell only in
+    /// its row is caught rather than accepted.
+    fn report_escaping_cell(&mut self, site: &RegionSite, ty: &Type) {
+        let mut printer = Printer::new();
+        let shown = printer.ty(ty);
+        let mut d = Diagnostic::error(
+            codes::TYPE_MISMATCH,
+            format!("the cell escapes its `with_cell[{}]` region", site.name),
+        );
+        let spans = if site.exits.is_empty() {
+            &[site.body_span][..]
+        } else {
+            &site.exits
+        };
+        for span in spans {
+            d = d.primary(*span, format!("this has type `{shown}`"));
+        }
+        if carries_brand_in_row(ty, site.name.as_str()) {
+            d = d.note(format!(
+                "the closure's row still carries `cell.read[{0}]` or `cell.write[{0}]`, so it \
+                 reads or writes a cell the region frees",
+                site.name
+            ));
+        }
+        self.diags
+            .push(d.note("read the cell inside the region and return the value instead"));
+    }
+
+    /// A store into something the region did not create — the case the exit type
+    /// cannot see, because the region's own result is then `Unit` and the brand
+    /// is sitting in a binding that predates it.
+    fn check_region_stores(&mut self, site: &RegionSite) {
+        for binding in &site.outer {
+            let ty = self.subst.resolve_ty(&binding.ty);
+            if !brand_in(&ty, site.name.as_str()) {
+                continue;
+            }
+            let mut printer = Printer::new();
+            self.diags.push(
+                Diagnostic::error(
+                    codes::REGION_ESCAPE,
+                    format!(
+                        "a value allocated in region `{}` is stored where it outlives the region",
+                        site.name
+                    ),
+                )
+                .primary(
+                    binding.site,
+                    format!(
+                        "`{}` has type `{}`, and it was bound before `{}` opened",
+                        binding.name,
+                        printer.ty(&ty),
+                        site.name
+                    ),
+                )
+                .secondary(
+                    site.span,
+                    format!("`{}` opens here and is freed at its `}}`", site.name),
+                )
+                .note(format!(
+                    "storing into `{}` outlives the region, so what is stored may not mention `{}`",
+                    binding.name, site.name
+                )),
+            );
+        }
+    }
+
+    /// A task outlives the region that spawned it whenever the scheduler does,
+    /// and the scheduler is the enclosing `simulate`. A `simulate` opened
+    /// *inside* the region ends before the region does and is therefore safe;
+    /// one opened outside it is not, and a branded value reaching that spawn is
+    /// an escape into another task.
+    fn check_region_spawns(&mut self, site: &RegionSite) {
+        for spawn in &site.spawns {
+            let ty = self.subst.resolve_ty(&spawn.ty);
+            if !brand_in(&ty, site.name.as_str()) {
+                continue;
+            }
+            let mut printer = Printer::new();
+            self.diags.push(
+                Diagnostic::error(
+                    codes::REGION_ESCAPE,
+                    format!(
+                        "a value allocated in region `{}` is sent to another task",
+                        site.name
+                    ),
+                )
+                .primary(spawn.span, format!("this has type `{}`", printer.ty(&ty)))
+                .secondary(
+                    site.span,
+                    format!("`{}` opens here and is freed at its `}}`", site.name),
+                )
+                .note(
+                    "the scheduler that runs the task was installed outside the region, so the \
+                     task can still be running when the region's memory is gone",
+                )
+                .note(format!(
+                    "open the `simulate` region inside `with_region[{}]`, or pass the task \
+                     something that does not mention `{0}`",
+                    site.name
+                )),
+            );
+        }
+    }
+
+    /// The route no other check can see, because at the far end of it there is
+    /// no type left to look at.
+    ///
+    /// An operation is declared once for the whole program, so
+    /// [`Checker::reject_declared_cell`] already refuses one that names a `Cell`.
+    /// A declaration that names a *type variable* instead says nothing about
+    /// cells and is not refused — and the perform site and the handler
+    /// instantiate that variable independently, in different definitions. The
+    /// perform site solves its copy to `Cell[r]<Int>`; the handler's copy stays a
+    /// variable it may generalize, store into a binding that outlives the region,
+    /// or answer the whole `handle` with. Nothing the handler holds mentions `r`,
+    /// so the escape is invisible there and has to be refused here.
+    fn check_region_handoffs(&mut self, site: &RegionSite) {
+        for handoff in &site.handoffs {
+            let ty = self.subst.resolve_ty(&handoff.ty);
+            if !brand_in(&ty, site.name.as_str()) {
+                continue;
+            }
+            let mut printer = Printer::new();
+            let mut d = Diagnostic::error(
+                codes::REGION_ESCAPE,
+                format!(
+                    "a value allocated in region `{}` is handed to `{}`",
+                    site.name, handoff.op
+                ),
+            )
+            .primary(handoff.span, format!("this has type `{}`", printer.ty(&ty)))
+            .secondary(
+                site.span,
+                format!("`{}` opens here and is freed at its `}}`", site.name),
+            );
+            if carries_brand_in_row(&ty, site.name.as_str()) {
+                d = d.note(format!(
+                    "the closure's row still carries `cell.read[{0}]` or `cell.write[{0}]`, so \
+                     whoever handles the operation can read or write a value the region frees",
+                    site.name
+                ));
+            }
+            self.diags.push(
+                d.note(format!(
+                    "`{}` is declared outside every region, so its type cannot say the value \
+                     belongs to `{}`, and the handler — which may be installed anywhere, and may \
+                     outlive the region — receives it at a type variable that mentions no region \
+                     at all",
+                    handoff.op, site.name
+                ))
+                .note(format!(
+                    "read the value inside the region and perform the operation with something \
+                     that does not mention `{}`",
+                    site.name
+                )),
+            );
+        }
     }
 
     /// The `handle` rule with a fixed clause set, plus one atom of its own:
@@ -4283,7 +4883,9 @@ impl<'a> Checker<'a> {
     /// holding state the tasks inside share is how tasks share memory.
     fn infer_simulate(&mut self, e: &Expr, body: &Expr) -> (Type, Row) {
         let mark = self.performs.len();
+        self.simulate_depth += 1;
         let (body_ty, body_row) = self.infer(body);
+        self.simulate_depth -= 1;
         let handled = prelude::simulated_atoms();
         self.discharge(mark..self.performs.len(), &handled);
 
@@ -4910,16 +5512,137 @@ fn contains_fn(t: &Type) -> bool {
     }
 }
 
-fn mentions_region(t: &Type, resource: &str) -> bool {
+/// Whether a **resolved** type carries region `r`'s brand, by either of the two
+/// routes a brand travels.
+///
+/// The first is the type itself: the brand is a nullary constructor no lexer can
+/// produce, sitting where a `Cell`'s region argument goes, and a walk into every
+/// type argument, record field and function position finds it wherever it was
+/// put — a list element, a `Map` key, a constructor's type argument, a returned
+/// closure's result. Running on the resolved type is what closes the alias
+/// route: `conv_type` expands an alias before a `Type` exists, so `Map<Key, Int>`
+/// and `Map<String, Int>` are the same type here and get the same answer.
+///
+/// The second is a function's effect row. A closure that captured a value
+/// allocated in `r` need not mention `r` in its parameters or its result — but
+/// reading or writing that value is a `cell.read[r]` / `cell.write[r]` atom, and
+/// the atom is in the closure's row whether the read is written in the closure
+/// or in something the closure calls. That is what makes a capture visible to a
+/// check that only ever looks at types.
+fn brand_in(t: &Type, region: &str) -> bool {
     match t {
-        Type::Con(_, args) => {
-            region_of(t) == Some(resource) || args.iter().any(|a| mentions_region(a, resource))
-        }
-        Type::Fn { params, ret, .. } => {
-            params.iter().any(|p| mentions_region(p, resource)) || mentions_region(ret, resource)
-        }
-        Type::Record(fields) => fields.values().any(|f| mentions_region(f, resource)),
         Type::Var(_) => false,
+        Type::Con(_, args) => {
+            region_of(t) == Some(region) || args.iter().any(|a| brand_in(a, region))
+        }
+        Type::Fn {
+            params,
+            ret,
+            effects,
+        } => {
+            row_brands(effects, region)
+                || params.iter().any(|p| brand_in(p, region))
+                || brand_in(ret, region)
+        }
+        Type::Record(fields) => fields.values().any(|f| brand_in(f, region)),
+    }
+}
+
+/// Whether the brand reached this type through a function's row rather than
+/// through its shape, which is the difference between "you returned the cell"
+/// and "you returned something that reads it".
+fn carries_brand_in_row(t: &Type, region: &str) -> bool {
+    match t {
+        Type::Var(_) => false,
+        Type::Con(_, args) => args.iter().any(|a| carries_brand_in_row(a, region)),
+        Type::Fn {
+            params,
+            ret,
+            effects,
+        } => {
+            row_brands(effects, region)
+                || params.iter().any(|p| carries_brand_in_row(p, region))
+                || carries_brand_in_row(ret, region)
+        }
+        Type::Record(fields) => fields.values().any(|f| carries_brand_in_row(f, region)),
+    }
+}
+
+/// Only `cell` atoms are region-scoped. A `db.read[users]` names a table and a
+/// region named `users` names memory; treating the two as one label would refuse
+/// programs for a collision of spelling.
+fn row_brands(row: &Row, region: &str) -> bool {
+    row.atoms.iter().any(|a| {
+        a.effect.as_str() == CELL
+            && matches!(&a.resource, Resource::Named(r) if r.as_str() == region)
+    })
+}
+
+/// The positions a region body's value leaves through.
+///
+/// Every one of them is unified with the region's own result type, so the walk
+/// decides *where* an escape is reported and never *whether* one happened. A
+/// tail-resumptive clause is not an exit: its body has the operation's return
+/// type, not the `handle`'s. A `handle` with a `return` clause exits through the
+/// clause and not through the body, because a `return x -> 0` discards whatever
+/// the body produced.
+fn region_exits<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    const RED_ZONE: usize = 256 * 1024;
+    const NEW_SEGMENT: usize = 2 * 1024 * 1024;
+    stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, || match &e.kind {
+        ExprKind::Block { tail, .. } => {
+            if let Some(t) = tail {
+                region_exits(t, out);
+            }
+        }
+        ExprKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            region_exits(then_branch, out);
+            region_exits(else_branch, out);
+        }
+        ExprKind::Match { arms, .. } => arms.iter().for_each(|a| region_exits(&a.body, out)),
+        ExprKind::WithCell { body, .. }
+        | ExprKind::WithRegion { body, .. }
+        | ExprKind::Simulate { body } => region_exits(body, out),
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
+            match return_clause {
+                Some(rc) => region_exits(&rc.body, out),
+                None => region_exits(body, out),
+            }
+            for c in clauses.iter().filter(|c| c.resume.is_some()) {
+                region_exits(&c.body, out);
+            }
+        }
+        _ => out.push(e),
+    })
+}
+
+/// Whether a declared type could carry a brand. The written row counts: a `cell`
+/// atom is writable in an annotation — a cell that outlives its region through a
+/// continuation puts one in a published footprint — so a field declared
+/// `() -> Int / {cell.read[r]}` is a closure-shaped hiding place for exactly the
+/// same reason a field declared `Cell<Int>` is a cell-shaped one.
+fn mentions_cell(t: &Type) -> bool {
+    match t {
+        Type::Var(_) => false,
+        Type::Con(name, args) => name.as_str() == "Cell" || args.iter().any(mentions_cell),
+        Type::Fn {
+            params,
+            ret,
+            effects,
+        } => {
+            effects.atoms.iter().any(|a| a.effect.as_str() == CELL)
+                || params.iter().any(mentions_cell)
+                || mentions_cell(ret)
+        }
+        Type::Record(fields) => fields.values().any(mentions_cell),
     }
 }
 
@@ -5088,6 +5811,7 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
             collect_refs(init, out);
             collect_refs(body, out);
         }
+        ExprKind::WithRegion { body, .. } => collect_refs(body, out),
         ExprKind::Simulate { body } => collect_refs(body, out),
     }
 }

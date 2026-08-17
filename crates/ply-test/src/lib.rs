@@ -6,6 +6,7 @@ pub mod diagnose;
 pub mod hybrid;
 pub mod key;
 pub mod obligation;
+pub mod region;
 pub mod report;
 pub mod schedule;
 pub mod sim;
@@ -44,10 +45,11 @@ pub use bisect::{
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
 pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
+pub use region::GroupRegion;
 pub use schedule::{
-    AMBIENT, Isolation, Parallelism, SIM_EFFECT, SIMULATED, WORLD_BACKED, contends,
-    group_by_conflict, is_ambient, is_seeded, is_world_backed, parallelism, shared_footprint,
-    world_isolated,
+    AMBIENT, Isolation, Parallelism, REGION_SCOPED, SIM_EFFECT, SIMULATED, contends,
+    contends_only_over_regions, group_by_conflict, is_ambient, is_region_scoped, is_seeded,
+    parallelism, region_isolated, shared_footprint,
 };
 pub use sim::{Record, SimSummary, record_under, replay_command};
 pub use slice::{
@@ -191,6 +193,10 @@ pub struct TestResult {
     /// Absent when nothing was written: a spent budget proved nothing, and a
     /// seeded test whose search went unobserved is a run nobody watched.
     pub recorded: Option<Record>,
+    /// Whether the differential oracle actually compared two engines on this
+    /// test. `None` outside `--engine both`, where there is no oracle to have a
+    /// coverage; `Some(false)` for a test only one engine could run.
+    pub audited: Option<bool>,
 }
 
 impl TestResult {
@@ -402,6 +408,47 @@ pub struct RunReport {
     /// aggregated over the tests that ran, and `simulated == 0` is the honest
     /// answer for a corpus with no `simulate` region.
     pub simulation: SimSummary,
+    /// How much of this run the differential oracle actually covered. `None`
+    /// when no oracle ran, so a consumer cannot read a zero as "nothing was
+    /// skipped".
+    pub audit: Option<AuditSummary>,
+}
+
+/// What `--engine both` compared, and what it could not.
+///
+/// A run that reports `0 failed` under two engines invites the reading that two
+/// engines agreed about every test in it. They did not agree about the ones only
+/// one engine can run — a clause binding a continuation is `E0504` on the
+/// tree-walker (ADR 0005 required test 3) and a searched test is re-run per
+/// interleaving on the machine alone — and those are exactly the constructs a
+/// change to the memory model moves. ADR 0017 §6 states the trap for the
+/// isolation counts; the oracle's own coverage is the same trap, so it is
+/// counted here and printed rather than left to be inferred from a green run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct AuditSummary {
+    /// Tests both engines ran and whose outcomes were compared.
+    pub compared: usize,
+    /// Tests one engine could not run, and which the oracle therefore says
+    /// nothing about.
+    pub unaudited: usize,
+}
+
+impl AuditSummary {
+    pub fn total(&self) -> usize {
+        self.compared + self.unaudited
+    }
+
+    /// The summary line, or nothing when there is no coverage to report.
+    pub fn line(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let mut line = format!("audited {} of {}", self.compared, self.total());
+        if self.unaudited > 0 {
+            line.push_str(&format!(" · {} ran on one engine only", self.unaudited));
+        }
+        Some(line)
+    }
 }
 
 impl RunReport {
@@ -442,6 +489,14 @@ pub trait Executor: Sync {
     /// one that touched nothing" are different claims and the cache branches on
     /// the difference.
     fn host_use(&self, _worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
+        None
+    }
+
+    /// Whether the last [`Executor::execute`] compared two engines.
+    ///
+    /// `None` when this run has no differential oracle at all, which is not the
+    /// same claim as "the oracle covered nothing" — see [`AuditSummary`].
+    fn audited(&self, _worker: &Self::Worker) -> Option<bool> {
         None
     }
 
@@ -581,6 +636,13 @@ pub struct Worker<'a> {
     /// per interleaving, and reading the worker's own machine would answer with
     /// whatever the *previous* test did.
     host: Option<ply_eval::host::HostUse>,
+    /// The region this worker's tests run in, built once and mutated in place.
+    /// A worker lives for exactly one concurrency group, so "once per worker"
+    /// and ADR 0017 §6's "once per group" are the same build.
+    region: GroupRegion,
+    /// Whether the last test was actually compared on two engines. See
+    /// [`AuditSummary`].
+    audited: Option<bool>,
 }
 
 impl<'a> Worker<'a> {
@@ -589,7 +651,55 @@ impl<'a> Worker<'a> {
             engines,
             exploration: None,
             host: None,
+            region: GroupRegion::empty(),
+            audited: None,
         }
+    }
+
+    pub fn in_region(engines: Engines<'a>, region: GroupRegion) -> Worker<'a> {
+        Worker {
+            region,
+            ..Worker::new(engines)
+        }
+    }
+
+    /// The group's region as it stands: the fixture, plus every write the tests
+    /// run so far made to it.
+    pub fn region(&self) -> &GroupRegion {
+        &self.region
+    }
+
+    /// Hands each engine the region to run the next test in. Called per test
+    /// rather than per worker: the region moves as the group's tests write to
+    /// it, and an engine holding the one it was built with would run against a
+    /// fixture that is one test out of date.
+    fn open_region(&mut self) {
+        let world = self.region.open();
+        match &mut self.engines {
+            Engines::Treewalk(i) => i.set_base_world(world),
+            Engines::Machine(m) => m.set_base_world(world),
+            Engines::Both(i, m) => {
+                i.set_base_world(world.fork());
+                m.set_base_world(world);
+            }
+        }
+    }
+
+    /// Closes the test's region. Its own cells go; its writes to the fixture
+    /// stay.
+    ///
+    /// Read off the authoritative engine rather than [`Worker::world`], which
+    /// answers with the tree-walker under `Both`. The two have just been proved
+    /// to end with equal worlds *unless* the test was machine-only, in which
+    /// case the tree-walker refused it and its world is the region untouched —
+    /// and carrying that forward would silently drop the test's writes under
+    /// `--engine both` and keep them under `--engine machine`.
+    fn close_region(&mut self) {
+        let after = match &self.engines {
+            Engines::Treewalk(i) => i.world().fork(),
+            Engines::Machine(m) | Engines::Both(_, m) => m.world().fork(),
+        };
+        self.region.close(&after);
     }
 
     /// The world of the engine whose verdict is reported.
@@ -631,13 +741,16 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    /// The world every test forks from. A `World` holds `Rc` and cannot cross a
-    /// thread, so this is a factory called on each worker's own thread rather
-    /// than a value — one fixture per worker, one fork per test.
+    /// The fixture a group's tests share. A `World` holds `Rc` and cannot cross
+    /// a thread, so this is a factory called on each worker's own thread rather
+    /// than a value — and a worker lives for exactly one concurrency group, so
+    /// it runs **once per group**, which is what ADR 0017 §6 replaces "fork it
+    /// per test" with.
     ///
-    /// A test's writes therefore reach neither the base nor a sibling worker,
-    /// which is the premise the scheduler's world-backed exemption rests on: a
-    /// shared mutable fixture here would make `cell` atoms contend again.
+    /// Every test in the group then mutates that one fixture in place. What
+    /// makes it safe is the colouring: since a region label conflicts like any
+    /// other resource, no two tests in a group can name one piece of fixture
+    /// state, so the order they run in cannot decide a verdict.
     pub fn with_fixture(mut self, fixture: &'a (dyn Fn() -> World + Sync)) -> Self {
         self.fixture = Some(fixture);
         self
@@ -663,11 +776,18 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
+    /// The region this worker's group runs in, built on the worker's own
+    /// thread. Empty when no fixture was supplied, which is every corpus that
+    /// has not been handed one.
+    fn build_region(&self) -> GroupRegion {
+        match self.fixture {
+            Some(build) => GroupRegion::build(build),
+            None => GroupRegion::empty(),
+        }
+    }
+
     fn interp(&self) -> Box<Interp<'a>> {
         let mut interp = Interp::new(self.program, self.resolved, self.check);
-        if let Some(fixture) = self.fixture {
-            interp.set_base_world(fixture());
-        }
         if let Some(binding) = &self.hosts.binding {
             interp.set_host_binding(Arc::clone(binding));
         }
@@ -678,9 +798,6 @@ impl<'a> InterpExecutor<'a> {
     /// own handle on the reactor.
     fn machine(&self) -> Box<Machine<'a>> {
         let mut machine = Machine::new(self.program, self.resolved, self.check);
-        if let Some(fixture) = self.fixture {
-            machine.set_base_world(fixture());
-        }
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
@@ -706,7 +823,7 @@ impl<'a> InterpExecutor<'a> {
     /// reachable without any dishonest handler: a `handle` whose clause set
     /// covers some but not all operations of an atom discharges the atom out of
     /// the row and leaves the uncovered operation to fall through to the
-    /// binding. That test is then scheduled as world-isolated over a footprint
+    /// binding. That test is then scheduled as region-isolated over a footprint
     /// that says it touches nothing, while it touches a socket.
     ///
     /// Restated per test because one `Machine` serves many of them: a claim that
@@ -733,17 +850,25 @@ impl<'a> InterpExecutor<'a> {
                 .is_some_and(|t| is_seeded(&t.footprint))
     }
 
-    /// The whole test, once per interleaving, each from a fresh fork of the base
-    /// world.
+    /// The whole test, once per interleaving, each opening the group's region as
+    /// the test found it.
     ///
     /// Whole-test replay rather than re-entering the region: restoring the world
     /// as of region entry is the snapshot/restore capability ADR 0005 refused as
     /// having no type-level account. A test is re-run, so its writes are re-done
-    /// rather than un-done, and the monotone world survives. It costs re-doing
-    /// whatever setup precedes the region, per interleaving.
+    /// rather than un-done. It costs re-doing whatever setup precedes the region,
+    /// per interleaving.
+    ///
+    /// Nothing is written back into the group's region here, and that is the
+    /// point: a replayed test would otherwise apply its writes once per
+    /// interleaving, and which world the group ended up with would depend on
+    /// which schedule the search happened to explore last. A seed has to
+    /// reproduce a run exactly, so every interleaving starts from the same
+    /// fixture.
     #[allow(clippy::type_complexity)]
     fn search(
         &self,
+        region: &GroupRegion,
         index: usize,
     ) -> (
         Result<(), Diagnostic>,
@@ -764,6 +889,7 @@ impl<'a> InterpExecutor<'a> {
         let mut host: Option<ply_eval::host::HostUse> = None;
         let mut interleaving = |seed: &Seed| {
             let mut machine = self.machine();
+            machine.set_base_world(region.open());
             self.arm_footprint_check(machine.as_mut(), index);
             machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);
@@ -805,11 +931,18 @@ impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Worker<'a>;
 
     fn worker(&self) -> Worker<'a> {
-        Worker::new(match self.engine {
-            EngineChoice::Treewalk => Engines::Treewalk(self.interp()),
-            EngineChoice::Machine => Engines::Machine(self.machine()),
-            EngineChoice::Both => Engines::Both(self.interp(), self.machine()),
-        })
+        let mut worker = Worker::in_region(
+            match self.engine {
+                EngineChoice::Treewalk => Engines::Treewalk(self.interp()),
+                EngineChoice::Machine => Engines::Machine(self.machine()),
+                EngineChoice::Both => Engines::Both(self.interp(), self.machine()),
+            },
+            self.build_region(),
+        );
+        // So that a worker holds the group's region from the moment it exists,
+        // rather than only from its first test.
+        worker.open_region();
+        worker
     }
 
     fn exploration(&self, worker: &Worker<'a>) -> Option<Exploration> {
@@ -820,26 +953,45 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.host.clone()
     }
 
+    fn audited(&self, worker: &Worker<'a>) -> Option<bool> {
+        worker.audited
+    }
+
     /// Only the machine has a runtime to close anything on: the tree-walker
     /// refuses a bound host operation rather than driving one, so there is never
-    /// a scope of its to hear about.
+    /// a scope of its to hear about. A reference cycle is either engine's to
+    /// find, so that one is taken whatever ran.
     fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
-        match &mut worker.engines {
+        // A cycle among escaped values is never collected (ADR 0017 §4), so the
+        // run that built one is the only place it can be reported at all. Both
+        // engines reach the same write, so the report is deduplicated at its
+        // site rather than here.
+        let mut out = ply_eval::rc::take_cycles();
+        out.extend(match &mut worker.engines {
             Engines::Machine(m) | Engines::Both(_, m) => m.take_teardown_warnings(),
             Engines::Treewalk(_) => Vec::new(),
-        }
+        });
+        out
     }
 
     fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         worker.exploration = None;
         worker.host = None;
+        let auditing = matches!(worker.engines, Engines::Both(_, _));
+        worker.audited = None;
         if self.searches(index) {
-            let (outcome, exploration, host) = self.search(index);
+            // A searched test is re-run per interleaving on a machine built for
+            // the schedule, so the tree-walker never sees it and there is no
+            // second answer to compare against.
+            worker.audited = auditing.then_some(false);
+            let (outcome, exploration, host) = self.search(&worker.region, index);
             worker.exploration = exploration;
             worker.host = host;
             return outcome;
         }
-        let outcome = self.execute_directly(worker, index);
+        worker.open_region();
+        let (outcome, audited) = self.execute_directly(worker, index);
+        worker.audited = auditing.then_some(audited);
         // Only the machine can reach a host handler: the tree-walker refuses one
         // as machine-only rather than driving it, so under `--engine both` there
         // is one answer here and never two to reconcile.
@@ -847,17 +999,28 @@ impl<'a> Executor for InterpExecutor<'a> {
             Engines::Machine(m) | Engines::Both(_, m) => m.host_use().cloned(),
             Engines::Treewalk(_) => None,
         };
+        // A failing test closes its region like a passing one: what it
+        // allocated is still gone, and the next test in the group must not
+        // inherit it because this one was red.
+        worker.close_region();
         outcome
     }
 }
 
 impl<'a> InterpExecutor<'a> {
-    fn execute_directly(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
+    /// The verdict, and whether two engines produced it. The second half is
+    /// `false` whenever one engine declined the test, which is a claim about the
+    /// oracle's coverage and not about the program — see [`AuditSummary`].
+    fn execute_directly(
+        &self,
+        worker: &mut Worker<'a>,
+        index: usize,
+    ) -> (Result<(), Diagnostic>, bool) {
         match &mut worker.engines {
-            Engines::Treewalk(i) => self.run_one(i.as_mut(), index),
+            Engines::Treewalk(i) => (self.run_one(i.as_mut(), index), false),
             Engines::Machine(m) => {
                 self.arm_footprint_check(m.as_mut(), index);
-                self.run_one(m.as_mut(), index)
+                (self.run_one(m.as_mut(), index), false)
             }
             Engines::Both(i, m) => {
                 self.arm_footprint_check(m.as_mut(), index);
@@ -870,7 +1033,7 @@ impl<'a> InterpExecutor<'a> {
                 // between an engine that declined to start and one that did the
                 // work, which is not a disagreement about what the program means.
                 if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
-                    return right;
+                    return (right, false);
                 }
                 let subject = self
                     .check
@@ -883,18 +1046,25 @@ impl<'a> InterpExecutor<'a> {
                     .tests
                     .get(index)
                     .map_or(ply_span::Span::DUMMY, |t| t.span);
-                match compare_outcomes(i.as_ref(), m.as_ref(), &subject, Some(index), &left, &right)
-                {
+                let verdict = match compare_outcomes(
+                    i.as_ref(),
+                    m.as_ref(),
+                    &subject,
+                    Some(index),
+                    &left,
+                    &right,
+                ) {
                     Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
-                    // The authoritative engine's answer, so that which engine a
-                    // run reports never depends on whether auditing was on. The
-                    // two have just been proved equal, so this is a statement
-                    // about provenance rather than about the value.
+                    // The authoritative engine's answer, so that which engine
+                    // a run reports never depends on whether auditing was on.
+                    // The two have just been proved equal, so this is a
+                    // statement about provenance rather than about the value.
                     None => match EngineChoice::Both.primary() {
                         Engine::Machine => right,
                         Engine::Treewalk => left,
                     },
-                }
+                };
+                (verdict, true)
             }
         }
     }
@@ -1335,6 +1505,7 @@ pub fn run_with<E: Executor>(
                 failure: executed.failure,
                 simulation: exploration,
                 recorded,
+                audited: executed.audited,
             });
         }
     }
@@ -1352,6 +1523,7 @@ pub fn run_with<E: Executor>(
     }
 
     let simulation = summarize_simulation(selection, &results);
+    let audit = summarize_audit(&results);
 
     RunReport {
         passed,
@@ -1363,7 +1535,27 @@ pub fn run_with<E: Executor>(
         results,
         warnings,
         simulation,
+        audit,
     }
+}
+
+/// `None` unless at least one test knew whether it had been audited, so a run
+/// with no oracle reports no coverage rather than a coverage of zero.
+fn summarize_audit(results: &[TestResult]) -> Option<AuditSummary> {
+    let mut summary = AuditSummary::default();
+    let mut seen = false;
+    for result in results {
+        let Some(audited) = result.audited else {
+            continue;
+        };
+        seen = true;
+        if audited {
+            summary.compared += 1;
+        } else {
+            summary.unaudited += 1;
+        }
+    }
+    seen.then_some(summary)
 }
 
 fn summarize_simulation(selection: &Selection, results: &[TestResult]) -> SimSummary {
@@ -1439,6 +1631,8 @@ struct Executed {
     /// What the host runtime reported while closing the entry point. A run-level
     /// warning rather than part of the verdict.
     teardown: Vec<Diagnostic>,
+    /// Whether two engines produced this verdict. `None` when no oracle ran.
+    audited: Option<bool>,
 }
 
 /// One worker per pool thread, built lazily so a group smaller than the pool
@@ -1479,6 +1673,7 @@ fn execute_group<E: Executor>(
             // nothing to report about what it searched.
             let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
             let host = worker.as_ref().and_then(|w| executor.host_use(w));
+            let audited = worker.as_ref().and_then(|w| executor.audited(w));
             let teardown = worker
                 .as_mut()
                 .map(|w| executor.teardown(w))
@@ -1491,6 +1686,7 @@ fn execute_group<E: Executor>(
                 exploration,
                 host,
                 teardown,
+                audited,
             });
         }
     });

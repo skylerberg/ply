@@ -1,28 +1,41 @@
 //! Which selected tests may run at the same time.
 //!
-//! The conflict graph exists because tests share real state. State reached
-//! through a `with_cell` region does not: it lives in a world, every test runs
-//! against its own fork, and no reference crosses between two forks. Two tests
-//! that both retain `cell.write[users]` name two different pieces of state, so
-//! the graph is built over [`shared_footprint`]s — the atoms that escape.
+//! The conflict graph exists because tests share real state. Under ADR 0005 a
+//! `cell` atom named state that lived in a `World`, every test ran against its
+//! own fork of one, and two tests that both retained `cell.write[users]` named
+//! two different pieces of state — so the graph was built over the atoms that
+//! *escaped* a fork.
 //!
-//! That is a claim about the execution model rather than about two atoms, which
-//! is why `ply_core::EffectAtom::conflicts_with` is unchanged and the scheduler
-//! is the one place that knows two tests get two worlds.
+//! ADR 0017 §6 removes the fork. A test's allocations live in a region closed
+//! when the test ends, so tests still cannot observe each other's allocations,
+//! but a region **label** is a name two tests can both write and the scheduler
+//! can no longer prove their state is disjoint: the group's fixture is built
+//! once and mutated in place, so two tests naming one label are two tests
+//! naming one piece of state. `cell` therefore contends like anything else, and
+//! that lost case is the whole cost of the change — measured, not assumed, by
+//! `ply_corpus::regions`.
+//!
+//! What stays exempt is [`AMBIENT`]: a seed is an input handed to a test rather
+//! than state shared between two, and no memory model changes that.
 //!
 //! **This module is about two tests, and none of it transfers to two tasks.**
-//! Two tests hold two worlds; two tasks inside one simulated run hold one, so
-//! `ply_eval::sim` keeps `cell` accesses in its dependence relation and must not
-//! reuse [`shared_footprint`]. Dropping them there would prune away every
+//! Two tasks inside one simulated run share one region, so `ply_eval::sim` keeps
+//! `cell` accesses in its dependence relation and must not reuse
+//! [`shared_footprint`]. Dropping them there would prune away every
 //! shared-memory race in the corpus while reporting a larger reduction for it.
 
 use ply_core::{EffectAtom, Footprint};
 use serde::Serialize;
 
-/// Effects whose atoms name state that lives in a `World`. Exactly one at v0:
-/// the builtin `cell`, which `with_cell` regions publish under and which no
-/// user program may redeclare.
-pub const WORLD_BACKED: &[&str] = &["cell"];
+/// Effects whose atoms name a region label. Exactly one at v0: the builtin
+/// `cell`, which `with_cell[r]` regions publish under and which no user program
+/// may redeclare.
+///
+/// This is **not** an exemption. It is what lets a report say *why* two tests
+/// contend — sharing a label is a fact a reader can act on by renaming one,
+/// where sharing a database table is not — and it is the population ADR 0017 §6
+/// costs the change in.
+pub const REGION_SCOPED: &[&str] = &["cell"];
 
 /// Effects whose atoms name an input no test can write. Exactly one at v0: the
 /// builtin `sim`, whose `sim.read` is a simulated region's seed.
@@ -41,8 +54,8 @@ pub const SIMULATED: &[&str] = &["task", "clock", "random"];
 /// The seed effect. Deliberately not `nondet`: a seed is an input.
 pub const SIM_EFFECT: &str = "sim";
 
-pub fn is_world_backed(atom: &EffectAtom) -> bool {
-    WORLD_BACKED.contains(&atom.effect.as_str())
+pub fn is_region_scoped(atom: &EffectAtom) -> bool {
+    REGION_SCOPED.contains(&atom.effect.as_str())
 }
 
 pub fn is_ambient(atom: &EffectAtom) -> bool {
@@ -51,18 +64,28 @@ pub fn is_ambient(atom: &EffectAtom) -> bool {
 
 /// Whether this atom can bring one test into contention with another.
 pub fn contends(atom: &EffectAtom) -> bool {
-    !is_world_backed(atom) && !is_ambient(atom)
+    !is_ambient(atom)
 }
 
-/// Nothing this test touches can be reached from another one. The empty
-/// footprint is world-isolated.
-pub fn world_isolated(f: &Footprint) -> bool {
+/// Nothing this test names can be reached from another one. The empty footprint
+/// is region-isolated, and so is a footprint carrying nothing but a seed read.
+pub fn region_isolated(f: &Footprint) -> bool {
     !f.atoms().any(contends)
 }
 
-/// The atoms that can contend across tests: `f` minus what only it can reach.
+/// The atoms that can contend across tests: `f` minus the inputs only it is
+/// handed.
 pub fn shared_footprint(f: &Footprint) -> Footprint {
     Footprint::from_atoms(f.atoms().filter(|a| contends(a)).cloned())
+}
+
+/// This test contends, and only over region labels. It was isolated under the
+/// forkable world and is grouped by footprint conflict now, so it is exactly
+/// what ADR 0017 §6 costs — and the one contention a reader can remove by
+/// renaming a label.
+pub fn contends_only_over_regions(f: &Footprint) -> bool {
+    let shared = shared_footprint(f);
+    !shared.is_empty() && shared.atoms().all(is_region_scoped)
 }
 
 /// This test's outcome is a function of its definition set **and** a seed:
@@ -76,29 +99,31 @@ pub fn is_seeded(f: &Footprint) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// The footprint is entirely world-backed: this test conflicts with
-    /// nothing, whatever else the corpus contains.
-    World,
-    /// At least one atom escapes to a resource another test can reach.
+    /// This test names nothing another test can reach: its allocations live in
+    /// a region closed when it ends, and its footprint carries no atom that
+    /// contends. It conflicts with nothing, whatever else the corpus contains.
+    Region,
+    /// At least one atom names state another test can reach — a resource
+    /// outside the program, or a region label a sibling also writes.
     Shared,
 }
 
 impl Isolation {
     pub fn of(footprint: &Footprint) -> Self {
-        if world_isolated(footprint) {
-            Isolation::World
+        if region_isolated(footprint) {
+            Isolation::Region
         } else {
             Isolation::Shared
         }
     }
 
-    pub fn is_world(self) -> bool {
-        self == Isolation::World
+    pub fn is_isolated(self) -> bool {
+        self == Isolation::Region
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Isolation::World => "world",
+            Isolation::Region => "region",
             Isolation::Shared => "shared",
         }
     }
@@ -115,6 +140,14 @@ pub struct Parallelism {
     pub total: usize,
     pub isolated: usize,
     pub shared: usize,
+    /// Of `shared`: how many contend *only* over a region label. Under the
+    /// forkable world these were isolated and free; they are coloured now.
+    ///
+    /// Reported on every run rather than modelled once, because ADR 0008 §6's
+    /// trap is that a count which stops being true is still printed. A project
+    /// watching `isolated` go up needs to see this go up too, or the change
+    /// that cost it the parallelism is invisible.
+    pub region_contended: usize,
     /// Selected tests: what `groups` and `shared_groups` are counted over.
     pub scheduled: usize,
     pub groups: usize,
@@ -143,14 +176,19 @@ pub fn parallelism<'a>(
 ) -> Parallelism {
     let mut total = 0usize;
     let mut isolated = 0usize;
+    let mut region_contended = 0usize;
     for footprint in universe {
         total += 1;
-        isolated += usize::from(world_isolated(footprint));
+        if region_isolated(footprint) {
+            isolated += 1;
+        } else if contends_only_over_regions(footprint) {
+            region_contended += 1;
+        }
     }
 
     let shared_only: Vec<(usize, Footprint)> = scheduled
         .iter()
-        .filter(|(_, f)| !world_isolated(f))
+        .filter(|(_, f)| !region_isolated(f))
         .cloned()
         .collect();
 
@@ -158,6 +196,7 @@ pub fn parallelism<'a>(
         total,
         isolated,
         shared: total - isolated,
+        region_contended,
         scheduled: scheduled.len(),
         groups: groups.len(),
         shared_groups: group_by_conflict(&shared_only).len(),
@@ -172,7 +211,7 @@ pub fn parallelism<'a>(
 /// still mostly empty. Colouring in source order routinely produces one more
 /// group than it needs to, and a group costs a full round of wall-clock time.
 ///
-/// A world-isolated test clears every class, so it always lands in group 0 and
+/// A region-isolated test clears every class, so it always lands in group 0 and
 /// never creates a group. That is what makes adding one free.
 pub fn group_by_conflict(tests: &[(usize, Footprint)]) -> Vec<Vec<usize>> {
     let shared: Vec<Footprint> = tests.iter().map(|(_, f)| shared_footprint(f)).collect();
@@ -231,14 +270,31 @@ mod tests {
     /// for no reason: a seed is handed to a test, never shared between two.
     #[test]
     fn a_seed_read_does_not_make_a_test_shared() {
+        let f = Footprint::from_atoms([atom(SIM_EFFECT, None, Mode::Read)]);
+        assert!(is_seeded(&f));
+        assert!(region_isolated(&f));
+        assert_eq!(Isolation::of(&f), Isolation::Region);
+        assert!(shared_footprint(&f).is_empty());
+    }
+
+    /// The case ADR 0017 §6 costs, at its smallest: a seed keeps its exemption
+    /// and the region label does not, so the test is shared *and* the seed is
+    /// not what made it shared.
+    #[test]
+    fn a_region_label_contends_and_the_seed_beside_it_still_does_not() {
         let f = Footprint::from_atoms([
             atom(SIM_EFFECT, None, Mode::Read),
             atom("cell", Some("users"), Mode::Write),
         ]);
         assert!(is_seeded(&f));
-        assert!(world_isolated(&f));
-        assert_eq!(Isolation::of(&f), Isolation::World);
-        assert!(shared_footprint(&f).is_empty());
+        assert!(!region_isolated(&f));
+        assert_eq!(Isolation::of(&f), Isolation::Shared);
+        assert!(contends_only_over_regions(&f));
+        assert_eq!(
+            shared_footprint(&f).to_string(),
+            "{cell.write[users]}",
+            "the seed must not appear among the atoms that made it shared"
+        );
     }
 
     /// The spawned body's effects flow through `task.spawn`'s row, so a test
@@ -251,7 +307,8 @@ mod tests {
             atom("db", Some("orders"), Mode::Write),
         ]);
         let reader = Footprint::from_atoms([atom("db", Some("orders"), Mode::Read)]);
-        assert!(!world_isolated(&writer));
+        assert!(!region_isolated(&writer));
+        assert!(!contends_only_over_regions(&writer));
         assert!(shared_footprint(&writer).conflicts_with(&shared_footprint(&reader)));
     }
 
@@ -262,8 +319,9 @@ mod tests {
         assert!(!is_seeded(&Footprint::empty()));
     }
 
-    /// Adding world-isolated *simulated* tests must be as free as adding any
-    /// other world-isolated test — ADR 0005 §5's property, preserved.
+    /// ADR 0005 §5's property, preserved with its population changed: what is
+    /// free to add is a test that names nothing, not a test whose state used to
+    /// be forked.
     #[test]
     fn adding_isolated_simulated_tests_changes_no_group_count() {
         let shared: Vec<(usize, Footprint)> = vec![
@@ -281,12 +339,61 @@ mod tests {
         for i in 0..100 {
             wider.push((
                 2 + i,
-                Footprint::from_atoms([
-                    atom(SIM_EFFECT, None, Mode::Read),
-                    atom("cell", Some("s"), Mode::Write),
-                ]),
+                Footprint::from_atoms([atom(SIM_EFFECT, None, Mode::Read)]),
             ));
         }
         assert_eq!(group_by_conflict(&wider).len(), before);
+    }
+
+    /// Two tests naming one label are coloured apart; two tests naming
+    /// different labels are not. Counting the population rather than the
+    /// conflicts is the easiest way to over-state what this change costs.
+    #[test]
+    fn one_label_separates_its_writers_and_two_labels_do_not() {
+        let same: Vec<(usize, Footprint)> = (0..4)
+            .map(|i| {
+                (
+                    i,
+                    Footprint::from_atoms([atom("cell", Some("users"), Mode::Write)]),
+                )
+            })
+            .collect();
+        assert_eq!(group_by_conflict(&same).len(), 4);
+
+        let distinct: Vec<(usize, Footprint)> = (0..4)
+            .map(|i| {
+                (
+                    i,
+                    Footprint::from_atoms([atom("cell", Some(&format!("r{i}")), Mode::Write)]),
+                )
+            })
+            .collect();
+        assert_eq!(group_by_conflict(&distinct).len(), 1);
+    }
+
+    #[test]
+    fn parallelism_counts_the_region_contended_apart_from_the_rest() {
+        let footprints = [
+            Footprint::empty(),
+            Footprint::from_atoms([atom("cell", Some("users"), Mode::Write)]),
+            Footprint::from_atoms([atom("cell", Some("users"), Mode::Write)]),
+            Footprint::from_atoms([atom("db", Some("orders"), Mode::Write)]),
+            Footprint::from_atoms([
+                atom("cell", Some("users"), Mode::Write),
+                atom("db", Some("orders"), Mode::Write),
+            ]),
+        ];
+        let scheduled: Vec<(usize, Footprint)> = footprints.iter().cloned().enumerate().collect();
+        let groups = group_by_conflict(&scheduled);
+        let p = parallelism(footprints.iter(), &scheduled, &groups);
+
+        assert_eq!(p.total, 5);
+        assert_eq!(p.isolated, 1);
+        assert_eq!(p.shared, 4);
+        assert_eq!(
+            p.region_contended, 2,
+            "the mixed footprint contends over a real resource too and is not this number"
+        );
+        assert!(p.holds(), "{p:?}");
     }
 }

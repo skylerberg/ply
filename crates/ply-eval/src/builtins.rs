@@ -441,6 +441,38 @@ impl fmt::Debug for Step {
     }
 }
 
+/// `push`, with the reuse that is the point of reference counting.
+///
+/// A list the caller is the last owner of grows in place; one anybody else can
+/// still see is copied. The two answer the same value — that is what
+/// [`Arc::get_mut`] checks and why the choice is invisible — and they do not
+/// cost the same: appending in a fold copies the whole accumulator per element
+/// without this, which is quadratic in the list being built.
+///
+/// [`Arc::get_mut`]: std::sync::Arc::get_mut
+fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
+    let x = args.pop().expect("arity checked");
+    let mut xs = args.pop().expect("arity checked");
+    let copied = match &mut xs {
+        Value::List(list) => match std::sync::Arc::get_mut(list) {
+            Some(items) => {
+                items.push(x);
+                crate::rc::note_update(true);
+                return Ok(Step::Done(xs));
+            }
+            None => {
+                let mut out = Vec::with_capacity(list.len() + 1);
+                out.extend(list.iter().cloned());
+                out.push(x);
+                out
+            }
+        },
+        other => return Err(type_error(span, "`push`", "List", other)),
+    };
+    crate::rc::note_update(false);
+    Ok(Step::Done(Value::list(copied)))
+}
+
 /// `world` is the current world, threaded rather than snapshotted: `cell_get`
 /// must observe every write made before this call, including one a handler
 /// clause made before resuming.
@@ -483,13 +515,7 @@ pub fn call(
             other => Err(type_error(span, "`len`", "a List or String", other)),
         },
 
-        Builtin::Push => {
-            let xs = args[0].as_list(span, "`push`")?;
-            let mut out = Vec::with_capacity(xs.len() + 1);
-            out.extend(xs.iter().cloned());
-            out.push(args[1].clone());
-            Ok(Step::Done(Value::list(out)))
-        }
+        Builtin::Push => push(args, span),
 
         Builtin::Map => {
             let items = args[0].as_list(span, "`map`")?.clone();
@@ -792,15 +818,18 @@ pub fn call(
         // builder forgets — which is exactly how `map_of_entries` and
         // `map_merge` came to be an ordering oracle over a credential.
         Builtin::MapNew => Ok(Step::Done(map::new())),
-        Builtin::MapInsert => Ok(Step::Done(map::insert(
-            &args[0],
-            args[1].clone(),
-            args[2].clone(),
-            span,
-        )?)),
+        Builtin::MapInsert => {
+            let mut args = args;
+            let (k, v) = (args.remove(1), args.remove(1));
+            Ok(Step::Done(map::insert(args.remove(0), k, v, span)?))
+        }
         Builtin::MapGet => Ok(Step::Done(map::get(&args[0], &args[1], span)?)),
         Builtin::MapContains => Ok(Step::Done(map::contains(&args[0], &args[1], span)?)),
-        Builtin::MapRemove => Ok(Step::Done(map::remove(&args[0], &args[1], span)?)),
+        Builtin::MapRemove => {
+            let mut args = args;
+            let k = args.remove(1);
+            Ok(Step::Done(map::remove(args.remove(0), &k, span)?))
+        }
         Builtin::MapLen => Ok(Step::Done(map::len(&args[0], span)?)),
         Builtin::MapKeys => Ok(Step::Done(map::keys(&args[0], span)?)),
         Builtin::MapValues => Ok(Step::Done(map::values(&args[0], span)?)),
@@ -829,7 +858,12 @@ pub fn call(
 
         Builtin::CellSet => {
             let id = args[0].as_cell(span, "`cell_set`")?;
-            if world.set(id, args[1].clone()) {
+            // Reported rather than refused: refusing would change what a legal
+            // program means, and ADR 0017 §4 accepts the leak and asks only that
+            // it be said out loud.
+            crate::rc::cell_cycle(id, &args[1], span);
+            let mut args = args;
+            if world.set(id, args.remove(1)) {
                 Ok(Step::Done(Value::Unit))
             } else {
                 Err(no_such_cell(span, id))

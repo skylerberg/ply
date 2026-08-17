@@ -463,6 +463,53 @@ fn renaming_a_cell_binder_changes_no_hash() {
     assert_eq!(hash_of(program("cell"), "f"), hash_of(program("c"), "f"));
 }
 
+/// ADR 0017 §1. A region is part of the definition it brands: adding one,
+/// removing one, or renaming it changes what the definition means, so each moves
+/// the hash. Omitting the brand from the encoding would let a program whose
+/// values are freed at one point share a cache entry with one whose values are
+/// freed at another.
+#[test]
+fn a_region_is_part_of_the_definition_it_brands() {
+    let bare = hash_of(vec![func("f", &[], int(0))], "f");
+    let region = |name: &str| {
+        hash_of(
+            vec![func(
+                "f",
+                &[],
+                e(ExprKind::WithRegion {
+                    region: id(name),
+                    body: Box::new(int(0)),
+                }),
+            )],
+            "f",
+        )
+    };
+    assert_ne!(bare, region("r"));
+    assert_ne!(region("r"), region("s"));
+}
+
+/// The region brands the values, not the names inside it: a local is a de Bruijn
+/// level under a region exactly as it is anywhere else.
+#[test]
+fn renaming_a_cell_binder_under_a_region_changes_no_hash() {
+    let program = |binder: &str| {
+        vec![func(
+            "f",
+            &[],
+            e(ExprKind::WithRegion {
+                region: id("r"),
+                body: Box::new(e(ExprKind::WithCell {
+                    resource: id("r"),
+                    init: Box::new(int(0)),
+                    binder: id(binder),
+                    body: Box::new(callv("cell_get", vec![var(binder)])),
+                })),
+            }),
+        )]
+    };
+    assert_eq!(hash_of(program("cell"), "f"), hash_of(program("c"), "f"));
+}
+
 #[test]
 fn de_bruijn_levels_distinguish_which_binder_is_used() {
     let first = hash_of(vec![func("f", &["a", "b"], var("a"))], "f");
@@ -2316,6 +2363,51 @@ fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
     let bare = hash_of(constrained("a", &[]), "f");
     let dangling = hash_of(constrained("a", &[(Deriver::Json, "b")]), "f");
     assert_eq!(bare, dangling);
+}
+
+/// The decoder's half for a region. The brand is in the byte stream, so a body
+/// that lost it would decode into a definition with a different hash than the
+/// key it is filed under.
+#[test]
+fn a_region_survives_a_body_round_trip() {
+    let items = vec![func(
+        "f",
+        &[],
+        e(ExprKind::WithRegion {
+            region: id("r"),
+            body: Box::new(e(ExprKind::WithCell {
+                resource: id("r"),
+                init: Box::new(int(0)),
+                binder: id("c"),
+                body: Box::new(callv("cell_get", vec![var("c")])),
+            })),
+        }),
+    )];
+    let (hashes, bodies) = crate::hash_ast_with_bodies(&module(items)).expect("module should hash");
+    let rebuilt = crate::body::reconstruct(&bodies).expect("bodies should reconstruct");
+
+    let f = rebuilt
+        .program
+        .modules
+        .iter()
+        .flat_map(|m| &m.items)
+        .find_map(|item| match item {
+            Item::Fn(d) => Some(d),
+            _ => None,
+        })
+        .expect("the definition should come back");
+    let ExprKind::WithRegion { region, .. } = &f.body.kind else {
+        panic!("the region should come back, got {:?}", f.body.kind);
+    };
+    assert_eq!(region.name.as_str(), "r");
+
+    let (again, _) = crate::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
+        .expect("rebuilt module should hash");
+    assert_eq!(
+        again.defs.values().collect::<Vec<_>>(),
+        hashes.defs.values().collect::<Vec<_>>(),
+        "a decoded definition hashes back to its key"
+    );
 }
 
 /// The decoder's half. A constraint is in the byte stream, so a body that lost

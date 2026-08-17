@@ -479,6 +479,33 @@ pub mod codes {
     /// request's span. A span the program never closed is not this: it is closed
     /// at teardown and reported [`SPAN_ABANDONED`].
     pub const SPAN_UNBALANCED: &str = "E0445";
+    /// A value branded with a region's name would outlive the region:
+    /// returned from it, stored into a binding that predates it, captured by a
+    /// closure that leaves it, or written as a field of a declared type, which
+    /// is outside every region there is.
+    ///
+    /// Reported where the value would escape rather than where it is later
+    /// used, and always naming both the value's type and the region it belongs
+    /// to. Deliberately not [`TYPE_MISMATCH`]: nothing here disagrees about
+    /// what a value *is*, only about how long it lives, and the two call for
+    /// different edits.
+    pub const REGION_ESCAPE: &str = "E0446";
+    /// Two regions in scope at once under one name. The brand is the name, so
+    /// the inner region's values would be indistinguishable from the outer's
+    /// and closing the inner one would free memory the outer still holds.
+    ///
+    /// Refused rather than reinterpreted, because there is no reading of the
+    /// program under which the two brands mean different things.
+    pub const REGION_ALREADY_OPEN: &str = "E0447";
+    /// A region declared `unique` across which a continuation capture is
+    /// reachable — ADR 0017 §3.
+    ///
+    /// A refusal rather than a downgrade to `shared`, because the two kinds
+    /// differ in what a program *means*: a `unique` region is a bump pointer
+    /// with no snapshot, so one resumption would observe another resumption's
+    /// writes. Reinterpreting the annotation would leave a reader believing the
+    /// cheap kind had been proved where it had only been asked for.
+    pub const REGION_KIND_REFUSED: &str = "E0448";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -535,6 +562,14 @@ pub mod codes {
     /// deployment must be able to tell a clean stop from one that dropped
     /// requests.
     pub const DRAIN_INCOMPLETE: &str = "W0608";
+    /// A value was made to reach itself, so reference counting will never free
+    /// it: ADR 0017 §4 does not collect cycles and accepts the leak.
+    ///
+    /// A `W` because refusing the write would change what a legal program means,
+    /// which is the one thing the region model may not do. It names the cell and
+    /// the write that closed the loop, so the leak is a fact on the run rather
+    /// than something a reader has to infer from memory growth.
+    pub const REFERENCE_CYCLE: &str = "W0610";
     /// Spans were still open when an entry point ended, so teardown closed them
     /// rather than the program. The program's fault and attributed like any
     /// other failure, but not an error: the records are written either way, and
@@ -751,6 +786,9 @@ mod tests {
             ("ARTIFACT_INVALID", codes::ARTIFACT_INVALID, "E0443"),
             ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
             ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
+            ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
+            ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
+            ("REGION_KIND_REFUSED", codes::REGION_KIND_REFUSED, "E0448"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
