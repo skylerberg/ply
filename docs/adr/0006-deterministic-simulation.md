@@ -1,8 +1,20 @@
 # 6. Deterministic simulation
 
-Status: accepted (the seed, the plan and the dependence relation landed;
-everything that runs is outstanding)
+Status: accepted — **implemented**
 Date: 2026-08-13
+
+> **Corrected by the W6 documentation audit.** This line read "the seed, the
+> plan and the dependence relation landed; everything that runs is outstanding".
+> Everything that runs has since landed, verified against the tree: the
+> deterministic scheduler is `crates/ply-eval/src/sched.rs`, the DPOR search in
+> the backtrack-set formulation is `crates/ply-eval/src/explore.rs` — which sets
+> `exhaustive` from the search rather than asserting it — and `--simulation` is
+> a real option group on `ply test`, `ply prove` and `ply review`
+> (`crates/ply-cli/src/cli.rs`). `Isolation` and the ambient-atom rule are
+> `crates/ply-test/src/schedule.rs`.
+>
+> Two entries in "Not in M7" have also stopped being true; each is marked there
+> rather than here.
 Builds on: `0005-control-stack-and-world.md`, whose threaded world and explicit
 control stack are the two things this milestone is impossible without.
 
@@ -1402,6 +1414,15 @@ cover.
   socket has partitions, reordering, duplication and partial writes, each of
   which is a modelling decision, and inventing them under a scheduler rewrite is
   two designs in one change. **This is the largest gap in the milestone.**
+
+  **No longer a gap, and not closed the way this bullet imagined.** W1 shipped
+  `net` as a *host* effect behind ADR 0008's boundary (`ply_host::tcp`), and W3
+  built HTTP/1.1 framing on top of it in Ply. So the network arrived as a host
+  binding rather than as a simulated effect, and the modelling decisions this
+  bullet listed were never taken: there is still no simulated socket, and ADR
+  0006 §7.3's rule — the language does not get to claim it simulated something
+  it has never heard of — is why. A test that reaches the real network is
+  refused inside a re-run search by `E0427`/`E0425` (ADR 0011 §7) instead.
 - **Finding races in Rust code.** Nothing here inspects the interpreter's own
   threading. The races found are races between Ply tasks over Ply resources.
 - **Cancellation, timeouts as a primitive, channels, mutexes.** Cells plus
@@ -1419,3 +1440,15 @@ cover.
 - **Reclaiming world entries.** Still unsound for the reasons ADR 0005 gives, and
   now more visible: whole-test replay means a long exploration allocates a
   region's cells once per interleaving.
+
+  **Superseded by ADR 0017.** There are no world entries to reclaim: the world
+  is gone and a cell is an arena `Slot`. ADR 0005's "every cheap rule is
+  unsound" argument was about a *monotone* map with no ownership information;
+  ADR 0017 §3 supplies the missing information — a region is `unique` when the
+  compiler can prove no continuation is captured across it, and `shared`
+  otherwise, with `shared` slots reference-counted rather than retained forever.
+  Reclamation is therefore decided at a region's lexical close
+  (`TaskRegions::close_region`, `Reclaim`) rather than deferred to a tracing
+  collector. What ADR 0005 got right is that no rule *keyed on the region alone*
+  is sound, and that is why the kind is inferred over the whole program
+  (`ply_eval::region_kind`) rather than read off the syntax.

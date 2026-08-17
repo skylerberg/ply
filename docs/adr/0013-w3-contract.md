@@ -1201,10 +1201,33 @@ The ones whose absence would let W3 ship broken rather than merely incomplete.
 26. **The cost property**: the W2 head-length sweep is re-run against
     `std.http.parse_head` over heads grown to 8 KB of fields the parser never
     reads, and the time is flat in the head's length.
+    *Enforced by `the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read`
+    (`crates/ply-corpus/tests/http_cost.rs:143`), which sweeps pad lengths
+    `0, 64, 256, 1024, 4096, 8192` and asserts on the ratio rather than on
+    absolute microseconds. A second sweep in the same file covers the
+    field-**count** direction, which this entry does not mention and should:
+    growing fields must cost linearly, not quadratically.*
 26a. **The same property for routing**: four times the percent-escapes in one
     path cost about four times the time and not sixteen, and a path of escapes
     longer than the interpreter's nested-call limit returns a value rather than
     ending the run.
+    *First clause enforced by `routing_a_path_of_escapes_costs_its_length_and_not_its_square`
+    (`crates/ply-cli/tests/w3_http_audit.rs:694`), comparing `escapes(11)`
+    against `escapes(13)`. Note the assertion is `four <= one * 9.0`, not "about
+    four": the test's own doc explains the slack — quadratic would be 16x and
+    9x is chosen so a contended machine cannot redden it while a reintroduced
+    copying accumulator cannot green it. That is a defensible threshold, and it
+    is looser than this line reads.*
+    **Second clause not demonstrated.** `ply_eval::DEFAULT_MAX_CALLS` is
+    `10_000` (`crates/ply-eval/src/limit.rs:23`). The largest escape path any
+    test builds is `escapes(13)` = `3 · 2^13` = 24,576 bytes, i.e. 8,192
+    escapes — under the limit, so it does not exercise the case. The nearest
+    thing is `"a path with two thousand segments is answered"`
+    (`crates/ply-cli/tests/routing_audit.rs:322`), which is 2,000 *segments*,
+    also under the limit and not escapes. So nothing checks that a path of
+    escapes past 10,000 returns a value rather than ending the run with a
+    recursion-limit diagnostic. Whichever way that case actually behaves, it is
+    unmeasured.
 
 **Routing**
 
@@ -1290,8 +1313,13 @@ Plus one `tests/fixtures/` entry per new code.
 - **`Upgrade`, WebSockets and `CONNECT`.** Authority-form targets are `400`.
 - **Cross-module `effect set`s.** §1.3 states the mechanism the sound version
   needs.
-- **Effect sets over row variables** — `effect set Handler<e> = {db, log | e}`.
-  ADR 0009 already deferred it and W3 does not need it.
+- **Effect sets over row variables** — `effect set Handler<e> = {db.read[users],
+  log.write | e}`. ADR 0009 already deferred it and W3 does not need it.
+
+  *(Written `{db, log | e}` here until the W6 documentation audit. That is the
+  whole-effect form §1.2 of this same document refuses, so the example spelled
+  the deferred feature in syntax the milestone had just made illegal. Corrected
+  to atoms, which is how ADR 0009's own "Not in this ADR" writes it.)*
 - **Cheap slicing of a shared `Bytes`.** ADR 0011 §8 deferred the question to
   W3; §4 answers it, and the answer is no, with the measurement W6 would need to
   change it.

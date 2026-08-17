@@ -1,17 +1,75 @@
 # ADR 0017 — Regions, and what replaces the forkable world
 
-Status: proposed
+Status: accepted — **implemented**. Supersedes ADR 0005 §2 and amends ADR
+0008 §6.
+
+> **Corrected by the W6 documentation audit.** This line read "proposed" while
+> the document's own §"What must be measured" reported readings "taken with the
+> arena wired", said "`World` is gone", and quoted measurements from
+> `region_reclamation_census.rs` — none of which is possible from a proposal.
+> Checked against the tree rather than against the prose: `ply_eval::world` does
+> not exist; `TaskRegions` is `crates/ply-eval/src/task_regions.rs`;
+> `ExprKind::WithRegion` is in both `ply_syntax::ast` and `ply_eval::code` as a
+> `Code` node; `region_kind::infer` is `crates/ply-eval/src/region_kind.rs`;
+> `Isolation::Region` has replaced `Isolation::World` in
+> `crates/ply-test/src/schedule.rs`, whose module doc cites this ADR §6 by
+> number; and `crates/ply-eval/tests/` holds twelve files whose names begin
+> `region_` or `reference_`, counted rather than estimated.
+>
+> §4 is implemented too, and by a compiler pass rather than at runtime as its
+> one-paragraph statement might suggest: `crates/ply-eval/src/rc.rs` holds the
+> liveness analysis (`Live`, `Own`, `Dead`) and `code.rs` runs it at lowering,
+> so a last use moves and a dead binding releases without a runtime check.
+> Cycles are uncollected exactly as §4 accepts, with `rc::cell_cycle` and
+> `rc::take_cycles` supplying the diagnostics §4 asks for.
+>
+> The forward-looking tense throughout §6 and §"What must be measured" — "that
+> cost must be measured before this lands", "`--explain` must keep reporting" —
+> was written before the work and is left as written, because each is
+> immediately followed by the measurement that answered it.
 
 ## Context
 
 Two decisions taken together force this document.
 
-**Zero-cost is the goal.** ADR 0016 measured codegen at 8.44× on the fragment it
-can compile and 1.02–1.05× end to end, because that fragment is 2–5% of a
+**Zero-cost is the goal.** ADR 0016 measured codegen at **11.67× on the fragment
+it can compile** and 1.02–1.05× end to end, because that fragment is 2–5% of a
 request. The ceiling is low not because compilation fails but because the
 *representation* is expensive: every value is heap-allocated, every handler
-dispatch walks a stack. One `/health` response costs **9,343 allocations and
-1.03 MB**. Raising codegen's ceiling means fixing representation first.
+dispatch walks a stack. One `/health` response cost **1,035 allocations and
+0.124 MB** at the point this ADR was opened. Raising codegen's ceiling means
+fixing representation first.
+
+> **Two figures in the paragraph above were wrong and are corrected in place, by
+> a documentation audit that checked them against their sources rather than
+> against the prose that carried them.**
+>
+> - **8.44× was unsourced.** It appears nowhere else in this repository. ADR
+>   0016 §9 reports the spike's `k` as **11.67×** — the minimum over its five
+>   inputs, interpreter-best against spike-worst — and `benches/w6-spike.json`'s
+>   five inputs give **11.67× to 12.97×** on that pairing (12.97, 12.83, 11.67,
+>   12.97, 12.31). The widest reading of the file, best against best, tops out at
+>   13.23×; a first pass of this bullet wrote the band as "11.67× to 13.23×",
+>   which silently mixes the two pairings. No pairing of that file produces
+>   8.44×. The 1.02–1.05× end to end and the 2–5% fragment share do
+>   check out against ADR 0016 §10.3.
+> - **9,343 allocations and 1.03 MB was a retired first take.** It is ADR 0016's
+>   pre-constant-memo number; the correct *pre-region baseline* — which is what
+>   the Context paragraph wants, since it is sizing the problem this ADR
+>   inherits — is **1,035 allocations and 0.124 MB**, which is what
+>   `benches/w6-ladder.json` publishes and what `w6_report_allocations.rs`
+>   guards. (A first pass of this correction called 1,035 "the shipped figure".
+>   It is not, and this document says so 375 lines below: the shipped figure
+>   after the arena and the lexical close is **1,122 / 131,677**, re-taken by a
+>   later audit as `{"allocations_per_request":1122.335,
+>   "bytes_per_request":131677.4}`. §"What must be measured" ¶1 shows the whole
+>   1,035 → 1,082 → 1,122 progression and why the +87 is one-time. Leaving
+>   "shipped" attached to 1,035 reproduced, one level down, the exact defect the
+>   bullet was written to fix.) This ADR already said so 290 lines below,
+>   in "What must be measured" ¶1 — but it said it *there*, while the Context
+>   went on asserting the retired pair as current fact. Anyone reading only the
+>   Context would have sized this milestone's win against a baseline nine times
+>   too large. The correction is now at both ends.
 
 **Regions are the memory model.** Ply already has most of one and did not notice:
 `with_cell[r]` is a lexically-scoped region whose atoms are discharged at the
@@ -30,11 +88,25 @@ ADR 0005 merged the control stack and the forkable world into one milestone for
 a specific reason: capture a continuation inside a `with_cell` region, resume it
 outside, and the cell escapes. Three answers were considered — brand the region
 so it cannot escape, make the world a persistent value, or copy at capture. The
-persistent world won **because branding looked heavy in the type system**.
+persistent world won on **two** objections to branding, and this ADR dissolves
+only the first:
 
-Building regions for memory means building that branding anyway. The mechanism
-that replaces the forkable world is one this project is now committed to for an
-unrelated reason, so the objection that decided M6 no longer applies.
+1. **Branding looked heavy in the type system** — rank-2 polymorphism introduced
+   into an otherwise Hindley–Milner system to serve one construct. Building
+   regions for memory means building that branding anyway, so this objection is
+   genuinely gone: the mechanism is one this project is now committed to for an
+   unrelated reason.
+2. **Branding "forbids the programs multi-shot exists for"** (ADR 0005,
+   Alternatives (a)) — and this objection is **not** dissolved. It is *paid*.
+   §2's "that retires a landed shape" is that payment, itemized: three shapes
+   that used to compile no longer do.
+
+> **Corrected by the W6 documentation audit.** This section previously said "the
+> objection that decided M6 no longer applies", singular, which is true of (1)
+> and false of (2) — and (2) is the one a reader is entitled to see priced,
+> because it is a change of program meaning under an ADR whose governing
+> property is that meaning does not change. §2 already prices it honestly; this
+> section is what pointed the reader past it.
 
 ## The property this ADR must not break
 
@@ -73,8 +145,19 @@ another task are all the same error, reported at the point the value would
 escape rather than where it is later used.
 
 This is what replaces the forkable world's guarantee. Under ADR 0005 a cell
-could not meaningfully escape because each resumption got its own world; here it
-cannot escape because the type says so.
+could not meaningfully escape because a cell was a *key* rather than a pointer —
+so an escaped cell read a live entry rather than dangling into freed memory, and
+the escape question stopped being about safety. Here it cannot escape because
+the type says so.
+
+> **Corrected with §3, by the same audit.** This paragraph originally read
+> "because each resumption got its own world". That is the snapshot reading §3
+> retracted, and ADR 0005 §3.1 names the phrase itself — "the reading the phrase
+> *each resumption gets its own world* invites" — as the wrong one, listing it in
+> its Alternatives as rejected. ADR 0005's actual reason is quoted above and is
+> §2's "a cell is a key, not a pointer". The sentence survived §3's rewrite
+> because it is three sections away from it, which is exactly how a retracted
+> premise stays in a document: it is not retracted anywhere it is *restated*.
 
 #### The rule applies to a bare `with_cell[r]`, and that retires a landed shape
 
@@ -127,7 +210,18 @@ type is declared, so no type after the constructor mentions `log`. Refusing it
 would need the brand to survive a nominal declaration, which is the rank-2
 machinery ADR 0005 §"Alternatives" rejected. It is recorded here as the one
 route that is open, and it is what
-`ply-eval/tests/world_isolation_audit.rs` now attacks the world with.
+`crates/ply-eval/tests/region_isolation_audit.rs` now attacks the region stack
+with — layer 2 of that file, "a cell smuggled out of its region through every
+carrier the language has, and a continuation resumed after the region that made
+it returned".
+
+> **Path corrected by the W6 documentation audit.** This read
+> `ply-eval/tests/world_isolation_audit.rs`, which does not exist and cannot:
+> the file was renamed with the thing it audits when `World` became
+> `TaskRegions`. It was the only dangling repository path anywhere in
+> `docs/adr/`, and it pointed at the file a reader would open to check the *one*
+> escape route this ADR admits is still open — so the cost of the stale name is
+> exactly that the check looks unavailable.
 
 The consequence for footprints: with every other route closed, **a written row
 is the only way a `cell` atom reaches a published footprint.** ADR 0008 §6's
@@ -388,12 +482,24 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    carries a `cell` atom in its footprint at all, so the exemption was
    exempting nothing. `--hypothetical cells:labels` is how the risk is priced
    for a corpus that would.
+
+   *Audit re-take: everything load-bearing here reproduced —* `5→5` *groups, 186
+   tests, 176 isolated, 0 carrying a* `cell` *atom, 0 newly serialized, ratio*
+   `1.00x`. *The one figure that did not is the critical path, which came back
+   at* **91.4 ms → 91.4 ms** *(modelled makespan 223.7 ms) on a box that measures
+   slower than this rig across the tree. It is a wall-clock absolute derived from
+   per-test durations, so it is the least portable number in the paragraph and
+   the ratio beside it — which is the actual claim — is the portable one.*
 3. **Region-scoped fixture cost**, measured the way fork's 1 ns was, so
    "cheap" stays a fact rather than becoming a slogan.
 
    `fixture_open_cost.rs`: opening a 10,000-cell fixture and writing one cell
    costs **95.7 µs per test**, against `World::fork`'s 1 ns. At 100,000 cells an
-   open is 800 allocations and 4.45 MB. This is the price §6 says is paid, and
+   open is 800 allocations and 4.45 MB. (Audit re-take: the two allocation
+   figures are exact — the test prints `100000 → 800` allocations and `4452576`
+   bytes. The 95.7 µs is a wall-clock timing and came back at **155.3 µs** on a
+   slower box, so it is the figure to re-take rather than to quote.) This is the
+   price §6 says is paid, and
    it is paid per test rather than per group. Every Ply program in this
    repository opens an empty fixture, where it is nothing at all — which is also
    why the number is a projection about a construct that is still not writable

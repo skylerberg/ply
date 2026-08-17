@@ -1,6 +1,21 @@
 # ADR 0008 — The host effect boundary
 
-Status: proposed
+Status: accepted — **implemented in W1**, and settled to implementation
+precision by ADR 0011, which wins where the two disagree because it was written
+after this one and against the code. §6 is **amended by ADR 0017**; see the note
+in §6.
+
+> **Corrected by the W6 documentation audit.** This line read "proposed" through
+> six shipped milestones, while ADR 0011 opened with "ADR 0008 settled *what*
+> the host boundary is" and ADRs 0013, 0014 and 0015 each built on it. Every
+> mechanism this document names is in the tree: `ply hosts` is
+> `Command::Hosts`, `--host` is a flag on four subcommands, `E0427` is
+> `HOST_FOOTPRINT_ESCAPE` and `E0428` is `HOST_BLOCKING_ANSWER` in
+> `ply_span::codes`, and `HostAnswer::{Value, Pending}` is
+> `crates/ply-eval/src/host.rs`. A status of "proposed" on a document that is
+> the trusted computing base's specification is exactly the shape of claim this
+> project's audits keep finding, in the harmless direction: it invites a reader
+> to skip it.
 
 ## Context
 
@@ -129,6 +144,31 @@ non-forkable, and the consequences follow:
 
 M6's isolation guarantee is not weakened; it is declared inapplicable where it
 cannot hold.
+
+> **Amended by ADR 0017.** There is no forkable world any more, so the premise
+> of this section's title is gone while its conclusion is untouched — the
+> conclusion never depended on *which* isolation mechanism the language had,
+> only on a socket not having one. Read it as: **region isolation does not apply
+> to a host-backed test, and footprint conflict grouping is the only isolation
+> it has.** That is what `crates/ply-cli/src/hosts.rs` implements, in the
+> comment above `Counts`.
+>
+> Two mechanical details a reader would otherwise get wrong from this section:
+>
+> - The correction is **not** an `Isolation` variant. `ply_test::schedule::Isolation`
+>   has exactly two constructors, `Region` and `Shared`, and a host atom is an
+>   ordinary contending atom under both. The host category is computed at the
+>   CLI, by `ply_cli::hosts::Counts::of` asking `Hosts::reaches(footprint)`, so
+>   that a host-backed test is subtracted from `isolated` rather than counted in
+>   it. ADR 0011 §7's first bullet, which promised an `Isolation::Host`, is
+>   corrected there.
+> - `--explain` does not print the word `host` in place of `shared`. It prints
+>   `N host-backed and never free` as a separate clause beside the group counts
+>   (`crates/ply-cli/src/commands/test.rs`), which keeps the denominator of
+>   `isolated: n of m` the same as `selected: n of m`.
+>
+> This section's *reporting* obligation is the one ADR 0017 §6 cites as the trap
+> to avoid repeating, and `Parallelism::region_contended` exists because of it.
 
 ### 7. A host handler is linear — at most one resumption
 

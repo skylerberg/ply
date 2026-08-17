@@ -1,7 +1,20 @@
 # 4. Machine-shaped failure
 
-Status: accepted (interface landed, implementation outstanding)
+Status: accepted — **implemented**
 Date: 2026-07-25
+
+> **Corrected by the W6 documentation audit.** This line read "interface landed,
+> implementation outstanding", and the "Not done here" section below listed four
+> things as unimplemented. All four have since shipped, verified against the
+> tree: `Hybrid` assembly, relinking and evaluation is
+> `crates/ply-test/src/hybrid.rs`; `Delta` construction by re-normalizing
+> against the baseline hash table is `crates/ply-test/src/bisect/renormalize.rs`
+> (with `classify.rs` beside it); the structured `Assertion` payload is emitted
+> by `crates/ply-test/src/report.rs::assertion_json`, so `assertion` is no
+> longer always `null`; and `--bisect-budget` is a real flag with a default of
+> 64 in `crates/ply-cli/src/cli.rs`. The paragraph below about `NoHybrid`
+> answering every mixture `Unresolved` described the tree as it stood then and
+> is kept, struck, because it is the measurement that motivated the work.
 Depends on: `docs/adr/0003` — the store must hold definition **bodies**, not
 only hashes and interfaces. Section 3 below states exactly what M5 needs from
 it, and what M5 degrades to if 0003 lands in a weaker form.
@@ -600,26 +613,31 @@ serve the red one. `det` replay makes the re-run free of risk.
 
 This ADR lands the search, the classification and fusion rules, the artifact
 types, and the report projection in `ply-test`. `Store::pass_record` /
-`put_pass_record` and the body store have since landed with `ADR 0003`. Not
-implemented:
+`put_pass_record` and the body store have since landed with `ADR 0003`.
 
-- The `Hybrid` implementation: assembling, checking, hashing and evaluating a
-  mixed definition graph. This is the bulk of M5's remaining work.
+**Every item below has since been implemented.** The list is kept, struck,
+rather than deleted, because the `NoHybrid` measurement under the first bullet
+is what made the case for building it and would be lost with it. Where each one
+landed is in the status line at the top.
 
-  Measured on a 10,000-definition corpus, this is not a partial capability but a
+- ~~The `Hybrid` implementation: assembling, checking, hashing and evaluating a
+  mixed definition graph. This is the bulk of M5's remaining work.~~
+
+  Measured on a 10,000-definition corpus **at the time this was written**, this
+  was not a partial capability but a
   binary one. `NoHybrid` answers every mixture `Unresolved`, so the only verdicts
-  reachable today are `sole` — exactly one candidate, which needs no search — and
+  reachable then were `sole` — exactly one candidate, which needs no search — and
   `not_attempted(no_hybrids)`. Break one leaf definition and the culprit is named
   with **zero** evaluations. Break one and make twelve value-preserving edits
   beside it and the artifact has no culprit at all: `candidates: 0`,
   `evaluated: 0`, five suspects handed back to the reader. The "which of my
-  twelve edits broke this" case the ADR opens with is precisely the case that
-  does not work yet, and `--bisect-budget` is inert until it does.
-- `Delta` *construction* from a baseline: the re-normalization that decides
+  twelve edits broke this" case the ADR opens with was precisely the case that
+  did not work, and `--bisect-budget` was inert until it did.
+- ~~`Delta` *construction* from a baseline: the re-normalization that decides
   `Derived`, and the interface comparison that decides `independent`. The
-  algorithm is specified above; the code needs the body store.
-- The tracer in `ply-eval`, and the structured `Assertion` payload — today
+  algorithm is specified above; the code needs the body store.~~
+- ~~The tracer in `ply-eval`, and the structured `Assertion` payload — today
   `expected`/`actual` are rendered into the diagnostic's notes and the artifact's
-  `assertion` field is `null`.
-- `ply-cli`: the flags, the culprit-first terminal block, and the v2 JSON
-  emitter. `ply-test`'s own projection is the reference for the shape.
+  `assertion` field is `null`.~~
+- ~~`ply-cli`: the flags, the culprit-first terminal block, and the v2 JSON
+  emitter. `ply-test`'s own projection is the reference for the shape.~~
