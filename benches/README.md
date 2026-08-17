@@ -485,8 +485,14 @@ group count, the critical path and a modelled makespan for each.
 
 Four things about it are load-bearing:
 
-**Only `cell` moves.** `ply_test::WORLD_BACKED` is exactly `["cell"]`, so that
-exemption is the whole of what forking buys the scheduler. `AMBIENT` —
+**Only `cell` moves.** `ply_test::REGION_SCOPED` is exactly `["cell"]`, so that
+exemption is the whole of what forking buys the scheduler. (This paragraph named
+the constant `ply_test::WORLD_BACKED`, which exists nowhere in the tree —
+`grep -rn WORLD_BACKED crates/` returns nothing. The shipped name is
+`REGION_SCOPED`, declared at `crates/ply-test/src/schedule.rs:38` as
+`pub const REGION_SCOPED: &[&str] = &["cell"];` and re-exported from
+`crates/ply-test/src/lib.rs:51`. The claim itself — that the list is exactly
+`["cell"]` — checks out against that declaration.) `AMBIENT` —
 `sim.read`, a seed — is a claim about inputs rather than about memory and stays
 exempt on both sides; dropping it too would report a loss ADR 0017 does not
 cause, and every simulated test in the corpus would be in the number.
@@ -496,6 +502,20 @@ cause, and every simulated test in the corpus would be in the number.
 test and `tests/region_isolation_cost.rs` assert it reproduces that function
 exactly on the projection `ply-test` applies. On `examples/` it reproduces the
 five groups and the `[179, 1, 2, 2, 2]` sizes `ply test --explain` prints.
+(A previous audit pass rewrote this list to `[175, 1, 2, 2, 2]`, calling `179`
+stale. That was the wrong direction and is reverted. Re-taken with
+`./target/release/ply test examples/ --explain --no-cache`, which prints
+`176 of 186 region-isolated and free · 5 groups for the 10 shared tests` and
+then `group 0 · 179 tests`, followed by groups of 1, 2, 2 and 2.
+`179 + 1 + 2 + 2 + 2 = 186`, the whole selected set; the `175` variant sums to
+182 and matches nothing. Note also that no test asserts these sizes — the two
+assertions cited above compare `regions::colour` against
+`ply_test::group_by_conflict` on a synthetic seven-test set
+(`crates/ply-corpus/src/regions.rs:666`) and on real corpora
+(`crates/ply-corpus/tests/region_isolation_cost.rs:150`), and neither pins a
+group size. The sizes here are only as current as the last hand re-run, and the
+group *count*, which is what the surrounding paragraph is about, is what the
+tests actually protect.)
 
 **A group is a barrier.** `ply_test::run` finishes one group before starting the
 next and builds a worker per pool thread per group, so a schedule is not

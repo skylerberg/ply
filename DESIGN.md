@@ -41,8 +41,12 @@ Resource granularity is the design contribution. Most effect systems track
 `db.write[orders]`, because that is exactly the information needed to decide
 whether two tests can run concurrently.
 
-Two footprints **conflict** iff they name a common resource and at least one
-access is a `Write`. Readers-writers, applied to test scheduling.
+Two atoms **conflict** iff they name the same resource *of the same effect* and
+at least one access is a `Write`. Readers-writers, applied to test scheduling.
+The effect is part of the test because effects are nominal (§3): `db.read[users]`
+and `audit.read[users]` name a resource with the same label and do not contend.
+Two footprints conflict iff any of their atoms do
+(`EffectAtom::conflicts_with`, `crates/ply-core/src/ty.rs:52`).
 
 ### Declaring effects
 
@@ -79,8 +83,12 @@ with an occurs check on row variables. Effect-polymorphic functions thread the
 tail:
 
 ```ply
-fn map<a, b, e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e = ...
+fn map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e = ...
 ```
+
+The `|` in the generic list separates type parameters from effect variables. A
+bare `<a, b, e>` puts `e` in the type namespace and the row annotation is then
+`E0301 unknown effect variable`, which is what this sample said until it was run.
 
 If a function omits its `/ {...}` annotation the row is inferred. If it carries
 one, the annotation is the published signature and inference must produce a
@@ -94,11 +102,15 @@ because both satisfy the same declared signature.
 
 ```ply
 handle body() with {
-  db.get[users](k)    -> map_lookup(ref_get(cell), k)
-  db.put[users](k, v) -> ref_set(cell, map_insert(ref_get(cell), k, v))
+  db.get[users](k)    -> map_get(cell_get(cell), k)
+  db.put[users](k, v) -> cell_set(cell, map_insert(cell_get(cell), k, v))
   return x            -> x
 }
 ```
+
+(The cell builtins are `cell_get` / `cell_set` and the map lookup is `map_get`.
+This sample read `ref_get` / `ref_set` / `map_lookup` until it was run; none of
+those three names has ever existed, and each is `E0101 unknown name`.)
 
 **Typing rule.** The `handle` expression's footprint is
 
@@ -111,10 +123,28 @@ still reports network access. A handler backed by a test-local cell reports
 nothing that escapes the test, which is precisely why the test is provably
 isolated.
 
-**v0 restriction: tail-resumptive only.** A clause body's value is returned
-directly to the perform site; there is no reified `resume`, so no continuation
-capture. This covers state, reader, writer, and every in-memory test double —
-the cases that matter for the thesis. Multi-shot continuations are M6.
+**Resumption.** A clause written `op(x) -> body` is *tail-resumptive*: the body's
+value goes straight back to the perform site, with no continuation captured. That
+covers state, reader, writer, and every in-memory test double — the cases that
+matter for the thesis, and still the shape nearly every shipped handler uses.
+Across `examples/` and `crates/ply-std/ply/` exactly **one** clause of some 294
+binds a continuation: `db.rollback(reason) resume k -> ...` in
+`std.db.transaction`, which is how a rollback declines to resume its body.
+
+> **Corrected.** This section read "**v0 restriction: tail-resumptive only** …
+> there is no reified `resume` … Multi-shot continuations are M6" long after M6
+> landed them. There *is* a reified `resume`: a clause may be written
+> `op(x) resume k -> ...`, which binds the delimited continuation as `k` and may
+> invoke it zero, one or many times — `amb.flip[coin]() resume k -> k(true) +
+> k(false)` is the multi-shot case, and it parses and runs today
+> (`crates/ply-syntax/src/ast.rs:1019`, `crates/ply-eval/src/handler.rs`).
+> `resume` is contextual, a keyword only between a clause's `)` and its `->`, so
+> it stays an ordinary identifier everywhere else. The one live restriction is
+> the *engine*, not the language: a clause binding a continuation is `E0504`
+> under `--engine treewalk` ("this clause needs an explicit control stack"), so
+> such a program runs on the control-stack machine — the default — and a program
+> that wants the two-engine agreement check of `--engine both` must stay
+> tail-resumptive.
 
 **State in handlers** uses region-scoped cells, a builtin rather than a
 user-level effect so that its atoms are discharged at the region boundary and
@@ -187,7 +217,7 @@ test "active_users excludes inactive" {
   with_cell[users](seed) { cell ->
     handle {
       assert_eq(len(active_users()), 2)
-    } with { db.get[users](k) -> map_lookup(ref_get(cell), k) }
+    } with { db.get[users](k) -> map_get(cell_get(cell), k) }
   }
 }
 ```
@@ -210,12 +240,31 @@ resource, run concurrently by construction rather than by convention.
 from a `nondet` effect after handling, that is a compile error:
 
 ```
-error[E0412]: nondeterministic effect in a deterministic test
-  ┌─ src/user.ply:42:13
-42│     let now = clock.now()
-  │               ^^^^^^^^^^^ performs `clock`, declared `nondet`
-  = handle `clock`, or declare the test `test/nondet`
+[E0412] Error: nondeterministic effect in a deterministic test
+   ╭─[ user.ply:8:13 ]
+   │
+ 8 │   assert_eq(stamp(), stamp())
+   │             ───┬───
+   │                ╰───── reaches `user.clock.read`, and `user.clock` is declared `nondet`
+   │
+   ├─[ user.ply:8:13 ]
+   │
+ 7 │ test "it stamps" {
+   │      ─────┬─────
+   │           ╰─────── test `it stamps` is deterministic
+   │
+   │ Note 1: `user.clock.read` is performed inside something this expression calls
+   │
+   │ Note 2: handle it here, e.g. `handle <body> with { clock.now() -> <value> }`
+   │
+   │ Note 3: or declare this `test/nondet`, which opts out of the cache and re-runs every time
+───╯
 ```
+
+(Transcribed from a run rather than sketched: the previous rendering here was in
+a `error[E0412]: … ┌─ … ^^^` style this compiler has never emitted. Note that the
+atom and the effect are printed **module-qualified** — `user.clock.read`, not
+`clock.read` — because the module is what the effect is nominal in, per §3.)
 
 `test/nondet` opts out and is never cached.
 
@@ -273,8 +322,21 @@ ordinary `det`, cacheable test. A failure reports its seed and `ply test --seed
 commute, so exploring both orders is provably redundant. Partial-order reduction
 algorithms spend their complexity approximating that relation; Ply computes it
 exactly, at resource granularity, with the same predicate that decides which
-tests may run concurrently. When the search exhausts its frontier the result is
-not a sample but a proof over every interleaving.
+tests may run concurrently — literally the same function: the search's
+`Access::conflicts_with` delegates to `EffectAtom::conflicts_with` for atoms.
+When the search exhausts its frontier the result is not a sample but a proof over
+every interleaving.
+
+A step's footprint is wider than its atoms, though, and the two extra kinds both
+*add* dependence rather than remove it. Two cell accesses contend iff they are
+the same location and one writes — the same readers-writers rule, at a location
+instead of a resource. **Two allocations always contend**, because they draw from
+one bump pointer: run in the other order, two tasks that each open a private
+`with_cell` reach a *different arena*, so treating them as independent would be
+unsound. `Access::Alloc` is recorded on a cell allocation and on a region open or
+close, and only while a `simulate` is running. The practical consequence is that
+a search can explore more than an atoms-only reading of this section predicts —
+two tasks that allocate are ordered even when nothing in their rows conflicts.
 
 **Over every interleaving the scheduler could have chosen.** Tasks interleave at
 the operations the scheduler answers — `task`, `clock` and `random` — so a task
@@ -314,6 +376,19 @@ law "credit and debit cancel"
   }
 ```
 
+Run that sample and the law comes back `proved` — *propositional · congruence ·
+linear arithmetic · 2 unfoldings* — but `withdraw`'s `ensures` comes back
+**`unattempted`**, not `proved`, with *"raised: integer overflow in subtraction,
+shrunk to acct = {balance: -9223372036854775808}, amount = 9047"*. That is the
+system behaving correctly and it is worth seeing here rather than being
+surprised by it: `Int` is `i64` and `-` is checked, so at the bottom of the range
+the expression *raises* and there is no result for the postcondition to be true
+of. A proof covering "every input satisfying the guard" has to cover those too.
+`requires amount > 0` does not bound the domain enough; `examples/bank.ply`'s
+specs carry explicit `> -1000000000 && < 1000000000` guards for exactly this
+reason. A spec that looks obviously true is not the same as one the prover can
+close.
+
 **A spec expression is pure — an empty effect row.** A spec that can perform
 effects can change what it observes, and an obligation that mutates the world it
 is judging is meaningless. The one exception is a law whose body is a `simulate`
@@ -334,24 +409,60 @@ Each obligation is discharged at the strongest tier the system can **demonstrate
 
 | tier | what it claims |
 | --- | --- |
-| `proved` | a static argument covering **every** input satisfying the guard |
+| `proved` | an argument covering **every** input satisfying the guard |
 | `property` | randomized cases, the count reported, shrinking on failure |
 | `example` | concrete cases, and no coverage claim |
 
-`proved` is a small, exactly-stated fragment — linear arithmetic over `Int`, case
-analysis over ADTs, structural equality and congruence closure, and unfolding of
-*non-recursive* definitions only. Recursion over unbounded data needs induction,
-which is not here, so `reverse(reverse(xs)) == xs` is `property` and should be.
-An inconclusive proof attempt reports `property`, never `proved`.
+`proved` is a small, exactly-stated fragment. The rules a certificate may name
+are, in full (`ply_prove::Rule`): ground evaluation of a closed Boolean term;
+exhaustive enumeration of a finite domain up to `ENUMERATION_BOUND` = 4096
+points; linear arithmetic over `Int` — `+`, `-`, unary `-`, multiplication *by a
+literal*, and the six comparisons, with `x * y` at two symbolics, `/` and `%`
+excluded; propositional reasoning by case split; a case split on a scrutinee's
+outermost constructor; congruence closure; constructor injectivity; and
+unfolding of *non-recursive* definitions only. Recursion over unbounded data
+needs induction, which is not here, so `reverse(reverse(xs)) == xs` is
+`property` and should be. An inconclusive proof attempt never reports `proved`.
+It reports one of two weaker things, and the distinction matters: where the
+obligation has binders the prover can *sample*, it falls back and reports
+`property`; where it cannot even do that — an evaluation that raised, a body
+whose row is not empty, a `law/host` under a hermetic run — it reports
+**`unattempted`** (`W0604`), which is a *gap* rather than a weak tier. An
+`unattempted` obligation is not green, is never cached, and is counted on its own
+in the summary line, as the coverage example below shows. Reporting a gap as a
+weak tier would be the same defect as reporting a sample as a proof.
+
+> **Corrected: `proved` is not always a *static* argument.** This table said "a
+> static argument" and the fragment above was listed as four rules rather than
+> nine. There is a ninth rule, `ExhaustiveInterleaving`, and the source calls it
+> "the one certificate rule that comes from execution rather than from a static
+> argument": §6's footprint-guided search empties its frontier, so every
+> interleaving *ran*. It is a proof over the schedule space, and it is reached by
+> running the program. `examples/bank.ply`'s concurrency law is discharged this
+> way and `ply prove` reports it `proved · exhaustive over 6 interleavings`. The
+> coverage claims stay independent: that law has no binders, so its value domain
+> is covered for free; add one `Int` binder and the honest tier drops to
+> `property` however exhaustive the search was.
 
 > **A tier label is a truth claim.** Every prior milestone could produce a wrong
 > answer; only this one can produce a wrong answer wearing a certificate. When in
 > doubt, report the weaker tier.
 
-That is enforced structurally rather than by convention: there is no `tier` field
-anywhere. A tier is computed from the evidence a discharge carries, and the only
-evidence that computes to `proved` is a certificate naming the inference rules it
-used — which only the prover can construct.
+That is enforced structurally rather than by convention: a tier is computed from
+the evidence a discharge carries, and the only evidence that computes to `proved`
+is a certificate naming the inference rules it used — which only the prover can
+construct. `ply_prove` carries no `tier` field at all; `Evidence::tier()` derives
+it.
+
+The exception, stated because "there is no `tier` field anywhere" is what this
+paragraph used to say and a reader can falsify that with one grep:
+`ply_store::obligations::CachedObligation` **does** have a `pub tier: String`, in
+the on-disk cache. It is not an authority and cannot be used to assert one —
+`ply_test::obligation::from_cached` recomputes the tier from the evidence and
+returns an error rather than a discharge when the two disagree, so a file
+labelled `proved` over a case report is refused. The field exists so that such a
+disagreement is *detectable* rather than silently read past. The guarantee is
+intact; the absolute phrasing was not.
 
 ### Frame conditions are already inferred
 
@@ -393,11 +504,36 @@ clauses beside it, not a contract checked at every call site.
 
 `docs/adr/0007-specs.md` is the specification.
 
-## Non-goals for the vertical slice
+## What of this is built
 
-Native codegen (the v0 evaluator is a tree-walking interpreter), multi-shot
-continuations, VM-level snapshot/fork, deterministic scheduling simulation, and
-specs are all deliberately deferred. See ROADMAP.md — each has a milestone, and
-the M0–M4 architecture is shaped so none of them requires a rewrite. §6 is M7 and
-§7 is M8; both describe what those milestones land, not what the vertical slice
-ships.
+This section used to read: "Native codegen (the v0 evaluator is a tree-walking
+interpreter), multi-shot continuations, VM-level snapshot/fork, deterministic
+scheduling simulation, and specs are all deliberately deferred … §6 is M7 and §7
+is M8; both describe what those milestones land, not what the vertical slice
+ships." Four of those five have since landed and one of the four has since been
+*removed again*, so the sentence inverted without being rewritten. What is
+actually true of the shipped language:
+
+| §  | mechanism | state |
+| --- | --- | --- |
+| §1–§3 | effect rows, handlers, content addressing | built (M2, M3) |
+| §2 | multi-shot continuations, a reified `resume` | **built** (M6) |
+| §2 | region-scoped cells on a bump arena, `with_region`, `E0446`/`E0449` | **built** (ADR 0017) |
+| §4 | the exact cache and conflict-coloured scheduling | built (M4) |
+| §5 | machine-shaped failure, the suspect set | built (M5) |
+| §6 | deterministic simulation | **built** (M7) |
+| §7 | specs, tiers, `ply prove` / `ply review` | **built** (M8) |
+| —  | VM-level snapshot/fork (the persistent `World`) | built in M6, then **removed** by ADR 0017 |
+| —  | native codegen | **the one thing still deferred** (M9) |
+
+The evaluator is still an interpreter, and there are two of them: a tree-walker
+and a control-stack machine, with `--engine both` asserting they agree. Native
+codegen is deferred on a *measurement* rather than on effort — the interpreter is
+about 35% of a served request, which caps any execution-strategy change at 1.55x,
+and a Cranelift spike projects 1.48x against a 1.50x bar. `docs/adr/0016-w6-performance.md`
+holds the numbers and states what would reopen it. See ROADMAP.md for the
+milestone-by-milestone record.
+
+The forkable world that ADR 0005 built *has* been replaced rather than deferred:
+ADR 0017 moved cells onto a region-scoped bump arena, which is why §2 above talks
+about regions and brands at all.

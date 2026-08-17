@@ -322,9 +322,34 @@ of 0008 §2.
 
 A host-backed computation is **not forkable**, and W1 spends that in four places:
 
-- `Isolation` gains a `Host` variant. A host-backed test is never counted in the
-  `isolated: n of m` number, and `--explain` says `host` rather than `shared`, so
-  the trivially-parallel count stays honest and the reason is legible.
+- ~~`Isolation` gains a `Host` variant. A host-backed test is never counted in
+  the `isolated: n of m` number, and `--explain` says `host` rather than
+  `shared`, so the trivially-parallel count stays honest and the reason is
+  legible.~~
+
+  **Corrected against the code by the W6 documentation audit.** The *property*
+  holds and is what matters; the mechanism this bullet named does not exist.
+  `ply_test::schedule::Isolation` has exactly two constructors — `Region` and
+  `Shared` (ADR 0017 §6 renamed `World` to `Region`) — and a host atom is
+  neither region-scoped nor ambient, so a host-backed test classifies as
+  `Shared` like any other contending test.
+
+  The host category is computed one level up, at the CLI, by
+  `ply_cli::hosts::Counts::of` asking `Hosts::reaches(footprint)` per test:
+  a test the binding can reach is counted as `host` and subtracted from
+  `isolated`, so `isolated: n of m` cannot over-claim. Doing it there rather
+  than in `Isolation` is not an oversight — `ply-test` classifies from a
+  footprint alone and has no binding to ask, so an `Isolation::Host` computed
+  in `ply-test` would have had to guess.
+
+  `--explain` does not print `host` in place of `shared` either. It prints a
+  separate clause, `· N host-backed and never free`, beside the group counts
+  (`crates/ply-cli/src/commands/test.rs`), which keeps `isolated: n of m` and
+  `selected: n of m` sharing a denominator a reader can check.
+
+  Also note that "not forkable" is now vacuous as stated: ADR 0017 removed the
+  forkable world. Read this section's premise as *region isolation does not
+  apply to a host-backed test*, which is the form the code states it in.
 - Grouping is unchanged: a host atom is an ordinary contending atom, so
   readers-writers over `db.read[users]` still decides what may run beside what.
   0008 §6 asks for footprint conflict grouping as the only isolation mechanism,
