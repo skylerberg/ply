@@ -6,13 +6,13 @@
 //! interleaving, same result, on any machine, at any thread count, in any order
 //! the corpus happens to be run in.
 //!
-//! **One world, threaded.** The scheduler holds no [`World`] and forks none.
-//! ADR 0006 §3.4 is the reason: there is exactly one current world at every
-//! point of a simulated run, so task *B* observes task *A*'s writes when *B*
-//! next runs and not before — which is what shared memory *is*. A per-task
-//! world would mean no task ever observes another, every interleaving would
-//! reach the same result, and the milestone would be silently vacuous rather
-//! than loudly broken. Forking happens one level up, per interleaving: a test is
+//! **One region stack, threaded.** The scheduler holds no [`TaskRegions`] and
+//! opens none. ADR 0006 §3.4 is the reason: there is exactly one current state
+//! at every point of a simulated run, so task *B* observes task *A*'s writes
+//! when *B* next runs and not before — which is what shared memory *is*. A
+//! per-task stack would mean no task ever observes another, every interleaving
+//! would reach the same result, and the milestone would be silently vacuous
+//! rather than loudly broken. Reset happens one level up, per interleaving: a test is
 //! replayed whole from a fresh fork of the base world, which is what every entry
 //! point already does.
 //!
@@ -54,8 +54,9 @@
 //! [`HostRuntime`] it is handed, which no seeded path can name.
 //!
 //! [`Handlers`]: crate::sim::Handlers
-//! [`World`]: crate::world::World
+//! [`TaskRegions`]: crate::task_regions::TaskRegions
 
+use crate::arena::Pin;
 use crate::cont::{Continuation, Delimiter, SimId};
 use crate::host::{HostBinding, HostRuntime, Pending};
 use crate::region::Trail;
@@ -207,6 +208,17 @@ struct Task {
     /// diagnostic points at it when a task is blocked with no wait site of its
     /// own.
     origin: Span,
+    /// This task's claim on the regions that were open at its `spawn`.
+    ///
+    /// A spawned body is a closure, not a continuation, so it takes no pin from
+    /// a capture — and ADR 0017 §2 lets a cell reach a task, so the closure may
+    /// hold one. `with_cell[s](0) { c -> spawn(|| cell_set(c, 1)) }` returns from
+    /// the region before the child has run, and without this the region's close
+    /// would hand back the slot the child is about to write.
+    ///
+    /// Held, never read: dropping it with the task is the whole of its job.
+    #[allow(dead_code)]
+    pin: Option<Pin>,
 }
 
 /// One step of one task, as the search reads it back.
@@ -356,6 +368,9 @@ impl Scheduler {
             tasks: vec![Task {
                 state: TaskState::Ready(Resumption::Enter),
                 origin: span,
+                // The root task is the region's own control; it holds no claim
+                // of its own, because the region it runs in outlives it.
+                pin: None,
             }],
             clocks: vec![vec![0]],
             max_steps,
@@ -661,11 +676,23 @@ impl Scheduler {
         let mut resolved: Vec<(usize, Value)> = Vec::new();
         for (at, task) in self.tasks.iter().enumerate() {
             if let TaskState::Blocked {
-                wait: Wait::Host { pending, .. },
+                wait: Wait::Host { pending, span },
                 ..
             } = &task.state
                 && let Some(value) = rt.poll(pending)?
             {
+                // The third route a host answer takes back into the program, and
+                // the one the machine's own two checks cannot see: the task
+                // parked, so nothing on this path knows which registration
+                // minted the token. See `crate::escape`.
+                crate::escape::check(
+                    &crate::escape::Boundary::HostToken {
+                        label: pending.label,
+                        token: pending.token,
+                    },
+                    &value,
+                    *span,
+                )?;
                 resolved.push((at, value));
             }
         }
@@ -724,11 +751,18 @@ impl Scheduler {
     /// ending at the region's own: a `handle` written inside the region body
     /// encloses the tasks it lexically contains, which is what makes the row
     /// `spawn` publishes true of them.
-    pub fn spawn(&mut self, body: Value, over: Vec<Delimiter>, span: Span) -> TaskId {
+    pub fn spawn(
+        &mut self,
+        body: Value,
+        over: Vec<Delimiter>,
+        span: Span,
+        pin: Option<Pin>,
+    ) -> TaskId {
         let id = TaskId(self.tasks.len() as u32);
         self.tasks.push(Task {
             state: TaskState::Ready(Resumption::Start { body, over, span }),
             origin: span,
+            pin,
         });
         // Everything the parent had done by the spawn happens before everything
         // the child does, so the child starts from the parent's clock. Nothing
@@ -1221,10 +1255,10 @@ fn err_unknown_task(span: Span, task: TaskId) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::Slot;
     use crate::cont::{Prompt, Stack};
     use crate::env::Env;
     use crate::sim::{Answer, Handlers, signature};
-    use crate::world::CellId;
     use ply_core::{EffectAtom, Resource};
     use ply_span::Symbol;
     use ply_syntax::ast::Mode;
@@ -1378,8 +1412,12 @@ mod tests {
                             }
                             Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                             Act::Spawn(index) => {
-                                let id =
-                                    sched.spawn(Value::Int(index as i64), Vec::new(), Span::DUMMY);
+                                let id = sched.spawn(
+                                    Value::Int(index as i64),
+                                    Vec::new(),
+                                    Span::DUMMY,
+                                    None,
+                                );
                                 while script.len() <= id.0 as usize {
                                     script.push(0);
                                     pc.push(0);
@@ -1881,7 +1919,7 @@ mod tests {
         trail.record_access(atom("random", None, Mode::Write));
         trail.record_access(atom("db", Some("orders"), Mode::Write));
         trail.record_access(Access::Cell {
-            id: CellId(3),
+            id: Slot::new(3, 0),
             mode: Mode::Write,
         });
         assert_eq!(trail.steps()[0].accesses.len(), 3);
@@ -1899,7 +1937,7 @@ mod tests {
             panic!("expected the root's step");
         };
         trail.record_access(Access::Cell {
-            id: CellId(1),
+            id: Slot::new(1, 0),
             mode: Mode::Write,
         });
         sched.suspend(suspended(), Value::Unit).expect("running");
@@ -1907,7 +1945,7 @@ mod tests {
             panic!("expected a second step");
         };
         trail.record_access(Access::Cell {
-            id: CellId(1),
+            id: Slot::new(1, 0),
             mode: Mode::Read,
         });
         let steps = trail.steps();
@@ -2165,8 +2203,8 @@ mod tests {
             panic!("expected the root's step");
         };
         assert_eq!(task, ROOT);
-        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY);
-        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY);
+        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
+        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
         sched.suspend(suspended(), Value::Unit).expect("running");
 
         let mut order = Vec::new();
@@ -2192,7 +2230,7 @@ mod tests {
 
         // The opening perform is answered through the same path every later one
         // takes, which is what stops `spawn` meaning two things.
-        let child = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY);
+        let child = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
         sched
             .suspend(suspended(), Value::Task(child))
             .expect("the root is running");
@@ -2276,7 +2314,7 @@ mod tests {
     /// condition `err_host_deadlock` reports, and the one a stop has to turn
     /// into a wait rather than a verdict.
     fn deadlock(sched: &mut Scheduler) {
-        let other = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY);
+        let other = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
         sched
             .join(suspended(), other, Span::DUMMY)
             .expect("the root is running");

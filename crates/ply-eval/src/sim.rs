@@ -23,9 +23,9 @@ use ply_syntax::ast::Mode;
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::arena::Slot;
 use crate::interp::arity_error;
 use crate::value::Value;
-use crate::world::CellId;
 
 /// The repro artifact.
 ///
@@ -434,23 +434,23 @@ impl Plan {
 /// One access a step made.
 ///
 /// Finer than a [`ply_core::Footprint`] in exactly one place: a cell is a
-/// *location*, so it is keyed by [`CellId`] rather than by the `[r]` label
-/// several cells may share. The label would be sound and coarser; the id is
+/// *location*, so it is keyed by [`Slot`] rather than by the `[r]` label
+/// several cells may share. The label would be sound and coarser; the slot is
 /// sound and exact, and it costs nothing because a `cell_get` already holds it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
     Atom(EffectAtom),
     Cell {
-        id: CellId,
+        id: Slot,
         mode: Mode,
     },
-    /// A `with_cell` took the next id from the world's own counter.
+    /// A `with_cell` took the next slot from the arena's bump pointer.
     ///
     /// Allocation has no location to name — that is the point of it — so it is
     /// its own kind of access, dependent with every other allocation and with
     /// nothing else. Without it two tasks that each open a private cell look
     /// like tasks that touch nothing, and §6.1's soundness condition is false of
-    /// them: run in the other order they reach a *different world*, because the
+    /// them: run in the other order they reach a *different arena*, because the
     /// two ids are swapped.
     Alloc,
 }
@@ -1226,15 +1226,15 @@ mod tests {
     #[test]
     fn two_cells_are_two_locations_whatever_they_were_labelled() {
         let one = StepFootprint::from_accesses([Access::Cell {
-            id: CellId(1),
+            id: Slot::new(1, 0),
             mode: Mode::Write,
         }]);
         let two = StepFootprint::from_accesses([Access::Cell {
-            id: CellId(2),
+            id: Slot::new(2, 0),
             mode: Mode::Write,
         }]);
         let also_one = StepFootprint::from_accesses([Access::Cell {
-            id: CellId(1),
+            id: Slot::new(1, 0),
             mode: Mode::Read,
         }]);
         assert!(!one.conflicts_with(&two));
@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn cell_accesses_are_in_the_relation() {
         let write = StepFootprint::from_accesses([Access::Cell {
-            id: CellId(7),
+            id: Slot::new(7, 0),
             mode: Mode::Write,
         }]);
         assert!(write.conflicts_with(&write));
@@ -1260,7 +1260,7 @@ mod tests {
         let atoms =
             StepFootprint::from_accesses([Access::Atom(atom("cell", Some("u"), Mode::Write))]);
         let cells = StepFootprint::from_accesses([Access::Cell {
-            id: CellId(0),
+            id: Slot::new(0, 0),
             mode: Mode::Write,
         }]);
         assert!(!atoms.conflicts_with(&cells));

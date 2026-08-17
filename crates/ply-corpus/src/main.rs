@@ -28,7 +28,7 @@ enum Command {
     /// Generate and benchmark at several sizes, for one comparison table.
     Sweep(SweepArgs),
     /// Price the control-stack machine's own claims: interpreter throughput
-    /// against the tree-walker, fork against rebuild, resumption cost, and
+    /// against the tree-walker, fixture open against rebuild, resumption cost, and
     /// what isolation did to the schedule.
     Measure(MeasureArgs),
     /// Price the search: interleavings pruned against unpruned, seeds to the
@@ -224,7 +224,7 @@ struct SweepArgs {
 #[derive(Args, Debug)]
 struct MeasureArgs {
     /// A directory a previous `gen` wrote. Omit it for the measurements that
-    /// need no corpus — fork cost and resumption cost.
+    /// need no corpus — fixture cost and resumption cost.
     corpus: Option<PathBuf>,
     /// Repeats per measurement; the fastest is reported.
     #[arg(long, default_value_t = 3)]
@@ -233,7 +233,7 @@ struct MeasureArgs {
     /// and is what a profiler should be pointed at.
     #[arg(long, default_value = "both", value_parser = parse_engine)]
     engine: EngineChoice,
-    /// World sizes for the fork comparison.
+    /// Fixture sizes for the open-against-rebuild comparison.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 100, 1_000, 10_000, 100_000])]
     cells: Vec<usize>,
     /// Skip everything but the throughput table, so a profile is not dominated
@@ -1222,11 +1222,11 @@ fn measure(args: MeasureArgs) -> Result<()> {
         throughput: None,
         scheduling: None,
         store_open: None,
-        fork: Vec::new(),
+        fixture: Vec::new(),
         multi_shot: None,
     };
     if !args.only_throughput {
-        out.fork = measure::fork_cost(&args.cells, args.repeats);
+        out.fixture = measure::fixture_cost(&args.cells, args.repeats);
         out.multi_shot = Some(measure::multi_shot(args.repeats)?);
     }
 

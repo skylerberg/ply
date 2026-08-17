@@ -8,10 +8,9 @@
 //! audit.
 //!
 //! Only a `perform` is recorded. `cell_get` / `cell_set` are builtins over a
-//! `CellId` that carries no resource label, so their atoms cannot be
-//! reconstructed here — and they need not be, because the final world is
-//! compared cell by cell, which is the stronger statement about the same
-//! effects.
+//! slot that carries no resource label, so their atoms cannot be reconstructed
+//! here — and they need not be, because the two engines' arenas are compared
+//! slot by slot, which is the stronger statement about the same effects.
 
 use ply_core::ty::{EffectAtom, Footprint};
 

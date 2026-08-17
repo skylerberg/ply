@@ -101,9 +101,9 @@ impl Compiled {
             virtual_time,
             steps,
             world: machine
-                .world()
                 .cells()
-                .map(|(id, v)| format!("{id}={}", v.render()))
+                .slots()
+                .map(|(slot, v)| format!("{}={}", slot.index(), v.render()))
                 .collect(),
         }
     }
@@ -128,6 +128,32 @@ impl Compiled {
         self.run(index, seed).0
     }
 
+    /// One call of a named function, with both of the things a search wants from
+    /// it: what it interleaved, and the value it answered.
+    ///
+    /// The answer rather than the arena, because a region hands its cells back
+    /// at its lexical close and there is nothing left to read afterwards. A
+    /// program that reports its own outcome is the stronger oracle anyway: it
+    /// observes what the program computed rather than what the allocator kept.
+    fn answer(&self, name: &str, seed: &Seed) -> (Interleaving, Vec<String>) {
+        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        machine.set_seed(seed.clone(), 100_000);
+        let outcome = machine.call(name, Vec::new(), ply_span::Span::DUMMY);
+        let world = match &outcome {
+            Ok(value) => vec![value.render()],
+            Err(_) => Vec::new(),
+        };
+        let outcome = outcome.map(|_| ());
+        let interleaving = match machine.simulated() {
+            Some(record) => record.interleaving(&outcome),
+            None => match outcome {
+                Ok(()) => Interleaving::passed(Vec::new()),
+                Err(d) => Interleaving::failed(Vec::new(), d),
+            },
+        };
+        (interleaving, world)
+    }
+
     /// One run, with both of the things a search wants from it: what it
     /// interleaved, and the world it left behind.
     fn run(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
@@ -135,9 +161,9 @@ impl Compiled {
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
         let world = machine
-            .world()
             .cells()
-            .map(|(id, v)| format!("{id}={}", v.render()))
+            .slots()
+            .map(|(slot, v)| format!("{}={}", slot.index(), v.render()))
             .collect();
         let interleaving = match machine.simulated() {
             Some(record) => record.interleaving(&outcome),
@@ -514,7 +540,7 @@ fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
   counter.put[n](seen + 1)
 }
 
-test "two tasks contending for one counter" {
+pub fn two_tasks_contending() -> Int = {
   with_cell[n](0) { c ->
     handle {
       simulate {
@@ -522,7 +548,8 @@ test "two tasks contending for one counter" {
         let b = task.spawn(|| bump());
         task.join(a);
         task.join(b);
-        assert(counter.get[n]() >= 1)
+        assert(counter.get[n]() >= 1);
+        counter.get[n]()
       }
     } with {
       counter.get[n]() -> cell_get(c),
@@ -531,7 +558,7 @@ test "two tasks contending for one counter" {
   }
 }
 
-test "a racer behind a barrier" {
+pub fn a_racer_behind_a_barrier() -> Int = {
   with_cell[n](0) { c ->
     handle {
       simulate {
@@ -542,7 +569,8 @@ test "a racer behind a barrier" {
         });
         bump();
         task.join(late);
-        assert(counter.get[n]() >= 1)
+        assert(counter.get[n]() >= 1);
+        counter.get[n]()
       }
     } with {
       counter.get[n]() -> cell_get(c),
@@ -551,7 +579,7 @@ test "a racer behind a barrier" {
   }
 }
 
-test "a nested spawn racing its parent's sibling" {
+pub fn a_nested_spawn_racing() -> Int = {
   with_cell[n](0) { c ->
     handle {
       simulate {
@@ -562,7 +590,8 @@ test "a nested spawn racing its parent's sibling" {
         let other = task.spawn(|| bump());
         task.join(outer);
         task.join(other);
-        assert(counter.get[n]() >= 1)
+        assert(counter.get[n]() >= 1);
+        counter.get[n]()
       }
     } with {
       counter.get[n]() -> cell_get(c),
@@ -571,7 +600,7 @@ test "a nested spawn racing its parent's sibling" {
   }
 }
 
-test "two tasks woken by one timer" {
+pub fn two_tasks_one_timer() -> Int = {
   with_cell[n](0) { c ->
     handle {
       simulate {
@@ -579,7 +608,8 @@ test "two tasks woken by one timer" {
         let b = task.spawn(|| { clock.sleep(50); bump() });
         task.join(a);
         task.join(b);
-        assert(counter.get[n]() >= 1)
+        assert(counter.get[n]() >= 1);
+        counter.get[n]()
       }
     } with {
       counter.get[n]() -> cell_get(c),
@@ -588,7 +618,7 @@ test "two tasks woken by one timer" {
   }
 }
 
-test "two tasks drawing from one stream" {
+pub fn two_tasks_one_stream() -> Int = {
   with_cell[n](0) { c ->
     handle {
       simulate {
@@ -596,7 +626,8 @@ test "two tasks drawing from one stream" {
         let b = task.spawn(|| counter.put[n](random.below(1000)));
         task.join(a);
         task.join(b);
-        assert(counter.get[n]() >= 0)
+        assert(counter.get[n]() >= 0);
+        counter.get[n]()
       }
     } with {
       counter.get[n]() -> cell_get(c),
@@ -606,12 +637,17 @@ test "two tasks drawing from one stream" {
 }
 "#;
 
+/// The five fixtures are **functions** rather than tests, and the outcome a
+/// search compares is what one answers rather than what it left in the arena.
+/// A region hands its cells back at its lexical close, so a counter read after
+/// the run is a read of nothing on every interleaving alike — an oracle that
+/// cannot tell two outcomes apart is an audit that passes for the wrong reason.
 const PRUNING_NAMES: [&str; 5] = [
-    "two tasks contending for one counter",
-    "a racer behind a barrier",
-    "a nested spawn racing its parent's sibling",
-    "two tasks woken by one timer",
-    "two tasks drawing from one stream",
+    "t.two_tasks_contending",
+    "t.a_racer_behind_a_barrier",
+    "t.a_nested_spawn_racing",
+    "t.two_tasks_one_timer",
+    "t.two_tasks_one_stream",
 ];
 
 /// The audit that fails rather than flatters.
@@ -629,19 +665,19 @@ const PRUNING_NAMES: [&str; 5] = [
 #[test]
 fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
     let compiled = compile(PRUNING);
-    for (index, name) in PRUNING_NAMES.iter().enumerate() {
+    for name in PRUNING_NAMES.iter() {
         let plan = dpor(4096);
 
         let mut pruned: BTreeSet<Vec<String>> = BTreeSet::new();
         let a = explore_under(&plan, Dependence::Exact, &mut |seed: &Seed| {
-            let (interleaving, world) = compiled.run(index, seed);
+            let (interleaving, world) = compiled.answer(name, seed);
             pruned.insert(world);
             interleaving
         });
 
         let mut whole: BTreeSet<Vec<String>> = BTreeSet::new();
         let b = explore_under(&plan, Dependence::All, &mut |seed: &Seed| {
-            let (interleaving, world) = compiled.run(index, seed);
+            let (interleaving, world) = compiled.answer(name, seed);
             whole.insert(world);
             interleaving
         });

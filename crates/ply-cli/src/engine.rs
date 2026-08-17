@@ -1034,7 +1034,7 @@ impl Judge for Cases<'_> {
 /// interleaving search chooses.
 ///
 /// A fresh machine per interleaving, exactly as `ply test` re-runs a whole test
-/// per interleaving: restoring the world as of region entry is a snapshot
+/// per interleaving: restoring the arena as of region entry is a snapshot
 /// capability the language does not have.
 struct Search<'a, 'p> {
     prover: &'p Prover<'a>,

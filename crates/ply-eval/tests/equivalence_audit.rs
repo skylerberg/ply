@@ -10,7 +10,7 @@
 //! records whichever engine ran first and never recomputes it.
 
 use ply_eval::differential::compare_tests;
-use ply_eval::{Interp, Machine, World};
+use ply_eval::{Fixture, Interp, Machine};
 use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -34,7 +34,7 @@ fn agree(src: &str) -> usize {
     let (program, resolved) = load(src);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}\n--- program ---\n{src}");
     assert!(
         report.compared > 0 || report.machine_only > 0,
@@ -776,7 +776,7 @@ test "two resumptions" {
     let (program, resolved) = load(src);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 0, "{report}");
     assert_eq!(report.machine_only, 1, "{report}");
@@ -797,7 +797,7 @@ test "calls it" { assert_eq(unreached(), 3) }
     let (program, resolved) = load(src);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared + report.machine_only, 2, "{report}");
 }
@@ -883,7 +883,7 @@ fn tail_and_general_forms_agree(tail: &str, general: &str) {
     let (b, rb) = load(general);
     let mut treewalk = Interp::for_program(&a, &ra);
     let mut machine = Machine::for_program(&b, &rb);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(
         report.is_clean(),
         "{report}\n--- tail ---{tail}\n--- general ---{general}"
@@ -1440,7 +1440,7 @@ fn generated_programs_agree_on_value_diagnostic_and_world() {
         let (program, resolved) = load(&src);
         let mut treewalk = Interp::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
-        let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         assert!(report.is_clean(), "seed {seed}\n{report}\n{src}");
         compared += report.compared;
 
@@ -1528,7 +1528,7 @@ test "a clause for another resource does not catch it" {
     let (program, resolved) = load_modules(files);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 6, "{report}");
 }
@@ -1598,26 +1598,29 @@ fn takes(a: Int, b: Int) -> Int = a - b
     }
 }
 
-/// A fixture built once and forked per test is the milestone's mechanism, and
+/// A fixture built once and opened per test is the milestone's mechanism, and
 /// it has to mean the same thing on both engines: every test sees the seed and
 /// no test sees another's writes.
 #[test]
-fn a_seeded_base_world_forks_identically_on_both_engines() {
+fn a_seeded_fixture_opens_identically_on_both_engines() {
     let src = r#"
-test "writes over its own fork" { with_cell[extra](0) { c -> cell_set(c, 1) } }
-test "writes over its own fork again" { with_cell[extra](0) { c -> cell_set(c, 2) } }
+test "writes over its own region" { with_cell[extra](0) { c -> cell_set(c, 1) } }
+test "writes over its own region again" { with_cell[extra](0) { c -> cell_set(c, 2) } }
 "#;
     let (program, resolved) = load(src);
-    let mut seeded = World::new();
-    let id = seeded.alloc(ply_eval::Value::Int(7));
+    let seeded = Fixture::build(|r| ply_eval::Value::Cell(r.alloc_cell(ply_eval::Value::Int(7))));
+    let id = seeded
+        .handle()
+        .as_cell(ply_span::Span::DUMMY, "the fixture handle")
+        .expect("a cell");
 
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
     let report = compare_tests(&mut treewalk, &mut machine, &seeded);
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 2, "{report}");
-    assert_eq!(treewalk.world().get(id).unwrap().render(), "7");
-    assert_eq!(machine.world().get(id).unwrap().render(), "7");
+    assert_eq!(treewalk.cells().get(id).unwrap().render(), "7");
+    assert_eq!(machine.cells().get(id).unwrap().render(), "7");
 }
 
 /// ADR 0005 §4.1: an operation is performed once, at the `perform`, and every
@@ -1663,7 +1666,7 @@ fn the_two_clause_forms_agree_on_generated_programs() {
         let (b, rb) = load(&general);
         let mut treewalk = Interp::for_program(&a, &ra);
         let mut machine = Machine::for_program(&b, &rb);
-        let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         assert!(
             report.is_clean(),
             "seed {seed}\n{report}\n--- tail ---\n{tail}\n--- general ---\n{general}"
@@ -1817,7 +1820,7 @@ test "performs one atom" {
     let (program, resolved) = load(src);
     let mut treewalk = Interp::for_program(&program, &resolved);
     let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 1, "{report}");
     assert_eq!(report.footprints_compared, 1, "{report}");

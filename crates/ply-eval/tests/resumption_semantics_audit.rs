@@ -98,22 +98,20 @@ impl Compiled {
         }
     }
 
-    /// The world the machine is left holding after one test, as ints by
-    /// ascending cell id. The assertions in the source are half the evidence;
-    /// what survives in the world is the other half, and it is the half that
-    /// distinguishes threading from snapshotting when a program's own value
-    /// happens to coincide.
+    /// Every cell the test held, at the value it held when its region closed,
+    /// by ascending cell id.
+    ///
+    /// Read from the arena's reclamation journal rather than from what the run
+    /// left behind: a region hands its slots back at its lexical close, so the
+    /// arena afterwards is empty and an oracle built on it would agree with
+    /// every reading of §3 at once. The assertions in the source are half the
+    /// evidence; this is the half that distinguishes threading from snapshotting
+    /// when a program's own value happens to coincide.
     fn ints_after(&self, name: &str) -> Vec<i64> {
-        let index = self.index_of(name);
-        let mut machine = self.machine();
-        machine
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("{name:?} must run: {d:#?}"));
-        machine
-            .world()
-            .cells()
-            .map(|(_, v)| match v {
-                Value::Int(i) => *i,
+        self.reclaimed(name)
+            .into_iter()
+            .map(|v| match v {
+                Value::Int(i) => i,
                 other => panic!("expected Int cells, found {other:?}"),
             })
             .collect()
@@ -122,12 +120,19 @@ impl Compiled {
     /// The same, for a world holding something other than integers — the parked
     /// continuation in the escape fixture is a value like any other.
     fn renders_after(&self, name: &str) -> Vec<String> {
+        self.reclaimed(name).iter().map(Value::render).collect()
+    }
+
+    fn reclaimed(&self, name: &str) -> Vec<Value> {
         let index = self.index_of(name);
         let mut machine = self.machine();
+        machine.cells_mut().journal();
         machine
             .eval_test(index)
             .unwrap_or_else(|d| panic!("{name:?} must run: {d:#?}"));
-        machine.world().cells().map(|(_, v)| v.render()).collect()
+        let mut cells: Vec<(ply_eval::arena::Slot, Value)> = machine.cells().journalled().to_vec();
+        cells.sort_by_key(|(slot, _)| *slot);
+        cells.into_iter().map(|(_, v)| v).collect()
     }
 }
 
@@ -565,13 +570,15 @@ fn the_search_re_runs_each_interleaving_from_the_seed_rather_than_from_the_last_
 
     let explored = explore(&Plan::default(), &mut |seed: &Seed| {
         let mut machine = compiled.machine();
+        machine.cells_mut().journal();
         machine.set_seed(seed.clone(), 10_000);
         let outcome = machine.eval_test(index);
         // The world after each interleaving is that interleaving's alone: one
         // cell, holding 1 (an update was lost) or 2 (both landed). Never more.
         let ints: Vec<i64> = machine
-            .world()
             .cells()
+            .journalled()
+            .iter()
             .map(|(_, v)| match v {
                 Value::Int(i) => *i,
                 other => panic!("expected an Int counter, found {other:?}"),

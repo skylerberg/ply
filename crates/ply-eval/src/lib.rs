@@ -19,6 +19,7 @@ pub mod code;
 pub mod cont;
 pub mod differential;
 mod env;
+pub mod escape;
 pub mod explore;
 mod frame;
 pub mod handler;
@@ -34,9 +35,9 @@ pub mod region;
 pub mod region_kind;
 pub mod sched;
 pub mod sim;
+pub mod task_regions;
 pub mod trace;
 mod value;
-pub mod world;
 
 // `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the
 // allocator's own vocabulary and each of those names means something else
@@ -52,11 +53,13 @@ pub use differential::{
     is_machine_only, machine_only_clause, machine_only_clauses,
 };
 pub use env::{Env, Slot as ScopeSlot};
+pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
     is_drain_incomplete,
 };
+pub use task_regions::{Fixture, TaskRegions};
 // `explore::Step` is deliberately not re-exported: `Step` at the root is the
 // builtin's, and one name for two things is worse than a qualified path.
 pub use explore::{
@@ -78,7 +81,6 @@ pub use value::{
     Closure, ClosureKind, Decimal, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
     first_difference, values_equal,
 };
-pub use world::{CellId, Fixture, World};
 
 /// The default is the engine whose results are authoritative. Flipping it is a
 /// `RUNTIME_VERSION` bump, because a cached `Pass` is a claim about what the
@@ -86,7 +88,7 @@ pub use world::{CellId, Fixture, World};
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Engine {
     Treewalk,
-    /// Explicit control stack, forkable world, multi-shot continuations.
+    /// Explicit control stack, region-allocated state, multi-shot continuations.
     #[default]
     Machine,
 }

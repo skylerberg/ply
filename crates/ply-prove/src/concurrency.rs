@@ -662,8 +662,9 @@ mod tests {
     use super::*;
     use crate::{Frame, ObligationKind, Tier};
     use ply_core::{Footprint, LawBinder};
+    use ply_eval::arena::Slot;
     use ply_eval::explore::Step;
-    use ply_eval::{Access, CellId, Domain, SimId, SimMode, StepFootprint, Stream, TaskId};
+    use ply_eval::{Access, Domain, SimId, SimMode, StepFootprint, Stream, TaskId};
     use ply_hash::DefHash;
     use ply_syntax::ast::Mode;
 
@@ -735,7 +736,7 @@ mod tests {
                     enabled,
                     choice: choice as u16,
                     accesses: StepFootprint::from_accesses([Access::Cell {
-                        id: CellId(0),
+                        id: Slot::new(0, 0),
                         mode,
                     }]),
                     definition: Some(Symbol::new("transfer")),

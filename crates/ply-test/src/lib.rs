@@ -19,7 +19,8 @@ use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{
-    Engine, EngineChoice, Exploration, Interp, Machine, Plan, Race, Seed, World, compare_outcomes,
+    Arena, Engine, EngineChoice, Exploration, Interp, Machine, Plan, Race, Seed, TaskRegions,
+    Value, compare_outcomes,
 };
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -607,7 +608,7 @@ pub struct InterpExecutor<'a> {
     /// position in `check.tests` is not a position in `program`. This is the
     /// key that means the same thing in both.
     addresses: Vec<(Symbol, usize)>,
-    fixture: Option<&'a (dyn Fn() -> World + Sync)>,
+    fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     engine: EngineChoice,
     search: Search,
@@ -637,8 +638,12 @@ pub struct Worker<'a> {
     /// whatever the *previous* test did.
     host: Option<ply_eval::host::HostUse>,
     /// The region this worker's tests run in, built once and mutated in place.
-    /// A worker lives for exactly one concurrency group, so "once per worker"
-    /// and ADR 0017 §6's "once per group" are the same build.
+    /// A worker lives for exactly one concurrency group, but a group is executed
+    /// by up to `--jobs` of them, so this is one build per worker and not
+    /// ADR 0017 §6's one per group. What makes the difference unobservable is
+    /// the colouring, not the count: no two tests that could name one piece of
+    /// fixture state share a group, so nothing may depend on which worker ran
+    /// which test.
     region: GroupRegion,
     /// Whether the last test was actually compared on two engines. See
     /// [`AuditSummary`].
@@ -669,44 +674,68 @@ impl<'a> Worker<'a> {
         &self.region
     }
 
-    /// Hands each engine the region to run the next test in. Called per test
-    /// rather than per worker: the region moves as the group's tests write to
-    /// it, and an engine holding the one it was built with would run against a
-    /// fixture that is one test out of date.
+    /// Hands each engine a stack seeded from the group's region, one each, so
+    /// that two engines under `--engine both` cannot write through to one
+    /// another.
+    ///
+    /// Called per test rather than per worker, because the region moves as the
+    /// group's tests write to it and an engine holding the stack it was built
+    /// with would run against a fixture that is one test out of date.
+    ///
+    /// **Nothing at all when the region is empty**, which is every corpus in
+    /// this repository. An engine resets its own stack to its fixture at every
+    /// entry point, so an empty region is already what the next test opens, and
+    /// installing a fresh stack would throw away an arena whose chunks are warm
+    /// — the allocation this milestone exists to stop paying.
+    ///
+    /// The fixture's handle is dropped here because no test can name it: there
+    /// is no surface syntax that binds one. Whoever adds it binds this value.
     fn open_region(&mut self) {
-        let world = self.region.open();
+        if self.region.is_empty() {
+            return;
+        }
         match &mut self.engines {
-            Engines::Treewalk(i) => i.set_base_world(world),
-            Engines::Machine(m) => m.set_base_world(world),
+            Engines::Treewalk(i) => i.set_regions(self.region.open().0),
+            Engines::Machine(m) => m.set_regions(self.region.open().0),
             Engines::Both(i, m) => {
-                i.set_base_world(world.fork());
-                m.set_base_world(world);
+                i.set_regions(self.region.open().0);
+                m.set_regions(self.region.open().0);
             }
         }
     }
 
-    /// Closes the test's region. Its own cells go; its writes to the fixture
-    /// stay.
+    /// Closes the test's region: its own slots go back to the bump pointer at
+    /// the next entry point, and its writes to the fixture are carried here.
     ///
-    /// Read off the authoritative engine rather than [`Worker::world`], which
+    /// Read off the authoritative engine rather than [`Worker::cells`], which
     /// answers with the tree-walker under `Both`. The two have just been proved
-    /// to end with equal worlds *unless* the test was machine-only, in which
-    /// case the tree-walker refused it and its world is the region untouched —
-    /// and carrying that forward would silently drop the test's writes under
+    /// to end with equal cells *unless* the test was machine-only, in which case
+    /// the tree-walker refused it and its stack is the region untouched — and
+    /// carrying that forward would silently drop the test's writes under
     /// `--engine both` and keep them under `--engine machine`.
     fn close_region(&mut self) {
+        if self.region.is_empty() {
+            return;
+        }
         let after = match &self.engines {
-            Engines::Treewalk(i) => i.world().fork(),
-            Engines::Machine(m) | Engines::Both(_, m) => m.world().fork(),
+            Engines::Treewalk(i) => i.cells(),
+            Engines::Machine(m) | Engines::Both(_, m) => m.cells(),
         };
-        self.region.close(&after);
+        self.region.close(after);
     }
 
-    /// The world of the engine whose verdict is reported.
-    pub fn world(&self) -> &World {
+    /// The cells of the engine whose verdict is reported.
+    pub fn cells_mut(&mut self) -> &mut Arena {
+        match &mut self.engines {
+            Engines::Treewalk(i) | Engines::Both(i, _) => i.cells_mut(),
+            Engines::Machine(m) => m.cells_mut(),
+        }
+    }
+
+    pub fn cells(&self) -> &Arena {
         match &self.engines {
-            Engines::Treewalk(i) | Engines::Both(i, _) => i.world(),
-            Engines::Machine(m) => m.world(),
+            Engines::Treewalk(i) | Engines::Both(i, _) => i.cells(),
+            Engines::Machine(m) => m.cells(),
         }
     }
 }
@@ -741,17 +770,21 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    /// The fixture a group's tests share. A `World` holds `Rc` and cannot cross
-    /// a thread, so this is a factory called on each worker's own thread rather
-    /// than a value — and a worker lives for exactly one concurrency group, so
-    /// it runs **once per group**, which is what ADR 0017 §6 replaces "fork it
-    /// per test" with.
+    /// The fixture a group's tests share. A region stack holds `Rc` and cannot
+    /// cross a thread, so this is a seed called on each worker's own thread
+    /// rather than a value: it runs **once per worker**, which is ADR 0017 §6's
+    /// "once per group" only at `--jobs 1` and is *w* builds at *w* workers. The
+    /// cost is stated rather than rounded down, because a fixture that is
+    /// expensive to seed is charged for it once per worker per group.
     ///
-    /// Every test in the group then mutates that one fixture in place. What
-    /// makes it safe is the colouring: since a region label conflicts like any
+    /// Every test a worker runs then mutates that one fixture in place, and a
+    /// write is visible only to the later tests that land on the same worker.
+    /// What makes that safe — and what makes it unnecessary to say which worker
+    /// ran what — is the colouring: since a region label conflicts like any
     /// other resource, no two tests in a group can name one piece of fixture
-    /// state, so the order they run in cannot decide a verdict.
-    pub fn with_fixture(mut self, fixture: &'a (dyn Fn() -> World + Sync)) -> Self {
+    /// state, so neither the order they run in nor the worker they run on can
+    /// decide a verdict.
+    pub fn with_fixture(mut self, fixture: &'a (dyn Fn(&mut TaskRegions) -> Value + Sync)) -> Self {
         self.fixture = Some(fixture);
         self
     }
@@ -853,15 +886,17 @@ impl<'a> InterpExecutor<'a> {
     /// The whole test, once per interleaving, each opening the group's region as
     /// the test found it.
     ///
-    /// Whole-test replay rather than re-entering the region: restoring the world
-    /// as of region entry is the snapshot/restore capability ADR 0005 refused as
-    /// having no type-level account. A test is re-run, so its writes are re-done
-    /// rather than un-done. It costs re-doing whatever setup precedes the region,
-    /// per interleaving.
+    /// Whole-test replay rather than re-entering the region: restoring the
+    /// arena as of region entry is the snapshot/restore capability ADR 0005
+    /// refused as having no type-level account, and ADR 0017 §3 keeps it off
+    /// this path — putting it here would make resumption *n* stop observing
+    /// resumption *n−1*'s writes. A test is re-run, so its writes are re-done
+    /// rather than un-done. It costs re-doing whatever setup precedes the
+    /// region, per interleaving.
     ///
     /// Nothing is written back into the group's region here, and that is the
     /// point: a replayed test would otherwise apply its writes once per
-    /// interleaving, and which world the group ended up with would depend on
+    /// interleaving, and which state the group ended up with would depend on
     /// which schedule the search happened to explore last. A seed has to
     /// reproduce a run exactly, so every interleaving starts from the same
     /// fixture.
@@ -889,7 +924,9 @@ impl<'a> InterpExecutor<'a> {
         let mut host: Option<ply_eval::host::HostUse> = None;
         let mut interleaving = |seed: &Seed| {
             let mut machine = self.machine();
-            machine.set_base_world(region.open());
+            if !region.is_empty() {
+                machine.set_regions(region.open().0);
+            }
             self.arm_footprint_check(machine.as_mut(), index);
             machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);

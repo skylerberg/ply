@@ -19,9 +19,10 @@
 //! allocation in `ply-eval`'s unit tests would perturb every other number the
 //! crate takes.
 
+use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind};
-use ply_eval::{Value, World};
 use ply_span::Span;
+use rpds::RedBlackTreeMap;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::time::Instant;
@@ -268,33 +269,33 @@ fn snapshot_cost_as_a_function_of_region_size() {
     }
 }
 
-/// What the allocator is worth on the workload it would replace.
+/// What the allocator is worth on the workload it replaced.
 ///
-/// The arena is not yet the machine's cell store — see the module comment on
-/// `ply_eval::arena` and ADR 0017 §2, which has to land first — so this is the
-/// head-to-head that says what flipping it would buy: the same ten thousand
-/// cells, built, read and written, in a [`World`]'s persistent map and in a
-/// region.
+/// The arena **is** the machine's cell store now, so this is a result rather
+/// than the projection it was written as. The denominator is the data structure
+/// the store used to be — a persistent map keyed by a dense integer, which is
+/// what `World` was — kept here so the comparison survives the type's removal.
 ///
 /// Printed as well as asserted. The assertion is only the direction, because a
-/// ratio is this machine's and a reader deciding whether to flip the store
-/// needs the numbers rather than the verdict.
+/// ratio is this machine's and a reader deciding what the store is worth needs
+/// the numbers rather than the verdict.
 #[test]
-fn a_region_against_the_persistent_map_it_would_replace() {
+fn a_region_against_the_persistent_map_it_replaced() {
     const CELLS: usize = 10_000;
 
     // The handle vectors are reserved before either side is armed, so what is
     // counted is the store's own cost and not the test's bookkeeping.
-    let mut world = World::new();
+    let mut map: RedBlackTreeMap<u32, Value> = RedBlackTreeMap::new();
     let mut ids = Vec::with_capacity(CELLS);
     let (world_build, world_bytes, ()) = counted(|| {
         for i in 0..CELLS {
-            ids.push(world.alloc(Value::Int(i as i64)));
+            map.insert_mut(i as u32, Value::Int(i as i64));
+            ids.push(i as u32);
         }
     });
     let (world_write, _, ()) = counted(|| {
         for id in &ids {
-            world.set(*id, Value::Int(-1));
+            map.insert_mut(*id, Value::Int(-1));
         }
     });
 
@@ -320,7 +321,7 @@ fn a_region_against_the_persistent_map_it_would_replace() {
     });
 
     println!(
-        "\n  {CELLS} cells\n    world:  build {world_build} allocations, {world_bytes} bytes; \
+        "\n  {CELLS} cells\n    map:    build {world_build} allocations, {world_bytes} bytes; \
          {world_write} allocations to write every cell\n    region: build {region_build} \
          allocations, {region_bytes} bytes; {region_write} allocations to write every cell; \
          {region_close} to close"
@@ -387,4 +388,76 @@ fn the_two_kinds_differ_by_exactly_the_snapshots() {
     assert_eq!(unique.stats().snapshots, 0);
     assert_eq!(shared.stats().snapshots, 1);
     assert_eq!(shared.stats().slots_copied, SIZE as u64);
+}
+
+// ------------------------------------------- 3. what a close itself costs
+
+/// The reclamation event R2 put on the evaluation path, timed against the two
+/// answers it can give.
+///
+/// Only the close is inside the clock: the region is opened and filled outside
+/// it, so the figure is the reclamation and not the bumps that preceded it.
+///
+/// - **freed** — no pin covers it, so the close truncates. This is what a
+///   `unique` region always does and what a `shared` region does whenever no
+///   continuation outlived it, which on `examples/` is every time.
+/// - **deferred** — a live pin covers it, so the slots are held as a run
+///   instead. The cost of `shared` when it is really shared.
+///
+/// Printed rather than bounded: a nanosecond figure moves with the machine, and
+/// what is asserted is only that a deferred run does eventually go back.
+#[test]
+fn a_close_is_priced_against_what_it_can_answer() {
+    const SIZE: usize = 1_000;
+    const ROUNDS: usize = 2_000;
+
+    let mut arena = Arena::new();
+    for _ in 0..4 {
+        cycle(&mut arena, RegionKind::Unique, SIZE);
+    }
+
+    let mut freeing = std::time::Duration::ZERO;
+    for _ in 0..ROUNDS {
+        let r = arena.open(RegionKind::Unique, Span::DUMMY);
+        for i in 0..SIZE {
+            arena.alloc(Value::Int(i as i64));
+        }
+        let started = Instant::now();
+        arena.close(r);
+        freeing += started.elapsed();
+    }
+
+    let mut deferring = std::time::Duration::ZERO;
+    for _ in 0..ROUNDS {
+        let r = arena.open(RegionKind::Shared, Span::DUMMY);
+        for i in 0..SIZE {
+            arena.alloc(Value::Int(i as i64));
+        }
+        let pin = arena.pin().expect("the region is open");
+        let started = Instant::now();
+        arena.close(r);
+        deferring += started.elapsed();
+        // Outside the clock: what the deferral costs is the close, and the run
+        // it left goes back at the next one.
+        drop(pin);
+    }
+    arena.collect();
+
+    let free = freeing.as_secs_f64() * 1e9 / ROUNDS as f64;
+    let defer = deferring.as_secs_f64() * 1e9 / ROUNDS as f64;
+    // A deferral is cheaper *at the close* than a free, and that is not a
+    // saving: it records a run and postpones the truncation, which the next
+    // close after the continuation dies then pays in full.
+    println!(
+        "  closing a region of {SIZE} slots: freed {free:.0} ns ({:.2} ns/slot); \
+         deferred to a live continuation {defer:.0} ns, which is the run being recorded \
+         rather than the slots being handed back",
+        free / SIZE as f64,
+    );
+
+    assert_eq!(arena.retained_slots(), 0, "every deferred run went back");
+    assert!(
+        free > 0.0 && defer > 0.0,
+        "the clock resolved neither close"
+    );
 }

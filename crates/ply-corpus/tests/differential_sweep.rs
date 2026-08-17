@@ -3,7 +3,7 @@
 
 use ply_corpus::{CorpusSpec, build::generate, pipeline, write};
 use ply_eval::differential::compare_tests;
-use ply_eval::{Interp, Machine, World};
+use ply_eval::{Fixture, Interp, Machine};
 
 #[test]
 fn the_two_engines_agree_over_a_sweep_of_generated_corpora() {
@@ -25,7 +25,7 @@ fn the_two_engines_agree_over_a_sweep_of_generated_corpora() {
         let front = pipeline::front(&root).unwrap();
         let mut treewalk = Interp::for_program(&front.program, &front.resolved);
         let mut machine = Machine::for_program(&front.program, &front.resolved);
-        let report = compare_tests(&mut treewalk, &mut machine, &World::new());
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         assert!(report.is_clean(), "seed {seed}\n{report}");
         // A sweep that compared no footprints agrees on two axes of three, and
         // a generated corpus is where the third one earns its keep.

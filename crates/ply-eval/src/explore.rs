@@ -730,8 +730,8 @@ fn render(tasks: &[TaskId]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::Slot;
     use crate::sim::{Access, Domain, Stream};
-    use crate::world::CellId;
     use ply_core::{EffectAtom, Resource};
     use ply_syntax::ast::Mode;
 
@@ -879,14 +879,14 @@ mod tests {
                     Op::Load(cell) => {
                         tasks[t].register = *cells.get(&cell).unwrap_or(&0);
                         accesses.insert(Access::Cell {
-                            id: CellId(cell),
+                            id: Slot::new(cell, 0),
                             mode: Mode::Read,
                         });
                     }
                     Op::Store(cell) => {
                         cells.insert(cell, tasks[t].register + 1);
                         accesses.insert(Access::Cell {
-                            id: CellId(cell),
+                            id: Slot::new(cell, 0),
                             mode: Mode::Write,
                         });
                     }
@@ -1451,7 +1451,7 @@ mod tests {
     fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
         let cell = |id: u32, mode: Mode| {
             StepFootprint::from_accesses([Access::Cell {
-                id: CellId(id),
+                id: Slot::new(id, 0),
                 mode,
             }])
         };

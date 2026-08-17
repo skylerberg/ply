@@ -45,10 +45,45 @@
 //! never [`Arena::snapshot`]: a resumption may write any region open at the
 //! point of the save, so covering only the innermost leaves the enclosing
 //! regions' writes in place.
+//!
+//! # Reclamation, which is what the two kinds actually decide
+//!
+//! A `unique` region's close is a truncation and costs nothing. A `shared`
+//! region's slots may be reached by a continuation resumed after its lexical
+//! close, so they may **not** go back to the bump pointer there: they are
+//! reference counted and reclaimed when the last continuation that can reach
+//! them dies.
+//!
+//! The count is [`Pin`], and there is one rule for the capture path to follow:
+//!
+//! > **Take a [`Pin`] at every continuation capture and hold it for exactly as
+//! > long as the continuation.**
+//!
+//! A `Pin` is an `Rc` token; the arena keeps one end of it and the capture path
+//! keeps the other, so the arena can ask whether anything but itself still holds
+//! the token. It names no region: a capture is reachable across *every* region
+//! open at it — the same argument [`Arena::snapshot_open`] is built on — so a
+//! pin retains all of them and none of the ones opened afterwards.
+//! [`Arena::close`] answers [`Reclaim::Retained`] rather than
+//! [`Reclaim::Freed`] while one is held, and the slots go back at the first
+//! [`Arena::collect`] or close after the last holder drops.
+//!
+//! **A capture path that does not pin is a use-after-free**, and it is a silent
+//! one only until the generation discipline turns it into a `None` read: a
+//! reclaimed slot never aliases the value now living at its index, so a stale
+//! access is [`stale_slot`] rather than a wrong answer.
+//!
+//! One case is not reclaimed, and it is ADR 0017 §4's accepted leak stated in
+//! this module's terms: a continuation parked in a cell of a region it pins is a
+//! reference cycle — the region holds the continuation and the continuation
+//! holds the region — so neither end dies and the slots stay retained until the
+//! whole arena is dropped. [`Arena::retained_slots`] is what makes that visible
+//! rather than silent.
 
 use crate::value::Value;
-use ply_span::Span;
+use ply_span::{Diagnostic, Span, codes};
 use std::fmt;
+use std::rc::Rc;
 
 /// Slots per chunk.
 ///
@@ -58,6 +93,9 @@ use std::fmt;
 /// the values a live region is holding and would put an allocation back on the
 /// path this module exists to take it off.
 const CHUNK: usize = 256;
+
+/// Live pins tolerated before [`Arena::pin`] sweeps the dead ones.
+const PIN_PRUNE_AT: usize = 256;
 
 const fn chunk_of(index: usize) -> usize {
     index / CHUNK
@@ -128,6 +166,14 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// A slot naming a physical position directly. Nothing is checked here and
+    /// nothing needs to be: a slot that names a position the arena has since
+    /// re-handed out fails to resolve on the generation, which is the same
+    /// answer it would give for any other stale slot.
+    pub fn new(index: u32, generation: u32) -> Slot {
+        Slot { index, generation }
+    }
+
     /// Ascending allocation order within one arena, so a caller that iterates
     /// slots iterates them identically on every run.
     pub fn index(self) -> u32 {
@@ -151,7 +197,106 @@ struct Scope {
     kind: RegionKind,
     /// The bump pointer when the region opened. Closing truncates back to it.
     mark: usize,
+    /// Regions opened before this one, over the arena's whole life. It answers
+    /// "was this region open at that capture" exactly — a region open now and
+    /// opened before the capture has been open continuously since, because
+    /// regions close in stack order — and a `mark` cannot, since a region opened
+    /// after a capture that allocated nothing carries the same one.
+    ordinal: u64,
     span: Span,
+}
+
+/// A live continuation's claim on every region that was open when it was
+/// captured — ADR 0017 §3's "reference counted, and reclaimed when the last
+/// continuation that can reach them dies".
+///
+/// Clone it wherever the continuation is cloned and drop it wherever the
+/// continuation is dropped; the arena holds the other end and reads the count.
+/// It deliberately names no region: a capture is reachable across every region
+/// open at it, so a pin retains all of them — and, just as deliberately, none
+/// opened afterwards, which is what keeps a `unique` region opened inside a
+/// handler clause free.
+#[derive(Clone)]
+pub struct Pin(Rc<PinCore>);
+
+struct PinCore {
+    /// [`Stats::regions_opened`] at the capture. A region whose ordinal is below
+    /// this was open then.
+    frontier: u64,
+    /// The bump pointer at the capture, for [`Arena::restore`]'s guard and for
+    /// reporting.
+    top: usize,
+}
+
+impl Pin {
+    /// Slots that were live when this continuation was captured.
+    pub fn extent(&self) -> usize {
+        self.0.top
+    }
+
+    /// Regions the arena had opened when this continuation was captured.
+    pub fn frontier(&self) -> u64 {
+        self.0.frontier
+    }
+}
+
+impl fmt::Debug for Pin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Pin({} slots, {} regions, {} holders)",
+            self.0.top,
+            self.0.frontier,
+            Rc::strong_count(&self.0).saturating_sub(1)
+        )
+    }
+}
+
+/// A run of slots whose regions have closed and whose memory a live [`Pin`]
+/// still covers.
+///
+/// Runs are disjoint and ascending. A close absorbs every run above its own
+/// mark, because those regions nested inside the one closing and its extent
+/// covers them.
+struct Retained {
+    lo: usize,
+    hi: usize,
+    /// The ordinal of the outermost region in the run — the one whose close
+    /// created it, and the one a pin is tested against.
+    ordinal: u64,
+    /// Every region in the run, ascending, so a report of what is still held is
+    /// byte-identical run to run.
+    regions: Vec<RegionId>,
+}
+
+/// What a close did with the region's slots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reclaim {
+    /// The slots went back to the bump pointer. The `unique` case, and the
+    /// `shared` case where every continuation captured across the region has
+    /// already died.
+    Freed(usize),
+    /// A live continuation can still reach them, so they did not. They go back
+    /// at the first [`Arena::collect`] or close after the last holder of the
+    /// [`Pin`] drops it.
+    Retained(usize),
+    /// The region was not open — a teardown running twice, which is not a
+    /// second free.
+    NotOpen,
+}
+
+impl Reclaim {
+    /// Slots the close accounted for, either way.
+    pub fn slots(self) -> usize {
+        match self {
+            Reclaim::Freed(n) | Reclaim::Retained(n) => n,
+            Reclaim::NotOpen => 0,
+        }
+    }
+
+    pub fn freed(self) -> bool {
+        matches!(self, Reclaim::Freed(_))
+    }
 }
 
 /// What the arena has cost, so "a bump pointer is free" stays a measurement.
@@ -177,6 +322,24 @@ pub struct Stats {
     pub restores: u64,
     /// The high-water mark of live slots.
     pub peak_live: usize,
+    /// Pins taken — one per continuation capture, on a capture path that
+    /// follows the rule. Zero over a run that captured a continuation means the
+    /// capture path is not pinning, which is a use-after-free waiting for a
+    /// resumption to find it.
+    pub pins_taken: u64,
+    /// Closes that handed their slots straight back. With `closes_deferred`
+    /// this is the *dynamic* split between the two region kinds, which is the
+    /// one that decides what reclamation is worth: a `shared` region no
+    /// continuation outlived still frees here.
+    pub closes_freed: u64,
+    /// Closes that retained their slots rather than freeing them, because a
+    /// continuation captured across the region was still live. The cost of
+    /// `shared`, as a count.
+    pub closes_deferred: u64,
+    /// Slots handed back late, after the last continuation that could reach
+    /// them died. A run whose `closes_deferred` is high and whose this is zero
+    /// is holding memory a cycle will never release.
+    pub slots_reclaimed_late: u64,
 }
 
 impl Stats {
@@ -265,8 +428,27 @@ pub struct Arena {
     /// The bump pointer.
     live: usize,
     scopes: Vec<Scope>,
+    /// One end of every [`Pin`] handed out. The other ends are held by the
+    /// continuations, and a record whose `Rc` this is the only owner of is a
+    /// continuation that has died.
+    pins: Vec<Rc<PinCore>>,
+    /// Slots whose regions have closed and which a live pin still covers.
+    /// Disjoint and ascending by `lo`, so the top of the arena is the last
+    /// entry and reclamation is a truncation from there down.
+    retained: Vec<Retained>,
     next_region: u32,
     stats: Stats,
+    /// Every slot a close has reclaimed, in the order it was reclaimed, and
+    /// `None` when nothing asked for one.
+    ///
+    /// A region that reclaims at its close leaves an empty arena behind, and an
+    /// oracle that compares two engines' *residual* cells then compares nothing
+    /// — the false-green shape this project keeps finding. `--engine both` and
+    /// the equivalence audits turn this on and compare what each engine freed,
+    /// which is every cell that ever existed rather than only the ones that
+    /// happened to survive. Off on every other path, where it is one `Option`
+    /// test per reclaimed slot.
+    journal: Option<Vec<(Slot, Value)>>,
 }
 
 impl Default for Arena {
@@ -282,8 +464,35 @@ impl Arena {
             generations: Vec::new(),
             live: 0,
             scopes: Vec::new(),
+            pins: Vec::new(),
+            retained: Vec::new(),
             next_region: 0,
             stats: Stats::default(),
+            journal: None,
+        }
+    }
+
+    /// Starts recording what closes reclaim. Idempotent, and clears what an
+    /// earlier entry point journalled: a comparison is per run.
+    pub fn journal(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+
+    /// What every close has reclaimed since [`Arena::journal`], in order.
+    /// Empty — rather than absent — when journalling was never asked for, so a
+    /// caller comparing two arenas that both declined is comparing equals.
+    pub fn journalled(&self) -> &[(Slot, Value)] {
+        self.journal.as_deref().unwrap_or(&[])
+    }
+
+    pub fn journalling(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Forgets what earlier entry points reclaimed, so a journal covers one run.
+    pub fn clear_journal(&mut self) {
+        if let Some(journal) = &mut self.journal {
+            journal.clear();
         }
     }
 
@@ -315,6 +524,7 @@ impl Arena {
             id,
             kind,
             mark: self.live,
+            ordinal: self.stats.regions_opened,
             span,
         });
         self.stats.regions_opened += 1;
@@ -351,9 +561,12 @@ impl Arena {
     ///
     /// `None` outside every region, because a value with no region has no
     /// lifetime to be freed at — a caller that reaches this has lost its scope
-    /// and must say so rather than allocate into nothing.
+    /// and must say so rather than allocate into nothing. `None` too once the
+    /// index space is spent: a `Slot` addresses a position with a `u32`, and
+    /// wrapping it would hand two live cells one identity, which is the one
+    /// thing the generation discipline exists to prevent.
     pub fn alloc(&mut self, value: Value) -> Option<Slot> {
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() || self.live > u32::MAX as usize {
             return None;
         }
         let index = self.live;
@@ -382,8 +595,7 @@ impl Arena {
     }
 
     /// `false` when the slot's region has closed, which the caller must report
-    /// rather than ignore — the same rule [`World::set`](crate::World::set)
-    /// follows, and for the same reason.
+    /// with [`stale_slot`] rather than ignore.
     pub fn set(&mut self, slot: Slot, value: Value) -> bool {
         let Some(index) = self.resolve(slot) else {
             return false;
@@ -396,25 +608,85 @@ impl Arena {
         self.resolve(slot).is_some()
     }
 
-    /// Closes `region` and every region nested inside it, freeing their slots.
+    /// Closes `region` and every region nested inside it.
+    ///
+    /// This is ADR 0017 §3's whole distinction between the two kinds. A region
+    /// no live [`Pin`] covers is **truncated**: the bump pointer goes back to
+    /// its mark, the values it held are dropped — an `Arc` payload's refcount
+    /// falls here — and the freed positions' generations rise so that a slot
+    /// naming one of them can never resolve again. That is the `unique` case and
+    /// it is free.
+    ///
+    /// A region a live pin covers keeps its slots. A continuation captured while
+    /// it was open may be resumed after this close and read them, so handing
+    /// them back to the bump pointer here is the use-after-free this milestone
+    /// exists to make impossible. They are held as a run of retained slots and
+    /// go back at the first close or [`Arena::collect`] after the last holder of
+    /// that pin drops it.
     ///
     /// Nested regions are closed too rather than refused: a `perform` whose
     /// handler discards the continuation abandons every region the body had
     /// open, and the enclosing region's close is the only place left to reclaim
-    /// them. Closing an already-closed region is a no-op, so a teardown that
-    /// runs twice is not a second free.
+    /// them. Closing an already-closed region is [`Reclaim::NotOpen`], so a
+    /// teardown that runs twice is not a second free.
     ///
-    /// The chunks keep their capacity. Freeing a region drops the values it
-    /// held — an `Arc` payload's refcount falls here, which is the whole of
-    /// "freed at the region's close" — and gives the *slots* back to the bump
-    /// pointer, not the memory back to the allocator.
-    pub fn close(&mut self, region: RegionId) {
+    /// The chunks keep their capacity either way: a close gives the *slots* back
+    /// to the bump pointer, never the memory back to the allocator.
+    pub fn close(&mut self, region: RegionId) -> Reclaim {
+        self.close_at(region, false)
+    }
+
+    /// A close that frees whatever a pin says, for the end of an entry point.
+    ///
+    /// Nothing can be resumed there: the engine has already produced its answer
+    /// and cleared its control, so a continuation still reachable from a cell is
+    /// reachable only from inside the very region being reclaimed. Honouring a
+    /// pin held by a value that lives in the run being torn down is a cycle —
+    /// the leak ADR 0017 §4 declines to collect — and honouring it at *this*
+    /// close would leak the whole entry point and break the isolation the reset
+    /// exists for.
+    pub fn close_final(&mut self, region: RegionId) -> Reclaim {
+        self.close_at(region, true)
+    }
+
+    fn close_at(&mut self, region: RegionId, force: bool) -> Reclaim {
+        // Before deciding, so that a continuation which died between its capture
+        // and this close does not defer anything.
+        self.collect();
         let Some(at) = self.scope(region) else {
-            return;
+            return Reclaim::NotOpen;
         };
-        let mark = self.scopes[at].mark;
+        let scope = self.scopes[at];
+        debug_assert!(
+            scope.mark <= self.live,
+            "an open region's mark sits above the bump pointer"
+        );
+        let slots = self.live.saturating_sub(scope.mark);
+        // A region holding nothing has nothing to hold on to, whoever is pinning
+        // it, and an empty run would be state to carry for no memory.
+        if slots > 0 && !force && self.pinned(scope.ordinal) {
+            let closing: Vec<RegionId> = self.scopes[at..].iter().map(|s| s.id).collect();
+            self.scopes.truncate(at);
+            self.retain(scope, closing);
+            return Reclaim::Retained(slots);
+        }
         self.scopes.truncate(at);
-        self.truncate(mark, true);
+        self.stats.closes_freed += 1;
+        // Every run above this mark belongs to a region that nested inside the
+        // one closing, so its ordinal is higher and no pin that spares this
+        // region could have covered it. They are freed with it.
+        debug_assert!(
+            self.retained
+                .iter()
+                .all(|run| run.hi <= scope.mark || run.lo >= scope.mark),
+            "a retained run straddles a region boundary, so regions did not nest"
+        );
+        self.retained.retain(|run| run.lo < scope.mark);
+        self.truncate(scope.mark, true);
+        // The truncation may have put an older retained run back at the top of
+        // the arena, where it is a truncation of its own.
+        self.release();
+        Reclaim::Freed(slots)
     }
 
     /// Closes the innermost open region.
@@ -422,6 +694,162 @@ impl Arena {
         let id = self.scopes.last()?.id;
         self.close(id);
         Some(id)
+    }
+
+    /// [`Arena::close_current`] under [`Arena::close_final`]'s rule.
+    pub fn close_current_final(&mut self) -> Option<RegionId> {
+        let id = self.scopes.last()?.id;
+        self.close_final(id);
+        Some(id)
+    }
+
+    // ------------------------------------------------------------ reclamation
+
+    /// Takes a continuation's claim on every region open at this point.
+    ///
+    /// The capture path calls this at every capture and holds the [`Pin`] for
+    /// exactly as long as the continuation. `None` outside every region, where
+    /// there is nothing for a resumption to reach.
+    ///
+    /// It never refuses. A [`RegionKind::Unique`] region open here is the
+    /// inference and the machine disagreeing — [`Arena::unique_open`] names it,
+    /// and the caller reports it — but the pin is taken anyway, because the
+    /// answer to a disagreement about whether memory is reachable is never to
+    /// free it.
+    pub fn pin(&mut self) -> Option<Pin> {
+        if self.scopes.is_empty() {
+            return None;
+        }
+        // A program that performs a million times inside one region takes a
+        // million pins before anything closes, and a dead one is only pruned at
+        // a close. Amortized so the roster cannot outgrow the arena it guards.
+        if self.pins.len() >= PIN_PRUNE_AT {
+            self.pins.retain(|core| Rc::strong_count(core) > 1);
+        }
+        let core = Rc::new(PinCore {
+            frontier: self.stats.regions_opened,
+            top: self.live,
+        });
+        self.pins.push(Rc::clone(&core));
+        self.stats.pins_taken += 1;
+        Some(Pin(core))
+    }
+
+    /// The innermost open region the compiler called `unique`, if any.
+    ///
+    /// At a capture this is a contradiction: `unique` is the claim that no
+    /// continuation is captured across the region, so its memory may be freed at
+    /// its close. The capture path checks it and reports [`unique_capture`]
+    /// rather than proceeding as though the kinds agreed.
+    pub fn unique_open(&self) -> Option<RegionId> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|s| s.kind == RegionKind::Unique)
+            .map(|s| s.id)
+    }
+
+    /// Forgets every claim a continuation made, and hands back what those claims
+    /// were holding.
+    ///
+    /// For the end of an entry point and nowhere else. A continuation that is
+    /// still reachable there is reachable only from the run being torn down, and
+    /// the value holding it commonly lives in the very region it pins — the
+    /// cycle ADR 0017 §4 declines to collect. Honouring it would leak the whole
+    /// entry point and let the next one read the last one's slots, which is the
+    /// isolation `World::fork` used to give for nothing.
+    pub fn abandon_pins(&mut self) {
+        self.pins.clear();
+        self.release();
+    }
+
+    /// Drops the pins whose continuations have died and hands back every run of
+    /// slots that no live pin still covers.
+    ///
+    /// A close runs it, so a program that keeps opening regions reclaims without
+    /// being asked. A caller that drops the last continuation and then opens no
+    /// further region calls it directly.
+    pub fn collect(&mut self) {
+        // One owner is this arena's own end of the token; anything more is a
+        // continuation that can still be resumed.
+        self.pins.retain(|core| Rc::strong_count(core) > 1);
+        self.release();
+    }
+
+    /// Slots held past their region's close for a continuation that can still
+    /// reach them.
+    pub fn retained_slots(&self) -> usize {
+        self.retained.iter().map(|run| run.hi - run.lo).sum()
+    }
+
+    /// The regions whose slots are being held, ascending. Deterministic, because
+    /// a report of what a run retained has to be byte-identical run to run.
+    pub fn retained_regions(&self) -> Vec<RegionId> {
+        let mut out: Vec<RegionId> = self
+            .retained
+            .iter()
+            .flat_map(|run| run.regions.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Continuations that can still reach a region open at their capture.
+    /// Counted rather than reaped, so it is safe to ask from `&self`.
+    pub fn live_pins(&self) -> usize {
+        self.pins
+            .iter()
+            .filter(|core| Rc::strong_count(core) > 1)
+            .count()
+    }
+
+    /// Whether a continuation captured while this region was open is still live.
+    fn pinned(&self, ordinal: u64) -> bool {
+        self.pins
+            .iter()
+            .any(|core| core.frontier > ordinal && Rc::strong_count(core) > 1)
+    }
+
+    /// Holds `scope`'s extent past its close, absorbing the runs nested inside
+    /// it — their regions closed within this one, so this run's release covers
+    /// them.
+    fn retain(&mut self, scope: Scope, closing: Vec<RegionId>) {
+        let mut regions = closing;
+        while self.retained.last().is_some_and(|run| run.lo >= scope.mark) {
+            let mut run = self.retained.pop().expect("just tested");
+            regions.append(&mut run.regions);
+        }
+        regions.sort_unstable();
+        self.retained.push(Retained {
+            lo: scope.mark,
+            hi: self.live,
+            ordinal: scope.ordinal,
+            regions,
+        });
+        self.stats.closes_deferred += 1;
+    }
+
+    /// Truncates away every retained run that has become both unpinned and the
+    /// top of the arena.
+    ///
+    /// Both conditions are required. A run below an open region's slots cannot
+    /// be handed back however dead its pin is — a bump pointer frees a suffix,
+    /// not a hole — so it waits for that region to close, which is the point at
+    /// which the truncation covers both.
+    fn release(&mut self) {
+        let floor = self.scopes.last().map_or(0, |s| s.mark);
+        loop {
+            let Some(run) = self.retained.last() else {
+                return;
+            };
+            if run.hi != self.live || run.lo < floor || self.pinned(run.ordinal) {
+                return;
+            }
+            let lo = run.lo;
+            self.retained.pop();
+            self.stats.slots_reclaimed_late += (self.live - lo) as u64;
+            self.truncate(lo, true);
+        }
     }
 
     /// The extent of `region` and of everything nested inside it, as it stands
@@ -519,13 +947,22 @@ impl Arena {
     ///   below and frees nothing at all.
     ///
     /// `false` when the snapshot's region has closed, which is a caller error
-    /// rather than a silent no-op.
+    /// rather than a silent no-op, and `false` too while a live [`Pin`] or a
+    /// retained run covers what the restore would truncate: undoing an
+    /// allocation a captured continuation can reach is the same free, taken from
+    /// the other end.
     pub fn restore(&mut self, snapshot: &Snapshot) -> bool {
         // The region must still be open *at the depth it was taken from*.
         // Anything else means an enclosing scope closed and reopened under a
         // fresh id, which cannot happen, or that the caller is restoring into an
         // arena this snapshot did not come from.
         if self.scopes.get(snapshot.depth).map(|s| s.id) != Some(snapshot.region) {
+            return false;
+        }
+        self.collect();
+        if self.pins.iter().any(|core| core.top > snapshot.top)
+            || self.retained.iter().any(|run| run.hi > snapshot.base)
+        {
             return false;
         }
         // Everything allocated above the snapshot is freed with its generation
@@ -549,9 +986,7 @@ impl Arena {
     }
 
     /// Ascending by index — the order a differential comparison and a rendered
-    /// artifact both need, and the same guarantee [`World::cells`] gives.
-    ///
-    /// [`World::cells`]: crate::World::cells
+    /// artifact both need.
     pub fn slots(&self) -> impl Iterator<Item = (Slot, &Value)> {
         (0..self.live).map(move |index| {
             let (c, o) = (chunk_of(index), offset_of(index));
@@ -588,6 +1023,15 @@ impl Arena {
         if mark >= self.live {
             return;
         }
+        // Before the invalidation, so a journalled slot carries the generation
+        // the cell had rather than the one its position went on to.
+        if let Some(journal) = &mut self.journal {
+            for index in mark..self.live {
+                let (c, o) = (chunk_of(index), offset_of(index));
+                let slot = Slot::new(index as u32, self.generations[c][o]);
+                journal.push((slot, self.chunks[c][o].clone()));
+            }
+        }
         if invalidate {
             for index in mark..self.live {
                 let (c, o) = (chunk_of(index), offset_of(index));
@@ -608,12 +1052,60 @@ impl fmt::Debug for Arena {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Arena({} live, {} regions open, {} chunks)",
+            "Arena({} live, {} retained, {} regions open, {} chunks)",
             self.live,
+            self.retained_slots(),
             self.scopes.len(),
             self.chunks.len()
         )
     }
+}
+
+/// A read or a write through a slot whose region has been reclaimed.
+///
+/// This is where the generation discipline pays for itself. A reclaimed
+/// position's generation has risen, so a stale slot resolves to nothing rather
+/// than to whatever the next region allocated in its place: the failure surfaces
+/// here, deterministically and on every run, instead of as a value that is
+/// merely wrong.
+///
+/// [`codes::INTERNAL_ERROR`] rather than [`codes::RUNTIME_ERROR`] because it is
+/// never the program's fault. A value cannot outlive its region — ADR 0017 §2
+/// makes that a type error — so a slot that fails to resolve means either that
+/// the escape check let one through or that a continuation was resumed across a
+/// region freed while it could still reach it. Both are Ply's, and there is
+/// nothing in the user's definition graph to attribute them to.
+pub fn stale_slot(slot: Slot, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("slot {slot} belongs to a region whose memory has been reclaimed"),
+    )
+    .primary(span, "this read cannot be answered")
+    .note(
+        "a region's slots are freed at its close unless a continuation captured across it is \
+         still live, so reaching one here means either a value outlived its region or a capture \
+         was not counted",
+    )
+}
+
+/// A continuation captured while a region the compiler called `unique` was open.
+///
+/// The annotation — or the inference — claimed no continuation is captured
+/// across that region, which is the claim that its memory may be freed at its
+/// close. It is reported rather than absorbed: the pin is taken either way, so
+/// nothing is freed under the continuation, but a run that reaches this is
+/// running on an inference that does not describe it.
+pub fn unique_capture(region: RegionId, region_span: Span, capture: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a continuation was captured across `{region}`, which is `unique`"),
+    )
+    .primary(capture, "the continuation is captured here")
+    .secondary(region_span, "this region is `unique`")
+    .note(
+        "`unique` is the claim that nothing can reach the region's slots after its close, so the \
+         inference and the machine disagree about what this program does",
+    )
 }
 
 #[cfg(test)]

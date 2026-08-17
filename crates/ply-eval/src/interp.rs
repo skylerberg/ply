@@ -1,12 +1,13 @@
+use crate::arena::{Arena, RegionKind};
 use crate::builtins::Builtin;
 use crate::env::Env;
 use crate::handler::{OpDecl, check_operation, performed_atom};
 use crate::host::{HostBinding, err_hermetic, err_machine_only_host, operation_label};
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, grow};
 use crate::memo::{Lookup, Memo};
+use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Decimal, Value, type_error, values_equal};
-use crate::world::World;
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{
@@ -15,7 +16,9 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// An operation's declaration, by program-wide effect name and operation name.
@@ -59,10 +62,15 @@ pub struct Interp<'a> {
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
     handlers: Vec<HandlerFrame>,
-    /// The world every entry point forks from, so one seeded world serves every
-    /// test in a run without any of them observing another's writes.
-    base_world: World,
-    world: World,
+    /// Where every cell this engine allocates lives, and the fixture every
+    /// entry point resets to — so one seeded fixture serves every test in a run
+    /// without any of them observing another's writes. ADR 0017 §1 and §5.
+    regions: TaskRegions,
+    /// Which of ADR 0017 §3's two kinds each region in this program is, computed
+    /// on the first region this evaluator actually opens. Lazy for the reason
+    /// the machine's copy is: a whole-program analysis must not be run for an
+    /// entry point that opens no region.
+    region_kinds: OnceCell<Rc<crate::region_kind::Regions>>,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
     /// The module a bare name is resolved in: the one that wrote the expression
@@ -155,8 +163,8 @@ impl<'a> Interp<'a> {
             ops,
             tests,
             handlers: Vec::new(),
-            base_world: World::new(),
-            world: World::new(),
+            regions: TaskRegions::new(),
+            region_kinds: OnceCell::new(),
             trace: Trace::new(),
             module: 0,
             calls: Vec::new(),
@@ -184,19 +192,22 @@ impl<'a> Interp<'a> {
         self.program
     }
 
-    pub fn world(&self) -> &World {
-        &self.world
+    pub fn cells(&self) -> &Arena {
+        self.regions.arena()
     }
 
-    pub(crate) fn world_mut(&mut self) -> &mut World {
-        &mut self.world
+    pub fn cells_mut(&mut self) -> &mut Arena {
+        self.regions.arena_mut()
     }
 
-    /// Every subsequent entry point forks from `world` rather than from an
-    /// empty one. A fixture built once is handed to every test this way.
-    pub fn set_base_world(&mut self, world: World) {
-        self.base_world = world;
-        self.world = self.base_world.fork();
+    pub fn regions(&self) -> &TaskRegions {
+        &self.regions
+    }
+
+    /// Every subsequent entry point resets to this stack's fixture rather than
+    /// to an empty one. A fixture built once is handed to every test this way.
+    pub fn set_regions(&mut self, regions: TaskRegions) {
+        self.regions = regions;
     }
 
     pub fn check(&self) -> Option<&'a CheckOutput> {
@@ -227,7 +238,9 @@ impl<'a> Interp<'a> {
         };
         self.reset();
         self.module = module;
-        self.eval(body, &Env::empty()).map(|_| ())
+        let outcome = self.eval(body, &Env::empty()).map(|_| ());
+        self.end_entry_point();
+        outcome
     }
 
     /// Runs the `ordinal`-th test declared by `module`.
@@ -255,16 +268,34 @@ impl<'a> Interp<'a> {
         };
         self.reset();
         self.module = owner;
-        self.eval(body, &Env::empty()).map(|_| ())
+        let outcome = self.eval(body, &Env::empty()).map(|_| ());
+        self.end_entry_point();
+        outcome
     }
 
     pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
         self.reset();
-        self.eval(e, &Env::empty())
+        let outcome = self.eval(e, &Env::empty());
+        self.end_entry_point();
+        outcome
+    }
+
+    /// Closes every region the run left open. A diagnostic propagating out of a
+    /// region body unwinds past this evaluator's own close on the machine, so
+    /// both engines end an entry point with the same arena — which is what
+    /// `--engine both` compares.
+    fn end_entry_point(&mut self) {
+        self.regions.close_program_regions();
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
     pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+        // Both engines, at the same point and with the same message, or
+        // `--engine both` reports the refusal as a divergence. See `escape`.
+        let boundary = crate::escape::Boundary::EntryPoint { name };
+        for arg in &args {
+            crate::escape::check(&boundary, arg, span)?;
+        }
         self.reset();
         let sym = Symbol::new(name);
         let f = self.globals.get(&sym).cloned().ok_or_else(|| {
@@ -272,7 +303,9 @@ impl<'a> Interp<'a> {
                 .primary(span, "not defined in this program")
                 .note("this name is program-wide: `store.orders.place`, not `place`")
         })?;
-        self.apply(f, args, span)
+        let outcome = self.apply(f, args, span);
+        self.end_entry_point();
+        outcome
     }
 
     /// A previous failure can leave frames installed; nothing survives from one
@@ -282,7 +315,7 @@ impl<'a> Interp<'a> {
         self.calls.clear();
         self.trace.clear();
         self.module = 0;
-        self.world = self.base_world.fork();
+        self.regions.reset();
     }
 
     /// Resolution already decided what this denotes; nothing here re-derives it.
@@ -385,10 +418,8 @@ impl<'a> Interp<'a> {
             } => self.eval_handle(body, clauses, return_clause.as_deref(), env),
             ExprKind::WithCell {
                 init, binder, body, ..
-            } => self.eval_with_cell(init, binder, body, env),
-            // See `code::lower_node`: a region is a claim about where a value
-            // lives, and nothing in this evaluator represents that yet.
-            ExprKind::WithRegion { body, .. } => self.eval(body, env),
+            } => self.eval_with_cell(init, binder, body, env, e.span),
+            ExprKind::WithRegion { body, .. } => self.in_region(e.span, |me| me.eval(body, env)),
             // Refused before the body runs, for the reason a general clause is:
             // running one unnamed interleaving would be a plausible wrong answer
             // and the result cache would keep it.
@@ -587,6 +618,39 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The kind of the region opened at `span`, and `None` when that span opens
+    /// no region of its own. The machine answers this from the same analysis
+    /// over the same program, which is what keeps `--engine both` from seeing
+    /// two different region structures.
+    fn region_kind(&self, span: Span) -> Option<RegionKind> {
+        self.region_kinds
+            .get_or_init(|| Rc::new(crate::region_kind::infer(self.program, self.resolved)))
+            .at(span)
+            .map(|region| region.kind)
+    }
+
+    /// Opens the region, runs `body` in it and closes it — on the error path
+    /// too, because a diagnostic propagating out of a region body is that
+    /// region's lexical end just as much as a value is.
+    ///
+    /// The close is where the two kinds differ, and it is the arena that decides
+    /// rather than the kind: a continuation captured across the region and still
+    /// live holds a pin, and the close retains its slots instead of handing them
+    /// back.
+    fn in_region(
+        &mut self,
+        span: Span,
+        f: impl FnOnce(&mut Self) -> Result<Value, Diagnostic>,
+    ) -> Result<Value, Diagnostic> {
+        let Some(kind) = self.region_kind(span) else {
+            return f(self);
+        };
+        let region = self.regions.open_region(kind, span);
+        let out = f(self);
+        self.regions.close_region(region);
+        out
+    }
+
     #[inline(never)]
     fn eval_with_cell(
         &mut self,
@@ -594,11 +658,16 @@ impl<'a> Interp<'a> {
         binder: &Ident,
         body: &Expr,
         env: &Env,
+        span: Span,
     ) -> Result<Value, Diagnostic> {
         let initial = self.eval(init, env)?;
-        let cell = self.world.alloc(initial);
-        let scope = env.bind(binder.name.clone(), Value::Cell(cell));
-        self.eval(body, &scope)
+        self.in_region(span, |me| {
+            let Some(cell) = me.regions.alloc(initial) else {
+                return Err(crate::handler::err_cells_exhausted(body.span));
+            };
+            let scope = env.bind(binder.name.clone(), Value::Cell(cell));
+            me.eval(body, &scope)
+        })
     }
 
     /// Locals, then the module's own items and its selective imports, then the
