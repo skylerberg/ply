@@ -321,6 +321,37 @@ verdict or a threshold — a test asserts that a serialized report carries
 neither — so the decision printed above them is recomputed from
 `w6::Criteria::default()` on every run.
 
+### There are two ladders, and which one you want depends on the question
+
+| file | taken | what it is for |
+| --- | --- | --- |
+| `w6-ladder.json` | W6, before the region track | the **baseline**. It is the only record of what a `/health` request cost before regions — 1,035 allocations and 0.124 MB, in its `boxing on hot paths` alternative — and R3's decision rule is stated against that figure. |
+| `w6-ladder-r3.json` | 2026-08-18, after R3 | the **current** ladder: the same nine rungs on the same command, re-taken on this tree. |
+
+Both render the same way and both are judged by the same criteria in code:
+
+```
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder.json    benches/w6-spike.json
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder-r3.json benches/w6-spike.json
+```
+
+**Never write `ply-corpus w6 benches/*.json`.** `w6` merges the files it is given
+field by field, last one wins, and a shell expands that glob alphabetically —
+`w6-ladder-r3.json`, then `w6-ladder.json`, then `w6-spike.json`. So the glob
+renders the **older** ladder: run today it prints a provenance of `2026-08-16`
+and a boxing lever of `1035 times and 0.124 MB`, as though the region track had
+not happened. That was checked by running it, not reasoned. Name the two files
+you want.
+
+**Do not overwrite `w6-ladder.json` with a fresh take, either.** The two
+staleness guards read it by name — `w6_report_integrity.rs` and
+`w6_report_allocations.rs`, both under `cargo test --workspace` — and their bands
+are wide (`0.25..=4.0` on release microseconds, `0.5..=2.0` on allocations,
+both in those files) precisely so a live tree can drift inside them without the
+baseline being destroyed to make them pass. A re-take belongs beside it, as
+`w6-ladder-r3.json` is. Nothing reads `w6-ladder-r3.json`, which is the honest
+statement of its status: it is a measurement, not a guard.
+
 It takes no measurement of its own. It merges one or more measurement files
 field by field — so the ladder run and the spike run produce their halves
 independently — assembles the ladder, applies the criteria, and prints the

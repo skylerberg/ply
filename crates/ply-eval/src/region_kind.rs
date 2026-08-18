@@ -20,7 +20,14 @@
 //! on `shared`:
 //!
 //! - a call whose callee is not a statically known definition, because the value
-//!   could be any closure in the program;
+//!   could be any closure in the program — and a **local binding shadowing a
+//!   definition's name is not that definition**. `fn go(helper: (Int) -> Int)`
+//!   in a module that also declares `fn helper(n: Int)` calls whatever the
+//!   caller passed, so the region holding the call is `shared`, not `unique`
+//!   over `helper`'s body. [`Analysis::locals`] is what keeps the two apart, and
+//!   it over-approximates on purpose: a pattern cannot be told from a nullary
+//!   constructor without resolution, and reading a constructor as a local costs
+//!   only precision;
 //! - an argument to a callback builtin (`map`, `filter`, `fold`, `map_fold`,
 //!   `bytes_position`) that is not a lambda written at the call site or a
 //!   definition named there, for the same reason;
@@ -78,12 +85,42 @@
 //! Escape. A value outliving its region is a type error under ADR 0017 §2,
 //! carried by the brand in its type; this module is about the *cost* of the
 //! region and says nothing about what may leave it.
+//!
+//! # Where the answer is computed, and why it is not keyed by a definition hash
+//!
+//! A region's kind is a static property of a **program**, so it belongs off the
+//! runtime — [`Kinds`] is what carries one program's answer to every engine
+//! built from that program, so the analysis runs at most once however many
+//! machines a run builds.
+//!
+//! It is *not* a property of a definition, and it may not be cached under a
+//! definition's hash the way a scheme or a footprint is. Two of the inputs
+//! below are whole-program and neither is inside the hashed dependency closure
+//! of the region's own definition:
+//!
+//! - [`Analysis::promote_indirect`] asks whether **any** capture is written
+//!   **anywhere** in the program. With none, an unknown callee has nothing to
+//!   reach and every [`Cause::Indirect`] is dropped. So adding a `handle` to an
+//!   unrelated module — one this definition neither names nor transitively
+//!   reaches, so one that moves no hash of its own — flips a region holding an
+//!   indirect call from `unique` to `shared`.
+//! - [`Analysis::new`] decides whether a name denotes a definition or a local
+//!   from the program-wide set of definition names.
+//!
+//! A cache keyed by the region's definition hash would therefore answer
+//! `unique` where a fresh inference answers `shared`, which frees an arena a
+//! continuation can still reach. `a_capture_in_an_unrelated_module_makes_a_region_shared`
+//! in `crates/ply-eval/tests/region_kind_inference.rs` is that program, written
+//! down so the key cannot be narrowed by accident. The sound key is the whole
+//! `(Program, Resolved)` pair, which is what [`Kinds`] is keyed by:
+//! construction, one per loaded program.
 
 use crate::arena::RegionKind;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Expr, ExprKind, Item, Program, QName, Stmt};
+use ply_syntax::ast::{Expr, ExprKind, Item, Pattern, PatternKind, Program, QName, Stmt};
 use ply_syntax::resolve::{Namespace, Resolved};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 
 /// Why a continuation capture is reachable.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -220,6 +257,26 @@ impl Regions {
     }
 }
 
+/// One program's region kinds, computed at most once however many engines are
+/// built from that program.
+///
+/// The analysis is whole-program, so its answer is a property of the
+/// `(Program, Resolved)` pair and of nothing smaller. Handing one of these to
+/// every engine built from one program is what keeps it off the runtime; a
+/// `Machine` that is handed none infers its own, which is correct and is what
+/// costs a whole-program traversal per entry point.
+///
+/// Still filled on first use rather than at construction, because a run that
+/// opens no region must not pay for an analysis of every region in the project
+/// — `ply test` on a fully cached corpus is that run.
+///
+/// **The program a `Kinds` is filled from is the program it is an answer
+/// about.** Sharing one across two different programs answers about the wrong
+/// one, and where the two happen to agree on a span it answers `unique` for a
+/// region the other program captures across. Share it only where the
+/// `(Program, Resolved)` pair is the same pair.
+pub type Kinds = Arc<OnceLock<Regions>>;
+
 /// Infers a kind for every region in the program.
 pub fn infer(program: &Program, resolved: &Resolved) -> Regions {
     let (regions, _) = decide(program, resolved, &[]);
@@ -340,6 +397,15 @@ struct Analysis<'a> {
     /// Program-wide names of the definitions, so a `Var` can be told from a
     /// constructor or a builtin.
     definitions: BTreeSet<Symbol>,
+    /// The local binders in scope at the point of the walk, innermost last.
+    ///
+    /// `Resolved::scopes[module]` is the **module** scope, so without this a
+    /// parameter, a `let` or a pattern binder that shadows a definition's name
+    /// resolves to that definition — and a call through it is recorded as an
+    /// edge to a body that may reach no capture, rather than as
+    /// [`Cause::Indirect`] over a callee that could be any closure the caller
+    /// passed. That is the one direction this module may not be wrong in.
+    locals: Vec<Symbol>,
     /// The prelude's constructors, which no module declares.
     prelude_ctors: BTreeSet<Symbol>,
     /// Per definition. `BTreeMap` rather than a hash map because the propagation
@@ -368,6 +434,7 @@ impl<'a> Analysis<'a> {
             program,
             resolved,
             definitions,
+            locals: Vec::new(),
             prelude_ctors: ply_core::prelude::ctor_arities()
                 .into_iter()
                 .map(|(name, _)| name)
@@ -385,10 +452,18 @@ impl<'a> Analysis<'a> {
     fn scan_program(&mut self) {
         for (m, module) in self.program.modules.iter().enumerate() {
             for item in &module.items {
-                let (name, body) = match item {
-                    Item::Fn(f) => (Some(module.name.qualify(&f.name.name)), &f.body),
-                    Item::Test(t) => (None, &t.body),
-                    Item::Law(l) => (None, &l.body),
+                let (name, body, binders) = match item {
+                    Item::Fn(f) => (
+                        Some(module.name.qualify(&f.name.name)),
+                        &f.body,
+                        f.params.iter().map(|p| p.name.name.clone()).collect(),
+                    ),
+                    Item::Test(t) => (None, &t.body, Vec::new()),
+                    Item::Law(l) => (
+                        None,
+                        &l.body,
+                        l.binders.iter().map(|b| b.name.name.clone()).collect(),
+                    ),
                     _ => continue,
                 };
                 let ctx = Ctx {
@@ -397,7 +472,7 @@ impl<'a> Analysis<'a> {
                     brands: Vec::new(),
                 };
                 let mut scan = Scan::default();
-                self.walk(body, &ctx, &mut scan);
+                self.scoped(binders, |a| a.walk(body, &ctx, &mut scan));
                 if self.anywhere.is_none() {
                     self.anywhere = scan.direct.clone();
                 }
@@ -520,6 +595,17 @@ impl<'a> Analysis<'a> {
         crate::limit::grow(|| self.walk_at(e, ctx, out));
     }
 
+    /// Runs `f` with `names` bound as locals, and unbinds them however it
+    /// returns. Shadowing is by position — the innermost binding of a name is
+    /// the last one pushed — so a `Vec` and a truncation are the whole scope
+    /// discipline.
+    fn scoped(&mut self, names: Vec<Symbol>, f: impl FnOnce(&mut Self)) {
+        let depth = self.locals.len();
+        self.locals.extend(names);
+        f(self);
+        self.locals.truncate(depth);
+    }
+
     fn walk_at(&mut self, e: &Expr, ctx: &Ctx, out: &mut Scan) {
         match &e.kind {
             ExprKind::Var(q) => {
@@ -529,6 +615,41 @@ impl<'a> Analysis<'a> {
             }
             ExprKind::App { func, args } => {
                 self.walk_call(e.span, func, args, ctx, out);
+            }
+            ExprKind::Lambda { params, body } => {
+                let bound = params.iter().map(|p| p.name.name.clone()).collect();
+                self.scoped(bound, |a| a.walk(body, ctx, out));
+            }
+            ExprKind::Block { stmts, tail } => {
+                let depth = self.locals.len();
+                // A `let`'s binders are in scope for the statements after it and
+                // for the tail, and not for its own right-hand side.
+                for stmt in stmts {
+                    match stmt {
+                        Stmt::Let { pat, value, .. } => {
+                            self.walk(value, ctx, out);
+                            pattern_binders(pat, &mut self.locals);
+                        }
+                        Stmt::Expr(e) => self.walk(e, ctx, out),
+                    }
+                }
+                if let Some(tail) = tail {
+                    self.walk(tail, ctx, out);
+                }
+                self.locals.truncate(depth);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.walk(scrutinee, ctx, out);
+                for arm in arms {
+                    let mut bound = Vec::new();
+                    pattern_binders(&arm.pat, &mut bound);
+                    self.scoped(bound, |a| {
+                        if let Some(guard) = &arm.guard {
+                            a.walk(guard, ctx, out);
+                        }
+                        a.walk(&arm.body, ctx, out);
+                    });
+                }
             }
             ExprKind::Perform {
                 effect, op, args, ..
@@ -568,10 +689,14 @@ impl<'a> Analysis<'a> {
                 // A clause body and a return clause run *below* their own
                 // handler, so they are walked under the enclosing context.
                 for clause in clauses {
-                    self.walk(&clause.body, ctx, out);
+                    let mut bound: Vec<Symbol> =
+                        clause.params.iter().map(|p| p.name.clone()).collect();
+                    bound.extend(clause.resume.iter().map(|r| r.name.clone()));
+                    self.scoped(bound, |a| a.walk(&clause.body, ctx, out));
                 }
                 if let Some(ret) = return_clause {
-                    self.walk(&ret.body, ctx, out);
+                    let bound = vec![ret.binder.name.clone()];
+                    self.scoped(bound, |a| a.walk(&ret.body, ctx, out));
                 }
             }
             ExprKind::Simulate { body } => {
@@ -584,16 +709,19 @@ impl<'a> Analysis<'a> {
             ExprKind::WithCell {
                 resource,
                 init,
+                binder,
                 body,
-                ..
             } => {
                 self.walk(init, ctx, out);
+                let bound = vec![binder.name.clone()];
                 // A cell written inside the region of the same brand is a value
                 // allocated in *that* region — ADR 0017 §1 — so it opens nothing.
                 if ctx.brands.contains(&resource.name) {
-                    self.walk(body, ctx, out);
+                    self.scoped(bound, |a| a.walk(body, ctx, out));
                 } else {
-                    self.walk_region(e.span, resource.name.clone(), body, ctx, out);
+                    let span = e.span;
+                    let brand = resource.name.clone();
+                    self.scoped(bound, |a| a.walk_region(span, brand, body, ctx, out));
                 }
             }
             _ => children(e, &mut |child| self.walk(child, ctx, out)),
@@ -627,7 +755,7 @@ impl<'a> Analysis<'a> {
             self.walk(arg, ctx, out);
         }
         match &func.kind {
-            ExprKind::Var(q) => {
+            ExprKind::Var(q) if !self.is_local(q) => {
                 if let Some(name) = self.definition(ctx.module, q) {
                     out.refs.push(name);
                     return;
@@ -643,12 +771,18 @@ impl<'a> Analysis<'a> {
                     }
                     return;
                 }
-                // A local binding, so the callee is whatever it holds.
                 out.indirect_at(span, Cause::Indirect);
             }
+            // A local binding, so the callee is whatever it holds — including
+            // when it shadows the name of a definition, a constructor or a
+            // builtin, which is the case the module scope alone gets wrong.
+            ExprKind::Var(_) => out.indirect_at(span, Cause::Indirect),
             // Written at the call site: the callee is known, and its body has
             // already been walked as an argument-free subexpression.
-            ExprKind::Lambda { body, .. } => self.walk(body, ctx, out),
+            ExprKind::Lambda { params, body } => {
+                let bound = params.iter().map(|p| p.name.name.clone()).collect();
+                self.scoped(bound, |a| a.walk(body, ctx, out));
+            }
             // A field, the result of another call: nothing here names what will
             // run.
             _ => {
@@ -680,9 +814,11 @@ impl<'a> Analysis<'a> {
             // there: the `Var` arm above has already recorded the edge.
             Some(ExprKind::Lambda { .. }) => true,
             Some(ExprKind::Var(q)) => {
-                self.definition(ctx.module, q).is_some()
-                    || self.is_constructor(ctx.module, q)
-                    || (q.is_bare() && crate::builtins::Builtin::from_name(q.symbol()).is_some())
+                !self.is_local(q)
+                    && (self.definition(ctx.module, q).is_some()
+                        || self.is_constructor(ctx.module, q)
+                        || (q.is_bare()
+                            && crate::builtins::Builtin::from_name(q.symbol()).is_some()))
             }
             _ => false,
         };
@@ -716,14 +852,26 @@ impl<'a> Analysis<'a> {
         );
     }
 
+    /// Whether a bare name is bound by something inside the body being walked.
+    /// A qualified name cannot be: only a module path reaches one.
+    fn is_local(&self, q: &QName) -> bool {
+        q.is_bare() && self.locals.contains(q.symbol())
+    }
+
     /// The program-wide name of the definition a reference denotes, or `None`
     /// when it denotes anything else — a local, a constructor, a builtin.
     fn definition(&self, module: usize, q: &QName) -> Option<Symbol> {
+        if self.is_local(q) {
+            return None;
+        }
         let name = self.global(module, Namespace::Value, q)?;
         self.definitions.contains(&name).then_some(name)
     }
 
     fn is_constructor(&self, module: usize, q: &QName) -> bool {
+        if self.is_local(q) {
+            return false;
+        }
         match self.global(module, Namespace::Value, q) {
             Some(name) => !self.definitions.contains(&name),
             None => q.is_bare() && self.prelude_ctors.contains(q.symbol()),
@@ -778,8 +926,43 @@ fn refuse_unique(found: &Found, site: &CaptureSite) -> Diagnostic {
     )
 }
 
-/// Every subexpression, in source order. The cases the analysis handles itself
-/// are still routed through here by their own arms.
+/// Every name a pattern can bind.
+///
+/// A bare `Var` pattern naming a nullary constructor binds nothing, and telling
+/// the two apart needs resolution this walk does not do per pattern. The
+/// over-approximation is safe in the direction that matters: reading a
+/// constructor as a local turns a call through it into [`Cause::Indirect`] and a
+/// callback argument into [`Cause::Callback`], both of which land on `shared`.
+fn pattern_binders(p: &Pattern, out: &mut Vec<Symbol>) {
+    crate::limit::grow(|| match &p.kind {
+        PatternKind::Wildcard | PatternKind::Lit(_) => {}
+        PatternKind::Var(id) => out.push(id.name.clone()),
+        PatternKind::Ctor { args, .. } => {
+            for arg in args {
+                pattern_binders(arg, out);
+            }
+        }
+        PatternKind::Record { fields, .. } => {
+            for (_, pat) in fields {
+                pattern_binders(pat, out);
+            }
+        }
+        PatternKind::List { items, rest } => {
+            for item in items {
+                pattern_binders(item, out);
+            }
+            if let Some(rest) = rest {
+                pattern_binders(rest, out);
+            }
+        }
+    });
+}
+
+/// Every subexpression, in source order, for the forms that bind nothing and
+/// open nothing. Every form that binds a name or opens a region has its own arm
+/// in [`Analysis::walk_at`] and does not reach here — a scope has to be pushed
+/// around the child rather than beside it. The match stays exhaustive so that
+/// adding a form to the AST is a compile error in both places.
 fn children(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match &e.kind {
         ExprKind::Lit(_) | ExprKind::Var(_) => {}

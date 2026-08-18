@@ -101,6 +101,7 @@ impl Simulation for Driver<'_> {
         self.runs += 1;
         let mut machine =
             Machine::new(&self.front.program, &self.front.resolved, &self.front.check);
+        machine.share_region_kinds(self.front.shared_region_kinds());
         ply_test::sim::seed_run(&mut machine, seed, self.steps);
         let outcome = machine.eval_test_in(&self.test.module, self.test.ordinal);
         match ply_test::sim::interleaving_of(&machine, &outcome) {

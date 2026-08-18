@@ -19,8 +19,8 @@ use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{
-    Arena, Engine, EngineChoice, Exploration, Interp, Machine, Plan, Race, Seed, TaskRegions,
-    Value, compare_outcomes,
+    Arena, Engine, EngineChoice, Exploration, Interp, Lowering, Machine, Plan, Race, Seed,
+    TaskRegions, Value, compare_outcomes,
 };
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -612,6 +612,11 @@ pub struct InterpExecutor<'a> {
     hosts: Hosting<'a>,
     engine: EngineChoice,
     search: Search,
+    /// This program's region kinds, shared by every engine this run builds.
+    /// The analysis is a whole-program one and a run builds an engine per
+    /// worker per group, so leaving each to infer its own is a whole-program
+    /// traversal per worker per group.
+    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 /// One test's evaluator. Under [`EngineChoice::Both`] it is two of them, run
@@ -672,6 +677,16 @@ impl<'a> Worker<'a> {
     /// run so far made to it.
     pub fn region(&self) -> &GroupRegion {
         &self.region
+    }
+
+    /// What this worker's machine has already lowered, for the machines a search
+    /// builds per interleaving. `None` under `--engine treewalk`, which lowers
+    /// nothing.
+    fn lowering(&self) -> Option<Rc<Lowering<'a>>> {
+        match &self.engines {
+            Engines::Machine(m) | Engines::Both(_, m) => Some(m.share_lowering()),
+            Engines::Treewalk(_) => None,
+        }
     }
 
     /// Hands each engine a stack seeded from the group's region, one each, so
@@ -767,6 +782,7 @@ impl<'a> InterpExecutor<'a> {
             hosts: Hosting::hermetic(),
             engine: EngineChoice::default(),
             search: Search::default(),
+            region_kinds: ply_eval::region_kind::Kinds::default(),
         }
     }
 
@@ -821,16 +837,38 @@ impl<'a> InterpExecutor<'a> {
 
     fn interp(&self) -> Box<Interp<'a>> {
         let mut interp = Interp::new(self.program, self.resolved, self.check);
+        interp.share_region_kinds(self.shared_region_kinds());
         if let Some(binding) = &self.hosts.binding {
             interp.set_host_binding(Arc::clone(binding));
         }
         Box::new(interp)
     }
 
+    /// The run's one answer about this program's regions. Handed to every
+    /// engine below, including the machines a search rebuilds per interleaving.
+    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
+        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
+    }
+
     /// A machine, with the run's binding and — on this worker's own thread — its
     /// own handle on the reactor.
     fn machine(&self) -> Box<Machine<'a>> {
+        self.machine_lowering(None)
+    }
+
+    /// The same machine, lowering into `lowering` rather than into a cache of
+    /// its own.
+    ///
+    /// A search builds one of these per interleaving and every one of them would
+    /// otherwise re-lower the test and every definition it reaches. Unlike the
+    /// region kinds beside it this cannot be shared beyond one thread — lowered
+    /// code is `Rc` — so it is the worker's rather than the run's.
+    fn machine_lowering(&self, lowering: Option<Rc<Lowering<'a>>>) -> Box<Machine<'a>> {
         let mut machine = Machine::new(self.program, self.resolved, self.check);
+        machine.share_region_kinds(self.shared_region_kinds());
+        if let Some(lowering) = lowering {
+            machine.set_lowering(lowering);
+        }
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
@@ -903,7 +941,7 @@ impl<'a> InterpExecutor<'a> {
     #[allow(clippy::type_complexity)]
     fn search(
         &self,
-        region: &GroupRegion,
+        worker: &Worker<'a>,
         index: usize,
     ) -> (
         Result<(), Diagnostic>,
@@ -922,8 +960,10 @@ impl<'a> InterpExecutor<'a> {
         // performed, and reporting only the last would let the cache believe a
         // pass that a socket answered.
         let mut host: Option<ply_eval::host::HostUse> = None;
+        let region = &worker.region;
+        let lowering = worker.lowering();
         let mut interleaving = |seed: &Seed| {
-            let mut machine = self.machine();
+            let mut machine = self.machine_lowering(lowering.clone());
             if !region.is_empty() {
                 machine.set_regions(region.open().0);
             }
@@ -1021,7 +1061,7 @@ impl<'a> Executor for InterpExecutor<'a> {
             // the schedule, so the tree-walker never sees it and there is no
             // second answer to compare against.
             worker.audited = auditing.then_some(false);
-            let (outcome, exploration, host) = self.search(&worker.region, index);
+            let (outcome, exploration, host) = self.search(worker, index);
             worker.exploration = exploration;
             worker.host = host;
             return outcome;

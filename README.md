@@ -350,10 +350,40 @@ slicing, so taking a sub-slice allocates. Response write counts and copies were
 
 **`--engine both` is not free.** The guarantee that the tree-walking evaluator
 and the control-stack machine agree costs two runs, and the two are not the same
-speed: the tree-walker is 2.73x faster on the request path.
+speed: the tree-walker is 2.82x faster on the request path.
+
+> **Corrected (regression audit, 2026-08-17).** This read **2.73x**, which is
+> the engine substitution in `benches/w6-ladder.json` — a dated pre-region file.
+> The sentence is present tense, so it wants the current ladder:
+> `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`
+> renders the same substitution at **2.82x** (treewalk 56.34µs against machine
+> 158.92µs). Both are one rig; the conclusion — the oracle is not free and the
+> engines are not the same speed — is unchanged.
 
 **The request-path allocation count is large.** One `/health` request makes
-**1,122 allocations and 131,677 bytes** to produce a 107-byte response.
+**1,082 allocations and 127,955 bytes** to produce a 107-byte response.
+
+> **Corrected again (regression audit, 2026-08-17).** This sentence read
+> **1,122 allocations and 131,677 bytes**, which the block below had just put
+> there. R3 hoisted `region_kind::infer` and body lowering off the request path
+> after that block was written and nothing re-took this paragraph with them, so
+> the correction reproduced the defect it was correcting: a present-tense claim
+> the tree had moved under. Re-taken on this tree:
+>
+> ```
+> $ ./target/release/w6-alloc --repo . --requests 200
+> {"allocations_per_request":1081.87,"bytes_per_request":127954.65,
+>  "requests":200,"response_bytes":107,"route":"/health"}
+> ```
+>
+> **1,082 against W6's pre-region 1,035, so the paragraph's point stands and
+> the direction does too** — the region track is still up on this route. The
+> ~40 that came off are the one-time `region_kind::infer`; `ROADMAP.md` §R3 is
+> the record and `docs/adr/0017-regions.md` §"What must be measured" ¶1 carries
+> the 1,035 → 1,082 → 1,122 → 1,082 progression. Read the byte figure only
+> against another 200-request reading: `bytes_per_request` rises with the
+> window for a reason nobody has diagnosed (`CONTRIBUTING.md` §"Things known to
+> be broken" item 8).
 
 > **Corrected (docs pass, 2026-08-17).** This sentence read **1,035 allocations
 > and 0.124 MB** in the present tense. That is W6's number and what the ladder
@@ -463,12 +493,35 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,566 tests across 147 targets** (134 test
+`cargo test --workspace` runs **3,597 tests across 151 targets** (138 test
 binaries plus 13 doc-test suites); all pass on an unloaded machine. Four are
 marked `ignored`: three are timing benchmarks you run on purpose
 (`ply-corpus --test http_cost`) and the fourth is a doc-test, not a benchmark.
 Those counts were **3,206 across 123** here and had not been re-taken as the tree
-grew. One caveat the old sentence implied away: the `ignored` set is not the
+grew.
+
+> **Re-taken after R3 (2026-08-17), which added three test binaries.** This
+> sentence read **3,566 across 147** (134 binaries). R3 landed
+> `ply-eval/tests/region_kind_sharing.rs` (4 tests),
+> `ply-eval/tests/lowering_sharing.rs` (3) and
+> `ply-corpus/tests/region_kind_hoisted.rs` (2), and added nine more inside
+> existing binaries; nothing re-took the paragraph with them. Re-taken as
+> `cargo test --workspace`, summing the `test result:` lines: **3,584 passed,
+> 0 failed, 4 ignored**, with `grep -c '^     Running'` → 137 and
+> `grep -c '^   Doc-tests'` → 13.
+
+> **Re-taken again (regression audit, 2026-08-17).** The block above is what
+> R3 measured and it did not survive the audit that followed it. That audit
+> landed `ply-eval/tests/hoist_staleness_audit.rs` — a binary R3's count could
+> not have included — and the fixes for what it found added three more tests:
+> one in that file, one in `ply-corpus/tests/w6_report_allocations.rs`, and the
+> first doc-test `ply-eval` has ever had, a `compile_fail` example pinning
+> `Lowering<'a>`'s invariance. Re-taken the same way, on the same machine:
+> **3,597 passed, 0 failed, 4 ignored** in **399.6s** (6m 40s) and again at
+> **406.9s**, with `grep -c '^     Running'` → **138** and
+> `grep -c '^   Doc-tests'` → 13. Two runs on an idle machine, not a best-of-N.
+
+One caveat the old sentence implied away: the `ignored` set is not the
 whole of the timing-sensitive suite —
 `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock growth ratio and runs by default, and it failed for us on

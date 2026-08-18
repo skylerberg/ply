@@ -508,6 +508,9 @@ struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
+    /// One answer about this program's regions for every rung below, rather
+    /// than one per rung's machine.
+    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 impl Program {
@@ -542,11 +545,14 @@ impl Program {
             program,
             resolved,
             check,
+            region_kinds: ply_eval::region_kind::Kinds::default(),
         })
     }
 
     fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
+        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        machine
     }
 
     fn footprint(&self, name: &str) -> Option<Footprint> {

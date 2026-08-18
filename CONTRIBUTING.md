@@ -57,13 +57,23 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # ~5.5 min — 3,566 pass, 0 fail, 4 ignored
+cargo test --workspace                          # ~6.5 min — 3,597 pass, 0 fail, 4 ignored
 ```
 
-**All three are currently clean**, re-verified by the docs audit: `fmt --check`
-silent and exit 0, `clippy` zero warnings, `cargo test --workspace` 3,566 passed
-/ 0 failed / 4 ignored across 147 targets in 324.5s. If you introduce the first
-warning, that is a regression, not a baseline.
+**All three are currently clean**, re-verified after the regression audit that
+followed R3 (2026-08-17): `fmt --check` silent and exit 0, `clippy --workspace
+--all-targets` zero warnings, `cargo test --workspace` 3,597 passed / 0 failed /
+4 ignored across 151 targets in 399.6s, and again at 406.9s. If you introduce the
+first warning, that is a regression, not a baseline.
+
+> **The counts moved twice and the reason is in the tree both times, not in the
+> suite.** They read 3,566 / 147 / 324.5s, then 3,584 / 150 / 352.4s. R3 added
+> three test binaries and nine tests inside existing ones; the audit after it
+> added `ply-eval/tests/hoist_staleness_audit.rs`, and the fixes for what it
+> found added three more tests — including the first doc-test `ply-eval` has
+> ever had, a `compile_fail` example that is the only way to assert a variance.
+> `README.md`'s Status paragraph and `docs/ONBOARDING.md` §2 carry the same
+> re-take and the list of files.
 
 ### There is no CI
 
@@ -81,7 +91,7 @@ short version:
 | --- | --- |
 | postgres, the pool, transaction scope | `PLY_PG_URL=postgres://localhost/postgres cargo test -p ply-host` (36–38s, 281 pass, 0 fail) — otherwise ten tests pass in 0.00s without running, and cargo captures the skip notice so nothing tells you: `skipped:` occurs zero times in a whole `cargo test --workspace` log |
 | shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix |
-| the served request path or its cost | `./target/release/ply-corpus w6 benches/*.json`, and see §"Things known to be broken" |
+| the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
 | `examples/desk.ply` or any host handler | `./examples/same-tests.sh` — build `--release` first, it does not build for you |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
@@ -97,14 +107,20 @@ Re-run on a quiet one before you believe it.
 3. If you changed a *guarantee*, you found and updated the document that states
    it. `grep -rn` the guarantee's words across `README.md`, `DESIGN.md`,
    `ROADMAP.md`, `CONTRACTS.md` and `docs/adr/`. Roughly 24,500 lines of prose
-   and no test reads any of it — you are the only check. (Re-take the figure
-   rather than quoting it; `docs/ONBOARDING.md` §7 gives the command.)
+   and **one sentence** of it is read by a test — `README.md`'s request-path
+   allocation count, by
+   `w6_report_allocations::the_readme_still_describes_this_request_path`, added
+   after that sentence went stale twice. For the other 24,500 lines you are the
+   only check. (Re-take the figure rather than quoting it;
+   `docs/ONBOARDING.md` §7 gives the command.)
 4. If you changed something the shipped measurement files describe, re-take
    them. The command is in `docs/adr/0016-w6-performance.md` §"Provenance"; the
-   two tests that will fail otherwise are
-   `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`
-   and
-   `w6_report_allocations::the_shipped_allocation_evidence_still_describes_this_request_path`.
+   three tests that will fail otherwise are
+   `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`,
+   `w6_report_allocations::the_shipped_allocation_evidence_still_describes_this_request_path`
+   and — if you moved what a request allocates at all —
+   `w6_report_allocations::the_readme_still_describes_this_request_path`, whose
+   band is 1% rather than a factor of two.
 5. If you deleted or renamed a public type, `grep` `CONTRACTS.md` for it. It is
    a construction document written ahead of the code and it goes stale silently;
    `World` occurs in it **37 times on 33 lines**, and the `ply_eval` type of that
@@ -143,6 +159,54 @@ throughout and it is the most trustworthy section in the repository.
 Never quote a figure from another document. Re-take it or cite the file that
 holds it (`benches/w6-ladder.json`, `benches/w6-spike.json`) and the command
 that renders it.
+
+### Measure an ADR's motivating claim before accepting the ADR
+
+If an ADR is motivated by a performance argument, that argument needs a
+measurement **before** the ADR is accepted — not after the milestone ships.
+
+ADR 0017 is the worked example, and it is the most expensive instance in the
+repository. It opened by asserting that the persistent forkable world and the
+zero-cost path were "mutually exclusive", reasoning that Perceus-style in-place
+update fires only on uniquely-owned values and that forking keeps reference
+counts high. It concluded that removing the world was therefore *forced*.
+
+Every sentence of that was reasoned. None of it was measured. R1 and R2 removed
+the world across two milestones, and allocations per `/health` went **up**, from
+1,035 to 1,122. A later attribution run (`cargo test -p ply-corpus --release
+--test w6_alloc_sites -- --nocapture`) showed why: the allocations were never in
+the world. They were in `frame::dispatch` (24%), in `code::lower_*` running on
+the request path (~24%), and — after R2 — in `region_kind::infer` running at
+runtime (~12%). One profiling run before the ADR would have caught it.
+
+**R3 finished the example, and the ending is the part worth learning from.** It
+hoisted both compile-time analyses off the request path and they are now at
+**0.0 allocations per request** apiece, measurable by the command above. The
+figure came back to **1,082** — and 1,082 is still above 1,035, so a milestone
+run to a decision rule fixed in advance handed back the answer *the design does
+not look justified on this route*. `ROADMAP.md` §R3 records it.
+
+Two lessons, and the second is the expensive one:
+
+- The rule existed before the number, which is the only reason the answer could
+  be reported instead of argued with. `ply_corpus::w6::Criteria::default()` is
+  the same idea in code.
+- **One of the two things R3 was scoped to remove may never have been on the
+  request path at all.** The `~24%` for `code::lower_*` above was read off a
+  20-request window, and one-time work divided by twenty looks exactly like that;
+  the same family reads 33.8% of a 20-request window today while costing nothing
+  per request. If you take an attribution, take it at two windows and fit a
+  slope — `w6_alloc_sites.rs` does, and its header says why. A ranking is not a
+  cost.
+
+Note what *was* measured. R1 measured the isolation cost, the one number that
+could argue against the design, and it came back zero before six agents built on
+it. That was the right instinct pointed at the wrong claim: the isolation cost
+was a tiebreaker, and the premise was load-bearing for the entire milestone.
+
+So: **the claim that motivates the work is the one to measure first**, not the
+claim most likely to object to it. If you cannot measure the premise, say in the
+ADR that it is unmeasured and what would test it, and do not write "forced".
 
 ### Do not state a guarantee you have not armed
 
@@ -218,7 +282,8 @@ An ADR here is expected to state the criteria *before* the measurement, in code
 where possible. `ply_corpus::w6::Criteria::default()` is the model: eight
 thresholds that a measurement file cannot supply, so a number cannot set the bar
 it is about to clear. That is why the M9 deferral is re-derivable
-(`ply-corpus w6 benches/*.json`) rather than re-arguable.
+(`ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`) rather than
+re-arguable. Name the files; see the warning in the gate table above.
 
 ## Where a change is likely to bite
 
@@ -269,6 +334,17 @@ Recorded here so nobody spends an afternoon rediscovering them.
    member crates inherit it with `license.workspace = true` rather than each
    carrying the SPDX expression, and `crates/ply-codegen-spike/Cargo.toml`
    declares no license at all.
+8. **`w6-alloc`'s `bytes_per_request` grows with the window and nobody knows
+   why.** `./target/release/w6-alloc --repo . --requests N` reports 127,954
+   bytes at N=200, 177,236 at 400 and 277,417 at 800 — total bytes growing
+   faster than the request count — while `allocations_per_request` falls with N
+   exactly as a per-request slope plus a per-`Machine` intercept must. Something
+   on that path is superlinear in the number of connections in one script.
+   Consequence: the **allocation count** is the sound half of that output and the
+   **byte count** may only be compared at the window a baseline was taken at,
+   which for every published figure is 200. Found by R3 while re-taking the
+   figure; not diagnosed, and `docs/adr/0017-regions.md` §"What must be measured"
+   ¶1 says so in place.
 
 Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects

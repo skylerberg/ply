@@ -452,6 +452,10 @@ fn evaluate(
     let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
     interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+    // One analysis for the program rather than one per engine: under `both` the
+    // two would otherwise each run the whole-program region-kind pass, and the
+    // answer is a property of the program neither of them owns.
+    machine.share_region_kinds(interp.shared_region_kinds());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

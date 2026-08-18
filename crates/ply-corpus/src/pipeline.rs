@@ -98,6 +98,16 @@ pub struct Front {
     pub check: CheckOutput,
     pub hashes: HashOutput,
     pub timings: Timings,
+    /// This program's region kinds. A property of the program, so it is held
+    /// beside the program and handed to the engines below rather than inferred
+    /// once per engine — and a search builds one engine per interleaving.
+    region_kinds: ply_eval::region_kind::Kinds,
+}
+
+impl Front {
+    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
+        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
+    }
 }
 
 pub fn front(root: &Path) -> Result<Front> {
@@ -153,6 +163,7 @@ pub fn front(root: &Path) -> Result<Front> {
         check,
         hashes,
         timings,
+        region_kinds: ply_eval::region_kind::Kinds::default(),
     })
 }
 

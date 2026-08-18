@@ -16,6 +16,19 @@
 //!
 //! A `#[global_allocator]` is a whole-binary decision, which is why this is its
 //! own test binary rather than an assertion inside `w6_report_integrity.rs`.
+//!
+//! # The second test reads `README.md`, and it is the only test in the tree that
+//! reads a prose document
+//!
+//! It exists because that figure went stale twice in one milestone and the
+//! second time it went stale **inside the correction block written for the first
+//! time**. `README.md` §"Where this is not competitive" is what
+//! `CONTRIBUTING.md` §"Say how it was checked, or say it was not" holds up as
+//! the model for honest reporting, and it carried a present-tense count of
+//! 1,035 after the tree made 1,122, then a present-tense 1,122 after R3 took the
+//! tree to 1,082. Both were found by an adversarial reader rather than by
+//! anything that runs. `docs/ONBOARDING.md` §7's checked/written boundary moves
+//! by exactly this one line.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -73,6 +86,26 @@ fn number_before(text: &str, after: &str) -> Option<f64> {
     digits.replace(',', "").trim().parse().ok()
 }
 
+/// What one `/health` request allocates, in a 200-request window.
+///
+/// 200 because that is the window every published figure was taken at, and the
+/// byte count may only be read at the window its baseline was taken at:
+/// `bytes_per_request` *rises* with the window, undiagnosed —
+/// `CONTRIBUTING.md` §"Things known to be broken" item 8.
+fn per_request() -> (f64, f64) {
+    let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
+    let request = ply_corpus::w6_run::head();
+    // One warm pass, so lazily-built machine state is not charged to the count.
+    loaded
+        .over_sim(vec![vec![request.clone()]])
+        .expect("the service serves one connection");
+
+    const N: usize = 200;
+    let script: Vec<Vec<Vec<u8>>> = (0..N).map(|_| vec![request.clone()]).collect();
+    let (_, allocs, bytes) = counted(|| loaded.over_sim(script).expect("the service serves"));
+    (allocs as f64 / N as f64, bytes as f64 / N as f64)
+}
+
 /// What the shipped report says a request allocates, against what one does.
 ///
 /// The band is a factor of two either way. Allocation counts do move with a
@@ -94,18 +127,8 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     let claimed_mb =
         number_before(&alternative.what, " MB").expect("the lever states a byte count");
 
-    let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
-    let request = ply_corpus::w6_run::head();
-    // One warm pass, so lazily-built machine state is not charged to the count.
-    loaded
-        .over_sim(vec![vec![request.clone()]])
-        .expect("the service serves one connection");
-
-    const N: usize = 200;
-    let script: Vec<Vec<Vec<u8>>> = (0..N).map(|_| vec![request.clone()]).collect();
-    let (_, allocs, bytes) = counted(|| loaded.over_sim(script).expect("the service serves"));
-    let per_request = allocs as f64 / N as f64;
-    let mb_per_request = bytes as f64 / N as f64 / 1e6;
+    let (per_request, bytes) = per_request();
+    let mb_per_request = bytes / 1e6;
 
     println!(
         "the report says {claimed_allocs:.0} allocations and {claimed_mb:.2} MB per /health \
@@ -123,4 +146,54 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
          --postgres <version> --out benches/w6-ladder.json`, which runs `w6-alloc` for this \
          number itself."
     );
+}
+
+/// What `README.md` says a request allocates, against what one does.
+///
+/// The band is **1%**, not the factor of two above, and the difference is
+/// deliberate: `benches/w6-ladder.json` is a dated artifact and its figure is
+/// past tense, while this sentence is present tense about this tree. A refactor
+/// that moves the count by one allocation moves what the README says, and the
+/// only thing that has ever caught that here is a reader.
+///
+/// Re-take it with `./target/release/w6-alloc --repo . --requests 200` and
+/// correct the sentence in place, keeping the withdrawn figure beside the new
+/// one — `CONTRIBUTING.md` §"Correct, do not delete".
+#[test]
+fn the_readme_still_describes_this_request_path() {
+    let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");
+    let marker = "One `/health` request makes";
+    let at = text.find(marker).unwrap_or_else(|| {
+        panic!(
+            "`README.md` no longer contains \"{marker}\", so the sentence this guards was moved \
+             or reworded. Point this test at wherever the request-path allocation count now \
+             lives, or delete it and say in `docs/ONBOARDING.md` §7 that no test reads a prose \
+             document again."
+        )
+    });
+    let claimed_allocs = number_before(&text[at..], " allocations")
+        .expect("the sentence states an allocation count before the word `allocations`");
+    let claimed_bytes = number_before(&text[at..], " bytes")
+        .expect("the sentence states a byte count before the word `bytes`");
+
+    let (allocs, bytes) = per_request();
+    println!(
+        "`README.md` says {claimed_allocs:.0} allocations and {claimed_bytes:.0} bytes per \
+         /health request; this tree makes {allocs:.2} and {bytes:.2}"
+    );
+
+    for (what, claimed, measured) in [
+        ("allocations", claimed_allocs, allocs),
+        ("bytes", claimed_bytes, bytes),
+    ] {
+        let drift = (claimed - measured).abs() / measured;
+        assert!(
+            drift <= 0.01,
+            "`README.md:363` says one /health request makes {claimed:.0} {what} and this tree \
+             makes {measured:.2} — {:.1}% apart. That sentence is present tense about this tree \
+             and it has gone stale twice, the second time inside the block correcting the first. \
+             Re-take it: `./target/release/w6-alloc --repo . --requests 200`.",
+            drift * 100.0
+        );
+    }
 }
