@@ -44,7 +44,7 @@ mod value;
 // somewhere in this crate.
 pub use arena::{Arena, RegionKind};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
-pub use code::{Code, Node, NodeKind, lower};
+pub use code::{Code, Lowering, Node, NodeKind, lower};
 pub use cont::{
     Continuation, Delimiter, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };

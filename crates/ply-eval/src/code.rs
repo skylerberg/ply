@@ -6,9 +6,9 @@
 //! which would spread through `Env` and every crate that holds an
 //! evaluated value; and neither can be an owned `Expr`, because a frame is
 //! pushed per node and cloning a subtree per push is quadratic. `Rc` on every
-//! node is the representation that is cheap in both directions: `lower` runs
-//! once per machine, and after it every handle to a subexpression is one
-//! pointer.
+//! node is the representation that is cheap in both directions: [`Lowering`]
+//! runs `lower` once per body per *program*, and after it every handle to a
+//! subexpression is one pointer.
 //!
 //! The shape mirrors `ply_syntax::ast::ExprKind` one to one. Anything the
 //! machine never has to suspend inside — patterns, names, literals, operators —
@@ -22,10 +22,14 @@
 use crate::rc::{Dead, Live, Own};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
-    BinOp, Expr, ExprKind, HandleClause, Ident, Lit, MatchArm, Pattern, PatternKind, QName,
-    ReturnClause, Stmt as AstStmt, UnOp,
+    BinOp, Expr, ExprKind, HandleClause, Ident, Lit, MatchArm, Pattern, PatternKind, Program,
+    QName, ReturnClause, Stmt as AstStmt, UnOp,
 };
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub type Code = Rc<Node>;
 
@@ -183,6 +187,150 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     let mut live = Live::new(ownable);
     live.declare(params.len());
     lower_in(e, &mut live)
+}
+
+/// A body's parameters, shared with the closure the machine builds from it
+/// rather than copied into the cache — the cache's own storage is a cost on a
+/// request path that lowers nothing, so it is kept to the map's slots.
+pub type Params = Rc<Vec<Symbol>>;
+
+/// Lowered bodies, shared by every machine built from one program.
+///
+/// A body is lowered once per *machine* without this, and a machine is built
+/// per pool thread per concurrency group, per interleaving of a search, and per
+/// sampled case of a spec — so the same traversal runs hundreds of times over
+/// one program. Lowering depends on the syntax and on nothing else a machine
+/// holds, so one result serves all of them.
+///
+/// The key is the body's address, and what makes an address an identity is the
+/// lifetime rather than the map: everything keyed here is borrowed for `'a` and
+/// this cache cannot outlive `'a`, so nothing it has keyed can be freed and
+/// something else allocated in its place while it is still readable. That is
+/// the reuse a bare pointer key would otherwise admit.
+///
+/// **That argument holds only because `invariant` below makes `Lowering<'a>`
+/// invariant in `'a`, and it is false without it.** With the type covariant —
+/// which it was until a regression audit, its only `'a`-carrying field being
+/// `&'a Program` — `&Lowering<'long>` coerces to `&Lowering<'short>`, and
+/// [`Lowering::of`] takes `&self`, so a shared reference to a long-lived cache
+/// accepts a body borrowed for any shorter lifetime at all. Keying a `Box<Expr>`
+/// through that coercion and dropping it leaves an entry under a dangling
+/// address, and the next allocation to land there is answered with the freed
+/// expression's code. Reproduced on the first attempt of a thousand before the
+/// field was added. The refusal is machine-checked by the `compile_fail` example
+/// below, which runs under `cargo test --workspace` as a doc-test — a variance
+/// property is a compile-time property and a `#[test]` cannot observe it.
+///
+/// ```compile_fail
+/// use ply_eval::Lowering;
+/// // Covariance in `'a` is what would let a body outlived by the cache be keyed
+/// // in it, so this coercion must not compile.
+/// fn shrink<'long: 'short, 'short>(c: &'short Lowering<'long>) -> &'short Lowering<'short> {
+///     c
+/// }
+/// ```
+///
+/// [`Lowering::describes`] is the second guard and it is about intent rather
+/// than safety: a cache filled from one program tells a machine over another
+/// nothing — two live programs have distinct addresses, so every lookup would
+/// miss — and refusing it at the point it is handed over says so once instead of
+/// leaving a reader to re-derive it. `params` is stored and compared on a hit
+/// rather than assumed, so a caller that lowers one body under two parameter
+/// lists gets two answers instead of the first one twice.
+pub struct Lowering<'a> {
+    program: &'a Program,
+    bodies: RefCell<FxHashMap<usize, (Params, Code)>>,
+    /// The parameter list of a test body and of a spec clause, so that the
+    /// overwhelmingly common empty one is one allocation for the cache rather
+    /// than one per entry.
+    nullary: Params,
+    /// Load-bearing, not decoration: a function pointer is contravariant in its
+    /// argument and covariant in its result, so `'a` occurring in both makes
+    /// this field — and therefore the whole type — invariant in `'a`. See the
+    /// type's own note for what that buys. `PhantomData<&'a mut Program>` does
+    /// **not** work here and was the first attempt: `&'a mut T` is invariant in
+    /// `T` but still covariant in `'a`.
+    invariant: PhantomData<fn(&'a Program) -> &'a Program>,
+}
+
+impl<'a> Lowering<'a> {
+    pub fn for_program(program: &'a Program) -> Lowering<'a> {
+        Lowering {
+            program,
+            bodies: RefCell::new(FxHashMap::default()),
+            nullary: Rc::new(Vec::new()),
+            invariant: PhantomData,
+        }
+    }
+
+    /// Whether this cache was taken over `program`. See the type's own note for
+    /// why this is intent rather than safety.
+    pub fn describes(&self, program: &Program) -> bool {
+        std::ptr::eq(self.program, program)
+    }
+
+    /// [`lower_fn`] over a body that takes no parameters: a test, a law, a spec
+    /// clause.
+    pub fn body(&self, body: &'a Expr) -> Code {
+        self.of(&self.nullary, body)
+    }
+
+    /// [`lower_fn`], skipped when this body has been lowered before.
+    pub fn of(&self, params: &Params, body: &'a Expr) -> Code {
+        let key = std::ptr::from_ref(body) as usize;
+        let hit = self
+            .bodies
+            .borrow()
+            .get(&key)
+            .filter(|(cached, _)| cached == params)
+            .map(|(_, code)| Rc::clone(code));
+        if let Some(code) = hit {
+            return code;
+        }
+        let code = lower_fn(params, body);
+        self.bodies
+            .borrow_mut()
+            .insert(key, (Rc::clone(params), Rc::clone(&code)));
+        code
+    }
+
+    /// How many bodies this has lowered.
+    pub fn len(&self) -> usize {
+        self.bodies.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The lowered body of the last closure the tree-walker made that the machine
+/// applied.
+///
+/// Such a body is a deep clone rather than a node of the program, so [`Lowering`]
+/// cannot hold it: its address is an identity only for as long as something owns
+/// it, which is why the `Arc` is kept beside the code. One slot rather than a
+/// map, because the shape this exists for is a closure applied in a loop and a
+/// map keyed on a value the program can mint would grow without a bound.
+#[derive(Default)]
+pub struct ClosureCode {
+    last: Option<(Arc<Expr>, Vec<Symbol>, Code)>,
+}
+
+impl ClosureCode {
+    /// [`lower_fn`], skipped when this is the same body and the same parameters
+    /// as the previous call.
+    pub fn of(&mut self, params: &[Symbol], body: &Arc<Expr>) -> Code {
+        if let Some((held, cached, code)) = &self.last
+            && Arc::ptr_eq(held, body)
+            && cached.as_slice() == params
+        {
+            return Rc::clone(code);
+        }
+        let code = lower_fn(params, body);
+        self.last = Some((Arc::clone(body), params.to_vec(), Rc::clone(&code)));
+        code
+    }
 }
 
 fn lower_in(e: &Expr, live: &mut Live) -> Code {
@@ -656,7 +804,10 @@ fn barrier_binders(e: &Expr, out: &mut Vec<Symbol>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{at, bin, block, callv, discard, int, lam, record, spanned, var};
+    use crate::build::{
+        at, bin, block, callv, discard, fn_def, int, lam, record, spanned, standalone, var,
+    };
+    use ply_syntax::ast::Item;
 
     #[test]
     fn lowering_preserves_spans() {
@@ -693,5 +844,78 @@ mod tests {
         };
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["b", "a"]);
+    }
+
+    fn body_of<'a>(program: &'a ply_syntax::ast::Program, name: &str) -> &'a Expr {
+        program.modules[0]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(f) if f.name.name.as_str() == name => Some(&f.body),
+                _ => None,
+            })
+            .expect("the program declares it")
+    }
+
+    #[test]
+    fn a_body_lowered_twice_is_lowered_once() {
+        let (program, _) = standalone(vec![fn_def("f", &["x"], bin(BinOp::Add, var("x"), int(1)))]);
+        let lowering = Lowering::for_program(&program);
+        let params: Params = Rc::new(vec![Symbol::new("x")]);
+        let first = lowering.of(&params, body_of(&program, "f"));
+        let second = lowering.of(&params, body_of(&program, "f"));
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the same body lowered twice produced two different trees"
+        );
+        assert_eq!(lowering.len(), 1, "one body, {} entries", lowering.len());
+    }
+
+    /// The parameter list is what makes a name ownable inside the body, so a
+    /// cache that answered for one from the other would hand out a liveness
+    /// analysis of a different function.
+    #[test]
+    fn one_body_under_two_parameter_lists_is_lowered_twice() {
+        let (program, _) = standalone(vec![fn_def("f", &["x"], var("x"))]);
+        let lowering = Lowering::for_program(&program);
+        let body = body_of(&program, "f");
+        let owned = lowering.of(&Rc::new(vec![Symbol::new("x")]), body);
+        let borrowed = lowering.body(body);
+        assert!(matches!(owned.own, Own::Owned));
+        assert!(
+            matches!(borrowed.own, Own::Borrowed),
+            "a body lowered under no parameters was answered from the entry that had one"
+        );
+    }
+
+    #[test]
+    fn a_cache_taken_over_another_program_does_not_describe_this_one() {
+        let (one, _) = standalone(vec![fn_def("f", &[], int(1))]);
+        let (two, _) = standalone(vec![fn_def("f", &[], int(2))]);
+        let lowering = Lowering::for_program(&one);
+        assert!(lowering.describes(&one));
+        assert!(
+            !lowering.describes(&two),
+            "a cache over one program claimed to describe another, so a bisection's \
+             rebuilt body could be answered from the body it replaced"
+        );
+    }
+
+    #[test]
+    fn the_last_closure_body_is_lowered_once_however_often_it_is_applied() {
+        let body = Arc::new(bin(BinOp::Add, var("x"), int(1)));
+        let params = [Symbol::new("x")];
+        let mut cache = ClosureCode::default();
+        let first = cache.of(&params, &body);
+        let second = cache.of(&params, &body);
+        assert!(Rc::ptr_eq(&first, &second));
+
+        let other = Arc::new(bin(BinOp::Sub, var("x"), int(1)));
+        let third = cache.of(&params, &other);
+        assert!(
+            !Rc::ptr_eq(&first, &third),
+            "a different body was answered from the previous one's entry"
+        );
+        assert!(Rc::ptr_eq(&third, &cache.of(&params, &other)));
     }
 }

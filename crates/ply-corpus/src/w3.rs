@@ -377,6 +377,11 @@ pub struct Loaded {
     pub program: ply_syntax::ast::Program,
     pub resolved: ply_syntax::resolve::Resolved,
     pub check: CheckOutput,
+    /// This program's region kinds, shared by every machine below rather than
+    /// inferred once per machine. The analysis is a property of the program,
+    /// and a harness that builds a machine inside the window it measures
+    /// charges a whole-program traversal to that window otherwise.
+    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 impl Loaded {
@@ -408,11 +413,26 @@ impl Loaded {
             program,
             resolved,
             check,
+            region_kinds: ply_eval::region_kind::Kinds::default(),
         })
     }
 
     pub fn full(&self, simple: &str) -> Result<String> {
         self.full_in("desk", simple)
+    }
+
+    /// This program's one answer about its regions, for an engine built
+    /// outside this module.
+    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
+        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
+    }
+
+    /// A machine over this program, holding this program's region kinds rather
+    /// than inferring its own.
+    pub fn machine(&self) -> Machine<'_> {
+        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        machine
     }
 
     /// `Machine::call` takes the program-wide name, and two modules may declare
@@ -430,7 +450,7 @@ impl Loaded {
 
     /// One pure call, timed.
     pub fn pure_call(&self, name: &str, args: Vec<Value>, calls: u32) -> Result<(Duration, Value)> {
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         let mut last = Value::Unit;
         let started = Instant::now();
         for _ in 0..calls {
@@ -452,7 +472,7 @@ impl Loaded {
             .bind(&self.check)
             .map_err(|d| diagnostics("binding the simulated network", &d))?;
         let name = self.full("run_memory")?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         machine.set_host_binding(Arc::new(binding));
         if let Some(declared) = self.footprint("run_memory") {
             machine.set_declared_footprint(declared);
@@ -484,7 +504,7 @@ impl Loaded {
             .bind(&self.check)
             .map_err(|d| diagnostics("binding the simulated network", &d))?;
         let name = self.full("run_memory")?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         machine.set_host_binding(Arc::new(binding));
         if let Some(declared) = self.footprint("run_memory") {
             machine.set_declared_footprint(declared);

@@ -1140,6 +1140,9 @@ fn evaluate(
     let mut interp = Interp::new(&opened.program, &opened.resolved, &opened.check);
     interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+    // See `commands::run::evaluate`: the region kinds belong to the program, so
+    // the two engines share one analysis instead of running it twice.
+    machine.share_region_kinds(interp.shared_region_kinds());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

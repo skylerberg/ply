@@ -791,3 +791,90 @@ fn the_split_over_the_repositorys_own_examples() {
         "the examples open no region, so the census measured nothing"
     );
 }
+
+// ------------------------------------ the key this analysis may be cached under
+
+/// The module that decides nothing about itself: byte-identical in both
+/// programs below, naming nothing outside itself.
+const UNCHANGED: &str = r#"
+fn go(f: (Int) -> Int) -> Int =
+  with_cell[acc](0) { c -> { cell_set(c, f(1)); cell_get(c) } }
+"#;
+
+/// A second module the first neither names nor reaches.
+const ELSEWHERE: &str = r#"
+effect amb { read flip[coin]() -> Bool }
+
+fn search() -> Int =
+  handle { if amb.flip[coin]() { 1 } else { 2 } } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  }
+"#;
+
+#[track_caller]
+fn regions_over(modules: &[(&str, &str)]) -> Regions {
+    let mut map = SourceMap::new();
+    let ids: Vec<SourceId> = modules
+        .iter()
+        .map(|(name, src)| map.add(format!("{name}.ply"), src.to_string()))
+        .collect();
+    let inputs: Vec<_> = ids
+        .iter()
+        .zip(modules)
+        .map(|(&id, (name, src))| (id, ModuleName::from_dotted(name), *src))
+        .collect();
+    let program = match parse_program(inputs) {
+        Ok(p) => p,
+        Err(ds) => panic!("the probe must parse: {ds:#?}"),
+    };
+    let resolved = resolve(&program).expect("the probe must resolve");
+    infer(&program, &resolved)
+}
+
+/// **A region's kind may not be cached under its own definition's hash.**
+///
+/// `acc` holds a call to `f`, which is a parameter — so the callee is whatever
+/// the caller passed and could be any closure in the program. Whether that
+/// costs anything is decided by whether the *program* writes a capture
+/// anywhere: with none there is nothing for an unknown callee to reach
+/// (`Analysis::promote_indirect`), and with one there is.
+///
+/// So `elsewhere`, which `unchanged` neither imports nor names nor transitively
+/// reaches, flips `acc` from `unique` to `shared`. `unchanged`'s source is the
+/// same `&str` in both runs, and `ply-hash` erases names and hashes referents
+/// (`crates/ply-hash/src/normalize.rs:1-11`), so nothing in `unchanged`'s
+/// hashed closure moved either. A cache keyed by that hash would answer
+/// `unique` for the second program and free an arena a continuation can still
+/// reach — which is a use-after-free, not a lost optimization. The sound key is
+/// the whole `(Program, Resolved)` pair, and `ply_eval::region_kind::Kinds` is
+/// keyed by construction, one per loaded program.
+#[test]
+fn a_capture_in_an_unrelated_module_makes_a_region_shared() {
+    let alone = regions_over(&[("unchanged", UNCHANGED)]);
+    assert_eq!(
+        region(&alone, "acc").kind,
+        RegionKind::Unique,
+        "with no capture written anywhere, an unknown callee reaches none"
+    );
+
+    let together = regions_over(&[("unchanged", UNCHANGED), ("elsewhere", ELSEWHERE)]);
+    assert_eq!(
+        region(&together, "acc").kind,
+        RegionKind::Shared,
+        "`unchanged` is byte-identical and names nothing in `elsewhere`, yet its region's kind is \
+         a function of `elsewhere` — so this decision cannot be filed under `go`'s hash"
+    );
+    assert!(
+        matches!(
+            &region(&together, "acc")
+                .capture
+                .as_ref()
+                .expect("a shared region names its site")
+                .cause,
+            Cause::Indirect
+        ),
+        "{:?}",
+        region(&together, "acc").capture
+    );
+}

@@ -59,11 +59,17 @@ fixing representation first.
 >   inherits — is **1,035 allocations and 0.124 MB**, which is what
 >   `benches/w6-ladder.json` publishes and what `w6_report_allocations.rs`
 >   guards. (A first pass of this correction called 1,035 "the shipped figure".
->   It is not, and this document says so 375 lines below: the shipped figure
->   after the arena and the lexical close is **1,122 / 131,677**, re-taken by a
+>   It is not, and this document says so 375 lines below: the figure after the
+>   arena and the lexical close was **1,122 / 131,677**, re-taken by a
 >   later audit as `{"allocations_per_request":1122.335,
->   "bytes_per_request":131677.4}`. §"What must be measured" ¶1 shows the whole
->   1,035 → 1,082 → 1,122 progression and why the +87 is one-time. Leaving
+>   "bytes_per_request":131677.4}`. **The shipped figure is now 1,082 / 127,955**
+>   — R3 hoisted the one-time analysis back off, and a regression audit re-took
+>   it on this tree as `./target/release/w6-alloc --repo . --requests 200` →
+>   `{"allocations_per_request":1081.87,"bytes_per_request":127954.65}`. Past
+>   tense above, because this bullet asserting 1,122 as *the shipped figure*
+>   after R3 had moved it was the same defect one level further down.
+>   §"What must be measured" ¶1 shows the whole
+>   1,035 → 1,082 → 1,122 → 1,082 progression and why the +87 was one-time. Leaving
 >   "shipped" attached to 1,035 reproduced, one level down, the exact defect the
 >   bullet was written to fix.) This ADR already said so 290 lines below,
 >   in "What must be measured" ¶1 — but it said it *there*, while the Context
@@ -81,6 +87,52 @@ only when a value is **uniquely owned**; a design that forks worlds keeps
 reference counts high by construction and the optimization never triggers. So
 the persistent forkable world and the zero-cost path are mutually exclusive, and
 choosing zero-cost chooses this.
+
+> **The paragraph above is the premise this ADR was accepted on, it was never
+> measured, and R3's attribution contradicts it. It is kept as written, because
+> deleting it would hide what the milestone was decided from.**
+>
+> What it claims is that the forkable world is what holds allocations up. R1 and
+> R2 removed the world, and allocations per `/health` went **up**. R3 then
+> hoisted the two compile-time analyses that were running at runtime, and the
+> figure came back down to where it was before the lexical close — still above
+> where it started. Every reading below is from this tree on 2026-08-18, release,
+> and each names the command that re-takes it.
+>
+> - `./target/release/w6-alloc --repo . --requests 200` →
+>   `{"allocations_per_request":1081.87,"bytes_per_request":127954.65,
+>   "requests":200,"response_bytes":107,"route":"/health"}`. The pre-region
+>   baseline is what `benches/w6-ladder.json` publishes in its `boxing on hot
+>   paths` alternative, and
+>   `cargo test -p ply-corpus --release --test w6_report_allocations --
+>   --nocapture` prints both sides against each other: *"the report says 1035
+>   allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128
+>   MB"*.
+> - So on the route the ADR sized itself against, the region track is **+4.5% in
+>   allocations and +3.2% in bytes** against the representation it replaced. Not
+>   the direction the premise predicts, and not within measurement noise: an
+>   allocation count is exact and does not move with a machine, which is the
+>   whole reason `w6_report_allocations.rs` exists.
+> - `cargo test -p ply-corpus --release --test w6_alloc_sites -- --nocapture`
+>   fits two windows over the same call and says where they are. The largest
+>   per-request site is
+>   `frame::dispatch < Machine::step < Machine::call` at **415.0 allocations a
+>   request, 45.5%** of the marginal cost. `ply_eval::region_kind` is **0.0 per
+>   request and 0 per `Machine`**; `ply_eval::code::lower` is **0.0 per request
+>   and 17,821 per `Machine`**. Neither analysis is on the request path at all
+>   any more, and removing them did not take `/health` below the pre-region
+>   figure.
+>
+> The premise was a chain of sound-sounding reasoning — unique ownership,
+> reference counts, forking — with no measurement under any link of it, and the
+> word this ADR used for its conclusion was *forced*. `CONTRIBUTING.md`
+> §"Measure an ADR's motivating claim before accepting the ADR" is written from
+> this document. What the region model is worth is real and is measured
+> elsewhere in this file: the arena against the persistent map it replaced (§"What
+> must be measured" ¶1), and the escape discipline, which is a safety property
+> and was never an allocation claim. What is **not** established, and what R3's
+> rule reopens, is that removing the forkable world bought the request path
+> anything. See §"What must be measured" ¶1 and `ROADMAP.md` §R3.
 
 ### Why this is available now and was not in M6
 
@@ -443,6 +495,58 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    and once for the close. `/health` opens no region per request and its 1,035
    are boxes.
 
+   **R3 took the last sentence above at its word, and the answer is 1,082.** The
+   paragraph before it named the fix — share one `Regions` across the machines
+   built from one program — and R3 made it, along with the same move for lowered
+   code. Re-taken on this tree on 2026-08-18, release, with the command this
+   section has used throughout:
+
+   ```
+   $ ./target/release/w6-alloc --repo . --requests 200
+   {"allocations_per_request":1081.87,"bytes_per_request":127954.65,
+    "requests":200,"response_bytes":107,"route":"/health"}
+   $ ./target/release/w6-alloc --repo . --requests 800
+   {"allocations_per_request":961.92375,"bytes_per_request":277417.2325, ...}
+   ```
+
+   The forty are gone: `w6_alloc_sites.rs`'s two-window fit now puts
+   `ply_eval::region_kind` at **0.0 allocations per request and 0 per
+   `Machine`**, and `ply_eval::code::lower` at **0.0 per request and 17,821 per
+   `Machine`** — so neither compile-time analysis is on the request path in
+   either sense. What is left is **911.5 allocations per request and 34,465 once
+   per `Machine`**, of which the single largest per-request site is
+   `frame::dispatch < Machine::step < Machine::call` at **415.0 a request,
+   45.5%**. `region_kind::decide` and `Symbol::new < region_kind::decide`, which
+   were ranked sites before R3, do not appear at all; the `Symbol::new` that
+   remains is `Symbol::new < Machine::build`, 1,011 per `Machine` and 0.0 per
+   request.
+
+   Two cautions on the numbers just above, because this document has been burned
+   by both.
+
+   - **A window share is not a request cost.** `code::lower` reads **33.8%** of
+     the 20-request window and **8.2%** of the 200-request one while contributing
+     **nothing** per request; the fit is what separates them, and
+     `w6_alloc_sites.rs`'s own header explains why the two windows disagree about
+     the ranking as well as the total. A pre-R3 attribution taken at one window
+     and read as request-path work is exactly the mistake this shape produces.
+   - **`bytes_per_request` is only comparable at the published 200-request
+     window, and that is an unexplained finding rather than a caveat.** It
+     *rises* with the window — 127,954 at 200, 177,236 at 400, 277,417 at 800 —
+     so total bytes grow faster than the request count while the allocation
+     *count* falls with the window exactly as a slope plus an intercept must.
+     Something on the `w6-alloc` path is superlinear in the number of
+     connections in one script; **this milestone did not diagnose which**, and
+     the honest consequence is that the byte figure may be read only at the
+     window the baseline was taken at, and that whoever next touches the
+     allocation harness should find out why. The comparison in this section is
+     safe because both sides are 200-request readings.
+
+   **Against the pre-region baseline the number is still up: 1,082 against 1,035
+   allocations, 0.128 MB against 0.124 MB.** The rule R3 was given before it
+   started reads on that comparison and not on the fit, because the baseline is a
+   200-request reading too. `ROADMAP.md` §R3 records which branch fired.
+
    The **dynamic** split is where the milestone is worth something, and it is not
    the static one. Over `examples/` and the `std` modules they import the static
    split is **113 regions, 0 `unique`, 113 `shared`**, every one of them because
@@ -535,6 +639,31 @@ The forkable world is removed. Codegen's ceiling should be re-measured after thi
 lands, because ADR 0016's 1.05× was a verdict on the old representation and this
 ADR changes exactly what made that ceiling low.
 
+> **Done, after R3, and the ceiling did not move.** The whole ladder was re-taken
+> on 2026-08-18 with the command `benches/README.md` §"Taking the ladder"
+> publishes, and it is shipped as **`benches/w6-ladder-r3.json`** so it can be
+> re-rendered rather than quoted:
+> `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`.
+> That prints the whole table, the verdict and the audit; the readings this
+> paragraph turns on are the interpreter share, **35% (34.3%–34.7% over its
+> repeats), a 1.53× ceiling**, and the verdict, **keep deferring M9**. The engine
+> substitution — the cheapest bound on dispatch cost there is — came back at
+> **2.82×** (treewalk 56.34µs against machine 158.92µs per request).
+>
+> The absolutes are all larger than ADR 0016 §8.1's, and the reason is the rig
+> rather than this change: the **Rust floor**, which has no Ply under it at all,
+> moved 15.68µs → **17.13µs**, so the box measures about 9% slow against the one
+> W6 used. The portable readings are the ratios, and they are flat: total over
+> floor 37.8× → **38.5×**, interpreter share 35.3% → **34.5%**. R3 did not move
+> what a request costs, and it was not expected to — it removed work that was
+> already amortized over a served process's lifetime. It removed it from the
+> *count*, which is exact, and the count is where it is visible.
+>
+> `benches/w6-ladder.json` is deliberately **not** overwritten: it is the only
+> record of the pre-region 1,035, which is the anchor of R3's decision rule and
+> of the two corrections in this document. `benches/README.md` says so beside
+> both files.
+
 Where this could go wrong, in order of how hard it would be to see:
 
 - **A resumption failing to observe a previous resumption's writes.** §3's
@@ -549,6 +678,28 @@ Where this could go wrong, in order of how hard it would be to see:
   `shared`. In particular a `handle` that lexically *encloses* a region does not
   make the operations it answers local to that region — it answers across the
   region's boundary, which is the definition of a capture crossing it.
+
+  > **This one happened, and it was found by a reader rather than by a test.**
+  > `region_kind::Analysis` carried no local scope: it resolved a bare name
+  > against `Resolved::scopes[module]`, the *module* scope, so a parameter, a
+  > `let` or a pattern binder shadowing a top-level definition's name was read as
+  > that definition. `fn go(helper: (Int) -> Int)` in a module also declaring
+  > `fn helper` recorded an edge to `helper` — which reaches no capture —
+  > instead of `Cause::Indirect`, and inferred `unique` over a callee that is
+  > whatever the caller passed. Measured as
+  > `Region { brand: "acc", kind: Unique, capture: None }` against an unshadowed
+  > control's `Shared` / `Cause::Indirect`. It was latent rather than live only
+  > because `Arena::close_at` never reads the kind, but `region_kind::check` did
+  > accept a hand-written `unique` this section requires it to refuse. Closed by
+  > `region_kind::Analysis::locals`; the answer is pinned for a parameter, a
+  > `let`, a `match` binder, a lambda parameter and a callback argument by
+  > `crates/ply-eval/tests/hoist_staleness_audit.rs`'s
+  > `a_local_shadowing_a_definitions_name_is_still_a_local` and
+  > `a_declared_unique_over_a_local_shadowing_a_definition_is_refused`. The
+  > census the module comment publishes did not move —
+  > `cargo test -p ply-eval --test region_kind_inference --
+  > the_split_over_the_repositorys_own_examples --nocapture` still prints
+  > `113 regions, 0 unique, 113 shared`.
 
 ## Not in this ADR
 

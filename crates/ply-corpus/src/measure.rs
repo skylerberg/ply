@@ -151,10 +151,14 @@ fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePas
     fn build<'a>(front: &'a Front, engine: Engine) -> Box<dyn Evaluator + 'a> {
         match engine {
             Engine::Treewalk => {
-                Box::new(Interp::new(&front.program, &front.resolved, &front.check))
+                let mut interp = Interp::new(&front.program, &front.resolved, &front.check);
+                interp.share_region_kinds(front.shared_region_kinds());
+                Box::new(interp)
             }
             Engine::Machine => {
-                Box::new(Machine::new(&front.program, &front.resolved, &front.check))
+                let mut machine = Machine::new(&front.program, &front.resolved, &front.check);
+                machine.share_region_kinds(front.shared_region_kinds());
+                Box::new(machine)
             }
         }
     }

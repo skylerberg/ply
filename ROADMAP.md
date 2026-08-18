@@ -25,11 +25,15 @@ M0–M4 are the vertical slice: the smallest system that proves the thesis end t
 end. M5+ are the milestones the slice's architecture is shaped to accept without
 a rewrite.
 
-**Status: M0–M8, W1–W6, and R1–R2 are complete.** The web track closed at W6 with
+**Status: M0–M8, W1–W6, and R1–R3 are complete.** The web track closed at W6 with
 a measured decision rather than a build. The region track that followed it landed
-in two halves — R1 built the machinery, R2 connected it — and it removed the
-forkable world M6 shipped; see the region track below, and read M6's entry with
-that correction in hand.
+in three parts — R1 built the machinery, R2 connected it, R3 took the
+compile-time work back off the request path — and it removed the forkable world
+M6 shipped; see the region track below, and read M6's entry with that correction
+in hand. **R3 ended on a decision rule fixed before it started, and the rule went
+against the design**: allocations per `/health` are still above the pre-region
+baseline, so whether the regions trade was worth making is open rather than
+settled. §R3 is where that is recorded and it is not a formality.
 
 **M9 is the one milestone deferred on a measurement.** W6 deferred it against
 criteria fixed in code before any number existed, and the deferral carries the
@@ -773,7 +777,7 @@ showed the form the implementation rejects.
 
 ---
 
-# Region track — complete, R1 and R2
+# Region track — complete, R1 through R3
 
 W6 said codegen's ceiling is low because the *representation* is expensive, not
 because compilation fails: every value is heap-allocated and every handler
@@ -789,10 +793,21 @@ the forkable world over branding the region **because branding looked heavy in
 the type system**; building regions for memory means building that branding
 anyway, so the objection that decided M6 stopped applying and the world went.
 
+> **Audit note (R3, 2026-08-18): the paragraph above states the premise as fact
+> and it was never measured.** It is left standing because it is what the track
+> was decided from, and because ADR 0017's Context now carries the same
+> correction beside the same sentence. Three milestones of measurement did not
+> support it: R1 and R2 removed the world and allocations per `/health` went
+> **up**; R3 removed the compile-time work that had landed on the request path
+> and they came back down to **1,082**, against a pre-region **1,035**. What
+> the region model demonstrably bought is safety (the escape discipline) and the
+> arena against the persistent map it replaced. What it has never been shown to
+> buy is the request path. §R3 below.
+
 `docs/adr/0017-regions.md`, which supersedes ADR 0005 §2 and amends ADR 0008 §6.
 
-**It landed in two halves, and the split is the instructive part.** Describing
-regions as one milestone would hide the defect the shape produced, so both halves
+**It landed in three parts, and the split is the instructive part.** Describing
+regions as one milestone would hide the defect the shape produced, so all three
 are below.
 
 ## R1 — the machinery
@@ -869,7 +884,7 @@ R2 put R1's machinery on the evaluation path and deleted what it replaced:
 
 | claim | measured |
 | --- | --- |
-| allocations per `/health` request | **1,122.34** and 131,677 bytes for a 107-byte response, against W6's pre-region **1,035** — the region model moved this the *wrong* way, and ADR 0017 says so rather than burying it |
+| allocations per `/health` request | **1,122.34** and 131,677 bytes for a 107-byte response, against W6's pre-region **1,035** — the region model moved this the *wrong* way, and ADR 0017 says so rather than burying it. R3 took the ~40 one-time allocations back off (§R3): the figure is **1,082** today and still above 1,035. The 1,122.34 is *not* re-takeable from this tree; the 1,082 is, with `./target/release/w6-alloc --repo . --requests 200` |
 | the static split over `examples/` and the `std` it imports | **113 regions, 0 `unique`, 113 `shared`** — every one because of a tail-resumptive clause |
 | the dynamic split, which is the one that matters | **709 region closes, 709 freed at the close, 0 deferred**; 348 slot bumps against a peak of 6 live; 73 pins taken, 0 slots reclaimed late |
 | the arena against the persistent map it replaced, at 10,000 cells | map: **20,000 allocations and 1.04 MB** to build, 10,000 more to write every cell. Region: **0 to build, 0 to write, 0 to close** |
@@ -926,45 +941,334 @@ rejected. The consequence is a good one for footprints — with every other rout
 closed, **a written row is the only way a `cell` atom reaches a published
 footprint**.
 
+## R3 — the hoists, and the rule that went against the design
+
+R2 left allocations per `/health` **higher** than the representation it replaced,
+and ADR 0017 said so rather than burying it. What it did not do was find out
+where they were. An attribution run then ranked two compile-time analyses among
+the largest items: `region_kind::infer`, a whole-program analysis memoized per
+`Machine` when a `Machine` is built per entry point, and body lowering. Neither
+is a design tradeoff; both are work the front end could have done once. R3
+hoisted both — the region-kind analysis and the lowered bodies are now scoped to
+the *program*, so an engine built next over the same program is handed the answer
+instead of recomputing it (`Machine::share_region_kinds`,
+`Machine::share_lowering`; the new tests are
+`ply-eval/tests/region_kind_sharing.rs`, `ply-eval/tests/lowering_sharing.rs` and
+`ply-corpus/tests/region_kind_hoisted.rs`).
+
+R3 did **not** do unboxing, evidence passing or codegen. Those were the planned
+next milestone, and the premise under them is the one that had just failed.
+
+**One caveat on the run that scoped this milestone, because it is the same trap
+the milestone then found.** That attribution reported `code::lower_*` at roughly
+a quarter of a request. It was read at a 20-request window, and the same family
+reads **33.8%** of a 20-request window on this tree today while costing **0.0**
+allocations per request — so a large window share was never evidence that
+lowering was on the request path, and it is not re-takeable now whether it ever
+was. The region-kind half of that run is different: its cost was one whole-program
+traversal per `Machine`, both harnesses build a `Machine` per call, and the
+before-and-after pair is written down in
+`crates/ply-corpus/tests/region_kind_hoisted.rs`'s header — which says in the
+same breath that only the *after* half of it is re-takeable from this tree. What
+R3 can show is where both families are now, and it is zero per request for both.
+
+### The rule, which was fixed before the milestone started
+
+> Allocations per `/health` **below 1,035** → regions were fine, the cost was
+> always elsewhere, removing the forkable world was neutral-to-good, and the next
+> milestone is frame representation.
+>
+> Allocations per `/health` **still above 1,035** → regions carry a real fixed
+> overhead ADR 0017 did not account for, and whether to keep them genuinely
+> reopens.
+
+1,035 is what `benches/w6-ladder.json` publishes in its `boxing on hot paths`
+alternative, and it is the pre-region reading.
+
+### What it measures at
+
+**1,082 allocations and 0.128 MB.** The second branch fires.
+
+Everything below was taken on this tree on 2026-08-18, release profile, on the
+machine in `docs/ONBOARDING.md` §Provenance, and each row names the command that
+re-takes it. Where a figure from before this milestone appears it is in its own
+column, labelled with where it comes from, and it is *not* re-takeable here —
+that is the point of separating the columns rather than merging them into a
+delta.
+
+| | measured | command |
+| --- | --- | --- |
+| allocations per `/health`, 200 requests | **1,081.87**, 127,954.65 bytes | `./target/release/w6-alloc --repo . --requests 200` |
+| the same, against the file that holds the baseline | *"the report says 1035 allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128 MB"* | `cargo test -p ply-corpus --release --test w6_report_allocations -- --nocapture` |
+| the same at 800 requests | **961.92**, 277,417.23 bytes | `./target/release/w6-alloc --repo . --requests 800` |
+| the two-window fit | **911.5 per request + 34,465 once per `Machine`** | `cargo test -p ply-corpus --release --test w6_alloc_sites -- --nocapture` |
+
+**So the hoists worked and the milestone still fails its own rule.** Those are
+two separate findings and both belong here.
+
+### The attribution: both hoist targets are gone, and what is on top now
+
+From the same `w6_alloc_sites` run, which fits a per-request slope and a
+per-`Machine` intercept from two windows over one call rather than reading a
+share off one window:
+
+| family | per request | per `Machine` | share at n=20 | share at n=200 |
+| --- | --- | --- | --- | --- |
+| `ply_eval::region_kind` | **0.0** | **0** | 0.0% | 0.0% |
+| `ply_eval::code::lower` | **0.0** | 17,821 | 33.8% | 8.2% |
+
+The largest per-request sites that remain, ranked by slope:
+
+| allocations per request | share of the marginal | site |
+| --- | --- | --- |
+| **415.0** | **45.5%** | `frame::dispatch < Machine::step < Machine::call` |
+| 65.0 | 7.1% | `interp::literal < Machine::step < Machine::call` |
+| 53.0 | 5.8% | `Machine::step < Machine::call < w3::Loaded::over_sim` |
+| 47.0 | 5.2% | `ply_eval < Machine::perform_host < Machine::step` |
+| 25.0 | 2.7% | `Value::list < Machine::match_pattern < frame::dispatch` |
+
+`region_kind::decide`, `Symbol::new < region_kind::decide` and
+`region_kind::Analysis::walk_at` were all ranked sites before R3 and none of them
+appears anywhere in the ranking now. The `Symbol::new` that remains is
+`Symbol::new < Machine::build`, 1,011 per `Machine` and 0.0 per request.
+
+**`code::lower` is the trap in this table and it is worth reading twice.** It
+still reads 33.8% of a 20-request window while costing **nothing** per request,
+because a 20-request window divides one-time work by twenty. A share taken at one
+window is not evidence that work is on the request path; the fit is. That is
+stated in `w6_alloc_sites.rs`'s own header, and it is the most likely way for the
+next attribution to be misread.
+
+**Frame representation is now 45.5% of what a request allocates**, which is the
+lever the next milestone was already pointed at. Read the two columns for that
+site the right way round before comparing it to anything: it is **27.9%** of the
+20-request window and **45.5%** of the per-request slope, and an older
+attribution reporting a share near the former is reporting the same site at the
+same cost, not a smaller one.
+
+### Request cost and throughput, re-taken
+
+The whole W6 ladder was re-taken with the command in `benches/README.md`
+§"Taking the ladder" and is shipped as **`benches/w6-ladder-r3.json`**, so it can
+be rendered rather than quoted:
+
+```
+./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json
+```
+
+`benches/w6-ladder.json` is **not** overwritten: it holds the pre-region 1,035
+this milestone's rule is stated against, and it is the file the two staleness
+guards read.
+
+The verdict is unchanged — **keep deferring M9** — and so is everything the
+verdict is composed from: interpreter share **35%** (34.3%–34.7% over its
+repeats), ceiling **1.53×**, projection **1.46×**, six of ADR 0016 §4's seven
+levers unpriced.
+
+The absolutes are all larger than ADR 0016 §8.1's, and the control says why:
+the **Rust floor**, which has no Ply in it at all, moved from 15.68µs to
+**17.13µs**. This box measures about 9% slow against the one W6 used, so the
+absolutes are not comparable and the ratios are:
+
+| reading | ADR 0016 §8.1–8.3 | re-taken 2026-08-18 |
+| --- | --- | --- |
+| total / floor | 37.8× | **38.5×** |
+| interpreter share, residue charged back | 35.3% | **34.5%** |
+| treewalk against machine, same pure request path | 2.73× | **2.82×** |
+| `/health` plaintext against a floor replaying its 107 bytes | 16.8× | **15.7×** |
+
+**R3 did not move what a request costs**, and it was not expected to: the work it
+removed was already amortized over a served process's lifetime. It removed it
+from the *count*, which is exact and does not move with a machine, and that is
+where it is visible.
+
+### What the front end pays, since both hoists move work forward
+
+The concern is real — `ply test` pays the front end on a cold run — and the
+answer is that the front end did not gain work. Both hoists are caches in front
+of work that already happened lazily and now happens once per *program* instead
+of once per *engine*; `region_kind::infer` is still not run at load
+(`region_kind_hoisted.rs` asserts the analysis is unfilled until something opens
+a region). Measured on this tree:
+
+| | measured |
+| --- | --- |
+| `cargo test --workspace` | **3,584 passed, 0 failed, 4 ignored** across 137 test binaries + 13 doc-test suites, **359.7s** — one run, idle machine, not a best-of-N. Re-taken after the regression audit below at **3,597 / 0 / 4** across **138** + 13, **399.6s** and **406.9s** over two runs |
+| `ply test examples/`, cold cache, release | 186 selected, 186 passed, **0.31s** wall |
+| the same, warm | 1 selected, 185 cached, **0.04s** wall |
+| 10,000-definition corpus, cold | **668.3 ms** total: parse 58.4, typecheck 162.9, hash 79.4, execute 331.6 |
+| the same, warm | **362.3 ms**, 157 of 5,000 selected |
+| lowering every test body in that corpus, once | **11.4 ms** (`ply-corpus measure`) |
+
+**What I could not do is take the same numbers before R3.** Reconstructing the
+pre-R3 tree needs git and this work was done under a rule forbidding it, so there
+is no before-and-after wall clock here and it would be dishonest to imply one
+from a document. The claim that survives is the narrow one: R3 added no phase and
+no traversal to the front end, the phase split above is what a cold check costs
+today, and it is re-takeable by anyone with `ply-corpus bench`.
+
+### No regression
+
+Re-run rather than assumed. Every row is a command whose output was read.
+
+| invariant | measured |
+| --- | --- |
+| a rename selects zero deterministic tests | `selected 1 of 186 (185 cached)` after renaming `line_total` project-wide — identical to the nothing-changed run; the 1 is the `nondet` clock test |
+| incremental and `--no-incremental` agree | byte-identical once wall clocks are stripped, 186 passed both ways |
+| `--engine both` reports zero divergences | `audited 166 of 186 · 20 ran on one engine only`, no `E0503` |
+| verdicts stable at `--jobs 1` and `--jobs 8` | 186 passed, 0 failed, both |
+| `ply prove` reports honest tiers | 7 obligations · 2 proved · 5 property · 0 example, **7 held** |
+| `ply hosts --host` lists the TCB | 25 host handlers · 47 operations |
+| postgres transactions commit and roll back | `examples/same-tests.sh`: **29 requests byte for byte identical**, committed 201 with orders 3→4, rolled back 409 with the sequence still consumed |
+| `Store::open` under 5 ms at 10,000 definitions | **1.79 ms** over 4,841 results, 9,821 definitions seen |
+| simulation seed rate | **5,331–7,107 seeds/s** over 5 trials on a `--concurrent-tests` corpus; every exploration exhaustive, 54 interleavings after reduction from ≥4,096 (`ply-corpus sim`). That a seeded replay is *exact* is asserted by the suite, not by this row |
+| the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval/tests/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
+
+The remaining invariants are asserted by the suite rather than re-run by hand,
+and each has a name to grep for rather than a claim to take:
+`ply-hash/tests/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
+`ply-cli/tests/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
+`ply-test/tests/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
+`ply-eval/tests/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
+effect in a `det` test —
+`ply-cli/tests/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
+runs `ply test --json` on a two-line project and asserts exit code 2 with
+`diagnostics[0].code == "E0412"`. The suite is green above, which is what makes
+those citations rather than promises.
+
+### Two defects in the hoists, found by a regression audit and closed
+
+R3 replaced two per-`Machine` recomputations with two per-program caches, and a
+cache is a claim that an entry is still the right answer. Both caches were
+audited after the milestone and both were wrong in a way the milestone's own
+tests could not see, because those tests asserted that a *correct* handle is
+shared. Neither cost a request an allocation and neither is visible in any figure
+above; they are recorded here because the shape — a hoist that trades
+recomputation for an invalidation condition — is the shape the next hoist will
+have too.
+
+| defect | what was wrong | what closed it |
+| --- | --- | --- |
+| `Lowering` keyed on a raw address, and the safety argument in its own doc comment was false | the argument needs `Lowering<'a>` invariant in `'a`; it was **covariant**, its only `'a`-carrying field being `&'a Program`, and `of` takes `&self` — so `&Lowering<'long>` coerced to `&Lowering<'short>` and accepted a body that does not outlive the cache. A `Box<Expr>` holding `111` keyed through that coercion and dropped, then a `Box<Expr>` holding `222` at the same address, was answered `111` on the **first** of a thousand attempts | an `invariant: PhantomData<fn(&'a Program) -> &'a Program>` field. Note `PhantomData<&'a mut Program>` does **not** do it — `&'a mut T` is invariant in `T` but covariant in `'a`, and it was tried first and compiled. The refusal is machine-checked by a `compile_fail` doc-test on the type, because a variance is a compile-time property no `#[test]` can observe |
+| `region_kind` had no local-binder scope | `Analysis::definition` resolved a bare name against `Resolved::scopes[module]` — the *module* scope — so a parameter, a `let` or a pattern binder shadowing a definition's name was read as that definition, and the region inferred **`unique` over a callee that could be any closure in the program**. That is the one direction ADR 0017 §Consequences says inference may never be wrong in | `Analysis::locals`, a lexical scope stack pushed at every binder the language has. It over-approximates on purpose: a `Var` pattern naming a nullary constructor is read as a local, which costs precision and lands on `shared` |
+
+Neither moved what a request allocates:
+`./target/release/w6-alloc --repo . --requests 200` reads
+`{"allocations_per_request":1081.87,"bytes_per_request":127954.65,...}` after
+both, the same pair to the hundredth as before them. The region census did not
+move either — still `113 regions, 0 unique, 113 shared` from
+`cargo test -p ply-eval --test region_kind_inference --
+the_split_over_the_repositorys_own_examples --nocapture`.
+
+The same audit found `README.md`'s request-path allocation sentence stale for the
+**second** time in this milestone, the second time inside the correction block
+written for the first. That sentence is now the one line of prose in this
+repository that a test reads —
+`ply-corpus/tests/w6_report_allocations.rs:163
+the_readme_still_describes_this_request_path`, both numbers, within 1%.
+`docs/ONBOARDING.md` §7's checked/written boundary moved by exactly that line and
+says so.
+
+### What this means, said plainly
+
+**The regions question is open.** The rule was written before the measurement
+precisely so this outcome could be reported rather than argued away, and it is
+the outcome. Three milestones after ADR 0017 asserted that the forkable world was
+what kept allocations high, `/health` allocates more than it did before the
+forkable world was removed, and the two things that were plausibly regions' fault
+have been hoisted out and it still does.
+
+What that does **not** license is ripping regions out. Two things the region
+track bought are measured and are not in dispute. The **escape discipline** is a
+safety property, not an allocation claim: the arena is what made a use-after-free
+constructible in this language at all, and the brand is what refuses it at
+compile time (`crates/ply-eval/tests/use_after_free_audit.rs`). And the **arena
+beats the persistent map it replaced**, re-taken here with
+`cargo test -p ply-eval --release --test region_arena_cost -- --nocapture`, which
+prints for 10,000 cells:
+
+```
+  map:    build 20000 allocations, 1040000 bytes; 10000 allocations to write every cell
+  region: build 0 allocations, 0 bytes; 0 allocations to write every cell; 0 to close
+```
+
+What is *not* established — and what nobody should now assert without a
+measurement — is that removing the forkable world bought the request path
+anything. A milestone that revisits this owes a number for what the world cost,
+taken the way this one was, and ADR 0017's Context is where the untested version
+of that claim is kept for comparison.
+
 ---
 
 # What is next
 
-M9 is deferred on a measurement and is not the front of the queue. ADR 0017 "Not
-in this ADR" names what the region track was built to enable, and the order is
-not arbitrary — each one moves the number the next one is judged against:
+**R3's decision rule fired on its second branch, and that is what sets this
+queue.** Allocations per `/health` came back at **1,082** against a pre-region
+**1,035** — measured, `./target/release/w6-alloc --repo . --requests 200` — so
+the milestone that was planned to follow R3 is *not* automatically the right one.
+§R3 is where the reading and its provenance are, and it should be read before
+this list rather than after it.
 
-1. **Unboxed primitive representation, and monomorphization.** This is what
-   ADR 0017's own falsified allocation hypothesis points at: a `/health` request
-   makes about 1,000 `Rc<Value>` boxes to produce 107 bytes, and they are on the
-   framing, routing and encode path rather than in any cell. The region model
-   established the memory discipline; these are what actually remove the boxes.
-2. **Evidence passing and handler specialization.** A bound is already measured
-   and it is one of the three ADR 0016 §10.1 calls large enough to matter: the
-   tree-walker beats the control-stack machine **2.73x** on the same pure request
-   path, which prices ADR 0005's four-heap-allocations-per-frame-push as a lever
-   rather than restating it as a fact. The other two on that list — allocation,
-   and framing at 97.83µs and 16.5% of a request — are item 1 above and W2's
+M9 remains deferred on a measurement and is not the front of the queue; the
+ladder was re-taken after R3 and the verdict did not move
+(`./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`).
+
+0. **Decide the regions question, because R3 reopened it and it is upstream of
+   everything below.** The claim that motivated the whole track — that the
+   persistent forkable world is what held allocations up — is now contradicted by
+   three milestones of measurement, and the two hoists that could have explained
+   the gap are gone from the request path. What is owed is a *number for what the
+   world cost*, taken the way R3's was, against which "keep regions" or "the trade
+   was not worth it" can be decided instead of asserted. Note what is not in
+   question: the escape discipline is a safety property and the arena beats the
+   persistent map it replaced by every measurement in ADR 0017 §"What must be
+   measured". This item is about the request path and about nothing else. It is
+   also the item most likely to be skipped, because everything below it is more
+   fun and the previous entry in this position was skipped for exactly that
+   reason.
+1. **Unboxed primitive representation, and monomorphization.** R3's attribution
+   is what now points at this, and more sharply than ADR 0017's did: with both
+   compile-time passes hoisted off, the largest per-request allocation site is
+   `frame::dispatch < Machine::step < Machine::call` at **415.0 allocations a
+   request, 45.5%** of the marginal cost, and the rest are `Rc<Value>` boxes on
+   the framing, routing and encode path rather than in any cell.
+2. **Evidence passing and handler specialization.** A bound is measured and it is
+   one of the three ADR 0016 §10.1 calls large enough to matter: re-taken after
+   R3, the tree-walker beats the control-stack machine **2.82×** on the same pure
+   request path (56.34µs against 158.92µs), which prices ADR 0005's
+   four-heap-allocations-per-frame-push as a lever rather than restating it as a
+   fact. The other two on that list — allocation, and framing at **101.41µs and
+   15.4%** of a request in the re-taken ladder — are item 1 above and W2's
    precedent respectively, and none of the three has an end-to-end price yet.
 3. **Re-measure codegen's ceiling — and do it before arguing about M9 again.**
-   W6's `S = 0.353`, `E = 1.48` and ceiling `1.55x` were read off a
-   representation R2 has since changed in part — the cell store and the world,
-   not the boxing, which is item 1 — and the ladder has not been re-taken since.
-   ADR 0017's Consequences require this re-measurement by name. The verdict machinery
-   is unchanged and still in code: `ply_corpus::w6::decide` reads
-   `Criteria::default()`, whose eight thresholds have not moved in either
-   direction across two audits, and the reopen sentence is composed from the
-   criteria that are *not* met rather than written by hand.
+   ~~and the ladder has not been re-taken since~~ — **it has now.**
+   `benches/w6-ladder-r3.json` is the post-R3 take and the verdict machinery
+   re-derives from it unchanged: interpreter share **35%** (34.3%–34.7%), ceiling
+   **1.53×**, projection **1.46×**, `keep deferring M9`. Every absolute in that
+   ladder is larger than W6's and the Rust floor moved with them (15.68µs →
+   17.13µs), so read the ratios and not the microseconds. What is still owed here
+   is the *spike* half, which cannot be re-taken at all: `crates/ply-codegen-spike`
+   does not compile (`CONTRIBUTING.md` §"Things known to be broken" item 1), so
+   `E = 1.46×` is a projection from a file rather than from a rebuilt spike.
 
 Two smaller obligations are open and both are recorded above rather than in a
 tracker: `crates/ply-codegen-spike` is still present and ADR 0016 §3.5 requires
 its deletion, and `Machine::constant` disables the constant memo inside any open
 *scheduler* region, which CONTRACTS.md calls a defect rather than a rule and
-which costs a spawning service **1.77x on `/health`**.
+which costs a spawning service **1.78× on `/health`** — re-taken after R3, at
+273.0µs sequential against 488.7µs spawning on the same service, and printed by
+`ply-corpus w6` over `benches/w6-ladder-r3.json`.
 
 The one thing a contributor should not do is re-argue M9 from the numbers in this
-file. They were measured, they are reproducible from
-`benches/w6-ladder.json` and `benches/w6-spike.json` by
-`ply-corpus w6`, and every one of them is stale in the same direction: **every
-cheaper lever that lands makes M9's case weaker**, and three have now landed
-where a code generator was predicted to be the answer.
+file. They were measured, they are re-derivable from
+`benches/w6-ladder-r3.json` (or `benches/w6-ladder.json`, the pre-region
+baseline) and `benches/w6-spike.json` by `ply-corpus w6`, and every one of them
+is stale in the same direction: **every cheaper lever that lands makes M9's case
+weaker**, and three have now landed where a code generator was predicted to be
+the answer.
+
+**The one thing this file should not be allowed to do is quietly close the
+regions question.** It was reopened by a rule fixed in advance, by a measurement,
+and it stays open until another measurement closes it. If a later revision of
+this section presents item 0 as settled without a number beside it, that revision
+is the defect.

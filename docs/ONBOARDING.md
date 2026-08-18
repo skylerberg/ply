@@ -37,10 +37,17 @@ Everything below was measured on **2026-08-17**:
 | toolchain | `rustc 1.93.1 (01f6ddf75 2026-02-11)`, `cargo 1.93.1` |
 | postgres | PostgreSQL 18.3 (Homebrew), running on `:5432` |
 
-Your wall clocks will differ. The **counts** — 3,566 tests, 5,000 tests
+Your wall clocks will differ. The **counts** — 3,597 tests, 5,000 tests
 selected down to 157, 7 obligations, 25 host handlers, 29 agreeing requests —
 should not. If a count differs on your machine, that is a finding; open it as
 one.
+
+> **The test count moved twice on 2026-08-17 and the others did not.** It read
+> 3,566 until R3 added three test binaries, then 3,584 until the regression audit
+> after R3 added a fourth and its fixes added three tests (§2). The other four
+> were re-taken on the same day against this tree and are unchanged: 5,000 → 157
+> from `ply-corpus bench`, and 7 / 25 / 29 from `ply prove examples/desk.ply`,
+> `ply hosts examples/desk.ply --host` and `examples/same-tests.sh`.
 
 ## 0. What Ply is, in ninety seconds
 
@@ -170,14 +177,37 @@ Measured, from an already-built `target/`:
 
 | | |
 | --- | --- |
-| wall clock | **339s** (5m 39s); re-taken at **324.5s** |
-| result | **3,566 passed, 0 failed, 4 ignored** |
-| targets | **147** — 134 test binaries + 13 doc-test suites |
+| wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s** — five runs of one command on one machine, which is the spread to expect |
+| result | **3,597 passed, 0 failed, 4 ignored** |
+| targets | **151** — 138 test binaries + 13 doc-test suites |
 
-That reproduces `README.md:466`'s Status paragraph exactly, count for count, and
+That reproduces `README.md`'s Status paragraph exactly, count for count, and
 the audit re-ran it and got the same three numbers again (`grep -c '^     Running'`
-→ 134, `grep -c '^   Doc-tests'` → 13). It is the longest thing in this file;
-budget six minutes and do not run it under load.
+→ 138, `grep -c '^   Doc-tests'` → 13). It is the longest thing in this file;
+budget seven minutes and do not run it under load.
+
+> **Re-taken 2026-08-17, after R3.** This table read **3,566 passed** across
+> **147** targets (134 binaries), and the paragraph under it said 134. R3 added
+> three test binaries — `ply-eval/tests/region_kind_sharing.rs`,
+> `ply-eval/tests/lowering_sharing.rs`,
+> `ply-corpus/tests/region_kind_hoisted.rs` — and nine more tests inside
+> existing ones. Re-taken as `time cargo test --workspace`, summing the
+> `test result:` lines: 3,584 / 0 / 4 in 352.4s, with `grep -c '^     Running'`
+> → 137 and `grep -c '^   Doc-tests'` → 13. The wall clock is one run on an
+> otherwise idle machine and is not a best-of-N.
+
+> **Re-taken again 2026-08-17, after the regression audit that followed R3.**
+> That audit landed a fourteenth new binary,
+> `ply-eval/tests/hoist_staleness_audit.rs` (10 tests), which is why `Running`
+> reads 138 rather than 137 — the block above was written before that file
+> existed and is not wrong about what it measured. Fixing the two defects it
+> found added three more: one in that file
+> (`a_declared_unique_over_a_local_shadowing_a_definition_is_refused`), one in
+> `ply-corpus/tests/w6_report_allocations.rs`
+> (`the_readme_still_describes_this_request_path`), and the first doc-test
+> `ply-eval` has ever had — a `compile_fail` example on `Lowering`, because a
+> variance is a compile-time property no `#[test]` can observe. Re-taken the same
+> way: **3,597 / 0 / 4 in 399.6s**, re-taken at **406.9s**, `Running` → **138**, `Doc-tests` → 13.
 
 ### Four things a green suite does not prove
 
@@ -582,15 +612,33 @@ test suite asserts it" in every document means *someone has to run
 `cargo test --workspace` locally, and nobody is watching whether they did.*
 Assume nothing has been run since the last person who said so.
 
-### No test reads any prose document
+### Exactly one test reads a prose document, and it reads one sentence of it
+
+> **This section read "No test reads any prose document" and that was true when
+> it was written.** A regression audit on 2026-08-17 found `README.md`'s
+> request-path allocation figure stale for the second time in one milestone —
+> the second time *inside the block correcting the first* — and armed the one
+> sentence rather than writing the finding down again. What follows is re-taken.
 
 Checked: `grep -rn '\.md"' crates/*/tests crates/*/src` filtered to file-opening
-calls returns **nothing**. Not one test opens `README.md`, `DESIGN.md`,
-`ROADMAP.md`, `CONTRACTS.md` or any ADR. Every number, signature and guarantee in
-the prose surface is unenforced by the suite — **24,443 lines** across
+calls returns **one** hit,
+`crates/ply-corpus/tests/w6_report_allocations.rs:163
+the_readme_still_describes_this_request_path`. It reads `README.md`'s *"One
+`/health` request makes N allocations and M bytes"* and compares both numbers
+against a freshly counted 200-request window, within **1%** — a tighter band than
+the factor of two the test beside it holds `benches/w6-ladder.json` to, because
+that file is a dated artifact and this sentence is present tense about this tree.
+Run it: `cargo test -p ply-corpus --test w6_report_allocations -- --nocapture`
+prints both sides, and the count is the same in debug and release because an
+allocation count does not vary with a profile.
+
+Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
+ADR, and no other sentence of `README.md` is read. Every other number, signature
+and guarantee in the prose surface is unenforced by the suite — **24,951 lines**
+across
 `README.md`, `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` and the seventeen ADRs
 (`cat DESIGN.md ROADMAP.md CONTRACTS.md README.md docs/adr/*.md | wc -l`), or
-**26,085** counting `benches/README.md`, `CONTRIBUTING.md` and this file. Both
+**26,777** counting `benches/README.md`, `CONTRIBUTING.md` and this file. Both
 figures move whenever anyone edits any of those files, so re-take them rather
 than quoting them.
 
@@ -598,11 +646,14 @@ So the checked/written boundary is:
 
 **CHECKED — machine-verified against the tree, will fail if the tree moves:**
 
-- The two shipped measurement files, and only those. `benches/w6-ladder.json`
+- The two *guarded* measurement files, and only those. `benches/` holds three
+  since R3 — `w6-ladder-r3.json` is the post-R3 re-take and **nothing reads it**,
+  which `benches/README.md` states rather than leaves to be discovered; it is a
+  measurement, not a guard. `benches/w6-ladder.json`
   and `benches/w6-spike.json` are read by
   `ply-corpus/tests/w6_report_integrity.rs:304
   the_shipped_ladder_still_describes_the_tree_it_ships_in` and
-  `ply-corpus/tests/w6_report_allocations.rs:82
+  `ply-corpus/tests/w6_report_allocations.rs:115
   the_shipped_allocation_evidence_still_describes_this_request_path`. Both run
   under `cargo test --workspace`. Read the doc comment at
   `w6_report_integrity.rs:280-302` — it opens *"the staleness guard, and the one
@@ -610,8 +661,12 @@ So the checked/written boundary is:
   *shape* as a fraction of the framing rung in every profile, and absolute
   microseconds **in release only, within a factor of four either way**. That band
   is deliberately wide and is not a tight guard.
+- **One sentence of `README.md`** — its request-path allocation count, both
+  numbers, within 1%, by `w6_report_allocations.rs:163
+  the_readme_still_describes_this_request_path`. See the section above for why
+  that one and nothing else.
 - Behavioural invariants stated as tests, e.g. the rename invariant at
-  `ply-cli/tests/cli.rs:145`. There are 3,566 tests; how many of them pin a
+  `ply-cli/tests/cli.rs:145`. There are 3,597 tests; how many of them pin a
   documented guarantee rather than an implementation detail is **not measured
   and no document claims a figure for it.**
 - Anything you can re-run from this file. The loop numbers, the selection table,
@@ -620,7 +675,8 @@ So the checked/written boundary is:
 
 **WRITTEN — true when someone typed it, unverified since:**
 
-- Every prose claim in `README.md`, `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md`
+- Every prose claim in `README.md` bar the one sentence above, and every one in
+  `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md`
   and the seventeen ADRs.
 - `CONTRACTS.md` in particular is a **construction** document, not an API
   reference. Its own preamble says so: *"Crates are implemented concurrently
@@ -662,11 +718,22 @@ claim that was silently removed teaches nobody. Follow the convention — see
 the current queue and it is ordered on purpose: each item moves the number the
 next one is judged against.
 
-1. Unboxed primitive representation, and monomorphization.
+0. **Decide the regions question.** R3 ended on a decision rule fixed before it
+   started and the rule fired against the design: `/health` still allocates
+   **1,082** times against a pre-region **1,035**. Re-take it yourself in one
+   command — `./target/release/w6-alloc --repo . --requests 200`, and the
+   baseline is in `benches/w6-ladder.json`'s `boxing on hot paths` alternative.
+   `ROADMAP.md` §R3 is the record.
+1. Unboxed primitive representation, and monomorphization. R3's attribution
+   points here: `frame::dispatch < Machine::step < Machine::call` is **45.5%** of
+   what a request allocates, per `cargo test -p ply-corpus --release --test
+   w6_alloc_sites -- --nocapture`.
 2. Evidence passing and handler specialization.
-3. Re-measure codegen's ceiling — **before** re-arguing M9. (Note that item 3
-   requires the spike, which does not build; see §1. That blocker is not
-   recorded in `ROADMAP.md`.)
+3. Re-measure codegen's ceiling — **before** re-arguing M9. The *ladder* half has
+   been re-taken and ships as `benches/w6-ladder-r3.json`; render it with
+   `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`.
+   The *spike* half still cannot be re-taken, because the spike does not build;
+   see §1. `ROADMAP.md` §"What is next" item 3 now records that blocker.
 
 Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR
 0016 §3.5, and fix `Machine::constant` refusing the memo inside any open
@@ -682,6 +749,16 @@ than re-arguable. Run it:
 ```
 ./target/release/ply-corpus w6 benches/w6-ladder.json benches/w6-spike.json
 ```
+
+> **Two ladders exist since R3, and the line above renders the older one on
+> purpose** — it is the W6 file the verdict quoted below came off, kept because
+> it is also the only record of the pre-region allocation baseline. For the
+> current tree substitute `benches/w6-ladder-r3.json`, taken 2026-08-18: the
+> verdict is the same (`keep deferring M9`) and the numbers inside it move a
+> little — share 35%, ceiling **1.53x**, projection **1.46x**. **Do not run
+> `ply-corpus w6 benches/*.json`**: `w6` merges last-wins and the glob sorts
+> `-r3` first, so it silently renders the older file. `benches/README.md`
+> §"There are two ladders" is the full note.
 
 That prints the verdict, its inputs, and — the part that matters — the exact
 condition that reopens it. The verdict block, **abridged** (marked as such
