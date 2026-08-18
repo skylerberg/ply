@@ -11,7 +11,7 @@
 use crate::arena::Arena;
 use crate::arena::RegionKind;
 use crate::builtins::{self, Builtin, Step};
-use crate::code::{self, Code, NodeKind, Stmt as CodeStmt, lower, lower_fn};
+use crate::code::{self, ClosureCode, Code, Lowering, NodeKind, Stmt as CodeStmt, lower};
 use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
 use crate::env::{Env, Slot};
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
@@ -40,7 +40,6 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
-use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -113,6 +112,22 @@ pub struct Machine<'a> {
     /// traversal per worker per concurrency group — the single largest item in
     /// the machine's profile — for code no test in the group would run.
     lowered: FxHashMap<Symbol, Value>,
+    /// Where the lowering itself is kept, and the reason `lowered` above is only
+    /// a map from a name to a closure this machine has already built.
+    ///
+    /// Scoped to the *program*, for the reason `region_kinds` below is: what a
+    /// body lowers to is a property of the syntax and of nothing a machine
+    /// holds, so a machine built next over the same program
+    /// ([`Machine::share_lowering`]) reads what this one lowered rather than
+    /// lowering it again. That is what a search costs otherwise — it builds a
+    /// machine per interleaving.
+    lowering: Rc<Lowering<'a>>,
+    /// The lowered body of the last tree-walker closure this machine applied.
+    /// Only [`Interp`] and the prover's generators build one, so this is empty
+    /// in a run of the machine alone.
+    ///
+    /// [`Interp`]: crate::Interp
+    closure_code: ClosureCode,
     /// What a nullary pure definition evaluated to, so a service does not
     /// rebuild its route table once per request.
     memo: Memo,
@@ -123,14 +138,19 @@ pub struct Machine<'a> {
     /// entry point resets to — so one seeded fixture serves every test in a run
     /// without any of them observing another's writes. ADR 0017 §1 and §5.
     regions: TaskRegions,
-    /// Which of ADR 0017 §3's two kinds each region in this program is, computed
-    /// on the first region the machine actually opens.
+    /// Which of ADR 0017 §3's two kinds each region in this program is.
     ///
-    /// Lazily, for the reason `lowered` is lazy: it is a whole-program analysis
-    /// and a machine is built per worker per concurrency group, so a program
-    /// whose entry point opens no region must not pay for one. `/health` opens
-    /// none.
-    region_kinds: OnceCell<Rc<crate::region_kind::Regions>>,
+    /// Lazily, for the reason `lowered` is lazy: a program whose entry point
+    /// opens no region must not pay for a whole-program analysis. `/health`
+    /// opens none.
+    ///
+    /// Scoped to the *program* rather than to this machine, because that is
+    /// what the answer is a property of. A machine built from a program another
+    /// machine has already analysed is handed that analysis
+    /// ([`Machine::share_region_kinds`]) instead of repeating it; a machine
+    /// handed none analyses its own program on first need, which is correct and
+    /// is what a machine per entry point used to cost.
+    region_kinds: crate::region_kind::Kinds,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
     stack: Stack,
@@ -275,12 +295,14 @@ impl<'a> Machine<'a> {
             check,
             fns,
             lowered: FxHashMap::default(),
+            lowering: Rc::new(Lowering::for_program(program)),
+            closure_code: ClosureCode::default(),
             memo: Memo::default(),
             ctors,
             ops,
             tests,
             regions: TaskRegions::new(),
-            region_kinds: OnceCell::new(),
+            region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
             stack: Stack::new(),
             state: State::Halt(Value::Unit),
@@ -433,10 +455,54 @@ impl<'a> Machine<'a> {
     /// no region: one the inference never saw, or a `with_cell[r]` nested inside
     /// the `with_region[r]` that already opened `r`.
     pub fn region_kind(&self, span: Span) -> Option<RegionKind> {
+        self.region_kinds().at(span).map(|region| region.kind)
+    }
+
+    /// This program's region kinds, inferring them if nothing has yet.
+    pub fn region_kinds(&self) -> &crate::region_kind::Regions {
         self.region_kinds
-            .get_or_init(|| Rc::new(crate::region_kind::infer(self.program, self.resolved)))
-            .at(span)
-            .map(|region| region.kind)
+            .get_or_init(|| crate::region_kind::infer(self.program, self.resolved))
+    }
+
+    /// The handle to hand another engine built from **this same program**, so
+    /// the analysis behind it runs once for the program rather than once per
+    /// engine.
+    pub fn shared_region_kinds(&self) -> crate::region_kind::Kinds {
+        crate::region_kind::Kinds::clone(&self.region_kinds)
+    }
+
+    /// Take another engine's answer for this program instead of inferring one.
+    ///
+    /// `kinds` must have been filled — or be about to be filled — from the same
+    /// `(Program, Resolved)` pair this machine holds. A handle from a different
+    /// program is an answer about the wrong program, and where the two agree on
+    /// a span it can say `unique` for a region the running program captures
+    /// across, which frees an arena a continuation still reaches.
+    pub fn share_region_kinds(&mut self, kinds: crate::region_kind::Kinds) {
+        self.region_kinds = kinds;
+    }
+
+    /// The lowering cache to hand a machine built next over **this same
+    /// program**, so a body is lowered once for the program rather than once per
+    /// machine.
+    ///
+    /// Not a [`crate::region_kind::Kinds`]-shaped handle, and it cannot be one:
+    /// lowered code is `Rc`, so this is shareable between machines on one thread
+    /// and between no two threads.
+    pub fn share_lowering(&self) -> Rc<Lowering<'a>> {
+        Rc::clone(&self.lowering)
+    }
+
+    /// Lower into `lowering` rather than into a cache of this machine's own.
+    ///
+    /// **Ignored when `lowering` was taken over a different program**, where it
+    /// would answer nothing this machine asks it. A bisection builds a program
+    /// whose definitions carry the names of the ones they replace, and the
+    /// nearest thing to a caller passing the wrong cache is there.
+    pub fn set_lowering(&mut self, lowering: Rc<Lowering<'a>>) {
+        if lowering.describes(self.program) {
+            self.lowering = lowering;
+        }
     }
 
     /// Every subsequent entry point resets to this stack's fixture rather than
@@ -464,7 +530,8 @@ impl<'a> Machine<'a> {
             )
             .primary(Span::DUMMY, "requested test does not exist"));
         };
-        let (module, body) = (slot.module, lower(slot.body));
+        let (module, source) = (slot.module, slot.body);
+        let body = self.lowering.body(source);
         self.drive(body, Env::empty(), module).map(|_| ())
     }
 
@@ -480,8 +547,8 @@ impl<'a> Machine<'a> {
             .iter()
             .filter(|t| program.modules[t.module].name.as_symbol() == module)
             .nth(ordinal)
-            .map(|slot| (slot.module, lower(slot.body)));
-        let Some((owner, body)) = found else {
+            .map(|slot| (slot.module, slot.body));
+        let Some((owner, source)) = found else {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("module `{module}` has no test at position {ordinal}"),
@@ -489,9 +556,15 @@ impl<'a> Machine<'a> {
             .primary(Span::DUMMY, "this test's module was not parsed")
             .note("run `ply cache clear`, or pass `--no-incremental`"));
         };
+        let body = self.lowering.body(source);
         self.drive(body, Env::empty(), owner).map(|_| ())
     }
 
+    /// An expression of unknown provenance, lowered afresh.
+    ///
+    /// It cannot go through [`Lowering`]: the cache keys on an address and holds
+    /// the program that makes an address an identity, and this expression need
+    /// not be in that program. [`Machine::eval_expr_in`] is the one that can.
     pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
         self.drive(lower(e), Env::empty(), 0)
     }
@@ -503,9 +576,14 @@ impl<'a> Machine<'a> {
     /// its own module, so its bare names resolve there and nowhere else, and its
     /// binders are values the caller drew rather than anything the program
     /// bound.
+    ///
+    /// `e` is borrowed from this machine's program, which is what lets the
+    /// clause be lowered once rather than once per case: a property draws
+    /// hundreds of points and judges every one of them against this same
+    /// expression.
     pub fn eval_expr_in(
         &mut self,
-        e: &Expr,
+        e: &'a Expr,
         module: usize,
         bindings: &[(Symbol, Value)],
     ) -> Result<Value, Diagnostic> {
@@ -513,7 +591,8 @@ impl<'a> Machine<'a> {
         for (name, value) in bindings {
             env = env.bind(name.clone(), value.clone());
         }
-        self.drive(lower(e), env, module)
+        let body = self.lowering.body(e);
+        self.drive(body, env, module)
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
@@ -1684,9 +1763,11 @@ impl<'a> Machine<'a> {
                 let (body, env, module) = (body.clone(), env.clone(), *module);
                 self.enter_code(closure, params, body, env, module, args, span)
             }
-            // A closure the tree-walker made, handed in through `call`. Lowering
-            // it here costs a traversal per call and keeps the two engines'
-            // values interchangeable, which is what `--engine both` needs.
+            // A closure the tree-walker made, handed in through `call`. Its body
+            // is a deep clone rather than a node of the program, so it cannot go
+            // through `Lowering`; `closure_code` remembers the last one, which
+            // is what a closure applied in a loop needs and is all a value the
+            // program can mint may be allowed to hold.
             ClosureKind::Fn {
                 params,
                 body,
@@ -1694,7 +1775,8 @@ impl<'a> Machine<'a> {
                 module,
             } => {
                 let params: Vec<Symbol> = params.clone();
-                let (body, env, module) = (lower_fn(&params, body), env.clone(), *module);
+                let body = self.closure_code.of(&params, body);
+                let (env, module) = (env.clone(), *module);
                 self.enter_code(closure, &params, body, env, module, args, span)
             }
             ClosureKind::Ctor { name, arity } => {
@@ -2015,25 +2097,24 @@ impl<'a> Machine<'a> {
         Err(err_unknown_name(q))
     }
 
-    /// The closure for a program-wide name, lowering its body the first time.
+    /// The closure for a program-wide name, lowering its body the first time
+    /// **any** machine over this program reaches it.
     fn definition(&mut self, name: &Symbol) -> Option<Value> {
         if let Some(v) = self.lowered.get(name) {
             return Some(v.clone());
         }
         let slot = self.fns.get(name)?;
-        let params: Vec<Symbol> = slot
-            .def
-            .params
-            .iter()
-            .map(|p| p.name.name.clone())
-            .collect();
+        let (def, module) = (slot.def, slot.module);
+        let params: code::Params =
+            Rc::new(def.params.iter().map(|p| p.name.name.clone()).collect());
+        let body = self.lowering.of(&params, &def.body);
         let closure = Closure {
             name: Some(name.clone()),
             kind: ClosureKind::Code {
-                body: lower_fn(&params, &slot.def.body),
-                params: Rc::new(params),
+                body,
+                params,
                 env: Env::empty(),
-                module: slot.module,
+                module,
             },
         };
         let value = Value::Closure(Arc::new(closure));

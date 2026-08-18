@@ -164,6 +164,10 @@ pub struct Prover<'a> {
     /// those machines needs an identity of its own so that two host laws in
     /// flight are two scope stacks.
     hosting: Option<Hosting<'a>>,
+    /// This program's region kinds, for the reason `ctx` is built once: the
+    /// analysis behind them is whole-program, and `machine()` is called per
+    /// obligation.
+    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 /// The binding and the reactor a `law/host` runs against.
@@ -201,6 +205,7 @@ impl<'a> Prover<'a> {
             defs,
             laws,
             hosting: None,
+            region_kinds: ply_eval::region_kind::Kinds::default(),
         }
     }
 
@@ -235,7 +240,10 @@ impl<'a> Prover<'a> {
     }
 
     fn machine(&self) -> Machine<'a> {
-        Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS)
+        let mut machine =
+            Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
+        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        machine
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding, and a reactor

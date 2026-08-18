@@ -1042,3 +1042,75 @@ fn the_two_engines_agree_on_every_expression_form() {
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
+
+// ------------------------------------------------------- lowering, once each
+
+#[track_caller]
+fn answer(machine: &mut Machine<'_>) -> i64 {
+    match machine.call("f", Vec::new(), sp()) {
+        Ok(Value::Int(i)) => i,
+        other => panic!("expected an Int from `f`, got {other:?}"),
+    }
+}
+
+/// Lowering is a property of the syntax, so a machine built next over the same
+/// program reads what this one lowered. A search builds one per interleaving and
+/// `ply test` one per pool thread per group, which is what this is worth.
+#[test]
+fn a_second_machine_over_one_program_lowers_nothing_the_first_already_did() {
+    let (program, resolved) = standalone(vec![
+        fn_def("g", &["x"], bin(BinOp::Add, var("x"), int(1))),
+        fn_def("f", &[], callv("g", vec![int(6)])),
+    ]);
+
+    let mut first = Machine::for_program(&program, &resolved);
+    assert_eq!(answer(&mut first), 7);
+    let shared = first.share_lowering();
+    let lowered = shared.len();
+    assert_eq!(lowered, 2, "`f` and `g`, and nothing else, were lowered");
+
+    let mut second = Machine::for_program(&program, &resolved);
+    second.set_lowering(std::rc::Rc::clone(&shared));
+    assert_eq!(answer(&mut second), 7);
+    assert_eq!(
+        shared.len(),
+        lowered,
+        "the second machine lowered {} more bodies the first had already lowered",
+        shared.len() - lowered
+    );
+}
+
+/// A bisection rebuilds a program whose definitions carry the names of the ones
+/// they replace, so a cache keyed on a body's address must be refused rather
+/// than consulted across two programs. The answer here is the running program's.
+#[test]
+fn a_machine_refuses_a_lowering_taken_over_a_different_program() {
+    let (one, one_resolved) = standalone(vec![fn_def("f", &[], int(1))]);
+    let (two, two_resolved) = standalone(vec![fn_def("f", &[], int(2))]);
+
+    let mut first = Machine::for_program(&one, &one_resolved);
+    assert_eq!(answer(&mut first), 1);
+
+    let mut second = Machine::for_program(&two, &two_resolved);
+    second.set_lowering(first.share_lowering());
+    assert!(
+        !std::rc::Rc::ptr_eq(&second.share_lowering(), &first.share_lowering()),
+        "a machine took a cache built over another program"
+    );
+    assert_eq!(
+        answer(&mut second),
+        2,
+        "the second program's `f` answered with the first program's body"
+    );
+}
+
+/// `eval_test` lowered the body it was about to run on every call and cached
+/// nothing, so a worker re-running a test paid the traversal again.
+#[test]
+fn a_test_run_twice_is_lowered_once() {
+    let (program, resolved) = standalone(vec![test_def("t", bin(BinOp::Add, int(1), int(2)))]);
+    let mut machine = Machine::for_program(&program, &resolved);
+    machine.eval_test(0).expect("the test passes");
+    machine.eval_test(0).expect("the test passes again");
+    assert_eq!(machine.share_lowering().len(), 1);
+}

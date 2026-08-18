@@ -16,9 +16,7 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
-use std::cell::OnceCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 /// An operation's declaration, by program-wide effect name and operation name.
@@ -66,11 +64,10 @@ pub struct Interp<'a> {
     /// entry point resets to — so one seeded fixture serves every test in a run
     /// without any of them observing another's writes. ADR 0017 §1 and §5.
     regions: TaskRegions,
-    /// Which of ADR 0017 §3's two kinds each region in this program is, computed
-    /// on the first region this evaluator actually opens. Lazy for the reason
-    /// the machine's copy is: a whole-program analysis must not be run for an
-    /// entry point that opens no region.
-    region_kinds: OnceCell<Rc<crate::region_kind::Regions>>,
+    /// Which of ADR 0017 §3's two kinds each region in this program is. Lazy,
+    /// and scoped to the program rather than to this evaluator, for the reasons
+    /// the machine's copy is — [`crate::Machine::share_region_kinds`].
+    region_kinds: crate::region_kind::Kinds,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
     /// The module a bare name is resolved in: the one that wrote the expression
@@ -164,7 +161,7 @@ impl<'a> Interp<'a> {
             tests,
             handlers: Vec::new(),
             regions: TaskRegions::new(),
-            region_kinds: OnceCell::new(),
+            region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
             module: 0,
             calls: Vec::new(),
@@ -623,10 +620,24 @@ impl<'a> Interp<'a> {
     /// over the same program, which is what keeps `--engine both` from seeing
     /// two different region structures.
     fn region_kind(&self, span: Span) -> Option<RegionKind> {
+        self.region_kinds().at(span).map(|region| region.kind)
+    }
+
+    /// This program's region kinds, inferring them if nothing has yet.
+    pub fn region_kinds(&self) -> &crate::region_kind::Regions {
         self.region_kinds
-            .get_or_init(|| Rc::new(crate::region_kind::infer(self.program, self.resolved)))
-            .at(span)
-            .map(|region| region.kind)
+            .get_or_init(|| crate::region_kind::infer(self.program, self.resolved))
+    }
+
+    /// See [`crate::Machine::shared_region_kinds`].
+    pub fn shared_region_kinds(&self) -> crate::region_kind::Kinds {
+        crate::region_kind::Kinds::clone(&self.region_kinds)
+    }
+
+    /// See [`crate::Machine::share_region_kinds`], whose contract this shares:
+    /// `kinds` must be an answer about the same program.
+    pub fn share_region_kinds(&mut self, kinds: crate::region_kind::Kinds) {
+        self.region_kinds = kinds;
     }
 
     /// Opens the region, runs `body` in it and closes it — on the error path

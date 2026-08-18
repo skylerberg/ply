@@ -11,8 +11,8 @@
 //! the report this produces was taken by this file in one run on one machine.
 
 use anyhow::{Context, Result, bail};
+use ply_eval::Value;
 use ply_eval::host::HostRuntime;
-use ply_eval::{Machine, Value};
 use ply_span::Span;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -435,7 +435,7 @@ fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Dur
         .bind(&loaded.check)
         .map_err(|d| anyhow::anyhow!("binding the network failed: {}", d[0].message))?;
     let name = loaded.full("run_memory")?;
-    let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+    let mut machine = loaded.machine();
     machine.set_host_binding(Arc::new(binding));
     let runtime: Rc<dyn HostRuntime> = host.runtime();
     machine.set_host_runtime(runtime);
@@ -822,11 +822,11 @@ pub fn engines(repo: &Path, iterations: u32, repeats: usize) -> Result<Vec<w6::E
                 ply_eval::Engine::Treewalk => {
                     let mut interp =
                         ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
+                    interp.share_region_kinds(loaded.shared_region_kinds());
                     interp.call(&name, args.clone(), Span::DUMMY)
                 }
                 ply_eval::Engine::Machine => {
-                    let mut machine =
-                        Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+                    let mut machine = loaded.machine();
                     machine.call(&name, args.clone(), Span::DUMMY)
                 }
             };
