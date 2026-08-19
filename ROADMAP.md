@@ -1272,3 +1272,27 @@ regions question.** It was reopened by a rule fixed in advance, by a measurement
 and it stays open until another measurement closes it. If a later revision of
 this section presents item 0 as settled without a number beside it, that revision
 is the defect.
+
+## Compute kernels — is Ply ever the right choice for MCTS-shaped work?
+
+`docs/adr/0018-compute-kernel-performance.md`. Proposed, nothing accepted.
+
+The probe: a maximally-performant Monte Carlo tree search library. Almost pure
+compute — a tight loop over a mutable tree, millions of iterations, hot RNG,
+parallel rollouts contending on shared nodes. It exercises every place Ply is weak
+and almost none of where it is strong. The answer today is Rust, by roughly an
+order of magnitude.
+
+The gaps, and what the ADR plans for each: boxed primitives, interpreted dispatch,
+no unboxed mutable arrays, per-operation effect dispatch, no monomorphization, no
+vocabulary for shared mutable state across tasks, and no SIMD or layout control.
+
+**The first step is a measurement, not a build.** ADR 0016 priced the codegen
+spike at 11.67x on its compilable fragment and 1.02-1.05x end to end, because that
+fragment is 2-5% of an HTTP request. An MCTS inner loop may be *mostly* that
+fragment. Re-pricing the existing spike against a kernel is cheap, and every other
+item is ordered on an assumption only that measurement can test.
+
+Available today, and it is the design working rather than a concession: the kernel
+in Rust behind a host handler with a declared footprint, the strategy and
+experiment harness in Ply. The boundary costs 0.5 us per crossing, measured.
