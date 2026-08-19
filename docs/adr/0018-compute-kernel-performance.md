@@ -23,7 +23,7 @@ per gap, ordered by what the existing measurements actually support.
 | --- | --- |
 | 41.6× the Rust floor, served request | `benches/w6-ladder-r3.json` |
 | 2.51× tree-walker, control-stack machine on the pure path | ADR 0016 |
-| 11.67× minimum, codegen spike on its compilable fragment | `benches/w6-spike.json` |
+| 11.67× minimum, codegen spike on its compilable fragment | **computed from** `benches/w6-spike.json` — interpreter-best ÷ spike-worst, not a field in the file |
 | 1.55× end to end from a fast execution strategy | ADR 0016 §"the second lever" |
 | 1,082 allocations per `/health`, 24% in `frame::dispatch` | `w6-alloc`, `w6_alloc_sites` |
 
