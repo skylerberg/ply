@@ -14,6 +14,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
+mod argv;
 pub mod builtins;
 pub mod code;
 pub mod cont;
@@ -43,6 +44,10 @@ mod value;
 // allocator's own vocabulary and each of those names means something else
 // somewhere in this crate.
 pub use arena::{Arena, RegionKind};
+// The one thing outside this crate needs from `argv`: the attribution harness
+// splits a request's surviving argument vectors at the free list's widest class
+// and must split at the same number this crate serves.
+pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Code, Lowering, Node, NodeKind, lower};
 pub use cont::{

@@ -361,7 +361,31 @@ speed: the tree-walker is 2.82x faster on the request path.
 > engines are not the same speed — is unchanged.
 
 **The request-path allocation count is large.** One `/health` request makes
-**1,082 allocations and 127,955 bytes** to produce a 107-byte response.
+**773 allocations and 108,200 bytes** to produce a 107-byte response.
+
+> **Corrected (R4, 2026-08-21).** This sentence read **1,082 allocations and
+> 127,955 bytes**, which the block below put there on 2026-08-17. R4 landed the
+> three levers of `docs/adr/0019-value-representation.md` — §1's free list for
+> the call-argument vector, and §2's two halves, a literal's `Value` built once
+> at lowering and one `Value` per constructor mention per thread. Re-taken on
+> this tree, three consecutive runs byte-identical:
+>
+> ```
+> $ ./target/release/w6-alloc --repo . --requests 200
+> {"allocations_per_request":773.4,"bytes_per_request":108199.93,
+>  "requests":200,"response_bytes":107,"route":"/health"}
+> ```
+>
+> **773 against 1,082, so the paragraph's point is weaker than it was and it
+> still stands**: 773 allocations to produce 107 bytes. The split between the
+> three levers is measured rather than apportioned — each was A/B'd against the
+> same tree with only its own change swapped, and the deltas are additive to the
+> digit: **§1 −178.0, §2's literal half −65.0, §2's constructor half −45.0** per
+> request on the (20, 200) slope, summing to the 911.5 → 623.5 that
+> `cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture`
+> prints. Read the byte figure only against another 200-request reading:
+> `bytes_per_request` rises with the window for a reason nobody has diagnosed
+> (`CONTRIBUTING.md` §"Things known to be broken" item 8).
 
 > **Corrected again (regression audit, 2026-08-17).** This sentence read
 > **1,122 allocations and 131,677 bytes**, which the block below had just put
