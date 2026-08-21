@@ -22,6 +22,14 @@
 //! 95.3% between the (20, 200) and (200, 400) window pairs. So a verdict here
 //! reads the allocation count, the window pair is pinned, and no threshold in
 //! this file is stated in bytes.
+//!
+//! **Re-taken after §1 and §2 landed (regression audit, 2026-08-21). Those two
+//! figures are the pre-lever tree's and neither comes back from that command
+//! any more: it prints 1.5% and 113.4%**, three runs identical to the digit.
+//! They are left above because they are what the paragraph was written against.
+//! Nothing in this file is stated in either — they are the reason a threshold
+//! here is in allocations — and the conclusion is unchanged and slightly
+//! stronger, because the byte slope moved further rather than less.
 
 /// The window pair every figure a verdict reads must be fitted from.
 ///

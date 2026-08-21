@@ -35,6 +35,24 @@ it before anything is built.**
 
 ## 1. Re-price the spike against a compute kernel — do this first
 
+> **Discharged (R4, 2026-08-21), and it changed the ordering of everything
+> below.** The measurement this section asked for is
+> `benches/adr0018-mcts.json`, written by the command in `benches/README.md`
+> §"What `mcts` adds"; the kernel is `benches/kernel/`, in Ply, and it passes
+> `ply test benches/kernel/ --engine both`. The assumption held on **shape** —
+> 22 of 34 kernel functions, 386 of 745 lowered nodes, and **81.0% of the
+> kernel's executed work** are inside the fragment, against the 2–5% ADR 0016
+> measured for an HTTP request. The conclusion it was supposed to license did
+> **not** hold: end to end the hybrid is **0.998× [0.979–1.007]** against a
+> harness floor of 1.000× [0.994–1.009], because **the interpreter cannot call
+> compiled code** — a function the fragment accepts whose callers it refuses is
+> compiled and never entered. The Amdahl ceiling over the two measured numbers
+> is **4.86×**, not the 11.67× this ADR carries for the spike and not the
+> 52.58× the fragment shows where it does run. `docs/adr/0019-value-
+> representation.md` §5 is the write-up and lists the six things an amendment
+> to this document owes; it does not make them, and neither does this block.
+
+
 The spike measured **11.67× minimum** on arithmetic, comparisons, `if`, `let`,
 `block`, and `match` on literal patterns. ADR 0016 concluded 1.02–1.05× end to
 end because that fragment is 2–5% of an HTTP request.
@@ -55,6 +73,65 @@ is low, §2–§4 are the wrong plan and this ADR should be rewritten rather tha
 executed.
 
 ## 2. Unboxed primitives
+
+> **Corrected in place (R4, 2026-08-21). Both sentences of "The gap" below are
+> wrong, and they are left standing verbatim underneath this block because
+> `CONTRIBUTING.md` §"Correct, do not delete" wants the withdrawn claim beside
+> the measurement.** This ADR opened §2 by reasoning from them, and a milestone
+> was requested on their strength.
+>
+> **"Every `Int` is a heap-allocated `Value`" is false.** `Int`, `Bool`,
+> `Float`, `Unit`, `Decimal`, `Cell` and `Task` are inline variants of the
+> `Value` enum (`crates/ply-eval/src/value.rs:50-104`) and building one touches
+> no allocator. `size_of::<Value>()` is 32 bytes. Printed by name, by a test
+> that runs:
+>
+> ```
+> cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture
+> ```
+>
+> > ```
+> > -- what one Value costs to build --
+> >   Value::Int       0 allocations
+> >   Value::Bool      0 allocations
+> >   Value::Float     0 allocations
+> >   Value::Unit      0 allocations
+> >   Value::Decimal   0 allocations
+> > ```
+>
+> **There is no primitive boxing in this evaluator to remove**, so the plan
+> below — "a tagged representation where `Int`, `Bool` and `Float` live inline
+> in the value word rather than behind a pointer" — describes what the tree
+> already does.
+>
+> **"`interp::literal` allocates 111 times per request" attributes to the wrong
+> thing.** The count was real; the conclusion drawn from it did not follow.
+> `interp::literal` cannot allocate at all unless the literal is a `Str` or a
+> `Bytes` (`crates/ply-eval/src/interp.rs:1000-1010`), and the 111 was read off
+> a **20-request window**: it fits to 65.0 per request plus 925 once per
+> `Machine`, and 65.0 + 925/20 = 111.25. One-time work divided by twenty looks
+> exactly like a per-request cost, which is the failure `CONTRIBUTING.md`
+> §"Measure an ADR's motivating claim before accepting the ADR" closes with.
+>
+> **What the request actually spends its allocations on** was measured instead,
+> attributed to the value being built rather than to the frame that built it and
+> fitted over two windows: the largest line was the **call-argument vector**, at
+> 372.4 per request, 40.9%. R4 landed a free list for it and built a
+> compile-time constant's `Value` once, and `/health` went from **1,082 to 773**
+> allocations per request (`./target/release/w6-alloc --repo . --requests 200`).
+> `docs/adr/0019-value-representation.md` is that ADR; its §4 **rejects**
+> narrowing `Value`, with the number that would have justified it, which is
+> zero allocations.
+>
+> **§2's success criterion is also spent.** It reads "a `w6_alloc_sites` re-run
+> showing `interp::literal` gone from the top sites". `interp::literal` is now
+> 0.0 allocations per request on both routes — and the profile's top line is
+> unmoved, because it never was `interp::literal`.
+>
+> **This ADR is not otherwise amended, and §5 below is untouched.** ADR 0019 §5
+> lists what an amendment owes, including the item that outranks everything in
+> this section: a backend the interpreter cannot *enter* buys nothing whatever
+> the representation is, measured at 0.998× end to end.
 
 **The gap.** Every `Int` is a heap-allocated `Value`. `interp::literal` allocates
 111 times per request on a workload doing almost no arithmetic. MCTS is visit

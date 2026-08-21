@@ -517,12 +517,39 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,597 tests across 151 targets** (138 test
-binaries plus 13 doc-test suites); all pass on an unloaded machine. Four are
-marked `ignored`: three are timing benchmarks you run on purpose
-(`ply-corpus --test http_cost`) and the fourth is a doc-test, not a benchmark.
-Those counts were **3,206 across 123** here and had not been re-taken as the tree
-grew.
+`cargo test --workspace` runs **3,644 tests across 155 targets** (142 test
+binaries plus 13 doc-test suites); all pass on an unloaded machine. Five are
+marked `ignored`: four are timing benchmarks you run on purpose (three in
+`ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
+doc-test, not a benchmark. Those counts were **3,206 across 123** here and had
+not been re-taken as the tree grew.
+
+> **Re-taken (R4 integration pass, 2026-08-21), which added four test binaries
+> and the first `ignored` test outside `http_cost`.** This read **3,597 passed,
+> 0 failed, 4 ignored** across **151** targets (138 binaries). R4 landed
+> `ply-eval/tests/literal_value_sharing.rs` (8 tests),
+> `ply-eval/tests/literal_sharing.rs` (6),
+> `ply-eval/tests/ctor_value_sharing.rs` (6) and
+> `ply-corpus/tests/r4_value_construction.rs` (9), plus tests inside existing
+> binaries; the integration pass added one rule to the last of those. Re-taken
+> as `cargo test --workspace --no-fail-fast`, summing the `test result:` lines:
+> **3,644 passed, 0 failed, 5 ignored**, with `grep -c '^     Running'` →
+> **142** and `grep -c '^   Doc-tests'` → 13, so **155 targets**.
+>
+> The fifth `ignored` is
+> `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,
+> a timing benchmark that prints its own recipe exactly as the three in
+> `http_cost` do; the other four are unchanged.
+>
+> **The wall clock is 569.3s (9m 29s) real, 726.6s user**, `/usr/bin/time -p` on
+> one run from an already-built `target/` — and that run was **not on an idle
+> machine**, unlike the ones in the block below, so read it as an upper-ish
+> bound. The `test result:` lines sum to **478.5s** of in-target time across the
+> 155 targets, which excludes compilation. One target dominates
+> the increase: `r4_value_construction` is an allocation attribution that
+> captures a backtrace per allocation over 20-, 200- and 400-request windows,
+> and it takes **70.9s in debug against 25.6s in release** — the profile
+> `cargo test --workspace` runs is the slow one. Budget accordingly.
 
 > **Re-taken after R3 (2026-08-17), which added three test binaries.** This
 > sentence read **3,566 across 147** (134 binaries). R3 landed

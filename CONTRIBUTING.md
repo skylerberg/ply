@@ -57,14 +57,28 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # ~6.5 min — 3,597 pass, 0 fail, 4 ignored
+cargo test --workspace                          # ~9.5 min — 3,644 pass, 0 fail, 5 ignored
 ```
 
-**All three are currently clean**, re-verified after the regression audit that
-followed R3 (2026-08-17): `fmt --check` silent and exit 0, `clippy --workspace
---all-targets` zero warnings, `cargo test --workspace` 3,597 passed / 0 failed /
-4 ignored across 151 targets in 399.6s, and again at 406.9s. If you introduce the
-first warning, that is a regression, not a baseline.
+**All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
+--all --check` silent and exit 0, `clippy --workspace --all-targets` **zero**
+warnings and zero errors, `cargo test --workspace --no-fail-fast` **3,644 passed
+/ 0 failed / 5 ignored** across **155 targets** (142 binaries + 13 doc-test
+suites). If you introduce the first warning, that is a regression, not a
+baseline.
+
+> **Re-taken after R4 (2026-08-21).** The line read `~6.5 min — 3,597 pass, 0
+> fail, 4 ignored` and the paragraph `3,597 / 0 / 4 across 151 targets in
+> 399.6s, and again at 406.9s`. R4 added four test binaries; §"Things known to
+> be broken" and `docs/ONBOARDING.md` §2 name them. The wall clock re-take is
+> **569.3s (9m 29s) real, 726.6s user**, `/usr/bin/time -p` on one run from an
+> already-built `target/` — and that run was **not on an idle machine**, so it
+> is an upper-ish bound rather than the clean figure the older ones are. The
+> `test result:` lines sum to 478.5s of in-target time, excluding compilation.
+> The reason the estimate went up is one target:
+> `ply-corpus/tests/r4_value_construction.rs` takes **70.9s in debug and 25.6s
+> in release**, because it captures a backtrace per allocation. It is not
+> `ignored`, and the figures it is documented to print are the release ones.
 
 > **The counts moved twice and the reason is in the tree both times, not in the
 > suite.** They read 3,566 / 147 / 324.5s, then 3,584 / 150 / 352.4s. R3 added
@@ -270,8 +284,10 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is seventeen files, `00NN-slug.md`, with **no index** — the numbers
-are the ordering. Number yours `0018` and up. ADR 0005 is superseded in part by
+`docs/adr/` is **nineteen** files, `00NN-slug.md`, with **no index** — the
+numbers are the ordering. Number yours `0020` and up. (This read "seventeen" and
+"`0018` and up"; 0018 and 0019 have since been written, and nothing counts the
+directory for you — `ls docs/adr/*.md | wc -l`.) ADR 0005 is superseded in part by
 ADR 0017, and it is the model for how to record that: 0005's *title* does not say
 so, but its header does — lines 3–9 carry `Status: accepted — … §2's persistent
 forkable world is **superseded by ADR 0017**` and `Superseded in part by:
@@ -292,8 +308,9 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-hash/src/normalize.rs` | **every cached result everywhere.** The bytes are the identity. A change here is a cache-format change; see `CACHE_VERSION_CHANGED` (`W0603`). |
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
-| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which nothing compiles. It has already bit-rotted this way. |
-| the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it |
+| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today: `cd crates/ply-codegen-spike && cargo +1.94.0 test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering |
+| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
+| the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | any public signature | `CONTRACTS.md`, which no test reads |
 | `examples/desk.ply` | `examples/serve.sh`, whose `rewrite()` (`serve.sh:103-112`) matches exact source lines with `grep -qF` and aborts loudly if one is missing — that abort is deliberate and is the good case. How many lines it rewrites depends on the mode: `--memory` rewrites two (`:122` and `:125`), `--tls` rewrites one (`:127`), and a plain `--db` run rewrites none |
 
@@ -301,17 +318,43 @@ re-arguable. Name the files; see the warning in the gate table above.
 
 Recorded here so nobody spends an afternoon rediscovering them.
 
-1. **`crates/ply-codegen-spike` does not compile.** Two independent walls:
-   cranelift 0.134.3 requires rustc ≥ 1.94.0 (no `rust-toolchain.toml` pins
-   anything), and on 1.94.0 it fails with two `E0164`s because
-   `ply_eval::code::Stmt::Expr` became a struct variant. It is outside the
-   workspace, so nothing compiles it and nothing caught the drift. Consequence:
-   ADR 0016's `11.67x`, `1.71x` and §9.2 census are **not reproducible from this
-   tree**, and `ROADMAP.md` §"What is next" item 3 — re-measure codegen's
-   ceiling — is blocked until this is fixed or the crate is deleted per ADR 0016
-   §3.5. ADR 0016 records the toolchain wall only, at lines 764–767 and
-   1105–1106; the source-incompatibility wall is recorded nowhere but here and
-   in `docs/ONBOARDING.md` §1.
+1. ~~**`crates/ply-codegen-spike` does not compile.**~~ **Half fixed, and the
+   half that is left is the one that bit it.** The second wall is gone: R4
+   repaired the `E0164`s (`ply_eval::code::Stmt::Expr` is a struct variant) and
+   then widened `NodeKind::Lit` under it and repaired that too, so the crate
+   builds and its tests run. Re-taken 2026-08-21 by the integration pass, from
+   `crates/ply-codegen-spike/`:
+
+   ```
+   $ cargo +1.94.0 build --release
+       Finished `release` profile [optimized] target(s) in 1m 19s
+   $ cargo +1.94.0 test --release
+   test result: ok. 7 passed; 0 failed; ...      # tests/spike.rs
+   test result: ok. 8 passed; 0 failed; ...      # tests/mcts_kernel.rs
+   ```
+
+   The **first** wall stands and is not a defect to fix: cranelift 0.134.3
+   requires rustc ≥ 1.94.0 and nothing in this repository pins a toolchain, so
+   `cargo test` on the default `stable` still refuses. `+1.94.0` is the
+   invocation, and every command in `benches/README.md` §"What `mcts` adds"
+   carries it.
+
+   What has **not** changed is why this rotted: the crate declares its own
+   `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
+   `cargo clippy --workspace --all-targets` still do not touch it, and the next
+   change to `ply_eval::code` will break it again with nothing to say so. It is
+   also not clippy-clean and never has been — `cargo +1.94.0 clippy
+   --all-targets` there reports 13 `not_unsafe_ptr_arg_deref` errors, all in
+   `src/rt.rs`, which is the JIT's calling convention, plus 6 warnings; the
+   project's stated gate is `--workspace` and does not reach them.
+
+   Consequence, revised: ADR 0016's `11.67x` **is** re-takeable now, and R4 took
+   it — `benches/w6-spike-r4.json`, at `11.68×` by the same expression, so the
+   `read_line` half did not move. `ROADMAP.md` §"What is next" item 3 is
+   unblocked and ADR 0018 §1 is discharged; what item 3 asked for is in
+   `benches/adr0018-mcts.json` and `docs/adr/0019-value-representation.md` §5.
+   ADR 0016 records the toolchain wall at lines 764–767 and 1105–1106 and is
+   otherwise unamended.
 2. **`examples/same-tests.sh` does not build the binary it runs.** It uses
    `target/release/ply` (line 44) with no `cargo build` anywhere.
 3. **`examples/same-tests.sh` step 1 can be vacuous.** It passes

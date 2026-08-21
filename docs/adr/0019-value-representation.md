@@ -15,6 +15,49 @@ Status: **partly accepted.**
   cost is real.
 - **Not decided here:** everything in §5. The spike re-pricing changed what ADR
   0018 should say. This ADR records what changed and does not amend ADR 0018.
+- **Reported, not priced:** §6, one allocating site found while integrating,
+  with its measurement and the reason it is not taken here.
+
+> **Where this ADR stands after the integration pass (2026-08-21).** §1 and §2
+> are **landed and green**: `/health` reads **773.4** allocations per request
+> against 1,082 before, `--engine both` reports zero divergences over the
+> example suite, the `benches/kernel` MCTS kernel and eight generated corpora,
+> and neither store version moved: `RUNTIME_VERSION` still reads **0.11.2** —
+> the value §"What is assumed" item 3 names as the constant memo's — and
+> `FRONTEND_VERSION` **0.15.0** (`crates/ply-store/src/lib.rs:83,116`), with
+> `schema::tests::the_stored_schema_is_pinned` green and untouched. So
+> §"What would make this ADR wrong" item 3 did not fire, and `Value::builtin`
+> stands as a precedent rather than a latent defect.
+> `judge` answers **`Verdict::Short`** on §1 anyway, for the reason §1's
+> correction block gives; **no threshold and no attributed share in
+> `ply_corpus::r4` was edited.**
+>
+> Two of §"What would make this ADR wrong"'s five conditions remain
+> **unchecked** and a reader should not assume otherwise: nobody has measured
+> the **served-request wall clock** before and after §1, so
+> `Criteria::max_time_regression` has never been evaluated and assumption 1 is
+> still assumed; and `size_of::<Value>()` is still 32, so the widening
+> condition did not arise.
+>
+> > **Corrected (regression audit, 2026-08-21). The first half of that sentence
+> > is false, and it is false against §1 of this same document.** It is left
+> > standing above because it is what the integration pass wrote. §1's
+> > correction block reports `Criteria::max_time_regression` **evaluated**:
+> > fourteen paired windows of `ply-corpus serve --repo . --no-load --repeats 5
+> > --ladder-requests 8000`, alternating the two binaries, reading the `answer`
+> > rung — 18.90 µs without the free list against 19.00 µs with it, a paired
+> > ratio of **1.005** (0.990–1.021 over the seven quiet windows), against a
+> > 1.02 bar. Checked here that the instrument the block names is real and
+> > prints that rung: `ply-corpus serve --help` carries `--no-load`,
+> > `--repeats` and `--ladder-requests`, and the ladder's first row is
+> > `answer — the HTTP parse and the response build, as ordinary Ply`. What the
+> > audit did **not** do is re-take the pair — that needs the lever reverted
+> > again and a quiet machine, and §1 already says a 2% criterion cannot be
+> > resolved on a loaded one. So the honest statement is *measured once, by the
+> > build agent, at 1.005 and under the bar, and not independently reproduced*
+> > — which is a different claim from "never evaluated", and the difference
+> > matters because assumption 1 is the one this ADR named as most likely to
+> > sink §1. `size_of::<Value>()` is still 32; that half stands, re-checked.
 
 ## Provenance
 
@@ -49,6 +92,15 @@ are left standing in ADR 0018, and this is the correction. `CONTRIBUTING.md`
 means a block in ADR 0018 — §5 item 1 is that obligation, deliberately not
 discharged here, and until it is, a reader who opens ADR 0018 §2 first will read
 the false claim with nothing pointing at this file.
+
+> **Discharged (R4 integration pass, 2026-08-21).** ADR 0018 §2 now opens with a
+> correction block carrying both withdrawn sentences verbatim, the measurement,
+> and a pointer here; §1 of that document carries a block saying it is
+> discharged and what the answer was. **Items 1 and 2 of §5 below are therefore
+> done and items 3 through 6 are not** — in particular item 3, the blocker that
+> a backend the interpreter cannot enter buys nothing, is still absent from ADR
+> 0018 and is upstream of its §2, §3 and §5. Nothing else in ADR 0018 was
+> touched: its ordering still assumes what §5 measured false.
 
 `Int`, `Bool`, `Float`, `Unit` and `Decimal` are **inline enum variants** of
 `Value` (`crates/ply-eval/src/value.rs:50-104`) and building one touches no
@@ -98,6 +150,24 @@ Two independently written classifiers agree on it — `w6_alloc_sites.rs` ranks 
 frame and `r4_value_construction.rs` ranks by value, and both print 65.0 and
 925.
 
+> **Both paragraphs above are in the present tense and neither is true of this
+> tree any more; they are what was measured before §2 landed and they are the
+> reasoning this ADR rests on, so they stay.** Re-run today, the same
+> `w6_alloc_sites` command reaches `ply_eval::interp::literal` only underneath
+> `ply_eval::code::lower_node` — it is compile-time work now — and it is not a
+> ranked site at any window; `r4_value_construction` prints the literal bucket
+> as **0.0 per request** on both routes. The full before/after table is in
+> §"What is measured" below.
+>
+> > *Corrected, regression audit 2026-08-21:* **"not a ranked site at any
+> > window" is too strong**, and it is left standing above because it is what
+> > was written. `interp::literal` is **still printed in that command's ranked
+> > list** — 1.6 allocations, 0.6% of the `endpoint` rung, and 5.0, 0.7% of
+> > `framing`, at the 20-request window — with `ply_eval::code::lower_node`
+> > above it in every frame. The rest of the sentence holds and is the part
+> > that matters: every one of those is compile-time, and the per-request slope
+> > is 0.0 on both routes.
+
 This is R3's lesson arriving a second time and `CONTRIBUTING.md` §"Measure an
 ADR's motivating claim before accepting the ADR" is where it is written down.
 A ranking is not a cost, and a frame is not a type.
@@ -114,6 +184,41 @@ a fourth, and this ADR is that ranking with a threshold under each.
 
 Every figure below has a command that renders it. None is quoted from another
 document.
+
+> **Corrected (R4 integration pass, 2026-08-21). Every figure in this table is
+> the attribution *before* the levers, and thirteen of them no longer come back
+> from the command named beside them.** The table is left standing because it is
+> the pre-registration this ADR's thresholds are fractions of — `BASELINE` is
+> 911.5 and `Lever::attributed_share` divides by it — and editing it would
+> destroy the only thing that makes `judge` mean anything. But the sentence
+> above it says *"has a command that renders it"* in the present tense, and for
+> these rows that is now false. Re-run on this tree, same commands:
+>
+> | reads, before → now | row |
+> | --- | --- |
+> | 911.5 → **623.5** per request, 34,465 → **30,372** per `Machine` | the `fit:` line, `/health` |
+> | 1,083.9 → **775.4** | the `200 requests:` line, `/health` |
+> | 1,082 → **773.4**, and `README.md:363` now says 773 | `./target/release/w6-alloc --repo . --requests 200` |
+> | 496.0 → **315.0** | the routing rung's `fit:` line |
+> | 372.4 → **194.4** argument vectors, 40.9% → 31.2% | `Vec<Value> — call arguments`, `/health` |
+> | 245.0 → **129.0**, 49.4% → 41.0% | the same, routing rung |
+> | 65.0 → **0.0** literal `Str`/`Bytes` | `Value::Str\|Bytes — literal, rebuilt per evaluation` |
+> | 110.0 → **0.0** rebuilt from a compile-time constant | the closing summary |
+> | 341.4 transient → the four-way split **178.0 / 31.0 / 23.0 / 140.4** | §1's correction block; the harness prints it |
+>
+> Unmoved, and re-checked rather than assumed: **33.0** `Record` B-tree nodes at
+> 544 bytes, **31.0** buffers retained as `Ctor.args`, `size_of::<Value>()` =
+> **32**, and the spike minimum at **11.68×** over `benches/w6-spike-r4.json`
+> against **11.67×** over `benches/w6-spike.json`.
+>
+> Two rows are worth reading twice. The argument vector is **still the largest
+> single line on both routes** after §1 took 178.0 off it, which is the four-way
+> split saying what it says: the mechanism reached everything it could reach and
+> what is left is a different change to a different signature. And the two
+> literal rows now read exactly **0.0**, which is the assertion
+> `a_requests_allocations_are_attributed_to_the_values_they_build` makes — it
+> was written as `> 0.0` and is now `== 0.0`, inverted rather than deleted, so
+> a regression is still a failure.
 
 | Figure | Source |
 | --- | --- |
@@ -168,6 +273,14 @@ Each of these is load-bearing for something below. None is measured today.
    does not measure the depth at which they overlap. A pool that misses is a
    pool that allocates anyway.
    *Settled by:* the allocation count after §1, against `Lever::floor`.
+   *Settled, and depth was not the miss.* Every buffer that reached
+   `Machine::enter_code` was recycled — a warm 1-argument Ply call added to a
+   loop body allocates 0.00 times per iteration, measured. The count of 341.4
+   non-retained buffers is right; what is wrong is the claim that `enter_code`
+   frees them. It frees 178.0. Of the remaining 163.4, **140.4 are consumed by
+   `builtins::call`**, which takes its `Vec<Value>` by value, and 23.0 are wider
+   than the free list's four capacity classes. §1's correction block is the
+   arithmetic.
 3. **That interning a compile-time constant is unobservable.** The argument is
    that no Ply expression can read an address, and `Value::builtin`
    (`value.rs:200`) is the standing precedent — one `Closure` per builtin per
@@ -190,6 +303,16 @@ Each of these is load-bearing for something below. None is measured today.
    and a byte slope moving 95.3% — `CONTRIBUTING.md` §"Things known to be
    broken" item 8, reproduced on this path. **No threshold in this ADR is stated
    in bytes**, and `ply_corpus::r4` has no byte field.
+
+   > **Corrected (regression audit, 2026-08-21). Both figures above are the
+   > pre-lever tree's and the command prints neither now: 1.5% and 113.4%**,
+   > three runs identical to the digit
+   > (`cargo test -p ply-corpus --release --test r4_value_construction
+   > the_per_request_slope -- --nocapture`). The same correction is on
+   > `crates/ply-corpus/src/r4.rs`'s module note, which carried the same two
+   > numbers. The assumption is unchanged and slightly stronger: the byte slope
+   > moved further, not less, so a byte column is still comparable only against
+   > another taken at the same window pair.
 
 ## 0. Two things every change below preserves
 
@@ -297,6 +420,56 @@ by running the pin test.
 > still passes against the pre-registered numbers; a re-derived floor is a
 > decision for whoever amends this ADR, and the number to derive it from is
 > 19.53%.
+>
+> **Assumption 1 is discharged: no regression detected, which is weaker than
+> no regression.** That assumption — *"that a free list is cheaper than the
+> allocator here"* — was the one this section named as most likely to sink it,
+> and `ply_corpus::r4::Criteria::max_time_regression` is 1.02.
+>
+> The instrument is paired windows of `ply-corpus serve --repo . --no-load
+> --repeats 5 --ladder-requests 8000`, running the two binaries back to back so
+> each pair is one window, alternating which goes first so first-position bias
+> cancels, and reading the `answer` rung — the HTTP parse and the response build
+> as ordinary Ply, the rung with no socket in it. Windows are kept or dropped by
+> the load average sampled at the *start* of the window, on a threshold fixed
+> before the data was taken; `benches/README.md` §"Every ratio is taken inside
+> one window" is why, and windows taken while this machine's load average was
+> above 30 spread from 0.497 to 1.607, which is why a 2% criterion cannot be
+> resolved on a loaded machine at all.
+>
+> | run | filter | kept | paired ratio (pool ÷ seam) | 95% CI | at 1.02 |
+> | --- | --- | --- | --- | --- | --- |
+> | 3, pre-registered | load < 4.5 | 10 of 40 | mean **0.999**, median 1.000, sd 0.037 | 0.973 – 1.026 | **not resolved** |
+> | 1 + 2 | load < 6.0 | 19 | mean 1.007, median 1.000, sd 0.093 | 0.963 – 1.052 | **not resolved** |
+> | all three | load < 4.5 | 20 | mean **1.000**, median 1.000, sd 0.027 | 0.988 – 1.013 | clears it |
+>
+> **The honest reading is the first row.** Run 3 is the one experiment whose
+> filter was written down before its data existed, and at n=10 it is underpowered
+> — at its own spread, resolving a 2% effect needs about 14 quiet windows. The
+> third row reaches 20 and does clear the bar, but it gets there by applying run
+> 3's threshold back over runs 1 and 2, which had been collected under a looser
+> one, and run 1's load figure is per-sitting rather than per-window. That is a
+> defensible uniform rule and it is still a filter chosen with some of the data
+> already seen, so it is reported as a supporting cut and not as the result.
+>
+> What every cut agrees on is the point estimate: **1.000 to 1.005**, with
+> min-of-N 18.90 µs without the list against 19.00 µs with it.
+>
+> **One thing does lean, and it leans the wrong way for this change.** Across the
+> 20 strict-filter windows the pool is slower in 9, faster in 3, and exactly tied
+> in 8 — a sign test on the 12 non-tied windows gives p = 0.15, so it is not a
+> result, but it is not nothing either and it should not be filed under "no
+> difference" without saying so. What holds it down is the magnitude: the median
+> non-tied difference is 0.1 µs, which is one print step of the harness, on 19 µs.
+> A consistent 0.5% cost that the mean cannot see because it is at the
+> quantisation floor is exactly what a bounds check, a class index and a length
+> reset would look like, and this instrument cannot separate that from rounding.
+> Resolving it needs a timer with more digits than the ladder prints, not more
+> windows.
+>
+> So: the bounds check, class index and length reset cost nothing the harness can
+> resolve, the criterion is not cleared by the one pre-registered run, and the
+> honest statement is the weak one.
 >
 > **The 140.4 is the next lever and it is larger than §3.** Recovering the buffer
 > a builtin consumes means `builtins::call` taking `&mut Vec<Value>` or draining
@@ -598,10 +771,11 @@ neither number is the ceiling for a kernel; 4.86× is.
 
 So an amendment to ADR 0018 owes, at minimum:
 
-1. **§2's two motivating sentences corrected in place**, per §"Context" above.
-   `CONTRIBUTING.md` §"Correct, do not delete" — keep the original beside the
-   measurement.
-2. **§2's success criterion replaced.** It reads "a `w6_alloc_sites` re-run
+1. ~~**§2's two motivating sentences corrected in place**~~ — **done**, R4
+   integration pass, 2026-08-21. Both are quoted verbatim inside the block that
+   corrects them, per `CONTRIBUTING.md` §"Correct, do not delete".
+2. **§2's success criterion replaced** — **stated in the same block**, R4
+   integration pass. It reads "a `w6_alloc_sites` re-run
    showing `interp::literal` gone from the top sites". `interp::literal` is
    7.1% of the request. Removing all of it leaves a slope of 911.5 − 65.0 =
    846.5 and an intercept of 34,465 − 925 = 33,540, so **1,014** at the
@@ -627,6 +801,53 @@ So an amendment to ADR 0018 owes, at minimum:
 
 Item 5 is why the sequencing below does not put §2 of ADR 0018 first, and item 3
 is why it does not put codegen anywhere.
+
+## 6. Found while integrating, and deliberately not priced here
+
+One site was named during the integration pass and is recorded rather than
+fixed, because a lever with no attribution and no pre-registered floor is the
+thing this ADR exists to refuse.
+
+**`ply_std::is_reserved` builds a `String` on every call.**
+`crates/ply-std/src/lib.rs:128` is
+`name == ROOT || name.starts_with(&format!("{ROOT}."))`, and
+`ply_eval::host::registration_names` (`crates/ply-eval/src/host.rs:703`) asks it
+once per host-operation resolution. Measured on `/health` at the (20, 200)
+window: **22.0 allocations of 8 bytes per request**, counted directly in debug,
+where the predicate has a frame of its own. It cannot be counted separately in
+release — it is inlined — but the difference between the two profiles' host
+boundary lines before the rule below was added, 61.2 against 38.2, is **23.0**
+and is entirely this site, so the two readings agree to within a request's
+rounding. `is_pseudo_path` (`:146`) has the same shape and is not on this path.
+
+That is **≈3.5% of the 623.5 this tree now makes** and the removal is three lines
+with no semantic content — `strip_prefix` in place of `format!` — so it is
+almost certainly worth taking. It is not taken here for two reasons, and the
+second is the real one:
+
+1. It is not a value-representation change, so nothing in `ply_corpus::r4`
+   places a share under it or sets a floor for it, and `judge` cannot answer.
+2. Landing it would move `README.md`'s freshly re-taken **773.4** and break the
+   per-lever decomposition beside it, which was A/B'd one change at a time
+   against this tree and cannot be re-derived here (this work is done under a
+   rule forbidding git). And §"Sequencing" step 2 is explicit that when a lever
+   lands under its floor the next step is *another attribution* rather than the
+   next lever — §1 did land under its floor, so that is where this ADR is, and
+   it applies to a lever found by accident as much as to a planned one.
+
+**How it surfaced is worth more than the site.** `r4_value_construction`'s rule
+table attributes an allocation by (deepest `ply_*` frame, size) over a
+three-frame window, and in release this allocation is inlined into
+`Machine::perform_host` and lands in the host-boundary bucket, while in debug it
+is a frame of its own whose two callers symbolize to a bare crate name — so the
+window ended before `perform_host` and the same tree was attributed two ways by
+profile. The residue was 54.9 in release and 74.9 in debug against a ceiling of
+60, so **the harness passed in the profile it was developed in and failed in the
+one `cargo test --workspace` runs.** A rule naming
+`ply_std::is_reserved` restores the module note's own invariant — *"both
+spellings must land in the same bucket"* — and brings the two profiles to 54.9
+and 52.9. Anything else added to that table should be checked in both profiles
+before it is believed.
 
 ## The criteria, in code
 

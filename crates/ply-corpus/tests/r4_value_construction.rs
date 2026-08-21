@@ -473,6 +473,30 @@ const RULES: &[Rule] = &[
         frame: "ply_host",
         size: any,
     },
+    // The same allocations as the two rules above, under the one spelling the
+    // three-frame window cannot reach past.
+    //
+    // `ply_eval::host::registration_names` (`host.rs:703`) asks
+    // `ply_std::is_reserved` whether a registered name is under the stdlib root,
+    // and that predicate builds a `String` per call — `name.starts_with(&format!
+    // ("{ROOT}."))`, `crates/ply-std/src/lib.rs:128`. In release it is inlined
+    // into `Machine::perform_host` and lands in the bucket above; in debug it is
+    // a frame of its own, and the two `ply_eval` frames beneath it symbolize to
+    // a bare crate name, so the window ends before `perform_host`. Counted
+    // directly in debug on `/health`: **22.0 per request**, which is the whole
+    // of the difference between a release residue of 54.9 and a debug residue
+    // of 74.9 against a ceiling of 60. Without this rule the same tree is
+    // attributed two ways by profile, which the module note says it may not be.
+    //
+    // Naming it is not pricing it: 22–23 allocations of 8 bytes a request is a
+    // real per-request cost with no lever and no threshold behind it. See
+    // `docs/adr/0019-value-representation.md` §6.
+    Rule {
+        bucket: "host boundary — footprints, sockets, diagnostics",
+        kind: Kind::Other,
+        frame: "ply_std::is_reserved",
+        size: any,
+    },
     Rule {
         bucket: "region arena and scheduler",
         kind: Kind::Other,
