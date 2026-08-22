@@ -517,7 +517,7 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,644 tests across 155 targets** (142 test
+`cargo test --workspace` runs **3,661 tests across 156 targets** (143 test
 binaries plus 13 doc-test suites); all pass on an unloaded machine. Five are
 marked `ignored`: four are timing benchmarks you run on purpose (three in
 `ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
@@ -535,6 +535,18 @@ not been re-taken as the tree grew.
 > as `cargo test --workspace --no-fail-fast`, summing the `test result:` lines:
 > **3,644 passed, 0 failed, 5 ignored**, with `grep -c '^     Running'` →
 > **142** and `grep -c '^   Doc-tests'` → 13, so **155 targets**.
+>
+> > **Re-taken again (second regression audit, 2026-08-21); the sentence above
+> > carries this reading and this block carries the one it replaced, 3,644
+> > across 155.** The audit that
+> > armed `ply-eval/tests/value_semantics_audit.rs` added a binary and did not
+> > move this paragraph, and the fixes it drove added three more tests. Same
+> > command, same pipelines: **3,661 passed, 0 failed, 5 ignored** across
+> > **156 targets** (**143** binaries + 13 doc-test suites). The wall clock is
+> > **1,087.3s (18m 7s) real, 1,174.4s user**, `/usr/bin/time -p`, one run on a
+> > machine whose load average ran 4 to 12 — nearly double the 569.3s below, on
+> > the same tree plus four tests, which is what a loaded machine does to this
+> > figure and is the reason the counts are the part to trust.
 >
 > The fifth `ignored` is
 > `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,

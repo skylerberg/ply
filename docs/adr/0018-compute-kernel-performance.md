@@ -33,6 +33,85 @@ That an MCTS kernel's hot loop falls mostly inside the spike's compilable
 fragment. Everything below is ordered on that assumption and **§1 exists to test
 it before anything is built.**
 
+## 0. §1 RAN. The assumption held and the plan failed anyway.
+
+> **Measured 2026-08-21.** `benches/adr0018-mcts.json`, one run, cranelift
+> 0.134.3, load 3.54 falling to 3.05. Kernel: `benches/kernel/mcts.ply`,
+> three-heap Nim, tree as `Map<Int, Node>`, UCB1 in integer fixed point. Agreement
+> was taken **before anything was timed** — 1,344 generated cases across 21
+> functions plus 24 whole-kernel searches, against both engines, 0 disagreements.
+
+§1 said everything below it was ordered on one untested assumption: that an MCTS
+kernel's hot loop falls mostly inside the spike's compilable fragment. It said to
+rewrite this ADR if the fraction came back low.
+
+**The fraction came back high — 81.0% of executed work, against 2–5% for an HTTP
+request — and codegen still bought nothing.**
+
+| compiled set | crossings | end to end |
+| --- | ---: | ---: |
+| floor, no JIT | 0 | 1.000× |
+| entry only | 1 | 0.999× |
+| outer loop | 102 | 0.996× |
+| + playouts | 102 | 0.999× |
+| **everything accepted** | 102 | **0.998×** |
+
+0.998× is inside the method's own noise floor. The kernel ratio on the part that
+is wholly inside the fragment and crosses zero times, `mcts.playouts`, is
+**52.58×** — and reporting *that* would misprice the decision in exactly the way
+ADR 0016 warned about.
+
+**Why 81% inside and 52× there still buys nothing: the interpreter cannot call
+compiled code.** Only compiled→interpreter exists (`rt_call_machine`). Every
+function the fragment accepts whose *callers* it refuses is compiled and then
+never entered. Compiling the twenty arithmetic functions between rungs 2 and 4
+moved the whole program from 57,700 µs to 57,582 µs. In the hybrid, compiled code
+is reached by exactly three functions: `mcts.iterate` (100 entries), `mcts.root`
+(1), `mcts.best_action` (1).
+
+It is **not** the boundary cost. 102 crossings total 9.9 µs, 0.017% of the run.
+
+**The ceiling, by Amdahl over the two measured numbers and nothing else:**
+
+| | |
+| --- | ---: |
+| a backend that could be *entered* from interpreted code | **4.86×** |
+| an infinitely fast fragment | **5.26×** |
+
+Not 11.67×, and not 52×. This ADR opens by saying Ply is off the Rust floor "by
+roughly an order of magnitude" on MCTS. **The fragment as specified caps the
+recovery at 5.26×**, so §2 onward cannot reach the goal §"Context" states, and
+the binding constraint is architectural — one-way calling — rather than the size
+of the fragment or the cost of the boundary.
+
+### What is actually outside, ranked — this is the roadmap §1 promised
+
+By lowered nodes removed from the fragment:
+
+| nodes | fns | what |
+| ---: | ---: | --- |
+| 253 | 7 | a field access |
+| 71 | 2 | a list pattern `[x, ..rest]` |
+| 25 | 2 | unary `-` |
+| 10 | 1 | a list literal `[]` |
+
+And by *executed* work, **19.0% of the run is the `Map`/record/list machinery
+itself**, which is outside the fragment no matter which functions compile.
+
+Two hazards that belong to the fragment rather than to any function, so they
+appear in no census: there is **no `Float` path** — accepted silently and raising
+at run time — and **no nested-call bound**, where the machine answers
+`recursion limit of 10000 nested calls exceeded` and compiled code SIGABRTs.
+
+### What this changes
+
+§2 through §7 below were ordered on the assumption §1 tested. The assumption held
+and the conclusion did not follow from it, so the ordering is not rescued by
+compiling more: **make the interpreter able to enter compiled code, or the
+ceiling is 5.26× however much of the fragment you accept.** That is a different
+first milestone from any listed below, and nothing below should start until it is
+decided.
+
 ## 1. Re-price the spike against a compute kernel — do this first
 
 > **Discharged (R4, 2026-08-21), and it changed the ordering of everything

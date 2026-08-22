@@ -57,7 +57,7 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # ~9.5 min — 3,644 pass, 0 fail, 5 ignored
+cargo test --workspace                          # 9.5-18 min — 3,661 pass, 0 fail, 5 ignored
 ```
 
 **All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
@@ -66,6 +66,17 @@ warnings and zero errors, `cargo test --workspace --no-fail-fast` **3,644 passed
 / 0 failed / 5 ignored** across **155 targets** (142 binaries + 13 doc-test
 suites). If you introduce the first warning, that is a regression, not a
 baseline.
+
+> **Re-verified again (second regression audit, 2026-08-21).** `fmt --all
+> --check` silent and exit 0; `clippy --workspace --all-targets` zero lines
+> matching `warning` or `error`; `cargo test --workspace --no-fail-fast`
+> **3,661 passed / 0 failed / 5 ignored** across **156 targets** (**143**
+> binaries + 13 doc-test suites), **1,087.3s real** on a machine at load 4–12.
+> The four new tests are one binary the audit before it added
+> (`ply-eval/tests/value_semantics_audit.rs`) and three the fixes for what it
+> found added: two in `ply-eval/tests/map_order.rs` and
+> `value_semantics_audit.rs`, and
+> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
 
 > **Re-taken after R4 (2026-08-21).** The line read `~6.5 min — 3,597 pass, 0
 > fail, 4 ignored` and the paragraph `3,597 / 0 / 4 across 151 targets in
@@ -365,8 +376,8 @@ Recorded here so nobody spends an afternoon rediscovering them.
    $ cargo +1.94.0 build --release
        Finished `release` profile [optimized] target(s) in 1m 19s
    $ cargo +1.94.0 test --release
-   test result: ok. 7 passed; 0 failed; ...      # tests/spike.rs
-   test result: ok. 8 passed; 0 failed; ...      # tests/mcts_kernel.rs
+   test result: ok. 8 passed; 0 failed; ...      # tests/spike.rs
+   test result: ok. 7 passed; 0 failed; ...      # tests/mcts_kernel.rs
    ```
 
    The **first** wall stands and is not a defect to fix: cranelift 0.134.3

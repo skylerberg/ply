@@ -37,11 +37,11 @@ Everything below was measured on **2026-08-17**:
 | toolchain | `rustc 1.93.1 (01f6ddf75 2026-02-11)`, `cargo 1.93.1` |
 | postgres | PostgreSQL 18.3 (Homebrew), running on `:5432` |
 
-Your wall clocks will differ. The **counts** — 3,644 tests, 5,000 tests
+Your wall clocks will differ. The **counts** — 3,661 tests, 5,000 tests
 selected down to 157, 7 obligations, 25 host handlers, 29 agreeing requests —
 should not. If a count differs on your machine, that is a finding; open it as
-one. (The test count read 3,597 before R4 and is the only one of the five that
-has ever moved; the other four were re-taken on 2026-08-21 and are unchanged —
+one. (The test count read 3,597 before R4, 3,644 after it, and is the only one
+of the five that has ever moved; the other four were re-taken on 2026-08-21 and are unchanged —
 `ply prove examples/desk.ply` → 7, `ply hosts examples/desk.ply --host` → 25,
 `examples/same-tests.sh` → 29.)
 
@@ -132,9 +132,15 @@ There is no `rustfmt.toml` and no `clippy.toml`; both run on defaults.
 > $ cargo +1.94.0 build --release
 >     Finished `release` profile [optimized] target(s) in 1m 19s
 > $ cargo +1.94.0 test --release
-> test result: ok. 7 passed; 0 failed; ...      # tests/spike.rs
-> test result: ok. 8 passed; 0 failed; ...      # tests/mcts_kernel.rs
+> test result: ok. 8 passed; 0 failed; ...      # tests/spike.rs
+> test result: ok. 7 passed; 0 failed; ...      # tests/mcts_kernel.rs
 > ```
+>
+> (**The two counts were swapped here and in `CONTRIBUTING.md` §"Things known
+> to be broken" item 1** — this block read `7 … # tests/spike.rs` and
+> `8 … # tests/mcts_kernel.rs`. Re-taken 2026-08-21 by the second regression
+> audit against this tree: `spike.rs` is 8 and `mcts_kernel.rs` is 7, plus
+> three zero-test unit targets, so the crate runs 15 tests in five targets.)
 >
 > And the command ADR 0016 gives for its own spike half runs, once you name a
 > binary — the crate ships two now, so the invocation at
@@ -241,8 +247,8 @@ Measured, from an already-built `target/`:
 | | |
 | --- | --- |
 | wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s**, and after R4 at **569.3s** (9m 29s) — six runs of one command on one machine, which is the spread to expect. The last of them was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
-| result | **3,644 passed, 0 failed, 5 ignored** |
-| targets | **155** — 142 test binaries + 13 doc-test suites |
+| result | **3,661 passed, 0 failed, 5 ignored** |
+| targets | **156** — 143 test binaries + 13 doc-test suites |
 
 That reproduces `README.md`'s Status paragraph exactly, count for count. It is
 the longest thing in this file; **budget ten minutes now** — see the R4 block
@@ -282,6 +288,22 @@ below for which target grew and by how much — and do not run it under load.
 > The fifth `ignored` is new: `ply-eval` lib
 > `interp::tests::a_cached_mention_against_the_allocation_it_replaces`, a timing
 > benchmark that prints its own recipe the way the three in `http_cost` do.
+
+> **Re-taken again 2026-08-21, by the second regression audit.** The table above
+> now reads **3,661 / 0 / 5** across **156** targets (**143** binaries + 13
+> doc-test suites) — the block below this one is the R4 reading and is left as
+> it was. Four tests arrived after it: the regression audit before this one
+> added `ply-eval/tests/value_semantics_audit.rs` (a whole binary, 14 tests then
+> and 15 now) without moving these counts, and the fixes for what it found added
+> `map_order.rs::a_decimal_anywhere_under_a_key_is_canonical`,
+> `value_semantics_audit.rs::canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it`
+> and
+> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
+> Same command, same pipelines. The wall clock re-take is **1,087.3s (18m 7s)
+> real, 1,174.4s user**, `/usr/bin/time -p`, one run, on a machine whose load
+> average ran **4 to 12** — nearly double the 569.3s below on four more tests,
+> which is what a shared machine does to this figure. The counts are the part
+> that should not move.
 
 > **Re-taken 2026-08-17, after R3.** This table read **3,566 passed** across
 > **147** targets (134 binaries), and the paragraph under it said 134. R3 added
@@ -758,6 +780,12 @@ documents; re-taken 2026-08-21.)
 > pair of numbers this paragraph has carried in one day, which is the
 > paragraph's own point.
 
+> **And a fourth pair, 2026-08-21, from the second regression audit**, which
+> added ADR 0019 §7, correction blocks in `ROADMAP.md`, `CONTRACTS.md`,
+> `docs/adr/0012-w2-contract.md`, `CONTRIBUTING.md`, `README.md` and this file:
+> **26,685** and **28,933**, same two pipelines, re-taken after these blocks
+> were written. The ADR total is **16,353** (`cat docs/adr/*.md | wc -l`).
+
 So the checked/written boundary is:
 
 **CHECKED — machine-verified against the tree, will fail if the tree moves:**
@@ -786,7 +814,7 @@ So the checked/written boundary is:
   the_readme_still_describes_this_request_path`. See the section above for why
   that one and nothing else.
 - Behavioural invariants stated as tests, e.g. the rename invariant at
-  `ply-cli/tests/cli.rs:145`. There are 3,644 tests; how many of them pin a
+  `ply-cli/tests/cli.rs:145`. There are 3,661 tests; how many of them pin a
   documented guarantee rather than an implementation detail is **not measured
   and no document claims a figure for it.**
 - Anything you can re-run from this file. The loop numbers, the selection table,
@@ -1026,7 +1054,7 @@ whoever takes them.
 | [`DESIGN.md`](../DESIGN.md) | the language and the reasoning; §"What of this is built" is the honest state table | you need to know what a mechanism *means* |
 | [`ROADMAP.md`](../ROADMAP.md) | milestone-by-milestone record; **§"What is next" is the queue** | you need to know what to do |
 | [`CONTRACTS.md`](../CONTRACTS.md) | the crate-construction contract, 7,650 lines | you need a signature — and see §7 |
-| [`docs/adr/`](adr/) | **nineteen** decisions with their arguments, `00NN-slug.md`, no index | you want to know *why*, and are prepared for **16,100** lines (`cat docs/adr/*.md \| wc -l`, re-taken 2026-08-21 by the regression audit; this row said "seventeen decisions" and "14,785 lines", which was true before ADR 0018 and ADR 0019 existed, and before that said 24k, which is the whole prose surface and not the ADRs) |
+| [`docs/adr/`](adr/) | **nineteen** decisions with their arguments, `00NN-slug.md`, no index | you want to know *why*, and are prepared for **16,353** lines (`cat docs/adr/*.md \| wc -l`, re-taken 2026-08-21 by the second regression audit; it read 16,100 before ADR 0019 §7; this row said "seventeen decisions" and "14,785 lines", which was true before ADR 0018 and ADR 0019 existed, and before that said 24k, which is the whole prose surface and not the ADRs) |
 | [`benches/README.md`](../benches/README.md) | what the measurement harness does and its caveats | before quoting any `ply-corpus` number |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | how to make a change here | before your first commit |
 
