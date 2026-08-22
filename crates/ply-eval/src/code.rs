@@ -20,6 +20,7 @@
 //! rather than a second traversal of every definition body.
 
 use crate::rc::{Dead, Live, Own};
+use crate::value::Value;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
     BinOp, Expr, ExprKind, HandleClause, Ident, Lit, MatchArm, Pattern, PatternKind, Program,
@@ -41,7 +42,21 @@ pub struct Node {
 }
 
 pub enum NodeKind {
-    Lit(Lit),
+    /// The literal, and the [`Value`] it denotes, built once here rather than
+    /// per evaluation.
+    ///
+    /// A literal is a compile-time constant, so `Str` and `Bytes` were the only
+    /// two that ever reached the allocator and they reached it on every
+    /// evaluation; cloning the value instead is a refcount bump. Sharing is
+    /// unobservable for the same reason [`Value::builtin`] is: no Ply
+    /// expression reads an address, and nothing mutates a `Str` or a `Bytes` in
+    /// place — the one in-place path, `builtins::push`, is `List`-only and no
+    /// literal builds a `List`.
+    ///
+    /// The `Lit` stays because `crates/ply-codegen-spike` dispatches on it to
+    /// choose a Cranelift type; it is outside the workspace, so nothing in
+    /// `cargo test --workspace` would catch its loss.
+    Lit(Lit, Value),
     Var(QName),
     Unary {
         op: UnOp,
@@ -350,7 +365,7 @@ fn node(kind: NodeKind, span: Span) -> Code {
 /// occurrence is reached. Construction order is irrelevant; this order is not.
 fn lower_node(e: &Expr, live: &mut Live) -> Code {
     let kind = match &e.kind {
-        ExprKind::Lit(lit) => NodeKind::Lit(lit.clone()),
+        ExprKind::Lit(lit) => NodeKind::Lit(lit.clone(), crate::interp::literal(lit)),
         ExprKind::Var(q) => {
             let own = if q.is_bare() {
                 live.use_of(q.symbol())

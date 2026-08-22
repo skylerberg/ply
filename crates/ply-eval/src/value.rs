@@ -35,6 +35,15 @@ pub type Vector<T> = Arc<Vec<T>>;
 /// implementation is not reachable from here: `rpds` keeps the entries sorted
 /// and hands out no other iteration order.
 ///
+/// The order is necessary and was not sufficient. [`Value::cmp`] is coarser
+/// than what a program can print — `1.50m` and `1.5m` are one key and two
+/// strings — so an ordered tree holding whichever spelling was inserted last
+/// made `map_keys` a function of insertion history anyway, which is the exact
+/// failure this note names. [`canonical_key`] is the second half: a key is
+/// reduced to one representative per class on the way in, so the four
+/// guarantees above hold of the contents rather than of the order they arrived
+/// in.
+///
 /// `RcK` rather than `ArcK`, so a `Value` stays thread-confined.
 pub type Map = RedBlackTreeMap<Value, Value>;
 
@@ -176,7 +185,7 @@ impl Value {
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Value {
         let mut m = Map::new();
         for (k, v) in entries {
-            m.insert_mut(k, v);
+            insert_key(&mut m, k, v);
         }
         Value::Map(m)
     }
@@ -607,8 +616,11 @@ fn discriminant(v: &Value) -> u8 {
     }
 }
 
-/// Structural, total and deterministic — the order `Map` keys are held in, so
-/// `map_keys` is a function of the values and of nothing else.
+/// Structural, total and deterministic — the order `Map` keys are held in.
+///
+/// It is not on its own enough to make `map_keys` a function of the values: it
+/// is coarser than rendering is, at `Decimal`, and [`canonical_key`] is what
+/// closes the gap between the two. See the note on [`Map`].
 ///
 /// Two things about it are load-bearing rather than incidental:
 ///
@@ -690,6 +702,92 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+/// The one place a key enters a [`Map`] from Rust, so that the canonical form
+/// below cannot be bypassed by a seventh map builder.
+pub(crate) fn insert_key(m: &mut Map, k: Value, v: Value) {
+    m.insert_mut(canonical_key(&k).unwrap_or(k), v);
+}
+
+/// The canonical member of a key's equivalence class under [`Value::cmp`], or
+/// `None` when the key already is one.
+///
+/// [`Value::cmp`] is deliberately **coarser** than what a program can print: a
+/// `Decimal` compares by numeric value so that `1.50m` and `1.5m` are one key,
+/// while [`Value::write`] and `decimal_to_string` keep the scale as stored
+/// because the scale is a digit count the value carries. A `Map` that held
+/// whichever of the two spellings arrived last would answer `map_keys`,
+/// `map_entries`, `map_fold` and every derived encoding as a function of
+/// insertion history — the failure the note on [`Map`] gives as the reason this
+/// is a search tree, arriving anyway through the key rather than through the
+/// order. Reducing a key to the one representative of its class closes it
+/// without touching either decision: `1.50m == 1.5m` still holds, and a
+/// `Decimal` that is not a key still renders every digit it was written with.
+///
+/// Every position [`Value::cmp`] descends into is walked, because a `Decimal`
+/// anywhere under a key is a distinction the order cannot see — including a
+/// map's *values*, when that map is itself a key. A `Secret` is not descended
+/// into: it is refused as a key before this runs ([`map::key`](crate::map)),
+/// `derivable(ord, Secret<a>)` is false, and a path that rebuilt a credential's
+/// payload is what ADR 0015 §2 exists to prevent.
+///
+/// The scan does not allocate, so a key with no `Decimal` under it — every
+/// `Int`, `String` and `Bytes` key — pays one walk and nothing else, against
+/// the `O(log n)` walks the `cmp`s of the insert it accompanies already pay.
+pub(crate) fn canonical_key(v: &Value) -> Option<Value> {
+    if is_canonical(v) {
+        return None;
+    }
+    Some(canonicalize(v))
+}
+
+fn is_canonical(v: &Value) -> bool {
+    match v {
+        // `normalize` is minimal scale, which is unique per numeric value, so
+        // it is a canonical form rather than merely a smaller one. Compared on
+        // the serialized representation because `Decimal`'s own `==` is the
+        // numeric comparison this is trying to see past.
+        Value::Decimal(d) => d.serialize() == d.normalize().serialize(),
+        Value::List(items) => grow(|| items.iter().all(is_canonical)),
+        Value::Map(entries) => grow(|| {
+            entries
+                .iter()
+                .all(|(k, val)| is_canonical(k) && is_canonical(val))
+        }),
+        Value::Record(fields) => grow(|| fields.values().all(is_canonical)),
+        Value::Ctor { args, .. } => grow(|| args.iter().all(is_canonical)),
+        _ => true,
+    }
+}
+
+fn canonicalize(v: &Value) -> Value {
+    match v {
+        Value::Decimal(d) => Value::Decimal(d.normalize()),
+        Value::List(items) => grow(|| Value::list(items.iter().map(canonicalize).collect())),
+        // Rebuilt through `insert_key` rather than `insert_mut`, so that a
+        // nested map is canonical by the same rule and by the same code.
+        Value::Map(entries) => grow(|| {
+            let mut out = Map::new();
+            for (k, val) in entries.iter() {
+                insert_key(&mut out, canonicalize(k), canonicalize(val));
+            }
+            Value::Map(out)
+        }),
+        Value::Record(fields) => grow(|| {
+            Value::Record(Arc::new(
+                fields
+                    .iter()
+                    .map(|(name, val)| (name.clone(), canonicalize(val)))
+                    .collect(),
+            ))
+        }),
+        Value::Ctor { name, args } => grow(|| Value::Ctor {
+            name: name.clone(),
+            args: Arc::new(args.iter().map(canonicalize).collect()),
+        }),
+        other => other.clone(),
+    }
+}
 
 /// The refusal every path that would order a credential meets.
 ///

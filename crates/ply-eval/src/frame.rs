@@ -108,7 +108,7 @@ impl Machine<'_> {
                 self.push(
                     Frame::AppArgs {
                         callee: value,
-                        done: Vec::with_capacity(args.len()),
+                        done: crate::argv::take(args.len()),
                         args,
                         next: 1,
                         env: carried,

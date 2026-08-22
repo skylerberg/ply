@@ -37,10 +37,13 @@ Everything below was measured on **2026-08-17**:
 | toolchain | `rustc 1.93.1 (01f6ddf75 2026-02-11)`, `cargo 1.93.1` |
 | postgres | PostgreSQL 18.3 (Homebrew), running on `:5432` |
 
-Your wall clocks will differ. The **counts** — 3,597 tests, 5,000 tests
+Your wall clocks will differ. The **counts** — 3,661 tests, 5,000 tests
 selected down to 157, 7 obligations, 25 host handlers, 29 agreeing requests —
 should not. If a count differs on your machine, that is a finding; open it as
-one.
+one. (The test count read 3,597 before R4, 3,644 after it, and is the only one
+of the five that has ever moved; the other four were re-taken on 2026-08-21 and are unchanged —
+`ply prove examples/desk.ply` → 7, `ply hosts examples/desk.ply --host` → 25,
+`examples/same-tests.sh` → 29.)
 
 > **The test count moved twice on 2026-08-17 and the others did not.** It read
 > 3,566 until R3 added three test binaries, then 3,584 until the regression audit
@@ -115,7 +118,52 @@ treat 13.7s as the first-run cost and not as what you will see.
 
 There is no `rustfmt.toml` and no `clippy.toml`; both run on defaults.
 
-### `crates/ply-codegen-spike` does not build. Do not start there.
+### `crates/ply-codegen-spike` builds again, but only on `+1.94.0`
+
+> **Corrected (R4 integration pass, 2026-08-21). This section said the spike
+> "no longer compiles, on any toolchain available here", and that half of it is
+> now false.** The heading read *"`crates/ply-codegen-spike` does not build. Do
+> not start there."* R4 repaired the two `E0164`s, then widened
+> `NodeKind::Lit` underneath the spike and repaired that too, because ADR 0018
+> §1 needed the spike to answer at all. Re-taken, from
+> `crates/ply-codegen-spike/`:
+>
+> ```
+> $ cargo +1.94.0 build --release
+>     Finished `release` profile [optimized] target(s) in 1m 19s
+> $ cargo +1.94.0 test --release
+> test result: ok. 8 passed; 0 failed; ...      # tests/spike.rs
+> test result: ok. 7 passed; 0 failed; ...      # tests/mcts_kernel.rs
+> ```
+>
+> (**The two counts were swapped here and in `CONTRIBUTING.md` §"Things known
+> to be broken" item 1** — this block read `7 … # tests/spike.rs` and
+> `8 … # tests/mcts_kernel.rs`. Re-taken 2026-08-21 by the second regression
+> audit against this tree: `spike.rs` is 8 and `mcts_kernel.rs` is 7, plus
+> three zero-test unit targets, so the crate runs 15 tests in five targets.)
+>
+> And the command ADR 0016 gives for its own spike half runs, once you name a
+> binary — the crate ships two now, so the invocation at
+> `docs/adr/0016-w6-performance.md:827` needs `--bin ply-codegen-spike` added
+> or it dies with *"could not determine which binary to run"*:
+>
+> ```
+> $ cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml \
+>       --bin ply-codegen-spike -- --half /tmp/spike-check.json
+> ...
+> wrote /tmp/spike-check.json
+> ```
+>
+> **The first wall below stands, verbatim and re-run** — the default `stable`
+> toolchain still refuses, so `+1.94.0` is not optional. **The second wall,
+> the two `E0164`s, is gone.** It is left printed below because it is what the
+> drift looked like and it is the thing that will happen again: the crate is
+> still outside the workspace, so `cargo build --workspace`, `cargo test
+> --workspace` and `cargo clippy --workspace --all-targets` still do not
+> compile it, and R4 broke it a second time in exactly this way before noticing.
+> It is also not clippy-clean and never was: 13 `not_unsafe_ptr_arg_deref`
+> errors in `src/rt.rs` (the JIT's calling convention) and 6 warnings, none of
+> which the project's stated gate reaches.
 
 `crates/` holds fourteen directories but the workspace has **thirteen members**.
 `ply-codegen-spike` declares its own `[workspace]` so `cargo build --workspace`
@@ -167,6 +215,27 @@ input pairs it was computed from and `ply-corpus w6` recomputes it from the file
 (§8). What cannot be done is measuring the spike again. The ladder half
 (`benches/w6-ladder.json`) is unaffected and does reproduce — see §7.
 
+> **Corrected (R4, 2026-08-21): the spike *was* measured again, and the
+> `read_line` half did not move.** The paragraph above is what was true before
+> R4 and its reasoning was sound; what it concluded is not true of this tree.
+> `benches/w6-spike-r4.json` is the re-take, and the conservative minimum ADR
+> 0016 publishes as `11.67x` — `min(interpreter_best_micros ÷
+> spike_worst_micros)` over the file's five inputs, which is **not** a field in
+> either file — recomputes to **11.68×** over the R4 file and **11.67×** over
+> the older one. Both recomputed here from the shipped JSON rather than quoted.
+>
+> Two cautions the re-take earned. **That expression is load-sensitive**: it
+> divides a *best* by a *worst* over separate repeats rather than pairing them
+> inside one window, and a fresh half taken on this machine while a
+> `cargo test --workspace` was running came back at **7.38×** on the same
+> function. `benches/README.md` §"Every ratio is taken inside one window" is
+> the harness that does not have this problem, and the `mcts` half is built on
+> it. **And 11.68× is not a ceiling for a compute kernel**: ADR 0018 §1 asked
+> for exactly that comparison and the answer is in `benches/adr0018-mcts.json`
+> — 52.58× where the fragment runs, 0.998× end to end, and 4.86× as the
+> Amdahl ceiling, because the interpreter cannot call compiled code.
+> `docs/adr/0019-value-representation.md` §5 is the write-up.
+
 ## 2. Test
 
 ```
@@ -177,14 +246,64 @@ Measured, from an already-built `target/`:
 
 | | |
 | --- | --- |
-| wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s** — five runs of one command on one machine, which is the spread to expect |
-| result | **3,597 passed, 0 failed, 4 ignored** |
-| targets | **151** — 138 test binaries + 13 doc-test suites |
+| wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s**, and after R4 at **569.3s** (9m 29s) — six runs of one command on one machine, which is the spread to expect. The last of them was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
+| result | **3,661 passed, 0 failed, 5 ignored** |
+| targets | **156** — 143 test binaries + 13 doc-test suites |
 
-That reproduces `README.md`'s Status paragraph exactly, count for count, and
-the audit re-ran it and got the same three numbers again (`grep -c '^     Running'`
-→ 138, `grep -c '^   Doc-tests'` → 13). It is the longest thing in this file;
-budget seven minutes and do not run it under load.
+That reproduces `README.md`'s Status paragraph exactly, count for count. It is
+the longest thing in this file; **budget ten minutes now** — see the R4 block
+below for which target grew and by how much — and do not run it under load.
+
+> **Re-taken 2026-08-21, after R4.** The result row read **3,597 / 0 / 4** and
+> the target row **151 — 138 + 13**. R4 added four test binaries —
+> `ply-eval/tests/literal_value_sharing.rs` (8 tests),
+> `ply-eval/tests/literal_sharing.rs` (6),
+> `ply-eval/tests/ctor_value_sharing.rs` (6),
+> `ply-corpus/tests/r4_value_construction.rs` (9) — and tests inside existing
+> ones. Re-taken as `cargo test --workspace --no-fail-fast`, summing the
+> `test result:` lines: **3,644 / 0 / 5**, `grep -c '^     Running'` → **142**,
+> `grep -c '^   Doc-tests'` → 13.
+>
+> **The wall clock was re-taken once and the conditions were not clean.**
+> `/usr/bin/time -p cargo test --workspace --no-fail-fast` from an already-built
+> `target/`: **569.31s real** (9m 29s), 726.64s user. That run was **not on an
+> idle machine** — a documentation pass was reading and rebuilding beside it —
+> so treat it as an upper-ish bound rather than a clean figure, and it is one
+> run, not a best-of-N. Summing the `test result:` lines instead gives **478.5s**
+> of in-target time, which excludes compilation and is a lower bound.
+>
+> One target is most of the increase and it is worth knowing about before you
+> start:
+> `r4_value_construction` captures a backtrace per allocation over 20-, 200- and
+> 400-request windows, and it takes **70.9s under `cargo test` (debug) against
+> 25.6s under `cargo test --release`**. It is not `ignored`, and the numbers it
+> is documented to print are release numbers. (An earlier draft of this block
+> said 255.2s for the debug side. That was this target's `finished in` line from
+> a workspace run taken while a second `cargo build --release` was competing for
+> the machine, and it is a reading of the load, not of the target — the same
+> line in an unloaded run is 70.88s and the target run on its own is 69.35s.
+> Re-taken rather than left standing, because a 3.6x error in the one figure
+> this block exists to warn about is worse than no warning.)
+>
+> The fifth `ignored` is new: `ply-eval` lib
+> `interp::tests::a_cached_mention_against_the_allocation_it_replaces`, a timing
+> benchmark that prints its own recipe the way the three in `http_cost` do.
+
+> **Re-taken again 2026-08-21, by the second regression audit.** The table above
+> now reads **3,661 / 0 / 5** across **156** targets (**143** binaries + 13
+> doc-test suites) — the block below this one is the R4 reading and is left as
+> it was. Four tests arrived after it: the regression audit before this one
+> added `ply-eval/tests/value_semantics_audit.rs` (a whole binary, 14 tests then
+> and 15 now) without moving these counts, and the fixes for what it found added
+> `map_order.rs::a_decimal_anywhere_under_a_key_is_canonical`,
+> `value_semantics_audit.rs::canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it`
+> and
+> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
+> Same command, same pipelines. The wall clock re-take is **1,087.3s (18m 7s)
+> real, 1,174.4s user**, `/usr/bin/time -p`, one run, on a machine whose load
+> average ran **4 to 12** — nearly double the 569.3s below on four more tests,
+> which is what a shared machine does to this figure. The counts are the part
+> that should not move.
 
 > **Re-taken 2026-08-17, after R3.** This table read **3,566 passed** across
 > **147** targets (134 binaries), and the paragraph under it said 134. R3 added
@@ -267,7 +386,7 @@ here, and passed again on the audit's re-run. On a machine busy compiling
 something else it has been seen to fail. If it is your only failure, re-run on a
 quiet machine before you believe it.
 
-The four `ignored` tests, verbatim from the run: three timing benchmarks in
+The five `ignored` tests, verbatim from the run: three timing benchmarks in
 `ply-corpus/tests/http_cost.rs`, each of which prints its own recipe —
 
 ```
@@ -275,9 +394,18 @@ test the_cost_of_a_head_is_linear_in_the_number_of_fields ... ignored, timing;
   run with `cargo test -p ply-corpus --test http_cost -- --ignored --nocapture`
 ```
 
+— a fourth of the same shape that R4 added in `ply-eval`'s lib tests —
+
+```
+test interp::tests::a_cached_mention_against_the_allocation_it_replaces ... ignored, timing;
+  run with `cargo test -p ply-eval --release --lib
+  interp::tests::a_cached_mention_against_the_allocation_it_replaces -- --ignored --nocapture`
+```
+
 — and one doc-test, `crates/ply-host/src/db/pool.rs - db::pool::job (line 107)`.
-That matches `README.md`'s "three are timing benchmarks … and the fourth is a
-doc-test, not a benchmark."
+That matches `README.md`'s "four are timing benchmarks … and the fifth is a
+doc-test, not a benchmark." (This paragraph said *four* and named three
+benchmarks; R4 added the fourth.)
 
 ## 3. Run the examples
 
@@ -634,22 +762,42 @@ allocation count does not vary with a profile.
 
 Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
 ADR, and no other sentence of `README.md` is read. Every other number, signature
-and guarantee in the prose surface is unenforced by the suite — **24,951 lines**
+and guarantee in the prose surface is unenforced by the suite — **26,322 lines**
 across
-`README.md`, `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` and the seventeen ADRs
+`README.md`, `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` and the **nineteen** ADRs
 (`cat DESIGN.md ROADMAP.md CONTRACTS.md README.md docs/adr/*.md | wc -l`), or
-**26,777** counting `benches/README.md`, `CONTRIBUTING.md` and this file. Both
+**28,484** counting `benches/README.md`, `CONTRIBUTING.md` and this file. Both
 figures move whenever anyone edits any of those files, so re-take them rather
-than quoting them.
+than quoting them. (They read 24,951 and 26,777 over seventeen ADRs, before
+0018 and 0019 existed and before R4's integration pass edited five of the other
+documents; re-taken 2026-08-21.)
+
+> **Re-taken again 2026-08-21, by the regression audit after R4**, whose own
+> correction blocks in `ROADMAP.md` and `docs/adr/0019-value-representation.md`
+> moved them: **26,385** and **28,558**, by the two `wc -l` pipelines above —
+> the second figure counts this file, so it counts this block too, and was
+> re-taken after the block was written rather than before. This is the third
+> pair of numbers this paragraph has carried in one day, which is the
+> paragraph's own point.
+
+> **And a fourth pair, 2026-08-21, from the second regression audit**, which
+> added ADR 0019 §7, correction blocks in `ROADMAP.md`, `CONTRACTS.md`,
+> `docs/adr/0012-w2-contract.md`, `CONTRIBUTING.md`, `README.md` and this file:
+> **26,685** and **28,933**, same two pipelines, re-taken after these blocks
+> were written. The ADR total is **16,353** (`cat docs/adr/*.md | wc -l`).
 
 So the checked/written boundary is:
 
 **CHECKED — machine-verified against the tree, will fail if the tree moves:**
 
-- The two *guarded* measurement files, and only those. `benches/` holds three
-  since R3 — `w6-ladder-r3.json` is the post-R3 re-take and **nothing reads it**,
-  which `benches/README.md` states rather than leaves to be discovered; it is a
-  measurement, not a guard. `benches/w6-ladder.json`
+- The two *guarded* measurement files, and only those. `benches/` holds
+  **five** since R4 (`ls benches/*.json`) — `w6-ladder-r3.json` is the post-R3
+  re-take, `w6-spike-r4.json` the R4 re-take of the spike's `read_line` half,
+  and `adr0018-mcts.json` the compute-kernel re-pricing ADR 0018 §1 asked for.
+  **Nothing reads any of those three**, which `benches/README.md` states rather
+  than leaves to be discovered; they are measurements, not guards. (This line
+  said "three since R3" and was correct when written; R4 added two files.)
+  `benches/w6-ladder.json`
   and `benches/w6-spike.json` are read by
   `ply-corpus/tests/w6_report_integrity.rs:304
   the_shipped_ladder_still_describes_the_tree_it_ships_in` and
@@ -666,7 +814,7 @@ So the checked/written boundary is:
   the_readme_still_describes_this_request_path`. See the section above for why
   that one and nothing else.
 - Behavioural invariants stated as tests, e.g. the rename invariant at
-  `ply-cli/tests/cli.rs:145`. There are 3,597 tests; how many of them pin a
+  `ply-cli/tests/cli.rs:145`. There are 3,661 tests; how many of them pin a
   documented guarantee rather than an implementation detail is **not measured
   and no document claims a figure for it.**
 - Anything you can re-run from this file. The loop numbers, the selection table,
@@ -677,7 +825,7 @@ So the checked/written boundary is:
 
 - Every prose claim in `README.md` bar the one sentence above, and every one in
   `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md`
-  and the seventeen ADRs.
+  and the **nineteen** ADRs (`ls docs/adr/*.md | wc -l`; this said seventeen).
 - `CONTRACTS.md` in particular is a **construction** document, not an API
   reference. Its own preamble says so: *"Crates are implemented concurrently
   against them, so a signature here is a promise other crates have already been
@@ -718,16 +866,39 @@ claim that was silently removed teaches nobody. Follow the convention — see
 the current queue and it is ordered on purpose: each item moves the number the
 next one is judged against.
 
+> **Re-taken after R4 (2026-08-21). Items 0, 1 and 3 below all state something
+> the tree has since moved, and the list is left standing with the corrections
+> attached because `ROADMAP.md` §"What is next" carries the same corrections and
+> the two must not drift apart.**
+
 0. **Decide the regions question.** R3 ended on a decision rule fixed before it
    started and the rule fired against the design: `/health` still allocates
    **1,082** times against a pre-region **1,035**. Re-take it yourself in one
    command — `./target/release/w6-alloc --repo . --requests 200`, and the
    baseline is in `benches/w6-ladder.json`'s `boxing on hot paths` alternative.
    `ROADMAP.md` §R3 is the record.
+
+   > **1,082 was R3's reading; the same command reads 773.4 here**, three runs
+   > byte-identical, after R4's two levers. That is now *below* the pre-region
+   > 1,035 — and it does **not** settle this item, because R4 changed how a
+   > value is built and not whether a region is the right memory model. Nobody
+   > has taken a number for what the forkable world cost.
+
 1. Unboxed primitive representation, and monomorphization. R3's attribution
    points here: `frame::dispatch < Machine::step < Machine::call` is **45.5%** of
    what a request allocates, per `cargo test -p ply-corpus --release --test
    w6_alloc_sites -- --nocapture`.
+
+   > **"Unboxed primitive representation" was never a thing this tree could
+   > do.** `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and `Task` are
+   > inline variants of a 32-byte `Value` and allocate nothing; ADR 0019 §4
+   > *rejects* narrowing `Value` with the number that would have justified it,
+   > which is zero. `frame::dispatch` at 45.5% is a **frame** ranking and the
+   > frame is three different things — attributed by the value instead
+   > (`cargo test -p ply-corpus --release --test r4_value_construction --
+   > --nocapture`) its bulk was the call-argument vector, now handled.
+   > **Monomorphization is untouched and still open.**
+
 2. Evidence passing and handler specialization.
 3. Re-measure codegen's ceiling — **before** re-arguing M9. The *ladder* half has
    been re-taken and ships as `benches/w6-ladder-r3.json`; render it with
@@ -735,9 +906,22 @@ next one is judged against.
    The *spike* half still cannot be re-taken, because the spike does not build;
    see §1. `ROADMAP.md` §"What is next" item 3 now records that blocker.
 
+   > **The spike builds and the ceiling was measured.**
+   > `benches/w6-spike-r4.json` is the re-take of the `read_line` half and
+   > `benches/adr0018-mcts.json` is the same instrument pointed at a compute
+   > kernel that is 81.0% inside the compiled fragment. End to end it is
+   > **0.998×** — nothing — and the Amdahl ceiling is **4.86×**, because **the
+   > interpreter cannot enter compiled code**. That sentence is a prerequisite
+   > for every codegen lever and it is in no ADR yet.
+
 Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR
 0016 §3.5, and fix `Machine::constant` refusing the memo inside any open
 scheduler region, which costs a spawning service 1.77x on `/health`.
+
+> **Do not delete the spike yet.** ADR 0016 §3.5 wants it gone, and it is the
+> only instrument in the repository that can price a code generator — ADR 0018
+> §1 could not have been answered without it. Deleting it and then re-arguing
+> M9 from a file is the failure mode this whole section exists to prevent.
 
 ### M9 (native codegen) is deferred, not forgotten, and you can re-derive it
 
@@ -809,8 +993,12 @@ not re-argue M9 from the numbers in either.** Re-measure.
 
 Everything here cost this audit real time. In descending order of cost.
 
-1. **`crates/ply-codegen-spike` does not compile** — two walls, neither
-   recorded outside this file. §1.
+1. **`crates/ply-codegen-spike` needs `+1.94.0`, and nothing in the workspace
+   compiles it** — one wall of the two is gone as of R4 (the crate builds and
+   its tests pass), but the toolchain wall stands and the crate is still
+   outside `--workspace`, so it rots silently and has done so twice. Its
+   `--half` invocation also needs `--bin ply-codegen-spike` now that the crate
+   ships two binaries. §1.
 2. **`examples/same-tests.sh` never builds the binary it runs.** Build release
    first or it dies on line 79. §4.
 3. **`--no-incremental` is not `--no-cache`.** `same-tests.sh` step 1 can print
@@ -828,12 +1016,15 @@ Everything here cost this audit real time. In descending order of cost.
    so the default run tells you nothing. §2.
 8. **`CONTRACTS.md` carries stale signatures with the correction above them,
    not beside them.** §7.
-9. **There is no ADR index.** `docs/adr/` is seventeen numbered files and
-   nothing else. The titles, in order: modules, incremental front end, cache
+9. **There is no ADR index.** `docs/adr/` is **nineteen** numbered files and
+   nothing else (`ls docs/adr/*.md | wc -l`, re-taken 2026-08-21; this line
+   said seventeen, which was true before ADR 0018 and ADR 0019 landed). The
+   titles, in order: modules, incremental front end, cache
    storage, machine-shaped failure, control stack and world *(superseded in part
    by 0017)*, deterministic simulation, specs, host effect boundary, effect-set
    aliases, derivation-now-dispatch-deferred, then W1–W6 contracts (0011–0016),
-   then regions (0017).
+   then regions (0017), compute-kernel performance (0018) and value
+   representation (0019).
 10. **ADR 0005 is partly superseded by ADR 0017** and 0005 is 46,844 characters.
     The persistent forkable `World` its §2 specifies was removed; regions on a
     bump arena replaced it. Its *title* does not say so — but its header does,
@@ -863,7 +1054,7 @@ whoever takes them.
 | [`DESIGN.md`](../DESIGN.md) | the language and the reasoning; §"What of this is built" is the honest state table | you need to know what a mechanism *means* |
 | [`ROADMAP.md`](../ROADMAP.md) | milestone-by-milestone record; **§"What is next" is the queue** | you need to know what to do |
 | [`CONTRACTS.md`](../CONTRACTS.md) | the crate-construction contract, 7,650 lines | you need a signature — and see §7 |
-| [`docs/adr/`](adr/) | seventeen decisions with their arguments, `00NN-slug.md`, no index | you want to know *why*, and are prepared for 14,785 lines (this row said 24k, which is the whole prose surface, not the ADRs) |
+| [`docs/adr/`](adr/) | **nineteen** decisions with their arguments, `00NN-slug.md`, no index | you want to know *why*, and are prepared for **16,353** lines (`cat docs/adr/*.md \| wc -l`, re-taken 2026-08-21 by the second regression audit; it read 16,100 before ADR 0019 §7; this row said "seventeen decisions" and "14,785 lines", which was true before ADR 0018 and ADR 0019 existed, and before that said 24k, which is the whole prose surface and not the ADRs) |
 | [`benches/README.md`](../benches/README.md) | what the measurement harness does and its caveats | before quoting any `ply-corpus` number |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | how to make a change here | before your first commit |
 

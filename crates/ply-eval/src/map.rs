@@ -11,7 +11,10 @@
 //!
 //! The order itself is [`Value::cmp`](crate::value::Value#impl-Ord-for-Value)
 //! and lives beside the value it orders, so there is one definition of it rather
-//! than one per operation.
+//! than one per operation. The order is not enough on its own: it is coarser
+//! than what a program can print, so the *key* is reduced to the canonical
+//! member of its class as well — [`value::canonical_key`](crate::value::canonical_key)
+//! says which distinction that is and why the order cannot see it.
 
 use crate::cont::Frame;
 use crate::value::{Map, Value};
@@ -57,19 +60,25 @@ fn key(k: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     crate::value::secret_has_no_order(k, what, span)
 }
 
-/// The only `insert_mut` in this module, so that adding a seventh map builder
-/// cannot reintroduce the gap: there is one place a key enters a `Map`.
+/// The only insert in this module, so that adding a seventh map builder cannot
+/// reintroduce the gap: there is one place a key enters a `Map`.
+///
+/// [`value::insert_key`](crate::value::insert_key) is what it delegates to, and
+/// it puts the key in canonical form first — see [`value::canonical_key`](crate::value::canonical_key).
 fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     key(&k, what, span)?;
-    m.insert_mut(k, v);
+    crate::value::insert_key(m, k, v);
     Ok(())
 }
 
 /// Replaces an equal key's entry, **key and value both** — the last write wins.
-/// Visible only where two equal keys are distinguishable, which is `Decimal`:
-/// inserting `1.5m` over `1.50m` leaves the key `1.5m`, so `map_keys` then
-/// renders `1.5` where it rendered `1.50`. The alternative costs a lookup on
-/// every insert to preserve a distinction nobody asked for.
+///
+/// That rule is only observable where two equal keys are distinguishable, which
+/// is `Decimal`, and it is not observable there either: a key is reduced to the
+/// canonical member of its class on the way in, so `1.5m` and `1.50m` both
+/// store `1.5` and `map_keys` answers the same list whichever was written last.
+/// The alternative — keeping the first spelling instead of the last — is still
+/// a function of insertion history and fixes nothing.
 ///
 /// Takes the map **by value**, so a caller that was its last owner hands over
 /// the tree rather than a second handle to it and `insert_mut` rewrites the

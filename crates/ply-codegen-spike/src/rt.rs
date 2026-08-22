@@ -31,6 +31,11 @@ pub struct Ctx {
     pub machine: Option<Box<Machine<'static>>>,
     pub builtin_calls: u64,
     pub machine_calls: u64,
+    /// The same total, split by `targets` index, so that a hybrid run reports
+    /// which Ply functions the compiled fragment had to leave to reach.
+    pub machine_calls_by_target: Vec<u64>,
+    /// And by `builtins` index, for the same reason.
+    pub builtin_calls_by_index: Vec<u64>,
 }
 
 impl Ctx {
@@ -48,7 +53,18 @@ impl Ctx {
             machine: None,
             builtin_calls: 0,
             machine_calls: 0,
+            machine_calls_by_target: Vec::new(),
+            builtin_calls_by_index: Vec::new(),
         }
+    }
+
+    /// Zeroes the per-target and per-builtin tallies and sizes them to the
+    /// tables the compiled program declared.
+    pub fn reset_counts(&mut self) {
+        self.builtin_calls = 0;
+        self.machine_calls = 0;
+        self.machine_calls_by_target = vec![0; self.targets.len()];
+        self.builtin_calls_by_index = vec![0; self.builtins.len()];
     }
 
     /// Between calls. The arena is the whole of this spike's memory management,
@@ -205,6 +221,9 @@ pub extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64
     let b = ctx.builtins[index as usize];
     let args = args_of(ctx, args, n);
     ctx.builtin_calls += 1;
+    if let Some(slot) = ctx.builtin_calls_by_index.get_mut(index as usize) {
+        *slot += 1;
+    }
     match ply_eval::builtins::call(b, args, &mut ctx.regions, Span::DUMMY) {
         Ok(Step::Done(v)) => ctx.push(v),
         Ok(_) => {
@@ -245,6 +264,9 @@ pub extern "C" fn rt_call_machine(ctx: *mut Ctx, index: i64, args: *const i64, n
     let name = ctx.targets[index as usize].clone();
     let args = args_of(ctx, args, n);
     ctx.machine_calls += 1;
+    if let Some(slot) = ctx.machine_calls_by_target.get_mut(index as usize) {
+        *slot += 1;
+    }
     let Some(machine) = ctx.machine.as_mut() else {
         let d = error(format!("`{name}` needs the machine trampoline and none was installed"));
         return ctx.fail(d);

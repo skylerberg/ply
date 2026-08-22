@@ -21,7 +21,7 @@ use crate::host::{
 };
 use crate::interp::{
     OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
-    err_unknown_name, literal, op_decl,
+    err_unknown_name, op_decl,
 };
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
 use crate::memo::{Lookup, Memo};
@@ -845,7 +845,9 @@ impl<'a> Machine<'a> {
         let span = code.span;
         self.current = span;
         match &code.kind {
-            NodeKind::Lit(lit) => self.go_return(literal(lit)),
+            // Built at lowering; this is a refcount bump for a `Str` or a
+            // `Bytes` and a copy of an inline variant for everything else.
+            NodeKind::Lit(_, value) => self.go_return(value.clone()),
 
             // The reference-counting pass says whether this is the last read of
             // a binding of this scope. When it is, the value is moved out rather
@@ -1804,7 +1806,7 @@ impl<'a> Machine<'a> {
         body: Code,
         env: Env,
         module: usize,
-        args: Vec<Value>,
+        mut args: Vec<Value>,
         span: Span,
     ) -> Result<(), Diagnostic> {
         if params.len() != args.len() {
@@ -1827,9 +1829,10 @@ impl<'a> Machine<'a> {
             _ => false,
         };
         let mut scope = env;
-        for (p, v) in params.iter().zip(args) {
+        for (p, v) in params.iter().zip(args.drain(..)) {
             scope = scope.bind(p.clone(), v);
         }
+        crate::argv::give(args);
         if self.stack.calls() >= self.max_calls {
             return Err(self.err_call_limit(span, &self.stack));
         }

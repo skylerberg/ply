@@ -57,9 +57,23 @@ impl Harness {
 
     pub fn with(names: &[&str], opts: Opts) -> Result<Harness> {
         let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library()?));
+        Harness::over(loaded, names, opts, Some(ENTRY_FN))
+    }
+
+    /// The same, over a program somebody else loaded, and with the entry-cost
+    /// function named by the caller — a project that does not import
+    /// `std.http` has no [`ENTRY_FN`] to add.
+    pub fn over(
+        loaded: &'static Loaded,
+        names: &[&str],
+        opts: Opts,
+        entry: Option<&str>,
+    ) -> Result<Harness> {
         let mut all: Vec<&str> = names.to_vec();
-        if !all.contains(&ENTRY_FN) {
-            all.push(ENTRY_FN);
+        if let Some(entry) = entry
+            && !all.contains(&entry)
+        {
+            all.push(entry);
         }
         let compiled = Jit::compile_with(loaded, &all, opts)?;
         let mut ctx = compiled.context();

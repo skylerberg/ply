@@ -352,6 +352,41 @@ baseline being destroyed to make them pass. A re-take belongs beside it, as
 `w6-ladder-r3.json` is. Nothing reads `w6-ladder-r3.json`, which is the honest
 statement of its status: it is a measurement, not a guard.
 
+### And there are now two spike halves
+
+| file | taken | what it is for |
+| --- | --- | --- |
+| `w6-spike.json` | W6 | the **guard**. `w6_report_integrity.rs::the_shipped_ladder_still_describes_the_tree_it_ships_in` reads it by name under `cargo test --workspace`. Do not overwrite it. |
+| `w6-spike-r4.json` | 2026-08-21, R4 | a **re-take**, and the first one possible: `crates/ply-codegen-spike` had not compiled since `ply_eval::code::Stmt::Expr` became a struct variant, so ADR 0016's spike figures were not reproducible from this tree at all. Nothing reads this file. |
+
+The re-take reproduces the shipped number. Both, rendered side by side:
+
+```
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder-r3.json benches/w6-spike.json
+   ... the spike compiled `std.http.read_line` and held 11.67x on its weakest input,
+       which projects 1.46x end to end
+
+cargo run --release -p ply-corpus -- w6 benches/w6-ladder-r3.json benches/w6-spike-r4.json
+   ... the spike compiled `std.http.read_line` and held 11.68x on its weakest input,
+       which projects 1.46x end to end
+```
+
+`11.67x` and `11.68x`, and the verdict — `keep deferring M9` — is the same
+either way. The re-take is
+`cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml -- --no-served --iterations 4000 --repeats 15 --half benches/w6-spike-r4.json`,
+run on a machine whose load average was 8.5 falling to 5.2. **Take it on a quiet
+machine.** The same command at `--repeats 7` under a load average of 9.6
+reported `2.92x` for the same variant, because the ratio is
+interpreter-best over spike-**worst** and a contended machine inflates the worst
+by a factor of eight. That is not the spike being wrong; it is what a worst-of
+number does under load, and it is why every ratio in the next section is taken
+inside a single window instead.
+
+There are now four files under `benches/`, so the warning above is stronger, not
+weaker: `benches/*.json` expands to `w6-ladder-r3.json`, `w6-ladder.json`,
+`w6-spike-r4.json`, `w6-spike.json`, and last-wins merging still renders the
+**older** ladder and the **older** spike half. Name the two files you want.
+
 It takes no measurement of its own. It merges one or more measurement files
 field by field — so the ladder run and the spike run produce their halves
 independently — assembles the ladder, applies the criteria, and prints the
@@ -563,6 +598,112 @@ so the error is in the absolutes and cancels out of the ratio between them.
 tests carrying a `cell` atom spread over `labels` region labels — because the
 measured corpora carry none at all and a risk that is only ever reported as
 zero is a risk nobody can size.
+
+## What `mcts` adds — ADR 0018 §1, the compute kernel
+
+ADR 0016 measured the codegen spike on `std.http.read_line` and concluded
+1.02–1.05x end to end, because the fragment it compiles is 2–5% of an HTTP
+request. ADR 0018 is ordered on the assumption that an MCTS inner loop is
+*almost entirely* that fragment, and its §1 says in as many words that the
+assumption must be tested before anything is built. This is that test.
+
+```
+cd crates/ply-codegen-spike && cargo +1.94.0 build --release
+./crates/ply-codegen-spike/target/release/mcts \
+    --dir benches/kernel --iterations 100 --inner 3 --repeats 21 \
+    --out benches/adr0018-mcts.json
+```
+
+`benches/kernel/` is the kernel itself, in Ply, and it is a program rather than a
+microbenchmark: three-heap Nim under normal play, positions bit-packed into one
+`Int`, UCB1 in integer fixed point, bounded playouts, a tree of `Map<Int, Node>`
+with children held as lists of ids. It passes `ply test benches/kernel/
+--engine both` — eight tests, one of which checks the search against Nim's
+closed-form optimal strategy rather than against itself. `benches/kernel/work.ply`
+is instrumentation kept in its own module so that a census of the kernel is a
+census of the kernel; it re-runs the same iteration sequence and totals the work
+each one does, and its own test pins that correspondence.
+
+### What the run reports, and what each number is
+
+| section | what it is |
+| --- | --- |
+| the census | every function of `mcts`, compiled or refused **by name**, with its lowered node count. Deterministic. |
+| what is outside, ranked | the refusal reasons, ordered by the nodes they take with them. This is the roadmap. Deterministic. |
+| agreement | every scalar-argument function against generated inputs, plus whole searches, against **both** shipped evaluators, before anything is timed. Deterministic. |
+| the ladder | four compiled sets, each a superset of the last, timed end to end against the interpreter. |
+| the same fragment with the tree removed | `mcts.playouts`, which is inside the fragment top to bottom and crosses nothing. |
+| where the interpreter's time goes | the fragment's share of executed work. |
+| the ceiling | Amdahl over the two measured numbers above, and nothing else. |
+| the bound compiled code does not carry | run as a subprocess, because observing it means watching a process die. |
+
+### Every ratio is taken inside one window
+
+The machine this repository is developed on is shared, and its load average
+moved between 3 and 47 while these numbers were being taken. A ratio between two
+best-of numbers timed minutes apart is a ratio between two different machines:
+the same end-to-end comparison read `0.413x` under a load average of 28 and
+`1.004x` under a load average of 4. So the ladder times both sides in the **same
+repeat**, and reports the median of the per-window ratios with the extremes
+beside it.
+
+The run also prints a **floor**: the same search, no JIT involved at all, on the
+two `Machine` instances the harness holds. It was `1.004x [0.971-1.030]`. A rung
+is only saying something if it is outside that band.
+
+### What it found, 2026-08-21, load average 3.54 falling to 3.05
+
+Every figure below is in `benches/adr0018-mcts.json`, written by the command at
+the top of this section.
+
+- **22 of 34 functions and 386 of 745 lowered nodes** are inside the fragment.
+- **81.0% of the kernel's executed work** is inside it — against the 2–5% ADR
+  0016 measured for an HTTP request. So ADR 0018's premise is not wrong about
+  the shape of a compute kernel.
+- The fragment runs **52.58x [50.19-53.52]** faster where it runs, measured on
+  `mcts.playouts`, which is inside the fragment top to bottom and crosses the
+  boundary zero times. ADR 0016's spike reported 11.67x on `read_line`; on a
+  compute kernel it is four and a half times that.
+- **End to end, on the whole kernel, it is 0.998x [0.979-1.007]** — nothing —
+  against a floor of 1.000x [0.994-1.009]. Compiling the twenty arithmetic
+  functions between the second rung and the fourth moved the whole-program time
+  from 57,700µs to 57,582µs.
+- The reason is structural, and it is the finding: **the interpreter cannot call
+  compiled code.** Every function the fragment accepts whose callers it refuses
+  is compiled and then never entered. In the hybrid the compiled code reaches
+  exactly three functions — `mcts.iterate` (100 crossings), `mcts.root` (1) and
+  `mcts.best_action` (1) — and every `ucb`, `isqrt`, `ilog2` and `rollout` call
+  underneath them runs in the machine.
+- The boundary is **not** what is happening: 102 crossings cost 9.9µs, 0.017% of
+  the run, and entering the machine with the whole 101-node tree in hand costs
+  2.849µs against 0.097µs with no argument at all.
+- The ceiling, Amdahl over the two measured numbers and nothing else: **4.86x**
+  end to end for a backend that could be *entered* from interpreted code, and
+  **5.26x** at an infinitely fast fragment. Not 11.67x, and not 52x.
+- A lever with no compiler work in it. Ply ships no `sqrt` and no `ln` for
+  `Int`, `Float` or `Decimal` — the numeric builtins are the decimal
+  conversions and nothing else — so `ucb` computes its own square root by
+  Newton's method over an `ilog2` approximation of the logarithm, at 28.34µs a
+  call against 1.35µs for the same function with those two operations removed.
+  That is **2.50x** on this kernel, from two prelude builtins.
+- The fragment has **no `Float` path at all**, and does not say so at compile
+  time: it compiles `a + b` as `Int` arithmetic whatever the operands are, and
+  a `Float` reaches the runtime helper and raises *arithmetic on a Float*. So a
+  census that counted such a function as compiled would be counting one that
+  cannot run. ADR 0018 §2 asks for `Int`, `Bool` **and `Float`** unboxed; the
+  spike prices only the first two.
+  (`crates/ply-codegen-spike/tests/mcts_kernel.rs::the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time`.)
+- Compiled code carries no equivalent of `ply_eval::limit`'s bound on nested
+  calls. `mcts.playouts(0, 1, 5000000)` is a diagnostic in the machine —
+  *recursion limit of 10000 nested calls exceeded* — and `SIGABRT` in the
+  fragment. The report runs both as subprocesses and prints what each did,
+  because observing the second means watching a process die.
+
+### What it does not measure
+
+Allocation: this is wall clock only. One machine, one process, no cross-machine
+check. And the ceiling is Amdahl, which assumes the two measured pieces compose
+— a backend that changed the representation of a `Value` would move both.
 
 ## Reproducing a corpus
 

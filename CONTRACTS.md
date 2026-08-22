@@ -1582,6 +1582,17 @@ pub type Code = Rc<Node>;
 pub struct Node { pub kind: NodeKind, pub span: Span }
 pub enum NodeKind { Lit, Var, Unary, Binary, Lambda, App, If, Match, Block,
                     Record, Field, List, Perform, Handle, WithCell }
+// Corrected (R4, 2026-08-21) — the block above is what was designed and the
+// three lines below are what `crates/ply-eval/src/code.rs` holds. Nothing reads
+// this file, so it went stale silently, which is what `CONTRIBUTING.md`
+// §"Before you open a change" item 5 is about.
+pub struct Node { pub kind: NodeKind, pub span: Span, pub own: Own }
+//   NodeKind::Lit carries the Value it denotes, built once at lowering rather
+//   than per evaluation — ADR 0019 §2. The Lit stays because
+//   `crates/ply-codegen-spike` dispatches on it to pick a Cranelift type.
+Lit(Lit, Value),
+//   and Stmt::Expr is a struct variant, which is what bit-rotted the spike.
+Stmt::Expr { code: Code, dead: bool },
 pub struct Arm { pub pat: Pattern, pub guard: Option<Code>, pub body: Code, pub span: Span }
 pub enum Stmt { Let { pat: Pattern, value: Code, span: Span }, Expr(Code) }
 pub struct Clause {
@@ -1598,6 +1609,29 @@ pub fn lower(e: &Expr) -> Code;
 
 `lower_clause` sets `resume: None` today and must read `HandleClause::resume` as
 soon as the grammar below lands. It is the only place that has to learn about it.
+
+### `ply-eval::argv` — landed after this document, R4
+
+Not designed here; recorded so the public surface is complete. A thread-local
+free list of `Vec<Value>` in four capacity classes, taken at
+`Frame::AppCallee` and given back by `Machine::enter_code` once the arguments
+are bound into scope. ADR 0019 §1 is the decision and its module note is the
+measurement.
+
+```rust
+pub const ply_eval::ARGUMENT_VECTOR_CLASSES: usize;  // = argv::CLASSES
+pub(crate) fn take(arity: usize) -> Vec<Value>;
+pub(crate) fn give(args: Vec<Value>);
+```
+
+The constant is public for one reason and it is worth stating as a contract: the
+attribution harness must split its arity histogram at the same number this
+module serves, rather than at a copy of it. `give` **refuses a non-empty
+vector** rather than emptying it — a caller still holding an argument has not
+finished with it, and a pooled buffer holding a `Value` would keep a `Cell` past
+the region that reclaims it and park a `Secret` where the next call reads
+(ADR 0015 §2). Every access is `try_with`, so a release during thread-local
+teardown falls back to the allocator instead of aborting a worker.
 
 ### `ply-eval::cont` — landed
 
@@ -4576,6 +4610,14 @@ order, not unspecified. Content addressing, the result cache, seeded replay and
 `--engine both` all assume a value has one canonical form, and every failure a
 hash-ordered map would produce is a green result or a red result over correct
 code.
+
+> **Corrected (regression audit, 2026-08-21).** Ascending order is necessary and
+> was not sufficient: `Value::cmp` is coarser than rendering at `Decimal`, so a
+> map held whichever of `1.50m` / `1.5m` was inserted last and `map_keys` was a
+> function of insertion history anyway. A key is now reduced to the canonical
+> member of its class on the way in (`ply_eval::value::canonical_key`, reached
+> from `ply_eval::value::insert_key`, which is the one site every `Map` insert
+> passes through). `docs/adr/0019-value-representation.md` §7 is the write-up.
 
 A key type must be **ordered**, which is exactly `derivable(ord, k)` — one
 predicate, shared with derivation. Ordered: `Int`, `Bool`, `String`, `Bytes`,

@@ -325,6 +325,60 @@ test "one map, one document" {
     );
 }
 
+/// The same claim over the key type it was **false** for until 2026-08-21.
+///
+/// The test above uses `String` and `Int` keys, which have one spelling each.
+/// `Decimal` has many — `1.50m` and `1.5m` are one key by `Value::cmp` and two
+/// strings by `decimal_to_string`, which is what `std.json`'s number writer
+/// calls — so a map that kept whichever spelling was inserted last served two
+/// different bodies for two maps a test had proved equal, with `--engine both`
+/// reporting nothing because it was never an engine disagreement. Fixed by
+/// `ply_eval::value::canonical_key`; `docs/adr/0019-value-representation.md` §7
+/// is the write-up.
+///
+/// The `2` in the expected body is the canonical spelling of `2.00m`, and it is
+/// spelled out here rather than compared only against its sibling so that a
+/// regression to *either* spelling fails rather than only a disagreement
+/// between two.
+#[test]
+fn a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last() {
+    let dir = project(&[(
+        "m.ply",
+        r#"import std.json
+
+pub type Catalogue = { prices: Map<Decimal, String> }
+derive json for Catalogue
+
+fn from_catalogue() -> Catalogue =
+  {prices: map_insert(map_insert(map_new(), 1.50m, "bolt"), 2.00m, "nut")}
+
+fn after_promotion() -> Catalogue =
+  {prices: map_insert(from_catalogue().prices, 1.5m, "bolt")}
+
+fn body(c: Catalogue) -> String =
+  string_of_bytes(json::encode_bytes(c, catalogue_json()))
+
+test "one catalogue, one document" {
+  assert_eq(from_catalogue(), after_promotion());
+  assert_eq(body(from_catalogue()), body(after_promotion()));
+  assert_eq(body(after_promotion()),
+            "{\"prices\":[{\"key\":1.5,\"value\":\"bolt\"},{\"key\":2,\"value\":\"nut\"}]}")
+}
+"#,
+    )]);
+
+    let (code, text) = run(dir.path(), &["test"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("0 failed, 1 passed"), "{text}");
+
+    let (code, text) = run(dir.path(), &["test", "--engine", "both", "--no-cache"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.contains("E0503"),
+        "the two engines disagreed about a `Decimal`-keyed map:\n{text}"
+    );
+}
+
 // ------------------------------------------------------------------ the stdlib
 
 /// The stdlib digest is **in no cache key**, and this is the assertion that says

@@ -339,10 +339,16 @@ fn mangle(name: &str) -> String {
     format!("ply${}", name.replace('.', "$"))
 }
 
+/// The size of a lowered body, so a census can weight a refusal by how much of
+/// the program it takes out rather than by one function each.
+pub fn node_count(code: &Code) -> usize {
+    count_nodes(code)
+}
+
 fn count_nodes(code: &Code) -> usize {
     let mut n = 1;
     match &code.kind {
-        NodeKind::Lit(_) | NodeKind::Var(_) => {}
+        NodeKind::Lit(..) | NodeKind::Var(_) => {}
         NodeKind::Unary { operand, .. } => n += count_nodes(operand),
         NodeKind::Binary { lhs, rhs, .. } => n += count_nodes(lhs) + count_nodes(rhs),
         NodeKind::Lambda { body, .. } => n += count_nodes(body),
@@ -368,7 +374,7 @@ fn count_nodes(code: &Code) -> usize {
             for s in stmts.iter() {
                 n += match s {
                     Stmt::Let { value, .. } => count_nodes(value),
-                    Stmt::Expr(e) => count_nodes(e),
+                    Stmt::Expr { code, .. } => count_nodes(code),
                 };
             }
             if let Some(t) = tail {
@@ -382,6 +388,7 @@ fn count_nodes(code: &Code) -> usize {
         NodeKind::Handle { body, .. } => n += count_nodes(body),
         NodeKind::WithCell { init, body, .. } => n += count_nodes(init) + count_nodes(body),
         NodeKind::Simulate { body } => n += count_nodes(body),
+        NodeKind::WithRegion { body } => n += count_nodes(body),
     }
     n
 }
@@ -585,9 +592,9 @@ impl Fx<'_, '_> {
     /// branches are compiled so a join can be given a block parameter.
     fn kind_of(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
         Ok(match &code.kind {
-            NodeKind::Lit(Lit::Int(_)) => Kind::Int,
-            NodeKind::Lit(Lit::Bool(_)) => Kind::Bool,
-            NodeKind::Lit(_) => Kind::Boxed,
+            NodeKind::Lit(Lit::Int(_), _) => Kind::Int,
+            NodeKind::Lit(Lit::Bool(_), _) => Kind::Bool,
+            NodeKind::Lit(..) => Kind::Boxed,
             NodeKind::Var(q) => match self.denotation(q, scope)? {
                 Denotes::Local(v) => v.kind,
                 _ => Kind::Boxed,
@@ -646,7 +653,7 @@ impl Fx<'_, '_> {
 
     fn expr(&mut self, code: &Code, scope: &mut Scope) -> Result<Val> {
         match &code.kind {
-            NodeKind::Lit(lit) => Ok(self.literal(lit)),
+            NodeKind::Lit(lit, _) => Ok(self.literal(lit)),
 
             NodeKind::Var(q) => match self.denotation(q, scope)? {
                 Denotes::Local(v) => Ok(v),
@@ -736,8 +743,8 @@ impl Fx<'_, '_> {
                                 }
                             }
                         }
-                        Stmt::Expr(e) => {
-                            self.expr(e, &mut inner)?;
+                        Stmt::Expr { code, .. } => {
+                            self.expr(code, &mut inner)?;
                         }
                     }
                 }
@@ -784,6 +791,7 @@ impl Fx<'_, '_> {
             NodeKind::Handle { .. } => self.refuse("a `handle`"),
             NodeKind::WithCell { .. } => self.refuse("a `with cell`"),
             NodeKind::Simulate { .. } => self.refuse("a `simulate`"),
+            NodeKind::WithRegion { .. } => self.refuse("a `region` block"),
         }
     }
 
