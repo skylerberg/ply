@@ -12,6 +12,7 @@ pub mod measure;
 pub mod model;
 pub mod payload;
 pub mod pipeline;
+pub mod r4;
 pub mod regions;
 pub mod rng;
 pub mod serve;

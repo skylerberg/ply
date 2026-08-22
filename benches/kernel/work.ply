@@ -1,0 +1,90 @@
+// Instrumentation, kept out of `mcts` so that a census of the kernel is a
+// census of the kernel.
+//
+// `iterate` is a pure function of the tree it is handed, so re-running the same
+// sequence of iterations here visits exactly the trees `mcts::search` visits.
+// That is what lets a measurement weight a per-call cost by a real call count
+// rather than by an estimate — the test at the bottom pins the correspondence
+// by checking that the node total this walk reports is the node total the real
+// search produces.
+
+import mcts
+
+type Work = { ucb: Int, plies: Int, steps: Int, nodes: Int }
+
+// One `ucb` evaluation per child examined, at every node on the descent.
+fn descent(t: mcts::Tree, id: Int, acc: Int) -> Int = {
+  let n = mcts::node_at(t, id);
+  if n.untried > 0 || len(n.children) == 0 { acc }
+  else {
+    descent(t, mcts::best_child(t, n.children, n.visits, -1, 0), acc + len(n.children))
+  }
+}
+
+// The number of moves a playout from `s` with this seed actually plays.
+pub fn plies(s: Int, seed: Int, fuel: Int) -> Int =
+  if mcts::terminal(s) { 0 }
+  else if fuel <= 0 { 0 }
+  else {
+    let r = mcts::next_seed(seed);
+    let m = mcts::nth_move(s, mcts::below(r, mcts::move_count(s)));
+    1 + plies(mcts::apply_move(s, m), r, fuel - 1)
+  }
+
+fn depth(t: mcts::Tree, id: Int, acc: Int) -> Int =
+  if id < 0 { acc } else { depth(t, mcts::node_at(t, id).parent, acc + 1) }
+
+fn one(t: mcts::Tree) -> Work = {
+  let leaf = mcts::select(t, 0);
+  let n = mcts::node_at(t, leaf);
+  let grown = if n.untried > 0 { mcts::expand(t, leaf) } else { t };
+  let target = if n.untried > 0 { grown.size - 1 } else { leaf };
+  let seed = mcts::next_seed(t.seed);
+  { ucb: descent(t, 0, 0),
+    plies: plies(mcts::node_at(grown, target).state, seed, 64),
+    steps: depth(grown, target, 0),
+    nodes: grown.size - t.size }
+}
+
+fn walk(t: mcts::Tree, n: Int, acc: Work) -> Work =
+  if n <= 0 { acc }
+  else {
+    let w = one(t);
+    walk(mcts::iterate(t), n - 1,
+      { ucb: acc.ucb + w.ucb, plies: acc.plies + w.plies,
+        steps: acc.steps + w.steps, nodes: acc.nodes + w.nodes })
+  }
+
+// The nullary function both sides' entry costs are read off: its body is one
+// literal, so what it measures is the cost of arriving rather than of working.
+// `std.http.chunk_budget` plays the same role in ADR 0016's spike.
+pub fn zero() -> Int = 0
+
+// The cost of crossing into the machine with a whole tree in hand, isolated:
+// the body is one field read, so what a call to this measures is the entry.
+pub fn touch(t: mcts::Tree) -> Int = t.size
+
+// What `mcts::ucb` would cost if Ply shipped `sqrt` and `ln`: the same
+// exploitation term, and one divide where the exploration term's square root
+// is. It scores nothing anyone should search with — it exists so the
+// measurement can price the two missing builtins rather than assert that they
+// matter.
+pub fn ucb_if_sqrt_were_free(wins: Int, visits: Int, parent_visits: Int) -> Int =
+  if visits == 0 { 1073741823 }
+  else { (wins * 1024) / visits + (1414 * parent_visits) / (1000 * visits) }
+
+pub fn work_753(n: Int) -> Work =
+  walk(mcts::root(mcts::pack(7, 5, 3, 0), 20260821), n,
+       { ucb: 0, plies: 0, steps: 0, nodes: 0 })
+
+pub fn size_753(n: Int) -> Int =
+  mcts::search(mcts::root(mcts::pack(7, 5, 3, 0), 20260821), n).size
+
+test "the instrumented walk visits the trees the real search visits" {
+  let w = work_753(60);
+  assert_eq(w.nodes, size_753(60) - 1);
+  assert(w.ucb > 0);
+  assert(w.plies > 0);
+  assert(w.steps >= 60);
+  assert(w.plies <= 60 * 64)
+}

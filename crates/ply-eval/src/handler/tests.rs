@@ -23,16 +23,21 @@ fn node(kind: NodeKind) -> Code {
     })
 }
 
+fn lit(l: Lit) -> Code {
+    let value = crate::interp::literal(&l);
+    node(NodeKind::Lit(l, value))
+}
+
 fn int(i: i64) -> Code {
-    node(NodeKind::Lit(Lit::Int(i)))
+    lit(Lit::Int(i))
 }
 
 fn boolean(b: bool) -> Code {
-    node(NodeKind::Lit(Lit::Bool(b)))
+    lit(Lit::Bool(b))
 }
 
 fn unit() -> Code {
-    node(NodeKind::Lit(Lit::Unit))
+    lit(Lit::Unit)
 }
 
 fn var(name: &str) -> Code {

@@ -1041,9 +1041,12 @@ impl<'a> Checker<'a> {
                 ),
             ),
             // The only impure one, and only because it threads its function's
-            // row. It visits entries in ascending key order, so a fold over a
-            // map is a function of the map's contents rather than of how it was
-            // built — which is what makes a seeded replay take the same branch.
+            // row. It visits entries in ascending key order, and the keys are
+            // canonical (`ply_eval::value::canonical_key` — ascending order
+            // alone was not enough, because two spellings of one `Decimal` are
+            // one key and two strings), so a fold over a map is a function of
+            // the map's contents rather than of how it was built — which is
+            // what makes a seeded replay take the same branch.
             (
                 "map_fold",
                 poly(

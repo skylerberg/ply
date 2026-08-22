@@ -308,10 +308,20 @@ fn the_order_is_total() {
     }
 }
 
-/// `1.50m` and `1.5m` are one key, and the retained one is the last inserted —
-/// `map_insert` replaces the key as well as the value.
+/// `1.50m` and `1.5m` are one key, the **value** is the last inserted, and the
+/// key is the canonical member of the class whichever spelling arrived last.
+///
+/// **The second half of this test asserted the opposite until 2026-08-21**, and
+/// had since W2: under the name `an_equal_key_is_replaced_key_and_value_both`
+/// it required `keys(&other)` to be `["1.50"]` — the spelling written last —
+/// because `map_insert` replaced the key as well as the value. That made
+/// `map_keys` a function of insertion history, which is the failure this
+/// file's module note says the whole design exists to prevent.
+/// `ply_eval::value::canonical_key` is the fix, and the two `render` and `eq`
+/// assertions below are new: two maps that `assert_eq` as one value now render
+/// one string and serve one set of encoded bytes.
 #[test]
-fn an_equal_key_is_replaced_key_and_value_both() {
+fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     let m = map_of(vec![
         (dec("1.50"), Value::str("first")),
         (dec("1.5"), Value::str("second")),
@@ -323,7 +333,68 @@ fn an_equal_key_is_replaced_key_and_value_both() {
         (dec("1.5"), Value::str("first")),
         (dec("1.50"), Value::str("second")),
     ]);
-    assert_eq!(keys(&other), vec!["1.50"]);
+    assert_eq!(
+        keys(&other),
+        vec!["1.5"],
+        "the surviving key is still a function of which spelling was written last"
+    );
+    assert_eq!(other.render(), "{1.5: \"second\"}");
+    assert!(
+        eq(&m, &other),
+        "two maps that hold one key and one value are not equal"
+    );
+    assert_eq!(
+        m.render(),
+        other.render(),
+        "two `==`-equal maps render as two different strings, so `map_keys`, `map_entries`, \
+         `map_fold` and every derived encoding over them are functions of insertion history"
+    );
+}
+
+/// A `Decimal` under a compound key is canonical too, at every position
+/// [`Value::cmp`] descends into — a list, a record field, a constructor
+/// argument and a nested map's key *and* value.
+///
+/// `Map<{sku: String, price: Decimal}, _>` typechecks, so the compound case is
+/// reachable from a well-typed program and is not a Rust-level curiosity.
+#[test]
+fn a_decimal_anywhere_under_a_key_is_canonical() {
+    let field = |d: &str| {
+        Value::Record(std::sync::Arc::new(std::collections::BTreeMap::from([(
+            ply_span::Symbol::new("price"),
+            dec(d),
+        )])))
+    };
+    let cases: Vec<(Value, Value, &str)> = vec![
+        (
+            Value::list(vec![dec("1.50")]),
+            Value::list(vec![dec("1.5")]),
+            "[1.5]",
+        ),
+        (field("1.50"), field("1.5"), "{price: 1.5}"),
+        (
+            Value::ctor("Box", vec![dec("2.00")]),
+            Value::ctor("Box", vec![dec("2")]),
+            "Box(2)",
+        ),
+        (
+            map_of(vec![(dec("1.50"), dec("3.10"))]),
+            map_of(vec![(dec("1.5"), dec("3.1"))]),
+            "{1.5: 3.1}",
+        ),
+    ];
+    for (written, canonical, rendered) in cases {
+        let a = map_of(vec![(written.clone(), Value::Int(1))]);
+        let b = map_of(vec![(canonical.clone(), Value::Int(1))]);
+        assert_eq!(keys(&a), vec![rendered.to_string()]);
+        assert_eq!(keys(&b), vec![rendered.to_string()]);
+        assert!(
+            eq(&a, &b),
+            "{} and {} are not one map",
+            written.render(),
+            canonical.render()
+        );
+    }
 }
 
 /// A map big enough that the tree is deep, iterated ascending and counted.

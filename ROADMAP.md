@@ -25,15 +25,19 @@ M0–M4 are the vertical slice: the smallest system that proves the thesis end t
 end. M5+ are the milestones the slice's architecture is shaped to accept without
 a rewrite.
 
-**Status: M0–M8, W1–W6, and R1–R3 are complete.** The web track closed at W6 with
+**Status: M0–M8, W1–W6, and R1–R4 are complete.** The web track closed at W6 with
 a measured decision rather than a build. The region track that followed it landed
-in three parts — R1 built the machinery, R2 connected it, R3 took the
-compile-time work back off the request path — and it removed the forkable world
-M6 shipped; see the region track below, and read M6's entry with that correction
-in hand. **R3 ended on a decision rule fixed before it started, and the rule went
-against the design**: allocations per `/health` are still above the pre-region
-baseline, so whether the regions trade was worth making is open rather than
-settled. §R3 is where that is recorded and it is not a formality.
+in four parts — R1 built the machinery, R2 connected it, R3 took the
+compile-time work back off the request path, R4 changed how a value is built —
+and it removed the forkable world M6 shipped; see the region track below, and
+read M6's entry with that correction in hand. **R3 ended on a decision rule
+fixed before it started, and the rule went against the design**: allocations per
+`/health` were still above the pre-region baseline, so whether the regions trade
+was worth making is open rather than settled. §R3 is where that is recorded and
+it is not a formality. **R4 was requested on a premise that turned out to be
+false and reported that first**; its own rule then answered `Short` on the lever
+that worked, because the share the ADR placed under it was wrong and the
+threshold was left alone rather than edited. §R4.
 
 **M9 is the one milestone deferred on a measurement.** W6 deferred it against
 criteria fixed in code before any number existed, and the deferral carries the
@@ -777,7 +781,7 @@ showed the form the implementation rejects.
 
 ---
 
-# Region track — complete, R1 through R3
+# Region track — complete, R1 through R4
 
 W6 said codegen's ceiling is low because the *representation* is expensive, not
 because compilation fails: every value is heap-allocated and every handler
@@ -1198,6 +1202,150 @@ anything. A milestone that revisits this owes a number for what the world cost,
 taken the way this one was, and ADR 0017's Context is where the untested version
 of that claim is kept for comparison.
 
+## R4 — value construction, and a milestone whose premise was false
+
+`docs/adr/0019-value-representation.md` is the record;
+`docs/adr/0018-compute-kernel-performance.md` §1 and §2 are what it answers.
+
+### The premise was measured first, and it did not hold
+
+R4 was requested as **unboxed primitives**, on ADR 0018 §2's two sentences:
+*"Every `Int` is a heap-allocated `Value`. `interp::literal` allocates 111 times
+per request on a workload doing almost no arithmetic."*
+
+The first is false — `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and
+`Task` are inline variants of a 32-byte enum and building one touches no
+allocator — and the second is a **20-request window** fitting to 65.0 per
+request plus 925 once per `Machine`, which is one-time work divided by twenty.
+Both are corrected in place in ADR 0018 §2 with the originals beside them.
+`cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture`
+prints the zeroes by name.
+
+**So the milestone as scoped had nothing to remove**, and this is R3's lesson
+arriving a second time: `CONTRIBUTING.md` §"Measure an ADR's motivating claim
+before accepting the ADR" is where it is written down, and it was written down
+after R3 and did not stop R4 being scoped this way.
+
+### What was built instead, and what it moved
+
+An attribution by **the value being built** rather than by the frame that built
+it, fitted over a 20- and a 200-request window so a per-`Machine` intercept
+cannot masquerade as per-request work. It ranked three changes and refused a
+fourth, with a floor under each fixed in `ply_corpus::r4` before any of them
+existed. Two landed:
+
+- **§1, a free list for the call-argument vector** — the largest line on both
+  routes, 372.4 per request.
+- **§2, a compile-time constant's `Value` built once** — a literal's value on
+  the lowered node, and one `Value` per constructor mention per thread.
+
+`/health` went from **1,082 to 773.4** allocations per request, re-taken with
+`./target/release/w6-alloc --repo . --requests 200`, three runs byte-identical.
+`README.md` §"Where this is not competitive" carries the correction and the
+per-lever split.
+
+### The rule fired again, and again it was left alone
+
+`ply_corpus::r4::judge` answers **`Verdict::Short`** on §1: the floor was 20% of
+the request, derived before the lever from an attribution that assumed every
+transient buffer reaches `Machine::enter_code`. It does not — `builtins::call`
+takes its `Vec<Value>` by value — so the most the mechanism could ever remove is
+178.0/911.5 = **19.53%**, and it removed all of it. **The floor was not edited
+and neither was the attributed share.** That is the whole point of putting a
+threshold in code: a documentation defect reported as `Short` is worth more than
+a passing number nobody can check. ADR 0019 §1 carries the four-way split
+(178.0 recycled / 31.0 retained as `Ctor.args` / 23.0 too wide / 140.4 freed
+where they cannot be handed back) and says what the next lever is.
+
+§3, a record's fields in one allocation, is **ranked and priced and not
+accepted**: it waits on a record-width histogram that does not exist. §4,
+narrowing `Value` below 32 bytes, is **rejected with its number** — it would
+save bytes and **zero** allocations, and cost one allocation per applied
+constructor.
+
+### ADR 0018 §1 is discharged, and it inverted that ADR's ordering
+
+The codegen spike compiles again (`+1.94.0`; see `CONTRIBUTING.md` §"Things
+known to be broken" item 1) and was re-priced against a real compute kernel —
+`benches/kernel/`, three-heap Nim under MCTS, in Ply, passing
+`ply test benches/kernel/ --engine both`. `benches/adr0018-mcts.json` is the
+report.
+
+The premise held on **shape**: 81.0% of the kernel's executed work is inside the
+compiled fragment, against the 2–5% ADR 0016 measured for an HTTP request. The
+conclusion did not: end to end the hybrid is **0.998× [0.979–1.007]** against a
+floor of 1.000× [0.994–1.009], because **the interpreter cannot call compiled
+code** — a function the fragment accepts whose callers it refuses is compiled
+and never entered. The Amdahl ceiling over the two measured numbers is
+**4.86×**, not 11.67× and not the 52.58× the fragment shows where it runs. And
+a lever ADR 0018 does not list outranks most of the ones it does: Ply ships no
+`sqrt` and no `ln`, so the kernel computes its own, at 28.34µs a call against
+1.35µs without — **≈2.5× on the whole kernel from two prelude builtins**.
+
+ADR 0019 §5 lists the six things an amendment to ADR 0018 owes. Two are
+discharged; **the other four are open**, and the one that matters is that a
+backend the interpreter cannot enter buys nothing whatever the representation
+is.
+
+### What R4 could not do
+
+Take the same numbers before R4. This work was done under a rule forbidding git,
+so the per-lever A/B deltas in `README.md` are as the build agents measured them
+and are not re-derivable from this tree without re-editing the two function
+bodies by hand. The claim that survives is the narrow one: `w6-alloc` reads
+773.4 here, and it read 1,082 in the block above.
+
+> **Audit note (regression audit, 2026-08-21): the before-number was
+> re-derived, by re-editing the bodies by hand exactly as the paragraph above
+> says would be needed.** The three lever bodies were reverted in place —
+> `argv::take` back to `Vec::with_capacity` and `argv::give` back to a drop,
+> `NodeKind::Lit`'s arm in `Machine::eval` back to calling `interp::literal`
+> per evaluation, and `interp::ctor_value` back to building a fresh value per
+> mention — `cargo build --workspace --release` re-run, and the same command
+> taken twice:
+>
+> ```
+> $ ./target/release/w6-alloc --repo . --requests 200
+> {"allocations_per_request":1084.09,"bytes_per_request":128024.73,
+>  "requests":200,"response_bytes":107,"route":"/health"}
+> ```
+>
+> **1,084.09 against the 1,081.87 this tree recorded on 2026-08-17**, on this
+> machine, with this command — a 0.2% gap, and the residue is expected rather
+> than unexplained: the revert cannot un-widen `NodeKind::Lit`, so a literal's
+> `Value` is still built once at lowering and charged to the per-`Machine`
+> intercept. The three bodies were restored and the tree re-verified byte-for-
+> byte (`shasum` on all three files, and `w6-alloc` back to 773.4) before this
+> note was written. So the before/after is one rig and one command, and
+> 773.4 → 1,084.09 → 773.4 was walked in both directions here.
+
+### A defect R4 did not cause and R4's audit closed: a `Map` key was a function of insertion history
+
+> **Audit note (second regression audit, 2026-08-21).** Not an R4 regression —
+> it predates the milestone and neither lever touches it — but it is a
+> value-representation defect and this is where the value-representation work
+> is recorded.
+>
+> `Value::cmp` compares a `Decimal` by numeric value so that `1.50m` and `1.5m`
+> are one map key; `Value::write` and `decimal_to_string` print the scale as
+> stored. Both deliberate. Together they made `map_insert` replace an equal
+> key's **key**, so `map_keys`, `map_entries`, `map_fold` and every derived
+> encoding over a `Map<Decimal, _>` answered as a function of which spelling was
+> written last. Two maps a test had proved equal with `assert_eq` served two
+> different `derive json` bodies. Three comments in the tree —
+> `ply-eval/src/value.rs`'s `Map` note and its note on `Value::cmp`, and
+> `ply-core/src/infer.rs`'s on `map_fold` — asserted the opposite, as do ADR
+> 0012 §"Iteration order is the property that matters" and `CONTRACTS.md`; all
+> five now carry the correction.
+>
+> Fixed in the representation rather than in either deliberate decision:
+> `ply_eval::value::canonical_key` reduces a key to one representative per
+> equivalence class on the way in, at every position `Value::cmp` descends into,
+> reached from the single `ply_eval::value::insert_key`.
+> `docs/adr/0019-value-representation.md` §7 is the write-up. It costs nothing
+> on the request path — `./target/release/w6-alloc --repo . --requests 200`
+> reads **773.4**, three runs identical, the same figure as before it.
+
 ---
 
 # What is next
@@ -1208,6 +1356,14 @@ queue.** Allocations per `/health` came back at **1,082** against a pre-region
 the milestone that was planned to follow R3 is *not* automatically the right one.
 §R3 is where the reading and its provenance are, and it should be read before
 this list rather than after it.
+
+> **Audit note (R4, 2026-08-21): the 1,082 above is R3's reading and this tree
+> makes 773.4.** Same command, three runs byte-identical. R4's two levers took
+> 288 allocations off `/health` and the figure is now **below** the pre-region
+> 1,035 for the first time. That does **not** close item 0 — R4 changed how a
+> value is *built*, not whether a region is the right memory model, and no
+> number for what the forkable world cost has been taken. The paragraph is left
+> as R3 wrote it because it is what set this queue; §R4 is the newer reading.
 
 M9 remains deferred on a measurement and is not the front of the queue; the
 ladder was re-taken after R3 and the verdict did not move
@@ -1226,6 +1382,25 @@ ladder was re-taken after R3 and the verdict did not move
    also the item most likely to be skipped, because everything below it is more
    fun and the previous entry in this position was skipped for exactly that
    reason.
+1. ~~**Unboxed primitive representation, and monomorphization.**~~ **Half of
+   this item did not exist and R4 measured it. Read §R4 before re-adding it.**
+
+   > **Audit note (R4, 2026-08-21).** The item read as printed below, and
+   > "unboxed primitive representation" is the half that was never there:
+   > `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and `Task` are inline
+   > variants of a 32-byte `Value` and allocate nothing. R3's `frame::dispatch`
+   > at 415.0 a request was a **frame** ranking, and the frame is three
+   > different things; attributed by the value instead, its bulk was the
+   > **call-argument vector** — 372.4 per request, 40.9%, now 194.4 after ADR
+   > 0019 §1. Narrowing `Value` below 32 bytes is **rejected** with its number
+   > in ADR 0019 §4: zero allocations saved, one added per applied constructor.
+   >
+   > **Monomorphization is untouched and is still open.** So is the successor
+   > R4 named and did not take: 140.4 argument vectors a request are freed
+   > inside `ply_eval::builtins::call`, which takes its `Vec<Value>` by value
+   > and so cannot hand one back. That is a change to a signature across a
+   > ~100-arm match, and it is larger than ADR 0019 §3.
+
 1. **Unboxed primitive representation, and monomorphization.** R3's attribution
    is what now points at this, and more sharply than ADR 0017's did: with both
    compile-time passes hoisted off, the largest per-request allocation site is
@@ -1241,6 +1416,19 @@ ladder was re-taken after R3 and the verdict did not move
    15.4%** of a request in the re-taken ladder — are item 1 above and W2's
    precedent respectively, and none of the three has an end-to-end price yet.
 3. **Re-measure codegen's ceiling — and do it before arguing about M9 again.**
+
+   > **Audit note (R4, 2026-08-21): the spike compiles again and the ceiling was
+   > measured.** The closing sentence of this item says the spike half "cannot
+   > be re-taken at all". It can: `crates/ply-codegen-spike` builds under
+   > `+1.94.0`, `benches/w6-spike-r4.json` is the re-take of the `read_line`
+   > half at **11.68×** against 11.67× before it, and
+   > `benches/adr0018-mcts.json` is the same instrument pointed at a compute
+   > kernel. The answer is worse for M9 than the projection this item calls a
+   > projection: **0.998× end to end** on a kernel that is 81.0% inside the
+   > fragment, and a **4.86×** ceiling, because the interpreter cannot enter
+   > compiled code. That last sentence is a prerequisite for every codegen
+   > lever and it is in no ADR yet — ADR 0019 §5 item 3.
+
    ~~and the ladder has not been re-taken since~~ — **it has now.**
    `benches/w6-ladder-r3.json` is the post-R3 take and the verdict machinery
    re-derives from it unchanged: interpreter share **35%** (34.3%–34.7%), ceiling

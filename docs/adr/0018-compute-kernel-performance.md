@@ -33,7 +33,104 @@ That an MCTS kernel's hot loop falls mostly inside the spike's compilable
 fragment. Everything below is ordered on that assumption and **§1 exists to test
 it before anything is built.**
 
+## 0. §1 RAN. The assumption held and the plan failed anyway.
+
+> **Measured 2026-08-21.** `benches/adr0018-mcts.json`, one run, cranelift
+> 0.134.3, load 3.54 falling to 3.05. Kernel: `benches/kernel/mcts.ply`,
+> three-heap Nim, tree as `Map<Int, Node>`, UCB1 in integer fixed point. Agreement
+> was taken **before anything was timed** — 1,344 generated cases across 21
+> functions plus 24 whole-kernel searches, against both engines, 0 disagreements.
+
+§1 said everything below it was ordered on one untested assumption: that an MCTS
+kernel's hot loop falls mostly inside the spike's compilable fragment. It said to
+rewrite this ADR if the fraction came back low.
+
+**The fraction came back high — 81.0% of executed work, against 2–5% for an HTTP
+request — and codegen still bought nothing.**
+
+| compiled set | crossings | end to end |
+| --- | ---: | ---: |
+| floor, no JIT | 0 | 1.000× |
+| entry only | 1 | 0.999× |
+| outer loop | 102 | 0.996× |
+| + playouts | 102 | 0.999× |
+| **everything accepted** | 102 | **0.998×** |
+
+0.998× is inside the method's own noise floor. The kernel ratio on the part that
+is wholly inside the fragment and crosses zero times, `mcts.playouts`, is
+**52.58×** — and reporting *that* would misprice the decision in exactly the way
+ADR 0016 warned about.
+
+**Why 81% inside and 52× there still buys nothing: the interpreter cannot call
+compiled code.** Only compiled→interpreter exists (`rt_call_machine`). Every
+function the fragment accepts whose *callers* it refuses is compiled and then
+never entered. Compiling the twenty arithmetic functions between rungs 2 and 4
+moved the whole program from 57,700 µs to 57,582 µs. In the hybrid, compiled code
+is reached by exactly three functions: `mcts.iterate` (100 entries), `mcts.root`
+(1), `mcts.best_action` (1).
+
+It is **not** the boundary cost. 102 crossings total 9.9 µs, 0.017% of the run.
+
+**The ceiling, by Amdahl over the two measured numbers and nothing else:**
+
+| | |
+| --- | ---: |
+| a backend that could be *entered* from interpreted code | **4.86×** |
+| an infinitely fast fragment | **5.26×** |
+
+Not 11.67×, and not 52×. This ADR opens by saying Ply is off the Rust floor "by
+roughly an order of magnitude" on MCTS. **The fragment as specified caps the
+recovery at 5.26×**, so §2 onward cannot reach the goal §"Context" states, and
+the binding constraint is architectural — one-way calling — rather than the size
+of the fragment or the cost of the boundary.
+
+### What is actually outside, ranked — this is the roadmap §1 promised
+
+By lowered nodes removed from the fragment:
+
+| nodes | fns | what |
+| ---: | ---: | --- |
+| 253 | 7 | a field access |
+| 71 | 2 | a list pattern `[x, ..rest]` |
+| 25 | 2 | unary `-` |
+| 10 | 1 | a list literal `[]` |
+
+And by *executed* work, **19.0% of the run is the `Map`/record/list machinery
+itself**, which is outside the fragment no matter which functions compile.
+
+Two hazards that belong to the fragment rather than to any function, so they
+appear in no census: there is **no `Float` path** — accepted silently and raising
+at run time — and **no nested-call bound**, where the machine answers
+`recursion limit of 10000 nested calls exceeded` and compiled code SIGABRTs.
+
+### What this changes
+
+§2 through §7 below were ordered on the assumption §1 tested. The assumption held
+and the conclusion did not follow from it, so the ordering is not rescued by
+compiling more: **make the interpreter able to enter compiled code, or the
+ceiling is 5.26× however much of the fragment you accept.** That is a different
+first milestone from any listed below, and nothing below should start until it is
+decided.
+
 ## 1. Re-price the spike against a compute kernel — do this first
+
+> **Discharged (R4, 2026-08-21), and it changed the ordering of everything
+> below.** The measurement this section asked for is
+> `benches/adr0018-mcts.json`, written by the command in `benches/README.md`
+> §"What `mcts` adds"; the kernel is `benches/kernel/`, in Ply, and it passes
+> `ply test benches/kernel/ --engine both`. The assumption held on **shape** —
+> 22 of 34 kernel functions, 386 of 745 lowered nodes, and **81.0% of the
+> kernel's executed work** are inside the fragment, against the 2–5% ADR 0016
+> measured for an HTTP request. The conclusion it was supposed to license did
+> **not** hold: end to end the hybrid is **0.998× [0.979–1.007]** against a
+> harness floor of 1.000× [0.994–1.009], because **the interpreter cannot call
+> compiled code** — a function the fragment accepts whose callers it refuses is
+> compiled and never entered. The Amdahl ceiling over the two measured numbers
+> is **4.86×**, not the 11.67× this ADR carries for the spike and not the
+> 52.58× the fragment shows where it does run. `docs/adr/0019-value-
+> representation.md` §5 is the write-up and lists the six things an amendment
+> to this document owes; it does not make them, and neither does this block.
+
 
 The spike measured **11.67× minimum** on arithmetic, comparisons, `if`, `let`,
 `block`, and `match` on literal patterns. ADR 0016 concluded 1.02–1.05× end to
@@ -55,6 +152,65 @@ is low, §2–§4 are the wrong plan and this ADR should be rewritten rather tha
 executed.
 
 ## 2. Unboxed primitives
+
+> **Corrected in place (R4, 2026-08-21). Both sentences of "The gap" below are
+> wrong, and they are left standing verbatim underneath this block because
+> `CONTRIBUTING.md` §"Correct, do not delete" wants the withdrawn claim beside
+> the measurement.** This ADR opened §2 by reasoning from them, and a milestone
+> was requested on their strength.
+>
+> **"Every `Int` is a heap-allocated `Value`" is false.** `Int`, `Bool`,
+> `Float`, `Unit`, `Decimal`, `Cell` and `Task` are inline variants of the
+> `Value` enum (`crates/ply-eval/src/value.rs:50-104`) and building one touches
+> no allocator. `size_of::<Value>()` is 32 bytes. Printed by name, by a test
+> that runs:
+>
+> ```
+> cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture
+> ```
+>
+> > ```
+> > -- what one Value costs to build --
+> >   Value::Int       0 allocations
+> >   Value::Bool      0 allocations
+> >   Value::Float     0 allocations
+> >   Value::Unit      0 allocations
+> >   Value::Decimal   0 allocations
+> > ```
+>
+> **There is no primitive boxing in this evaluator to remove**, so the plan
+> below — "a tagged representation where `Int`, `Bool` and `Float` live inline
+> in the value word rather than behind a pointer" — describes what the tree
+> already does.
+>
+> **"`interp::literal` allocates 111 times per request" attributes to the wrong
+> thing.** The count was real; the conclusion drawn from it did not follow.
+> `interp::literal` cannot allocate at all unless the literal is a `Str` or a
+> `Bytes` (`crates/ply-eval/src/interp.rs:1000-1010`), and the 111 was read off
+> a **20-request window**: it fits to 65.0 per request plus 925 once per
+> `Machine`, and 65.0 + 925/20 = 111.25. One-time work divided by twenty looks
+> exactly like a per-request cost, which is the failure `CONTRIBUTING.md`
+> §"Measure an ADR's motivating claim before accepting the ADR" closes with.
+>
+> **What the request actually spends its allocations on** was measured instead,
+> attributed to the value being built rather than to the frame that built it and
+> fitted over two windows: the largest line was the **call-argument vector**, at
+> 372.4 per request, 40.9%. R4 landed a free list for it and built a
+> compile-time constant's `Value` once, and `/health` went from **1,082 to 773**
+> allocations per request (`./target/release/w6-alloc --repo . --requests 200`).
+> `docs/adr/0019-value-representation.md` is that ADR; its §4 **rejects**
+> narrowing `Value`, with the number that would have justified it, which is
+> zero allocations.
+>
+> **§2's success criterion is also spent.** It reads "a `w6_alloc_sites` re-run
+> showing `interp::literal` gone from the top sites". `interp::literal` is now
+> 0.0 allocations per request on both routes — and the profile's top line is
+> unmoved, because it never was `interp::literal`.
+>
+> **This ADR is not otherwise amended, and §5 below is untouched.** ADR 0019 §5
+> lists what an amendment owes, including the item that outranks everything in
+> this section: a backend the interpreter cannot *enter* buys nothing whatever
+> the representation is, measured at 0.998× end to end.
 
 **The gap.** Every `Int` is a heap-allocated `Value`. `interp::literal` allocates
 111 times per request on a workload doing almost no arithmetic. MCTS is visit
