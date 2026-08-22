@@ -1040,6 +1040,27 @@ that bear on the verdict:
 - **What a partially-covering backend is worth.** The `solo, trampolined`
   variant is one point on that curve (1.71x); nothing measured a whole request
   path compiled at partial coverage.
+
+  > **Audit note (R5, 2026-08-21): the `solo, trampolined` variant no longer
+  > exists and 1.71x cannot be re-taken.** It compiled `read_line` alone and let
+  > `line_at` and `line_stops` return to the interpreter through
+  > `rt_call_machine`, the escape hatch §3.2 allows. That helper was a whole
+  > `Machine::call` entry point — `escape::check`, `reset()`, `close_regions`,
+  > `end_entry_point` — on a second, privately held machine, which was
+  > survivable only while the sole way *into* compiled code was at the top of a
+  > pure integer kernel. R5 made the interpreter able to enter compiled code
+  > (`ply_eval::Compiled`), so the same helper became a route out of a live
+  > machine's frame into a different machine's `reset()`, discarding the
+  > caller's handler stack, trail, region generations and footprint in silence.
+  > It is deleted: a call to a function outside the compiled unit now refuses
+  > the enclosing function at compile time, so a compiled set is closed under
+  > calls. The figure in `benches/w6-spike.json` and `benches/w6-ladder*.json`
+  > stands as what was measured on 2026-08-20; the variant that produced it is
+  > gone, and partial coverage is now priced the other way round — the
+  > interpreter drives and enters compiled leaves. `benches/adr0018-mcts.json`'s
+  > `crossings_by_target`, `trampoline_tax_micros` and
+  > `end_to_end_without_trampoline_tax` are the same kind of record: taken
+  > before R5, not re-takeable after it.
 - **What a route body costs when it is not a constant**, other than through the
   twin's `/items` handler.
 - **The in-Ply loop rungs 2–4 are read off** — 0.87µs an iteration. It cancels

@@ -103,6 +103,58 @@ appear in no census: there is **no `Float` path** — accepted silently and rais
 at run time — and **no nested-call bound**, where the machine answers
 `recursion limit of 10000 nested calls exceeded` and compiled code SIGABRTs.
 
+> **Corrected (R5, 2026-08-21): the nested-call half is closed; the `Float` half
+> is closed at the boundary and still open inside the fragment.**
+>
+> The sentence above is quoted verbatim from before R5 and both halves of it were
+> true when it was written. `benches/adr0018-mcts.json`'s
+> `recursion_bound_compiled` holds the crash it describes:
+> `the process died: signal: 6 (SIGABRT) — ... stack overflow`.
+>
+> *Nested calls.* Every compiled function now carries a four-instruction fuel
+> prologue seeded from the budget `ply_eval::Compiled::enter` is handed — the
+> machine's own `max_calls` minus its current depth. A body that would pass it
+> fails, the entry declines, and the machine evaluates the definition and raises
+> **its own** diagnostic. Both probes now answer
+> `recursion limit of 10000 nested calls exceeded`
+> (`mcts --dir benches/kernel --probe machine|compiled`), and
+> `crates/ply-codegen-spike/tests/mcts_kernel.rs::a_runaway_recursion_is_the_machines_diagnostic_and_not_a_crash`
+> asserts it as a subprocess, because an in-process assertion cannot observe its
+> own `SIGABRT`. It is not free: that program takes **7.9 s** with a backend
+> attached against **0.11 s** without, because the machine re-offers the same
+> function at all ten thousand interpreted depths and each attempt burns its
+> whole remaining fuel first — 19,992 entries and 10,000 fuel declines. Bounded,
+> paid only by a program that is about to die, and recorded rather than fixed;
+> `crate::entry::Declines::out_of_fuel` carries the reasoning.
+>
+> *`Float`.* The fragment still compiles `a + b` as `Int` arithmetic whatever the
+> operands are, and
+> `mcts_kernel.rs::the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time`
+> still passes. What changed is that it can no longer be *reached* from a
+> program: `ply_eval::Compiled` carries `Int` and `Bool` and nothing else in
+> either direction, and the spike will not register a definition whose declared
+> signature is not `Int`/`Bool` throughout. Two independent refusals, and the
+> same test now asserts that a `Float` call is never offered to the backend at
+> all. Inside the fragment, called directly, the gap is exactly as described.
+>
+> > **Narrowed again (R5 audit pass, 2026-08-21): "it can no longer be reached
+> > from a program" is one word too strong.** Neither refusal reads a definition's
+> > *body*, so a `Float`, `Decimal` or `String` **literal inside an `Int` -> `Int`
+> > body** passes both: `numerics.float_inside(n) = if 1.5 + 1.5 > 2.0 { n } else
+> > { n * 2 }` is compiled, is registered as enterable, and is offered. What
+> > happens then is the part worth writing down — the native body runs, meets the
+> > constant at `rt_unbox_int`, fails, and the entry **declines**, so the program
+> > gets the interpreter's answer and a slow call rather than a wrong one.
+> > `crates/ply-codegen-spike/tests/hazards.rs::a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer`
+> > asserts the decline as an exact count, so a lowering that ever *answered* one
+> > of these goes red.
+> >
+> > The census consequence in ADR 0019 §5 item 4 stands and is now demonstrated:
+> > those three definitions are counted as compiled and cannot run. The audit's
+> > third case for this hazard, ordering on `String`, is not reachable at all —
+> > `E0201` refuses `a < b` on `String`, so the run-time support in `interp.rs` is
+> > unreachable from a well-typed program (`tests/fixtures/string_ordering/`).
+
 ### What this changes
 
 §2 through §7 below were ordered on the assumption §1 tested. The assumption held

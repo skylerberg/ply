@@ -40,6 +40,7 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -189,6 +190,34 @@ pub struct Machine<'a> {
     /// runtime is one thread's reactor handle, and because a value-shaped
     /// handler — a clock read, a byte operation — never touches it.
     runtime: Option<Rc<dyn HostRuntime>>,
+    /// A source of natively compiled bodies. `None` on every machine this
+    /// workspace builds — nothing in `crates/*` implements [`Compiled`], and the
+    /// doubles in this crate's tests are the only implementors that ship.
+    ///
+    /// `'static` rather than `'a`, and it has to be: a trait object is opaque to
+    /// dropck, so a `dyn Compiled + 'a` here would make every `Machine<'a>` count
+    /// as using `'a` when it drops — which turns the ordinary
+    /// `Machine::new(&c.program, ..)` followed by `c` moving out into a borrow
+    /// error at every existing call site. A backend therefore may not borrow the
+    /// program; [`Compiled::describes`] is a pointer comparison, which a stored
+    /// `*const Program` serves without a borrow.
+    ///
+    /// [`Compiled`]: crate::Compiled
+    /// [`Compiled::describes`]: crate::Compiled::describes
+    compiled: Option<Rc<dyn crate::Compiled>>,
+    /// Native entries taken, calls a backend was offered and declined, and
+    /// answers refused at the boundary. Cumulative over the machine's life
+    /// rather than per entry point, like `teardown` above.
+    ///
+    /// [`Cell`] rather than plain fields so `Machine::compiled_answer` can stay
+    /// `&self` — which is what makes a decline provably free, since a method that
+    /// cannot mutate the machine cannot have committed anything to undo.
+    ///
+    /// A measurement reporting a speedup with `entries == 0` is reporting a null
+    /// result. R4's 0.998x was exactly that and nothing in the harness said so.
+    compiled_entries: Cell<u64>,
+    compiled_declines: Cell<u64>,
+    compiled_refusals: Cell<u64>,
     /// At-most-once host operations answered in this entry point.
     host_ops: u64,
     /// What this entry point reached across the boundary, and the authority on
@@ -317,6 +346,10 @@ impl<'a> Machine<'a> {
             record: None,
             binding: Arc::new(HostBinding::hermetic()),
             runtime: None,
+            compiled: None,
+            compiled_entries: Cell::new(0),
+            compiled_declines: Cell::new(0),
+            compiled_refusals: Cell::new(0),
             host_ops: 0,
             host_use: HostUse::default(),
             declared: None,
@@ -503,6 +536,53 @@ impl<'a> Machine<'a> {
         if lowering.describes(self.program) {
             self.lowering = lowering;
         }
+    }
+
+    /// Take compiled bodies for this program's definitions, so a call the
+    /// backend accepts is entered natively instead of evaluated.
+    ///
+    /// **Ignored when `compiled` was built over a different program**, exactly as
+    /// [`Machine::set_lowering`] is and for the same reason: a bisection builds a
+    /// program whose definitions carry the names of the ones they replace, and a
+    /// registry keyed on a bare name would answer for the wrong body.
+    ///
+    /// Nothing in this workspace implements [`Compiled`] and no shipping command
+    /// calls this. Two consequences, both stated rather than guarded:
+    ///
+    /// - A run with a backend attached is a third execution strategy, and a
+    ///   cached `Pass` is a claim about the authoritative engine
+    ///   ([`crate::EngineChoice::bypasses_cache`]). That rule is **not enforced
+    ///   for a backend** — it is unreachable, because `cache_bypassed` at
+    ///   `crates/ply-cli/src/commands/test.rs:335` takes a `&TestArgs` with no
+    ///   `Machine` in scope and no shipping command can install one. The day a
+    ///   flag can, that line moves in the same change.
+    /// - A backend's answer is trusted to be the definition's. The boundary
+    ///   checks its *kind* and nothing else; a wrong `Int` is caught by
+    ///   `--engine both` and by nothing here.
+    ///
+    /// [`Compiled`]: crate::Compiled
+    pub fn set_compiled(&mut self, compiled: Rc<dyn crate::Compiled>) {
+        if compiled.describes(self.program) {
+            self.compiled = Some(compiled);
+        }
+    }
+
+    /// Native entries taken and calls declined, over this machine's whole life.
+    ///
+    /// For a harness that must not report a ratio without them: a speedup
+    /// measured with `entries == 0` is a null result, which is what R4's 0.998x
+    /// was.
+    pub fn compiled_counts(&self) -> (u64, u64) {
+        (self.compiled_entries.get(), self.compiled_declines.get())
+    }
+
+    /// Answers a backend returned that this boundary refuses — a non-scalar, in
+    /// practice. Counted in the declines above as well, because that is what the
+    /// machine did with them; separate because a non-zero count here is a backend
+    /// bug rather than a fragment limit, and the two should not be read as one
+    /// number.
+    pub fn compiled_refusals(&self) -> u64 {
+        self.compiled_refusals.get()
     }
 
     /// Every subsequent entry point resets to this stack's fixture rather than
@@ -1828,6 +1908,32 @@ impl<'a> Machine<'a> {
             },
             _ => false,
         };
+        if let Some(value) = self.compiled_answer(closure, &args) {
+            // The interpreted path moves these into the callee's `Env`; a scalar
+            // carries no refcount and no `Drop`, so dropping them here is the
+            // same observation. `argv::give` refuses a non-empty vector, so the
+            // buffer must be emptied to stay in the free list.
+            args.clear();
+            crate::argv::give(args);
+            // The bound was charged in `compiled_answer` — a zero budget declines
+            // — so what is left is the frame bound `push` checks, in the order
+            // the interpreted path below checks them.
+            //
+            // Returning through `go_return` rather than handing the value back
+            // directly is what writes the memo: `ret` pops this frame and
+            // `frame::dispatch` performs `remember_constant` on exactly the terms
+            // an interpreted call does.
+            self.push(
+                Frame::Call {
+                    name: closure.name.clone(),
+                    call_site: span,
+                    memo,
+                },
+                span,
+            )?;
+            self.go_return(value);
+            return Ok(());
+        }
         let mut scope = env;
         for (p, v) in params.iter().zip(args.drain(..)) {
             scope = scope.bind(p.clone(), v);
@@ -1868,6 +1974,109 @@ impl<'a> Machine<'a> {
         if self.sims.is_empty() {
             self.memo.remember(name, value);
         }
+    }
+
+    /// The compiled answer for this call, or `None` to evaluate it.
+    ///
+    /// `&self` is the load-bearing part: nothing is committed until there is a
+    /// value, so a decline restores nothing because nothing was disturbed. The
+    /// only mutation is three counters behind [`Cell`], and they are read by
+    /// harnesses rather than by the program.
+    ///
+    /// The gates are ordered cheapest and most-discriminating first, and the
+    /// argument-shape gate deliberately precedes the row lookup: with a backend
+    /// attached, a call taking a record, a list or a string is refused on one
+    /// discriminant test per argument and never hashes a [`Symbol`] into
+    /// [`CheckOutput::defs`].
+    ///
+    /// The [`Frame::Call`] at the call site is pushed *after* `enter` returns.
+    /// That is sound only because `enter` is handed no route back into this
+    /// machine, so nothing can observe the stack while a native body runs and
+    /// `note_step_site`, `err_call_limit` and [`Stack::calls`] have no reader to
+    /// serve. Give a backend a callback and that push must move above `enter`,
+    /// and the bailout stops being free.
+    fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
+        let backend = self.compiled.as_ref()?;
+        // A tree-walker closure carries a program-wide name (`interp.rs:118`)
+        // over a body that is a deep clone rather than a node of the program, and
+        // `Interp` is the independent oracle `--engine both` audits against.
+        // Routing its closures into compiled code would audit the backend against
+        // itself.
+        if !matches!(closure.kind, ClosureKind::Code { .. }) {
+            return None;
+        }
+        if !args.iter().all(crate::compiled::crossable) {
+            return None;
+        }
+        // Off inside a `simulate` region, for the reason `constant` is off there:
+        // an allocation a search depends on must not be skipped, and an `Access`
+        // never recorded is an interleaving never explored. `record_cell_access`
+        // and `record_alloc_access` are no-ops outside one, so this single gate
+        // is the whole partial-order story — a compiled body cannot fail to
+        // record what nothing is recording.
+        if !self.sims.is_empty() {
+            return None;
+        }
+        let name = closure.name.as_ref()?;
+        // Necessary and not sufficient, exactly as the memo's note says: an empty
+        // row still permits a definition that opens its own `with_cell`. Outside
+        // a `simulate` region that allocation is unobservable — the cell cannot
+        // escape the region that made it and no scalar can carry it out — which
+        // is the same argument `constant` already rests on.
+        if !crate::memo::pure_by_published_row(self.check, name) {
+            return None;
+        }
+        // Zero budget declines, and the interpreted path below raises the
+        // machine's own call-limit diagnostic rather than a backend's.
+        let budget = self.max_calls.checked_sub(self.stack.calls())?;
+        if budget == 0 {
+            return None;
+        }
+
+        #[cfg(debug_assertions)]
+        let before = self.compiled_witness();
+        let answer = backend.enter(name, args, budget);
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            before == self.compiled_witness(),
+            "a compiled body moved machine state it was handed no route to"
+        );
+
+        match answer {
+            Some(value) if crate::compiled::crossable(&value) => {
+                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                Some(value)
+            }
+            // Refused in every profile, on purpose. A `debug_assert!` here would
+            // make the boundary behave one way under `cargo test` and another in
+            // release, and the release half would be the one nobody ran.
+            Some(_) => {
+                self.compiled_refusals.set(self.compiled_refusals.get() + 1);
+                self.compiled_declines.set(self.compiled_declines.get() + 1);
+                None
+            }
+            None => {
+                self.compiled_declines.set(self.compiled_declines.get() + 1);
+                None
+            }
+        }
+    }
+
+    /// What a compiled body is handed no route to move. Debug only, and its value
+    /// is not today's backend — it is that adding a callback, or handing a
+    /// backend an arena, goes red here instead of breaking `note_step_site` in
+    /// silence.
+    #[cfg(debug_assertions)]
+    fn compiled_witness(&self) -> (usize, usize, u64, usize, u64, u64) {
+        let arena = self.regions.arena().stats();
+        (
+            self.stack.frames(),
+            self.stack.calls(),
+            self.host_ops,
+            self.sims.len(),
+            arena.allocations,
+            arena.regions_opened,
+        )
     }
 
     pub(crate) fn call_builtin(

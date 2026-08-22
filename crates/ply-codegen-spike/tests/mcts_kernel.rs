@@ -6,10 +6,11 @@
 //! by name, and that the compiled code answers what both shipped evaluators
 //! answer. A ratio between two evaluators that disagree prices nothing.
 
-use ply_codegen_spike::jit::{Jit, Opts};
+use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_signature};
+use ply_codegen_spike::jit::Opts;
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
-use ply_eval::{Interp, Value, values_equal};
+use ply_eval::{Interp, Value, compare_answers, values_equal};
 use ply_span::Span;
 use std::path::PathBuf;
 
@@ -27,18 +28,40 @@ fn loaded() -> &'static Loaded {
     ))
 }
 
+/// Why the fragment refused `name`, taken over the whole `mcts` module at once.
+///
+/// > **Corrected in R5.** This used to be `Jit::compile(loaded, &[name])` — one
+/// > function on its own — and that is no longer the same question. A call to a
+/// > function outside the compiled unit now refuses the caller, so a lone
+/// > `mcts.rollout` is refused for calling `mcts.terminal` rather than compiled.
+/// > Offering the whole module keeps the answer a statement about *constructs*,
+/// > which is what the ADR 0018 §0 roadmap ranks.
 fn refusal(loaded: &'static Loaded, name: &str) -> Option<String> {
-    match Jit::compile(loaded, &[name]) {
-        Ok(_) => None,
-        Err(e) => {
-            let text = e.to_string();
-            Some(
-                text.rsplit_once(": ")
-                    .map(|(_, r)| r.to_string())
-                    .unwrap_or(text),
-            )
-        }
-    }
+    let all = loaded.functions_in("mcts");
+    refusals_over(loaded, &all)
+        .expect("the module classifies")
+        .into_iter()
+        .find(|(f, _)| f == name)
+        .map(|(_, why)| why)
+}
+
+/// The same, for a program with one module of another name.
+fn refusal_in(loaded: &'static Loaded, module: &str, name: &str) -> Option<String> {
+    let all = loaded.functions_in(module);
+    refusals_over(loaded, &all)
+        .expect("the module classifies")
+        .into_iter()
+        .find(|(f, _)| f == name)
+        .map(|(_, why)| why)
+}
+
+fn kernel_harness(loaded: &'static Loaded) -> (Harness, Vec<String>) {
+    let all = loaded.functions_in("mcts");
+    let accepted = admissible(loaded, &all).expect("the module classifies");
+    let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
+    let harness =
+        Harness::over(loaded, &names, Opts::default(), Some("work.zero")).expect("it compiles");
+    (harness, accepted)
 }
 
 #[test]
@@ -55,9 +78,26 @@ fn the_kernel_loads_beside_the_shipped_standard_library() {
     );
 }
 
+/// > **Corrected in R5.** This list used to end `"mcts.search", "mcts.plan",
+/// > "mcts.plan_753"` and assert that the fragment compiled all three.
+/// >
+/// > It did, and every one of them left the fragment on its first iteration:
+/// > `search` calls `iterate`, which reads a field, so the compiled `search` was
+/// > a native loop around a trampoline back into a second `Machine`. ADR 0018 §0
+/// > measured what that is worth end to end — 0.998× — and why: "the interpreter
+/// > cannot call compiled code", so the twenty arithmetic functions under them
+/// > were compiled and never entered.
+/// >
+/// > There is no trampoline now. A compiled set is closed under calls, so those
+/// > three are refused, and the twenty arithmetic functions are the ones that
+/// > run — entered from the interpreter at the leaves instead of driving it from
+/// > the top. `the_interpreter_enters_compiled_code_at_the_leaves` is the test
+/// > that says so.
 #[test]
 fn the_fragment_compiles_the_position_arithmetic_and_the_playout() {
     let loaded = loaded();
+    let all = loaded.functions_in("mcts");
+    let accepted = admissible(loaded, &all).expect("the module classifies");
     for name in [
         "mcts.heap",
         "mcts.turn",
@@ -66,19 +106,32 @@ fn the_fragment_compiles_the_position_arithmetic_and_the_playout() {
         "mcts.next_seed",
         "mcts.ilog2",
         "mcts.isqrt",
+        "mcts.isqrt_step",
         "mcts.ucb",
         "mcts.rollout",
         "mcts.playouts",
-        "mcts.search",
-        "mcts.plan",
-        "mcts.plan_753",
     ] {
-        assert_eq!(
-            refusal(loaded, name),
-            None,
-            "the fragment refused `{name}`, which the measurement counts as compiled"
+        assert!(
+            accepted.contains(&name.to_string()),
+            "the fragment refused `{name}` ({:?}), which the measurement counts as compiled",
+            refusal(loaded, name)
+        );
+        assert!(
+            scalar_signature(loaded, name),
+            "`{name}` is compiled and cannot be entered, so compiling it buys nothing"
         );
     }
+    for name in ["mcts.search", "mcts.plan", "mcts.plan_753"] {
+        assert!(
+            !accepted.contains(&name.to_string()),
+            "`{name}` reaches the tree, so a compiled set holding it is not closed under calls"
+        );
+    }
+    assert_eq!(
+        enterable(loaded, &accepted).len(),
+        accepted.len(),
+        "every accepted kernel function is `Int`/`Bool` throughout, so all of them are enterable"
+    );
 }
 
 /// The finding this whole milestone turns on, stated as an assertion: every
@@ -109,21 +162,17 @@ fn the_fragment_refuses_every_function_that_touches_the_tree_and_names_why() {
     }
 }
 
+/// > **Corrected in R5.** This used to enter `mcts.plan` as compiled code and
+/// > compare its answer. `mcts.plan` is refused now — it reaches the tree — so
+/// > the comparison runs the *interpreter* on both sides and attaches a backend
+/// > to one of them. That is the shape R5 exists to produce, and it is a
+/// > stronger check as well: `differential::compare_answers` compares the
+/// > diagnostic field by field, the observed footprint and the cell arena, not
+/// > only the value.
 #[test]
-fn the_compiled_kernel_answers_what_both_evaluators_answer() {
+fn a_search_the_interpreter_drives_answers_the_same_with_a_backend_attached() {
     let loaded = loaded();
-    let accepted: Vec<String> = loaded
-        .functions_in("mcts")
-        .into_iter()
-        .filter(|n| refusal(loaded, n).is_none())
-        .collect();
-    let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
-    let mut harness =
-        Harness::over(loaded, &names, Opts::default(), Some("work.zero")).expect("it compiles");
-    let entry = harness
-        .compiled
-        .entry("mcts.plan")
-        .expect("`mcts.plan` is in the compiled set");
+    let (mut harness, _) = kernel_harness(loaded);
 
     // Positions drawn deterministically, so a failure here is reproducible from
     // the numbers in the message.
@@ -143,27 +192,131 @@ fn the_compiled_kernel_answers_what_both_evaluators_answer() {
             Value::Int(iterations),
         ];
 
-        let machine = harness.interpret("mcts.plan", &args).expect("it runs");
-        let compiled = harness.compiled_call(entry, &args).expect("it runs");
+        let plain = harness.interpret_outcome("mcts.plan", &args);
+        let hybrid = harness.hybrid_outcome("mcts.plan", &args);
         assert!(
-            values_equal(&machine, &compiled, Span::DUMMY).unwrap_or(false),
-            "case {case}: heaps ({a},{b},{c}) seed {seed} × {iterations} iterations — \
-             the machine answered {} and the compiled fragment answered {}",
-            machine.render(),
-            compiled.render()
+            compare_answers(
+                &harness.machine,
+                &harness.hybrid,
+                "mcts.plan",
+                &plain,
+                &hybrid
+            )
+            .is_none(),
+            "case {case}: heaps ({a},{b},{c}) seed {seed} × {iterations} iterations — the \
+             backend changed what the interpreter answered: {:?}",
+            compare_answers(
+                &harness.machine,
+                &harness.hybrid,
+                "mcts.plan",
+                &plain,
+                &hybrid
+            )
+            .map(|d| d.to_string())
         );
 
         let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-        let walked = interp
-            .call("mcts.plan", args, Span::DUMMY)
-            .expect("it runs");
+        let walked = interp.call("mcts.plan", args, Span::DUMMY);
         assert!(
-            values_equal(&machine, &walked, Span::DUMMY).unwrap_or(false),
-            "case {case}: the tree-walker answered {} and the machine answered {}",
-            walked.render(),
-            machine.render()
+            compare_answers(&interp, &harness.machine, "mcts.plan", &walked, &plain).is_none(),
+            "case {case}: the tree-walker and the machine disagree, which is not about the \
+             backend at all"
         );
     }
+    let (entries, _) = harness.hybrid_counts();
+    assert!(
+        entries > 0,
+        "the backend was attached and never entered, so this test compared the interpreter \
+         with itself — which is exactly the null result R4 reported as 0.998x"
+    );
+}
+
+/// The number ADR 0018 §0 says is the whole milestone.
+///
+/// > In the hybrid, compiled code is reached by exactly three functions:
+/// > `mcts.iterate` (100 entries), `mcts.root` (1), `mcts.best_action` (1).
+///
+/// Those were *crossings out of* compiled code, taken because the search was
+/// driven from the top. This asserts the inverse: the interpreter drives, and
+/// drops into compiled code at the leaves — `ucb` on every child examined,
+/// `rollout` on every playout, the position arithmetic under both.
+#[test]
+fn the_interpreter_enters_compiled_code_at_the_leaves() {
+    let loaded = loaded();
+    let (mut harness, _) = kernel_harness(loaded);
+    harness.bodies.reset_counts();
+    let args = vec![
+        Value::Int(7 + 5 * 16 + 3 * 256),
+        Value::Int(20260821),
+        Value::Int(40),
+    ];
+    harness
+        .run_hybrid("mcts.plan", &args)
+        .expect("the search runs");
+
+    let by_name = harness.bodies.entries_by_name();
+    let (entries, declines) = harness.hybrid_counts();
+    // Deterministic: one position, one seed, a fixed iteration count, and a
+    // kernel with no clock and no randomness that is not the seed. Pinned
+    // exactly rather than bounded, so a change to what the fragment accepts
+    // shows up here as a number rather than as a still-passing inequality.
+    assert_eq!(
+        (entries, by_name.as_slice()),
+        (
+            721,
+            [
+                ("mcts.ucb".to_string(), 375),
+                ("mcts.turn".to_string(), 105),
+                ("mcts.move_count".to_string(), 81),
+                ("mcts.apply_move".to_string(), 40),
+                ("mcts.next_seed".to_string(), 40),
+                ("mcts.nth_move".to_string(), 40),
+                ("mcts.rollout".to_string(), 40),
+            ]
+            .as_slice()
+        ),
+        "a 40-iteration search entered compiled code {entries} times. Before R5 the whole \
+         run reached three functions and 102 crossings *out of* compiled code, and every \
+         `ucb`, `isqrt` and `rollout` under them ran in the machine (ADR 0018 §0)."
+    );
+    for name in ["mcts.ucb", "mcts.rollout", "mcts.next_seed", "mcts.turn"] {
+        assert!(
+            by_name.iter().any(|(n, c)| n == name && *c > 0),
+            "`{name}` is inside the fragment and was never entered: {by_name:?}"
+        );
+    }
+    assert_eq!(
+        harness.hybrid.compiled_refusals(),
+        0,
+        "the machine refused an answer at the boundary, which is a backend bug rather than a \
+         fragment limit"
+    );
+    let d = harness.bodies.declines();
+    assert_eq!(d.reentered, 0, "an entry began while another was running");
+    assert_eq!(
+        d.touched_cells, 0,
+        "compiled code allocated in its private arena"
+    );
+    assert_eq!(
+        d.arity, 0,
+        "the machine offered a call with the wrong arity"
+    );
+    assert_eq!(
+        d.failed + d.out_of_fuel,
+        0,
+        "a compiled body of this kernel failed and was silently re-evaluated"
+    );
+    assert_eq!(
+        entries + declines,
+        harness.bodies.entered() + d.total(),
+        "the machine's counts and the provider's disagree about what was offered"
+    );
+    // Everything the machine declined, it declined because the name is not in
+    // the compiled set — a caller the fragment refused, not a body that failed.
+    assert_eq!(
+        d.not_compiled, declines,
+        "some calls were declined for a reason other than not being compiled: {d:?}"
+    );
 }
 
 /// The playout batch is the part of the kernel the fragment covers end to end,
@@ -188,7 +341,6 @@ fn the_compiled_playout_batch_agrees_over_a_sweep_of_seeds() {
     ];
     let mut harness =
         Harness::over(loaded, &names, Opts::default(), Some("work.zero")).expect("it compiles");
-    let entry = harness.compiled.entry("mcts.playouts").expect("compiled");
     for seed in [1i64, 7, 4242, 20260821, 2_147_483_647] {
         for batch in [1i64, 5, 37] {
             let args = vec![
@@ -197,7 +349,9 @@ fn the_compiled_playout_batch_agrees_over_a_sweep_of_seeds() {
                 Value::Int(batch),
             ];
             let machine = harness.interpret("mcts.playouts", &args).expect("it runs");
-            let compiled = harness.compiled_call(entry, &args).expect("it runs");
+            let compiled = harness
+                .compiled_call("mcts.playouts", &args)
+                .expect("it runs");
             assert!(
                 values_equal(&machine, &compiled, Span::DUMMY).unwrap_or(false),
                 "seed {seed} × {batch} playouts: the machine answered {} and the fragment \
@@ -205,48 +359,107 @@ fn the_compiled_playout_batch_agrees_over_a_sweep_of_seeds() {
                 machine.render(),
                 compiled.render()
             );
+            // And through the hook, which is the path a program takes.
+            let entered = harness.hybrid_counts().0;
+            let hybrid = harness.run_hybrid("mcts.playouts", &args).expect("it runs");
+            assert!(
+                harness.hybrid_counts().0 > entered,
+                "`mcts.playouts` is the fragment's own showcase and the interpreter did not \
+                 enter it"
+            );
+            assert!(
+                values_equal(&machine, &hybrid, Span::DUMMY).unwrap_or(false),
+                "seed {seed} × {batch} playouts: the interpreter answered {} without a backend \
+                 and {} with one",
+                machine.render(),
+                hybrid.render()
+            );
         }
     }
 }
 
-/// A crossing back into the machine is counted per target, which is what lets
-/// the report say *which* function the fragment had to leave to reach rather
-/// than only how often it left.
+/// > **Corrected in R5.** This test used to be
+/// > `a_hybrid_run_records_which_function_each_crossing_went_to`: it compiled
+/// > `mcts.plan_753` and asserted that a 12-iteration search crossed back into
+/// > the machine 12 times, once per `mcts.iterate`. The crossing is gone with
+/// > the trampoline, and so is the compiled `plan_753`.
+/// >
+/// > What replaced it is the claim those crossings were evidence *against*: the
+/// > interpreter drives and enters compiled code, and it does so once per
+/// > iteration of exactly the functions the search's inner loop reaches.
 #[test]
-fn a_hybrid_run_records_which_function_each_crossing_went_to() {
+fn a_hybrid_run_records_which_function_each_entry_went_to() {
     let loaded = loaded();
-    let names = ["mcts.plan_753", "mcts.plan", "mcts.search", "mcts.pack"];
-    let mut harness =
-        Harness::over(loaded, &names, Opts::default(), Some("work.zero")).expect("it compiles");
-    harness.ctx.reset_counts();
-    let entry = harness.compiled.entry("mcts.plan_753").expect("compiled");
+    let (mut harness, _) = kernel_harness(loaded);
+    harness.bodies.reset_counts();
     harness
-        .compiled_call(entry, &[Value::Int(12)])
+        .run_hybrid("mcts.plan_753", &[Value::Int(12)])
         .expect("it runs");
+    let by_name = harness.bodies.entries_by_name();
+    let count = |name: &str| {
+        by_name
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    // One playout per iteration, exactly where the old test found one crossing
+    // per iteration — and this is the direction that pays. An entered `rollout`
+    // plays its whole game natively, so the sixty-odd `next_seed`, `nth_move`
+    // and `apply_move` calls inside it are native calls rather than entries.
+    // `next_seed` shows twelve because `iterate` reseeds once per iteration and
+    // those twelve are the only ones the interpreter makes.
+    assert_eq!(
+        (count("mcts.rollout"), count("mcts.next_seed")),
+        (12, 12),
+        "a 12-iteration search should enter one playout and one reseed per iteration; the \
+         entries were {by_name:?}"
+    );
+    let total: u64 = by_name.iter().map(|(_, c)| *c).sum();
+    assert_eq!(
+        total,
+        harness.bodies.entered(),
+        "the per-function tally and the total disagree"
+    );
+    assert_eq!(
+        total,
+        harness.hybrid_counts().0,
+        "the provider and the machine disagree about how many entries were taken"
+    );
+}
 
-    let by_target: Vec<(String, u64)> = harness
-        .ctx
-        .targets
-        .iter()
-        .cloned()
-        .zip(harness.ctx.machine_calls_by_target.iter().copied())
-        .filter(|(_, n)| *n > 0)
-        .collect();
-    let iterate = by_target
-        .iter()
-        .find(|(name, _)| name == "mcts.iterate")
-        .map(|(_, n)| *n);
-    assert_eq!(
-        iterate,
-        Some(12),
-        "a 12-iteration search should leave the fragment once per iteration; the crossings \
-         were {by_target:?}"
-    );
-    assert_eq!(
-        harness.ctx.machine_calls,
-        harness.ctx.machine_calls_by_target.iter().sum::<u64>(),
-        "the per-target tally and the total disagree"
-    );
+/// The guarantee `ply_eval::limit` exists to keep, kept in the hybrid too.
+///
+/// ADR 0019 §5 item 6 records the gap: the machine answers `recursion limit of
+/// 10000 nested calls exceeded` and compiled code `SIGABRT`s, because the
+/// fragment compiles a self-call to a native call with no bound.
+/// `benches/adr0018-mcts.json`'s `recursion_bound_compiled` field holds the
+/// crash. This runs it as a subprocess so the claim is observed rather than
+/// asserted — an in-process assertion cannot see its own `SIGABRT`.
+#[test]
+fn a_runaway_recursion_is_the_machines_diagnostic_and_not_a_crash() {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_mcts"));
+    let dir = kernel_dir();
+    let mut says = Vec::new();
+    for which in ["machine", "compiled"] {
+        let out = std::process::Command::new(&exe)
+            .args(["--dir", &dir.display().to_string(), "--probe", which])
+            .output()
+            .expect("the probe runs");
+        assert!(
+            out.status.success(),
+            "the `{which}` probe died with {} — {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        says.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    for (which, said) in ["machine", "hybrid"].iter().zip(&says) {
+        assert!(
+            said.contains("recursion limit of 10000 nested calls exceeded"),
+            "the {which} side answered `{said}` rather than the bound both engines owe"
+        );
+    }
 }
 
 /// ADR 0018 §2 wants `Int`, `Bool` **and `Float`** unboxed. ADR 0016 §3.2's
@@ -271,7 +484,7 @@ fn the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time() {
     ));
 
     assert_eq!(
-        refusal(loaded, "floaty.add"),
+        refusal_in(loaded, "floaty", "floaty.add"),
         None,
         "the fragment refused `Float` arithmetic by name, which would make this test obsolete \
          and the census stricter than it is"
@@ -287,8 +500,7 @@ fn the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time() {
         machine.render()
     );
 
-    let entry = harness.compiled.entry("floaty.add").expect("compiled");
-    let compiled = harness.compiled_call(entry, &args);
+    let compiled = harness.compiled_call("floaty.add", &args);
     let message = match compiled {
         Ok(v) => panic!(
             "the compiled fragment answered {} for `1.5 + 2.25` on `Float`s; it has no `Float` \
@@ -298,8 +510,31 @@ fn the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time() {
         Err(e) => e.to_string(),
     };
     assert!(
-        message.contains("arithmetic on a Float"),
+        message.contains("an `Int` operation on a Float"),
         "the fragment failed on `Float` arithmetic, but not where this test says it does: {message}"
+    );
+
+    // And R5's half of it: the machine is never offered the call at all, so a
+    // program that would have started raising at a call site nobody opted into
+    // simply runs in the interpreter. Two independent refusals — the signature
+    // filter at registration, and the boundary's own `crossable` on the values —
+    // and the test asserts the outcome rather than either mechanism.
+    assert!(
+        enterable(loaded, &["floaty.add".to_string()]).is_empty(),
+        "`floaty.add` was registered as enterable, so the fragment's missing `Float` path is \
+         one dynamic check away from being a raise in a working program"
+    );
+    let before = harness.hybrid_counts();
+    let hybrid = harness.run_hybrid("floaty.add", &args).expect("it runs");
+    assert_eq!(
+        harness.hybrid_counts(),
+        before,
+        "the boundary offered a `Float` call to a backend that has no `Float` path"
+    );
+    assert!(
+        matches!(hybrid, Value::Float(f) if f == 3.75),
+        "with a backend attached the interpreter answered {}",
+        hybrid.render()
     );
 
     std::fs::remove_dir_all(&dir).ok();

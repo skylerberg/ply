@@ -17,6 +17,7 @@ pub mod arena;
 mod argv;
 pub mod builtins;
 pub mod code;
+mod compiled;
 pub mod cont;
 pub mod differential;
 mod env;
@@ -50,6 +51,7 @@ pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Code, Lowering, Node, NodeKind, lower};
+pub use compiled::Compiled;
 pub use cont::{
     Continuation, Delimiter, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };

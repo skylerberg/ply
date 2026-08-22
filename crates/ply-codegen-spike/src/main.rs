@@ -141,7 +141,6 @@ struct Variant {
     body_speedup: f64,
     per_request: PerRequest,
     builtin_calls_per_call: f64,
-    machine_calls_per_call: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -307,11 +306,10 @@ fn verify(harness: &mut Harness, large: &[u8]) -> Result<usize> {
         });
     }
 
-    let entry = harness.compiled.entry(READ_LINE).expect("the group compiled");
     let mut disagreements = Vec::new();
     for input in &inputs {
         let expected = harness.interpret(READ_LINE, &input.args);
-        let actual = harness.compiled_call(entry, &input.args);
+        let actual = harness.compiled_call(READ_LINE, &input.args);
         let same = match (&expected, &actual) {
             (Ok(a), Ok(b)) => ply_eval::values_equal(a, b, Span::DUMMY).unwrap_or(false),
             (Err(_), Err(_)) => true,
@@ -380,12 +378,11 @@ fn variant(
         spike_total += m.results[0].spike_best_micros - spike_entry;
     }
 
-    harness.ctx.builtin_calls = 0;
-    harness.ctx.machine_calls = 0;
-    let probe = harness.compiled.entry(READ_LINE).expect("compiled");
+    let builtin_calls_before = harness.bodies.builtin_calls();
     for _ in 0..100 {
-        harness.compiled_call(probe, &args(head, 0, MAX_REQUEST_LINE))?;
+        harness.compiled_call(READ_LINE, &args(head, 0, MAX_REQUEST_LINE))?;
     }
+    let builtin_calls = harness.bodies.builtin_calls() - builtin_calls_before;
 
     Ok(Variant {
         name: name.to_string(),
@@ -394,9 +391,9 @@ fn variant(
         compiled: group.iter().map(|s| (*s).to_string()).collect(),
         nodes: group
             .iter()
-            .filter_map(|n| harness.compiled.nodes.get(*n))
+            .filter_map(|n| harness.compiled().nodes.get(*n))
             .sum(),
-        compile_micros: harness.compiled.compile_nanos as f64 / 1000.0,
+        compile_micros: harness.compiled().compile_nanos as f64 / 1000.0,
         interpreter_entry_micros: interpreter_entry,
         spike_entry_micros: spike_entry,
         inputs: measured.results,
@@ -408,47 +405,47 @@ fn variant(
             interpreter_micros: interpreter_total,
             spike_micros: spike_total,
         },
-        builtin_calls_per_call: harness.ctx.builtin_calls as f64 / 100.0,
-        machine_calls_per_call: harness.ctx.machine_calls as f64 / 100.0,
+        builtin_calls_per_call: builtin_calls as f64 / 100.0,
     })
 }
 
-/// Compiles every function of a module on its own and records what happened.
+/// How much of one module the fragment reaches, offering the module **as one
+/// unit**.
+///
+/// > **Corrected in R5.** This used to call `Jit::compile(loaded, &[name])` once
+/// > per function — each on its own — and count the ones that compiled. That was
+/// > the right question while a call to an uncompiled function became a
+/// > trampoline back into the machine. It is the wrong question now: a call to a
+/// > function outside the unit refuses the caller, so a function measured alone
+/// > is refused for *being alone*, and a census taken that way would report "a
+/// > call to `std.http.line_stops`" as a property of the fragment.
+/// >
+/// > Offering every function of the module together keeps the refusals about
+/// > constructs, which is what a coverage number is supposed to mean. It also
+/// > changes the number: a function whose only problem was a callee now counts
+/// > as accepted.
 fn census(loaded: &'static Loaded, module: &str) -> Census {
-    let mut functions = 0;
-    let mut accepted = 0;
+    let all = loaded.functions_in(module);
+    let functions = all.len();
+    let lost = ply_codegen_spike::entry::refusals_over(loaded, &all)
+        .unwrap_or_else(|e| panic!("classifying `{module}` failed: {e}"));
     let mut reasons: Vec<(String, usize)> = Vec::new();
-    for m in &loaded.ast.modules {
-        if m.name.to_string() != module {
+    let mut seen: Vec<&str> = Vec::new();
+    for (function, reason) in &lost {
+        if seen.contains(&function.as_str()) {
             continue;
         }
-        for item in &m.items {
-            let ply_syntax::ast::Item::Fn(def) = item else {
-                continue;
-            };
-            let name = m.name.qualify(&def.name.name).to_string();
-            functions += 1;
-            match Jit::compile(loaded, &[&name]) {
-                Ok(_) => accepted += 1,
-                Err(e) => {
-                    let text = e.to_string();
-                    let reason = text
-                        .rsplit_once(": ")
-                        .map(|(_, r)| r.to_string())
-                        .unwrap_or(text);
-                    match reasons.iter_mut().find(|(r, _)| *r == reason) {
-                        Some((_, n)) => *n += 1,
-                        None => reasons.push((reason, 1)),
-                    }
-                }
-            }
+        seen.push(function);
+        match reasons.iter_mut().find(|(r, _)| r == reason) {
+            Some((_, n)) => *n += 1,
+            None => reasons.push((reason.clone(), 1)),
         }
     }
     reasons.sort_by(|a, b| b.1.cmp(&a.1));
     Census {
         module: module.to_string(),
         functions,
-        accepted,
+        accepted: functions - seen.len(),
         refused_by: reasons,
     }
 }
@@ -499,18 +496,6 @@ fn main() -> Result<()> {
             GROUP,
             Opts {
                 fold_literals: false,
-            },
-            &inputs,
-            served::REQUEST,
-            &a,
-        )?,
-        variant(
-            "solo, trampolined",
-            "only `read_line` compiled: `line_at` and `line_stops` go back into the machine \
-             through the trampoline ADR 0016 §3.2 allows",
-            &[READ_LINE],
-            Opts {
-                fold_literals: true,
             },
             &inputs,
             served::REQUEST,
@@ -635,11 +620,8 @@ fn main() -> Result<()> {
             v.speedup, v.body_speedup, v.compile_micros, v.nodes
         );
         println!(
-            "   entry: interpreter {:.3}µs, spike {:.3}µs; trampolines per call: {} builtin, {} machine",
-            v.interpreter_entry_micros,
-            v.spike_entry_micros,
-            v.builtin_calls_per_call,
-            v.machine_calls_per_call
+            "   entry: interpreter {:.3}µs, spike {:.3}µs; {} builtin calls per call",
+            v.interpreter_entry_micros, v.spike_entry_micros, v.builtin_calls_per_call
         );
         println!(
             "   per request ({} head bytes, {} calls): interpreter {:.3}µs → spike {:.3}µs ({:.2}x)",

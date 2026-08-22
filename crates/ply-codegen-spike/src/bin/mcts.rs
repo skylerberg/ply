@@ -24,10 +24,11 @@
 //! process, in this run.
 
 use anyhow::{Result, bail};
-use ply_codegen_spike::jit::{Jit, Opts, node_count};
+use ply_codegen_spike::entry::{Declines, admissible, enterable, refusals_over};
+use ply_codegen_spike::jit::{Opts, node_count};
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
-use ply_eval::{Interp, Value, lower, values_equal};
+use ply_eval::{Interp, Value, compare_answers, lower};
 use ply_span::Span;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -54,6 +55,11 @@ struct Args {
     inner: u32,
     out: Option<String>,
     probe: Option<String>,
+    /// `agreement` stops after the census, the agreement corpus and the entry
+    /// counts — everything deterministic — and takes no wall clock at all.
+    /// Correctness before timing is the house rule, and a mode that cannot time
+    /// is how it is kept on a loaded machine.
+    only: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -64,6 +70,7 @@ fn parse_args() -> Result<Args> {
         inner: 3,
         out: None,
         probe: None,
+        only: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -74,6 +81,7 @@ fn parse_args() -> Result<Args> {
             "--inner" => a.inner = argv.next().unwrap_or_default().parse()?,
             "--out" => a.out = argv.next(),
             "--probe" => a.probe = argv.next(),
+            "--only" => a.only = argv.next(),
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -171,33 +179,45 @@ struct CensusRow {
     function: String,
     nodes: usize,
     accepted: bool,
+    /// Accepted **and** offered to the machine. A function the fragment compiles
+    /// whose signature is not `Int`/`Bool` throughout stays compiled — a native
+    /// body may call it, which is what makes the set closed — and is never
+    /// entered, because the boundary carries no other kind.
+    enterable: bool,
     refused_because: Option<String>,
 }
 
-fn census(loaded: &'static Loaded, module: &str) -> Vec<CensusRow> {
+/// What the fragment accepts, taken over the whole module **as one unit**.
+///
+/// Before R5 this compiled each function on its own and a call to an uncompiled
+/// function became a trampoline, so `mcts.search` counted as accepted while
+/// every iteration of it left the fragment. It cannot now: the compiled set is
+/// closed under calls, so a function is accepted only if everything it can reach
+/// is too, and the census is a census of what can actually run natively.
+fn census(loaded: &'static Loaded, module: &str) -> Result<(Vec<CensusRow>, Vec<String>)> {
+    let all = loaded.functions_in(module);
+    let accepted = admissible(loaded, &all)?;
+    let entered = enterable(loaded, &accepted);
+    let refusals = refusals_over(loaded, &all)?;
     let mut rows = Vec::new();
-    for name in loaded.functions_in(module) {
-        let (def, _) = loaded.definition(&name).expect("it was just listed");
+    for name in &all {
+        let (def, _) = loaded.definition(name).expect("it was just listed");
         let nodes = node_count(&lower(&def.body));
-        let (accepted, why) = match Jit::compile(loaded, &[&name]) {
-            Ok(_) => (true, None),
-            Err(e) => {
-                let text = e.to_string();
-                let reason = text
-                    .rsplit_once(": ")
-                    .map(|(_, r)| r.to_string())
-                    .unwrap_or(text);
-                (false, Some(reason))
-            }
-        };
+        // A function can be refused twice — once on its own construct, once
+        // again after a callee is dropped. The first refusal is the cause.
+        let why = refusals
+            .iter()
+            .find(|(f, _)| f == name)
+            .map(|(_, r)| r.clone());
         rows.push(CensusRow {
-            function: name,
+            function: name.clone(),
             nodes,
-            accepted,
+            accepted: accepted.contains(name),
+            enterable: entered.contains(name),
             refused_because: why,
         });
     }
-    rows
+    Ok((rows, accepted))
 }
 
 /// Whether every parameter is written `Int` or `Bool` — the shapes a generic
@@ -285,80 +305,370 @@ const LARGE_SAFE: &[&str] = &[
     "mcts.isqrt",
     "mcts.isqrt_step",
     "mcts.ucb",
-    "mcts.zero",
+    "work.zero",
+    "work.ucb_if_sqrt_were_free",
 ];
+
+/// The functions whose last argument names a number of *iterations*, with the
+/// cap a corpus may draw there.
+///
+/// A wide draw in that position is not a wide input; it is a search that does
+/// not finish inside a corpus run. Stated here rather than left to [`Rng::int`]
+/// because the alternative is a hostile `i64::MAX` that costs the rest of the
+/// corpus its run and tests nothing [`deep_recursion`] does not test
+/// deliberately.
+///
+/// `mcts.playouts` is deliberately absent: its count is the one that reaches
+/// the machine's nested-call bound, and that case is wanted.
+const COUNTED: &[(&str, i64)] = &[
+    ("mcts.plan", 16),
+    ("mcts.plan_753", 16),
+    ("work.work_753", 12),
+    ("work.size_753", 12),
+];
+
+/// Functions that cost milliseconds a case on four evaluators, so they get
+/// fewer generated cases. Named rather than inferred from a timing, so that a
+/// function which becomes cheap leaves this list because somebody decided it
+/// had.
+const HEAVY: &[&str] = &[
+    "mcts.plan",
+    "mcts.plan_753",
+    "mcts.playouts",
+    "mcts.root",
+    "work.work_753",
+    "work.size_753",
+    "work.plies",
+];
+
+/// Every kernel function a corpus can call directly: all parameters `Int` or
+/// `Bool`, whatever it answers.
+///
+/// > **Widened by the R5 audit, 2026-08-21.** This used to be the *enterable*
+/// > set — the functions the fragment compiles and the boundary will offer,
+/// > which is 19 of the kernel's 34 — and that leaves the claim untested exactly
+/// > where it is most interesting. `mcts.plan` and `mcts.plan_753` are refused
+/// > by the fragment and are the functions whose *callees* get entered; running
+/// > generated cases through them is what puts a corpus on the
+/// > interpreter-drives-and-drops-in path rather than only on the leaves.
+/// > Functions answering a `Node` or a `Tree` are here for the same reason: the
+/// > answer crosses no boundary, so any difference in one is a difference the
+/// > interpreter made while a backend was attached.
+fn subjects(loaded: &'static Loaded) -> Vec<String> {
+    let mut out = Vec::new();
+    for module in ["mcts", "work"] {
+        for name in loaded.functions_in(module) {
+            if scalar_params(loaded, &name).is_some() {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
 
 #[derive(Serialize)]
 struct Agreement {
     functions: usize,
+    /// The subjects the fragment compiles, of [`Agreement::functions`]. The rest
+    /// are the callers it refuses, and they are in the corpus on purpose.
+    compiled_functions: usize,
     cases: usize,
+    /// Cases whose arguments the boundary refuses on sight — a `Float`, a
+    /// `Str`, a `List`, a `Map`, a record, a `Decimal`, a `Secret`, `Unit`. The
+    /// hook must never be offered these, in any argument position, and the
+    /// interpreter must answer exactly what it answers with no backend at all.
+    non_scalar_cases: usize,
+    /// Cases where the machine raised. Before R5 these were scored as agreement
+    /// on both sides raising and never compared at all, which is the weaker
+    /// check `ply_eval::differential` forbids by name.
+    raising_cases: usize,
     whole_kernel_cases: usize,
+    /// Cases where the fragment failed and the machine did not — a decline, not
+    /// a disagreement, but counted because a fragment that declines everything
+    /// agrees with everything.
+    fragment_declined: usize,
+    /// Native entries the hybrid machine took over the whole corpus.
+    entries: u64,
+    /// Distinct compiled functions the interpreter actually dropped into. A
+    /// corpus that entered one function a hundred thousand times has covered one
+    /// function.
+    entered_functions: usize,
+    /// Entries the corpus declined for running out of fuel — i.e. generated
+    /// cases that reached the machine's own bound on nested calls, before
+    /// [`deep_recursion`] adds the deliberate ones. Recorded because "the corpus
+    /// reached the bound" is a fact about coverage rather than about the run.
+    corpus_out_of_fuel: u64,
     disagreements: Vec<String>,
 }
 
-/// Agreement against **both** evaluators, on generated inputs, before anything
-/// is timed. A raise on both sides counts as agreement: the fragment is
-/// supposed to reproduce the machine's failures too.
+/// Every argument shape the boundary must refuse, one of each kind.
+///
+/// `Secret` is here because ADR 0019 §0.1 arms `argv`'s pool against exactly a
+/// table that keeps one past the call that carried it, and the fragment's
+/// `Ctx::slots` is such a table.
+fn non_scalar_arguments() -> Vec<(&'static str, Value)> {
+    vec![
+        ("Float", Value::Float(1.5)),
+        ("Str", Value::str("7")),
+        ("Bytes", Value::bytes(b"7")),
+        ("Unit", Value::Unit),
+        ("List", Value::list(vec![Value::Int(1)])),
+        ("Map", Value::Map(ply_eval::Map::new())),
+        (
+            "Record",
+            Value::Record(std::sync::Arc::new(std::collections::BTreeMap::new())),
+        ),
+        ("Decimal", Value::Decimal(ply_eval::Decimal::new(7, 0))),
+        (
+            "Ctor",
+            Value::ctor(ply_span::Symbol::new("None"), Vec::new()),
+        ),
+        ("Secret", Value::secret(Value::Int(7))),
+    ]
+}
+
+/// The values that make an arithmetic body fail rather than answer: an overflow
+/// in `next_seed`'s multiply, a division by zero in `below`, the extremes of the
+/// representation.
+const HOSTILE: &[i64] = &[
+    0,
+    -1,
+    1,
+    i64::MAX,
+    i64::MIN,
+    i64::MAX / 2,
+    -9_223_372_036_854_775_000,
+];
+
+/// One generated call, and whether the boundary is allowed to carry it.
+struct Case {
+    args: Vec<Value>,
+    /// False when some argument is a kind the boundary refuses. Such a case must
+    /// not move *this function's* entry count and must not make a compiled body
+    /// run and fail, which is a tighter claim than "the totals did not move":
+    /// `mcts.plan_753(1.5)` legitimately enters `mcts.pack` on its way to
+    /// raising.
+    scalar: bool,
+}
+
+/// The whole case list for one function: generated, hostile everywhere, hostile
+/// in one position at a time, and every refused kind in every position.
+///
+/// > **Widened by the R5 audit.** The refused-kind sweep used to write the shape
+/// > into argument 0 only, so `ucb(3, "7", 3)` had never been offered to
+/// > anything. Position now varies, which is where a boundary that checked only
+/// > its first argument would show up.
+fn cases_for(
+    rng: &mut Rng,
+    name: &str,
+    kinds: &[&'static str],
+    cases: usize,
+    shapes: &[(&'static str, Value)],
+) -> Vec<Case> {
+    let cap = COUNTED
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, cap)| *cap);
+    let clamp = |args: &mut Vec<Value>| {
+        if let Some(cap) = cap
+            && let Some(Value::Int(n)) = args.last_mut()
+        {
+            *n = n.rem_euclid(cap + 1);
+        }
+    };
+    let benign = |kinds: &[&'static str]| -> Vec<Value> {
+        kinds
+            .iter()
+            .map(|k| match *k {
+                "Bool" => Value::Bool(true),
+                _ => Value::Int(3),
+            })
+            .collect()
+    };
+
+    let mut out: Vec<Case> = Vec::new();
+    if kinds.is_empty() {
+        // A nullary definition takes the constant memo path, and one case is the
+        // whole of its input domain. Two, so the memo is consulted as well as
+        // written.
+        out.push(Case {
+            args: Vec::new(),
+            scalar: true,
+        });
+        out.push(Case {
+            args: Vec::new(),
+            scalar: true,
+        });
+        return out;
+    }
+
+    let draws = if HEAVY.contains(&name) {
+        cases / 8
+    } else {
+        cases
+    };
+    for case in 0..draws.max(4) {
+        let big = LARGE_SAFE.contains(&name) && case % 2 == 1;
+        let mut args: Vec<Value> = kinds
+            .iter()
+            .map(|k| match *k {
+                "Bool" => Value::Bool(rng.next().is_multiple_of(2)),
+                _ => Value::Int(if big { rng.large() } else { rng.int() }),
+            })
+            .collect();
+        clamp(&mut args);
+        out.push(Case { args, scalar: true });
+    }
+    for hostile in HOSTILE {
+        let mut args: Vec<Value> = kinds
+            .iter()
+            .map(|k| match *k {
+                "Bool" => Value::Bool(hostile % 2 == 0),
+                _ => Value::Int(*hostile),
+            })
+            .collect();
+        clamp(&mut args);
+        out.push(Case { args, scalar: true });
+        for position in 0..kinds.len() {
+            let mut args = benign(kinds);
+            if kinds[position] != "Bool" {
+                args[position] = Value::Int(*hostile);
+            }
+            clamp(&mut args);
+            out.push(Case { args, scalar: true });
+        }
+    }
+    for position in 0..kinds.len() {
+        for (_, shape) in shapes {
+            let mut args = benign(kinds);
+            args[position] = shape.clone();
+            out.push(Case {
+                args,
+                scalar: false,
+            });
+        }
+    }
+    out
+}
+
+/// Agreement, before anything is timed, and against every evaluator there is.
+///
+/// Three claims, checked separately because they fail separately:
+///
+///   1. **The hybrid machine answers what the machine answers.** This is R5's
+///      whole claim and it is checked with `differential::compare_answers`, so a
+///      difference in the diagnostic's code, message, labels, spans or notes, in
+///      the observed footprint, or in the cell arena is a disagreement — not
+///      only a difference in the value. The two sides are the same `Machine` over
+///      the same program; the backend is the only difference there is.
+///   2. **The tree-walker agrees too**, so the audit is against an independent
+///      implementation rather than against the engine under test.
+///   3. **The fragment, called directly, answers what the machine answers where
+///      it answers at all.** A fragment that fails where the machine succeeds is
+///      a decline and is counted; a fragment that *succeeds where the machine
+///      raises* is a wrong answer and is a disagreement.
+///
+/// A failing input is compared rather than waved through. `(Err(_), Err(_))`
+/// counted as agreement until R5, and lines 1–3 of `ply_eval::differential` say
+/// why that is the one comparison that hides what it exists to catch.
 fn verify(
     loaded: &'static Loaded,
     harness: &mut Harness,
-    accepted: &[String],
     seed: u64,
     cases: usize,
 ) -> Result<Agreement> {
     let mut rng = Rng(seed);
     let mut bad = Vec::new();
     let mut n_fn = 0;
+    let mut n_compiled = 0;
     let mut n_case = 0;
-    for name in accepted {
-        let Some(kinds) = scalar_params(loaded, name) else {
+    let mut n_nonscalar = 0;
+    let mut n_raising = 0;
+    let mut n_declined = 0;
+    let shapes = non_scalar_arguments();
+
+    for name in subjects(loaded) {
+        let Some(kinds) = scalar_params(loaded, &name) else {
             continue;
         };
-        let Some(entry) = harness.compiled.entry(name) else {
-            continue;
-        };
+        let compiled = harness.compiled().entry(&name).is_some();
         n_fn += 1;
-        for case in 0..cases {
-            let big = LARGE_SAFE.contains(&name.as_str()) && case % 2 == 1;
-            let args: Vec<Value> = kinds
-                .iter()
-                .map(|k| match *k {
-                    "Bool" => Value::Bool(rng.next().is_multiple_of(2)),
-                    _ => Value::Int(if big { rng.large() } else { rng.int() }),
-                })
-                .collect();
+        if compiled {
+            n_compiled += 1;
+        }
+
+        for (case, Case { args, scalar }) in cases_for(&mut rng, &name, &kinds, cases, &shapes)
+            .into_iter()
+            .enumerate()
+        {
             n_case += 1;
-            let expected = harness.interpret(name, &args);
-            let actual = harness.compiled_call(entry, &args);
-            let same = match (&expected, &actual) {
-                (Ok(a), Ok(b)) => values_equal(a, b, Span::DUMMY).unwrap_or(false),
-                (Err(_), Err(_)) => true,
-                _ => false,
-            };
-            if !same {
+            if !scalar {
+                n_nonscalar += 1;
+            }
+            let before = (entries_for(harness, &name), harness.bodies.declines());
+            let expected = harness.interpret_outcome(&name, &args);
+            let hybrid = harness.hybrid_outcome(&name, &args);
+            let after = (entries_for(harness, &name), harness.bodies.declines());
+            if expected.is_err() {
+                n_raising += 1;
+            }
+            // A refused kind must not be carried into `name`'s own body, and must
+            // not make any compiled body run and fail — the two ways a boundary
+            // that checked one argument would show up. The totals are *not* the
+            // check: `mcts.plan_753(1.5)` enters `mcts.pack` legitimately before
+            // it raises.
+            if !scalar && (after.0 != before.0 || after.1.failed != before.1.failed) {
                 bad.push(format!(
-                    "{name} case {case}: the machine and the fragment differ"
+                    "{name} case {case}: the boundary carried an argument kind it refuses \
+                     ({} entries and {} failed bodies became {} and {})",
+                    before.0, before.1.failed, after.0, after.1.failed
                 ));
+            }
+            if let Some(d) =
+                compare_answers(&harness.machine, &harness.hybrid, &name, &expected, &hybrid)
+            {
+                bad.push(format!("{name} case {case}: with a backend attached, {d}"));
+            }
+
+            let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
+            let walked = interp.call(&name, args.clone(), Span::DUMMY);
+            if let Some(d) = compare_answers(&interp, &harness.machine, &name, &walked, &expected) {
+                bad.push(format!("{name} case {case}: the tree-walker {d}"));
+            }
+
+            // And the fragment on its own, which is the only place its answers
+            // are visible at all: a decline is invisible through the machine by
+            // design. Only for the functions it compiled — a name it refused has
+            // no body to call and would report every case as a decline.
+            if !compiled {
                 continue;
             }
-            if expected.is_ok() {
-                let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-                let walked = interp.call(name, args.clone(), Span::DUMMY);
-                let agreed = match (&walked, &actual) {
-                    (Ok(a), Ok(b)) => values_equal(a, b, Span::DUMMY).unwrap_or(false),
-                    _ => false,
-                };
-                if !agreed {
-                    bad.push(format!("{name} case {case}: the tree-walker disagreed"));
+            let direct = harness.compiled_call(&name, &args);
+            match (&expected, &direct) {
+                (Ok(a), Ok(b)) => {
+                    if !ply_eval::values_equal(a, b, Span::DUMMY).unwrap_or(false) {
+                        bad.push(format!(
+                            "{name} case {case}: the machine answered {} and the fragment \
+                             answered {}",
+                            a.render(),
+                            b.render()
+                        ));
+                    }
                 }
+                (Ok(_), Err(_)) => n_declined += 1,
+                (Err(_), Ok(v)) => bad.push(format!(
+                    "{name} case {case}: the machine raised and the fragment answered {}",
+                    v.render()
+                )),
+                (Err(_), Err(_)) => {}
             }
         }
     }
 
     // And the whole kernel, which is the claim that actually matters: a search
-    // driven from compiled code answers the move both interpreters answer.
+    // the interpreter drives, dropping into compiled code at the leaves, answers
+    // the move both interpreters answer.
     let mut whole = 0;
-    let plan_entry = harness.compiled.entry("mcts.plan");
     for case in 0..24 {
         let a = 1 + (rng.next() % 8) as i64;
         let b = (rng.next() % 8) as i64;
@@ -367,33 +677,116 @@ fn verify(
         let s = 1 + (rng.next() % 1_000_000) as i64;
         let n = 1 + (rng.next() % 40) as i64;
         let args = vec![Value::Int(state), Value::Int(s), Value::Int(n)];
-        let expected = harness.interpret("mcts.plan", &args)?;
         whole += 1;
-        if let Some(entry) = plan_entry {
-            let actual = harness.compiled_call(entry, &args)?;
-            if !values_equal(&expected, &actual, Span::DUMMY).unwrap_or(false) {
-                bad.push(format!(
-                    "mcts.plan case {case} (state {state}, seed {s}, {n} iterations): \
-                     the fragment answered {} and the machine answered {}",
-                    actual.render(),
-                    expected.render()
-                ));
-            }
+        let expected = harness.interpret_outcome("mcts.plan", &args);
+        let hybrid = harness.hybrid_outcome("mcts.plan", &args);
+        if let Some(d) = compare_answers(
+            &harness.machine,
+            &harness.hybrid,
+            "mcts.plan",
+            &expected,
+            &hybrid,
+        ) {
+            bad.push(format!(
+                "mcts.plan case {case} (state {state}, seed {s}, {n} iterations): {d}"
+            ));
         }
         let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
         let walked = interp.call("mcts.plan", args, Span::DUMMY);
-        match walked {
-            Ok(v) if values_equal(&expected, &v, Span::DUMMY).unwrap_or(false) => {}
-            _ => bad.push(format!("mcts.plan case {case}: the tree-walker disagreed")),
+        if let Some(d) = compare_answers(&interp, &harness.machine, "mcts.plan", &walked, &expected)
+        {
+            bad.push(format!("mcts.plan case {case}: the tree-walker {d}"));
         }
     }
 
+    let (entries, _) = harness.hybrid_counts();
     Ok(Agreement {
         functions: n_fn,
+        compiled_functions: n_compiled,
         cases: n_case,
+        non_scalar_cases: n_nonscalar,
+        raising_cases: n_raising,
         whole_kernel_cases: whole,
+        fragment_declined: n_declined,
+        entries,
+        entered_functions: harness.bodies.entries_by_name().len(),
+        corpus_out_of_fuel: harness.bodies.declines().out_of_fuel,
         disagreements: bad,
     })
+}
+
+/// Native entries into one function, which is what a refused-kind case must not
+/// move. The totals cannot serve: a call that raises on a refused kind may
+/// legitimately have entered *other* functions first.
+fn entries_for(harness: &Harness, name: &str) -> u64 {
+    harness
+        .bodies
+        .entries_by_name()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, count)| count)
+        .unwrap_or(0)
+}
+
+/// Two deep recursions, both compared field by field rather than described.
+///
+/// ADR 0019 §5 item 6 records the nested-call bound as closed and the R5 audit
+/// asks to *see* it: a program the machine answers with `recursion limit of
+/// 10000 nested calls exceeded` must answer the same thing with a backend
+/// attached, down to the labels and the spans, and must not become a `SIGABRT`.
+///
+/// The two are different shapes and only the first reaches the bound:
+///
+///   * **`mcts.playouts` from a terminal position** recurses once per playout
+///     and plays no game, so what it exercises is the nesting. It is itself
+///     compiled, so the machine offers it, the native body burns its whole fuel,
+///     declines, and the machine evaluates one level and offers it again — the
+///     O(`max_calls`²) cost `entry::Declines::out_of_fuel` records. Two more
+///     cases in the corpus above reach the bound the same way, from
+///     `mcts.playouts(3, 3, i64::MAX)` and from `i64::MAX / 2`, which together
+///     with this one are the run's 30,000 fuel declines.
+///   * **`work.plies`** is *not* compiled, so the recursion is the machine's own
+///     and it drops into compiled `mcts.next_seed`/`mcts.below`/`mcts.nth_move`
+///     at every depth — the half the audit calls unobserved, since before R5 a
+///     crossing went through `Machine::call`, which resets `stack.calls()`. It
+///     does **not** reach the bound: a playout ends when the position is
+///     terminal, so the fuel argument is not what stops it. The version that
+///     does reach the bound with an entry at every depth is
+///     `tests/hazards.rs::an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded`,
+///     over a fixture whose recursion no game terminates.
+fn deep_recursion(loaded: &'static Loaded, harness: &mut Harness) -> Vec<String> {
+    let mut bad = Vec::new();
+    let deep: [(&str, Vec<Value>); 2] = [
+        (
+            "mcts.playouts",
+            vec![Value::Int(0), Value::Int(1), Value::Int(5_000_000)],
+        ),
+        (
+            "work.plies",
+            vec![
+                Value::Int(7 + 5 * 16 + 3 * 256),
+                Value::Int(20260821),
+                Value::Int(5_000_000),
+            ],
+        ),
+    ];
+    for (name, args) in deep {
+        let expected = harness.interpret_outcome(name, &args);
+        let hybrid = harness.hybrid_outcome(name, &args);
+        if let Some(d) =
+            compare_answers(&harness.machine, &harness.hybrid, name, &expected, &hybrid)
+        {
+            bad.push(format!("{name} at the nested-call bound: {d}"));
+        }
+        let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
+        let walked = interp.call(name, args.clone(), Span::DUMMY);
+        if let Some(d) = compare_answers(&interp, &harness.machine, name, &walked, &expected) {
+            bad.push(format!(
+                "{name} at the nested-call bound: the tree-walker {d}"
+            ));
+        }
+    }
+    bad
 }
 
 #[derive(Serialize)]
@@ -409,33 +802,81 @@ struct Rung {
     speedup: f64,
     low: f64,
     high: f64,
-    crossings_per_call: f64,
-    builtin_calls_per_call: f64,
+    /// Native bodies entered during one call of the whole kernel. **The number
+    /// R5 exists to move.** In the hybrid ADR 0018 §0 reports, compiled code was
+    /// reached by exactly three functions and 102 crossings; a rung whose
+    /// interpreter never enters anything is a null result whatever its ratio
+    /// says, and this is the field that says so.
+    entries_per_call: f64,
+    declines_per_call: f64,
+    entries_by_function: Vec<(String, u64)>,
 }
 
-/// Total machine calls, total builtin calls, and the machine calls split by the
-/// function each one went to.
-type Crossings = (f64, f64, Vec<(String, u64)>);
+/// The compiled sets the ladder walks, each a superset of the one above.
+///
+/// They are *leaves* the interpreter drops into rather than drivers it is
+/// entered from. Before R5 a rung named the outermost function the harness could
+/// enter at, and the twenty arithmetic functions under it were compiled and
+/// never run — which is the whole of what ADR 0018 §0 measured as 0.998x.
+fn ladder_groups<'a>(everything: &[&'a str]) -> Vec<(&'static str, &'static str, Vec<&'a str>)> {
+    let exploration: Vec<&str> = vec!["mcts.ilog2", "mcts.isqrt", "mcts.isqrt_step", "mcts.ucb"];
+    let playout: Vec<&str> = {
+        let mut v = exploration.clone();
+        v.extend([
+            "mcts.rollout",
+            "mcts.terminal",
+            "mcts.winner",
+            "mcts.turn",
+            "mcts.objects",
+            "mcts.heap",
+            "mcts.move_count",
+            "mcts.nth_move",
+            "mcts.apply_move",
+            "mcts.next_seed",
+            "mcts.below",
+        ]);
+        v
+    };
+    vec![
+        (
+            "control: nothing enterable",
+            "a backend attached with nothing in it but the nullary entry probe, so every \
+             offered call declines — this rung is what the hook itself costs",
+            Vec::new(),
+        ),
+        (
+            "the exploration term",
+            "`ucb` and its whole call graph: `ilog2`, `isqrt`, `isqrt_step`. ADR 0018 \
+             attributes 62.6% of the kernel to it, and its only caller is refused",
+            exploration,
+        ),
+        (
+            "+ the playout",
+            "the same, plus `rollout` and the position arithmetic under it",
+            playout,
+        ),
+        (
+            "everything the fragment accepts",
+            "every function of the kernel the fragment did not refuse",
+            everything.to_vec(),
+        ),
+    ]
+}
 
-fn crossings(harness: &mut Harness, name: &str, args: &[Value]) -> Result<Crossings> {
-    harness.ctx.reset_counts();
-    let entry = harness
-        .compiled
-        .entry(name)
-        .ok_or_else(|| anyhow::anyhow!("`{name}` was not compiled"))?;
-    harness.compiled_call(entry, args)?;
-    let by_target: Vec<(String, u64)> = harness
-        .ctx
-        .targets
-        .iter()
-        .cloned()
-        .zip(harness.ctx.machine_calls_by_target.iter().copied())
-        .filter(|(_, n)| *n > 0)
-        .collect();
+/// Native entries the interpreter takes over one call, and where they went.
+fn entries(
+    harness: &mut Harness,
+    name: &str,
+    args: &[Value],
+) -> Result<(f64, f64, Vec<(String, u64)>)> {
+    harness.bodies.reset_counts();
+    let before = harness.hybrid_counts();
+    harness.run_hybrid(name, args)?;
+    let after = harness.hybrid_counts();
     Ok((
-        harness.ctx.machine_calls as f64,
-        harness.ctx.builtin_calls as f64,
-        by_target,
+        (after.0 - before.0) as f64,
+        (after.1 - before.1) as f64,
+        harness.bodies.entries_by_name(),
     ))
 }
 
@@ -505,17 +946,19 @@ struct Report {
     ceiling_at_infinite_ratio: f64,
     unattributed_share: f64,
     end_to_end: f64,
-    end_to_end_without_trampoline_tax: f64,
-    trampoline_tax_micros: f64,
     pure_compute_speedup: f64,
     harness_floor: Paired,
     pure_compute: Paired,
     micros_per_ucb: f64,
     micros_per_ucb_without_sqrt: f64,
     boundary_cost_by_tree_size: Vec<Crossing>,
-    crossings_by_target: Vec<(String, u64)>,
+    /// Which functions the interpreter dropped into, and how often, over one
+    /// whole-kernel call with everything the fragment accepts compiled.
+    entries_by_function: Vec<(String, u64)>,
+    entries_per_call: f64,
+    declines: Declines,
     recursion_bound_machine: String,
-    recursion_bound_compiled: String,
+    recursion_bound_hybrid: String,
     not_measured: Vec<String>,
 }
 
@@ -549,15 +992,25 @@ fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
     // measures is the nesting rather than the game.
     let args = vec![Value::Int(0), Value::Int(1), Value::Int(5_000_000)];
     if compiled {
-        let entry = h.compiled.entry("mcts.playouts").expect("compiled");
-        match h.compiled_call(entry, &args) {
-            Ok(v) => println!("compiled answered {}", v.render()),
-            Err(e) => println!("compiled raised: {e}"),
+        match h.hybrid_outcome("mcts.playouts", &args) {
+            Ok(v) => println!("the hybrid answered {}", v.render()),
+            Err(d) => println!("the hybrid raised: {}", d.message),
         }
+        // Which half did the work matters: a hybrid that was never offered the
+        // call would answer the machine's diagnostic for the machine's reason,
+        // and this probe would say nothing about the fragment's own bound.
+        let d = h.bodies.declines();
+        println!(
+            "   the fragment was entered {} times and declined {} of them for running out of \
+             fuel ({} for other reasons)",
+            h.bodies.entered(),
+            d.out_of_fuel,
+            d.total() - d.out_of_fuel
+        );
     } else {
-        match h.interpret("mcts.playouts", &args) {
+        match h.interpret_outcome("mcts.playouts", &args) {
             Ok(v) => println!("machine answered {}", v.render()),
-            Err(e) => println!("machine raised: {e}"),
+            Err(d) => println!("machine raised: {}", d.message),
         }
     }
     Ok(())
@@ -571,12 +1024,7 @@ fn main() -> Result<()> {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(&a.dir)?));
 
     // ---------------------------------------------------------- 1. census --
-    let rows = census(loaded, KERNEL);
-    let accepted: Vec<String> = rows
-        .iter()
-        .filter(|r| r.accepted)
-        .map(|r| r.function.clone())
-        .collect();
+    let (rows, accepted) = census(loaded, KERNEL)?;
     let total_nodes: usize = rows.iter().map(|r| r.nodes).sum();
     let accepted_nodes: usize = rows.iter().filter(|r| r.accepted).map(|r| r.nodes).sum();
     let mut ranked: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -594,7 +1042,13 @@ fn main() -> Result<()> {
     println!("== the kernel, function by function ==");
     for r in &rows {
         match &r.refused_because {
-            None => println!("   compiled   {:<24} {:>4} nodes", r.function, r.nodes),
+            None if r.enterable => {
+                println!("   enterable  {:<24} {:>4} nodes", r.function, r.nodes)
+            }
+            None => println!(
+                "   compiled   {:<24} {:>4} nodes   (reachable natively, never entered)",
+                r.function, r.nodes
+            ),
             Some(why) => println!(
                 "   refused    {:<24} {:>4} nodes   {why}",
                 r.function, r.nodes
@@ -602,11 +1056,13 @@ fn main() -> Result<()> {
         }
     }
     println!(
-        "\n   {} of {} functions, {} of {} lowered nodes, are inside the fragment",
+        "\n   {} of {} functions, {} of {} lowered nodes, are inside the fragment; {} of them \
+         can be entered from the interpreter",
         accepted.len(),
         rows.len(),
         accepted_nodes,
-        total_nodes
+        total_nodes,
+        rows.iter().filter(|r| r.enterable).count()
     );
     println!("\n== what is outside, ranked by the nodes it takes with it ==");
     for (why, n, nodes) in &refusals {
@@ -616,12 +1072,18 @@ fn main() -> Result<()> {
     // -------------------------------------------- 2. compile and verify --
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
     let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
-    let agreement = verify(loaded, &mut harness, &accepted, 0x9E3779B97F4A7C15, 64)?;
+    let mut agreement = verify(loaded, &mut harness, 0x9E3779B97F4A7C15, 64)?;
+    agreement
+        .disagreements
+        .extend(deep_recursion(loaded, &mut harness));
     println!(
         "\n== agreement, before anything is timed ==\n   \
-         {} functions × generated inputs = {} cases, plus {} whole-kernel searches, \
-         against the machine and the tree-walker",
-        agreement.functions, agreement.cases, agreement.whole_kernel_cases
+         {} functions ({} of them compiled) × generated inputs = {} cases, plus {} whole-kernel \
+         searches\n   and 2 deep recursions, against the machine and the tree-walker",
+        agreement.functions,
+        agreement.compiled_functions,
+        agreement.cases,
+        agreement.whole_kernel_cases
     );
     if !agreement.disagreements.is_empty() {
         for d in &agreement.disagreements {
@@ -633,6 +1095,74 @@ fn main() -> Result<()> {
         );
     }
     println!("   0 disagreements");
+    println!(
+        "   {} of those cases were arguments the boundary refuses on sight, {} raised in the \
+         machine,\n   {} were declined by the fragment and answered by the interpreter instead",
+        agreement.non_scalar_cases, agreement.raising_cases, agreement.fragment_declined
+    );
+    println!(
+        "\n== the number R5 exists to move ==\n   the interpreter entered compiled code \
+         {} times over the agreement corpus.\n   Before R5 it could not enter compiled code at \
+         all: the hybrid reached three functions, and\n   every `ucb`, `isqrt` and `rollout` \
+         under them ran in the machine (ADR 0018 §0).",
+        agreement.entries
+    );
+    println!(
+        "   {} distinct compiled functions were entered: {:?}",
+        agreement.entered_functions,
+        harness.bodies.entries_by_name()
+    );
+    println!(
+        "   {} of the generated cases reached the machine's own bound on nested calls before the \
+         two deliberate ones",
+        agreement.corpus_out_of_fuel
+    );
+    let declines = harness.bodies.declines();
+    println!(
+        "   declines: {} not compiled, {} arity, {} the body failed, {} out of fuel, {} re-entered, \
+         {} touched a cell",
+        declines.not_compiled,
+        declines.arity,
+        declines.failed,
+        declines.out_of_fuel,
+        declines.reentered,
+        declines.touched_cells
+    );
+    if harness.hybrid.compiled_refusals() != 0 {
+        bail!(
+            "the machine refused {} answer(s) at the boundary: the backend returned a value this \
+             boundary does not carry, which is a backend bug rather than a fragment limit",
+            harness.hybrid.compiled_refusals()
+        );
+    }
+    if a.only.as_deref() == Some("entries") {
+        println!(
+            "\n== native entries per `{WHOLE}({})` call, by compiled set ==\n   \
+             deterministic: one position, one seed, a fixed iteration count. Nothing timed.",
+            a.iterations
+        );
+        let arg = Value::Int(a.iterations);
+        for (name, _, group) in ladder_groups(&names) {
+            let mut h = Harness::over(loaded, &group, Opts::default(), Some(ENTRY))?;
+            let (taken, declined, by_function) =
+                entries(&mut h, WHOLE, std::slice::from_ref(&arg))?;
+            println!("   {name:<32} {taken:>8.0} entries, {declined:>8.0} declines");
+            for (f, c) in &by_function {
+                println!("      {c:>8}  {f}");
+            }
+            if by_function.is_empty() {
+                println!("      nothing entered");
+            }
+        }
+        return Ok(());
+    }
+    if a.only.as_deref() == Some("agreement") {
+        println!(
+            "\n--only agreement: nothing was timed. Correctness first; a ratio taken on a loaded \
+             machine is a ratio between two machines."
+        );
+        return Ok(());
+    }
 
     // --------------------------------------------------- 3. entry costs --
     let entry_interp = band(
@@ -643,10 +1173,9 @@ fn main() -> Result<()> {
         2000,
         a.repeats,
     )?;
-    let zero_entry = harness.compiled.entry(ENTRY).expect("compiled");
     let entry_compiled = band(
         || {
-            harness.compiled_call(zero_entry, &[])?;
+            harness.compiled_call(ENTRY, &[])?;
             Ok(())
         },
         2000,
@@ -655,10 +1184,10 @@ fn main() -> Result<()> {
     let n = Value::Int(a.iterations);
     let n_probe = n.clone();
 
-    // The same interpreter, reached through the *other* `Machine` — the one the
-    // trampoline calls into. Nothing is compiled on this path and nothing
-    // crosses; it exists so that a rung's ratio can be read against what the
-    // harness costs rather than against 1.00x assumed.
+    // The same search on the two `Machine`s this harness holds, with the backend
+    // attached to neither: nothing is entered on either side. It exists so that
+    // a rung's ratio can be read against what the harness costs rather than
+    // against 1.00x assumed.
     let floor = {
         let cell = std::cell::RefCell::new(&mut harness);
         paired(
@@ -668,10 +1197,8 @@ fn main() -> Result<()> {
                 Ok(())
             },
             || {
-                let mut h = cell.borrow_mut();
-                let m = h.ctx.machine.as_mut().expect("installed");
-                m.call(WHOLE, vec![n_probe.clone()], Span::DUMMY)
-                    .map_err(|d| anyhow::anyhow!("{}", d.message))?;
+                cell.borrow_mut()
+                    .interpret(WHOLE, std::slice::from_ref(&n_probe))?;
                 Ok(())
             },
             a.inner,
@@ -682,56 +1209,12 @@ fn main() -> Result<()> {
     // ------------------------------------------------- 4. the timing ladder --
     let mut rungs = Vec::new();
 
-    // The ladder's rungs are compiled sets, each a superset of the one above.
-    let outer: Vec<&str> = vec!["mcts.plan_753", "mcts.plan", "mcts.search", "mcts.pack"];
-    let rollout_group: Vec<&str> = {
-        let mut v = outer.clone();
-        v.extend([
-            "mcts.rollout",
-            "mcts.terminal",
-            "mcts.winner",
-            "mcts.turn",
-            "mcts.objects",
-            "mcts.heap",
-            "mcts.move_count",
-            "mcts.nth_move",
-            "mcts.apply_move",
-            "mcts.next_seed",
-            "mcts.below",
-        ]);
-        v
-    };
-    let ladder: Vec<(&str, &str, Vec<&str>)> = vec![
-        (
-            "control: entry only",
-            "only `plan_753`, so one crossing and no compiled work — this rung \
-             is here to show what the harness costs when it compiles nothing that runs",
-            vec!["mcts.plan_753", "mcts.pack"],
-        ),
-        (
-            "outer loop only",
-            "the search driver and nothing under it",
-            outer.clone(),
-        ),
-        (
-            "outer loop + playouts",
-            "the driver plus the whole playout and its position arithmetic",
-            rollout_group.clone(),
-        ),
-        (
-            "everything the fragment accepts",
-            "every function of the kernel the fragment did not refuse",
-            names.clone(),
-        ),
-    ];
+    let ladder = ladder_groups(&names);
 
-    let mut whole_by_target = Vec::new();
+    let mut whole_entries_by_function = Vec::new();
+    let mut whole_declines = Declines::default();
     for (name, what, group) in &ladder {
         let mut h = Harness::over(loaded, group, Opts::default(), Some(ENTRY))?;
-        let entry = h
-            .compiled
-            .entry(WHOLE)
-            .ok_or_else(|| anyhow::anyhow!("`{WHOLE}` is not in this rung's compiled set"))?;
         let p = {
             let arg = n.clone();
             let cell = std::cell::RefCell::new(&mut h);
@@ -743,7 +1226,7 @@ fn main() -> Result<()> {
                 },
                 || {
                     cell.borrow_mut()
-                        .compiled_call(entry, std::slice::from_ref(&arg))?;
+                        .run_hybrid(WHOLE, std::slice::from_ref(&arg))?;
                     Ok(())
                 },
                 a.inner,
@@ -752,9 +1235,10 @@ fn main() -> Result<()> {
         };
         let interp = p.a;
         let hybrid = p.b;
-        let (m, b, by_target) = crossings(&mut h, WHOLE, std::slice::from_ref(&n))?;
+        let (taken, declined, by_function) = entries(&mut h, WHOLE, std::slice::from_ref(&n))?;
         if *name == "everything the fragment accepts" {
-            whole_by_target = by_target;
+            whole_entries_by_function = by_function.clone();
+            whole_declines = h.bodies.declines();
         }
         rungs.push(Rung {
             name: (*name).to_string(),
@@ -765,8 +1249,9 @@ fn main() -> Result<()> {
             speedup: p.median,
             low: p.low,
             high: p.high,
-            crossings_per_call: m,
-            builtin_calls_per_call: b,
+            entries_per_call: taken,
+            declines_per_call: declined,
+            entries_by_function: by_function,
         });
     }
 
@@ -777,7 +1262,6 @@ fn main() -> Result<()> {
         Value::Int(20260821),
         Value::Int(a.iterations),
     ];
-    let pure_entry = harness.compiled.entry(PURE).expect("playouts compiled");
     let pure = {
         let cell = std::cell::RefCell::new(&mut harness);
         paired(
@@ -786,7 +1270,7 @@ fn main() -> Result<()> {
                 Ok(())
             },
             || {
-                cell.borrow_mut().compiled_call(pure_entry, &pure_args)?;
+                cell.borrow_mut().run_hybrid(PURE, &pure_args)?;
                 Ok(())
             },
             a.inner * 4,
@@ -1072,10 +1556,9 @@ fn main() -> Result<()> {
     attribution.sort_by(|x, y| y.micros_total.partial_cmp(&x.micros_total).unwrap());
     let fragment_share: f64 = attribution.iter().map(|c| c.share_of_request).sum();
 
-    let last = rungs.last().expect("three rungs");
+    let last = rungs.last().expect("four rungs");
     let end_to_end = last.speedup;
-    let tax = last.crossings_per_call * entry_interp.best;
-    let end_to_end_no_tax = last.interpreter.best / (last.hybrid.best - tax).max(1e-9);
+    let entries_per_call = last.entries_per_call;
 
     println!("\n== entry cost, the price of arriving on each side ==");
     println!("   interpreter  {:.3} µs per `{ENTRY}`", entry_interp.best);
@@ -1089,7 +1572,7 @@ fn main() -> Result<()> {
         a.iterations
     );
     println!(
-        "   the same search, no JIT involved, on the two `Machine`s this harness holds:\n   \
+        "   the same search timed against itself, no backend on either side:\n   \
          {:.1} µs and {:.1} µs — {:.3}x [{:.3}–{:.3}], which is what this method's own noise\n   \
          looks like, and what a rung's ratio is read against",
         floor.a.best, floor.b.best, floor.median, floor.low, floor.high
@@ -1097,36 +1580,29 @@ fn main() -> Result<()> {
     for r in &rungs {
         println!(
             "   {:<32} interpreter {:>9.1} µs   hybrid {:>9.1} µs   {:.3}x [{:.3}–{:.3}]   \
-             {:.0} crossings",
+             {:.0} entries, {:.0} declines",
             r.name,
             r.interpreter.best,
             r.hybrid.best,
             r.speedup,
             r.low,
             r.high,
-            r.crossings_per_call
+            r.entries_per_call,
+            r.declines_per_call
         );
     }
     println!("\n   end to end, everything the fragment accepts: {end_to_end:.3}x");
-    println!(
-        "   the {:.0} trampoline crossings cost {tax:.1} µs at the machine's own entry price, \n   \
-         which is {:.3}% of the run — so the boundary is not what is happening here. \n   \
-         Charging it back gives {end_to_end_no_tax:.3}x.",
-        last.crossings_per_call,
-        100.0 * tax / last.interpreter.best
-    );
-    println!(
-        "   Compiling the twenty arithmetic functions between the second rung and the fourth \n   \
-         moved the whole-program time from {:.1} µs to {:.1} µs: the interpreter cannot enter \n   \
-         compiled code, so a function the fragment accepts and whose callers it refuses is \n   \
-         compiled and then never run.",
-        rungs[1].hybrid.best, last.hybrid.best
-    );
+    if last.entries_per_call == 0.0 {
+        println!(
+            "   NULL RESULT: the interpreter entered compiled code zero times, so the ratio \n   \
+             above is a measurement of noise. R4's 0.998x was exactly this and nothing said so."
+        );
+    }
 
     println!("\n== the same fragment with the tree removed: `{PURE}` ==");
     println!(
         "   interpreter {:>9.1} µs   compiled {:>9.1} µs   {pure_speedup:.2}x [{:.2}–{:.2}], \
-         zero crossings",
+         entered from the interpreter",
         pure_interp.best, pure_hybrid.best, pure.low, pure.high
     );
 
@@ -1200,9 +1676,12 @@ fn main() -> Result<()> {
         );
     }
 
-    println!("\n== crossings, by the function the fragment had to leave to ==");
-    for (name, count) in &whole_by_target {
+    println!("\n== where the interpreter dropped into compiled code, per whole-kernel call ==");
+    for (name, count) in &whole_entries_by_function {
         println!("   {count:>8}  {name}");
+    }
+    if whole_entries_by_function.is_empty() {
+        println!("   nothing. Every number above is a null result.");
     }
 
     println!("\n== the bound compiled code does not carry ==");
@@ -1290,17 +1769,17 @@ fn main() -> Result<()> {
         ceiling_at_infinite_ratio,
         unattributed_share: 1.0 - fragment_share,
         end_to_end,
-        end_to_end_without_trampoline_tax: end_to_end_no_tax,
-        trampoline_tax_micros: tax,
         pure_compute_speedup: pure_speedup,
         harness_floor: floor.clone(),
         pure_compute: pure.clone(),
         micros_per_ucb: t_ucb,
         micros_per_ucb_without_sqrt: t_ucb_free,
         boundary_cost_by_tree_size: boundary,
-        crossings_by_target: whole_by_target,
+        entries_by_function: whole_entries_by_function,
+        entries_per_call,
+        declines: whole_declines,
         recursion_bound_machine: machine_says,
-        recursion_bound_compiled: compiled_says,
+        recursion_bound_hybrid: compiled_says,
         not_measured: vec![
             "the interpreter cannot call compiled code, so a function the fragment accepts \
              but whose only callers it refuses is compiled and never entered — every `ucb`, \

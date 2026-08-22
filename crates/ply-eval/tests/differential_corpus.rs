@@ -229,3 +229,180 @@ fn the_two_engines_agree_on_examples() {
     assert!(report.compared >= files.len(), "{report}");
     assert!(report.is_clean(), "{report}");
 }
+
+/// The same corpora, with a backend attached.
+///
+/// `crates/ply-eval/src/compiled.rs` holds hand-built doubles over hand-built
+/// programs. This is the same seam over real source at corpus scale, which is
+/// where ADR 0018 §0's 1,344 green cases would have been the wrong instrument:
+/// the counters below fail the test if the seam was never reached.
+mod backends {
+    use ply_eval::{Compiled, Interp, Value};
+    use ply_span::{Span, Symbol};
+    use ply_syntax::ast::Program;
+    use ply_syntax::resolve::{Resolved, resolve};
+    use std::cell::{Cell, RefCell};
+
+    /// Declines every call and counts what it was offered.
+    pub struct Declining {
+        program: *const Program,
+        offered: Cell<u64>,
+    }
+
+    impl Declining {
+        pub fn over(program: &Program) -> Declining {
+            Declining {
+                program: std::ptr::from_ref(program),
+                offered: Cell::new(0),
+            }
+        }
+
+        pub fn offered(&self) -> u64 {
+            self.offered.get()
+        }
+    }
+
+    impl Compiled for Declining {
+        fn describes(&self, program: &Program) -> bool {
+            std::ptr::eq(self.program, std::ptr::from_ref(program))
+        }
+
+        fn enter(&self, _: &Symbol, _: &[Value], _: usize) -> Option<Value> {
+            self.offered.set(self.offered.get() + 1);
+            None
+        }
+    }
+
+    /// A backend whose "compiled code" is the tree-walker, over its own copy of
+    /// the program with its own world.
+    ///
+    /// It is not a JIT and does not pretend to be one. What it is, is a backend
+    /// that answers the right value for every call this boundary admits, which
+    /// makes the *accept* path testable against real source: every gate, the
+    /// `Frame::Call` push, the constant memo and the argument-vector hand-back
+    /// run for thousands of calls instead of the dozen a hand-built double
+    /// reaches. A wrong answer here is a defect in the seam.
+    ///
+    /// The program is leaked because a backend may not borrow — see the
+    /// `compiled` field on `Machine`. A test binary that leaks one AST is a
+    /// better trade than a seam nobody entered.
+    pub struct TreeWalker {
+        program: *const Program,
+        inner: RefCell<Interp<'static>>,
+    }
+
+    impl TreeWalker {
+        pub fn over(program: &Program) -> TreeWalker {
+            let copy: &'static Program = Box::leak(Box::new(program.clone()));
+            let resolved: &'static Resolved = Box::leak(Box::new(
+                resolve(copy).expect("the corpus resolved once already"),
+            ));
+            TreeWalker {
+                program: std::ptr::from_ref(program),
+                inner: RefCell::new(Interp::for_program(copy, resolved)),
+            }
+        }
+    }
+
+    impl Compiled for TreeWalker {
+        fn describes(&self, program: &Program) -> bool {
+            std::ptr::eq(self.program, std::ptr::from_ref(program))
+        }
+
+        fn enter(&self, name: &Symbol, args: &[Value], _: usize) -> Option<Value> {
+            let mut inner = self.inner.try_borrow_mut().ok()?;
+            match inner.call(name.as_str(), args.to_vec(), Span::DUMMY) {
+                Ok(v @ (Value::Int(_) | Value::Bool(_))) => Some(v),
+                _ => None,
+            }
+        }
+    }
+}
+
+#[test]
+fn a_backend_that_declines_everything_changes_nothing_over_every_corpus_on_disk() {
+    let root = workspace_root();
+    let mut offered = 0;
+    let mut compared = 0;
+
+    for (label, dir, files) in corpora(&root) {
+        let Some((program, resolved)) = load(&dir, &files) else {
+            continue;
+        };
+        // `Machine::for_program` carries no `CheckOutput`, and the purity gate
+        // reads the published row: without one the hook is inert and this test
+        // would be green over a seam it never reached.
+        let Ok(check) = ply_core::check_program(&program, &resolved) else {
+            continue;
+        };
+        let backend = std::rc::Rc::new(backends::Declining::over(&program));
+        let mut treewalk = Interp::new(&program, &resolved, &check);
+        let mut machine = Machine::new(&program, &resolved, &check);
+        machine.set_compiled(backend.clone());
+
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        assert!(report.is_clean(), "{label}\n{report}");
+        assert_eq!(
+            report.footprints_compared, report.compared,
+            "{label}\n{report}"
+        );
+        assert_eq!(
+            machine.compiled_counts().0,
+            0,
+            "{label}: a declining backend was entered"
+        );
+        assert_eq!(machine.compiled_refusals(), 0, "{label}");
+        offered += backend.offered();
+        compared += report.compared;
+    }
+
+    assert!(compared > 0, "no corpus ran");
+    assert!(
+        offered > 0,
+        "{compared} tests ran and the seam was never reached, so this proves nothing"
+    );
+    println!("declining backend: {offered} calls offered over {compared} tests");
+}
+
+#[test]
+fn a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk() {
+    let root = workspace_root();
+    let mut entered = 0;
+    let mut declined = 0;
+    let mut compared = 0;
+
+    for (label, dir, files) in corpora(&root) {
+        let Some((program, resolved)) = load(&dir, &files) else {
+            continue;
+        };
+        let Ok(check) = ply_core::check_program(&program, &resolved) else {
+            continue;
+        };
+        let mut treewalk = Interp::new(&program, &resolved, &check);
+        let mut machine = Machine::new(&program, &resolved, &check);
+        machine.set_compiled(std::rc::Rc::new(backends::TreeWalker::over(&program)));
+
+        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        assert!(report.is_clean(), "{label}\n{report}");
+        assert_eq!(
+            report.footprints_compared, report.compared,
+            "{label}\n{report}"
+        );
+        assert_eq!(
+            machine.compiled_refusals(),
+            0,
+            "{label}: the boundary refused an answer it should never have been offered"
+        );
+        let (e, d) = machine.compiled_counts();
+        entered += e;
+        declined += d;
+        compared += report.compared;
+    }
+
+    assert!(compared > 0, "no corpus ran");
+    assert!(
+        entered > 0,
+        "{compared} tests ran and no call was ever entered, so the accept path is unexercised"
+    );
+    println!("answering backend: {entered} entered, {declined} declined, over {compared} tests");
+}
