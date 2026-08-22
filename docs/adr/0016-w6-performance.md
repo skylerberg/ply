@@ -570,6 +570,25 @@ another is that input's, so the weakest one is the claim.
   `cranelift-jit` and `cranelift-codegen` as **optional** dependencies at
   `0.134.3` — so that deferring M9 deletes one feature block and one dependency
   line, and nothing else in the workspace knows it existed.
+
+  > **Corrected in place (R5 review, 2026-08-22): the last clause is no longer
+  > true, and R5 is what made it untrue.** The first half stands and was
+  > verified by performing the deletion rather than arguing it — a reviewer
+  > copied the tree, ran `rm -r crates/ply-codegen-spike`, and got
+  > `cargo build --workspace --all-targets` and
+  > `cargo test --workspace --no-fail-fast` green: 155 test binaries, 3,680
+  > passed, 0 failed. No cranelift in any shipping manifest;
+  > `grep -c cranelift Cargo.lock` is 0.
+  >
+  > What is false is *"nothing else in the workspace knows it existed"*. After
+  > R5, `crates/ply-eval` carries `compiled.rs` — a public `Compiled` trait,
+  > `Machine::set_compiled`, three counters on `Machine`, and a branch in
+  > `Machine::enter_code` taken on every interpreted call — none of it with a
+  > shipping implementor or caller, all of it surviving the `rm -r`. That is a
+  > deliberate change made by R5 under ADR 0018 §0's "make the interpreter able
+  > to enter compiled code", and no ADR recorded the amendment until this block.
+  > It costs 0.0 allocations per `/health` request (`benches/r5-timing/`
+  > §1) and 237.87 predictable branch tests, and it buys nothing that ships.
 - It may **not** report a ratio whose two sides did different work — for
   instance an interpreter column that includes `Machine::call` entry where the
   spike column does not. Rung 1 is measured precisely so that cost is known and

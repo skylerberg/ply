@@ -1,6 +1,7 @@
 //! ADR 0018 §1 — re-pricing ADR 0016 §3's codegen spike against a compute kernel.
 //!
 //!     mcts [--dir benches/kernel] [--iterations N] [--repeats R] [--out mcts.json]
+//!          [--only agreement|entries] [--mutate <corruption>]
 //!
 //! ADR 0016 measured the spike on `std.http.read_line` and concluded 1.02–1.05×
 //! end to end, because the fragment it compiles is 2–5% of an HTTP request. ADR
@@ -22,12 +23,21 @@
 //!
 //! Nothing here reads a figure out of a document. Every number is taken in this
 //! process, in this run.
+//!
+//! `--mutate` is item 4's price tag. "0 disagreements" is also what a corpus
+//! that compares nothing reports, so the flag corrupts the backend on purpose —
+//! `--mutate off-by-one`, `inverted`, `stale`, `wrong-type`, `unoffered`,
+//! `exceeds-budget[={k}]`, `answers={int}@{function}`, each optionally
+//! `@function` — and the run fails if the corpus *fails to notice*. Every
+//! corruption and what caught it is tabulated in `tests/mutations.rs`, which is
+//! the standing version of the same experiment.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::entry::{Declines, admissible, enterable, refusals_over};
 use ply_codegen_spike::jit::{Opts, node_count};
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
+use ply_codegen_spike::wrong::Mutant;
 use ply_eval::{Interp, Value, compare_answers, lower};
 use ply_span::Span;
 use serde::Serialize;
@@ -55,11 +65,19 @@ struct Args {
     inner: u32,
     out: Option<String>,
     probe: Option<String>,
+    /// A deliberate corruption of the backend, for the run that prices the
+    /// corpus rather than the compiler. Nothing constructs one by default and
+    /// the accepted spellings are [`ply_codegen_spike::wrong::parse`]'s.
+    ///
+    /// A corpus that has never been run against a wrong backend reports the same
+    /// "0 disagreements" whether it tests the seam or nothing at all.
+    mutate: Option<String>,
     /// `agreement` stops after the census, the agreement corpus and the entry
     /// counts — everything deterministic — and takes no wall clock at all.
     /// Correctness before timing is the house rule, and a mode that cannot time
     /// is how it is kept on a loaded machine.
     only: Option<String>,
+    why: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -70,6 +88,8 @@ fn parse_args() -> Result<Args> {
         inner: 3,
         out: None,
         probe: None,
+        why: None,
+        mutate: None,
         only: None,
     };
     let mut argv = std::env::args().skip(1);
@@ -81,9 +101,16 @@ fn parse_args() -> Result<Args> {
             "--inner" => a.inner = argv.next().unwrap_or_default().parse()?,
             "--out" => a.out = argv.next(),
             "--probe" => a.probe = argv.next(),
+            "--why" => a.why = argv.next(),
+            "--mutate" => a.mutate = argv.next(),
             "--only" => a.only = argv.next(),
             other => bail!("unknown argument: {other}"),
         }
+    }
+    // Checked here rather than where it is used, so a misspelled corruption
+    // costs a message instead of a compile and a census.
+    if let Some(spec) = &a.mutate {
+        ply_codegen_spike::wrong::parse(spec)?;
     }
     Ok(a)
 }
@@ -113,6 +140,24 @@ fn band(mut run: impl FnMut() -> Result<()>, inner: u32, repeats: u32) -> Result
     Ok(Band { best, worst })
 }
 
+// `getloadavg` is in libSystem on macOS and in libc on Linux; declaring it here
+// rather than taking a `libc` dependency keeps this frozen tree's manifests and
+// lock file untouched by the measurement they are being measured with.
+unsafe extern "C" {
+    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+}
+
+/// The 1-minute load average, read **between** windows and never inside one.
+///
+/// `benches/r5-timing/PRE-REGISTERED.md` discards any window taken above 4.5,
+/// and a filter that cannot see the load cannot be applied afterwards without
+/// becoming the thing it exists to prevent.
+fn load1() -> f64 {
+    let mut a = [0f64; 3];
+    let n = unsafe { getloadavg(a.as_mut_ptr(), 3) };
+    if n >= 1 { a[0] } else { f64::NAN }
+}
+
 /// A ratio taken **inside** one repeat rather than between two best-of numbers.
 ///
 /// This machine is shared with other work and its load average moved between
@@ -125,6 +170,12 @@ struct Paired {
     a: Band,
     b: Band,
     ratios: Vec<f64>,
+    /// Per-window arm times and the load average at each window's start, kept
+    /// so a pre-registered window filter is applied to data rather than to a
+    /// median somebody already looked at.
+    a_micros: Vec<f64>,
+    b_micros: Vec<f64>,
+    loads: Vec<f64>,
     median: f64,
     low: f64,
     high: f64,
@@ -137,9 +188,13 @@ fn paired(
     repeats: u32,
 ) -> Result<Paired> {
     let mut ratios = Vec::new();
+    let mut a_micros = Vec::new();
+    let mut b_micros = Vec::new();
+    let mut loads = Vec::new();
     let (mut abest, mut aworst) = (f64::INFINITY, 0.0f64);
     let (mut bbest, mut bworst) = (f64::INFINITY, 0.0f64);
     for _ in 0..repeats {
+        loads.push(load1());
         let t0 = Instant::now();
         for _ in 0..inner {
             a()?;
@@ -155,6 +210,8 @@ fn paired(
         bbest = bbest.min(tb);
         bworst = bworst.max(tb);
         ratios.push(ta / tb);
+        a_micros.push(ta);
+        b_micros.push(tb);
     }
     let mut sorted = ratios.clone();
     sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
@@ -171,6 +228,9 @@ fn paired(
         low: sorted[0],
         high: sorted[sorted.len() - 1],
         ratios,
+        a_micros,
+        b_micros,
+        loads,
     })
 }
 
@@ -810,6 +870,29 @@ struct Rung {
     entries_per_call: f64,
     declines_per_call: f64,
     entries_by_function: Vec<(String, u64)>,
+    /// Every window behind `speedup`, with the load average each was taken at.
+    /// A median is a summary and a pre-registered filter needs the data.
+    windows: Paired,
+}
+
+/// One function timed alone, interpreted against hybrid, in the same windows.
+///
+/// The mean hides a regression and the worst does not: a function whose body is
+/// cheaper than the boundary that reaches it is slower with a backend attached,
+/// and an aggregate over a kernel dominated by `ucb` would never show it.
+#[derive(Clone, Serialize)]
+struct PerFunction {
+    function: String,
+    /// Argument sets, from the same generator the agreement corpus draws on
+    /// rather than sets chosen by the person measuring.
+    sets: usize,
+    calls_per_window: u32,
+    micros_per_interpreted_call: f64,
+    /// Native entries the hybrid arm took during **its own** timed windows. A
+    /// ratio over zero entries is a null result for one function exactly as it
+    /// is for a rung, and this is the field that says so.
+    entries_in_timed_run: u64,
+    windows: Paired,
 }
 
 /// The compiled sets the ladder walks, each a superset of the one above.
@@ -956,6 +1039,13 @@ struct Report {
     /// whole-kernel call with everything the fragment accepts compiled.
     entries_by_function: Vec<(String, u64)>,
     entries_per_call: f64,
+    /// Every function timed alone, sorted worst ratio first.
+    per_function: Vec<PerFunction>,
+    /// Functions whose own cases were too expensive to time 21 times over, with
+    /// the per-call microseconds that disqualified them. Listed rather than
+    /// dropped: a per-function table that quietly omits its slowest members is
+    /// the green-over-unexplored-space result this project keeps finding.
+    per_function_not_timed: Vec<(String, f64)>,
     declines: Declines,
     recursion_bound_machine: String,
     recursion_bound_hybrid: String,
@@ -1016,10 +1106,139 @@ fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
     Ok(())
 }
 
+/// One function's per-function row, taken apart: the same argument sets the
+/// per-function table draws, timed one at a time, with the machine's entry count
+/// and the fragment's own decline reasons for each.
+///
+/// This exists because the per-function table found `mcts.playouts` running
+/// *slower* with a backend attached, and a mechanism inferred from a ratio is
+/// the kind of claim this project's reviews keep catching.
+fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
+    let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(dir)?));
+    let (_, accepted) = census(loaded, KERNEL)?;
+    let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
+    let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
+    let shapes = non_scalar_arguments();
+    // The same seed and the same draw order, so these are the very sets the
+    // per-function table timed rather than fresh ones that happen to be similar.
+    let mut rng = Rng(0x243F6A8885A308D3);
+    for name in subjects(loaded) {
+        let Some(kinds) = scalar_params(loaded, &name) else {
+            continue;
+        };
+        let generated = cases_for(&mut rng, &name, &kinds, 12, &shapes);
+        if name != which {
+            continue;
+        }
+        let mut sets: Vec<Vec<Value>> = Vec::new();
+        for Case { args, scalar } in generated {
+            if sets.len() >= 8 {
+                break;
+            }
+            if !scalar || harness.interpret_outcome(&name, &args).is_err() {
+                continue;
+            }
+            let before = harness.hybrid_counts().0;
+            if harness.hybrid_outcome(&name, &args).is_err() {
+                continue;
+            }
+            if harness.hybrid_counts().0 == before {
+                continue;
+            }
+            sets.push(args);
+        }
+        println!("== {name}: {} argument set(s) ==", sets.len());
+        for set in &sets {
+            let rendered: Vec<String> = set.iter().map(|v| v.render()).collect();
+            let ti = band(
+                || {
+                    harness.interpret(&name, set)?;
+                    Ok(())
+                },
+                1,
+                repeats,
+            )?;
+            harness.bodies.reset_counts();
+            let e0 = harness.hybrid_counts();
+            let th = band(
+                || {
+                    harness.run_hybrid(&name, set)?;
+                    Ok(())
+                },
+                1,
+                repeats,
+            )?;
+            let e1 = harness.hybrid_counts();
+            let d = harness.bodies.declines();
+            println!(
+                "   ({})\n      interpreted {:>10.1} µs   hybrid {:>10.1} µs   {:.3}x",
+                rendered.join(", "),
+                ti.best,
+                th.best,
+                ti.best / th.best
+            );
+            println!(
+                "      over {repeats} hybrid call(s): {} entries, {} declines by the machine; \
+                 fragment declines: {} out of fuel, {} body failed, {} not compiled, {} arity, \
+                 {} re-entered, {} touched a cell",
+                e1.0 - e0.0,
+                e1.1 - e0.1,
+                d.out_of_fuel,
+                d.failed,
+                d.not_compiled,
+                d.arity,
+                d.reentered,
+                d.touched_cells
+            );
+        }
+
+        // And the very loop the per-function table uses, window by window, so a
+        // number that disagrees with the per-set table above is attributable to
+        // the loop rather than argued about.
+        println!("   -- the same sets through the per-function paired loop --");
+        let inner = 1u32;
+        let p = {
+            let (mut i, mut j) = (0usize, 0usize);
+            let n = sets.len();
+            let sets = &sets;
+            let fname = name.as_str();
+            let cell = std::cell::RefCell::new(&mut harness);
+            paired(
+                || {
+                    cell.borrow_mut().interpret(fname, &sets[i % n])?;
+                    i += 1;
+                    Ok(())
+                },
+                || {
+                    cell.borrow_mut().run_hybrid(fname, &sets[j % n])?;
+                    j += 1;
+                    Ok(())
+                },
+                inner,
+                repeats,
+            )?
+        };
+        for k in 0..p.ratios.len() {
+            println!(
+                "      win {k:>2}  set {}  a {:>10.2} µs  b {:>10.2} µs  {:>9.4}x",
+                k % sets.len(),
+                p.a_micros[k],
+                p.b_micros[k],
+                p.ratios[k]
+            );
+        }
+        return Ok(());
+    }
+    bail!("`{which}` is not one of this kernel's subjects")
+}
+
 fn main() -> Result<()> {
     let a = parse_args()?;
     if let Some(which) = &a.probe {
         return probe_recursion(&a.dir, which == "compiled");
+    }
+    if let Some(which) = &a.why {
+        return why(&a.dir, which, a.repeats);
     }
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(&a.dir)?));
 
@@ -1072,6 +1291,24 @@ fn main() -> Result<()> {
     // -------------------------------------------- 2. compile and verify --
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
     let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
+    let mutant = match &a.mutate {
+        None => None,
+        Some(spec) => {
+            let (mutation, target) = ply_codegen_spike::wrong::parse(spec)?;
+            let mutant = match &target {
+                Some(name) => Mutant::over(harness.bodies.clone(), mutation, name),
+                None => Mutant::new(harness.bodies.clone(), mutation),
+            };
+            harness.set_backend(mutant.clone());
+            println!(
+                "\n== MUTATED: the backend is wrong on purpose ==\n   \
+                 `--mutate {spec}`: {}\n   \
+                 A green agreement below is a hole in the corpus, not a pass.",
+                mutant.describe()
+            );
+            Some(mutant)
+        }
+    };
     let mut agreement = verify(loaded, &mut harness, 0x9E3779B97F4A7C15, 64)?;
     agreement
         .disagreements
@@ -1085,13 +1322,62 @@ fn main() -> Result<()> {
         agreement.cases,
         agreement.whole_kernel_cases
     );
+    if let Some(mutant) = &mutant {
+        println!(
+            "   the mutation was offered {} calls, {} of them for its target, and changed \
+             {} answer(s)",
+            mutant.offered(),
+            mutant.offered_target(),
+            mutant.fired()
+        );
+        if mutant.fired() == 0 {
+            bail!(
+                "the mutation never fired, so this run says nothing about the corpus: it was \
+                 offered {} calls and changed none of them",
+                mutant.offered()
+            );
+        }
+    }
     if !agreement.disagreements.is_empty() {
-        for d in &agreement.disagreements {
+        // Capped, because a mutated run produces thousands of these and the
+        // first few name the case that caught it, which is the whole answer.
+        for d in agreement.disagreements.iter().take(12) {
             println!("   DISAGREEMENT  {d}");
+        }
+        if agreement.disagreements.len() > 12 {
+            println!("   ... and {} more", agreement.disagreements.len() - 12);
+        }
+        if mutant.is_some() {
+            // Which subjects noticed, rather than only how many cases did. A
+            // corruption reported by one function's own cases and by no caller
+            // above it is a narrower result than a count suggests.
+            let mut by_subject: BTreeMap<&str, usize> = BTreeMap::new();
+            for d in &agreement.disagreements {
+                *by_subject
+                    .entry(d.split_whitespace().next().unwrap_or("?"))
+                    .or_default() += 1;
+            }
+            let listed: Vec<String> = by_subject
+                .iter()
+                .map(|(name, n)| format!("{name} ({n})"))
+                .collect();
+            println!(
+                "   noticed by {} subject(s): {}",
+                by_subject.len(),
+                listed.join(", ")
+            );
         }
         bail!(
             "{} disagreement(s): a faster wrong answer prices nothing",
             agreement.disagreements.len()
+        );
+    }
+    if mutant.is_some() {
+        bail!(
+            "the backend was corrupted and the corpus reported 0 disagreements over {} cases and \
+             {} whole-kernel searches. That is a HOLE in the corpus and not a pass.",
+            agreement.cases,
+            agreement.whole_kernel_cases
         );
     }
     println!("   0 disagreements");
@@ -1252,8 +1538,101 @@ fn main() -> Result<()> {
             entries_per_call: taken,
             declines_per_call: declined,
             entries_by_function: by_function,
+            windows: p.clone(),
         });
     }
+
+    // ------------------------- 4b. every entered function, timed on its own --
+    //
+    // Pre-registered in `benches/r5-timing/PRE-REGISTERED.md`: the **worst**
+    // per-function ratio is reported rather than the mean, and a per-function
+    // median below 1.00 is a finding even under a winning aggregate. A kernel
+    // whose cost is 62.6% one function can carry a badly regressed one for free,
+    // and the ladder above cannot see it.
+    let mut per_function: Vec<PerFunction> = Vec::new();
+    let mut per_function_skipped: Vec<(String, f64)> = Vec::new();
+    {
+        let shapes = non_scalar_arguments();
+        let mut rng = Rng(0x243F6A8885A308D3);
+        for name in subjects(loaded) {
+            let Some(kinds) = scalar_params(loaded, &name) else {
+                continue;
+            };
+            // Sets both engines answer and on which the hybrid enters something.
+            // A set the machine raises on times the diagnostic path, and a set
+            // that enters nothing makes this row a null result.
+            let mut sets: Vec<Vec<Value>> = Vec::new();
+            for Case { args, scalar } in cases_for(&mut rng, &name, &kinds, 12, &shapes) {
+                if sets.len() >= 8 {
+                    break;
+                }
+                if !scalar || harness.interpret_outcome(&name, &args).is_err() {
+                    continue;
+                }
+                let before = harness.hybrid_counts().0;
+                if harness.hybrid_outcome(&name, &args).is_err() {
+                    continue;
+                }
+                if harness.hybrid_counts().0 == before {
+                    continue;
+                }
+                sets.push(args);
+            }
+            if sets.is_empty() {
+                continue;
+            }
+            // Size the window from the work rather than fixing it: one call of
+            // `mcts.turn` is 0.4 µs and one of `mcts.plan_753` is milliseconds,
+            // and a fixed `inner` would time the work on one and the clock on
+            // the other.
+            let probe = Instant::now();
+            for set in &sets {
+                harness.interpret(&name, set)?;
+            }
+            let each = probe.elapsed().as_secs_f64() * 1e6 / sets.len() as f64;
+            if each > 250_000.0 {
+                per_function_skipped.push((name.clone(), each));
+                continue;
+            }
+            let inner = ((2000.0 / each.max(0.05)).round() as u32).clamp(1, 20_000);
+            let before = harness.hybrid_counts().0;
+            let p = {
+                let (mut i, mut j) = (0usize, 0usize);
+                let n = sets.len();
+                let sets = &sets;
+                let fname = name.as_str();
+                let cell = std::cell::RefCell::new(&mut harness);
+                paired(
+                    || {
+                        cell.borrow_mut().interpret(fname, &sets[i % n])?;
+                        i += 1;
+                        Ok(())
+                    },
+                    || {
+                        cell.borrow_mut().run_hybrid(fname, &sets[j % n])?;
+                        j += 1;
+                        Ok(())
+                    },
+                    inner,
+                    a.repeats,
+                )?
+            };
+            per_function.push(PerFunction {
+                function: name.clone(),
+                sets: sets.len(),
+                calls_per_window: inner,
+                micros_per_interpreted_call: each,
+                entries_in_timed_run: harness.hybrid_counts().0 - before,
+                windows: p,
+            });
+        }
+    }
+    per_function.sort_by(|x, y| {
+        x.windows
+            .median
+            .partial_cmp(&y.windows.median)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // ------------------------------- 5. the same fragment with no tree at all --
     let pure_state = Value::Int(7 + 5 * 16 + 3 * 256);
@@ -1684,6 +2063,29 @@ fn main() -> Result<()> {
         println!("   nothing. Every number above is a null result.");
     }
 
+    println!("\n== every entered function, timed alone: worst ratio first ==");
+    println!(
+        "   {:<26} {:>9} {:>9} {:>9} {:>10} {:>9}",
+        "function", "ratio", "10th", "90th", "interp µs", "entries"
+    );
+    for f in &per_function {
+        let mut r = f.windows.ratios.clone();
+        r.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let pct = |q: f64| r[(((r.len() - 1) as f64) * q).round() as usize];
+        println!(
+            "   {:<26} {:>8.3}x {:>8.3}x {:>8.3}x {:>10.3} {:>9}",
+            f.function,
+            f.windows.median,
+            pct(0.10),
+            pct(0.90),
+            f.micros_per_interpreted_call,
+            f.entries_in_timed_run
+        );
+    }
+    for (name, each) in &per_function_skipped {
+        println!("   {name:<26}  not timed: {each:.0} µs a call is too slow to window 21 times");
+    }
+
     println!("\n== the bound compiled code does not carry ==");
     let exe = std::env::current_exe()?;
     let machine_side = std::process::Command::new(&exe)
@@ -1777,6 +2179,8 @@ fn main() -> Result<()> {
         boundary_cost_by_tree_size: boundary,
         entries_by_function: whole_entries_by_function,
         entries_per_call,
+        per_function: per_function.clone(),
+        per_function_not_timed: per_function_skipped.clone(),
         declines: whole_declines,
         recursion_bound_machine: machine_says,
         recursion_bound_hybrid: compiled_says,

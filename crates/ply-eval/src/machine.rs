@@ -49,10 +49,27 @@ use std::sync::Arc;
 /// The frames are heap cells and this is how many of them a program may hold at
 /// once.
 ///
-/// It is not the bound a runaway recursion hits. That is [`DEFAULT_MAX_CALLS`],
-/// which both engines share and which every recursion reaches first, since a
-/// call costs at least one frame. This one catches a program that pends a
-/// million frames without nesting ten thousand calls.
+/// It catches a program that pends a million frames without nesting ten
+/// thousand calls.
+///
+/// > **Corrected (R5 review, 2026-08-22).** This doc used to continue: *"It is
+/// > not the bound a runaway recursion hits. That is [`DEFAULT_MAX_CALLS`],
+/// > which both engines share and which every recursion reaches first, since a
+/// > call costs at least one frame."* The premise is true and the conclusion
+/// > does not follow. A *call* costs one frame; a *body* costs as many as it
+/// > pends. A recursion whose body pends `k` frames per level reaches **this**
+/// > bound first whenever `k > DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 100.
+/// > Measured with `ply test --engine machine` at depth 9,990 on
+/// > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }`: `k = 90`
+/// > passes, `k = 100` raises here.
+/// >
+/// > Two open consequences, both in `CONTRIBUTING.md` §"Things known to be
+/// > broken". The two engines do **not** agree on the bound for such a program —
+/// > the tree-walker has no frame bound and passes where the machine raises,
+/// > which is a `--engine both` divergence with no backend involved. And this
+/// > bound cannot be expressed at the compiled-entry seam: `Compiled::enter` is
+/// > handed only the *call* budget, so a backend answers where the machine
+/// > would have raised.
 pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
 
 const CALL_SCAN_LIMIT: usize = 4096;

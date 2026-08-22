@@ -196,6 +196,14 @@ impl SpikeBodies {
         &self.compiled
     }
 
+    /// Whether a body was registered for `name`. What separates "the fragment
+    /// ran this and declined" from "this name was never given a body at all",
+    /// which is a distinction only a wrapper around this provider needs — see
+    /// [`crate::wrong::Mutation::Unoffered`].
+    pub fn admits(&self, name: &Symbol) -> bool {
+        self.admitted.contains_key(name)
+    }
+
     /// Native bodies actually run, over this provider's whole life.
     ///
     /// The number R5 exists to move. A ratio reported beside a zero here is a

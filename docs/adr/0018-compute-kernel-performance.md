@@ -164,6 +164,223 @@ ceiling is 5.26× however much of the fragment you accept.** That is a different
 first milestone from any listed below, and nothing below should start until it is
 decided.
 
+> **R5 did it, and §0.5 is the answer.** Entry works and is worth **6.199×** on
+> this kernel — which is *above* the 4.86×/5.26× this section derives, so the
+> ceiling above is withdrawn as a bound rather than confirmed. Read §0.5 before
+> §1: it also records that no shipping command can install a backend, so none of
+> the 6.199× is reachable by any user of Ply.
+
+## 0.5. Entry was built. The answer is 6.199×, and this ADR's ceiling was wrong.
+
+> **Measured 2026-08-21 (R5), pre-registered 2026-08-21 before any number
+> existed.** Experiment: `benches/r5-timing/PRE-REGISTERED.md`. Result:
+> `benches/r5-timing/RESULTS.md`. Raw report: `benches/r5-timing/mcts-r5.json`,
+> cut only by `benches/r5-timing/analyze.py`. Same kernel as §0
+> (`benches/kernel/`), same box, cranelift 0.134.3, `+1.94.0`. Agreement was
+> taken before anything was timed: 2,396 generated cases over 29 functions and
+> 24 whole-kernel searches, 0 disagreements, against both the no-backend machine
+> and the independent tree-walker.
+
+§0 closes: **"make the interpreter able to enter compiled code, or the ceiling is
+5.26× however much of the fragment you accept."** R5 made it possible. This
+section is the answer.
+
+### What was built
+
+`crates/ply-eval/src/compiled.rs` — a `Compiled` trait taking a name, some
+scalars and a call budget and returning at most one scalar. No arena, no stack,
+no handler stack, no host binding, no `&mut Machine`, no route back in, so a
+backend that cannot finish has changed nothing observable and declining is free
+by construction. The hook is one branch in `Machine::enter_code`. Entry
+demonstrably happens: with nothing enterable the search offers 45,586 calls and
+enters 0; with everything the fragment accepts it enters **2,162**.
+
+### The cost side, on the workload that ships
+
+**0.0 allocations per `/health` request.** `HOOK` (the tree as it ships, no
+backend) against `NOHOOK` (the same tree with the `enter_code` call site
+deleted), two binaries from one frozen tree, arms alternated `H N H N H N`: both
+read **773.4** at the 200-request window, byte-identical including
+`bytes_per_request`, and identical again at 20 and at 2,000 requests, so the
+delta is flat in the window rather than absorbed by it. By the pre-registered
+rule (`HOOK − NOHOOK > 0.0 allocations` ⇒ regressed) it is **not a regression**.
+In the linked binary the hook is 80 bytes of machine code.
+
+Zero allocations is not zero cost, and the load-independent count that says so:
+instrumented, one `/health` request reaches the hook **237.87 times**, and every
+one is a miss — `compiled_answer` exits on its first line. **The wall-clock cost
+of those 237.87 branch tests was never taken**, on either binary, although both
+existed. The currency was pre-registered as allocations and a wall-clock rule
+was not, and this ADR should not be read as if it had been.
+
+### The kernel ratio
+
+Load gate 2.63 against a pre-registered 4.5 on a 10-core box — that reading is
+prose only and appears nowhere in `mcts-r5.json`, whose provenance line records
+`2.78 3.34 4.66` and whose first ladder window records 2.52; the gate passes on
+all three. All 84 ladder windows sampled between 2.40 and 2.91, so **no window
+was dropped by either pre-registered filter on any rung** — which also means
+neither filter was ever tested, and on macOS the 1-minute average updates every
+~5 s against a ~190 ms window, so the load filter can only drop a whole rung or
+none. Controls, both required in 0.95–1.05:
+harness floor **0.9995×**, nothing-enterable rung **0.9758×**.
+
+| rung | ratio | 10th–90th | entries/call |
+| --- | ---: | --- | ---: |
+| control: nothing enterable | 0.976× | — | **0** |
+| the exploration term | 2.860× | [2.835, 2.871] | 1,275 |
+| + the playout | 6.176× | [6.139, 6.197] | 2,161 |
+| **everything the fragment accepts** | **6.199×** | **[6.143, 6.226]** | **2,162** |
+
+**6.199×, 10th–90th percentile [6.143, 6.226], over 21 of 21 surviving paired
+windows, 2,162 native entries.** Pre-registered verdict **`entry-paid-off`**.
+The ladder is monotone in entries and the aggregate is filter-independent. Two
+reviewers replicated the top rung independently on busier machines — 6.215×
+at load 5.3–6.8 and 6.240× at load 12–16, both formally void under the
+pre-registration's own load rule and both reported here as direction and
+magnitude rather than as a second result.
+
+Pre-R5 the same rung was **0.998× with 0 entries**. §0's diagnosis — that the
+binding constraint was architectural, one-way calling, and not the size of the
+fragment or the cost of the boundary — is **confirmed**.
+
+### 6.199× is above this ADR's own ceiling, and that is a defect in the ceiling
+
+§0 puts the Amdahl ceiling at **4.86×** for a backend that can be entered and
+**5.26×** at an infinitely fast fragment. The R5 run recomputes them from its own
+attribution as 4.806× / 5.212×. **The measurement is above both**, taken with
+19 of 34 kernel functions accepted — nowhere near "however much of the fragment
+you accept". A result that beats its own predicted ceiling is a sign that the
+model was wrong, not that the result is extra good, and the model was wrong in a
+way this ADR can name:
+
+- interpreted, the search offers **45,586** calls to the hook per
+  `mcts.plan_753(100)`;
+- with everything compiled it offers **2,266** (2,162 entered, 104 declined);
+- so **43,320 interpreted calls per search stop existing**, because they now
+  happen inside a native body.
+
+The ceiling's denominator was built by pricing each function's **body** in
+isolation — `per_call` subtracts the machine's own entry cost — which charges the
+call-site machinery to the 19.2% "unattributed" bucket rather than to any
+function. The "81.0% of executed work inside the fragment" figure is a
+body-only accounting, and entering compiled code deletes the call-site machinery
+too: the argument vector, the frame push, the `Env` binding. At the measured
+machine entry cost alone (0.0989 µs) those vanished calls are 4,284 µs of a
+57,329 µs search, **7.5%**, and arrival is the *cheapest* part of an interpreted
+call. **§0's ceiling is an artifact of a body-only attribution, not a bound, and
+this ADR withdraws it as a bound.**
+
+**The same fact turned up as a correctness defect, from the other side.** A
+compiled body pushes **one** `Frame::Call` for a whole call; the interpreter
+pends a frame per pending operand as well. That is the unattributed machinery,
+counted. It is also why `probe.hog` below diverges, and the two are one fact.
+
+### What entry also bought: a divergence, with the real backend and no mutation
+
+`fn hog(n: Int) -> Int = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }`, 150
+`+ 1` terms, is accepted whole by the fragment. `hog(9000)` gives
+`Err("recursion limit of 1000000 pending frames exceeded")` on the machine alone
+and **`Ok(1350000)`** with the backend attached — one entry, zero declines,
+`ply_eval::compare_answers` calling it a divergence. The seam passes only
+`budget = max_calls - stack.calls()`; the machine's second bound,
+`DEFAULT_MAX_FRAMES`, cannot be expressed at the boundary and no backend can
+honour it. `CONTRIBUTING.md` §"Things known to be broken" item 9 carries it, and
+item 10 carries the older defect it uncovered: the same program is an
+`--engine both` divergence **with no backend at all**.
+
+Two more the reviews found, both open and both in that section: every entry into
+the spike's backend costs O(the previous entry's peak arena) — item 12 — which is
+the real mechanism behind a per-function regression `RESULTS.md` §3 blamed on its
+own filter; and a definition that discharges its own effects publishes an empty
+row, so the seam's purity gate clears it and offers it (item 11).
+
+### Nothing here ships, and that is the load-bearing sentence
+
+**No shipping command can install a backend.** `Compiled` and `set_compiled`
+appear nowhere in `ply-cli`; outside `crates/ply-eval`'s own tests and the
+deletable spike, `set_compiled` has no caller in `crates/*`. `ply test --engine
+both` cannot attach one and therefore catches **none** of the eight deliberately
+wrong backends the spike's mutation harness runs. The rule that a run with a
+backend attached is a third execution strategy whose results the result cache
+must not keep is stated in `Machine::set_compiled` and is **not enforced,
+because it is unreachable** — `cache_bypassed` has no `Machine` in scope. So
+**none of the 6.199× is available to any user of Ply.** It is a measurement at a
+seam only the spike's harness and `ply-eval`'s differential corpus can reach.
+
+### So are §2 through §7 correctly ordered?
+
+**No, and not for the reason §0 gave.** §0 said the ordering was not rescued by
+compiling more because the ceiling was 5.26×. That ceiling is withdrawn above.
+What replaces it is worse for the list, not better:
+
+1. **§0's own first milestone is discharged as an experiment and not as a
+   feature.** "Nothing below should start until it is decided" — it is decided:
+   entry works, it is worth 6.199× on this kernel, and it is unreachable from
+   every shipping command. Making it reachable is M9, and ADR 0016 §3.5 requires
+   the spike be deleted rather than promoted, so the next decision this ADR owes
+   is not a lever at all.
+2. **§2 is spent** and was already corrected in place by R4: there is no
+   primitive boxing to remove.
+3. **§3 is unpriced by this measurement and must not be read as re-ranked.**
+   `benches/kernel` declares **no effect at all**, so no entered definition ever
+   exercised a handler, the purity gate or the effect path. R5 says nothing
+   whatever about evidence passing.
+4. **§4 is the largest lever this ADR still identifies for this kernel**, by
+   §0's own unchanged number: 19.0% of executed work is the `Map`/record/list
+   machinery, which is outside the fragment no matter which functions compile,
+   and is therefore what caps a kernel that *can* enter compiled code. That is
+   inference from a pre-R5 attribution, not a new measurement, and it should be
+   re-taken on a hybrid run before anything is built on it.
+5. **§5's sequencing note is void**: it reads "after §2", and §2 does not exist.
+6. **§6 and §7 are untouched.** Nothing in R5 bears on shared mutable state or
+   on the host boundary.
+
+The honest summary: the ordering below was derived from a model that undercounts
+what entry removes, and every remaining item is still priced by that model. No
+lever in §2–§7 has an end-to-end price on a kernel that can enter compiled code.
+That is what an amendment to this ADR owes, and this section does not pay it.
+
+### What a reader still does not know
+
+- **The wall-clock cost of the hook on the request path.** Only allocations were
+  taken. 0.0 allocations must not be read as 0 cost.
+- **What a backend costs in allocations.** No allocation figure was taken with a
+  backend attached anywhere, and `compiled.rs` warns that a `w6-alloc` figure
+  from a run without one may not be quoted for a run with one.
+- **Whether 6.199× holds anywhere else.** One kernel, one program, one box, one
+  pre-registered run; the pre-registration forbade re-running.
+- **What JIT compile time costs.** It is in no ratio; every window times warm
+  code.
+- **Anything about the seam under the rest of the language.** Effects,
+  handlers, continuations captured across an entry, `simulate`, secrets,
+  `Float`/`Str`/`Decimal`/`Bytes`, higher-order closures, the store, the test
+  cache, `ply prove` and the host path were **not exercised with a backend**.
+- **Whether the fragment's own lowering is correct.** `jit.rs`'s instruction
+  selection was read and never mutated; every wrong backend R5 built corrupts
+  *answers*, not lowering.
+- **How strong the agreement result really is.** 12 of the 19 compiled
+  functions are offered to the backend **zero** times during the 24 whole-kernel
+  searches, and a uniform off-by-one in `mcts.ucb` — 1,268 wrong scores —
+  changes no move in any of them. Half the entered functions are caught by their
+  own generated cases and by nothing else.
+- **Whether the oracle is right.** If the tree-walker and the machine were wrong
+  in the same way, every comparison here agrees.
+
+### One correction to §1's discharge block, while this is open
+
+`benches/adr0018-mcts.json` still holds the **pre-R5** numbers, including an
+`end_to_end` of 0.998× measured with zero entries; R5 wrote to
+`benches/r5-timing/mcts-r5.json` and did not overwrite the artifact this ADR
+quotes. The two disagree on the fragment's shape, and the newer file is right:
+removing the trampoline made a compiled set closed under calls, so `mcts.search`,
+`mcts.plan` and `mcts.plan_753` are now refused by name and the census moved from
+**22 of 34 functions and 386 of 745 lowered nodes to 19 and 352**. §1's block
+below still says 22 and 386, as does `docs/adr/0019-value-representation.md` in
+two places — its measured-figures table and its §5. `benches/README.md` already
+carries the correction in place. Corrected here because the number is §1's
+premise; the executed-work share is unmoved (81.0% against 80.8%).
+
 ## 1. Re-price the spike against a compute kernel — do this first
 
 > **Discharged (R4, 2026-08-21), and it changed the ordering of everything
@@ -392,6 +609,16 @@ This is not a concession — it is the design working. But it should be stated a
 the current answer so nobody discovers it by disappointment.
 
 ## Sequencing
+
+> **Audit note (R5, 2026-08-22): this list is stale in three places and §0.5 is
+> why.** Item 1 is discharged (twice: R4 and R5). Item 2 was refuted by R4 —
+> there is no primitive boxing to remove — which also voids item 6's "after §2".
+> Item 5, "re-price codegen again", was done and produced a number **above** this
+> ADR's own ceiling, which §0.5 withdraws. What the list does not contain, and
+> what §0.5 says is now owed first, is a decision about whether a backend is ever
+> reachable from a shipping command: today `set_compiled` has no caller in
+> `crates/*` outside `ply-eval`'s tests and the deletable spike. The order below
+> is left standing verbatim because it is what this ADR was written from.
 
 1. **§1, re-price the spike on a kernel.** Cheap, and it tests the assumption
    everything else rests on.

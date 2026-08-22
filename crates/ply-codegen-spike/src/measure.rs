@@ -115,6 +115,16 @@ impl Harness {
         self.bodies.compiled()
     }
 
+    /// Puts a different backend behind the hybrid machine, over the same
+    /// program and the same compiled bodies.
+    ///
+    /// The one caller that matters is [`crate::wrong::Mutant`]: a corpus whose
+    /// backend cannot be swapped for a wrong one is a corpus whose green result
+    /// nobody can price.
+    pub fn set_backend(&mut self, backend: Rc<dyn ply_eval::Compiled>) {
+        self.hybrid.set_compiled(backend);
+    }
+
     /// The shipped interpreter, with no backend. Every baseline is this.
     pub fn interpret(&mut self, name: &str, args: &[Value]) -> Result<Value> {
         self.machine

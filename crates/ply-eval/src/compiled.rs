@@ -18,6 +18,23 @@
 //!   built without a `CheckOutput` has no row to read and so enters nothing at
 //!   all — which is most of this crate's own tests, and the reason the corpus
 //!   tests assert an entry count rather than only a clean report.
+//!
+//!   > **Narrowed (R5 review, 2026-08-22): the row gate does not cover the whole
+//!   > of "effects".** A definition that performs its operations and
+//!   > **discharges them under its own `handle`** publishes an *empty* row —
+//!   > `crates/ply-codegen-spike/tests/fixtures/hazards/effects.ply`'s
+//!   > `handled` is declared `-> Int` with no row and type-checks, and both its
+//!   > `footprint` and its `performed` come back empty — so this gate clears it
+//!   > and the machine **offers it**. Entering it is then a real difference:
+//!   > `ply-test` reports an `observed_footprint` (`report.rs`) and reads a
+//!   > declared-but-unobserved atom as "a branch was not taken" (`slice.rs`),
+//!   > and a native body performs nothing, so a user would be told a branch was
+//!   > not taken when it was. It is **latent and not live** — the only backend
+//!   > in the tree refuses `handle` at compile time (`jit.rs`) — but that is a
+//!   > backend remembering the invariant, which is the property this module
+//!   > claims to have engineered away. No published row can close it: `handled`
+//!   > carries no fact distinguishing it from a genuinely pure definition.
+//!   > `CONTRIBUTING.md` §"Things known to be broken" carries it as open.
 //! - **Continuations.** Nothing runs in the machine while a body runs, so no
 //!   continuation can be captured beneath a native activation and no handler
 //!   clause can resume into one.
@@ -29,14 +46,40 @@
 //!   construction.
 //! - **The deterministic scheduler.** The hook is off inside a `simulate` region,
 //!   so every `Access` a search reads is still recorded by the interpreter.
-//! - **Recursion.** `budget` is the machine's remaining nested calls. A backend
-//!   that would exceed it answers `None`, and the machine raises the same
+//! - **Recursion, and only one of the machine's two bounds.** `budget` is the
+//!   machine's remaining nested calls. A backend that would exceed it answers
+//!   `None`, and the machine raises the same
 //!   `recursion limit of 10000 nested calls exceeded` both engines answer with.
+//!
+//!   > **Refuted (R5 review, 2026-08-22), with the real backend, no mutation,
+//!   > one entry and zero declines.** The machine has a *second* bound —
+//!   > [`crate::DEFAULT_MAX_FRAMES`], 1,000,000 pending frames, enforced in
+//!   > `Machine::push` — and nothing in this signature can express it. A
+//!   > compiled body pushes **one** `Frame::Call` for the whole call; the
+//!   > interpreter pends one frame per pending operand as well. So a body
+//!   > pending more than `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 100 frames
+//!   > per level raises on the machine and **answers** through this seam:
+//!   > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }` with 150
+//!   > `+ 1` terms, at `hog(9000)`, gives `Err(recursion limit of 1000000
+//!   > pending frames exceeded)` alone and `Ok(1350000)` with a backend
+//!   > attached. Reproduced with a hand-built honest backend inside this crate,
+//!   > and with `Machine::with_max_frames(64)` and no recursion at all. The
+//!   > underlying `--engine both` divergence is older than this seam and is a
+//!   > separate defect; both are in `CONTRIBUTING.md` §"Things known to be
+//!   > broken".
 //!
 //! What is **not** structural, stated plainly: a backend that answers an `Int`
 //! the definition would not have produced is a wrong answer this boundary cannot
 //! detect. It is caught by `--engine both` and the differential corpus, which
 //! compare the machine against an independent tree-walker, and by nothing here.
+//!
+//! That claim is now demonstrated rather than argued —
+//! `crates/ply-codegen-spike/tests/mutations.rs` runs eight deliberately wrong
+//! backends against the kernel corpus and names what caught each — and two of
+//! them were **not** caught: a backend that ignores its budget entirely
+//! overflows the native stack before any comparison runs, and no corpus in this
+//! tree can exercise the published-row gate at all. Read that file's header
+//! before trusting this one.
 //!
 //! Two more, stated because they are limits rather than guarantees. A backend's
 //! panic is not caught, so a backend bug aborts the process rather than becoming
