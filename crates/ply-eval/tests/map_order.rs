@@ -311,14 +311,15 @@ fn the_order_is_total() {
 /// `1.50m` and `1.5m` are one key, the **value** is the last inserted, and the
 /// key is the canonical member of the class whichever spelling arrived last.
 ///
-/// **This test used to assert the opposite of its last two lines**, and had
-/// since W2: `keys(&m)` was `["1.5"]` and `keys(&other)` was `["1.50"]`, under
-/// the name `an_equal_key_is_replaced_key_and_value_both`, because
-/// `map_insert` replaced the key as well as the value. That made `map_keys` a
-/// function of insertion history — the failure this file's module note says
-/// the whole design exists to prevent — and
-/// `ply_eval::value::canonical_key` is the fix. Two maps that `assert_eq` as
-/// one value now render one string and serve one set of encoded bytes.
+/// **The second half of this test asserted the opposite until 2026-08-21**, and
+/// had since W2: under the name `an_equal_key_is_replaced_key_and_value_both`
+/// it required `keys(&other)` to be `["1.50"]` — the spelling written last —
+/// because `map_insert` replaced the key as well as the value. That made
+/// `map_keys` a function of insertion history, which is the failure this
+/// file's module note says the whole design exists to prevent.
+/// `ply_eval::value::canonical_key` is the fix, and the two `render` and `eq`
+/// assertions below are new: two maps that `assert_eq` as one value now render
+/// one string and serve one set of encoded bytes.
 #[test]
 fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     let m = map_of(vec![

@@ -163,6 +163,41 @@ The house conventions:
 
 Both quote the withdrawn text verbatim. Do the same.
 
+### Gate on an idle machine before measuring, not after
+
+A wall-clock measurement on this machine is worthless above about load 4, and
+the way to find that out is not to take forty windows and discard thirty by rule.
+R4 §1 spent three sittings doing exactly that. Windows above load 30 spread
+0.497–1.607 on a ratio whose true value was about 1.000.
+
+Two cheap habits, the second borrowed from a peer session measuring an unrelated
+crate on the same machine and offered explicitly:
+
+- **Spin until the machine is quiet, then measure.** A loop on
+  `top proc < 60% CPU && load < 4` costs nothing and replaces a sitting's worth
+  of rounds you were going to throw away.
+- **Check the instrument, not just the result.** Require the final re-run to
+  land within N% of that session's *first* measurement. A run whose own repeat
+  disagrees with it has told you the instrument drifted, and no amount of
+  averaging fixes that. R4 lacked this check and would have caught its own drift
+  sooner with it.
+
+**Pre-register the filter.** Write the load threshold, the statistic and the
+decision rule down before any data exists. R4 ended with a cut that cleared its
+2% criterion and had to discard it, because the threshold was chosen after
+seeing the numbers — the honest row was the underpowered pre-registered one whose
+confidence interval straddled the bar. "Re-run until it passes" is not a
+protocol.
+
+**And know which of your numbers this even applies to.** Allocation counts,
+hashes, interleaving counts and seeded replays are deterministic: they reproduce
+to the digit on a burning machine, and three agents in three worktrees confirmed
+R4's to the digit at load 40. Only wall clock is at risk. If the deterministic
+half carries your claim, an unresolved timing number is a caveat in a harmless
+place — say `UNMEASURED` and check in the raw windows so a reader can re-cut
+them. That is a better artifact than a number of unknown provenance sitting
+where the hole was.
+
 ### Say how it was checked, or say it was not
 
 Every number gets a provenance: the machine, the profile, the command, and
@@ -311,6 +346,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today: `cd crates/ply-codegen-spike && cargo +1.94.0 test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering |
 | how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
+| `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | any public signature | `CONTRACTS.md`, which no test reads |
 | `examples/desk.ply` | `examples/serve.sh`, whose `rewrite()` (`serve.sh:103-112`) matches exact source lines with `grep -qF` and aborts loudly if one is missing — that abort is deliberate and is the good case. How many lines it rewrites depends on the mode: `--memory` rewrites two (`:122` and `:125`), `--tls` rewrites one (`:127`), and a plain `--db` run rewrites none |
 

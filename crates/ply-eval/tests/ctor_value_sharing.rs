@@ -15,9 +15,13 @@
 //!   engines — an equal value would mean it was rebuilt and nothing was saved.
 //! - **meaning did not move.** The shared value matches the arm a fresh one
 //!   matched, is equal to a fresh one, and both engines answer the same thing.
-//!   `--engine both` over the corpora on disk is the mechanical form of that
-//!   claim (`differential_corpus.rs`); this is the version that names the
-//!   construct.
+//!   **`--engine both` is not the mechanical form of that claim here** — this
+//!   note said it was — because `interp::ctor_value` is what both engines call
+//!   (`interp.rs:712`, `machine.rs:2093`), so the differential harness compares
+//!   one memo against itself and `Arc::ptr_eq` across the two engines is *true*
+//!   (`value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`).
+//!   This file is the evidence, not the corroboration; `on_both`'s note below
+//!   has always said why.
 //! - **it holds nothing.** A cached value has the program's lifetime, so a
 //!   region that closes underneath it must not be able to reclaim anything it
 //!   points at, and it must not be reachable from a `Secret`. A nullary

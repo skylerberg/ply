@@ -4611,6 +4611,14 @@ order, not unspecified. Content addressing, the result cache, seeded replay and
 hash-ordered map would produce is a green result or a red result over correct
 code.
 
+> **Corrected (regression audit, 2026-08-21).** Ascending order is necessary and
+> was not sufficient: `Value::cmp` is coarser than rendering at `Decimal`, so a
+> map held whichever of `1.50m` / `1.5m` was inserted last and `map_keys` was a
+> function of insertion history anyway. A key is now reduced to the canonical
+> member of its class on the way in (`ply_eval::value::canonical_key`, reached
+> from `ply_eval::value::insert_key`, which is the one site every `Map` insert
+> passes through). `docs/adr/0019-value-representation.md` §7 is the write-up.
+
 A key type must be **ordered**, which is exactly `derivable(ord, k)` — one
 predicate, shared with derivation. Ordered: `Int`, `Bool`, `String`, `Bytes`,
 `Unit`, `Decimal`, and structurally `List`, records, ADTs and `Map` over ordered

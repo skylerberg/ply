@@ -1319,6 +1319,33 @@ bodies by hand. The claim that survives is the narrow one: `w6-alloc` reads
 > note was written. So the before/after is one rig and one command, and
 > 773.4 → 1,084.09 → 773.4 was walked in both directions here.
 
+### A defect R4 did not cause and R4's audit closed: a `Map` key was a function of insertion history
+
+> **Audit note (second regression audit, 2026-08-21).** Not an R4 regression —
+> it predates the milestone and neither lever touches it — but it is a
+> value-representation defect and this is where the value-representation work
+> is recorded.
+>
+> `Value::cmp` compares a `Decimal` by numeric value so that `1.50m` and `1.5m`
+> are one map key; `Value::write` and `decimal_to_string` print the scale as
+> stored. Both deliberate. Together they made `map_insert` replace an equal
+> key's **key**, so `map_keys`, `map_entries`, `map_fold` and every derived
+> encoding over a `Map<Decimal, _>` answered as a function of which spelling was
+> written last. Two maps a test had proved equal with `assert_eq` served two
+> different `derive json` bodies. Three comments in the tree —
+> `ply-eval/src/value.rs`'s `Map` note and its note on `Value::cmp`, and
+> `ply-core/src/infer.rs`'s on `map_fold` — asserted the opposite, as do ADR
+> 0012 §"Iteration order is the property that matters" and `CONTRACTS.md`; all
+> five now carry the correction.
+>
+> Fixed in the representation rather than in either deliberate decision:
+> `ply_eval::value::canonical_key` reduces a key to one representative per
+> equivalence class on the way in, at every position `Value::cmp` descends into,
+> reached from the single `ply_eval::value::insert_key`.
+> `docs/adr/0019-value-representation.md` §7 is the write-up. It costs nothing
+> on the request path — `./target/release/w6-alloc --repo . --requests 200`
+> reads **773.4**, three runs identical, the same figure as before it.
+
 ---
 
 # What is next

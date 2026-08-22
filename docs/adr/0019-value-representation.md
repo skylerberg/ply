@@ -58,6 +58,40 @@ Status: **partly accepted.**
 > > — which is a different claim from "never evaluated", and the difference
 > > matters because assumption 1 is the one this ADR named as most likely to
 > > sink §1. `size_of::<Value>()` is still 32; that half stands, re-checked.
+>
+> > > **Reproduced independently (second regression audit, 2026-08-21), and the
+> > > residue above is discharged.** The pair was re-taken by a second agent
+> > > that did not take the first one, by the recipe §1 names: two release
+> > > `ply-corpus` binaries differing only in `argv::take` and `argv::give`'s bodies —
+> > > the free list against `Vec::with_capacity`/`drop` — A/B'd as **eight
+> > > alternating windows** of
+> > > `ply-corpus serve --repo . --no-load --repeats 5 --ladder-requests 8000`,
+> > > reading the `answer` rung. The two binaries were first checked to be the
+> > > two things they are supposed to be: `w6-alloc --repo . --requests 200`
+> > > reads **965.4** allocations per `/health` without the list and **773.4**
+> > > with it.
+> > >
+> > > | window | without (µs) | with (µs) | paired ratio | load (1 min) |
+> > > | --- | --- | --- | --- | --- |
+> > > | 1 | 18.9 | 19.7 | 1.042 | 7.34 |
+> > > | 2 | 21.2 | 19.4 | 0.915 | 6.35 |
+> > > | 3 | 21.2 | 20.0 | 0.943 | 7.24 |
+> > > | 4 | 19.9 | 29.2 | 1.467 | 12.14 |
+> > > | 5 | 21.6 | 20.3 | 0.940 | 8.97 |
+> > > | 6 | 19.1 | 19.8 | 1.037 | 6.34 |
+> > > | 7 | 19.7 | 19.1 | 0.970 | 4.61 |
+> > > | 8 | 19.2 | 19.7 | 1.026 | 3.91 |
+> > >
+> > > **Median paired ratio 0.998; min-of-N 18.9 against 19.1, a ratio of
+> > > 1.011.** Both are under `Criteria::max_time_regression`'s 1.02, which is
+> > > the same verdict the first take reached at 1.005 — and the *number* is not
+> > > the same, which is the honest part: this machine's load average ran 3.9 to
+> > > 12.1 and never reached the "near 4" the first take read its quiet windows
+> > > at, and window 4 alone spans 1.467. **A 2% criterion is still not resolved
+> > > by this instrument on this machine**, exactly as §1's block says. What is
+> > > now settled is the weaker claim the criterion actually needs: over eight
+> > > paired windows the free list did not cost wall clock that the harness can
+> > > see, and it was measured twice by two agents rather than once by one.
 
 ## Provenance
 
@@ -289,9 +323,16 @@ Each of these is load-bearing for something below. None is measured today.
    — that is the argument for doing it" and then says what moved anyway: the
    calls pending under a second reference, and with them what `E0502` fires on.
    The same sentence is available for this change and would be as wrong.
-   *Settled by:* `--engine both` over every corpus on disk
+   *Settled by:* ~~`--engine both` over every corpus on disk
    (`crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`),
-   plus `crates/ply-eval/tests/constant_memo.rs` unchanged.
+   plus `crates/ply-eval/tests/constant_memo.rs` unchanged.~~
+   **Corrected (regression audit, 2026-08-21):** that settles the *literal*
+   half and nothing about the constructor half, because both engines call
+   `interp::ctor_value` and read one memo — see the correction block in §2.
+   What settles the constructor half is
+   `crates/ply-eval/tests/ctor_value_sharing.rs` in full, plus
+   `constant_memo.rs` unchanged; `--engine both` remains the evidence for the
+   literals and for §1.
 4. **That a record's field count stays small.** §3's flat layout is a linear
    scan; a B-tree is not. Nothing in this repository measures the distribution
    of record widths in a real program.
@@ -544,6 +585,28 @@ thing most likely to sink this.
   is where it surfaces.
 - `crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`.
 
+> **Corrected (regression audit, 2026-08-21). The last bullet cannot see the
+> case this lever is most likely to break, and it is left standing above
+> because it is what was written.** Every `resume k` clause is `E0504
+> MACHINE_ONLY_CLAUSE` in the tree-walker, so the differential harness records
+> the tree-walker's *refusal* and compares no value at all for any program that
+> resumes a continuation — and multi-shot resumption is exactly where one
+> `Frame::AppArgs` becomes two, each finishing a buffer taken from the free
+> list. `crates/ply-eval/tests/resumption_semantics_audit.rs` states that
+> blindness as a finding against ADR 0017 (`fn both`'s doc comment); it is the
+> same blindness here and this ADR did not carry it.
+>
+> **What does audit it**, and asserts the values `--engine both` cannot:
+> `crates/ply-eval/tests/value_semantics_audit.rs::an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_arguments`
+> — a continuation captured *inside an argument list* and resumed twice, at
+> every arity the free list serves and one it does not, with positional
+> encodings so that a shifted, duplicated or stale argument is a different
+> integer — and
+> `::the_tree_walker_refuses_every_resumption_case_so_engine_both_compares_none_of_them`,
+> which asserts the blindness itself so that a tree-walker that later grew the
+> capability turns the first test's justification into a failure rather than
+> leaving it stale.
+
 **Versioning.** No stored type moves; no rendered byte moves. No
 `FRONTEND_VERSION` bump, no `RUNTIME_VERSION` bump. That claim is checked by
 `ply-store`'s pin test staying green without being touched.
@@ -597,6 +660,34 @@ compile-time constant whose `Value` could be built once at lowering, and an
 The tree-walker is not changed. Both engines must still agree, and that is the
 check rather than a symmetry requirement.
 
+> **Corrected (regression audit, 2026-08-21). Both sentences are false for item
+> 2, and they are left standing above because they are what this ADR specified
+> the lever against.** Item 2 puts the memo inside `interp::ctor_value`, and
+> `crates/ply-eval/src/interp.rs:712` — the **tree-walker's** constructor arm —
+> calls it, as does `machine.rs:2093`. So §2 *did* change the tree-walker, and
+> the two engines answer a constructor mention **from one memo**: measured, not
+> reasoned, by
+> `crates/ply-eval/tests/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
+> which asserts `Arc::ptr_eq` **true** across the two engines for the nullary
+> `Ctor` and for the constructor closure. Comparing the two is comparing a value
+> against itself.
+>
+> Item 1 is the half where the sentence holds and the same test is the control:
+> `interp.rs:383` is `ExprKind::Lit(lit) => Ok(literal(lit))`, so the
+> tree-walker builds a fresh `Arc<str>` per evaluation while the machine clones
+> `NodeKind::Lit`'s value (`code.rs:368`, `machine.rs:850`), and cross-engine
+> `Arc::ptr_eq` is **false**. A literal divergence would be visible to
+> `--engine both`; a constructor divergence would not.
+>
+> This is the failure class `CONTRIBUTING.md` §"The one rule" lists twice (M8,
+> W5): a mitigation named in a document that is structurally incapable of
+> firing. **What actually audits the memo is
+> `crates/ply-eval/tests/ctor_value_sharing.rs`**, whose own note on `on_both`
+> says why it can — *"`ctor_value` is shared by the two, so a cache in it is a
+> change to both"* — and which checks the properties that survive sharing: the
+> shared value matches the arm a fresh one matched, is `values_equal` to a fresh
+> one, and holds nothing a closing region could reclaim.
+
 **What it costs.** A `Value` per literal node held for the program's life
 instead of built per evaluation — the same bytes `NodeKind::Lit`'s owned `Lit`
 already holds, moved rather than added — and a thread-local lookup on a
@@ -609,15 +700,23 @@ constructor mention.
 | a shared `Str` may not become observable as shared | no Ply operation reads an address; `Value::cmp` answers `Equal` for any two closures, which is why `Value::builtin` was already safe |
 | the constant memo's semantics | `RUNTIME_VERSION` 0.11.2 exists because remembering a nullary definition moved what `E0502` fires on. Interning a *value* is not that, and the difference has to be shown, not asserted |
 | a simulation's recorded accesses | `Machine::constant` refuses the memo inside a `simulate` region because an allocation is an `Access::Alloc` the search depends on (`machine.rs:1858`). Constructing a `Ctor` is not an `Access` — but if any interning touches a cell, the same rule applies |
-| `--engine both` | the tree-walker keeps building per evaluation; the two must still produce the same value |
+| `--engine both` | ~~the tree-walker keeps building per evaluation; the two must still produce the same value~~ — **true of item 1 only.** For item 2 both engines call `interp::ctor_value` and read one memo, so this row compares a value against itself; `ctor_value_sharing.rs` is the evidence, and `value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two` is what fails if that stops being true |
 
 **The tests that catch it breaking.**
 
+- `crates/ply-eval/tests/ctor_value_sharing.rs` in full. **This is the file that
+  audits item 2**, and the correction block above is why it is first rather than
+  last: it asserts the properties that survive one memo being read by both
+  engines, which is what `--engine both` cannot do.
 - `crates/ply-eval/tests/constant_memo.rs` in full, unchanged — in particular
   `a_nullary_pure_definition_is_evaluated_once_and_both_engines_agree` and
   `a_constant_built_behind_a_handler_is_remembered_with_its_value_intact`.
 - `crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`
-  and `::the_two_engines_agree_on_examples`.
+  and `::the_two_engines_agree_on_examples` — **independent evidence for item 1
+  and for item 2's literals only**, per the correction block above.
+- `crates/ply-eval/tests/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
+  which pins which of the two halves `--engine both` can see, so that this row
+  cannot go stale silently in either direction.
 - `crates/ply-eval/tests/resumption_semantics_audit.rs::two_resumptions_thread_one_world_rather_than_snapshotting_per_branch`
   — the two-resumption cell reads 2, and a shared constant reached through a
   resumed continuation is where that would stop being true.
@@ -848,6 +947,111 @@ one `cargo test --workspace` runs.** A rule naming
 spellings must land in the same bucket"* — and brings the two profiles to 54.9
 and 52.9. Anything else added to that table should be checked in both profiles
 before it is believed.
+
+## 7. Found while auditing, and fixed: a `Map` key was a function of insertion history
+
+**Not a lever, not ranked, and not an R4 regression** — it predates R4 and
+neither §1 nor §2 touches it. It is here because it is a *value representation*
+defect, this is the value-representation ADR, and the consequence was recorded
+nowhere while three comments in the tree asserted its opposite.
+
+**The defect.** `Value::cmp` and `values_equal` compare a `Decimal` **by numeric
+value**, deliberately, so that `1.50m` and `1.5m` are one map key and so that a
+`Decimal` may appear in a `proved` obligation as an uninterpreted term.
+`Value::write` and `decimal_to_string` print **the scale as stored**,
+deliberately, because the scale is a digit count the value carries. The
+conjunction made a `Map`'s *keys* a function of insertion history:
+`map::insert` replaced an equal key's key as well as its value, so whichever
+spelling was written last is the one `map_keys` answered with.
+
+Three written claims said that could not happen, and each is quoted here because
+each is now enforced rather than asserted:
+
+- `crates/ply-eval/src/value.rs`, the `Map` type note — *"a hash-ordered map
+  makes `map_keys` a function of a hasher's seed and of insertion history, and
+  four separate guarantees rest on a value having one canonical form"*. That is
+  the stated reason `Map` is a search tree; the failure it names was present
+  anyway, through the key rather than through the order.
+- `crates/ply-eval/src/value.rs`, on `Value::cmp` — *"`map_keys` is a function
+  of the values and of nothing else"*.
+- `crates/ply-core/src/infer.rs`, on `map_fold` — *"a fold over a map is a
+  function of the map's contents rather than of how it was built"*.
+
+`docs/adr/0012-w2-contract.md` §"Iteration order is the property that matters"
+and `CONTRACTS.md` §`Map` state the same guarantee and were false in the same
+way; both now carry a pointer here.
+
+**What it cost, end to end.** Two maps that `assert_eq` as one value served two
+different response bodies. `std.json`'s number writer is
+`crates/ply-std/ply/json.ply:534`, `Number(d) -> bytes_of_string(decimal_to_string(d))`,
+so a `derive json` over a record holding a `Map<Decimal, String>` wrote the key
+`1.50` or `1.5` depending only on the order two inserts ran in — with
+`--engine both` reporting no divergence, because this was never an engine
+disagreement. It was the language. Re-run on this tree, the body is one string
+either way and it is the canonical spelling, measured rather than reasoned:
+`{"prices":[{"key":1.5,"value":"bolt"},{"key":2,"value":"nut"}]}` from both
+insertion orders, asserted by
+`crates/ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`,
+which runs the program under `ply test` and again under `--engine both`. (The
+`2` is `2.00m`'s canonical spelling, and the entry shape is `{key, value}`
+records rather than pairs, which is what `map_json` writes — take the body from
+the test, not from a sentence.)
+
+The blast radius was wider than `Map<Decimal, _>`:
+`Map<{sku: String, price: Decimal}, Int>` typechecks, so a record-keyed map
+carried it into a compound key.
+
+**The fix, and where it goes.** In the representation, not in either deliberate
+decision: `ply_eval::value::canonical_key` reduces a key to the one
+representative of its equivalence class on the way in, and
+`ply_eval::value::insert_key` is the single site every `Map` insert now passes
+through — `map::put` (which is already the one gate every builtin reaches) and
+`Value::map` (the Rust-level constructor `ply-prove`'s shrinker and
+`ply-host`'s row decoder use). For a `Decimal` the canonical member is
+`Decimal::normalize`: minimal scale, which is unique per numeric value, so it is
+a canonical form rather than merely a smaller one. Every position `Value::cmp`
+descends into is walked — a list's items, a record's field values, a
+constructor's arguments, and a nested map's keys *and* values — because a
+`Decimal` anywhere under a key is a distinction the order cannot see. A
+`Secret` is **not** descended into: it is refused as a key before this runs, it
+cannot be under one (`derivable(ord, Secret<a>)` is false), and a path that
+rebuilt a credential's payload is what ADR 0015 §2 exists to prevent.
+
+`1.50m == 1.5m` still holds, and a `Decimal` that is not a map key still renders
+every digit it was written with — both asserted, so that a "fix" which rounded
+the scale away everywhere would fail.
+
+**What it costs.** The scan does not allocate and answers in one match arm for
+every `Int`, `String` and `Bytes` key, and a compound key's walk is one pass
+against the `O(log n)` `cmp` walks the insert it accompanies already pays.
+Measured on the request path rather than argued: `./target/release/w6-alloc
+--repo . --requests 200` reads **773.4** allocations per `/health`, three runs
+identical to the digit, the same figure as before this change and the one
+`README.md:363` states.
+
+**Versioning.** A stored artifact's contents **do** move for a program that
+renders a `Map` with a `Decimal` key — `Value::render`'s output is cached as
+`Outcome::Fail { message }` — but only from one of two spellings to the
+canonical one, and only for a value that had no single spelling before. No
+stored *type*'s encoding moves, so no `FRONTEND_VERSION` bump; the pin test
+`schema::tests::the_stored_schema_is_pinned` stays green untouched. Whether the
+rendered-byte move is worth a `RUNTIME_VERSION` bump is a judgement this section
+makes explicitly rather than by omission: **it is not taken**, because the
+values whose rendering moves are exactly the ones whose cached message described
+a run that was not reproducible in the first place, and a cache entry keyed by a
+hash that did not move still describes the same *verdict*. A reader who
+disagrees should bump it; the argument is here to be disagreed with.
+
+**The tests.** `crates/ply-eval/tests/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
+carries verbatim what it asserted from W2 until this change, and
+`::a_decimal_anywhere_under_a_key_is_canonical` is the compound half.
+`crates/ply-eval/tests/value_semantics_audit.rs` holds the three tests that
+found it — `two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map`,
+`map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling`,
+`a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too` — each
+rewritten to assert the fix with the old expectation quoted in its note, and
+`::canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it` arms the
+ADR 0015 §2 bound against the new path on the `Arc` pointer.
 
 ## The criteria, in code
 

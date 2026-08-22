@@ -654,9 +654,12 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
 /// `std.json`'s number writer calls — `crates/ply-std/ply/json.ply:534`,
 /// `Number(d) -> bytes_of_string(decimal_to_string(d))` — so the strings below
 /// are **encoded response bodies** for two maps that `assert_eq` as one value.
-/// **Before `canonical_key` they were two bodies**, `[[1.5,"bolt"],…]` and
-/// `[[1.50,"bolt"],…]`, for a pair of maps a test had proved equal; the
-/// assertion here is that they are now one.
+/// **Before `canonical_key` they were two bodies**, differing in the key's
+/// spelling, for a pair of maps a test had proved equal; the assertion here is
+/// that they are now one.
+/// `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`
+/// is the same claim through a real `derive json` codec, whose body is the one
+/// to read rather than a sentence about it.
 #[test]
 fn map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling() {
     let compiled = compile(
