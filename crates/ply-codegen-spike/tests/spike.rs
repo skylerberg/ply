@@ -33,8 +33,18 @@ fn inputs() -> Vec<Input> {
         ("empty", b"".to_vec(), 0i64, 8192i64),
         ("past-end", b"GET /x HTTP/1.1\r\n".to_vec(), 99, 8192),
         ("at-end", b"GET /x HTTP/1.1\r\n".to_vec(), 17, 8192),
-        ("bare-lf", b"GET /x HTTP/1.1\nHost: a\r\n\r\n".to_vec(), 0, 8192),
-        ("bare-cr", b"GET /x HTTP/1.1\rHost: a\r\n\r\n".to_vec(), 0, 8192),
+        (
+            "bare-lf",
+            b"GET /x HTTP/1.1\nHost: a\r\n\r\n".to_vec(),
+            0,
+            8192,
+        ),
+        (
+            "bare-cr",
+            b"GET /x HTTP/1.1\rHost: a\r\n\r\n".to_vec(),
+            0,
+            8192,
+        ),
         ("nul", b"GET /x\0 HTTP/1.1\r\n".to_vec(), 0, 8192),
         ("del", b"GET /x\x7f HTTP/1.1\r\n".to_vec(), 0, 8192),
         ("too-long", vec![b'a'; 200], 0, 16),
@@ -71,9 +81,16 @@ fn agree_on(harness: &mut Harness, input: &Input) -> bool {
 fn the_compiled_function_answers_what_the_machine_answers() {
     let mut harness = Harness::new(GROUP).expect("the group compiles");
     let inputs = inputs();
-    assert!(inputs.len() >= 3, "a ratio over fewer inputs is one input's constant");
+    assert!(
+        inputs.len() >= 3,
+        "a ratio over fewer inputs is one input's constant"
+    );
     for input in &inputs {
-        assert!(agree_on(&mut harness, input), "disagreed on `{}`", input.name);
+        assert!(
+            agree_on(&mut harness, input),
+            "disagreed on `{}`",
+            input.name
+        );
     }
 }
 

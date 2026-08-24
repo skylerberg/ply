@@ -237,9 +237,27 @@ impl SpikeBodies {
     /// ever stops resetting: `Ctx::slots` is a bump arena with no pop, so
     /// unbounded growth here is memory proportional to executed work rather than
     /// to live data.
+    ///
+    /// The length is **zero between entries** since `Ctx::end` — an entry gives
+    /// its slots back rather than leaving them for its successor to drop, which
+    /// is what stopped an entry costing O(the previous entry's peak arena). The
+    /// size the last entry used is [`SpikeBodies::arena_after_entry`].
     pub fn slots(&self) -> (usize, usize) {
         let ctx = self.ctx.borrow();
         (ctx.slots.len(), ctx.slots.capacity())
+    }
+
+    /// How much of the value arena the entry that just finished used — the
+    /// independent variable of `mcts --carryover`, and the number
+    /// `CONTRIBUTING.md` item 12's curve is drawn against.
+    pub fn arena_after_entry(&self) -> usize {
+        self.ctx.borrow().arena_after_entry()
+    }
+
+    /// Entries whose predecessor had not closed itself. Always zero; see
+    /// [`crate::rt::Ctx::unclosed_entries`].
+    pub fn unclosed_entries(&self) -> u64 {
+        self.ctx.borrow().unclosed_entries()
     }
 
     /// Builtin calls made from inside compiled code, over this provider's whole
@@ -313,12 +331,15 @@ impl SpikeBodies {
         let out = unsafe { entry(&mut *ctx as *mut Ctx, handles.as_ptr()) };
         if ctx.failed != 0 {
             let d = ctx.take_failure();
+            ctx.end();
             bail!(
                 "compiled code raised: {}",
                 d.map(|d| d.message).unwrap_or_else(|| "no message".into())
             );
         }
-        Ok(ctx.read(out).clone())
+        let value = ctx.read(out).clone();
+        ctx.end();
+        Ok(value)
     }
 }
 
@@ -352,6 +373,7 @@ impl ply_eval::Compiled for SpikeBodies {
             // it was is still counted, because "the budget ran out" and "the
             // arithmetic overflowed" are different facts about a run.
             let out_of_fuel = ctx.failed == FAILED_OUT_OF_FUEL;
+            ctx.end();
             drop(ctx);
             return self.decline(|d| {
                 if out_of_fuel {
@@ -362,10 +384,12 @@ impl ply_eval::Compiled for SpikeBodies {
             });
         }
         if ctx.touched_cells() {
+            ctx.end();
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);
         }
         let value = ctx.read(out).clone();
+        ctx.end();
         drop(ctx);
         self.entered.set(self.entered.get() + 1);
         admitted.entered.set(admitted.entered.get() + 1);

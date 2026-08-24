@@ -516,8 +516,48 @@ Recorded here so nobody spends an afternoon rediscovering them.
     declared-but-unobserved atom as "a branch was not taken", so an entered
     definition would tell a user a branch was not taken when it was.
     `compiled.rs`'s "Effects" bullet is narrowed in place.
-12. **Every entry into the spike's backend costs O(the *previous* entry's peak
-    arena).** `crates/ply-codegen-spike/src/rt.rs`, `Ctx::begin`, runs
+12. ~~**Every entry into the spike's backend costs O(the *previous* entry's peak
+    arena).**~~ **Fixed (2026-08-24), and re-measured the way it was found.**
+    `Ctx::begin` no longer touches the arena: `Ctx::end` clears it at the end of
+    the entry that filled it, so an entry pays for its own work and its successor
+    pays for nothing, and the shrink is amortized over `SHRINK_EVERY` = 64
+    entries instead of running per entry. Re-taken with
+    `mcts --dir benches/kernel --carryover mcts.playouts --repeats 7`, a mode
+    added for this so the curve is re-takeable by a command rather than by a
+    reviewer, two runs per arm on one tree at load 14–17:
+
+    | | 4 slots | 384 | 3824 | 19,584 | spread |
+    | --- | --- | --- | --- | --- | --- |
+    | before | 0.375 µs | 1.709 | 13.667 | 67.833 | **180.888x** |
+    | before, again | 0.458 | 1.917 | 14.875 | 68.125 | **181.667x** |
+    | after | 0.416 | 0.458 | 0.500 | 0.500 | **1.202x** |
+    | after, again | 0.417 | 0.458 | 0.625 | 0.583 | **1.499x** |
+
+    The before arm reproduces the published table nearly digit for digit
+    (0.375 / 1.666→1.709 / 13.584→13.667 / 68.083→67.833), which is what says the
+    two arms are measuring the same thing. At the unit,
+    `crates/ply-codegen-spike/tests/entry_cost.rs` reads `end` at 4.168 ns/slot
+    and `begin` at **0 ns at every rung** — below the platform's ~40 ns clock
+    resolution, which is the honest way to say "constant".
+
+    Two things the re-measurement found that the original did not:
+
+    - **The interpreter arm is not flat either.** The original recorded "no
+      carry-over on the interpreter arm (0.79 / 0.83 / 0.83 µs)" — measured after
+      the three *smallest* predecessors, where this re-take also reads 0.79–0.88.
+      Run out to the 19,584-slot predecessor and the interpreter column reads
+      1.2–2.8 µs, so a call after an expensive interpreted call is slower on both
+      arms. It is not monotone and not the seam; the likeliest reading is cache.
+      It matters because it was the control: a pre-registered rule of mine said
+      to withdraw the whole measurement if the control moved, and **that rule
+      failed**. It is reported failed rather than rewritten. What carries the
+      claim instead is the paired before/after on the same rows in the same
+      binary, where a common-mode effect appears in both arms.
+    - **The 181x is not the thing to fix.** See the withdrawn clause below: the
+      shrink is not measurably part of it, and the fix is not "stop shrinking".
+
+    The original entry, kept because it is the record of how it was found:
+    `crates/ply-codegen-spike/src/rt.rs`, `Ctx::begin`, ran
     `slots.clear()` and then `shrink_to(RETAINED_SLOTS)`; the clear drops that
     many `Value`s and the shrink reallocates. Measured best-of-7, twice, at two
     loads: the identical hybrid call `mcts.playouts(0,0,0)` runs in 0.375 µs
@@ -530,34 +570,107 @@ Recorded here so nobody spends an afternoon rediscovering them.
     that section is corrected in place and its "no function of the 26 is below
     1.00x" is withdrawn. Spike-only, so `rm -r` removes it — but the number it
     invalidates was published.
-13. **Three holes in what polices the compiled seam, none of them closed.**
-    Recorded together because each is a green result over space nothing
-    exercises.
 
-    - **`ply test --engine both` cannot install a backend at all.** `Compiled`
-      and `set_compiled` appear nowhere in `ply-cli`, so the shipping CLI catches
-      **zero** of the eight deliberately wrong backends in
-      `crates/ply-codegen-spike/tests/mutations.rs`. Only that harness and
-      `crates/ply-eval/tests/differential_corpus.rs`'s two hand-built backends
-      police it. See also the `set_compiled` doc: the rule that a backend run
-      must not populate the result cache is **unenforced because it is
-      unreachable**.
-    - **A backend that ignores its budget is a stack overflow, not a
-      disagreement.** `--mutate exceeds-budget` dies with
-      `fatal runtime error: stack overflow`, exit 134, before a single case is
-      compared. The bounded form (`exceeds-budget=4`) *is* caught, on the
-      diagnostic-label axis only — a harness scoring `(Err, Err)` as agreement
-      would have passed it.
+    > **Reproduced, and one clause withdrawn (2026-08-24).** A number that
+    > withdrew a published claim should be reproducible by somebody other than
+    > the reviewer who took it, so `Ctx::begin` was re-measured directly —
+    > `crates/ply-codegen-spike/tests/entry_cost.rs`, release, best-of-7, run on
+    > request with `--ignored --nocapture`. The mechanism holds: cost is monotone
+    > in the previous entry's slots and the slope is **3.06 ns/slot** against the
+    > reported "about 3.5 ns", across three runs. The 181x is not restated here
+    > because it is an end-to-end ratio and this measures `begin` alone; the
+    > slope is the claim, and the ratio was the slope times the ladder's span.
+    >
+    > **Withdrawn**: *"the clear drops that many `Value`s, **and the shrink
+    > reallocates**"*. The shrink is not measurably part of it. `RETAINED_SLOTS`
+    > is 4096, and `capacity() > RETAINED_SLOTS` is the only thing deciding
+    > whether the shrink runs: an arena grown to 4096 has capacity 4096 and skips
+    > it, one more push doubles capacity to 8192 and the reallocation fires.
+    > Across that boundary the cost is **12583 ns against 12583 ns — 1.00x**, and
+    > the ladder's slope is identical above and below it (3.07 ns/slot at 3824
+    > slots, where no shrink runs, and 3.06 at 19,584, where one does). The whole
+    > of the effect is `slots.clear()` walking N `Value`s to drop them. This
+    > matters for the fix rather than for the diagnosis: removing the `shrink_to`
+    > would return the memory the comment is worried about and change the timing
+    > not at all.
+    >
+    > **And it gets worse in exactly the direction the fragment is being widened
+    > in.** The ladder fills the arena with `Value::Int`, the cheapest thing
+    > `clear` can walk — no refcount, no destructor. ADR 0018 §0's census and the
+    > lexer profile both say the next thing to compile is record construction and
+    > field access, which puts `Arc<BTreeMap<Symbol, Value>>` in those slots
+    > instead, and then `clear` drops a refcount per slot and frees a map
+    > whenever it held the last handle. Over the same 19,584 slots:
+    > **Int 4.17 ns/slot, `Str` 17.4, two-field `Record` 177.0 — a
+    > record-shaped arena costs 42x an Int-shaped one to clear.** So widening
+    > multiplies both terms at once: more slots per entry, and a drop per slot
+    > that is two orders of magnitude dearer. Item 12 is cheap to fix now and
+    > expensive to leave until after the widening it most affects.
+13. **Three holes in what polices the compiled seam; one of the three is now
+    half closed.** Recorded together because each is a green result over space
+    nothing exercises. The unarmed name gate under the third bullet is fixed and
+    the bullet says so; the other two holes, and the corpus half of the third,
+    are open.
+
+    - **`ply test --engine both` cannot install a backend at all.** Still true
+      and deliberately not fixed here — wiring a backend into the CLI is gated on
+      item 9 and on the result-cache rule. What is new is that the claim is now
+      written down as an inventory somebody can check rather than as a sentence:
+      `crates/ply-eval/src/compiled.rs` §"What polices this seam, and what does
+      not" counts it. `Compiled` and `set_compiled` occur **zero** times in
+      `crates/ply-cli`, source and tests both; all five `set_compiled` call sites
+      in the workspace are tests or the spike's own harness (2 in
+      `ply-codegen-spike/src/measure.rs`, 5 in its `hazards.rs`, 3 in its
+      `mutations.rs`, 27 in `ply-eval/src/compiled.rs`'s own tests, 2 in
+      `ply-eval/tests/differential_corpus.rs`). So the shipping CLI catches
+      **zero** of the eight deliberately wrong backends, and the rule that a
+      backend run must not populate the result cache is **unenforced because it
+      is unreachable**.
+    - ~~**A backend that ignores its budget is a stack overflow, not a
+      disagreement.**~~ **Closed (2026-08-24).** It read: *"`--mutate
+      exceeds-budget` dies with `fatal runtime error: stack overflow`, exit 134,
+      before a single case is compared."* It still overflows the stack — that is
+      what the corruption *is*, a native recursion with no bound — but nothing
+      inside a dead process can report it, so the report comes from outside it:
+      every `--mutate` run is now started as a child, and a child that dies by a
+      signal is scored as the disagreement it is. Re-taken with the shipped
+      binary, the run ends `DISAGREEMENT  the backend took the process down
+      (signal 6)` and a non-zero exit.
+      `mutations.rs::a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it`
+      is the standing form; it runs the crash as a child of the test binary and
+      asserts the child died by a signal, that it died of a stack overflow, and
+      that the harness phrases it as a disagreement.
+
+      The related weakness the catalogue recorded — the bounded form
+      (`exceeds-budget=4`) is caught on the diagnostic-label axis only, and a
+      harness scoring `(Err, Err)` as agreement would have passed it — is now
+      armed by
+      `mutations.rs::two_raises_that_differ_are_not_agreement_although_both_are_raises`,
+      which asserts error-*ness* agrees on two real diagnostics, that
+      `compare_answers` reports them anyway, and that one diagnostic compared
+      against itself is still agreement. The corpus-scale row for
+      `exceeds-budget=4` was **not** re-taken: one `--mutate` corpus run costs
+      4m46s at this load and the bounded form was killed after twenty minutes, so
+      R5's figure stands as R5 took it.
     - **The published-row gate is untestable by every corpus in the tree.**
       `benches/kernel` declares no effect at all and `ply-eval`'s differential
       corpus declines effectful names, so if that gate regresses both corpora
-      report success. Three unit tests in `ply_eval::compiled` notice, and one of
-      the seam's gates has **no** biting test: replacing
-      `let name = closure.name.as_ref()?` with a fabricated empty `Symbol` leaves
+      report success. Unit tests in `ply_eval::compiled` are the only thing that
+      notices. **Still open**: no corpus in the tree exercises this gate, and
+      adding one means a corpus that declares an effect.
+
+      The unarmed-gate half of this bullet is **closed**. It read: replacing
+      `let name = closure.name.as_ref()?` with a fabricated empty `Symbol` left
       `cargo test -p ply-eval --lib` at 519/519 green, because
       `memo::pure_by_published_row` refuses the unknown name downstream — so
-      `an_anonymous_closure_is_never_offered`, whose doc says "the name gate is
-      what refuses it", is satisfied by a different gate.
+      `an_anonymous_closure_is_never_offered`, whose doc claimed "the name gate
+      is what refuses it", was satisfied by a different gate. The six gates now
+      live in `ply_eval::compiled::admit`, which answers with the `Gate` that
+      refused rather than with a bare `None`, and each has a test asserting
+      *that* gate. Every one of the six deletions was run against the full
+      526-test lib suite and the reds are tabulated in that module's test
+      header; the fabrication above is now caught, by exactly one test and
+      nothing else.
 
 Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects
@@ -565,7 +678,12 @@ documents. Item 5's comment was a document and was corrected; item 1 is a real
 code defect and is reported, not fixed. Items 9 through 13 are R5's, found by
 the reviews of it: **three of the four review lenses pointed at R5 refuted the
 claim they were given**, and the documents they refuted are corrected in place
-rather than rewritten. None of 9–13 is fixed. They are open.
+rather than rewritten. Of 9–13, **item 12 is fixed**, and two of item 13's three
+holes are closed: the unarmed name gate and the budget-ignoring backend that used
+to take the process down uncaught. Item 13's first bullet — no shipping command
+can install a backend — is deliberately left open, because closing it is gated on
+item 9 and on the result-cache rule; what changed is that it is now an inventory
+somebody can check. Items 9, 10 and 11 are open and untouched.
 
 ## Style
 

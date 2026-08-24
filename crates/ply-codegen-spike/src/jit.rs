@@ -12,11 +12,12 @@
 use crate::program::Loaded;
 use crate::rt::{self, Ctx, Tables};
 use anyhow::{Result, anyhow};
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData,
-    StackSlotKind, types};
-use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context as ClifContext;
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{
+    AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind, types,
+};
+use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -181,7 +182,15 @@ impl Jit {
             clif.clear();
             let (id, _, _) = jit.funcs[name];
             clif.func.signature = jit.entry_signature();
-            jit.define(&mut clif, &mut fctx, loaded, name, params, body, *module_index)?;
+            jit.define(
+                &mut clif,
+                &mut fctx,
+                loaded,
+                name,
+                params,
+                body,
+                *module_index,
+            )?;
             jit.module.define_function(id, &mut clif)?;
         }
         jit.module.finalize_definitions()?;
@@ -468,7 +477,9 @@ fn count_nodes(code: &Code) -> usize {
                 n += count_nodes(t);
             }
         }
-        NodeKind::Record { fields } => n += fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>(),
+        NodeKind::Record { fields } => {
+            n += fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
+        }
         NodeKind::Field { base, .. } => n += count_nodes(base),
         NodeKind::List { items } => n += items.iter().map(count_nodes).sum::<usize>(),
         NodeKind::Perform { args, .. } => n += args.iter().map(count_nodes).sum::<usize>(),
@@ -639,10 +650,7 @@ impl Fx<'_, '_> {
         id: FuncId,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        let func = self
-            .jit
-            .module
-            .declare_func_in_func(id, self.builder.func);
+        let func = self.jit.module.declare_func_in_func(id, self.builder.func);
         let mut all = vec![self.ctx];
         all.extend_from_slice(args);
         let call = self.builder.ins().call(func, &all);
@@ -650,10 +658,7 @@ impl Fx<'_, '_> {
     }
 
     fn helper_void(&mut self, id: FuncId, args: &[cranelift_codegen::ir::Value]) {
-        let func = self
-            .jit
-            .module
-            .declare_func_in_func(id, self.builder.func);
+        let func = self.jit.module.declare_func_in_func(id, self.builder.func);
         let mut all = vec![self.ctx];
         all.extend_from_slice(args);
         self.builder.ins().call(func, &all);
@@ -738,7 +743,10 @@ impl Fx<'_, '_> {
             };
             return Ok(Denotes::Builtin(index));
         }
-        self.refuse(format!("the name `{}` denotes nothing this spike knows", q.symbol()))
+        self.refuse(format!(
+            "the name `{}` denotes nothing this spike knows",
+            q.symbol()
+        ))
     }
 
     /// The representation an expression will produce, decided before its
@@ -758,8 +766,14 @@ impl Fx<'_, '_> {
             },
             NodeKind::Binary { op, .. } => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-                | BinOp::And | BinOp::Or => Kind::Bool,
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or => Kind::Bool,
                 BinOp::Concat => Kind::Boxed,
             },
             NodeKind::If {
@@ -853,9 +867,7 @@ impl Fx<'_, '_> {
                 let else_block = self.builder.create_block();
                 let join = self.builder.create_block();
                 self.builder.append_block_param(join, types::I64);
-                self.builder
-                    .ins()
-                    .brif(c, then_block, &[], else_block, &[]);
+                self.builder.ins().brif(c, then_block, &[], else_block, &[]);
 
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
@@ -999,10 +1011,10 @@ impl Fx<'_, '_> {
             let rhs_block = self.builder.create_block();
             let join = self.builder.create_block();
             self.builder.append_block_param(join, types::I64);
-            let short = self.builder.ins().iconst(
-                types::I64,
-                i64::from(matches!(op, BinOp::Or)),
-            );
+            let short = self
+                .builder
+                .ins()
+                .iconst(types::I64, i64::from(matches!(op, BinOp::Or)));
             if matches!(op, BinOp::And) {
                 self.builder
                     .ins()
@@ -1050,10 +1062,7 @@ impl Fx<'_, '_> {
                 self.builder.ins().jump(self.failure, &[]);
                 self.builder.switch_to_block(ok);
                 self.builder.seal_block(ok);
-                Ok(Val {
-                    kind: Kind::Int,
-                    v,
-                })
+                Ok(Val { kind: Kind::Int, v })
             }
             BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 let a = self.as_int(l);
@@ -1066,10 +1075,7 @@ impl Fx<'_, '_> {
                 let code = self.builder.ins().iconst(types::I64, code);
                 let v = self.helper(self.jit.helpers.arith, &[code, a, b]);
                 self.check();
-                Ok(Val {
-                    kind: Kind::Int,
-                    v,
-                })
+                Ok(Val { kind: Kind::Int, v })
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let a = self.as_int(l);
@@ -1141,10 +1147,7 @@ impl Fx<'_, '_> {
             let h = self.boxed(v);
             handles.push(h);
         }
-        let n = self
-            .builder
-            .ins()
-            .iconst(types::I64, handles.len() as i64);
+        let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
         let v = match denotes {
             Denotes::Compiled(id, arity) => {
                 if arity != handles.len() {

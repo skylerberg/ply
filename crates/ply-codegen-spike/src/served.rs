@@ -112,9 +112,7 @@ fn read_response(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<usize> 
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn content_length(head: &[u8]) -> Result<usize> {

@@ -42,7 +42,78 @@ use ply_eval::{Compiled, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::Program;
 use std::cell::{Cell, RefCell};
+use std::process::{Command, ExitStatus};
 use std::rc::Rc;
+
+
+/// How a run that might not come back ended.
+///
+/// [`Mutation::ExceedsBudget(None)`](Mutation::ExceedsBudget) is not a wrong
+/// answer: it is a native recursion with no bound, and the process is gone —
+/// `fatal runtime error: stack overflow`, exit 134 — before any comparison runs.
+/// No harness *inside* that process can report it, because there is no inside
+/// left, which is why `CONTRIBUTING.md` §"Things known to be broken" item 13
+/// recorded it as caught by nothing. The harness that can report it is the one
+/// that started it.
+#[derive(Debug)]
+pub enum Ended {
+    /// The run finished and said what it found, whatever that was.
+    Exited(ExitStatus),
+    /// The run was killed. On Unix this is the signal; everywhere else it is
+    /// whatever the platform says about a process that did not exit.
+    Killed(String),
+}
+
+impl Ended {
+    /// The disagreement a killed run *is*, phrased the way the corpus phrases
+    /// one — or `None` when the run came back and can speak for itself.
+    ///
+    /// A machine with no backend answers this call with a diagnostic. A machine
+    /// with this backend answers nothing at all, ever, and takes the reporter
+    /// with it. That is the largest disagreement available and it is scored as
+    /// one: the alternative is a harness whose most catastrophic case is its
+    /// quietest.
+    pub fn as_disagreement(&self) -> Option<String> {
+        match self {
+            Ended::Exited(_) => None,
+            Ended::Killed(how) => Some(format!(
+                "the backend took the process down ({how}): the machine alone answers a \
+                 diagnostic and the machine with this backend answers nothing at all"
+            )),
+        }
+    }
+}
+
+/// Runs `command` to completion and says whether it came back.
+///
+/// The only reason this exists is that a `SIGSEGV` in a child is data and a
+/// `SIGSEGV` in yourself is not.
+pub fn run_guarded(command: &mut Command) -> Result<(Ended, String)> {
+    let out = command.output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((ended(out.status), text))
+}
+
+/// The same question of a status somebody else waited on: a run whose output is
+/// streaming to the terminal is waited on with `status`, and there is nothing to
+/// capture.
+pub fn ended(status: ExitStatus) -> Ended {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return Ended::Killed(format!("signal {signal}"));
+        }
+    }
+    if status.code().is_none() {
+        return Ended::Killed("no exit code".to_string());
+    }
+    Ended::Exited(status)
+}
 
 /// One way of being wrong.
 #[derive(Clone)]

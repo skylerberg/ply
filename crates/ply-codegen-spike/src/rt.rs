@@ -90,10 +90,26 @@ fn holds_a_handle(value: &Value) -> Option<&'static str> {
     }
 }
 
-/// How much of the value arena is kept between entries. Enough that an ordinary
-/// call never reallocates, small enough that one outsized call does not hold
-/// memory for the life of the process.
+/// The floor under the value arena between entries. Enough that an ordinary call
+/// never reallocates, small enough that a process holding one idle provider is
+/// holding kilobytes.
+///
+/// It is a floor and not a ceiling: [`Ctx::end`] keeps whatever the last
+/// [`SHRINK_EVERY`] entries actually used, so a program whose calls need more
+/// than this does not grow the buffer and hand it straight back on every call.
 const RETAINED_SLOTS: usize = 4096;
+
+/// How many entries a buffer larger than [`RETAINED_SLOTS`] is kept for before
+/// it is offered back.
+///
+/// Handing it back is a reallocation, and paying one per entry is the *time*
+/// half of what `CONTRIBUTING.md` §"Things known to be broken" item 12 reported.
+/// Amortized over this many entries it is 1/64th of a reallocation each, and an
+/// outsized buffer is released after at most two windows — the first records the
+/// peak that earned it, the second finds that peak unclaimed. The memory that
+/// buys the time is bounded by the same two windows rather than by the life of
+/// the provider.
+pub const SHRINK_EVERY: u32 = 64;
 
 /// The failure a compiled function reports by, and the fuel it spends.
 ///
@@ -124,6 +140,14 @@ pub struct Ctx {
     /// `recursion limit of 10000 nested calls exceeded`.
     pub fuel: i64,
     pub slots: Vec<Value>,
+    /// The slots the entry that just finished used, kept because [`Ctx::end`]
+    /// clears the arena and the number is otherwise gone.
+    last_entry: usize,
+    /// The largest arena any entry in the current window used, which is what
+    /// [`Ctx::end`] keeps rather than shrinking back to [`RETAINED_SLOTS`].
+    window_peak: usize,
+    since_shrink: u32,
+    unclosed_entries: u64,
     pub tables: Rc<Tables>,
     /// The arena `ply_eval::builtins::call` insists on. Structurally unreachable:
     /// `cell_get` and `cell_set` are the only builtins that touch it and the
@@ -155,6 +179,10 @@ impl Ctx {
             failed: 0,
             fuel: 0,
             slots: Vec::with_capacity(64),
+            last_entry: 0,
+            window_peak: 0,
+            since_shrink: 0,
+            unclosed_entries: 0,
             tables,
             cells,
             cells_baseline: (stats.allocations, stats.regions_opened),
@@ -176,16 +204,70 @@ impl Ctx {
     pub fn begin(&mut self, fuel: i64) {
         self.failed = 0;
         self.fuel = fuel;
-        self.slots.clear();
-        // One pathological entry — a recursion that runs out of fuel ten
-        // thousand frames down — boxes an intermediate per operation and
-        // `clear` keeps the capacity. Held for the provider's life that is a
-        // leak proportional to the worst call ever made rather than to the
-        // work in front of it, so the buffer is given back.
-        if self.slots.capacity() > RETAINED_SLOTS {
-            self.slots.shrink_to(RETAINED_SLOTS);
-        }
         self.diagnostic = None;
+        // Every path out of an entry calls `end`, so this is one comparison
+        // against an empty arena. It recovers rather than asserts because an
+        // entry handed the previous one's slots is not a crash — the handles
+        // index live `Value`s of usually the same type, which is a plausible
+        // integer and no crash — and it is counted because the day a path
+        // forgets, the count is the only thing that would say so.
+        if !self.slots.is_empty() {
+            self.unclosed_entries += 1;
+            self.end();
+        }
+    }
+
+    /// The other end of [`Ctx::begin`]: the entry gives back what it used.
+    ///
+    /// Until this was split out, `begin` did all of it, and so **every entry
+    /// cost O(the *previous* entry's peak arena)** — `CONTRIBUTING.md`
+    /// §"Things known to be broken" item 12. The clear drops the previous
+    /// entry's `Value`s and the shrink reallocates, and the identical hybrid
+    /// call `mcts.playouts(0, 0, 0)` measured 0.375 µs after a 4-slot
+    /// predecessor against 68.083 µs after a 19,584-slot one: 181x, monotone,
+    /// about 3.5 ns a retained slot, for work it had not asked for.
+    ///
+    /// The drops do not become free — they are the same `Value`s and somebody
+    /// drops them — they are charged to the entry that made them, which is the
+    /// entry whose cost is already proportional to them. What does go away is
+    /// the reallocation, for all but one entry in [`SHRINK_EVERY`].
+    /// `benches/r5-timing/RESULTS.md` §3 carries the before and after.
+    pub fn end(&mut self) {
+        self.last_entry = self.slots.len();
+        self.window_peak = self.window_peak.max(self.last_entry);
+        self.slots.clear();
+        self.since_shrink += 1;
+        if self.since_shrink >= SHRINK_EVERY {
+            let keep = self.window_peak.max(RETAINED_SLOTS);
+            if self.slots.capacity() > keep {
+                self.slots.shrink_to(keep);
+            }
+            self.since_shrink = 0;
+            self.window_peak = 0;
+        }
+    }
+
+    /// How much of the value arena the entry that just finished used.
+    ///
+    /// Two terms because the count is in two places: an entry that closed itself
+    /// recorded it, and an entry that did not — there is no such path, and
+    /// [`Ctx::unclosed_entries`] is what would say so — left its slots in place
+    /// for the next `begin` to find. It is what
+    /// `mcts --carryover` reads a predecessor's size off, and no compiled body
+    /// can see it.
+    pub fn arena_after_entry(&self) -> usize {
+        if self.slots.is_empty() {
+            self.last_entry
+        } else {
+            self.slots.len()
+        }
+    }
+
+    /// Entries that reached [`Ctx::begin`] without their predecessor having
+    /// closed itself. Always zero, and counted rather than asserted for the
+    /// reason [`crate::entry::Declines::reentered`] is.
+    pub fn unclosed_entries(&self) -> u64 {
+        self.unclosed_entries
     }
 
     /// Whether a builtin allocated a cell in the private arena. Always `false`,
