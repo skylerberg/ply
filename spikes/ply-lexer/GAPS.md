@@ -280,8 +280,14 @@ max_calls crates/ply-cli/src/` returns **one** line —
 the `use` that imports the constant. **There is no CLI flag**, and `ply run
 --help` offers none.
 
-`examples/desk.ply` is 19,576 tokens and `crates/ply-std/ply/db.ply` — the
-largest `.ply` file in the tree, and one the compiler ships — is **29,212**. A
+`examples/desk.ply` is 19,576 tokens and `crates/ply-std/ply/db.ply` — the file
+with the most tokens in the tree, and one the compiler ships — is **29,213**.
+
+> **Corrected (verification pass, 2026-08-24).** This read *"the largest `.ply`
+> file in the tree, and one the compiler ships — is **29,212**"*. It is 29,213
+> by `plydump`, and it is the largest by *tokens*, not by bytes:
+> `examples/desk.ply` is 159,683 bytes against `db.ply`'s 135,285. Neither
+> correction touches the conclusion — the bound is 10,000 either way. A
 recursive scanner, which is the shape `std.json` uses and the shape the Rust
 lexer's `loop` translates to, dies at token 10,000: a third of the way through
 `db.ply`, with a diagnostic that ends the whole run. The ceiling is not a
