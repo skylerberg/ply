@@ -52,17 +52,34 @@
 //! | `unoffered` | 377 | `mcts.empty_node case 0: — left {action: -1, …}, right 0` |
 //! | `answers=0@mcts.below` | 69 | `mcts.below case 24: verdict — left [E0502] remainder by zero, right passed` |
 //! | `exceeds-budget=4` | 3 | `mcts.playouts case 23: diagnostic labels[0] — this call is too deeply nested, at two different spans` |
-//! | `exceeds-budget` (no bound) | none | no case ran: `fatal runtime error: stack overflow`, exit 134 |
+//! | `exceeds-budget` (no bound) | **1, and it is the crash** | `the backend took the process down (signal 6)` — re-taken 2026-08-24 |
 //!
 //! The last two rows are the ones to read twice. Overrunning the budget by a
 //! factor of four is caught, and caught on the axis this project added
 //! deliberately: both engines raise `recursion limit of 10000 nested calls
 //! exceeded`, and what separates them is the *label span* — a comparison that
-//! scored `(Err, Err)` as agreement would have passed. Ignoring the budget
-//! altogether is not caught at all, because it is not a wrong answer: the native
-//! recursion overflows the stack and the process is gone before anything is
-//! compared. The bounded, crash-free form of that same mistake is
-//! [`a_backend_that_runs_past_its_budget_is_caught`].
+//! scored `(Err, Err)` as agreement would have passed. That axis is armed by
+//! [`two_raises_that_differ_are_not_agreement_although_both_are_raises`], which
+//! asserts the discrimination on two real diagnostics rather than relying on a
+//! corruption tuned to produce one.
+//!
+//! > **The last row is corrected (2026-08-24), and the correction is a fix
+//! > rather than a re-measurement.** It read: *"| `exceeds-budget` (no bound) |
+//! > none | no case ran: `fatal runtime error: stack overflow`, exit 134 |"*,
+//! > and the paragraph under it read *"Ignoring the budget altogether is not
+//! > caught at all, because it is not a wrong answer: the native recursion
+//! > overflows the stack and the process is gone before anything is compared."*
+//! > Both were true of a harness that ran the corpus in its own process. Every
+//! > `--mutate` run is now started as a child (`mcts::guard_a_mutated_run`,
+//! > `ply_codegen_spike::wrong::run_guarded`), and a child that dies by a signal
+//! > is reported as the disagreement it is: the machine alone answers a
+//! > diagnostic, the machine with that backend answers nothing at all. Re-taken
+//! > with the shipped binary — the child still overflows its stack, and the run
+//! > now ends `DISAGREEMENT  the backend took the process down (signal 6)` with
+//! > a non-zero exit, where it used to end `exit 134` with no report.
+//! > [`a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it`]
+//! > is the standing form. The bounded, crash-free form is
+//! > [`a_backend_that_runs_past_its_budget_is_caught`].
 //!
 //! Every one of those was reported by one leg of the corpus and not the other,
 //! and it is worth knowing which. `verify` compares the hybrid machine against
@@ -141,10 +158,11 @@ use ply_codegen_spike::entry::admissible;
 use ply_codegen_spike::jit::Opts;
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
-use ply_codegen_spike::wrong::{Mutant, Mutation};
+use ply_codegen_spike::wrong::{Ended, Mutant, Mutation, run_guarded};
 use ply_eval::{Machine, Value, compare_answers};
 use ply_span::Span;
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 
 fn hazards() -> &'static Loaded {
@@ -526,6 +544,146 @@ fn a_backend_that_runs_past_its_budget_is_caught() {
         compare_answers(&machine, &hybrid, "pure.ladder", &expected, &actual).is_some(),
         "a backend that ignored the machine's bound answered {} and nothing reported it",
         actual.map(|v| v.render()).unwrap_or_default()
+    );
+}
+
+/// What tells this test binary that it is the child and must run the crash
+/// rather than guard it.
+const CRASH_CHILD: &str = "PLY_SPIKE_CRASH_CHILD";
+
+/// 7b. Ignoring the budget *entirely*, which is not a wrong answer at all.
+///
+/// [`a_backend_that_runs_past_its_budget_is_caught`] bounds the runaway at 1,000
+/// native frames so that a comparison exists to make. Unbounded there is no
+/// comparison and no harness: the native recursion overflows the stack and the
+/// process is gone — `fatal runtime error: stack overflow`, exit 134 — before a
+/// single case runs. `CONTRIBUTING.md` §"Things known to be broken" item 13
+/// recorded that as caught by nothing, and the reason it was caught by nothing
+/// is that every candidate reporter was inside the process that died.
+///
+/// So the reporter is outside it. This runs the crash as a child of itself and
+/// asserts three things a report needs: the child really did die, it died by a
+/// signal rather than by an exit code (an exit code is a harness talking; a
+/// signal is a harness that never got the chance), and
+/// [`Ended::as_disagreement`] phrases it as the disagreement it is. `mcts`
+/// guards every `--mutate` run the same way, through the same two functions.
+///
+/// Deleting the guard is what this bites: `run_guarded` answering
+/// `Ended::Exited` for a killed child, or `as_disagreement` answering `None` for
+/// a killed one, fails here and nowhere else.
+#[test]
+fn a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it() {
+    if std::env::var_os(CRASH_CHILD).is_some() {
+        the_run_that_does_not_come_back();
+        // Reached only if the premise died: a native recursion of five million
+        // frames that did *not* overflow the stack. Distinguishable from a
+        // signal by the parent, which is the point of not panicking here.
+        std::process::exit(77);
+    }
+
+    let exe = std::env::current_exe().expect("a test binary knows where it is");
+    let mut command = Command::new(exe);
+    command
+        .args([
+            "--exact",
+            "a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it",
+            "--nocapture",
+        ])
+        .env(CRASH_CHILD, "1");
+    let (ended, output) = run_guarded(&mut command).expect("the child runs");
+
+    let how = match &ended {
+        Ended::Killed(how) => how.clone(),
+        Ended::Exited(status) => panic!(
+            "a backend running a five-million-deep native recursion with unlimited fuel came \
+             back with {status:?}, so the hazard this test is about is gone and the report \
+             below is describing nothing:\n{output}"
+        ),
+    };
+    assert!(
+        output.contains("stack overflow"),
+        "the child died ({how}) without overflowing its stack, so it died of something else \
+         and this test is measuring that instead:\n{output}"
+    );
+    let reported = ended
+        .as_disagreement()
+        .expect("a killed run is a disagreement");
+    assert!(
+        reported.contains("took the process down"),
+        "a killed run was reported as `{reported}`, which does not say what happened"
+    );
+}
+
+/// The child's half: a backend with unlimited fuel under a machine whose bound
+/// is 600, on a recursion deep enough that the native stack is what stops it.
+fn the_run_that_does_not_come_back() {
+    let loaded = hazards();
+    let harness = pure_harness(loaded);
+    let mutant = Mutant::new(harness.bodies.clone(), Mutation::ExceedsBudget(None));
+    let mut hybrid = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check).with_max_calls(600);
+    hybrid.set_compiled(mutant);
+    let _ = hybrid.call(
+        "pure.ladder",
+        vec![Value::Int(5_000_000), Value::Int(1)],
+        Span::DUMMY,
+    );
+}
+
+/// 7c. Two raises are not agreement, and the axis that says so.
+///
+/// The bounded form of the same corruption is caught on the diagnostic-label
+/// axis and only there: over the kernel corpus, `--mutate exceeds-budget=4`
+/// reports `mcts.playouts case 23: diagnostic labels[0] — this call is too
+/// deeply nested, at two different spans`. Both engines raise, both raise the
+/// *same* code and the same message, and the two differ in where. **A harness
+/// scoring `(Err, Err)` as agreement would have passed that run**, and this
+/// project shipped exactly that comparison until R5.
+///
+/// So this asserts the discrimination directly rather than through a corruption
+/// tuned to produce it: two real diagnostics from this fixture, error-ness
+/// identical, and `compare_answers` — the function the corpus and the hazard
+/// tests both call — reporting them as a divergence anyway. The first assertion
+/// is the one that matters: it is what a weaker harness would have satisfied.
+#[test]
+fn two_raises_that_differ_are_not_agreement_although_both_are_raises() {
+    let loaded = hazards();
+    let mut left = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
+    let mut right = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check).with_max_calls(600);
+
+    let divided = left.call(
+        "pure.share",
+        vec![Value::Int(1), Value::Int(0)],
+        Span::DUMMY,
+    );
+    let too_deep = right.call(
+        "pure.ladder",
+        vec![Value::Int(100_000), Value::Int(1)],
+        Span::DUMMY,
+    );
+    assert_eq!(
+        divided.is_err(),
+        too_deep.is_err(),
+        "the fixture stopped raising on both sides, so there is no `(Err, Err)` to compare"
+    );
+    assert!(divided.is_err(), "neither side raised at all");
+    assert!(
+        compare_answers(&left, &right, "pure.share", &divided, &too_deep).is_some(),
+        "a division by zero and a recursion limit were scored as agreement because both were \
+         raises"
+    );
+
+    // And the control: the same diagnostic on both sides is agreement, so the
+    // assertion above is discrimination rather than a comparison that reports
+    // everything.
+    let mut same = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
+    let again = same.call(
+        "pure.share",
+        vec![Value::Int(1), Value::Int(0)],
+        Span::DUMMY,
+    );
+    assert!(
+        compare_answers(&left, &same, "pure.share", &divided, &again).is_none(),
+        "one diagnostic compared against itself was reported as a divergence"
     );
 }
 

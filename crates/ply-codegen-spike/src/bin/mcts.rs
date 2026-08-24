@@ -72,6 +72,9 @@ struct Args {
     /// A corpus that has never been run against a wrong backend reports the same
     /// "0 disagreements" whether it tests the seam or nothing at all.
     mutate: Option<String>,
+    /// The subject of [`carryover`]: one function, timed after predecessors of
+    /// every size the corpus generates for it.
+    carryover: Option<String>,
     /// `agreement` stops after the census, the agreement corpus and the entry
     /// counts — everything deterministic — and takes no wall clock at all.
     /// Correctness before timing is the house rule, and a mode that cannot time
@@ -89,6 +92,7 @@ fn parse_args() -> Result<Args> {
         out: None,
         probe: None,
         why: None,
+        carryover: None,
         mutate: None,
         only: None,
     };
@@ -102,6 +106,7 @@ fn parse_args() -> Result<Args> {
             "--out" => a.out = argv.next(),
             "--probe" => a.probe = argv.next(),
             "--why" => a.why = argv.next(),
+            "--carryover" => a.carryover = argv.next(),
             "--mutate" => a.mutate = argv.next(),
             "--only" => a.only = argv.next(),
             other => bail!("unknown argument: {other}"),
@@ -1232,10 +1237,191 @@ fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
     bail!("`{which}` is not one of this kernel's subjects")
 }
 
+/// What one entry costs as a function of the *previous* entry's arena.
+///
+/// `CONTRIBUTING.md` §"Things known to be broken" item 12 is a curve, and a
+/// curve nobody can re-take is a number of unknown provenance the moment the
+/// code moves. This is the harness for it. Every row times the **same** call —
+/// the cheapest argument set the corpus generates for `which` — and varies only
+/// the call made immediately before it, which is drawn from the same eight sets
+/// `--why` uses. The interpreter column is the control: it runs the same two
+/// calls with no backend attached, so a slope that appears in both columns is
+/// the program and a slope that appears in one is the seam.
+///
+/// Best-of-`repeats` on the timed call, and the predecessor is **not** timed —
+/// what it costs is its own business, and the question here is what it charges
+/// the call after it.
+fn carryover(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
+    let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(dir)?));
+    let (_, accepted) = census(loaded, KERNEL)?;
+    let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
+    let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
+    let shapes = non_scalar_arguments();
+    // The same seed and the same draw order as `--why`, so these are the sets
+    // the per-function table timed rather than fresh ones that resemble them.
+    let mut rng = Rng(0x243F6A8885A308D3);
+    let mut sets: Vec<Vec<Value>> = Vec::new();
+    let mut found = false;
+    for name in subjects(loaded) {
+        let Some(kinds) = scalar_params(loaded, &name) else {
+            continue;
+        };
+        let generated = cases_for(&mut rng, &name, &kinds, 12, &shapes);
+        if name != which {
+            continue;
+        }
+        found = true;
+        for Case { args, scalar } in generated {
+            if sets.len() >= 8 {
+                break;
+            }
+            if !scalar || harness.interpret_outcome(&name, &args).is_err() {
+                continue;
+            }
+            let before = harness.hybrid_counts().0;
+            if harness.hybrid_outcome(&name, &args).is_err() {
+                continue;
+            }
+            if harness.hybrid_counts().0 == before {
+                continue;
+            }
+            sets.push(args);
+        }
+        break;
+    }
+    if !found {
+        bail!("`{which}` is not one of this kernel's subjects");
+    }
+    if sets.len() < 2 {
+        bail!(
+            "`{which}` generated {} enterable argument set(s); a carry-over curve needs at \
+             least two sizes to have a shape",
+            sets.len()
+        );
+    }
+
+    // What each set leaves behind, measured rather than assumed: the arena is a
+    // function of the work the body did and not of the arguments' magnitude.
+    let mut arenas: Vec<usize> = Vec::new();
+    for set in &sets {
+        harness.run_hybrid(which, set)?;
+        arenas.push(harness.bodies.arena_after_entry());
+    }
+    let subject = arenas
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, arena)| **arena)
+        .map(|(i, _)| i)
+        .expect("there is at least one set");
+
+    let rendered = |set: &Vec<Value>| {
+        let parts: Vec<String> = set.iter().map(|v| v.render()).collect();
+        format!("({})", parts.join(", "))
+    };
+    println!("== {which}: what an entry costs after the entry before it ==");
+    println!(
+        "   timed call, identical in every row: {}   best of {repeats}",
+        rendered(&sets[subject])
+    );
+    println!("   1-minute load average: {:.2}", load1());
+    println!(
+        "   {:<28} {:>8}  {:>12}  {:>12}",
+        "predecessor", "arena", "hybrid µs", "interp µs"
+    );
+
+    let mut rows: Vec<(usize, String, f64, f64, u64)> = Vec::new();
+    for (i, set) in sets.iter().enumerate() {
+        let mut hybrid_best = f64::INFINITY;
+        let mut arena = 0usize;
+        let entered_before = harness.hybrid_counts().0;
+        for _ in 0..repeats {
+            harness.run_hybrid(which, set)?;
+            arena = harness.bodies.arena_after_entry();
+            let started = Instant::now();
+            harness.run_hybrid(which, &sets[subject])?;
+            hybrid_best = hybrid_best.min(started.elapsed().as_secs_f64() * 1e6);
+        }
+        let entries = harness.hybrid_counts().0 - entered_before;
+
+        let mut interp_best = f64::INFINITY;
+        for _ in 0..repeats {
+            harness.interpret(which, set)?;
+            let started = Instant::now();
+            harness.interpret(which, &sets[subject])?;
+            interp_best = interp_best.min(started.elapsed().as_secs_f64() * 1e6);
+        }
+        rows.push((arena, rendered(set), hybrid_best, interp_best, entries));
+        let _ = i;
+    }
+    rows.sort_by_key(|r| r.0);
+    for (arena, set, hybrid, interp, entries) in &rows {
+        println!("   {set:<28} {arena:>8}  {hybrid:>12.3}  {interp:>12.3}   {entries} entries");
+    }
+    let flattest = rows.iter().map(|r| r.2).fold(f64::INFINITY, f64::min);
+    let steepest = rows.iter().map(|r| r.2).fold(0.0f64, f64::max);
+    println!(
+        "   spread: {:.3}x over arenas {} to {}",
+        steepest / flattest,
+        rows.first().map(|r| r.0).unwrap_or(0),
+        rows.last().map(|r| r.0).unwrap_or(0)
+    );
+    println!(
+        "   entries that found their predecessor's slots still in place: {}",
+        harness.bodies.unclosed_entries()
+    );
+    Ok(())
+}
+
+/// What tells a re-executed `--mutate` run that it is the child and must do the
+/// work rather than guard it.
+const MUTANT_CHILD: &str = "PLY_SPIKE_MUTANT_CHILD";
+
+/// A mutated run, started as a child, so that a backend which takes the process
+/// down is a reported disagreement rather than a dead terminal.
+///
+/// `--mutate exceeds-budget` with no bound is a native recursion with no bound:
+/// `fatal runtime error: stack overflow`, exit 134, before a single case is
+/// compared. Nothing inside that process can report it, so the report comes from
+/// outside it. Every `--mutate` run is guarded and not only that one, because
+/// "which corruptions can crash" is exactly the thing a corpus is not supposed
+/// to have to know in advance.
+///
+/// The child's output is inherited rather than captured: a corpus run prints as
+/// it goes, and a guard that swallowed the output until the end would be paid
+/// for by every run that does not crash.
+fn guard_a_mutated_run() -> Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.args(std::env::args_os().skip(1)).env(MUTANT_CHILD, "1");
+    let ended = ply_codegen_spike::wrong::ended(command.status()?);
+    match ended.as_disagreement() {
+        Some(d) => {
+            println!("\n   DISAGREEMENT  {d}");
+            bail!(
+                "1 disagreement: the corpus noticed, and what it noticed was fatal. A backend \
+                 that ignores its budget is not a wrong answer — it is a native recursion with \
+                 no bound — so the machine that reports it has to be a different one."
+            )
+        }
+        None => match ended {
+            ply_codegen_spike::wrong::Ended::Exited(status) if status.success() => Ok(()),
+            ply_codegen_spike::wrong::Ended::Exited(status) => {
+                std::process::exit(status.code().unwrap_or(1))
+            }
+            ply_codegen_spike::wrong::Ended::Killed(_) => unreachable!("answered above"),
+        },
+    }
+}
+
 fn main() -> Result<()> {
     let a = parse_args()?;
+    if a.mutate.is_some() && std::env::var_os(MUTANT_CHILD).is_none() {
+        return guard_a_mutated_run();
+    }
     if let Some(which) = &a.probe {
         return probe_recursion(&a.dir, which == "compiled");
+    }
+    if let Some(which) = &a.carryover {
+        return carryover(&a.dir, which, a.repeats);
     }
     if let Some(which) = &a.why {
         return why(&a.dir, which, a.repeats);

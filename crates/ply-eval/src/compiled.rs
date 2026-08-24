@@ -75,11 +75,18 @@
 //!
 //! That claim is now demonstrated rather than argued —
 //! `crates/ply-codegen-spike/tests/mutations.rs` runs eight deliberately wrong
-//! backends against the kernel corpus and names what caught each — and two of
-//! them were **not** caught: a backend that ignores its budget entirely
-//! overflows the native stack before any comparison runs, and no corpus in this
-//! tree can exercise the published-row gate at all. Read that file's header
-//! before trusting this one.
+//! backends against the kernel corpus and names what caught each. **One of them
+//! is still not caught by any corpus in this tree**: no corpus can exercise the
+//! published-row gate, because `benches/kernel` declares no effect and the
+//! differential corpus declines effectful names. Read that file's header before
+//! trusting this one.
+//!
+//! > **Narrowed (2026-08-24).** This read "and two of them were **not** caught:
+//! > a backend that ignores its budget entirely overflows the native stack
+//! > before any comparison runs, and no corpus in this tree can exercise the
+//! > published-row gate at all." The first half is closed: a `--mutate` run is
+//! > started as a child, and a child that dies by a signal is reported as a
+//! > disagreement rather than ending the run. The second half stands.
 //!
 //! Two more, stated because they are limits rather than guarantees. A backend's
 //! panic is not caught, so a backend bug aborts the process rather than becoming
@@ -90,8 +97,47 @@
 //!
 //! No implementation of [`Compiled`] exists in this workspace. The doubles in
 //! this module's tests are what keep it exercised.
+//!
+//! # What polices this seam, and what does not
+//!
+//! Counted rather than characterised, 2026-08-24, because
+//! `CONTRIBUTING.md` §"Things known to be broken" item 13's first bullet is a
+//! claim about coverage and a claim about coverage is checkable:
+//!
+//! | polices it | what it is |
+//! | --- | --- |
+//! | this module's tests | **32** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity |
+//! | `crates/ply-eval/tests/differential_corpus.rs` | **5** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
+//! | `crates/ply-codegen-spike/tests/mutations.rs` | **13** tests, eight deliberately wrong backends, each asserted to have *fired* before it is asserted to be caught |
+//! | `crates/ply-codegen-spike/tests/hazards.rs`, `mcts_kernel.rs` | **25** tests over the real cranelift backend |
+//! | `mcts --mutate <corruption>` | the same eight corruptions at corpus scale — 2,396 generated cases; run by hand, nothing runs it for you |
+//!
+//! And what does not, which is the part worth writing down:
+//!
+//! - **`ply test --engine both` cannot install a backend at all.** `Compiled`
+//!   and `set_compiled` occur **zero** times in `crates/ply-cli` — source and
+//!   tests both. Every one of the five `set_compiled` call sites in the
+//!   workspace is a test or the spike's own harness. So the shipping CLI catches
+//!   **none** of the eight wrong backends, on any corpus, and `--engine both`
+//!   compares the tree-walker against the machine and nothing else. A backend is
+//!   reachable only from a test or from the spike's binaries.
+//! - **Nothing enforces the result-cache rule.** A run with a backend attached
+//!   is a third execution strategy whose results a cache must not keep; the rule
+//!   is unenforced *because it is unreachable* — see [`crate::Machine::set_compiled`].
+//!   Wiring a backend into the CLI is what would make it reachable, and it is
+//!   gated on the entry-point defect (`CONTRIBUTING.md` item 9) rather than on
+//!   this seam.
+//! - **No corpus in the tree can exercise the published-row gate.**
+//!   `benches/kernel` declares no effect, so every definition in it publishes an
+//!   empty row and the gate has nothing to refuse; `ply-eval`'s differential
+//!   corpus declines effectful names before the gate is reached. Closing it
+//!   means a corpus that declares an effect, which does not exist yet.
+//! - **A wrong `Int` is not caught here by anything.** It is caught by
+//!   `--engine both` and the differential corpus comparing against an
+//!   independent tree-walker, which is the sentence above this section.
 
-use crate::value::Value;
+use crate::value::{Closure, ClosureKind, Value};
+use ply_core::CheckOutput;
 use ply_span::Symbol;
 use ply_syntax::ast::Program;
 
@@ -151,6 +197,95 @@ pub(crate) fn crossable(value: &Value) -> bool {
     matches!(value, Value::Int(_) | Value::Bool(_))
 }
 
+/// Which gate refused a call, named rather than collapsed into `None`.
+///
+/// A refusal that carries no reason is a refusal any *other* gate can satisfy,
+/// and this seam has already paid for that once: [`Gate::Anonymous`] was
+/// asserted by `an_anonymous_closure_is_never_offered` — whose doc said "the
+/// name gate is what refuses it" — and replacing that gate with a fabricated
+/// empty [`Symbol`] left the test, and all of this crate's unit tests, green,
+/// because [`Gate::PublishedRow`] refuses an unknown name one line later. The
+/// test named a mechanism it could not see. Every variant here has a test that
+/// asserts *it*, and the table in this module's test header records the deletion
+/// that was run against each one and the test that went red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// Not a body this machine lowered: a tree-walker closure, a constructor or
+    /// a builtin.
+    NotLoweredCode,
+    /// An argument this boundary does not carry — see [`crossable`].
+    ArgumentShape,
+    /// Inside a `simulate` region.
+    SimulateRegion,
+    /// A body with no program-wide name: a lambda.
+    Anonymous,
+    /// The published effect row is non-empty, or there is no row to read at all.
+    PublishedRow,
+    /// No nested call left before the machine's own bound.
+    Budget,
+}
+
+/// The name a backend may be offered this call under and the budget to offer it
+/// with, or the gate that refused the call.
+///
+/// Split out of `Machine::compiled_answer` so that each gate is a fact a test
+/// can assert directly. The machine half of the seam is the two lines around it:
+/// the backend lookup, which is what a machine with no backend fails, and the
+/// [`crossable`] test on the answer.
+///
+/// The gates are ordered cheapest and most-discriminating first, and
+/// [`Gate::ArgumentShape`] deliberately precedes the row lookup: with a backend
+/// attached, a call taking a record, a list or a string is refused on one
+/// discriminant test per argument and never hashes a [`Symbol`] into
+/// [`CheckOutput::defs`]. That ordering is a cost claim, so
+/// `the_shape_gate_is_reached_before_the_row_is_looked_up` asserts it.
+///
+/// - **[`Gate::NotLoweredCode`]**: a tree-walker closure carries a program-wide
+///   name (`interp.rs:118`) over a body that is a deep clone rather than a node
+///   of the program, and `Interp` is the independent oracle `--engine both`
+///   audits against. Routing its closures into compiled code would audit the
+///   backend against itself.
+/// - **[`Gate::SimulateRegion`]**: off inside a `simulate` region for the reason
+///   `Machine::constant` is off there — an allocation a search depends on must
+///   not be skipped, and an `Access` never recorded is an interleaving never
+///   explored. `record_cell_access` and `record_alloc_access` are no-ops outside
+///   one, so this single gate is the whole partial-order story: a compiled body
+///   cannot fail to record what nothing is recording.
+/// - **[`Gate::PublishedRow`]**: necessary and not sufficient, exactly as the
+///   memo's note says — an empty row still permits a definition that opens its
+///   own `with_cell`, and (see this module's header) one that discharges its own
+///   effects under its own `handle`. Outside a `simulate` region that allocation
+///   is unobservable, which is the same argument `Machine::constant` rests on.
+/// - **[`Gate::Budget`]**: a zero budget declines, and the interpreted path
+///   raises the machine's own call-limit diagnostic rather than a backend's.
+pub(crate) fn admit<'a>(
+    closure: &'a Closure,
+    args: &[Value],
+    in_simulate: bool,
+    check: Option<&CheckOutput>,
+    max_calls: usize,
+    calls: usize,
+) -> Result<(&'a Symbol, usize), Gate> {
+    if !matches!(closure.kind, ClosureKind::Code { .. }) {
+        return Err(Gate::NotLoweredCode);
+    }
+    if !args.iter().all(crossable) {
+        return Err(Gate::ArgumentShape);
+    }
+    if in_simulate {
+        return Err(Gate::SimulateRegion);
+    }
+    let name = closure.name.as_ref().ok_or(Gate::Anonymous)?;
+    if !crate::memo::pure_by_published_row(check, name) {
+        return Err(Gate::PublishedRow);
+    }
+    let budget = max_calls.checked_sub(calls).ok_or(Gate::Budget)?;
+    if budget == 0 {
+        return Err(Gate::Budget);
+    }
+    Ok((name, budget))
+}
+
 /// Doubles, because nothing in this workspace implements [`Compiled`].
 ///
 /// `rm -r crates/ply-codegen-spike` must leave a seam that is still exercised
@@ -159,6 +294,53 @@ pub(crate) fn crossable(value: &Value) -> bool {
 /// violate it. Two of them are deliberately wrong backends: one answers a value
 /// this boundary refuses, one answers the wrong `Int`. The second is not caught
 /// here and the test says so.
+///
+/// # What each gate's test is worth
+///
+/// A test named after a mechanism it cannot see is this crate's known defect
+/// (`CONTRIBUTING.md` §"Things known to be broken" item 13), so each gate's
+/// deletion was run against the whole of `cargo test -p ply-eval --lib` — 526
+/// tests — and the tests that went red are recorded. Nothing below is reasoning
+/// about what a deletion would do.
+///
+/// Re-running it: mutate, `touch` the file, and check the run actually printed
+/// `Compiling ply-eval` before believing its result. Cargo fingerprints on
+/// second-granular mtimes, so a script that rewrites this file and invokes
+/// `cargo test` within the same second can be served the previous artifact —
+/// which reports the *previous* mutation's reds under the current one's name.
+/// Every row below was taken with that check enforced.
+///
+/// | Deletion from [`admit`] | Red |
+/// |---|---|
+/// | the [`ClosureKind::Code`] test | `a_body_this_machine_did_not_lower_is_refused_by_the_kind_gate`, `a_tree_walker_closure_with_a_program_wide_name_is_never_offered` |
+/// | the [`crossable`] test on arguments | 5, incl. `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `a_secret_is_never_offered_and_never_accepted` |
+/// | the `in_simulate` test | `a_call_inside_a_simulate_region_is_refused_by_the_region_gate`, `nothing_is_offered_inside_a_simulate_region` |
+/// | the name test, replaced by a fabricated empty [`Symbol`] | `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`, **and nothing else** |
+/// | the published-row test | 5, incl. `a_definition_whose_published_row_is_not_empty_is_never_offered` |
+/// | the `budget == 0` test | `the_last_nested_call_is_refused_by_the_budget_gate`, `the_budget_is_the_machines_remaining_depth_and_never_reaches_zero` |
+/// | `checked_sub` weakened to `saturating_sub` | **nothing — 526 still green** |
+///
+/// > **Corrected in place (2026-08-24).** The last two rows were one row, and it
+/// > read: *"| the budget test, replaced by `saturating_sub` |
+/// > `the_last_nested_call_is_refused_by_the_budget_gate`,
+/// > `the_budget_is_the_machines_remaining_depth_and_never_reaches_zero` |"*.
+/// > That credits one mutation with another mutation's result. Re-run one at a
+/// > time: deleting the `budget == 0` test turns those two red, and weakening
+/// > `checked_sub` to `saturating_sub` turns **nothing** red. The second is not
+/// > a hole — `saturating_sub` answers `0` where `checked_sub` answers `None`,
+/// > and `0` is what the next line already refuses, so the two spellings are
+/// > indistinguishable to any test. `checked_sub` is there to say in the source
+/// > that a machine whose `max_calls` was lowered under a live stack is a case
+/// > somebody thought about; it is a spelling, not a gate, and it is the one
+/// > line in this function no test can bite.
+///
+/// The fourth row is the whole of item 13. Before this block that deletion was
+/// caught by nothing at all: the row gate refuses an unpublished name one line
+/// later, so a fabricated name produced the same *behaviour* through a
+/// different mechanism, and `an_anonymous_closure_is_never_offered` — which
+/// claimed the name gate by name — stayed green. One test covering one gate is
+/// the thinnest row in the table, and it is thin because the gate below it
+/// masks it; that is the fact the row is recording, not a gap in it.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,9 +725,18 @@ mod tests {
         assert_eq!(backend.names(), vec!["double"]);
     }
 
-    /// A lambda is `ClosureKind::Code` with no name, so the name gate is what
-    /// refuses it — a backend is keyed by program-wide name and has nothing to
-    /// answer for an anonymous body.
+    /// A lambda is `ClosureKind::Code` with no name, and nothing anonymous
+    /// reaches a backend — a backend is keyed by program-wide name and has
+    /// nothing to answer for an anonymous body.
+    ///
+    /// > **Corrected in place (2026-08-24).** This doc used to say "so the name
+    /// > gate is what refuses it". It could not see that: replacing
+    /// > `closure.name.as_ref()?` with a fabricated empty `Symbol` left this
+    /// > test — and every one of this crate's unit tests — green, because the
+    /// > row gate refuses the fabricated name one line later. What it asserts is
+    /// > the behaviour. The *mechanism* is asserted by
+    /// > [`an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`],
+    /// > which is the test that goes red under that substitution.
     #[test]
     fn an_anonymous_closure_is_never_offered() {
         let c = checked(vec![double_def()]);
@@ -565,6 +756,230 @@ mod tests {
             backend.names(),
             vec!["double"],
             "an anonymous closure was offered to a backend"
+        );
+    }
+
+    /// A `Code` closure built by hand, so [`admit`] can be asked about a body
+    /// the machine would not otherwise hand it: an anonymous one, or one under a
+    /// name no definition publishes.
+    fn code_closure(name: Option<&str>, params: &[&str], body: Expr) -> Closure {
+        Closure {
+            name: name.map(Symbol::new),
+            kind: ClosureKind::Code {
+                params: Rc::new(params.iter().copied().map(Symbol::new).collect()),
+                body: crate::code::lower(&body),
+                env: Env::empty(),
+                module: 0,
+            },
+        }
+    }
+
+    fn double_closure() -> Closure {
+        code_closure(Some("double"), &["x"], bin(BinOp::Mul, var("x"), int(2)))
+    }
+
+    /// The gate chain over `c`'s program, outside a region and at full budget.
+    /// The name is rendered because what a test wants to say is "offered as
+    /// `double`", and `Symbol` is not what it wants to write.
+    fn gate(c: &Checked, closure: &Closure, args: &[Value]) -> Result<(String, usize), Gate> {
+        admit(closure, args, false, Some(&c.check), DEFAULT_MAX_CALLS, 0)
+            .map(|(name, budget)| (name.as_str().to_string(), budget))
+    }
+
+    /// What every gate test below reads its refusal against: this call, on this
+    /// program, clears all of them.
+    fn admitted() -> Result<(String, usize), Gate> {
+        Ok(("double".to_string(), DEFAULT_MAX_CALLS))
+    }
+
+    /// A tree-walker closure carries a program-wide name over a body that is a
+    /// deep clone rather than a node of the program, and `Interp` is the oracle
+    /// `--engine both` audits the machine against. The behaviour is
+    /// [`a_tree_walker_closure_with_a_program_wide_name_is_never_offered`]; this
+    /// is the gate that produces it.
+    #[test]
+    fn a_body_this_machine_did_not_lower_is_refused_by_the_kind_gate() {
+        let c = checked(vec![double_def()]);
+        let treewalk = Closure {
+            name: Some(Symbol::new("double")),
+            kind: ClosureKind::Fn {
+                params: vec![Symbol::new("x")],
+                body: Arc::new(bin(BinOp::Mul, var("x"), int(2))),
+                env: Env::empty(),
+                module: 0,
+            },
+        };
+        assert_eq!(
+            gate(&c, &treewalk, &[Value::Int(21)]),
+            Err(Gate::NotLoweredCode)
+        );
+        assert_eq!(
+            gate(&c, &double_closure(), &[Value::Int(21)]),
+            admitted(),
+            "the same name over a lowered body is refused too, so the test above says nothing"
+        );
+    }
+
+    /// The kinds this boundary carries, asked of the gate rather than of a run.
+    #[test]
+    fn an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate() {
+        let c = checked(vec![double_def()]);
+        let subject = double_closure();
+        for refused in [
+            Value::Float(1.0),
+            Value::str("21"),
+            Value::Unit,
+            Value::List(Default::default()),
+            Value::Secret(Arc::new(Value::Int(21))),
+        ] {
+            assert_eq!(
+                gate(&c, &subject, std::slice::from_ref(&refused)),
+                Err(Gate::ArgumentShape),
+                "{refused:?} was carried across the boundary"
+            );
+        }
+        assert_eq!(gate(&c, &subject, &[Value::Int(21)]), admitted());
+        assert_eq!(gate(&c, &subject, &[Value::Bool(true)]), admitted());
+    }
+
+    /// Inside a `simulate` region every cell touch and every allocation is an
+    /// `Access` the search prunes on, and a body the machine did not run records
+    /// none of them.
+    #[test]
+    fn a_call_inside_a_simulate_region_is_refused_by_the_region_gate() {
+        let c = checked(vec![double_def()]);
+        let subject = double_closure();
+        let args = [Value::Int(21)];
+        assert_eq!(
+            admit(&subject, &args, true, Some(&c.check), DEFAULT_MAX_CALLS, 0),
+            Err(Gate::SimulateRegion)
+        );
+        assert_eq!(gate(&c, &subject, &args), admitted());
+    }
+
+    /// The gate this block exists to arm, and the one hole
+    /// `CONTRIBUTING.md` §"Things known to be broken" item 13 named.
+    ///
+    /// [`an_anonymous_closure_is_never_offered`] asserts the behaviour — nothing
+    /// anonymous reaches a backend — and is satisfied by whichever gate happens
+    /// to refuse first. Replacing `closure.name.as_ref()?` with a fabricated
+    /// empty `Symbol` leaves it green, because the row gate refuses the
+    /// fabrication downstream. The third assertion here is that fabrication,
+    /// spelled out: a name no definition publishes really is refused by
+    /// [`Gate::PublishedRow`], which is *why* it could stand in for the name
+    /// gate without anything noticing. Under that substitution the first
+    /// assertion reads `Err(Gate::PublishedRow)` and this test is what goes red.
+    #[test]
+    fn an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate() {
+        let c = checked(vec![double_def()]);
+        let anonymous = code_closure(None, &["x"], bin(BinOp::Mul, var("x"), int(2)));
+        assert_eq!(
+            gate(&c, &anonymous, &[Value::Int(21)]),
+            Err(Gate::Anonymous)
+        );
+        assert_eq!(
+            gate(&c, &double_closure(), &[Value::Int(21)]),
+            admitted(),
+            "the same body under a published name is refused too, so the refusal above is not \
+             the name"
+        );
+        let fabricated = code_closure(Some(""), &["x"], bin(BinOp::Mul, var("x"), int(2)));
+        assert_eq!(
+            gate(&c, &fabricated, &[Value::Int(21)]),
+            Err(Gate::PublishedRow),
+            "a name the program does not publish cleared the row gate, and the substitution \
+             above would now be visible to the behavioural test after all"
+        );
+    }
+
+    /// The published row is the reviewable artifact, and "no row at all" is the
+    /// same refusal as "a row that is not empty" — a machine built without a
+    /// `CheckOutput` enters nothing, which is most of this crate's own tests.
+    #[test]
+    fn a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate() {
+        let c = checked(vec![
+            double_def(),
+            effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
+            fn_def(
+                "touch",
+                &["x"],
+                perform("state", "get", None, vec![var("x")]),
+            ),
+        ]);
+        assert!(
+            !c.check.defs[&Symbol::new("touch")].footprint.is_empty(),
+            "the fixture is wrong: `touch` publishes an empty row"
+        );
+        let effectful = code_closure(Some("touch"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &effectful, &[Value::Int(1)]),
+            Err(Gate::PublishedRow)
+        );
+        let unknown = code_closure(Some("never.declared"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &unknown, &[Value::Int(1)]),
+            Err(Gate::PublishedRow)
+        );
+        assert_eq!(
+            admit(
+                &double_closure(),
+                &[Value::Int(21)],
+                false,
+                None,
+                DEFAULT_MAX_CALLS,
+                0
+            ),
+            Err(Gate::PublishedRow),
+            "a machine with no `CheckOutput` cleared a definition it has no row for"
+        );
+        assert_eq!(gate(&c, &double_closure(), &[Value::Int(21)]), admitted());
+    }
+
+    /// `budget` is the machine's remaining nested calls, so the last one belongs
+    /// to the machine: the interpreted path raises the bound both engines raise,
+    /// at the machine's own span.
+    ///
+    /// What this test bites is the `budget == 0` refusal — deleting it turns
+    /// this and `the_budget_is_the_machines_remaining_depth_and_never_reaches_zero`
+    /// red. It does *not* bite the checked subtraction underneath it, and this
+    /// doc no longer says it does: see the table in this module's header for why
+    /// no test can.
+    #[test]
+    fn the_last_nested_call_is_refused_by_the_budget_gate() {
+        let c = checked(vec![double_def()]);
+        let subject = double_closure();
+        let args = [Value::Int(21)];
+        let at = |max: usize, calls: usize| {
+            admit(&subject, &args, false, Some(&c.check), max, calls).map(|(_, budget)| budget)
+        };
+        assert_eq!(at(8, 8), Err(Gate::Budget));
+        // Not evidence for `checked_sub` over `saturating_sub`: both answer
+        // `Err` here, one via `None` and one via the `budget == 0` refusal. What
+        // it pins is that an over-subscribed stack is refused rather than
+        // wrapping to an enormous budget.
+        assert_eq!(at(8, 9), Err(Gate::Budget));
+        assert_eq!(at(8, 7), Ok(1));
+        assert_eq!(at(8, 0), Ok(8));
+    }
+
+    /// The ordering is a cost claim — a call taking a record, a list or a string
+    /// is refused on one discriminant test per argument and never hashes a
+    /// `Symbol` into `CheckOutput::defs` — and a cost claim nothing asserts is a
+    /// comment. Two orderings are load-bearing and both are observable now that
+    /// a refusal carries its reason.
+    #[test]
+    fn the_shape_gate_is_reached_before_the_row_is_looked_up() {
+        let c = checked(vec![double_def()]);
+        let unknown = code_closure(Some("never.declared"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &unknown, &[Value::str("21")]),
+            Err(Gate::ArgumentShape),
+            "the row was looked up for a call the argument shape had already refused"
+        );
+        let anonymous = code_closure(None, &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &anonymous, &[Value::str("21")]),
+            Err(Gate::ArgumentShape)
         );
     }
 

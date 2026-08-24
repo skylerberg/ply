@@ -200,6 +200,51 @@ being inconvenient.
 > `mcts.turn` really is 2.2x faster entered on the sets it was timed with, and
 > the aggregate ladder is unaffected. What must not be carried forward is any
 > claim of the form "no function regressed".
+>
+> ---
+>
+> **The mechanism is fixed, and the curve above is a curve the code no longer
+> has (2026-08-24).** `Ctx::end` now clears the arena at the end of the entry
+> that filled it, so an entry pays for its own work and its successor pays for
+> nothing; the shrink is amortized over 64 entries rather than run per entry.
+> Re-taken with `mcts --dir benches/kernel --carryover mcts.playouts --repeats
+> 7` — a mode added for this, so the curve is re-takeable by a command rather
+> than by a reviewer — two runs per arm, one tree, load 14–17:
+>
+> ```
+> predecessor's slots:      4     384    3824   19584     spread
+> before, µs:           0.375   1.709  13.667  67.833   180.888x
+> before, again:        0.458   1.917  14.875  68.125   181.667x
+> after, µs:            0.416   0.458   0.500   0.500     1.202x
+> after, again:         0.417   0.458   0.625   0.583     1.499x
+> ```
+>
+> The before arm reproduces the table above nearly digit for digit, which is
+> what says the two arms measure the same thing. **The `mcts.playouts` 0.068x
+> row is therefore a measurement of a defect that no longer exists**; it is not
+> restated as a corrected ratio here, because re-taking the per-function table
+> means re-running the whole R5 experiment and this document should not carry a
+> number nobody took.
+>
+> Two refinements the re-take produced, both of which correct something above:
+>
+> - **"the shrink reallocates" is withdrawn.** Held at 19,584 slots with the
+>   shrink forced and not forced, the cost is 81,667 ns against 81,708 ns —
+>   **1.00x**. The whole of the effect is the clear walking N `Value`s to drop
+>   them, at 4.168 ns/slot. Anyone reading the paragraph above as "remove the
+>   `shrink_to` and the 181x goes away" would have shipped a no-op.
+>   `crates/ply-codegen-spike/tests/entry_cost.rs` is the standing measurement.
+> - **"with no carry-over on the interpreter arm" is narrowed.** That was
+>   measured after the three smallest predecessors (0.79 / 0.83 / 0.83 µs), and
+>   this re-take agrees there — 0.79–0.88 µs. Out at the 19,584-slot predecessor
+>   the interpreter column reads 1.2–2.8 µs, so a call after an expensive
+>   interpreted call is slower on **both** arms. It is not monotone and it is not
+>   the seam; the likeliest reading is cache. It is recorded because it was the
+>   pre-registered control for the re-take, and by that pre-registration the
+>   control failed. The rule is reported failed rather than rewritten: what
+>   carries the claim instead is that before and after are paired on the same
+>   rows in the same binary, where a common-mode effect appears in both arms and
+>   a 181x-to-1.2x change does not.
 
 **By the pre-registered rule the worst is `mcts.playouts` at 0.068x** — a 14.7x
 regression. **It is an artifact of my own filter, and here is the evidence.**
