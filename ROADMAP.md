@@ -1,16 +1,51 @@
 # Ply — Roadmap
 
 > **How to read an exit criterion here (docs pass, 2026-08-17).** "Demonstrable"
-> below means *a test demonstrates it on a machine that can run that test*. Four
-> conditional skips exist, and each returns a **passing** result when its
-> dependency is absent:
+> below means *a test demonstrates it on a machine that can run that test*.
+> **Five** conditional skips exist, and each returns a **passing** result when
+> its dependency is absent:
 >
 > | gate | where | when it skips | says so? |
 > | --- | --- | --- | --- |
 > | `cluster::available()` | `crates/ply-host/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
-> | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — and **nothing in the repo sets it** | yes, on stderr of a passing test |
+> | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
 > | `#![cfg(unix)]` | `crates/ply-cli/tests/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
 > | its own `[workspace]` | `crates/ply-codegen-spike/Cargo.toml` | always, under `cargo test --workspace` | no |
+> | `PLY_TEST_DB` | `crates/ply-host/src/db/pool/tests.rs:25` | the variable is unset | **no — nothing is printed at all, on either stream** |
+>
+> **Audit note (CI pass, 2026-08-24): the table describes a stock local
+> checkout, and since `.github/workflows/ci.yml` was added it no longer
+> describes CI.** All five are supplied there — the first four are also
+> *asserted* open, and the run fails if any of them skips. §W4's exit criterion
+> carries the gate-by-gate reading, the commands, and — the part that matters —
+> what was and was not actually executed before the claim was written.
+>
+> **The fifth is the one to be careful about, and it is the row added on
+> 2026-08-24.** `PLY_TEST_DB` is set by the same job, but nothing in CI can
+> check that it *arrived unset*, because the 26 tests behind it print no notice
+> on either stream. Re-measured on the machine in `docs/ONBOARDING.md`
+> §Provenance on 2026-08-24, `cargo test -p ply-host --lib db::pool` against a
+> local postgres 18.3 — three rows, and this table previously carried only the
+> first two, with the second reading `1.35s` where `CONTRIBUTING.md` read
+> `1.55s` for the same measurement:
+>
+> | `PLY_TEST_DB` | result |
+> | --- | --- |
+> | unset | **26 passed**, `0.00s` — silent, and green |
+> | set, server reachable | **26 passed**, `0.94s` |
+> | set, server unreachable | **20 FAILED**, `0.02s`, `E0431` |
+>
+> **The third row is the one nobody had taken, and it changes the conclusion.**
+> `crates/ply-host/src/db/pool/tests.rs:41` does
+> `Reactor::start(config).expect("the test database is reachable")`, so a set
+> but wrong `PLY_TEST_DB` is a loud red build. The gate is not unassertable;
+> only the *unset* case is silent, and CI fails on that with `test -n`. Every
+> other gate here can be asserted open after the fact by grepping for the notice
+> it prints; this one cannot, so what the
+> workflow does for it is supply the variable and say so, and no more than
+> that. A timing assertion was considered and rejected: a check that fails when
+> a runner is slow is a check people learn to ignore, which is the failure mode
+> `CONTRACTS.md` names twice.
 >
 > `cargo test --workspace` green therefore proves the W4 database claims only on
 > a machine with postgres, the W5 shutdown claims only on Unix, and none of ADR
@@ -544,9 +579,77 @@ and none of them check.
 > phases are behind it, seventeen of them in
 > `db_transaction_audit.rs::transactions_the_pool_and_parameters_under_adversarial_conditions`
 > alone. A second gate, `PLY_PG_URL`, hides ten more tests in
-> `crates/ply-host/src/db/scope/tests/live.rs` and is set by nothing in the
-> repository, so those skip even on a machine that has postgres. The twin half
+> `crates/ply-host/src/db/scope/tests/live.rs` and is set by nothing on a stock
+> local checkout, so those skip even on a machine that has postgres — CI sets
+> it, per the audit note below. The twin half
 > of the criterion, and the agreement law, are hermetic and unconditional.
+> **Audit note (CI pass, 2026-08-24): all four of the gates in the preamble
+> table are forced open on every push, and that table now describes a stock
+> local checkout rather than CI.** The `PLY_PG_URL` cell read *"the variable is
+> unset — and **nothing in the repo sets it**"*, and the paragraph above read
+> *"A second gate, `PLY_PG_URL`, hides ten more tests in
+> `crates/ply-host/src/db/scope/tests/live.rs` and is set by nothing in the
+> repository"*. Both were true until `.github/workflows/ci.yml` was added. Read
+> against that file, gate by gate — and read the last paragraph of this note
+> before believing any of it, because what CI does on GitHub is not what was
+> checked here:
+>
+> - **`PLY_PG_URL`** — the `test ply-host (postgres)` job sets it to a
+>   `postgres:18.6` service container. It then runs `cargo test -p ply-host
+>   --lib db::scope::tests::live -- --nocapture --test-threads=1 2>&1 | tee`,
+>   fails if the output matches
+>   `skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)`, and fails unless
+>   the run reports `10 passed`. Checked here against a local postgres 18.3:
+>   with the variable set, exit 0, **10 passed in 0.29s**, zero notices; with it
+>   unset, exit 0, **10 passed in 0.00s**, and **ten** notices.
+>
+>   Three separate things in that command are load-bearing and each was wrong
+>   here first, which is the reason for the detail. **`--nocapture`**: without
+>   it the notice appears **zero** times, because cargo captures a passing
+>   test's output. **`2>&1`**: the notice is an `eprintln!`, so a bare
+>   `cargo test | tee log` carries none of it — measured, with the variable
+>   unset, **0** notices in the log piping stdout alone against **10** with
+>   `2>&1 | tee`. **An unanchored pattern**: libtest prints the notice on the
+>   same line as the test name, so `^skipped:` matches nothing. And the
+>   `10 passed` assertion covers none of the three — the ten return early and
+>   *pass*, so that line reads `10 passed` with no server anywhere.
+> - **`cluster::available()`** — the same job puts a
+>   `/usr/lib/postgresql/<major>/bin` holding `initdb`, `postgres` and `psql` on
+>   `PATH`, `apt-get install`ing `postgresql` if the image has none, and fails
+>   if it still cannot find them; `available()` searches `PATH` first, so that
+>   is the same statement as the gate being open. It then runs the cheapest
+>   cluster-gated binary, `host_park`, with the same grep. Checked here on a
+>   machine that has the binaries: exit 0, **2 passed in 2.87s**, zero notices.
+>   The `apt-get` and `PATH` half is Linux-only and was **not** executed here.
+> - **`#![cfg(unix)]`** — every job runs on `ubuntu-24.04`, so
+>   `crates/ply-cli/tests/w5_shutdown.rs` is compiled rather than empty, and a
+>   step in the shard holding `ply-cli` fails unless that binary reports at
+>   least one passing test. Being compiled is not left to speak for itself,
+>   because it speaks by saying nothing.
+> - **its own `[workspace]`** — the `crates/ply-codegen-spike` job runs
+>   `cargo test --locked --release` from inside that directory on a **pinned
+>   1.94.0**, which `cranelift 0.134.3` requires. Checked here: exit 0, **45
+>   tests** across `hazards.rs` (16), `mutations.rs` (11), `mcts_kernel.rs` (9)
+>   and `spike.rs` (9), 438.9s including the cold release build. It is not
+>   linted: that crate is not clippy-clean and never has been.
+>
+> A **fifth** gate exists and is not in the table: `PLY_TEST_DB`, at
+> `crates/ply-host/src/db/pool/tests.rs:25`, hides 26 pool tests and prints
+> nothing at all when it is unset. CI sets it at the same container, but there
+> is no notice to grep, so it is the one gate with no positive proof.
+> `docs/ONBOARDING.md` §2 has the measurement.
+>
+> **What was not checked.** The commands quoted in this note were run on the
+> machine in `docs/ONBOARDING.md` §Provenance and the figures are that
+> machine's, but that is not true of `ci.yml` as a whole: `CONTRIBUTING.md`
+> §"There is CI" carries the per-command ledger, including the shard command
+> that **failed** and the three steps that were stopped unfinished rather than
+> measured on a machine at load 27. Nothing in `ci.yml` has ever run on GitHub
+> Actions. The runner image, the service
+> container, the `apt-get` fallback and the cache action are exercised by a push
+> and by nothing else, and the first push is where they are tested. Nothing here
+> is a claim about a *local* run, which is unchanged.
+>
 > `docs/adr/0014-w4-contract.md` §13.1 has the full inventory and says which
 > required tests depend on which gate. **Two of W4's required tests are
 > enforced by nothing at all** — 14, the `EXPLAIN (GENERIC_PLAN)` differential
