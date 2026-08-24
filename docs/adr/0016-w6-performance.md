@@ -570,6 +570,25 @@ another is that input's, so the weakest one is the claim.
   `cranelift-jit` and `cranelift-codegen` as **optional** dependencies at
   `0.134.3` — so that deferring M9 deletes one feature block and one dependency
   line, and nothing else in the workspace knows it existed.
+
+  > **Corrected in place (R5 review, 2026-08-22): the last clause is no longer
+  > true, and R5 is what made it untrue.** The first half stands and was
+  > verified by performing the deletion rather than arguing it — a reviewer
+  > copied the tree, ran `rm -r crates/ply-codegen-spike`, and got
+  > `cargo build --workspace --all-targets` and
+  > `cargo test --workspace --no-fail-fast` green: 155 test binaries, 3,680
+  > passed, 0 failed. No cranelift in any shipping manifest;
+  > `grep -c cranelift Cargo.lock` is 0.
+  >
+  > What is false is *"nothing else in the workspace knows it existed"*. After
+  > R5, `crates/ply-eval` carries `compiled.rs` — a public `Compiled` trait,
+  > `Machine::set_compiled`, three counters on `Machine`, and a branch in
+  > `Machine::enter_code` taken on every interpreted call — none of it with a
+  > shipping implementor or caller, all of it surviving the `rm -r`. That is a
+  > deliberate change made by R5 under ADR 0018 §0's "make the interpreter able
+  > to enter compiled code", and no ADR recorded the amendment until this block.
+  > It costs 0.0 allocations per `/health` request (`benches/r5-timing/`
+  > §1) and 237.87 predictable branch tests, and it buys nothing that ships.
 - It may **not** report a ratio whose two sides did different work — for
   instance an interpreter column that includes `Machine::call` entry where the
   spike column does not. Rung 1 is measured precisely so that cost is known and
@@ -1040,6 +1059,27 @@ that bear on the verdict:
 - **What a partially-covering backend is worth.** The `solo, trampolined`
   variant is one point on that curve (1.71x); nothing measured a whole request
   path compiled at partial coverage.
+
+  > **Audit note (R5, 2026-08-21): the `solo, trampolined` variant no longer
+  > exists and 1.71x cannot be re-taken.** It compiled `read_line` alone and let
+  > `line_at` and `line_stops` return to the interpreter through
+  > `rt_call_machine`, the escape hatch §3.2 allows. That helper was a whole
+  > `Machine::call` entry point — `escape::check`, `reset()`, `close_regions`,
+  > `end_entry_point` — on a second, privately held machine, which was
+  > survivable only while the sole way *into* compiled code was at the top of a
+  > pure integer kernel. R5 made the interpreter able to enter compiled code
+  > (`ply_eval::Compiled`), so the same helper became a route out of a live
+  > machine's frame into a different machine's `reset()`, discarding the
+  > caller's handler stack, trail, region generations and footprint in silence.
+  > It is deleted: a call to a function outside the compiled unit now refuses
+  > the enclosing function at compile time, so a compiled set is closed under
+  > calls. The figure in `benches/w6-spike.json` and `benches/w6-ladder*.json`
+  > stands as what was measured on 2026-08-20; the variant that produced it is
+  > gone, and partial coverage is now priced the other way round — the
+  > interpreter drives and enters compiled leaves. `benches/adr0018-mcts.json`'s
+  > `crossings_by_target`, `trampoline_tax_micros` and
+  > `end_to_end_without_trampoline_tax` are the same kind of record: taken
+  > before R5, not re-takeable after it.
 - **What a route body costs when it is not a constant**, other than through the
   twin's `/items` handler.
 - **The in-Ply loop rungs 2–4 are read off** — 0.87µs an iteration. It cancels

@@ -145,20 +145,35 @@ pub(crate) fn give(args: Vec<Value>) {
     });
 }
 
+/// Empties every class, so a test that counts hits is not reading whatever the
+/// test before it left behind. Test order within a binary is not fixed.
+///
+/// The list is thread-local and the test harness gives each test its own thread,
+/// so this is per-test state and not a shared fixture.
+#[cfg(test)]
+pub(crate) fn drain_the_free_list() {
+    let _ = FREE.try_with(|free| {
+        for class in free.borrow_mut().iter_mut() {
+            class.clear();
+        }
+    });
+}
+
+/// Buffers currently parked in every class. What a caller that gave one back
+/// left behind, for a test asserting a code path did the giving.
+#[cfg(test)]
+pub(crate) fn kept() -> [usize; CLASSES] {
+    FREE.try_with(|free| {
+        let free = free.borrow();
+        std::array::from_fn(|class| free[class].len())
+    })
+    .unwrap_or([0; CLASSES])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    /// Empties every class, so a test that counts hits is not reading whatever
-    /// the test before it left behind. Test order within a binary is not fixed.
-    fn drain_the_free_list() {
-        let _ = FREE.try_with(|free| {
-            for class in free.borrow_mut().iter_mut() {
-                class.clear();
-            }
-        });
-    }
 
     #[test]
     fn a_vector_taken_for_an_arity_has_room_for_it_and_nothing_in_it() {
