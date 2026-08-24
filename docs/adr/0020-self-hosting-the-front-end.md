@@ -655,13 +655,64 @@ lexer's inner loop is `bytes_at`, `bytes_scan`, `bytes_slice`,
 the fragment does not accelerate. The 11.68x was measured on a workload whose hot
 operations *are* the half it does accelerate.
 
-**So the transfer is unmeasured, and this ADR does not guess it.** The
-measurement that would settle it is one attribution run splitting the Ply
-lexer's time between `ply_eval::builtins::call` and everything else. If builtins
-dominate, the fragment buys the front end little and needs open-coded `Bytes`
-primitives before it is relevant. If dispatch dominates, the fragment is the
-right lever. That is one profile, it is cheap, and nothing in the tree has taken
-it.
+**The transfer was unmeasured. It has now been measured, and the answer is the
+one that favours the fragment.**
+
+> **Superseded within this ADR.** This paragraph read: *"So the transfer is
+> unmeasured, and this ADR does not guess it. The measurement that would settle
+> it is one attribution run splitting the Ply lexer's time between
+> `ply_eval::builtins::call` and everything else. If builtins dominate, the
+> fragment buys the front end little and needs open-coded `Bytes` primitives
+> before it is relevant. If dispatch dominates, the fragment is the right lever.
+> That is one profile, it is cheap, and nothing in the tree has taken it."* The
+> profile was taken rather than left as a recommendation, because it was named
+> as the highest-value decision-relevant measurement in the document and it cost
+> six seconds.
+
+`/usr/bin/sample` against the release binary running `lexer.ply` over four
+distinct slices of `examples/desk.ply` (distinct so a pure-function memo cannot
+collapse them), 1 ms interval, 6 s window, attribution by walking the call graph
+and charging each subtree to its outermost matching frame. **Two independent
+windows, load ~40:**
+
+| | window 1 | window 2 |
+| --- | ---: | ---: |
+| samples under `run::evaluate` | 3,930 | 4,909 |
+| of those, anywhere under `ply_eval::builtins::*` | 179 — **4.6%** | 200 — **4.1%** |
+
+**Dispatch dominates builtin bodies by roughly twenty to one.** Where the CPU
+actually is, by leaf sample (window 1): the machine's own step and dispatch
+**43.8%**, reference-counting and `Drop` traffic — `Value`, `Env`, `Chain`,
+`pool::link` — **26.5%**, the continuation stack **15.0%**, `malloc`/`free`
+**2.8%**, and every builtin body together **1.3%**. `memcmp`/`memcpy`, which is
+where a byte-scanning workload's "real work" lives, is **2.8%**.
+
+So the objection this section was written to answer does not hold: a lexer is
+*not* builtin-bound. Its cost is the interpreter's per-step protocol and the
+refcount churn around it, which is precisely the half the fragment removes. That
+makes the fragment the right lever for a front end on this evidence, and it
+makes open-coded `Bytes` primitives a second-order concern rather than a
+prerequisite.
+
+**Three things this does not license, and the first is the one that bites.**
+
+- **The fragment cannot take the loop.** `admissible_builtin` refuses every
+  higher-order builtin, and `lex`'s whole scan is
+  `fold(range(0, n + 1), start, ..)` while `dump` is two `map`s. So `lex`,
+  `dump`, `hex` and `int_of_digits` are refused outright, and what the fragment
+  could accept is the per-token work beneath them — `token_at`, `punct`, `ident`,
+  `number`, `string_lit` and the predicates. That means **one entry per token**,
+  not one per file.
+- **One entry per token meets `CONTRIBUTING.md` item 12 head on**: every entry
+  costs O(the *previous* entry's peak arena), measured there at 181x. At one
+  entry per token that is on the hot path rather than beside it. **Not measured
+  for this workload**, and it could plausibly erase the gain entirely.
+- **The 4.6% is a share of the interpreter's time, not a predicted speedup.**
+  Removing dispatch for the compiled fraction does not make the compiled
+  fraction free; the 11.68x on `read_line` is the only measured speedup and it
+  was taken on a workload with no such entry pattern.
+
+The profile is checked in as a method rather than a file: the command is in §9.
 
 Two further interactions, both recorded rather than resolved:
 
@@ -686,10 +737,16 @@ that.
 
 Ranked, what would change the answer:
 
-1. **An attribution run splitting the Ply lexer's time between builtin bodies
-   and dispatch** (§6.3). One profile. It decides whether the fragment is the
-   lever or a distraction, and it is the cheapest decision-relevant measurement
-   named in this document.
+1. ~~**An attribution run splitting the Ply lexer's time between builtin bodies
+   and dispatch** (§6.3).~~ **Taken.** Builtin bodies are **4.6% / 4.1%** of
+   evaluation across two windows; dispatch and refcount traffic are the rest.
+   The fragment is the lever, not a distraction — with the entry-rate caveat
+   §6.3 now carries. **What replaces it at the top of this list** is the
+   measurement that caveat names: the per-entry arena cost
+   (`CONTRIBUTING.md` item 12, 181x, O(the previous entry's peak arena)) at
+   **one entry per token**, which is the entry pattern a front end would
+   actually produce and the one thing that could still make the fragment
+   worthless here.
 2. **Making §1 visible.** A lint, a `--explain` line, anything that says *this
    `push` will copy*. `GAPS.md` calls this the highest-value change and this
    review agrees, for two reasons the spike could not see. §4.1 shows the trap
@@ -742,10 +799,17 @@ coverage. It is 0.15% error paths and 24 float tokens (§3.1).
   half; if user CPU is itself distorted by cache contention at this load — not
   checked — the absolute figures move. The *shape* results in §4.1 (4x per
   doubling against 2x) do not depend on it.
-- **§6.3's conclusion rests on reading `rt_builtin`, not on profiling it.** If
-  the machine's per-call overhead dominates the builtin bodies for this
-  workload, the fragment transfers better than argued and the ranking in §7
-  changes.
+- ~~**§6.3's conclusion rests on reading `rt_builtin`, not on profiling it.**~~
+  **Closed by measurement**, and it resolved against the reading: the machine's
+  per-call overhead *does* dominate the builtin bodies (4.6% / 4.1% builtins
+  over two windows), so the fragment transfers better than §6.3 first argued and
+  §7's ranking moved accordingly. What is still unmeasured is narrower and is
+  stated in §6.3: the per-entry arena cost at one entry per token.
+- **The profile is a sampling profile of one workload on one input.** Symbol
+  attribution in a release build can be distorted by inlining — a builtin body
+  inlined into `Machine::step` would be charged to dispatch. The leaf histogram
+  corroborates rather than assumes (builtins 1.3% of leaves, `memcmp`/`memcpy`
+  2.8%), but a counter-based attribution would settle it and none exists.
 - **The 12.6x in §6.1 divides two numbers taken at different loads** (17,000
   tokens/s at load 41–45, 215,000 at load 37). Both are user CPU and the gap is
   an order of magnitude, so the conclusion is not sensitive to it, but the ratio
@@ -799,6 +863,17 @@ Commands, all from the worktree root:
 cd spikes/ply-lexer/harness && PLY_BIN=../../../target/release/ply \
   cargo test -j 2 -- --test-threads=2 --nocapture
 ./spikes/ply-lexer/harness/target/release/plydump <file.ply>
+
+# §6.3's attribution profile. The probe is `lexer.ply` plus a generated
+# `probe.ply` holding examples/desk.ply as a b"..." literal, whose entry point is
+#   fn main() -> Int =
+#     fold(range(0, 4), 0, |a: Int, i: Int|
+#       a + string_len(dump(bytes_slice(source(), 0, bytes_len(source()) - i))))
+# — four distinct slices so a pure-function memo cannot collapse them into one.
+./target/release/ply run <probe-dir> & PID=$!
+sleep 1; /usr/bin/sample $PID 6 1 -file sample.txt; wait $PID
+# Attribution: walk the call graph, charge each subtree to its outermost
+# matching frame, and divide by the subtree under `run::evaluate`.
 ```
 
 Not re-run here, and stated as not re-run: `cargo fmt --all --check`,
