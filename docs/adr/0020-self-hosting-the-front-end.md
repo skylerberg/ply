@@ -703,10 +703,37 @@ prerequisite.
   could accept is the per-token work beneath them — `token_at`, `punct`, `ident`,
   `number`, `string_lit` and the predicates. That means **one entry per token**,
   not one per file.
-- **One entry per token meets `CONTRIBUTING.md` item 12 head on**: every entry
-  costs O(the *previous* entry's peak arena), measured there at 181x. At one
-  entry per token that is on the hot path rather than beside it. **Not measured
-  for this workload**, and it could plausibly erase the gain entirely.
+- ~~**One entry per token meets `CONTRIBUTING.md` item 12 head on.**~~ **The
+  premise was withdrawn hours after this was written.**
+
+  > **Corrected (2026-08-24).** This bullet read: *"One entry per token meets
+  > `CONTRIBUTING.md` item 12 head on: every entry costs O(the previous entry's
+  > peak arena), measured there at 181x. At one entry per token that is on the
+  > hot path rather than beside it. Not measured for this workload, and it could
+  > plausibly erase the gain entirely."* Item 12 was fixed in PR #24 and 181x is
+  > a withdrawn figure. It is corrected here rather than deleted because it was
+  > this ADR's stated reason to doubt the fragment.
+
+  `Ctx::begin` no longer touches the arena; `Ctx::end` clears it at the end of
+  the entry that filled it, so an entry pays for its own work and its successor
+  pays for nothing. Re-measured by the lane that fixed it, paired arms in one
+  binary: **180.888x / 181.667x before, 1.202x / 1.499x after.** Checked here at
+  the mechanism rather than the ratio, since a re-run at this load would be
+  noise: `begin` is a single `is_empty` check plus a recovery path
+  (`crates/ply-codegen-spike/src/rt.rs`), read at the unit as **0 ns at every
+  rung**, against `end` at **4.168 ns per slot the entry itself used**, with the
+  shrink amortized over `SHRINK_EVERY` = 64 entries.
+
+  **The question therefore changed shape — it is no longer carry-over but a
+  per-entry constant, and the constant is small.** Arithmetic, not measurement:
+  at a generous 100 slots per token-sized entry, the corpus's 120,490 tokens
+  cost 120,490 x 417 ns of arena work, about **50 ms**, against the ~7.1 s this
+  lexer spends on that corpus at its measured 17,000 tokens/s — **under 1%**.
+  **Still unmeasured for this workload** and still worth measuring, but it is now
+  an open question about a ~1.2x carry-over and a sub-1% constant rather than a
+  181x multiplier. That is the difference between *probably fatal* and *probably
+  fine, go and check*. A second lane is refining the fix further, so the figure
+  may move down again.
 - **The 4.6% is a share of the interpreter's time, not a predicted speedup.**
   Removing dispatch for the compiled fraction does not make the compiled
   fraction free; the 11.68x on `read_line` is the only measured speedup and it
@@ -720,10 +747,15 @@ Two further interactions, both recorded rather than resolved:
   `GAPS.md` §14 priced as the alternative to the fold is *excluded from the
   fragment*. The two routes to making a Ply lexer fast are mutually exclusive
   today.
-- `CONTRIBUTING.md` §"Things known to be broken" item 12: every entry into the
+- ~~`CONTRIBUTING.md` §"Things known to be broken" item 12: every entry into the
   fragment costs O(the previous entry's peak arena), measured at 181x. A front
   end entered once per `lex()` is fine; one entered per parse function is not.
-  **Not measured for this workload.**
+  **Not measured for this workload.**~~ **Withdrawn: item 12 was fixed
+  (2026-08-24, PR #24), and both the figure and the conclusion drawn from it are
+  void.** An entry now pays for its own arena and its successor pays for nothing
+  — 181x carry-over became 1.202x / 1.499x — so "one entered per parse function
+  is not [fine]" no longer follows. §6.3 carries the re-measurement, the
+  mechanism check, and the per-entry arithmetic that replaces this.
 
 ---
 
@@ -742,11 +774,13 @@ Ranked, what would change the answer:
    evaluation across two windows; dispatch and refcount traffic are the rest.
    The fragment is the lever, not a distraction — with the entry-rate caveat
    §6.3 now carries. **What replaces it at the top of this list** is the
-   measurement that caveat names: the per-entry arena cost
-   (`CONTRIBUTING.md` item 12, 181x, O(the previous entry's peak arena)) at
-   **one entry per token**, which is the entry pattern a front end would
-   actually produce and the one thing that could still make the fragment
-   worthless here.
+   measurement that caveat names: **the fragment's actual throughput at one
+   entry per token**, which is the entry pattern a front end would produce.
+   The reason to worry has shrunk since this item was written: it first cited
+   item 12's 181x carry-over, which was **fixed the same day** (1.202x / 1.499x
+   after — §6.3). What is left is a per-entry constant that arithmetic puts
+   under 1% of current lexing time, so this is now *confirm the expectation*
+   rather than *check for a cliff*.
 2. **Making §1 visible.** A lint, a `--explain` line, anything that says *this
    `push` will copy*. `GAPS.md` calls this the highest-value change and this
    review agrees, for two reasons the spike could not see. §4.1 shows the trap
