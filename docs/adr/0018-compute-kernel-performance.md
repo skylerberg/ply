@@ -289,6 +289,16 @@ honour it. `CONTRIBUTING.md` §"Things known to be broken" item 9 carries it, an
 item 10 carries the older defect it uncovered: the same program is an
 `--engine both` divergence **with no backend at all**.
 
+> **Superseded (2026-08-24): both are fixed, and the sentence above describing a
+> "second bound" no longer describes the machine.** There is one bound,
+> `DEFAULT_MAX_CALLS`, and `budget` expresses all of it. The frame count was a
+> resource guard on the machine's own heap that had been phrased as a program
+> answer, and it was sensitive to how a body's operands were spelled rather than
+> to what the body did: at `hog(9000)`, `hog(n - 1) + 150` answered where
+> `hog(n - 1) + 1 + 1 + ...` raised. `Machine::with_max_frames` keeps it as an
+> opt-in ceiling, and a machine holding one now enters no compiled body at all,
+> so nothing this seam admits can turn on a limit it was not handed.
+
 Two more the reviews found, both open and both in that section: every entry into
 the spike's backend costs O(the previous entry's peak arena) — item 12 — which is
 the real mechanism behind a per-function regression `RESULTS.md` §3 blamed on its

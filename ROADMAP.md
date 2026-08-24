@@ -1511,9 +1511,24 @@ a hand-built honest backend, and with `with_max_frames(64)` and no recursion at
 all. `DEFAULT_MAX_FRAMES`'s own doc asserted the opposite — *"every recursion
 reaches [`DEFAULT_MAX_CALLS`] first, since a call costs at least one frame"* — and
 that is false: a **call** costs one frame, a **body** costs as many as it pends.
-Both that doc and `limit.rs`'s are corrected in place, and `compiled.rs`'s
-"Recursion" bullet is narrowed. **Not fixed.** All three candidate fixes change
-shipping semantics.
+
+> **Audit note (docs pass, 2026-08-24): the paragraph above ended "Both that doc
+> and `limit.rs`'s are corrected in place, and `compiled.rs`'s 'Recursion'
+> bullet is narrowed. **Not fixed.** All three candidate fixes change shipping
+> semantics."** It is fixed. Of the three candidates the finding listed, the one
+> that holds is the one it did not: **the frame count was never semantics**, so
+> the fix is to stop the machine defaulting to a ceiling on it rather than to
+> estimate a frame cost for an entry or to refuse entry near the bound. What
+> settles it is that the ceiling was a function of spelling — at `hog(9000)`,
+> `hog(n - 1) + 150` answered and `hog(n - 1) + 1 + 1 + ...` raised, same
+> function, same 9,001 nested calls, measured on the shipping release binary
+> 2026-08-24. `Machine::with_max_frames` is what is left: opt-in, off by
+> default, and a machine holding one enters no compiled body, because a native
+> body pends no frames and could not honour it. Charging an entry an estimate
+> was rejected on evidence, not taste: the only conservative charge is
+> `budget × the body's static pend`, which declines every recursive entry the
+> seam exists for. Item 9 of `CONTRIBUTING.md` §"Things known to be broken"
+> carries the close.
 
 **2. The per-function regression was the backend, and R5 blamed its own filter.**
 `benches/r5-timing/RESULTS.md` §3 reported `mcts.playouts` at 0.068× — a 14.7×
@@ -1582,10 +1597,26 @@ the deletability of the spike, the falsification table's reproducibility, and th
 > Crossover measured at depth 9,990: k = 90 passes, k = 100 raises.
 > `crates/ply-eval/tests/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
 > therefore holds only below that ratio — both its programs pend two frames a
-> level — and its name and doc claimed the general statement. The doc is
-> narrowed; the test is **not** changed to assert the divergence, so **nothing in
-> the suite arms the true bound**. `CONTRIBUTING.md` §"Things known to be broken"
-> item 10.
+> level — and its name and doc claimed the general statement.
+>
+> > **Audit note (docs pass, 2026-08-24): the sentence above ended "The doc is
+> > narrowed; the test is **not** changed to assert the divergence, so **nothing
+> > in the suite arms the true bound**."** Something arms it now. The machine no
+> > longer carries a default frame ceiling, so both engines bound the same one
+> > thing, and
+> > `equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends`
+> > compares the tree-walker against the plain machine on a body pending 150
+> > frames a call at depth 6,700 — 1,011,700 pending frames, past where the
+> > ceiling sat. Restoring the ceiling makes it fail with the divergence quoted
+> > above, checked by doing it — though not by the lane that wrote the fix: the
+> > revert was taken by the orchestrating session in an `rsync` copy of the
+> > worktree under `CARGO_INCREMENTAL=0`, because the lane's own tree would not
+> > hold still long enough for the result to mean anything.
+> > `CONTRIBUTING.md` item 10 carries the provenance and why it reads that way.
+> > That test is also the memory-heaviest in the crate, at **4,858 MiB** peak
+> > RSS and 15.5s in a debug build, which is inherent: the machine's frame stack
+> > is the tree-walker's native stack reified one for one, so no cheaper program
+> > crosses a ceiling of a million frames.
 
 ### What R5 did not do
 

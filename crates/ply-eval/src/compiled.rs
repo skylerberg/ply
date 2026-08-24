@@ -46,27 +46,32 @@
 //!   construction.
 //! - **The deterministic scheduler.** The hook is off inside a `simulate` region,
 //!   so every `Access` a search reads is still recorded by the interpreter.
-//! - **Recursion, and only one of the machine's two bounds.** `budget` is the
+//! - **Recursion, and the whole of the machine's one bound.** `budget` is the
 //!   machine's remaining nested calls. A backend that would exceed it answers
 //!   `None`, and the machine raises the same
 //!   `recursion limit of 10000 nested calls exceeded` both engines answer with.
+//!   Nested calls is all there is to express: a machine asked for a frame
+//!   ceiling ([`crate::Machine::with_max_frames`]) enters nothing at all, so no
+//!   backend is ever offered a call under a limit it was not handed.
 //!
-//!   > **Refuted (R5 review, 2026-08-22), with the real backend, no mutation,
-//!   > one entry and zero declines.** The machine has a *second* bound —
-//!   > [`crate::DEFAULT_MAX_FRAMES`], 1,000,000 pending frames, enforced in
-//!   > `Machine::push` — and nothing in this signature can express it. A
-//!   > compiled body pushes **one** `Frame::Call` for the whole call; the
-//!   > interpreter pends one frame per pending operand as well. So a body
-//!   > pending more than `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 100 frames
-//!   > per level raises on the machine and **answers** through this seam:
-//!   > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }` with 150
-//!   > `+ 1` terms, at `hog(9000)`, gives `Err(recursion limit of 1000000
-//!   > pending frames exceeded)` alone and `Ok(1350000)` with a backend
-//!   > attached. Reproduced with a hand-built honest backend inside this crate,
-//!   > and with `Machine::with_max_frames(64)` and no recursion at all. The
-//!   > underlying `--engine both` divergence is older than this seam and is a
-//!   > separate defect; both are in `CONTRIBUTING.md` §"Things known to be
-//!   > broken".
+//!   > **Closed (2026-08-24). This bullet used to read "and only one of the
+//!   > machine's two bounds", under a refutation an R5 review took with the real
+//!   > backend, no mutation, one entry and zero declines:** *"The machine has a
+//!   > **second** bound — `DEFAULT_MAX_FRAMES`, 1,000,000 pending frames,
+//!   > enforced in `Machine::push` — and nothing in this signature can express
+//!   > it. A compiled body pushes **one** `Frame::Call` for the whole call; the
+//!   > interpreter pends one frame per pending operand as well … `hog(9000)`
+//!   > gives `Err(recursion limit of 1000000 pending frames exceeded)` alone and
+//!   > `Ok(1350000)` with a backend attached."* The refutation was right and the
+//!   > signature was not the thing to change. A native body pends no frames, so
+//!   > any frame cost charged to an entry is an estimate, and an estimate that
+//!   > differs from the interpreter's exact count is itself the divergence — the
+//!   > only conservative charge, `budget × the body's static pend`, declines
+//!   > every recursive entry the seam exists for. So the second bound went
+//!   > instead: it was a resource guard on this engine's heap that had been
+//!   > phrased as a program answer, and it was sensitive to how a body's
+//!   > additions were spelled rather than to what the body did.
+//!   > `Machine::with_max_frames` carries the measurement.
 //!
 //! What is **not** structural, stated plainly: a backend that answers an `Int`
 //! the definition would not have produced is a wrong answer this boundary cannot
@@ -161,6 +166,12 @@ pub trait Compiled {
     /// then re-evaluates and raises its own `recursion limit of 10000 nested
     /// calls exceeded`, which is the guarantee `limit.rs` exists to keep in both
     /// engines.
+    ///
+    /// It is also the *only* bound to honour, which is what makes this one
+    /// `usize` sufficient rather than merely convenient. How many frames the
+    /// interpreter would have pended running this body is not a fact about the
+    /// program and no answer may turn on it; a machine that was nonetheless
+    /// asked for a frame ceiling declines to enter anything.
     ///
     /// The machine has committed nothing when this is called and commits nothing
     /// on `None`, so declining is free after no work or after a whole body. That
@@ -302,6 +313,12 @@ pub(crate) fn admit<'a>(
 /// deletion was run against the whole of `cargo test -p ply-eval --lib` — 526
 /// tests — and the tests that went red are recorded. Nothing below is reasoning
 /// about what a deletion would do.
+///
+/// The 526 is that suite's size when the table was taken. The frame-ceiling
+/// change (`CONTRIBUTING.md` items 9 and 10) has since added one test to it, so
+/// a re-run reads 527 green and the reds below are unchanged — none of the six
+/// deletions touches the ceiling gate, which lives in `Machine::compiled_answer`
+/// rather than here.
 ///
 /// Re-running it: mutate, `touch` the file, and check the run actually printed
 /// `Compiling ply-eval` before believing its result. Cargo fingerprints on
