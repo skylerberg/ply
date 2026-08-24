@@ -60,7 +60,7 @@ impl Memo {
                 Slot::Known(value) => Lookup::Known(value.clone()),
             };
         }
-        if !is_constant(check, name) {
+        if !pure_by_published_row(check, name) {
             self.slots.insert(name.clone(), Slot::Never);
             return Lookup::Ignore;
         }
@@ -121,13 +121,19 @@ fn world_independent(value: &Value, depth: u32) -> bool {
     }
 }
 
-/// The caller has already established that the closure takes no parameters;
-/// this is the rest of it.
+/// Whether `name`'s *published* row claims it reads nothing of the world.
+///
+/// For the memo the caller has already established that the closure takes no
+/// parameters; this is the rest of it. It is also the necessary — never
+/// sufficient — purity gate `Machine::compiled_answer` reads before entering a
+/// compiled body: see this module's note for what an empty row still permits,
+/// and `compiled.rs` for why an allocation it still permits is unobservable
+/// outside a `simulate` region.
 ///
 /// `constraints` disqualifies a `where derivable(..)` definition. Evaluation is
 /// type-erased, so such a definition is a constant too, but the exclusion costs
 /// nothing and keeps the rule readable as a sentence about the signature.
-fn is_constant(check: Option<&CheckOutput>, name: &Symbol) -> bool {
+pub(crate) fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
         .is_some_and(|def| def.footprint.is_empty() && def.constraints.is_empty())

@@ -628,14 +628,15 @@ each one does, and its own test pins that correspondence.
 
 | section | what it is |
 | --- | --- |
-| the census | every function of `mcts`, compiled or refused **by name**, with its lowered node count. Deterministic. |
+| the census | every function of `mcts`, compiled or refused, with its lowered node count, offering the module **as one unit** so that a refusal names a construct rather than a missing callee. Marks which accepted functions the interpreter can actually enter. Deterministic. |
 | what is outside, ranked | the refusal reasons, ordered by the nodes they take with them. This is the roadmap. Deterministic. |
 | agreement | every scalar-argument function against generated inputs, plus whole searches, against **both** shipped evaluators, before anything is timed. Deterministic. |
-| the ladder | four compiled sets, each a superset of the last, timed end to end against the interpreter. |
+| the ladder | four compiled sets, each a superset of the last, timed end to end against the interpreter — and since R5 they are *leaves* the interpreter drops into rather than drivers it is entered from. Every rung carries its entry and decline counts, and a rung with zero entries is printed as a null result. |
 | the same fragment with the tree removed | `mcts.playouts`, which is inside the fragment top to bottom and crosses nothing. |
+| `--only agreement` | stops after the census, the agreement corpus and the entry counts, and takes no wall clock at all. |
 | where the interpreter's time goes | the fragment's share of executed work. |
 | the ceiling | Amdahl over the two measured numbers above, and nothing else. |
-| the bound compiled code does not carry | run as a subprocess, because observing it means watching a process die. |
+| the bound compiled code now carries | run as a subprocess, because before R5 observing it meant watching a process die. |
 
 ### Every ratio is taken inside one window
 
@@ -699,11 +700,134 @@ the top of this section.
   fragment. The report runs both as subprocesses and prints what each did,
   because observing the second means watching a process die.
 
+### What R5 changed, 2026-08-21 — **no wall clock was re-taken**
+
+R5 made the interpreter able to enter compiled code (`ply_eval::Compiled`), which
+is the thing the block above says was missing. Everything below is deterministic
+and reproduces on a loaded machine; **not one timing number above was re-taken**,
+so every ratio in the previous section still describes the pre-R5 arrangement and
+must not be read as describing this one.
+
+- > **Corrected: "22 of 34 functions and 386 of 745 lowered nodes are inside the
+  > fragment."** It is now **19 of 34 and 352 of 745**, and the difference is
+  > exactly `mcts.search` (15 nodes), `mcts.plan` (9) and `mcts.plan_753` (10).
+  > Those three were counted as compiled because a call to an uncompiled function
+  > became a trampoline back into a second `Machine`; the census was compiling
+  > each function on its own and never asked what it called. A compiled set is
+  > closed under calls now, so they are refused by name — "a call to
+  > `mcts.iterate`, which is not in this compiled unit" — and the nineteen that
+  > remain are the ones that can actually run natively end to end. All nineteen
+  > are `Int`/`Bool` throughout, so all nineteen can be entered.
+- The construct ranking is **unchanged**: 253 nodes / 7 functions to a field
+  access, 71 / 2 to a list pattern, 25 / 2 to unary `-`, 10 / 1 to a list
+  literal. That is what the roadmap was read off and R5 does not move it.
+- > **Corrected: "the compiled code reaches exactly three functions —
+  > `mcts.iterate` (100 crossings), `mcts.root` (1) and `mcts.best_action` (1) —
+  > and every `ucb`, `isqrt`, `ilog2` and `rollout` call underneath them runs in
+  > the machine."** Those were crossings *out of* compiled code. The interpreter
+  > now drives and enters compiled code at the leaves: one `mcts.plan` search of
+  > **40 iterations takes 721 native entries** — `ucb` 375, `turn` 105,
+  > `move_count` 81, `apply_move` 40, `next_seed` 40, `nth_move` 40, `rollout`
+  > 40. An entered `rollout` plays its whole game natively, so a twelve-iteration
+  > search enters exactly twelve playouts and twelve reseeds rather than the
+  > sixty-odd calls inside them. Pinned in
+  > `crates/ply-codegen-spike/tests/mcts_kernel.rs::the_interpreter_enters_compiled_code_at_the_leaves`.
+- Agreement, re-run and widened. It compares failing cases instead of scoring
+  `(Err(_), Err(_))` as agreement — each is compared with
+  `ply_eval::differential::compare_answers`, which checks the diagnostic's code,
+  message, labels, spans and notes, the observed footprint and the cell arena.
+  It compares the interpreter *with* a backend against the interpreter without
+  one, which is the R5 claim. And it feeds cases whose arguments the boundary
+  refuses on sight — a `Float`, `Str`, `Bytes`, `Unit`, `List`, `Map`, record,
+  `Decimal`, `Secret` and nullary constructor — asserting that no such call is
+  offered to the backend at all.
+
+  > **Corrected (R5 audit pass, 2026-08-21): "19 functions × generated inputs =
+  > 1,520 cases plus 24 whole-kernel searches, 0 disagreements ... 171 cases
+  > whose arguments the boundary refuses on sight ... in the first position ...
+  > the interpreter entered compiled code 10,614 times and declined 707: 661
+  > because the name is not compiled, 46 because the body failed, 0 for arity, 0
+  > out of fuel, 0 re-entered, 0 having touched a cell."**
+  >
+  > Every figure above is superseded, and two of them were narrower than they
+  > read. The corpus ran over the *enterable* set, which is the 19 functions the
+  > fragment compiles — so `mcts.plan` and `mcts.plan_753`, the functions whose
+  > callees are the ones entered, had no generated cases at all. And the refused
+  > kinds were written into argument 0 only, so `ucb(3, "7", 3)` had never been
+  > offered to anything.
+  >
+  > The corpus is now every kernel function whose parameters are `Int`/`Bool`,
+  > whatever it answers — the callers the fragment refuses included:
+  > **29 functions (20 of them compiled) × generated inputs = 2,396 cases, plus
+  > 24 whole-kernel searches and 2 recursions to the machine's own bound,
+  > 0 disagreements.** 510 of the cases carry a refused kind, in **every**
+  > argument position; 574 raise in the machine and are compared field by field.
+  > Over it the interpreter enters compiled code **56,876 times across 20
+  > distinct functions** and declines 32,802: 2,683 because the name is not
+  > compiled, 119 because the body failed, **30,000 out of fuel** (the two
+  > deliberate recursions), 0 for arity, 0 re-entered, 0 having touched a cell.
+  > Three runs, digit for digit, at load 5. Command:
+  > `mcts --dir benches/kernel --only agreement`.
+- > **Corrected: "compiled code carries no equivalent of `ply_eval::limit`'s
+  > bound on nested calls ... a diagnostic in the machine and `SIGABRT` in the
+  > fragment."** Every compiled function now carries a fuel prologue seeded from
+  > the budget the machine hands the entry. `mcts.playouts(0, 1, 5000000)`
+  > answers *recursion limit of 10000 nested calls exceeded* on **both** sides,
+  > and `benches/adr0018-mcts.json`'s `recursion_bound_compiled` — `signal: 6
+  > (SIGABRT)`, stack overflow — is a record of the old behaviour rather than
+  > the current one. It is not free: that program takes **7.9 s** with a backend
+  > attached against **0.11 s** without (two runs, load 2.3), because the machine
+  > re-offers the same function at all ten thousand interpreted depths and each
+  > attempt burns its remaining fuel first — 19,992 entries, 10,000 fuel
+  > declines.
+- The `Float` gap is unchanged *inside* the fragment and unreachable *from a
+  program*: the boundary carries `Int` and `Bool` and nothing else in either
+  direction, and the spike will not register a definition whose declared
+  signature is not `Int`/`Bool` throughout. The old test still passes and now
+  also asserts that a `Float` call is never offered.
+- **The hazard audit's ten cases, run rather than read** —
+  `crates/ply-codegen-spike/tests/hazards.rs`, 16 tests over
+  `tests/fixtures/hazards/`. A reentrant offer, a raise followed by the next
+  entry, a native body under a live handler stack and a resume, a definition that
+  opens its own region, a `Float`/`Decimal` literal inside an `Int` -> `Int`
+  body, a higher-order builtin behind a scalar signature, an interpreted
+  recursion that enters compiled code at every one of ten thousand depths, a
+  compiled recursion that outruns its budget, 100,000 entries against the value
+  arena, a `Secret`, and a `simulate` region with a real race in it. Two of the
+  ten turned out not to be programs: `E0201` refuses `<` on `String` and `E0304`
+  refuses a `cell_get` whose region cannot be named, so the audit's `sless` and
+  its `fn bump(c) = cell_set(c, cell_get(c) + 1)` are refused by the type checker
+  before any backend exists. Both are kept as fixtures that fail to load.
+- **A `Float` does reach compiled code, and it declines rather than answering.**
+  `numerics.float_inside(n: Int) -> Int = if 1.5 + 1.5 > 2.0 { n } else { n * 2 }`
+  is compiled, registered as enterable and offered — nothing in its signature
+  says a `Float` is under it — and the native body runs, meets the constant at
+  `rt_unbox_int` and fails, which is one more `Declines::failed` per call and the
+  machine's own answer. Asserted as an exact count rather than as an inequality,
+  because a version of that test where the fragment had refused the definition
+  would be green over a boundary it never reached.
+- Two hazards that existed and had no census row, closed at compile time rather
+  than at run time: **higher-order builtins** (`map`, `filter`, `fold`,
+  `map_fold`, `bytes_position`) used to compile clean and raise out of
+  `rt_builtin`, and **`cell_get`/`cell_set`** used to run against the spike's own
+  private arena. Both are refusals now. That moves the `std.http` coverage figure
+  the run prints in both directions at once — a function refused for `fold` is a
+  new refusal, a function refused only for calling an uncompiled neighbour is no
+  longer one — and it prints 48 of 144 for `std.http` where the per-function
+  census printed 35.
+
 ### What it does not measure
 
 Allocation: this is wall clock only. One machine, one process, no cross-machine
 check. And the ceiling is Amdahl, which assumes the two measured pieces compose
 — a backend that changed the representation of a `Value` would move both.
+
+Since R5, and specifically: **no ratio in this section has been re-taken with a
+backend the interpreter can enter.** The ceiling of 4.86x is Amdahl over two
+pre-R5 numbers, one of which — the 52.58x — was measured with `compiled_call`,
+which clones its arguments, reseeds a flat arena and pays no frame push. An entry
+through the hook pays the `Frame::Call` push and boxes its arguments into the
+value arena, so it is not the same number and nobody should assume it is.
 
 ## Reproducing a corpus
 

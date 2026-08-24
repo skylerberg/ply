@@ -8,9 +8,21 @@
 //!
 //! So the bound is on **nested calls**, which both engines can count exactly:
 //! the tree-walker as its own nesting, the machine as the `Frame::Call`s pending
-//! on its stack. The machine keeps a second, far looser bound on total pending
-//! frames — a resource limit on a heap that is nobody's native stack — but a
-//! program reaches this one first, which is what keeps the two answers equal.
+//! on its stack. The machine keeps a second bound on total pending frames — a
+//! resource limit on a heap that is nobody's native stack — which the
+//! tree-walker has no counterpart for.
+//!
+//! > **Corrected (R5 review, 2026-08-22).** The sentence above used to end:
+//! > *"— but a program reaches this one first, which is what keeps the two
+//! > answers equal."* It does not, for every program. `DEFAULT_MAX_FRAMES` is
+//! > 1,000,000 against `DEFAULT_MAX_CALLS`'s 10,000, so a recursion whose body
+//! > pends more than **100 frames per level** hits the frame bound first, the
+//! > tree-walker passes where the machine raises, and `--engine both` reports a
+//! > divergence with no backend attached. Measured at depth 9,990: k = 90
+//! > passes, k = 100 raises. The two answers are equal only below that ratio,
+//! > which is what `equivalence_audit.rs::the_two_engines_agree_on_the_
+//! > recursion_bound` actually tests. Open; `CONTRIBUTING.md` §"Things known to
+//! > be broken".
 //!
 //! A call is not the only thing a program can nest, though. A *value* nests too,
 //! and walking one structurally — comparing two, diffing two — is host recursion

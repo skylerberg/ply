@@ -781,7 +781,7 @@ showed the form the implementation rejects.
 
 ---
 
-# Region track — complete, R1 through R4
+# Region track — R1 through R5
 
 W6 said codegen's ceiling is low because the *representation* is expensive, not
 because compilation fails: every value is heap-allocated and every handler
@@ -813,6 +813,13 @@ anyway, so the objection that decided M6 stopped applying and the world went.
 **It landed in three parts, and the split is the instructive part.** Describing
 regions as one milestone would hide the defect the shape produced, so all three
 are below.
+
+**R4 and R5 continue the numbering and are not region milestones.** R4 is value
+construction and R5 is compiled-code entry; both are here because each was what
+the previous milestone's measurement pointed at, and moving them elsewhere would
+break the chain that explains why they were scoped the way they were. The track
+is about the representation and the execution strategy under it, and it stopped
+being about regions after R3.
 
 ## R1 — the machinery
 
@@ -1346,6 +1353,278 @@ bodies by hand. The claim that survives is the narrow one: `w6-alloc` reads
 > on the request path — `./target/release/w6-alloc --repo . --requests 200`
 > reads **773.4**, three runs identical, the same figure as before it.
 
+## R5 — the interpreter can enter compiled code, and three of four reviews refuted the write-up
+
+`docs/adr/0018-compute-kernel-performance.md` §0.5 is the record;
+`benches/r5-timing/` holds the pre-registration, the raw report and the results.
+ADR 0018 §0 said **"make the interpreter able to enter compiled code, or the
+ceiling is 5.26× however much of the fragment you accept"**, and named that as a
+different first milestone from anything in its own list. R5 is that milestone.
+
+### What was built, and it is not a feature
+
+`crates/ply-eval/src/compiled.rs`: a `Compiled` trait that takes a name, some
+scalars and a call budget and gives back at most one scalar. No arena, no stack,
+no handler stack, no host binding, no `&mut Machine` and no route back in, so a
+backend that cannot finish a call has changed nothing the program can observe
+and declining is free by construction. One branch in `Machine::enter_code` is
+the whole shipping delta.
+
+**No shipping command can install a backend, and this is the sentence to read
+first.** `Compiled` and `set_compiled` appear nowhere in `ply-cli`; outside
+`crates/ply-eval`'s own tests and `crates/ply-codegen-spike`, which ADR 0016
+§3.5 requires be deletable, `set_compiled` has **no caller in `crates/*`**. So
+`ply test --engine both` cannot attach one, and the rule that a backend run is a
+third execution strategy whose results the result cache must not keep — written
+down on `Machine::set_compiled` — is **not enforced, because it is
+unreachable**. **Ply does not ship this.** Everything below is a measurement at
+a seam only the spike's harness and `ply-eval`'s differential corpus can reach.
+
+ADR 0016 §3.5 said deferring M9 "deletes one feature block and one dependency
+line, and nothing else in the workspace knows it existed". After R5 that clause
+is false — `compiled.rs`, the trait, `set_compiled`, three counters on `Machine`
+and a branch on every interpreted call all survive the `rm -r` — and it is
+corrected in place there. The first half of §3.5 was verified by **performing**
+the deletion rather than arguing it: `rm -r crates/ply-codegen-spike` in a copied
+tree, then `cargo build --workspace --all-targets` and `cargo test --workspace`
+green, 155 test binaries, **3,680 passed, 0 failed**, with the seam's 25 unit
+tests and both differential-corpus backends still among them.
+
+### What it costs on the workload that ships
+
+**0.0 allocations per `/health` request.** `HOOK` (the tree as it ships) against
+`NOHOOK` (the same tree with the `enter_code` call site deleted), two binaries
+from one frozen tree, arms alternated `H N H N H N`: both read **773.4** at 200
+requests, byte-identical including `bytes_per_request`, and identical again at 20
+and 2,000 requests. Pre-registered rule, decided before any number existed:
+`HOOK − NOHOOK > 0.0 allocations` ⇒ regressed. **Not a regression.** In the
+linked binary the hook is 80 bytes of machine code. R4's 773.4 is unmoved, so
+this doubles as R4's staleness guard.
+
+Zero allocations is not zero cost. Instrumented, one `/health` request reaches
+the hook **237.87 times** and every one is a miss — `compiled_answer` exits on
+its first line, because nothing can install a backend. **The wall clock of those
+237.87 branch tests was never measured**, on either binary, although both
+existed: the currency was pre-registered as allocations and a wall-clock rule was
+not. That is the honest shape of this result and not a technicality — a
+deterministic quantity known in advance to be zero is a check, not an experiment.
+
+### What it bought on the kernel
+
+`benches/kernel/`, the same three-heap Nim MCTS R4 measured. Load gate **2.63**
+against a pre-registered 4.5; all 84 ladder windows sampled between 2.40 and
+2.91, so **no window was dropped by either pre-registered filter on any rung**.
+Controls, both required in 0.95–1.05: harness floor **0.9995×**,
+nothing-enterable **0.9758×**.
+
+| rung | ratio | 10th–90th | entries/call |
+| --- | ---: | --- | ---: |
+| control: nothing enterable | 0.976× | — | **0** |
+| the exploration term | 2.860× | [2.835, 2.871] | 1,275 |
+| + the playout | 6.176× | [6.139, 6.197] | 2,161 |
+| **everything the fragment accepts** | **6.199×** | **[6.143, 6.226]** | **2,162** |
+
+**6.199×, [6.143, 6.226], over 21 of 21 surviving paired windows, 2,162 native
+entries**, pre-registered verdict `entry-paid-off`. Pre-R5 the same rung was
+**0.998× with 0 entries**, and the ladder is monotone in entries. Two reviewers
+replicated the top rung independently at load 5.3–6.8 (6.215×) and at load 12–16
+(6.240×) — both formally void under the pre-registration's own load rule, and
+reported as direction and magnitude rather than as a second result. A reviewer
+attacked it directly, controlled for the arm order R4 alternated and R5 did not
+(≤3%, sign flips with load), and could not break it.
+
+**So ADR 0018 §0's diagnosis was right: the binding constraint was
+architectural.** One-way calling was what made 81% of executed work inside the
+fragment worth 0.998×.
+
+### 6.199× is above the ceiling that ordered ADR 0018, and the ceiling is what was wrong
+
+ADR 0018 §0 puts the Amdahl ceiling at **4.86×** for an enterable backend and
+**5.26×** at an infinitely fast fragment. 6.199× is above both, taken with 19 of
+34 functions accepted — nowhere near "however much of the fragment you accept".
+**A number that beats its own predicted ceiling means the model was wrong, not
+that the result is extra good**, and the same report holds the number that says
+how: interpreted, the search offers **45,586** calls to the hook per
+`mcts.plan_753(100)`; compiled, it offers **2,266**. **43,320 interpreted calls
+per search stop existing.**
+
+The ceiling's denominator priced each function's *body* in isolation, charging
+the call-site machinery — argument vector, frame push, `Env` binding — to a 19.2%
+"unattributed" bucket belonging to no function. Entry deletes that machinery too,
+and arrival is the cheapest part of an interpreted call. ADR 0018 withdraws its
+ceiling as a bound in §0.5.
+
+**The same fact is also a correctness defect, read from the other side**: a
+compiled body pushes **one** frame where the interpreter pends many. That is
+finding 1 below, and it and the ceiling are one fact.
+
+### A wrong backend was pointed at this for the first time
+
+R5 as delivered argued the corpus could detect a wrong answer and never
+demonstrated it. `crates/ply-codegen-spike/tests/mutations.rs` now runs eight
+deliberately wrong backends and names what caught each; the table is
+reproducible and a reviewer reproduced three rows digit for digit
+(`--mutate off-by-one`: **1,635 disagreements**, first
+`mcts.heap case 0: result value — left 0, right 1`). **Two were not caught.**
+
+- **A backend that ignores its call budget** is a stack overflow, exit 134,
+  before a single case is compared. The bounded form (4× fuel) *is* caught — on
+  the diagnostic-label axis only, so a harness scoring `(Err, Err)` as agreement
+  would have passed it.
+- **The published-row gate is untestable by every corpus in the tree.**
+  `benches/kernel` declares no effect at all; `ply-eval`'s differential corpus
+  declines effectful names. If that gate regresses, both corpora report success.
+
+And the sharpest row is not a mutation at all: a uniform off-by-one in
+`mcts.ucb` — 2,156 wrong scores — is reported **only** by the 84 cases generated
+directly against `mcts.ucb`. No caller and none of the 24 whole-kernel searches
+notices, because UCB feeds an argmax. Measured separately: **12 of the 19
+compiled functions are offered to the backend zero times during those 24
+searches.** The whole-kernel leg of R5's agreement result is much weaker than it
+sounds, and half the entered functions are policed by their own generated cases
+and by nothing else.
+
+`ply test --engine both` catches **none** of the eight, on any corpus, for any
+mutation, because it cannot install a backend.
+
+### Three of the four review lenses refuted the write-up
+
+Reported here as prominently as the 6.199×, because that is what this file is
+for. All three are open in `CONTRIBUTING.md` §"Things known to be broken", items
+9 through 13.
+
+**1. The seam carries one of the machine's two resource bounds.** With the real
+cranelift backend, no mutation, one entry and zero declines:
+
+```
+pub fn hog(n: Int) -> Int =
+  if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }     // 150 "+ 1"
+
+machine alone:   Err("recursion limit of 1000000 pending frames exceeded")
+machine + spike: Ok(1350000)
+```
+
+`compiled_answer` hands over `budget = max_calls - stack.calls()` and nothing
+else; `DEFAULT_MAX_FRAMES = 1_000_000`, enforced in `push`, cannot be expressed
+at the boundary and no backend can honour it. Reproduced inside `ply-eval` with
+a hand-built honest backend, and with `with_max_frames(64)` and no recursion at
+all. `DEFAULT_MAX_FRAMES`'s own doc asserted the opposite — *"every recursion
+reaches [`DEFAULT_MAX_CALLS`] first, since a call costs at least one frame"* — and
+that is false: a **call** costs one frame, a **body** costs as many as it pends.
+Both that doc and `limit.rs`'s are corrected in place, and `compiled.rs`'s
+"Recursion" bullet is narrowed. **Not fixed.** All three candidate fixes change
+shipping semantics.
+
+**2. The per-function regression was the backend, and R5 blamed its own filter.**
+`benches/r5-timing/RESULTS.md` §3 reported `mcts.playouts` at 0.068× — a 14.7×
+regression — then withdrew it as an artifact of R5's own stall filter, saying
+*"I did not identify the mechanism — only that it is the arm interleaving and not
+the backend"*. It is the backend. `crates/ply-codegen-spike/src/rt.rs`,
+`Ctx::begin`, runs `slots.clear()` then `shrink_to(RETAINED_SLOTS)`, so **every
+entry costs O(the previous entry's peak arena)**. Measured best-of-7, twice, at
+two loads: the identical hybrid call `mcts.playouts(0,0,0)` runs in 0.375 µs
+after a 4-slot predecessor and 68.083 µs after a 19,584-slot one — **181×**,
+monotone, ~3.5 ns a slot, with no carry-over on the interpreter arm. §3 is
+corrected in place and these sentences are withdrawn by name: *"no function of
+the 26 is below 1.00×"*, *"nothing in this kernel is too small to be worth
+entering"*, and *"6.199× is if anything an underestimate"*. The aggregate is
+unaffected — it is filter-independent and was replicated twice — but it no longer
+carries a sign.
+
+A second row that table cannot show at all: its argument-set selection skips any
+set the interpreter raises on, which is exactly the fuel-decline path. Re-taken
+2026-08-22 with the shipped binary, `mcts --dir benches/kernel --probe machine`
+is **0.17 s** against `--probe compiled` at **11.82 s** — ~**69× slower with a
+backend attached** on a program that is about to raise either way. ADR 0018 §0
+records it and RESULTS.md never mentions it.
+
+**3. A definition that handles its own effects is offered to a backend.**
+`effects.handled` in the spike's own hazard fixture performs two operations and
+discharges them under its own `handle`; it is declared `-> Int` with no row and
+type-checks, and both `footprint` and `performed` come back **empty**, so the
+purity gate clears it. A probe had it offered and answered, and the corpus
+reported `effects.handled: observed footprint — left {effects.tally.read[log],
+effects.tally.write[log]}, right {}` — character for character the evidence R5's
+own mutation table reports for *deleting* that gate from shipping code. The gate
+is in place; it does not apply. Latent only because the one backend in the tree
+refuses `handle` at compile time — which is a backend remembering an invariant
+`compiled.rs` claims to enforce by construction. That bullet is narrowed in
+place. It also reaches past the seam: `ply-test` reads a declared-but-unobserved
+atom as "a branch was not taken", so an entered definition would say a branch was
+not taken when it was.
+
+**The fourth lens held**, and it held after being executed rather than argued:
+the deletability of the spike, the falsification table's reproducibility, and the
+0-allocation hot-path tax all survived (see §"What was built" above).
+
+### A defect R5 did not cause and R5's review found
+
+> **Not an R5 regression** — it predates the seam and no backend is involved —
+> but the probe that found finding 1 found it, and it is a `--engine both`
+> divergence, which is the failure mode this project treats as never a warning.
+>
+> The two engines bound recursion at different things: the tree-walker at nested
+> calls, the machine at nested calls **and** at 1,000,000 pending frames. A body
+> pending more than `1_000_000 / 10_000` = **100 frames per call** hits the frame
+> bound first, and the tree-walker has no such bound. With the shipping binary
+> and no backend:
+>
+> ```
+> $ ply test /tmp/zzhog.ply --engine both
+>   PANIC a recursion whose body pends 150 frames a level
+>     no culprit: the interpreter failed rather than the program; this is a
+>     defect in Ply
+>     `treewalk` and `machine` disagree
+>     = treewalk: passed
+>     = machine: [E0502] recursion limit of 1000000 pending frames exceeded
+> ```
+>
+> Crossover measured at depth 9,990: k = 90 passes, k = 100 raises.
+> `crates/ply-eval/tests/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
+> therefore holds only below that ratio — both its programs pend two frames a
+> level — and its name and doc claimed the general statement. The doc is
+> narrowed; the test is **not** changed to assert the divergence, so **nothing in
+> the suite arms the true bound**. `CONTRIBUTING.md` §"Things known to be broken"
+> item 10.
+
+### What R5 did not do
+
+- **Wall clock on `/health`, with and without the hook.** Both binaries existed
+  and the A/B was never run.
+- **Any allocation figure with a backend attached, anywhere.** The 6.199× is
+  wall clock only.
+- **Replicate.** One run, one kernel, one program, one box; the pre-registration
+  forbade re-running, so the reported run is a sample of size one. The two
+  reviewer replications are above the load gate and formally void.
+- **Test its own filters.** Zero windows were dropped by either pre-registered
+  filter on any rung. The load filter never fired; on macOS the 1-minute average
+  updates every ~5 s against a ~190 ms window, so it can only drop a whole rung
+  or none — it is a per-rung gate wearing a per-window filter's clothes. The only
+  place the stall filter fired, it produced a false regression.
+- **Source the decisive gate reading.** RESULTS.md's "load average immediately
+  before the timed section: **2.63**" appears nowhere in `mcts-r5.json`; the
+  provenance line records `2.78 3.34 4.66` and `analyze.py` recomputes the gate
+  from the first ladder window's 2.52. The gate passes on all three, so nothing
+  turns on it, but the input to a refusal rule is prose only.
+- **Exercise the seam under the rest of the language.** Effects, handlers,
+  continuations captured across an entry, `simulate`, secrets, `Float`/`Str`/
+  `Decimal`/`Bytes`, higher-order closures, the store, the test cache,
+  `ply prove` and the host path were never run with a backend attached. The
+  kernel declares no effect at all, so the purity gate and the effect path cost
+  nothing here because nothing reached them.
+- **Mutate `jit.rs`'s lowering, or the oracle.** Every wrong backend R5 built
+  corrupts *answers*. A real instruction-selection bug is untested, and if the
+  tree-walker and the machine were wrong in the same way every comparison here
+  agrees.
+- **Update `benches/adr0018-mcts.json`.** It still holds the pre-R5 numbers,
+  including `end_to_end` 0.998× measured with zero entries. R5 wrote to
+  `benches/r5-timing/mcts-r5.json` instead. The two disagree on the fragment's
+  shape and the newer one is right: the census moved from 22 of 34 functions and
+  386 of 745 nodes to **19 and 352**, because removing the trampoline made a
+  compiled set closed under calls. `benches/README.md` carries that correction;
+  ADR 0018 §0.5 carries it for §1's premise; ADR 0019 still states the old shape
+  in two places.
+
 ---
 
 # What is next
@@ -1429,6 +1708,27 @@ ladder was re-taken after R3 and the verdict did not move
    > compiled code. That last sentence is a prerequisite for every codegen
    > lever and it is in no ADR yet — ADR 0019 §5 item 3.
 
+   > **Audit note (R5, 2026-08-22): the prerequisite was built, and the ceiling
+   > above is withdrawn as a bound.** The interpreter can enter compiled code
+   > (§R5). On the same kernel, same harness, pre-registered before any number
+   > existed, end to end is **6.199× [6.143, 6.226]** over 21 of 21 paired
+   > windows with 2,162 native entries, against 0.998× with zero entries — and
+   > 6.199× is **above** the 4.86× and 5.26× this item quotes, with 19 of 34
+   > functions accepted rather than all of them. ADR 0018 §0.5 says why: the
+   > ceiling priced each function's *body* and charged the call-site machinery
+   > to an unattributed bucket, and entry deletes that machinery too — 43,320
+   > interpreted calls per search stop existing.
+   >
+   > **This does not re-open M9 and nothing here argues that it does.** The
+   > 6.199× is measured at a seam **no shipping command can reach**:
+   > `set_compiled` has no caller in `crates/*` outside `ply-eval`'s own tests
+   > and the deletable spike, `ply test --engine both` cannot attach a backend,
+   > and the rule that a backend run must not populate the result cache is
+   > unenforced because it is unreachable. What this item now owes is not
+   > another ratio. It is a decision about whether a backend is ever reachable
+   > from a shipping command, which is M9 with an ADR, and ADR 0016 §3.5 still
+   > requires the spike be deleted rather than promoted.
+
    ~~and the ladder has not been re-taken since~~ — **it has now.**
    `benches/w6-ladder-r3.json` is the post-R3 take and the verdict machinery
    re-derives from it unchanged: interpreter share **35%** (34.3%–34.7%), ceiling
@@ -1441,9 +1741,11 @@ ladder was re-taken after R3 and the verdict did not move
 
 Two smaller obligations are open and both are recorded above rather than in a
 tracker: `crates/ply-codegen-spike` is still present and ADR 0016 §3.5 requires
-its deletion, and `Machine::constant` disables the constant memo inside any open
-*scheduler* region, which CONTRACTS.md calls a defect rather than a rule and
-which costs a spawning service **1.78× on `/health`** — re-taken after R3, at
+its deletion — R5 verified the deletion still leaves the workspace green by
+performing it (3,680 tests, 0 failed) and also made §3.5's *other* half false,
+which is corrected in place there — and `Machine::constant` disables the
+constant memo inside any open *scheduler* region, which CONTRACTS.md calls a
+defect rather than a rule and which costs a spawning service **1.78× on `/health`** — re-taken after R3, at
 273.0µs sequential against 488.7µs spawning on the same service, and printed by
 `ply-corpus w6` over `benches/w6-ladder-r3.json`.
 
@@ -1480,6 +1782,16 @@ spike at 11.67x on its compilable fragment and 1.02-1.05x end to end, because th
 fragment is 2-5% of an HTTP request. An MCTS inner loop may be *mostly* that
 fragment. Re-pricing the existing spike against a kernel is cheap, and every other
 item is ordered on an assumption only that measurement can test.
+
+> **Audit note (R5, 2026-08-22): that measurement has now been taken twice.**
+> R4 took it and got **0.998x** on a kernel 81.0% inside the fragment, because
+> the interpreter could not enter compiled code. R5 made entry possible and got
+> **6.199x [6.143, 6.226]** with 2,162 native entries — above the 4.86x/5.26x
+> ceiling ADR 0018 derived, which §0.5 there withdraws as an artifact of a
+> body-only attribution. Read §R5 before this paragraph: none of the 6.199x is
+> reachable by any user of Ply, three of the four reviews of R5 refuted what it
+> wrote, and the seam carries only one of the machine's two recursion bounds, so
+> a backend can answer where the machine raises.
 
 Available today, and it is the design working rather than a concession: the kernel
 in Rust behind a host handler with a declared footprint, the strategy and

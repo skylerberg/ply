@@ -894,9 +894,17 @@ So an amendment to ADR 0018 owes, at minimum:
    of the kernel's time, so that is **≈2.5× on the whole kernel** — Amdahl over
    `micros_per_ucb`, `micros_per_ucb_without_sqrt` and `attribution[0].share_of_request`,
    three fields of one file — from two prelude builtins and no compiler work.
-6. **A safety gap recorded.** Compiled code carries no equivalent of
+6. ~~**A safety gap recorded.** Compiled code carries no equivalent of
    `ply_eval::limit`'s bound on nested calls: the same call is a diagnostic in
-   the machine and `SIGABRT` in the fragment.
+   the machine and `SIGABRT` in the fragment.~~ — **closed, R5, 2026-08-21.**
+   Every compiled function carries a fuel prologue seeded from the budget
+   `ply_eval::Compiled::enter` is handed, which is the machine's `max_calls`
+   minus its current depth; a body that would pass it fails, the entry declines,
+   and the machine raises its own bound. Both probes answer
+   `recursion limit of 10000 nested calls exceeded`, asserted as a subprocess in
+   `crates/ply-codegen-spike/tests/mcts_kernel.rs`. See ADR 0018 §0's correction
+   block for the cost, which is real: 7.9 s against 0.11 s on the runaway
+   program, because the same call is re-offered at every interpreted depth.
 
 Item 5 is why the sequencing below does not put §2 of ADR 0018 first, and item 3
 is why it does not put codegen anywhere.

@@ -1691,6 +1691,24 @@ fn the_two_clause_forms_agree_on_generated_programs() {
 /// The budget is now `DEFAULT_MAX_CALLS` on both sides, counted as pending
 /// calls: the tree-walker's own nesting, the machine's `Frame::Call`s. Both
 /// halves of the original finding are asserted, one program each.
+///
+/// > **Narrowed (R5 review, 2026-08-22): the name and the paragraph above claim
+/// > more than the two programs below test, and the gap is a live divergence.**
+/// > Both bodies pend two frames per level, so both reach `DEFAULT_MAX_CALLS`
+/// > first and the frame bound is never in play. It is in play at
+/// > `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = **100 pending frames per call**:
+/// > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }` with 150 `+ 1`
+/// > terms, called at 9,000, makes `ply test --engine both` report
+/// > `treewalk: passed` against
+/// > `machine: [E0502] recursion limit of 1000000 pending frames exceeded`.
+/// > Measured at depth 9,990: k = 90 agrees, k = 100 diverges.
+/// >
+/// > So what this test holds is: **the two engines agree on the recursion bound
+/// > for bodies pending fewer than 100 frames per call.** Nothing in the suite
+/// > arms the rest, and nothing here is changed to assert the divergence,
+/// > because a test that pins a defect is not the same artifact as one that
+/// > pins a guarantee. `CONTRIBUTING.md` §"Things known to be broken" carries
+/// > it as open.
 #[test]
 fn the_two_engines_agree_on_the_recursion_bound() {
     let between = r#"

@@ -56,9 +56,10 @@ fn inputs() -> Vec<Input> {
 }
 
 fn agree_on(harness: &mut Harness, input: &Input) -> bool {
-    let entry = harness.compiled.entry(READ_LINE).expect("compiled");
-    let expected = harness.machine.call(READ_LINE, input.args.clone(), Span::DUMMY);
-    let actual = harness.compiled_call(entry, &input.args);
+    let expected = harness
+        .machine
+        .call(READ_LINE, input.args.clone(), Span::DUMMY);
+    let actual = harness.compiled_call(READ_LINE, &input.args);
     match (expected, actual) {
         (Ok(a), Ok(b)) => values_equal(&a, &b, Span::DUMMY).unwrap_or(false),
         (Err(_), Err(_)) => true,
@@ -121,31 +122,68 @@ fn folding_a_literal_into_the_code_object_changes_no_answer() {
     }
 }
 
+/// **Corrected in R5.** This test used to read
+/// `a_call_the_spike_did_not_compile_goes_through_the_machine_and_still_agrees`,
+/// compiled `read_line` alone, and asserted that `harness.ctx.machine_calls > 0`
+/// — that the trampoline ADR 0016 §3.2 allows was taken and still agreed. There
+/// is no trampoline now.
+///
+/// It was a whole `Machine::call` entry point on a second, privately held
+/// machine: `escape::check`, `reset()`, `close_regions`, `end_entry_point`. That
+/// was invisible while the only way into compiled code was at the top of a pure
+/// integer kernel. Once the interpreter can *enter* compiled code, the same
+/// helper is a route out of a live machine's frame into a different machine's
+/// `reset()` — the caller's handler stack, trail, region generations and
+/// footprint discarded in silence. So a call to a function outside the unit
+/// refuses the unit, and the compiled set is closed under calls.
 #[test]
-fn a_call_the_spike_did_not_compile_goes_through_the_machine_and_still_agrees() {
-    let mut harness = Harness::with(&[READ_LINE], Opts::default()).expect("compiles");
-    harness.ctx.machine_calls = 0;
-    for input in inputs() {
-        assert!(
-            agree_on(&mut harness, &input),
-            "the trampolined form disagreed on `{}`",
-            input.name
-        );
-    }
+fn a_unit_missing_a_callee_is_refused_and_names_the_call() {
+    let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
+    let refusal = Jit::compile(loaded, &[READ_LINE]);
+    let message = match refusal {
+        Ok(_) => panic!(
+            "`{READ_LINE}` was compiled without `line_at` and `line_stops`, so it must be \
+             reaching them some other way — which is the trampoline this milestone removed"
+        ),
+        Err(e) => e.to_string(),
+    };
     assert!(
-        harness.ctx.machine_calls > 0,
-        "the trampoline was never taken, so this measured nothing"
+        message.contains("which is not in this compiled unit"),
+        "the unit was refused for something other than the missing callee: {message}"
     );
+    assert!(
+        message.contains("std.http.line_stops") || message.contains("std.http.line_at"),
+        "the refusal does not name the function that was missing: {message}"
+    );
+    // And the whole group still compiles, so the refusal is about closure rather
+    // than about `read_line`.
+    Jit::compile(loaded, GROUP).expect("the closed group compiles");
 }
 
+/// > **Corrected in R5.** `std.http.list_field` was listed here as refused for a
+/// > "list literal". It is now refused earlier, for `fold` — a builtin that calls
+/// > user code.
+/// >
+/// > That is not a cosmetic reordering. `fold`, `map`, `filter`, `map_fold` and
+/// > `bytes_position` used to compile clean and then raise at run time out of
+/// > `rt_builtin`, because `builtins::call` answers `Step::Apply` for them and a
+/// > native frame has no machine to run the callback on. A census counting such
+/// > a function as compiled was counting one that could not run — the same
+/// > defect ADR 0019 §5 item 4 records for `Float`. They are refused at compile
+/// > time now, so the refusal fires before the list literal does.
+/// >
+/// > `std.http.contains_string` moved for the same reason, and it was this
+/// > list's only lambda. The lambda refusal is still armed — see
+/// > [`a_lambda_is_refused_by_name`], which reaches it through a Ply function
+/// > rather than through a builtin.
 #[test]
 fn the_fragment_refuses_what_it_cannot_compile_and_names_it() {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
     for (name, expected) in [
         ("std.http.parse_head", "field access"),
-        ("std.http.list_field", "list literal"),
+        ("std.http.list_field", "a builtin that calls user code"),
         ("std.net.send_from", "perform"),
-        ("std.http.contains_string", "lambda"),
+        ("std.http.contains_string", "a builtin that calls user code"),
         ("std.http.header", "pattern"),
     ] {
         let refusal = Jit::compile(loaded, &[name]);
@@ -165,6 +203,11 @@ fn a_function_inside_the_fragment_is_compiled_rather_than_refused() {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
     let compiled = Jit::compile(loaded, GROUP).expect("the group is inside the fragment");
     assert!(compiled.entry(READ_LINE).is_some());
+    assert!(
+        ply_codegen_spike::entry::enterable(loaded, &[READ_LINE.to_string()]).is_empty(),
+        "`read_line` takes `Bytes` and answers a constructor, so the machine must never be \
+         offered it whatever the fragment compiled"
+    );
     assert_eq!(compiled.arity(READ_LINE), Some(3));
     assert!(compiled.nodes[READ_LINE] > 0);
     assert!(
@@ -209,4 +252,35 @@ fn a_measured_input_carries_four_times_and_an_agreement() {
     assert!(r.interpreter_best_micros <= r.interpreter_worst_micros);
     assert!(r.spike_best_micros <= r.spike_worst_micros);
     assert!(r.spike_best_micros > 0.0);
+}
+
+/// The lambda refusal, reached where a higher-order *builtin* does not shadow it.
+///
+/// `Fx::app` resolves the callee before it lowers the arguments, so a lambda
+/// handed to `fold` is refused as `fold` and the lambda is never reached. Handed
+/// to a Ply function it is the first thing outside the fragment, which is what
+/// this probe arranges. Kept because `the_fragment_refuses_what_it_cannot_compile_and_names_it`
+/// used to cover it and no longer can.
+#[test]
+fn a_lambda_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("ply-lambda-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    std::fs::write(
+        dir.join("lam.ply"),
+        "pub fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))\n\
+         pub fn go(x: Int) -> Int = twice(|n: Int| n + 1, x)\n",
+    )
+    .expect("the probe source");
+    let loaded: &'static Loaded = Box::leak(Box::new(
+        Loaded::project(&dir).expect("the probe program loads"),
+    ));
+    let message = match Jit::compile(loaded, &["lam.go"]) {
+        Ok(_) => panic!("a lambda was compiled"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        message.contains("lambda"),
+        "`lam.go` was refused as `{message}`, which does not name the lambda"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

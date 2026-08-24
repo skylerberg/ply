@@ -10,7 +10,7 @@
 //! compile, which is the one failure mode that would make the number worthless.
 
 use crate::program::Loaded;
-use crate::rt::{self, Ctx};
+use crate::rt::{self, Ctx, Tables};
 use anyhow::{Result, anyhow};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData,
@@ -26,6 +26,7 @@ use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, Lit, PatternKind, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
@@ -75,18 +76,21 @@ struct Helpers {
     builtin: FuncId,
     ctor: FuncId,
     record: FuncId,
-    call_machine: FuncId,
+    no_fuel: FuncId,
 }
 
 /// One compiled program, and the tables its runtime context needs.
+///
+/// It owns the [`JITModule`], so every [`Entry`] handed out lives exactly as
+/// long as this does. Nothing frees the executable pages — `JITModule` unmaps
+/// only through `unsafe fn free_memory(self)` and nothing calls it — so dropping
+/// one leaks. That is a spike, not a design; it is written down here because the
+/// bare `fn` pointer [`Compiled::entry`] returns carries no lifetime and would
+/// otherwise look safe.
 pub struct Compiled {
     module: JITModule,
     entries: HashMap<String, (FuncId, usize)>,
-    pub consts: Vec<Value>,
-    pub ctors: Vec<(Symbol, usize)>,
-    pub shapes: Vec<Vec<Symbol>>,
-    pub builtins: Vec<Builtin>,
-    pub targets: Vec<String>,
+    tables: Rc<Tables>,
     pub nodes: HashMap<String, usize>,
     /// Nanoseconds spent in `cranelift`, from the first declaration to
     /// `finalize_definitions`.
@@ -104,15 +108,13 @@ impl Compiled {
         self.entries.get(name).map(|(_, a)| *a)
     }
 
+    pub fn tables(&self) -> &Rc<Tables> {
+        &self.tables
+    }
+
     /// A context wired to this program's tables. One per thread of calls.
     pub fn context(&self) -> Ctx {
-        let mut ctx = Ctx::new();
-        ctx.consts = self.consts.clone();
-        ctx.ctors = self.ctors.clone();
-        ctx.shapes = self.shapes.clone();
-        ctx.builtins = self.builtins.clone();
-        ctx.targets = self.targets.clone();
-        ctx
+        Ctx::new(self.tables.clone())
     }
 }
 
@@ -141,7 +143,6 @@ pub struct Jit {
     ctors: Vec<(Symbol, usize)>,
     shapes: Vec<Vec<Symbol>>,
     builtins: Vec<Builtin>,
-    targets: Vec<String>,
     funcs: HashMap<String, (FuncId, usize, usize)>,
     helpers: Helpers,
     nodes: HashMap<String, usize>,
@@ -158,18 +159,115 @@ fn helper_sig(module: &JITModule, params: usize, returns: bool) -> Signature {
     sig
 }
 
+/// A lowered body, held between declaration and definition.
+type Body = (String, Vec<Symbol>, Code, usize);
+
 impl Jit {
     /// Compiles `names` as one unit: a call between two of them is a direct
-    /// call, and a call to anything else is a trampoline.
+    /// call, and a call to anything else refuses the caller.
+    ///
+    /// The compiled set is therefore **closed under calls** — which is the whole
+    /// of what R5 changed here. See [`Denotes::Uncompiled`].
     pub fn compile(loaded: &'static Loaded, names: &[&str]) -> Result<Compiled> {
         Jit::compile_with(loaded, names, Opts::default())
     }
 
-    pub fn compile_with(
+    pub fn compile_with(loaded: &'static Loaded, names: &[&str], opts: Opts) -> Result<Compiled> {
+        let (mut jit, bodies, started) = Jit::prepare(loaded, names, opts)?;
+        let mut clif = ClifContext::new();
+        let mut fctx = FunctionBuilderContext::new();
+        for (name, params, body, module_index) in &bodies {
+            jit.nodes.insert(name.clone(), count_nodes(body));
+            clif.clear();
+            let (id, _, _) = jit.funcs[name];
+            clif.func.signature = jit.entry_signature();
+            jit.define(&mut clif, &mut fctx, loaded, name, params, body, *module_index)?;
+            jit.module.define_function(id, &mut clif)?;
+        }
+        jit.module.finalize_definitions()?;
+        let compile_nanos = started.elapsed().as_nanos();
+
+        let entries = jit
+            .funcs
+            .iter()
+            .map(|(name, (id, arity, _))| (name.clone(), (*id, *arity)))
+            .collect();
+        Ok(Compiled {
+            module: jit.module,
+            entries,
+            tables: Rc::new(Tables {
+                consts: jit.consts,
+                ctors: jit.ctors,
+                shapes: jit.shapes,
+                builtins: jit.builtins,
+            }),
+            nodes: jit.nodes,
+            compile_nanos,
+        })
+    }
+
+    /// Every refusal `names` produces when they are offered **as one unit**,
+    /// rather than the first one.
+    ///
+    /// [`Jit::compile_with`] fails the whole unit on the first construct outside
+    /// the fragment, which is right for a measurement and useless for deciding
+    /// *which* functions a unit could hold. A caller closing a candidate set
+    /// under calls needs all of them, because dropping one function can refuse
+    /// its callers on the next round.
+    ///
+    /// Nothing is finalized and no [`Compiled`] is produced: a refused function
+    /// is declared and never defined, and finalizing that is an error.
+    pub fn refusals(loaded: &'static Loaded, names: &[&str], opts: Opts) -> Result<Vec<Refused>> {
+        let (mut jit, bodies, _) = Jit::prepare(loaded, names, opts)?;
+        let mut out = Vec::new();
+        for (name, params, body, module_index) in &bodies {
+            // A fresh context per function: `FunctionBuilder::finalize` is what
+            // returns a `FunctionBuilderContext` to a reusable state, and a
+            // refused body never reaches it.
+            let mut clif = ClifContext::new();
+            let mut fctx = FunctionBuilderContext::new();
+            clif.func.signature = jit.entry_signature();
+            if let Err(e) = jit.define(
+                &mut clif,
+                &mut fctx,
+                loaded,
+                name,
+                params,
+                body,
+                *module_index,
+            ) {
+                // A refusal is the answer this is asking for; anything else —
+                // a cranelift failure, a name that does not resolve — is a bug
+                // in the spike and must not be read as "outside the fragment".
+                let Some(refused) = e.downcast_ref::<Refused>() else {
+                    return Err(e);
+                };
+                out.push(Refused {
+                    function: refused.function.clone(),
+                    construct: refused.construct.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(ctx, args) -> handle`, the one shape every compiled function has.
+    fn entry_signature(&self) -> Signature {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig
+    }
+
+    /// Everything both drivers do before a body is lowered to instructions:
+    /// build the module, register the runtime symbols, declare every function
+    /// so that a call between two of them resolves, and lower each body.
+    fn prepare(
         loaded: &'static Loaded,
         names: &[&str],
         opts: Opts,
-    ) -> Result<Compiled> {
+    ) -> Result<(Jit, Vec<Body>, std::time::Instant)> {
         let mut flags = settings::builder();
         flags.set("use_colocated_libcalls", "false")?;
         flags.set("is_pic", "false")?;
@@ -197,7 +295,7 @@ impl Jit {
             builtin: declare(&mut module, "rt_builtin", 4, true)?,
             ctor: declare(&mut module, "rt_ctor", 4, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
-            call_machine: declare(&mut module, "rt_call_machine", 4, true)?,
+            no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
         };
 
         let mut jit = Jit {
@@ -207,7 +305,6 @@ impl Jit {
             ctors: loaded.ctors(),
             shapes: Vec::new(),
             builtins: Vec::new(),
-            targets: Vec::new(),
             funcs: HashMap::new(),
             helpers,
             nodes: HashMap::new(),
@@ -218,10 +315,7 @@ impl Jit {
             let (def, module_index) = loaded
                 .definition(name)
                 .ok_or_else(|| anyhow!("no definition named `{name}`"))?;
-            let mut sig = jit.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
+            let sig = jit.entry_signature();
             let id = jit
                 .module
                 .declare_function(&mangle(name), Linkage::Export, &sig)?;
@@ -230,42 +324,7 @@ impl Jit {
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
             bodies.push(((*name).to_string(), params, lower(&def.body), module_index));
         }
-
-        let mut clif = ClifContext::new();
-        let mut fctx = FunctionBuilderContext::new();
-        for (name, params, body, module_index) in &bodies {
-            jit.nodes.insert(name.clone(), count_nodes(body));
-            clif.clear();
-            let (id, _, _) = jit.funcs[name];
-            clif.func.signature = {
-                let mut sig = jit.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                sig.params.push(AbiParam::new(types::I64));
-                sig.returns.push(AbiParam::new(types::I64));
-                sig
-            };
-            jit.define(&mut clif, &mut fctx, loaded, name, params, body, *module_index)?;
-            jit.module.define_function(id, &mut clif)?;
-        }
-        jit.module.finalize_definitions()?;
-        let compile_nanos = started.elapsed().as_nanos();
-
-        let entries = jit
-            .funcs
-            .iter()
-            .map(|(name, (id, arity, _))| (name.clone(), (*id, *arity)))
-            .collect();
-        Ok(Compiled {
-            module: jit.module,
-            entries,
-            consts: jit.consts,
-            ctors: jit.ctors,
-            shapes: jit.shapes,
-            builtins: jit.builtins,
-            targets: jit.targets,
-            nodes: jit.nodes,
-            compile_nanos,
-        })
+        Ok((jit, bodies, started))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -289,21 +348,6 @@ impl Jit {
 
         let failure = builder.create_block();
 
-        let mut scope = Vec::new();
-        for (i, p) in params.iter().enumerate() {
-            let handle =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), args_ptr, (i * 8) as i32);
-            scope.push((
-                p.clone(),
-                Val {
-                    kind: Kind::Boxed,
-                    v: handle,
-                },
-            ));
-        }
-
         let mut fx = Fx {
             jit: self,
             builder,
@@ -313,8 +357,51 @@ impl Jit {
             function: name.to_string(),
             module_index,
         };
+
+        // The prologue `ply_eval::limit` needs and ADR 0019 §5 item 6 records as
+        // missing: one nested call is spent here and given back on the normal
+        // return, so a compiled recursion is bounded by the same number the
+        // machine bounds an interpreted one by. Four instructions — load,
+        // subtract, branch, store — on a path a real backend pays for a stack
+        // check anyway.
+        let fuel = fx.load_fuel();
+        let spent = fx.builder.ins().iadd_imm_s(fuel, -1);
+        let go = fx.builder.create_block();
+        let exhausted = fx.builder.create_block();
+        let none_left = fx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, spent, 0);
+        fx.builder.ins().brif(none_left, exhausted, &[], go, &[]);
+        fx.builder.switch_to_block(exhausted);
+        fx.builder.seal_block(exhausted);
+        fx.helper_void(fx.jit.helpers.no_fuel, &[]);
+        fx.builder.ins().jump(failure, &[]);
+        fx.builder.switch_to_block(go);
+        fx.builder.seal_block(go);
+        fx.store_fuel(spent);
+
+        let mut scope = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let handle = fx.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                args_ptr,
+                (i * 8) as i32,
+            );
+            scope.push((
+                p.clone(),
+                Val {
+                    kind: Kind::Boxed,
+                    v: handle,
+                },
+            ));
+        }
+
         let result = fx.expr(body, &mut scope)?;
         let handle = fx.boxed(result);
+        // The only path that gives the nested call back. `failure` does not, and
+        // must not: a failed entry is abandoned whole and `Ctx::begin` reseeds.
+        let left = fx.load_fuel();
+        let restored = fx.builder.ins().iadd_imm_s(left, 1);
+        fx.store_fuel(restored);
         fx.builder.ins().return_(&[handle]);
 
         fx.builder.switch_to_block(failure);
@@ -393,12 +480,70 @@ fn count_nodes(code: &Code) -> usize {
     n
 }
 
+/// Where compiled code finds `Ctx::failed`, taken from the type rather than
+/// written down: `#[repr(C)]` fixes the layout and `offset_of!` reads it, so the
+/// two cannot drift when a field is added.
+const FAILED_OFFSET: i32 = std::mem::offset_of!(Ctx, failed) as i32;
+const FUEL_OFFSET: i32 = std::mem::offset_of!(Ctx, fuel) as i32;
+
+/// Whether a compiled body may call this builtin, and what to say when it may
+/// not.
+///
+/// Each refusal closes a hazard rather than being conservative for its own sake,
+/// and each is read off `ply_eval`'s own vocabulary rather than a list somebody
+/// transcribed:
+///
+/// - [`Builtin::higher_order`] is the crate's own name for "calls user code", so
+///   `call` may answer `Step::Apply`. Running user code from inside a native
+///   frame needs the machine, and a compiled body is handed no machine — before
+///   R5 these compiled clean and raised at run time, which meant a census
+///   counted a function that could not run.
+/// - `cell_get` and `cell_set` are the only builtins that reach an arena. A
+///   compiled body's arena is not the machine's, so the access would land in the
+///   wrong world; handing over the right one would be worse, because it would
+///   skip `Machine::record_cell_access` and leave a `simulate` region's
+///   partial-order reduction pruning interleavings that race.
+/// - `secret_of_string` is the only introduction of a [`Value::Secret`], and the
+///   fragment's `slots` and constant pool both outlive the call that made one.
+fn admissible_builtin(b: Builtin) -> Result<(), String> {
+    if b.higher_order() {
+        return Err(format!("`{}`, a builtin that calls user code", b.name()));
+    }
+    match b {
+        Builtin::CellGet | Builtin::CellSet => Err(format!(
+            "`{}`, which reaches a cell arena compiled code is not given",
+            b.name()
+        )),
+        Builtin::SecretOfString => Err(format!(
+            "`{}`, which would put a credential in the fragment's value arena",
+            b.name()
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// What a name denotes, decided at compile time in the order
 /// `Machine::lookup` decides it at run time.
+///
+/// Every variant is handled without a wildcard where it matters ([`Fx::app`]),
+/// so a variant added later fails to compile until somebody decides whether a
+/// compiled body may reach it.
 enum Denotes {
     Local(Val),
     Compiled(FuncId, usize),
-    Machine(usize, usize),
+    /// A Ply function this unit did not compile.
+    ///
+    /// **This refuses the enclosing function.** It used to emit a trampoline —
+    /// `rt_call_machine`, a whole `Machine::call` entry point on a second,
+    /// privately-held machine — and that was tolerable only while nothing could
+    /// enter compiled code from inside a live machine. It can now, so a
+    /// trampoline would be a route from one machine's frame into another
+    /// machine's `reset()`: the caller's handler stack, trail, region
+    /// generations and footprint discarded, silently. Refusing the caller
+    /// instead makes the compiled set closed under calls, which is the property
+    /// `crate::entry::SpikeBodies` needs to promise the machine that a native
+    /// body cannot reach anything the machine is holding.
+    Uncompiled(String),
     Ctor(usize, usize),
     Builtin(usize),
     Constant(i64),
@@ -430,13 +575,25 @@ impl Fx<'_, '_> {
         -(self.jit.consts.len() as i64)
     }
 
+    fn load_fuel(&mut self) -> cranelift_codegen::ir::Value {
+        self.builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), self.ctx, FUEL_OFFSET)
+    }
+
+    fn store_fuel(&mut self, v: cranelift_codegen::ir::Value) {
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), v, self.ctx, FUEL_OFFSET);
+    }
+
     /// After every call that can fail: one load and one branch, which is what a
     /// real backend pays for a fallible runtime call too.
     fn check(&mut self) {
-        let failed = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), self.ctx, 0);
+        let failed =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), self.ctx, FAILED_OFFSET);
         let next = self.builder.create_block();
         self.builder
             .ins()
@@ -545,16 +702,9 @@ impl Fx<'_, '_> {
             return Ok(Denotes::Compiled(*id, *arity));
         }
         if let Some(name) = &global
-            && let Some((def, _)) = self.loaded.definition(name.as_str())
+            && self.loaded.definition(name.as_str()).is_some()
         {
-            let index = match self.jit.targets.iter().position(|t| t == name.as_str()) {
-                Some(i) => i,
-                None => {
-                    self.jit.targets.push(name.to_string());
-                    self.jit.targets.len() - 1
-                }
-            };
-            return Ok(Denotes::Machine(index, def.params.len()));
+            return Ok(Denotes::Uncompiled(name.to_string()));
         }
         let ctor = global.clone().or_else(|| {
             if q.is_bare() && self.jit.ctors.iter().any(|(n, _)| n == q.symbol()) {
@@ -576,6 +726,9 @@ impl Fx<'_, '_> {
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
         {
+            if let Err(why) = admissible_builtin(b) {
+                return self.refuse(why);
+            }
             let index = match self.jit.builtins.iter().position(|x| *x == b) {
                 Some(i) => i,
                 None => {
@@ -1008,19 +1161,10 @@ impl Fx<'_, '_> {
                 self.check();
                 v
             }
-            Denotes::Machine(index, arity) => {
-                if arity != handles.len() {
-                    return self.refuse(format!(
-                        "`{}` is called with {} arguments and takes {arity}",
-                        q.symbol(),
-                        handles.len()
-                    ));
-                }
-                let ptr = self.spill(&handles);
-                let index = self.builder.ins().iconst(types::I64, index as i64);
-                let v = self.helper(self.jit.helpers.call_machine, &[index, ptr, n]);
-                self.check();
-                v
+            Denotes::Uncompiled(target) => {
+                return self.refuse(format!(
+                    "a call to `{target}`, which is not in this compiled unit"
+                ));
             }
             Denotes::Builtin(index) => {
                 let ptr = self.spill(&handles);

@@ -10,8 +10,10 @@
 //! reach on the hottest pure function of the request path — and is deleted when
 //! W6 closes whatever that number turns out to be.
 
+pub mod entry;
 pub mod jit;
 pub mod measure;
 pub mod program;
 pub mod rt;
 pub mod served;
+pub mod wrong;

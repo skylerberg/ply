@@ -4,18 +4,23 @@
 //! checked for agreement against **both** evaluators before anything is timed:
 //! a faster wrong answer prices nothing.
 
-use crate::jit::{Compiled, Entry, Jit, Opts};
+use crate::entry::{SpikeBodies, enterable};
+use crate::jit::{Compiled, Jit, Opts};
 use crate::program::Loaded;
-use crate::rt::Ctx;
-use anyhow::{Result, bail};
-use ply_eval::{Interp, Machine, Value, values_equal};
-use ply_span::Span;
+use anyhow::Result;
+use ply_eval::{DEFAULT_MAX_CALLS, Interp, Machine, Value, values_equal};
+use ply_span::{Diagnostic, Span};
 use serde::Serialize;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// The three functions the fragment covers, compiled as one unit. `read_line`
 /// is the one under measurement; the other two are its whole call graph, and
 /// compiling them is what keeps the ratio from being a trampoline's.
+///
+/// Since R5 there is no trampoline to be: a unit that left one of these out
+/// would not compile at all, because a call to a function outside the unit
+/// refuses the caller.
 pub const GROUP: &[&str] = &[
     "std.http.read_line",
     "std.http.line_at",
@@ -41,11 +46,20 @@ pub struct InputResult {
     pub agreed: bool,
 }
 
+/// One program, compiled once, with the two machines a comparison needs.
+///
+/// The pair is the point. `machine` has no backend and is what this workspace
+/// ships; `hybrid` is the same machine with the same program and the compiled
+/// bodies registered through `ply_eval::Compiled`. Any difference between them
+/// is the backend, and there is nothing else it could be — same AST, same
+/// `CheckOutput`, same `Machine::new`.
 pub struct Harness {
     pub loaded: &'static Loaded,
-    pub compiled: Compiled,
-    pub ctx: Ctx,
+    pub bodies: Rc<SpikeBodies>,
+    /// The interpreter as shipped. Nothing is registered on it, ever.
     pub machine: Machine<'static>,
+    /// The same interpreter, with compiled bodies it may enter.
+    pub hybrid: Machine<'static>,
 }
 
 impl Harness {
@@ -63,6 +77,10 @@ impl Harness {
     /// The same, over a program somebody else loaded, and with the entry-cost
     /// function named by the caller — a project that does not import
     /// `std.http` has no [`ENTRY_FN`] to add.
+    ///
+    /// `names` must be closed under calls; [`crate::entry::admissible`] computes
+    /// the largest such set, and a set that is not closed fails to compile here
+    /// rather than trampolining out of the fragment at run time.
     pub fn over(
         loaded: &'static Loaded,
         names: &[&str],
@@ -76,41 +94,73 @@ impl Harness {
             all.push(entry);
         }
         let compiled = Jit::compile_with(loaded, &all, opts)?;
-        let mut ctx = compiled.context();
-        ctx.machine = Some(Box::new(Machine::new(
-            &loaded.ast,
-            &loaded.resolved,
-            &loaded.check,
-        )));
+        // Only the scalar-signature members are offered to the machine. The rest
+        // are compiled and reachable from inside a native body — which is what
+        // makes the set closed — and would decline on every call if registered.
+        let compiled_names: Vec<String> = all.iter().map(|n| (*n).to_string()).collect();
+        let admitted = enterable(loaded, &compiled_names);
+        let bodies = Rc::new(SpikeBodies::new(loaded, compiled, &admitted)?);
         let machine = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
+        let mut hybrid = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
+        hybrid.set_compiled(bodies.clone());
         Ok(Harness {
             loaded,
-            compiled,
-            ctx,
+            bodies,
             machine,
+            hybrid,
         })
     }
 
+    pub fn compiled(&self) -> &Compiled {
+        self.bodies.compiled()
+    }
+
+    /// Puts a different backend behind the hybrid machine, over the same
+    /// program and the same compiled bodies.
+    ///
+    /// The one caller that matters is [`crate::wrong::Mutant`]: a corpus whose
+    /// backend cannot be swapped for a wrong one is a corpus whose green result
+    /// nobody can price.
+    pub fn set_backend(&mut self, backend: Rc<dyn ply_eval::Compiled>) {
+        self.hybrid.set_compiled(backend);
+    }
+
+    /// The shipped interpreter, with no backend. Every baseline is this.
     pub fn interpret(&mut self, name: &str, args: &[Value]) -> Result<Value> {
         self.machine
             .call(name, args.to_vec(), Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("`{name}` raised: {}", d.message))
     }
 
-    /// The compiled call, with the arena reset and the arguments boxed — the
-    /// whole of what a caller pays to enter compiled code here.
-    pub fn compiled_call(&mut self, entry: Entry, args: &[Value]) -> Result<Value> {
-        self.ctx.reset();
-        let handles: Vec<i64> = args.iter().map(|a| self.ctx.push(a.clone())).collect();
-        let out = unsafe { entry(&mut self.ctx as *mut Ctx, handles.as_ptr()) };
-        if self.ctx.failed != 0 {
-            let d = self.ctx.take_failure();
-            bail!(
-                "compiled code raised: {}",
-                d.map(|d| d.message).unwrap_or_else(|| "no message".into())
-            );
-        }
-        Ok(self.ctx.read(out).clone())
+    /// The same, keeping the diagnostic rather than its message — what a
+    /// comparison against the tree-walker needs.
+    pub fn interpret_outcome(&mut self, name: &str, args: &[Value]) -> Result<Value, Diagnostic> {
+        self.machine.call(name, args.to_vec(), Span::DUMMY)
+    }
+
+    /// The interpreter with the backend attached: the R5 measurement.
+    pub fn hybrid_outcome(&mut self, name: &str, args: &[Value]) -> Result<Value, Diagnostic> {
+        self.hybrid.call(name, args.to_vec(), Span::DUMMY)
+    }
+
+    pub fn run_hybrid(&mut self, name: &str, args: &[Value]) -> Result<Value> {
+        self.hybrid
+            .call(name, args.to_vec(), Span::DUMMY)
+            .map_err(|d| anyhow::anyhow!("`{name}` raised: {}", d.message))
+    }
+
+    /// Native entries taken and calls declined by the machine, straight off the
+    /// machine rather than off the provider — so a report cannot quote a ratio
+    /// without the count that says whether anything ran.
+    pub fn hybrid_counts(&self) -> (u64, u64) {
+        self.hybrid.compiled_counts()
+    }
+
+    /// A direct native call, outside any machine: ADR 0016's original path, and
+    /// the only one that can report the fragment's own failure.
+    pub fn compiled_call(&mut self, name: &str, args: &[Value]) -> Result<Value> {
+        self.bodies
+            .call_direct(name, args, DEFAULT_MAX_CALLS as i64)
     }
 }
 
@@ -154,15 +204,10 @@ pub fn compare(
     iterations: u32,
     repeats: u32,
 ) -> Result<Measured> {
-    let entry = harness
-        .compiled
-        .entry(function)
-        .ok_or_else(|| anyhow::anyhow!("`{function}` was not compiled"))?;
-
     let mut results = Vec::new();
     for input in inputs {
         let expected = harness.interpret(function, &input.args)?;
-        let actual = harness.compiled_call(entry, &input.args)?;
+        let actual = harness.compiled_call(function, &input.args)?;
         let agreed = values_equal(&expected, &actual, Span::DUMMY).unwrap_or(false);
 
         let args = input.args.clone();
@@ -182,7 +227,7 @@ pub fn compare(
             let h = &mut *harness;
             band(
                 || {
-                    h.compiled_call(entry, &args)?;
+                    h.compiled_call(function, &args)?;
                     Ok(())
                 },
                 iterations,
@@ -212,11 +257,7 @@ pub fn agrees_with_treewalk(harness: &mut Harness, function: &str, input: &Input
     let expected = interp
         .call(function, input.args.clone(), Span::DUMMY)
         .map_err(|d| anyhow::anyhow!("the tree-walker raised: {}", d.message))?;
-    let entry = harness
-        .compiled
-        .entry(function)
-        .ok_or_else(|| anyhow::anyhow!("`{function}` was not compiled"))?;
-    let actual = harness.compiled_call(entry, &input.args)?;
+    let actual = harness.compiled_call(function, &input.args)?;
     Ok(values_equal(&expected, &actual, Span::DUMMY).unwrap_or(false))
 }
 

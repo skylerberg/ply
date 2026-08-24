@@ -436,10 +436,136 @@ Recorded here so nobody spends an afternoon rediscovering them.
    figure; not diagnosed, and `docs/adr/0017-regions.md` §"What must be measured"
    ¶1 says so in place.
 
+9. **The compiled-entry seam carries one of the machine's two resource bounds,
+   so a backend answers where the machine raises.** Found by an R5 review with
+   the real cranelift backend, no mutation, one entry and zero declines.
+   `Machine::compiled_answer` computes `budget = max_calls - stack.calls()` and
+   that is the only bound `Compiled::enter(name, args, budget)` receives. The
+   machine has a second: `DEFAULT_MAX_FRAMES = 1_000_000`, enforced in `push`. A
+   compiled body pushes **one** `Frame::Call` for the whole call, where the
+   interpreter also pends a frame per pending operand, and nothing at the
+   boundary can express that — no backend can honour a bound it is not handed.
+
+   ```
+   pub fn hog(n: Int) -> Int =
+     if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }     // 150 "+ 1"
+   ```
+
+   `probe.hog` is accepted whole by the fragment. `hog(9000)`:
+
+   ```
+   machine alone:   Err("recursion limit of 1000000 pending frames exceeded")
+   machine + spike: Ok(1350000)          1 entry, 0 declines
+   ```
+
+   `ply_eval::compare_answers` calls that a `Divergence` on the verdict axis.
+   Reproduced inside `ply-eval` alone with a hand-built honest backend built as
+   `for_program(..).with_max_calls(budget)`, so it provably cannot outrun its
+   budget, and with `Machine::with_max_frames(64)` and **no recursion at all** —
+   a body of 300 chained `+ 1`s, which pends 300 frames and calls nothing. The doc on
+   `DEFAULT_MAX_FRAMES` and the module doc on `limit.rs` both used to assert the
+   opposite and both now carry the correction; `compiled.rs`'s "Recursion"
+   bullet is narrowed. **Not fixed**, and the fix is not obvious: a frame budget
+   is meaningless to a native body, so the options are charging an entry an
+   estimated frame cost, dropping `DEFAULT_MAX_FRAMES` so both engines share one
+   bound, or refusing to enter when `max_frames - frames()` is small relative to
+   `budget` — and all three change shipping semantics.
+10. **The two engines disagree on the recursion bound for any body pending 100
+    or more frames per call, with no backend involved.** This is not R5's defect;
+    R5's review found it while probing item 9, and it is older than the seam.
+    `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 1,000,000 / 10,000 = 100, and the
+    tree-walker has no frame bound at all, so it passes where the machine raises.
+    Item 9's program plus `test "..." { assert_eq(hog(9000), 1350000) }`, with
+    the shipping `target/release/ply` and no backend, re-taken 2026-08-22:
+
+    ```
+    $ ply test hog.ply --engine both
+      PANIC a recursion whose body pends 150 frames a level
+        no culprit: the interpreter failed rather than the program; this is a
+        defect in Ply
+        `treewalk` and `machine` disagree
+        = treewalk: passed
+        = machine: [E0502] recursion limit of 1000000 pending frames exceeded
+    ```
+
+    Measured crossover at depth 9,990 with `--engine machine`: k = 90 passes,
+    k = 100 raises. Consequence for the suite:
+    `crates/ply-eval/tests/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
+    holds only below that ratio — both of its programs pend two frames a level —
+    and its name and doc claimed the general statement. The doc is narrowed in
+    place; the test is **not** changed to assert the divergence, so **nothing in
+    the suite arms the true bound**.
+11. **A definition that discharges its own effects publishes an empty row, so
+    the compiled seam's purity gate clears it and the machine offers it.** Latent
+    rather than live, and reported because the design claims otherwise.
+    `crates/ply-codegen-spike/tests/fixtures/hazards/effects.ply`'s `handled`
+    performs two operations and handles them under its own `handle`, inside its
+    own `with_cell`; it is declared `-> Int` with no row, and both `footprint`
+    and `performed` come back empty. A probe over the existing `Harness`/`Mutant`
+    plumbing had it offered and answered with the value the interpreter produces,
+    and the corpus reported
+    `effects.handled: observed footprint — left {effects.tally.read[log],
+    effects.tally.write[log]}, right {}` — character for character the evidence
+    R5's mutation table reports for *deleting* the purity gate from shipping
+    code. The gate is in place; it does not apply. Nothing stops it today except
+    that the only backend in the tree refuses `handle` at compile time, which is
+    a backend remembering an invariant the seam claims to enforce structurally.
+    No published row can close it: `handled` carries no fact distinguishing it
+    from a genuinely pure definition. It also reaches further than the seam —
+    `ply-test`'s `report.rs` emits an `observed_footprint` and `slice.rs` reads a
+    declared-but-unobserved atom as "a branch was not taken", so an entered
+    definition would tell a user a branch was not taken when it was.
+    `compiled.rs`'s "Effects" bullet is narrowed in place.
+12. **Every entry into the spike's backend costs O(the *previous* entry's peak
+    arena).** `crates/ply-codegen-spike/src/rt.rs`, `Ctx::begin`, runs
+    `slots.clear()` and then `shrink_to(RETAINED_SLOTS)`; the clear drops that
+    many `Value`s and the shrink reallocates. Measured best-of-7, twice, at two
+    loads: the identical hybrid call `mcts.playouts(0,0,0)` runs in 0.375 µs
+    after a 4-slot predecessor and 68.083 µs after a 19,584-slot one — **181x**,
+    monotone, about 3.5 ns a retained slot, with no carry-over on the
+    interpreter arm. `begin`'s own comment describes the retained buffer as a
+    *memory* leak and does not connect it to the time. This is the mechanism
+    behind R5's `mcts.playouts` 0.068x row, which
+    `benches/r5-timing/RESULTS.md` §3 attributed to its own arm interleaving;
+    that section is corrected in place and its "no function of the 26 is below
+    1.00x" is withdrawn. Spike-only, so `rm -r` removes it — but the number it
+    invalidates was published.
+13. **Three holes in what polices the compiled seam, none of them closed.**
+    Recorded together because each is a green result over space nothing
+    exercises.
+
+    - **`ply test --engine both` cannot install a backend at all.** `Compiled`
+      and `set_compiled` appear nowhere in `ply-cli`, so the shipping CLI catches
+      **zero** of the eight deliberately wrong backends in
+      `crates/ply-codegen-spike/tests/mutations.rs`. Only that harness and
+      `crates/ply-eval/tests/differential_corpus.rs`'s two hand-built backends
+      police it. See also the `set_compiled` doc: the rule that a backend run
+      must not populate the result cache is **unenforced because it is
+      unreachable**.
+    - **A backend that ignores its budget is a stack overflow, not a
+      disagreement.** `--mutate exceeds-budget` dies with
+      `fatal runtime error: stack overflow`, exit 134, before a single case is
+      compared. The bounded form (`exceeds-budget=4`) *is* caught, on the
+      diagnostic-label axis only — a harness scoring `(Err, Err)` as agreement
+      would have passed it.
+    - **The published-row gate is untestable by every corpus in the tree.**
+      `benches/kernel` declares no effect at all and `ply-eval`'s differential
+      corpus declines effectful names, so if that gate regresses both corpora
+      report success. Three unit tests in `ply_eval::compiled` notice, and one of
+      the seam's gates has **no** biting test: replacing
+      `let name = closure.name.as_ref()?` with a fabricated empty `Symbol` leaves
+      `cargo test -p ply-eval --lib` at 519/519 green, because
+      `memo::pure_by_published_row` refuses the unknown name downstream — so
+      `an_anonymous_closure_is_never_offered`, whose doc says "the name gate is
+      what refuses it", is satisfied by a different gate.
+
 Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects
 documents. Item 5's comment was a document and was corrected; item 1 is a real
-code defect and is reported, not fixed. They are open.
+code defect and is reported, not fixed. Items 9 through 13 are R5's, found by
+the reviews of it: **three of the four review lenses pointed at R5 refuted the
+claim they were given**, and the documents they refuted are corrected in place
+rather than rewritten. None of 9–13 is fixed. They are open.
 
 ## Style
 
