@@ -702,8 +702,21 @@ fn a_whole_kernel_search_notices_a_wrong_leaf() {
     let loaded = kernel();
     let mut honest = kernel_harness(loaded);
     let control = mutated(&mut honest, Mutation::None, None);
+    // > **Corrected (fragment widening, 2026-08-24).** This mutated
+    // > `mcts.nth_move`, a leaf. The `Mutant` is a *backend*, so it corrupts an
+    // > answer at the boundary and only sees functions the machine actually
+    // > enters. `mcts.plan` is inside the fragment now, so a whole-kernel search
+    // > is **one** crossing and no entry is ever named `mcts.nth_move` — the
+    // > mutation could not fire, and `mutant.fired() > 0` went red.
+    // >
+    // > This is the second bullet of `a_whole_kernel_search_is_a_weak_oracle...`
+    // > applied one level up: everything under an entered function is a native
+    // > call the hook never sees, and the entered function is now the search
+    // > itself. The test is retargeted at the crossing that exists rather than
+    // > deleted, because what it pins — a search notices a backend that lies to
+    // > it — is still the property that matters.
     let mut wrong = kernel_harness(loaded);
-    let mutant = mutated(&mut wrong, Mutation::OffByOne, Some("mcts.nth_move"));
+    let mutant = mutated(&mut wrong, Mutation::OffByOne, Some("mcts.plan"));
 
     let mut noticed = 0;
     for args in searches() {
@@ -719,8 +732,36 @@ fn a_whole_kernel_search_notices_a_wrong_leaf() {
     assert!(mutant.fired() > 0, "the mutation never fired");
     assert!(
         noticed > 0,
-        "24 whole-kernel searches ran with `mcts.nth_move` off by one and every one of them \
+        "24 whole-kernel searches ran with `mcts.plan` off by one and every one of them \
          answered the same move"
+    );
+    // And the withdrawn form, asserted rather than described: a leaf mutation is
+    // now invisible to a search, because the search does not cross the boundary
+    // at the leaf any more. This is a *loss of resolution* in the corpus's
+    // search leg and it is pinned here so that it is a number rather than a
+    // surprise.
+    let mut leaf = kernel_harness(loaded);
+    let leaf_mutant = mutated(&mut leaf, Mutation::OffByOne, Some("mcts.nth_move"));
+    for args in searches() {
+        if let Some(d) = disagreement(&mut leaf, "mcts.plan", &args) {
+            panic!(
+                "a search noticed a mutated `mcts.nth_move` after all — good news, and the \
+                 correction on this test is now wrong: {d}"
+            );
+        }
+    }
+    assert_eq!(
+        leaf_mutant.fired(),
+        0,
+        "`mcts.nth_move` was corrupted {} times from a search, so the search still crosses the \
+         boundary at the leaves and this correction is wrong",
+        leaf_mutant.fired()
+    );
+    // The direct case still reaches it, which is what keeps the leaf covered.
+    caught(
+        &mut leaf,
+        "mcts.nth_move",
+        &[Value::Int(7 + 5 * 16 + 3 * 256), Value::Int(1)],
     );
 }
 
@@ -739,6 +780,23 @@ fn a_whole_kernel_search_notices_a_wrong_leaf() {
 ///     the nineteen compiled functions are in this position: `below`, `terminal`,
 ///     `heap`, `objects`, `winner`, `pack`, `playouts`, `nim_sum`, `bit_xor`,
 ///     `ilog2`, `isqrt`, `isqrt_step`.
+///
+/// > **Corrected (fragment widening, 2026-08-24): the first bullet's figure is
+/// > withdrawn and its conclusion is now reached by the second bullet's
+/// > mechanism.** It read: *"It answers 1,268 wrong scores over these 24
+/// > searches and every one of them still answers the same move, because UCB
+/// > feeds an argmax and adding one to every score leaves the ranking alone."*
+/// >
+/// > That was measured and correct while `mcts.ucb` was an entry point. It is
+/// > not one now: the whole tree half is inside the fragment, `mcts.plan` is the
+/// > only crossing a search makes, and `ucb` has joined the list in the second
+/// > bullet. So it answers **0** wrong scores rather than 1,268 — not because
+/// > the argmax absorbs them but because the mutation never fires. The blind
+/// > spot the test names is real and is now wider: **every** compiled function
+/// > except the search entry points is invisible to a search.
+/// >
+/// > The direct per-function leg below is unchanged and is what still covers
+/// > them, which is the point the test's title makes.
 ///
 /// Both are caught by a direct case on the function, which is what the corpus's
 /// per-function leg is for, and this test asserts that too — a limitation is
@@ -769,9 +827,12 @@ fn a_whole_kernel_search_is_a_weak_oracle_and_the_per_function_cases_are_not() {
             );
         }
     }
-    assert!(
-        ucb_mutant.fired() > 100,
-        "`mcts.ucb` was corrupted {} times, so the blind spot above is not what was measured",
+    assert_eq!(
+        ucb_mutant.fired(),
+        0,
+        "`mcts.ucb` was corrupted {} times from a search. The withdrawn assertion here was \
+         `fired() > 100`, when `ucb` was an entry point; if it fires again the fragment has \
+         narrowed and the correction on this test is wrong",
         ucb_mutant.fired()
     );
     assert_eq!(

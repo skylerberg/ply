@@ -95,6 +95,54 @@ By lowered nodes removed from the fragment:
 | 25 | 2 | unary `-` |
 | 10 | 1 | a list literal `[]` |
 
+> **Corrected (fragment widening, 2026-08-24): this is a FIRST-REFUSAL census,
+> and read as a work list it is wrong by more than an order of magnitude.**
+>
+> The table is accurate and the section's title is not. It is titled *"What is
+> actually outside, ranked — this is the roadmap §1 promised"*, which invites
+> exactly one reading: remove the top row and seven functions, 253 nodes, come
+> inside. That is not what happens, and the number to plan from is not in this
+> table.
+>
+> Each row reports the construct named **first** when a function was refused, one
+> function at a time. Two things break the arithmetic:
+>
+> * **A refusal names one construct, not all of them.** `mcts.empty_node` is
+>   listed under unary `-` and also contains `[]`. Admitting unary `-` moves it
+>   to the list-literal row rather than into the fragment.
+> * **The fragment must be closed under calls** (`jit::Denotes::Uncompiled`
+>   refuses the caller of anything it did not compile), so a function is only
+>   admitted when every construct in it *and every function it reaches* is
+>   admitted.
+>
+> Measured, one item at a time, `mcts --dir benches/kernel --only agreement`:
+>
+> | after admitting | fns inside | nodes inside | enterable | entries |
+> | --- | ---: | ---: | ---: | ---: |
+> | *nothing (baseline)* | 19 / 34 | 352 / 745 | 19 | 56,876 |
+> | a field access | 20 / 34 | 363 / 745 | 19 | 56,876 |
+> | + constructor patterns | 20 / 34 | 363 / 745 | 19 | 56,876 |
+> | + unary `-`, `[]`, list patterns | **34 / 34** | **745 / 745** | **21** | 49,489 |
+>
+> **The 253-node row delivered 11 nodes and one function, and changed nothing
+> about what executes.** The four rows are not four wins; they are one closure,
+> and the whole of it arrives on the last item. A fifth construct nobody
+> censused — a **constructor pattern** (`Some(n) ->`), which sits behind the
+> field access in `mcts.node_at` and therefore never got to be a first refusal —
+> had to be lowered as well.
+>
+> `benches/README.md` §"What `mcts` adds" carries the same correction, and
+> `crates/ply-codegen-spike/tests/spike.rs`'s stdlib row for
+> `std.http.parse_head` is the standing illustration: it used to be refused for
+> "a field access" and is now refused for its call to `read_line`. Removing the
+> named construct moved the name.
+>
+> **What did not move, and bounds all of it:** the 19.0% of executed work that
+> is the `Map`, record and list machinery itself is still outside the fragment
+> and is untouched by any of this. `rt_field`, `rt_record` and `rt_list` call
+> `ply_eval`'s own representations; widening changes *which functions compile*,
+> never what a `Map` insert costs.
+
 And by *executed* work, **19.0% of the run is the `Map`/record/list machinery
 itself**, which is outside the fragment no matter which functions compile.
 
@@ -148,6 +196,28 @@ at run time — and **no nested-call bound**, where the machine answers
 > > `crates/ply-codegen-spike/tests/hazards.rs::a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer`
 > > asserts the decline as an exact count, so a lowering that ever *answered* one
 > > of these goes red.
+> >
+> > **Closed (fragment widening, 2026-08-24).** `jit::Fx::literal` now refuses a
+> > `Float` or `Decimal` **literal**, so `float_inside`, `decimal_inside` and
+> > `float_arith_inside` are refused at compile time instead of compiled,
+> > offered, and declined at `rt_unbox_int`. The fragment's claimed coverage and
+> > its behaviour now agree.
+> >
+> > *Refuse rather than build a path* was the choice, and the reason is scope,
+> > not difficulty: a real `Float` path widens the agreement surface by `NaN`, by
+> > `-0.0`, by float equality and by `Decimal` precision, and the workload this
+> > fragment is being widened for — a self-hosted front end — is field accesses
+> > and list patterns, not floating point. ADR 0018 §2 still asks for `Float`
+> > unboxed; this closes the *dishonesty* rather than the §2 item.
+> >
+> > **What is still open, and it is the half a reader will assume is closed:**
+> > only the literal-shaped case is refused. A `Float` arriving in an
+> > `Int` -> `Int` body as a **builtin's return value** is refused by nothing —
+> > it still meets `rt_unbox_int`, still fails, and still declines. That remains
+> > a slow answer rather than a wrong one, which is the property
+> > `hazards.rs::a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer`
+> > asserts; the test was rewritten in place, with its withdrawn assertions
+> > quoted, and its direct `compiled_call("numerics.fadd", ...)` leg is unchanged.
 > >
 > > The census consequence in ADR 0019 §5 item 4 stands and is now demonstrated:
 > > those three definitions are counted as compiled and cannot run. The audit's

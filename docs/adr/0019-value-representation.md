@@ -269,7 +269,7 @@ document.
 | `size_of::<Value>()` = 32; 24 with `Ctor` boxed; 40 with `Ctor.args` as `Arc<[Value]>` | same run, `-- what the 32 bytes are spent on --` |
 | narrowing `Value` to 24 bytes saves 7,085 bytes per request and **zero** allocations | same run, `-- what a narrower Value would move --` |
 | `Value::Record(1 field)` costs 2 allocations, `[40, 544]` | same run, `the_shape_of_every_value_variant_is_measured` |
-| 22 of 34 kernel functions and 386 of 745 lowered nodes inside the codegen fragment | `benches/adr0018-mcts.json`, `accepted_functions` / `accepted_nodes` |
+| 22 of 34 kernel functions and 386 of 745 lowered nodes inside the codegen fragment — **stale twice over: R5's closure-under-calls change made it 19 and 352, and the 2026-08-24 widening made it 34 and 745** | `benches/adr0018-mcts.json`, `accepted_functions` / `accepted_nodes`; re-take with `mcts --dir benches/kernel --only agreement` |
 | 81.0% of the kernel's executed work inside the fragment | same file, `fragment_share_measured` |
 | 52.58× [50.19–53.52] where the fragment runs | same file, `pure_compute` |
 | 0.998× [0.979–1.007] end to end, against a floor of 1.000× [0.994–1.009] | same file, `rungs[3]` and `harness_floor` |
@@ -845,6 +845,19 @@ lowered nodes it takes with it (`benches/adr0018-mcts.json`, `refusals_ranked`):
 a **field access**, 7 functions and 253 nodes; a list pattern in a `match`, 2
 and 71; unary `-`, 2 and 25; a list literal, 1 and 10. One construct is 71% of
 the refused nodes.
+
+> **Corrected (fragment widening, 2026-08-24): "it is one thing" and "one
+> construct is 71% of the refused nodes" are both withdrawn as a work list.**
+> The figures are transcribed correctly from a run; the inference from them is
+> what fails. That table is a **first-refusal** census — one construct named per
+> refused function — so the rows are not additive and are not independent:
+> admitting the field access moved 7 functions and 253 nodes by **one function
+> and 11 nodes**, and left what executes unchanged. The four rows are a single
+> closure that arrives on the last item, and a fifth construct that appears in
+> no row (a constructor pattern, hidden behind the field access in
+> `mcts.node_at`) had to be lowered too. All five are in now: **34 of 34
+> functions, 745 of 745 nodes, 0 refusals, 0 disagreements.** ADR 0018 §0
+> carries the per-item table and the reasoning.
 
 **The conclusion it drew from that does not hold.** End to end on the whole
 kernel the hybrid is **0.998× [0.979–1.007]** against a floor of 1.000×
