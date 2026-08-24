@@ -1391,7 +1391,9 @@ const MUTANT_CHILD: &str = "PLY_SPIKE_MUTANT_CHILD";
 /// for by every run that does not crash.
 fn guard_a_mutated_run() -> Result<()> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
-    command.args(std::env::args_os().skip(1)).env(MUTANT_CHILD, "1");
+    command
+        .args(std::env::args_os().skip(1))
+        .env(MUTANT_CHILD, "1");
     let ended = ply_codegen_spike::wrong::ended(command.status()?);
     match ended.as_disagreement() {
         Some(d) => {

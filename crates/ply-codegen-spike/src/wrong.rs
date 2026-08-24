@@ -45,7 +45,6 @@ use std::cell::{Cell, RefCell};
 use std::process::{Command, ExitStatus};
 use std::rc::Rc;
 
-
 /// How a run that might not come back ended.
 ///
 /// [`Mutation::ExceedsBudget(None)`](Mutation::ExceedsBudget) is not a wrong
