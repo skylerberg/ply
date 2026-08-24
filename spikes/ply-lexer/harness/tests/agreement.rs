@@ -238,11 +238,27 @@ fn the_ply_lexer_agrees_with_the_rust_one_on_the_shipped_standard_library() {
     }
 }
 
-/// The corpus above is every `.ply` file in the tree and **all of it is
-/// ASCII** — checked, and the reason this test exists. Nothing in it reaches a
-/// malformed literal, an out-of-range number, or an unterminated string, so
-/// agreeing on it says nothing at all about the error paths, which are half of
-/// what `lexer.rs` does.
+/// Nothing in the corpus above reaches a malformed literal, an out-of-range
+/// number, or an unterminated string, so agreeing on it says nothing at all
+/// about the error paths, which are half of what `lexer.rs` does. These ten
+/// files are the only thing in the spike that exercises them: **all 25
+/// diagnostics in the whole comparison come from five of these ten fixtures**,
+/// and the 767,638 bytes of real source raise none.
+///
+/// > **Corrected (verification pass, 2026-08-24).** This doc opened: *"The
+/// > corpus above is every `.ply` file in the tree and **all of it is ASCII** —
+/// > checked, and the reason this test exists."* Both halves are false, and the
+/// > second is refuted by
+/// > `every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree`
+/// > forty lines below, which asserts **1,543** non-ASCII bytes and carries two
+/// > correction blocks of its own saying so. The corpus is **33** files; the
+/// > tree holds **109** `.ply` files outside `spikes/`, so **86** files and
+/// > **95,419** bytes are not compared — among them
+/// > `tests/fixtures/unterminated_string.ply`, the one file outside this spike
+/// > that raises a lexer diagnostic. (Compared by hand during the verification
+/// > pass: the two lexers agree on it exactly, `E0002` included.) A stale
+/// > sentence sitting above a test whose own body refutes it is this
+/// > repository's signature defect in miniature.
 #[test]
 fn the_ply_lexer_agrees_with_the_rust_one_on_the_hand_written_edge_cases() {
     for path in ply_files(&spike_dir().join("fixtures")) {
