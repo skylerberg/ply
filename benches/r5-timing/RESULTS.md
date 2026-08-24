@@ -18,6 +18,15 @@ machine **answers where it would have raised** on a body pending more than 100
 frames per call, because the seam passes the call budget and cannot express
 `DEFAULT_MAX_FRAMES`.
 
+> **Corrected (2026-08-24): the paragraph above is written in the present tense
+> and no longer holds.** It described items 9 and 10, and both are fixed. The
+> machine has no default frame ceiling, so there is nothing the seam fails to
+> express: `budget` is the whole bound. Nothing in this file's ratios moves —
+> they were taken with a backend that entered bodies well inside both limits —
+> but a reader should not carry the "second bound" away from here.
+> `crates/ply-eval/src/machine.rs`'s `with_max_frames` has the measurement that
+> settled it.
+
 ---
 
 ## 1. The hot-path tax: zero allocations, 237.87 checks

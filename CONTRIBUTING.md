@@ -57,7 +57,7 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # 9.5-18 min — 3,661 pass, 0 fail, 5 ignored
+cargo test --workspace                          # 9.5-29 min — 3,690 pass, 0 fail, 5 ignored
 ```
 
 **All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
@@ -66,6 +66,27 @@ warnings and zero errors, `cargo test --workspace --no-fail-fast` **3,644 passed
 / 0 failed / 5 ignored** across **155 targets** (142 binaries + 13 doc-test
 suites). If you introduce the first warning, that is a regression, not a
 baseline.
+
+> **Re-taken after the frame-ceiling fix (2026-08-24).** The line above read
+> `9.5-18 min — 3,661 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
+> --no-fail-fast -- --test-threads=2` now reports **3,690 passed / 0 failed / 5
+> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
+> **1,735.2s real / 1,548.7s user** by `/usr/bin/time -p`. That wall clock was
+> taken on a machine at load 25–43 with three other agents building and testing
+> on it, so it is an upper bound and not comparable with the older figures; the
+> counts are deterministic and are. The +29 is three tests from §"Things known
+> to be broken" items 9, 10 and 13's close and twenty-six from the per-gate
+> tests item 13's close added. `fmt --all --check` silent, `clippy --workspace
+> --all-targets` zero warnings and zero errors, both re-run on the same tree.
+> Two caveats worth carrying. The heaviest new test peaks near 4.2 GiB — see
+> §"The suite proves less than it looks like it proves". And the **binary count
+> is 142 here where the reading above it is 143, and this pass could not account
+> for the difference**: every `tests/*.rs` in every workspace member appears in
+> the run except the five under `crates/ply-codegen-spike/`, which are excluded
+> by design because that crate declares its own `[workspace]` (item 1), and
+> `value_semantics_audit` — the binary the 143 reading added — is present and
+> ran. Recorded rather than reconciled, because "the count moved and I guessed
+> why" is the failure this file is about.
 
 > **Re-verified again (second regression audit, 2026-08-21).** `fmt --all
 > --check` silent and exit 0; `clippy --workspace --all-targets` zero lines
@@ -122,6 +143,15 @@ short version:
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock ratio and runs by default. A busy machine can fail it.
 Re-run on a quiet one before you believe it.
+
+And one test is memory-heavy rather than slow:
+`ply-eval/tests/equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends`
+peaks around **4.2 GiB** in a debug build. It runs the tree-walker over a
+program pending 1,011,700 frames, and the tree-walker spends kilobytes of native
+stack per pending level. That is inherent, not sloppiness — the machine's frame
+stack is the tree-walker's native stack reified one for one, so no cheaper
+program crosses the million-frame ceiling this test exists to prove is gone. See
+§"Things known to be broken" item 10 for the figures.
 
 ## Before you open a change
 
@@ -436,8 +466,11 @@ Recorded here so nobody spends an afternoon rediscovering them.
    figure; not diagnosed, and `docs/adr/0017-regions.md` §"What must be measured"
    ¶1 says so in place.
 
-9. **The compiled-entry seam carries one of the machine's two resource bounds,
-   so a backend answers where the machine raises.** Found by an R5 review with
+9. ~~**The compiled-entry seam carries one of the machine's two resource
+   bounds, so a backend answers where the machine raises.**~~ **Fixed
+   2026-08-24, together with item 10 — they were one defect.** The entry below
+   is left as it was written, and the fix is at the end of item 10. Found by an
+   R5 review with
    the real cranelift backend, no mutation, one entry and zero declines.
    `Machine::compiled_answer` computes `budget = max_calls - stack.calls()` and
    that is the only bound `Compiled::enter(name, args, budget)` receives. The
@@ -470,8 +503,9 @@ Recorded here so nobody spends an afternoon rediscovering them.
    estimated frame cost, dropping `DEFAULT_MAX_FRAMES` so both engines share one
    bound, or refusing to enter when `max_frames - frames()` is small relative to
    `budget` — and all three change shipping semantics.
-10. **The two engines disagree on the recursion bound for any body pending 100
-    or more frames per call, with no backend involved.** This is not R5's defect;
+10. ~~**The two engines disagree on the recursion bound for any body pending
+    100 or more frames per call, with no backend involved.**~~ **Fixed
+    2026-08-24; the close is at the end of this entry.** This is not R5's defect;
     R5's review found it while probing item 9, and it is older than the seam.
     `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 1,000,000 / 10,000 = 100, and the
     tree-walker has no frame bound at all, so it passes where the machine raises.
@@ -495,6 +529,123 @@ Recorded here so nobody spends an afternoon rediscovering them.
     and its name and doc claimed the general statement. The doc is narrowed in
     place; the test is **not** changed to assert the divergence, so **nothing in
     the suite arms the true bound**.
+
+    > **Closed, 9 and 10 together (2026-08-24).** The machine has no default
+    > frame ceiling any more, so `DEFAULT_MAX_CALLS` is the only bound on what a
+    > program may do — the one the tree-walker counts as its own nesting, the
+    > machine counts as `Frame::Call`s, and `Compiled::enter` is handed as
+    > `budget`. `pub const DEFAULT_MAX_FRAMES` is deleted;
+    > `Machine::with_max_frames` remains as an opt-in resource ceiling that is
+    > **not** semantics, does not say "recursion limit", and withdraws the
+    > compiled seam's offer entirely while it is set, because a native body pends
+    > no frames and could not honour it.
+    >
+    > **Why removal and not one of the three fixes item 9 lists.** The ceiling
+    > was a function of **spelling**, not of behaviour. Two definitions of the
+    > same function `hog(n) = 150n`, the same 9,001 nested calls, shipping
+    > release binary, 2026-08-24:
+    >
+    > ```
+    > $ ply test spell_a.ply --engine machine --no-cache   # hog(n - 1) + 150
+    >    ok    one addition of 150
+    > $ ply test spell_b.ply --engine machine --no-cache   # hog(n - 1) + 1 + 1 + ...
+    >    FAIL  one hundred fifty additions of 1
+    >      recursion limit of 1000000 pending frames exceeded
+    > ```
+    >
+    > Copying the ceiling into the tree-walker would have made *both* engines
+    > refuse the right-hand program over how its additions were written, and
+    > would still have left a backend answering where both raised — item 9 is
+    > structurally unfixable while the ceiling is semantics, because a native
+    > body has no frames and any charge is an estimate, and an estimate that
+    > differs from the interpreter's exact count *is* the divergence. The only
+    > conservative charge, `budget × the body's static pend`, declines every
+    > recursive entry the seam exists for.
+    >
+    > **What the ceiling was protecting, measured.** Nothing the product does not
+    > already spend. Peak RSS, `/usr/bin/time -l`, debug, one process per figure,
+    > same program and same 1,350,000 pending levels on both sides: the
+    > **machine** holds them in **194 MiB**, about 151 bytes a frame; the
+    > **tree-walker** holds them in **5,365 MiB**, about 4.2 KiB a level, and
+    > reports `passed`. The engine carrying the guard was the one spending about
+    > a 28th as much of the resource it guarded.
+    >
+    > Pending frames are also not unbounded without calls, which is what would
+    > have made removal reckless. Measured, not reasoned: `fold` over a list
+    > needs exactly the frames the list's builder needs and `map` exactly one
+    > more, whatever the length — peak frames 205/405/805 for the builder alone
+    > and for `fold`, 206/406/806 for `map`, at lengths 200/400/800 — so a
+    > builtin loop is O(1) in frames; and a continuation splice carries its calls
+    > with its frames, staying at `5 × calls − 1` across three sizes (54/11,
+    > 104/21, 204/41). What bounds the heap is `DEFAULT_MAX_CALLS` times how much
+    > a body pends, and the tree-walker has always been held to exactly that and
+    > no more.
+    >
+    > **Armed by**
+    > `crates/ply-eval/tests/equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends`
+    > — tree-walker against the plain machine, then the plain machine against a
+    > machine with a budget-honest backend, on a body pending 150 frames a call
+    > at depth 6,700 (1,011,700 pending frames), plus R5's crossover at depth
+    > 9,990 for k = 90, 100 and 150 — and by
+    > `a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend`.
+    >
+    > **The first was confirmed to fail with the change reverted, and the
+    > provenance is not the usual one.** The revert was taken by the
+    > orchestrating session, not by the lane that wrote the fix, in an `rsync`
+    > copy of this worktree excluding `target/` and `.git`, with
+    > `CARGO_INCREMENTAL=0`, setting `max_frames: None` back to
+    > `Some(1_000_000)`. It went red on the verdict axis, which is the right one:
+    >
+    > ```
+    > treewalk vs machine: 1 compared, 1 footprints, 0 machine-only, 1 divergences
+    >   a recursion whose body pends 150 frames a level: verdict —
+    >   left passed, right [E0502] this engine's ceiling of 1000000 pending frames was reached
+    > ```
+    >
+    > It was taken that way because the lane could not hold its own tree still
+    > long enough to take it: `crates/ply-eval/src/machine.rs` returned four
+    > different sha256 values across that session with no write by the lane
+    > between them, once changing inside a single `sha → touch → cargo build →
+    > sha` command, and one `grep` reported `max_frames: Some(1_000_000)` and no
+    > seam gate ninety seconds before a `sed` on the same path reported
+    > `max_frames: None` and the gate present in full. A revert-verification run
+    > on a tree that will not hold still is worth nothing, so it was refused
+    > there and taken somewhere it could be trusted.
+    >
+    > **The second test's revert behaviour is confirmed too, and by where its
+    > failure landed rather than by its own build.** Reverting both halves at
+    > once — the `None` default and the seam gate — turned
+    > `a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend` red at
+    > its *final* assertion, `entries()` = 1 against 0. That is the gate's
+    > assertion, and the failure reaching it is what attributes it: the test
+    > opens with a control leg requiring a machine nobody capped to reach the
+    > seam at all, and with the gate present and only the default reverted it is
+    > the control that goes red instead. So each half of the change is armed, at
+    > a different assertion of the same test. A gate-only revert was not run as
+    > its own build.
+    >
+    > **The left-hand side has to be the plain machine**: comparing the
+    > tree-walker against a machine that has a backend attached can pass with the
+    > ceiling restored, because a backend answers at the first level shallow
+    > enough to fit — that masking is item 9 itself, and it must not be what
+    > stands in for the comparison.
+    >
+    > The first test also proves it is not vacuous **without** a source edit: it
+    > hands the same program to the same machine under `with_max_frames(1_000_000)`
+    > and requires it to raise. A witness too small to have reached the old
+    > default would sail through every leg above it, and that assertion is what
+    > says this one is not.
+    >
+    > **Cost, because it is inherent and someone will want to cut it.** That test
+    > peaks at **4,858 MiB** and runs 15.5s in a debug build — `/usr/bin/time -l`
+    > on the test binary, `--test-threads=1 --exact`, 2026-08-24. The machine's
+    > frame stack is the tree-walker's native stack reified, one frame per level,
+    > so any program pending a million machine frames nests a million native
+    > levels at kilobytes each — 1,529 MiB at 304,000 levels, 3,054 MiB at
+    > 608,000 and 5,036 MiB at 1,003,200, which is 5,274, 5,267 and 5,264 bytes a
+    > level, and 5,365 MiB at 1,350,000, which is 4,167 and so does not sit on
+    > that line. There is no cheaper witness that crosses a ceiling of a million,
+    > so the tree-walker is run **once** and every other leg is a machine.
 11. **A definition that discharges its own effects publishes an empty row, so
     the compiled seam's purity gate clears it and the machine offers it.** Latent
     rather than live, and reported because the design claims otherwise.
@@ -717,18 +868,51 @@ Recorded here so nobody spends an afternoon rediscovering them.
       header; the fabrication above is now caught, by exactly one test and
       nothing else.
 
+14. **`AssertionKind::RecursionLimit` classifies nothing.** Found 2026-08-24
+    while splitting the frame ceiling's diagnostic out of
+    `ply_eval::limit::err_recursion_limit`, whose doc asserted the opposite:
+    *"The message keeps the phrase 'recursion limit' so that ADR 0004's
+    `AssertionKind::RecursionLimit` still classifies it."* The variant is
+    declared at `crates/ply-test/src/slice.rs:268` and mapped to
+    `"recursion_limit"` at `:284`, and it is **constructed nowhere** —
+    `grep -rn 'AssertionKind::' --include=*.rs` finds exactly one variant ever
+    built, `Eq`, at `slice.rs:326`. This is the `E0435` pattern: declared,
+    registered, raised nowhere. Consequence is small and worth knowing — a
+    consumer reading `Assertion::kind` to tell a runaway recursion from a failed
+    `assert_eq` cannot, and the four tests that do tell them apart
+    (`ply-cli/tests/failure_classification_audit.rs`, `ply-test/tests/hybrid.rs`,
+    `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) all match the rendered
+    string instead. `limit.rs`'s doc is corrected in place; the code gap is
+    **not** fixed, because deciding whether the fix is to construct the variant
+    or to delete it is a `ply-test` design call and this change was in
+    `ply-eval`.
+
+Items 9 and 10 are closed; see the block at the end of item 10 for the fix, the
+measurements behind it and the tests that arm it. Items 11, 12, 13 and 14 are
+open.
+
 Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects
 documents. Item 5's comment was a document and was corrected; item 1 is a real
 code defect and is reported, not fixed. Items 9 through 13 are R5's, found by
 the reviews of it: **three of the four review lenses pointed at R5 refuted the
 claim they were given**, and the documents they refuted are corrected in place
-rather than rewritten. Of 9–13, **item 12 is fixed**, and two of item 13's three
-holes are closed: the unarmed name gate and the budget-ignoring backend that used
-to take the process down uncaught. Item 13's first bullet — no shipping command
-can install a backend — is deliberately left open, because closing it is gated on
-item 9 and on the result-cache rule; what changed is that it is now an inventory
-somebody can check. Items 9, 10 and 11 are open and untouched.
+rather than rewritten. ~~None of 9–13 is fixed. They are open.~~ **That is no
+longer true, and the current state is:**
+
+- **9 and 10 are fixed (2026-08-24).** The frame bound was an engine's private
+  resource guard rather than semantics; `DEFAULT_MAX_FRAMES` is deleted and
+  `Machine::with_max_frames` is an opt-in ceiling no shipping command sets.
+- **11 is open.** A definition that discharges its own effects still publishes an
+  empty row, so the seam's purity gate still clears it.
+- **12 is fixed (2026-08-24).** `Ctx::begin` no longer walks the previous entry's
+  arena; `Ctx::end` clears it at the end of the entry that filled it, and the
+  shrink is amortized over `SHRINK_EVERY` entries.
+- **13 is two-thirds closed.** The unarmed name gate and the budget-ignoring
+  backend that used to take the process down uncaught are both fixed. The first
+  bullet — no shipping command can install a backend — is deliberately left
+  open, because closing it is gated on the result-cache rule; what changed is
+  that it is now an inventory somebody can check.
 
 ## Style
 

@@ -1692,23 +1692,17 @@ fn the_two_clause_forms_agree_on_generated_programs() {
 /// calls: the tree-walker's own nesting, the machine's `Frame::Call`s. Both
 /// halves of the original finding are asserted, one program each.
 ///
-/// > **Narrowed (R5 review, 2026-08-22): the name and the paragraph above claim
-/// > more than the two programs below test, and the gap is a live divergence.**
-/// > Both bodies pend two frames per level, so both reach `DEFAULT_MAX_CALLS`
-/// > first and the frame bound is never in play. It is in play at
-/// > `DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = **100 pending frames per call**:
-/// > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }` with 150 `+ 1`
-/// > terms, called at 9,000, makes `ply test --engine both` report
-/// > `treewalk: passed` against
-/// > `machine: [E0502] recursion limit of 1000000 pending frames exceeded`.
-/// > Measured at depth 9,990: k = 90 agrees, k = 100 diverges.
-/// >
-/// > So what this test holds is: **the two engines agree on the recursion bound
-/// > for bodies pending fewer than 100 frames per call.** Nothing in the suite
-/// > arms the rest, and nothing here is changed to assert the divergence,
-/// > because a test that pins a defect is not the same artifact as one that
-/// > pins a guarantee. `CONTRIBUTING.md` §"Things known to be broken" carries
-/// > it as open.
+/// > **Still narrow, no longer a gap (2026-08-24).** An R5 review narrowed this
+/// > doc in place, correctly: *"Both bodies pend two frames per level, so both
+/// > reach `DEFAULT_MAX_CALLS` first and the frame bound is never in play … So
+/// > what this test holds is: **the two engines agree on the recursion bound for
+/// > bodies pending fewer than 100 frames per call.** Nothing in the suite arms
+/// > the rest, and nothing here is changed to assert the divergence … carries it
+/// > as open."* The two programs below still pend two frames a level and this
+/// > test still holds only what R5 said it holds. What changed is the rest:
+/// > there is no frame bound to reach any more, and
+/// > `the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends`
+/// > below arms the ratio R5 measured, at the scale it measured it.
 #[test]
 fn the_two_engines_agree_on_the_recursion_bound() {
     let between = r#"
@@ -1734,6 +1728,247 @@ test "no base case at all" { assert_eq(forever(0), 0) }
         )),
         "{}",
         d.message
+    );
+}
+
+/// A backend that is honest about its budget: it runs the body on its own
+/// engine, capped at exactly the `budget` the seam handed it, so it provably
+/// cannot outrun the bound the machine is holding the program to.
+///
+/// This is the shape R5's review used to reproduce the seam defect inside this
+/// crate, kept because it is the only thing here that exercises the accept path
+/// under a budget that matters.
+mod honest {
+    use ply_eval::{Compiled, Machine, Value};
+    use ply_span::{Span, Symbol};
+    use ply_syntax::ast::Program;
+    use ply_syntax::resolve::{Resolved, resolve};
+    use std::cell::Cell;
+
+    pub struct Budgeted {
+        program: *const Program,
+        copy: &'static Program,
+        resolved: &'static Resolved,
+        entries: Cell<u64>,
+    }
+
+    impl Budgeted {
+        /// The program is leaked because a backend may not borrow one — see the
+        /// `compiled` field on `Machine`.
+        pub fn over(program: &Program) -> Budgeted {
+            let copy: &'static Program = Box::leak(Box::new(program.clone()));
+            let resolved: &'static Resolved =
+                Box::leak(Box::new(resolve(copy).expect("it resolved once already")));
+            Budgeted {
+                program: std::ptr::from_ref(program),
+                copy,
+                resolved,
+                entries: Cell::new(0),
+            }
+        }
+
+        pub fn entries(&self) -> u64 {
+            self.entries.get()
+        }
+    }
+
+    impl Compiled for Budgeted {
+        fn describes(&self, program: &Program) -> bool {
+            std::ptr::eq(self.program, std::ptr::from_ref(program))
+        }
+
+        fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
+            let mut inner = Machine::for_program(self.copy, self.resolved).with_max_calls(budget);
+            match inner.call(name.as_str(), args.to_vec(), Span::DUMMY) {
+                Ok(v @ (Value::Int(_) | Value::Bool(_))) => {
+                    self.entries.set(self.entries.get() + 1);
+                    Some(v)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `hog(n) = k * n`, spelled so that descending to the recursive call leaves `k`
+/// binary operands pending — one machine frame each, one native tree-walker
+/// level each. `k + 1` frames a call, times `depth` calls.
+fn hog(k: usize, depth: usize) -> String {
+    let plus = vec!["+ 1"; k].join(" ");
+    format!(
+        "fn hog(n: Int) -> Int = if n == 0 {{ 0 }} else {{ hog(n - 1) {plus} }}\n\
+         test \"a recursion whose body pends {k} frames a level\" {{ assert_eq(hog({depth}), {}) }}\n",
+        k * depth
+    )
+}
+
+/// How many frames a body pends per call changes nothing about the answer, on
+/// any of the three ways a program can be run here.
+///
+/// The bound is nested calls, `DEFAULT_MAX_CALLS`. The tree-walker counts its
+/// own nesting, the machine counts the `Frame::Call`s on its stack, and a
+/// backend is handed the remainder as `budget` — one number, three engines. The
+/// operands pending around those calls bound nothing: on the tree-walker they
+/// are native stack, on the machine they are heap cells, and a natively
+/// compiled body has neither.
+///
+/// > **This is the test the catalogue said did not exist (2026-08-24).**
+/// > `CONTRIBUTING.md` §"Things known to be broken" item 10 read *"nothing in
+/// > the suite arms the true bound"*, and item 9 recorded the same ratio
+/// > reaching the compiled seam: *"`machine alone: Err("recursion limit of
+/// > 1000000 pending frames exceeded")` / `machine + spike: Ok(1350000)`"*. Both
+/// > are closed by removing the machine's default frame ceiling — see
+/// > `Machine::with_max_frames` — and this is what would notice if it came back.
+/// > The ceiling sat at 1,000,000 and a body pending `k` frames a call crossed
+/// > it at `depth × (k + 1) > 1_000_000`; R5 measured the crossover at depth
+/// > 9,990, k = 90 passing and k = 100 raising, and both are asserted below.
+///
+/// **This is the memory-heaviest test in the crate and that is inherent.** The
+/// tree-walker spends kilobytes of native stack per pending level in a debug
+/// build, so the smallest program that crosses a ceiling of 1,000,000 frames
+/// costs it gigabytes of peak RSS. There is no cheaper witness: the machine's
+/// frame stack is the tree-walker's native stack reified, one frame per level,
+/// so any program pending a million machine frames nests a million native
+/// levels. So the tree-walker runs **once** here, over the smallest crossing
+/// program, and every other leg is a machine — which measured **4,243 MiB**
+/// peak for the whole test, `/usr/bin/time -l`, debug, 2026-08-24.
+///
+/// The per-level figures behind that, peak RSS in one process each, three of
+/// them from one run of a three-point series: 1,529 MiB at 304,000 levels,
+/// 3,054 MiB at 608,000, 5,036 MiB at 1,003,200 — 5,274, 5,267 and 5,264 bytes
+/// a level, flat — and 5,365 MiB at 1,350,000, which is 4,167 bytes a level and
+/// so does not sit on that line. Five KiB a level is the number to plan with,
+/// not a constant to quote.
+#[test]
+fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
+    // 6,700 * 151 = 1,011,700 pending frames: the least this can cost and still
+    // cross where the machine used to stop, against 6,701 nested calls.
+    let crossing = hog(150, 6_700);
+    let (program, resolved) = load(&crossing);
+    let check = ply_core::check_program(&program, &resolved).expect("the witness type-checks");
+
+    // Strategy 1 against strategy 2: the comparison `--engine both` makes, and
+    // the one that printed "this is a defect in Ply". The machine on the right
+    // has to be the *plain* one. Comparing the tree-walker against a machine
+    // with a backend attached passes even with the ceiling restored, because the
+    // backend answers at the first level shallow enough to fit and the machine
+    // takes it — that masking is item 9 itself, and it is asserted below rather
+    // than being allowed to stand in for this.
+    let mut plain = Machine::new(&program, &resolved, &check);
+    let mut treewalk = Interp::new(&program, &resolved, &check);
+    let report = compare_tests(&mut treewalk, &mut plain, &Fixture::empty());
+    assert!(report.is_clean(), "{report}\n{crossing}");
+    assert_eq!(report.compared, 1, "{report}");
+    assert_eq!(report.footprints_compared, report.compared, "{report}");
+
+    // The value rather than merely agreement: two engines that both raised would
+    // "agree" and prove nothing.
+    let mut plain = Machine::new(&program, &resolved, &check);
+    plain
+        .eval_test(0)
+        .unwrap_or_else(|d| panic!("the machine alone raised: [{}] {}", d.code, d.message));
+
+    // Strategy 2 against strategy 3. `budget` is now the whole of what the
+    // machine holds the program to, so there is nothing left for a backend to be
+    // on the wrong side of.
+    let backend = std::rc::Rc::new(honest::Budgeted::over(&program));
+    let mut entered = Machine::new(&program, &resolved, &check);
+    entered.set_compiled(backend.clone());
+    let mut plain = Machine::new(&program, &resolved, &check);
+    let report = compare_tests(&mut plain, &mut entered, &Fixture::empty());
+    assert!(report.is_clean(), "{report}\n{crossing}");
+    assert_eq!(report.compared, 1, "{report}");
+    assert!(
+        backend.entries() > 0,
+        "the backend was never entered, so this compared the machine with itself"
+    );
+
+    // Proof that the three legs above are not vacuous, without needing a source
+    // edit to get it. A test that passes over a program too small to have
+    // reached the old ceiling would prove nothing at all, so: hand this same
+    // program to this same machine with a ceiling of exactly the 1,000,000 that
+    // used to be the default, and it must still be too big for it.
+    let ceilinged = Machine::for_program(&program, &resolved)
+        .with_max_frames(1_000_000)
+        .eval_test(0)
+        .expect_err("6,700 * 151 pending frames must not fit under a ceiling of 1,000,000");
+    assert!(
+        ceilinged
+            .message
+            .contains("ceiling of 1000000 pending frames"),
+        "the witness stopped being big enough to reach the old default: {}",
+        ceilinged.message
+    );
+
+    // And the exact crossover R5 measured, at the depth it measured it: k = 90
+    // passed and k = 100 raised. Machines only from here — the tree-walker has
+    // answered for this shape above and costs gigabytes each time it is asked.
+    for k in [90, 100, 150] {
+        let src = hog(k, 9_990);
+        let (p, r) = load(&src);
+        let out = Machine::for_program(&p, &r).eval_test(0);
+        assert!(
+            out.is_ok(),
+            "k = {k} at depth 9,990 still raises: [{}] {}",
+            out.as_ref().unwrap_err().code,
+            out.as_ref().unwrap_err().message
+        );
+    }
+
+    // The one number that does bound it still bites, and bites identically on
+    // both engines for a body pending 150 frames a call. Held to a budget of 50
+    // rather than the default 10,000 on purpose: at the default the tree-walker
+    // would nest 1,510,000 levels to reach the conclusion it reaches here in
+    // 7,550.
+    let past = hog(150, 20_000);
+    let (p, r) = load(&past);
+    let m = Machine::for_program(&p, &r)
+        .with_max_calls(50)
+        .eval_test(0)
+        .expect_err("20,000 calls do not fit in 50");
+    let t = Interp::for_program(&p, &r)
+        .with_max_calls(50)
+        .eval_test(0)
+        .expect_err("20,000 calls do not fit in 50");
+    assert_eq!(m.code, t.code);
+    assert_eq!(
+        m.message, t.message,
+        "the two engines phrase it differently"
+    );
+    assert!(
+        m.message
+            .contains("recursion limit of 50 nested calls exceeded"),
+        "{}",
+        m.message
+    );
+}
+
+/// A frame ceiling is one engine's resource guard, so a machine carrying one
+/// offers nothing to a backend: a native body pends no frames and could not
+/// honour it, and an answer only one of the three strategies can give is the
+/// thing this seam exists to make structurally impossible.
+#[test]
+fn a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend() {
+    let src = hog(4, 20);
+    let (program, resolved) = load(&src);
+    let check = ply_core::check_program(&program, &resolved).expect("the witness type-checks");
+
+    let offered = std::rc::Rc::new(honest::Budgeted::over(&program));
+    let mut open = Machine::new(&program, &resolved, &check);
+    open.set_compiled(offered.clone());
+    open.eval_test(0).expect("no ceiling, so this is entered");
+    assert!(offered.entries() > 0, "the control never reached the seam");
+
+    // Far above what this program needs, so nothing here is about running out:
+    // the ceiling's mere presence is what withdraws the offer.
+    let refused = std::rc::Rc::new(honest::Budgeted::over(&program));
+    let mut capped = Machine::new(&program, &resolved, &check).with_max_frames(1_000_000);
+    capped.set_compiled(refused.clone());
+    capped.eval_test(0).expect("the ceiling is far above this");
+    assert_eq!(
+        refused.entries(),
+        0,
+        "a machine holding a bound it cannot hand over entered compiled code anyway"
     );
 }
 

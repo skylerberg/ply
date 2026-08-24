@@ -75,7 +75,7 @@ pub use explore::{
 };
 pub use interp::Interp;
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
-pub use machine::{DEFAULT_MAX_FRAMES, Machine, Progress};
+pub use machine::{Machine, Progress};
 pub use rc::{Own, Stats as RcStats};
 pub use region_kind::Regions;
 pub use sim::{
