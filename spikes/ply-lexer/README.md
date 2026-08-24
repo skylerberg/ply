@@ -74,12 +74,40 @@ goes red.
 
 ### What it does not check
 
-- **The decimal-to-binary conversion of a float literal.** Ply cannot build a
-  `Float` at all (`GAPS.md` §3), so `lexer.ply` emits a float's *normalised
-  literal text* and the harness converts it with Rust's `f64` parser before
-  comparing (`harness/src/lib.rs::floats_to_bits`). What is compared is that the
-  Ply lexer classified the literal as a float, spanned the same bytes, and
-  extracted the same digits. The conversion itself is delegated and unchecked.
+- **The digits of a float literal — this is a blind spot, not a narrow gap.**
+  Ply cannot build a `Float` at all (`GAPS.md` §3), so `lexer.ply` emits a
+  float's *normalised literal text* and the harness converts it with Rust's
+  `f64` parser before comparing (`harness/src/lib.rs::floats_to_bits`). What is
+  compared is therefore the resulting **value**: that the Ply lexer classified
+  the literal as a float, spanned the same bytes, and produced digits that round
+  to the same `f64`. **Any corruption of the digits that rounds to the same
+  `f64` passes.** Demonstrated, not reasoned — two mutations of
+  `lexer.ply::float_text`, both reported **AGREE** by the whole corpus:
+  appending `"0"` to every fraction (`1.5` → `1.50`), and truncating every
+  fraction to 17 significant digits, which is an ordinary fixed-buffer bug.
+
+  > **Corrected (verification pass, 2026-08-24).** This bullet claimed the
+  > comparison checks that the Ply lexer *"extracted the same digits. The
+  > conversion itself is delegated and unchecked."* The first sentence is
+  > false — the digits are exactly what is **not** checked — and it is the more
+  > load-bearing half, because it is the sentence that would stop the next
+  > reader looking.
+
+  **Not fixable in this harness**, which is why it is recorded here rather than
+  closed. `ply_syntax::lexer` builds the string it hands to `f64::from_str` as a
+  local (`lexer.rs:426-439`) and keeps only `TokenKind::Float(f64)`, so the
+  reference side has no digits to compare against. Closing it needs either a
+  change to `ply_syntax` to carry the normalised text on the token, or a third
+  normaliser in the harness — which would be a re-implementation of the thing
+  under test and is worse than the hole.
+
+  **The bound on the damage, and where it stops holding.** For a *lexer* the
+  observable output is the `f64`, so a digit corruption that round-trips is not
+  observable and the comparison is adequate. That stops being true the moment a
+  self-hosted front end performs the decimal-to-binary conversion itself, which
+  is exactly what `GAPS.md` §3 says it cannot do today and would have to do
+  eventually. **Anyone extending this spike past the lexer must close this
+  first.**
 - **Diagnostic messages and notes.** Only the code and the primary span are
   compared. Two lexers raising `E0001` at the same span with different prose
   would pass.
