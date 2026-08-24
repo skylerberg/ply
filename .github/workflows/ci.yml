@@ -1,0 +1,563 @@
+# The three commands in CONTRIBUTING.md §"The loop", run on every push and every
+# pull request, with the gates that skip silently forced open.
+#
+# Four things here are decisions rather than boilerplate, and each is argued
+# where it is made:
+#
+#   * `ubuntu-24.04`, and only that.  A Linux runner is what compiles
+#     `crates/ply-cli/tests/w5_shutdown.rs` at all — it is `#![cfg(unix)]` — and
+#     service containers are Linux-only.  See the `test-postgres` job.
+#   * a postgres service container *and* postgres binaries on `PATH`.  Two
+#     different gates want two different things and one does not satisfy the
+#     other.  See the `test-postgres` job.
+#   * thirteen tests moved off the parallel shards onto a runner of their
+#     own, because their assertion is a wall clock.  Six of the thirteen were
+#     found by running a shard's own command on a loaded machine and watching
+#     it fail — twice, after two separate surveys had each declared the list
+#     complete.  See the `test-timing` job and `.github/ci-shards.sh`.
+#   * `toolchain: stable`, unpinned.  A new Rust release can add a clippy lint
+#     and turn the `clippy` job red with no change to the tree.  That is
+#     deliberate: CONTRIBUTING.md §"The loop" says zero warnings is the gate and
+#     "if you introduce the first warning, that is a regression, not a
+#     baseline", so inheriting new lints is the behaviour the project asked for,
+#     and a developer running the outer loop on their own stable sees the same
+#     thing.  To take the other side of that trade, change `toolchain: stable`
+#     to an exact version — `toolchain: 1.94.0`, say — in the `fmt`, `clippy`,
+#     `test`, `test-postgres`, `test-timing` and `same-tests` jobs.  The `spike`
+#     job is already pinned and says why.
+#
+# What this workflow does NOT prove, stated here so nobody has to infer it from
+# a green check:
+#
+#   * Nothing about macOS or Windows.  A Windows leg would be green over an
+#     empty binary, since the shutdown suite compiles to nothing there — the
+#     exact failure this project is worst at.  A macOS leg would be honest and
+#     is not here.
+#   * Nothing about the `ply-corpus w6` ladder.  That is re-measurement rather
+#     than verification, and `w6_report_integrity` already fails inside
+#     `cargo test` if the shipped ladder stops describing the tree.
+#   * Nothing about the prose.  One sentence of `README.md` is read by a test;
+#     the other ~24,500 lines are not, here or anywhere.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A superseded push has nothing left to prove.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are per-machine scratch that no later job reuses, and
+  # they are the largest thing a cache would otherwise carry.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  plan:
+    name: shard table is total
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.table.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The one thing a split test suite can get wrong without anyone noticing.
+      - name: Every workspace member is in exactly one shard
+        run: .github/ci-shards.sh verify
+
+      - name: Emit the matrix
+        id: table
+        run: echo "matrix=$(.github/ci-shards.sh matrix)" >> "$GITHUB_OUTPUT"
+
+  fmt:
+    name: cargo fmt --all --check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      # No cache: this compiles nothing.
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy --workspace --all-targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: clippy
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+      # `-D warnings` is how "must be 0 warnings" becomes an exit code. Without
+      # it clippy exits 0 with the warnings on stdout, and CONTRIBUTING.md's
+      # requirement would be enforced by whoever happened to read the log.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: test ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-${{ matrix.shard }}
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # Three things here are guards rather than plumbing, and all three are
+      # the same failure: a command that runs nothing and exits 0.
+      #
+      #   1. `packages` is assigned before use, not interpolated. An unknown
+      #      shard id has to fail the step rather than produce an empty list,
+      #      which `cargo test` reads as "every default member".
+      #   2. `--exact` is passed only when there is something to skip. Under
+      #      `--exact`, **one empty-string filter word silently filters the
+      #      entire suite out and exits 0**. Measured on this repository:
+      #      `cargo test -p ply-derive -- --exact ""` reports `0 passed; 24
+      #      filtered out` and `0 passed; 7 filtered out`, exit 0 — while the
+      #      same command without `--exact` runs all 31, because an empty
+      #      substring matches everything. This was not hypothetical: a
+      #      whole-workspace invocation that reached libtest with an empty
+      #      filter word reported `0 passed; 3683 filtered out` across 142
+      #      targets and exited 0. Bare `--exact` with no filter at all is
+      #      harmless — it runs everything — so the hazard is the empty word,
+      #      not the flag.
+      #   3. The run has to have executed at least one test. That is the
+      #      backstop for (2) and for anything else that silently filters the
+      #      suite away, and it is the only one of the three that does not
+      #      depend on reasoning about shell expansion.
+      - name: cargo test
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
+          read -r -a packages <<<"$packages_raw"
+          [ "${#packages[@]}" -gt 0 ] || { echo "shard '$SHARD' names no packages" >&2; exit 1; }
+          skips_raw=$(.github/ci-shards.sh skips)
+          read -r -a skips <<<"$skips_raw"
+          if [ "${#skips[@]}" -gt 0 ]; then
+            harness=(--exact "${skips[@]}")
+          else
+            harness=()
+          fi
+          cargo test --locked --no-fail-fast "${packages[@]}" \
+            -- ${harness[@]+"${harness[@]}"} 2>&1 | tee /tmp/shard.log
+          ran=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/shard.log |
+            awk '{s += $1} END {print s + 0}')
+          echo "shard '$SHARD' ran $ran tests"
+          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
+
+      # ROADMAP.md's preamble table, gate three: this file is `#![cfg(unix)]`,
+      # and on a non-Unix host it is not compiled and prints nothing at all —
+      # the only one of the gates that gives no notice whatsoever. The runner is
+      # Linux, so it must have run; this is what says so if a future edit makes
+      # the binary vanish again.
+      #
+      # Keyed on which shard holds `ply-cli` rather than on a shard *name*: the
+      # names in `.github/ci-shards.sh` are a balance decision and they have
+      # already moved once, and an `if:` naming a shard that no longer exists is
+      # a check that silently never runs.
+      - name: The unix-only shutdown suite really ran
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
+          case " $packages_raw " in
+            *" ply-cli "*) ;;
+            *) echo "ply-cli is not in shard '$SHARD'; the shard that has it runs this"; exit 0 ;;
+          esac
+          cargo test --locked -p ply-cli --test w5_shutdown | tee /tmp/w5.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/w5.log || {
+            echo "w5_shutdown ran no tests — #![cfg(unix)] compiled it away" >&2
+            exit 1
+          }
+
+  test-postgres:
+    name: test ply-host (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    # Gate two of ROADMAP.md's table. Ten tests in
+    # `crates/ply-host/src/db/scope/tests/live.rs` return early unless
+    # `PLY_PG_URL` is set, and they return *passing*: cargo captures the skip
+    # notice, so `skipped:` occurs zero times in a whole `cargo test
+    # --workspace` log. Without this container CI would report ten green tests
+    # that never opened a connection.
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: ply
+          POSTGRES_PASSWORD: ply
+          POSTGRES_DB: ply
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ply -d ply"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PLY_PG_URL: postgres://ply:ply@127.0.0.1:5432/ply
+      # A fifth gate, which ROADMAP.md's table of four did not list:
+      # `crates/ply-host/src/db/pool/tests.rs` hides 26 pool tests behind
+      # `PLY_TEST_DB` and, unlike every other gate here, prints *nothing at all*
+      # when it is unset. Measured on the machine in docs/ONBOARDING.md
+      # §Provenance, 2026-08-24, against a local postgres 18.3:
+      #
+      #   unset                    26 passed, 0.00s   <- silent, and green
+      #   set, server reachable    26 passed, 0.94s
+      #   set, server unreachable  20 FAILED, 0.02s   <- E0431, loudly
+      #
+      # That third row is the one worth knowing, and it is why this job is
+      # better guarded than "there is no notice to grep for" suggests. The
+      # harness does `Reactor::start(config).expect("the test database is
+      # reachable")` at tests.rs:41, so a set-but-wrong `PLY_TEST_DB` is a red
+      # build rather than a quiet skip. The only silent failure left is the
+      # variable going missing entirely, and the pre-flight below fails the job
+      # on exactly that with `test -n`.
+      PLY_TEST_DB: postgres://ply:ply@127.0.0.1:5432/ply
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-postgres
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # Gate one of ROADMAP.md's table is a *different* dependency and the
+      # service container does not satisfy it: `cluster::available()` in
+      # `crates/ply-host/tests/support/cluster.rs:38` wants `initdb` and
+      # `postgres` as executables on this machine, because six test binaries
+      # there start a cluster of their own rather than touching a shared server.
+      # `available()` searches `PATH` first, so putting the runner's versioned
+      # bin directory on `PATH` and failing when it is not there is the same
+      # statement as "`available()` is true". `psql` is checked too: it is not
+      # in `available()`, but `Cluster::psql` calls it and the tests panic
+      # rather than skip without it.
+      - name: Put initdb, postgres and psql on PATH, or fail
+        run: |
+          set -euo pipefail
+          find_bin() {
+            for candidate in /usr/lib/postgresql/*/bin; do
+              if [ -x "$candidate/initdb" ] && [ -x "$candidate/postgres" ] && [ -x "$candidate/psql" ]; then
+                echo "$candidate"
+              fi
+            done | tail -n 1
+          }
+          bin=$(find_bin)
+          if [ -z "$bin" ]; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends postgresql postgresql-client
+            bin=$(find_bin)
+          fi
+          if [ -z "$bin" ]; then
+            echo "no initdb/postgres/psql on this runner: cluster::available() would be false," >&2
+            echo "and six ply-host test binaries would pass without ever starting a server" >&2
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/initdb" --version
+          "$bin/postgres" --version
+          "$bin/psql" --version
+
+      - name: The servers named by PLY_PG_URL and PLY_TEST_DB answer
+        run: |
+          set -euo pipefail
+          test -n "$PLY_PG_URL"
+          test -n "$PLY_TEST_DB"
+          psql "$PLY_PG_URL" -c 'SELECT version()'
+          psql "$PLY_TEST_DB" -c 'SELECT 1'
+
+      # The proof that gate two is open, run before the suite so a
+      # misconfiguration is one fast red step rather than a green 40-second run.
+      #
+      # `--nocapture` is load-bearing, and so is `2>&1`.
+      #
+      # The notice is an `eprintln!`, so it goes to **stderr**. `cargo test |
+      # tee log` redirects only stdout, so the notice never reaches the file the
+      # grep reads, and the grep cannot fire whatever pattern it uses. Measured
+      # on the machine in docs/ONBOARDING.md §Provenance, with `PLY_PG_URL`
+      # unset: piping stdout alone puts **0** notices in the log, and `2>&1 |
+      # tee` puts **10** there. The `test result: ok. 10 passed` assertion below
+      # does not cover the difference — the ten tests return early and *pass*, so
+      # that line reads `10 passed` with no server anywhere.
+      #
+      # Both halves were wrong here once, in opposite directions, which is why
+      # this comment is long: an anchored `^skipped:` was written first and the
+      # stream was never captured. Either bug alone is a guard that cannot fire
+      # over a gate whose entire defect is that it silently never runs.
+      - name: The ten live postgres tests ran against the server
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ply-host --lib db::scope::tests::live \
+            -- --nocapture --test-threads=1 2>&1 | tee /tmp/live.log
+          if grep -Eq 'skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)' /tmp/live.log; then
+            echo "a live test skipped itself: PLY_PG_URL did not reach the tests" >&2
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. 10 passed' /tmp/live.log || {
+            echo "expected 10 live tests; see the log above for what ran" >&2
+            exit 1
+          }
+
+      # The proof that gate one is open, by the same method. `host_park` is the
+      # cheapest cluster-gated binary — two tests, 2.87s in-target measured —
+      # and it starts a real `initdb` cluster, so a pass here is evidence about
+      # all six of them rather than about `PATH`.
+      - name: A cluster-gated suite really started a cluster
+        run: |
+          set -euo pipefail
+          # 2>&1 for the same reason as the step above: the skip notice is an
+          # eprintln! and a bare pipe would not carry it.
+          cargo test --locked -p ply-host --test host_park \
+            -- --nocapture --test-threads=1 2>&1 | tee /tmp/park.log
+          if grep -Eq 'skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)' /tmp/park.log; then
+            echo "cluster::available() was false: initdb/postgres are not where the tests look" >&2
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. 2 passed' /tmp/park.log || {
+            echo "expected 2 tests in host_park; see the log above" >&2
+            exit 1
+          }
+
+      # The same three guards as the `test` job; see the comment there for why
+      # `--exact` is conditional and why the test count is asserted.
+      - name: cargo test
+        run: |
+          set -euo pipefail
+          packages_raw=$(.github/ci-shards.sh packages postgres)
+          read -r -a packages <<<"$packages_raw"
+          [ "${#packages[@]}" -gt 0 ] || { echo "the postgres shard names no packages" >&2; exit 1; }
+          skips_raw=$(.github/ci-shards.sh skips)
+          read -r -a skips <<<"$skips_raw"
+          if [ "${#skips[@]}" -gt 0 ]; then
+            harness=(--exact "${skips[@]}")
+          else
+            harness=()
+          fi
+          cargo test --locked --no-fail-fast "${packages[@]}" \
+            -- ${harness[@]+"${harness[@]}"} 2>&1 | tee /tmp/pg.log
+          ran=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/pg.log |
+            awk '{s += $1} END {print s + 0}')
+          echo "the postgres shard ran $ran tests"
+          [ "$ran" -gt 0 ] || { echo "the postgres shard ran no tests at all" >&2; exit 1; }
+
+  test-timing:
+    name: wall-clock measurements
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-timing
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # One test at a time, one thread, nothing else on the runner. This is the
+      # quietest a hosted runner gets; it is not a quiet machine, and the honest
+      # statement is that it reduces the noise rather than removing it.
+      #
+      # `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+      # is the one CONTRIBUTING.md names, and the decision for it is: keep it
+      # running and keep it required, here. Not `#[ignore]`, because an ignored
+      # measurement is a measurement nobody takes; not a wider tolerance,
+      # because the band is the finding; and not a retry, because a retry turns
+      # a real regression into a green run on the second attempt. If it does
+      # flake, the fix belongs in the assertion or in an `#[ignore]` with a
+      # documented command, and not in this file.
+      #
+      # `--nocapture`, because every one of these prints a table, and a
+      # measurement nobody can read is not a measurement.
+      - name: Each timing test, alone
+        run: |
+          set -euo pipefail
+          while read -r package target test; do
+            echo "::group::$package/$target $test"
+            # `lib` is the table's spelling for a unit test, which is reached by
+            # `--lib` and named by its full module path rather than by a binary.
+            if [ "$target" = lib ]; then
+              selector=(--lib)
+            else
+              selector=(--test "$target")
+            fi
+            cargo test --locked -p "$package" "${selector[@]}" \
+              -- --exact --test-threads=1 --nocapture "$test" | tee /tmp/timing.log
+            grep -Eq 'test result: ok\. 1 passed' /tmp/timing.log || {
+              echo "$test did not run: the shard table names a test cargo did not find" >&2
+              exit 1
+            }
+            echo "::endgroup::"
+          done < <(.github/ci-shards.sh deferred)
+
+  spike:
+    name: crates/ply-codegen-spike
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned, and not to `stable`, because this crate has a hard floor rather
+      # than a preference: `cranelift 0.134.3` requires rustc >= 1.94.0 and
+      # CONTRIBUTING.md §"Things known to be broken" item 1 records `cargo
+      # +1.94.0 test --release` as the invocation that works. Every command in
+      # `benches/README.md` §"What `mcts` adds" carries the same `+1.94.0`.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: spike
+          workspaces: crates/ply-codegen-spike
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # Gate four of ROADMAP.md's table, and the only one that is not a skip: the
+      # crate declares its own `[workspace]`, so `cargo build --workspace`,
+      # `cargo test --workspace` and `cargo clippy --workspace --all-targets`
+      # have never touched it. It has bit-rotted that way twice —
+      # `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening —
+      # and both times nothing said so. This job is what says so.
+      #
+      # `--release` because that is the documented invocation and because the
+      # figures the crate exists to produce are release figures.
+      #
+      # Not linted, and that is a gap rather than a decision that closes it.
+      # CONTRIBUTING.md §"Things known to be broken" item 1 records that
+      # `cargo +1.94.0 clippy --all-targets` here reports 13
+      # `not_unsafe_ptr_arg_deref` errors in `src/rt.rs`, the JIT's calling
+      # convention — that figure is quoted from there and was not re-taken when
+      # this job was written. The project's stated gate is `--workspace`, which
+      # does not reach this crate, so this job builds and tests it and stops.
+      - name: cargo test --release
+        working-directory: crates/ply-codegen-spike
+        run: |
+          set -euo pipefail
+          cargo test --locked --release | tee /tmp/spike.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/spike.log || {
+            echo "the spike ran no tests" >&2
+            exit 1
+          }
+
+  same-tests:
+    name: examples/same-tests.sh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: same-tests
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # The script manages its own cluster with `initdb`/`pg_ctl` when it is not
+      # given a `--db`, so this job needs the binaries and not a service.
+      - name: Put initdb, pg_ctl and psql on PATH, or fail
+        run: |
+          set -euo pipefail
+          find_bin() {
+            for candidate in /usr/lib/postgresql/*/bin; do
+              if [ -x "$candidate/initdb" ] && [ -x "$candidate/pg_ctl" ] && [ -x "$candidate/psql" ]; then
+                echo "$candidate"
+              fi
+            done | tail -n 1
+          }
+          bin=$(find_bin)
+          if [ -z "$bin" ]; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends postgresql postgresql-client
+            bin=$(find_bin)
+          fi
+          if [ -z "$bin" ]; then
+            echo "same-tests.sh needs initdb, pg_ctl and psql and this runner has none" >&2
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+
+      # W4's exit criterion: the same `examples/desk.ply` endpoints answered by
+      # the in-memory twin and by real postgres, compared byte for byte. Nothing
+      # in `cargo test` covers it — the twin half is hermetic and the postgres
+      # half is behind the gates above — and CONTRIBUTING.md §"The suite proves
+      # less than it looks like it proves" lists running it by hand as the
+      # obligation this job takes over.
+      #
+      # The release build is the script's own requirement: step 1 runs
+      # `target/release/ply` before `serve.sh` gets a chance to build it.
+      - name: cargo build --release -p ply-cli
+        run: cargo build --locked --release -p ply-cli
+
+      - name: examples/same-tests.sh
+        run: ./examples/same-tests.sh
+
+  # Every job, in one required check. Without this, a matrix that produced no
+  # legs — or a job skipped because something it needed was skipped — reports a
+  # green tick over nothing run at all.
+  ci:
+    name: CI
+    if: always()
+    needs: [plan, fmt, clippy, test, test-postgres, test-timing, spike, same-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        run: |
+          set -euo pipefail
+          echo '${{ toJSON(needs) }}' > /tmp/needs.json
+          cat /tmp/needs.json
+          not_ok=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key) = \(.value.result)"' /tmp/needs.json)
+          if [ -n "$not_ok" ]; then
+            echo "$not_ok" >&2
+            exit 1
+          fi
+          echo "fmt, clippy and the whole test suite are green."
