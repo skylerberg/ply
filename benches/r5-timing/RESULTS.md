@@ -206,7 +206,7 @@ being inconvenient.
 > **The mechanism is fixed, and the curve above is a curve the code no longer
 > has (2026-08-24).** `Ctx::end` now clears the arena at the end of the entry
 > that filled it, so an entry pays for its own work and its successor pays for
-> nothing; the shrink is amortized over 64 entries rather than run per entry.
+> nothing.
 > Re-taken with `mcts --dir benches/kernel --carryover mcts.playouts --repeats
 > 7` — a mode added for this, so the curve is re-takeable by a command rather
 > than by a reviewer — two runs per arm, one tree, load 14–17:
@@ -217,7 +217,13 @@ being inconvenient.
 > before, again:        0.458   1.917  14.875  68.125   181.667x
 > after, µs:            0.416   0.458   0.500   0.500     1.202x
 > after, again:         0.417   0.458   0.625   0.583     1.499x
+> after, shipped:       0.458   0.541   0.583   0.625     1.365x
+> after, shipped again: 0.458   0.542   0.583   0.542     1.365x
 > ```
+>
+> The two `shipped` rows are the code that exists; the two above them were taken
+> against a first version of the fix that amortized the shrink over a 64-entry
+> window, and that window is gone. See the third bullet.
 >
 > The before arm reproduces the table above nearly digit for digit, which is
 > what says the two arms measure the same thing. **The `mcts.playouts` 0.068x
@@ -228,12 +234,21 @@ being inconvenient.
 >
 > Two refinements the re-take produced, both of which correct something above:
 >
-> - **"the shrink reallocates" is withdrawn.** Held at 19,584 slots with the
->   shrink forced and not forced, the cost is 81,667 ns against 81,708 ns —
->   **1.00x**. The whole of the effect is the clear walking N `Value`s to drop
->   them, at 4.168 ns/slot. Anyone reading the paragraph above as "remove the
->   `shrink_to` and the 181x goes away" would have shipped a no-op.
->   `crates/ply-codegen-spike/tests/entry_cost.rs` is the standing measurement.
+> - **"the shrink reallocates" is withdrawn as an explanation of the 181x, and
+>   the withdrawal was then over-read — including by me.** Held at 19,584 slots
+>   with the shrink forced and not forced, the cost is 81,667 ns against
+>   81,708 ns, **1.00x**: the whole of the 181x is the clear walking N `Value`s
+>   to drop them, at ~4.17 ns/slot, and anyone reading the paragraph above as
+>   "remove the `shrink_to` and the 181x goes away" would have shipped a no-op.
+>   **But 1.00x does not mean shrinking is free.** That comparison shrank a
+>   32,768-slot buffer to 19,584 — already close to its target. The cost is in
+>   releasing memory, so it scales with how much is released: same timed entry,
+>   varying only its predecessor, it is +0.3 µs after a predecessor twice the
+>   size, +14 µs at four times, +32 µs at eight, and three repeats at load 27–48
+>   put the 4x row anywhere between +29 and +67 µs. One number, quoted once,
+>   became a design argument for a window that then had to be removed; the
+>   standing measurement in `crates/ply-codegen-spike/tests/entry_cost.rs` now
+>   prints the whole table rather than a single ratio, for that reason.
 > - **"with no carry-over on the interpreter arm" is narrowed.** That was
 >   measured after the three smallest predecessors (0.79 / 0.83 / 0.83 µs), and
 >   this re-take agrees there — 0.79–0.88 µs. Out at the 19,584-slot predecessor
