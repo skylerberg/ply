@@ -23,7 +23,7 @@ use crate::interp::{
     OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
     err_unknown_name, op_decl,
 };
-use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS, PENDING_FRAMES};
+use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS};
 use crate::memo::{Lookup, Memo};
 use crate::rc::Own;
 use crate::region::{self, Region, StepSite, Trail};
@@ -45,33 +45,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A bound on pending frames: a resource limit, not a native-stack workaround.
-/// The frames are heap cells and this is how many of them a program may hold at
-/// once.
-///
-/// It catches a program that pends a million frames without nesting ten
-/// thousand calls.
-///
-/// > **Corrected (R5 review, 2026-08-22).** This doc used to continue: *"It is
-/// > not the bound a runaway recursion hits. That is [`DEFAULT_MAX_CALLS`],
-/// > which both engines share and which every recursion reaches first, since a
-/// > call costs at least one frame."* The premise is true and the conclusion
-/// > does not follow. A *call* costs one frame; a *body* costs as many as it
-/// > pends. A recursion whose body pends `k` frames per level reaches **this**
-/// > bound first whenever `k > DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 100.
-/// > Measured with `ply test --engine machine` at depth 9,990 on
-/// > `hog(n) = if n == 0 { 0 } else { hog(n - 1) + 1 + 1 + ... }`: `k = 90`
-/// > passes, `k = 100` raises here.
-/// >
-/// > Two open consequences, both in `CONTRIBUTING.md` §"Things known to be
-/// > broken". The two engines do **not** agree on the bound for such a program —
-/// > the tree-walker has no frame bound and passes where the machine raises,
-/// > which is a `--engine both` divergence with no backend involved. And this
-/// > bound cannot be expressed at the compiled-entry seam: `Compiled::enter` is
-/// > handed only the *call* budget, so a backend answers where the machine
-/// > would have raised.
-pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
-
+// `pub const DEFAULT_MAX_FRAMES: usize = 1_000_000` stood here and was this
+// machine's default frame ceiling. It is gone; `Machine::with_max_frames`
+// carries what it used to say and why it had to go.
 const CALL_SCAN_LIMIT: usize = 4096;
 
 pub enum Progress {
@@ -174,7 +150,10 @@ pub struct Machine<'a> {
     stack: Stack,
     state: State,
     current: Span,
-    max_frames: usize,
+    /// An opt-in ceiling on this engine's own heap. `None` — the default — is
+    /// what keeps a program's answer a function of the program: see
+    /// [`Machine::with_max_frames`].
+    max_frames: Option<usize>,
     max_calls: usize,
     /// The seed the next entry point's `simulate` region runs at, and the
     /// scheduling-step budget one interleaving may spend. A run is a pure
@@ -353,7 +332,7 @@ impl<'a> Machine<'a> {
             stack: Stack::new(),
             state: State::Halt(Value::Unit),
             current: Span::DUMMY,
-            max_frames: DEFAULT_MAX_FRAMES,
+            max_frames: None,
             max_calls: DEFAULT_MAX_CALLS,
             seed: Seed::default(),
             sim_steps: DEFAULT_STEPS,
@@ -376,8 +355,54 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// Caps this engine's own heap at `max` pending frames. Off unless asked
+    /// for, and **not** part of what a program means.
+    ///
+    /// The frames are heap cells the machine keeps because nothing about a Ply
+    /// computation lives on the native stack. The tree-walker spends the native
+    /// stack on the same nesting and has no counterpart, so a ceiling here is
+    /// one engine's resource guard and nothing a program's answer may turn on.
+    /// Setting it is for a test that wants to observe the stack's shape, or for
+    /// an embedder that would rather have a diagnostic than an OOM kill —
+    /// knowing that the value it picks is a limit only this engine enforces.
+    /// A machine that has one enters no compiled body, because a native body
+    /// pends no frames and so cannot honour it (`compiled_answer`).
+    ///
+    /// > **Corrected (2026-08-24): this used to be a default, `DEFAULT_MAX_FRAMES
+    /// > = 1_000_000`, and its exhaustion used to be a program-level `recursion
+    /// > limit` diagnostic.** The constant's doc read *"A bound on pending
+    /// > frames: a resource limit, not a native-stack workaround. The frames are
+    /// > heap cells and this is how many of them a program may hold at once. It
+    /// > catches a program that pends a million frames without nesting ten
+    /// > thousand calls."* An R5 review then corrected it in place with *"A
+    /// > **call** costs one frame; a **body** costs as many as it pends. A
+    /// > recursion whose body pends `k` frames per level reaches **this** bound
+    /// > first whenever `k > DEFAULT_MAX_FRAMES / DEFAULT_MAX_CALLS` = 100"*,
+    /// > and named two consequences it left open: the two engines disagreed on
+    /// > such a program with no backend involved, and the compiled-entry seam
+    /// > could not express the bound at all.
+    /// >
+    /// > What settles it is that the bound was a function of **spelling**, not
+    /// > of behaviour. Measured with the shipping `target/release/ply` on
+    /// > 2026-08-24 — two definitions of the same function `hog(n) = 150n`,
+    /// > making the same 9,001 nested calls, at `hog(9000)`:
+    /// >
+    /// > ```text
+    /// > hog(n - 1) + 150            ok    one addition of 150
+    /// > hog(n - 1) + 1 + 1 + ...    FAIL  recursion limit of 1000000 pending frames exceeded
+    /// > ```
+    /// >
+    /// > A semantic bound may not separate those. The frame count also protects
+    /// > nothing at program level that the product does not already spend. Peak
+    /// > RSS, `/usr/bin/time -l`, debug, one process per figure: the machine
+    /// > holds 1,350,000 pending frames in **194 MiB**, about **151 bytes** a
+    /// > frame; the tree-walker holds the same 1,350,000 levels of the same
+    /// > program in **5,365 MiB**, about **4.2 KiB** a level, and reports
+    /// > `passed`. The engine carrying the guard was the one spending about a
+    /// > **28th** as much of the resource it guarded.
+    /// > `CONTRIBUTING.md` §"Things known to be broken" items 9 and 10.
     pub fn with_max_frames(mut self, max: usize) -> Machine<'a> {
-        self.max_frames = max.max(1);
+        self.max_frames = Some(max.max(1));
         self
     }
 
@@ -924,14 +949,17 @@ impl<'a> Machine<'a> {
     }
 
     /// Adopts what a [`handler`] transition decided. Every stack it hands back
-    /// is checked against both bounds here, so a splice that would make the
-    /// machine unbounded is refused at the one place splices land.
+    /// is checked against the call bound here, so a splice that would make the
+    /// machine unbounded is refused at the one place splices land — and against
+    /// a frame ceiling too, when one was asked for.
     pub(crate) fn take(&mut self, transition: Transition) -> Result<(), Diagnostic> {
         if transition.stack.calls() > self.max_calls {
             return Err(self.err_call_limit(self.current, &transition.stack));
         }
-        if transition.stack.frames() > self.max_frames {
-            return Err(self.err_frame_limit(self.current, &transition.stack));
+        if let Some(max) = self.max_frames
+            && transition.stack.frames() > max
+        {
+            return Err(self.err_frame_ceiling(self.current, max, &transition.stack));
         }
         self.stack = transition.stack;
         self.state = transition.state.into();
@@ -2015,6 +2043,18 @@ impl<'a> Machine<'a> {
     /// and the bailout stops being free.
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
         let backend = self.compiled.as_ref()?;
+        // A native body pends no frames, so it cannot honour a ceiling counted
+        // in them — `enter` is handed the call budget and there is nothing else
+        // to hand it. Rather than let an engine-local resource guard decide an
+        // answer only one of the three strategies could give, a machine that was
+        // asked for one enters nothing. This is the seam's side of item 9.
+        //
+        // It is deliberately NOT a `Gate` inside `admit`: `admit` takes
+        // properties of the CANDIDATE, and a frame ceiling is a property of the
+        // MACHINE, like the backend lookup above it.
+        if self.max_frames.is_some() {
+            return None;
+        }
         let (name, budget) = crate::compiled::admit(
             closure,
             args,
@@ -2365,8 +2405,10 @@ impl<'a> Machine<'a> {
     }
 
     pub(crate) fn push(&mut self, frame: Frame, span: Span) -> Result<(), Diagnostic> {
-        if self.stack.frames() >= self.max_frames {
-            return Err(self.err_frame_limit(span, &self.stack));
+        if let Some(max) = self.max_frames
+            && self.stack.frames() >= max
+        {
+            return Err(self.err_frame_ceiling(span, max, &self.stack));
         }
         self.stack = std::mem::take(&mut self.stack).pushed(frame);
         Ok(())
@@ -2383,13 +2425,11 @@ impl<'a> Machine<'a> {
         limit::err_recursion_limit(span, NESTED_CALLS, self.max_calls, &innermost_calls(stack))
     }
 
-    fn err_frame_limit(&self, span: Span, stack: &Stack) -> Diagnostic {
-        limit::err_recursion_limit(
-            span,
-            PENDING_FRAMES,
-            self.max_frames,
-            &innermost_calls(stack),
-        )
+    /// Only reachable through [`Machine::with_max_frames`], and phrased so a
+    /// reader can tell it apart from the bound both engines share: this one says
+    /// which engine ran out of what, and never the words "recursion limit".
+    fn err_frame_ceiling(&self, span: Span, max: usize, stack: &Stack) -> Diagnostic {
+        limit::err_frame_ceiling(span, max, self.max_calls, &innermost_calls(stack))
     }
 }
 

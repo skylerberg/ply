@@ -1713,10 +1713,19 @@ default engine as of `RUNTIME_VERSION` 0.4.0 and every entry point below exists.
 Two do not: see the note after the block.
 
 ```rust
-/// A resource limit on the heap the frames live on. Not the bound a runaway
-/// recursion hits — that is `limit::DEFAULT_MAX_CALLS`, which both engines
-/// share and which a recursion reaches first, since a call costs a frame.
-pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
+// Revised 2026-08-24. This block declared:
+//
+//     /// A resource limit on the heap the frames live on. Not the bound a
+//     /// runaway recursion hits — that is `limit::DEFAULT_MAX_CALLS`, which
+//     /// both engines share and which a recursion reaches first, since a call
+//     /// costs a frame.
+//     pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
+//
+// The constant is gone and so is the default. Its last clause was false — a
+// call costs one frame, a body costs as many as it pends — and a ceiling that
+// fires on a body pending 100+ frames per call is a bound only one engine has.
+// `with_max_frames` below is what remains: opt-in, not semantics, and a machine
+// carrying one enters no compiled body.
 
 pub enum Progress { Running, Halted(Value) }
 
@@ -2184,8 +2193,11 @@ Numbered as in ADR 0005; `(landed)` marks the ones already passing.
     count. *(landed)*
 16. A continuation captured inside `map`'s callback and resumed twice produces
     two complete lists.
-17. Exceeding `DEFAULT_MAX_FRAMES` is a diagnostic containing "recursion limit"
-    whose notes name the innermost `Call` frames.
+17. Exceeding a frame ceiling asked for through `with_max_frames` is a
+    diagnostic whose notes name the innermost `Call` frames and whose message
+    does **not** contain "recursion limit". *(Revised 2026-08-24; it read
+    "Exceeding `DEFAULT_MAX_FRAMES` is a diagnostic containing 'recursion limit'
+    whose notes name the innermost `Call` frames.")*
 18. A continuation applied to the wrong number of arguments is `ARITY_MISMATCH`.
 19. One footprint for the same program resuming zero, one and two times.
 20. `ρ_κ` does not trip the occurs check; a clause calling its own continuation

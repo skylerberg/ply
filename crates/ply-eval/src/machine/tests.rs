@@ -16,9 +16,16 @@ fn eval(e: Expr) -> Result<Value, Diagnostic> {
     eval_in(Vec::new(), e)
 }
 
+/// A machine whose only binding limit is the frame ceiling. `max_calls` is
+/// raised out of the way deliberately: at the ceiling's real order of magnitude
+/// a body pends far more than 250,000 frames only after more than 10,000 nested
+/// calls, so a default machine answers `recursion limit of 10000 nested calls
+/// exceeded` and the ceiling under test never fires. Isolating the bound is the
+/// whole point of the helper.
 fn eval_frames(items: Vec<Item>, e: Expr, max: usize) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
     Machine::for_program(&program, &resolved)
+        .with_max_calls(usize::MAX)
         .with_max_frames(max)
         .eval_expr_for_test(&e)
 }
@@ -519,41 +526,81 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
     assert_eq!(d.code, codes::NON_EXHAUSTIVE_MATCH);
 }
 
+/// A frame ceiling that is asked for is enforced, and it is a diagnostic rather
+/// than a native-stack abort — which is the whole reason the knob exists.
+///
+/// > **Renamed and re-pointed (2026-08-24).** This was
+/// > `deep_non_tail_recursion_is_a_diagnostic_not_a_crash` and it asserted
+/// > `d.message.contains("recursion limit")`. Deep non-tail recursion is
+/// > bounded by `DEFAULT_MAX_CALLS` and always was; what this actually
+/// > exercises is the frame ceiling `eval_frames` sets, which is no longer a
+/// > default and no longer says "recursion limit" — saying it is what let a
+/// > resource guard read as a statement about the program.
 #[test]
-fn deep_non_tail_recursion_is_a_diagnostic_not_a_crash() {
+fn a_frame_ceiling_that_was_asked_for_is_a_diagnostic_not_a_crash() {
     let d = match eval_frames(
         vec![non_tail_recursive()],
         callv("sum", vec![int(100_000)]),
         64,
     ) {
         Err(d) => d,
-        Ok(v) => panic!("expected a recursion diagnostic, got {v}"),
+        Ok(v) => panic!("expected a frame-ceiling diagnostic, got {v}"),
     };
     assert_eq!(d.code, codes::RUNTIME_ERROR);
-    assert!(d.message.contains("recursion limit"), "{}", d.message);
+    assert!(
+        d.message.contains("ceiling of 64 pending frames"),
+        "{}",
+        d.message
+    );
+    assert!(
+        !d.message.contains("recursion limit"),
+        "a resource ceiling is being reported as a bound on the program: {}",
+        d.message
+    );
 }
 
-/// At the bound's real order of magnitude, where reporting the failure means
+/// At the ceiling's real order of magnitude, where reporting the failure means
 /// unwinding a stack of a quarter of a million frames rather than sixty.
 #[test]
-fn the_frame_bound_holds_at_the_scale_it_is_set_for() {
+fn the_frame_ceiling_holds_at_the_scale_it_is_set_for() {
     let out = eval_frames(
         vec![non_tail_recursive()],
         callv("sum", vec![int(1_000_000)]),
         250_000,
     );
     let d = out.expect_err("a million levels needs more than 250,000 frames");
-    assert!(d.message.contains("recursion limit"), "{}", d.message);
+    assert!(
+        d.message.contains("ceiling of 250000 pending frames"),
+        "{}",
+        d.message
+    );
+}
+
+/// A plain machine does not acquire a small ceiling by accident: 9,000 levels of
+/// `sum` pend about 18,000 frames and none of them is refused.
+///
+/// Named for what it checks rather than for what it is about. It does **not**
+/// show that a plain machine has *no* ceiling — 18,000 frames would have passed
+/// under the 1,000,000 default this change removed, so this test is green either
+/// way. The absence of the default is armed at the only scale that can arm it,
+/// by `equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_
+/// frames_a_body_pends`, which crosses 1,000,000 pending frames and costs
+/// gigabytes to do it. What this one is worth is the cheap half: a regression
+/// setting some *small* default here fails in milliseconds.
+#[test]
+fn a_machine_nobody_asked_for_a_ceiling_does_not_acquire_a_small_one() {
+    let out = eval_in(vec![non_tail_recursive()], callv("sum", vec![int(9_000)]));
+    assert!(matches!(out, Ok(Value::Int(40504500))), "{out:?}");
 }
 
 #[test]
-fn the_recursion_diagnostic_names_the_innermost_calls() {
+fn the_frame_ceiling_diagnostic_names_the_innermost_calls() {
     let d = eval_frames(
         vec![non_tail_recursive()],
         callv("sum", vec![int(100_000)]),
         64,
     )
-    .expect_err("the limit is exceeded");
+    .expect_err("the ceiling is exceeded");
     let named = d
         .notes
         .iter()

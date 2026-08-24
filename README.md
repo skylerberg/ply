@@ -517,7 +517,7 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,661 tests across 156 targets** (143 test
+`cargo test --workspace` runs **3,690 tests across 155 targets** (142 test
 binaries plus 13 doc-test suites); all pass on an unloaded machine. Five are
 marked `ignored`: four are timing benchmarks you run on purpose (three in
 `ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
@@ -547,6 +547,27 @@ not been re-taken as the tree grew.
 > > machine whose load average ran 4 to 12 — nearly double the 569.3s below, on
 > > the same tree plus four tests, which is what a loaded machine does to this
 > > figure and is the reason the counts are the part to trust.
+> >
+> > > **Re-taken again (frame-ceiling change, `CONTRIBUTING.md` items 9 and 10,
+> > > 2026-08-24). The sentence above already carried these counts when this
+> > > change came to re-take them, with no block saying where they came from;
+> > > this block is that provenance.** Same command, same pipelines:
+> > > **3,690 passed, 0 failed, 5 ignored** across **155 targets** (**142**
+> > > binaries + 13 doc-test suites). This change accounts for three of the +29
+> > > over 3,661; the rest is other work that landed in the same tree and did
+> > > not re-take this paragraph.
+> > >
+> > > The binaries read **142**, as they did two readings ago, not the **143**
+> > > directly above. This run did not cause that and did not chase it down, so
+> > > read 142 as the measurement and the 143 as unexplained — not as a
+> > > deletion.
+> > >
+> > > The wall clock is **1,735.2s (28m 55s) real, 1,548.7s user**,
+> > > `/usr/bin/time -p`, one run on a machine whose load average ran **24 to
+> > > 43** with several unrelated builds running throughout. User time *below*
+> > > real time is the giveaway: this run spent minutes waiting for cores
+> > > rather than using them, so the figure describes the machine and not the
+> > > tree. The counts are the part to trust.
 >
 > The fifth `ignored` is
 > `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,

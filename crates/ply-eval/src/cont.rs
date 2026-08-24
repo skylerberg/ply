@@ -410,11 +410,15 @@ impl<T: Pooled> Default for Chain<T> {
     }
 }
 
-/// Iterative, because the frames pending on a stack are bounded by
-/// [`DEFAULT_MAX_FRAMES`] and not by anything the native stack could survive
-/// unwinding recursively.
+/// Iterative, because nothing bounds the frames pending on a stack at a depth
+/// the native stack could survive unwinding recursively.
 ///
-/// [`DEFAULT_MAX_FRAMES`]: crate::machine::DEFAULT_MAX_FRAMES
+/// > **Corrected (2026-08-24): this used to read "bounded by
+/// > `DEFAULT_MAX_FRAMES` and not by anything the native stack could survive".**
+/// > There is no longer a default frame ceiling — see
+/// > [`crate::Machine::with_max_frames`] — so the loop below is more load-bearing
+/// > than it was, not less: what used to cap the chain at a million links now
+/// > caps it at nothing but memory.
 impl<T: Pooled> Drop for Chain<T> {
     fn drop(&mut self) {
         let mut cur = self.head.take();
@@ -533,8 +537,9 @@ impl Stack {
         Stack::default()
     }
 
-    /// Total pending frames. O(1), and it is the resource bound on a stack that
-    /// is now a heap value rather than the native one.
+    /// Total pending frames. O(1), and what an opt-in resource ceiling on this
+    /// engine's heap is checked against — never what a program's answer turns
+    /// on. That is [`Stack::calls`].
     pub fn frames(&self) -> usize {
         self.frames
     }
@@ -1068,9 +1073,10 @@ mod tests {
         assert_eq!(field_of(&replayed), "f2");
     }
 
-    /// A stack may hold up to `DEFAULT_MAX_FRAMES` frames, so releasing one has
-    /// to be a loop. A recursive drop through the links would abort the process
-    /// on a worker's stack rather than raise a diagnostic.
+    /// A stack may hold as many frames as the calls under `DEFAULT_MAX_CALLS`
+    /// can pend, which no constant caps, so releasing one has to be a loop. A
+    /// recursive drop through the links would abort the process on a worker's
+    /// stack rather than raise a diagnostic.
     #[test]
     fn dropping_a_deep_stack_does_not_recurse_through_the_native_stack() {
         std::thread::Builder::new()

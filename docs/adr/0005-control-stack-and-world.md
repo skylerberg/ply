@@ -704,6 +704,10 @@ The *semantic* limit stays: a runaway recursion must be a diagnostic and not an
 out-of-memory kill. It is our own bookkeeping, queryable in O(1), and adjusted in
 O(1) when a continuation is spliced. The message keeps the phrase "recursion
 limit" so that ADR 0004's `AssertionKind::RecursionLimit` still classifies it,
+<!-- Corrected 2026-08-24: it does not. That variant is declared in
+`ply_test::slice` and constructed nowhere, so nothing classifies on it; what
+reads the phrase is four tests matching the string. See `ply-eval/src/limit.rs`
+and CONTRIBUTING §"Things known to be broken". -->
 and the diagnostic can now name the innermost `Call` frames — the actual
 recursion path, which the old guard could not produce.
 
@@ -749,6 +753,29 @@ becomes an available answer.
 stack. A call costs at least one frame, so the call bound is reached first and
 the frame bound catches only a program that pends a million frames without
 nesting ten thousand calls.
+
+> **Superseded by the fix to this section's own §7.1 (2026-08-24).** The
+> paragraph above is wrong in its second sentence and the error is the same one
+> §7.1 was written to correct, made once more: a **call** costs one frame, a
+> **body** costs as many as it pends, so the call bound is *not* reached first
+> — a body pending more than `1_000_000 / 10_000` = 100 frames per call reaches
+> the frame bound. `DEFAULT_MAX_FRAMES` no longer exists as a default. What is
+> left is `Machine::with_max_frames`, an opt-in ceiling that is not part of what
+> a program means, and a machine carrying one enters no compiled body — a native
+> body pends no frames and cannot honour a limit counted in them.
+>
+> The reason the ceiling had to go rather than be copied into the tree-walker:
+> it was a function of **spelling**, not of behaviour. Measured on the shipping
+> release binary, 2026-08-24, on two definitions of the same function making the
+> same 9,001 nested calls at `hog(9000)` — `hog(n - 1) + 150` answered
+> `1350000`, and `hog(n - 1) + 1 + 1 + ...` with 150 terms raised. Giving the
+> tree-walker the same ceiling would have made both engines refuse the second
+> program over how its additions were written, and would still have left a
+> backend answering where both raised.
+>
+> This also retires the third bullet of §7.1's list of what the frame bound
+> counts: with no ceiling, `Stack::frames()` is an observation and
+> `Stack::calls()` is the bound.
 
 ## Consequences
 
@@ -829,8 +856,15 @@ Machine mechanics:
     `Continuation::segments` and `Continuation::frames`. *(landed)*
 16. A continuation captured inside `map`'s callback and resumed twice produces
     two complete lists.
-17. Exceeding `DEFAULT_MAX_FRAMES` is a diagnostic whose message contains
-    "recursion limit" and whose notes name the innermost `Call` frames.
+17. Exceeding a frame ceiling that was asked for (`Machine::with_max_frames`)
+    is a diagnostic whose notes name the innermost `Call` frames, and whose
+    message deliberately does **not** contain "recursion limit" — it is one
+    engine's heap running out, not a statement about the program.
+    *(Revised 2026-08-24. It read: "Exceeding `DEFAULT_MAX_FRAMES` is a
+    diagnostic whose message contains 'recursion limit' and whose notes name the
+    innermost `Call` frames." There is no `DEFAULT_MAX_FRAMES`, and phrasing a
+    resource ceiling as a recursion limit is what let it read as a program
+    answer.)*
 18. A continuation applied to the wrong number of arguments is `ARITY_MISMATCH`.
 
 Typing and scheduling:
