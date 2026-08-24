@@ -328,13 +328,23 @@ below for which target grew and by how much — and do not run it under load.
 > variance is a compile-time property no `#[test]` can observe. Re-taken the same
 > way: **3,597 / 0 / 4 in 399.6s**, re-taken at **406.9s**, `Running` → **138**, `Doc-tests` → 13.
 
-### Four things a green suite does not prove
+### Five things a green suite does not prove
 
-`cargo test --workspace` green is weaker than it looks, and the four gaps are
-enumerated in `ROADMAP.md`'s preamble table. Two of them will bite you here:
+> **This section read "Four things a green suite does not prove", and said the
+> gaps "are enumerated in `ROADMAP.md`'s preamble table".** There are five, and
+> the table enumerates four. The fifth is `PLY_TEST_DB`, below. Checked before
+> this change was made: `grep -rn PLY_TEST_DB` over the whole repository
+> returned **four** hits, all four inside
+> `crates/ply-host/src/db/pool/tests.rs` — no ADR, no `ROADMAP.md` row, no
+> mention in this file — which is presumably why nothing counted it. (Re-run it
+> today and you also get this section, `CONTRIBUTING.md` and
+> `.github/workflows/ci.yml`.) Found 2026-08-24 while wiring CI.
 
-**Ten postgres tests skip unless you set `PLY_PG_URL`, and nothing in the
-repository sets it.** They *pass* without running. Measured, both ways:
+`cargo test --workspace` green is weaker than it looks. Four of the five gaps
+are enumerated in `ROADMAP.md`'s preamble table. Two of them will bite you here:
+
+**Ten postgres tests skip unless you set `PLY_PG_URL`.** They *pass* without
+running. Measured, both ways:
 
 ```
 $ cargo test -p ply-host --lib db::scope::tests::live
@@ -356,6 +366,15 @@ $ cargo test -p ply-host --lib db::scope::tests::live -- --nocapture
 skipped: PLY_PG_URL is unset, so the scope table was not run against real postgres
 ```
 
+> **Corrected: the clause "and nothing in the repository sets it" is no longer
+> true.** That is the withdrawn text, verbatim, and it stood in the bolded
+> sentence above until 2026-08-24.
+> `.github/workflows/ci.yml`'s `test-postgres` job sets it, at a
+> `postgres:18.6` service container, and fails the run if any of the ten prints
+> its skip notice. Nothing sets it *locally*, which is what the paragraph is
+> about and which is unchanged: on your machine these ten still pass in 0.00s
+> without running.
+
 To actually run them:
 
 ```
@@ -373,18 +392,101 @@ one you do not mind that happening in.
 host is not compiled and prints nothing at all. Every W5 shutdown claim is
 unproven there, silently.
 
-The other two gates are `cluster::available()`
+The other two gates in the table are `cluster::available()`
 (`crates/ply-host/tests/support/cluster.rs:39` — `ROADMAP.md` cites `:38`, which
 is the blank line above it; skips without `initdb` or `postgres` on `PATH`, and
 says so on stderr) and the codegen spike's own workspace (§1).
 
-### One test is wall-clock sensitive and runs by default
+**The fifth gate is `PLY_TEST_DB`, and it is the quietest of them.**
+`crates/ply-host/src/db/pool/tests.rs:25` reads it, and every pool test that
+needs a server returns early without it — with **no notice at all**, not even
+the stderr line the other two print. Deliberately, per the comment at
+`crates/ply-host/src/db/pool/tests.rs:30-31`: *"Deliberately not a `panic!`: a
+developer without postgres running must be able to `cargo test -p ply-host` and
+get a green, honest result."* The cost is that
+there is nothing to grep for. Measured 2026-08-24, `cargo test -p ply-host --lib
+db::pool`:
+
+```
+$ cargo test -p ply-host --lib db::pool
+test result: ok. 26 passed; 0 failed; ... finished in 0.00s
+
+$ PLY_TEST_DB='postgresql://ply@127.0.0.1:55432/ply?sslmode=disable' \
+    cargo test -p ply-host --lib db::pool
+test result: ok. 26 passed; 0 failed; ... finished in 0.94s
+
+$ PLY_TEST_DB=postgres://ply@127.0.0.1:55432/ply \
+    cargo test -p ply-host --lib db::pool     # server not running
+test result: FAILED. 6 passed; 20 failed; ... finished in 0.02s
+```
+
+> **The second figure read `1.55s` here, and `1.35s` in `ROADMAP.md`, for the
+> same measurement.** Neither had been re-taken; both are replaced by the block
+> above, taken 2026-08-24 against a local postgres 18.3. The third invocation is
+> new — nobody had run the pointed-at-nothing case.
+
+Same count and same line for the first two, and the wall clock is the only tell
+between them — the same shape as `PLY_PG_URL` and without even the captured
+stderr. **The third is the useful one.** `db/pool/tests.rs:41` does
+`Reactor::start(config).expect("the test database is reachable")`, so pointing
+`PLY_TEST_DB` at a server that is not there is a loud `E0431` failure, not a
+quiet skip. CI sets the variable at the same container it points `PLY_PG_URL`
+at and pre-flights it with `test -n` and a `psql SELECT 1`: a missing value
+fails the pre-flight, a wrong one fails the tests. What CI still cannot do is
+prove after the fact that these 26 took the live path the way it can for the
+ten.
+
+### Thirteen tests are wall-clock sensitive and run by default
+
+> **This section read "One test is wall-clock sensitive and runs by default".**
+> That is the withdrawn text. The count reached thirteen on 2026-08-24 and the
+> way it got there is more useful than the number — see below. The one test it
+> named is real and is still the clearest example.
 
 `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a timing growth ratio and is **not** in the `ignored` set. It passed
 here, and passed again on the audit's re-run. On a machine busy compiling
 something else it has been seen to fail. If it is your only failure, re-run on a
 quiet machine before you believe it.
+
+Twelve more assert a performance figure the same way. The full list is
+`.github/ci-shards.sh`'s `DEFERRED` table; CI runs all thirteen alone on a
+runner, one at a time, single-threaded, and the parallel shards skip them.
+
+**How the list is actually maintained: by running the shards.** Two surveys were
+done and each was refuted by the next shard run within the hour, so do not trust
+the next survey either.
+
+The first survey grepped `crates/*/tests` for `Instant::now` and found seven.
+Running the corpus shard's own command, with three other `cargo test
+--workspace` runs in flight, then failed at
+`crates/ply-corpus/src/measure.rs:861`:
+
+```
+the fourth resumption cost 5680.8965 us against 2196.552 us for a whole
+one-resumption call
+```
+
+`four.marginal_micros < one.micros * 2.0`, in a unit test in `src/` — a place
+that grep could not reach. Re-surveying `crates/*/src` took the list to twelve.
+
+The second survey keyed on a timing vocabulary — `Instant`, `elapsed`,
+`Duration`, `_nanos`, `_micros`. The cli-eval shard then failed at
+`crates/ply-cli/tests/w3_http_audit.rs:714`:
+
+```
+four times the escapes cost 1655.9ms against 143.6ms for k, which is 11.5x
+```
+
+`four <= one * 9.0`, in a test that reads no Rust clock at all — it parses
+milliseconds out of `ply test`'s own output. None of the vocabulary appears in
+it. That took the list to thirteen. Its doc comment says the 9x threshold was
+picked "so that a slow or contended machine cannot make it red"; the machine was
+contended and it went red at 11.5x. Run alone it passes three times out of three.
+
+Nothing was wrong with the code in either case. That is the failure a shared
+runner produces, and it is why the list is thirteen rather than one — and why
+thirteen is a running count rather than a result.
 
 The five `ignored` tests, verbatim from the run: three timing benchmarks in
 `ply-corpus/tests/http_cost.rs`, each of which prints its own recipe —
@@ -733,12 +835,84 @@ There is no symbol index. What worked:
 This is the section the rest of the project's audit history is about. Be exact
 about it.
 
-### There is no CI
+### There is CI, and what it does and does not settle
 
-**`.github/` does not exist.** No workflow, no hook, no pipeline. Every "the
-test suite asserts it" in every document means *someone has to run
-`cargo test --workspace` locally, and nobody is watching whether they did.*
-Assume nothing has been run since the last person who said so.
+> **This section read "There is no CI" and that was true when it was written.**
+> The withdrawn text, verbatim: *"**`.github/` does not exist.** No workflow, no
+> hook, no pipeline. Every "the test suite asserts it" in every document means
+> *someone has to run `cargo test --workspace` locally, and nobody is watching
+> whether they did.* Assume nothing has been run since the last person who said
+> so."* `.github/workflows/ci.yml` was added 2026-08-24. What follows is
+> re-taken. `CONTRIBUTING.md` §"There is CI, and it is younger than most of this
+> file" lists the jobs.
+
+**What it settles.** `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets -- -D warnings` and the whole test suite run on every push and
+every pull request. So do four of the five gates §2 describes — the ones that
+return a *passing* result when their dependency is absent:
+
+- `PLY_PG_URL` is set at a `postgres:18.6` service container, and the job then
+  runs the ten live tests with `--nocapture` and **fails if it finds the notice
+  a skipped one prints**. Three things make that work and all three were wrong
+  at some point while it was written: cargo captures the notice on a passing
+  test, so `--nocapture` is needed to emit it at all; the notice is an
+  `eprintln!`, so the step needs `2>&1` to get it into the file the grep reads,
+  and without that the grep cannot fire whatever it matches; and the
+  `10 passed` assertion beside it does *not* substitute, because the ten tests
+  return early and pass, so that line reads `10 passed` with no server
+  anywhere. Measured with `PLY_PG_URL` unset: stdout alone carries **0**
+  notices, `2>&1` carries **10**.
+- `initdb`, `postgres` and `psql` are put on `PATH` where
+  `cluster::available()` looks, and the job fails if they are not there. It then
+  runs a cluster-gated binary and greps for the same notice.
+- `#![cfg(unix)]` compiles, because the runner is `ubuntu-24.04`, and a step
+  fails if that binary reports zero tests.
+- `crates/ply-codegen-spike` is built and tested in a job of its own, on a
+  pinned 1.94.0, because `cranelift 0.134.3` needs it. That gate is not a skip —
+  the crate declares its own `[workspace]`, so `--workspace` has never reached
+  it — and it has bit-rotted twice with nothing to say so.
+
+`examples/same-tests.sh` runs too, which is W4's exit criterion and was
+previously a thing you had to remember.
+
+**What it does not settle.** Four things, and they are why this section is not
+just the list above.
+
+1. **Nothing changed on your machine.** The gates skip locally exactly as
+   before. CI is a second reader, not a replacement for the outer loop.
+2. **The fifth gate has no positive proof, even in CI — but it is better
+   guarded than that sounds.** `PLY_TEST_DB` is set at the same container, and
+   the pool tests print nothing when it is missing, so there is no notice to
+   grep and no log line that shows after the fact that the 26 took the live
+   path. What there *is*: a wrong value is loud. Measured 2026-08-24 —
+   `PLY_TEST_DB` set at an unreachable server gives **20 of 26 FAILED** with
+   `E0431` in 0.02s, because `db/pool/tests.rs:41` does
+   `.expect("the test database is reachable")`. Unset gives 26 passed in 0.00s
+   and set-and-reachable gives 26 passed in 0.94s. So only the *missing* case is
+   silent, and the job's `test -n` pre-flight fails on that. §2 has the rest.
+3. **CI checks the tree, not the prose.** §"Exactly one test reads a prose
+   document" below is unchanged: one sentence of `README.md` is enforced and the
+   rest is not. Every number in this file is a number someone typed, and CI
+   would not notice if it went stale.
+4. **The toolchain is unpinned, except for the spike.** Nothing in the
+   repository names a version, so CI's `stable` is whatever stable is on the day
+   it runs, and a release that adds a clippy lint turns the `clippy` job red
+   with no change to the tree. That is a deliberate trade — the alternative is
+   not noticing new lints, and `CONTRIBUTING.md` §"The loop" says zero warnings
+   is the gate — and `ci.yml`'s header names the line to edit to take the other
+   side of it.
+
+**And one thing it does not settle that is specific to how it was built.** Some
+of the workflow's commands were run on the machine in §Provenance and some were
+not; `ci.yml` was then edited again, so "all of them were run" is not a sentence
+this section is entitled to. `CONTRIBUTING.md` §"There is CI" carries the ledger
+of which commands have an exit code against the current file, which one failed,
+and which were stopped unfinished when the machine reached load 27 — read that
+rather than assuming this section rests on a complete pass, because it does not.
+
+Nothing in `ci.yml` has ever run on GitHub Actions: the runner image, the
+service container, the `apt-get` fallback and the cache action are the parts
+only a push can exercise, and the first push is where they get tested.
 
 ### Exactly one test reads a prose document, and it reads one sentence of it
 
@@ -1010,10 +1184,13 @@ Everything here cost this audit real time. In descending order of cost.
    the grep that shows it. §4.
 6. **`grep conflict` matches 51 files** across two unrelated conflict notions.
    §6.
-7. **`PLY_PG_URL` is set by nothing**, so ten postgres tests pass without
-   running — and `ROADMAP.md`'s gate table says that skip "says so, on stderr of
-   a passing test", which is **not true under `cargo test`**: cargo captures it,
-   so the default run tells you nothing. §2.
+7. **`PLY_PG_URL` is set by nothing *locally*** — the withdrawn wording was
+   "is set by nothing", and CI has set it since 2026-08-24 — so ten postgres
+   tests still pass without running on your machine. `ROADMAP.md`'s gate table
+   says that skip "says so, on stderr of a passing test", which is **not true
+   under `cargo test`**: cargo captures it, so the default run tells you
+   nothing. A fifth gate, `PLY_TEST_DB`, hides 26 more and prints nothing at
+   all. §2.
 8. **`CONTRACTS.md` carries stale signatures with the correction above them,
    not beside them.** §7.
 9. **There is no ADR index.** `docs/adr/` is **nineteen** numbered files and

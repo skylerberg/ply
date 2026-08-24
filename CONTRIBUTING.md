@@ -121,24 +121,218 @@ baseline.
 > `README.md`'s Status paragraph and `docs/ONBOARDING.md` §2 carry the same
 > re-take and the list of files.
 
-### There is no CI
+### There is CI, and it is younger than most of this file
 
-`.github/` does not exist. Nothing runs on a push. The three commands above are
-the entire verification apparatus and they only run when a human runs them.
-Assume the person before you did not.
+> **This section read "There is no CI".** The withdrawn text, verbatim:
+> *"`.github/` does not exist. Nothing runs on a push. The three commands above
+> are the entire verification apparatus and they only run when a human runs
+> them. Assume the person before you did not."* That was true until 2026-08-24,
+> when `.github/workflows/ci.yml` was added.
+
+`.github/workflows/ci.yml` runs on every push and every pull request, on every
+branch and not only the default one. It runs the three commands above, and it
+opens all five of the gates the next section describes — which is most of why it
+exists, because a gate that returns a *passing* result when its dependency is
+absent is the thing a human is least likely to notice. It **asserts** four of
+them open by a notice the job greps for: `PLY_PG_URL`, `cluster::available()`,
+`#![cfg(unix)]` and the spike each fail a job if the gate is shut. `PLY_TEST_DB`
+has no notice — those 26 tests print nothing at all when they skip — so it is
+asserted a different way, and the measurement behind it is in the gate table
+below: a *wrong* value fails 20 of the 26 loudly, because the harness expects
+the database to be reachable, and a *missing* value is caught by the job's
+`test -n` pre-flight. What no one can show after the fact is a log line saying
+the 26 ran.
+
+| job | what it runs |
+| --- | --- |
+| `shard table is total` | `.github/ci-shards.sh verify`, before anything compiles |
+| `cargo fmt --all --check` | the same command, and it must be silent |
+| `cargo clippy --workspace --all-targets` | with `-D warnings`, so the first warning is a failed run rather than a line in a log |
+| `test corpus` / `cli-eval` / `core` | the suite, three shards by package; the split is `.github/ci-shards.sh` |
+| `test ply-host (postgres)` | `ply-host`, with `PLY_PG_URL` and `PLY_TEST_DB` pointed at a `postgres:18.6` service container **and** `initdb`/`postgres`/`psql` on `PATH` — then it fails if any test printed a skip notice |
+| `wall-clock measurements` | the thirteen timing-sensitive tests, one at a time, single-threaded, alone on a runner |
+| `crates/ply-codegen-spike` | `cargo test --locked --release` on a pinned 1.94.0, in the spike's own workspace |
+| `examples/same-tests.sh` | W4's exit criterion: a release `ply`, a cluster the script starts itself, and the twin compared against postgres byte for byte |
+| `CI` | one required check that fails unless every job above reported `success` |
+
+Three things follow, and the second is the one this project would regret not
+having straight.
+
+**The suite is sharded, and the shard table is the thing to get right.** A
+package in no shard is a package nothing tests, and the run would be green and
+say nothing about it — this repository's most expensive defect class, in CI
+form. So the partition is written once, in `.github/ci-shards.sh`, and the first
+job reads the workspace members out of `Cargo.toml` and fails if a member is in
+no shard, in two shards, or named in the table and absent from the tree. It also
+fails on a crate directory under `crates/` that is in neither `members` nor the
+script's `KNOWN_OUTSIDE` list, and on a `Cargo.toml` whose `members` list it
+cannot parse — because a table that matched nothing would otherwise pass every
+check it makes. Add a crate, and CI tells you where to put it.
+
+**The gates are asserted open, not assumed open.** A service container that came
+up is not evidence that a test connected to it. So the postgres job runs the ten
+live tests with `--nocapture`, greps its own output for the notice a skipped
+test prints, and fails if it finds one; it does the same for a cluster-gated
+binary; and it fails unless the runs report exactly `10 passed` and `2 passed`.
+The `--nocapture` matters and so does the shape of the grep: cargo captures a
+passing test's output, so without it the notice appears **zero** times, and
+libtest prints it on the same line as the test name — `test <name> ... skipped:
+PLY_PG_URL is unset, …` — so a `^skipped:` anchored pattern never fires. The
+first version of that grep in this workflow was anchored, and it was a guard
+that could not fire; it was caught by running the job's own command with the
+variable unset and watching it pass.
+
+**CI is not a substitute for the outer loop, because it is not the same run.**
+On your machine every gate below still skips exactly as it always did: nothing
+local sets `PLY_PG_URL` or `PLY_TEST_DB`, and `cargo test --workspace` still
+does not reach the spike. CI closing them means the gap is caught before a
+merge, not that it is closed where you are standing. Run the outer loop anyway.
+
+Two things about the shape, and one about how much to trust any of it.
+
+The three shards are cut from a measurement, not a guess. `cargo test -p
+<package>` on the machine in `docs/ONBOARDING.md` §Provenance, warm target,
+`-j 2 -- --test-threads=2` to approximate a two-core hosted runner, 2026-08-24:
+`ply-corpus` **289s**, `ply-cli` **149s**, `ply-eval` **137s**, `ply-store`
+32s, `ply-hash` 15s, `ply-test` 13s, `ply-core` 8s, `ply-span` 5s, `ply-prove`
+4s, `ply-syntax` 3s, `ply-std` 2s, `ply-derive` 1s — 658s summed, of which
+`ply-corpus` is 44%. That one package is the floor: no arrangement of `-p` flags
+finishes sooner than it does, so a fourth shard would buy nothing and pay the
+dependency build again. The numbers are that machine's and the ordering is what
+the table depends on; re-take with `cargo test -p <package>` if a package grows
+a slow suite, and move it.
+
+**And the part that is not checked. This is a ledger, not a blanket.** An
+earlier draft of this paragraph said *"every command in `ci.yml` was run on that
+machine before it was committed, and their exit codes are the evidence for
+everything above."* It was withdrawn the same day it was written, because
+`ci.yml` was edited after that run and the sentence outlived the thing it rested
+on. What follows is what has an exit code against the file as it stands, taken
+on the machine in `docs/ONBOARDING.md` §Provenance, 2026-08-24.
+
+**Static checks, all exit 0.** `actionlint` 1.7.12 over `ci.yml` with its
+`shellcheck` integration active; `python3 -c "yaml.safe_load(...)"`, which
+parses and reports nine jobs; `shellcheck` over `.github/ci-shards.sh`; and
+`ci-shards.sh verify`, which reports *13 workspace members, each in exactly one
+shard; 1 crate deliberately outside; 13 deferred tests, each present in the
+tree*. `verify`'s failure paths were exercised too, eight of them, each exiting
+1 with a named reason: a member in no shard, a member in two, a shard naming a
+non-member, a deferred test renamed, a deferred test in a missing target, a
+`KNOWN_OUTSIDE` entry for a crate not in the tree, an unexcused crate directory
+(`crates/zz-verify-probe/`, created and removed), and a `Cargo.toml` whose
+`members` list does not parse — which would otherwise have made every check
+above it pass vacuously. `ci-shards.sh packages nosuch` exits **1**.
+
+**Commands the jobs run, with exit codes.**
+
+| command | result |
+| --- | --- |
+| `cargo fmt --all --check` | **0**, silent |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | **0**, 34.36s, zero lines beginning `warning` or `error` |
+| `cargo +1.94.0 test --locked --release` in `crates/ply-codegen-spike` | **0**, **45 tests** — `hazards.rs` 16, `mutations.rs` 11, `mcts_kernel.rs` 9, `spike.rs` 9 — 438.9s including the cold release build |
+| `cargo build --locked --release -p ply-cli` | **0** |
+| `./examples/same-tests.sh` | **0**, **29 requests byte-for-byte identical** between the twin and postgres, 5.63s, against a cluster the script started itself |
+| the postgres job's live-test step | **0**, `10 passed` in **0.29s**, zero skip notices |
+| the postgres job's cluster step | **0**, `2 passed` in **2.87s**, zero skip notices |
+| the `test` job's `w5_shutdown` step | **0**, **8 passed**, guard matches |
+| the `test` job's `corpus` shard, end to end | **0**, 733s, **196 tests ran, 0 failed** across 16 test binaries, **3 filtered** — exactly its three |
+| the `test` job's `core` shard, end to end | **0**, 105s, **1521 tests ran, 0 failed** across 41 test binaries, **6 filtered** — exactly its six |
+| the `test` job's `cli-eval` shard, end to end | **0**, 366s, **1669 tests ran, 0 failed** across 77 test binaries, **4 filtered** — exactly its four. Its first run, before the thirteenth entry existed, was `exit=101`; see below |
+| the `test-timing` job, all **thirteen** deferred tests | **0** and `1 passed` for every one, including both tests that failed inside a shard — run alone and single-threaded they pass at load 20–28, which is the entire argument for the job |
+| `cargo test -p ply-host --lib db::pool`, all three `PLY_TEST_DB` states | unset **26 passed** `0.00s`; set and reachable **26 passed** `0.94s`; set and unreachable **20 FAILED** `0.02s` `E0431` |
+| the `test-postgres` job's `cargo test`, both variables set at a live server | **0**, **281 passed, 0 failed** across **9 targets** — 8 binaries and doc-tests — in 45s, and no skip notice anywhere in the log |
+
+**The guards, exercised in both directions.** With `PLY_PG_URL` unset the live
+step's command exits **0** and reports `10 passed` in `0.00s` — the green this
+whole job exists to refuse — and the grep fires. Piping stdout alone puts **0**
+notices in the log against **10** with `2>&1`, and running without `--nocapture`
+puts **0** there either way. The shards' `--skip` list was shown to remove
+exactly what it names: `ply-store --lib` goes from `102 passed` to `100 passed;
+… 2 filtered out`. `cargo test -p ply-derive -- --exact ""` gives `0 passed; 24
+filtered out` at exit **0**, while bare `--exact` with no filter gives `24
+passed` — so the run-nothing hazard is the empty word and not the flag. And the
+`ran -gt 0` backstop was run against a zero log (**exit 1**) and a real one
+(`ran=153`, **exit 0**). The thirteenth entry was demonstrated the same way:
+`ply-cli --test w3_http_audit` goes from `18 passed` to
+`17 passed; … 1 filtered out` once the table names it.
+
+**One measurement that was wrong in two documents at once.** `PLY_TEST_DB`'s
+live-path timing was recorded as `1.55s` here and `1.35s` in `ROADMAP.md` for
+what was described as the same run. Neither could be reproduced, because the
+re-take had to be done against a server that was actually up — the first attempt
+gave `20 FAILED` and the reason turned out to be that the scratch cluster had
+been shut down hours earlier, which is itself the finding: *a set-but-unreachable
+`PLY_TEST_DB` fails loudly*. All three states are now in the table above, and
+`ROADMAP.md` and `docs/ONBOARDING.md` carry the same three with the old figures
+quoted as withdrawn.
+
+**Run, and it failed.** The corpus shard's command against the *seven*-entry
+deferred table: **`rc=101`**, `measure::tests::every_resumption_costs_about_what_the_first_one_did`.
+That failure is how the table went from seven to twelve; the cli-eval shard
+later failed the same way and took it to thirteen. See §"The suite proves less
+than it looks like it proves". Re-run against the current table, that package's lib
+target reports **`150 passed; 3 filtered out`** where it previously reported
+`152 passed; 1 failed` — 153 either way, and the three filtered are exactly the
+three `ply-corpus` names the table adds.
+
+**A figure that was doubted and turned out to be right.** The `281 pass` in the
+gate table below had been flagged as the kind of number that gets typed rather
+than taken. It was taken: the run above gives exactly **281 passed** across
+exactly **9 targets**, counting doc-tests as the ninth. Suspicion of a
+suspicious-looking figure is a reason to re-take it, not a finding on its own.
+
+**What it cost to get the `corpus` row.** It was started three times. Two runs
+were abandoned after the machine went from load 19 to load **52** with three
+other lanes running `cargo test --workspace` on it — the second reached 8 of its
+17 targets in about an hour, against 672s for the same shard earlier the same
+day. Its slow target, `r4_value_construction`, is the one §"Where a change is
+likely to bite" already names. Neither abandoned run was written down as a
+result, in either direction: this file's own §"Gate on an idle machine before
+measuring, not after" makes a wall-clock number from a load-52 machine worth
+less than no number, and that cuts both ways. The third attempt, at a load the
+machine could sustain, is the 733s row above. Inside it, the `--lib` target
+reports `150 passed; 3 filtered out` where the seven-entry table gave
+`152 passed; 1 failed` — 153 either way, and the flake gone.
+
+**`cli-eval` failed first, and that is how the list became thirteen.** `exit=101`,
+765s, 1652 tests ran, one failure:
+`routing_a_path_of_escapes_costs_its_length_and_not_its_square`,
+`crates/ply-cli/tests/w3_http_audit.rs:714` — *"four times the escapes cost
+1655.9ms against 143.6ms for k, which is 11.5x"*, against `four <= one * 9.0`.
+Run alone it passes three times out of three at load 20, so it is contention and
+not a regression. Its own doc comment says the 9x threshold was chosen "so that
+a slow or contended machine cannot make it red"; a contended machine made it red
+at 11.5x, which is the measurement that matters and the reason the row exists.
+With that row in the table the same shard is the `exit 0` above.
+
+**All thirteen are accounted for across the shards**, which is the check that the
+table and the runs agree: `corpus` filtered 3, `core` 6, `cli-eval` 4. 3 + 6 + 4
+= 13, and no shard filtered a test belonging to another.
+
+**So what is left.** Every command in `ci.yml` has now been run on this machine
+with a real exit code, including all four shard invocations and all thirteen
+timing tests. What has not been exercised is the runner itself.
+
+**Never run anywhere.** **Nothing in `ci.yml` has ever run on GitHub Actions.**
+The runner image, the service container, the `apt-get` fallback, the cache
+action and the `ubuntu-24.04` `PATH` layout are exercised by a push and by
+nothing else, and the first push is where they get tested. If the first run is
+red, that is the expected place for it to be red.
 
 ### The suite proves less than it looks like it proves
 
-Four gates skip silently or near-silently; `ROADMAP.md`'s preamble table
-enumerates them and `docs/ONBOARDING.md` §2 explains the two that matter. The
-short version:
+Five gates skip silently or near-silently. `ROADMAP.md`'s preamble table
+enumerates **four** of them — the fifth, `PLY_TEST_DB`, is in no document in
+this repository older than 2026-08-24 — and `docs/ONBOARDING.md` §2 explains the
+two that matter and carries the measurement for the fifth. The short version:
 
 | if your change touches | you must also run |
 | --- | --- |
 | postgres, the pool, transaction scope | `PLY_PG_URL=postgres://localhost/postgres cargo test -p ply-host` (36–38s, 281 pass, 0 fail) — otherwise ten tests pass in 0.00s without running, and cargo captures the skip notice so nothing tells you: `skipped:` occurs zero times in a whole `cargo test --workspace` log |
-| shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix |
+| the pool | `PLY_TEST_DB='postgresql://ply@127.0.0.1:5432/ply_test?sslmode=disable' cargo test -p ply-host --lib db::pool`. **This is the worst of the five: 26 tests hide behind it and print *nothing* when it is unset** — not a skip line, not on stderr, nothing. Re-measured 2026-08-24 on the machine in `docs/ONBOARDING.md` §Provenance against a local postgres 18.3: unset gives `26 passed` in `0.00s`; set and reachable gives `26 passed` in `0.94s`; set and *unreachable* gives **`20 FAILED`** in `0.02s` with `E0431`, because `db/pool/tests.rs:41` does `.expect("the test database is reachable")`. So a wrong value is loud and only a missing one is silent — CI sets the variable, pre-flights it with `test -n` and a `psql SELECT 1`, and that combination does cover it. An earlier version of this row said the figure was `1.55s` while `ROADMAP.md` said `1.35s` for the same measurement; neither had been re-taken |
+| shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix. CI runs on `ubuntu-24.04`, so it is compiled there, and a step fails if that binary reports zero tests |
 | the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
-| `examples/desk.ply` or any host handler | `./examples/same-tests.sh` — build `--release` first, it does not build for you |
+| `examples/desk.ply` or any host handler | `./examples/same-tests.sh` — build `--release` first, it does not build for you. CI runs it in a job of its own, so this one is now caught before a merge rather than only when you remember |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock ratio and runs by default. A busy machine can fail it.
@@ -152,6 +346,72 @@ stack per pending level. That is inherent, not sloppiness — the machine's fram
 stack is the tree-walker's native stack reified one for one, so no cheaper
 program crosses the million-frame ceiling this test exists to prove is gone. See
 §"Things known to be broken" item 10 for the figures.
+
+> **It is not the only one. There are thirteen, and two of them failed here.**
+> Thirteen tests assert a *performance* figure — a ratio, or a nanosecond,
+> microsecond or millisecond budget — rather than a result. Note how the count
+> was arrived at, because it matters more than the number: **two surveys, each
+> of which declared itself complete, and each of which was refuted by the next
+> shard run within the hour.**
+>
+> Seven are in `crates/*/tests`: the named ratio above;
+> `ply-eval/tests/fixture_open_cost.rs::a_seeded_fixture_opens_per_test_in_microseconds`
+> (`< 2ms` per test); `ply-eval/tests/simulation.rs::a_long_sleep_is_a_jump`
+> (`< 1s` for a test that must not wait); and all four tests in
+> `ply-test/tests/region_fixture_cost.rs`, which compare measured nanosecond
+> figures against each other and against absolute budgets.
+>
+> **Five are unit tests in `src/`, and the first survey missed all five** — it
+> read `crates/*/tests` and stopped there. They are
+> `ply-corpus`'s `measure::tests::every_resumption_costs_about_what_the_first_one_did`,
+> `::capture_and_resume_are_flat_in_the_frames_they_move` and
+> `::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real`, and
+> `ply-store`'s `tests::opening_a_ten_thousand_definition_cache_is_under_the_budget`
+> and `tests::a_baseline_for_every_test_does_not_slow_the_open` — the last two
+> being `elapsed < 250ms` in debug and `< 5ms` in release.
+>
+> **How they were found is the point.** Not by a better grep: by running the
+> corpus shard's own `cargo test` command on this machine while three other
+> `cargo test --workspace` runs were on it, and watching
+> `every_resumption_costs_about_what_the_first_one_did` fail —
+> *"the fourth resumption cost 5680.8965 us against 2196.552 us for a whole
+> one-resumption call"*, `crates/ply-corpus/src/measure.rs:861`, against an
+> assertion of `four.marginal_micros < one.micros * 2.0`. That is exactly the
+> flake a hosted runner produces, and the survey that was supposed to have
+> caught it had already been written down as complete. It was not.
+>
+> **The thirteenth was missed by the second survey too, and differently.**
+> `crates/ply-cli/tests/w3_http_audit.rs::routing_a_path_of_escapes_costs_its_length_and_not_its_square`
+> reads no Rust clock at all — it parses milliseconds out of `ply test`'s own
+> output through a local `duration_of` helper — so no timing vocabulary appears
+> in it and no grep for one will ever find it. The cli-eval shard found it, at
+> `exit=101`.
+>
+> All thirteen are listed once, in `.github/ci-shards.sh`'s `DEFERRED` table, and
+> CI runs them in a job of their own — one at a time, single-threaded, alone on
+> a runner — while the parallel shards `--skip` them by name.
+> `ci-shards.sh verify` fails if a name in that table no longer exists in the
+> tree, so the two halves cannot drift apart silently.
+>
+> **Three more read a clock and were deliberately left where they are**, because
+> what they assert is a *deadline* the code under test is supposed to honour
+> rather than a speed: `w5_drain_audit.rs`'s `elapsed < 8s` and its
+> `200ms + 5s + 1s` teardown bound — whose own comment says the last second is
+> "slack for a loaded machine" — and `db_transaction_audit.rs`'s
+> `waited >= 250ms && waited < 5s`. Moving those to a serial job would not make
+> them more true; they are second-scale bounds on configured timeouts, and they
+> live in `ply-host`, which already has a runner to itself.
+>
+> **Stop surveying; run the shards.** That is the actual lesson of the two
+> misses. The second pass keyed on a timing vocabulary — `Instant`, `elapsed`,
+> `Duration`, `_nanos`, `_micros` — and the thirteenth test contains none of
+> those words; a third pass would have its own blind spot and would also feel
+> complete. `crates/ply-codegen-spike` has still never been surveyed at all.
+> **Treat thirteen as the current count, not the answer**: when a shard goes red
+> on a ratio or a budget, the fix is usually another row in `DEFERRED`, and that
+> is a normal maintenance event rather than a sign something was done wrong.
+> And a runner of one's own is not a quiet machine: a hosted runner is two
+> shared cores, so this reduces the noise rather than removing it.
 
 ## Before you open a change
 
@@ -250,6 +510,107 @@ Never quote a figure from another document. Re-take it or cite the file that
 holds it (`benches/w6-ladder.json`, `benches/w6-spike.json`) and the command
 that renders it.
 
+### Disclosing a gap does not close it
+
+**Writing "this might have missed X" discharges the honesty obligation and not
+the work obligation, and the two feel identical from the inside.** The disclosure
+is the part that reads as diligence — it is candid, it is in the reader's
+interest, and it is the thing the section above asks for. It is also the point at
+which the gap stops being uncomfortable, which is exactly when it stops getting
+closed. If X is one grep away, the caveat is not the finish line. Go and grep.
+
+This is a different failure from the seven at the top of this file. Those were
+claims that were false. This one is a claim that was *true* — the caveat
+described the hole accurately — and was still the wrong thing to have stopped
+at. That is why it needs its own rule: nothing in "correct, do not delete" or
+"say how it was checked" catches it, because both were obeyed.
+
+The worked example is this file, on 2026-08-24. The correction it produced is in
+§"The suite proves less than it looks like it proves".
+
+The `test-timing` job exists because some tests assert a wall clock and a shared
+runner fails them at random. The list of those tests was built by grepping
+`crates/*/tests` for `Instant::now`. That is a real method with a real hole in
+it, and the hole was written down, here, in these words: *"It is not a survey. It
+came from one pass over `Instant::now` in `crates/*/tests`, so a wall-clock
+assertion inside a `#[test]` in `src/` would not have been found by it."* Seven
+tests went into the table. The caveat went into the documentation. Both were
+true. Nothing else happened.
+
+The next thing that ran was the corpus shard's own command, on a machine with
+three other `cargo test --workspace` runs on it, and it failed:
+
+```
+crates/ply-corpus/src/measure.rs:861
+measure::tests::every_resumption_costs_about_what_the_first_one_did
+the fourth resumption cost 5680.8965 us against 2196.552 us for a whole
+one-resumption call
+```
+
+A wall-clock assertion inside a `#[test]` in `src/`. The exact category the
+caveat had named, in the safety device built to catch that category, found by
+running the thing rather than by reading it. A second pass over `crates/*/src`
+took minutes and turned seven into twelve.
+
+**Then it happened again, to the corrected version.** The second pass came with
+its own caveat — that it keyed on a timing vocabulary and would miss a test that
+measured without those words. The next shard run failed on
+`routing_a_path_of_escapes_costs_its_length_and_not_its_square`, which measures
+by parsing `ply test`'s own output and contains none of those words. Twelve
+became thirteen. The rule below is not "survey harder"; it is that a list of
+this kind is maintained by the thing that exercises it, and a survey is at best
+a way to seed it.
+
+So the rule, and it is narrower and more demanding than "say how it was
+checked":
+
+- **A caveat that names a specific, cheap check is a to-do, not a disclaimer.**
+  "I did not look in `src/`" is a task. "I could not get a quiet machine" is a
+  disclaimer. Only the second one is finished when you write it down.
+- **State limits as a floor, not as an apology.** "Twelve is a lower bound: the
+  pass keyed on `Instant`, `elapsed`, `Duration`, `_nanos`, `_micros`, so a test
+  that measures without those words is still missable, and
+  `crates/ply-codegen-spike` was not surveyed at all" is a caveat the next
+  person can act on. "This is not a survey" is one they cannot. The difference
+  is whether the reader is told *where to look next*.
+- **Prefer the check that can fail to the sentence that cannot.**
+  `ci-shards.sh verify` resolves every name in the table against the tree and
+  exits non-zero if one is missing. A list that cannot prove its own entries
+  exist is a list that rots silently, and a paragraph explaining that it might
+  rot is not a substitute for the exit code. The same pass found the reason
+  this matters: `cmd_deferred` split `package:target:test` on the *last* colon,
+  so a unit test named `measure::tests::foo` yielded `foo`, and the shard's
+  `--skip foo` under `--exact` matched **nothing**. A skip list that silently
+  skips nothing, protecting a test that then flakes, inside the mechanism whose
+  only job is to stop flakes reaching a shard — a defect in a safety device is
+  invisible precisely because the device reports success either way.
+
+**A second worked example, one level in, and it is not mine.** The corrected
+survey came with a corrected caveat — a floor, naming the vocabulary it keyed on
+and what could still hide from it. The next shard run was refuted by something
+sitting in exactly that blind spot:
+`crates/ply-cli/tests/w3_http_audit.rs::routing_a_path_of_escapes_costs_its_length_and_not_its_square`,
+which asserts a wall-clock ratio while touching no Rust clock at all — it parses
+milliseconds out of `ply test`'s own output. **No vocabulary-based survey can
+find that class**, which is why the `DEFERRED` table is now maintained by running
+the shards rather than by grepping the tree, and why a new row in it is normal
+maintenance rather than evidence that someone was sloppy.
+
+Now read that test's own doc comment:
+
+> *"The threshold is deliberately loose — quadratic is 16x and this refuses at
+> 9x — so that a slow or contended machine cannot make it red while a
+> re-introduced `push` accumulator cannot make it green."*
+
+A contended machine made it red, at **11.5x**. The tolerance was reasoned and
+never taken. This is the repository's signature defect appearing *inside a test
+written to guard against a different one*, in a sentence that reads as though
+the measurement had been done — and it is the same failure as the `src/` caveat
+above, one level further in: a claim about robustness, argued rather than
+measured, sitting in the artifact whose entire job was robustness. When you
+write "this cannot fail under X", X is a thing to go and do, not a thing to
+reason about.
+
 ### Measure an ADR's motivating claim before accepting the ADR
 
 If an ADR is motivated by a performance argument, that argument needs a
@@ -311,8 +672,10 @@ the refusing and confirm it can fire. Two live examples of what this catches:
   statement, on first execution). `README.md` §"What is missing" had this right
   all along. This is the W1 defect exactly — a check advertised and never armed —
   and it is left legible rather than deleted for that reason.
-- ADR 0016's spike figures cannot be re-taken because the spike does not
-  compile. See §"Things known to be broken".
+- ~~ADR 0016's spike figures cannot be re-taken because the spike does not
+  compile.~~ Stale twice over: R4 repaired the crate, and CI's `spike` job now
+  builds and tests it on every push. See §"Things known to be broken" item 1,
+  which has carried the correction since 2026-08-21.
 
 The test for whether you have armed something: **name the file and line that
 raises it, and the test that proves the raise.** If you cannot, write "not
@@ -384,7 +747,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-hash/src/normalize.rs` | **every cached result everywhere.** The bytes are the identity. A change here is a cache-format change; see `CACHE_VERSION_CHANGED` (`W0603`). |
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
-| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today: `cd crates/ply-codegen-spike && cargo +1.94.0 test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering |
+| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today: `cd crates/ply-codegen-spike && cargo +1.94.0 test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
 | how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
@@ -399,16 +762,25 @@ Recorded here so nobody spends an afternoon rediscovering them.
    half that is left is the one that bit it.** The second wall is gone: R4
    repaired the `E0164`s (`ply_eval::code::Stmt::Expr` is a struct variant) and
    then widened `NodeKind::Lit` under it and repaired that too, so the crate
-   builds and its tests run. Re-taken 2026-08-21 by the integration pass, from
+   builds and its tests run. Re-taken 2026-08-24, from
    `crates/ply-codegen-spike/`:
 
    ```
-   $ cargo +1.94.0 build --release
-       Finished `release` profile [optimized] target(s) in 1m 19s
    $ cargo +1.94.0 test --release
-   test result: ok. 8 passed; 0 failed; ...      # tests/spike.rs
-   test result: ok. 7 passed; 0 failed; ...      # tests/mcts_kernel.rs
+       Finished `release` profile [optimized] target(s) in 1m 22s
+   test result: ok. 16 passed; 0 failed; ...     # tests/hazards.rs
+   test result: ok.  9 passed; 0 failed; ...     # tests/mcts_kernel.rs
+   test result: ok. 11 passed; 0 failed; ...     # tests/mutations.rs
+   test result: ok.  9 passed; 0 failed; ...     # tests/spike.rs
    ```
+
+   **45 tests across 8 targets, 0 failed.** This block read `8 passed #
+   tests/spike.rs` and `7 passed # tests/mcts_kernel.rs` and listed no others,
+   which was the 2026-08-21 reading; R5 then rewrote most of the crate and added
+   `tests/hazards.rs` and `tests/mutations.rs` without re-taking it here. Nothing
+   was wrong with the crate — the figures had simply stopped describing it, which
+   is the failure mode §"The one rule" is about and the reason the `spike` CI job
+   now runs this command on every push.
 
    The **first** wall stands and is not a defect to fix: cranelift 0.134.3
    requires rustc ≥ 1.94.0 and nothing in this repository pins a toolchain, so
@@ -416,10 +788,13 @@ Recorded here so nobody spends an afternoon rediscovering them.
    invocation, and every command in `benches/README.md` §"What `mcts` adds"
    carries it.
 
-   What has **not** changed is why this rotted: the crate declares its own
-   `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
-   `cargo clippy --workspace --all-targets` still do not touch it, and the next
-   change to `ply_eval::code` will break it again with nothing to say so. It is
+   Why it rotted is unchanged and the consequence is not: the crate declares its
+   own `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
+   `cargo clippy --workspace --all-targets` still do not touch it — but since
+   2026-08-24 something does. `.github/workflows/ci.yml`'s `spike` job runs
+   `cargo test --release` there on 1.94.0, on every push, so the next change to
+   `ply_eval::code` that breaks it fails a required job instead of being found
+   two milestones later. Locally it is still on you to run it. It is
    also not clippy-clean and never has been — `cargo +1.94.0 clippy
    --all-targets` there reports 13 `not_unsafe_ptr_arg_deref` errors, all in
    `src/rt.rs`, which is the JIT's calling convention, plus 6 warnings; the
@@ -447,8 +822,17 @@ Recorded here so nobody spends an afternoon rediscovering them.
    `examples/serve.sh:37-54` now records the claim, the grep that refutes it, and
    the error you actually get. Kept in this list because the *code* gap — no
    schema check at bind time — is still open; only the false comment was closed.
-6. **`PLY_PG_URL` is set by nothing in the repository**, so ten postgres tests
-   pass without running by default.
+6. ~~**`PLY_PG_URL` is set by nothing in the repository**, so ten postgres
+   tests pass without running by default.~~ **Half fixed.**
+   `.github/workflows/ci.yml` sets it, at a service container, and fails the run
+   if any of the ten prints its skip notice — so the gap is caught before a
+   merge. Nothing sets it *locally*, so on your machine the ten still pass in
+   0.00s without running. And a **fifth** gate of the same shape was found while
+   wiring that job: `crates/ply-host/src/db/pool/tests.rs:25` hides 26 pool
+   tests behind `PLY_TEST_DB`, prints nothing whatsoever when it is unset, and
+   is named in no document in this repository. `docs/ONBOARDING.md` §2 has the
+   measurement — 26 passed in 0.00s without it, 26 passed in 0.94s with it, and
+   **20 of 26 failed** when it is set at a server that is not there.
 7. **No `LICENSE` or `LICENSE-APACHE` file exists** although `README.md:499` and
    the workspace root `Cargo.toml:22` declare `MIT OR Apache-2.0`. The thirteen
    member crates inherit it with `license.workspace = true` rather than each

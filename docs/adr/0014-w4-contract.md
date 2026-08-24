@@ -1608,6 +1608,33 @@ this one skips on a stock checkout *even when postgres is installed and gate A
 is running*. It was unset on the audit machine while gate A's clusters were
 starting and passing.
 
+> **Corrected: the "no CI file" half of that sentence stopped being true on
+> 2026-08-24.** The withdrawn clause, verbatim: *"it appears in no
+> `.cargo/config.toml`, no `build.rs` and no CI file"*. There is now a CI file,
+> `.github/workflows/ci.yml`, whose `test-postgres` job — displayed as `test
+> ply-host (postgres)` — sets `PLY_PG_URL` to a `postgres:18.6` service
+> container, runs the ten tests below with `--nocapture`, and fails both if one
+> of them printed its skip line and if the run did not report `10 passed`.
+>
+> Measured on the machine in `docs/ONBOARDING.md` §Provenance, and the
+> measurement is the point rather than the decoration. With `PLY_PG_URL` unset,
+> `cargo test -p ply-host -- --nocapture` exits **0** and the ten tests report
+> **`10 passed`** — so the count assertion alone proves nothing, because these
+> tests return early and *pass*. What distinguishes the two runs is the notice:
+> **10** of them with the variable unset, **0** with it set. The notice is an
+> `eprintln!`, so a step that pipes only stdout never sees it; that was the
+> first version of this guard and it passed in both directions.
+>
+> One more thing worth writing down, because it decided the pattern: anchoring
+> the grep at `^skipp` is unreliable. Two runs of the same unset command on this
+> machine matched **8** and then **10** of the ten, because libtest interleaves
+> streams differently under parallel threads. The workflow greps unanchored and
+> pins `--test-threads=1`.
+>
+> The rest of the sentence stands: a stock local checkout still sets nothing, so
+> gate B still skips for a developer who does not export the variable, and the
+> audit reading above is what the audit machine saw.
+
 The ten are, at `live.rs` lines 231, 246, 265, 287, 298, 323, 345, 376, 394 and
 425: `a_committed_transaction_persists_and_the_connection_is_reusable`,
 `an_aborted_transaction_leaves_nothing_and_the_connection_is_reusable`,
