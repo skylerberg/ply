@@ -2000,11 +2000,12 @@ impl<'a> Machine<'a> {
     /// only mutation is three counters behind [`Cell`], and they are read by
     /// harnesses rather than by the program.
     ///
-    /// The gates are ordered cheapest and most-discriminating first, and the
-    /// argument-shape gate deliberately precedes the row lookup: with a backend
-    /// attached, a call taking a record, a list or a string is refused on one
-    /// discriminant test per argument and never hashes a [`Symbol`] into
-    /// [`CheckOutput::defs`].
+    /// Every gate a call must clear is in [`crate::compiled::admit`], which
+    /// answers with the gate that refused rather than with a bare `None`: a
+    /// refusal carrying no reason is a refusal some *other* gate can satisfy,
+    /// and one of these was unarmed for exactly that reason. What is left here
+    /// is the machine's own half — the backend lookup, which is the whole of the
+    /// shipping cost, and the [`crate::compiled::crossable`] test on the answer.
     ///
     /// The [`Frame::Call`] at the call site is pushed *after* `enter` returns.
     /// That is sound only because `enter` is handed no route back into this
@@ -2014,41 +2015,15 @@ impl<'a> Machine<'a> {
     /// and the bailout stops being free.
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
         let backend = self.compiled.as_ref()?;
-        // A tree-walker closure carries a program-wide name (`interp.rs:118`)
-        // over a body that is a deep clone rather than a node of the program, and
-        // `Interp` is the independent oracle `--engine both` audits against.
-        // Routing its closures into compiled code would audit the backend against
-        // itself.
-        if !matches!(closure.kind, ClosureKind::Code { .. }) {
-            return None;
-        }
-        if !args.iter().all(crate::compiled::crossable) {
-            return None;
-        }
-        // Off inside a `simulate` region, for the reason `constant` is off there:
-        // an allocation a search depends on must not be skipped, and an `Access`
-        // never recorded is an interleaving never explored. `record_cell_access`
-        // and `record_alloc_access` are no-ops outside one, so this single gate
-        // is the whole partial-order story — a compiled body cannot fail to
-        // record what nothing is recording.
-        if !self.sims.is_empty() {
-            return None;
-        }
-        let name = closure.name.as_ref()?;
-        // Necessary and not sufficient, exactly as the memo's note says: an empty
-        // row still permits a definition that opens its own `with_cell`. Outside
-        // a `simulate` region that allocation is unobservable — the cell cannot
-        // escape the region that made it and no scalar can carry it out — which
-        // is the same argument `constant` already rests on.
-        if !crate::memo::pure_by_published_row(self.check, name) {
-            return None;
-        }
-        // Zero budget declines, and the interpreted path below raises the
-        // machine's own call-limit diagnostic rather than a backend's.
-        let budget = self.max_calls.checked_sub(self.stack.calls())?;
-        if budget == 0 {
-            return None;
-        }
+        let (name, budget) = crate::compiled::admit(
+            closure,
+            args,
+            !self.sims.is_empty(),
+            self.check,
+            self.max_calls,
+            self.stack.calls(),
+        )
+        .ok()?;
 
         #[cfg(debug_assertions)]
         let before = self.compiled_witness();

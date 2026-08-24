@@ -286,8 +286,18 @@ fn verify(harness: &mut Harness, large: &[u8]) -> Result<usize> {
         ("empty", b"".to_vec(), 0i64, 8192i64),
         ("past-end", b"GET /x HTTP/1.1\r\n".to_vec(), 99, 8192),
         ("at-end", b"GET /x HTTP/1.1\r\n".to_vec(), 17, 8192),
-        ("bare-lf", b"GET /x HTTP/1.1\nHost: a\r\n\r\n".to_vec(), 0, 8192),
-        ("bare-cr", b"GET /x HTTP/1.1\rHost: a\r\n\r\n".to_vec(), 0, 8192),
+        (
+            "bare-lf",
+            b"GET /x HTTP/1.1\nHost: a\r\n\r\n".to_vec(),
+            0,
+            8192,
+        ),
+        (
+            "bare-cr",
+            b"GET /x HTTP/1.1\rHost: a\r\n\r\n".to_vec(),
+            0,
+            8192,
+        ),
         ("nul-byte", b"GET /x\0 HTTP/1.1\r\n".to_vec(), 0, 8192),
         ("del-byte", b"GET /x\x7f HTTP/1.1\r\n".to_vec(), 0, 8192),
         ("htab-inside", b"GET /x\tHTTP/1.1\r\n".to_vec(), 0, 8192),
@@ -348,7 +358,13 @@ fn variant(
         name: ENTRY_FN.to_string(),
         args: Vec::new(),
     }];
-    let entry = compare(&mut harness, ENTRY_FN, &entry_input, a.iterations, a.repeats)?;
+    let entry = compare(
+        &mut harness,
+        ENTRY_FN,
+        &entry_input,
+        a.iterations,
+        a.repeats,
+    )?;
     let interpreter_entry = entry.results[0].interpreter_best_micros;
     let spike_entry = entry.results[0].spike_best_micros;
 
@@ -457,7 +473,9 @@ fn main() -> Result<()> {
 
     let mut harness = Harness::new(GROUP)?;
     let checked = verify(&mut harness, &large)?;
-    println!("agreement: {checked} inputs, against the machine and the tree-walker, before anything was timed");
+    println!(
+        "agreement: {checked} inputs, against the machine and the tree-walker, before anything was timed"
+    );
     drop(harness);
 
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library()?));
@@ -539,7 +557,10 @@ fn main() -> Result<()> {
             .to_path_buf();
         let binary = root.join("target/release/ply");
         if !binary.exists() {
-            bail!("{} does not exist; the served denominator needs the release binary", binary.display());
+            bail!(
+                "{} does not exist; the served denominator needs the release binary",
+                binary.display()
+            );
         }
         let out = std::env::temp_dir().join("ply-codegen-spike");
         let project = served::project(&root, &out)?;
@@ -548,12 +569,7 @@ fn main() -> Result<()> {
         // whatever it lowers on the way.
         served::drive(server.port, 1, 20)?;
         let short = served::drive(server.port, a.connections, a.per_connection)?;
-        let long = served::drive_with(
-            server.port,
-            a.connections,
-            a.per_connection,
-            BROWSER_HEAD,
-        )?;
+        let long = served::drive_with(server.port, a.connections, a.per_connection, BROWSER_HEAD)?;
         drop(server);
         Some((
             Served {
@@ -645,7 +661,10 @@ fn main() -> Result<()> {
             );
         }
     }
-    for (label, p) in [("63-byte head", &projection), ("browser head", &projection_browser)] {
+    for (label, p) in [
+        ("63-byte head", &projection),
+        ("browser head", &projection_browser),
+    ] {
         if let Some(p) = p {
             println!(
                 "{label}: share of a request {:.1}% · of parse_head {:.1}% · k {:.2}x · end to end {:.3}x · ceiling {:.3}x",
