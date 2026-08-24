@@ -1,0 +1,75 @@
+// The field-order cliff, as a runnable reproduction.
+//
+// `slow` and `fast` compute the same value from the same inputs and differ
+// only in the order the fields of the returned record literal are written.
+// `slow` is quadratic in `n`; `fast` is linear. At n=32,000 that is 8.15s
+// against 0.09s on a release build — 90x, with no diagnostic and no syntactic
+// hint that the two differ at all.
+//
+// > **Corrected 2026-08-24. The paragraph below used to explain this by the
+// > last occurrence of the state variable:** *"the reference-counting pass
+// > (ADR 0017 section 4) marks the *last* occurrence of `s` as owned... When
+// > `s` is mentioned again *after* the push, the record stays in the scope, the
+// > clone is not transient, and `push` copies the whole list on every step. So
+// > the rule is: in a record-threaded accumulator, the field being appended to
+// > must be the last field in the literal that mentions the state variable."*
+// > That is refuted by binding every other field to a `let` *before* the push,
+// > which makes `s.toks` the last mention of `s` and leaves it quadratic
+// > anyway: n = 8,000 / 16,000 / 32,000 gives 0.34s / 1.29s / 5.02s, still 4x
+// > per doubling. The rule is positional in the enclosing node and has nothing
+// > to do with the variable.
+//
+// Why, read off the evaluator rather than inferred. `ply_eval::rc::carry`
+// (`crates/ply-eval/src/rc.rs:98`) is `if remaining { env.clone() } else {
+// Env::empty() }`, and every one of its eight call sites passes `remaining` =
+// *is there another sub-expression after this one*: call arguments, record
+// fields, list items, handler arguments. A carried scope keeps the enclosing
+// value alive, so `Env::take_unique` refuses at `Rc::get_mut` (`env.rs:133`,
+// "Refuses at the first shared link"), the field read clones instead of moving,
+// and `push` copies.
+//
+// So the rule is: **a growing container must be built in the last
+// sub-expression of its enclosing node** — last record field, last call
+// argument, last list element — or the operation copies. It is not about
+// records: `sink(push(xs, i), i, i)` is quadratic and `sink(i, i, push(xs, i))`
+// is linear, same measurement shape.
+//
+// This shape is `spikes/ply-lexer`'s `Scan` record, which is why it is written
+// with five fields and two collections rather than reduced to the minimum: with
+// two accumulators only one of them can be last, and that is fine, because the
+// one that is *pushed to* in a given step is the only one that must be.
+
+type Scan = { pos: Int, ntok: Int, toks: List<Int>, ndiag: Int, diags: List<Int> }
+
+fn empty() -> Scan = {pos: 0, ntok: 0, toks: [], ndiag: 0, diags: []}
+
+// `s.toks` is not the last mention of `s`: `s.ndiag` and `s.diags` follow it.
+fn slow_step(s: Scan, i: Int) -> Scan =
+  { pos: i, ntok: s.ntok + 1, toks: push(s.toks, i), ndiag: s.ndiag, diags: s.diags }
+
+// `s.toks` is the last mention of `s`. Nothing else changed.
+fn fast_step(s: Scan, i: Int) -> Scan =
+  { pos: i, ntok: s.ntok + 1, ndiag: s.ndiag, diags: s.diags, toks: push(s.toks, i) }
+
+pub fn slow(n: Int) -> Int = len(fold(range(0, n), empty(), slow_step).toks)
+
+pub fn fast(n: Int) -> Int = len(fold(range(0, n), empty(), fast_step).toks)
+
+// The two orders are the same function. This is the whole point: nothing about
+// the answer distinguishes them, only the time taken to reach it.
+test "the two field orders agree on every answer" {
+  assert_eq(slow(0), fast(0));
+  assert_eq(slow(1), fast(1));
+  assert_eq(slow(200), fast(200));
+  assert_eq(fast(200), 200)
+}
+
+// The bare accumulator, for contrast: outside a record there is no ordering
+// hazard, because the parameter itself is the last use.
+fn bare_step(xs: List<Int>, i: Int) -> List<Int> = push(xs, i)
+
+pub fn bare(n: Int) -> Int = len(fold(range(0, n), [], bare_step))
+
+test "a bare accumulator needs no ordering care" {
+  assert_eq(bare(200), 200)
+}
