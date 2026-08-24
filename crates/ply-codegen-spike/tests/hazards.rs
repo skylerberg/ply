@@ -705,8 +705,19 @@ fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
 
 // -- 8. `Ctx.slots` is append-only for the life of an entry ------------------
 
-/// The value arena does not grow with executed work, and one pathological entry
-/// does not hold memory for the life of the provider.
+/// The value arena does not grow with executed work.
+///
+/// > **The second clause of this doc was withdrawn (2026-08-24).** It read: "and
+/// > one pathological entry does not hold memory for the life of the provider".
+/// > The second half of this test does not establish that, because the entry it
+/// > calls pathological never runs: measured with the counters,
+/// > `pure.ladder(5_000_000, 1)` produces **0 entries and 10,000
+/// > `Declines::out_of_fuel`**, and the last entry to close used 4 slots. The
+/// > assertion below is kept exactly as it was — it is a true statement about a
+/// > provider that has just declined ten thousand offers, and it would catch a
+/// > regression that made the decline path allocate — but the property it was
+/// > named for is held by
+/// > [`one_large_entry_gives_the_arena_back_to_the_entry_after_it`] instead.
 #[test]
 fn the_entry_arena_does_not_grow_with_executed_work() {
     let loaded = hazards();
@@ -724,8 +735,9 @@ fn the_entry_arena_does_not_grow_with_executed_work() {
          grows with work rather than with live data"
     );
 
-    // One entry deep enough to box tens of thousands of intermediates, and then
-    // the arena is given back.
+    // A recursion the provider refuses ten thousand times over. It was written
+    // as "one entry deep enough to box tens of thousands of intermediates";
+    // it is not one entry and it boxes almost nothing. See this test's doc.
     let mut hybrid = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
     hybrid.set_compiled(harness.bodies.clone());
     let _ = hybrid.call(
@@ -740,6 +752,60 @@ fn the_entry_arena_does_not_grow_with_executed_work() {
     assert!(
         capacity <= 4096,
         "a runaway entry left the value arena at capacity {capacity} for the life of the provider"
+    );
+}
+
+/// The other half of hazard 8, which the test above cannot reach.
+///
+/// **`pure.ladder(5_000_000, 1)` is not one pathological entry.** Measured with
+/// the counters rather than read off the source: it produces **zero entries and
+/// 10,000 `Declines::out_of_fuel`**, and leaves `arena_after_entry` at 4 slots.
+/// The machine re-offers `ladder` at every interpreted depth, the provider
+/// declines each offer because the body would nest past the budget it was
+/// handed, and a body that never runs never takes a slot. So the assertion above
+/// is satisfied by an arena that never grew, and the comment beside it — "one
+/// entry deep enough to box tens of thousands of intermediates" — describes
+/// something that does not happen.
+///
+/// The case that *does* grow it is a ladder that **fits** its budget: one entry,
+/// no declines, 27,002 slots. That is the shape that pins memory when the arena
+/// is handed back on a schedule instead of on demand, and it is what this test
+/// holds. Every step is armed, because the lesson of the test above is that an
+/// assertion about memory being returned proves nothing unless it also checks
+/// the memory was taken.
+#[test]
+fn one_large_entry_gives_the_arena_back_to_the_entry_after_it() {
+    let loaded = hazards();
+    let mut harness = pure_harness(loaded);
+    harness.bodies.reset_counts();
+
+    let before = harness.bodies.entered();
+    harness
+        .run_hybrid("pure.ladder", &[Value::Int(9_000), Value::Int(1)])
+        .expect("a bounded ladder answers");
+    let used = harness.bodies.arena_after_entry();
+    let entries = harness.bodies.entered() - before;
+    let fuel_declines = harness.bodies.declines().out_of_fuel;
+
+    assert_eq!(
+        (entries, fuel_declines),
+        (1, 0),
+        "the bounded ladder was meant to be one entry that runs; it was {entries} entries with          {fuel_declines} fuel declines, so this test is measuring the decline path and not the          arena"
+    );
+    assert!(
+        used > 4096,
+        "the bounded ladder used {used} slots, at or below the {} the arena is kept at anyway, so          the assertion below would hold without the arena ever having grown",
+        4096
+    );
+
+    harness
+        .run_hybrid("pure.mix", &[Value::Int(1), Value::Int(2)])
+        .expect("it runs");
+
+    let (_, capacity) = harness.bodies.slots();
+    assert!(
+        capacity <= 4096,
+        "one entry used {used} slots and the entry after it still sees capacity {capacity}, so a          single large call pins the arena for the calls that follow it"
     );
 }
 

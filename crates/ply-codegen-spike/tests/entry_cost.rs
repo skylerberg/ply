@@ -20,10 +20,23 @@
 //! > longer touches the arena except to recover from a path that forgot to close
 //! > itself, and [`the_cost_is_the_clear_and_not_the_shrink`] below used to step
 //! > across `RETAINED_SLOTS` on the assumption that `begin` shrinks whenever
-//! > capacity exceeds it. `end` shrinks once every [`SHRINK_EVERY`] entries
-//! > instead, so that test now forces the shrink rather than assuming it. What
-//! > survives unchanged is the finding: **the cost is the clear and not the
-//! > shrink**, and the slope is what item 12 is about.
+//! > capacity exceeds it. `end` decides per entry against what that entry used,
+//! > so that test now arms the shrink with a predecessor the timed entry does
+//! > not justify. What survives unchanged is the finding: **the cost is the
+//! > clear and not the shrink**, and the slope is what item 12 is about.
+//!
+//! > **And a second time, for a reason worth stating (2026-08-24).** The version
+//! > between those two amortized the shrink over a 64-entry window, and this
+//! > file's shrink measurement ran the window out to arm it. That measurement
+//! > was then cited as grounds for deleting the amortization — wrongly, because
+//! > it times the shrink and not the **regrowth** the shrink forces on the next
+//! > entry. Shrinking a cleared `Vec` is an alloc and a free with nothing to
+//! > copy; growing it back through a doubling buffer copies 4,096 then 8,192
+//! > then 16,384 live `Value`s, and that cost lands outside this timer in both
+//! > arms. What the 1.00x below licenses is narrow: *given the buffer is
+//! > shrunk*, the shrink itself is free. It says nothing about how often
+//! > shrinking is worth doing, which is why [`SLACK`] exists and is measured by
+//! > the steady-state arm rather than by this one.
 //!
 //! **`#[ignore]` on purpose.** It is a measurement, not a gate. Asserting a
 //! floor on the ratio would pin the *defect* in place — the day somebody makes
@@ -38,7 +51,7 @@
 //! Release matters: the thing being timed is a `clear` and a `shrink_to`, and a
 //! debug build measures the profile rather than the code.
 
-use ply_codegen_spike::rt::{Ctx, SHRINK_EVERY, Tables};
+use ply_codegen_spike::rt::{Ctx, SLACK, Tables};
 use ply_eval::Value;
 use ply_span::Symbol;
 use std::collections::BTreeMap;
@@ -149,54 +162,104 @@ fn an_entry_pays_for_its_own_arena_and_the_next_one_pays_for_nothing() {
     assert_eq!(timed.len(), LADDER.len());
 }
 
-/// Which of the two things an entry's close does is the cost.
+/// What an entry pays to hand back a buffer it did not earn.
 ///
-/// Item 12 named both — *"the clear drops that many `Value`s, and the shrink
-/// reallocates"* — and the ladder above cannot separate them, because it grows
-/// the arena and the shrink together. This holds the arena fixed at 19,584 slots
-/// and varies **only** whether the shrink runs: `end` shrinks on the entry that
-/// completes a window of [`SHRINK_EVERY`], so running the window out first is
-/// what arms it.
+/// Item 12 named two costs — *"the clear drops that many `Value`s, and the
+/// shrink reallocates"* — and the ladder above cannot separate them, because it
+/// grows the arena and the shrink together. This holds the timed entry fixed at
+/// 19,584 slots and varies **only what ran before it**, which is what decides
+/// whether its `end` shrinks: a predecessor the same size leaves a buffer this
+/// entry justifies, and larger predecessors leave one it does not. Every row
+/// clears the same 19,584 slots, so the difference between them is the
+/// reallocation and nothing else.
 ///
-/// If the shrink were a meaningful part of the cost, the second row would jump.
+/// > **This is the third time this measurement has been taken and the second
+/// > time it has overturned its own predecessor, so read the number and not the
+/// > sentence.** It was first taken against a `begin` that shrank on every
+/// > entry, and reported the shrink as no part of the cost. It was taken again
+/// > against a 64-entry window, holding the arena at 19,584 slots and forcing
+/// > the shrink, and reported **1.00x** — 81,667 ns against 81,708 ns — which
+/// > was then cited as grounds for deleting the window. That comparison shrank
+/// > 32,768 slots to 19,584, a buffer already close to its target, and
+/// > generalised from it to every shrink. It does not generalise: the cost is in
+/// > **releasing the buffer**, so it scales with how much is given back, and a
+/// > predecessor four times the size makes the same shrink cost real money. The
+/// > surviving claim from all three takes is narrow and unchanged — the 181x of
+/// > item 12 was the clear, at ~4.17 ns a slot, not the reallocation — and the
+/// > table below is what the design trade-off is actually read off.
+///
+/// **What three runs of it said, at load 27-48**, against a steady-state row of
+/// 75-82 µs: a 2N predecessor cost +7.3, +0.8 and -6.4 µs, which straddles zero
+/// and is inter-arm noise; 4N cost +67, +29 and +58 µs; 8N cost +91, +41 and
+/// +48 µs. So the sign and the order of magnitude are stable and the magnitude
+/// is not — releasing a multi-megabyte buffer costs **tens of microseconds**,
+/// the same order as clearing the 19,584 slots themselves, and a single run of
+/// this test should not be quoted to more than one significant figure. The
+/// negative row is the useful one to keep in view: it is what the noise floor
+/// between two arms looks like, and it is why the 2N row is reported as "no
+/// measurable cost" rather than as a speed-up.
 #[test]
 #[ignore = "a measurement, not a gate — see this file's header"]
-fn the_cost_is_the_clear_and_not_the_shrink() {
+fn what_an_entry_pays_to_hand_back_what_it_did_not_earn() {
     const N: usize = 19584;
     let int = |i: usize| Value::Int(i as i64);
 
-    fn end_ns(slots: usize, with_shrink: bool, make: &impl Fn(usize) -> Value) -> u128 {
+    /// One entry of `slots`, preceded by one of `slots * before`, timed at its
+    /// close. `before == 1` is the steady state, where nothing is handed back.
+    fn end_ns(slots: usize, before: usize, make: &impl Fn(usize) -> Value) -> (u128, usize) {
         let mut best = u128::MAX;
+        let mut held = 0;
         for _ in 0..BEST_OF {
             let mut ctx = Ctx::new(tables());
-            // Leave the window exactly one entry short of a shrink, over an
-            // empty arena so the run-up costs nothing and shrinks nothing.
-            if with_shrink {
-                for _ in 0..SHRINK_EVERY - 1 {
-                    ctx.end();
-                }
-            }
+            fill(&mut ctx, slots * before, make);
+            ctx.end();
             fill(&mut ctx, slots, make);
+            held = ctx.slots.capacity();
             let t = Instant::now();
             ctx.end();
             best = best.min(t.elapsed().as_nanos());
         }
-        best
+        (best, held)
     }
 
-    end_ns(1024, false, &int);
-    let without = end_ns(N, false, &int);
-    let with = end_ns(N, true, &int);
+    end_ns(1024, 1, &int);
+    let rows: Vec<(usize, u128, usize)> = [1usize, 2, 4, 8]
+        .iter()
+        .map(|&b| {
+            let (ns, held) = end_ns(N, b, &int);
+            (b, ns, held)
+        })
+        .collect();
 
-    println!("\nCtx::end over {N} slots, with and without the reallocation:\n");
-    println!("  clear only:                     {without:>9} ns");
-    println!("  clear and shrink_to the floor:  {with:>9} ns");
+    let (_, baseline, _) = rows[0];
+    println!("\nCtx::end over {N} slots, by what the entry before it left:\n");
     println!(
-        "\n  the reallocation costs {:.2}x\n",
-        with as f64 / without.max(1) as f64
+        "  {:>12}  {:>14}  {:>10}  {:>14}",
+        "predecessor", "capacity held", "end ns", "over steady"
+    );
+    for &(before, ns, held) in &rows {
+        // Deliberately not divided by the slots released: 4N and 8N release
+        // twice as much for about the same money, so the cost is a transition
+        // and not a rate, and a per-slot column would invite the reader to
+        // extrapolate a line through it.
+        println!(
+            "  {:>11}N  {:>14}  {:>10}  {:>+14}",
+            before,
+            held,
+            ns,
+            ns as i128 - baseline as i128
+        );
+    }
+    println!(
+        "\n  The steady state hands nothing back and pays nothing for it, which is what\n  \
+         `SLACK` is for. Every other row is one `free` of a buffer this entry did not\n  \
+         allocate, charged to it because it is the entry that found the buffer\n  \
+         unearned. Tens of microseconds, once, at a downward transition -- against\n  \
+         item 12, which charged every entry 4.17 ns for each of its predecessor's\n  \
+         slots, for ever.\n"
     );
 
-    assert!(without > 0 && with > 0);
+    assert!(rows.iter().all(|&(_, ns, _)| ns > 0));
 }
 
 /// What widening the fragment would do to the cost above.

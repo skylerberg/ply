@@ -94,22 +94,24 @@ fn holds_a_handle(value: &Value) -> Option<&'static str> {
 /// never reallocates, small enough that a process holding one idle provider is
 /// holding kilobytes.
 ///
-/// It is a floor and not a ceiling: [`Ctx::end`] keeps whatever the last
-/// [`SHRINK_EVERY`] entries actually used, so a program whose calls need more
-/// than this does not grow the buffer and hand it straight back on every call.
+/// It is a floor and not a ceiling: [`Ctx::end`] keeps whatever the entry that
+/// just finished actually used, so a program whose calls all need more than this
+/// does not grow the buffer and hand it straight back on every call.
 const RETAINED_SLOTS: usize = 4096;
 
-/// How many entries a buffer larger than [`RETAINED_SLOTS`] is kept for before
-/// it is offered back.
+/// How far above what an entry used the buffer may sit before [`Ctx::end`] hands
+/// the slack back.
 ///
-/// Handing it back is a reallocation, and paying one per entry is the *time*
-/// half of what `CONTRIBUTING.md` §"Things known to be broken" item 12 reported.
-/// Amortized over this many entries it is 1/64th of a reallocation each, and an
-/// outsized buffer is released after at most two windows — the first records the
-/// peak that earned it, the second finds that peak unclaimed. The memory that
-/// buys the time is bounded by the same two windows rather than by the life of
-/// the provider.
-pub const SHRINK_EVERY: u32 = 64;
+/// A `Vec` grows by doubling, so an entry that ends with N slots holds at most
+/// 2N, and a shrink triggered at exactly N would make every entry of a
+/// steady-state workload pay a reallocation on the way back up. The trigger is
+/// therefore `max(N * SLACK, RETAINED_SLOTS)` — which leaves the mcts kernel's
+/// 19,584 slots an entry neither shrinking nor regrowing, while an entry that
+/// used nothing much still pulls the buffer back to the floor rather than to
+/// twice it. The slack is granted against what the entry *used*, never against
+/// the floor, so `RETAINED_SLOTS` stays the exact ceiling between small entries
+/// and `tests/hazards.rs` can go on asserting it.
+pub const SLACK: usize = 2;
 
 /// The failure a compiled function reports by, and the fuel it spends.
 ///
@@ -143,10 +145,6 @@ pub struct Ctx {
     /// The slots the entry that just finished used, kept because [`Ctx::end`]
     /// clears the arena and the number is otherwise gone.
     last_entry: usize,
-    /// The largest arena any entry in the current window used, which is what
-    /// [`Ctx::end`] keeps rather than shrinking back to [`RETAINED_SLOTS`].
-    window_peak: usize,
-    since_shrink: u32,
     unclosed_entries: u64,
     pub tables: Rc<Tables>,
     /// The arena `ply_eval::builtins::call` insists on. Structurally unreachable:
@@ -180,8 +178,6 @@ impl Ctx {
             fuel: 0,
             slots: Vec::with_capacity(64),
             last_entry: 0,
-            window_peak: 0,
-            since_shrink: 0,
             unclosed_entries: 0,
             tables,
             cells,
@@ -229,21 +225,49 @@ impl Ctx {
     ///
     /// The drops do not become free — they are the same `Value`s and somebody
     /// drops them — they are charged to the entry that made them, which is the
-    /// entry whose cost is already proportional to them. What does go away is
-    /// the reallocation, for all but one entry in [`SHRINK_EVERY`].
+    /// entry whose cost is already proportional to them.
     /// `benches/r5-timing/RESULTS.md` §3 carries the before and after.
+    ///
+    /// The reallocation does **not** become free, and the first version of this
+    /// fix said it did. An entry that finds a buffer far larger than it earned
+    /// hands it back, and handing back a multi-megabyte buffer costs tens of
+    /// microseconds — the same order as clearing 19,584 slots.
+    /// `tests/entry_cost.rs` prices it: nothing at all for a steady state, +0.3
+    /// µs after a predecessor twice the size, +14 µs at four times, +32 µs at
+    /// eight. That is one `free` at a downward transition, against item 12's
+    /// 4.17 ns for every one of the predecessor's slots on **every** entry, for
+    /// ever. The trade is worth making, and it is a trade rather than a saving.
+    ///
+    /// > **Corrected in place (2026-08-24).** This said: *"What does go away is
+    /// > the reallocation, for all but one entry in `SHRINK_EVERY`."* The first
+    /// > form of this fix amortized the shrink over a window of 64 entries and
+    /// > kept the window's peak, and it was justified by a measurement of
+    /// > 81,667 ns against 81,708 ns at 19,584 slots — 1.00x, the shrink is
+    /// > free. **That measurement does not generalise and the sentence built on
+    /// > it was wrong.** It shrank a 32,768-slot buffer to 19,584, one already
+    /// > close to its target; the cost is in releasing memory, so it scales with
+    /// > how much is released, and the same shrink after a predecessor four
+    /// > times the size costs tens of microseconds. A first attempt to correct
+    /// > this blamed the *regrowth* on the following entry instead, which is
+    /// > also real but is not what the table shows and is not why the window
+    /// > went.
+    /// >
+    /// > The window went because a schedule cannot answer a question about
+    /// > demand: one entry that used 27,002 slots left the arena at capacity
+    /// > 32,768 for the entries after it, for up to two windows, and a provider
+    /// > that then goes idle holds it for ever.
+    /// > [`one_large_entry_gives_the_arena_back_to_the_entry_after_it`] in
+    /// > `tests/hazards.rs` is the armed form, and it was written red before any
+    /// > of this changed. The decision is now per-entry against what that entry
+    /// > used, with [`SLACK`] of hysteresis so a steady state neither shrinks nor
+    /// > regrows.
     pub fn end(&mut self) {
         self.last_entry = self.slots.len();
-        self.window_peak = self.window_peak.max(self.last_entry);
         self.slots.clear();
-        self.since_shrink += 1;
-        if self.since_shrink >= SHRINK_EVERY {
-            let keep = self.window_peak.max(RETAINED_SLOTS);
-            if self.slots.capacity() > keep {
-                self.slots.shrink_to(keep);
-            }
-            self.since_shrink = 0;
-            self.window_peak = 0;
+        let keep = self.last_entry.max(RETAINED_SLOTS);
+        let trigger = self.last_entry.saturating_mul(SLACK).max(RETAINED_SLOTS);
+        if self.slots.capacity() > trigger {
+            self.slots.shrink_to(keep);
         }
     }
 

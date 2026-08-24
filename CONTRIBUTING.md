@@ -520,8 +520,7 @@ Recorded here so nobody spends an afternoon rediscovering them.
     arena).**~~ **Fixed (2026-08-24), and re-measured the way it was found.**
     `Ctx::begin` no longer touches the arena: `Ctx::end` clears it at the end of
     the entry that filled it, so an entry pays for its own work and its successor
-    pays for nothing, and the shrink is amortized over `SHRINK_EVERY` = 64
-    entries instead of running per entry. Re-taken with
+    pays for nothing. Re-taken with
     `mcts --dir benches/kernel --carryover mcts.playouts --repeats 7`, a mode
     added for this so the curve is re-takeable by a command rather than by a
     reviewer, two runs per arm on one tree at load 14–17:
@@ -532,6 +531,8 @@ Recorded here so nobody spends an afternoon rediscovering them.
     | before, again | 0.458 | 1.917 | 14.875 | 68.125 | **181.667x** |
     | after | 0.416 | 0.458 | 0.500 | 0.500 | **1.202x** |
     | after, again | 0.417 | 0.458 | 0.625 | 0.583 | **1.499x** |
+    | after, per-entry shrink | 0.458 | 0.541 | 0.583 | 0.625 | **1.365x** |
+    | after, per-entry, again | 0.458 | 0.542 | 0.583 | 0.542 | **1.365x** |
 
     The before arm reproduces the published table nearly digit for digit
     (0.375 / 1.666→1.709 / 13.584→13.667 / 68.083→67.833), which is what says the
@@ -540,7 +541,10 @@ Recorded here so nobody spends an afternoon rediscovering them.
     and `begin` at **0 ns at every rung** — below the platform's ~40 ns clock
     resolution, which is the honest way to say "constant".
 
-    Two things the re-measurement found that the original did not:
+    The last two rows are the shipped code and the first two are not; see the
+    correction below.
+
+    Three things the re-measurement found that the original did not:
 
     - **The interpreter arm is not flat either.** The original recorded "no
       carry-over on the interpreter arm (0.79 / 0.83 / 0.83 µs)" — measured after
@@ -554,7 +558,48 @@ Recorded here so nobody spends an afternoon rediscovering them.
       claim instead is the paired before/after on the same rows in the same
       binary, where a common-mode effect appears in both arms.
     - **The 181x is not the thing to fix.** See the withdrawn clause below: the
-      shrink is not measurably part of it, and the fix is not "stop shrinking".
+      181x is the *clear*, at 4.17 ns a slot, and the fix is not "stop
+      shrinking".
+    - **The shrink is not free either, and the first fix said it was.** Priced
+      properly — same timed entry, varying only what ran before it — handing back
+      a buffer costs nothing for a steady state, +0.3 µs after a predecessor
+      twice the size, +14 µs at four times and +32 µs at eight. Tens of
+      microseconds is the same order as clearing 19,584 slots. It is a trade, not
+      a saving: **one** `free` at a downward transition, against item 12's 4.17
+      ns for every one of the predecessor's slots on **every** entry.
+
+    > **Corrected in place (2026-08-24), same day, and the correction is a code
+    > change.** The paragraph above read "and the shrink is amortized over
+    > `SHRINK_EVERY` = 64 entries instead of running per entry", and the two
+    > `after` rows in the table were measured against that. The window is gone.
+    > It was justified by a measurement of the shrink at 19,584 slots — 81,667 ns
+    > against 81,708 ns, **1.00x, the shrink is free** — and that measurement
+    > shrank a buffer already close to its target and does not generalise to one
+    > four times the size. Worse, a schedule cannot answer a question about
+    > demand: **one entry that used 27,002 slots left the arena at capacity
+    > 32,768 for the entries that followed it**, for up to two 64-entry windows,
+    > and for ever if the provider then went idle.
+    >
+    > `Ctx::end` now decides per entry, against what that entry used, with a
+    > factor-of-two slack so a steady state neither shrinks nor regrows. The
+    > hazard is armed by
+    > `hazards.rs::one_large_entry_gives_the_arena_back_to_the_entry_after_it`,
+    > which was written **red** against the windowed version and quotes the
+    > numbers above in its failure message. The carryover curve was re-taken
+    > against the shipped policy — the last two rows of the table, 1.365x twice —
+    > because the first two rows measure code that no longer exists.
+    >
+    > One test in that file was also mis-describing itself and is corrected
+    > rather than changed: `the_entry_arena_does_not_grow_with_executed_work`
+    > called `pure.ladder(5_000_000, 1)` "one entry deep enough to box tens of
+    > thousands of intermediates". Measured with the counters, it is **zero
+    > entries and 10,000 `out_of_fuel` declines**, and the last entry to close
+    > used four slots — the provider refuses every offer before the body can
+    > allocate, so the second half of that test asserted memory was returned
+    > without ever establishing it had been taken. Its assertion is left exactly
+    > as written; the property it was named for is held by the new test, which
+    > checks the entry count and the slots used before it checks anything about
+    > memory.
 
     The original entry, kept because it is the record of how it was found:
     `crates/ply-codegen-spike/src/rt.rs`, `Ctx::begin`, ran
