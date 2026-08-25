@@ -247,8 +247,23 @@ Measured, from an already-built `target/`:
 | | |
 | --- | --- |
 | wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s**, and after R4 at **569.3s** (9m 29s) — six runs of one command on one machine, which is the spread to expect. The last of them was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
-| result | **3,661 passed, 0 failed, 5 ignored** |
-| targets | **156** — 143 test binaries + 13 doc-test suites |
+| result | **3,696 passed, 0 failed, 5 ignored** |
+| targets | **155** — 142 test binaries + 13 doc-test suites |
+
+> **Re-taken 2026-08-24, and it had drifted two readings behind.** The rows
+> above read **3,661 passed, 0 failed, 5 ignored** across **156** targets
+> (**143** binaries + 13 doc-test suites). That was already stale before item
+> 11's fix: `CONTRIBUTING.md` recorded **3,690 / 0 / 5** across **155** (**142**
+> + 13) after the frame-ceiling change and this file was not moved with it, so
+> "reproduces `README.md` exactly, count for count" had stopped being true —
+> which is the failure this line exists to make visible and did not. Both files
+> now read **3,696 / 0 / 5** across **155** (**142** + 13), taken twice: once as
+> `cargo test --workspace` and once as `.github/ci-shards.sh`'s four shards, in
+> an `rsync`ed copy digested before and after. `CONTRIBUTING.md` §"The loop"
+> carries the shard table and §"A moving tree invalidates a correctness number"
+> carries why it was done that way. The binary count is **142**, not 143 — the
+> unreconciled difference `CONTRIBUTING.md` records is unchanged and is not
+> resolved here.
 
 That reproduces `README.md`'s Status paragraph exactly, count for count. It is
 the longest thing in this file; **budget ten minutes now** — see the R4 block

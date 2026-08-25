@@ -66,6 +66,7 @@ fn check_of(names: &[&str]) -> CheckOutput {
                 row_aliases: Vec::new(),
                 constraints: Vec::new(),
                 spec: Vec::new(),
+                internally_effectful: true,
                 span: Span::DUMMY,
             },
         );

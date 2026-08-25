@@ -517,7 +517,7 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,690 tests across 155 targets** (142 test
+`cargo test --workspace` runs **3,696 tests across 155 targets** (142 test
 binaries plus 13 doc-test suites); all pass on an unloaded machine. Five are
 marked `ignored`: four are timing benchmarks you run on purpose (three in
 `ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
@@ -568,6 +568,28 @@ not been re-taken as the tree grew.
 > > > real time is the giveaway: this run spent minutes waiting for cores
 > > > rather than using them, so the figure describes the machine and not the
 > > > tree. The counts are the part to trust.
+> > >
+> > > > **Re-taken again (item 11's fix, 2026-08-24). The sentence above this
+> > > > chain now carries 3,696 / 155 / 142; this block is where that came
+> > > > from.** It read **3,690 passed, 0 failed, 5 ignored** across the same
+> > > > 155 targets. The **+6 is this change and nothing else**, attributed per
+> > > > package rather than by subtraction: `cargo test -p ply-eval --lib` goes
+> > > > 527 → 531, `-p ply-eval --test differential_corpus` 5 → 6, and
+> > > > `-p ply-core --lib` 204 → 205. Targets and binaries do not move — every
+> > > > new test joins a target that already existed.
+> > > >
+> > > > Taken **twice by two methods on one frozen tree**: one
+> > > > `cargo test --workspace` run, and `.github/ci-shards.sh`'s four shards
+> > > > summed (1,528 + 1,688 + 199 + 281). Both give 3,696 / 0 / 5 across
+> > > > 142 + 13. `CONTRIBUTING.md` §"The loop" has the shard table and the
+> > > > provenance, which is longer than usual for a reason: three earlier
+> > > > attempts at this number were void — two killed by the machine, one
+> > > > whose log turned out to hold two runs at once.
+> > > >
+> > > > No wall clock is offered for comparison with the figures above. Four
+> > > > agents shared the machine throughout; the shards summed to 577.3s from
+> > > > a warm `target/` and that is a different measurement from any of the
+> > > > single-run numbers in this chain.
 >
 > The fifth `ignored` is
 > `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,

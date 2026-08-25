@@ -44,8 +44,27 @@ pub struct CausalSlice {
     /// Outermost first, innermost last. The last frame is where the failure
     /// happened.
     pub stack: Vec<Frame>,
-    /// The atoms actually performed, which is a subset of the declared
-    /// footprint. A declared atom that never fired means a branch was not taken.
+    /// The atoms actually performed.
+    ///
+    /// > **Corrected in place (2026-08-24): it is not a subset of the declared
+    /// > footprint.** This read *"The atoms actually performed, which is a
+    /// > subset of the declared footprint. A declared atom that never fired
+    /// > means a branch was not taken."* The second sentence stands. The first
+    /// > does not, and no change was needed to refute it: both engines record
+    /// > **every** `perform` (`ply_eval::machine`'s `State::Perform`,
+    /// > `ply_eval::interp`'s `perform`), including one a `handle` inside the
+    /// > call discharges — and discharging is exactly what keeps an atom out of
+    /// > a row. Measured on a definition that performs `state.get` and handles
+    /// > it itself: its published `footprint` and its inferred `performed` are
+    /// > both empty and `ply_eval::Trace` holds `state.read`. So `observed` and
+    /// > the declared footprint are two sets that overlap, and a reader may
+    /// > conclude "a branch was not taken" from a declared atom that is absent
+    /// > here, but may **not** conclude that an atom present here was declared.
+    /// >
+    /// > Nothing outside `ply-test/tests/bisect_audit.rs` builds one of these
+    /// > yet — see `CONTRIBUTING.md` §"Things known to be broken" item 15 —
+    /// > so the correction is to the contract rather than to an output anyone
+    /// > has seen.
     pub observed: Footprint,
     /// A trace that hit its size cap. The stack is still exact; `entered` is not.
     pub truncated: bool,

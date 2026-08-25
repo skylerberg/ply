@@ -1341,6 +1341,14 @@ impl<'s> Driver<'s> {
                             // signature with its `where` clauses missing, and
                             // an `E0206` that should fire will not.
                             constraints: Vec::new(),
+                            // There is no body to walk, so the answer is the
+                            // conservative one — which costs nothing, because a
+                            // skipped module contributes no AST and so no
+                            // closure the seam could be offered. Gate 1 forces
+                            // `parse` on any module a parsed module imports
+                            // (`close_over_imports`), so nothing a run can call
+                            // is restored this way.
+                            internally_effectful: true,
                             span: entry.span.rebase(source),
                         },
                     );

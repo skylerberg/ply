@@ -7702,3 +7702,103 @@ that stopped being true is worse than one that was never printed. So:
    persistent world; state it rather than discovering it. What must still hold is
    the weaker claim: one test's whole region cost stays under rebuilding the
    fixture for it, at every size.
+
+## The compiled seam's second effect fact — `DefInfo::internally_effectful`
+
+Landed 2026-08-24, closing `CONTRIBUTING.md` §"Things known to be broken" item
+11. Recorded here because it is a change to a public signature and nothing else
+in the tree reads this file.
+
+```rust
+pub struct DefInfo { /* ... */
+    /// Whether running this definition can execute a `perform` that
+    /// `footprint` does not show. Transitive: true when this body is written
+    /// with `perform` or `handle`, or when anything reachable from it is.
+    pub internally_effectful: bool,
+}
+```
+
+**Why a row could not carry it.** A `Footprint` is the set of atoms that
+*escape* a call. An atom performed inside a call and discharged by a `handle`
+inside that same call escapes nothing, so both `footprint` and `performed` are
+empty and *correct* — row inference subtracts exactly what a handler discharges,
+which is what makes `performed` a subset of `footprint` in the first place. The
+seam needed the other question, "can an atom be performed and discharged in
+here", and no row can express it because discharging is what takes an atom out
+of a row.
+
+**Why it is transitive.** A definition that merely calls one that discharges its
+own effects publishes an empty row too and is written with neither keyword, so a
+per-body bit clears it and loses the same atoms. `fn wrapper(x) = handled(x)`
+publishes `{}` for both rows and records `state.read` when it runs.
+
+**Not on `KnownDef` and not on `CachedDef`, deliberately** — the one place this
+change does *not* follow the precedent `performed` set, so the reasoning is
+written down rather than left to be inferred. `Checker::mark_internal_effects`
+recomputes it every run from the parsed program, and gate 2's path
+(`publish_known`) is a parsed file whose AST is right there, so a stored copy
+would be a second answer to a question the AST already answers. Gate 1's path
+has no AST at all, and `driver.rs`'s `restore_skipped` therefore seeds `true`:
+by gate 1's own import rule — a module imported by a parsed module is forced to
+parse, to a fixpoint — nothing a run can call is restored that way, so the
+conservative value is never read and costs nothing. **`FRONTEND_VERSION`,
+`FRONTEND_FORMAT` and `BODY_ENCODING` do not move**, because no stored bytes
+changed.
+
+**Polarity is part of the contract.** Every `DefInfo` is constructed with the
+flag set; `mark_internal_effects` is the only thing that clears it, and only for
+a definition it positively cleared. "Nothing walked this" and "do not enter
+this" are one answer, which is `compiled.rs`'s stated default that declining is
+what everything not positively cleared gets.
+
+**No command prints it, and that is a gap rather than a decision defended.**
+`footprint` and `performed` are both reviewable — `ply check --types
+--explain` prints the declared row, the body's inferred row and the difference
+— and this fact is not. A reader who wants to know why a definition is not
+being entered has to run the checker in a test. It was left out because adding
+a field to that output moves bytes several tests pin, and item 11's fix was
+already reaching across three crates; the cost of the omission is that the
+seam's second gate is the only one whose input a reviewer cannot see from the
+command line.
+
+### Required properties
+
+1. A definition that performs and discharges its own operations publishes an
+   empty `footprint` *and* an empty `performed`, and is refused by
+   `Gate::InternalEffects` rather than by `Gate::PublishedRow` — the two are
+   separate variants so that neither gate's test can be satisfied by the other.
+2. The refusal follows a call chain to a fixpoint, not one hop: through four
+   wrappers, through a mutually recursive pair entered at either member, and
+   through a call reached only from a lambda bound in a `let`.
+3. A genuinely pure chain of the same depth is still admitted. A gate that
+   refused everything with a call in it would satisfy 1 and 2.
+4. Deleting the gate fails at corpus scale, not only in unit tests:
+   `tests/fixtures/self_handled_effect.ply` under
+   `crates/ply-eval/tests/differential_corpus.rs`.
+
+**It over-approximates, by how much is measured, and the direction is stated.**
+An edge is any reference that denotes a definition of this program, minus the
+enclosing definition's own parameters — which shadow a global of the same name
+for the whole body, so a bare reference to one never denotes it. Locals bound
+further in are **not** resolved away, so a lambda parameter or a `let` binder
+that shadows a definition's name still contributes that definition's edge. The
+error is always "refuse a definition that could have been entered" and never the
+reverse.
+
+Its size on this tree, `examples/` being the largest corpus: of 1,067
+definitions, 953 publish an empty row, and `Gate::InternalEffects` refuses
+**11** of those. Without the parameter subtraction it refuses 29, and the extra
+eighteen are one shape — `desk.item_named(shelf, ..)` folds over its own
+parameter and `desk` also declares `fn shelf`. The eleven are real:
+`desk.under` is `handle { .. } with { signal.stopping() -> false }` under an
+empty published row, and the other ten reach it.
+
+**What the gate costs the seam today: nothing measurable.** With the tree-walking
+backend of `differential_corpus.rs` attached over every corpus in the tree
+except the new fixture, the counters read **18,772 entered / 101,567 declined
+over 1,011 tests** with the gate and **18,772 / 101,567** without it — the same
+numbers, because every call those eleven definitions make in this corpus is
+already refused by `Gate::ArgumentShape`, which precedes both effect gates. That
+is also the honest reading of item 11's *"latent rather than live"*: on this
+tree what stops those eleven is the argument shape, not — as the entry said —
+that the only backend refuses `handle` at compile time.

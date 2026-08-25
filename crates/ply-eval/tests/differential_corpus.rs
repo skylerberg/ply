@@ -211,6 +211,93 @@ fn a_machine_only_fixture_is_counted_apart_from_what_was_compared() {
     assert_eq!(refused.code, ply_span::codes::MACHINE_ONLY_CLAUSE);
 }
 
+/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11,
+/// pinned on its fixture rather than left to the sweep above.
+///
+/// The sweep runs every corpus on disk and would keep passing if this fixture
+/// were deleted, renamed or quietly made pure — which is the shape of failure
+/// this repository produces most. So the coverage is asserted here: the fixture
+/// exists, it declares an effect, its two self-handling definitions publish
+/// **empty** rows, the backend can answer both of them, and neither is offered.
+///
+/// The last of those is what makes the test bite. `backends::TreeWalker` runs a
+/// definition on its own `Interp` with no handler stack, so it can answer a
+/// definition that discharges its own operations and cannot answer one that
+/// performs into its caller. Delete the effects gate and this fixture is
+/// entered, the machine records neither atom, and `compare_tests` reports
+/// `observed footprint — left {..tally.read[log], ..tally.write[log]},
+/// right {}`.
+#[test]
+fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered() {
+    let root = workspace_root();
+    let dir = root.join("tests/fixtures");
+    let file = dir.join("self_handled_effect.ply");
+    assert!(
+        file.exists(),
+        "{} is part of the repository, and it is the only corpus in the tree that declares an \
+         effect and discharges it",
+        file.display()
+    );
+
+    let (program, resolved) = load(&dir, std::slice::from_ref(&file)).expect("the fixture loads");
+    let check = ply_core::check_program(&program, &resolved).expect("the fixture checks");
+
+    let empty: Vec<&str> = ["handled", "wrapper", "doubled"]
+        .iter()
+        .filter(|simple| {
+            let name = ply_span::Symbol::new(format!("self_handled_effect.{simple}"));
+            let def = check
+                .defs
+                .get(&name)
+                .unwrap_or_else(|| panic!("the fixture declares `{name}`"));
+            def.footprint.is_empty() && def.performed.is_empty()
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        empty,
+        vec!["handled", "wrapper", "doubled"],
+        "the fixture stopped publishing empty rows, so the row gate now refuses these and the \
+         effects gate is unexercised again"
+    );
+
+    // The other effect gate, on the same corpus: `measured` is what performs
+    // into its caller, so its row is not empty and `Gate::PublishedRow` is what
+    // refuses it. Asserted on the row rather than on the gate because a corpus
+    // run counts declines without recording which gate produced one.
+    let measured = check
+        .defs
+        .get(&ply_span::Symbol::new("self_handled_effect.measured"))
+        .expect("the fixture declares `measured`");
+    assert!(
+        !measured.footprint.is_empty(),
+        "`measured` stopped publishing a row, so this corpus no longer reaches the row gate"
+    );
+
+    let backend = std::rc::Rc::new(backends::TreeWalker::over(&program));
+    let mut treewalk = Interp::new(&program, &resolved, &check);
+    let mut machine = Machine::new(&program, &resolved, &check);
+    machine.set_compiled(backend);
+
+    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+    assert!(report.is_clean(), "{report}");
+    assert_eq!(report.compared, 1, "{report}");
+    assert_eq!(report.footprints_compared, 1, "{report}");
+    assert!(
+        machine.trace().performs() > 0,
+        "the fixture performed nothing, so agreeing on its footprint proves nothing"
+    );
+
+    // The control is the point: `doubled` *is* entered, so the two refusals
+    // above are this gate rather than a backend that answers nothing here.
+    let (entered, _) = machine.compiled_counts();
+    assert!(
+        entered > 0,
+        "no call in this fixture was entered at all, so nothing distinguishes the effects gate \
+         from a backend that declines"
+    );
+}
+
 /// `examples/` is the corpus the milestone's exit criterion names, so it gets
 /// its own assertion rather than being one entry in a loop that would still
 /// pass if it silently stopped loading.

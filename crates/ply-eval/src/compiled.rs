@@ -11,13 +11,18 @@
 //! by a backend remembering them. Declining is the default for everything the
 //! machine has not positively cleared:
 //!
-//! - **Effects.** A backend cannot `perform`: it is handed no machine to perform
-//!   into. `Machine::compiled_answer` additionally refuses any definition whose
-//!   *published* row is non-empty, which is the reviewable artifact and the same
-//!   rule the constant memo reads (`memo::pure_by_published_row`). A machine
-//!   built without a `CheckOutput` has no row to read and so enters nothing at
-//!   all — which is most of this crate's own tests, and the reason the corpus
-//!   tests assert an entry count rather than only a clean report.
+//! - **Effects, in two gates rather than one.** A backend cannot `perform`: it is
+//!   handed no machine to perform into. [`admit`] additionally refuses any
+//!   definition whose *published* row is non-empty ([`Gate::PublishedRow`], the
+//!   same rule the constant memo reads, `memo::pure_by_published_row`) **and**
+//!   any definition that can perform an atom its row does not show
+//!   ([`Gate::InternalEffects`], `ply_core::DefInfo::internally_effectful`). A
+//!   row answers "can an atom escape this call"; it cannot answer "can an atom
+//!   be performed and discharged inside it", because discharging is precisely
+//!   what takes an atom out of a row. A machine built without a `CheckOutput`
+//!   reads neither fact and so enters nothing at all — which is most of this
+//!   crate's own tests, and the reason the corpus tests assert an entry count
+//!   rather than only a clean report.
 //!
 //!   > **Narrowed (R5 review, 2026-08-22): the row gate does not cover the whole
 //!   > of "effects".** A definition that performs its operations and
@@ -35,6 +40,44 @@
 //!   > claims to have engineered away. No published row can close it: `handled`
 //!   > carries no fact distinguishing it from a genuinely pure definition.
 //!   > `CONTRIBUTING.md` §"Things known to be broken" carries it as open.
+//!
+//!   > **Closed (2026-08-24), and the narrowing above was right about the row
+//!   > and wrong about the remedy.** Its last two sentences are withdrawn:
+//!   > *"No published row can close it: `handled` carries no fact
+//!   > distinguishing it from a genuinely pure definition. `CONTRIBUTING.md`
+//!   > §"Things known to be broken" carries it as open."* No published **row**
+//!   > can close it and that half stands — a row is a set of atoms that escape,
+//!   > and none escape. What closes it is a published fact that is not a row:
+//!   > `ply_core::DefInfo::internally_effectful`, read here by
+//!   > [`Gate::InternalEffects`].
+//!   >
+//!   > **The fact has to be transitive, and that was measured before it was
+//!   > built.** The obvious form — a per-body bit for "written with `perform`
+//!   > or `handle`" — closes `handled` and leaves the hole open one call away.
+//!   > With `fn wrapper(x) = handled(x)`, inference publishes an empty
+//!   > `footprint` *and* an empty `performed` for `wrapper`, it is written with
+//!   > neither keyword, and running it records `state.read` in
+//!   > [`crate::Trace`]. Every fact `wrapper` carries about its own text is a
+//!   > fact a pure definition carries. `a_definition_that_only_calls_one_that_discharges_its_own_effects_is_refused_too`
+//!   > and `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`
+//!   > are what hold that, the second at four hops, through a mutually
+//!   > recursive pair and through a lambda.
+//!   >
+//!   > **One consequence the narrowing named does not follow, and is withdrawn
+//!   > separately.** It read: *"`ply-test` reports an `observed_footprint`
+//!   > (`report.rs`) and reads a declared-but-unobserved atom as "a branch was
+//!   > not taken" (`slice.rs`), and a native body performs nothing, so a user
+//!   > would be told a branch was not taken when it was."* Entering a body can
+//!   > only lose atoms **discharged inside** it — an escaping atom puts the row
+//!   > gate in the way one line earlier — and a discharged atom appears in no
+//!   > declared row anywhere, so no *declared* atom can go missing this way.
+//!   > What entering costs is an `observed_footprint` that under-reports a run,
+//!   > which is a wrong answer to a user but not that one. Separately, and
+//!   > measured rather than read:
+//!   > `ply test <a failing fixture> --trace always --json` answers
+//!   > `"causal_slice": null`, because `ply_test::SliceBuilder` is constructed
+//!   > nowhere outside `ply-test/tests/bisect_audit.rs` — see
+//!   > `CONTRIBUTING.md` §"Things known to be broken" item 15.
 //! - **Continuations.** Nothing runs in the machine while a body runs, so no
 //!   continuation can be captured beneath a native activation and no handler
 //!   clause can resume into one.
@@ -93,6 +136,34 @@
 //! > started as a child, and a child that dies by a signal is reported as a
 //! > disagreement rather than ending the run. The second half stands.
 //!
+//! > **Half closed, and the halves are different harnesses (2026-08-24).** The
+//! > sentence above it — *"**One of them is still not caught by any corpus in
+//! > this tree**: no corpus can exercise the published-row gate, because
+//! > `benches/kernel` declares no effect and the differential corpus declines
+//! > effectful names."* — and this block's *"The second half stands"* were
+//! > written as one claim and are two.
+//! >
+//! > **A corpus in this tree now catches it.**
+//! > `tests/fixtures/self_handled_effect.ply` declares an effect and discharges
+//! > it, and `crates/ply-eval/tests/differential_corpus.rs` reads it. Measured
+//! > by deleting [`Gate::InternalEffects`] and running
+//! > `cargo test -p ply-eval --test differential_corpus`:
+//! > `a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk` and
+//! > `a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`
+//! > both fail with `observed footprint — left
+//! > {self_handled_effect.tally.read[log], self_handled_effect.tally.write[log]},
+//! > right {}` — the shape R5's mutation table reports for deleting the purity
+//! > gate outright.
+//! >
+//! > **`mcts --mutate` still does not.** That harness runs over
+//! > `benches/kernel`, `benches/kernel` still declares no effect
+//! > (`grep -rn '^effect ' benches/kernel` is empty), and this fixture is not in
+//! > it — a `.ply` under `tests/fixtures/` is read by the workspace suite and by
+//! > nothing the spike runs. So the eight-mutant table in
+//! > `crates/ply-codegen-spike/tests/mutations.rs` is **not** completed by this
+//! > change; what changed is that `cargo test --workspace` catches the mutant
+//! > the spike's own corpus cannot.
+//!
 //! Two more, stated because they are limits rather than guarantees. A backend's
 //! panic is not caught, so a backend bug aborts the process rather than becoming
 //! a silent slow path. And a run with a backend attached is a third execution
@@ -111,11 +182,19 @@
 //!
 //! | polices it | what it is |
 //! | --- | --- |
-//! | this module's tests | **32** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity |
-//! | `crates/ply-eval/tests/differential_corpus.rs` | **5** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
+//! | this module's tests | **36** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity |
+//! | `crates/ply-eval/tests/differential_corpus.rs` | **6** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
 //! | `crates/ply-codegen-spike/tests/mutations.rs` | **13** tests, eight deliberately wrong backends, each asserted to have *fired* before it is asserted to be caught |
 //! | `crates/ply-codegen-spike/tests/hazards.rs`, `mcts_kernel.rs` | **25** tests over the real cranelift backend |
 //! | `mcts --mutate <corruption>` | the same eight corruptions at corpus scale — 2,396 generated cases; run by hand, nothing runs it for you |
+//!
+//! > **Two rows re-taken (2026-08-24).** They read **32** and **5**. The effects
+//! > gate added four tests here — three for the gate and one for the transitive
+//! > closure behind it — and one to `differential_corpus.rs`. Re-counted from
+//! > the runs rather than by arithmetic: `cargo test -p ply-eval --lib
+//! > compiled::` reports 36 and `cargo test -p ply-eval --test
+//! > differential_corpus` reports 6. The other three rows are untouched by this
+//! > change and were not re-taken.
 //!
 //! And what does not, which is the part worth writing down:
 //!
@@ -132,11 +211,21 @@
 //!   Wiring a backend into the CLI is what would make it reachable, and it is
 //!   gated on the entry-point defect (`CONTRIBUTING.md` item 9) rather than on
 //!   this seam.
-//! - **No corpus in the tree can exercise the published-row gate.**
-//!   `benches/kernel` declares no effect, so every definition in it publishes an
-//!   empty row and the gate has nothing to refuse; `ply-eval`'s differential
-//!   corpus declines effectful names before the gate is reached. Closing it
-//!   means a corpus that declares an effect, which does not exist yet.
+//! - ~~**No corpus in the tree can exercise the published-row gate.**~~
+//!   **Closed (2026-08-24).** It read: *"`benches/kernel` declares no effect, so
+//!   every definition in it publishes an empty row and the gate has nothing to
+//!   refuse; `ply-eval`'s differential corpus declines effectful names before
+//!   the gate is reached. Closing it means a corpus that declares an effect,
+//!   which does not exist yet."* It does now:
+//!   `tests/fixtures/self_handled_effect.ply` declares `effect tally`, performs
+//!   both its operations and discharges both under its own `handle`, so its
+//!   `handled` and `wrapper` are refused by [`Gate::InternalEffects`] on the
+//!   corpus path rather than in a unit test, and its `measured` publishes a row
+//!   that is not empty, which is what [`Gate::PublishedRow`] reads. The row is
+//!   what is asserted, not the gate: a corpus run counts declines and does not
+//!   record which gate produced one. `benches/kernel` still declares no effect —
+//!   checked, `grep -rn '^effect ' benches/kernel` is empty — and that half is
+//!   unchanged, which is why the fixture lives in `tests/fixtures/` instead.
 //! - **A wrong `Int` is not caught here by anything.** It is caught by
 //!   `--engine both` and the differential corpus comparing against an
 //!   independent tree-walker, which is the sentence above this section.
@@ -232,8 +321,52 @@ pub(crate) enum Gate {
     Anonymous,
     /// The published effect row is non-empty, or there is no row to read at all.
     PublishedRow,
+    /// The published row is empty and the definition performs anyway, under a
+    /// `handle` of its own or of something it calls — see
+    /// [`internally_effectful`].
+    InternalEffects,
     /// No nested call left before the machine's own bound.
     Budget,
+}
+
+/// Whether entering `name` natively would lose a `perform` the interpreter
+/// would have run.
+///
+/// [`Gate::PublishedRow`] answers "can an atom **escape** this call", which is
+/// what a row is. This answers the other half — "can an atom be performed and
+/// **discharged** inside it" — which no row can, because discharging is exactly
+/// what removes an atom from one. `ply_core::DefInfo::internally_effectful`
+/// carries it, transitively over the call graph, and is `true` for anything the
+/// checker did not positively clear.
+///
+/// A name with no entry is refused, for the reason [`Gate::PublishedRow`]
+/// refuses one: a machine that cannot read the fact has not been told it holds.
+///
+/// # What it rests on, marked as reasoning rather than as a measurement
+///
+/// The published fact is reachability over the **named** call graph, and a
+/// `perform` can also arrive inside a value that carries code. Every route this
+/// pass knows of is closed, but by two gates rather than by one, so the
+/// argument is worth writing down instead of trusting:
+///
+/// - A lambda that performs is syntactically inside some definition's body, and
+///   the scan walks lambda bodies — so that definition is marked, and anything
+///   naming it inherits the mark.
+/// - A closure handed **in** as an argument is refused by [`crossable`] before
+///   this gate is reached: no `Value::Closure` crosses this boundary.
+/// - A closure fetched out of a cell is reached through a `Value::Cell`, which
+///   [`crossable`] also refuses, and a cell cannot outlive the `with_cell` that
+///   made it.
+///
+/// So a definition admitted here takes only [`Value::Int`] and [`Value::Bool`],
+/// which carry no code, and the only code it can run is code some definition it
+/// names contains. That is an argument, not a proof and not a measurement; what
+/// **is** measured is that deleting either gate turns tests red, and the
+/// deletion table in this module's test header records which.
+fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
+    check
+        .and_then(|check| check.defs.get(name))
+        .is_none_or(|def| def.internally_effectful)
 }
 
 /// The name a backend may be offered this call under and the budget to offer it
@@ -264,9 +397,10 @@ pub(crate) enum Gate {
 ///   cannot fail to record what nothing is recording.
 /// - **[`Gate::PublishedRow`]**: necessary and not sufficient, exactly as the
 ///   memo's note says — an empty row still permits a definition that opens its
-///   own `with_cell`, and (see this module's header) one that discharges its own
-///   effects under its own `handle`. Outside a `simulate` region that allocation
-///   is unobservable, which is the same argument `Machine::constant` rests on.
+///   own `with_cell`. Outside a `simulate` region that allocation is
+///   unobservable, which is the same argument `Machine::constant` rests on.
+/// - **[`Gate::InternalEffects`]**: the other half of "effects", and the reason
+///   an empty row alone was never enough. See this module's header.
 /// - **[`Gate::Budget`]**: a zero budget declines, and the interpreted path
 ///   raises the machine's own call-limit diagnostic rather than a backend's.
 pub(crate) fn admit<'a>(
@@ -289,6 +423,9 @@ pub(crate) fn admit<'a>(
     let name = closure.name.as_ref().ok_or(Gate::Anonymous)?;
     if !crate::memo::pure_by_published_row(check, name) {
         return Err(Gate::PublishedRow);
+    }
+    if internally_effectful(check, name) {
+        return Err(Gate::InternalEffects);
     }
     let budget = max_calls.checked_sub(calls).ok_or(Gate::Budget)?;
     if budget == 0 {
@@ -320,6 +457,27 @@ pub(crate) fn admit<'a>(
 /// deletions touches the ceiling gate, which lives in `Machine::compiled_answer`
 /// rather than here.
 ///
+/// > **Re-taken whole (2026-08-24), for item 11's close.** The paragraph above
+/// > is left as it was written; the suite is no longer that size. Adding
+/// > [`Gate::InternalEffects`] and four tests takes
+/// > `cargo test -p ply-eval --lib` to **531 passed / 0 failed / 1 ignored**.
+/// >
+/// > A new gate below an old one can mask the old one's deletion — that is the
+/// > defect this table exists to catch, and [`Gate::InternalEffects`] sits
+/// > below four of the five gates above it. So every row was re-run one at a
+/// > time rather than carried, in an `rsync`ed copy of the tree that no other
+/// > session could write to, restored and digest-checked after the last one.
+/// > Seven reproduce exactly: kind 2, shape 5, `in_simulate` 2, name-test 1,
+/// > `budget == 0` 2, `saturating_sub` 0, [`internally_effectful`] 4. **One
+/// > moved** — the published-row row, from five to four — and the correction
+/// > under the table says which test it lost and why.
+/// >
+/// > The name-test row's mutation needs one line of scaffolding to compile,
+/// > since [`admit`] answers a `&'a Symbol` borrowed from the closure and a
+/// > fabricated one is a local: it was run as
+/// > `None => Box::leak(Box::new(Symbol::new("")))`, which is the same
+/// > substitution the row describes.
+///
 /// Re-running it: mutate, `touch` the file, and check the run actually printed
 /// `Compiling ply-eval` before believing its result. Cargo fingerprints on
 /// second-granular mtimes, so a script that rewrites this file and invokes
@@ -333,9 +491,27 @@ pub(crate) fn admit<'a>(
 /// | the [`crossable`] test on arguments | 5, incl. `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `a_secret_is_never_offered_and_never_accepted` |
 /// | the `in_simulate` test | `a_call_inside_a_simulate_region_is_refused_by_the_region_gate`, `nothing_is_offered_inside_a_simulate_region` |
 /// | the name test, replaced by a fabricated empty [`Symbol`] | `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`, **and nothing else** |
-/// | the published-row test | 5, incl. `a_definition_whose_published_row_is_not_empty_is_never_offered` |
+/// | the published-row test | 4: `a_definition_that_opens_its_own_simulate_region_is_never_offered`, `a_definition_whose_published_row_is_not_empty_is_never_offered`, `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`, `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate` |
+/// | the [`internally_effectful`] test | 4: `a_definition_that_discharges_its_own_effects_is_refused_by_the_internal_effects_gate`, `a_definition_that_only_calls_one_that_discharges_its_own_effects_is_refused_too`, `nothing_that_performs_under_its_own_handler_is_offered_to_a_backend`, `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop` — **and 2 more outside this suite**, see below |
 /// | the `budget == 0` test | `the_last_nested_call_is_refused_by_the_budget_gate`, `the_budget_is_the_machines_remaining_depth_and_never_reaches_zero` |
-/// | `checked_sub` weakened to `saturating_sub` | **nothing — 526 still green** |
+/// | `checked_sub` weakened to `saturating_sub` | **nothing — 531 still green** |
+///
+/// The fact [`Gate::InternalEffects`] reads is computed in another crate, so it
+/// gets two rows of its own. `ply_core::infer`'s `Checker::mark_internal_effects`
+/// seeds a per-body bit and then propagates it over the reference graph, and
+/// **the propagation is the half a reviewer is most likely to think is
+/// decoration**:
+///
+/// | Mutation of `mark_internal_effects` | Red |
+/// |---|---|
+/// | the propagation deleted, leaving the per-body bit — which is the fix as it was first specified | 3: `a_definition_that_only_calls_one_that_discharges_its_own_effects_is_refused_too`, `nothing_that_performs_under_its_own_handler_is_offered_to_a_backend`, `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop` |
+/// | the fixpoint replaced by a single pass over the seeds | `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`, **and nothing else** |
+///
+/// The second row is the thin one, and it is thin the way the name-test row is:
+/// one hop is all `wrapper` needs, so every other test in this block is
+/// satisfied by a propagation that stops after one. Only a chain — four
+/// wrappers, a mutually recursive pair, a call reached from a lambda — can tell
+/// a single pass from a fixpoint.
 ///
 /// > **Corrected in place (2026-08-24).** The last two rows were one row, and it
 /// > read: *"| the budget test, replaced by `saturating_sub` |
@@ -351,7 +527,48 @@ pub(crate) fn admit<'a>(
 /// > somebody thought about; it is a spelling, not a gate, and it is the one
 /// > line in this function no test can bite.
 ///
-/// The fourth row is the whole of item 13. Before this block that deletion was
+/// > **The published-row row re-taken, and it went down (2026-08-24).** It read
+/// > *"| the published-row test | 5, incl.
+/// > `a_definition_whose_published_row_is_not_empty_is_never_offered` |"*. The
+/// > five were the four now listed plus
+/// > `a_machine_with_no_check_output_offers_nothing`, measured by deleting the
+/// > row gate **and** stubbing [`internally_effectful`] to `false`, which is
+/// > this file as it stood before the effects gate: 8 red, of which 3 are the
+/// > effects gate's own new tests.
+/// >
+/// > Adding [`Gate::InternalEffects`] one line below the row gate **masked one
+/// > of them**. A machine with no `CheckOutput` fails both gates — the row is
+/// > unreadable and so is the flag — so
+/// > `a_machine_with_no_check_output_offers_nothing`, which asserts a
+/// > behaviour, is now satisfied by whichever gate refuses first and stays
+/// > green under the row gate's deletion. That is
+/// > [`an_anonymous_closure_is_never_offered`]'s defect reappearing one gate
+/// > further down, and the reason this table is re-run rather than reasoned
+/// > about. It is not a hole: the mechanism it stands for is asserted by
+/// > `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`,
+/// > which reads `Err(Gate::PublishedRow)` for a machine with no `CheckOutput`
+/// > and does go red.
+/// >
+/// > A second test was masked and was **repaired instead of recorded**:
+/// > `a_definition_whose_published_row_is_not_empty_is_never_offered` asserted
+/// > only that `touch` reaches no backend, which the effects gate also
+/// > guarantees. It now asserts `Err(Gate::PublishedRow)` directly and is back
+/// > in the row above. Without that repair this row would read 3.
+///
+/// **The [`internally_effectful`] row is the only one with a corpus behind it,
+/// and that is the point of it.** Every other deletion above is caught by hand-built doubles
+/// over hand-built programs, which is what item 13's third bullet complained
+/// about. Deleting the [`internally_effectful`] test and running
+/// `cargo test -p ply-eval --test differential_corpus` also fails
+/// **`a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk`** and
+/// **`a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`**
+/// — 4 passed, 2 failed — on `tests/fixtures/self_handled_effect.ply`, with
+/// `observed footprint — left {self_handled_effect.tally.read[log],
+/// self_handled_effect.tally.write[log]}, right {}`. Measured on this tree by
+/// deleting the two lines, `touch`ing this file, confirming `Compiling
+/// ply-eval` in the output, and restoring.
+///
+/// The name-test row is the whole of item 13. Before this block that deletion was
 /// caught by nothing at all: the row gate refuses an unpublished name one line
 /// later, so a fabricated name produced the same *behaviour* through a
 /// different mechanism, and `an_anonymous_closure_is_never_offered` — which
@@ -1005,6 +1222,16 @@ mod tests {
     /// refused whatever the backend claims — and a backend has no route to
     /// `perform` in any case, which is why the refusal is a correctness gate and
     /// not a courtesy.
+    ///
+    /// > **Strengthened (2026-08-24), because it stopped biting.** This test
+    /// > used to assert only the behaviour — that `touch` reaches no backend.
+    /// > [`Gate::InternalEffects`] refuses `touch` one line after
+    /// > [`Gate::PublishedRow`] does, so once that gate existed, deleting the
+    /// > row gate left this test green and the deletion table's row for it fell
+    /// > from five reds to three. That is [`an_anonymous_closure_is_never_offered`]'s
+    /// > defect exactly, one gate further down. The `gate(..)` assertion below
+    /// > is what bites now: under a deleted row gate it reads
+    /// > `Err(Gate::InternalEffects)`.
     #[test]
     fn a_definition_whose_published_row_is_not_empty_is_never_offered() {
         let c = checked(vec![
@@ -1019,6 +1246,15 @@ mod tests {
         assert!(
             !c.check.defs[&Symbol::new("touch")].footprint.is_empty(),
             "the fixture is wrong: `touch` publishes an empty row"
+        );
+        assert_eq!(
+            gate(
+                &c,
+                &code_closure(Some("touch"), &["x"], var("x")),
+                &[Value::Int(1)]
+            ),
+            Err(Gate::PublishedRow),
+            "the row gate is not what refused a definition whose row is not empty"
         );
 
         let backend = Double::declining(&c.program);
@@ -1046,6 +1282,152 @@ mod tests {
             vec!["bump"],
             "a definition that can `perform` was offered to a backend"
         );
+    }
+
+    /// A program whose `handled` performs and discharges its own operation, and
+    /// whose `wrapper` does nothing but call it.
+    ///
+    /// This is `crates/ply-codegen-spike/tests/fixtures/hazards/effects.ply`
+    /// reduced to what the gate turns on. `bump` is the control: same shape,
+    /// same arguments, empty row, and genuinely pure.
+    fn self_handled() -> Checked {
+        checked(vec![
+            effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
+            fn_def(
+                "touch",
+                &["x"],
+                perform("state", "get", None, vec![var("x")]),
+            ),
+            fn_def(
+                "handled",
+                &["x"],
+                handle(
+                    callv("touch", vec![var("x")]),
+                    vec![clause(
+                        "state",
+                        "get",
+                        None,
+                        &["n"],
+                        bin(BinOp::Add, var("n"), int(1)),
+                    )],
+                ),
+            ),
+            fn_def("wrapper", &["x"], callv("handled", vec![var("x")])),
+            fn_def("bump", &["x"], bin(BinOp::Add, var("x"), int(0))),
+        ])
+    }
+
+    /// The gate this whole change exists for
+    /// (`CONTRIBUTING.md` §"Things known to be broken" item 11).
+    ///
+    /// The first two assertions are what makes the third mean anything: the row
+    /// gate *cannot* be what refuses `handled`, because its published row and
+    /// its inferred body row are both empty and it is indistinguishable from
+    /// `bump` on either. Under a deleted [`Gate::InternalEffects`] the third
+    /// assertion reads `Ok(("handled", ..))`.
+    #[test]
+    fn a_definition_that_discharges_its_own_effects_is_refused_by_the_internal_effects_gate() {
+        let c = self_handled();
+        let handled = &c.check.defs[&Symbol::new("handled")];
+        assert!(
+            handled.footprint.is_empty() && handled.performed.is_empty(),
+            "the fixture is wrong: `handled` publishes {:?} and performed {:?}, so the row gate \
+             would refuse it and this test would prove nothing",
+            handled.footprint,
+            handled.performed
+        );
+        assert!(
+            crate::memo::pure_by_published_row(Some(&c.check), &Symbol::new("handled")),
+            "the row gate refused `handled`, so nothing below is about the effects gate"
+        );
+
+        let subject = code_closure(Some("handled"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &subject, &[Value::Int(1)]),
+            Err(Gate::InternalEffects)
+        );
+
+        let control = code_closure(Some("bump"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &control, &[Value::Int(1)]),
+            Ok(("bump".to_string(), DEFAULT_MAX_CALLS)),
+            "a genuinely pure definition in the same program was refused too, so the refusal \
+             above is not about this program"
+        );
+    }
+
+    /// The half a per-body fact cannot reach, and the reason
+    /// `DefInfo::internally_effectful` is transitive.
+    ///
+    /// `wrapper` is written with neither `perform` nor `handle`; every fact
+    /// about its own text says it is pure, and its published row and inferred
+    /// body row are as empty as `bump`'s. It performs `state.read` anyway,
+    /// because `handled` does. A gate reading a syntactic per-body bit clears
+    /// this and loses exactly the atoms the gate exists to keep.
+    #[test]
+    fn a_definition_that_only_calls_one_that_discharges_its_own_effects_is_refused_too() {
+        let c = self_handled();
+        let wrapper = &c.check.defs[&Symbol::new("wrapper")];
+        assert!(
+            wrapper.footprint.is_empty() && wrapper.performed.is_empty(),
+            "the fixture is wrong: `wrapper` publishes a row, so the row gate would refuse it"
+        );
+
+        let subject = code_closure(Some("wrapper"), &["x"], var("x"));
+        assert_eq!(
+            gate(&c, &subject, &[Value::Int(1)]),
+            Err(Gate::InternalEffects)
+        );
+
+        // The atoms this refusal is protecting, measured rather than asserted
+        // from the row: running `wrapper` performs, and the published row says
+        // it does not.
+        let mut machine = c.machine();
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("wrapper", vec![int(1)]))),
+            Value::Int(2)
+        );
+        assert_eq!(machine.trace().performs(), 1);
+        assert_eq!(
+            machine
+                .trace()
+                .footprint()
+                .atoms()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>(),
+            vec!["state.read".to_string()],
+            "the engine recorded no atom, so entering `wrapper` would lose nothing and this \
+             gate would be pointless"
+        );
+    }
+
+    /// The same thing said about a run rather than about the gate: with a
+    /// backend attached, neither the definition that handles its own operation
+    /// nor the one that merely calls it is ever offered, and the atoms both of
+    /// them perform are still recorded.
+    #[test]
+    fn nothing_that_performs_under_its_own_handler_is_offered_to_a_backend() {
+        let c = self_handled();
+        let backend = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+
+        let e = bin(
+            BinOp::Add,
+            bin(
+                BinOp::Add,
+                callv("handled", vec![int(1)]),
+                callv("wrapper", vec![int(10)]),
+            ),
+            callv("bump", vec![int(100)]),
+        );
+        assert_eq!(ok(machine.eval_expr_for_test(&e)), Value::Int(113));
+        assert_eq!(
+            backend.names(),
+            vec!["bump"],
+            "a definition that performs under its own handler was offered to a backend"
+        );
+        assert_eq!(machine.trace().performs(), 2);
     }
 
     /// The whole partial-order story, and the reason it is one gate: inside a
@@ -1585,6 +1967,91 @@ mod tests {
             Value::Int(42)
         );
         assert_eq!(backend.names(), vec!["double"]);
+    }
+
+    /// One hop is `wrapper`. Four hops, a mutually recursive pair and a call
+    /// reached only through a lambda are what separate a fixpoint from a single
+    /// pass — and a single pass would satisfy every other test in this block.
+    ///
+    /// The `clean` chain is the same depth and genuinely pure. Without it this
+    /// test is also passed by a gate that refuses everything with a call in it,
+    /// which would close the seam rather than narrow it.
+    #[test]
+    fn the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop() {
+        let c = checked(vec![
+            effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
+            fn_def(
+                "touch",
+                &["x"],
+                perform("state", "get", None, vec![var("x")]),
+            ),
+            fn_def(
+                "handled",
+                &["x"],
+                handle(
+                    callv("touch", vec![var("x")]),
+                    vec![clause(
+                        "state",
+                        "get",
+                        None,
+                        &["n"],
+                        bin(BinOp::Add, var("n"), int(1)),
+                    )],
+                ),
+            ),
+            fn_def("hop1", &["x"], callv("handled", vec![var("x")])),
+            fn_def("hop2", &["x"], callv("hop1", vec![var("x")])),
+            fn_def("hop3", &["x"], callv("hop2", vec![var("x")])),
+            fn_def("hop4", &["x"], callv("hop3", vec![var("x")])),
+            // Only `ping` can reach the handler; `pong` reaches it through the
+            // recursion, which a propagation that stopped at a cycle would miss.
+            fn_def(
+                "ping",
+                &["x"],
+                if_(
+                    bin(BinOp::Lt, var("x"), int(1)),
+                    callv("handled", vec![var("x")]),
+                    callv("pong", vec![bin(BinOp::Sub, var("x"), int(1))]),
+                ),
+            ),
+            fn_def("pong", &["x"], callv("ping", vec![var("x")])),
+            fn_def(
+                "via_lambda",
+                &["x"],
+                block(
+                    vec![letv("f", lam(&["y"], callv("handled", vec![var("y")])))],
+                    Some(call(var("f"), vec![var("x")])),
+                ),
+            ),
+            fn_def("clean1", &["x"], bin(BinOp::Add, var("x"), int(1))),
+            fn_def("clean2", &["x"], callv("clean1", vec![var("x")])),
+            fn_def("clean3", &["x"], callv("clean2", vec![var("x")])),
+            fn_def("clean4", &["x"], callv("clean3", vec![var("x")])),
+        ]);
+
+        let refused = ["hop1", "hop2", "hop3", "hop4", "ping", "pong", "via_lambda"];
+        for name in refused {
+            let info = &c.check.defs[&Symbol::new(name)];
+            assert!(
+                info.footprint.is_empty() && info.performed.is_empty(),
+                "the fixture is wrong: `{name}` publishes a row, so the row gate refuses it and \
+                 this says nothing about the effects gate"
+            );
+            let subject = code_closure(Some(name), &["x"], var("x"));
+            assert_eq!(
+                gate(&c, &subject, &[Value::Int(1)]),
+                Err(Gate::InternalEffects),
+                "`{name}` was admitted, so the propagation stopped short of it"
+            );
+        }
+        for name in ["clean1", "clean2", "clean3", "clean4"] {
+            let subject = code_closure(Some(name), &["x"], var("x"));
+            assert_eq!(
+                gate(&c, &subject, &[Value::Int(1)]),
+                Ok((name.to_string(), DEFAULT_MAX_CALLS)),
+                "`{name}` is pure at every hop and was refused anyway"
+            );
+        }
     }
 
     /// A `Float` in flight is what `crossable` refuses; this is the same
