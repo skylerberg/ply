@@ -92,6 +92,9 @@ pub fn check_program_with(
     c.attribute_generated(program);
     c.check_simulations();
     c.check_regions();
+    // Last, because it is the only pass that needs every module's `DefInfo` to
+    // exist: it answers a question about a definition's callees.
+    c.mark_internal_effects(program);
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(c.diags)
     } else {
@@ -1941,11 +1944,9 @@ impl<'a> Checker<'a> {
         let adj: Vec<Vec<usize>> = fns
             .iter()
             .map(|d| {
-                let mut refs = Vec::new();
-                collect_refs(&d.body, &mut refs);
                 let mut seen = FxHashSet::default();
-                refs.iter()
-                    .filter(|r| r.is_bare())
+                Refs::of(&d.body)
+                    .bare()
                     .filter_map(|r| index.get(r.symbol()).copied())
                     .filter(|i| seen.insert(*i))
                     .collect()
@@ -2010,6 +2011,9 @@ impl<'a> Checker<'a> {
                         row_aliases: row_aliases(def),
                         constraints,
                         spec: Vec::new(),
+                        // Lowered by `mark_internal_effects` once every module
+                        // is walked, and only for a definition it cleared.
+                        internally_effectful: true,
                         span: def.span,
                     },
                 );
@@ -2072,6 +2076,10 @@ impl<'a> Checker<'a> {
                     row_aliases: row_aliases(fns[i]),
                     constraints,
                     spec: Vec::new(),
+                    // A restored interface says nothing about this, and the
+                    // body is right here — `mark_internal_effects` walks it
+                    // like any other.
+                    internally_effectful: true,
                     span: fns[i].span,
                 },
             );
@@ -4622,10 +4630,9 @@ impl<'a> Checker<'a> {
             return Vec::new();
         }
 
-        let mut refs = Vec::new();
-        collect_refs(body, &mut refs);
+        let refs = Refs::of(body);
         let mut first: FxHashMap<&Symbol, Span> = FxHashMap::default();
-        for q in refs.iter().filter(|q| q.is_bare()) {
+        for q in refs.bare() {
             first.entry(q.symbol()).or_insert(q.span);
         }
 
@@ -4904,6 +4911,135 @@ impl<'a> Checker<'a> {
         let row = self.subst.resolve_row(&body_row).without(&handled);
         let row = self.join(e.span, row, Row::singleton(seed));
         (body_ty, row)
+    }
+
+    /// Fills in [`DefInfo::internally_effectful`] for every definition in the
+    /// program: which of them can execute a `perform` their published row does
+    /// not show.
+    ///
+    /// Every `DefInfo` is constructed with the flag **set**, and this is the
+    /// only thing that clears it. So the answer to "was this definition
+    /// walked?" and the answer to "may a compiled body be entered for it?" are
+    /// the same answer, and a definition this pass never reaches keeps the
+    /// conservative one.
+    ///
+    /// # Why it is transitive
+    ///
+    /// An atom performed inside a call either escapes — and the published row
+    /// carries it, which is the gate `Machine::compiled_answer` already had —
+    /// or it is discharged by a `handle` in the call's dynamic extent, and then
+    /// nothing published records it at all. The `handle` that discharges it can
+    /// be anywhere in that extent, not only in the body that performed. So a
+    /// definition whose own body mentions neither `perform` nor `handle` still
+    /// performs, invisibly, when something it calls discharges its own
+    /// operations. Measured rather than reasoned: with
+    /// `fn handled(x) = handle { touch(x) } with { .. }` and
+    /// `fn wrapper(x) = handled(x)`, inference publishes an empty `footprint`
+    /// *and* an empty `performed` for both, and running `wrapper` records
+    /// `state.read` in `ply_eval::Trace`.
+    ///
+    /// # What is and is not an edge
+    ///
+    /// A reference is an edge when it denotes a definition of this program.
+    /// A builtin, a constructor and a prelude name are not: the only route to
+    /// `ply_eval::Trace::record` in either engine is an `ExprKind::Perform`
+    /// (`machine.rs`'s `State::Perform`, `interp.rs`'s `perform`), which is
+    /// source this pass walks. `with_cell` is deliberately not an effect here
+    /// for the same reason `Trace` does not record one — a cell atom carries no
+    /// resource label to reconstruct, and the two engines' arenas are compared
+    /// slot by slot instead.
+    ///
+    /// Locals other than the definition's own parameters are not resolved away,
+    /// so a lambda parameter or a `let` binder that shadows a definition's name
+    /// contributes that definition's edge. That costs a definition its entry and
+    /// never the other way round. Measured on `examples/` rather than guessed
+    /// at, and it is why the parameter set is subtracted at all: without that
+    /// one step **29** of the 953 empty-row definitions there are marked, and
+    /// with it **11**. The eighteen were spurious in one shape —
+    /// `desk.item_named(shelf, ..)` is `fold` over its own parameter and `desk`
+    /// also declares `fn shelf`. The eleven that remain are real: `desk.under`
+    /// is `handle { .. } with { signal.stopping() -> false }` and publishes an
+    /// empty row, and the other ten reach it.
+    ///
+    /// A `requires` / `ensures` clause is not walked: it is erased before
+    /// evaluation and cannot perform (`E0412`).
+    fn mark_internal_effects(&mut self, program: &Program) {
+        let mut index: FxHashMap<Symbol, usize> = FxHashMap::default();
+        let mut names: Vec<Symbol> = Vec::new();
+        for module in &program.modules {
+            for item in &module.items {
+                let Item::Fn(def) = item else { continue };
+                let name = module.name.qualify(&def.name.name);
+                // A module declaring the same name twice is `E0105`, and this
+                // pass runs *before* the diagnostic is reported —
+                // `check_program_with` collects and reports at the end. So the
+                // second `fn f` reuses the first one's node rather than
+                // claiming an index no vector has, and the two bodies' effects
+                // merge, which is the conservative direction.
+                // `a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_effect`
+                // is what fails without this: a pure duplicate is survivable
+                // because `&&` short-circuits the out-of-bounds read, and one
+                // written with `handle` is not.
+                if !index.contains_key(&name) {
+                    index.insert(name.clone(), names.len());
+                    names.push(name);
+                }
+            }
+        }
+
+        let mut effects = vec![false; names.len()];
+        // Callee -> callers, because propagation runs from a definition that
+        // performs outwards to everything that can reach it.
+        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
+        let mut pending: Vec<usize> = Vec::new();
+        for (m, module) in program.modules.iter().enumerate() {
+            self.module = m;
+            for item in &module.items {
+                let Item::Fn(def) = item else { continue };
+                let Some(&at) = index.get(&module.name.qualify(&def.name.name)) else {
+                    continue;
+                };
+                let refs = Refs::of(&def.body);
+                if refs.effects && !effects[at] {
+                    effects[at] = true;
+                    pending.push(at);
+                }
+                // A parameter shadows a definition of the same name for the
+                // whole body — an inner binder only shadows it further — so a
+                // bare reference to one never denotes the global. Dropping
+                // those is the one narrowing available without a scope-aware
+                // walk, and it is worth having: `desk.item_named(shelf, sku)`
+                // is `fold` over its own parameter, and `desk` also declares
+                // `fn shelf`.
+                let params: FxHashSet<&Symbol> = def.params.iter().map(|p| &p.name.name).collect();
+                for q in &refs.names {
+                    if q.is_bare() && params.contains(q.symbol()) {
+                        continue;
+                    }
+                    let Some(callee) = self.declared_value(q) else {
+                        continue;
+                    };
+                    if let Some(&to) = index.get(&callee) {
+                        callers[to].push(at);
+                    }
+                }
+            }
+        }
+
+        while let Some(at) = pending.pop() {
+            for &caller in &callers[at] {
+                if !effects[caller] {
+                    effects[caller] = true;
+                    pending.push(caller);
+                }
+            }
+        }
+
+        for (at, name) in names.iter().enumerate() {
+            if let Some(def) = self.defs.get_mut(name) {
+                def.internally_effectful = effects[at];
+            }
+        }
     }
 
     /// Nesting and task escape, asked once the module is solved. Both questions
@@ -5744,18 +5880,49 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// What one walk of a body answers: the names it mentions, and whether it is
+/// written with an effect operation at all.
+///
+/// One walk rather than two because the second question is asked of every
+/// definition in the program by [`Checker::mark_internal_effects`], and because
+/// [`collect_refs_inner`] is an exhaustive `match` with no wildcard arm — so a
+/// new [`ExprKind`] fails to compile here rather than silently answering
+/// `false` for a form that can perform. That is the whole reason the flag lives
+/// in this walker instead of one of its own.
+#[derive(Default)]
+struct Refs<'a> {
+    names: Vec<&'a QName>,
+    /// A `perform` or a `handle` written anywhere in this body, lambdas
+    /// included. Not a claim that either one runs: a `perform` inside a lambda
+    /// nothing calls sets this too, which costs a definition its entry into a
+    /// compiled body and never the other way round.
+    effects: bool,
+}
+
+impl<'a> Refs<'a> {
+    fn of(e: &'a Expr) -> Refs<'a> {
+        let mut out = Refs::default();
+        collect_refs(e, &mut out);
+        out
+    }
+
+    fn bare(&self) -> impl Iterator<Item = &&'a QName> {
+        self.names.iter().filter(|q| q.is_bare())
+    }
+}
+
 /// Grows for the same reason [`Infer::infer`] does: it walks the same tree, so a
 /// chain deep enough to need the growth there needs it here too.
-fn collect_refs<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
+fn collect_refs<'a>(e: &'a Expr, out: &mut Refs<'a>) {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, || collect_refs_inner(e, out))
 }
 
-fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
+fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Refs<'a>) {
     match &e.kind {
         ExprKind::Lit(_) => {}
-        ExprKind::Var(q) => out.push(q),
+        ExprKind::Var(q) => out.names.push(q),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_refs(lhs, out);
             collect_refs(rhs, out);
@@ -5798,12 +5965,16 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Vec<&'a QName>) {
         ExprKind::Record { fields } => fields.iter().for_each(|(_, v)| collect_refs(v, out)),
         ExprKind::Field { base, .. } => collect_refs(base, out),
         ExprKind::List { items } => items.iter().for_each(|i| collect_refs(i, out)),
-        ExprKind::Perform { args, .. } => args.iter().for_each(|a| collect_refs(a, out)),
+        ExprKind::Perform { args, .. } => {
+            out.effects = true;
+            args.iter().for_each(|a| collect_refs(a, out));
+        }
         ExprKind::Handle {
             body,
             clauses,
             return_clause,
         } => {
+            out.effects = true;
             collect_refs(body, out);
             clauses.iter().for_each(|c| collect_refs(&c.body, out));
             if let Some(rc) = return_clause {

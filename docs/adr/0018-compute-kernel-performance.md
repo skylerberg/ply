@@ -375,6 +375,15 @@ the real mechanism behind a per-function regression `RESULTS.md` §3 blamed on i
 own filter; and a definition that discharges its own effects publishes an empty
 row, so the seam's purity gate clears it and offers it (item 11).
 
+> **Both are closed now (2026-08-24), and the sentence above is left as it was
+> written.** Item 12 was fixed by `Ctx::end` clearing the arena at the end of the
+> entry that filled it. Item 11 was fixed by publishing a second fact rather
+> than a second row: `ply_core::DefInfo::internally_effectful`, transitive over
+> the call graph, refused at the seam by `Gate::InternalEffects`. "The seam's
+> purity gate" is now two gates, and a definition that discharges its own
+> effects is refused by the second one while its empty published row — which is
+> correct, since nothing escapes — clears the first.
+
 ### Nothing here ships, and that is the load-bearing sentence
 
 **No shipping command can install a backend.** `Compiled` and `set_compiled`

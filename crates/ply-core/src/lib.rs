@@ -175,6 +175,31 @@ pub struct DefInfo {
     /// interface: a spec is erased from the definition's hash, so a spec edit
     /// does not move it and gate 2 would otherwise skip a clause that changed.
     pub spec: Vec<SpecInfo>,
+    /// Whether running this definition can execute a `perform` that
+    /// [`DefInfo::footprint`] does not show.
+    ///
+    /// An atom performed inside a call either escapes — and then the published
+    /// row carries it — or is discharged by a `handle` inside the call, and then
+    /// no row anywhere records that it happened. The second kind is invisible to
+    /// [`DefInfo::footprint`] and to [`DefInfo::performed`] alike, because row
+    /// inference discharges it. This is the fact that distinguishes such a
+    /// definition from a genuinely pure one, and it is what
+    /// `ply_eval::compiled::admit` reads: a native body performs nothing, so
+    /// entering one in place of a definition that performs and handles its own
+    /// operations loses every atom it would have recorded.
+    ///
+    /// **Transitive, and it has to be.** A definition that merely *calls* one
+    /// that discharges its own effects publishes an empty row too and is written
+    /// with neither `perform` nor `handle`, so a per-body syntactic bit clears
+    /// it and loses exactly the same atoms. True here means "this body is
+    /// written with `perform` or `handle`, or something reachable from it is".
+    ///
+    /// **True is the safe value and it is the default.** Inference constructs
+    /// every `DefInfo` with this set, and only `Checker::mark_internal_effects`
+    /// lowers it, for a definition it positively cleared. A definition nothing
+    /// walked — a module gate 1 skipped, an `ExprKind` a future scan forgets —
+    /// stays refused rather than becoming enterable.
+    pub internally_effectful: bool,
     pub span: Span,
 }
 

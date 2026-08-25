@@ -580,6 +580,10 @@ effect set Web
             row_aliases: aliases.iter().copied().map(Symbol::new).collect(),
             constraints: Vec::new(),
             spec: Vec::new(),
+            // Provenance rendering reads the two rows and nothing else. `true`
+            // rather than `false` because it is the value inference constructs
+            // and the value a reader should have to justify lowering.
+            internally_effectful: true,
             span: ply_span::Span::DUMMY,
         }
     }
