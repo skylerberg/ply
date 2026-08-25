@@ -1671,6 +1671,28 @@ place. It also reaches past the seam: `ply-test` reads a declared-but-unobserved
 atom as "a branch was not taken", so an entered definition would say a branch was
 not taken when it was.
 
+> **Audit note (item 11's fix, 2026-08-24): the finding held, its last sentence
+> did not.** The bullet above is left as R5's review wrote it. Two corrections.
+>
+> The finding is **fixed**: `ply_core::DefInfo::internally_effectful` is a
+> second published fact — transitive over the call graph, because
+> `fn wrapper(x) = handled(x)` publishes two empty rows and performs anyway —
+> and `ply_eval::compiled::admit` refuses on it as its own `Gate` variant. The
+> bullet's own diagnosis, *"No published row can close it"*, is why the fix is
+> not a row.
+>
+> The last sentence — *"It also reaches past the seam: `ply-test` reads a
+> declared-but-unobserved atom as "a branch was not taken", so an entered
+> definition would say a branch was not taken when it was."* — is **withdrawn**.
+> It does not follow: entering a body can only lose atoms discharged *inside*
+> it, an escaping atom is refused by the row gate one line earlier, and a
+> discharged atom is in no declared row anywhere — so no *declared* atom can go
+> missing this way. The cost is an `observed_footprint` that under-reports a
+> run, which is a wrong answer to a user but not that one. And no report has
+> ever carried one: nothing in the workspace constructs a `SliceBuilder`, so
+> `ply test --trace always --json` answers `"causal_slice": null`. That is
+> `CONTRIBUTING.md` item 15, opened by this pass.
+
 **The fourth lens held**, and it held after being executed rather than argued:
 the deletability of the spike, the falsification table's reproducibility, and the
 0-allocation hot-path tax all survived (see §"What was built" above).

@@ -6,10 +6,10 @@ step. This file is what to do *after* that: how to make a change here without
 breaking something, and — the part this project cares about most — how to write
 a claim down.
 
-- [The one rule](#the-one-rule)
+- [The one rule](#the-one-rule) — and [the shape it keeps taking](#the-shape-it-keeps-taking-declared-registered-raised-nowhere)
 - [The loop](#the-loop)
 - [Before you open a change](#before-you-open-a-change)
-- [Writing a claim down](#writing-a-claim-down)
+- [Writing a claim down](#writing-a-claim-down) — including [a moving tree invalidates a correctness number](#a-moving-tree-invalidates-a-correctness-number-and-only-an-instrument-says-so)
 - [Adding things](#adding-things) — a diagnostic code, a host handler, an ADR
 - [Where a change is likely to bite](#where-a-change-is-likely-to-bite)
 - [Things known to be broken](#things-known-to-be-broken)
@@ -41,6 +41,29 @@ exactly what stops the next reader looking. The seven:
 The last two were documentation about *correct code*. Correct code does not
 protect you here.
 
+### The shape it keeps taking: declared, registered, raised nowhere
+
+Four of the seven above and two more found since are the same defect wearing
+different clothes — a mechanism that is *named* everywhere a reader would look
+for it and *constructed* nowhere. Counted, so the count is checkable rather than
+rhetorical, and every one of them was found by grepping for the constructor
+rather than by reading the declaration:
+
+| the name | where it is declared | what constructs it |
+| --- | --- | --- |
+| `E0435 DB_SCHEMA_MISMATCH` | `ply-span`'s `codes`, its registry test, and `host.rs`'s reserved list | nothing — §"Do not state a guarantee you have not armed" |
+| W1's footprint check | advertised in the milestone's own report | nothing — it was never armed |
+| M8's mitigation | disclosed beside the unsoundness it was for | nothing that could fire |
+| `AssertionKind::RecursionLimit` | `ply-test/src/slice.rs:268`, mapped at `:284` | nothing — item 14 |
+| `CausalSlice` / `Event::Perform` | `ply-test/src/slice.rs`, rendered by `report.rs`, read by `commands/test.rs:793`, specified by ADR 0004 | nothing outside `tests/bisect_audit.rs` — item 15 |
+
+The check that finds one takes a minute: `grep -rn '<TypeName>::<Variant>'` or
+`grep -rn '<ConstructorFn>' --include=*.rs`, and then read the hits for one that
+is not a test and not the declaration. Do it before you write "X is reported",
+and do it for the thing you are about to *rely on* as well — item 15 was found
+by asking whether item 11's defect could reach a user, and the answer was that
+the route does not exist.
+
 ## The loop
 
 The inner loop is fast; use it. All timings measured on the machine in
@@ -57,8 +80,78 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # 9.5-29 min — 3,690 pass, 0 fail, 5 ignored
+cargo test --workspace                          # 9.5-29 min — 3,696 pass, 0 fail, 5 ignored
 ```
+
+> **Re-taken after item 11's fix (2026-08-24).** The line above read `9.5-29
+> min — 3,690 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
+> --no-fail-fast -- --test-threads=2` now reports **3,696 passed / 0 failed / 5
+> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
+> **1,172.3s real / 1,168.4s user** by `/usr/bin/time -p`, with `fmt --all
+> --check` silent and `clippy --workspace --all-targets` at zero. The wall clock
+> is an upper bound as usual — another agent was building on this machine.
+>
+> **The +6 is all of item 11's, and it was attributed per package rather than
+> subtracted.** An earlier draft of this block hedged — *"The +6 is not
+> attributable to this change alone and is not claimed to be … Reading a
+> per-target diff against a tree that no longer exists is how you would
+> attribute the rest, and this pass did not do it."* — and then named exactly
+> six tests, which is the whole of the +6. The three package counts were taken
+> on both sides while the change was being built, so no diff against a vanished
+> tree is needed:
+>
+> | suite | before | after |
+> | --- | --- | --- |
+> | `cargo test -p ply-eval --lib` | 527 | 531 |
+> | `cargo test -p ply-eval --test differential_corpus` | 5 | 6 |
+> | `cargo test -p ply-core --lib` | 204 | 205 |
+>
+> The 527 is not this pass's word for it either: `compiled.rs`'s test-module
+> header recorded *"a re-run reads 527 green"* when the frame-ceiling change
+> took the 3,690. Four of the six are the effects gate's own — including
+> `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`,
+> the only one that catches a propagation stopping after one hop — one is the
+> corpus test, and one is `ply-core`'s for the duplicate-`fn` hazard
+> `mark_internal_effects` would otherwise panic on.
+>
+> **Taken twice, by two methods, and they agree.** The figure above is one
+> `--workspace` run. It was also taken as `.github/ci-shards.sh`'s four shards,
+> each into its own log, from a `rsync`ed copy under `/tmp` that no other
+> session could reach — `ci-shards.sh verify` reports *13 workspace members,
+> each in exactly one shard*, so the four sum to the workspace:
+>
+> | shard | passed | failed | ignored | binaries | doc-tests | real |
+> | --- | --- | --- | --- | --- | --- | --- |
+> | `core` | 1,528 | 0 | 0 | 41 | 9 | 38.2s |
+> | `cli-eval` | 1,688 | 0 | 1 | 77 | 2 | 240.7s |
+> | `corpus` | 199 | 0 | 3 | 16 | 1 | 235.2s |
+> | `postgres` | 281 | 0 | 1 | 8 | 1 | 44.2s |
+> | **sum** | **3,696** | **0** | **5** | **142** | **13** | **558.2s** |
+>
+> The shard set was run **twice**, on two frozen copies taken either side of the
+> last documentation edit, and the five counts are identical both times
+> (1,528 / 1,688 / 199 / 281 and the 142 + 13 split); only the wall clocks moved
+> — 577.3s the first time, 558.2s the second, which is what a machine with three
+> other agents on it does to a wall clock and does not do to a count. Those are
+> sequential shards from a warm `target/` and are not comparable with the
+> single-run figure above. `PLY_PG_URL` was not set for any of the three runs,
+> so the `postgres` shard's ten live tests passed without running — the gate
+> every unqualified reading in this file was taken under.
+>
+> **Both runs were instrumented and an earlier one was not, which is the part
+> worth copying.** The earlier attempt reported 3,689 / **6 failed**, the six
+> being exactly the tests that go red when `Gate::InternalEffects` is deleted,
+> with the gate present in the file throughout — traced to
+> `crates/ply-core/src/infer.rs` being rewritten *during* the run, so cargo
+> built `ply-core` from a file that was mid-edit. Nothing in the log said so.
+> Who was writing is not established and the honest reading is in §"A moving
+> tree invalidates a correctness number": a background `cargo test --workspace`
+> and a foreground mutation in the same session will do this to you without any
+> second party. The runs above digest every non-`target/`, non-`.ply-cache/`
+> file before and after; the copy's digest was identical across the run
+> (`da4c6109…` for the final one), and its `.rs`, `.ply` and `.toml` matched the
+> worktree's when the run started. Take the digest — a wrong red costs an
+> afternoon, and a wrong **green** is what this file exists to prevent.
 
 **All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
 --all --check` silent and exit 0, `clippy --workspace --all-targets` **zero**
@@ -528,6 +621,96 @@ place — say `UNMEASURED` and check in the raw windows so a reader can re-cut
 them. That is a better artifact than a number of unknown provenance sitting
 where the hole was.
 
+### A moving tree invalidates a correctness number, and only an instrument says so
+
+The section above is about a busy machine invalidating a *timing* number. This
+is the same idea on the other axis, and it was learned the same way — by getting
+a number, believing it for a minute, and then finding out where it came from.
+
+**What happened (2026-08-24, item 11's fix).** Three ways to get a number that
+describes nothing, all three met in one afternoon. Two were measured here and
+the third is reported; they are marked apart because that is the point of the
+section.
+
+**Measured.** A full-suite log summed to **3,744 passed / 0 failed / 6 ignored
+across 144 binaries + 26 doc-test suites**, which is a plausible-looking result
+and is not a result at all: 26 is 13 twice. A `cargo test` that had been killed
+left a shell holding the log file open, a second run redirected to the same
+path, and the file ended up holding both runs. `grep -c '^real'` on it answers
+**2**, and `grep '^     Running' | sort | uniq -d` lists the targets counted
+twice.
+
+**Measured.** The `rsync`ed copy the run was taken in changed its digest during
+the run, with nothing but the suite touching it — because the suite writes into
+the *source* tree: `examples/.ply-cache/frontend.dat` and
+`tests/fixtures/.ply-cache/`. An instrument that cries contamination at its own
+subject is worse than none, which is why the prune list below is part of it.
+
+**Reported, not measured here.** A run that came back **3,689 passed / 6
+failed**, the six being exactly the tests that go red when
+`ply_eval::compiled::Gate::InternalEffects` is deleted, on a tree where the gate
+was present — traced to `crates/ply-core/src/infer.rs` being written *mid-suite*
+at 16:52:35, with a debug `eprintln!` in it. That log is not in this session's
+hands and the figure is not re-takeable, so it is recorded as an account rather
+than as a measurement. The mechanism is worth carrying even so, and the
+uncomfortable half of it is this: a mid-suite write does not need a mystery
+agent. Editing a file to run one targeted mutation while a background
+`cargo test --workspace` is still in flight does it to you, and that is the
+likeliest reading of this one.
+
+**The rule.** A suite run is a claim about *a state of the tree*, so name the
+state:
+
+- **Run verification in a frozen copy, not in the tree you are editing.** It
+  costs one `rsync` and it makes the claim attributable:
+
+  ```
+  rsync -a --exclude 'target/' --exclude '.git' --exclude '.ply-cache' \
+    ~/.worktrees/ply/<branch>/ /tmp/<branch>-frozen/
+  cd /tmp/<branch>-frozen && CARGO_INCREMENTAL=0 cargo test --workspace ...
+  ```
+
+- **Digest the copy before and after anyway.** Prevention is what gets you a
+  number; detection is what tells you a number is void. You want both, because
+  a copy proves nothing if you cannot show it did not move:
+
+  ```
+  find . -path ./target -prune -o -type f \
+      \( -name '*.rs' -o -name '*.ply' -o -name '*.toml' \) -print0 \
+    | sort -z | xargs -0 shasum -a 256 | shasum -a 256
+  ```
+
+  **Prune `target/` and `.ply-cache/`**, or the instrument reports your own run
+  as contamination. Cargo writes `.rs`, `.json` and `.toml` under `target/`; and
+  the suite writes **into the source tree** — `examples/.ply-cache/frontend.dat`
+  and `tests/fixtures/.ply-cache/` appear where no `.gitignore`d build directory
+  is. Both were found by a digest that flagged a copy nothing but the suite had
+  touched. Check the instrument the way you would check any other: take the
+  digest twice with the tree held still and require the two to match *before*
+  trusting a mismatch.
+
+- **Write the log somewhere only this run can write, and check it holds one
+  run.** A killed `cargo test` can leave a shell that still has the log open, so
+  a second run redirecting to the same path produces a file with two runs
+  interleaved in it — and the summing pipeline reads it as one. That is how
+  **3,744 passed / 0 failed / 6 ignored across 144 binaries + 26 doc-test
+  suites** happened here: 26 is 13 twice. `grep -c '^real'` on the log is the
+  one-line check — more than one means the file is a mixture and every count
+  taken from it is void.
+
+- **The same trap, one scale down**, is already recorded in
+  `crates/ply-eval/src/compiled.rs`'s test-module header: cargo fingerprints on
+  second-granular mtimes, so a mutation and a `cargo test` inside the same
+  second can be served the *previous* mutation's artifact. That guard covers one
+  mutation cycle; this one covers a whole suite. Both are the same sentence — a
+  test result describes the bytes that were compiled, not the bytes on disk when
+  you read the summary.
+
+None of the three is detectable after the fact without the instrument, which is
+the whole reason to arm it before you need it. And the cheapest rule of all:
+while a suite is running, do not touch the tree it is reading — start it in a
+copy and leave the copy alone.
+
 ### Say how it was checked, or say it was not
 
 Every number gets a provenance: the machine, the profile, the command, and
@@ -780,6 +963,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
+| `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
 | any public signature | `CONTRACTS.md`, which no test reads |
 | `examples/desk.ply` | `examples/serve.sh`, whose `rewrite()` (`serve.sh:103-112`) matches exact source lines with `grep -qF` and aborts loudly if one is missing — that abort is deliberate and is the good case. How many lines it rewrites depends on the mode: `--memory` rewrites two (`:122` and `:125`), `--tls` rewrites one (`:127`), and a plain `--db` run rewrites none |
 
@@ -1059,8 +1243,11 @@ Recorded here so nobody spends an afternoon rediscovering them.
     > level, and 5,365 MiB at 1,350,000, which is 4,167 and so does not sit on
     > that line. There is no cheaper witness that crosses a ceiling of a million,
     > so the tree-walker is run **once** and every other leg is a machine.
-11. **A definition that discharges its own effects publishes an empty row, so
-    the compiled seam's purity gate clears it and the machine offers it.** Latent
+11. ~~**A definition that discharges its own effects publishes an empty row, so
+    the compiled seam's purity gate clears it and the machine offers it.**~~
+    **Fixed (2026-08-24).** The entry as written is kept below; what was wrong
+    about it is the last sentence of the block after it, not the diagnosis.
+    Latent
     rather than live, and reported because the design claims otherwise.
     `crates/ply-codegen-spike/tests/fixtures/hazards/effects.ply`'s `handled`
     performs two operations and handles them under its own `handle`, inside its
@@ -1080,6 +1267,99 @@ Recorded here so nobody spends an afternoon rediscovering them.
     declared-but-unobserved atom as "a branch was not taken", so an entered
     definition would tell a user a branch was not taken when it was.
     `compiled.rs`'s "Effects" bullet is narrowed in place.
+
+    **The fix, and the part of the entry it refutes.** The entry says *"No
+    published row can close it"*, and that is true and is why the fix is not a
+    row. `ply_core::DefInfo::internally_effectful` is a second published fact —
+    "running this can execute a `perform` the row does not show" — and
+    `ply_eval::compiled::admit` refuses on it as `Gate::InternalEffects`, a
+    variant of its own rather than a second way to reach `Gate::PublishedRow`,
+    because a definition this refuses has an *empty* row and folding the two
+    would make the row gate's test satisfiable by this one. That is item 13's
+    failure mode and it is what this fix had to avoid reproducing.
+
+    **What was checked before it was built, because the obvious form of the fix
+    is wrong.** A per-body syntactic bit — "is this body written with `perform`
+    or `handle`" — closes the `handled` case in the entry above and leaves the
+    hole open one call away. Measured, not reasoned: with
+    `fn wrapper(x) = handled(x)`, inference publishes an empty `footprint`
+    **and** an empty `performed` for `wrapper`, `wrapper` is written with
+    neither keyword, and running it records `state.read` in `ply_eval::Trace`.
+    Every fact `wrapper` carries about its own text is a fact a pure definition
+    carries. So the bit is transitive over the call graph:
+    `Checker::mark_internal_effects` (`crates/ply-core/src/infer.rs`) seeds it
+    from `Refs::effects` — set in `collect_refs_inner`'s `Perform` and `Handle`
+    arms, in an exhaustive `match` with no wildcard, so a new `ExprKind` fails
+    to compile rather than silently answering "pure" — and propagates it to a
+    fixpoint over reverse edges.
+    `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`
+    holds that at four hops, through a mutually recursive pair whose entry point
+    is one member, and through a call reached only from a lambda in a `let`. A
+    one-pass propagation passes every other test in the block and fails that one.
+
+    **Polarity, which is the other thing that had to be right.** Every `DefInfo`
+    is constructed with the flag **set** and only `mark_internal_effects` lowers
+    it, for a definition it positively cleared — so "nothing walked this" and
+    "do not enter this" are one answer. `driver.rs`'s `restore_skipped` seeds
+    `true` for the same reason: a module gate 1 skipped has no AST, and by gate
+    1's own import rule nothing a run can call is restored that way.
+
+    **The corpus half of item 13's third bullet closes with it.**
+    `tests/fixtures/self_handled_effect.ply` is the first corpus in the tree
+    that declares an effect and discharges it, so `differential_corpus.rs`
+    reaches both effect gates over real source instead of over doubles.
+
+    **What is not closed, stated because the entry claims it.** The entry says
+    an entered definition *"would tell a user a branch was not taken when it
+    was"*. That does not follow and is withdrawn: entering a body can only lose
+    atoms **discharged inside** it, an escaping atom is refused by the row gate
+    one line earlier, and a discharged atom is in no declared row anywhere — so
+    no *declared* atom can go missing this way. The real cost is an
+    `observed_footprint` that under-reports a run. And that cost cannot be paid
+    today for an unrelated reason: nothing populates a `CausalSlice` at all —
+    see item 15. One thing found while checking it **is** a live wrong claim and
+    is corrected in place: `slice.rs`'s comment on `CausalSlice::observed` said
+    the observed atoms are *"a subset of the declared footprint"*, and they are
+    not — both engines record every `perform`, including one a `handle` inside
+    the call discharges, and discharging is what keeps an atom out of a row.
+
+    **"Latent rather than live" was right about the outcome and wrong about the
+    reason, and the reason matters.** The entry says *"Nothing stops it today
+    except that the only backend in the tree refuses `handle` at compile time"*.
+    On this tree what stops it is the **argument shape**. `examples/desk.ply`
+    has **11** definitions that are this defect — `desk.under` is
+    `handle { .. } with { signal.stopping() -> false }` under an empty published
+    row, and ten more reach it — so the corpus a reader is meant to learn from
+    is full of them, not just a spike fixture. They are never offered because
+    they take and return records, lists and closures, and `Gate::ArgumentShape`
+    precedes both effect gates. Measured: with `differential_corpus.rs`'s
+    tree-walking backend over every corpus in the tree except the new fixture,
+    the counters read **18,772 entered / 101,567 declined over 1,011 tests**
+    with the new gate and **18,772 / 101,567** without it. The gate is free on
+    everything that exists here; what it costs is a definition that both
+    discharges its own effects and takes scalars, which is what the fixture is.
+
+    **One thing the fix nearly got wrong, recorded because it was found by
+    reading and not by the suite.** `mark_internal_effects` indexes definitions
+    by program-wide name, and the first draft let a module's *second* `fn f`
+    overwrite the first one's index with one no vector had. `E0105` is reported
+    after this pass runs, so that is reachable source, and every
+    duplicate-definition fixture in the tree is **pure** — which survives it,
+    because `&&` short-circuits the out-of-bounds read. Written with `handle`,
+    the same program panicked the checker: `index out of bounds: the len is 1
+    but the index is 1`. A user would have got a crash where `E0105` belongs.
+    `a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_effect`
+    in `ply-core`'s tests is the standing form.
+
+    **It over-approximates and the size is measured.** An edge is any reference
+    naming a definition of this program, minus the definition's own parameters —
+    those shadow a global of the same name for the whole body. Locals bound
+    further in are not resolved away, so a lambda parameter or a `let` binder
+    that shadows a definition's name still draws that edge; the error is always
+    "refuse something enterable" and never the reverse. On `examples/` the
+    parameter subtraction is the difference between 29 refusals and 11, and the
+    eighteen were one shape: `desk.item_named(shelf, ..)` folds over its own
+    parameter and `desk` also declares `fn shelf`.
 12. ~~**Every entry into the spike's backend costs O(the *previous* entry's peak
     arena).**~~ **Fixed (2026-08-24), and re-measured the way it was found.**
     `Ctx::begin` no longer touches the arena: `Ctx::end` clears it at the end of
@@ -1215,11 +1495,17 @@ Recorded here so nobody spends an afternoon rediscovering them.
     > multiplies both terms at once: more slots per entry, and a drop per slot
     > that is two orders of magnitude dearer. Item 12 is cheap to fix now and
     > expensive to leave until after the widening it most affects.
-13. **Three holes in what polices the compiled seam; one of the three is now
-    half closed.** Recorded together because each is a green result over space
-    nothing exercises. The unarmed name gate under the third bullet is fixed and
-    the bullet says so; the other two holes, and the corpus half of the third,
-    are open.
+13. **Three holes in what polices the compiled seam; two of the three are now
+    closed.** Recorded together because each is a green result over space
+    nothing exercises.
+
+    > **Re-headed (2026-08-24).** This read: *"one of the three is now half
+    > closed … The unarmed name gate under the third bullet is fixed and the
+    > bullet says so; the other two holes, and the corpus half of the third,
+    > are open."* The budget-ignoring backend closed, and item 11's fix closed
+    > the corpus half of the third bullet — `tests/fixtures/self_handled_effect.ply`
+    > is a corpus that reaches the seam's effect gates. **The first bullet is
+    > the one still open**, and it is open on purpose.
 
     - **`ply test --engine both` cannot install a backend at all.** Still true
       and deliberately not fixed here — wiring a backend into the CLI is gated on
@@ -1261,12 +1547,26 @@ Recorded here so nobody spends an afternoon rediscovering them.
       `exceeds-budget=4` was **not** re-taken: one `--mutate` corpus run costs
       4m46s at this load and the bounded form was killed after twenty minutes, so
       R5's figure stands as R5 took it.
-    - **The published-row gate is untestable by every corpus in the tree.**
-      `benches/kernel` declares no effect at all and `ply-eval`'s differential
-      corpus declines effectful names, so if that gate regresses both corpora
-      report success. Unit tests in `ply_eval::compiled` are the only thing that
-      notices. **Still open**: no corpus in the tree exercises this gate, and
-      adding one means a corpus that declares an effect.
+    - ~~**The published-row gate is untestable by every corpus in the tree.**~~
+      **Closed (2026-08-24), by item 11's fix.** It read: *"`benches/kernel`
+      declares no effect at all and `ply-eval`'s differential corpus declines
+      effectful names, so if that gate regresses both corpora report success.
+      Unit tests in `ply_eval::compiled` are the only thing that notices.
+      **Still open**: no corpus in the tree exercises this gate, and adding one
+      means a corpus that declares an effect."* Adding one is what happened:
+      `tests/fixtures/self_handled_effect.ply` declares `effect tally`, performs
+      both of its operations and discharges both under its own `handle`, so its
+      `handled` and `wrapper` are refused by the effects gate on the corpus
+      path, and its `measured` publishes a row that is not empty, which is what
+      the row gate reads. The row is what the test asserts, not the gate: a
+      corpus run counts declines and does not record which gate produced one. Deleting the effects gate and running
+      `cargo test -p ply-eval --test differential_corpus` reads **4 passed, 2
+      failed** — `a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk`
+      and `a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`
+      — with `observed footprint — left {self_handled_effect.tally.read[log],
+      self_handled_effect.tally.write[log]}, right {}`. `benches/kernel` still
+      declares no effect; that half of the bullet is unchanged, which is why the
+      fixture is in `tests/fixtures/`.
 
       The unarmed-gate half of this bullet is **closed**. It read: replacing
       `let name = closure.name.as_ref()?` with a fabricated empty `Symbol` left
@@ -1299,10 +1599,54 @@ Recorded here so nobody spends an afternoon rediscovering them.
     **not** fixed, because deciding whether the fix is to construct the variant
     or to delete it is a `ply-test` design call and this change was in
     `ply-eval`.
+15. **Nothing populates a `CausalSlice`, so `--trace` reports nothing.** Found
+    2026-08-24 while checking whether item 11's seam defect could reach a user
+    through `ply-test`. It cannot, and neither can anything else: the causal
+    slice is the fifth "declared, registered, raised nowhere" this file records;
+    §"The shape it keeps taking" counts them.
+    `ply_test::SliceBuilder` is constructed in exactly one place in the
+    workspace — `crates/ply-test/tests/bisect_audit.rs`, four times, all tests —
+    and `grep -rn 'Event::Perform' --include=*.rs` matches only `slice.rs`'s own
+    `match` arm and its own unit test. `Attribution::slice` starts `None`
+    (`ply-test/src/lib.rs:305`) and its only writer is
+    `attribution.resolve(bisection, evidence.slice)` (`diagnose.rs:109`), whose
+    `evidence.slice` is `failure.attribution.slice.clone()` (`lib.rs:1331`) —
+    itself. Measured rather than read:
 
-Items 9 and 10 are closed; see the block at the end of item 10 for the fix, the
-measurements behind it and the tests that arm it. Items 11, 12, 13 and 14 are
-open.
+    ```
+    $ ./target/debug/ply test tests/fixtures/assertion_failed.ply --trace always --json \
+        | python3 -c 'import sys,json; d=json.load(sys.stdin); \
+            print([ (f["key"], f.get("causal_slice")) for f in d["failures"] ])'
+    [('assertion_failed.the running total of the journal', None)]
+    ```
+
+    The pipe is there because the field is `null` in a report of a few hundred
+    lines and "I did not see it" is not the same reading as "it is null".
+
+    Consequences worth knowing. `ply-cli/src/commands/test.rs:793`'s
+    `if let Some(slice) = &failure.attribution.slice` branch — the `ran: a → b →
+    c` line and the "the replay did not reproduce this failure" warning — is
+    dead. `Tracing`, `--trace auto|always|never`, `SliceBuilder::DEFAULT_CAP`
+    and the truncation story are all live code with no producer. And ADR 0004's
+    `causal_slice.observed_footprint`, which §"What a failure report carries"
+    presents as the answer to "which branch was taken, and which handler
+    fired", is `null` in every report the shipped binary has ever written.
+    Not fixed here: wiring the tracer is a `ply-test` design call — construct
+    the slice, or delete the type and its `--trace` surface — and this change
+    was in `ply-eval` and `ply-core`. **One thing that was fixed, because it is
+    a claim rather than a gap:** `slice.rs`'s comment on `CausalSlice::observed`
+    said the observed atoms are *"a subset of the declared footprint"*, and that
+    is false the moment the tracer is armed — `ply_eval`'s `Trace` records every
+    `perform` including one a `handle` discharges, so a definition with an empty
+    published row contributes atoms to `observed` that are in no declared row at
+    all. Measured on the fixture item 11's fix added: `handled` publishes `{}`
+    and running it records `{tally.read[log], tally.write[log]}`. Corrected in
+    place, with the withdrawn sentence beside it.
+
+Items 9, 10 and 11 are closed; see the block at the end of item 10 and the one
+at the end of item 11 for the fixes, the measurements behind them and the tests
+that arm them. Items 12, 13, 14 and 15 are open — 12 as fixed-but-listed, 13 in
+its first bullet only.
 
 Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects
@@ -1316,11 +1660,20 @@ longer true, and the current state is:**
 - **9 and 10 are fixed (2026-08-24).** The frame bound was an engine's private
   resource guard rather than semantics; `DEFAULT_MAX_FRAMES` is deleted and
   `Machine::with_max_frames` is an opt-in ceiling no shipping command sets.
-- **11 is open.** A definition that discharges its own effects still publishes an
-  empty row, so the seam's purity gate still clears it.
+- ~~**11 is open.** A definition that discharges its own effects still publishes
+  an empty row, so the seam's purity gate still clears it.~~ **11 is fixed
+  (2026-08-24).** It still publishes an empty row — correctly, since nothing
+  escapes — and the seam no longer reads the row alone.
+  `DefInfo::internally_effectful` is a second published fact, transitive over
+  the call graph, and `Gate::InternalEffects` refuses on it. The corpus half of
+  13's third bullet closed with it.
 - **12 is fixed (2026-08-24).** `Ctx::begin` no longer walks the previous entry's
   arena; `Ctx::end` clears it at the end of the entry that filled it, and the
   shrink is amortized over `SHRINK_EVERY` entries.
+- **13's third bullet is now fully closed** — the unarmed-gate half by the six
+  per-gate tests, the corpus half by `tests/fixtures/self_handled_effect.ply`.
+- **15 is open and is not mine to fix.** Nothing constructs a `SliceBuilder`, so
+  every `causal_slice` the binary has ever emitted is `null`.
 - **13 is two-thirds closed.** The unarmed name gate and the budget-ignoring
   backend that used to take the process down uncaught are both fixed. The first
   bullet — no shipping command can install a backend — is deliberately left

@@ -125,14 +125,25 @@ fn world_independent(value: &Value, depth: u32) -> bool {
 ///
 /// For the memo the caller has already established that the closure takes no
 /// parameters; this is the rest of it. It is also the necessary — never
-/// sufficient — purity gate `Machine::compiled_answer` reads before entering a
-/// compiled body: see this module's note for what an empty row still permits,
-/// and `compiled.rs` for why an allocation it still permits is unobservable
-/// outside a `simulate` region.
+/// sufficient — first of the two purity gates `compiled::admit` reads before
+/// entering a compiled body: see this module's note for what an empty row still
+/// permits, and `compiled.rs` for why an allocation it still permits is
+/// unobservable outside a `simulate` region.
 ///
 /// `constraints` disqualifies a `where derivable(..)` definition. Evaluation is
 /// type-erased, so such a definition is a constant too, but the exclusion costs
 /// nothing and keeps the rule readable as a sentence about the signature.
+///
+/// This rule is **not** enough for the compiled seam, and deliberately still is
+/// enough here. A definition that performs its operations and discharges them
+/// under its own `handle` publishes an empty row and clears this. Entering a
+/// native body for it loses every atom it would have recorded, which is why
+/// `compiled::admit` reads a second fact
+/// (`ply_core::DefInfo::internally_effectful`) beside this one. Substituting a
+/// remembered **value** does not: the first call ran the body and
+/// `ply_eval::Trace` recorded its atoms, so what a memo hit costs is a repeat of
+/// the same atoms and not the footprint. Both engines consult this memo, so
+/// `--engine both` sees the same count on both sides either way.
 pub(crate) fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))

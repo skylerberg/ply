@@ -3475,3 +3475,27 @@ fn a_clause_and_a_law_may_name_an_imported_definition() {
         "app.quadrupling is doubling twice"
     );
 }
+
+/// `mark_internal_effects` indexes definitions by program-wide name, and a
+/// module that declares one twice is `E0105` — a diagnostic this pass runs
+/// *before*, not after. Its second entry has to reuse the first one's node
+/// instead of claiming an index no vector has.
+///
+/// Written after the first draft did claim one. It answered `E0105` for a
+/// duplicated *pure* definition, because the effect flag short-circuits the
+/// out-of-bounds read, and panicked with `index out of bounds: the len is 1 but
+/// the index is 1` the moment one of the two bodies was written with `handle`.
+/// Every duplicate-definition fixture in the tree is pure, so nothing else here
+/// covers it.
+#[test]
+fn a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_effect() {
+    let src = "effect s { read g[r]() -> Int }\n\
+               fn balance() -> Int = handle { s.g[r]() } with { s.g[r]() -> 1 }\n\
+               fn balance(o: Int) -> Int = o\n";
+    let diags = check_files_err(&[("m", src)]);
+    assert!(
+        diags.iter().any(|d| d.code == codes::DUPLICATE_DEFINITION),
+        "the checker did not report the duplicate: {}",
+        render(&diags)
+    );
+}
