@@ -15,7 +15,8 @@ use anyhow::{Result, anyhow};
 use cranelift_codegen::Context as ClifContext;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind, types,
+    AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
+    types,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -76,7 +77,14 @@ struct Helpers {
     equal: FuncId,
     builtin: FuncId,
     ctor: FuncId,
+    list: FuncId,
+    list_fits: FuncId,
+    list_at: FuncId,
+    list_rest: FuncId,
+    ctor_is: FuncId,
+    ctor_arg: FuncId,
     record: FuncId,
+    field: FuncId,
     no_fuel: FuncId,
 }
 
@@ -143,6 +151,7 @@ pub struct Jit {
     consts: Vec<Value>,
     ctors: Vec<(Symbol, usize)>,
     shapes: Vec<Vec<Symbol>>,
+    fields: Vec<Symbol>,
     builtins: Vec<Builtin>,
     funcs: HashMap<String, (FuncId, usize, usize)>,
     helpers: Helpers,
@@ -208,6 +217,7 @@ impl Jit {
                 consts: jit.consts,
                 ctors: jit.ctors,
                 shapes: jit.shapes,
+                fields: jit.fields,
                 builtins: jit.builtins,
             }),
             nodes: jit.nodes,
@@ -303,7 +313,14 @@ impl Jit {
             equal: declare(&mut module, "rt_equal", 3, true)?,
             builtin: declare(&mut module, "rt_builtin", 4, true)?,
             ctor: declare(&mut module, "rt_ctor", 4, true)?,
+            list: declare(&mut module, "rt_list", 3, true)?,
+            list_fits: declare(&mut module, "rt_list_fits", 4, true)?,
+            list_at: declare(&mut module, "rt_list_at", 3, true)?,
+            list_rest: declare(&mut module, "rt_list_rest", 3, true)?,
+            ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
+            ctor_arg: declare(&mut module, "rt_ctor_arg", 3, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
+            field: declare(&mut module, "rt_field", 3, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
         };
 
@@ -313,6 +330,7 @@ impl Jit {
             consts: Vec::new(),
             ctors: loaded.ctors(),
             shapes: Vec::new(),
+            fields: Vec::new(),
             builtins: Vec::new(),
             funcs: HashMap::new(),
             helpers,
@@ -581,6 +599,20 @@ impl Fx<'_, '_> {
         .into())
     }
 
+    /// The index of a field name in the unit's table, added on first use.
+    ///
+    /// Deduplicated because a body reads the same name repeatedly —
+    /// `benches/kernel`'s `expand` reads seven fields of one record twice — and
+    /// a table with a row per *occurrence* would grow with the program rather
+    /// than with its vocabulary.
+    fn field_index(&mut self, name: &Symbol) -> i64 {
+        if let Some(i) = self.jit.fields.iter().position(|f| f == name) {
+            return i as i64;
+        }
+        self.jit.fields.push(name.clone());
+        (self.jit.fields.len() - 1) as i64
+    }
+
     fn intern(&mut self, value: Value) -> i64 {
         self.jit.consts.push(value);
         -(self.jit.consts.len() as i64)
@@ -820,7 +852,7 @@ impl Fx<'_, '_> {
 
     fn expr(&mut self, code: &Code, scope: &mut Scope) -> Result<Val> {
         match &code.kind {
-            NodeKind::Lit(lit, _) => Ok(self.literal(lit)),
+            NodeKind::Lit(lit, _) => self.literal(lit),
 
             NodeKind::Var(q) => match self.denotation(q, scope)? {
                 Denotes::Local(v) => Ok(v),
@@ -843,9 +875,27 @@ impl Fx<'_, '_> {
                             v,
                         })
                     }
-                    // `-x` is `Int`, `Float` or `Decimal` and this fragment
-                    // cannot tell which, so it refuses rather than guesses.
-                    UnOp::Neg => self.refuse("unary `-`"),
+                    // `Int` like the rest of the fragment: `as_int` refuses a
+                    // `Float` or `Decimal` operand at run time and the entry
+                    // declines, which is what every other arithmetic node here
+                    // already does. `i64::MIN` is the one input `checked_neg`
+                    // rejects, and `ply_eval::apply_unary` raises there too.
+                    UnOp::Neg => {
+                        let a = self.as_int(value);
+                        let overflowed = self.builder.create_block();
+                        let ok = self.builder.create_block();
+                        let is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
+                        self.builder.ins().brif(is_min, overflowed, &[], ok, &[]);
+                        self.builder.switch_to_block(overflowed);
+                        self.builder.seal_block(overflowed);
+                        let what = self.builder.ins().iconst(types::I64, 2);
+                        self.helper_void(self.jit.helpers.overflow, &[what]);
+                        self.builder.ins().jump(self.failure, &[]);
+                        self.builder.switch_to_block(ok);
+                        self.builder.seal_block(ok);
+                        let v = self.builder.ins().ineg(a);
+                        Ok(Val { kind: Kind::Int, v })
+                    }
                 }
             }
 
@@ -948,8 +998,35 @@ impl Fx<'_, '_> {
             }
 
             NodeKind::Lambda { .. } => self.refuse("a lambda"),
-            NodeKind::Field { .. } => self.refuse("a field access"),
-            NodeKind::List { .. } => self.refuse("a list literal"),
+
+            NodeKind::Field { base, field } => {
+                let base = self.expr(base, scope)?;
+                let base = self.boxed(base);
+                let index = self.field_index(&field.name);
+                let index = self.builder.ins().iconst(types::I64, index);
+                let v = self.helper(self.jit.helpers.field, &[base, index]);
+                self.check();
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
+
+            NodeKind::List { items } => {
+                let mut handles = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let v = self.expr(item, scope)?;
+                    let h = self.boxed(v);
+                    handles.push(h);
+                }
+                let ptr = self.spill(&handles);
+                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let v = self.helper(self.jit.helpers.list, &[ptr, n]);
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
             NodeKind::Perform { effect, op, .. } => {
                 self.refuse(format!("`perform {}.{}`", effect.symbol(), op))
             }
@@ -977,29 +1054,49 @@ impl Fx<'_, '_> {
         }
     }
 
-    fn literal(&mut self, lit: &Lit) -> Val {
+    /// A literal, or a refusal for the two the fragment has no arithmetic for.
+    ///
+    /// `Float` and `Decimal` are refused **here**, at the literal, because
+    /// neither of the two filters that guard this boundary reads a body:
+    /// `entry::scalar_signature` sees `Int -> Int` and the value boundary sees
+    /// an `Int` argument, so a `1.5` inside an `Int -> Int` body passed both and
+    /// was compiled, registered and offered. It could not produce a wrong answer
+    /// — the constant met `rt_unbox_int` and the entry declined — but a census
+    /// counted it as compiled and the fragment claimed a coverage it did not
+    /// have, which is the defect ADR 0018 §0 records.
+    ///
+    /// Refusing is the choice rather than building a `Float` path: a real one
+    /// widens the agreement surface by `NaN`, by `-0.0`, by float equality and
+    /// by `Decimal` precision, and the workload this fragment is being widened
+    /// for — a self-hosted front end — is field accesses and list patterns, not
+    /// floating point.
+    ///
+    /// **This closes the literal-shaped half only.** A `Float` reaching an
+    /// `Int` -> `Int` body as a *builtin's return value* is not refused by
+    /// anything here; it still meets `rt_unbox_int` and still declines. See
+    /// `tests/hazards.rs::a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer`.
+    fn literal(&mut self, lit: &Lit) -> Result<Val> {
         match lit {
-            Lit::Int(i) => Val {
+            Lit::Int(i) => Ok(Val {
                 kind: Kind::Int,
                 v: self.builder.ins().iconst(types::I64, *i),
-            },
-            Lit::Bool(b) => Val {
+            }),
+            Lit::Bool(b) => Ok(Val {
                 kind: Kind::Bool,
                 v: self.builder.ins().iconst(types::I64, i64::from(*b)),
-            },
+            }),
+            Lit::Float(_) => self.refuse("a `Float` literal, which the fragment has no path for"),
+            Lit::Decimal { .. } => {
+                self.refuse("a `Decimal` literal, which the fragment has no path for")
+            }
             other => {
                 let value = match other {
                     Lit::Str(s) => Value::str(s),
                     Lit::Bytes(b) => Value::bytes(b),
-                    Lit::Float(f) => Value::Float(*f),
-                    Lit::Decimal { mantissa, scale } => Value::Decimal(
-                        ply_eval::Decimal::try_from_i128_with_scale(*mantissa, *scale)
-                            .unwrap_or_default(),
-                    ),
                     _ => Value::Unit,
                 };
                 let handle = self.intern(value);
-                self.constant(handle)
+                Ok(self.constant(handle))
             }
         }
     }
@@ -1199,6 +1296,252 @@ impl Fx<'_, '_> {
         })
     }
 
+    /// The constructor a name in *pattern* position denotes, resolved the way
+    /// `ply_eval::Machine::ctor_name` resolves it, and `None` for a name that
+    /// denotes nothing — which is what makes it a binder.
+    ///
+    /// Pattern position is not expression position: [`Fx::denotation`] consults
+    /// the local scope and the function table first, and a pattern shadows
+    /// neither. Resolving one with the other is how the two engines came to
+    /// disagree in the first place.
+    fn ctor_of(&self, q: &QName) -> Option<(usize, usize)> {
+        let global = if q.is_bare() {
+            self.loaded
+                .resolved
+                .scopes
+                .get(self.module_index)
+                .and_then(|s| s.get(Namespace::Value, q.symbol()))
+                .map(|b| b.qualified.clone())
+        } else {
+            self.loaded
+                .resolved
+                .lookup(self.module_index, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.clone())
+        };
+        let name = global.or_else(|| {
+            if q.is_bare() && self.jit.ctors.iter().any(|(n, _)| n == q.symbol()) {
+                Some(q.symbol().clone())
+            } else {
+                None
+            }
+        })?;
+        let index = self.jit.ctors.iter().position(|(n, _)| *n == name)?;
+        Some((index, self.jit.ctors[index].1))
+    }
+
+    /// Whether a sub-pattern binds without being able to fail. Only these may
+    /// sit under a constructor pattern: a refutable one would need the arm's
+    /// `miss` edge from inside the block that already committed to the arm.
+    fn irrefutable(&self, pat: &ply_syntax::ast::Pattern) -> bool {
+        match &pat.kind {
+            PatternKind::Wildcard => true,
+            PatternKind::Var(id) => self
+                .ctor_of(&QName::bare(id.clone()))
+                .is_none_or(|(_, arity)| arity != 0),
+            _ => false,
+        }
+    }
+
+    /// The name a sub-pattern binds, and `None` for one that binds nothing —
+    /// a wildcard, or a bare nullary constructor, which is a test rather than a
+    /// binder ([`Fx::test_pattern`]).
+    fn binder(&self, pat: &ply_syntax::ast::Pattern) -> Option<Symbol> {
+        let PatternKind::Var(id) = &pat.kind else {
+            return None;
+        };
+        match self.ctor_of(&QName::bare(id.clone())) {
+            Some((_, 0)) => None,
+            _ => Some(id.name.clone()),
+        }
+    }
+
+    /// The refutable half of a pattern: leave the current block for `hit` when
+    /// it matches and `miss` when it does not.
+    ///
+    /// The `Var` arm consults the constructor table because
+    /// `ply_eval::Machine::matches` does, and the two must not diverge. It is
+    /// **unreachable from Ply source**: `ply_syntax`'s pattern parser sends
+    /// every capitalized bare name to `PatternKind::Ctor` with no arguments and
+    /// only a lowercase one to `PatternKind::Var`, so `None` never arrives here
+    /// as a `Var`. Checked by deleting the lookup and running the suite — all
+    /// green, and a direct `or_else(Some(7), 99)` still answers 7. Kept as the
+    /// cheap half of a mirror rather than advertised as a fix; the assertion
+    /// that carries this lowering is on the `Ctor` arm below.
+    fn test_pattern(
+        &mut self,
+        pat: &ply_syntax::ast::Pattern,
+        value: Val,
+        hit: Block,
+        miss: Block,
+    ) -> Result<()> {
+        match &pat.kind {
+            PatternKind::Wildcard => {
+                self.builder.ins().jump(hit, &[]);
+            }
+            PatternKind::Var(id) => match self.ctor_of(&QName::bare(id.clone())) {
+                Some((index, 0)) => self.test_ctor(value, index, hit, miss),
+                _ => {
+                    self.builder.ins().jump(hit, &[]);
+                }
+            },
+            PatternKind::Lit(lit) => {
+                let literal = self.literal(lit)?;
+                let native = (literal.kind == Kind::Int && value.kind == Kind::Int)
+                    || (literal.kind == Kind::Bool && value.kind == Kind::Bool);
+                let eq = if native {
+                    let a = if value.kind == Kind::Int {
+                        self.as_int(value)
+                    } else {
+                        self.as_bool(value)
+                    };
+                    let b = if literal.kind == Kind::Int {
+                        self.as_int(literal)
+                    } else {
+                        self.as_bool(literal)
+                    };
+                    self.builder.ins().icmp(IntCC::Equal, a, b)
+                } else {
+                    let a = self.boxed(value);
+                    let b = self.boxed(literal);
+                    let eq = self.helper(self.jit.helpers.equal, &[a, b]);
+                    self.check();
+                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, eq, 0)
+                };
+                self.builder.ins().brif(eq, hit, &[], miss, &[]);
+            }
+            PatternKind::List { items, rest } => {
+                if let Some(bad) = items
+                    .iter()
+                    .chain(rest.iter().map(|r| r.as_ref()))
+                    .find(|p| !self.irrefutable(p))
+                {
+                    return self.refuse(format!(
+                        "a {} pattern nested inside a list pattern",
+                        pattern_name(&bad.kind)
+                    ));
+                }
+                let v = self.boxed(value);
+                let len = self.builder.ins().iconst(types::I64, items.len() as i64);
+                let exact = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(rest.is_none()));
+                let fits = self.helper(self.jit.helpers.list_fits, &[v, len, exact]);
+                let fits = self.builder.ins().icmp_imm_s(IntCC::NotEqual, fits, 0);
+                self.builder.ins().brif(fits, hit, &[], miss, &[]);
+            }
+            PatternKind::Ctor { name, args } => {
+                let Some((index, arity)) = self.ctor_of(name) else {
+                    return self.refuse(format!(
+                        "the constructor pattern `{}`, which names nothing this unit knows",
+                        name.symbol()
+                    ));
+                };
+                if args.len() != arity {
+                    return self.refuse(format!(
+                        "the constructor pattern `{}` binds {} of its {arity} fields",
+                        name.symbol(),
+                        args.len()
+                    ));
+                }
+                if let Some(bad) = args.iter().find(|a| !self.irrefutable(a)) {
+                    return self.refuse(format!(
+                        "a {} pattern nested inside the constructor pattern `{}`",
+                        pattern_name(&bad.kind),
+                        name.symbol()
+                    ));
+                }
+                self.test_ctor(value, index, hit, miss);
+            }
+            other => {
+                return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
+            }
+        }
+        Ok(())
+    }
+
+    fn test_ctor(&mut self, value: Val, index: usize, hit: Block, miss: Block) {
+        let v = self.boxed(value);
+        let index = self.builder.ins().iconst(types::I64, index as i64);
+        let is = self.helper(self.jit.helpers.ctor_is, &[v, index]);
+        let is = self.builder.ins().icmp_imm_s(IntCC::NotEqual, is, 0);
+        self.builder.ins().brif(is, hit, &[], miss, &[]);
+    }
+
+    /// The bindings a pattern makes, emitted in the block that has already
+    /// committed to the arm. Every case here was admitted by
+    /// [`Fx::test_pattern`], so a shape it refuses cannot arrive.
+    fn bind_pattern(
+        &mut self,
+        pat: &ply_syntax::ast::Pattern,
+        value: Val,
+        scope: &mut Scope,
+    ) -> Result<()> {
+        match &pat.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Var(id) => {
+                if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))) {
+                    scope.push((id.name.clone(), value));
+                }
+            }
+            PatternKind::Lit(_) => {}
+            PatternKind::List { items, rest } => {
+                let base = self.boxed(value);
+                for (i, item) in items.iter().enumerate() {
+                    if let Some(name) = self.binder(item) {
+                        let i = self.builder.ins().iconst(types::I64, i as i64);
+                        let v = self.helper(self.jit.helpers.list_at, &[base, i]);
+                        self.check();
+                        scope.push((
+                            name,
+                            Val {
+                                kind: Kind::Boxed,
+                                v,
+                            },
+                        ));
+                    }
+                }
+                if let Some(rest) = rest
+                    && let Some(name) = self.binder(rest)
+                {
+                    let from = self.builder.ins().iconst(types::I64, items.len() as i64);
+                    let v = self.helper(self.jit.helpers.list_rest, &[base, from]);
+                    self.check();
+                    scope.push((
+                        name,
+                        Val {
+                            kind: Kind::Boxed,
+                            v,
+                        },
+                    ));
+                }
+            }
+            PatternKind::Ctor { args, .. } => {
+                let base = self.boxed(value);
+                for (i, arg) in args.iter().enumerate() {
+                    let Some(name) = self.binder(arg) else {
+                        continue;
+                    };
+                    let i = self.builder.ins().iconst(types::I64, i as i64);
+                    let v = self.helper(self.jit.helpers.ctor_arg, &[base, i]);
+                    self.check();
+                    scope.push((
+                        name,
+                        Val {
+                            kind: Kind::Boxed,
+                            v,
+                        },
+                    ));
+                }
+            }
+            other => {
+                return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
+            }
+        }
+        Ok(())
+    }
+
     fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], scope: &mut Scope) -> Result<Val> {
         let value = self.expr(scrutinee, scope)?;
         let join = self.builder.create_block();
@@ -1213,48 +1556,11 @@ impl Fx<'_, '_> {
             self.builder.seal_block(next);
             let body_block = self.builder.create_block();
             let after = self.builder.create_block();
-            match &arm.pat.kind {
-                PatternKind::Wildcard => {
-                    self.builder.ins().jump(body_block, &[]);
-                }
-                PatternKind::Var(_) => {
-                    self.builder.ins().jump(body_block, &[]);
-                }
-                PatternKind::Lit(lit) => {
-                    let literal = self.literal(lit);
-                    let native = (literal.kind == Kind::Int && value.kind == Kind::Int)
-                        || (literal.kind == Kind::Bool && value.kind == Kind::Bool);
-                    let eq = if native {
-                        let a = if value.kind == Kind::Int {
-                            self.as_int(value)
-                        } else {
-                            self.as_bool(value)
-                        };
-                        let b = if literal.kind == Kind::Int {
-                            self.as_int(literal)
-                        } else {
-                            self.as_bool(literal)
-                        };
-                        self.builder.ins().icmp(IntCC::Equal, a, b)
-                    } else {
-                        let a = self.boxed(value);
-                        let b = self.boxed(literal);
-                        let eq = self.helper(self.jit.helpers.equal, &[a, b]);
-                        self.check();
-                        self.builder.ins().icmp_imm_s(IntCC::NotEqual, eq, 0)
-                    };
-                    self.builder.ins().brif(eq, body_block, &[], after, &[]);
-                }
-                other => {
-                    return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
-                }
-            }
+            self.test_pattern(&arm.pat, value, body_block, after)?;
             self.builder.switch_to_block(body_block);
             self.builder.seal_block(body_block);
             let mut inner = scope.clone();
-            if let PatternKind::Var(name) = &arm.pat.kind {
-                inner.push((name.name.clone(), value));
-            }
+            self.bind_pattern(&arm.pat, value, &mut inner)?;
             let body = self.expr(&arm.body, &mut inner)?;
             let body = self.boxed(body);
             self.builder.ins().jump(join, &[BlockArg::Value(body)]);

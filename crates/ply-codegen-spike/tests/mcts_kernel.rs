@@ -121,45 +121,119 @@ fn the_fragment_compiles_the_position_arithmetic_and_the_playout() {
             "`{name}` is compiled and cannot be entered, so compiling it buys nothing"
         );
     }
+    // > **Corrected (fragment widening, 2026-08-24).** This read:
+    // >
+    // > ```
+    // > for name in ["mcts.search", "mcts.plan", "mcts.plan_753"] {
+    // >     assert!(
+    // >         !accepted.contains(&name.to_string()),
+    // >         "`{name}` reaches the tree, so a compiled set holding it is not
+    // >          closed under calls"
+    // >     );
+    // > }
+    // > ```
+    // >
+    // > It was true because the tree half was outside the fragment, not because
+    // > these three functions were special: a set holding them was not closed
+    // > under calls *while* `node_at` and the rest were refused. Field access,
+    // > list patterns, unary `-` and list literals now lower, so the closure
+    // > includes them and the assertion inverts.
     for name in ["mcts.search", "mcts.plan", "mcts.plan_753"] {
         assert!(
-            !accepted.contains(&name.to_string()),
-            "`{name}` reaches the tree, so a compiled set holding it is not closed under calls"
+            accepted.contains(&name.to_string()),
+            "`{name}` is outside the fragment ({:?}), so the tree half did not close",
+            refusal(loaded, name)
         );
     }
+    // > **Corrected (fragment widening, 2026-08-24).** This asserted
+    // > `enterable(loaded, &accepted).len() == accepted.len()`, "every accepted
+    // > kernel function is `Int`/`Bool` throughout, so all of them are
+    // > enterable". True while the fragment stopped at the tree: everything it
+    // > accepted was arithmetic over `Int`.
+    // >
+    // > The tree half is accepted now and it is typed in `Tree` and `Node`, so
+    // > accepted (34) and enterable (21) have come apart. That gap is not a
+    // > defect — `entry::scalar_signature` registers `Int`/`Bool` throughout and
+    // > a `Tree` argument has no boundary representation — but it is exactly the
+    // > distinction ADR 0018 §0's census does not draw, so it is asserted as two
+    // > numbers rather than one equality.
+    let enterable_now = enterable(loaded, &accepted).len();
     assert_eq!(
-        enterable(loaded, &accepted).len(),
-        accepted.len(),
-        "every accepted kernel function is `Int`/`Bool` throughout, so all of them are enterable"
+        (accepted.len(), enterable_now),
+        (34, 21),
+        "the kernel compiles {} of 34 functions and the machine may enter {enterable_now} of \
+         them; a change to either number is a change to what widening bought",
+        accepted.len()
     );
+    // The entry points that carry the win: scalar in and scalar out, with the
+    // whole tree behind them.
+    for name in ["mcts.plan", "mcts.plan_753"] {
+        assert!(
+            !enterable(loaded, &[name.to_string()]).is_empty(),
+            "`{name}` is compiled but not enterable, so the tree half compiles and never runs"
+        );
+    }
 }
 
-/// The finding this whole milestone turns on, stated as an assertion: every
-/// function that reads the tree is outside the fragment, and the fragment says
-/// which construct took it out.
+/// Every function that reads the tree is now **inside** the fragment, and this
+/// is the list ADR 0018 §0's ranked census was a census of.
+///
+/// > **Corrected (fragment widening, 2026-08-24).** This test was
+/// > `the_fragment_refuses_every_function_that_touches_the_tree_and_names_why`,
+/// > described as "the finding this whole milestone turns on, stated as an
+/// > assertion: every function that reads the tree is outside the fragment, and
+/// > the fragment says which construct took it out", and it asserted:
+/// >
+/// > ```
+/// > ("mcts.node_at", "a field access"),
+/// > ("mcts.put", "a field access"),
+/// > ("mcts.select", "a field access"),
+/// > ("mcts.expand", "a field access"),
+/// > ("mcts.backprop", "a field access"),
+/// > ("mcts.iterate", "a field access"),
+/// > ("mcts.best_action", "a field access"),
+/// > ("mcts.best_child", "a list pattern in a `match`"),
+/// > ("mcts.most_visited", "a list pattern in a `match`"),
+/// > ("mcts.fresh", "a list literal"),
+/// > ("mcts.empty_node", "unary `-`"),
+/// > ("mcts.root", "unary `-`"),
+/// > ```
+/// >
+/// > Every row was accurate when written. The four constructs are lowered now,
+/// > so every one of these compiles and the refusal set is empty. The list is
+/// > kept, inverted, because it is the thing that has to stay true: a later
+/// > change that puts any of them back outside the fragment should fail here
+/// > naming the function, not silently shrink a census.
 #[test]
-fn the_fragment_refuses_every_function_that_touches_the_tree_and_names_why() {
+fn every_function_that_touches_the_tree_is_inside_the_fragment() {
     let loaded = loaded();
-    for (name, why) in [
-        ("mcts.node_at", "a field access"),
-        ("mcts.put", "a field access"),
-        ("mcts.select", "a field access"),
-        ("mcts.expand", "a field access"),
-        ("mcts.backprop", "a field access"),
-        ("mcts.iterate", "a field access"),
-        ("mcts.best_action", "a field access"),
-        ("mcts.best_child", "a list pattern in a `match`"),
-        ("mcts.most_visited", "a list pattern in a `match`"),
-        ("mcts.fresh", "a list literal"),
-        ("mcts.empty_node", "unary `-`"),
-        ("mcts.root", "unary `-`"),
+    for name in [
+        "mcts.node_at",
+        "mcts.put",
+        "mcts.select",
+        "mcts.expand",
+        "mcts.backprop",
+        "mcts.iterate",
+        "mcts.best_action",
+        "mcts.best_child",
+        "mcts.most_visited",
+        "mcts.fresh",
+        "mcts.empty_node",
+        "mcts.root",
     ] {
         assert_eq!(
-            refusal(loaded, name).as_deref(),
-            Some(why),
-            "`{name}` is not refused for the reason the ranked roadmap says it is"
+            refusal(loaded, name),
+            None,
+            "`{name}` is still outside the fragment"
         );
     }
+    // The whole module, so that a construct nobody listed cannot hide.
+    let all = loaded.functions_in("mcts");
+    let refused = refusals_over(loaded, &all).expect("the module classifies");
+    assert!(
+        refused.is_empty(),
+        "the kernel is not wholly inside the fragment: {refused:?}"
+    );
 }
 
 /// > **Corrected in R5.** This used to enter `mcts.plan` as compiled code and
@@ -237,11 +311,32 @@ fn a_search_the_interpreter_drives_answers_the_same_with_a_backend_attached() {
 /// > `mcts.iterate` (100 entries), `mcts.root` (1), `mcts.best_action` (1).
 ///
 /// Those were *crossings out of* compiled code, taken because the search was
-/// driven from the top. This asserts the inverse: the interpreter drives, and
-/// drops into compiled code at the leaves — `ucb` on every child examined,
-/// `rollout` on every playout, the position arithmetic under both.
+/// driven from the top.
+///
+/// > **Corrected (fragment widening, 2026-08-24).** This test was
+/// > `the_interpreter_enters_compiled_code_at_the_leaves` and asserted 721
+/// > entries spread over seven functions:
+/// >
+/// > ```
+/// > (721, [("mcts.ucb", 375), ("mcts.turn", 105), ("mcts.move_count", 81),
+/// >        ("mcts.apply_move", 40), ("mcts.next_seed", 40),
+/// >        ("mcts.nth_move", 40), ("mcts.rollout", 40)])
+/// > ```
+/// >
+/// > with the description "the interpreter drives, and drops into compiled code
+/// > at the leaves — `ucb` on every child examined, `rollout` on every playout,
+/// > the position arithmetic under both". That was exactly right for a fragment
+/// > that stopped at the tree: `mcts.plan` was refused, so the interpreter had
+/// > to drive the search and could only drop into the arithmetic underneath it.
+/// >
+/// > It is withdrawn because the leaves are no longer the boundary. `mcts.plan`
+/// > is inside the fragment now, so the interpreter enters **once** and the
+/// > whole search — selection, expansion, playout, backpropagation — runs
+/// > natively. 721 crossings became 1. The old numbers are kept above because a
+/// > future change that re-refuses any tree function would restore them, and a
+/// > reader seeing 721 here again should know it means the fragment narrowed.
 #[test]
-fn the_interpreter_enters_compiled_code_at_the_leaves() {
+fn the_interpreter_enters_compiled_code_once_for_the_whole_search() {
     let loaded = loaded();
     let (mut harness, _) = kernel_harness(loaded);
     harness.bodies.reset_counts();
@@ -262,29 +357,12 @@ fn the_interpreter_enters_compiled_code_at_the_leaves() {
     // shows up here as a number rather than as a still-passing inequality.
     assert_eq!(
         (entries, by_name.as_slice()),
-        (
-            721,
-            [
-                ("mcts.ucb".to_string(), 375),
-                ("mcts.turn".to_string(), 105),
-                ("mcts.move_count".to_string(), 81),
-                ("mcts.apply_move".to_string(), 40),
-                ("mcts.next_seed".to_string(), 40),
-                ("mcts.nth_move".to_string(), 40),
-                ("mcts.rollout".to_string(), 40),
-            ]
-            .as_slice()
-        ),
-        "a 40-iteration search entered compiled code {entries} times. Before R5 the whole \
-         run reached three functions and 102 crossings *out of* compiled code, and every \
-         `ucb`, `isqrt` and `rollout` under them ran in the machine (ADR 0018 §0)."
+        (1, [("mcts.plan".to_string(), 1)].as_slice()),
+        "a 40-iteration search entered compiled code {entries} times. One is the whole \
+         search running natively behind a single crossing; 721 spread over seven functions \
+         is the fragment stopping at the tree again, and more than one entry to `mcts.plan` \
+         is the interpreter re-driving a search it should have handed over once."
     );
-    for name in ["mcts.ucb", "mcts.rollout", "mcts.next_seed", "mcts.turn"] {
-        assert!(
-            by_name.iter().any(|(n, c)| n == name && *c > 0),
-            "`{name}` is inside the fragment and was never entered: {by_name:?}"
-        );
-    }
     assert_eq!(
         harness.hybrid.compiled_refusals(),
         0,
@@ -403,17 +481,30 @@ fn a_hybrid_run_records_which_function_each_entry_went_to() {
             .map(|(_, c)| *c)
             .unwrap_or(0)
     };
-    // One playout per iteration, exactly where the old test found one crossing
-    // per iteration — and this is the direction that pays. An entered `rollout`
-    // plays its whole game natively, so the sixty-odd `next_seed`, `nth_move`
-    // and `apply_move` calls inside it are native calls rather than entries.
-    // `next_seed` shows twelve because `iterate` reseeds once per iteration and
-    // those twelve are the only ones the interpreter makes.
+    // > **Corrected (fragment widening, 2026-08-24).** This asserted
+    // > `(count("mcts.rollout"), count("mcts.next_seed")) == (12, 12)` — "a
+    // > 12-iteration search should enter one playout and one reseed per
+    // > iteration" — reasoning that "an entered `rollout` plays its whole game
+    // > natively, so the sixty-odd `next_seed`, `nth_move` and `apply_move`
+    // > calls inside it are native calls rather than entries. `next_seed` shows
+    // > twelve because `iterate` reseeds once per iteration and those twelve are
+    // > the only ones the interpreter makes."
+    // >
+    // > The reasoning was right and its conclusion has moved up one level. The
+    // > same argument now applies to `iterate` itself: `plan_753` is inside the
+    // > fragment, so the interpreter hands over the whole search in one entry
+    // > and makes no `rollout` or `next_seed` call at all. Twelve became zero,
+    // > and the total became one, for the same reason sixty became twelve.
     assert_eq!(
         (count("mcts.rollout"), count("mcts.next_seed")),
-        (12, 12),
-        "a 12-iteration search should enter one playout and one reseed per iteration; the \
+        (0, 0),
+        "the interpreter entered a leaf of a search it should have handed over whole; the \
          entries were {by_name:?}"
+    );
+    assert_eq!(
+        count("mcts.plan_753"),
+        1,
+        "the whole 12-iteration search should be one entry; the entries were {by_name:?}"
     );
     let total: u64 = by_name.iter().map(|(_, c)| *c).sum();
     assert_eq!(

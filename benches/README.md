@@ -657,6 +657,58 @@ is only saying something if it is outside that band.
 Every figure below is in `benches/adr0018-mcts.json`, written by the command at
 the top of this section.
 
+> **Superseded (fragment widening, 2026-08-24): the fragment now compiles the
+> whole kernel, and the numbers below are the state before it did.** They are
+> kept because every one of them was measured and because the *shape* of the
+> finding — compiled code that is never entered is worth nothing — is what the
+> widening was ordered by. Re-taken with
+> `mcts --dir benches/kernel --only agreement`:
+>
+> | | before | after |
+> | --- | ---: | ---: |
+> | functions inside the fragment | 19 / 34 | **34 / 34** |
+> | lowered nodes inside | 352 / 745 | **745 / 745** |
+> | of those, enterable | 19 | **21** |
+> | refusal reasons remaining | 7 | **0** |
+> | disagreements | 0 | **0** |
+>
+> Four constructs — a field access, a list pattern, unary `-`, a list literal —
+> plus a fifth that no census listed, a constructor pattern. ADR 0018 §0 carries
+> the correction that its ranked table is a *first-refusal* census and cannot be
+> read as a work list: the 253-node field-access row admitted **one** function
+> and moved nothing that executes.
+>
+> **Entries fell, 56,876 to 49,489, and that is the result rather than a
+> regression.** The count that matters is per search: a 40-iteration
+> `mcts.plan` was **721 crossings** spread over seven leaf functions — `ucb` 375,
+> `turn` 105, `move_count` 81, and four more — and is now **1**. The interpreter
+> used to drive the search and drop into compiled arithmetic at every leaf;
+> `mcts.plan` is inside the fragment now, so it hands the whole search over once
+> and selection, expansion, playout and backpropagation all run natively.
+> `mcts_kernel.rs::the_interpreter_enters_compiled_code_once_for_the_whole_search`
+> pins it.
+>
+> Two consequences a reader should not have to find out the hard way:
+>
+> * **The mutation corpus's search leg lost resolution.** `wrong::Mutant` is a
+>   *backend*, so it only sees functions the machine actually enters. With one
+>   crossing per search, a leaf mutation cannot fire from a search at all —
+>   `mcts.ucb` off by one fired 1,268 times and now fires **0**. The per-function
+>   direct cases are what still cover those functions, and `mutations.rs` asserts
+>   the new zero so that it is a number rather than a surprise.
+> * **19.0% of executed work is still outside the fragment and always was.** The
+>   `Map`, record and list machinery is `ply_eval`'s, called through `rt_record`,
+>   `rt_field` and `rt_list`; widening changes which functions compile and does
+>   not make a `Map` insert cheaper.
+>
+> **No wall-clock ratio was re-taken.** The load average on this machine ranged
+> 9-44 through the session and sat at 13.70 at the last check, and
+> `CONTRIBUTING.md` §"Gate on an idle machine" puts the usable bar at about 4.
+> Every figure above is deterministic — counts, censuses, entry tallies — and
+> reproduces on a loaded machine. The end-to-end ratio is **UNMEASURED**; it is
+> the first thing worth taking on a quiet machine, because this is the first time
+> the whole kernel has been behind a single crossing.
+
 - **22 of 34 functions and 386 of 745 lowered nodes** are inside the fragment.
 - **81.0% of the kernel's executed work** is inside it — against the 2–5% ADR
   0016 measured for an HTTP request. So ADR 0018's premise is not wrong about

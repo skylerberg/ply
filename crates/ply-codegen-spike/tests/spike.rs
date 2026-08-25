@@ -197,7 +197,16 @@ fn a_unit_missing_a_callee_is_refused_and_names_the_call() {
 fn the_fragment_refuses_what_it_cannot_compile_and_names_it() {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
     for (name, expected) in [
-        ("std.http.parse_head", "field access"),
+        // > **Corrected (fragment widening, 2026-08-24).** This row read
+        // > `("std.http.parse_head", "field access")`. A field access is inside
+        // > the fragment now, so the *first* construct `parse_head` is refused
+        // > for has moved on to its call to `read_line`, which this compiled
+        // > unit does not hold. The row still tests what it was there to test —
+        // > that a refusal names a construct rather than failing silently — and
+        // > it is a standing illustration of why the ranked census in ADR 0018
+        // > §0 is a first-refusal census: removing the named construct moves the
+        // > name rather than admitting the function.
+        ("std.http.parse_head", "a call to `std.http.read_line`"),
         ("std.http.list_field", "a builtin that calls user code"),
         ("std.net.send_from", "perform"),
         ("std.http.contains_string", "a builtin that calls user code"),

@@ -70,6 +70,7 @@ fn tables() -> Rc<Tables> {
         consts: Vec::new(),
         ctors: Vec::new(),
         shapes: Vec::new(),
+        fields: Vec::new(),
         builtins: Vec::new(),
     })
 }
