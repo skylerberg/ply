@@ -586,6 +586,20 @@ The house conventions:
 
 Both quote the withdrawn text verbatim. Do the same.
 
+**The cost of that convention, which you will pay before you understand it: a
+grep for a stale claim hits forever, and hits hardest in the document that
+corrected it.** Because the withdrawn wording is kept verbatim, searching for the
+old sentence finds the correction rather than a live error. Two agents have now
+reported a "stale claim" that was a blockquote — one flagged `CONTRIBUTING.md`
+for still saying `.github/` does not exist, three lines below a heading reading
+"There is CI".
+
+So: **before believing a grep hit, check whether it sits inside a `>` block, a
+`~~strike-through~~`, or a quoted-and-withdrawn span.** The same trap is live for
+`DEFAULT_MAX_FRAMES` across half a dozen files, for ADR 0018's `181x`, and for
+every figure this file has ever corrected. It is a real cost of a convention
+worth keeping, and it is cheaper to know than to rediscover.
+
 ### Gate on an idle machine before measuring, not after
 
 A wall-clock measurement on this machine is worthless above about load 4, and
