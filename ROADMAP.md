@@ -1795,6 +1795,19 @@ the deletability of the spike, the falsification table's reproducibility, and th
 
 # What is next
 
+> **The standing goal, and it is written down now rather than assumed:**
+> [ADR 0021](docs/adr/0021-why-bootstrap.md). Nothing in this file, `README.md`
+> or `DESIGN.md` mentioned self-hosting or bootstrapping before 2026-08-24,
+> which meant the reason for a whole track of work existed only in a
+> conversation. The short form: Ply's verification loop is O(the change) and
+> every toolchain it competes with is O(the project) — 915.8s of in-target time
+> for `cargo test --workspace` against 0.070s for a warm `ply test` with 185 of
+> 186 selected out — so compiler work done *in Ply* would verify in time
+> proportional to the edit and compiler work done in Rust never will.
+> [ADR 0020](docs/adr/0020-self-hosting-the-front-end.md) says not yet and
+> measures why; 0021 §4 is the critical path, and none of its four items are
+> self-hosting work.
+
 **R3's decision rule fired on its second branch, and that is what sets this
 queue.** Allocations per `/health` came back at **1,082** against a pre-region
 **1,035** — measured, `./target/release/w6-alloc --repo . --requests 200` — so
