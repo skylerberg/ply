@@ -2,6 +2,13 @@
 
 Status: **rejected for now, with two pieces of the spike kept.**
 
+> **Why anyone wanted this:** [ADR 0021](0021-why-bootstrap.md). This document
+> prices whether Ply can host its own front end and decides that it cannot yet.
+> It does not state the goal, and read alone it is a rejection with nothing
+> behind it. 0021 records the claim — Ply's verification loop is O(the change)
+> where every toolchain it competes with is O(the project) — and the four
+> preconditions that would change this answer.
+
 - **Rejected:** writing Ply's front end in Ply on today's interpreter. §6 prices
   it. The blocker is throughput, not expressiveness, and the compiled fragment
   cannot be assumed to close the gap — §6.3 says why, and what would measure it.
