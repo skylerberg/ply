@@ -1759,6 +1759,16 @@ the deletability of the spike, the falsification table's reproducibility, and th
   ADR 0018 §0.5 carries it for §1's premise; ADR 0019 still states the old shape
   in two places.
 
+  > **Audit note (fragment widening, 2026-08-24): the census moved again, and
+  > ADR 0019's two places are now annotated rather than merely flagged.** All
+  > four censused constructs and a fifth nobody censused are lowered, so the
+  > kernel is **34 of 34 functions and 745 of 745 nodes**, 0 refusals, 0
+  > disagreements. `benches/adr0018-mcts.json` is *still* the pre-R5 file and
+  > this bullet still stands as work. The widening also found that the ranked
+  > table this roadmap and ADR 0019 both quote is a **first-refusal** census and
+  > cannot be read as a work list — the 253-node row bought one function — which
+  > is corrected in place in ADR 0018 §0.
+
 ---
 
 # What is next

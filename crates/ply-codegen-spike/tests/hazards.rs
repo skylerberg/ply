@@ -469,43 +469,55 @@ fn a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer() {
             scalar_signature(loaded, name),
             "`{name}` stopped being `Int` -> `Int`, so nothing here is being tested"
         );
-        // Compiled, and registered as enterable. Both halves matter: this is the
-        // one hazard whose whole point is that neither filter can see it, and a
-        // version of this test where the fragment had refused the definition
-        // would be green over a boundary it never reached.
+        // **Corrected (fragment widening, 2026-08-24): the fragment now refuses
+        // these at compile time, so the two assertions this made about them are
+        // withdrawn.** They read:
+        //
+        // > // Compiled, and registered as enterable. Both halves matter: this
+        // > // is the one hazard whose whole point is that neither filter can
+        // > // see it, and a version of this test where the fragment had refused
+        // > // the definition would be green over a boundary it never reached.
+        // > assert!(
+        // >     harness.compiled().entry(name).is_some(),
+        // >     "`{name}` was refused by the fragment, so no `Float` ever reaches
+        // >      compiled code here and this test proves nothing"
+        // > );
+        // > assert!(
+        // >     !enterable(loaded, &[name.to_string()]).is_empty(),
+        // >     "`{name}` is not registered as enterable, so the machine never
+        // >      offers it"
+        // > );
+        //
+        // Both were true and load-bearing when written: the decline was the only
+        // thing standing between a `Float` constant and a wrong answer, so a
+        // refusing fragment would indeed have made this test vacuous. What
+        // changed is the fragment, not the reasoning — `jit::Fx::literal` now
+        // refuses a `Float` or `Decimal` literal, which is the ADR 0018 §0
+        // hazard closed at its source rather than survived at run time. The
+        // assertion below is the same claim about the same programs, inverted:
+        // it is now *refused* rather than *declined*, and either way it is never
+        // a wrong answer.
         assert!(
-            harness.compiled().entry(name).is_some(),
-            "`{name}` was refused by the fragment, so no `Float` ever reaches compiled code here \
-             and this test proves nothing"
+            harness.compiled().entry(name).is_none(),
+            "`{name}` still compiles, so the `Float` literal inside it is still reaching \
+             `rt_unbox_int` rather than being refused"
         );
+        let why = refusal(loaded, "numerics", name)
+            .unwrap_or_else(|| panic!("`{name}` was not refused, and not for a stated reason"));
         assert!(
-            !enterable(loaded, &[name.to_string()]).is_empty(),
-            "`{name}` is not registered as enterable, so the machine never offers it"
+            why.contains("literal, which the fragment has no path for"),
+            "`{name}` was refused for some reason other than its non-`Int` literal: {why}"
         );
+        // And it is still never a wrong answer through the boundary, which is
+        // the property the refusal has to preserve rather than replace.
         for n in [0i64, 1, 7, -3, 1_000_000] {
             let args = vec![Value::Int(n)];
-            let before = (entries(&harness), harness.bodies.declines().failed);
             if let Some(d) = agree(&mut harness, name, &args) {
                 panic!("`{name}({n})`: {d}");
             }
             if let Some(d) = agree_with_treewalk(loaded, &mut harness, name, &args) {
                 panic!("`{name}({n})`: {d}");
             }
-            let after = (entries(&harness), harness.bodies.declines().failed);
-            // The native body ran, met the `Float` and failed. That is what makes
-            // this a case rather than an argument: the offer was taken, the
-            // constant reached `rt_unbox_int`, and the decline is what turned it
-            // into a slow answer instead of a wrong one.
-            assert_eq!(
-                after,
-                (before.0, before.1 + 1),
-                "`{name}({n})` was not offered, or was answered rather than declined — entries \
-                 {} -> {}, failed bodies {} -> {}",
-                before.0,
-                after.0,
-                before.1,
-                after.1
-            );
         }
     }
     // And the most direct form of the same thing: a `Float` handed straight to a
@@ -933,5 +945,100 @@ fn the_hook_is_off_inside_a_simulate_region() {
         harness.bodies.declines().touched_cells,
         0,
         "a builtin allocated in the fragment's private arena"
+    );
+}
+
+// -- 11. A bare nullary constructor is a test, not a binding ------------------
+
+/// `match o { None -> d, Some(v) -> v }` answers through the arm the machine
+/// picks, not through the first one.
+///
+/// This is the one shape in which widening the fragment could produce a **wrong
+/// answer** rather than a decline — a constructor pattern that matches when it
+/// should not costs nothing at run time and reports nothing — so it is asserted
+/// on the answer rather than on a decline count. Verified by deletion: with
+/// `jit::Fx::test_ctor` made to jump unconditionally to its arm, this test is
+/// the only red in the suite.
+///
+/// > **The reason first written here was wrong, and is kept because it is the
+/// > kind of wrong worth seeing.** It read: *"A nullary constructor written bare
+/// > is `PatternKind::Var` in the AST — the parser cannot tell `None` from a
+/// > binder — and `ply_eval::Machine::matches` consults the constructor table to
+/// > tell them apart. Compiled code did not: every `Var` was an irrefutable
+/// > binding, so the `None` arm matched a `Some` and the match answered `d` for
+/// > every input."*
+/// >
+/// > That is what `ply_eval/src/machine.rs`'s own comment at the `Var` arm says,
+/// > and it is false: `ply_syntax/src/parser.rs`'s pattern parser routes every
+/// > **capitalized** bare name to `PatternKind::Ctor` with an empty argument
+/// > list (`starts_upper`), and only a lowercase one to `PatternKind::Var`. Ply
+/// > constructors are capitalized, so a `Var` that is really a nullary
+/// > constructor cannot be produced from Ply source. Deleting the constructor
+/// > table check from `jit`'s `Var` arm leaves the whole suite green, and a
+/// > direct `or_else(Some(7), 99)` still answers 7.
+/// >
+/// > The check is kept anyway — it mirrors the interpreter exactly, so the two
+/// > cannot diverge if some later producer of patterns does emit a `Var` — but
+/// > it is unreachable today and this test does not arm it. What this test arms
+/// > is the `PatternKind::Ctor` lowering underneath it.
+///
+/// The program is `crates/ply-cli/tests/prover_soundness_audit.rs`'s `or_else`
+/// unchanged, because the shape was already written in this repository.
+#[test]
+fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {
+    let loaded = hazards();
+    let mut harness = pure_harness(loaded);
+    harness.bodies.reset_counts();
+
+    assert!(
+        harness.compiled().entry("pure.or_else").is_some(),
+        "`pure.or_else` was refused, so the pattern this is about never lowered"
+    );
+    assert!(
+        scalar_signature(loaded, "pure.tagged"),
+        "`pure.tagged` stopped being `Int` -> `Int`, so the boundary never offers it"
+    );
+
+    // 1 is in the map and 2 is not, so the two arms are both taken. Without the
+    // constructor-table check the `None` arm takes both and each answers 99.
+    for (n, expected) in [(1i64, 7i64), (2, 99), (3, 99), (-1, 99)] {
+        let args = vec![Value::Int(n)];
+        let before = entries(&harness);
+        if let Some(d) = agree(&mut harness, "pure.tagged", &args) {
+            panic!("`pure.tagged({n})`: {d}");
+        }
+        if let Some(d) = agree_with_treewalk(loaded, &mut harness, "pure.tagged", &args) {
+            panic!("`pure.tagged({n})`: {d}");
+        }
+        let answered = harness
+            .run_hybrid("pure.tagged", &args)
+            .expect("`pure.tagged` runs");
+        assert_eq!(
+            answered,
+            Value::Int(expected),
+            "`pure.tagged({n})` answered {} rather than {expected}, so the `None` arm matched a \
+             `Some`",
+            answered.render()
+        );
+        assert!(
+            entries(&harness) > before,
+            "`pure.tagged({n})` was never offered to compiled code, so agreement here is two \
+             interpreters agreeing"
+        );
+    }
+
+    // The direct form, outside any machine: the same call with no interpreter
+    // available to answer it if the entry declines.
+    let direct = harness
+        .compiled_call(
+            "pure.or_else",
+            &[Value::ctor("Some", vec![Value::Int(7)]), Value::Int(99)],
+        )
+        .expect("`pure.or_else` runs in compiled code");
+    assert_eq!(
+        direct,
+        Value::Int(7),
+        "compiled `or_else(Some(7), 99)` answered {}, which is the `None` arm",
+        direct.render()
     );
 }

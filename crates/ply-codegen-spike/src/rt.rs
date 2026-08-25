@@ -26,6 +26,21 @@
 //! allocation into [`Ctx::slots`], or `ply_eval::builtins::call` on a builtin
 //! the compiler already proved cannot suspend and cannot touch a cell.
 
+// # Safety, once, for every `rt_*` helper below
+//
+// They share one contract and stating it twenty times would say less than
+// stating it here: each is called **only** from code Cranelift emitted in
+// [`crate::jit`], which passes the `*mut Ctx` that [`crate::entry`] created for
+// the entry currently running and passes handles this same context produced.
+// `Ctx` outlives every call into the body — `SpikeBodies` holds it in a
+// `RefCell` for the duration — and an entry cannot nest, so the `&mut` taken
+// here is unique. A handle is either an index into `Ctx::slots` or a negative
+// index into the constant pool, and `Ctx::read` bounds-checks both.
+//
+// Nothing outside this crate may call one: they are `pub` because
+// [`symbols`] hands their addresses to the JIT, not because they are an API.
+#![allow(clippy::missing_safety_doc)]
+
 use ply_eval::{Builtin, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::BTreeMap;
@@ -40,6 +55,9 @@ pub struct Tables {
     pub consts: Vec<Value>,
     pub ctors: Vec<(Symbol, usize)>,
     pub shapes: Vec<Vec<Symbol>>,
+    /// Every field name a compiled body reads, so that a field access is an
+    /// index rather than a `Symbol` rebuilt per evaluation.
+    pub fields: Vec<Symbol>,
     /// Every builtin a compiled body may call. The compiler refuses the ones
     /// that can suspend or reach a cell, so this holds only total functions of
     /// their arguments — see [`crate::jit::admissible_builtin`].
@@ -348,17 +366,17 @@ fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, message.into()).primary(Span::DUMMY, "in compiled code")
 }
 
-pub extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
+pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.push(Value::Int(v))
 }
 
-pub extern "C" fn rt_box_bool(ctx: *mut Ctx, v: i64) -> i64 {
+pub unsafe extern "C" fn rt_box_bool(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.push(Value::Bool(v != 0))
 }
 
-pub extern "C" fn rt_unbox_int(ctx: *mut Ctx, handle: i64) -> i64 {
+pub unsafe extern "C" fn rt_unbox_int(ctx: *mut Ctx, handle: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     match ctx.read(handle) {
         Value::Int(i) => *i,
@@ -369,7 +387,7 @@ pub extern "C" fn rt_unbox_int(ctx: *mut Ctx, handle: i64) -> i64 {
     }
 }
 
-pub extern "C" fn rt_unbox_bool(ctx: *mut Ctx, handle: i64) -> i64 {
+pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, handle: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     match ctx.read(handle) {
         Value::Bool(b) => i64::from(*b),
@@ -383,7 +401,7 @@ pub extern "C" fn rt_unbox_bool(ctx: *mut Ctx, handle: i64) -> i64 {
 /// The prologue's refusal: this call would nest past the budget the machine
 /// handed the entry. Not a program error — the machine re-evaluates and raises
 /// its own bound.
-pub extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
+pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past the machine's own bound on nested calls");
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
@@ -393,7 +411,7 @@ pub extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
 /// Multiplication and division are not on the request path this spike prices,
 /// so they are a call rather than an instruction; addition and subtraction are
 /// compiled with `sadd_overflow` and `ssub_overflow` inline.
-pub extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
+pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let (result, what) = match op {
         0 => (a.checked_mul(b), "multiplication"),
@@ -415,7 +433,7 @@ pub extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
 /// evaluation. Compiled code reaches this only when literal folding is switched
 /// off, which is how the spike separates "dispatch removed" from "the constant
 /// stopped being rebuilt per call".
-pub extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
+pub unsafe extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let value = ctx.read(index).clone();
     let rebuilt = match &value {
@@ -432,22 +450,26 @@ pub extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
 
 /// A `match` whose arms did not cover the value. The machine raises here, so
 /// this fails too rather than answering something.
-pub extern "C" fn rt_no_match(ctx: *mut Ctx) {
+pub unsafe extern "C" fn rt_no_match(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("no arm of this `match` matched");
     ctx.fail(d);
 }
 
-pub extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
+pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
-    let name = if what == 0 { "addition" } else { "subtraction" };
+    let name = match what {
+        0 => "addition",
+        1 => "subtraction",
+        _ => "negation",
+    };
     let d = error(format!("this {name} overflowed"));
     ctx.fail(d);
 }
 
 /// `==` and `!=` on anything that is not a pair of `Int`s or a pair of `Bool`s,
 /// answered by the evaluator's own comparison so the two cannot disagree.
-pub extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let (l, r) = (ctx.read(a).clone(), ctx.read(b).clone());
     match values_equal(&l, &r, Span::DUMMY) {
@@ -456,7 +478,7 @@ pub extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-pub extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
+pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
     let args = args_of(ctx, args, n);
@@ -477,7 +499,7 @@ pub extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64
     }
 }
 
-pub extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
+pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let name = ctx.tables.ctors[index as usize].0.clone();
     let args = args_of(ctx, args, n);
@@ -487,7 +509,7 @@ pub extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -
     })
 }
 
-pub extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
+pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let names = ctx.tables.shapes[shape as usize].clone();
     let args = args_of(ctx, args, n);
@@ -496,6 +518,138 @@ pub extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64)
         map.insert(name, value);
     }
     ctx.push(Value::Record(Arc::new(map)))
+}
+
+/// One field of a record, with the two failures the interpreter has here kept
+/// as failures rather than answered.
+///
+/// `ply_eval::frame`'s `Frame::FieldAccess` refuses a non-record base and a
+/// name the record does not carry, and the typechecker means a well-typed
+/// program reaches neither. They are still faults rather than a default,
+/// because the alternative — answering `Unit`, or the first field — is the one
+/// shape of bug this boundary cannot catch: a compiled body that returns a
+/// plausible wrong value agrees with nothing and is reported by nothing.
+pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let name = ctx.tables.fields[index as usize].clone();
+    match ctx.read(base) {
+        Value::Record(fields) => match fields.get(&name) {
+            Some(v) => {
+                let v = v.clone();
+                ctx.push(v)
+            }
+            None => {
+                let d = error(format!("this record has no field `{name}`"));
+                ctx.fail(d)
+            }
+        },
+        other => {
+            let d = error(format!(
+                "a field access needs a record, and this is {}",
+                other.type_name()
+            ));
+            ctx.fail(d)
+        }
+    }
+}
+
+/// A list literal, built from handles the way [`rt_record`] builds a record.
+pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let args = args_of(ctx, args, n);
+    ctx.push(Value::list(args))
+}
+
+/// Whether a value is a list long enough for a pattern: `exact` demands the
+/// length, and otherwise `len` is a minimum because a `..rest` takes the
+/// remainder. Both halves are `ply_eval::Machine::match_pattern`'s, which
+/// refuses a short list and — with no `rest` — a long one.
+pub unsafe extern "C" fn rt_list_fits(ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.read(value) {
+        Value::List(xs) => {
+            let n = xs.len() as i64;
+            i64::from(if exact != 0 { n == len } else { n >= len })
+        }
+        _ => 0,
+    }
+}
+
+/// One element of a list, once [`rt_list_fits`] has admitted its length.
+pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.read(value) {
+        Value::List(xs) => match xs.get(i as usize) {
+            Some(v) => {
+                let v = v.clone();
+                ctx.push(v)
+            }
+            None => {
+                let d = error("a list pattern read past the end of the list");
+                ctx.fail(d)
+            }
+        },
+        _ => {
+            let d = error("a list pattern bound a value that is not a list");
+            ctx.fail(d)
+        }
+    }
+}
+
+/// What a `..rest` binds: a fresh list of everything from `from` on, which is
+/// the copy `ply_eval` makes at the same point rather than a shared tail.
+pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.read(value) {
+        Value::List(xs) => {
+            let from = (from as usize).min(xs.len());
+            let tail = xs[from..].to_vec();
+            ctx.push(Value::list(tail))
+        }
+        _ => {
+            let d = error("a list pattern bound a value that is not a list");
+            ctx.fail(d)
+        }
+    }
+}
+
+/// Whether a value is the constructor at `index`, name and arity both.
+///
+/// Arity is part of the test because `ply_eval`'s own matcher tests it
+/// (`machine.rs`, `PatternKind::Ctor`): two variants of different arity can
+/// share a name across modules, and a pattern that checked only the name would
+/// then read arguments that are not there.
+pub unsafe extern "C" fn rt_ctor_is(ctx: *mut Ctx, value: i64, index: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (name, arity) = ctx.tables.ctors[index as usize].clone();
+    match ctx.read(value) {
+        Value::Ctor { name: n, args } => i64::from(*n == name && args.len() == arity),
+        _ => 0,
+    }
+}
+
+/// One argument of a constructor value, once [`rt_ctor_is`] has said it is that
+/// constructor. The bounds check is the arity test that already ran, so an
+/// out-of-range index here is a compiler bug rather than a program error and
+/// fails loudly instead of answering.
+pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.read(value) {
+        Value::Ctor { args, .. } => match args.get(i as usize) {
+            Some(v) => {
+                let v = v.clone();
+                ctx.push(v)
+            }
+            None => {
+                let d = error("a constructor pattern read an argument that is not there");
+                ctx.fail(d)
+            }
+        },
+        _ => {
+            let d = error("a constructor pattern bound a value that is not a constructor");
+            ctx.fail(d)
+        }
+    }
 }
 
 /// Every symbol the JIT registers, in one place so the compiler and the linker
@@ -515,5 +669,12 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_builtin", rt_builtin as *const u8),
         ("rt_ctor", rt_ctor as *const u8),
         ("rt_record", rt_record as *const u8),
+        ("rt_field", rt_field as *const u8),
+        ("rt_list", rt_list as *const u8),
+        ("rt_list_fits", rt_list_fits as *const u8),
+        ("rt_list_at", rt_list_at as *const u8),
+        ("rt_list_rest", rt_list_rest as *const u8),
+        ("rt_ctor_is", rt_ctor_is as *const u8),
+        ("rt_ctor_arg", rt_ctor_arg as *const u8),
     ]
 }

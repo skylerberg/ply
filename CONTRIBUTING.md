@@ -326,6 +326,35 @@ enumerates **four** of them — the fifth, `PLY_TEST_DB`, is in no document in
 this repository older than 2026-08-24 — and `docs/ONBOARDING.md` §2 explains the
 two that matter and carries the measurement for the fifth. The short version:
 
+> **A fifth, found 2026-08-24 by the lane widening the compiled fragment.** The
+> sentence above said four and there are five. `crates/ply-codegen-spike`
+> declares its own `[workspace]` — deliberately, so that deferring M9 can delete
+> it with `rm -r` (ADR 0016 §3.5) — and the consequence is that **every
+> `--workspace` gate in this file skips it in complete silence**. It is not in
+> `Cargo.toml`'s `members`, so `cargo test --workspace`, `cargo clippy
+> --workspace --all-targets` and `cargo fmt --all --check` have never once
+> looked at it.
+>
+> Both of the other two gates were red when this was checked, on merged `main`:
+>
+> * `cargo clippy --all-targets` inside the crate: **20 errors** — not warnings,
+>   errors — all `not_unsafe_ptr_arg_deref`, on every `rt_*` helper. Thirteen
+>   predate the widening. So "clippy is clean" has been true of the workspace and
+>   never checked here.
+> * `cargo fmt --check` inside the crate: **two files unformatted**,
+>   `src/bin/mcts.rs` and `src/wrong.rs`, both from the item-12/13 work merged
+>   earlier the same day.
+>
+> Both are fixed. The lesson is the one `PLY_PG_URL` already teaches and this is
+> the second instance of it: a gate's green can be manufactured by not running,
+> and nothing in the output distinguishes "passed" from "never looked".
+>
+> | if your change touches | you must also run |
+> | --- | --- |
+> | anything in `crates/ply-codegen-spike` | `cd crates/ply-codegen-spike && cargo +1.94.0 fmt --check && cargo +1.94.0 clippy --all-targets && cargo +1.94.0 test --release` — the toolchain is not optional, `cranelift 0.134.3` and `wasmtime 47.0.3` require rustc 1.94.0 and the default here is 1.93.1. And **never** pipe it: `cargo build 2>&1 \| tail` reports `tail`'s exit status, so a failed build reads as a successful one. |
+
+The original four:
+
 | if your change touches | you must also run |
 | --- | --- |
 | postgres, the pool, transaction scope | `PLY_PG_URL=postgres://localhost/postgres cargo test -p ply-host` (36–38s, 281 pass, 0 fail) — otherwise ten tests pass in 0.00s without running, and cargo captures the skip notice so nothing tells you: `skipped:` occurs zero times in a whole `cargo test --workspace` log |
