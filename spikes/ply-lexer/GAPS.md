@@ -190,10 +190,10 @@ This one, in its serializer, is not documented anywhere I could find.
 > **Since fixed — read this before quoting the table above as a live defect.**
 > ADR 0020 §7 item 3 was taken: `escape_runs` now performs one `push` per
 > escape in last-argument position, which is column 2 of the table above, and
-> the serializer is linear. Confirmed on the shipped module with
-> `ply_eval::rc::stats()` rather than a clock — whole-accumulator copies per
-> encode went from exactly k to **0** at k up to 32,000 — and guarded by
-> `crates/ply-eval/tests/stdlib_accumulator_cost.rs`. Column 3's warning was
+> the serializer is linear **on the machine engine**. Confirmed on the shipped
+> module with `ply_eval::rc::stats()` rather than a clock — whole-accumulator
+> copies per encode went from exactly k to **0** at k up to 32,000 — and guarded
+> by `crates/ply-eval/tests/stdlib_accumulator_cost.rs`. Column 3's warning was
 > confirmed at the same time and on the shipped module: built as two `push`es
 > that are each last, the largest string `encode_string` can encode under the
 > call budget halves, from **9,993 escapes to 4,996**. The line citation
@@ -212,20 +212,53 @@ This one, in its serializer, is not documented anywhere I could find.
 > > `json.ply:991-993` moved as well and was not listed.
 >
 > **Every `json.ply` citation in this file that pointed at line 588 or later is
-> short by 17**, a shift confirmed on four landmarks that bracket the insertion:
-> `escape_runs` 589 → 606, `hex_byte` 621 → 638, `byte_table` 626 → 643,
-> `b64_alphabet` 991 → 1008. So §11's `json.ply:621`, `json.ply:626-627` and
-> `json.ply:991-993` read `:638`, `:643-644` and `:1008-1010` today, while
+> short by 40**, a shift confirmed on four landmarks that bracket the insertion:
+> `escape_runs` 589 → 629, `hex_byte` 621 → 661, `byte_table` 626 → 666,
+> `b64_alphabet` 991 → 1031. So §11's `json.ply:621`, `json.ply:626-627` and
+> `json.ply:991-993` read `:661`, `:666-667` and `:1031-1033` today, while
 > §12's `json.ply:555` and `json.ply:564-568` are **unchanged and correct** —
 > they sit above the insertion. The functions all of them name are unmoved and
 > still findable by name — `hex_byte`, `byte_table`, `b64_alphabet` — which is
 > why they are left rather than renumbered into the next edit's drift.
+>
+> > **The shift was 17 and is now 40. Corrected 2026-08-27 by re-taking the same
+> > four landmarks.** This paragraph read *"short by **17** … `escape_runs`
+> > 589 → 606, `hex_byte` 621 → 638, `byte_table` 626 → 643, `b64_alphabet`
+> > 991 → 1008 … read `:638`, `:643-644` and `:1008-1010` today"*. Disclosing
+> > the engine-conditionality above `escape_runs` added twenty-three more lines
+> > there. Which is the point the paragraph itself makes: a line citation is
+> > invalidated by the next edit, and the four figures above are re-measured
+> > rather than arithmetic on the last set.
+>
 > §1's *finding* is unaffected — the trap is still invisible, which is
 > ADR 0020 §7 item 2, still open.
 >
 > The same counter found the shape twice more in the standard library, and both
 > were fixed: `std.trace`'s `append` and `std.router`'s `numbered`. `std.db` was
 > not measured.
+>
+> > **"Linear" was engine-conditional and this block did not say so. Corrected
+> > 2026-08-27 by counting on both engines.** The sentence above read *"the
+> > serializer is linear"* with no engine named, and the rule this whole section
+> > states — a growing container must be built in the last sub-expression of its
+> > enclosing node — is the **machine engine's rule**. On `--engine treewalk` the
+> > position makes no difference and every shape is quadratic, because the
+> > tree-walker runs no reference counting at all: it evaluates the AST, which
+> > carries no `Own` (that field is on the lowered `code::Node`, and lowering is
+> > the step this engine does not have); `Interp::lookup` answers every `Var`
+> > with `v.clone()`; and `interp.rs` has no `Env::take_unique` and no
+> > `rc::carry` call site. The accumulator is at two owners at every `push`,
+> > `Arc::get_mut` fails, and the four-column table above would be four equal
+> > columns there.
+> >
+> > Counted on the shipped modules after the fix — machine copies against
+> > tree-walker copies: `escape_runs` **0** against **k + 1** at k = 1,000
+> > through 8,000; `numbered` **0/0/0** against **200/400/800**; `append`
+> > **0/0/0** against **200/400/800**. All three of the fixes named in this
+> > block are the machine engine's. `--engine both` compares answers and not
+> > cost, so it never had an opinion about any of them; the disclosure carries
+> > its own assertion instead, in
+> > `stdlib_accumulator_cost.rs::all_three_fixes_are_the_machine_engines_only`.
 
 ### Cost to me
 
