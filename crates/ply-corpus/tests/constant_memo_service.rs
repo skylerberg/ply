@@ -132,6 +132,16 @@ fn what_remembering_the_constants_is_worth_per_request() {
 }
 
 /// The rung the ladder reads routing off, and the definition this began with.
+///
+/// **This asserts nothing, and something once leaned on it.** It prints
+/// microseconds and returns, so it passes whatever `router.ply` costs — and
+/// `PREREGISTRATION.md` §7.7 nonetheless offered "it is the test nearest that
+/// change; it passed" as evidence that the survey's fix to `numbered` held. It
+/// would have passed with that fix reverted, and that sentence is withdrawn
+/// there. What gates the cost is a count, in `ply-eval`'s
+/// `stdlib_accumulator_cost.rs::the_route_table_and_the_trace_sink_do_not_copy_
+/// their_accumulators_either`; leave the assertion there, where the statistic is
+/// deterministic, rather than putting a threshold on a clock here.
 #[test]
 fn what_the_route_table_costs_to_rebuild() {
     let loaded = w6_run::program(&repo()).expect("the ladder's driver loads");

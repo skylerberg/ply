@@ -159,6 +159,10 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
 /// Re-take it with `./target/release/w6-alloc --repo . --requests 200` and
 /// correct the sentence in place, keeping the withdrawn figure beside the new
 /// one — `CONTRIBUTING.md` §"Correct, do not delete".
+///
+/// The line number in the message below drifts with every edit above it in
+/// `README.md` — it moved 363 → 387 on 2026-08-27 — so the marker this searches
+/// for, not the number, is what finds the sentence.
 #[test]
 fn the_readme_still_describes_this_request_path() {
     let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");
@@ -189,7 +193,7 @@ fn the_readme_still_describes_this_request_path() {
         let drift = (claimed - measured).abs() / measured;
         assert!(
             drift <= 0.01,
-            "`README.md:363` says one /health request makes {claimed:.0} {what} and this tree \
+            "`README.md:387` says one /health request makes {claimed:.0} {what} and this tree \
              makes {measured:.2} — {:.1}% apart. That sentence is present tense about this tree \
              and it has gone stale twice, the second time inside the block correcting the first. \
              Re-take it: `./target/release/w6-alloc --repo . --requests 200`.",

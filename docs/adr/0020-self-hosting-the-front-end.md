@@ -917,6 +917,65 @@ Ranked, what would change the answer:
    at k = 1,000 / 2,000 / 4,000 / 8,000 / 16,000 / 32,000, and pushes from
    2k + 1 to k + 1.
 
+   > **The fix is the machine engine's, and this item did not say so. Corrected
+   > 2026-08-27 by counting on both engines.** Every figure in this item — the
+   > paragraph above, the clock ratios below it, and the two further sites at
+   > the end — was taken on the **machine** engine and stated without naming
+   > one. Ply ships two, `--engine both` is the audit that catches one drifting
+   > from the other, and it compares *answers*: diagnostics, footprints, cell
+   > state. A divergence in **cost** passes it in silence, which is exactly what
+   > this is.
+   >
+   > On `--engine treewalk` `escape_runs` is **still quadratic after the fix**,
+   > and no spelling of it is not. The tree-walker runs no reference counting at
+   > all: it evaluates the AST, which carries no `Own` — that field is on the
+   > lowered `code::Node` only, and lowering is the step this engine does not
+   > have; `Interp::lookup` answers every `Var` with `v.clone()`; and `interp.rs`
+   > contains no `Env::take_unique` and no `rc::carry` call site, so a pending
+   > "frame" is a native stack frame holding the caller's scope by shared
+   > reference for the whole of every subexpression. The accumulator is
+   > therefore at two owners at every `push`, `Arc::get_mut` fails, and position
+   > cannot help.
+   >
+   > Counted on the shipped modules, after the fix, machine against tree-walker:
+   >
+   > | site | n | machine copies | treewalk copies |
+   > | :--- | ---: | ---: | ---: |
+   > | `json.ply` `escape_runs` | 1,000 → 8,000 | **0** at every size | **n + 1** at every size |
+   > | `router.ply` `numbered` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
+   > | `trace.ply` `append` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
+   >
+   > So all three of the survey's fixes are engine-conditional, not just this
+   > one. What the fix buys on the tree-walker is a halved constant: with
+   > `escape_runs` reverted the tree-walker copies 2k + 1 times, with it in place
+   > k + 1 — measured here, not reasoned about.
+   >
+   > On the clock, `ply test --no-cache --no-incremental`, minimum of 5, both
+   > engines back to back on one machine state at load 11–22 (the 4.0 the
+   > workstream pre-registered was waited for and never reached, as in round 1):
+   > over 1,000 → 8,000 escapes the machine grows **7.8x** where linear predicts
+   > 8x, and the tree-walker **82.8x** and **74.1x** across two series where
+   > quadratic predicts 64x. At k = 8,000 the tree-walker is **12.9x** slower
+   > than the machine on the same program; at k = 1,000, 1.2x. The reviewer who
+   > raised this measured 22.1 / 81.1 / 330.2 ms and 3.67x / 4.07x per doubling;
+   > the shape reproduces, the per-doubling ratios here are 4.85 / 2.98 / 5.73
+   > and 5.47 / 2.85 / 4.75, and **the pre-registered "≥ 3.0x at two consecutive
+   > doublings" rule is therefore not met at 2,000 → 4,000 in either series**.
+   > That is stated rather than smoothed: the verdict rests on the counts, which
+   > are exact at any load, and the clock corroborates the direction only.
+   >
+   > **Disclosed rather than fixed, and the reason is in `CONTRACTS.md`.**
+   > Reuse on the tree-walker needs the Perceus pass the machine gets at
+   > lowering — a backward liveness walk over the AST, a by-value scope threaded
+   > through a recursive evaluator, and a `carry` discipline that a walker
+   > holding `&Env` on the native stack has no way to express. That is a new
+   > evaluator feature, and §"Deleted with the machine" retires `Interp`,
+   > `Engine` and `--engine` outright. The disclosure carries an assertion so it
+   > cannot go stale in silence:
+   > `stdlib_accumulator_cost.rs::all_three_fixes_are_the_machine_engines_only`
+   > pins one copy per element on the tree-walker at all three sites, and names
+   > the documents to correct on the day it fails.
+
    On the clock, which is the statistic §4.1 used: per-test milliseconds at
    k = 1,000 / 2,000 / 4,000 / 8,000 were 13.6 / 40.9 / 134.5 / 497.0 before and
    7.0 / 13.9 / 29.0 / 57.9 after — **3.29x and 3.70x** per doubling against
@@ -955,6 +1014,17 @@ Ranked, what would change the answer:
    check). `trace.ply`'s own comment had restated the reading `GAPS.md` §1
    withdrew and is corrected in place. `db.ply` has 78 `push` sites and was
    **not** measured; it is the obvious next place to point the counter.
+
+   > **Both of those were fixed and neither was gated, until 2026-08-27.** This
+   > paragraph reported two further fixes and named no test, and the sentence
+   > that stood in for one — *"`ply-corpus` is in the set because the survey
+   > changed `router.ply`, and its `what_the_route_table_costs_to_rebuild` is
+   > the test nearest that change; it passed"* — leans on a test that
+   > **asserts nothing**: it prints a microsecond figure and returns. It would
+   > have passed with both fixes reverted. `stdlib_accumulator_cost.rs` now
+   > covers all three sites with counts, each bound armed against a revert of
+   > **its own** literal — reverting `numbered` leaves the `trace` rows at 0
+   > copies and vice versa, which was demonstrated rather than assumed.
 4. **A loop, or a raisable call ceiling.** §5.1 makes this the difference
    between a portable parser and a rewritten one.
 4. ~~**A loop, or a raisable call ceiling.** §5.1 makes this the difference
