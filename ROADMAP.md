@@ -1807,6 +1807,21 @@ the deletability of the spike, the falsification table's reproducibility, and th
 > [ADR 0020](docs/adr/0020-self-hosting-the-front-end.md) says not yet and
 > measures why; 0021 §4 is the critical path, and none of its four items are
 > self-hosting work.
+>
+> > **Audit note (2026-08-27): ADR 0021 §4 item 2 is discharged, and not the
+> > way it asked.** The item was *"the nested-call ceiling. 10,000, no flag. A
+> > parser needs it raised or needs the bound to stop being reachable by
+> > ordinary sequence recursion."* The second half is delivered and the first is
+> > **refused**: [ADR 0022](docs/adr/0022-the-call-ceiling.md) adds `iterate`, an
+> > early-terminating loop that costs depth 1 on both engines however long it
+> > runs, and declines a bare `--max-calls` flag because results are cached as
+> > `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code writes only
+> > `Outcome::Pass` — raising the bound is monotone, lowering it would return a
+> > cached `Pass` for a program that now raises. 0022 also withdraws ADR 0020
+> > §5.1's premise, which is what made the item critical-path: the reference
+> > parser drives every sequence with a loop and bounds its own grammar nesting
+> > at 128. **Item 2 only.** Items 1, 3 and 4 are untouched, and ADR 0021's live
+> > objection — throughput at 12.6× — is untouched too.
 
 **R3's decision rule fired on its second branch, and that is what sets this
 queue.** Allocations per `/health` came back at **1,082** against a pre-region

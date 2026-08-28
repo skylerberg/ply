@@ -672,6 +672,57 @@ test "a producer with more chunks than the stream bound" {
     );
 }
 
+/// **`max_stream_chunks` is a policy number, not the evaluator's call ceiling.**
+///
+/// The `Limits` field used to carry a comment saying it was "also a recursion
+/// bound: `stream_chunks` is a tail call and the evaluator caps nested calls at
+/// 10,000" — an interpreter's implementation detail setting the largest usable
+/// value of an HTTP server's public configuration field. `stream_chunks` now
+/// drives its loop with `iterate`, which is depth 1 however long it runs.
+///
+/// 50,000 is five times `DEFAULT_MAX_CALLS`, and 20,000 chunks is twice it. On
+/// the tree before ADR 0022 this exact program raised `recursion limit of 10000
+/// nested calls exceeded` — verified on a release binary built at `d88aae5`
+/// before the change, which is what makes this test an assertion about the fix
+/// rather than about a bound nothing ever reached.
+#[test]
+fn a_streamed_response_may_exceed_the_evaluators_call_budget() {
+    let out = ply_test(
+        r#"
+import std.net (net)
+import std.http (respond_chunked, response, last_chunk, Http11, Limits)
+
+fn wide(n: Int) -> Limits =
+  {max_request_line: 8192, max_header_bytes: 65536, max_header_count: 100,
+   max_body: 1048576, max_chunk_size: 1048576, max_chunk_line: 4096,
+   max_trailer_bytes: 8192, max_keep_alive: 100, max_stream_chunks: n,
+   header_timeout_ms: 5000, body_timeout_ms: 30000, idle_timeout_ms: 5000,
+   write_timeout_ms: 30000}
+
+fn twenty_thousand(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
+  if seed >= 20000 { None } else { Some({chunk: b"x", next: seed + 1}) }
+
+test "a producer of twenty thousand chunks under a bound of fifty thousand" {
+  with_cell[outbox](b"") { outbox -> {
+    handle {
+      assert(respond_chunked(7, Http11, response(200, b""), true, wide(50000), 0,
+                             twenty_thousand))
+    } with {
+      net.send[conn](c, payload, t) -> {
+        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
+        Some(bytes_len(payload))
+      },
+    };
+    assert(bytes_ends_with(cell_get(outbox), last_chunk()))
+  } }
+}
+"#,
+    );
+    out.green(
+        "`max_stream_chunks` must be answerable from how many chunks a response may have and          from nothing else: a bound a user cannot raise past `DEFAULT_MAX_CALLS` is the          evaluator's ceiling wearing an HTTP server's configuration surface",
+    );
+}
+
 // --- The cost of routing ----------------------------------------------------
 
 /// **The cost property, for the router.**

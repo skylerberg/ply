@@ -85,10 +85,20 @@ pub type Limits = {
   // program runs under in this record — `respond_chunked` spent a read bound on
   // it, which is a number a reviewer reading `Limits` could not see.
   //
-  // It is also a recursion bound: `stream_chunks` is a tail call and the
-  // evaluator caps nested calls at 10,000, so a producer that must emit more
-  // than this emits larger chunks instead. Exceeding it terminates the response
+  // A policy number and nothing else. Exceeding it terminates the response
   // properly and closes the connection.
+  //
+  // > **Corrected (2026-08-27, ADR 0022).** This read: *"It is also a recursion
+  // > bound: `stream_chunks` is a tail call and the evaluator caps nested calls
+  // > at 10,000, so a producer that must emit more than this emits larger
+  // > chunks instead."* That was true and it was an interpreter's implementation
+  // > detail leaking into an HTTP server's public configuration surface: the
+  // > largest usable value of a field in this record was set by
+  // > `ply_eval::limit::DEFAULT_MAX_CALLS`. `stream_chunks` now drives its loop
+  // > with `iterate`, which is depth 1 however long it runs, so this number is
+  // > answerable from how many chunks a response may have and from nothing
+  // > else. 50,000 is a configuration this module now serves; before the change
+  // > it raised `recursion limit of 10000 nested calls exceeded`.
   max_stream_chunks: Int,
   header_timeout_ms: Int,
   body_timeout_ms:   Int,
@@ -1558,6 +1568,19 @@ pub fn respond_chunked<s | e>(c: Int, version: Version, r: Response, keep_alive:
 // kept the connection alive after that had its next response read as chunk data
 // by the client. So the message is always terminated, and `false` says the
 // response was cut short and the connection must not be reused.
+//
+// The loop is an `iterate` rather than a tail call, which is what makes `fuel`
+// a policy number: `iterate` is one frame however many rounds it runs, so the
+// bound this honours is the one written above it and not the evaluator's.
+//
+// The budget handed to `iterate` is `fuel + 1` and is a **backstop that cannot
+// fire**. The step counts its own `left` down and answers `Stop` at zero, which
+// takes at most `fuel + 1` rounds — the extra round being the one that observes
+// zero and writes the terminator. Spending the policy inside the step rather
+// than as `iterate`'s budget is deliberate: an exhausted `iterate` budget is a
+// diagnostic, and a diagnostic here would abort the run with the response
+// framed and unterminated, which is the smuggling this function exists to
+// prevent.
 fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
                        produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int) -> Bool
   / {net.write[conn] | e} =
@@ -1567,15 +1590,21 @@ fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
     send_all(c, last_chunk(), limits.write_timeout_ms);
     false
   } else {
-    match produce(seed) {
-      None -> send_all(c, last_chunk(), limits.write_timeout_ms),
-      Some(step) ->
-        if !send_all(c, encode_chunk(step.chunk), limits.write_timeout_ms) {
-          false
-        } else {
-          stream_chunks(c, limits, step.next, produce, fuel - 1)
-        },
-    }
+    iterate({ s: seed, left: fuel }, fuel + 1, |it: { s: s, left: Int }|
+      if it.left <= 0 {
+        send_all(c, last_chunk(), limits.write_timeout_ms);
+        Stop(false)
+      } else {
+        match produce(it.s) {
+          None -> Stop(send_all(c, last_chunk(), limits.write_timeout_ms)),
+          Some(step) ->
+            if !send_all(c, encode_chunk(step.chunk), limits.write_timeout_ms) {
+              Stop(false)
+            } else {
+              Continue({ s: step.next, left: it.left - 1 })
+            },
+        }
+      })
   }
 
 // The HTTP/1.0 form: the body is the bytes and the message ends when the
@@ -1587,22 +1616,36 @@ fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
   if fuel <= 0 {
     false
   } else {
-    match produce(seed) {
-      None -> false,
-      Some(step) ->
-        if bytes_len(step.chunk) > 0
-           && !send_all(c, step.chunk, limits.write_timeout_ms) {
-          false
-        } else {
-          stream_raw(c, limits, step.next, produce, fuel - 1)
-        },
-    }
+    iterate({ s: seed, left: fuel }, fuel + 1, |it: { s: s, left: Int }|
+      if it.left <= 0 {
+        Stop(false)
+      } else {
+        match produce(it.s) {
+          None -> Stop(false),
+          Some(step) ->
+            if bytes_len(step.chunk) > 0
+               && !send_all(c, step.chunk, limits.write_timeout_ms) {
+              Stop(false)
+            } else {
+              Continue({ s: step.next, left: it.left - 1 })
+            },
+        }
+      })
   }
 
 // Accept `count` connections and answer each. A count rather than a loop,
-// because every loop here is a tail call charged against the evaluator's call
+// because this loop is still a tail call charged against the evaluator's call
 // budget; the bound is named where a reader can see it rather than discovered at
 // connection ten thousand.
+//
+// > **Narrowed (2026-08-27, ADR 0022).** This read *"because **every** loop here
+// > is a tail call charged against the evaluator's call budget"*. That is no
+// > longer true of the file: `stream_chunks` and `stream_raw` are `iterate`
+// > drivers and are depth 1. It is still true of `serve` and of
+// > `connection_loop`, which are deliberately out of that change's scope — the
+// > same rewrite applies to both and neither was done here. `max_keep_alive`
+// > (100) and a caller's `count` sit far enough below 10,000 that neither is
+// > shaped by the ceiling the way `max_stream_chunks` was.
 pub fn serve<| e>(listener: Int, count: Int, limits: Limits, app: (Request) -> Response / e) -> Int
   / {net.write[listener], net.write[conn] | e} =
   if count <= 0 {

@@ -256,6 +256,23 @@ pub enum Frame {
         next: usize,
         span: Span,
     },
+
+    /// `iterate`'s loop. A frame for the same reason the five above are, and
+    /// the reason it exists at all: the loop is one frame however many times it
+    /// goes round, so an early-terminating loop costs the depth of a `fold`
+    /// rather than the depth of the recursion it replaces.
+    ///
+    /// `budget` is what the *program* wrote down, carried unchanged so the
+    /// diagnostic can name it; `left` is what is still owed. Both, rather than
+    /// a counter alone, because a resumption of a captured continuation
+    /// continues its own copy of the count and has to report against the same
+    /// number the source names.
+    IterateStep {
+        f: Value,
+        budget: i64,
+        left: i64,
+        span: Span,
+    },
 }
 
 pub struct Prompt {

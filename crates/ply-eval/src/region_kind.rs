@@ -792,15 +792,18 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// `map`, `filter`, `fold`, `map_fold` and `bytes_position` call a function
-    /// this analysis has to be able to name.
+    /// `map`, `filter`, `fold`, `iterate`, `map_fold` and `bytes_position` call
+    /// a function this analysis has to be able to name.
     ///
-    /// All five take it **last** — `map(xs, f)`, `fold(xs, init, f)` — and all
-    /// five have a fixed arity, so the callback is `args.last()` and the rest of
-    /// the arguments are data. [`the_callback_builtins_are_the_five_this_module_knows`]
-    /// is what stops a sixth from being added under this assumption.
+    /// All six take it **last** — `map(xs, f)`, `fold(xs, init, f)`,
+    /// `iterate(seed, budget, f)` — and all six have a fixed arity, so the
+    /// callback is `args.last()` and the rest of the arguments are data.
+    /// [`the_callback_builtins_are_the_six_this_module_knows`] is what stops a
+    /// seventh from being added under this assumption, and it is why `iterate`
+    /// takes its budget second: a callback in the middle would be read as data
+    /// and the budget read as the callback, silently.
     ///
-    /// [`the_callback_builtins_are_the_five_this_module_knows`]: tests::the_callback_builtins_are_the_five_this_module_knows
+    /// [`the_callback_builtins_are_the_six_this_module_knows`]: tests::the_callback_builtins_are_the_six_this_module_knows
     fn walk_callback(
         &mut self,
         span: Span,
@@ -1049,11 +1052,11 @@ mod tests {
     use crate::builtins::Builtin;
 
     /// [`Analysis::walk_callback`] reads the callback out of the **last**
-    /// argument, which is true of all five and is not a rule the type system
-    /// enforces. A sixth callback builtin has to be checked against that
+    /// argument, which is true of all six and is not a rule the type system
+    /// enforces. A seventh callback builtin has to be checked against that
     /// assumption before it is added, and this is where it is stopped.
     #[test]
-    fn the_callback_builtins_are_the_five_this_module_knows() {
+    fn the_callback_builtins_are_the_six_this_module_knows() {
         let mut names: Vec<&str> = Builtin::all()
             .iter()
             .filter(|b| b.higher_order())
@@ -1062,7 +1065,14 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["bytes_position", "filter", "fold", "map", "map_fold"],
+            [
+                "bytes_position",
+                "filter",
+                "fold",
+                "iterate",
+                "map",
+                "map_fold"
+            ],
             "a callback builtin was added or removed; `walk_callback` reads the function out of \
              the last argument and has to be checked against the new one"
         );
