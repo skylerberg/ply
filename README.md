@@ -655,4 +655,9 @@ cargo test --workspace
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0 — the texts are [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE) at the repository root, added 2026-08-27. Until
+then neither file existed, and this line and `Cargo.toml:22` declared a licence the
+repository did not ship; `CONTRIBUTING.md` §"Things known to be broken" item 7 is
+where that was recorded. The thirteen workspace members inherit the expression with
+`license.workspace = true`.
