@@ -103,8 +103,19 @@ for tool in "${needed[@]}"; do
   command -v "$tool" >/dev/null || { echo "$tool is needed and is not on PATH" >&2; exit 2; }
 done
 
+# `--locked`, and it was not before. This build re-resolves `Cargo.lock` if the
+# manifests have moved past it, and re-resolving is the one thing a measuring
+# script must not do quietly: in CI this runs *after* a `cargo build --locked`
+# step, so an unlocked build here could update the very file that step had just
+# vouched for and leave a green tick over a lock nothing checked. Measured on
+# this tree with one `[[package]]` entry deleted from the lock: without
+# `--locked` the build exits 0 and silently rewrites the file; with it, exit 101,
+# `cannot update the lock file ... because --locked was passed`, file untouched.
+# The cost is that a tree whose lock is genuinely stale must run `cargo build`
+# once before measuring — the same bargain the `clippy` and `test` jobs already
+# make, and a clearer failure than a lock that moved under a run.
 if [ "$build" -eq 1 ]; then
-  cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli
+  cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli
 fi
 
 # ~~This script does not build the binary it runs (CONTRIBUTING.md §"Things
@@ -124,12 +135,33 @@ if ! "$root/.github/binary-is-current.sh" "$ply"; then
 fi
 
 # The instrument, checked before it is used, on both paths. `target/release/ply.d`
-# is cargo's own dep-info for this exact binary: 152 files on this tree, twelve
-# crates, and neither `ply-corpus` nor `ply-codegen-spike` nor any crate's
-# `tests/` among them. That is the right domain. The wider `find crates -name
-# '*.rs' -newer target/release/ply` fires on edits that cannot change this
-# binary and cannot be cleared by rebuilding, and a guard that cries wolf gets
-# commented out.
+# is cargo's own dep-info for this exact binary — the sources cargo actually
+# compiled into it, and nothing else. That is the right domain. The wider `find
+# crates -name '*.rs' -newer target/release/ply` fires on edits that cannot change
+# this binary and cannot be cleared by rebuilding, and a guard that cries wolf
+# gets commented out.
+#
+# How big that domain is, the loop below counts and prints. It used to be written
+# here instead:
+#
+#   > is cargo's own dep-info for this exact binary: 152 files on this tree,
+#   > twelve crates, and neither `ply-corpus` nor `ply-codegen-spike` nor any
+#   > crate's `tests/` among them.
+#
+# That was true when it was written and it is still true: on 2026-08-27 this tree
+# printed `152 sources across 12 crates`, and
+# `sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' |
+#  grep -c 'ply-corpus\|ply-codegen-spike\|/tests/'` is 0 — but it is a figure
+# that moves whenever a crate is added, with nothing to notice, and the same
+# figure had been copied into CONTRIBUTING.md. Counting costs one `$((...))` per
+# file and cannot go stale.
+#
+# The count is load-bearing rather than decoration. Cargo's dep-info is
+# `target: src src ...` on line 1; a format that moved parses to **zero**
+# sources, and a loop over zero sources finds no stale file and pronounces every
+# binary you could hand it fresh. So `sources` must be at least 1 — a floor, like
+# step 1's `passed >= 1`, never an equality against a number that would turn this
+# script red the day a module is added.
 #
 # What it catches: a binary older than a source compiled into it, and a binary
 # that is not there — including a `CARGO_TARGET_DIR` that sent the build
@@ -154,15 +186,31 @@ if [ ! -f "$dep" ]; then
   exit 2
 fi
 stale=""
+sources=0
+crates_seen=""
 for src in $(sed -n '1s/^[^:]*://p' "$dep"); do
-  if [ -e "$src" ] && [ "$src" -nt "$ply" ]; then stale="$src"; break; fi
+  sources=$((sources + 1))
+  case "$src" in
+    */crates/*) rest="${src#*/crates/}"; crates_seen="$crates_seen ${rest%%/*}" ;;
+  esac
+  # No `break`: the whole list is walked so that what gets printed is a count of
+  # what was checked rather than of what was reached before the first failure.
+  if [ -z "$stale" ] && [ -e "$src" ] && [ "$src" -nt "$ply" ]; then stale="$src"; fi
 done
+if [ "$sources" -eq 0 ]; then
+  echo "$dep named no sources, so nothing was compared against $ply" >&2
+  echo "   cargo writes 'target: src src ...' on line 1; that shape moved" >&2
+  exit 2
+fi
 if [ -n "$stale" ]; then
   echo "$ply is older than a source it was built from:" >&2
   echo "   $stale" >&2
   echo "   rebuild it before measuring anything with it" >&2
   exit 2
 fi
+crates="$(printf '%s' "$crates_seen" | tr ' ' '\n' | sort -u | grep -c . || true)"
+echo "instrument: $sources sources across $crates crates in ${dep#"$root"/}, none newer than the binary"
+echo
 
 work="$(mktemp -d)"
 owned_cluster=0
