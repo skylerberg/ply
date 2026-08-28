@@ -611,10 +611,25 @@ open:
 > ./examples/same-tests.sh
 > ```
 
-Both halves are now wrong. The script runs `cargo build --release -p ply-cli`
-itself, and it also refuses to run against a binary that is absent or older than
-a source in `target/release/ply.d` — so a stale instrument is an abort naming
-the file rather than a number you would have believed. Re-run on a worktree with
+Both halves are now wrong. The script runs `cargo build --locked --release -p
+ply-cli` itself, and it also refuses to run against a binary that is absent or
+older than a source in `target/release/ply.d` — so a stale instrument is an abort
+naming the file rather than a number you would have believed. It prints what it
+checked, derived from that file rather than written down. On 2026-08-27:
+
+```
+instrument: 152 sources across 12 crates in target/release/ply.d, none newer than the binary
+```
+
+Both numbers come out of `target/release/ply.d` on the run that prints them, so
+a crate added tomorrow moves them without anyone editing this page.
+
+`--locked` arrived on a second pass the same day; this paragraph had said
+`cargo build --release -p ply-cli`, without it. An unlocked build re-resolves a
+`Cargo.lock` that has fallen behind the manifests and says nothing about it,
+which is not something a measuring script may do. If your lock is genuinely out
+of date the script now stops with cargo's own `cannot update the lock file ...
+because --locked was passed`; run `cargo build` once and re-run. Re-run on a worktree with
 no `target/` at all: exit 0, 29 requests, and the release build dominates the
 run — 54.8s of a 60.4s total. Those two are **observations**, not the figure
 withdrawn just above: the 1-minute load average went from 3.2 to 32.4 across
@@ -696,9 +711,12 @@ a suite it did not run, and step 1 was the tree's purest instance of that.
 
 It copies `desk.ply` into `examples/.serve/` and rewrites one line *there*, so
 your working tree is not modified (`PLY_SERVE_OUT` moves that directory). It
-runs `cargo build --release -p ply-cli` itself — ~~unlike `same-tests.sh`~~, a
-distinction that stopped existing on 2026-08-27 when `same-tests.sh` took the
-same line (`serve.sh:155`) and added a freshness check `serve.sh` does not have.
+runs `cargo build --locked --release -p ply-cli` itself — ~~unlike
+`same-tests.sh`~~, a distinction that stopped existing on 2026-08-27 when
+`same-tests.sh` took the same line (`serve.sh:160`) and added a freshness check
+`serve.sh` does not have. `--locked` reached both lines together, and had to:
+`same-tests.sh` starts this script twice, so an unlocked build here is an
+unlocked build inside a run whose whole point is a tree that does not move.
 It prints a generated `DESK_API_KEY` if you have not exported one.
 
 Measured, `--memory` on port 8911:

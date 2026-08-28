@@ -533,7 +533,7 @@ The original four:
 | the pool | `PLY_TEST_DB='postgresql://ply@127.0.0.1:5432/ply_test?sslmode=disable' cargo test -p ply-host --lib db::pool`. **This is the worst of the five: 26 tests hide behind it and print *nothing* when it is unset** — not a skip line, not on stderr, nothing. Re-measured 2026-08-24 on the machine in `docs/ONBOARDING.md` §Provenance against a local postgres 18.3: unset gives `26 passed` in `0.00s`; set and reachable gives `26 passed` in `0.94s`; set and *unreachable* gives **`20 FAILED`** in `0.02s` with `E0431`, because `db/pool/tests.rs:41` does `.expect("the test database is reachable")`. So a wrong value is loud and only a missing one is silent — CI sets the variable, pre-flights it with `test -n` and a `psql SELECT 1`, and that combination does cover it. An earlier version of this row said the figure was `1.55s` while `ROADMAP.md` said `1.35s` for the same measurement; neither had been re-taken |
 | shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix. CI runs on `ubuntu-24.04`, so it is compiled there, and a step fails if that binary reports zero tests |
 | the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
-| `examples/desk.ply` or any host handler | `./examples/same-tests.sh`. ~~build `--release` first, it does not build for you.~~ **It builds for you since 2026-08-27**, and refuses to run against a binary older than a source in its own dep-info, so the hand-build this row used to demand is now `--no-build` for the case where you meant a particular binary. CI runs it in a job of its own, so this one is caught before a merge rather than only when you remember |
+| `examples/desk.ply` or any host handler | `./examples/same-tests.sh`. ~~build `--release` first, it does not build for you.~~ **It builds for you since 2026-08-27**, and refuses to run against a binary older than a source in its own dep-info, so the hand-build this row used to demand is now `--no-build` for the case where you meant a particular binary. That build is `--locked`, so a `Cargo.lock` that has fallen behind the manifests stops the script with cargo's own `cannot update the lock file ... because --locked was passed` instead of being rewritten under a run: `cargo build` once, then re-run. CI runs it in a job of its own, so this one is caught before a merge rather than only when you remember |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock ratio and runs by default. A busy machine can fail it.
@@ -1374,8 +1374,8 @@ Recorded here so nobody spends an afternoon rediscovering them.
 2. ~~**`examples/same-tests.sh` does not build the binary it runs.** It uses
    `target/release/ply` (line 44) with no `cargo build` anywhere.~~ **Fixed
    2026-08-27.** The script runs
-   `cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli`
-   itself — `examples/serve.sh:155`'s exact form — and then, on that path and on
+   `cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli`
+   itself — `examples/serve.sh:160`'s exact form — and then, on that path and on
    the new `--no-build` path alike, refuses to run against a binary that is
    absent or older than a source listed in `target/release/ply.d`, cargo's own
    dep-info for that binary, and then calls `.github/binary-is-current.sh`,
@@ -1383,6 +1383,40 @@ Recorded here so nobody spends an afternoon rediscovering them.
    modules and those are `include_str!`ed into `ply`, so editing one changes
    what this comparison means while moving no `.rs` file. The build is the convenience; the refusal is the
    load-bearing half.
+
+   **`--locked` was not on that line until a second pass the same day**, and this
+   entry quoted it without. It read:
+
+   >   The script runs
+   >   `cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli`
+   >   itself
+
+   An unlocked build re-resolves `Cargo.lock` when the manifests have moved past
+   it, silently, and in CI this build runs *after* `cargo build --locked --release
+   -p ply-cli` — so it could rewrite the very file that step had just vouched for
+   and leave the locked check worth nothing. Reproduced on this tree with one
+   `[[package]]` entry deleted from `Cargo.lock`:
+
+   ```
+   $ cargo build --release --manifest-path .../Cargo.toml -p ply-cli
+       Finished `release` profile [optimized] target(s) in 0.37s      # exit 0
+   # and Cargo.lock is byte-identical to the pre-deletion copy again:
+   # the build put the entry back without being asked
+
+   $ cargo build --locked --release --manifest-path .../Cargo.toml -p ply-cli
+   error: cannot update the lock file .../Cargo.lock because --locked was passed
+   to prevent this                                                   # exit 101
+   # and Cargo.lock is byte-identical to the deleted-entry copy: untouched
+   ```
+
+   `examples/serve.sh:160` needed the same flag and now carries it, because
+   `same-tests.sh` starts `serve.sh` **twice**: an unlocked build there is an
+   unlocked build on the CI path. Checked the same way, with a stub `cargo` on
+   `PATH` recording its argv and then running the real one: `serve.sh` handed it
+   `build --release --manifest-path .../Cargo.toml -p ply-cli`, and the stale lock
+   came back rewritten. What `--locked` costs is that a tree whose lock has
+   genuinely fallen behind must run `cargo build` once before measuring — the
+   bargain the `clippy` and `test` jobs already make.
 
    Seen to fail before it was believed. Binary moved aside:
    `./examples/same-tests.sh --no-build` exits **2** with `no release binary at
@@ -1399,21 +1433,87 @@ Recorded here so nobody spends an afternoon rediscovering them.
    `find crates -name '*.rs' -newer target/release/ply` — house rule 6's literal
    form — is deliberately **not** the check. It walks `ply-corpus`,
    `ply-codegen-spike` and every crate's `tests/`, none of which is in this
-   binary's graph: the dep-info is 152 files across twelve crates and holds none
-   of those three. A guard that fires on an edit which cannot change the binary,
+   binary's graph. A guard that fires on an edit which cannot change the binary,
    and that rebuilding cannot clear, gets commented out. What the dep-info form
    does **not** catch is an edit and a build inside the same second;
    §"A moving tree invalidates a correctness number" records that trap for
    cargo's own fingerprints, this inherits a weaker form of it, and the script's
    comment says so rather than claiming the instrument problem is closed.
 
+   **How big that graph is is no longer written down.** This paragraph carried a
+   figure that the script's comment carried too. It read:
+
+   >   the dep-info is 152 files across twelve crates and holds none
+   >   of those three
+
+   That was true when it was written and it is true today; it was also a number
+   that moves the day a crate is added, asserted here and in the guard's own
+   comment in `examples/same-tests.sh`, and checked by nothing. The script now **counts** it, from the same file it was
+   already reading, and prints what it counted before step 1. On 2026-08-27, on
+   the machine in `docs/ONBOARDING.md` §Provenance, that line read:
+
+   ```
+   instrument: 152 sources across 12 crates in target/release/ply.d, none newer than the binary
+   ```
+
+   which is a transcript of a run and not a figure to keep true.
+
+   Derive the same two numbers by hand:
+
+   ```
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' | grep -c .
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' |
+     grep -o '/crates/[^/]*/' | sort -u | wc -l
+   ```
+
+   and the "holds none of those three" half, which is `0`:
+
+   ```
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' |
+     grep -c 'ply-corpus\|ply-codegen-spike\|/tests/'
+   ```
+
+   Counting it closed a hole and not only a staleness risk. The loop had **no
+   floor**. Cargo writes `target: src src ...` on line 1 of a dep-info; a first
+   line that names no sources parses to an empty list, and a loop over an empty
+   list finds no stale file and pronounces fresh whatever binary you hand it.
+   Seen: with that line emptied, the round-1 script printed nothing about the
+   instrument at all and went straight into step 1; the script as it stands exits
+   **2** with `... named no sources, so nothing was compared against ...`. The
+   check is `sources >= 1` — a floor, like step 1's `passed >= 1` — never an
+   equality against 152, which would turn the script red the day a module is
+   added.
+
    One thing this entry never said and should not be read as saying: CI was not
-   the exposure. `.github/workflows/ci.yml` has run `cargo build --locked
-   --release -p ply-cli` immediately before the script since the job existed.
-   The exposure was the **local** run, which §"If your change touches" told you
-   to work around by hand; that row is corrected too, and so is the CI comment,
-   whose stated rationale — "the script's own requirement" — is no longer why
-   the step is there.
+   the exposure **for the binary**. `.github/workflows/ci.yml` has run
+   `cargo build --locked --release -p ply-cli` immediately before the script
+   since the job existed. That exposure was the **local** run, which §"If your
+   change touches" told you to work around by hand; that row is corrected too,
+   and so is the CI comment, whose stated rationale — "the script's own
+   requirement" — is no longer why the step is there.
+
+   CI *was* exposed on the other axis, and that is the `--locked` finding above:
+   until both scripts took the flag, the job's one locked build was followed by
+   three unlocked ones — `same-tests.sh`'s own, and `serve.sh`'s twice — any of
+   which could have re-resolved the lock the locked step had just checked.
+   Nothing is known to have happened. This is a hole that was open, not a run
+   that went wrong, and it is recorded as the former.
+
+   **No timing figure was taken for any of this.** Every statistic above is an
+   exit status, a `cmp` of two copies of a file, or a count derived from a file:
+   deterministic, N=1 per case, pre-registered before it had a value, in a file
+   written outside this repository. `uptime` before the first probe read
+
+   ```
+   22:13  up 64 days,  5:39, 9 users, load averages: 8.47 7.30 10.23
+   ```
+
+   and after the last, `10.14`, against this project's gate of 4.0 — so the two
+   withdrawn wall clocks, `5.63s` in §"What CI runs, and what each step is worth"
+   and `4.6s` in `docs/ONBOARDING.md` §4, stay **withdrawn**. Neither was
+   re-taken, neither was replaced by a guess, and the end-to-end run behind them
+   was re-run only for its **29 requests** and its exit **0**, which are counts
+   and not clocks.
 3. ~~**`examples/same-tests.sh` step 1 can be vacuous.** It passes
 
 3. **`examples/same-tests.sh` step 1 can be vacuous.** It passes
