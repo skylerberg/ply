@@ -57,6 +57,31 @@ merged. Nothing in this repository's loop would have caught it: there is no CI,
 `cargo test --workspace` does not reach `spikes/`, and a modified working tree
 is invisible to every command in `CONTRIBUTING.md` §"The loop".
 
+> **Two of those three still hold; one is withdrawn, and something now catches
+> it (2026-08-27).** The withdrawn clause is *"there is no CI"* —
+> `.github/workflows/ci.yml` has existed since 2026-08-24 with nine jobs.
+> It still would not have caught this: its `spike` job runs
+> `crates/ply-codegen-spike` and nothing in it reaches `spikes/ply-lexer`, whose
+> harness declares its own `[workspace]`. The other two clauses are re-checked
+> and stand.
+>
+> **And this hazard turned out to have a second, worse form.** The rule this
+> project used for checking a binary against its tree,
+> `find crates -name '*.rs' -newer target/release/ply`, cannot see an edit to a
+> stdlib module at all: `crates/ply-std/src/lib.rs` `include_str!`s all eight
+> `crates/ply-std/ply/*.ply` into the binary, so editing one changes what
+> `import std.http` means and moves no `.rs`. A round-1 workstream lost a
+> headline count to exactly that, which makes §0's story the first of two.
+> Both are now mechanical: `.github/binary-is-current.sh` reads rustc's
+> dep-info — `target/release/ply.d`, which lists all eight `.ply` files beside
+> the 144 `.rs` — and diffs the stdlib the binary actually holds against the
+> files on disk. `CONTRIBUTING.md` §"The binary is an instrument too" carries
+> the reproduction, the corrected rule, and the list of measurements in this
+> ADR that were taken through a pre-built binary. **§1 and §4.1 of this
+> document are on that list**, and are not withdrawn by it: §1 was re-taken
+> three times by two parties on a clean binary and survived, and §9 records the
+> binary as built from the reviewed tree.
+
 ---
 
 ## §1 What was verified

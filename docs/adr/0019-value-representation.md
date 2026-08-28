@@ -110,6 +110,18 @@ the wall-clock ratios in §5 all come from a harness that times both sides insid
 one window for that reason (`benches/README.md` §"Every ratio is taken inside
 one window").
 
+> **One figure here is exposed to a stale binary and the rest are not
+> (2026-08-27).** Almost every row of §"What is measured" is rendered by
+> `cargo test -p ply-corpus --release …`, and cargo rebuilds — measured:
+> `touch crates/ply-std/ply/http.ply` alone makes `cargo build -p ply-std`
+> print `Compiling ply-std`, because the eight embedded `.ply` modules are in
+> the dep-info cargo reads. The exception is the row rendered by
+> `./target/release/w6-alloc --repo . --requests 200` (1,082, corrected to
+> 773.4), which runs a **pre-built** binary against a program that imports
+> `std`. Not withdrawn and not re-taken here; recorded so a reader knows which
+> row carries the risk. `CONTRIBUTING.md` §"The binary is an instrument too"
+> has the check to run before re-taking it.
+
 ## Context
 
 ### The milestone was requested as "unboxed primitives", and the premise was false
