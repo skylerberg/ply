@@ -2333,6 +2333,69 @@ test "a perform inside an iterate step" {
   assert_eq(handle { iterate({i: 0, acc: 0}, 41, step) }
             with { tally.bump[c](n) -> n + 2 },
             80)
+
+/// A record update runs on both engines, and it runs on the *same* path the
+/// longhand does — because expansion in the parser makes it the same tree.
+///
+/// That is the claim worth auditing here. The alternative design, a
+/// `RecordUpdate` node each engine evaluates for itself, is two implementations
+/// of one construct and two chances to disagree: ADR 0001 rejected `.` for
+/// qualified references on exactly that ground. Both engines carry an
+/// `unreachable!` for the node instead, guarded by
+/// `no_record_update_survives_parse_module_anywhere_in_the_tree`.
+#[test]
+fn a_record_update_agrees_with_its_longhand_on_both_engines() {
+    agree_and_pass(
+        r#"
+type L = {a: Int, b: Int, c: Int}
+type W = {lim: L, n: Int}
+
+fn sugar(s: L) -> L = {..s, b: 20}
+fn longhand(s: L) -> L = {a: s.a, c: s.c, b: 20}
+fn projected(w: W) -> L = {..w.lim, a: 7}
+fn identity(s: L) -> L = {..s}
+
+test "the sugar and the longhand compute one value" {
+  let s = {a: 1, b: 2, c: 3};
+  assert_eq(sugar(s), longhand(s));
+  assert_eq(sugar(s).b, 20);
+  assert_eq(sugar(s).a, 1);
+  assert_eq(sugar(s).c, 3);
+  assert_eq(identity(s), s);
+  assert_eq(projected({lim: s, n: 9}), {a: 7, b: 2, c: 3})
+}
+"#,
+    );
+}
+
+/// A replacement value may perform, and it performs exactly once — the base is
+/// copied field-wise, so an effect in a *written* field is not duplicated by the
+/// twelve copies beside it.
+#[test]
+fn a_replacement_value_performs_once_on_both_engines() {
+    agree_and_pass(
+        r#"
+type L = {a: Int, b: Int, c: Int}
+effect counter { write bump[n]() -> Int }
+
+fn go(s: L) -> L = {..s, b: counter.bump[n]()}
+
+test "one bump, not one per field" {
+  with_cell[t](0) { c ->
+    {
+      let s = {a: 1, b: 2, c: 3};
+      let r = handle {
+        go(s)
+      } with {
+        counter.bump[n]() -> { cell_set(c, cell_get(c) + 1); 99 }
+      };
+      // Counted, not assumed: the earlier form of this test handled `bump`
+      // without tallying it and pinned neither `r.b` nor the field set, so a
+      // replacement value performed twice passed it.
+      assert_eq(cell_get(c), 1);
+      assert_eq(r, {a: 1, b: 99, c: 3})
+    }
+  }
 }
 "#,
     );

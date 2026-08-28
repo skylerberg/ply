@@ -2,6 +2,7 @@ pub mod ast;
 mod effect_set;
 pub mod lexer;
 pub mod parser;
+mod record_update;
 pub mod resolve;
 
 #[cfg(test)]
