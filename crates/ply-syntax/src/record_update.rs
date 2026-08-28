@@ -29,7 +29,7 @@
 //! module leave a stale expansion behind in a file that never moved — and a
 //! stale expansion is a *wrong record*, not merely a stale name.
 //!
-//! The cost is a real restriction, recorded in `docs/adr/0022-record-update.md`
+//! The cost is a real restriction, recorded in `docs/adr/0023-record-update.md`
 //! §4 with its lift path: `{..cfg, x: 1}` where `cfg: std::http::Limits` is
 //! refused with `E0116`, because `Limits` is declared in another file.
 //!
@@ -335,6 +335,12 @@ impl Cx<'_> {
             .map(|(n, _)| n)
             .filter(|n| !written.iter().any(|(w, _)| w.name == n.name))
             .collect();
+        // By name, never by length. Every single-letter field set orders the
+        // same way under both, and one mixed-length pair only rules out the
+        // length direction it disagrees with, so each of these carries a pair
+        // each way: `crate::tests::copies_are_sorted_by_name_and_not_by_length`,
+        // and `ply-hash`'s `record_update_hashes_as_its_expansion` and
+        // `a_projected_base_hashes_as_its_expansion`.
         copies.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
 
         let mut fields: Vec<(Ident, Expr)> = Vec::with_capacity(copies.len() + written.len());
