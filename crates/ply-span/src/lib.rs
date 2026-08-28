@@ -202,6 +202,20 @@ pub struct Label {
 
 /// Stable diagnostic codes. Numbers are permanent once released so that tooling
 /// and agents can match on them.
+///
+/// Two things about this module are checked rather than remembered, both by
+/// `crates/ply-span/tests/armed.rs`:
+///
+/// * every constant here has a row in the registry table below
+///   (`the_code_registry_table_is_total_over_the_codes_module`). Before that
+///   test existed a constant could be added here and registered nowhere, and
+///   one was: `REFERENCE_CYCLE` sits out of numeric order between `W0608` and
+///   `W0609`, and had no row — 83 constants against 82 rows.
+/// * every constant here is passed to `Diagnostic::error` or
+///   `Diagnostic::warning` by some production source
+///   (`every_registered_code_is_constructed_in_production`), or is listed in
+///   that file's `UNARMED_CODES` with the reason it is reserved and unraised.
+///   `E0435` and `E0438` are listed there.
 pub mod codes {
     pub const UNEXPECTED_TOKEN: &str = "E0001";
     pub const UNTERMINATED_STRING: &str = "E0002";
@@ -829,6 +843,7 @@ mod tests {
             ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
             ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
             ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
+            ("REFERENCE_CYCLE", codes::REFERENCE_CYCLE, "W0610"),
         ];
 
         for (name, code, expected) in registry {

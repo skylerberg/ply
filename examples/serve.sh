@@ -42,8 +42,9 @@
 # "refuses at bind time with `E0435` if the live database is not the one
 # `desk.ply` describes". It does not, and never did. `E0435 DB_SCHEMA_MISMATCH`
 # is raised nowhere: `grep -rn 'E0435\|DB_SCHEMA_MISMATCH' crates/ --include='*.rs'`
-# returns five hits and none is a raise — `crates/ply-span/src/lib.rs:414`
-# defines the constant, `:787` registers it, `crates/ply-eval/src/host.rs:1106`
+# returns five hits and none is a raise — `crates/ply-span/src/lib.rs:428`
+# defines the constant, `:801` registers it (inside `#[cfg(test)] mod tests`),
+# `crates/ply-eval/src/host.rs:1106`
 # lists it as reserved, and `crates/ply-cli/src/artifact.rs:253` and
 # `crates/ply-cli/src/db.rs:539` are prose describing the check as future work.
 # What `--db-schema` actually does is resolve the name, check it is a nullary

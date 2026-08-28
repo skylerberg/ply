@@ -1129,8 +1129,14 @@ changes the database, and says so.
 > `tests/fixtures/db_schema_mismatch.ply` and in `examples/desk.ply:398`;
 > `pg_constraint` appears in prose only. **`E0435` is raised nowhere**: the
 > constant `codes::DB_SCHEMA_MISMATCH` has exactly three occurrences —
-> its definition and registry row in `crates/ply-span/src/lib.rs:414,787` and
+> its definition and registry row in `crates/ply-span/src/lib.rs:428,801` and
 > its membership in `RESERVED_CODES` at `crates/ply-eval/src/host.rs:1106`.
+> (Those two `ply-span` numbers read `:414,787` until 2026-08-27, when the
+> `codes` module grew a doc comment; the count and the finding are unchanged.
+> The registry-row hit is inside `#[cfg(test)] mod tests`, so under the rule
+> `crates/ply-span/tests/armed.rs` applies there is exactly **one** occurrence
+> outside tests, the `RESERVED_CODES` entry — which is why a file-granularity
+> sweep for "referenced outside tests" calls `E0435` live.)
 >
 > The implementation is honest about this where the ADR was not. `db.rs`
 > carries a two-state `schema::State` and comments the distinction itself:
@@ -1200,6 +1206,22 @@ like E0421–E0423.
 > exists and documents the refusal in detail; running it produces no `E0438`.
 > This is a code gap, reported rather than fixed here, since this is a
 > documentation pass.
+>
+> **Follow-up, 2026-08-27: still not fixed, but no longer only recorded.** The
+> finding above — that `E0435` and `E0438` are registered and reserved and
+> emitted nowhere — was a note in a document, which is precisely the shape of
+> defect `CONTRIBUTING.md` §"The shape it keeps taking: declared, registered,
+> raised nowhere" catalogues: it could stop being true, or stay true and be
+> forgotten, and nothing would say so either way. It is now an assertion.
+> `every_registered_code_is_constructed_in_production` in
+> `crates/ply-span/tests/armed.rs` fails on any registered code that no
+> production source passes to `Diagnostic::error`/`warning`, and `E0435` and
+> `E0438` are the two entries in that file's `UNARMED_CODES`, each carrying this
+> ADR as its citation. `no_allowlist_entry_has_outlived_its_reason` fails the
+> moment either is constructed, so the day someone builds the schema check the
+> allowlist row has to go with it. **Nothing about the gap itself changed**: no
+> raise site was added, `pg_trigger` is still queried nowhere, and §2.5's
+> guarantee is still not in force.
 
 E0432, E0433, E0434, E0436 and E0437 join E0424's row: `Failure::defect` is
 `false`, they are attributed like any other failure, and bisection is skipped
