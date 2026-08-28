@@ -7870,8 +7870,16 @@ no_record_update_survives_parse_module_anywhere_in_the_tree` parses every `.ply`
 file in the repository plus a file that uses the syntax, through both
 `Module`-returning entry points, and asserts none survives. `ply-hash`,
 `ply-core`, `ply-eval` and `ply-prove` carry arms for it that refuse — three
-`unreachable!` and one `Blocker::Region` — and those arms are safe only because
-of that guard.
+`unreachable!` and one `Blocker::UnexpandedSugar` — and those arms are safe only
+because of that guard.
+
+> **The prover's blocker was `Blocker::Region`.** That line read "three
+> `unreachable!` and one `Blocker::Region`". A record update is not a `perform`,
+> a `handle` or a `simulate`, and `ply_corpus::discharge::label` prints a
+> blocker's words to a reader, so the arm now carries its own variant.
+> Unreachable today, so nothing can print it and no test watches it fire; the
+> half that *is* checked is that `label` matches `Blocker` exhaustively with no
+> wildcard — delete the new row and `ply-corpus` fails to build with `E0004`.
 
 - **Expansion happens inside `ply_syntax::parse_module`**, immediately after
   `effect_set::expand`, for the same reasons and with the same shape.
@@ -7881,7 +7889,37 @@ of that guard.
   `base.<name>`; then the written fields in the order written. Sorted because
   `reordering_the_fields_of_a_record_type_is_free` is an invariant the suite
   asserts; written-last because `GAPS.md` §1 measures a growing sub-expression
-  out of last position as quadratic.
+  out of last position as quadratic. Sorted **by name and not by length** is a
+  separate claim and is pinned separately, because a suite written in
+  one-character field names orders identically under either comparator and says
+  nothing. Each of `crates/ply-syntax/src/tests.rs
+  copies_are_sorted_by_name_and_not_by_length`,
+  `record_update_hashes_as_its_expansion` and
+  `a_projected_base_hashes_as_its_expansion` therefore carries **two**
+  mixed-length pairs, one each way: a pair whose longer name sorts first
+  (`ab`/`b`, `aa`/`z`, `pp`/`q`) and a pair whose shorter one does (`a`/`bb`,
+  `a`/`zz`, `p`/`qq`).
+
+  > **One pair was not enough, and the gap had the same shape as the defect it was
+  > written to close.** The sentence above ended:
+  >
+  > > : `crates/ply-syntax/src/tests.rs
+  > > copies_are_sorted_by_name_and_not_by_length` reads the emitted order off the
+  > > tree, and `record_update_hashes_as_its_expansion` and
+  > > `a_projected_base_hashes_as_its_expansion` both carry field names whose
+  > > lexicographic and length orders disagree.
+  >
+  > They did — but all three pairs disagreed in the **same direction**. `ab`, `aa`
+  > and `pp` each sort before their partner lexicographically *and* are longer, so
+  > the three cases rule out a shortest-first comparator and leave a longest-first
+  > one green. Shown rather than argued: replacing the comparator with
+  > `b.len().cmp(&a.len()).then(a.cmp(b))` makes the expander emit
+  > `(rec (bb (field s bb)) (a (field s a)) (c 1))` — a wrong order — and left
+  > `ply-syntax` 229/229, the hash audit 53/53, `ply-cli --test stdlib` 25/25,
+  > `--test incremental` 25/25, `--test modules_hash_audit` 2/2,
+  > `ply-core --test record_update` 8/8 and `ply-eval --test equivalence_audit`
+  > 38/38 **all green**. The mirror pairs close it: with them, both length
+  > directions go red.
 - **The base is a path**, `s` or `state.limits`, never a call. The expansion
   writes `base.f` once per copied field, so a base that could perform or allocate
   would run once per field.
@@ -7906,7 +7944,7 @@ field set, and the width meets the same exact-key-set unification
 (`crates/ply-core/src/unify.rs`) every record literal meets. A too-wide shape is
 `E0101` from `ExprKind::Field`; a too-narrow one is `E0201` wherever the result
 meets a known record type — which is **not total** for a `{..s}` no annotation
-ever constrains, and is marked so in ADR 0022 §5 rather than claimed.
+ever constrains, and is marked so in ADR 0023 §5 rather than claimed.
 
 ### New diagnostic codes — landed
 
@@ -7928,13 +7966,61 @@ is copied from the limit of the same name**, which is asserted on the parsed tre
 at `crates/ply-cli/tests/stdlib.rs
 chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red on
 a mispairing while `ply check` stays green, because all thirteen `Limits` fields
-are `Int`.
+are `Int`. The same assertion covers the three converted test helpers
+(`the_limits_helpers_vary_only_the_bounds_they_are_named_for`), and
+`limits_with_pairs_each_bound_with_the_parameter_named_after_it` closes the one
+mispairing conversion does not remove: `limits_with` writes seven bounds from
+seven `Int` parameters, so `max_chunk_size: chunk_line` still type-checks and
+only the naming convention stands between it and a wrong bound.
 
-`default_limits`, `limits_with`, `limits_keeping` and `limits_streaming` still
-spell `Limits` out. They were left alone so that no `DefHash` outside
-`chunk_trailers`' dependency cone moved: 40 of 206 entries in `std.http`, **84 of
-1,428 in `examples/` — all 84 inside that cone** — and 0 in the other seven
-shipped modules.
+`limits_with`, `limits_keeping` and `limits_streaming` are record updates over a
+`let base: Limits = default_limits();` lift as well, each varying only the bounds
+its name promises. **`default_limits` is the one site that still spells `Limits`
+out, and it cannot stop**: it constructs from nothing, so there is no base to
+update.
+
+The moved set is the transitive-dependent set of the four converted definitions,
+exactly — "moved but not a dependent: none", "dependent that did not move: none":
+
+| corpus | entries | moved |
+| --- | --- | --- |
+| `crates/ply-std/ply/http.ply` | 206 = 150 definitions + 56 tests | **47** = 23 definitions + 24 tests |
+| `examples/` | 1,428 = 1,067 definitions + 361 tests | **91**, of which 44 are `desk.*` and 47 are `std.http`'s own entries |
+| the other seven shipped modules | — | **0** |
+
+`examples/desk.ply` imports `std.http`, so `desk` is a transitive dependent and
+its 44 moving is the intended behaviour. Nothing else written under `examples/`
+moved. No `FRONTEND_VERSION` or `RUNTIME_VERSION` bump: a binary built from this
+branch's compiler with the **base** `http.ply` embedded hashes the base corpus to
+**0 moved**, so the whole table is attributable to the `.ply` edit.
+
+> **The three helpers were on the deferred list, and both numbers beside them
+> were misleading.** This read:
+>
+> > `default_limits`, `limits_with`, `limits_keeping` and `limits_streaming`
+> > still spell `Limits` out. They were left alone so that no `DefHash` outside
+> > `chunk_trailers`' dependency cone moved: 40 of 206 entries in `std.http`,
+> > **84 of 1,428 in `examples/` — all 84 inside that cone** — and 0 in the
+> > other seven shipped modules.
+>
+> The deferral was deliberate and it was spent as soon as the criterion it
+> protected was established. It had a cost while it lasted: crossing
+> `max_chunk_size` and `max_chunk_line` inside `limits_keeping` left `ply check`
+> reporting `checked 2 modules, 150 definitions, 56 tests` and every targeted
+> suite green, because all thirteen `Limits` fields are `Int` and nothing
+> exercised those two bounds through that helper.
+>
+> `84 of 1,428` was a correct reading of the tree as it then stood
+> (`chunk_trailers` alone) and is superseded by the 91 above, not withdrawn.
+> **`40 of 206` was a scope, not a total**: it is 20 definitions and 20 tests,
+> and "40" alone reads as "40 definitions". A neighbouring reading of "60 moved
+> (40 definitions + 20 tests)" is not a contradiction and not a second
+> measurement — it comes from hashing the whole `crates/ply-std/ply/` directory,
+> where `http.ply` appears **twice**, once as the module `http` (the file) and
+> once as `std.http` (the copy compiled into the binary, reached through another
+> module's `import`), and then keying the comparison on the bare name, which
+> double-counts the definitions and collapses the tests that collide. One file,
+> one honest denominator: `ply hash` on `http.ply` itself.
 
 > **The `examples/` figure was wrong, and it was wrong in the reassuring
 > direction.** This sentence read:
@@ -7966,3 +8052,7 @@ shipped modules.
 > and "dependent that did not move: none". `std.http` re-reads **40 of 206**, as
 > above, and the whole `crates/ply-std/ply/` tree moves nothing outside
 > `http` — so the exit criterion holds; only the count was misreported.
+>
+> *(Round 2: "as above" in that last sentence points at the paragraph as it stood
+> then — `chunk_trailers` alone, 40 of 206. The paragraph now reads 47 of 206,
+> because three more definitions were converted afterwards.)*

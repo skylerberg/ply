@@ -916,13 +916,24 @@ fn record_update_hashes_as_its_expansion() {
 
     // Names of *differing length*, because `a`/`b`/`c` cannot tell
     // lexicographic order apart from any comparator that ties-breaks on length
-    // first — and a longhand a reader writes from ADR 0022 §Decision 2 has to
+    // first — and a longhand a reader writes from ADR 0023 §Decision 2 has to
     // match the emitted order for real field names, not just short ones.
+    //
+    // Both directions. `aa`/`z` sorts the longer name first, so it catches a
+    // shortest-first comparator and *not* a longest-first one, which emits the
+    // same order sorting by name does. `a`/`zz` is the mirror.
     const WIDE: &str = "type R = {aa: Int, z: Int, k: Int}\nfn f(s: R) -> R = ";
     unchanged(
         "record update with field names of differing length",
         &format!("{WIDE}{{..s, k: 1}}"),
         &format!("{WIDE}{{aa: s.aa, z: s.z, k: 1}}"),
+        "f",
+    );
+    const MIRROR: &str = "type R = {a: Int, zz: Int, k: Int}\nfn f(s: R) -> R = ";
+    unchanged(
+        "record update whose shorter field name sorts first",
+        &format!("{MIRROR}{{..s, k: 1}}"),
+        &format!("{MIRROR}{{a: s.a, zz: s.zz, k: 1}}"),
         "f",
     );
 }
@@ -959,14 +970,30 @@ fn updating_through_a_type_alias_hashes_as_its_expansion() {
 
 /// A projected base is copied as written, once per field, exactly as the
 /// longhand copies it. This is the `chunk_trailers` shape.
+///
+/// `pp`/`q` rather than `p`/`q`: the copies have to be two names whose
+/// lexicographic order and whose length order **disagree**, or this test passes
+/// under either comparator and pins nothing about which one ran. `Limits`, the
+/// record this shape exists for, has thirteen field names of eight different
+/// lengths.
+///
+/// And then `p`/`qq` as well, because one pair only disagrees with length in one
+/// direction: `pp` before `q` is what sorting by name *and* sorting longest-first
+/// both emit, so that pair alone leaves a longest-first comparator green.
 #[test]
 fn a_projected_base_hashes_as_its_expansion() {
+    const DECLS: &str = "type L = {pp: Int, q: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
     unchanged(
         "update through a field projection",
-        "type L = {p: Int, q: Int}\ntype W = {lim: L, tag: Int}\n\
-         fn f(w: W) -> L = {..w.lim, q: 2}",
-        "type L = {p: Int, q: Int}\ntype W = {lim: L, tag: Int}\n\
-         fn f(w: W) -> L = {p: w.lim.p, q: 2}",
+        &format!("{DECLS}fn f(w: W) -> L = {{..w.lim, r: 2}}"),
+        &format!("{DECLS}fn f(w: W) -> L = {{pp: w.lim.pp, q: w.lim.q, r: 2}}"),
+        "f",
+    );
+    const MIRROR: &str = "type L = {p: Int, qq: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
+    unchanged(
+        "projection whose shorter field name sorts first",
+        &format!("{MIRROR}fn f(w: W) -> L = {{..w.lim, r: 2}}"),
+        &format!("{MIRROR}fn f(w: W) -> L = {{p: w.lim.p, qq: w.lim.qq, r: 2}}"),
         "f",
     );
 }

@@ -2576,6 +2576,45 @@ fn a_record_update_parses_as_copies_then_writes() {
     );
 }
 
+/// The copies are sorted **by name**, and `a`/`b`/`c` cannot say so: every
+/// one-character field set orders identically under any comparator that compares
+/// length first and name second, so a suite written only in single letters
+/// passes whichever of the two ran.
+///
+/// **Both length directions, and that is not belt-and-braces.** One mixed-length
+/// pair rules out only the direction it happens to disagree with: `ab`/`b` puts
+/// the *longer* name first alphabetically, so a shortest-first comparator emits
+/// `b, ab` and fails — while a longest-first one emits `ab, b`, which is also
+/// what sorting by name emits, and passes. `a`/`bb` is the mirror pair and fails
+/// the other way. A comparator keyed on length in either direction is caught only
+/// by having both.
+#[test]
+fn copies_are_sorted_by_name_and_not_by_length() {
+    for (src, want, wrong) in [
+        (
+            "type R = {ab: Int, b: Int, c: Int}\nfn f(s: R) -> R = {..s, c: 1}",
+            "(rec (ab (field s ab)) (b (field s b)) (c 1))",
+            "shortest-first",
+        ),
+        (
+            "type R = {a: Int, bb: Int, c: Int}\nfn f(s: R) -> R = {..s, c: 1}",
+            "(rec (a (field s a)) (bb (field s bb)) (c 1))",
+            "longest-first",
+        ),
+    ] {
+        let m = ok(src);
+        let Item::Fn(f) = &m.items[1] else {
+            panic!("expected a fn")
+        };
+        assert_eq!(
+            dump_expr(&f.body),
+            want,
+            "a {wrong} comparator reverses this pair and passes every \
+             single-letter case in this file"
+        );
+    }
+}
+
 #[test]
 fn a_record_update_with_no_written_fields_copies_every_field() {
     let m = ok("type R = {b: Int, a: Int}\nfn f(s: R) -> R = {..s}");

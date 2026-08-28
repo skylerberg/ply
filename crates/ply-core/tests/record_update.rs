@@ -1,7 +1,7 @@
 //! What `{..b, f: e}` does to a check, at the source level.
 //!
 //! Three claims, and the first is the reason the feature is shaped the way it
-//! is (`docs/adr/0022-record-update.md`):
+//! is (`docs/adr/0023-record-update.md`):
 //!
 //! 1. **There is no typing rule for a record update.** By the time inference
 //!    runs, `{..s, a: 1}` *is* the literal that copies `s`'s other fields, so it
@@ -148,7 +148,7 @@ fn a_base_with_no_nameable_shape_is_e0116() {
 }
 
 /// The module-local restriction, stated as a test rather than as prose. This is
-/// the cost ADR 0022 §4 records: the stdlib gets the win at its own definition
+/// the cost ADR 0023 §4 records: the stdlib gets the win at its own definition
 /// sites and an importing file does not, and it is what keeps ADR 0002's gate 1
 /// sound.
 #[test]

@@ -279,7 +279,7 @@ which of the two it was going to be.
 
 > **Closed by W4, and one sentence of it was wrong.** Record update now exists,
 > spelled `{..b, f: e}` — the same `..` the record *pattern* uses, not the `...`
-> this section guessed at. `docs/adr/0022-record-update.md` records the design.
+> this section guessed at. `docs/adr/0023-record-update.md` records the design.
 > Everything below is kept as written, with the two corrections it needs marked
 > where they apply.
 
@@ -339,14 +339,30 @@ the twelve fields it stops spelling are twelve it can no longer mispair.
 > `crates/ply-cli/tests/stdlib.rs
 > chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red
 > on exactly that swap while `ply check` stays green.
+>
+> The three sites named above were left hand-written for one round and are now
+> record updates too, over a `let base: Limits = default_limits();` lift. Their
+> line numbers are from `http.ply` as it stood when the experiment ran and no
+> longer point at anything; `default_limits` is the one site that still spells
+> `Limits` out, because it constructs from nothing and has no base to update.
 
 **The compounding with §1 is narrowed, not removed.** Copies are pure field
-reads that never grow, and the expansion emits them **first**, so
-`{..s, toks: push(s.toks, t)}` lands on §1's *linear* spelling with no thought
-required. But `{..s, toks: push(s.toks, t), pos: p}` is still quadratic: the
-growing field only has to be last **among the fields you wrote**, which is a
-smaller thing to get right and a syntactic one a lint can check at the update
-site. The trap is not gone.
+reads that never grow, and the expansion emits them **first**, so a single-write
+update whose value grows — `{..s, toks: push(s.toks, t)}` — lands on §1's
+*linear* spelling with no thought required: there is nothing the expansion can
+put after it.
+
+The several-writes case is untouched. `{..s, toks: push(s.toks, t), pos: p}` is
+**still quadratic**, because `pos: p` is emitted after the growing `toks` and so
+the growing field is not last in the record node. `{..s, pos: p, toks:
+push(s.toks, t)}` puts it last and so lands on the *linear* spelling this
+section measured, and computes the same record value — but it is **not the
+same definition**, because written fields are emitted in the order written and
+field order is part of a record's hash, so choosing the linear spelling moves
+the `DefHash` and re-runs what reaches it. The rule left is narrower than
+before — *a growing field must be written last among the fields you write* —
+and it is **syntactic**, checkable at the update site with no types, which is
+what makes it lintable. The trap is not gone.
 
 ---
 

@@ -155,6 +155,18 @@ pub enum Blocker {
     /// A `perform`, `handle`, `with_cell` or `simulate`. Only reachable in a
     /// concurrency law, whose row may carry `sim.read`.
     Region,
+    /// A parse-time-only node the parser is supposed to have expanded away —
+    /// today only `{..b, f: e}`, whose expansion runs inside
+    /// `ply_syntax::parse_module`.
+    ///
+    /// **Unreachable, and therefore never seen in a report.** It is `blocked`
+    /// rather than `unreachable!` because a prover's safe answer is "I did not
+    /// reason about this" and never a term it guessed; it is its own variant
+    /// rather than `Region` because a record update is not a region, and a
+    /// blocker a report prints has to say what it means the day the arm becomes
+    /// reachable. What keeps it unreachable is
+    /// `ply_syntax::tests::no_record_update_survives_parse_module_anywhere_in_the_tree`.
+    UnexpandedSugar,
     /// A pattern the fragment declines to reduce, or a pattern guard.
     UndecidableMatchArm,
     DestructuringLet,
@@ -470,11 +482,8 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let base = self.lower(base);
                 self.terms.field(base, field.name.clone())
             }
-            // Unreachable — expansion runs in the parser — and `blocked` rather
-            // than `unreachable!` because a prover's safe answer is always "I
-            // did not reason about this", never a term it guessed.
             ExprKind::RecordUpdate { .. } => {
-                self.blocked(Blocker::Region);
+                self.blocked(Blocker::UnexpandedSugar);
                 self.terms.sym(None)
             }
             ExprKind::List { items } => {
