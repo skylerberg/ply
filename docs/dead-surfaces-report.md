@@ -17,17 +17,54 @@ ADR, the disagreement is stated and the correction is somebody else's change.
 
 ## 0. How to disbelieve this report
 
+> **Round 2, 2026-08-27: four claims in this report have been withdrawn in
+> place, and the recommendations are unchanged.** Adversarial review reproduced
+> the central measurements independently and found three defects in how they
+> were written up. All three are corrected below, each in a block that quotes the
+> withdrawn text verbatim:
+>
+> | | what was wrong | where the correction is | effect on the recommendation |
+> | --- | --- | --- | --- |
+> | D1 | §2.1 asserted, **as a measurement**, that only `diagnostic.message` distinguishes a runaway recursion from a failed `assert_eq`. It is `E0501` vs `E0502` — two registered codes. The pre-registered S4 decision rule had committed to that wording in advance, and its statistic could not license it | §2.1 | **none** — §2.4 and §2.5 already rested on the opposite, true fact |
+> | D2 | three grep transcripts were printed trimmed, in a report whose exit criterion is *"a command or grep printed with its output"* | §1.1, §2.1 (twice) | none for two of them; the third corrects a cost number, "four tests" → 10 in the maintained tree, 14 with the spike |
+> | D3 | the `failures` digest was printed with no canonicalization stated, so a reviewer computing it the usual way got a different value | §1.1 | none |
+>
+> The D1 defect is the one that matters: a pre-registered rule that encodes a
+> conclusion broader than the statistic gating it cannot go red on the
+> observation it names. **That is this repository's signature defect, committed
+> by the document written to catalogue it.** It is treated at length in §2.1
+> rather than summarised away here.
+>
+> Round-2 measurements were pre-registered before they were taken, in
+> `/tmp/.../PREREG-r2-dead-surfaces-corrections.md`, outside the repository —
+> two round-1 branches collided on a root-level `PREREGISTRATION.md`. Whatever
+> matters from it is quoted where it is used.
+
 **Where it was taken.** Worktree `~/.worktrees/ply/w5/dead-surfaces-report`, at
 commit `d88aae5`. Nothing in the tree was edited while the numbers were taken.
 If `main` has moved, this describes `d88aae5` and says so.
 
-**The instrument.** `target/debug/ply`, built in this worktree at 20:24 local.
-House rule 6, run immediately before each runtime series:
+**The instrument.** `target/debug/ply`, built in this worktree at 20:24 local,
+and the same binary in both rounds — its mtime is unchanged. Run immediately
+before each runtime series:
 
 ```
 $ find crates -name '*.rs' -newer target/debug/ply
-$                                      # prints nothing — no source is newer
+$                                      # prints nothing — no .rs source is newer
+
+$ find crates \( -name '*.rs' -o -name '*.ply' \) -newer target/debug/ply
+$                                      # prints nothing — no .ply is newer either
 ```
+
+The second form is round 2's, and it is wider on purpose. The first is the
+`CONTRIBUTING.md` recipe, which is blind to a stale `.ply`: `crates/ply-std/src/lib.rs`
+`include_str!`s every stdlib module into the binary, so an edited `.ply` is
+compiled in and invisible to an `.rs`-only check. Neither form changes any
+conclusion here — the fixtures this report runs are in `tests/fixtures`, not the
+stdlib — but the wider check is the one that can be trusted, so it is the one
+recorded. Note that the corrected recipe as *written* in the house rules,
+`find crates -name '*.rs' -o -name '*.ply' -newer BIN`, is mis-parenthesised and
+can never print nothing; §5 item 9 records that for `r2-instrument`.
 
 **The protocol.** `PREREGISTRATION.md` at the worktree root, written before any
 number in this document existed, carries the statistic, the run count and the
@@ -45,10 +82,18 @@ dated amendment first. Load is recorded anyway and it is high:
 | S4 — the same on a runaway recursion | 5 | 49.99 | 49.99 |
 | S3 — the grep inventory | 3 | 15.89 | 16.54 |
 | §4 gate check | 3 | 14.20 | 14.20 |
+| R1 (round 2) — `diagnostic.code` by failure class, 2 arms | 10 | 11.26 | 12.28 |
+| R1b (round 2) — the 60-fixture sweep | 60 | 10.08 | 9.75 |
+| R3 (round 2) — the digest, re-derived, 3 flag arms | 15 | 5.29 | 5.29 |
 
-Every one of those four series was byte-identical across all its runs. That is
-what the load reading is for: it is evidence that these numbers do not depend on
-it, not an excuse.
+Every repeated series in that table was identical across all its runs, in both
+rounds — S1, S4, S3, the §4 gate check, R1 (5 rounds per arm) and R3 (5 rounds
+per arm) each collapsed to one value. **R1b is the exception and is not a
+repeated series**: it is 60 *different* fixtures run once each, so "identical
+across runs" is not a claim that can be made of it and is not made. It is
+reported for its spread, not its stability. That distinction is the point of the
+load reading: it is evidence that these numbers do not depend on load, not an
+excuse.
 
 **One instrument in this workstream already lied, and it lied stably.** This
 belongs at the top rather than in a footnote, because it is the same species of
@@ -66,17 +111,23 @@ instrument are three identical wrong numbers.*
 **What is load-bearing and what is corroboration.** Every claim of the form
 "nothing constructs X" is an argument from absence, and absence is what greps are
 worst at — a macro, a `cfg`, a re-export, a trait default. So for the slice and
-the assertion the load-bearing evidence is **S1 and S4, runtime observations of
-the shipped binary across 20 runs and three flag settings**, which no spelling can
-fool. The greps corroborate and localise. Where only a grep supports a claim, the
-text says so.
+the assertion the load-bearing evidence is **runtime observation of the shipped
+binary**, which no spelling can fool: S1 and S4's 20 runs across three flag
+settings in round 1, and in round 2 a further 25 runs, 60 fixtures and three
+engines. The greps corroborate and localise. Where only a grep supports a claim,
+the text says so — and §2.1 records what happened when a claim that only a
+*runtime* series could support was made about fields that series never looked at.
 
-**What this workstream changed.** Two files: this one and `PREREGISTRATION.md`.
-No source file, no ADR, no `CONTRIBUTING.md`, no `CONTRACTS.md`, no `ROADMAP.md`.
-**This worktree ran no git command**, so that claim is asserted here and
-**checked by the parent agent running `git status`** — not by me. If `git status`
-shows anything else, this report is in breach of its own brief and the extra
-change should be reverted rather than reviewed.
+**What this workstream changed.** Round 1: two files, this one and
+`PREREGISTRATION.md`. Round 2: **this file only** — `PREREGISTRATION.md` is
+deliberately left carrying the over-broad S4 wording D1 withdraws, because a
+pre-registration is a record of what was committed to before the numbers existed
+and editing it afterwards would destroy the only thing it is for. No source file,
+no ADR, no `CONTRIBUTING.md`, no `CONTRACTS.md`, no `ROADMAP.md`, in either
+round. **This worktree ran no git command** in either round, so that claim is
+asserted here and **checked by the parent agent running `git status`** — not by
+me. If `git status` shows anything else, this report is in breach of its own
+brief and the extra change should be reverted rather than reviewed.
 
 ---
 
@@ -114,15 +165,66 @@ r5_always  failures=1 causal_slice=[None] assertion=[None] ran=[None] depth=[Non
 in its arm.
 
 **`--trace` changes nothing, and the catalogue does not say this.** The
-`failures` array is byte-identical across all fifteen runs — same SHA-256 of its
-canonical JSON, `7962884c3f8d40d2…`, for `never`, `auto` and `always` alike:
+`failures` array is identical across all fifteen runs. **The canonicalization,
+which the first version of this section did not state, is:**
+
+```python
+hashlib.sha256(json.dumps(failures, sort_keys=True).encode()).hexdigest()
+```
+
+`json.dumps` with `sort_keys=True` and **Python's default separators**, `', '`
+and `': '` — *not* the compact `separators=(',', ':')` that "canonical JSON"
+usually means. Under that canonicalization, re-derived here on a fresh 15-run
+series, CPython 3.14.1:
 
 ```
-$ for a in never auto always; do for r in 1 2 3 4 5; do
-    python3 -c "…hashlib.sha256(json.dumps(d['failures'],sort_keys=True))…"; done; done
-r1_never   7962884c3f8d40d2      r1_auto  7962884c3f8d40d2      r1_always 7962884c3f8d40d2
-…                                (all 15 the same digest)
+$ for r in 1 2 3 4 5; do for a in never auto always; do
+    ply --color never test tests/fixtures/assertion_failed.ply --json --no-cache --trace $a
+  done; done                       # then digest failures[] two ways
+sha256 over json.dumps(failures, sort_keys=True)                       : {'7962884c3f8d40d2': 15}
+sha256 over json.dumps(failures, sort_keys=True, separators=(',',':')) : {'4057a8497bdcf0ac': 15}
 ```
+
+Full digests:
+
+| canonicalization | sha256 |
+| --- | --- |
+| `json.dumps(failures, sort_keys=True)` — the one this report used | `7962884c3f8d40d21ea0bde1fe6d4af6a9b8ae037e2f1dd9ffca3e47c9ae9549` |
+| `json.dumps(failures, sort_keys=True, separators=(',',':'))` — compact | `4057a8497bdcf0acf73fc2f1d68398d69031f0da62a2c12956005f81de2c1d09` |
+
+> **Correction in place (2026-08-27): the digest was printed without its
+> canonicalization, which made it unreproducible.** The text read:
+>
+> > *"The `failures` array is **byte-identical** across all fifteen runs — same
+> > SHA-256 of its canonical JSON, `7962884c3f8d40d2…`, for `never`, `auto` and
+> > `always` alike"*
+> >
+> > *"`python3 -c "…hashlib.sha256(json.dumps(d['failures'],sort_keys=True))…"`"*
+>
+> An independent reviewer digesting the same array under
+> `json.dumps(sort_keys=True, separators=(',',':'))` — the usual reading of
+> "canonical JSON" — got `4057a8497bdcf0ac…` and could not reproduce the printed
+> value. Both digests are correct. They are digests of different byte strings,
+> because Python's default `json.dumps` separators insert a space after every
+> `,` and `:`, and the compact ones do not.
+>
+> Precisely where it went wrong, since that is the whole subject here: the
+> printed command was *literally* right — `json.dumps(d['failures'],sort_keys=True)`
+> passes no `separators`, so it gets the defaults. But it was wrapped in `…` at
+> both ends, so a reader could not tell whether the elision hid a `separators=`
+> argument, and the prose beside it said **"canonical JSON"**, which points at
+> the compact form. An elided command plus a phrase that names a *different*
+> convention is not a stated canonicalization. **The digest is not withdrawn —
+> it reproduces, 15 of 15, and is re-derived above — but the canonicalization is
+> now stated in full and both forms are printed, so neither reader is
+> stranded.**
+>
+> One word is withdrawn: **"byte-identical"**. It is true of the serialized form
+> under a fixed canonicalization, which is what was measured; it is not a
+> property of the array independent of one. The `failures` array carries no
+> `duration_ms` or other varying field (checked: no key under `failures[]`
+> matches `dur|ms|time`), which is *why* the digest is stable, and that is the
+> claim that should have been made.
 
 Diffing a whole report between `--trace never` and `--trace always` leaves
 exactly one non-timing difference — the echoed string the CLI prints back at
@@ -156,9 +258,28 @@ three fields; `bisect` and `budget` are read inside `diagnose` (`diagnose.rs:76`
 $ grep -rn '\.trace\b\|trace:' --include='*.rs' crates/ply-test/src
 crates/ply-test/src/diagnose.rs:22:    pub trace: Tracing,
 crates/ply-test/src/diagnose.rs:30:            trace: Tracing::Never,
+crates/ply-test/src/diagnose/tests.rs:570:            trace: Tracing::Never,
 ```
 
-Two definitions, zero reads. `Tracing`'s own predicates have no callers at all:
+> **Correction in place (2026-08-27): the transcript above was printed with its
+> last line removed, and the sentence under it counted the trimmed output.** The
+> block printed two of the grep's three lines, dropping
+> `crates/ply-test/src/diagnose/tests.rs:570`, and the sentence read:
+>
+> > *"Two definitions, zero reads."*
+>
+> **Withdrawn, restated: three occurrences, still zero reads.** The third is a
+> `#[cfg(test)]` module building an `Options` literal — a third *write* of the
+> field, not a read of it. Re-run raw in this worktree, the grep emits 3 lines,
+> identical on 3 of 3 runs. The section's conclusion is unchanged and is mildly
+> reinforced: the number of sites that *read* `Options::trace` is still zero, and
+> the restored line is one more site that only ever sets it. It is restored
+> anyway, because this report's own exit criterion is *"a command or grep printed
+> with its output"*, and a transcript trimmed to the length of the sentence under
+> it does not meet that criterion whichever way the conclusion falls. A trimmed
+> transcript presented as raw output is the failure this report is about.
+
+Zero reads. `Tracing`'s own predicates have no callers at all:
 
 ```
 $ grep -rn 'traces_first_run\|traces_replay\|Tracing::parse' --include='*.rs' . | grep -v '^\./target'
@@ -474,8 +595,9 @@ field that has never existed, which is a milestone, not a fix.
 | DELETE everything | 8 source files | **6**, deleted rather than fixed, plus the 4 `SliceBuilder` tests in `bisect_audit.rs` | 10 sections across 4 documents | `SCHEMA_VERSION` 4 → 5, breaking for artifact consumers |
 
 The split recommendation costs the least and closes the most: it removes the
-`--trace` flag that provably does nothing (§1.1's byte-identical digests are the
-evidence), keeps the one field the engines already pay for, and leaves the
+`--trace` flag that provably does nothing (§1.1's identical digests across the
+three arms are the evidence), keeps the one field the engines already pay for,
+and leaves the
 expensive half as an explicit, costed deferral rather than as dead code that
 reads like a feature.
 
@@ -516,18 +638,43 @@ keeps catching.
 classifies nothing. Nothing constructs an `Assertion` at all.**
 
 ```
-$ grep -rn '\bAssertion\b' --include='*.rs' . | grep -v '^\./target' | grep -v AssertionKind
+$ grep -rn '\bAssertion\b' --include='*.rs' . | grep -v '^\./target' | grep -v AssertionKind \
+    | sed 's|^\./||'                 # the trailing sed only strips the leading ./ that
 crates/ply-test/src/report.rs:10:use crate::slice::{Assertion, CausalSlice};
 crates/ply-test/src/report.rs:498:fn assertion_json(assertion: &Assertion) -> Value {
 crates/ply-test/src/lib.rs:370:    pub assertion: Option<Assertion>,
 crates/ply-test/src/slice.rs:321:pub struct Assertion {
-crates/ply-test/src/slice.rs:330:impl Assertion {              # new, eq, with_difference, with_message
+crates/ply-test/src/slice.rs:330:impl Assertion {
+crates/ply-test/src/slice.rs:332:        Assertion {
+crates/ply-test/src/slice.rs:341:    pub fn eq(expected: impl Into<String>, actual: impl Into<String>) -> Assertion {
+crates/ply-test/src/slice.rs:342:        Assertion {
+crates/ply-test/src/slice.rs:349:    pub fn with_difference(mut self, difference: Difference) -> Assertion {
+crates/ply-test/src/slice.rs:354:    pub fn with_message(mut self, message: impl Into<String>) -> Assertion {
 ```
 
-Five occurrences: one import, one renderer, one field, one declaration, one impl
-block. **Zero constructions.** The type's own constructors have no callers
-either — the single `Assertion::new` / `Assertion::eq` call site in the entire
-workspace is `slice.rs:345`, inside `Assertion::eq` calling `Assertion::new`:
+> **Correction in place (2026-08-27): the transcript above was printed with half
+> its lines removed, and the sentence under it counted the half that was
+> printed.** The block showed 5 of the grep's 10 lines — `slice.rs:332`, `:341`,
+> `:342`, `:349` and `:354` were dropped, and the `:330` line carried an
+> editorial annotation, `# new, eq, with_difference, with_message`, that the
+> grep does not emit. The sentence read:
+>
+> > *"Five occurrences: one import, one renderer, one field, one declaration, one
+> > impl block. **Zero constructions.**"*
+>
+> **Withdrawn, restated: ten occurrences, and "zero constructions" needs a
+> qualifier.** The five restored lines are all inside `Assertion`'s own `impl`
+> block — three return types (`:341`, `:349`, `:354`) and **two struct literals**,
+> `:332` inside `Assertion::new` and `:342` inside `Assertion::eq`. Those two are
+> constructions. The defensible claim is **zero constructions outside the type's
+> own constructors, and no caller of those constructors**, which is what the next
+> grep establishes and what the runtime series confirms: `failures[].assertion`
+> is null in every artifact this binary writes. The conclusion survives; the
+> printed evidence for it did not, and it is restored raw here.
+
+The type's own constructors have no callers either — the single `Assertion::new`
+/ `Assertion::eq` call site in the entire workspace is `slice.rs:345`, inside
+`Assertion::eq` calling `Assertion::new`:
 
 ```
 $ grep -rn 'Assertion::new(\|Assertion::eq(' --include='*.rs' . | grep -v '^\./target'
@@ -571,18 +718,222 @@ run4 code= E0502 assertion= None causal_slice= None msg= recursion limit of 1000
 run5 code= E0502 assertion= None causal_slice= None msg= recursion limit of 10000 nested calls exceeded
 ```
 
-**5 of 5.** So the artifact distinguishes a runaway recursion from a failed
-`assert_eq` **only** by the rendered `diagnostic.message` string — measured,
-not inferred. The four tests the catalogue names are doing the only thing
-available to them:
+**5 of 5.**
+
+> **Correction in place (2026-08-27): the sentence that stood here was false,
+> and it was asserted as a measurement.** It read:
+>
+> > *"**5 of 5.** So the artifact distinguishes a runaway recursion from a failed
+> > `assert_eq` **only** by the rendered `diagnostic.message` string — measured,
+> > not inferred."*
+>
+> **Withdrawn.** The artifact carries a second distinction and it is
+> machine-readable, and the S4 transcript immediately above shows half of it, in
+> its first column: `code= E0502`. Re-measured here on the same binary, both
+> arms, five interleaved rounds each, `--no-cache` on every invocation:
+>
+> ```
+> $ # arm A: tests/fixtures/assertion_failed.ply   arm B: the RUNAWAY program above
+> assert_r1   code=E0501  assertion=None  causal_slice=None  msg='assertion failed: expected 480000, found 470000'
+> assert_r2   code=E0501  …            (5 of 5 identical)
+> runaway_r1  code=E0502  assertion=None  causal_slice=None  msg='recursion limit of 10000 nested calls exceeded'
+> runaway_r2  code=E0502  …            (5 of 5 identical)
+> ```
+>
+> `E0501` is `ASSERTION_FAILED` (`crates/ply-span/src/lib.rs:522`) and `E0502` is
+> `RUNTIME_ERROR` (`:526`) — two distinct **registered** codes, in the same field
+> of the same artifact. **"Only" is false**, and it was false against this
+> report's own printed output.
+>
+> The `contains("recursion limit` grep that stood under the sentence, offered as
+> proof that string-matching was all that was available, was itself trimmed: see
+> the second correction below.
+
+**What the corrected sentence says.** `failures[].assertion` is null on both
+kinds of failure — the `assertion` object classifies nothing, which is the claim
+this section is actually about and which S4 does establish. What the artifact
+*does* carry is `diagnostic.code`. Diffing the two failure objects field by
+field, every difference is one of three kinds:
 
 ```
-$ grep -rn 'contains("recursion limit' --include='*.rs' . | grep -v '^\./target'
-crates/ply-cli/tests/failure_classification_audit.rs:242, :590
-crates/ply-test/src/tests.rs:1359
-crates/ply-test/tests/hybrid.rs:298
-crates/ply-eval/src/tests.rs:313, :408
+$ python3 -c "…flatten both failure objects, print keys whose values differ…"
+.diagnostic.code            'E0501' vs 'E0502'        <- registered code: machine-readable classification
+.diagnostic.message         'assertion failed: …' vs 'recursion limit of …'
+.diagnostic.labels[0].message   'these values are not equal' vs 'this call is too deeply nested'
+.diagnostic.notes[0], [1]   'expected: 480000' / 'actual: …' vs 'check for a recursive call …' / 'innermost calls: …'
+.key .name .module .location.* .test_hash .suspects[0].{name,hash}
+                            <- these differ because the two programs are different programs, not
+                               because the failures are of different kinds
 ```
+
+So the honest statement is: **the artifact distinguishes the two by
+`diagnostic.code`, a registered machine-readable code, and additionally by three
+rendered-string fields (`diagnostic.message`, `labels[].message`, `notes[]`).
+The one field ADR 0004 designated for this job, `assertion`, is null on both.**
+
+**The wider sweep the original series did not run.** S4 and S1 between them cover
+two failures. Run over all 60 `tests/fixtures/*.ply`, five produce a failure
+object, and they carry **five hits across four distinct codes** — while all four
+slice/assertion fields are null in every one:
+
+```
+$ for f in tests/fixtures/*.ply; do ./target/debug/ply --color never test "$f" \
+    --json --no-cache; done          # 60 fixtures
+fixtures run: 60
+fixtures producing a failure object: 5
+  assertion_failed   code=E0501  assertion=None  causal_slice=None  ran=[None]                    depth=[None]
+  bank_race          code=E0501  assertion=None  causal_slice=None  ran=[None,None,None,None,None] depth=[None,…]
+  deadlock           code=E0414  assertion=None  causal_slice=None  ran=[]                        depth=[]
+  runtime_error      code=E0502  assertion=None  causal_slice=None  ran=[None]                    depth=[None]
+  unhandled_effect   code=E0303  assertion=None  causal_slice=None  ran=[None]                    depth=[None]
+```
+
+That is the strongest form of both halves at once: the `assertion` object is
+dead across every failure the fixture suite can produce (5/5), **and** the
+artifact already classifies those failures four ways without it.
+
+**And the engine check neither series took.** The runaway program under all
+three `--engine` settings — the two engines separately and the differential
+`both` — because a classification that holds on only one engine is not a
+classification:
+
+```
+$ for e in treewalk machine both; do ply --color never test --json --no-cache --engine $e; done
+engine=treewalk  code=E0502  assertion=None  causal_slice=None  ran=[None]  depth=[None]
+engine=machine   code=E0502  assertion=None  causal_slice=None  ran=[None]  depth=[None]
+engine=both      code=E0502  assertion=None  causal_slice=None  ran=[None]  depth=[None]
+```
+
+All three settings agree, and the `failures` arrays are identical under both
+canonicalizations named in §1.1 — `sha256` `155f8542e6aa3fcf…` with default
+separators, `72616412138d236f…` compact, the same value in all three settings
+either way. (Naming which is which is the point of §1.1's correction; a digest
+without its canonicalization is not a checkable number.) This is
+the same fact `crates/ply-cli/tests/failure_classification_audit.rs:231` already
+asserts in the tree — `assert_eq!(failure["diagnostic"]["code"], "E0502")`, over
+the same three engines, in the very test this section quoted the `RUNAWAY`
+program *from*. A standing test asserting on `diagnostic.code` was cited two
+paragraphs above the sentence claiming only the message distinguishes them.
+
+> **The pre-registration pre-committed to the false wording, and that is the part
+> that matters.** `PREREGISTRATION.md` §5's S4 decision rule reads, verbatim:
+>
+> > *"All 5 runs `assertion == null` → the report states that the artifact
+> > distinguishes a runaway recursion from a failed `assert_eq` **only** by the
+> > rendered `diagnostic.message`, measured rather than inferred, and that
+> > constructing `AssertionKind::RecursionLimit` alone would change nothing
+> > because nothing constructs an `Assertion`."*
+>
+> **What that statistic could license.** S4's statistic is the nullity of
+> `failures[0].assertion`. Nullity of that one field licenses the rule's second
+> clause exactly — nothing constructs an `Assertion`, so constructing one variant
+> of `AssertionKind` changes nothing that any report carries. That clause is
+> sound and it survives.
+>
+> **What it could not license.** The first clause is a claim about *every other
+> field in the artifact*: that no field but `diagnostic.message` separates the
+> two failures. No observation of `assertion`'s nullity can bear on what
+> `diagnostic.code` contains. The rule encoded a conclusion strictly broader than
+> the statistic gating it, so the "all 5 runs null" branch could be taken while
+> the conclusion it authorised was false — which is what happened. **A
+> pre-registered rule whose conclusion is wider than its statistic cannot go red
+> on the observation it names, so passing it explores nothing. That is the same
+> species of defect this report was written to catch, committed by this report.**
+>
+> Sharper still: S4's own statistic list included `failures[0].diagnostic.code`,
+> and the series *recorded* `E0502` in all five runs. The refuting datum was in
+> the series' own printed output. The pre-registered wording walked past it,
+> because the wording had been fixed before the number existed and nothing in the
+> rule made the number able to contradict it.
+>
+> **`PREREGISTRATION.md` is not edited.** A pre-registration is a record of what
+> was committed to beforehand; rewriting it afterwards would destroy the only
+> thing it is for, and this workstream may in any case edit only this file. The
+> correction belongs here, where the claim was published. A reader comparing the
+> two should expect §5's S4 rule to still contain the over-broad wording, and
+> should read this block as its withdrawal.
+
+**Does this change the recommendation for this surface? No — and the reason is
+an internal contradiction in this report worth stating plainly.** §2.4 and §2.5
+already rest on the *opposite* fact. §2.4 proposes *"a code-based classifier
+(`E0502` is already the code — S4 shows it in every run)"*; §2.5's one-line
+reason is that *"`E0502` in the artifact (measured in all five S4 runs) is a
+cheaper branch field than a cross-crate `Assertion` channel"*. Both were written
+from the same S4 output as the withdrawn sentence, and both contradict it. So
+**DELETE stands, and the true version makes it slightly stronger**: the
+replacement classifier the recommendation asks for already exists in the artifact
+and does not have to be built. What the over-claim damaged is this report's
+standing as a measurement, not the advice it gives.
+
+**The tests that match on the message string.** The grep that stood here was
+trimmed like the two above, and its untrimmed output changes a cost number the
+recommendation quotes:
+
+```
+$ grep -rn 'contains("recursion limit' --include='*.rs' . | grep -v '^\./target' \
+    | sed 's|^\./||'                 # grep prepends when rooted at `.`; nothing else is filtered
+crates/ply-eval/tests/equivalence_audit.rs:1940:            .contains("recursion limit of 50 nested calls exceeded"),
+crates/ply-eval/tests/equivalence_audit.rs:2048:    assert!(machine.message.contains("recursion limit"), "{machine:?}");
+crates/ply-eval/src/compiled.rs:1508:            baseline.contains("recursion limit of 8 nested calls exceeded"),
+crates/ply-eval/src/tests.rs:313:    assert!(d.message.contains("recursion limit"), "{}", d.message);
+crates/ply-eval/src/tests.rs:408:    assert!(message.contains("recursion limit"), "{message}");
+crates/ply-eval/src/machine/tests.rs:534:/// > `d.message.contains("recursion limit")`. Deep non-tail recursion is
+crates/ply-eval/src/machine/tests.rs:556:        !d.message.contains("recursion limit"),
+crates/ply-cli/tests/failure_classification_audit.rs:242:                .contains("recursion limit of 10000 nested calls exceeded"),
+crates/ply-cli/tests/failure_classification_audit.rs:590:                .contains("recursion limit of 10000 nested values exceeded"),
+crates/ply-codegen-spike/tests/mcts_kernel.rs:550:            said.contains("recursion limit of 10000 nested calls exceeded"),
+crates/ply-test/src/tests.rs:1359:        failure.diagnostic.message.contains("recursion limit"),
+crates/ply-codegen-spike/tests/hazards.rs:625:        message.contains("recursion limit of 400 nested calls exceeded"),
+crates/ply-codegen-spike/tests/hazards.rs:649:            .contains("recursion limit of 10000 nested calls exceeded")),
+crates/ply-codegen-spike/tests/hazards.rs:675:            .contains("recursion limit of 600 nested calls exceeded")),
+crates/ply-test/tests/hybrid.rs:298:        diagnostic.message.contains("recursion limit"),
+crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion limit of 600 nested calls exceeded")),
+```
+
+> **Correction in place (2026-08-27): "four tests" is wrong, and this report
+> inherited the number instead of counting it.** The block above previously
+> printed six line references in four files, folded onto four lines, and the
+> sentence introducing it read:
+>
+> > *"The four tests the catalogue names are doing the only thing available to
+> > them"*
+>
+> **Withdrawn, restated: 16 occurrences in 10 files, in 15 distinct `#[test]`
+> functions.** Thirteen of those functions assert the phrase is **present**, one
+> (`a_frame_ceiling_that_was_asked_for_is_a_diagnostic_not_a_crash`,
+> `machine/tests.rs:556`) asserts it is **absent** — which is equally
+> load-bearing on the string — and one occurrence
+> (`machine/tests.rs:534`) is a doc comment. **Fourteen tests depend on the
+> message text, not four.**
+>
+> Split by workspace, because §3.1 establishes that `crates/ply-codegen-spike`
+> declares its own `[workspace]` and `cargo test --workspace` never reaches it,
+> and ADR 0016 §3.5 says it is thrown away whatever the verdict:
+>
+> | | occurrences | files | `#[test]` fns | of those, depend on the string |
+> | --- | --- | --- | --- | --- |
+> | main workspace | 11 | 7 | 11 | 10 (9 present, 1 absent) |
+> | `ply-codegen-spike` | 5 | 3 | 4 | 4 |
+> | total | 16 | 10 | 15 | 14 |
+>
+> **The number that should drive the cost is 10 tests in 7 files**, not 14 in 10
+> and not four in four: the spike's four are real but sit outside the workspace
+> and outside the maintained tree. Both numbers are given so neither has to be
+> re-derived. The "four" traces to
+> `crates/ply-eval/src/limit.rs:80`'s own correction block, which names four
+> *files* (`ply-cli/tests/failure_classification_audit.rs`,
+> `ply-test/tests/hybrid.rs`, `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)
+> and misses six more, `crates/ply-codegen-spike`'s three among them. Recorded
+> for the next change in §5.
+>
+> **Effect on the recommendation: direction unchanged, cost larger.** DELETE's
+> claim that *"nothing that works today stops working"* is unaffected — all
+> sixteen keep matching a message string that DELETE does not touch. What grows
+> is §2.5's second half, "give them a code-based assertion beside the string
+> one": that is **10 tests in 7 files across three crates in the maintained
+> tree** — 14 in 10 across four crates if `ply-codegen-spike` is counted — not
+> four tests in four files. Roughly two and a half times the work the report
+> implied, and still small. The cost table in §2.5 is corrected accordingly.
 
 ### 2.2 What the decision record promised
 
@@ -607,7 +958,9 @@ RecursionLimit }`.
 branch on to tell a recursion blow-up from a comparison failure, and that
 `assertion.expected`/`actual` spare them parsing a rendered message. Row 410 says
 so in exactly those words. Both are false in every report the binary has written,
-and the four tests in the tree prove it by parsing the rendered message.
+and the tests in the tree that parse the rendered message prove it — 10 in the
+main workspace, 14 counting `ply-codegen-spike`'s (§2.1; the count read "four"
+until it was corrected there).
 
 ### 2.3 Option ARM
 
@@ -632,8 +985,9 @@ no payload yet"* is a direct statement of this gap), and
 reachable — `err_recursion_limit` and the panic path both know their kind — and it
 would make `assertion.kind` the branch field ADR 0004 promises without any
 `Value` serialization. It arms rows 410 and 411 **only partially**, so ADR 0004
-would still need correcting, and the four string-matching tests would still be the
-only thing that actually classifies unless they are rewritten.
+would still need correcting, and the string-matching tests — 10 in the main
+workspace, 14 counting the spike's (§2.1) — would still be the only thing that
+actually classifies unless they are rewritten.
 
 ### 2.4 Option DELETE
 
@@ -649,11 +1003,13 @@ and rows 410–411; `CONTRACTS.md:1334`; `CONTRIBUTING.md` item 14 and its row i
 correction block exists only to explain why the phrase "recursion limit" is kept.
 
 **The capability genuinely lost:** structured comparison output. A consumer would
-keep matching `diagnostic.message`, which is what all four tests already do, so
+keep matching `diagnostic.message`, which is what all 16 occurrences of it
+already do, so
 **nothing that works today stops working**. The real loss is that
 `err_recursion_limit`'s message text becomes load-bearing API by default rather
 than by decision — `limit.rs:80`'s doc already says *"the phrase is load-bearing
-only for whatever matches on the string, which is four tests"*, and DELETE makes
+only for whatever matches on the string, which is four tests"* (quoted as
+written; that count is itself wrong, see §2.1 and §5), and DELETE makes
 that permanent. A DELETE should therefore be accompanied by making that explicit:
 either a code-based classifier (`E0502` is already the code — S4 shows it in every
 run) or a documented statement that the message string is the contract.
@@ -665,14 +1021,17 @@ carries. That is a green result over unexplored space in documentation form.
 
 ### 2.5 Recommendation
 
-**DELETE `Assertion`, `AssertionKind` and `Difference`; keep the four
-string-matching tests as the standing classifier and give them a code-based
-assertion beside the string one.**
+**DELETE `Assertion`, `AssertionKind` and `Difference`; keep the
+string-matching tests as the standing classifier — 10 of them in the maintained
+tree, 14 counting `ply-codegen-spike`'s — and give them a code-based assertion
+beside the string one.**
 
-*One-line reason:* the payload has never existed, the four tests that need the
+*One-line reason:* the payload has never existed, the tests that need the
 distinction already have a working one, and `E0502` in the artifact
-(measured in all five S4 runs) is a cheaper branch field than a cross-crate
-`Assertion` channel that ADR 0004 specifies and nothing has ever built.
+(measured in all five S4 runs, on all three engines, and asserted already by
+`failure_classification_audit.rs:231`) is a cheaper branch field than a
+cross-crate `Assertion` channel that ADR 0004 specifies and nothing has ever
+built.
 
 **Rough cost each way.**
 
@@ -681,6 +1040,16 @@ distinction already have a working one, and `E0502` in the artifact
 | ARM, kind + message only | 4-5 (`ply-eval` failure sites, a channel, `ply-test/src/lib.rs`, `slice.rs`) | 3 | ADR 0004 rows 410-411 still need correcting — partially armed is still wrong | the honest minimum |
 | ARM, full payload | + a `Value` renderer and a structural diff in `ply-eval` | 3 | rows 410-411 corrected by being made true | the largest of the three; ADR 0004 §7 is the only design |
 | DELETE | 3 (`slice.rs`, `lib.rs`, `report.rs`) | 3, deleted | 5 sections in 3 documents | `SCHEMA_VERSION` 4 → 5; pairs naturally with §1's delete, one bump for both |
+| the code-based assertion DELETE should carry with it | 7 test files in 3 crates (`ply-cli`, `ply-eval`, `ply-test`) in the main workspace; 3 more in `ply-codegen-spike`, which is its own workspace and is to be thrown away (§3.1, ADR 0016 §3.5) | 0 — the additions are assertions beside existing passing ones | none | **corrected 2026-08-27**: this row said "four tests" before §2.1's third correction; it is 10 tests in 7 files in the maintained tree, 14 in 10 counting the spike. Purely additive, and the CLI-level ones can assert `E0501` vs `E0502` directly, which `failure_classification_audit.rs:231` already does |
+
+> **Correction in place (2026-08-27).** The row above is new, and the two
+> sentences it replaces in §2.5's headline and one-line reason read *"keep the
+> **four** string-matching tests as the standing classifier"* and *"the **four**
+> tests that need the distinction already have a working one"*. Both counts came
+> from `limit.rs:80` rather than from a grep run here. Corrected throughout §2 to
+> 10 tests in the maintained tree, 14 counting the spike's; see §2.1. The direction of the recommendation is unchanged — DELETE is
+> still cheapest and still breaks nothing — but the accompanying work is roughly
+> three times the size this table implied.
 
 **Sequencing note.** If §1 and §2 are both actioned, do them in one change:
 `SCHEMA_VERSION` should move 4 → 5 once, not twice, and both surfaces live in
@@ -1260,6 +1629,42 @@ the next change does not have to rediscover them.
    population is at least six**, §4.3: E0438 is missing from the table and is
    already documented at `ROADMAP.md:861-870`.
 
+8. **`crates/ply-eval/src/limit.rs:80`'s correction block says four tests match
+   on the "recursion limit" string; 15 `#[test]` functions in 10 files contain
+   the phrase and 14 depend on it**, §2.1 (added 2026-08-27). Its text — *"the phrase is load-bearing only for
+   whatever matches on the string, which is four tests
+   (`ply-cli/tests/failure_classification_audit.rs`, `ply-test/tests/hybrid.rs`,
+   `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)"* — names four files.
+   Actual: `grep -rn 'contains("recursion limit' --include='*.rs' .` finds **16
+   occurrences in 10 files, in 15 distinct `#[test]` functions**; 13 assert the
+   phrase is present, one asserts it is absent, one is a doc comment. The six
+   files it misses are `ply-eval/tests/equivalence_audit.rs`,
+   `ply-eval/src/compiled.rs`, `ply-eval/src/machine/tests.rs`, and
+   `ply-codegen-spike/tests/{hazards,mcts_kernel,mutations}.rs`. This is a
+   correction block that is itself stale — the same second-order shape as item 1
+   above, where a correction carried a coordinate the correction next to it had
+   invalidated. Whoever fixes `limit.rs:80` should note that it is quoted, as
+   written, at §2.4 of this report.
+
+9. **`CONTRIBUTING.md`'s instrument-freshness recipe cannot print nothing as
+   written** (added 2026-08-27, and it is `r2-instrument`'s to fix, recorded here
+   because this report leans on it). The recipe that replaces the `include_str!`-
+   blind `find crates -name '*.rs' -newer target/release/ply` is written
+   `find crates -name '*.rs' -o -name '*.ply' -newer target/release/ply`. `find`
+   binds that as `(-name '*.rs') OR (-name '*.ply' AND -newer BIN)`, so the
+   `-newer` test never applies to the `.rs` arm and the command lists every `.rs`
+   file in the tree on every run, fresh binary or not — a check that can only
+   ever look failed, which is the mirror image of a check that can only ever look
+   green. The parenthesised form is the one that works:
+
+   ```
+   $ find crates \( -name '*.rs' -o -name '*.ply' \) -newer target/debug/ply
+   $                                    # silent — .rs and .ply both current
+   ```
+
+   Run in this worktree before every series in this document's round-2 pass; see
+   §0.
+
 ---
 
 ## Appendix — every command in this report, and where its output lives
@@ -1274,6 +1679,46 @@ the next change does not have to rediscover them.
 | 4.3 | `unarmed_gate.py .` | 3 | identical 3/3; both controls PASS; 2 unarmed, both allow-listed |
 | 4.4 | `unarmed_gate.py` on a modified copy, four ways | 1 each | exit 1, exit 1, exit 2, exit 1 — seen to fail |
 
-`PREREGISTRATION.md` at the worktree root carries the decision rule each of these
-was committed to before it was taken, including the two dated amendments and the
-one void result.
+Round 2, 2026-08-27, same binary:
+
+| § | command | runs | result |
+| --- | --- | --- | --- |
+| 0 | `find crates \( -name '*.rs' -o -name '*.ply' \) -newer target/debug/ply` | 4 | silent every time |
+| 1.1 | the S1 command, re-run, digesting `failures[]` under two canonicalizations | 15 | `7962884c3f8d40d2…` 15/15 and `4057a8497bdcf0ac…` 15/15 — one array, two canonicalizations |
+| 1.1 | `python3 -c "…scan failures[] for a key matching dur\|ms\|time…"` | 1 | none — which is why the digest is stable |
+| 2.1 | `ply test --json --no-cache` on `assertion_failed.ply` and on `RUNAWAY`, interleaved | 5 + 5 | `E0501` 5/5 and `E0502` 5/5; `assertion` null 10/10 |
+| 2.1 | flatten-and-diff the two failure objects | 1 | one registered-code difference, three rendered-string differences, the rest program identity |
+| 2.1 | `ply test --json --no-cache` over all 60 `tests/fixtures/*.ply` | 60 fixtures × 1 | 5 failure objects, 4 distinct codes, all four slice/assertion fields null 5/5 |
+| 2.1 | the same on `RUNAWAY` under `--engine {treewalk,machine,both}` | 3 | `E0502` on all three; `failures[]` digests identical |
+| 1.1, 2.1 | the three trimmed greps, re-run raw | 3 each | 3, 10 and 16 lines — against 2, 5 and 6 printed |
+| seen-to-fail | three probes corrupted on scratchpad copies, then restored | 1 each | each went red on the corruption and green again on restore; §"Seen to fail" below |
+
+**Seen to fail (round 2).** House rule 5: a passing check is vacuous until it has
+been watched fail. Each round-2 probe was broken deliberately, on a copy, never
+on the worktree:
+
+- **The code-distinction probe** (§2.1): rewrote `diagnostic.code` to `E0501` in
+  a *copy* of the runaway artifact. The probe printed *"RED: the artifact carries
+  no code-level distinction (both E0501)"* and exited 1. Against the untouched
+  artifacts it exits 0 and prints `E0501 vs E0502`. So it reads the field it
+  claims to read rather than printing a constant.
+- **The trimmed-transcript probe** (§1.1, §2.1): run against a *copy* of
+  `crates/ply-test` with `diagnose/tests.rs:570` deleted, the probe called a
+  2-line transcript complete — it follows the tree rather than a hard-coded
+  count. Against the real tree with the report's printed count of 2 it exits 1;
+  with the raw count of 3 it exits 0.
+- **The digest probe** (§1.1): flipping one character of `diagnostic.message` in
+  a *copy* of the artifact moved the digest to `c5422ad857b70caa…` and the probe
+  went red. The same probe also goes red when asked for the compact-separator
+  digest, which is the failure the reviewer actually hit and is what identified
+  D3.
+
+After every demonstration, `find crates \( -name '*.rs' -o -name '*.ply' \)
+-newer target/debug/ply` was re-run against the worktree and stayed silent: the
+corruptions never touched it.
+
+`PREREGISTRATION.md` at the worktree root carries the decision rule each round-1
+command was committed to before it was taken, including the two dated amendments
+and the one void result — and, per §2.1's D1 correction, the one S4 rule that was
+committed to a conclusion its statistic could not license. Round 2's rules are in
+`/tmp/.../PREREG-r2-dead-surfaces-corrections.md`, outside the repository.
