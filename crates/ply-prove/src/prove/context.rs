@@ -487,6 +487,10 @@ fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut
                 stack.extend(tail.as_deref());
             }
             ExprKind::Record { fields } => stack.extend(fields.iter().map(|(_, v)| v)),
+            ExprKind::RecordUpdate { base, fields } => {
+                stack.push(base);
+                stack.extend(fields.iter().map(|(_, v)| v));
+            }
             ExprKind::Field { base, .. } => stack.push(base),
             ExprKind::List { items } => stack.extend(items),
             ExprKind::Perform { args, .. } => stack.extend(args),

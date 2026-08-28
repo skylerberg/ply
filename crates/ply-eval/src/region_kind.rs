@@ -1015,6 +1015,12 @@ fn children(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(value);
             }
         }
+        ExprKind::RecordUpdate { base, fields } => {
+            f(base);
+            for (_, value) in fields {
+                f(value);
+            }
+        }
         ExprKind::Field { base, .. } => f(base),
         ExprKind::List { items } => {
             for item in items {

@@ -470,6 +470,13 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let base = self.lower(base);
                 self.terms.field(base, field.name.clone())
             }
+            // Unreachable — expansion runs in the parser — and `blocked` rather
+            // than `unreachable!` because a prover's safe answer is always "I
+            // did not reason about this", never a term it guessed.
+            ExprKind::RecordUpdate { .. } => {
+                self.blocked(Blocker::Region);
+                self.terms.sym(None)
+            }
             ExprKind::List { items } => {
                 let items: Vec<TermId> = items.iter().map(|i| self.lower(i)).collect();
                 self.terms.mk(Node::List(items), None)

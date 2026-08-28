@@ -836,3 +836,117 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
         "{v}"
     );
 }
+
+/// **The guard the `chunk_trailers` rewrite is worth.**
+///
+/// `std.http`'s `Limits` (`http.ply`) is the record ADR 0013 §4 puts every bound
+/// a program runs under into, and all thirteen of its fields are `Int`. Adding a
+/// field to it is already a **type error** at every site that spells the record
+/// out — `unify.rs` compares record key sets exactly and Ply has no width
+/// subtyping — so the hazard was never a forgotten field. It was a **mispairing**:
+/// `max_body: state.limits.max_chunk_size` type-checks and is a silently wrong
+/// bound in an HTTP server.
+///
+/// `chunk_trailers` now writes `{..state.limits, max_header_bytes:
+/// state.limits.max_trailer_bytes}`, and this asserts the property that buys:
+/// **every limit it does not deliberately replace is copied from the limit of
+/// the same name.** Checked on the tree the compiler actually uses, so it covers
+/// both a regression to the longhand and a broken expansion — and a field added
+/// to `Limits` tomorrow is covered without this test changing.
+#[test]
+fn chunk_trailers_copies_every_limit_it_does_not_replace() {
+    use ply_span::SourceId;
+    use ply_syntax::ast::{Expr, ExprKind, Item, Stmt, TypeDefBody, TypeExpr};
+
+    let source = ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships");
+    let module = ply_syntax::parse_module(SourceId(0), ModuleName::from_dotted("std.http"), source)
+        .expect("the shipped module parses");
+
+    let limits: Vec<String> = module
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Type(d) if d.name.name.as_str() == "Limits" => match &d.body {
+                TypeDefBody::Alias(TypeExpr::Record { fields, .. }) => Some(fields),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("`type Limits` is a record")
+        .iter()
+        .map(|(n, _)| n.name.to_string())
+        .collect();
+    assert!(
+        limits.len() >= 13,
+        "`Limits` shrank to {} fields; this test is about the cost of it growing",
+        limits.len()
+    );
+
+    let body = module
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Fn(d) if d.name.name.as_str() == "chunk_trailers" => Some(&d.body),
+            _ => None,
+        })
+        .expect("`chunk_trailers` is defined");
+    let ExprKind::Block { stmts, .. } = &body.kind else {
+        panic!("`chunk_trailers` is a block")
+    };
+    let record = stmts
+        .iter()
+        .find_map(|s| match s {
+            Stmt::Let { pat, value, .. }
+                if format!("{:?}", pat.kind).contains("trailer_limits") =>
+            {
+                Some(&**value)
+            }
+            _ => None,
+        })
+        .expect("`let trailer_limits = ...`");
+    let ExprKind::Record { fields } = &record.kind else {
+        panic!("`trailer_limits` is a record literal, expanded from `{{..state.limits, ..}}`")
+    };
+
+    // `state.limits.<name>`, and the name it reads.
+    fn copied_limit(e: &Expr) -> Option<String> {
+        let ExprKind::Field { base, field } = &e.kind else {
+            return None;
+        };
+        let ExprKind::Field { base, field: mid } = &base.kind else {
+            return None;
+        };
+        let ExprKind::Var(v) = &base.kind else {
+            return None;
+        };
+        (v.name.name.as_str() == "state" && mid.name.as_str() == "limits")
+            .then(|| field.name.to_string())
+    }
+
+    let mut names: Vec<String> = fields.iter().map(|(n, _)| n.name.to_string()).collect();
+    let mut expected = limits.clone();
+    names.sort();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "`trailer_limits` is not exactly `Limits`, so `fields(...)` would not type-check"
+    );
+
+    let mut replaced: Vec<(String, Option<String>)> = Vec::new();
+    for (name, value) in fields {
+        let name = name.name.to_string();
+        match copied_limit(value) {
+            Some(from) if from == name => {}
+            other => replaced.push((name, other)),
+        }
+    }
+    assert_eq!(
+        replaced,
+        vec![(
+            "max_header_bytes".to_string(),
+            Some("max_trailer_bytes".to_string())
+        )],
+        "exactly one bound may differ from the limit of its own name, and it is the \
+         header-block bound taking the trailer bound; anything else here is a mispaired limit"
+    );
+}

@@ -7838,3 +7838,131 @@ already refused by `Gate::ArgumentShape`, which precedes both effect gates. That
 is also the honest reading of item 11's *"latent rather than live"*: on this
 tree what stops those eleven is the argument shape, not — as the entry said —
 that the only backend refuses `handle` at compile time.
+
+## W4 — record update
+
+### `ply-syntax` — landed
+
+```
+record       := "{" [ ".." path "," ] { field "," } "}"
+             |  "{" ".." path "}"
+path         := ident { "." ident }
+```
+
+`..` is the token the record *pattern* already uses (`TokenKind::DotDot`); `...`
+is a parse error naming the correct spelling. A `{` followed by `..` is a record
+literal, because `..` cannot begin a statement — one token of lookahead, and
+`{x}` is still a block. A second `..`, or one not in first position, is a parse
+error.
+
+```rust
+pub enum ExprKind {
+    // ...
+    /// `{..base, f: e}` — **parse-time only**. Rewritten into `ExprKind::Record`
+    /// before `parse_module` returns.
+    RecordUpdate { base: Box<Expr>, fields: Vec<(Ident, Expr)> },
+}
+```
+
+**No crate downstream of `ply-syntax` can observe this variant**, and that is
+checked rather than argued: `crates/ply-syntax/src/tests.rs
+no_record_update_survives_parse_module_anywhere_in_the_tree` parses every `.ply`
+file in the repository plus a file that uses the syntax, through both
+`Module`-returning entry points, and asserts none survives. `ply-hash`,
+`ply-core`, `ply-eval` and `ply-prove` carry arms for it that refuse — three
+`unreachable!` and one `Blocker::Region` — and those arms are safe only because
+of that guard.
+
+- **Expansion happens inside `ply_syntax::parse_module`**, immediately after
+  `effect_set::expand`, for the same reasons and with the same shape.
+  `parse_expr` runs it with an empty context, so a spread in a bare expression
+  refuses (`E0116`) rather than leaking.
+- **The canonical expansion**: copies first, sorted by field name, valued
+  `base.<name>`; then the written fields in the order written. Sorted because
+  `reordering_the_fields_of_a_record_type_is_free` is an invariant the suite
+  asserts; written-last because `GAPS.md` §1 measures a growing sub-expression
+  out of last position as quadratic.
+- **The base is a path**, `s` or `state.limits`, never a call. The expansion
+  writes `base.f` once per copied field, so a base that could perform or allocate
+  would run once per field.
+- **The shape is read from this module's own `type` items and this file's
+  written annotations, and nothing else** — the ADR 0013 §1.3/§1.4 restriction,
+  for the ADR 0002 gate-1 reason. A shadowing binder *removes* the annotation
+  rather than inheriting it.
+
+### `ply-hash` — landed
+
+**Nothing.** No new tag, no encoding change, **no `FRONTEND_VERSION` and no
+`RUNTIME_VERSION` bump**. The sugar is gone before `ply-hash` sees anything, and
+that is the whole design: `{..s, a: 1}` and `{b: s.b, c: s.c, a: 1}` are one
+definition with one `DefHash`
+(`crates/ply-hash/tests/audit.rs record_update_hashes_as_its_expansion`).
+
+### `ply-core` — landed
+
+**No typing rule.** By the time inference runs the update *is* a record literal,
+so the update's type is the base's type because the expansion emits the base's
+field set, and the width meets the same exact-key-set unification
+(`crates/ply-core/src/unify.rs`) every record literal meets. A too-wide shape is
+`E0101` from `ExprKind::Field`; a too-narrow one is `E0201` wherever the result
+meets a known record type — which is **not total** for a `{..s}` no annotation
+ever constrains, and is marked so in ADR 0022 §5 rather than claimed.
+
+### New diagnostic codes — landed
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0116 | `RECORD_UPDATE_SHAPE` | the base of `{..b, ..}` has no record shape this file can name: an unannotated or shadowed binder, a type declared in another module, a qualified base, a generic alias, a sum type, or an alias chain over sixteen deep | the program's |
+| E0117 | `RECORD_UPDATE_FIELD` | a named field is not a field of the base — an update replaces, it does not widen | the program's |
+
+Fixtures: `tests/fixtures/record_update_shape.ply`,
+`tests/fixtures/record_update_field.ply`, checked by
+`crates/ply-core/tests/record_update.rs
+the_fixtures_produce_the_codes_they_are_named_for`.
+
+### `std.http` — landed
+
+`chunk_trailers` writes `{..state.limits, max_header_bytes:
+state.limits.max_trailer_bytes}`. **Every limit it does not deliberately replace
+is copied from the limit of the same name**, which is asserted on the parsed tree
+at `crates/ply-cli/tests/stdlib.rs
+chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red on
+a mispairing while `ply check` stays green, because all thirteen `Limits` fields
+are `Int`.
+
+`default_limits`, `limits_with`, `limits_keeping` and `limits_streaming` still
+spell `Limits` out. They were left alone so that no `DefHash` outside
+`chunk_trailers`' dependency cone moved: 40 of 206 entries in `std.http`, **84 of
+1,428 in `examples/` — all 84 inside that cone** — and 0 in the other seven
+shipped modules.
+
+> **The `examples/` figure was wrong, and it was wrong in the reassuring
+> direction.** This sentence read:
+>
+> > ... 40 of 206 entries in `std.http`, 0 of 1,428 in `examples/`, 0 in the
+> > other seven shipped modules.
+>
+> The **claim** the figure supports still holds; the **figure** did not. Nothing
+> outside `chunk_trailers`' dependency cone moved, but 84 entries inside it did,
+> and 19 of them are `desk.*` definitions in `examples/` rather than `std.http`
+> ones — `examples/desk.ply` imports `std.http`, so it is a transitive dependent
+> and moving is what content addressing is *for*.
+>
+> **A `0` here is what a stale binary reports**, which is why it is worth naming
+> the trap rather than just the number. `crates/ply-std/src/lib.rs` `include_str!`s
+> every `crates/ply-std/ply/*.ply` **into the binary**, so `import std.http`
+> resolves to the copy compiled in, never to the file on disk. Reverting or
+> editing `http.ply` and re-running `ply hash` **without rebuilding** therefore
+> changes nothing, and reports `0 moved`. Worse, the instrument check this
+> repository prescribes cannot see it: `find crates -name '*.rs' -newer
+> target/release/ply` prints nothing, because the stale input is a `.ply`.
+> **Add `-name '*.ply'` to that check before trusting any hash-movement number.**
+>
+> Re-taken with a binary verified fresh against both `*.rs` and `*.ply`, on
+> corpora copied out of each checkout with `.ply-cache` excluded (a stale cache in
+> a checkout will also skew this): `examples/` **1,428 entries, 84 moved**,
+> identical across two runs; the moved set and the transitive-dependent set of
+> `std.http.chunk_trailers` are **equal**, with "moved but not a dependent: none"
+> and "dependent that did not move: none". `std.http` re-reads **40 of 206**, as
+> above, and the whole `crates/ply-std/ply/` tree moves nothing outside
+> `http` — so the exit criterion holds; only the count was misreported.
