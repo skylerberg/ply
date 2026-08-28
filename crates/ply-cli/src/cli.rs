@@ -323,6 +323,19 @@ pub struct CheckArgs {
     /// that binds a continuation is refused by `treewalk`.
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
+
+    /// Report `W0611`: a growing container built anywhere but the last
+    /// sub-expression of its enclosing node, which makes the loop around it
+    /// quadratic. Parses every file, so the answer is a function of the source
+    /// rather than of what the cache held. Changes no exit code.
+    #[arg(long)]
+    pub field_order: bool,
+
+    /// Include the modules that ship with the compiler in `--field-order`. Off
+    /// by default, for `ply review --std`'s reason: a project reviews what it
+    /// wrote. The summary is computed across the boundary either way.
+    #[arg(long, requires = "field_order")]
+    pub std: bool,
 }
 
 #[derive(Args, Debug)]
@@ -538,6 +551,12 @@ pub struct ReviewArgs {
     /// declare. Off by default: a project reviews what it wrote.
     #[arg(long)]
     pub std: bool,
+
+    /// Also report `W0611`: a growing container built anywhere but the last
+    /// sub-expression of its enclosing node. `ply review` already parses every
+    /// file, so this costs the walk and nothing else.
+    #[arg(long)]
+    pub field_order: bool,
 
     #[command(flatten)]
     pub prove: ProveOptions,

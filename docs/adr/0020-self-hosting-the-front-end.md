@@ -269,12 +269,29 @@ enclosing node, not about the variable. Two people have now written the
 last-mention explanation down and both were wrong; the corrected text is in
 `GAPS.md` §1 and in `spikes/ply-lexer-rc/fieldorder.ply` lines 9-20.
 
-> **Residual, not corrected by the merge.** `fieldorder.ply:46` and `:50` still
-> carry the inline comments *"`s.toks` is not the last mention of `s`"* and
-> *"`s.toks` is the last mention of `s`. Nothing else changed."* — the withdrawn
+> **Corrected 2026-08-27 — the residual recorded here no longer exists, and
+> acting on it would have reintroduced the error.** This block used to read:
+> *"**Residual, not corrected by the merge.** `fieldorder.ply:46` and `:50`
+> still carry the inline comments "`s.toks` is not the last mention of `s`" and
+> "`s.toks` is the last mention of `s`. Nothing else changed." — the withdrawn
 > framing, restated as the salient difference, twenty-six lines below the block
 > that withdraws it. Both are true of those two functions and neither states the
-> rule. Worth a one-line fix.
+> rule. Worth a one-line fix."*
+>
+> Checked at `d88aae5`. `spikes/ply-lexer-rc/fieldorder.ply:46-47` reads
+> *"`push` is NOT in the last field: `ndiag` and `diags` follow it, so `carry`
+> clones the scope and the read cannot move the list"*, and `:51` — the line
+> moved, it is no longer `:50` — reads *"`push` IS the last field. Nothing else
+> changed."* Both state the **positional** rule. A tree-wide search for
+> "last mention" / "last occurrence" / "last use of the record" returns four
+> hits and every one of them sits inside a `>` or `// >` correction block.
+>
+> This is `CONTRIBUTING.md`'s "correct, do not delete" convention biting from
+> the direction nobody expects: a reader trusted this residual over the file,
+> and editing `:46`/`:51` as it instructs would have **replaced the correct
+> positional statement with the withdrawn last-mention framing** — making, on
+> instruction, the error two people have already made. The lines were not
+> touched. The fix belonged here.
 
 The call-argument form confirms it is not record-specific — `sink(push(xs,i),i,i)`
 at 0.28/1.09/4.33 against `sink2(i,i,push(xs,i))` at 0.01/0.03/0.06, user CPU,
@@ -896,6 +913,29 @@ reader does not have to take it on trust:
 No deterministic counter turned out to exist — `ply run --json` reports no step,
 call or allocation count — so wall clock was unavoidable and user CPU was used
 as the robust half. No run was discarded after the fact.
+
+> **Corrected 2026-08-27. One does now**, and the sentence above is the reason
+> it was built. `ply run --json` carries a `counters` object —
+> `updates`, `updates_in_place`, `in_place`, `takes_attempted`, `takes_moved`,
+> `dup_sites`, `dup_emitted`, `drop_sites`, `drop_emitted`, `elided`, `cycles`,
+> and the `engine` they came from. `ply_eval::rc::Stats` had counted all of it
+> since ADR 0017 §4; it had no CLI surface and was read by three test files.
+>
+> It replaces the clock for §4.1's own claim. The field-order arms separate on a
+> **count**: `in_place` is exactly `0.0` on every quadratic arm and exactly
+> `1.0` on every linear one, at n = 200 and n = 400, on a machine at load 24.75
+> — `crates/ply-eval/tests/field_order_oracle.rs`, which asserts it. That is why
+> that test is an ordinary suite member rather than an entry in
+> `.github/ci-shards.sh`'s `DEFERRED` table with the timing benchmarks.
+>
+> **What it still cannot do**, said here rather than discovered later:
+> `rc::note_update` carries no span, so the ratio is per run and not per site.
+> `escape_runs` contains two `push`es of which exactly one copies, so it reads
+> 0.50 — measured 0.5025 / 0.5012 / 0.5006 at k = 100 / 200 / 400 — and no band
+> over that ratio can classify it. The sharp statement is a count, not a
+> fraction: it copies **exactly k times**, once per escape, at the one site
+> `W0611` names. Attributing counters per push site is the change that would
+> close it.
 
 Commands, all from the worktree root:
 

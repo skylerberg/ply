@@ -924,12 +924,26 @@ That sentence is checkable in one grep. "The rename path is safe" is not.
 `crates/ply-span/src/lib.rs` holds every code as a `pub const` in `codes` **and**
 a registry table in its test module pairing the constant, its name and its
 literal number. The test asserts both that no code moved and that no two
-constants share a number. Add to both places, or the test fails — which is the
-intent.
+constants share a number. Add to both places.
+
+> **Corrected 2026-08-27. This used to end:** *"Add to both places, or the test
+> fails — which is the intent."* The test did **not** fail. Adding a `pub const`
+> and forgetting the registry row was silent, and it had already happened:
+> `REFERENCE_CYCLE` shipped as `W0610` and was never registered, so the one
+> table tooling is told to trust was missing a live code. A registry checked by
+> hand against memory is a green over exactly the space nobody looked at.
+>
+> The claim is now true rather than repaired. A second test,
+> `every_code_in_the_module_is_in_the_registry`, reads this file's own text,
+> extracts every `pub const` inside `pub mod codes`, and asserts set-equality
+> with the registry plus agreement on each number. Confirmed red under three
+> corruptions before being relied on: un-registering `REFERENCE_CYCLE` (the
+> historical defect, reproduced), adding an unregistered constant, and letting
+> the two hand-written copies of one number drift apart.
 
 Ranges in use: `E0001`–`E0002` and `E01xx`–`E05xx` for errors (73 codes; the two
 single-digit ones are the generic pair and are easy to miss when you assume the
-range starts at `E01xx`), and `W0601`–`W0610` for warnings. There is also a
+range starts at `E01xx`), and `W0601`–`W0611` for warnings. There is also a
 reserved list in `crates/ply-eval/src/host.rs` (`DB_SCHEMA_MISMATCH` is at
 `:1106`) naming codes a *handler* may not answer with. A code appearing in
 `codes`, in the registry, and in that list is **still raised nowhere** — that is

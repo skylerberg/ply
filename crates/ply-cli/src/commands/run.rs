@@ -1,6 +1,6 @@
 use super::common::{
-    IND, describe_schema, diagnostic_json, emit_json, location, plural, print_diagnostics,
-    report_bind_error, report_load_error,
+    Counted, IND, counted, counters_json, counters_line, describe_schema, diagnostic_json,
+    emit_json, location, plural, print_diagnostics, report_bind_error, report_load_error,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -158,7 +158,12 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let span = entry.span;
     let engine: EngineChoice = args.engine.into();
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer = evaluate(
+    let Counted {
+        answer,
+        counters,
+        engine: counted_engine,
+        carried_cycles,
+    } = evaluate(
         &loaded,
         engine,
         name.as_str(),
@@ -167,13 +172,17 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &hosts,
         declared.as_ref(),
     );
+    let counters_value = counters_json(&counters, counted_engine);
 
     // A cycle among escaped values is never collected (ADR 0017 §4), so the run
     // that built one is the only place a reader can be told it is there. It is
     // the program's own doing rather than the run's configuration, so it is
     // reported whatever the entry point answered and it changes no exit code.
     let mut config_warnings = config_warnings;
-    let cycles = ply_eval::rc::take_cycles();
+    // `carried_cycles` first: under `--engine both` those are the tree-walker's,
+    // rescued from the reset that cleared the counters between the two engines.
+    let mut cycles = carried_cycles;
+    cycles.extend(ply_eval::rc::take_cycles());
     if !cycles.is_empty() {
         if args.json {
             if let (Value::Array(items), Value::Array(more)) = (
@@ -216,10 +225,15 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "value": rendered,
                     "configuration": hosts.configuration().to_json(),
                     "shutdown": teardown_json,
+                    "counters": counters_value,
                     "diagnostics": config_warnings,
                 }));
             } else {
                 print_handshakes(&hosts, style);
+                eprintln!(
+                    "{IND}{}",
+                    style.dim(&counters_line(&counters, counted_engine))
+                );
                 println!("{IND}{rendered}");
             }
             EXIT_OK
@@ -256,9 +270,14 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "value": Value::Null,
                     "configuration": hosts.configuration().to_json(),
                     "shutdown": teardown_json,
+                    "counters": counters_value,
                     "diagnostics": Value::Array(all),
                 }));
             } else {
+                eprintln!(
+                    "{IND}{}",
+                    style.dim(&counters_line(&counters, counted_engine))
+                );
                 print_diagnostics(std::slice::from_ref(&diagnostic), &loaded.sources, style);
                 if !drained
                     && let Some(at) = diagnostic
@@ -440,6 +459,13 @@ fn print_handshakes(hosts: &Hosts, style: Style) {
 /// Under `both`, the authoritative engine's answer is what `main` produced and
 /// the other engine's is only ever a reason to fail: a value the two disagree
 /// about must never be printed as if it were the program's.
+/// Runs the entry point, and answers what the reference counters saw while it
+/// ran.
+///
+/// The counters are cleared here rather than at start-up because the lowering
+/// pass bumps `dup_*` and `drop_*` (`code.rs`'s `use_of`, `declare`,
+/// `released`) and the machine lowers lazily — so a reset placed any later
+/// would report a body's runtime without the analysis that shaped it.
 fn evaluate(
     loaded: &Loaded,
     engine: EngineChoice,
@@ -448,7 +474,7 @@ fn evaluate(
     plan: &Plan,
     hosts: &Hosts,
     declared: Option<&Footprint>,
-) -> Result<PlyValue, Diagnostic> {
+) -> Counted<Result<PlyValue, Diagnostic>> {
     let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
     interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
@@ -468,20 +494,32 @@ fn evaluate(
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
 
     match engine {
-        EngineChoice::Treewalk => interp.call(name, Vec::new(), span),
-        EngineChoice::Machine => machine.call(name, Vec::new(), span),
+        EngineChoice::Treewalk => counted(Engine::Treewalk, || interp.call(name, Vec::new(), span)),
+        EngineChoice::Machine => counted(Engine::Machine, || machine.call(name, Vec::new(), span)),
+        // Two evaluations of one program. Adding their counters together would
+        // report a run nobody asked for, so each is taken on its own and the
+        // machine's are the ones published: it is the engine that calls
+        // `rc::carry` — the tree-walker calls it nowhere — so it is the only
+        // one whose `in_place` can show the field-order trap at all.
         EngineChoice::Both => {
-            let left = interp.call(name, Vec::new(), span);
-            let right = machine.call(name, Vec::new(), span);
+            let left = counted(Engine::Treewalk, || interp.call(name, Vec::new(), span));
+            let mut right = counted(Engine::Machine, || machine.call(name, Vec::new(), span));
+            // The tree-walker's cycles were drained by the machine's reset and
+            // handed back; they are the run's just as much as the machine's.
+            let mut cycles = left.carried_cycles;
+            cycles.append(&mut right.carried_cycles);
+            right.carried_cycles = cycles;
+            let left = left.answer;
             // A refusal is not a disagreement: the tree-walker declined to
             // start, so the machine's answer is the only one there is.
             if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
                 return right;
             }
-            match compare_answers(&interp, &machine, name, &left, &right) {
+            let answer = match compare_answers(&interp, &machine, name, &left, &right.answer) {
                 Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
                 None => left,
-            }
+            };
+            Counted { answer, ..right }
         }
     }
 }

@@ -588,6 +588,28 @@ pub mod codes {
     /// other failure, but not an error: the records are written either way, and
     /// the `Abandoned` outcome on them is the signal.
     pub const SPAN_ABANDONED: &str = "W0609";
+    /// A growing container is built in a sub-expression that is **not** the last
+    /// one of its enclosing node, so every step copies it instead of rewriting
+    /// it and the loop that runs the step is quadratic.
+    ///
+    /// The precondition is positional and non-local, which is why it needs a
+    /// diagnostic rather than a documented convention: `ply_eval::rc::carry`
+    /// hands a pending frame `env.clone()` whenever another sub-expression
+    /// follows the one being evaluated, that second owner makes
+    /// `Env::take_unique` refuse, and the update takes its copying branch. It
+    /// never asks what the remaining sub-expression *reads*, so a literal
+    /// constant sitting after the call is enough — ADR 0020 §5.2 measured
+    /// exactly that. No property of the callee decides it; the caller does.
+    ///
+    /// A `W` because the program is correct and its answer is unchanged. Only
+    /// the asymptotics move, and refusing the program would refuse a legal one.
+    ///
+    /// **What it does not cover.** `List` built by `push`, and nothing else.
+    /// `builtins.rs:460` and `:472` are the only two `rc::note_update` call
+    /// sites in the tree, so `rc::Stats::updates` counts `push` alone and a
+    /// firing on a `Map` or a `Bytes` would be a claim with no counter behind
+    /// it. Widening the lint means widening the counter first, in that order.
+    pub const FIELD_ORDER_COPY: &str = "W0611";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -686,156 +708,162 @@ mod tests {
         assert_eq!(a.to(Span::DUMMY), a);
     }
 
+    /// Every code, with the number it was published under. Hand-written, and
+    /// checked against the module itself by
+    /// [`every_code_in_the_module_is_in_the_registry`] so that forgetting a row
+    /// is a red test rather than a silence.
+    const REGISTRY: &[(&str, &str, &str)] = &[
+        ("UNEXPECTED_TOKEN", codes::UNEXPECTED_TOKEN, "E0001"),
+        ("UNTERMINATED_STRING", codes::UNTERMINATED_STRING, "E0002"),
+        ("UNKNOWN_NAME", codes::UNKNOWN_NAME, "E0101"),
+        ("UNKNOWN_TYPE", codes::UNKNOWN_TYPE, "E0102"),
+        ("UNKNOWN_EFFECT", codes::UNKNOWN_EFFECT, "E0103"),
+        ("UNKNOWN_OPERATION", codes::UNKNOWN_OPERATION, "E0104"),
+        ("DUPLICATE_DEFINITION", codes::DUPLICATE_DEFINITION, "E0105"),
+        ("UNKNOWN_MODULE", codes::UNKNOWN_MODULE, "E0106"),
+        ("PRIVATE_NAME", codes::PRIVATE_NAME, "E0107"),
+        ("AMBIGUOUS_IMPORT", codes::AMBIGUOUS_IMPORT, "E0108"),
+        ("MODULE_CYCLE", codes::MODULE_CYCLE, "E0109"),
+        ("DUPLICATE_IMPORT", codes::DUPLICATE_IMPORT, "E0110"),
+        ("INVALID_MODULE_PATH", codes::INVALID_MODULE_PATH, "E0111"),
+        (
+            "AMBIGUOUS_ENTRY_POINT",
+            codes::AMBIGUOUS_ENTRY_POINT,
+            "E0112",
+        ),
+        ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
+        ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
+        ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
+        ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
+        ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
+        ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
+        ("NOT_A_FUNCTION", codes::NOT_A_FUNCTION, "E0204"),
+        ("NON_EXHAUSTIVE_MATCH", codes::NON_EXHAUSTIVE_MATCH, "E0205"),
+        ("NOT_DERIVABLE", codes::NOT_DERIVABLE, "E0206"),
+        ("UNKNOWN_DERIVER", codes::UNKNOWN_DERIVER, "E0207"),
+        ("ORPHAN_DERIVE", codes::ORPHAN_DERIVE, "E0208"),
+        ("DECIMAL_DIVISION", codes::DECIMAL_DIVISION, "E0209"),
+        ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
+        ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
+        ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
+        ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
+        ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
+        ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
+        ("DEADLOCK", codes::DEADLOCK, "E0414"),
+        (
+            "SIMULATION_DIVERGENCE",
+            codes::SIMULATION_DIVERGENCE,
+            "E0415",
+        ),
+        ("NESTED_SIMULATION", codes::NESTED_SIMULATION, "E0416"),
+        ("EFFECT_IN_SPEC", codes::EFFECT_IN_SPEC, "E0417"),
+        ("UNQUANTIFIABLE_TYPE", codes::UNQUANTIFIABLE_TYPE, "E0418"),
+        ("OBLIGATION_REFUTED", codes::OBLIGATION_REFUTED, "E0419"),
+        ("VACUOUS_OBLIGATION", codes::VACUOUS_OBLIGATION, "E0420"),
+        (
+            "HOST_OPERATION_UNKNOWN",
+            codes::HOST_OPERATION_UNKNOWN,
+            "E0421",
+        ),
+        (
+            "HOST_HANDLER_CONFLICT",
+            codes::HOST_HANDLER_CONFLICT,
+            "E0422",
+        ),
+        (
+            "HOST_DETERMINISM_MISMATCH",
+            codes::HOST_DETERMINISM_MISMATCH,
+            "E0423",
+        ),
+        ("HERMETIC_BOUNDARY", codes::HERMETIC_BOUNDARY, "E0424"),
+        ("HOST_IN_SIMULATION", codes::HOST_IN_SIMULATION, "E0425"),
+        (
+            "HOST_CONTINUATION_RESUMED",
+            codes::HOST_CONTINUATION_RESUMED,
+            "E0426",
+        ),
+        (
+            "HOST_FOOTPRINT_ESCAPE",
+            codes::HOST_FOOTPRINT_ESCAPE,
+            "E0427",
+        ),
+        ("HOST_BLOCKING_ANSWER", codes::HOST_BLOCKING_ANSWER, "E0428"),
+        (
+            "TLS_CREDENTIAL_UNKNOWN",
+            codes::TLS_CREDENTIAL_UNKNOWN,
+            "E0429",
+        ),
+        (
+            "TLS_CREDENTIAL_INVALID",
+            codes::TLS_CREDENTIAL_INVALID,
+            "E0430",
+        ),
+        ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
+        ("DB_STATEMENT_REFUSED", codes::DB_STATEMENT_REFUSED, "E0432"),
+        ("DB_PREPARE_FAILED", codes::DB_PREPARE_FAILED, "E0433"),
+        (
+            "DB_FOOTPRINT_UNDECLARED",
+            codes::DB_FOOTPRINT_UNDECLARED,
+            "E0434",
+        ),
+        ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
+        ("DB_TRANSACTION_SCOPE", codes::DB_TRANSACTION_SCOPE, "E0436"),
+        ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
+        (
+            "DB_UNMODELLED_SIDE_EFFECT",
+            codes::DB_UNMODELLED_SIDE_EFFECT,
+            "E0438",
+        ),
+        ("SECRET_TO_HOST", codes::SECRET_TO_HOST, "E0439"),
+        ("CONFIG_UNAVAILABLE", codes::CONFIG_UNAVAILABLE, "E0440"),
+        ("CONFIG_MISSING", codes::CONFIG_MISSING, "E0441"),
+        ("CONFIG_INVALID", codes::CONFIG_INVALID, "E0442"),
+        ("ARTIFACT_INVALID", codes::ARTIFACT_INVALID, "E0443"),
+        ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
+        ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
+        ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
+        ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
+        ("REGION_KIND_REFUSED", codes::REGION_KIND_REFUSED, "E0448"),
+        (
+            "REGION_ESCAPE_AT_BOUNDARY",
+            codes::REGION_ESCAPE_AT_BOUNDARY,
+            "E0449",
+        ),
+        ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
+        ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
+        ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
+        ("MACHINE_ONLY_CLAUSE", codes::MACHINE_ONLY_CLAUSE, "E0504"),
+        ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
+        ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
+        ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
+        (
+            "CACHE_VERSION_CHANGED",
+            codes::CACHE_VERSION_CHANGED,
+            "W0603",
+        ),
+        (
+            "OBLIGATION_NOT_DISCHARGED",
+            codes::OBLIGATION_NOT_DISCHARGED,
+            "W0604",
+        ),
+        ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
+        ("HOST_TEARDOWN", codes::HOST_TEARDOWN, "W0606"),
+        ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
+        ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
+        ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
+        ("REFERENCE_CYCLE", codes::REFERENCE_CYCLE, "W0610"),
+        ("FIELD_ORDER_COPY", codes::FIELD_ORDER_COPY, "W0611"),
+    ];
+
     /// A code is matched on by tooling long after the release that introduced
     /// it, so a number may never be reused or renumbered.
     #[test]
     fn every_registered_code_has_its_published_number() {
-        let registry = [
-            ("UNEXPECTED_TOKEN", codes::UNEXPECTED_TOKEN, "E0001"),
-            ("UNTERMINATED_STRING", codes::UNTERMINATED_STRING, "E0002"),
-            ("UNKNOWN_NAME", codes::UNKNOWN_NAME, "E0101"),
-            ("UNKNOWN_TYPE", codes::UNKNOWN_TYPE, "E0102"),
-            ("UNKNOWN_EFFECT", codes::UNKNOWN_EFFECT, "E0103"),
-            ("UNKNOWN_OPERATION", codes::UNKNOWN_OPERATION, "E0104"),
-            ("DUPLICATE_DEFINITION", codes::DUPLICATE_DEFINITION, "E0105"),
-            ("UNKNOWN_MODULE", codes::UNKNOWN_MODULE, "E0106"),
-            ("PRIVATE_NAME", codes::PRIVATE_NAME, "E0107"),
-            ("AMBIGUOUS_IMPORT", codes::AMBIGUOUS_IMPORT, "E0108"),
-            ("MODULE_CYCLE", codes::MODULE_CYCLE, "E0109"),
-            ("DUPLICATE_IMPORT", codes::DUPLICATE_IMPORT, "E0110"),
-            ("INVALID_MODULE_PATH", codes::INVALID_MODULE_PATH, "E0111"),
-            (
-                "AMBIGUOUS_ENTRY_POINT",
-                codes::AMBIGUOUS_ENTRY_POINT,
-                "E0112",
-            ),
-            ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
-            ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
-            ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
-            ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
-            ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
-            ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
-            ("NOT_A_FUNCTION", codes::NOT_A_FUNCTION, "E0204"),
-            ("NON_EXHAUSTIVE_MATCH", codes::NON_EXHAUSTIVE_MATCH, "E0205"),
-            ("NOT_DERIVABLE", codes::NOT_DERIVABLE, "E0206"),
-            ("UNKNOWN_DERIVER", codes::UNKNOWN_DERIVER, "E0207"),
-            ("ORPHAN_DERIVE", codes::ORPHAN_DERIVE, "E0208"),
-            ("DECIMAL_DIVISION", codes::DECIMAL_DIVISION, "E0209"),
-            ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
-            ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
-            ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
-            ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
-            ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
-            ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
-            ("DEADLOCK", codes::DEADLOCK, "E0414"),
-            (
-                "SIMULATION_DIVERGENCE",
-                codes::SIMULATION_DIVERGENCE,
-                "E0415",
-            ),
-            ("NESTED_SIMULATION", codes::NESTED_SIMULATION, "E0416"),
-            ("EFFECT_IN_SPEC", codes::EFFECT_IN_SPEC, "E0417"),
-            ("UNQUANTIFIABLE_TYPE", codes::UNQUANTIFIABLE_TYPE, "E0418"),
-            ("OBLIGATION_REFUTED", codes::OBLIGATION_REFUTED, "E0419"),
-            ("VACUOUS_OBLIGATION", codes::VACUOUS_OBLIGATION, "E0420"),
-            (
-                "HOST_OPERATION_UNKNOWN",
-                codes::HOST_OPERATION_UNKNOWN,
-                "E0421",
-            ),
-            (
-                "HOST_HANDLER_CONFLICT",
-                codes::HOST_HANDLER_CONFLICT,
-                "E0422",
-            ),
-            (
-                "HOST_DETERMINISM_MISMATCH",
-                codes::HOST_DETERMINISM_MISMATCH,
-                "E0423",
-            ),
-            ("HERMETIC_BOUNDARY", codes::HERMETIC_BOUNDARY, "E0424"),
-            ("HOST_IN_SIMULATION", codes::HOST_IN_SIMULATION, "E0425"),
-            (
-                "HOST_CONTINUATION_RESUMED",
-                codes::HOST_CONTINUATION_RESUMED,
-                "E0426",
-            ),
-            (
-                "HOST_FOOTPRINT_ESCAPE",
-                codes::HOST_FOOTPRINT_ESCAPE,
-                "E0427",
-            ),
-            ("HOST_BLOCKING_ANSWER", codes::HOST_BLOCKING_ANSWER, "E0428"),
-            (
-                "TLS_CREDENTIAL_UNKNOWN",
-                codes::TLS_CREDENTIAL_UNKNOWN,
-                "E0429",
-            ),
-            (
-                "TLS_CREDENTIAL_INVALID",
-                codes::TLS_CREDENTIAL_INVALID,
-                "E0430",
-            ),
-            ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
-            ("DB_STATEMENT_REFUSED", codes::DB_STATEMENT_REFUSED, "E0432"),
-            ("DB_PREPARE_FAILED", codes::DB_PREPARE_FAILED, "E0433"),
-            (
-                "DB_FOOTPRINT_UNDECLARED",
-                codes::DB_FOOTPRINT_UNDECLARED,
-                "E0434",
-            ),
-            ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
-            ("DB_TRANSACTION_SCOPE", codes::DB_TRANSACTION_SCOPE, "E0436"),
-            ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
-            (
-                "DB_UNMODELLED_SIDE_EFFECT",
-                codes::DB_UNMODELLED_SIDE_EFFECT,
-                "E0438",
-            ),
-            ("SECRET_TO_HOST", codes::SECRET_TO_HOST, "E0439"),
-            ("CONFIG_UNAVAILABLE", codes::CONFIG_UNAVAILABLE, "E0440"),
-            ("CONFIG_MISSING", codes::CONFIG_MISSING, "E0441"),
-            ("CONFIG_INVALID", codes::CONFIG_INVALID, "E0442"),
-            ("ARTIFACT_INVALID", codes::ARTIFACT_INVALID, "E0443"),
-            ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
-            ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
-            ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
-            ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
-            ("REGION_KIND_REFUSED", codes::REGION_KIND_REFUSED, "E0448"),
-            (
-                "REGION_ESCAPE_AT_BOUNDARY",
-                codes::REGION_ESCAPE_AT_BOUNDARY,
-                "E0449",
-            ),
-            ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
-            ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
-            ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
-            ("MACHINE_ONLY_CLAUSE", codes::MACHINE_ONLY_CLAUSE, "E0504"),
-            ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
-            ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
-            ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
-            (
-                "CACHE_VERSION_CHANGED",
-                codes::CACHE_VERSION_CHANGED,
-                "W0603",
-            ),
-            (
-                "OBLIGATION_NOT_DISCHARGED",
-                codes::OBLIGATION_NOT_DISCHARGED,
-                "W0604",
-            ),
-            ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
-            ("HOST_TEARDOWN", codes::HOST_TEARDOWN, "W0606"),
-            ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
-            ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
-            ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
-        ];
-
-        for (name, code, expected) in registry {
+        for (name, code, expected) in REGISTRY {
             assert_eq!(code, expected, "`{name}` moved to a different number");
         }
 
-        let mut numbers: Vec<&str> = registry.iter().map(|(_, code, _)| *code).collect();
+        let mut numbers: Vec<&str> = REGISTRY.iter().map(|(_, code, _)| *code).collect();
         numbers.sort_unstable();
         let before = numbers.len();
         numbers.dedup();
@@ -844,6 +872,85 @@ mod tests {
             numbers.len(),
             "two constants share one number: {numbers:?}"
         );
+    }
+
+    /// The registry above is written by hand, so it can be *forgotten*. It was:
+    /// `REFERENCE_CYCLE` shipped as `W0610` and was never added, and
+    /// `CONTRIBUTING.md`'s claim that "the test fails — which is the intent"
+    /// was false for as long as that lasted. A hand-written list checked by
+    /// hand is a green over exactly the space nobody looked at, so the list is
+    /// checked against the module instead of against memory.
+    ///
+    /// Reading this file's own text is the only way to enumerate the constants:
+    /// `pub const`s are not reflectable and a macro that generated them would
+    /// change how every one of them reads at its use site.
+    #[test]
+    fn every_code_in_the_module_is_in_the_registry() {
+        let text = include_str!("lib.rs");
+        // Bound the scan to the module. The registry's own array quotes every
+        // number too, and a scan of the whole file would match itself.
+        let start = text
+            .find("\npub mod codes {\n")
+            .expect("the codes module is declared at column 0");
+        let body = &text[start..];
+        let end = body.find("\n}\n").expect("the module closes at column 0");
+        let body = &body[..end];
+
+        let mut declared: Vec<(String, String)> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            let (name, rest) = rest.split_once(':').expect("`pub const NAME: &str`");
+            let code = rest
+                .split('"')
+                .nth(1)
+                .expect("a code is a string literal")
+                .to_string();
+            declared.push((name.trim().to_string(), code));
+        }
+        assert!(
+            declared.len() > 80,
+            "the scan found only {} constants, so it is not reading the module",
+            declared.len()
+        );
+
+        let registered: Vec<&str> = REGISTRY.iter().map(|(name, _, _)| *name).collect();
+        let missing: Vec<&str> = declared
+            .iter()
+            .filter(|(name, _)| !registered.contains(&name.as_str()))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared in `codes` but absent from the registry: {missing:?}"
+        );
+
+        let names: Vec<&str> = declared.iter().map(|(name, _)| name.as_str()).collect();
+        let extra: Vec<&str> = registered
+            .iter()
+            .copied()
+            .filter(|name| !names.contains(name))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "in the registry but not declared in `codes`: {extra:?}"
+        );
+
+        // The registry's third column is the published number; the module's
+        // literal is what tooling actually sees. They are two hand-written
+        // copies of one fact, so they are compared.
+        for (name, code) in &declared {
+            let (_, _, published) = REGISTRY
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .expect("just checked it is present");
+            assert_eq!(
+                code, published,
+                "`{name}` is `{code}` in the module and `{published}` in the registry"
+            );
+        }
     }
 
     #[test]

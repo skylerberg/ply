@@ -1,5 +1,6 @@
 pub mod derivable;
 pub mod env;
+pub mod fieldorder;
 pub mod infer;
 pub mod prelude;
 pub mod print;

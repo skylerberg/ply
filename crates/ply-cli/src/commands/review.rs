@@ -70,6 +70,19 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     };
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
+    // `load_complete` has already parsed every file, so the pass costs the walk
+    // and nothing else here. This is the answer to the objection the opt-in flag
+    // invites — that a lint nobody turns on is worth as little as one nobody can
+    // silence: the command a project already runs to decide what a human should
+    // look at can carry it.
+    let field_order = if args.field_order {
+        ply_core::fieldorder::check_where(&loaded.program, &loaded.resolved, |m| {
+            args.std || !ply_std::is_std(m)
+        })
+    } else {
+        Vec::new()
+    };
+
     let hashes = loaded.hashes.clone();
     let scoped = crate::obligations::project_view(&loaded.check, args.std);
     let laws = Laws::of(&scoped, &hashes);
@@ -128,11 +141,18 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     if args.json {
-        emit_json(&report_json(
-            &loaded, &report, &review, specified, &warnings,
-        ));
+        let mut object = report_json(&loaded, &report, &review, specified, &warnings);
+        // Its own key rather than the `diagnostics` array, which is the prove
+        // report's and is keyed to obligations. A consumer that does not ask
+        // for the lint sees an empty array rather than a missing one.
+        object["field_order"] =
+            crate::commands::common::diagnostics_json(&field_order, &loaded.sources);
+        emit_json(&object);
     } else {
         print_human(&loaded, &report, &review, specified, &warnings, style);
+        if !field_order.is_empty() {
+            print_diagnostics(&field_order, &loaded.sources, style);
+        }
     }
     if report.failed() {
         EXIT_FAILED

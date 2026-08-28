@@ -7374,8 +7374,21 @@ ply build --diff OLD.plyx [PATH]
 
 `--trace` defaults to `json` under `ply run` and `off` under `ply test`;
 `--trace-level` defaults to `info`. `pub const EXIT_DRAIN_INCOMPLETE: i32 = 3;`
-joins `ply-cli`'s exit codes. `ply run --json` emits its object before the entry
-point starts and the trace lines follow on stderr.
+joins `ply-cli`'s exit codes. `ply run --json` emits its object **after** the
+entry point returns, and the trace lines precede it on stderr.
+
+> **Corrected 2026-08-27. The last sentence used to read:** *"`ply run --json`
+> emits its object before the entry point starts and the trace lines follow on
+> stderr."* It never did. `run.rs`'s two `emit_json` calls are both in the
+> `match answer` that follows `evaluate`, and they have to be — the object
+> carries `"value"`, which does not exist until the program has answered.
+> Verified by running rather than by reading: `ply run --json` on a program
+> that folds three million times had written **0 bytes** to stdout 0.7 s in and
+> its whole 737-byte object at exit.
+>
+> The ordering matters now: the object's `counters` key reports what the
+> reference counters saw *during* the run, which an object emitted beforehand
+> could not have carried.
 
 ### New diagnostic codes — landed in `ply_span::codes`
 

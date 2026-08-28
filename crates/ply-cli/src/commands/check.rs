@@ -36,6 +36,22 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     };
     let warnings = once_each(warnings);
 
+    // Before the report is built, so that the same diagnostics reach the JSON
+    // array and the terminal. `--field-order` forces the complete parse: the
+    // pass answers a question about a *composition*, so a callee gate 1 skipped
+    // would be a callee it answers "does not grow" for — a silent miss, which
+    // is the failure mode this whole diagnostic exists to make loud. Paying a
+    // full parse is the price of the answer being a function of the source.
+    let field_order = if args.field_order {
+        if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
+            return report_load_error("check", &err, args.json, style);
+        }
+        ply_core::fieldorder::check_where(&loaded.program, &loaded.resolved, |m| {
+            args.std || !ply_std::is_std(m)
+        })
+    } else {
+        Vec::new()
+    };
     if args.json {
         let mut report = report_json(&loaded, &warnings);
         if !refused.is_empty() {
@@ -57,6 +73,15 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
             }
             attach_provenance(&mut report, &loaded);
         }
+        // Into the same array the other warnings use, so a consumer keys off
+        // `code` rather than off which array a diagnostic arrived in.
+        if let Value::Array(items) = &mut report["diagnostics"] {
+            items.extend(
+                field_order
+                    .iter()
+                    .map(|d| diagnostic_json(d, &loaded.sources)),
+            );
+        }
         emit_json(&report);
         return EXIT_OK;
     }
@@ -77,6 +102,11 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         plural(loaded.check.tests.len(), "test"),
     );
     print_warnings(&warnings, style);
+    // Rendered rather than listed: a lint whose whole content is *where* is
+    // useless without the line it points at.
+    if !field_order.is_empty() {
+        print_diagnostics(&field_order, &loaded.sources, style);
+    }
 
     if args.explain {
         print_explain(&loaded, style);

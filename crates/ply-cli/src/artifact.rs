@@ -1041,7 +1041,12 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer = evaluate(
+    let crate::commands::common::Counted {
+        answer,
+        counters,
+        engine: counted_engine,
+        carried_cycles: _,
+    } = evaluate(
         &opened,
         args.engine.into(),
         span,
@@ -1049,6 +1054,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         &hosts,
         declared.as_ref(),
     );
+    let counters_value = crate::commands::common::counters_json(&counters, counted_engine);
 
     // ADR 0015 §4.4's pinned order, on the machine's own thread and never from a
     // signal handler: roll every open transaction back, close every open span,
@@ -1083,9 +1089,17 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                     "value": rendered,
                     "configuration": hosts.configuration().to_json(),
                     "shutdown": teardown_json,
+                    "counters": counters_value,
                     "diagnostics": diagnostics_json(&warnings, &empty),
                 }));
             } else {
+                eprintln!(
+                    "{IND}{}",
+                    style.dim(&crate::commands::common::counters_line(
+                        &counters,
+                        counted_engine
+                    ))
+                );
                 println!("{IND}{rendered}");
             }
             EXIT_OK
@@ -1112,6 +1126,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                     "configuration": hosts.configuration().to_json(),
                     "value": serde_json::Value::Null,
                     "shutdown": teardown_json,
+                    "counters": counters_value,
                     "diagnostics": [diagnostic_json(&diagnostic, &opened.sources)],
                 }));
             } else {
@@ -1133,7 +1148,8 @@ fn evaluate(
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_core::ty::Footprint>,
-) -> Result<ply_eval::Value, Diagnostic> {
+) -> crate::commands::common::Counted<Result<ply_eval::Value, Diagnostic>> {
+    use crate::commands::common::{Counted, counted};
     use ply_eval::{Engine, EngineChoice, Interp, Machine, compare_answers};
 
     let name = opened.entry.as_str();
@@ -1152,19 +1168,27 @@ fn evaluate(
     }
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
 
+    // See `commands::run::evaluate` for why the machine's counters are the ones
+    // published under `both`, and why the cycles are drained around the reset.
+    // The artifact path reports no cycles at all today — it never called
+    // `rc::take_cycles` before this change either — so `carried_cycles` is
+    // dropped by its caller rather than merged. That gap is unchanged by this
+    // work and is not claimed closed by it.
     match engine {
-        EngineChoice::Treewalk => interp.call(name, Vec::new(), span),
-        EngineChoice::Machine => machine.call(name, Vec::new(), span),
+        EngineChoice::Treewalk => counted(Engine::Treewalk, || interp.call(name, Vec::new(), span)),
+        EngineChoice::Machine => counted(Engine::Machine, || machine.call(name, Vec::new(), span)),
         EngineChoice::Both => {
-            let left = interp.call(name, Vec::new(), span);
-            let right = machine.call(name, Vec::new(), span);
+            let left = counted(Engine::Treewalk, || interp.call(name, Vec::new(), span));
+            let right = counted(Engine::Machine, || machine.call(name, Vec::new(), span));
+            let left = left.answer;
             if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
                 return right;
             }
-            match compare_answers(&interp, &machine, name, &left, &right) {
+            let answer = match compare_answers(&interp, &machine, name, &left, &right.answer) {
                 Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
                 None => left,
-            }
+            };
+            Counted { answer, ..right }
         }
     }
 }

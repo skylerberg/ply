@@ -94,11 +94,17 @@ pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
 }
 ```
 
-Called from eight sites — call arguments (`machine.rs:1007`, `frame.rs:107`,
-`frame.rs:142`), record fields (`machine.rs:1064`, `frame.rs:263`), list items
-(`machine.rs:1094`, `frame.rs:301`) and handler arguments
+Called from eight sites — call arguments (`machine.rs:1035`, `frame.rs:107`,
+`frame.rs:142`), record fields (`machine.rs:1092`, `frame.rs:263`), list items
+(`machine.rs:1122`, `frame.rs:301`) and handler arguments
 (`handler.rs:208`) — always with `remaining` meaning *is there another
-sub-expression after this one*. When there is, the pending frame keeps a second
+sub-expression after this one*.
+
+> **Line numbers corrected 2026-08-27.** The three `machine.rs` anchors above
+> used to read **`machine.rs:1007`**, **`:1064`** and **`:1094`**. The file has
+> moved since; the sites themselves have not, and the five in `frame.rs` and
+> `handler.rs` are where they were. Re-checked by grepping for `carry(` rather
+> than by trusting the old numbers. When there is, the pending frame keeps a second
 reference to the scope for the whole of that sub-expression's evaluation.
 `Env::take_unique` (`env.rs:127`) then refuses: `let link = Rc::get_mut(node)?`,
 commented *"Refuses at the first shared link"*. So the variable read clones

@@ -129,10 +129,26 @@ pub struct Stats {
     pub takes_attempted: u64,
     /// Those that found the scope unshared and moved the value.
     pub takes_moved: u64,
-    /// Updates of a compound value — an operation that answers the argument it
-    /// was given with one element changed.
+    /// `push` on a `List`, and nothing else.
+    ///
+    /// > **Corrected 2026-08-27. This used to read:** *"Updates of a compound
+    /// > value — an operation that answers the argument it was given with one
+    /// > element changed."* That describes a counter this is not.
+    /// > `builtins.rs:460` and `:472` are the only two [`note_update`] call
+    /// > sites in the tree, and both are in `push`. `map_insert` is exactly the
+    /// > operation the withdrawn sentence describes and is **not** counted here.
+    ///
+    /// Widening it is not a one-line change and the reason is worth recording
+    /// rather than rediscovering: a `Map` is an `rpds::RedBlackTreeMap` and
+    /// `insert_mut` path-copies the shared nodes and rewrites the unshared
+    /// ones, so "in place" is a property of each node on the path rather than a
+    /// fork the operation takes. `push`'s `Arc::get_mut` is a single boolean and
+    /// that is why it is the one thing counted. Anything that reports on a
+    /// container other than `List` needs this settled first — including
+    /// [`codes::FIELD_ORDER_COPY`], whose scope is bounded by exactly this.
     pub updates: u64,
-    /// Updates that rewrote the value rather than copying it.
+    /// Those that rewrote the list rather than copying it — `push` reaching
+    /// `Arc::get_mut`'s `Some`.
     pub updates_in_place: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
@@ -153,6 +169,15 @@ impl Stats {
     }
 
     /// The fraction of updates that rewrote their argument in place.
+    ///
+    /// `None` when nothing was updated, for [`Stats::elided`]'s reason: a
+    /// program that pushed nothing has not failed to reuse anything.
+    ///
+    /// This is the number [`codes::FIELD_ORDER_COPY`] predicts. A definition
+    /// the lint fires in drives it toward 0; one it stays silent on leaves it
+    /// near 1. `ply-eval/tests/field_order_oracle.rs` is where the two are made
+    /// to agree, so that the lint is checked against a measurement rather than
+    /// against the prose that motivated it.
     pub fn in_place(&self) -> Option<f64> {
         if self.updates == 0 {
             return None;
