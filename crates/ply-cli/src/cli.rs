@@ -324,8 +324,9 @@ pub struct CheckArgs {
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
 
-    /// Report `W0611`: a growing container built anywhere but the last
-    /// sub-expression of its enclosing node, which makes the loop around it
+    /// Report `W0611`: a `push` the machine has to perform by copying, because
+    /// a pending frame is still holding either the scope it reads the list from
+    /// or an earlier sub-expression's value that contains it. In a loop that is
     /// quadratic. Parses every file, so the answer is a function of the source
     /// rather than of what the cache held. Changes no exit code.
     #[arg(long)]
@@ -552,9 +553,9 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub std: bool,
 
-    /// Also report `W0611`: a growing container built anywhere but the last
-    /// sub-expression of its enclosing node. `ply review` already parses every
-    /// file, so this costs the walk and nothing else.
+    /// Also report `W0611`: a `push` the machine has to perform by copying,
+    /// because something else still holds the list when it runs. `ply review`
+    /// already parses every file, so this costs the walk and nothing else.
     #[arg(long)]
     pub field_order: bool,
 

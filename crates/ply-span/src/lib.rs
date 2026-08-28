@@ -588,18 +588,30 @@ pub mod codes {
     /// other failure, but not an error: the records are written either way, and
     /// the `Abandoned` outcome on them is the signal.
     pub const SPAN_ABANDONED: &str = "W0609";
-    /// A growing container is built in a sub-expression that is **not** the last
-    /// one of its enclosing node, so every step copies it instead of rewriting
-    /// it and the loop that runs the step is quadratic.
+    /// A `push` the machine has to perform by copying, because something else
+    /// still holds the list when it runs — so every step copies the whole
+    /// accumulator and the loop that runs the step is quadratic.
     ///
-    /// The precondition is positional and non-local, which is why it needs a
-    /// diagnostic rather than a documented convention: `ply_eval::rc::carry`
-    /// hands a pending frame `env.clone()` whenever another sub-expression
-    /// follows the one being evaluated, that second owner makes
-    /// `Env::take_unique` refuse, and the update takes its copying branch. It
-    /// never asks what the remaining sub-expression *reads*, so a literal
-    /// constant sitting after the call is enough — ADR 0020 §5.2 measured
-    /// exactly that. No property of the callee decides it; the caller does.
+    /// > **Corrected 2026-08-28. This used to read:** *"A growing container is
+    /// > built in a sub-expression that is **not** the last one of its
+    /// > enclosing node ... The precondition is positional and non-local."*
+    /// > Positional is one of the two routes to a second owner, not the
+    /// > definition. `fn step(s: S, i: Int) -> S = { a: s.a, b: push(s.a, i) }`
+    /// > puts the `push` in the **last** field and measures `in_place` 0.0000
+    /// > at n = 200 and n = 400, because the first field's value is in
+    /// > `Frame::RecordField::done` and holds the same list.
+    ///
+    /// The two routes, and both need a diagnostic rather than a documented
+    /// convention because both are non-local. **The scope:**
+    /// `ply_eval::rc::carry` hands a pending frame `env.clone()` whenever
+    /// another sub-expression follows the one being evaluated, that second
+    /// owner makes `Env::take_unique` refuse, and the update takes its copying
+    /// branch. It never asks what the remaining sub-expression *reads*, so a
+    /// literal constant sitting after the call is enough — ADR 0020 §5.2
+    /// measured exactly that. **An earlier sibling:** the pending frames
+    /// accumulate the values they already have, so a sub-expression evaluated
+    /// before this one can hold the list directly. Either way no property of
+    /// the callee decides it; the composition does.
     ///
     /// A `W` because the program is correct and its answer is unchanged. Only
     /// the asymptotics move, and refusing the program would refuse a legal one.
@@ -609,6 +621,12 @@ pub mod codes {
     /// sites in the tree, so `rc::Stats::updates` counts `push` alone and a
     /// firing on a `Map` or a `Bytes` would be a claim with no counter behind
     /// it. Widening the lint means widening the counter first, in that order.
+    ///
+    /// It is **neither sound nor complete**, and the shapes it misses are named
+    /// with the number each one measures in `ply_core::fieldorder`'s module
+    /// comment, asserted in `ply-core/tests/field_order.rs` and measured in
+    /// `ply-eval/tests/field_order_oracle.rs`. Do not read a silence here as a
+    /// proof.
     pub const FIELD_ORDER_COPY: &str = "W0611";
 }
 

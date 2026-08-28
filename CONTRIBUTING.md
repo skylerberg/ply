@@ -1671,6 +1671,38 @@ Recorded here so nobody spends an afternoon rediscovering them.
     and running it records `{tally.read[log], tally.write[log]}`. Corrected in
     place, with the withdrawn sentence beside it.
 
+16. **The staleness check that guards every measurement here cannot fail, and a
+    second form of it is blind to half the tree.** Found 2026-08-28 while
+    rebuilding `W0611`. The form in `PREREGISTRATION.md:146` is
+
+    ```
+    find crates -name '*.rs' -newer target/release/ply    # must print NOTHING
+    ```
+
+    `find`'s implicit `-a` binds tighter than `-o`, so nothing here is being
+    `-o`'d — but the standing correction that adds `.ply` to it,
+
+    ```
+    find crates -name '*.rs' -o -name '*.ply' -newer target/release/ply
+    ```
+
+    parses as `(-name '*.rs') OR (-name '*.ply' AND -newer ...)`. It prints
+    **every `.rs` file in the tree, unconditionally** — 373 of them in this
+    worktree against 1 for the parenthesized form — so it can never print
+    nothing and can never be the gate it is written as. The form that works, and
+    the one this workstream ran before every series:
+
+    ```
+    find crates \( -name '*.rs' -o -name '*.ply' \) -newer target/release/ply
+    ```
+
+    The `.ply` half is not optional. `crates/ply-std/src/lib.rs` `include_str!`s
+    every standard-library `.ply` module into the binary, so an edited
+    `crates/ply-std/ply/json.ply` changes nothing a running `ply` does until the
+    crate is rebuilt, and `import std.json` resolves to the compiled-in copy.
+    An `.rs`-only check is blind to exactly that, and round 1 lost a headline
+    measurement to it.
+
 Items 9, 10 and 11 are closed; see the block at the end of item 10 and the one
 at the end of item 11 for the fixes, the measurements behind them and the tests
 that arm them. Items 12, 13, 14 and 15 are open — 12 as fixed-but-listed, 13 in

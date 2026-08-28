@@ -451,3 +451,374 @@ fn the_lint_fires_on_the_shipped_quadratic_in_the_json_serializer() {
         "W0611 points at `{text}`, which is not the inner `push`"
     );
 }
+
+// --- the round-2 probe table -------------------------------------------------
+
+/// One probe: a program whose stepping definition is the shape under test.
+struct Probe {
+    id: &'static str,
+    /// What the shape is, for the failure message.
+    shape: &'static str,
+    source: &'static str,
+    /// The definition `W0611` is expected to speak about, or not.
+    definition: &'static str,
+    /// The entry point's body, which folds `step` `n` times and reads the
+    /// answer out. Spelled per probe rather than inferred, because a shape the
+    /// harness guesses wrong is a probe that measures something else.
+    tail: &'static str,
+    /// `true` when the counter is expected in R2's quadratic band.
+    quadratic: bool,
+    /// A shape the pass is known **not** to decide, in either direction. The
+    /// band still applies — the counter is the counter — but the lint is
+    /// expected to disagree with it, and the disagreement is asserted so that
+    /// closing the gap is a red test rather than a silent improvement nobody
+    /// records.
+    disagrees: bool,
+}
+
+/// Every shape the round-2 rebuild of `W0611` rests on, with the number that
+/// decided it.
+///
+/// The findings that refuted the round-1 pass are `B1`–`B3` (silent, measured
+/// 0.0) and `D1`/`E1` (fired, measured 1.0). `F1`, `K1` and `M1` are the limits
+/// that remain, asserted as disagreements so that closing one is a red test.
+const PROBES: &[Probe] = &[
+    Probe {
+        id: "A1",
+        shape: "`push` in the last record field, nothing holding the list",
+        source: "type S = { pos: Int, toks: List<Int> }
+fn empty() -> S = {pos: 0, toks: []}
+fn step(s: S, i: Int) -> S = { pos: i, toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "A2",
+        shape: "`push` in field 1 of 3, so the scope is carried past it",
+        source: "type S = { pos: Int, toks: List<Int>, tail: Int }
+fn empty() -> S = {pos: 0, toks: [], tail: 0}
+fn step(s: S, i: Int) -> S = { pos: i, toks: push(s.toks, i), tail: s.tail }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "B1",
+        shape: "the LAST record field, with the first field holding the same list",
+        source: "type S = { keep: List<Int>, toks: List<Int> }
+fn empty() -> S = {keep: [], toks: []}
+fn step(s: S, i: Int) -> S = { keep: s.toks, toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "B2",
+        shape: "the LAST call argument, with the first argument holding the list",
+        source: "fn empty() -> List<Int> = []
+fn snd(a: List<Int>, b: List<Int>) -> List<Int> = b
+fn step(s: List<Int>, i: Int) -> List<Int> = snd(s, push(s, i))",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step))",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "B3",
+        shape: "the LAST list item, with the first item holding the list",
+        source: "fn empty() -> List<Int> = []
+fn last_of(ls: List<List<Int>>) -> List<Int> = fold(ls, [], |a: List<Int>, x: List<Int>| x)
+fn step(xs: List<Int>, i: Int) -> List<Int> = last_of([xs, push(xs, i)])",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step))",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "C1",
+        shape: "an earlier sibling that mentions the root and keeps nothing",
+        source: "type S = { n: Int, toks: List<Int> }
+fn empty() -> S = {n: 0, toks: []}
+fn step(s: S, i: Int) -> S = { n: len(s.toks), toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "C2",
+        shape: "an earlier sibling that is a different field of the same record",
+        source: "type S = { pos: Int, toks: List<Int> }
+fn empty() -> S = {pos: 0, toks: []}
+fn step(s: S, i: Int) -> S = { pos: s.pos, toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "D1",
+        shape: "a call at argument 0 of 2 whose only `push` is onto a fresh list",
+        source: "fn empty() -> List<Int> = []
+fn small(i: Int) -> Int = len(push([], i))
+fn keepr(a: Int, b: List<Int>) -> List<Int> = b
+fn step(s: List<Int>, i: Int) -> List<Int> = keepr(small(i), push(s, i))",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step))",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "E1",
+        shape: "a call at argument 0 of 2 that folds onto its own fresh accumulator",
+        source: "fn empty() -> Int = 0
+fn build(k: Int) -> List<Int> = fold(range(0, k), [], |a: List<Int>, j: Int| push(a, j))
+fn keepi(a: Int, b: Int) -> Int = a
+fn step(a: Int, i: Int) -> Int = keepi(len(build(10)), i)",
+        definition: "step",
+        tail: "fold(range(0, n), empty(), step)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "G3",
+        shape: "a record literal evaluated in the order it is written, not alphabetically",
+        source: "type S = { a: Int, b: List<Int> }
+fn empty() -> S = {a: 0, b: []}
+fn step(s: S, i: Int) -> S = { b: push(s.b, i), a: 0 }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).b)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "G4",
+        shape: "an earlier sibling whose value is a closure, which captured the scope",
+        source: "type S = { f: (Int) -> Int, toks: List<Int> }
+fn empty() -> S = {f: |z: Int| z, toks: []}
+fn step(s: S, i: Int) -> S = { f: |z: Int| len(s.toks) + z, toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "G2",
+        shape: "the same closure passed to a call, which is gone before the next field",
+        source: "type S = { n: Int, toks: List<Int> }
+fn empty() -> S = {n: 0, toks: []}
+fn mk(f: (Int) -> Int) -> Int = f(1)
+fn step(s: S, i: Int) -> S = { n: mk(|z: Int| len(s.toks) + z), toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "H1",
+        shape: "a `push` under a field access, which holds neither scope nor value",
+        source: "type W = { xs: List<Int> }
+fn empty() -> List<Int> = []
+fn wrap(a: List<Int>) -> W = { xs: a }
+fn step(xs: List<Int>, i: Int) -> List<Int> = wrap(push(xs, i)).xs",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step))",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "I1",
+        shape: "a growing call in the LAST argument, with the first holding what it grows",
+        source: "fn empty() -> List<Int> = []
+fn grow(xs: List<Int>, i: Int) -> List<Int> = push(xs, i)
+fn snd(a: List<Int>, b: List<Int>) -> List<Int> = b
+fn step(s: List<Int>, i: Int) -> List<Int> = snd(s, grow(s, i))",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step))",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "I2",
+        shape: "the same, where the kept place is a field of what the call was handed",
+        source: "type S = { pos: Int, toks: List<Int> }
+fn empty() -> S = {pos: 0, toks: []}
+fn node(s: S, i: Int) -> S = { pos: i, toks: push(s.toks, i) }
+fn keep(a: List<Int>, b: S) -> S = b
+fn step(s: S, i: Int) -> S = keep(s.toks, node(s, i))",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "J1",
+        shape: "an earlier sibling that wraps the list in a list literal",
+        source: "type S = { keep: List<List<Int>>, toks: List<Int> }
+fn empty() -> S = {keep: [], toks: []}
+fn step(s: S, i: Int) -> S = { keep: [s.toks], toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: false,
+    },
+    Probe {
+        id: "J2",
+        shape: "a lambda parameter shadowing the definition's, folding onto `[]`",
+        source: "fn empty() -> Int = 0
+fn keepi(a: Int, b: Int) -> Int = a
+fn build(xs: List<Int>) -> List<Int> = fold(range(0, 10), [], |xs: List<Int>, j: Int| push(xs, j))
+fn step(a: Int, i: Int) -> Int = keepi(len(build([])), i)",
+        definition: "step",
+        tail: "fold(range(0, n), empty(), step)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "M1",
+        shape: "a carried `push` onto a call's result — a measured false positive",
+        source: "fn empty() -> Int = 0
+fn mk(i: Int) -> List<Int> = [i]
+fn sink(a: List<Int>, b: Int) -> Int = len(a)
+fn step(a: Int, i: Int) -> Int = sink(push(mk(i), i), i)",
+        definition: "step",
+        tail: "fold(range(0, n), empty(), step)",
+        quadratic: false,
+        disagrees: true,
+    },
+    Probe {
+        id: "L1",
+        shape: "a `push` onto a fresh list, in a carried position",
+        source: "fn empty() -> Int = 0
+fn sink(a: List<Int>, b: Int) -> Int = len(a)
+fn step(a: Int, i: Int) -> Int = sink(push([], i), i)",
+        definition: "step",
+        tail: "fold(range(0, n), empty(), step)",
+        quadratic: false,
+        disagrees: false,
+    },
+    Probe {
+        id: "K1",
+        shape: "a `push` onto a list read out of a `Map` — the other known miss",
+        source: "fn empty() -> Map<Int, List<Int>> = map_insert(map_new(), 0, [])
+fn step(m: Map<Int, List<Int>>, i: Int) -> Map<Int, List<Int>> =
+  match map_get(m, 0) {
+    None -> m,
+    Some(vs) -> map_insert(m, 0, push(vs, i)),
+  }",
+        definition: "step",
+        tail: "match map_get(fold(range(0, n), empty(), step), 0) { None -> 0, Some(vs) -> len(vs) }",
+        quadratic: true,
+        disagrees: true,
+    },
+    Probe {
+        id: "F1",
+        shape: "an earlier sibling that holds the list through a call — the known miss",
+        source: "type S = { n: List<Int>, toks: List<Int> }
+fn empty() -> S = {n: [], toks: []}
+fn id(x: List<Int>) -> List<Int> = x
+fn step(s: S, i: Int) -> S = { n: id(s.toks), toks: push(s.toks, i) }",
+        definition: "step",
+        tail: "len(fold(range(0, n), empty(), step).toks)",
+        quadratic: true,
+        disagrees: true,
+    },
+];
+
+/// The whole entry point a probe needs, folded `n` times and finished so the
+/// counters describe one shape and nothing else.
+fn probe_source(p: &Probe) -> String {
+    format!("{}\npub fn run(n: Int) -> Int = {}\n", p.source, p.tail)
+}
+
+/// **The criterion this workstream exists to meet.** Every shape in the table,
+/// at two sizes, with the lint's answer and the counter's answer compared.
+///
+/// A round-1 review reproduced five defects on programs of this size with these
+/// counters as the oracle, so the table is the repair and the check at once. It
+/// asserts R2's bands, R4's drift and R3's agreement in one loop, and it names
+/// the one shape where agreement is not expected rather than leaving it out.
+#[test]
+fn every_probe_shape_agrees_with_the_counter_at_both_sizes() {
+    for p in PROBES {
+        let text = probe_source(p);
+        let (program, resolved, _) = load_source(&format!("<{}>", p.id), "probe.ply", &text);
+
+        let fired = ply_core::fieldorder::firings(&program, &resolved)
+            .iter()
+            .filter(|f| f.simple.as_str() == p.definition)
+            .count();
+
+        let (small, u_s, p_s) = ratio(&program, &resolved, "probe.run", 200);
+        let (large, u_l, p_l) = ratio(&program, &resolved, "probe.run", 400);
+        println!(
+            "{:<3} n=200 {}/{} = {:.4}   n=400 {}/{} = {:.4}   fired={}   {}",
+            p.id, p_s, u_s, small, p_l, u_l, large, fired, p.shape
+        );
+
+        for (n, got) in [(200, small), (400, large)] {
+            if p.quadratic {
+                assert!(
+                    got <= QUADRATIC_CEILING,
+                    "{} ({}) at n={n}: in_place = {got:.4}, above R2's {QUADRATIC_CEILING} \
+                     ceiling for a quadratic shape",
+                    p.id,
+                    p.shape
+                );
+            } else {
+                assert!(
+                    got >= LINEAR_FLOOR,
+                    "{} ({}) at n={n}: in_place = {got:.4}, below R2's {LINEAR_FLOOR} floor for a \
+                     linear shape",
+                    p.id,
+                    p.shape
+                );
+            }
+        }
+        assert!(
+            (small - large).abs() <= DRIFT,
+            "{}: in_place moved {:.4} across the doubling, more than R4's {DRIFT}",
+            p.id,
+            (small - large).abs()
+        );
+
+        let expected = p.quadratic != p.disagrees;
+        assert_eq!(
+            fired > 0,
+            expected,
+            "{} ({}): the lint {} and the counter says {:.4}. {}",
+            p.id,
+            p.shape,
+            if fired > 0 { "fires" } else { "is silent" },
+            small,
+            if p.disagrees {
+                "This shape is recorded in `fieldorder.rs`'s module comment as one the pass does \
+                 not decide; if it now agrees with the counter, take the row out of that table."
+            } else {
+                "One of the two is wrong and it is not the counter."
+            }
+        );
+    }
+}
+
+/// **R1 over the round-2 table.** Three runs of every probe must agree exactly.
+#[test]
+fn every_probe_counts_the_same_thing_three_times() {
+    for p in PROBES {
+        let text = probe_source(p);
+        let (program, resolved, _) = load_source(&format!("<{}>", p.id), "probe.ply", &text);
+        let mut seen = Vec::new();
+        for _ in 0..REPEATS {
+            seen.push(ratio(&program, &resolved, "probe.run", 200));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "{}: {REPEATS} runs disagreed — {seen:?}",
+            p.id
+        );
+    }
+}

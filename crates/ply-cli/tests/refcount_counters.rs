@@ -157,6 +157,14 @@ fn engine_both_reports_one_engines_counters_and_not_the_sum() {
 /// The tree-walker never lowers, so it bumps no `dup_*`/`drop_*`. Reported as
 /// zero and `null` rather than as the machine's numbers, because a figure
 /// attributed to the wrong evaluator is worse than an absent one.
+///
+/// `in_place` is `null` there for the same reason, and this test used to skip
+/// it — the one field `W0611` exists to predict, left unasserted while the
+/// paragraph above stated the principle. `interp.rs` calls nothing in
+/// `ply_eval::rc`: no `carry`, no `Env::take_unique`. It never moves a value
+/// out of a scope, so the two programs below — 0.995 and 0.0 on the machine —
+/// both read 0.0 there, and a ratio that cannot tell them apart is not the
+/// quantity its own name claims.
 #[test]
 fn the_treewalker_reports_its_own_counters_and_does_not_borrow_the_machines() {
     let dir = project(QUADRATIC);
@@ -166,6 +174,74 @@ fn the_treewalker_reports_its_own_counters_and_does_not_borrow_the_machines() {
     assert_eq!(c["elided"], Value::Null);
     // `push` is reached by both engines, so this one still moves.
     assert_eq!(c["updates"], 200);
+    assert_eq!(
+        c["in_place"],
+        Value::Null,
+        "the tree-walker never moves a value out of a scope, so a fraction of \
+         updates that reused is a fact about the evaluator and not about the \
+         program"
+    );
+    assert_eq!(
+        c["updates_in_place"], 0,
+        "the raw count stays: it is what happened, not a claim about reuse"
+    );
+
+    // The claim the null replaces has to be the true one. It is *not* that the
+    // tree-walker never reuses: a list the same expression just built has one
+    // owner whichever evaluator built it, and this program reads 2 of 2 on
+    // both. What is true is that it never moves a value out of a scope.
+    let fresh = project("fn main() -> Int = len(push(push([], 1), 2))\n");
+    let machine = counters(fresh.path(), &["--engine", "machine"]);
+    let walked = counters(fresh.path(), &["--engine", "treewalk"]);
+    assert_eq!(machine["updates_in_place"], 2);
+    assert_eq!(walked["updates_in_place"], 2);
+    assert_eq!(machine["in_place"], 1.0);
+    assert_eq!(walked["in_place"], Value::Null);
+
+    let linear = counters(project(LINEAR).path(), &["--engine", "treewalk"]);
+    assert_eq!(
+        linear["updates_in_place"], 0,
+        "the linear program, which the machine reads at 199 of 200"
+    );
+}
+
+/// The diagnostic points a reader at `counters.in_place`, so it has to say
+/// which engine reports one.
+#[test]
+fn the_diagnostic_names_the_engine_whose_counter_it_points_at() {
+    let dir = project(QUADRATIC);
+    let out = ply(dir.path())
+        .arg("check")
+        .arg("--json")
+        .arg("--field-order")
+        .arg("m.ply")
+        .output()
+        .unwrap();
+    let object = json_of(&out);
+    let fired: Vec<&Value> = object["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "W0611")
+        .collect();
+    assert_eq!(fired.len(), 1);
+    let notes = fired[0]["notes"].as_array().expect("notes");
+    let pointing: Vec<&str> = notes
+        .iter()
+        .filter_map(|n| n.as_str())
+        .filter(|n| n.contains("counters.in_place"))
+        .collect();
+    assert_eq!(
+        pointing.len(),
+        1,
+        "exactly one note should name the counter, got {notes:?}"
+    );
+    assert!(
+        pointing[0].contains("machine") && pointing[0].contains("treewalk"),
+        "the note sends a reader to a number that is `null` on one of the two \
+         shipped engines without saying so: {}",
+        pointing[0]
+    );
 }
 
 // --- the lint ---------------------------------------------------------------
@@ -295,4 +371,171 @@ fn review_carries_the_lint_when_asked_and_an_empty_array_when_not() {
     let fired = object["field_order"].as_array().expect("an array");
     assert_eq!(fired.len(), 1, "expected one W0611, got {fired:?}");
     assert_eq!(fired[0]["code"], "W0611");
+}
+
+// --- `--std`, which had no coverage at all -----------------------------------
+
+/// Every module the compiler ships, imported so that `--std` has all of them to
+/// report on.
+const IMPORT_EVERYTHING: &str = "\
+import std.config
+import std.db
+import std.http
+import std.json
+import std.net
+import std.router
+import std.signal
+import std.trace
+
+pub fn main() -> Int = 0
+";
+
+/// Every `W0611` in a report, as `(file, line, column, message)`.
+fn sites(object: &Value) -> Vec<(String, u64, u64, String)> {
+    object["diagnostics"]
+        .as_array()
+        .expect("a diagnostics array")
+        .iter()
+        .filter(|d| d["code"] == "W0611")
+        .map(|d| {
+            let primary = d["labels"]
+                .as_array()
+                .expect("labels")
+                .iter()
+                .find(|l| l["primary"] == true)
+                .expect("a primary label");
+            (
+                primary["file"].as_str().unwrap_or_default().to_string(),
+                primary["start"]["line"].as_u64().unwrap_or_default(),
+                primary["start"]["col"].as_u64().unwrap_or_default(),
+                d["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn lint(dir: &Path, extra: &[&str]) -> Value {
+    let mut cmd = ply(dir);
+    cmd.arg("check").arg("--json").arg("--field-order");
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg("m.ply");
+    json_of(&cmd.output().unwrap())
+}
+
+/// **The guarantee the round-1 standard-library figure did not have.** One
+/// firing is one site: no site appears twice in the report.
+///
+/// The number published for the standard library in round 1 was *221 over 174
+/// distinct sites*, and the two halves of that sentence describe different
+/// things. It was taken by running `check --field-order --std` inside
+/// `crates/ply-std/ply`, where the standard library's own source **is** the
+/// project: 174 firings in the project's modules `db`, `http`, `json`, `router`
+/// and `trace`, plus 47 more in the compiled-in `std.http` and `std.json` that
+/// those files import — the same text, analyzed as two different modules under
+/// two different names. Nothing was emitted twice; the *report* was the sum of
+/// two module sets and the headline called it one.
+#[test]
+fn one_firing_is_one_site_under_std() {
+    let dir = project(IMPORT_EVERYTHING);
+    let object = lint(dir.path(), &["--std"]);
+    let all = sites(&object);
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        all.len(),
+        unique.len(),
+        "a site is reported more than once: {:?}",
+        {
+            let mut counted = all.clone();
+            counted.sort();
+            counted.dedup();
+            all.iter()
+                .filter(|s| all.iter().filter(|t| t == s).count() > 1)
+                .collect::<Vec<_>>()
+        }
+    );
+    assert!(
+        all.iter().all(|(file, ..)| file.starts_with("<std>/")),
+        "a project with no code of its own reported a firing outside the standard library"
+    );
+}
+
+/// The figure itself, recomputed rather than quoted.
+///
+/// **45 firings over 45 distinct sites**, in five of the eight shipped modules:
+/// `db` 32, `http` 6, `json` 3, `router` 1, `trace` 3. Asserted so that the
+/// published number cannot drift from the code, and so that a change to the
+/// standard library that adds or removes one is a decision somebody makes on
+/// purpose. `crates/ply-std/ply/json.ply`'s `escape_runs` is one of the three
+/// in `json` and is **not** repaired here — a separate workstream owns it, and
+/// this test failing is how that landing announces itself.
+#[test]
+fn the_standard_library_figure_is_recomputed_by_this_test() {
+    let dir = project(IMPORT_EVERYTHING);
+    let all = sites(&lint(dir.path(), &["--std"]));
+
+    let mut per_module: Vec<(String, usize)> = Vec::new();
+    for (file, ..) in &all {
+        match per_module.iter_mut().find(|(f, _)| f == file) {
+            Some((_, n)) => *n += 1,
+            None => per_module.push((file.clone(), 1)),
+        }
+    }
+    per_module.sort();
+    assert_eq!(
+        per_module,
+        vec![
+            ("<std>/db.ply".to_string(), 32),
+            ("<std>/http.ply".to_string(), 6),
+            ("<std>/json.ply".to_string(), 3),
+            ("<std>/router.ply".to_string(), 1),
+            ("<std>/trace.ply".to_string(), 3),
+        ]
+    );
+    assert_eq!(
+        per_module.iter().map(|(_, n)| n).sum::<usize>(),
+        all.len(),
+        "the breakdown and the total have to be the same count, which is what \
+         `221 over 174` was not"
+    );
+    assert_eq!(all.len(), 45);
+}
+
+/// `--std` is what un-suppresses them, and without it a project that imports
+/// half the standard library hears nothing about it.
+#[test]
+fn without_std_the_shipped_modules_are_silent() {
+    let dir = project(IMPORT_EVERYTHING);
+    let all = sites(&lint(dir.path(), &[]));
+    assert!(
+        all.is_empty(),
+        "`--field-order` without `--std` reported {} firings in shipped modules",
+        all.len()
+    );
+}
+
+/// A project's own firing is reported without `--std`, which is the other half
+/// of the flag: the shipped modules are what the flag adds, not the whole
+/// report.
+#[test]
+fn a_projects_own_firing_is_reported_without_std() {
+    const SOURCE: &str = "\
+import std.json (Json, Str, to_string)
+
+fn sink(a: List<Int>, b: Int) -> List<Int> = a
+fn f(xs: List<Int>, j: Int) -> List<Int> = sink(push(xs, j), 0)
+
+pub fn main() -> Int = string_len(to_string(Str(\"x\"))) + len(f([], 1))
+";
+    let dir = project(SOURCE);
+    let all = sites(&lint(dir.path(), &[]));
+    assert_eq!(
+        all.len(),
+        1,
+        "expected the project's own firing, got {all:?}"
+    );
+    assert_eq!(all[0].0, "m.ply");
 }

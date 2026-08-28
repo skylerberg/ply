@@ -173,11 +173,29 @@ impl Stats {
     /// `None` when nothing was updated, for [`Stats::elided`]'s reason: a
     /// program that pushed nothing has not failed to reuse anything.
     ///
-    /// This is the number [`codes::FIELD_ORDER_COPY`] predicts. A definition
-    /// the lint fires in drives it toward 0; one it stays silent on leaves it
-    /// near 1. `ply-eval/tests/field_order_oracle.rs` is where the two are made
-    /// to agree, so that the lint is checked against a measurement rather than
-    /// against the prose that motivated it.
+    /// This is the number [`codes::FIELD_ORDER_COPY`] predicts, **on the
+    /// machine**. `ply-eval/tests/field_order_oracle.rs` is where the two are
+    /// made to agree, so that the lint is checked against a measurement rather
+    /// than against the prose that motivated it.
+    ///
+    /// > **Corrected 2026-08-28. This used to read:** *"This is the number
+    /// > [`codes::FIELD_ORDER_COPY`] predicts. A definition the lint fires in
+    /// > drives it toward 0; one it stays silent on leaves it near 1."* True on
+    /// > one of the two shipped evaluators. [`crate::interp`] calls nothing in
+    /// > this module — no [`carry`], no [`Env::take_unique`] — so it never
+    /// > moves a value out of a scope and every `push` whose list is read from
+    /// > a binding copies. Measured: the linear and the quadratic program of
+    /// > `ply-cli/tests/refcount_counters.rs`, which read 0.995 and 0.0 on the
+    /// > machine, both read **0.0** under `--engine treewalk`. The ratio there
+    /// > is a property of the evaluator and not of the program, so
+    /// > `counters_json` reports it as `null` on that engine, exactly as
+    /// > [`Stats::elided`] already is.
+    /// >
+    /// > It is **not** identically zero there, and the difference matters
+    /// > because the flat claim would have been the next thing to be refuted:
+    /// > `fn main() -> Int = len(push(push([], 1), 2))` reads **1.0** on both
+    /// > engines. A list the same expression just built has one owner whichever
+    /// > evaluator built it.
     pub fn in_place(&self) -> Option<f64> {
         if self.updates == 0 {
             return None;

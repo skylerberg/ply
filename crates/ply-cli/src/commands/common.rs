@@ -228,6 +228,17 @@ pub fn counted<T>(engine: ply_eval::Engine, f: impl FnOnce() -> T) -> Counted<T>
 /// is zero, following `Stats::elided`'s reasoning: a program that updated
 /// nothing has not failed to reuse anything, and a percentage would be a lie.
 ///
+/// **`in_place` is `null` under `--engine treewalk` for a second reason**, and
+/// it is the same one that makes `elided` null there: the number would not be
+/// about the program. `interp.rs` calls nothing in `ply_eval::rc` — no `carry`,
+/// no `Env::take_unique` — so it never moves a value out of a scope, and every
+/// `push` whose list is read from a binding copies. The linear and the
+/// quadratic program of `tests/refcount_counters.rs` read 0.995 and 0.0 on the
+/// machine and **both read 0.0** on the tree-walker, so a reader comparing them
+/// there learns nothing and a reader who did not notice the engine learns
+/// something false. `updates` and `updates_in_place` stay: those are counts of
+/// what happened, not a claim about reuse.
+///
 /// Whole-run on the `ply run` path, and checked rather than assumed:
 /// `rc::COUNTERS` is thread-local, and Ply's own `spawn` is a cooperative task
 /// in `sched.rs`'s `Vec<Task>` rather than an OS thread, so every Ply
@@ -240,7 +251,7 @@ pub fn counters_json(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> V
         "engine": engine.as_str(),
         "updates": stats.updates,
         "updates_in_place": stats.updates_in_place,
-        "in_place": stats.in_place(),
+        "in_place": engine_in_place(stats, engine),
         "takes_attempted": stats.takes_attempted,
         "takes_moved": stats.takes_moved,
         "dup_sites": stats.dup_sites,
@@ -267,11 +278,21 @@ pub fn counters_line(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> S
         engine.as_str(),
         stats.updates_in_place,
         stats.updates,
-        pct(stats.in_place()),
+        pct(engine_in_place(stats, engine)),
         stats.takes_moved,
         stats.takes_attempted,
         pct(stats.elided()),
     )
+}
+
+/// [`ply_eval::rc::Stats::in_place`] where it says something about the program,
+/// and `None` where it says something about the evaluator. See
+/// [`counters_json`].
+fn engine_in_place(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> Option<f64> {
+    match engine {
+        ply_eval::Engine::Treewalk => None,
+        ply_eval::Engine::Machine => stats.in_place(),
+    }
 }
 
 pub fn phases_json(phases: &crate::driver::Phases) -> Value {
