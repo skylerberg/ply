@@ -4,14 +4,45 @@
 #     examples/same-tests.sh                              # manages its own database
 #     examples/same-tests.sh --db postgres://localhost/x  # uses one you name
 #     examples/same-tests.sh --db ... --reset             # drops its tables first
+#     examples/same-tests.sh --no-build                   # measure a binary you built
+#
+# It builds `target/release/ply` itself, and checks that binary against cargo's
+# own dep-info for it whether it built it or not. It used to do neither, and
+# the entry this replaces in CONTRIBUTING.md §"Things known to be broken" said
+# so:
+#
+#   > **`examples/same-tests.sh` does not build the binary it runs.** It uses
+#   > `target/release/ply` (line 44) with no `cargo build` anywhere.
+#
+# So on a fresh clone it died at step 1 with "No such file or directory", and
+# on a tree where somebody had built once it measured whatever binary happened
+# to be lying there. `docs/adr/0020` §0 is what that costs: a whole ADR's
+# measurements taken against a binary built 54 seconds after an unattributed
+# source edit. `--no-build` skips the build; it does not skip the check.
 #
 # The claim is that `examples/desk.ply`'s endpoints run unchanged against the
 # in-memory twin and against real postgres. This script checks it in the two
 # ways it can be checked, and neither of them is "the suite is green":
 #
-#   1. `ply test examples/desk.ply` — the whole suite against the twin, `det`,
-#      cached, hermetic, with no `--host` and no database anywhere. Every route
-#      is in it.
+#   1. `ply test examples/desk.ply --no-cache` — the whole suite against the
+#      twin, `det`, hermetic, with no `--host` and no database anywhere. Every
+#      route is in it, and every route is *evaluated*: the counts on the
+#      summary line are read, not just the exit status.
+#
+#      This step used to claim less carefully than it checked. It said:
+#
+#      >   1. `ply test examples/desk.ply` — the whole suite against the twin,
+#      >      `det`, cached, hermetic, with no `--host` and no database
+#      >      anywhere. Every route is in it.
+#
+#      and it passed `--no-incremental`, which disables only the *front-end*
+#      cache — `crates/ply-cli/src/cli.rs:358-359` says so in as many words,
+#      and `crates/ply-cli/src/commands/test.rs:50` is
+#      `let incremental = !args.no_incremental && !no_cache;`. On a warm
+#      `examples/.ply-cache` the step therefore printed
+#      `0 failed, 0 passed, 68 cached (0.00s)` and exited 0 having evaluated
+#      nothing at all. `cached` was never a property step 1 could advertise and
+#      still be evidence; it was the hole the step reported success through.
 #
 #   2. The **same service**, started twice on two ports — once with `main`
 #      calling `run_memory` and once with it calling `run` against postgres —
@@ -46,6 +77,7 @@ ply="$root/target/release/ply"
 db=""
 keep=0
 reset=0
+build=1
 mem_port="${PLY_MEM_PORT:-8231}"
 pg_port="${PLY_PG_PORT:-8232}"
 
@@ -54,14 +86,33 @@ while [ $# -gt 0 ]; do
     --db) db="$2"; shift 2 ;;
     --keep) keep=1; shift ;;
     --reset) reset=1; shift ;;
-    -h|--help) sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's|^# \{0,1\}||'; exit 0 ;;
+    --no-build) build=0; shift ;;
+    # The whole leading comment, however long it grows. A fixed line range goes
+    # stale silently: `sed -n '2,31p'` was this line until the header outgrew
+    # 31 lines, and `--help` then stopped mid-sentence at "a value the twin and".
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' \
+      "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-# This script does not build the binary it runs (CONTRIBUTING.md §"Things known
-# to be broken" item 2), so the one thing it can do is refuse to run against a
-# binary that is not the tree. `desk.ply` imports all eight `std` modules and
+
+needed=(psql curl)
+if [ "$build" -eq 1 ]; then needed+=(cargo); fi
+for tool in "${needed[@]}"; do
+  command -v "$tool" >/dev/null || { echo "$tool is needed and is not on PATH" >&2; exit 2; }
+done
+
+if [ "$build" -eq 1 ]; then
+  cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli
+fi
+
+# ~~This script does not build the binary it runs (CONTRIBUTING.md §"Things
+# known to be broken" item 2), so the one thing it can do is refuse to run
+# against a binary that is not the tree.~~ **It builds now** — see the `--no-build`
+# handling above, which closed item 2. This check stays, and is the stronger half:
+# a build can succeed and still leave `$ply` stale if `CARGO_TARGET_DIR` points
+# elsewhere, and a build cannot notice a `.ply` edit at all. `desk.ply` imports all eight `std` modules and
 # they are `include_str!`ed into `ply`, so an edit to one changes what this
 # comparison means and moves no `.rs` file: `find crates -name '*.rs' -newer`
 # would call it clean. See CONTRIBUTING.md §"The binary is an instrument too".
@@ -72,9 +123,46 @@ if ! "$root/.github/binary-is-current.sh" "$ply"; then
   exit 2
 fi
 
-for tool in psql curl; do
-  command -v "$tool" >/dev/null || { echo "$tool is needed and is not on PATH" >&2; exit 2; }
+# The instrument, checked before it is used, on both paths. `target/release/ply.d`
+# is cargo's own dep-info for this exact binary: 152 files on this tree, twelve
+# crates, and neither `ply-corpus` nor `ply-codegen-spike` nor any crate's
+# `tests/` among them. That is the right domain. The wider `find crates -name
+# '*.rs' -newer target/release/ply` fires on edits that cannot change this
+# binary and cannot be cleared by rebuilding, and a guard that cries wolf gets
+# commented out.
+#
+# What it catches: a binary older than a source compiled into it, and a binary
+# that is not there — including a `CARGO_TARGET_DIR` that sent the build
+# somewhere `$ply` does not point, which the bare path below missed silently.
+# What it does not: an edit and a build inside the same second, mtime being what
+# it is. That is the second-granularity trap CONTRIBUTING.md §"A moving tree
+# invalidates a correctness number" already records for cargo's own
+# fingerprints, and this check inherits a weaker form of it. It is a check, not
+# a guarantee.
+if [ ! -x "$ply" ]; then
+  echo "no release binary at $ply" >&2
+  if [ "$build" -eq 0 ]; then
+    echo "   --no-build was passed, so this script did not build one" >&2
+  else
+    echo "   the build reported success, so CARGO_TARGET_DIR may point elsewhere" >&2
+  fi
+  exit 2
+fi
+dep="$root/target/release/ply.d"
+if [ ! -f "$dep" ]; then
+  echo "no dep-info at $dep, so $ply cannot be checked against its own sources" >&2
+  exit 2
+fi
+stale=""
+for src in $(sed -n '1s/^[^:]*://p' "$dep"); do
+  if [ -e "$src" ] && [ "$src" -nt "$ply" ]; then stale="$src"; break; fi
 done
+if [ -n "$stale" ]; then
+  echo "$ply is older than a source it was built from:" >&2
+  echo "   $stale" >&2
+  echo "   rebuild it before measuring anything with it" >&2
+  exit 2
+fi
 
 work="$(mktemp -d)"
 owned_cluster=0
@@ -89,7 +177,46 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== 1. the whole suite against the twin, hermetically =="
-"$ply" test "$here/desk.ply" --no-incremental
+"$ply" test "$here/desk.ply" --no-cache | tee "$work/step1.out"
+
+# The counts, not just the exit status. `ply test` exits 0 over a run that
+# evaluated nothing, which is what this step did for as long as it passed
+# `--no-incremental`. The line read here is printed by `print_summary` at
+# `crates/ply-cli/src/commands/test.rs:1016` as
+# "{IND}{failed}, {passed}, {cached} cached{hosted} ({:.2}s)" — `IND` is three
+# spaces, and `{hosted}` sits between the count and the seconds when a run is
+# host-backed, which is why neither end of the line is anchored.
+# `ply_test::RunReport::summary` (`crates/ply-test/src/report.rs:220`) builds
+# the same shape for other consumers; nothing pins either. So a format that
+# moves aborts here, loudly, rather than quietly reverting this step to
+# checking an exit status — the same reason `serve.sh`'s `rewrite()` refuses
+# instead of guessing.
+# `tee` makes step 1's stdout a pipe, so `style.rs:32` leaves it uncoloured —
+# step 1 alone prints plain, and that is the price of reading its counts.
+# Escapes are stripped regardless, so a change to that detection cannot disarm
+# this guard: a line it cannot parse has to mean the format moved.
+esc="$(printf '\033')"
+counts="$(sed "s/${esc}\[[0-9;]*m//g" "$work/step1.out" \
+  | grep -E '^[[:space:]]*[0-9]+ failed, [0-9]+ passed, [0-9]+ cached' \
+  | tail -n 1 || true)"
+if [ -z "$counts" ]; then
+  echo "step 1 printed no counts line in the shape crates/ply-cli/src/commands/test.rs:1016 builds" >&2
+  echo "   so nothing here can tell you whether it checked anything; the format moved" >&2
+  exit 1
+fi
+passed="$(printf '%s' "$counts" | sed -E 's/^[^0-9]*[0-9]+ failed, ([0-9]+) passed.*/\1/')"
+cached="$(printf '%s' "$counts" | sed -E 's/^.*, ([0-9]+) cached.*/\1/')"
+if [ "$cached" -ne 0 ]; then
+  echo "step 1 served $cached test(s) from the result cache: '$counts'" >&2
+  echo "   --no-cache is what forces the run; a cached step 1 is not evidence" >&2
+  exit 1
+fi
+if [ "$passed" -lt 1 ]; then
+  echo "step 1 evaluated no tests at all: '$counts'" >&2
+  echo "   an exit status over an empty suite is the failure this check exists for" >&2
+  exit 1
+fi
+echo "   $passed tests evaluated, 0 served from cache"
 echo
 
 # A cluster of this script's own, on a port nobody else is using, in a temporary
