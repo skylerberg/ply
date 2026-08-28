@@ -673,10 +673,15 @@ to say `--db-schema desk.schema` means "the driver refuses at bind time with
 `E0435` if the live database is not the one `desk.ply` describes." It does not.
 `E0435 DB_SCHEMA_MISMATCH` is **raised nowhere** —
 `grep -rn 'E0435\|DB_SCHEMA_MISMATCH' crates/ --include='*.rs'` returns five
-hits and not one of them constructs a diagnostic: `crates/ply-span/src/lib.rs:414`
-defines the constant, `:787` registers it, `crates/ply-eval/src/host.rs:1106`
-lists it as reserved, and `crates/ply-cli/src/artifact.rs:253` and
-`crates/ply-cli/src/db.rs:539` are comments describing the check as future work.
+hits and not one of them constructs a diagnostic: `crates/ply-span/src/lib.rs:428`
+defines the constant, `:801` registers it — inside `#[cfg(test)] mod tests`, so
+that hit is a test — `crates/ply-eval/src/host.rs:1106` lists it as reserved,
+and `crates/ply-cli/src/artifact.rs:253` and `crates/ply-cli/src/db.rs:539` are
+comments describing the check as future work. (The two `ply-span` numbers were
+`:414` and `:787` until 2026-08-27, when the `codes` module grew a doc comment;
+the finding is unchanged. This passage is now also a *test*: see
+`crates/ply-span/tests/armed.rs` and `CONTRIBUTING.md` §"The shape it keeps
+taking".)
 `--db-schema` resolves the name, checks it is a nullary function returning a
 `Schema`, evaluates it, and reads its table and column counts; **it never opens
 a connection to compare.** `README.md` §"What is missing" documents this
@@ -889,6 +894,21 @@ return a *passing* result when their dependency is absent:
 
 `examples/same-tests.sh` runs too, which is W4's exit criterion and was
 previously a thing you had to remember.
+
+**And one check that is not a gate in that sense.** Six **tree checks** run a
+second time, by name, in the shard that holds `ply-span`. They are the tests in
+`crates/ply-span/tests/armed.rs` that fail when a registered diagnostic code, or
+a variant of a covered enum, is declared and constructed nowhere — the defect
+`CONTRIBUTING.md` §"The shape it keeps taking" catalogues six instances of. They
+already ran inside `cargo test -p ply-span`; the second run is by `--exact` name
+with a `test result: ok. 1 passed` assertion, because `cargo test --exact` over
+a name nothing defines reports `0 passed; 11 filtered out` and exits **0**, so a
+renamed or deleted check would otherwise stop checking in silence.
+`.github/ci-shards.sh verify` catches the rename earlier, in the `plan` job.
+What this does **not** settle: the checks are lexical. They prove a construction
+site exists in production source, never that it can execute — so a mechanism of
+the W1 kind, advertised and unreachable, is still **not enforced** by anything.
+That file's header lists the rest of the gaps.
 
 **What it does not settle.** Four things, and they are why this section is not
 just the list above.
