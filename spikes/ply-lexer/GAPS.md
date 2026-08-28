@@ -187,6 +187,46 @@ This one, in its serializer, is not documented anywhere I could find.
 
 **I have not changed `json.ply`.** This spike touches no file outside `spikes/`.
 
+> **Since fixed — read this before quoting the table above as a live defect.**
+> ADR 0020 §7 item 3 was taken: `escape_runs` now performs one `push` per
+> escape in last-argument position, which is column 2 of the table above, and
+> the serializer is linear. Confirmed on the shipped module with
+> `ply_eval::rc::stats()` rather than a clock — whole-accumulator copies per
+> encode went from exactly k to **0** at k up to 32,000 — and guarded by
+> `crates/ply-eval/tests/stdlib_accumulator_cost.rs`. Column 3's warning was
+> confirmed at the same time and on the shipped module: built as two `push`es
+> that are each last, the largest string `encode_string` can encode under the
+> call budget halves, from **9,993 escapes to 4,996**. The line citation
+> `json.ply:589-599` above is the pre-fix one and no longer points at the
+> function.
+>
+> > **Corrected on review, 2026-08-27, measured rather than inferred.** This
+> > passage read: *"**Every `json.ply` line citation in this file below line 588
+> > is now short by 16**, including §11's `json.ply:621` and
+> > `json.ply:626-627` and §12's `json.ply:555` and `json.ply:564-568`:
+> > documenting the positional precondition above `escape_runs` added sixteen
+> > lines there."* Three things in that are wrong. The shift is **17**, not 16.
+> > The citations that moved are the ones *after* the insertion, not before it,
+> > so §12's `json.ply:555` and `json.ply:564-568` never moved and adding 16 to
+> > them would break two citations that are still exact. And §11's
+> > `json.ply:991-993` moved as well and was not listed.
+>
+> **Every `json.ply` citation in this file that pointed at line 588 or later is
+> short by 17**, a shift confirmed on four landmarks that bracket the insertion:
+> `escape_runs` 589 → 606, `hex_byte` 621 → 638, `byte_table` 626 → 643,
+> `b64_alphabet` 991 → 1008. So §11's `json.ply:621`, `json.ply:626-627` and
+> `json.ply:991-993` read `:638`, `:643-644` and `:1008-1010` today, while
+> §12's `json.ply:555` and `json.ply:564-568` are **unchanged and correct** —
+> they sit above the insertion. The functions all of them name are unmoved and
+> still findable by name — `hex_byte`, `byte_table`, `b64_alphabet` — which is
+> why they are left rather than renumbered into the next edit's drift.
+> §1's *finding* is unaffected — the trap is still invisible, which is
+> ADR 0020 §7 item 2, still open.
+>
+> The same counter found the shape twice more in the standard library, and both
+> were fixed: `std.trace`'s `append` and `std.router`'s `numbered`. `std.db` was
+> not measured.
+
 ### Cost to me
 
 It decided the architecture twice. I first wrote the accumulator as a
@@ -288,7 +328,14 @@ parser. In Rust that is one `parse` call.
 
 ## §5 There is no loop, there is no tail-call elimination, and the ceiling is 10,000 nested calls with no flag to raise it
 
-`DEFAULT_MAX_CALLS = 10_000` (`crates/ply-eval/src/limit.rs:35`). `grep -rn
+> **Line citation corrected on review, 2026-08-27.** This read
+> *"(`crates/ply-eval/src/limit.rs:35`)"*. The constant is at `limit.rs:50`.
+> ADR 0020 §1 recorded this stale `:35` while correcting its own copy of it
+> — *"`GAPS.md` §5 carries the same stale `:35`"* — but corrected it only
+> there, leaving the error in the file that actually contains it. The value,
+> the name and the §'s finding are unchanged.
+
+`DEFAULT_MAX_CALLS = 10_000` (`crates/ply-eval/src/limit.rs:50`). `grep -rn
 max_calls crates/ply-cli/src/` returns **one** line —
 
 > **Corrected (2026-08-27, ADR 0022).** The constant is at `limit.rs:57`, not
