@@ -586,6 +586,23 @@ fn quote(s: String) -> Bytes = {
 // The mirror of `string_chunks`: one native scan per run of bytes that need no
 // escape, so a string with none costs one pass and one copy. Non-ASCII is left
 // alone — the output is UTF-8, which is what JSON is.
+//
+// One `push` per escape, and it must stay the **last sub-expression of its
+// enclosing node**. A growing container built anywhere else is copied whole at
+// every step (`spikes/ply-lexer/GAPS.md` §1): the pending frame carries the
+// scope while a later sub-expression evaluates, so `acc` is at two owners and
+// `push` takes its copying branch. This read
+//
+//     push(push(acc, bytes_slice(raw, i, stop)), escaped_byte(bytes_at(raw, stop)))
+//
+// until ADR 0020 §7 item 3. The inner `push` sat at argument 0 of 2, so k
+// escapes cost k whole-accumulator copies and a response echoing client text
+// was quadratic in the escapes the client chose. Concatenating the run and its
+// escape into the one `push` is what buys the linear shape *here*: splitting
+// into two `push`es that are each last doubles the recursion, which this
+// function cannot afford — it already holds one frame per escape against the
+// 10,000-call ceiling. Measured both ways here: this shape encodes at most
+// 9,993 escapes, the split one 4,996.
 fn escape_runs(raw: Bytes, i: Int, acc: List<Bytes>) -> List<Bytes> = {
   let n = bytes_len(raw);
   let stop = scan_until(raw, i, string_stops());
@@ -595,7 +612,7 @@ fn escape_runs(raw: Bytes, i: Int, acc: List<Bytes>) -> List<Bytes> = {
     escape_runs(
       raw,
       stop + 1,
-      push(push(acc, bytes_slice(raw, i, stop)), escaped_byte(bytes_at(raw, stop))))
+      push(acc, bytes_concat(bytes_slice(raw, i, stop), escaped_byte(bytes_at(raw, stop)))))
   }
 }
 
@@ -1277,6 +1294,23 @@ test "escaping is the inverse of parsing, including the characters JSON does not
   assert_eq(to_bytes(Str("/é😀")), bytes_concat(b"\"", bytes_concat(bytes_of_string("/é😀"), b"\"")))
 }
 
+// `escape_runs` accumulates one piece per escape, each piece carrying its run
+// and the escape that ended it. That merge is invisible in the output and this
+// says so in bytes: the piece boundaries moved when ADR 0020 §7 item 3 was
+// taken, and nothing else was allowed to.
+test "runs and the escapes that end them survive the accumulator, byte for byte" {
+  // An escape at the first position and at the last, with runs between.
+  assert_eq(to_bytes(Str("\"ab\\cd\"")), b"\"\\\"ab\\\\cd\\\"\"");
+  // Adjacent escapes: the empty run between them must contribute no bytes
+  // rather than a stray piece.
+  assert_eq(to_bytes(Str("\"\"\"")), b"\"\\\"\\\"\\\"\"");
+  // A run with no escape after it at all is the base case, and still one piece.
+  assert_eq(to_bytes(Str("\"tail")), b"\"\\\"tail\"");
+  // Long enough to be the accumulator rather than the base case.
+  let many = fold(range(0, 200), "", |a: String, _i: Int| a ++ "ab\"");
+  assert_eq(bytes_len(to_bytes(Str(many))), 2 + 200 * 4)
+}
+
 // --- Tests: numbers ---------------------------------------------------------
 
 test "the number grammar is JSON's and not a decimal parser's" {
@@ -1632,6 +1666,16 @@ test "rendering is canonical, so a rendered document parses to itself" {
 //     would raise the bound roughly sixty-fold and is deliberately not done
 //     here, because it trades the clearest code in the module for a limit
 //     nothing has yet hit.
-//   - **Escapes in one string** cost one frame each, and each one copies the
-//     text decoded so far. A string that is mostly escapes is quadratic. Runs
-//     of ordinary text between escapes are not.
+//   - **Escapes in one string** cost one frame each, at both ends, and the two
+//     ends differ in what else they cost.
+//     *Decoding* one also copies the text decoded so far, so a string that is
+//     mostly escapes is quadratic to parse; runs of ordinary text between
+//     escapes are not.
+//     *Serializing* one is linear in the escapes: `escape_runs` performs one
+//     `push` per escape and it sits in last-argument position, which is the
+//     whole of why it is linear. It was quadratic — one whole-accumulator copy
+//     per escape, on client-influenced input — until ADR 0020 §7 item 3.
+//     The frame per escape is unchanged by that fix and bounds both ends the
+//     same way: **9,993 escapes in one string** is the most `encode_string`
+//     completes under the default 10,000-call budget, measured by bisection,
+//     and the 9,994th is a recursion limit rather than a value.
