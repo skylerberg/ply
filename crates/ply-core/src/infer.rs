@@ -648,7 +648,10 @@ impl<'a> Checker<'a> {
         let (ta, tb, tc, re) = (Type::Var(a), Type::Var(b), Type::Var(c), Row::open(e));
         // `map_fold`'s accumulator needs a third variable; `a` and `b` are the
         // key and the value everywhere below, which is what keeps the twelve
-        // signatures readable side by side.
+        // signatures readable side by side. `iterate` reuses `a` as its seed and
+        // `b` as the value its step stops with — two, because a loop that could
+        // only stop with its own seed would have to run one more round to
+        // report anything it computed.
         let map_ty = Type::map(ta.clone(), tb.clone());
         let entry_ty = Type::Record(BTreeMap::from([
             (Symbol::new("key"), ta.clone()),
@@ -752,6 +755,24 @@ impl<'a> Checker<'a> {
                         Type::Fn {
                             params: vec![tb.clone(), ta.clone()],
                             ret: Box::new(tb.clone()),
+                            effects: re.clone(),
+                        },
+                    ],
+                    tb.clone(),
+                    re.clone(),
+                ),
+            ),
+            (
+                "iterate",
+                poly(
+                    vec![a, b],
+                    vec![e],
+                    vec![
+                        ta.clone(),
+                        Type::int(),
+                        Type::Fn {
+                            params: vec![ta.clone()],
+                            ret: Box::new(Type::iter(ta.clone(), tb.clone())),
                             effects: re.clone(),
                         },
                     ],

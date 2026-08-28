@@ -39,6 +39,13 @@
 //! > `equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_
 //! > frames_a_body_pends` for the test.
 //!
+//! The bound below is not the only bound a loop can be held to, and since ADR
+//! 0022 it is not the one an early-terminating loop is held to. `iterate` takes
+//! its budget as an **argument**: the number is in the source, so it is in the
+//! definition's `DefHash`, and a program that raises its own bound invalidates
+//! its own cached results rather than silently keeping them. That is the
+//! property a `--max-calls` flag could not have — see [`err_iterate_budget`].
+//!
 //! A call is not the only thing a program can nest, though. A *value* nests too,
 //! and walking one structurally — comparing two, diffing two — is host recursion
 //! that no count of calls bounds. That is [`MAX_VALUE_DEPTH`], and it sits where
@@ -156,6 +163,36 @@ pub(crate) fn err_frame_ceiling(
         diag = diag.note(format!("innermost calls: {}", named.join(" from ")));
     }
     diag
+}
+
+/// An `iterate` whose step never answered `Stop`.
+///
+/// Deliberately **not** phrased through [`err_recursion_limit`], for the reason
+/// [`err_frame_ceiling`] already records and one more: this bound nests nothing
+/// — the loop is one frame however long it runs — and it is a number the
+/// *program* wrote down rather than one this evaluator chose. A reader who sees
+/// "recursion limit" will go looking for a missing base case; the base case
+/// here is the `Stop` the step never gave.
+pub(crate) fn err_iterate_budget(span: Span, budget: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`iterate` took its budget of {budget} steps without stopping"),
+    )
+    .primary(span, "this loop never answered `Stop`")
+    .note("raise the budget if the loop is right, or check the step that should have stopped")
+}
+
+/// A budget that is not a count of steps. Refused at the door rather than
+/// treated as an immediate exhaustion, because zero steps is a bound nobody
+/// writes on purpose and a negative one is arithmetic that went wrong upstream
+/// — neither is a loop that ran too long.
+pub(crate) fn err_iterate_budget_not_a_count(span: Span, budget: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`iterate` was given a budget of {budget}"),
+    )
+    .primary(span, "a budget is the most steps the loop may take")
+    .note("it must be at least 1")
 }
 
 /// A value too deep to walk. Phrased through the same message as a runaway

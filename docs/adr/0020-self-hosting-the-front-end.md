@@ -467,6 +467,41 @@ is the finding of this section rather than a list of aggravations.
 
 ### §5.1 The gap that changes category
 
+> **Its premise is withdrawn by ADR 0022 (2026-08-27).** This section's two
+> load-bearing sentences were:
+> *"A recursive-descent parser consuming N top-level definitions, or N list
+> elements, or N arguments, recurses once per element unless it is folded"* and
+> *"The lexer's fold-over-a-range escape hatch does not generalise, because a
+> recursive-descent parser's recursion **is** the grammar."*
+>
+> Neither holds of the reference implementation this repository ships.
+> `crates/ply-syntax/src/parser.rs` drives **every** sequence with a loop — 16
+> `while` and 5 `loop`, one per sequence, with the shared `comma_list`
+> (`:2059`, loop at `:2065`) called from **fourteen** sites covering argument
+> lists, list and record literals, parameters, generic arguments and pattern
+> arguments. It even climbs precedence iteratively (`bin_expr` `:1222`, `while`
+> at `:1224`), recursing only for the right operand, so its depth is bounded by
+> the six binding powers `bin_op` (`:2096`) declares rather than by operand
+> count — which also withdraws *"at perhaps 15 precedence levels that is ~255
+> frames"* below.
+>
+> It reserves recursion for grammar nesting, and **bounds that itself**:
+> `const MAX_DEPTH: u32 = 128` (`parser.rs:23`), enforced by `deeper()` (`:244`)
+> at `ty_inner` (`:1035`), `unary_expr` (`:1244`) and `pattern` (`:1846`). Against
+> the corpus maximum of 17 this section measures, and a ceiling of 10,000,
+> grammar nesting in this design cannot reach the ceiling — the parser refuses
+> at 128 first.
+>
+> ADR 0022 also adds `iterate`, an early-terminating loop that is depth 1 on
+> both engines, so the escape hatch generalises further than "fold over a
+> range": it no longer has to run to a conservative bound. See ADR 0022 §2 for
+> the citations, re-verified, and §3 for `fold` at 500,000 elements in 22.3 MiB
+> at depth 1.
+>
+> **What is not withdrawn:** §6's throughput finding, which is this ADR's actual
+> reason for deciding against self-hosting today. §5.1 was a second, independent
+> objection; only that one falls.
+
 **§5, the 10,000-call ceiling, stops being a tax and becomes an architecture
 constraint.** The lexer escaped it with `fold(range(0, n + 1), start, one)` — a
 loop over an eagerly materialised list of integers, driven by the machine's step
@@ -652,6 +687,13 @@ is wrong and is withdrawn:
 > higher-order builtins, `cell_get`/`cell_set` and `secret_of_string`; every
 > other builtin, `bytes_at` and `bytes_scan` included, is admitted and
 > dispatched through the `rt_builtin` helper (`jit.rs:295`, `:1169-1172`).
+>
+> > **Line number corrected (2026-08-27, ADR 0022).** `admissible_builtin` is
+> > at `jit.rs:537`, not `:508`; the citation above is left as written and
+> > corrected here rather than edited. What it refuses is unchanged and now
+> > includes `iterate`, whose `Builtin::higher_order()` is true — refused by the
+> > same first branch that refuses `fold`, which is expected and is not a
+> > regression.
 
 What `rt_builtin` does is the point (`rt.rs:353-372`): it calls
 `ply_eval::builtins::call(b, args, ..)` — **the identical interpreter builtin
@@ -801,8 +843,19 @@ Ranked, what would change the answer:
    `GAPS.md` §1 records that the obvious fix — splitting so each `push` is last —
    doubles the recursion depth and breaks the module at k = 8,000; the fix that
    works is one `push` per escape in last-argument position.
-4. **A loop, or a raisable call ceiling.** §5.1 makes this the difference
-   between a portable parser and a rewritten one.
+4. ~~**A loop, or a raisable call ceiling.** §5.1 makes this the difference
+   between a portable parser and a rewritten one.~~ **The loop is delivered and
+   the raisable ceiling is refused, by ADR 0022 (2026-08-27).** `iterate(seed,
+   budget, step)` is an early-terminating loop that is depth 1 on both engines
+   — asserted at
+   `crates/ply-eval/tests/equivalence_audit.rs:2194`, which runs 500,000 steps
+   under `with_max_calls(8)` while the same loop written as tail recursion
+   raises at the same cap. A bare `--max-calls` flag is refused because results
+   are cached as `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code
+   writes only `Outcome::Pass` (`ply-test/src/lib.rs:1429`, `:1558`): raising
+   the bound is monotone and safe, **lowering it silently returns a `Pass` for a
+   program that would now raise**. ADR 0022 §5. And §5.1's premise, which is
+   what put this item on the list, does not hold — see the correction there.
 5. **`Float` construction** (§4.2). The only absolute hole, and the smallest of
    the five in impact, because §3.2 shows the text-passing substitute works.
 

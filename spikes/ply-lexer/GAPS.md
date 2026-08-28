@@ -276,6 +276,22 @@ parser. In Rust that is one `parse` call.
 
 `DEFAULT_MAX_CALLS = 10_000` (`crates/ply-eval/src/limit.rs:35`). `grep -rn
 max_calls crates/ply-cli/src/` returns **one** line —
+
+> **Corrected (2026-08-27, ADR 0022).** The constant is at `limit.rs:57`, not
+> `:35`; the value is unchanged. And this section's title —
+> *"there is no loop, there is no tail-call elimination, and the ceiling is
+> 10,000 nested calls with no flag to raise it"* — reads two of those three as
+> oversights when both were decided. **Tail-call elimination** was removed
+> deliberately and the reasons are measured:
+> `docs/adr/0005-control-stack-and-world.md` §7.1, which this spike does not
+> cite. **The flag** is refused deliberately: results are cached as
+> `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code writes only
+> `Outcome::Pass`, so raising the bound is monotone and safe while *lowering* it
+> would let the cache answer `Pass` for a program that would now raise — ADR
+> 0022 §5. **"There is no loop" is now false**: `iterate(seed, budget, step)` is
+> an early-terminating loop that is depth 1 on both engines, so the
+> `fold(range(0, n + 1), ..)` shape below — 140,108 of desk.ply's 159,684 steps
+> being no-ops, 87% of the loop — is no longer the only way to write one.
 `engine.rs:244`, `Machine::new(..).with_max_calls(DEFAULT_MAX_CALLS)` — plus
 the `use` that imports the constant. **There is no CLI flag**, and `ply run
 --help` offers none.

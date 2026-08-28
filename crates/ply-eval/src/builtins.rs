@@ -38,6 +38,15 @@ pub enum Builtin {
     Map,
     Filter,
     Fold,
+    /// The one loop that can stop before its bound.
+    ///
+    /// `fold` visits every element, so a search or a parse expressed over one
+    /// runs to a conservative bound and no-ops after its real work is done.
+    /// This answers `Stop(r)` the step it is finished and costs the loop
+    /// nothing further, and it takes the bound as an argument so that a step
+    /// which never stops is a diagnostic naming a number the program wrote
+    /// rather than a hang.
+    Iterate,
     Range,
     IntToString,
     StringConcat,
@@ -172,6 +181,7 @@ impl Builtin {
             "map_of_entries" => Builtin::MapOfEntries,
             "map_merge" => Builtin::MapMerge,
             "map_fold" => Builtin::MapFold,
+            "iterate" => Builtin::Iterate,
             "decimal_div" => Builtin::DecimalDiv,
             "decimal_round" => Builtin::DecimalRound,
             "decimal_of_int" => Builtin::DecimalOfInt,
@@ -199,6 +209,7 @@ impl Builtin {
             Builtin::Map => "map",
             Builtin::Filter => "filter",
             Builtin::Fold => "fold",
+            Builtin::Iterate => "iterate",
             Builtin::Range => "range",
             Builtin::IntToString => "int_to_string",
             Builtin::StringConcat => "string_concat",
@@ -321,6 +332,7 @@ impl Builtin {
             | Builtin::IntOfDecimal
             | Builtin::SecretVerify => (2, 2),
             Builtin::Fold
+            | Builtin::Iterate
             | Builtin::BytesSlice
             | Builtin::BytesIndexOfFrom
             | Builtin::BytesPosition
@@ -340,6 +352,7 @@ impl Builtin {
             Builtin::Map
                 | Builtin::Filter
                 | Builtin::Fold
+                | Builtin::Iterate
                 | Builtin::BytesPosition
                 | Builtin::MapFold
         )
@@ -354,6 +367,7 @@ impl Builtin {
             Builtin::Map,
             Builtin::Filter,
             Builtin::Fold,
+            Builtin::Iterate,
             Builtin::Range,
             Builtin::IntToString,
             Builtin::StringConcat,
@@ -530,6 +544,14 @@ pub fn call(
         Builtin::Fold => {
             let items = args[0].as_list(span, "`fold`")?.clone();
             Ok(next_fold(args[2].clone(), items, 0, args[1].clone(), span))
+        }
+
+        Builtin::Iterate => {
+            let budget = args[1].as_int(span, "`iterate`")?;
+            if budget < 1 {
+                return Err(crate::limit::err_iterate_budget_not_a_count(span, budget));
+            }
+            next_iterate(args[2].clone(), args[0].clone(), budget, budget, span)
         }
 
         Builtin::Range => {
@@ -1143,6 +1165,16 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
             span,
         } => map::next_fold(f, entries, next, answer, span),
 
+        Frame::IterateStep {
+            f,
+            budget,
+            left,
+            span,
+        } => match iterate_answer(&answer, span)? {
+            Continued(seed) => return next_iterate(f, seed, budget, left, span),
+            Stopped(r) => Step::Done(r),
+        },
+
         Frame::BytesPositionStep {
             f,
             bytes,
@@ -1210,6 +1242,70 @@ fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span
             span,
         },
     }
+}
+
+/// `iterate`'s step, which is `next_fold`'s shape with the list replaced by a
+/// countdown and the end replaced by an answer the step itself gives.
+///
+/// It returns a `Result` where the others return a `Step`, because running out
+/// of budget is the one way this loop can end without a value: `Stop` is the
+/// only source of an `r`, so there is nothing to answer with and a diagnostic
+/// is the honest outcome.
+fn next_iterate(
+    f: Value,
+    seed: Value,
+    budget: i64,
+    left: i64,
+    span: Span,
+) -> Result<Step, Diagnostic> {
+    if left <= 0 {
+        return Err(crate::limit::err_iterate_budget(span, budget));
+    }
+    Ok(Step::Apply {
+        callee: f.clone(),
+        args: vec![seed],
+        frame: Frame::IterateStep {
+            f,
+            budget,
+            left: left - 1,
+            span,
+        },
+    })
+}
+
+/// What the step answered, with its payload.
+///
+/// The payload is cloned rather than moved out because [`Value`] is `Drop` and
+/// cannot be destructured by value. It costs a refcount bump that is gone
+/// before the seed is read: both engines drop `answer` inside [`advance`], so
+/// the value handed to the next round is again singly owned by the time the
+/// step runs on it.
+enum IterAnswer {
+    Continued(Value),
+    Stopped(Value),
+}
+use IterAnswer::{Continued, Stopped};
+
+/// Anything but the prelude's two constructors is a type error rather than a
+/// silent stop: inference admits only `Iter<s, r>` here, so reaching this with
+/// another shape means a host handler or a `Value` built in Rust answered
+/// something the checker never saw.
+fn iterate_answer(answer: &Value, span: Span) -> Result<IterAnswer, Diagnostic> {
+    if let Value::Ctor { name, args } = answer
+        && args.len() == 1
+    {
+        match name.as_str() {
+            "Continue" => return Ok(Continued(args[0].clone())),
+            "Stop" => return Ok(Stopped(args[0].clone())),
+            _ => {}
+        }
+    }
+    Err(type_error(
+        span,
+        "the function given to `iterate`",
+        "Continue or Stop",
+        answer,
+    ))
 }
 
 fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span) -> Step {
@@ -1519,9 +1615,15 @@ fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     .note("please report this: a cell value escaped the region that allocated it")
 }
 
-/// Only the three higher-order builtins suspend, so only their frames reach
-/// here. An engine that routes another one in has a dispatch bug, and saying so
-/// beats folding an unrelated frame into a list.
+/// Only the higher-order builtins suspend, so only their frames reach here. An
+/// engine that routes another one in has a dispatch bug, and saying so beats
+/// folding an unrelated frame into a list.
+///
+/// > **Corrected (2026-08-27): this read *"Only the **three** higher-order
+/// > builtins suspend"*.** There were five when `map_fold` and
+/// > `bytes_position` joined and there are six now that `iterate` has;
+/// > `exactly_the_callback_builtins_are_higher_order` is what counts them, so
+/// > the number is written down once, there.
 #[cold]
 fn not_a_builtin_step() -> Diagnostic {
     Diagnostic::error(
@@ -2467,6 +2569,178 @@ mod tests {
         assert_eq!(b.render(), "[9, 1, 1]");
     }
 
+    /// `iterate` through the protocol an engine drives, with the step answered
+    /// by hand: the seed is threaded, `Stop` ends it, and the value `Stop`
+    /// carries is the answer rather than the seed.
+    #[test]
+    fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
+        let stop_at = |n: i64| {
+            move |args: &[Value]| {
+                let Value::Int(i) = args[0] else {
+                    panic!("the seed is an Int here")
+                };
+                if i >= n {
+                    Value::ctor("Stop", vec![Value::str(format!("done at {i}"))])
+                } else {
+                    Value::ctor("Continue", vec![Value::Int(i + 1)])
+                }
+            }
+        };
+        let out = drive(
+            Builtin::Iterate,
+            vec![Value::Int(0), Value::Int(100), f()],
+            stop_at(7),
+        )
+        .unwrap();
+        assert_eq!(out.render(), "\"done at 7\"");
+
+        // Stopping on the very first step costs one round, not none: the step
+        // has to run to say so.
+        let out = drive(
+            Builtin::Iterate,
+            vec![Value::Int(9), Value::Int(1), f()],
+            stop_at(0),
+        )
+        .unwrap();
+        assert_eq!(out.render(), "\"done at 9\"");
+    }
+
+    /// The reason the loop is a `Frame` and not host recursion: a continuation
+    /// captured inside the step can be resumed more than once, and each
+    /// resumption has to continue **its own** copy of the countdown. A shared
+    /// counter would let the second resumption inherit what the first spent.
+    #[test]
+    fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
+        let mut cells = TaskRegions::new();
+        let start = call(
+            Builtin::Iterate,
+            vec![Value::Int(0), Value::Int(4), f()],
+            cells.arena_mut(),
+            Span::DUMMY,
+        )
+        .unwrap();
+        let Step::Apply { frame, .. } = start else {
+            panic!("iterate suspends on its first round");
+        };
+
+        // Each leg runs the loop out from the same captured point. Both get the
+        // full remaining budget, so both reach the same round and stop; a shared
+        // countdown would make the second leg raise instead.
+        let run = |mut step: Step, stop_after: i64| {
+            let mut seen = 0;
+            loop {
+                match step {
+                    Step::Done(v) => return Ok(v),
+                    Step::Apply { frame, .. } => {
+                        seen += 1;
+                        let answer = if seen >= stop_after {
+                            Value::ctor("Stop", vec![Value::Int(seen)])
+                        } else {
+                            Value::ctor("Continue", vec![Value::Int(seen)])
+                        };
+                        match advance(frame, answer) {
+                            Ok(next) => step = next,
+                            Err(d) => return Err(d),
+                        }
+                    }
+                }
+            }
+        };
+
+        let a = run(
+            advance(frame.clone(), Value::ctor("Continue", vec![Value::Int(0)])).unwrap(),
+            3,
+        )
+        .unwrap();
+        let b = run(
+            advance(frame, Value::ctor("Continue", vec![Value::Int(0)])).unwrap(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(a.render(), "3");
+        assert_eq!(
+            b.render(),
+            "3",
+            "the second resumption inherited a spent budget"
+        );
+
+        // And the budget above is exactly tight, which is what makes the pair
+        // above non-vacuous: one leg spends all four rounds, so two legs sharing
+        // a countdown could not both finish. At three, one leg already raises.
+        let mut cells = TaskRegions::new();
+        let tight = call(
+            Builtin::Iterate,
+            vec![Value::Int(0), Value::Int(3), f()],
+            cells.arena_mut(),
+            Span::DUMMY,
+        )
+        .unwrap();
+        let Step::Apply { frame, .. } = tight else {
+            panic!("iterate suspends on its first round");
+        };
+        let d = run(
+            advance(frame, Value::ctor("Continue", vec![Value::Int(0)])).unwrap(),
+            3,
+        )
+        .unwrap_err();
+        assert!(d.message.contains("budget of 3 steps"), "{}", d.message);
+    }
+
+    /// The budget is spent per round and exhausting it is a diagnostic, because
+    /// `Stop` is the only source of an answer and there is none to give.
+    #[test]
+    fn an_iterate_that_never_stops_exhausts_its_budget_and_says_so() {
+        let d = drive(
+            Builtin::Iterate,
+            vec![Value::Int(0), Value::Int(12), f()],
+            |args| {
+                let Value::Int(i) = args[0] else {
+                    panic!("the seed is an Int here")
+                };
+                Value::ctor("Continue", vec![Value::Int(i + 1)])
+            },
+        )
+        .unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("budget of 12 steps"), "{}", d.message);
+        // Nothing nested, so nothing here may say it did. Four consumers
+        // classify on this string; see `limit::err_recursion_limit`.
+        assert!(!d.message.contains("recursion limit"), "{}", d.message);
+    }
+
+    #[test]
+    fn an_iterate_budget_below_one_is_refused_before_the_loop_starts() {
+        for budget in [0, -1] {
+            let d = drive(
+                Builtin::Iterate,
+                vec![Value::Int(0), Value::Int(budget), f()],
+                |_| panic!("the step must not run at all"),
+            )
+            .unwrap_err();
+            assert_eq!(d.code, codes::RUNTIME_ERROR);
+            assert!(
+                d.message.contains(&format!("budget of {budget}")),
+                "{}",
+                d.message
+            );
+        }
+    }
+
+    /// Inference admits only `Iter<s, r>` in this position, so anything else
+    /// arriving here came from a host handler or a `Value` built in Rust — and
+    /// treating it as a silent stop would answer a value nobody asked for.
+    #[test]
+    fn an_iterate_step_answering_neither_continue_nor_stop_is_a_runtime_error() {
+        let d = drive(
+            Builtin::Iterate,
+            vec![Value::Int(0), Value::Int(5), f()],
+            |_| Value::ctor("Halt", vec![Value::Int(1)]),
+        )
+        .unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("Continue or Stop"), "{}", d.message);
+    }
+
     #[test]
     fn a_non_boolean_from_a_filter_predicate_is_a_runtime_error() {
         let d = drive(Builtin::Filter, vec![ints(&[1]), f()], |_| Value::Int(1)).unwrap_err();
@@ -2549,7 +2823,14 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["bytes_position", "filter", "fold", "map", "map_fold"]
+            [
+                "bytes_position",
+                "filter",
+                "fold",
+                "iterate",
+                "map",
+                "map_fold"
+            ]
         );
     }
 
