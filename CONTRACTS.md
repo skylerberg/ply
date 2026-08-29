@@ -993,9 +993,15 @@ impl<'a> Interp<'a> {
 - An unhandled `Perform` at runtime is `UNHANDLED_EFFECT`. Inference should have
   ruled this out; it is a bug-catcher, not a user-facing path.
 - Recursion depth must be bounded and produce a diagnostic, not a stack overflow.
+- **A loop is not a recursion.** `map`, `filter`, `fold`, `iterate`, `map_fold`
+  and `bytes_position` are driven by a step protocol — `Step::Apply` answered by
+  a `Frame` the machine pushes and pops, and a host loop on the tree-walker — so
+  each costs **depth 1** however many rounds it runs, on both engines. A driver
+  that nested would put the two engines' counts back into disagreement, which is
+  the defect ADR 0005 §7.1 removed tail-call elision to prevent. ADR 0022.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `map`, `filter`, `fold`,
-  `range`, `int_to_string`, `string_concat`, `cell_get`, `cell_set`, `panic`,
-  plus the `Bytes` and text builtins in the host-boundary section below.
+  `iterate`, `range`, `int_to_string`, `string_concat`, `cell_get`, `cell_set`,
+  `panic`, plus the `Bytes` and text builtins in the host-boundary section below.
   A failing `assert`/`assert_eq` is `ASSERTION_FAILED` with a structured
   expected/actual message.
 - An `Interp` must be usable from a worker thread. If `Value` holds `Rc`, keep
@@ -4656,6 +4662,28 @@ All pure except `map_fold`; every `k` carries `derivable(ord, k)`.
 | `map_merge` | `(Map<k, v>, Map<k, v>) -> Map<k, v>` |
 | `map_fold` | `(Map<k, v>, b, (b, k, v) -> b / e) -> b / e` |
 
+The list side's early-exiting driver, which takes no list at all:
+
+| builtin | type |
+| --- | --- |
+| `iterate` | `(a, Int, (a) -> Iter<a, b> / e) -> b / e` |
+
+`iterate(seed, budget, step)` applies `step` to the seed until it answers
+`Stop(r)`, and answers that `r`. `Continue(s)` is the next seed.
+`Iter<s, r> = Continue(s) | Stop(r)` is a **prelude** ADT, so `Iter` is reserved
+and a project's own `type Iter` is `E0105`; the constructor names are not
+reserved and a module may shadow them — **and a module that shadows one cannot
+call `iterate` at all**, because its own `Continue` or `Stop` is what the name
+then means and it will not unify with `Iter<s, r>`; there is no qualified
+spelling that reaches past the shadow, so the remedy is to rename the module's
+own constructor. (A *type* named `Stop`, as `std.signal` has, is a different
+namespace and costs nothing.) The budget is the most rounds the loop
+may take and is spent one per application: exhausting it is `RUNTIME_ERROR`
+saying so and **not** phrased as a recursion limit, because nothing nested; a
+budget below `1` is `RUNTIME_ERROR` refused before the first round. The callback
+is last for the reason every callback builtin's is — `region_kind`'s analysis
+reads it as `args.last()`.
+
 `map_insert` replaces an equal key's entry, **key and value both** — the last
 write wins, which is visible only for `Decimal`, where `1.5m` inserted over
 `1.50m` leaves the key `1.5m`. `map_of_entries` and `map_merge` let the later
@@ -4858,6 +4886,14 @@ type Ordering     = Less | Equal | Greater
 type Rounding     = HalfEven | HalfUp | Down | Up | Ceiling | Floor
 ```
 
+> **Still four here, five in the prelude (noted 2026-08-27, ADR 0022).** This
+> heading and block are W2's contract and are left as written: W2 did add
+> exactly these four. `ply_core::prelude::ADTS` now holds a fifth,
+> `Iter<s, r> = Continue(s) | Stop(r)`, added by ADR 0022 for `iterate` and
+> specified in §"the list side's early-exiting driver" above. Recorded here
+> because this block is the only place in this file that reads as a complete
+> list of the prelude's ADTs, and it no longer is.
+
 They join `BUILTIN_TYPES`, so a user `type Option<a>` becomes `E0105`. **This is
 a breaking change**: `examples/ledger.ply` and fixtures in `ply-syntax` and
 `ply-cli` declare their own `Option` and must be migrated as part of this work,
@@ -4932,7 +4968,7 @@ never clamped.
 | `bytes_split` | `(Bytes, Bytes) -> List<Bytes>` | an empty separator is `RUNTIME_ERROR` |
 | `bytes_scan` | `(Bytes, Int, Bytes, Int) -> Int` | first index at or after `from` **not** in the set |
 | `bytes_scan_until` | `(Bytes, Int, Bytes, Int) -> Int` | first index at or after `from` **in** the set |
-| `bytes_position` | `(Bytes, Int, (Int) -> Bool / e) -> Option<Int> / e` | the early-exiting find |
+| `bytes_position` | `(Bytes, Int, (Int) -> Bool / e) -> Option<Int> / e` | the early-exiting find; the `List` counterpart is `iterate` |
 
 `bytes_scan(b, from, set, max)` takes the byte class as a **`Bytes` of its
 members** — `b"0123456789"`, `b" \t"` — so there is no closed enum to extend, and

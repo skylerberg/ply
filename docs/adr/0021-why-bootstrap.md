@@ -69,6 +69,21 @@ Established, by writing a Ply lexer in Ply and measuring it:
   lexer's correctness was trustworthy. The verification method is lost, not just
   the porting strategy.
 
+  > **Withdrawn by ADR 0022 (2026-08-27).** *"A parser's recursion **is** the
+  > grammar: it recurses per definition and per argument"* is inherited from ADR
+  > 0020 §5.1 and is not true of `crates/ply-syntax/src/parser.rs`, the reference
+  > implementation. It drives every sequence with a loop — 16 `while`, 5 `loop`,
+  > and one shared `comma_list` called from fourteen sites — and reserves
+  > recursion for grammar nesting, which it bounds itself at
+  > `const MAX_DEPTH: u32 = 128` against a corpus maximum of 17. ADR 0022 §2.
+  > *"and there is no flag"* is now a **decision** rather than an omission: a
+  > bare `--max-calls` flag is refused, because lowering the bound would let the
+  > result cache answer `Pass` for a program that would raise (ADR 0022 §5).
+  > What replaces it is `iterate`, an early-terminating loop that is depth 1 on
+  > both engines. §5's second falsifier below has fired on this ADR's own terms.
+  > The **throughput** objection in the bullet above is untouched and remains
+  > this ADR's live one.
+
 Not established, and it is the number that would most change the estimate: the
 lexer-to-front-end multiplier in ADR 0020 §6.2 is **assumed** at 5–10×. The only
 thing that would settle it is writing the parser, which that ADR recommends
@@ -107,6 +122,16 @@ program, and each is a precondition.
 - **If the parser turns out to be expressible as recursive descent after all** —
   by raising the ceiling, by trampolining, or by a form nobody has tried. Then
   the differential method survives and §3's central objection dissolves.
+
+  > **This has fired (2026-08-27, ADR 0022) — by the third route, "a form
+  > nobody has tried".** Not by raising the ceiling, which ADR 0022 §5 refuses,
+  > and not by trampolining. The reference parser already reserves recursion for
+  > grammar nesting and drives sequences with loops, and it bounds its own
+  > nesting at 128 against a ceiling of 10,000 (ADR 0022 §2); `iterate` gives
+  > Ply the same shape at depth 1. So §3's ceiling objection dissolves and the
+  > differential method survives it. **§3's throughput objection does not**, and
+  > it is the one this ADR's decision actually rests on. Recorded because a
+  > falsifier that fires and is not written down is a falsifier nobody wrote.
 - **If a Rust-side tool could make `cargo`'s loop O(change).** Nothing in this
   project has tried, and it would remove the motive entirely. The reason to doubt
   it is that Ply had to be designed around content-addressed definitions from the

@@ -384,7 +384,8 @@ impl Machine<'_> {
             | Frame::FilterStep { .. }
             | Frame::FoldStep { .. }
             | Frame::MapFoldStep { .. }
-            | Frame::BytesPositionStep { .. }) => {
+            | Frame::BytesPositionStep { .. }
+            | Frame::IterateStep { .. }) => {
                 let span = builtin_step_span(&step);
                 let next = advance(step, value)?;
                 return self.run_builtin_step(next, span);
@@ -400,7 +401,8 @@ fn builtin_step_span(frame: &Frame) -> ply_span::Span {
         | Frame::FilterStep { span, .. }
         | Frame::FoldStep { span, .. }
         | Frame::MapFoldStep { span, .. }
-        | Frame::BytesPositionStep { span, .. } => *span,
+        | Frame::BytesPositionStep { span, .. }
+        | Frame::IterateStep { span, .. } => *span,
         _ => ply_span::Span::DUMMY,
     }
 }

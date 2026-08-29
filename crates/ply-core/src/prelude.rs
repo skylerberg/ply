@@ -59,10 +59,11 @@ pub fn is_prelude_effect(name: &Symbol) -> bool {
 
 /// An ADT the language declares rather than a module.
 ///
-/// `map_get` returns an `Option`, `decode` a `Result`, `compare` an `Ordering`
-/// and `decimal_div` takes a `Rounding`. A **builtin** whose type mentions a
-/// type the user has to import first is incoherent, so these are in scope
-/// everywhere and a user declaration of one is `E0105`.
+/// `map_get` returns an `Option`, `decode` a `Result`, `compare` an `Ordering`,
+/// `decimal_div` takes a `Rounding` and `iterate`'s step answers an `Iter`. A
+/// **builtin** whose type mentions a type the user has to import first is
+/// incoherent, so these are in scope everywhere and a user declaration of one is
+/// `E0105`.
 pub struct Adt {
     pub name: &'static str,
     pub params: &'static [&'static str],
@@ -106,6 +107,15 @@ pub const ADTS: &[Adt] = &[
             ("Ceiling", &[]),
             ("Floor", &[]),
         ],
+    },
+    // `iterate`'s step answers one of these, and the two type parameters are the
+    // point: `Stop` carries a value the seed never held, so a loop can finish
+    // with something it computed on its last step rather than with the seed it
+    // was handed. `Option<s>` would have cost that loop one more round.
+    Adt {
+        name: "Iter",
+        params: &["s", "r"],
+        variants: &[("Continue", &["s"]), ("Stop", &["r"])],
     },
 ];
 
