@@ -17,8 +17,27 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Whole-list sharing rather than structural sharing: `push` copies, which is
-/// fine at v0 sizes and costs no persistent-vector dependency.
+/// Whole-list sharing rather than structural sharing, which costs no
+/// persistent-vector dependency: `push` rewrites the array when its caller is
+/// the last owner of it, and copies the whole array when anything else can
+/// still see it.
+///
+/// > **Corrected (mechanism sweep, 2026-08-28): `push` does not always copy,
+/// > and what the copy costs is not a function of v0 sizes.** This read
+/// > *"Whole-list sharing rather than structural sharing: `push` copies, which
+/// > is fine at v0 sizes and costs no persistent-vector dependency."* The
+/// > dependency half stands and is why this alias exists. The rest does not.
+/// > [`crate::builtins`]'s `push` probes `Arc::get_mut` and grows the array in
+/// > place when it is unshared, so whether a copy is taken at all is decided by
+/// > what else holds the list at the instant of the update — usually a fact
+/// > about where the call sits in its enclosing node, and never a fact about
+/// > how long the list is. A growing container built anywhere but the last
+/// > sub-expression of its enclosing node copies once per element, and *that*
+/// > is quadratic in the list being built at any size: `json.ply`'s
+/// > `escape_runs` pays it once per escape in a string a client chooses
+/// > (ADR 0020 §4.1 — 0.03/0.07/0.22/0.79 s at k = 1,000/2,000/4,000/8,000, on
+/// > the shipped module). ADR 0024 §1 (branch `adr/ownership`) reopens the
+/// > representation question with this alias as its first exhibit.
 pub type Vector<T> = Arc<Vec<T>>;
 
 /// The `Map` primitive's representation.

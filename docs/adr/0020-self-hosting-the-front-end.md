@@ -863,7 +863,32 @@ Ranked, what would change the answer:
    correctly written function is made quadratic by its caller, and by a caller
    whose offending sub-expression can be a constant. That rules out the cheap
    remedy — a coding convention — because there is no local property an author
-   can check. A lint is not the convenient fix here; it is the only one.
+   can check. ~~A lint is not the convenient fix here; it is the only one.~~
+
+   > **Corrected (mechanism sweep, 2026-08-28): the lint was built and it was
+   > refuted.** The withdrawn sentence is *"A lint is not the convenient fix
+   > here; it is the only one."* Everything above it survives — the trap is
+   > already in the standard library, the precondition is non-local, and a coding
+   > convention cannot check it — but "the only one" was reached by eliminating
+   > the alternatives rather than by trying the remedy, and the remedy was tried
+   > and failed. `W0611`, a field-order lint in `ply-core` (`fieldorder.rs`, on
+   > PR #41 — not in this tree; the pass is closed), was written for exactly this
+   > rule, and adversarial review put it against the interpreter's own counters:
+   > it **fires** on `len(push([], i))` at argument 0 of 2, which copies nothing,
+   > and is **silent** on `{a: s.a, b: push(s.a, i)}`, which is fully quadratic —
+   > a false negative on the exact shape it existed for. ADR 0024, *"Ownership as
+   > a checked property, not an inferred hint"* (branch `adr/ownership`, PR #43),
+   > records the trial and supersedes this item: a lint is a partial oracle over a
+   > dynamic property, so a better lint is not what was missing.
+   >
+   > **The rest of this item's menu is worse, not better.** A `--explain` line
+   > shows the property only to someone who already suspects it and runs a tool
+   > with a flag — a diagnostic for the reader who least needs one. Under the
+   > authorship model this ADR is written inside, where most Ply is written by
+   > agents that cannot see a refcount and read a signature instead, a property
+   > visible only behind a flag is not visible at all. What survives is the item's
+   > title: §1 must be made visible somewhere an author cannot miss it, which
+   > ADR 0024 answers by putting it in the type rather than in a warning.
 3. **Fixing `escape_runs`** (§4.1). Shipped, quadratic, client-influenced input.
    `GAPS.md` §1 records that the obvious fix — splitting so each `push` is last —
    doubles the recursion depth and breaks the module at k = 8,000; the fix that
