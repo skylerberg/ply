@@ -936,6 +936,24 @@ pub enum ExprKind {
     Record {
         fields: Vec<(Ident, Expr)>,
     },
+
+    /// `{..base, f: e}` — **parse-time only**. `crate::record_update::expand`
+    /// rewrites every one of these into a plain [`ExprKind::Record`] before
+    /// [`crate::parse_module`] returns, so that the sugar and the longhand are
+    /// one definition with one hash rather than two spellings of one value.
+    ///
+    /// No crate downstream of `ply-syntax` can observe this variant. That is an
+    /// invariant the suite asserts over every `.ply` file in the tree, at
+    /// `crates/ply-syntax/src/tests.rs`
+    /// `no_record_update_survives_parse_module_anywhere_in_the_tree` — not an
+    /// argument. The arms other crates carry for it are unreachable, and they
+    /// exist because `ExprKind` is matched exhaustively with no `_`: a new
+    /// variant has to be refused somewhere explicit rather than absorbed.
+    RecordUpdate {
+        base: Box<Expr>,
+        fields: Vec<(Ident, Expr)>,
+    },
+
     Field {
         base: Box<Expr>,
         field: Ident,

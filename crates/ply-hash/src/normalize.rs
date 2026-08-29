@@ -788,6 +788,15 @@ impl<'a, 't> Normalizer<'a, 't> {
                     self.expr(value);
                 }
             }
+            // The one arm that must never guess. Hashing the sugar as if it
+            // were the record it is written beside would make `{..s, a: 1}` and
+            // its longhand two definitions computing one value; hashing it as a
+            // new tag would do the same. Expansion is upstream so that neither
+            // is representable.
+            ExprKind::RecordUpdate { .. } => unreachable!(
+                "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
+                 `no_record_update_survives_parse_module_anywhere_in_the_tree`"
+            ),
             ExprKind::Field { base, field } => {
                 self.tag(tag::E_FIELD);
                 self.expr(base);
@@ -1106,6 +1115,9 @@ fn is_pure(e: &Expr) -> bool {
             }) && tail.as_deref().is_none_or(is_pure)
         }
         ExprKind::Record { fields } => fields.iter().all(|(_, v)| is_pure(v)),
+        ExprKind::RecordUpdate { base, fields } => {
+            is_pure(base) && fields.iter().all(|(_, v)| is_pure(v))
+        }
         ExprKind::Field { base, .. } => is_pure(base),
         ExprKind::List { items } => items.iter().all(is_pure),
     })
@@ -1148,6 +1160,9 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
             }) || tail.as_deref().is_some_and(|t| mentions(t, names))
         }
         ExprKind::Record { fields } => fields.iter().any(|(_, v)| mentions(v, names)),
+        ExprKind::RecordUpdate { base, fields } => {
+            mentions(base, names) || fields.iter().any(|(_, v)| mentions(v, names))
+        }
         ExprKind::Field { base, .. } => mentions(base, names),
         ExprKind::List { items } => items.iter().any(|i| mentions(i, names)),
         ExprKind::Perform { args, .. } => args.iter().any(|a| mentions(a, names)),

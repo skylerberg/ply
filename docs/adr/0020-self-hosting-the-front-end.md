@@ -426,7 +426,10 @@ it is right to: a lexer has nowhere that wants open dispatch.
 ### §4.4 Real taxes, correctly ranked as taxes
 
 §2 (no record update — `http.ply:1016-1029` writes 13 `Limits` fields to change
-one, confirmed), §7 (no `byte_of_int`; the 1,024-character table appears in
+one, confirmed; **closed by W4**, see `docs/adr/0023-record-update.md`, and the
+"silently wrong limit rather than a type error" half of `GAPS.md` §2 was
+withdrawn there — it is a type error, and the surviving hazard is a mispairing),
+§7 (no `byte_of_int`; the 1,024-character table appears in
 `json.ply:627` and `lexer.ply:29` for the identical reason), §9 (no tuples),
 §10 (the `List` surface is `len/push/map/filter/fold/range` — confirmed against
 the builtin table: no index, concat, reverse, prepend or sort), §11

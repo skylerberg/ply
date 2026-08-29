@@ -836,3 +836,230 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
         "{v}"
     );
 }
+
+// --- The `Limits` mispairing guard ------------------------------------------
+//
+// `std.http`'s `Limits` (`http.ply`) is the record ADR 0013 §4 puts every bound a
+// program runs under into, and all thirteen of its fields are `Int`. Adding a
+// field to it is already a **type error** at every site that spells the record
+// out — `unify.rs` compares record key sets exactly and Ply has no width
+// subtyping — so the hazard was never a forgotten field. It is a **mispairing**:
+// `max_body: state.limits.max_chunk_size` type-checks and is a silently wrong
+// bound in an HTTP server.
+//
+// Every site that used to spell `Limits` out is now a record update, and what
+// that buys is asserted below rather than argued: **every bound a definition
+// does not deliberately vary is copied from the bound of the same name**.
+// Checked on the tree the compiler actually uses, so it covers a regression to
+// the longhand as well as a broken expansion — and a field added to `Limits`
+// tomorrow is covered without these tests changing.
+
+use ply_syntax::ast::{Expr, ExprKind, Ident, Item, Module, Stmt, TypeDefBody, TypeExpr};
+
+fn shipped_http() -> Module {
+    use ply_span::SourceId;
+    let source = ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships");
+    ply_syntax::parse_module(SourceId(0), ModuleName::from_dotted("std.http"), source)
+        .expect("the shipped module parses")
+}
+
+fn limits_fields(module: &Module) -> Vec<String> {
+    let fields = module
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Type(d) if d.name.name.as_str() == "Limits" => match &d.body {
+                TypeDefBody::Alias(TypeExpr::Record { fields, .. }) => Some(fields),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("`type Limits` is a record");
+    assert!(
+        fields.len() >= 13,
+        "`Limits` shrank to {} fields; these tests are about the cost of it growing",
+        fields.len()
+    );
+    fields.iter().map(|(n, _)| n.name.to_string()).collect()
+}
+
+/// A dotted path rendered back to source — `state.limits.max_body` — or `None`
+/// for anything that is not one.
+fn dotted(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Var(v) if v.is_bare() => Some(v.name.name.to_string()),
+        ExprKind::Field { base, field } => Some(format!("{}.{}", dotted(base)?, field.name)),
+        _ => None,
+    }
+}
+
+/// The field of `base` this expression reads, if it reads one directly.
+fn read_of_base(e: &Expr, base: &str) -> Option<String> {
+    let path = dotted(e)?;
+    let rest = path.strip_prefix(base)?.strip_prefix('.')?;
+    (!rest.contains('.')).then(|| rest.to_string())
+}
+
+/// The record literal `func` evaluates to: the value of `let <binder>` when one
+/// is named, otherwise the block's tail.
+fn limits_literal<'a>(module: &'a Module, func: &str, binder: Option<&str>) -> &'a [(Ident, Expr)] {
+    let body = module
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Fn(d) if d.name.name.as_str() == func => Some(&d.body),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{func}` is defined"));
+    let ExprKind::Block { stmts, tail } = &body.kind else {
+        panic!("`{func}` is a block")
+    };
+    let record = match binder {
+        Some(b) => stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Let { pat, value, .. } if format!("{:?}", pat.kind).contains(b) => {
+                    Some(&**value)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`let {b} = ...` in `{func}`")),
+        None => tail
+            .as_deref()
+            .unwrap_or_else(|| panic!("`{func}` has a tail")),
+    };
+    let ExprKind::Record { fields } = &record.kind else {
+        panic!("`{func}`'s result is a record literal, expanded from `{{..base, ..}}`")
+    };
+    fields
+}
+
+/// Asserts that `func` builds a full-width `Limits` in which every field it does
+/// not deliberately vary is `base.<that same field>`. `varied` is the exact list
+/// of the ones that do differ, in emitted order, each paired with the field of
+/// `base` it reads instead — or `None` when it reads something else entirely.
+#[track_caller]
+fn copies_every_limit_it_does_not_vary(
+    func: &str,
+    binder: Option<&str>,
+    base: &str,
+    varied: &[(&str, Option<&str>)],
+) {
+    let module = shipped_http();
+    let fields = limits_literal(&module, func, binder);
+
+    let mut names: Vec<String> = fields.iter().map(|(n, _)| n.name.to_string()).collect();
+    let mut expected = limits_fields(&module);
+    names.sort();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "`{func}` does not build exactly `Limits`, so it would not type-check as one"
+    );
+
+    let mut actual: Vec<(String, Option<String>)> = Vec::new();
+    for (name, value) in fields {
+        let name = name.name.to_string();
+        match read_of_base(value, base) {
+            Some(from) if from == name => {}
+            other => actual.push((name, other)),
+        }
+    }
+    let want: Vec<(String, Option<String>)> = varied
+        .iter()
+        .map(|(n, f)| (n.to_string(), f.map(str::to_string)))
+        .collect();
+    assert_eq!(
+        actual, want,
+        "in `{func}`, exactly these bounds may differ from `{base}`'s bound of their own name; \
+         anything else here is a mispaired limit"
+    );
+}
+
+/// **The guard the `chunk_trailers` rewrite is worth.** One bound is deliberately
+/// swapped — the header-block bound takes the trailer bound — and the other
+/// twelve are copies.
+#[test]
+fn chunk_trailers_copies_every_limit_it_does_not_replace() {
+    copies_every_limit_it_does_not_vary(
+        "chunk_trailers",
+        Some("trailer_limits"),
+        "state.limits",
+        &[("max_header_bytes", Some("max_trailer_bytes"))],
+    );
+}
+
+/// The three test helpers that used to re-spell `Limits` by hand. Each now
+/// varies the bounds its name promises and copies the rest from
+/// `default_limits()`, so twelve or six unwritten bounds cannot be mispaired at
+/// all — there is nothing written to mispair.
+#[test]
+fn the_limits_helpers_vary_only_the_bounds_they_are_named_for() {
+    copies_every_limit_it_does_not_vary(
+        "limits_keeping",
+        None,
+        "base",
+        &[("max_keep_alive", None)],
+    );
+    copies_every_limit_it_does_not_vary(
+        "limits_streaming",
+        None,
+        "base",
+        &[("max_stream_chunks", None)],
+    );
+    copies_every_limit_it_does_not_vary(
+        "limits_with",
+        None,
+        "base",
+        &[
+            ("max_request_line", None),
+            ("max_header_bytes", None),
+            ("max_header_count", None),
+            ("max_body", None),
+            ("max_chunk_size", None),
+            ("max_chunk_line", None),
+            ("max_trailer_bytes", None),
+        ],
+    );
+}
+
+/// `limits_with` is the one converted site where a mispairing survives the
+/// rewrite, because the seven bounds it *does* write are seven `Int` parameters
+/// and `max_chunk_size: chunk_line` type-checks. The remaining guard is the
+/// naming convention, so it is asserted rather than trusted: each written bound
+/// takes the parameter its own name is `max_`-prefixed from.
+#[test]
+fn limits_with_pairs_each_bound_with_the_parameter_named_after_it() {
+    let module = shipped_http();
+    let params: Vec<String> = module
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Fn(d) if d.name.name.as_str() == "limits_with" => Some(&d.params),
+            _ => None,
+        })
+        .expect("`limits_with` is defined")
+        .iter()
+        .map(|p| p.name.name.to_string())
+        .collect();
+
+    let mut paired = 0;
+    for (name, value) in limits_literal(&module, "limits_with", None) {
+        let name = name.name.to_string();
+        let Some(arg) = dotted(value).filter(|a| params.contains(a)) else {
+            continue;
+        };
+        assert_eq!(
+            name,
+            format!("max_{arg}"),
+            "`limits_with` passes `{arg}` as `{name}`, and every `Limits` field is `Int`, \
+             so nothing else would have caught it"
+        );
+        paired += 1;
+    }
+    assert_eq!(
+        paired,
+        params.len(),
+        "every parameter of `limits_with` must reach a bound, or one of them is dead"
+    );
+}

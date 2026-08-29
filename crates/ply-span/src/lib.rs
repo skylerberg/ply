@@ -250,6 +250,19 @@ pub mod codes {
     /// An `effect set` that contains itself, directly or through another.
     /// Expansion is a fixed point and a cycle has none.
     pub const EFFECT_SET_CYCLE: &str = "E0115";
+    /// The base of a record update `{..b, f: e}` has no record shape this
+    /// module can name.
+    ///
+    /// Expansion runs inside the parser and reads **this module's own `type`
+    /// items and the annotations written in this file**, for the reason
+    /// [`UNKNOWN_EFFECT_SET`] gives: gate 1 skips a file whose raw bytes are
+    /// unchanged, so a shape read across a module boundary would let an edit in
+    /// the declaring module leave a stale expansion behind in a file that never
+    /// moved — and a stale expansion is a wrong record, not a stale name.
+    pub const RECORD_UPDATE_SHAPE: &str = "E0116";
+    /// A record update names a field the base does not have. Update replaces;
+    /// it does not widen, because the result's type is the base's type.
+    pub const RECORD_UPDATE_FIELD: &str = "E0117";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -726,6 +739,8 @@ mod tests {
             ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
             ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
             ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
+            ("RECORD_UPDATE_SHAPE", codes::RECORD_UPDATE_SHAPE, "E0116"),
+            ("RECORD_UPDATE_FIELD", codes::RECORD_UPDATE_FIELD, "E0117"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

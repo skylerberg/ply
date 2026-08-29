@@ -1304,11 +1304,28 @@ comments record why each of the three non-obvious ones (`rustls`,
 ### An ADR
 
 `docs/adr/` is **twenty-two** files, `00NN-slug.md`, with **no index** — the
-numbers are the ordering. Number yours `0023` and up. (This read "seventeen" and
-"`0018` and up", then "nineteen" and "`0020` and up"; 0020, 0021 and 0022 have
-since been written, and nothing counts the directory for you — `ls docs/adr/*.md
-| wc -l`. That the count has now been stale twice is the argument for running
-the command rather than trusting this sentence.) ADR 0005 is superseded in part by
+numbers are the ordering. Number yours `0027` and up, and read the open pull
+requests before you pick: counting the directory is necessary and is not
+sufficient.
+
+> **Corrected by W4 round 2, which is the case the old wording could not
+> survive.** It read:
+>
+> > Number yours `0023` and up. (This read "seventeen" and "`0018` and up", then
+> > "nineteen" and "`0020` and up"; it has now been wrong twice for the same
+> > reason, which is that nothing counts the directory for you —
+> > `ls docs/adr/*.md | wc -l`. Run it.)
+>
+> The count was right and the advice still failed, because two round-1
+> branches each wrote a `docs/adr/0022-*.md` without seeing the other —
+> `0022-the-call-ceiling.md`, open as PR #34, and `0022-record-update.md`,
+> which this branch renumbered to `0023-record-update.md`. So this tree holds
+> twenty-two files with a **deliberate gap at `0022`** until #34 lands, and the
+> next author wants `0024`. Run `ls docs/adr/*.md | wc -l`, then look at what
+> the open branches have already claimed: the directory cannot show you a
+> number a sibling branch is holding.
+
+ADR 0005 is superseded in part by
 ADR 0017, and it is the model for how to record that: 0005's *title* does not say
 so, but its header does — lines 3–9 carry `Status: accepted — … §2's persistent
 forkable world is **superseded by ADR 0017**` and `Superseded in part by:

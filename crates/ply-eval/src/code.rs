@@ -460,6 +460,13 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
                 fields: Rc::new(lowered),
             }
         }
+        // Unreachable: the sugar is gone before any module reaches this crate,
+        // and lowering it as if it were a plain record would drop the base's
+        // untouched fields — a wrong value, silently.
+        ExprKind::RecordUpdate { .. } => unreachable!(
+            "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
+             `no_record_update_survives_parse_module_anywhere_in_the_tree`"
+        ),
         ExprKind::Field { base, field } => NodeKind::Field {
             base: lower_in(base, live),
             field: field.clone(),
@@ -788,6 +795,12 @@ fn barrier_binders(e: &Expr, out: &mut Vec<Symbol>) {
             }
         }
         ExprKind::Record { fields } => {
+            for (_, value) in fields {
+                barrier_binders(value, out);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            barrier_binders(base, out);
             for (_, value) in fields {
                 barrier_binders(value, out);
             }
