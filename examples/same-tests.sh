@@ -59,6 +59,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# This script does not build the binary it runs (CONTRIBUTING.md §"Things known
+# to be broken" item 2), so the one thing it can do is refuse to run against a
+# binary that is not the tree. `desk.ply` imports all eight `std` modules and
+# they are `include_str!`ed into `ply`, so an edit to one changes what this
+# comparison means and moves no `.rs` file: `find crates -name '*.rs' -newer`
+# would call it clean. See CONTRIBUTING.md §"The binary is an instrument too".
+if ! "$root/.github/binary-is-current.sh" "$ply"; then
+  echo >&2
+  echo "   $ply is not built from this tree." >&2
+  echo "   cargo build --release -p ply-cli" >&2
+  exit 2
+fi
+
 for tool in psql curl; do
   command -v "$tool" >/dev/null || { echo "$tool is needed and is not on PATH" >&2; exit 2; }
 done

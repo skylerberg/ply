@@ -23,6 +23,20 @@ Two builds are used and they are not interchangeable:
 - `target/debug/ply`, built 14:17 from `cargo build -j 2 --workspace`.
 - `target/release/ply`, built 14:31 from `cargo build -j 2 --release -p ply-cli`.
 
+> **Every number in this file was taken through a pre-built binary, which is a
+> provenance risk this file could not have stated when it was written
+> (2026-08-27).** ADR 0020 §0 is the account of the first instance —
+> `crates/ply-eval/src/frame.rs` written 54 seconds before this release binary
+> was built, in the mechanism §1 measures. The rule for catching that,
+> `find crates -name '*.rs' -newer target/release/ply`, has a second blind spot:
+> the eight `crates/ply-std/ply/*.ply` modules are `include_str!`ed into the
+> binary, so an edit to one is invisible to it. `lexer.ply` imports no `std`
+> module, so this file's numbers are exposed to a stale *interpreter* and not to
+> a stale stdlib — but `bench.sh` in the three sibling spike directories takes
+> `PLY=${1:-../../target/release/ply}` and builds nothing, so nothing checked.
+> Run `.github/binary-is-current.sh` before re-taking anything here;
+> `CONTRIBUTING.md` §"The binary is an instrument too" has the reproduction.
+
 > **Read this before quoting §1's first table.** The four numbers in §1's
 > "as first measured" row were taken with the **debug** binary. They are a
 > factor of roughly eight slower than the release ones and must not be quoted as

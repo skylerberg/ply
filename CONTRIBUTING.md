@@ -10,6 +10,7 @@ a claim down.
 - [The loop](#the-loop)
 - [Before you open a change](#before-you-open-a-change)
 - [Writing a claim down](#writing-a-claim-down) — including [a moving tree invalidates a correctness number](#a-moving-tree-invalidates-a-correctness-number-and-only-an-instrument-says-so)
+  and [the binary is an instrument too](#the-binary-is-an-instrument-too-and-the-rule-for-checking-it-was-blind)
 - [Adding things](#adding-things) — a diagnostic code, a host handler, an ADR
 - [Where a change is likely to bite](#where-a-change-is-likely-to-bite)
 - [Things known to be broken](#things-known-to-be-broken)
@@ -803,6 +804,226 @@ the whole reason to arm it before you need it. And the cheapest rule of all:
 while a suite is running, do not touch the tree it is reading — start it in a
 copy and leave the copy alone.
 
+### The binary is an instrument too, and the rule for checking it was blind
+
+The section above is about the *tree* moving under a suite. This is the same
+sentence for a **pre-built binary**: `./target/release/ply` is a frozen copy of
+a tree, the tree it was frozen from is not necessarily the one you are looking
+at, and the rule this project used for checking that could not see the
+difference in the place it is most often pointed.
+
+**The withdrawn rule, verbatim:**
+
+> ```
+> find crates -name '*.rs' -newer target/release/ply
+> ```
+
+It is quoted rather than corrected in place because **until this section it was
+written in no file in this repository.** Checked, before this section existed:
+
+```
+find . -name '*.md' -not -path './target/*' -exec grep -Hn -- '-newer' {} +
+grep -rn -- '-newer' --include='*.sh' --include='*.yml' .
+```
+
+Both returned nothing. The first now returns eight hits — five here, and one
+each in `benches/README.md`, `docs/adr/0020` and `spikes/ply-lexer/GAPS.md`,
+all of them this section's own citations of the withdrawn form. The bare word
+`newer` occurs six times in the Markdown and every one is the ordinary English
+word. So this was an **oral** rule, which is worse than a written one: nothing
+carried it, so nothing could correct it, and it was reproduced from memory into
+two rounds of work. It is written down here so that from now on it can be.
+
+**Why it is blind.** `crates/ply-std/src/lib.rs` `include_str!`s all eight
+stdlib modules into the binary, so editing `crates/ply-std/ply/http.ply` changes
+what `import std.http` means in every program and moves **no `.rs` file at
+all**. Reproduced here on 2026-08-27 — one line of `http.ply` changed from
+`pub fn max_reads() -> Int = 2048` to `4096`, and no rebuild:
+
+```
+$ find crates -name '*.rs' -newer target/release/ply | wc -l
+0                                   # the rule reports the instrument clean
+
+$ ply std --digest
+b3:a99604f49bd5                     # unchanged — the binary still holds 2048
+
+$ ply test probe.ply --no-cache     # assert_eq(http::max_reads(), 4096)
+  assertion failed: expected 4096, found 2048
+  suspects: std.http.max_reads
+```
+
+The file on disk says 4096, the program says 2048, and the check says clean.
+
+**Reported, not measured here.** A round-1 workstream published
+`examples/: 1,428 entries, 0 moved` as an exit criterion and the true figure is
+**84**, traced to this hole. That log is not in this session's hands and the
+figure was not re-taken here, so it is recorded as an account rather than as a
+measurement — the mechanism above is what was measured, and it is sufficient on
+its own. ADR 0020 §0 opens with a whole ADR nearly lost to the same class, which
+makes this the second instance, and is why the replacement below is a script you
+run rather than a sentence you remember.
+
+**The corrected instrument is rustc's own dep-info, not `find`.** Every link
+writes `<binary>.d` beside the binary listing exactly the files that were read
+to produce it. Measured on this tree, 2026-08-27:
+
+| dep-info | paths | `.rs` | `.ply` | crates |
+| --- | ---: | ---: | ---: | ---: |
+| `target/release/ply.d` | 152 | 144 | **8** | 12 |
+| `target/release/ply-corpus.d` | 175 | 165 | **10** | 13 |
+| `target/release/w6-alloc.d` | 175 | 165 | **10** | 13 |
+
+The eight are `crates/ply-std/ply/*.ply`; the two extra in the corpus binaries
+are `crates/ply-corpus/ply/w4.ply` and `w5.ply`. **Nothing had to tell rustc
+they were there** — that is the whole argument for dep-info over any `find`
+expression: it is per binary, it needs no list here that could go stale, and it
+covers the next `include_str!` somebody adds. `ply.d` omits `ply-corpus` and
+`ply-codegen-spike` because the `ply` binary does not depend on them, which is
+correct rather than a gap; each binary carries its own.
+
+The one-liner, if you want no script — and note it is **mtime only**, so it is
+the first instrument below and not the second. It closes the `.rs`/`.ply` hole
+in the withdrawn rule and stays blind to a `.ply` whose bytes changed while its
+mtime did not (measured: edit `json.ply` and `touch -t 202001010000` it, and
+this prints nothing while the running program disagrees with the file):
+
+```
+awk '{ i=index($0,":"); if (i) print substr($0,i+1) }' target/release/ply.d \
+  | tr ' ' '\n' | grep . | xargs -I{} find {} -newer target/release/ply
+```
+
+**Do not run this in your head — run `.github/binary-is-current.sh`.** A rule in
+a document is what failed twice.
+
+```
+.github/binary-is-current.sh                             # target/release/ply
+.github/binary-is-current.sh target/release/ply-corpus target/release/w6-alloc
+.github/binary-is-current.sh --self-test                 # watch it go red
+```
+
+Exit 0 current, 1 STALE, 2 unanswerable. It runs three instruments and the
+second is the one that matters:
+
+1. **dep-info** — a listed input missing, or not older than the binary.
+2. **The bytes, not the clock** — `ply std --show std.<m>` prints the module
+   source compiled into *this* binary, and it is diffed against the file. This
+   is a content check, not a timestamp check, so it survives `touch`, a checkout
+   that rewrites mtimes, an `rsync`, clock skew, and the second-granular window
+   `crates/ply-eval/src/compiled.rs`'s test-module header records. **Read that
+   as `ply` only.** `std --show` exists on no other binary, so `ply-corpus` and
+   `w6-alloc` — which embed `crates/ply-corpus/ply/{w4,w5}.ply` — get arms 1 and
+   3 and not this one. Measured 2026-08-27: appending a line to `w4.ply` and
+   backdating its mtime leaves `binary-is-current.sh target/release/w6-alloc`
+   reporting `current`, exit 0, while the binary holds other bytes. The script
+   now prints `NOTE  no content check for …` on those two rather than passing
+   silently, which labels the gap; closing it needs a `--show` equivalent on the
+   corpus binary, not more `find`. ADR 0019's `w6-alloc` row is the measurement
+   this bounds.
+3. **Cargo's inputs, which rustc never sees** — `Cargo.toml`, `Cargo.lock`,
+   `rust-toolchain*` and `.cargo/config.toml` appear in no `.d` file and are
+   checked explicitly. A newer `.rs`/`.ply` in a depended-on crate that the
+   dep-info does not list is reported as `SUSPECT`: usually a new file no `mod`
+   declares yet.
+
+Timestamps compare to whole seconds and **equality counts as stale**, because a
+false STALE costs one rebuild and a false "current" costs a measurement.
+
+`--self-test` is the part worth copying. Both instruments are driven red and
+green on every run — a corrupted *copy* of the stdlib, a dep-info naming a file
+newer than the binary, one naming a file that no longer exists, and one naming a
+file that really is older — and neither arm touches the worktree. A freshness
+check nobody has watched fail is this repository's signature defect one level
+up.
+
+Arms 6 and 7 were added on 2026-08-27 because arms 1-5 test the instruments and
+not the tool. They exercise the assembled verdict end to end. The corruption
+that made the case: rewriting `check_depinfo … || rc=1` to `… || true` in
+`verdict_for` left `--self-test` **green**, while the tool printed
+`NEWER crates/ply-std/ply/http.ply` and then `current` on the next line and
+exited 0 — a false green in the freshness check, which is the exact shape this
+section exists to prevent. Arm 6 now goes red on it. `check_cargo_inputs` and
+`check_unlisted` still have no self-test arm.
+
+**What else is embedded, established by measurement rather than by reading.**
+`grep -rn 'include_str!\|include_bytes!\|include!(' --include='*.rs' .`:
+
+| what | where | into |
+| --- | --- | --- |
+| 8 stdlib modules | `crates/ply-std/src/lib.rs:46-81` | every binary linking `ply-std`: `ply`, `ply-corpus`, `w6-alloc` |
+| `w4.ply`, `w5.ply` | `crates/ply-corpus/src/{w4.rs:52,w5.rs:53}` | `ply-corpus`, `w6-alloc` |
+| five `ply-eval` sources into their own test modules | `region.rs:317`, `region_kind.rs:1085`, `explore.rs:1817`, `sim.rs:1727`, `sched.rs:2014` | `ply-eval`'s lib test binary |
+| `machine.rs` | `crates/ply-eval/tests/determinism_audit.rs:944` | that test binary |
+| `examples/ledger.ply` | `crates/ply-hash/tests/audit.rs:702,711` and `crates/ply-test/src/bisect/delta_tests.rs:357` | those test binaries — and note this one is **outside `crates/`**, so even a `find crates` widened to `*.ply` would miss it |
+
+No `include_bytes!` and no `include!` anywhere. **No cargo build script either,
+and this is a trap worth naming**: `find . -name build.rs` returns three files —
+`crates/ply-cli/src/commands/build.rs`, `crates/ply-corpus/src/build.rs`,
+`crates/ply-eval/src/build.rs` — and all three are ordinary modules. No
+`Cargo.toml` in the workspace carries a `build =` key, so the count of real
+build scripts is **zero** and that `find` is three false positives.
+
+**Everything under `cargo` is safe; only a pre-built binary is exposed.**
+Measured, not assumed: `touch crates/ply-std/ply/http.ply` and nothing else,
+then `cargo build -p ply-std`, prints `Compiling ply-std` — cargo reads the same
+dep-info and rebuilds on a `.ply` edit. So a figure that came from
+`cargo test …` or `cargo run …` cannot be stale in this way. A figure that came
+from `./target/release/<bin>`, or from a script that does not build first, can.
+
+Which scripts build before they run, checked by reading them:
+
+| builds first | does not |
+| --- | --- |
+| `examples/serve.sh:155`, `benches/run.sh:20`, `spikes/ply-lexer/run.sh:12` | `examples/same-tests.sh` (§"Things known to be broken" item 2), `spikes/ply-lexer-nesting/bench.sh`, `spikes/ply-lexer-rc/bench.sh`, `spikes/ply-lexer-throughput/bench.sh`, and `crates/ply-codegen-spike/src/main.rs:558`, whose `--served` denominator shells out to `target/release/ply` and checks only that the file **exists** |
+
+**Which published measurements are exposed to this**, listed so a reader knows
+which numbers carry the risk. **This is not a claim that any of them is
+wrong** — none has been re-taken here, and ADR 0020 §1's were re-taken three
+times by two parties on a clean binary and survived. It is a claim about what
+their provenance does not rule out.
+
+| measurement | why it is exposed |
+| --- | --- |
+| ADR 0020 §4.1's shipped-`json.ply` series (0.03/0.07/0.22/0.79 s at k = 1,000–8,000) | the highest-exposure figure in the record: it runs `crates/ply-std/ply/json.ply` itself, through a pre-built binary, and `json.ply` is one of the eight embedded modules |
+| ADR 0020 §1's `ply test spikes/ply-lexer/lexer.ply` and the 33-file agreement corpus | `./target/release/ply`, pre-built. §0 is the account of this exact hazard being caught on this exact run |
+| ADR 0020 §3.1, §5.2 and §6.1, and `spikes/ply-lexer/GAPS.md` §1 and §13 | taken with `./target/release/ply` and `harness/target/release/plydump`, neither of them built by the command that used them. §6.1's `ply check examples/` row (0.21 s user cold, 0.03 s warm) is exposed twice over: it is a pre-built binary *and* the programs it checks import all eight `std` modules. `plydump` depends only on `ply-syntax` and `ply-span`, so it is exposed to a stale lexer and not to a stale stdlib |
+| `spikes/ply-lexer-nesting/bench.sh`, `-rc/bench.sh`, `-throughput/bench.sh` outputs | `PLY=${1:-../../target/release/ply}` with no build |
+| `benches/README.md` §"What `regions` adds"'s `179 + 1 + 2 + 2 + 2 = 186` group sizes | `./target/release/ply test examples/ --explain --no-cache`, pre-built, over `examples/` — which imports all eight `std` modules |
+| ADR 0019's `1,082 → 773.4` allocations per `/health` | `./target/release/w6-alloc --repo . --requests 200`, pre-built |
+| ADR 0018 §0.5 and §"The kernel ratio", and `benches/adr0018-mcts.json` | `crates/ply-codegen-spike`'s `mcts` is itself built by cargo, but its `--served` rung starts `target/release/ply` as a subprocess |
+
+**Pre-registered, and quoted here so the choice of instrument is not a choice
+made after seeing the answer.** Written to
+`/tmp/ply-r2-instrument/PREREGISTRATION.md` before any of the numbers above
+existed — outside the repository, because two round-1 branches each committed a
+root-level `PREREGISTRATION.md` and collided:
+
+> **M2.** Statistic B: whether each of the eight `crates/ply-std/ply/*.ply`
+> paths appears in `target/release/ply.d`. Decision rule, fixed before the
+> number exists: if B is *all eight present*, dep-info is declared the correct
+> instrument and `CONTRIBUTING` is corrected to name it; if B is *any absent*,
+> dep-info is declared insufficient and the corrected rule must union it with an
+> explicit `find(1)` over `*.ply`. No run is discarded.
+>
+> **M3.** The workstream succeeds only if the arm that edits a stdlib `.ply`
+> without rebuilding shows the old rule **clean** and the new check **stale**,
+> and the arm after the rebuild shows the new check **current**. If the old rule
+> already reports stale, the premise is refuted and the refutation is reported
+> instead of a fix.
+
+B came back *all eight present*, so the first branch was taken. Every figure in
+this section is deterministic — file counts, path counts, exit codes, verdict
+strings — so N = 1 and the command beside each is what reproduces it; no wall
+clock is claimed anywhere in it.
+
+**Not exposed, and worth stating so the list is a partition rather than a
+warning.** Everything in ADR 0019 rendered by `cargo test -p ply-corpus
+--release …` — the allocation attribution, the arity table, `size_of::<Value>()`
+— because cargo rebuilds. `benches/w6-ladder*.json` and
+`benches/w6-spike*.json`, taken through `cargo run --release -p ply-corpus` and
+`benches/run.sh`, which builds. And `benches/kernel/mcts.ply` and `work.ply`
+import no `std` module at all, so ADR 0018's kernel numbers are exposed only to
+a stale interpreter, never to a stale stdlib.
+
 ### Say how it was checked, or say it was not
 
 Every number gets a provenance: the machine, the profile, the command, and
@@ -1151,7 +1372,16 @@ Recorded here so nobody spends an afternoon rediscovering them.
    ADR 0016 records the toolchain wall at lines 764–767 and 1105–1106 and is
    otherwise unamended.
 2. **`examples/same-tests.sh` does not build the binary it runs.** It uses
-   `target/release/ply` (line 44) with no `cargo build` anywhere.
+   `target/release/ply` (line 44) with no `cargo build` anywhere. **Still true,
+   and no longer silent (2026-08-27):** the script now calls
+   `.github/binary-is-current.sh` before anything else and exits 2 with the
+   `cargo build` line to run if the binary is not this tree. Seen to fail —
+   `touch crates/ply-std/ply/json.ply` and nothing else makes it print
+   `NEWER crates/ply-std/ply/json.ply` / `STALE target/release/ply` and exit 2
+   before it looks for `psql`; with the mtime restored it runs to *29 requests,
+   byte for byte identical* and exits 0. Building it here would be the better
+   fix and is still open; refusing to compare two services through a binary
+   nobody can attribute is the half that was cheap.
 3. **`examples/same-tests.sh` step 1 can be vacuous.** It passes
    `--no-incremental`, which disables only the front-end cache; on a warm
    `examples/.ply-cache` it prints `0 failed, 0 passed, 68 cached` and the script
