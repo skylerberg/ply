@@ -602,6 +602,35 @@ impl<'a> Machine<'a> {
     ///   checks its *kind* and nothing else; a wrong `Int` is caught by
     ///   `--engine both` and by nothing here.
     ///
+    /// > **The first paragraph and the first bullet are withdrawn, 2026-08-28.
+    /// > That day came, and the line moved in the same change.** They read:
+    /// > *"Nothing in this workspace implements [`Compiled`] and no shipping
+    /// > command calls this"*, and *"That rule is **not enforced for a backend**
+    /// > — it is unreachable … The day a flag can, that line moves in the same
+    /// > change."*
+    /// >
+    /// > [`crate::backend::Reference`] implements it and
+    /// > `ply test --backend <spec>` installs it, through the one production
+    /// > caller this method has: `ply_test::InterpExecutor::machine_lowering`.
+    /// > The rule is armed twice, per ADR 0026 §4.6, because one of the halves
+    /// > alone would be an accident — `--engine both` already bypasses the cache,
+    /// > so a backend on *that* path would be safe for a reason that has nothing
+    /// > to do with backends:
+    /// >
+    /// > - `cache_bypassed` reads `args.backend`, so a backend run on the
+    /// >   **default** engine reads nothing from the store either. That is the
+    /// >   flag half and it covers a backend that arrives by the flag.
+    /// > - `ply_test::run_with` records `ply_test::Record::Backend` for any
+    /// >   test whose native entry count is non-zero, so nothing is written
+    /// >   whatever the flags said, and `ply test`'s `backend_escapes` turns a
+    /// >   written `Pass` beside a non-zero count into an `INTERNAL_ERROR`. That
+    /// >   is the half that survives a backend arriving by a route no flag names.
+    /// >
+    /// > The second bullet stands unchanged and is now checked rather than
+    /// > stated: `--engine both --backend wrong:off-by-one` is caught by two
+    /// > tests on the value axis, and six of the other seven configurations are
+    /// > caught too. `crates/ply-cli/tests/backend.rs` names the eighth.
+    ///
     /// [`Compiled`]: crate::Compiled
     pub fn set_compiled(&mut self, compiled: Rc<dyn crate::Compiled>) {
         if compiled.describes(self.program) {

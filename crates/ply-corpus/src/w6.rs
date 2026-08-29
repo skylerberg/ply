@@ -841,10 +841,28 @@ impl Default for Criteria {
     }
 }
 
+/// The one workload every share in this module is taken on.
+///
+/// A constant rather than a parameter because it is a property of the
+/// **instrument**: [`Ladder::missing`] refuses a ladder without all nine of
+/// `Layer::ORDER`'s rungs, so a compute kernel or a lexer over a file cannot be
+/// fed to `w6` at all — it answers [`Verdict::Undecided`] for them, correctly.
+///
+/// It is carried on [`Decision`] and printed beside the verdict because of what
+/// ADR 0026 §4.2 withdraws: this ladder's authority over **M9**, on three
+/// measured grounds — it refuses every workload but this one, its share moves
+/// with the network rather than with Ply, and its reopen sentence names a
+/// criterion only a regression can satisfy. The measurement is untouched and
+/// stays the best account this project has of where a served request's time
+/// goes. What changed is that "35% of a request" may no longer be read as "35%
+/// of Ply".
+pub const WORKLOAD: &str =
+    "the served HTTP workload (examples/desk.ply over a socket, TLS and postgres)";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Verdict {
-    /// Bring M9 forward.
+    /// Bring a code generator for this workload forward.
     Advance,
     /// The grey band cleared: M9 is justified, and the report says on what
     /// conditions, because the share alone did not carry it.
@@ -860,9 +878,9 @@ pub enum Verdict {
 impl Verdict {
     pub fn label(self) -> &'static str {
         match self {
-            Verdict::Advance => "advance M9",
-            Verdict::Conditional => "advance M9, conditionally",
-            Verdict::Defer => "keep deferring M9",
+            Verdict::Advance => "advance a code generator for this workload",
+            Verdict::Conditional => "advance a code generator for this workload, conditionally",
+            Verdict::Defer => "keep deferring a code generator for this workload",
             Verdict::Undecided => "undecided — the measurement did not decide it",
         }
     }
@@ -871,6 +889,8 @@ impl Verdict {
 #[derive(Clone, Debug, Serialize)]
 pub struct Decision {
     pub verdict: Verdict,
+    /// What the share was taken on. See [`WORKLOAD`].
+    pub workload: &'static str,
     /// [`Ladder::conservative_share`] — the share after a negative residue is
     /// charged back — because that is the one a decision may read.
     pub interpreter_share: f64,
@@ -916,6 +936,7 @@ pub fn decide(
 
     let undecided = |reasons: Vec<String>| Decision {
         verdict: Verdict::Undecided,
+        workload: WORKLOAD,
         interpreter_share: share,
         spike_speedup: 0.0,
         projected: 1.0,
@@ -1028,11 +1049,15 @@ pub fn decide(
     let reopens_at = if wants.is_empty() {
         "every criterion this ladder reads is already met".to_string()
     } else {
-        format!("M9 reopens when {}", wants.join(", and "))
+        format!(
+            "a code generator for this workload reopens when {}",
+            wants.join(", and ")
+        )
     };
 
     let mut decision = Decision {
         verdict: Verdict::Defer,
+        workload: WORKLOAD,
         interpreter_share: share,
         spike_speedup: k,
         projected: e,
@@ -1076,10 +1101,10 @@ pub fn decide(
                 gaps.len()
             )
         };
-        decision.reopens_at = if decision.reopens_at.starts_with("M9 reopens when") {
+        decision.reopens_at = if decision.reopens_at.starts_with("a code generator") {
             format!("{}, and {priced}", decision.reopens_at)
         } else {
-            format!("M9 reopens when {priced}")
+            format!("a code generator for this workload reopens when {priced}")
         };
         return decision;
     }
@@ -1162,7 +1187,8 @@ pub fn decide(
             criteria.min_share * 100.0,
             criteria.min_spike
         ));
-        decision.reopens_at = "decided; M9 is scheduled".to_string();
+        decision.reopens_at =
+            "decided for this workload; scheduling it is a milestone with an ADR".to_string();
         return decision;
     }
     if k >= criteria.gray_spike {
@@ -1174,7 +1200,7 @@ pub fn decide(
             criteria.gray_spike
         ));
         decision.reopens_at =
-            "conditional; M9's scope is the compiled fragment the spike proved, not a whole backend"
+            "conditional; the scope is the compiled fragment the spike proved, not a whole backend"
                 .to_string();
         return decision;
     }
@@ -1660,7 +1686,11 @@ pub fn render(report: &Report) -> String {
     }
 
     let decision = report.decision(&ladder);
-    s.push_str(&format!("M9: {}\n", decision.verdict.label()));
+    s.push_str(&format!(
+        "verdict: {}\n  workload: {}\n",
+        decision.verdict.label(),
+        decision.workload
+    ));
     for reason in &decision.reasons {
         s.push_str(&format!("  - {reason}\n"));
     }
@@ -2051,6 +2081,52 @@ mod tests {
         assert!(decision.reasons[0].contains("negative"));
     }
 
+    /// ADR 0026 §4.2, in code: the ladder answers about what it measured.
+    ///
+    /// Nothing about the thresholds moved and nothing about the arithmetic
+    /// moved; a run over the shipped files reads the same share, the same
+    /// projection and the same verdict it always did. What may not survive is
+    /// the *claim*: a nine-rung HTTP instrument that prints "keep deferring M9"
+    /// has answered a question about the language, and `Ladder::missing` refuses
+    /// every workload but this one — so it cannot have.
+    ///
+    /// Seen to fail: restoring `Verdict::label`'s "keep deferring M9" turns this
+    /// red on the first assertion, and dropping `Decision::workload` from the
+    /// rendered sentence turns it red on the second.
+    #[test]
+    fn a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone() {
+        let full = report(full_points());
+        let rendered = rendered(&full).unwrap();
+        assert_eq!(rendered.decision.workload, WORKLOAD);
+        for verdict in [
+            Verdict::Advance,
+            Verdict::Conditional,
+            Verdict::Defer,
+            Verdict::Undecided,
+        ] {
+            assert!(
+                !verdict.label().contains("M9"),
+                "`{}` names a milestone; the ladder decides a workload",
+                verdict.label()
+            );
+        }
+        assert!(
+            !rendered.decision.reopens_at.contains("M9"),
+            "the reopen sentence names a milestone: {}",
+            rendered.decision.reopens_at
+        );
+
+        let text = render(&full);
+        assert!(
+            text.contains("workload: the served HTTP workload"),
+            "the rendered report does not say what its share was taken on:\n{text}"
+        );
+        assert!(
+            !text.contains("M9:"),
+            "the rendered report still heads its verdict with a milestone:\n{text}"
+        );
+    }
+
     #[test]
     fn an_unpriced_alternative_defers_whatever_the_share_says() {
         let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -2357,7 +2433,8 @@ mod tests {
             "what this language serves today",
             "where this is genuinely not competitive",
             "what W6 did not measure",
-            "M9: advance M9",
+            "verdict: advance a code generator for this workload",
+            "workload: the served HTTP workload",
         ] {
             assert!(out.contains(expected), "`{expected}` missing from:\n{out}");
         }

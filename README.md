@@ -396,6 +396,22 @@ speed: the tree-walker is 2.82x faster on the request path.
 > **12.9x slower** than the machine at k = 8,000 against 1.2x at k = 1,000. The
 > counts behind that are in
 > `crates/ply-eval/tests/stdlib_accumulator_cost.rs` and ADR 0020 §7 item 3.
+>
+> **And it is three runs, not two, when `--backend` is given (2026-08-28).**
+> `ply test --backend <spec>` attaches a compiled backend, and under `--engine
+> both` that backend is a **third** engine — compared against the plain machine
+> rather than against the tree-walker, so that a divergence reported is the
+> backend's and nothing else's. ADR 0016 §2.2 priced the third pair as a
+> permanent cost before it existed;
+> [ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.5 is why it is paid.
+>
+> The backend that ships today is `reference` — a second tree-walker over the
+> scalar-signature fragment, **not** a code generator, and slower than the
+> machine. It exists so that a wrong backend can be *caught* before a fast one is
+> argued about: `--backend wrong:<mutation>` installs one of eight deliberately
+> wrong backends, and `ply test` catches seven of them. Nothing about this
+> makes Ply faster, and a run with a backend attached neither reads nor writes
+> the result cache.
 
 **The request-path allocation count is large.** One `/health` request makes
 **773 allocations and 108,200 bytes** to produce a 107-byte response.

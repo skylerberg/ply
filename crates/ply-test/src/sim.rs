@@ -63,6 +63,19 @@ pub enum Record {
     /// that under-reports, which is the failure mode the whole boundary is built
     /// around, so it is reported rather than silently uncached.
     Host,
+    /// The run entered natively compiled code, so its green verdict is a
+    /// statement about a third execution strategy and not about the
+    /// authoritative engine.
+    ///
+    /// The same shape as [`Record::Host`] and for the same reason, one field
+    /// over: decided by what the machine **did** — a non-zero native entry count
+    /// — never by the flag that installed the backend. ADR 0026 §4.6 is why the
+    /// two halves are separate: `--engine both` already bypasses the cache, so a
+    /// backend installed on that path would be cache-safe *by accident*, and a
+    /// rule enforced by an accident is not enforced. `ply test`'s
+    /// `backend_escapes` is the check that this variant was chosen, and it fires
+    /// when the runner and the backend disagree about what the run may record.
+    Backend,
 }
 
 impl Record {
