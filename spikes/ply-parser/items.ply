@@ -1,0 +1,1154 @@
+// Items: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`,
+// `derive`, and the import table — `crates/ply-syntax/src/parser.rs:261-1025`,
+// ported function for function.
+//
+// This area sits at the top of the AST's sort DAG (it reaches types, patterns
+// and expressions and none of them reaches back), and it owns **all** of the
+// recovery machinery: `run`'s abandon-and-resynchronise loop, `recover_to_item`,
+// and every "this cannot be `pub`" diagnostic. So it is the area where the
+// `bail: Bool` design either holds or does not, and the one whose testing is
+// fixture-driven rather than corpus-driven — no real `.ply` file in the tree
+// reaches a single line of the recovery half.
+//
+// Two shapes recur and both are the spine's:
+//
+//   * every function opens `if p.bail { { p: p, node: <placeholder> } }`, which
+//     is what replaces `?`;
+//   * every sequence is one `iterate` with the budget `remaining tokens + 1`, a
+//     backstop that cannot fire.
+
+import spine (Span, Ident, QName, Ctx, P, R, Acc, PDiag, Label, Ate, Start,
+              span_to, dummy_span, no_ident, no_qname, bare, qualified,
+              unexpected, unknown_deriver, unknown_effect_set,
+              diag1, diag2, push_diag, bail_with, error_here, unclosed,
+              kind, kind_at, cur_span, span_at, prev_span, at, at_eof,
+              at_ident_text, is_ident, is_str, starts_upper,
+              advance, bump, eat, expect, expect_close, expect_ident, expect_gt,
+              with_bail, clear_bail, with_no_brace, with_depth, with_sets,
+              fresh_item, start, qname, comma_list,
+              t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
+              t_comma, t_colon, t_dot, t_eq, t_lt, t_gt, t_ge, t_pipe,
+              t_slash, t_arrow,
+              k_pub, k_fn, k_type, k_effect, k_nondet, k_test, k_import,
+              num, hex, rec, nlist, opt, payload, word, dump_bool,
+              dump_list, dump_opt, dump_ident, dump_qname, dump_diags)
+import lexer (Tok, Token, TIdent, TStr, TKw, TPunct, TEof)
+import types (TypeExpr, RowExpr, AtomExpr, Mode, Generics, Param, RowMember,
+              MRead, MWrite, RMAtom, RMSet,
+              ty, ty_span, no_ty, mode, generics, param, row, row_member,
+              no_generics, dump_ty, dump_row, dump_atom, dump_param,
+              dump_generics, dump_mode)
+import exprs (Expr, expr, scrutinee, block_expr, expr_span, no_expr, dump_expr)
+
+// --- The tree ---------------------------------------------------------------
+//
+// Named record types rather than inline anonymous ones, which is available here
+// and is *not* available lower down: `Expr` and `TypeExpr` are recursive and a
+// named record alias in the cycle would be mutual recursion between an alias and
+// an ADT, which nothing in `crates/ply-std/ply/` or `examples/` does. Nothing
+// here recurses — `Item` reaches `FnDef` reaches `Expr` and stops — so the
+// reference's struct-per-item shape ports directly.
+
+pub type Vis = | VPub | VPriv
+
+pub type ImportKind = | IModule | IAlias(Ident) | INames(List<Ident>)
+
+pub type ImportDecl = { path: List<Ident>, kind: ImportKind, span: Span }
+
+pub type Deriver = | DJson | DEq | DOrd
+
+pub type Constraint = { deriver: Deriver, deriver_span: Span, param: Ident, span: Span }
+
+pub type SpecKind = | SRequires | SEnsures
+
+pub type SpecClause = { kind: SpecKind, expr: Expr, span: Span }
+
+// `FnDef::derived` is not carried: the parser writes `None` into it at
+// `parser.rs:723` and nothing in this file can produce anything else, so a field
+// that is constant over every parse is a field the dump cannot distinguish
+// anything by. The reference-side dumper asserts it is `None` rather than
+// omitting it silently — otherwise it is a field reached and not emitted, which
+// is the survivor the injectivity sweep exists to find.
+pub type FnDef = {
+  vis: Vis,
+  name: Ident,
+  generics: Generics,
+  params: List<Param>,
+  ret: Option<TypeExpr>,
+  effects: Option<RowExpr>,
+  constraints: List<Constraint>,
+  spec: List<SpecClause>,
+  body: Expr,
+  span: Span,
+}
+
+pub type Binder = { name: Ident, ty: TypeExpr, span: Span }
+
+pub type LawDef = {
+  name: Bytes,
+  name_span: Span,
+  host: Bool,
+  binders: List<Binder>,
+  guard: Option<Expr>,
+  body: Expr,
+  span: Span,
+}
+
+pub type VariantDef = { name: Ident, fields: List<TypeExpr>, span: Span }
+
+pub type TypeDefBody = | TDAlias(TypeExpr) | TDSum(List<VariantDef>)
+
+pub type TypeDef = { vis: Vis, name: Ident, params: List<Ident>, body: TypeDefBody, span: Span }
+
+pub type OpDef = {
+  name: Ident,
+  mode: Mode,
+  resource_param: Bool,
+  params: List<TypeExpr>,
+  ret: TypeExpr,
+  span: Span,
+}
+
+// `is_nondet`, not `nondet`: **`nondet` is one of Ply's fifteen keywords and a
+// keyword cannot be a record field name.** `EffectDef::nondet` and
+// `TestDef::nondet` are the reference's own field names, so the AST this parser
+// is a port of cannot be spelled in the language it is being ported into
+// without a rename. `GAPS.md` §P6.
+pub type EffectDef = { vis: Vis, name: Ident, is_nondet: Bool, ops: List<OpDef>, span: Span }
+
+pub type TestDef = { name: Bytes, name_span: Span, is_nondet: Bool, body: Expr, span: Span }
+
+pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span: Span }
+
+pub type EffectSetDef = {
+  name: Ident,
+  atoms: List<AtomExpr>,
+  includes: List<QName>,
+  expansion: List<AtomExpr>,
+  span: Span,
+}
+
+pub type Item =
+  | IFn(FnDef)
+  | IType(TypeDef)
+  | IEffect(EffectDef)
+  | ITest(TestDef)
+  | ILaw(LawDef)
+  | IDerive(DeriveDef)
+  | IEffectSet(EffectSetDef)
+
+// `Module::name` and `Module::source` are dropped: one file, one module, and the
+// name is the driver's business rather than the parser's.
+pub type Module = { imports: List<ImportDecl>, items: List<Item> }
+
+// --- Placeholders -----------------------------------------------------------
+//
+// The price of a bail flag: a function that has failed still has to answer a
+// value of its return type, so every sort needs a constructible zero. `M6`
+// counts these. In the reference each of them is the `Err(Bail)` that `?`
+// propagates and costs nothing to write.
+
+pub fn no_import() -> ImportDecl = { path: [], kind: IModule, span: dummy_span() }
+
+pub fn no_binder() -> Binder = { name: no_ident(), ty: no_ty(), span: dummy_span() }
+
+pub fn no_constraint() -> Constraint =
+  { deriver: DJson, deriver_span: dummy_span(), param: no_ident(), span: dummy_span() }
+
+pub fn no_spec() -> SpecClause = { kind: SRequires, expr: no_expr(), span: dummy_span() }
+
+pub fn no_variant() -> VariantDef = { name: no_ident(), fields: [], span: dummy_span() }
+
+pub fn no_op() -> OpDef =
+  { name: no_ident(), mode: MRead, resource_param: false, params: [], ret: no_ty(),
+    span: dummy_span() }
+
+pub fn no_fn() -> FnDef =
+  { vis: VPriv, name: no_ident(), generics: no_generics(), params: [], ret: None,
+    effects: None, constraints: [], spec: [], body: no_expr(), span: dummy_span() }
+
+pub fn no_type_def() -> TypeDef =
+  { vis: VPriv, name: no_ident(), params: [], body: TDAlias(no_ty()), span: dummy_span() }
+
+pub fn no_effect_def() -> EffectDef =
+  { vis: VPriv, name: no_ident(), is_nondet: false, ops: [], span: dummy_span() }
+
+pub fn no_test_def() -> TestDef =
+  { name: b"", name_span: dummy_span(), is_nondet: false, body: no_expr(), span: dummy_span() }
+
+pub fn no_law_def() -> LawDef =
+  { name: b"", name_span: dummy_span(), host: false, binders: [], guard: None,
+    body: no_expr(), span: dummy_span() }
+
+pub fn no_derive_def() -> DeriveDef =
+  { deriver: DJson, deriver_span: dummy_span(), target: no_ident(), span: dummy_span() }
+
+pub fn no_effect_set() -> EffectSetDef =
+  { name: no_ident(), atoms: [], includes: [], expansion: [], span: dummy_span() }
+
+pub fn no_item() -> Item = IFn(no_fn())
+
+pub fn item_span(i: Item) -> Span =
+  match i {
+    IFn(d) -> d.span,
+    IType(d) -> d.span,
+    IEffect(d) -> d.span,
+    ITest(d) -> d.span,
+    ILaw(d) -> d.span,
+    IDerive(d) -> d.span,
+    IEffectSet(d) -> d.span,
+  }
+
+// --- Item starts ------------------------------------------------------------
+
+// The spine's `is_ident`/`is_str` ask about the token under the cursor.
+// `at_law_start` and `at_effect_set_start` ask about the token one and two
+// ahead, and `kind_at` has already answered with a `Tok`, so the same question
+// is asked a second way. Two extra functions, and the only reason they exist is
+// that a `Tok` payload cannot be tested without naming its variant.
+pub fn tok_is_ident(t: Tok) -> Bool = match t { TIdent(n) -> true, _ -> false }
+
+pub fn tok_is_str(t: Tok) -> Bool = match t { TStr(v) -> true, _ -> false }
+
+// `parser.rs:386`.
+pub fn at_item_start(c: Ctx, p: P) -> Bool = {
+  let k = kind(c, p);
+  k == k_import() || k == k_pub() || k == k_fn() || k == k_type() || k == k_effect()
+    || k == k_nondet() || k == k_test() || at_law_start(c, p) || at_derive_start(c, p)
+}
+
+// `law` is contextual: it opens an item only when a quoted label follows, so
+// `fn law(..)` and a local named `law` keep their meaning. `law/host` puts a `/`
+// and a name between the two, exactly as `test/nondet` does. `parser.rs:399`.
+pub fn at_law_start(c: Ctx, p: P) -> Bool =
+  at_ident_text(c, p, b"law")
+    && (tok_is_str(kind_at(c, p, 1))
+        || (kind_at(c, p, 1) == t_slash() && tok_is_ident(kind_at(c, p, 2))))
+
+// `parser.rs:409`.
+pub fn at_derive_start(c: Ctx, p: P) -> Bool =
+  at_ident_text(c, p, b"derive") && tok_is_ident(kind_at(c, p, 1))
+
+// `set` is contextual: `effect set { .. }` is still an effect named `set`,
+// because only the third token being an identifier too can open a set.
+// `parser.rs:545`.
+pub fn at_effect_set_start(c: Ctx, p: P) -> Bool =
+  at(c, p, k_effect())
+    && (match kind_at(c, p, 1) { TIdent(n) -> n == b"set", _ -> false })
+    && tok_is_ident(kind_at(c, p, 2))
+
+// --- Recovery ---------------------------------------------------------------
+
+pub type Rec = { p: P, depth: Int }
+
+pub fn is_open(k: Tok) -> Bool = k == t_lparen() || k == t_lbrace() || k == t_lbracket()
+
+pub fn is_close(k: Tok) -> Bool = k == t_rparen() || k == t_rbrace() || k == t_rbracket()
+
+// `parser.rs:413`, the `loop` with a bracket-depth counter.
+//
+// This is the one `iterate` in the parser whose termination argument is not
+// "the item parser consumed a token". It is stronger: **the driver itself calls
+// `bump` on every round, unconditionally**, and `bump` clamps at the last token,
+// which is always `TEof` — at which point the first guard stops. So the loop
+// terminates in at most `ntok - pos` rounds however the grammar behaved, and the
+// budget below cannot fire.
+//
+// It is also the only place in this area that must run with `bail` **cleared**,
+// which the two callers do: recovery is what happens after the failure is
+// caught, and a guarded `bump` would refuse to move.
+pub fn recover_to_item(c: Ctx, p: P) -> P = {
+  // Both callers consume the leading keyword before they can fail, so already
+  // being at an item start means progress was made and the token belongs to the
+  // next construct rather than the abandoned one.
+  let p0 = if !at_eof(c, p) && !at_item_start(c, p) { bump(c, p) } else { p };
+  iterate({ p: p0, depth: 0 }, c.ntok - p0.pos + 2, |s: Rec|
+    if at_eof(c, s.p) { Stop(s.p) }
+    else if s.depth == 0 && at_item_start(c, s.p) { Stop(s.p) }
+    else {
+      let k = kind(c, s.p);
+      let d = if is_open(k) { s.depth + 1 }
+              else if is_close(k) { if s.depth <= 0 { 0 } else { s.depth - 1 } }
+              else { s.depth };
+      Continue({ p: bump(c, s.p), depth: d })
+    })
+}
+
+// --- Imports ----------------------------------------------------------------
+
+pub fn import_name(c: Ctx, p: P) -> R<Ident> =
+  expect_ident(c, p, b"a name to import from the module")
+
+// `import a.b.c` — the dotted path. `parser.rs:325`.
+pub fn import_path(c: Ctx, p: P, first: Ident) -> R<List<Ident>> =
+  iterate({ p: p, out: [first] }, c.ntok - p.pos + 1, |s: Acc<Ident>|
+    if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
+      let d = eat(c, s.p, t_dot());
+      if !d.ok { Stop({ p: d.p, node: s.out }) } else {
+        let n = expect_ident(c, d.p, b"another module path segment after `.`");
+        if n.p.bail { Stop({ p: n.p, node: s.out }) }
+        else { Continue({ p: n.p, out: push(s.out, n.node) }) }
+      }
+    })
+
+// `as` is contextual: it stays usable as an ordinary identifier.
+// `parser.rs:331-350`.
+pub fn import_kind(c: Ctx, p: P) -> R<ImportKind> =
+  if p.bail { { p: p, node: IModule } }
+  else if at_ident_text(c, p, b"as") {
+    let a = advance(c, p);
+    let n = expect_ident(c, a.p, b"a name to bind the module as, after `as`");
+    if n.p.bail { { p: n.p, node: IModule } } else { { p: n.p, node: IAlias(n.node) } }
+  }
+  else if at(c, p, t_lparen()) {
+    let o = advance(c, p);
+    let names = comma_list(c, o.p, t_rparen(), import_name);
+    let cl = expect_close(c, names.p, t_rparen(), o.node, b"`)` to close the imported names");
+    if cl.p.bail { { p: cl.p, node: IModule } }
+    else if len(names.node) == 0 {
+      // An empty list imports nothing: one primary label over `(..)`, one note.
+      { p: with_bail(push_diag(cl.p, diag1(unexpected(), span_to(o.node, cl.node), 1))),
+        node: IModule }
+    }
+    else { { p: cl.p, node: INames(names.node) } }
+  }
+  else { { p: p, node: IModule } }
+
+// `import m as x (a, b)` renames *and* selects, which is two bindings for one
+// declaration. `parser.rs:352-372`.
+pub fn imports_both(c: Ctx, p: P, k: ImportKind) -> Bool =
+  match k {
+    IAlias(a) -> at(c, p, t_lparen()),
+    INames(ns) -> at_ident_text(c, p, b"as"),
+    IModule -> false,
+  }
+
+pub fn import_decl(c: Ctx, p: P) -> R<ImportDecl> =
+  if p.bail { { p: p, node: no_import() } } else {
+    let st = advance(c, p);
+    let first = expect_ident(c, st.p, b"a module path after `import`");
+    if first.p.bail { { p: first.p, node: no_import() } } else {
+      let path = import_path(c, first.p, first.node);
+      if path.p.bail { { p: path.p, node: no_import() } } else {
+        let k = import_kind(c, path.p);
+        if k.p.bail { { p: k.p, node: no_import() } }
+        else if imports_both(c, k.p, k.node) {
+          { p: with_bail(push_diag(k.p, diag1(unexpected(), cur_span(c, k.p), 1))),
+            node: no_import() }
+        }
+        else {
+          { p: k.p,
+            node: { path: path.node, kind: k.node,
+                    span: span_to(st.node, prev_span(c, k.p)) } }
+        }
+      }
+    }
+  }
+
+// Every `import` precedes every item, so the import table is complete before any
+// body is parsed. `parser.rs:295`.
+pub fn imports(c: Ctx, p: P) -> R<List<ImportDecl>> =
+  iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<ImportDecl>|
+    if !at(c, s.p, k_import()) { Stop({ p: s.p, node: s.out }) } else {
+      let d = import_decl(c, s.p);
+      if d.p.bail { Continue({ p: recover_to_item(c, clear_bail(d.p)), out: s.out }) }
+      else { Continue({ p: d.p, out: push(s.out, d.node) }) }
+    })
+
+// Reported rather than silently accepted: a later pass would otherwise have to
+// look ahead to know what a name in an earlier body could mean. `parser.rs:308`.
+//
+// The secondary label points at the **first** item, and `Vec::first` is not
+// available: the `List` surface has no index and no head. Rather than fold the
+// item list on every out-of-order import, `run`'s accumulator carries the first
+// item's span as it goes — O(1) instead of O(n), at the cost of one more field
+// threaded through the loop. `GAPS.md` §P3.
+pub fn import_out_of_order(c: Ctx, p: P, first_item: Option<Span>) -> P =
+  match first_item {
+    Some(s) -> push_diag(p, diag2(unexpected(), cur_span(c, p), s, 1)),
+    None -> push_diag(p, diag1(unexpected(), cur_span(c, p), 1)),
+  }
+
+// --- `where` and its constraints -------------------------------------------
+
+// The derivers are fixed — there are no user-defined ones — so an unrecognized
+// name is reported here with the whole list rather than left to fail as an
+// unknown reference in generated code the user never wrote. `parser.rs:624`.
+pub fn deriver_of(name: Bytes) -> Option<Deriver> =
+  if name == b"json" { Some(DJson) }
+  else if name == b"eq" { Some(DEq) }
+  else if name == b"ord" { Some(DOrd) }
+  else { None }
+
+pub type RDeriver = { p: P, node: Deriver }
+
+pub fn deriver(c: Ctx, p: P, name: Ident) -> RDeriver =
+  if p.bail { { p: p, node: DJson } } else {
+    match deriver_of(name.name) {
+      Some(d) -> { p: p, node: d },
+      None -> { p: with_bail(push_diag(p, diag1(unknown_deriver(), name.span, 1))),
+                node: DJson },
+    }
+  }
+
+// `parser.rs:660`.
+pub fn constraint(c: Ctx, p: P) -> R<Constraint> =
+  if p.bail { { p: p, node: no_constraint() } } else {
+    let start = cur_span(c, p);
+    if !at_ident_text(c, p, b"derivable") {
+      { p: error_here(c, p, b"`derivable(<deriver>, <type parameter>)`"), node: no_constraint() }
+    } else {
+      let a = advance(c, p);
+      let o = expect(c, a.p, t_lparen(), b"`(` after `derivable`");
+      let n = expect_ident(c, o.p, b"a deriver name");
+      let d = deriver(c, n.p, n.node);
+      let cm = expect(c, d.p, t_comma(), b"`,` and the type parameter");
+      let pa = expect_ident(c, cm.p, b"the type parameter the constraint is about");
+      let cl = expect_close(c, pa.p, t_rparen(), o.node, b"`)` to close `derivable`");
+      if cl.p.bail { { p: cl.p, node: no_constraint() } }
+      else {
+        { p: cl.p,
+          node: { deriver: d.node, deriver_span: n.node.span, param: pa.node,
+                  span: span_to(start, cl.node) } }
+      }
+    }
+  }
+
+// `where derivable(json, a), derivable(ord, k)`, between the effect row and any
+// `requires`. Contextual: the grammar admits nothing but `=`, `{`, `requires`
+// and `ensures` at this position, so no ordinary name loses its meaning.
+// `parser.rs:646`.
+pub fn where_clause(c: Ctx, p: P) -> R<List<Constraint>> =
+  if p.bail || !at_ident_text(c, p, b"where") { { p: p, node: [] } } else {
+    let a = advance(c, p);
+    iterate({ p: a.p, out: [] }, c.ntok - a.p.pos + 1, |s: Acc<Constraint>|
+      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
+        let cn = constraint(c, s.p);
+        if cn.p.bail { Stop({ p: cn.p, node: s.out }) } else {
+          let cm = eat(c, cn.p, t_comma());
+          if !cm.ok { Stop({ p: cm.p, node: push(s.out, cn.node) }) }
+          else { Continue({ p: cm.p, out: push(s.out, cn.node) }) }
+        }
+      })
+  }
+
+// --- `fn` -------------------------------------------------------------------
+
+// `requires` and `ensures` are contextual, recognized only between a `fn` header
+// and its body — where the grammar previously admitted nothing but `=` and `{`,
+// so no ordinary name loses its meaning. `parser.rs:734`.
+pub fn spec_kind_at(c: Ctx, p: P) -> Option<SpecKind> =
+  if at_ident_text(c, p, b"requires") { Some(SRequires) }
+  else if at_ident_text(c, p, b"ensures") { Some(SEnsures) }
+  else { None }
+
+pub fn spec_clauses(c: Ctx, p: P) -> R<List<SpecClause>> =
+  if p.bail { { p: p, node: [] } } else {
+    iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<SpecClause>|
+      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
+        match spec_kind_at(c, s.p) {
+          None -> Stop({ p: s.p, node: s.out }),
+          Some(k) -> {
+            let a = advance(c, s.p);
+            // Parsed like an `if` condition: a `{` closes the clause and opens
+            // the function's block body, so `ensures p(x) { .. }` is a clause
+            // plus a body and never a record literal.
+            let e = scrutinee(c, a.p);
+            if e.p.bail { Stop({ p: e.p, node: s.out }) }
+            else {
+              Continue({ p: e.p,
+                         out: push(s.out, { kind: k, expr: e.node,
+                                            span: span_to(a.node, expr_span(e.node)) }) })
+            }
+          },
+        }
+      })
+  }
+
+pub fn fn_body(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let e = eat(c, p, t_eq());
+    if e.ok { expr(c, e.p) }
+    else if at(c, e.p, t_lbrace()) { block_expr(c, e.p) }
+    else { { p: error_here(c, e.p, b"`=` or `{` to start the function body"), node: no_expr() } }
+  }
+
+// `parser.rs:680`.
+pub fn fn_def(c: Ctx, p: P, vis: Vis) -> R<FnDef> =
+  if p.bail { { p: p, node: no_fn() } } else {
+    let st = advance(c, p);
+    let name = expect_ident(c, st.p, b"a function name after `fn`");
+    let g = if at(c, name.p, t_lt()) { generics(c, name.p) }
+            else { { p: name.p, node: no_generics() } };
+    let o = expect(c, g.p, t_lparen(), b"`(` to start the parameter list");
+    let ps = comma_list(c, o.p, t_rparen(), param);
+    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)` to close the parameter list");
+    let ar = eat(c, cl.p, t_arrow());
+    let ret = if ar.ok { let t = ty(c, ar.p); { p: t.p, node: Some(t.node) } }
+              else { { p: ar.p, node: None } };
+    let sl = eat(c, ret.p, t_slash());
+    let eff = if sl.ok { let r = row(c, sl.p); { p: r.p, node: Some(r.node) } }
+              else { { p: sl.p, node: None } };
+    let cs = where_clause(c, eff.p);
+    let sp = spec_clauses(c, cs.p);
+    let body = fn_body(c, sp.p);
+    if body.p.bail { { p: body.p, node: no_fn() } }
+    else {
+      { p: body.p,
+        node: { vis: vis, name: name.node, generics: g.node, params: ps.node,
+                ret: ret.node, effects: eff.node, constraints: cs.node, spec: sp.node,
+                body: body.node, span: span_to(st.node, expr_span(body.node)) } }
+    }
+  }
+
+// --- `law` ------------------------------------------------------------------
+
+// A binder's type is mandatory: inferring it would make a law's meaning depend
+// on how its body happened to be written. `parser.rs:810`.
+pub fn binder(c: Ctx, p: P) -> R<Binder> =
+  if p.bail { { p: p, node: no_binder() } } else {
+    let name = expect_ident(c, p, b"a binder name");
+    let co = expect(c, name.p, t_colon(), b"`:` and a type - a `forall` binder must be annotated");
+    let t = ty(c, co.p);
+    if t.p.bail { { p: t.p, node: no_binder() } }
+    else {
+      { p: t.p,
+        node: { name: name.node, ty: t.node,
+                span: span_to(name.node.span, ty_span(t.node)) } }
+    }
+  }
+
+pub type RBinders = { p: P, node: List<Binder> }
+
+pub fn law_binders(c: Ctx, p: P) -> RBinders =
+  if !at_ident_text(c, p, b"forall") { { p: p, node: [] } } else {
+    let a = advance(c, p);
+    let o = expect(c, a.p, t_lparen(), b"`(` to start the `forall` binders");
+    let bs = comma_list(c, o.p, t_rparen(), binder);
+    let cl = expect_close(c, bs.p, t_rparen(), o.node, b"`)` to close the binders");
+    if cl.p.bail { { p: cl.p, node: [] } }
+    else if len(bs.node) == 0 {
+      // A law with no binders is a ground claim: one primary over `(..)`, one
+      // note.
+      { p: with_bail(push_diag(cl.p, diag1(unexpected(), span_to(o.node, cl.node), 1))),
+        node: [] }
+    }
+    else { { p: cl.p, node: bs.node } }
+  }
+
+pub type RStr = { p: P, name: Bytes, span: Span }
+
+// A quoted label. `TokenKind::Str` carries the decoded text, which `lexer.ply`
+// carries as `TStr(Bytes)`.
+pub fn quoted(c: Ctx, p: P, what: Bytes) -> RStr =
+  if p.bail { { p: p, name: b"", span: dummy_span() } } else {
+    match kind(c, p) {
+      TStr(s) -> { p: bump(c, p), name: s, span: cur_span(c, p) },
+      _ -> { p: error_here(c, p, what), name: b"", span: dummy_span() },
+    }
+  }
+
+// `parser.rs:754`.
+pub fn law_def(c: Ctx, p: P) -> R<LawDef> =
+  if p.bail { { p: p, node: no_law_def() } } else {
+    let st = advance(c, p);
+    let sl = eat(c, st.p, t_slash());
+    let h = if !sl.ok { { p: sl.p, node: false } }
+            else if !at_ident_text(c, sl.p, b"host") { { p: error_here(c, sl.p, b"`host` after `law/`"), node: false } }
+            else { { p: advance(c, sl.p).p, node: true } };
+    let nm = quoted(c, h.p, b"a quoted law label");
+    if nm.p.bail { { p: nm.p, node: no_law_def() } } else {
+      let bs = law_binders(c, nm.p);
+      if bs.p.bail { { p: bs.p, node: no_law_def() } } else {
+        let w = eat(c, bs.p, t_pipe());
+        let g = if at_ident_text(c, bs.p, b"where") {
+                  let a = advance(c, bs.p);
+                  let e = scrutinee(c, a.p);
+                  { p: e.p, node: Some(e.node) }
+                } else { { p: bs.p, node: None } };
+        let body = block_expr(c, g.p);
+        if body.p.bail { { p: body.p, node: no_law_def() } }
+        else {
+          { p: body.p,
+            node: { name: nm.name, name_span: nm.span, host: h.node, binders: bs.node,
+                    guard: g.node, body: body.node,
+                    span: span_to(st.node, expr_span(body.node)) } }
+        }
+      }
+    }
+  }
+
+// --- `type` -----------------------------------------------------------------
+
+// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or a
+// second variant, so that `type Id = Int` keeps meaning what it looks like.
+// `parser.rs:896`.
+pub fn looks_like_variants(c: Ctx, p: P) -> Bool =
+  match kind(c, p) {
+    TPunct(s) -> s == b"pipe",
+    TIdent(n) ->
+      starts_upper(n) && (kind_at(c, p, 1) == t_lparen() || kind_at(c, p, 1) == t_pipe()),
+    _ -> false,
+  }
+
+// `parser.rs:906`.
+pub fn variants(c: Ctx, p: P) -> R<List<VariantDef>> =
+  if p.bail { { p: p, node: [] } } else {
+    let lead = eat(c, p, t_pipe());
+    iterate({ p: lead.p, out: [] }, c.ntok - lead.p.pos + 1, |s: Acc<VariantDef>|
+      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
+        let name = expect_ident(c, s.p, b"a variant name");
+        if name.p.bail { Stop({ p: name.p, node: s.out }) } else {
+          let fs = if !at(c, name.p, t_lparen()) { { p: name.p, node: [] } }
+                   else {
+                     let o = advance(c, name.p);
+                     let l = comma_list(c, o.p, t_rparen(), ty);
+                     let cl = expect_close(c, l.p, t_rparen(), o.node, b"`)` to close the variant fields");
+                     { p: cl.p, node: l.node }
+                   };
+          if fs.p.bail { Stop({ p: fs.p, node: s.out }) } else {
+            let v = { name: name.node, fields: fs.node,
+                      span: span_to(name.node.span, prev_span(c, fs.p)) };
+            let pi = eat(c, fs.p, t_pipe());
+            if !pi.ok { Stop({ p: pi.p, node: push(s.out, v) }) }
+            else { Continue({ p: pi.p, out: push(s.out, v) }) }
+          }
+        }
+      })
+  }
+
+// The type parameter list of a `type`, which is spelled out at `parser.rs:863`
+// rather than shared with `generics` because a `type` takes no effect
+// parameters.
+pub fn type_params(c: Ctx, p: P) -> R<List<Ident>> =
+  if !at(c, p, t_lt()) { { p: p, node: [] } } else {
+    let o = advance(c, p);
+    let ns = iterate({ p: o.p, out: [] }, c.ntok - o.p.pos + 1, |s: Acc<Ident>|
+      if s.p.bail || at(c, s.p, t_gt()) || at(c, s.p, t_ge()) {
+        Stop({ p: s.p, node: s.out })
+      } else if at_eof(c, s.p) {
+        Stop({ p: error_here(c, s.p, b"`>` to close the type parameter list"), node: s.out })
+      } else {
+        let n = expect_ident(c, s.p, b"a type parameter name");
+        if n.p.bail { Stop({ p: n.p, node: s.out }) } else {
+          let cm = eat(c, n.p, t_comma());
+          if !cm.ok { Stop({ p: cm.p, node: push(s.out, n.node) }) }
+          else { Continue({ p: cm.p, out: push(s.out, n.node) }) }
+        }
+      });
+    let g = expect_gt(c, ns.p, b"`>` to close the type parameter list");
+    { p: g.p, node: ns.node }
+  }
+
+// `parser.rs:860`.
+pub fn type_def(c: Ctx, p: P, vis: Vis) -> R<TypeDef> =
+  if p.bail { { p: p, node: no_type_def() } } else {
+    let st = advance(c, p);
+    let name = expect_ident(c, st.p, b"a type name after `type`");
+    let ps = type_params(c, name.p);
+    let eq = expect(c, ps.p, t_eq(), b"`=` after the type name");
+    if eq.p.bail { { p: eq.p, node: no_type_def() } } else {
+      let body = if looks_like_variants(c, eq.p) {
+                   let v = variants(c, eq.p);
+                   { p: v.p, node: TDSum(v.node) }
+                 } else {
+                   let t = ty(c, eq.p);
+                   { p: t.p, node: TDAlias(t.node) }
+                 };
+      if body.p.bail { { p: body.p, node: no_type_def() } }
+      else {
+        { p: body.p,
+          node: { vis: vis, name: name.node, params: ps.node, body: body.node,
+                  span: span_to(st.node, prev_span(c, body.p)) } }
+      }
+    }
+  }
+
+// --- `effect` ---------------------------------------------------------------
+
+// An operation parameter may be written `name: Type` for documentation; only the
+// type is part of the signature. `parser.rs:981`.
+pub fn op_param(c: Ctx, p: P) -> R<TypeExpr> =
+  if p.bail { { p: p, node: no_ty() } } else {
+    let p2 = if is_ident(c, p) && kind_at(c, p, 1) == t_colon() {
+               bump(c, bump(c, p))
+             } else { p };
+    ty(c, p2)
+  }
+
+// `parser.rs:947`.
+pub fn op_def(c: Ctx, p: P) -> R<OpDef> =
+  if p.bail { { p: p, node: no_op() } } else {
+    let start = cur_span(c, p);
+    let m = mode(c, p);
+    let name = expect_ident(c, m.p, b"an operation name");
+    let rp = if !at(c, name.p, t_lbracket()) { { p: name.p, node: false } }
+             else {
+               let o = advance(c, name.p);
+               let r = expect_ident(c, o.p, b"a resource parameter name inside `[..]`");
+               let cl = expect_close(c, r.p, t_rbracket(), o.node, b"`]`");
+               { p: cl.p, node: true }
+             };
+    let o = expect(c, rp.p, t_lparen(), b"`(` to start the operation parameters");
+    let ps = comma_list(c, o.p, t_rparen(), op_param);
+    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)` to close the operation parameters");
+    let ar = expect(c, cl.p, t_arrow(), b"`->` and a return type");
+    let ret = ty(c, ar.p);
+    if ret.p.bail { { p: ret.p, node: no_op() } }
+    else {
+      { p: ret.p,
+        node: { name: name.node, mode: m.node, resource_param: rp.node, params: ps.node,
+                ret: ret.node, span: span_to(start, ty_span(ret.node)) } }
+    }
+  }
+
+// `parser.rs:926`. The operation list has no separator, so this is the one
+// sequence in the area that is neither a `comma_list` nor `|`-separated: it
+// stops on `}` or end of input, and on a failed operation.
+pub fn op_defs(c: Ctx, p: P) -> R<List<OpDef>> =
+  iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<OpDef>|
+    if s.p.bail || at(c, s.p, t_rbrace()) || at_eof(c, s.p) {
+      Stop({ p: s.p, node: s.out })
+    } else {
+      let o = op_def(c, s.p);
+      if o.p.bail { Stop({ p: o.p, node: s.out }) }
+      else { Continue({ p: o.p, out: push(s.out, o.node) }) }
+    })
+
+pub fn effect_def(c: Ctx, p: P, vis: Vis) -> R<EffectDef> =
+  if p.bail { { p: p, node: no_effect_def() } } else {
+    let start = cur_span(c, p);
+    let nd = eat(c, p, k_nondet());
+    let ef = expect(c, nd.p, k_effect(), b"`effect` after `nondet`");
+    let name = expect_ident(c, ef.p, b"an effect name after `effect`");
+    let o = expect(c, name.p, t_lbrace(), b"`{` to start the operation list");
+    let ops = op_defs(c, o.p);
+    let cl = expect_close(c, ops.p, t_rbrace(), o.node, b"`}` to close the operation list");
+    if cl.p.bail { { p: cl.p, node: no_effect_def() } }
+    else {
+      { p: cl.p,
+        node: { vis: vis, name: name.node, is_nondet: nd.ok, ops: ops.node,
+                span: span_to(start, cl.node) } }
+    }
+  }
+
+// --- `effect set` -----------------------------------------------------------
+
+// Two lists grow in one loop and the positional rule can bless only one of them
+// (`spikes/ply-lexer/GAPS.md` §1: the growing container must be the *last*
+// sub-expression of its enclosing node). `atoms` takes the last slot because
+// every corpus member written as an atom lands there and `includes` is the rarer
+// form. Both are short — the largest set in the tree has three members — so the
+// choice is a shape, not a cost. `GAPS.md` §P5.
+pub type SetAcc = { p: P, includes: List<QName>, atoms: List<AtomExpr> }
+
+pub type RSetMembers = { p: P, includes: List<QName>, atoms: List<AtomExpr> }
+
+pub fn set_members(c: Ctx, p: P, open: Span) -> RSetMembers =
+  iterate({ p: p, includes: [], atoms: [] }, c.ntok - p.pos + 1, |s: SetAcc|
+    if s.p.bail || at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
+      Stop({ p: s.p, includes: s.includes, atoms: s.atoms })
+    } else if at_eof(c, s.p) {
+      Stop({ p: unclosed(c, s.p, open, b"`}` to close the effect set"), includes: s.includes, atoms: s.atoms })
+    } else {
+      let m = row_member(c, s.p);
+      if m.p.bail { Stop({ p: m.p, includes: s.includes, atoms: s.atoms }) } else {
+        let next = match m.node {
+          RMAtom(a) -> { p: m.p, includes: s.includes, atoms: push(s.atoms, a) },
+          RMSet(q) -> { p: m.p, atoms: s.atoms, includes: push(s.includes, q) },
+        };
+        let cm = eat(c, next.p, t_comma());
+        if !cm.ok {
+          Stop({ p: cm.p, includes: next.includes, atoms: next.atoms })
+        } else {
+          Continue({ p: cm.p, includes: next.includes, atoms: next.atoms })
+        }
+      }
+    })
+
+// `effect set Web = {..}`. `parser.rs:551`.
+//
+// `expansion` is left empty: `crates/ply-syntax/src/effect_set.rs::expand` fills
+// it, and it runs *inside* `parse_module` after the whole file is read. That
+// pass is 521 lines and is the fifth thing in this spike's build order, which is
+// to say it is not done. `README.md` records the two fallbacks and the size of
+// the exclusion.
+pub fn effect_set_def(c: Ctx, p: P) -> R<EffectSetDef> =
+  if p.bail { { p: p, node: no_effect_set() } } else {
+    let st = advance(c, with_sets(p));
+    let sk = advance(c, st.p);
+    let name = expect_ident(c, sk.p, b"a name for the effect set, after `effect set`");
+    let eq = expect(c, name.p, t_eq(), b"`=` after the effect set's name");
+    let o = expect(c, eq.p, t_lbrace(), b"`{` to open the effect set's members");
+    if o.p.bail { { p: o.p, node: no_effect_set() } } else {
+      let ms = set_members(c, o.p, o.node);
+      if ms.p.bail { { p: ms.p, node: no_effect_set() } }
+      else if at(c, ms.p, t_pipe()) {
+        // A set denotes a ground set of atoms, so there is no tail to abstract
+        // over and `| e` here would have no meaning to give: one primary, one
+        // note.
+        { p: with_bail(push_diag(ms.p, diag1(unexpected(), cur_span(c, ms.p), 1))),
+          node: no_effect_set() }
+      } else {
+        let cl = expect_close(c, ms.p, t_rbrace(), o.node, b"`}` to close the effect set");
+        if cl.p.bail { { p: cl.p, node: no_effect_set() } }
+        else {
+          { p: cl.p,
+            node: { name: name.node, atoms: ms.atoms, includes: ms.includes,
+                    expansion: [], span: span_to(st.node, cl.node) } }
+        }
+      }
+    }
+  }
+
+// --- `derive` ---------------------------------------------------------------
+
+// `derive json for Order`. `parser.rs:604`.
+pub fn derive_def(c: Ctx, p: P) -> R<DeriveDef> =
+  if p.bail { { p: p, node: no_derive_def() } } else {
+    let st = advance(c, p);
+    let name = expect_ident(c, st.p, b"a deriver name after `derive`");
+    let d = deriver(c, name.p, name.node);
+    if d.p.bail { { p: d.p, node: no_derive_def() } }
+    else if !at_ident_text(c, d.p, b"for") {
+      { p: error_here(c, d.p, b"`for` and the type to derive for"), node: no_derive_def() }
+    } else {
+      let f = advance(c, d.p);
+      let target = expect_ident(c, f.p, b"the type to derive for, after `for`");
+      if target.p.bail { { p: target.p, node: no_derive_def() } }
+      else {
+        { p: target.p,
+          node: { deriver: d.node, deriver_span: name.node.span, target: target.node,
+                  span: span_to(st.node, prev_span(c, target.p)) } }
+      }
+    }
+  }
+
+// --- `test` -----------------------------------------------------------------
+
+pub fn test_def(c: Ctx, p: P) -> R<TestDef> =
+  if p.bail { { p: p, node: no_test_def() } } else {
+    let st = advance(c, p);
+    let sl = eat(c, st.p, t_slash());
+    let nd = if !sl.ok { { p: sl.p, node: false } }
+             else { let k = expect(c, sl.p, k_nondet(), b"`nondet` after `test/`"); { p: k.p, node: true } };
+    let nm = quoted(c, nd.p, b"a quoted test name");
+    if nm.p.bail { { p: nm.p, node: no_test_def() } } else {
+      let body = block_expr(c, nm.p);
+      if body.p.bail { { p: body.p, node: no_test_def() } }
+      else {
+        { p: body.p,
+          node: { name: nm.name, name_span: nm.span, is_nondet: nd.node, body: body.node,
+                  span: span_to(st.node, expr_span(body.node)) } }
+      }
+    }
+  }
+
+// --- `item` -----------------------------------------------------------------
+
+// The four items that can never be `pub`, each reported where the reference
+// reports it and each **without** bailing: the `pub` is a mistake about the
+// item, not about the grammar, so the item is still parsed. `parser.rs:466`.
+pub fn no_pub(p: P, code: Bytes, s: Option<Span>, notes: Int) -> P =
+  match s { Some(sp) -> push_diag(p, diag1(code, sp, notes)), None -> p }
+
+pub fn item_at(c: Ctx, p: P, vis: Vis, pub_span: Option<Span>) -> R<Item> =
+  if at(c, p, k_fn()) {
+    let d = fn_def(c, p, vis);
+    { p: d.p, node: IFn(d.node) }
+  }
+  else if at(c, p, k_type()) {
+    let d = type_def(c, p, vis);
+    { p: d.p, node: IType(d.node) }
+  }
+  else if at_effect_set_start(c, p) {
+    // Two notes: an `effect set` is module-local, and a set expanding across a
+    // module boundary would leave a stale published row behind.
+    let d = effect_set_def(c, no_pub(p, unknown_effect_set(), pub_span, 2));
+    { p: d.p, node: IEffectSet(d.node) }
+  }
+  else if at(c, p, k_effect()) || at(c, p, k_nondet()) {
+    let d = effect_def(c, p, vis);
+    { p: d.p, node: IEffect(d.node) }
+  }
+  else if at(c, p, k_test()) {
+    let d = test_def(c, no_pub(p, unexpected(), pub_span, 1));
+    { p: d.p, node: ITest(d.node) }
+  }
+  else if at_law_start(c, p) {
+    let d = law_def(c, no_pub(p, unexpected(), pub_span, 1));
+    { p: d.p, node: ILaw(d.node) }
+  }
+  else if at_derive_start(c, p) {
+    let d = derive_def(c, no_pub(p, unexpected(), pub_span, 1));
+    { p: d.p, node: IDerive(d.node) }
+  }
+  else { { p: error_here(c, p, b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, or `derive`"), node: no_item() } }
+
+pub fn item(c: Ctx, p: P) -> R<Item> =
+  if p.bail { { p: p, node: no_item() } } else {
+    if at(c, p, k_pub()) {
+      let a = advance(c, p);
+      item_at(c, a.p, VPub, Some(a.node))
+    } else {
+      item_at(c, p, VPriv, None)
+    }
+  }
+
+// --- `run` ------------------------------------------------------------------
+
+// The module accumulator. **Two lists grow here too**, and `items` takes the
+// last slot because it is the one that grows on every file: an out-of-order
+// `import` is an error path and the corpus has none. `first` carries the first
+// item's span so that `import_out_of_order` can point at it without a `Vec::first`
+// the `List` surface does not have.
+pub type ModAcc = {
+  p: P,
+  first: Option<Span>,
+  imports: List<ImportDecl>,
+  items: List<Item>,
+}
+
+pub type RModule = { p: P, node: Module }
+
+// `parser.rs:261`.
+//
+// Every round either parses an item — which has consumed at least the keyword it
+// dispatched on before it can fail — or recovers, and `recover_to_item` consumes
+// one token unconditionally. So the loop makes progress on every round and the
+// budget below cannot fire.
+pub fn run(c: Ctx, p: P) -> RModule = {
+  let leading = imports(c, p);
+  let done = iterate({ p: leading.p, first: None, imports: leading.node, items: [] },
+                     c.ntok - leading.p.pos + 2,
+                     |s: ModAcc|
+    if at_eof(c, s.p) { Stop(s) } else {
+      // `run` resets both per-item pieces of state at the top of every round.
+      let p0 = fresh_item(s.p);
+      if at(c, p0, k_import()) {
+        let warned = import_out_of_order(c, p0, s.first);
+        let d = import_decl(c, warned);
+        if d.p.bail {
+          Continue({ p: recover_to_item(c, clear_bail(d.p)), first: s.first,
+                     items: s.items, imports: s.imports })
+        } else {
+          Continue({ p: d.p, first: s.first, items: s.items,
+                     imports: push(s.imports, d.node) })
+        }
+      } else {
+        let it = item(c, p0);
+        if it.p.bail {
+          Continue({ p: recover_to_item(c, clear_bail(it.p)), first: s.first,
+                     imports: s.imports, items: s.items })
+        } else {
+          let f = match s.first { None -> Some(item_span(it.node)), Some(x) -> Some(x) };
+          Continue({ p: it.p, first: f, imports: s.imports,
+                     items: push(s.items, it.node) })
+        }
+      }
+    });
+  { p: done.p, node: { imports: done.imports, items: done.items } }
+}
+
+pub fn parse(src: Bytes) -> RModule = {
+  let s = start(src);
+  run(s.c, s.p)
+}
+
+// --- The dump ---------------------------------------------------------------
+
+pub fn dump_vis(v: Vis) -> Bytes = match v { VPub -> word(b"pub"), VPriv -> word(b"priv") }
+
+pub fn dump_deriver(d: Deriver) -> Bytes =
+  match d { DJson -> word(b"json"), DEq -> word(b"eq"), DOrd -> word(b"ord") }
+
+pub fn dump_spec_kind(k: SpecKind) -> Bytes =
+  match k { SRequires -> word(b"requires"), SEnsures -> word(b"ensures") }
+
+pub fn dump_import_kind(k: ImportKind) -> Bytes =
+  match k {
+    IModule -> word(b"mod"),
+    IAlias(a) -> bytes_concat(word(b"alias"), dump_ident(a)),
+    INames(ns) -> bytes_concat(word(b"names"), dump_list(ns, dump_ident)),
+  }
+
+pub fn dump_import(d: ImportDecl) -> Bytes =
+  bytes_concat_all([rec(d.span, b"imp"), dump_list(d.path, dump_ident),
+                    dump_import_kind(d.kind)])
+
+pub fn dump_constraint(x: Constraint) -> Bytes =
+  bytes_concat_all([rec(x.span, b"cst"), dump_deriver(x.deriver),
+                    rec(x.deriver_span, b"dsp"), dump_ident(x.param)])
+
+pub fn dump_spec(x: SpecClause) -> Bytes =
+  bytes_concat_all([rec(x.span, b"spc"), dump_spec_kind(x.kind), dump_expr(x.expr)])
+
+pub fn dump_fn(d: FnDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"fn"), dump_vis(d.vis), dump_ident(d.name),
+                    dump_generics(d.generics), dump_list(d.params, dump_param),
+                    dump_opt(d.ret, dump_ty), dump_opt(d.effects, dump_row),
+                    dump_list(d.constraints, dump_constraint),
+                    dump_list(d.spec, dump_spec), dump_expr(d.body)])
+
+pub fn dump_binder(b: Binder) -> Bytes =
+  bytes_concat_all([rec(b.span, b"bnd"), dump_ident(b.name), dump_ty(b.ty)])
+
+pub fn dump_law(d: LawDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"law"), rec(d.name_span, b"lnm"), payload(d.name),
+                    dump_bool(d.host), dump_list(d.binders, dump_binder),
+                    dump_opt(d.guard, dump_expr), dump_expr(d.body)])
+
+pub fn dump_variant(v: VariantDef) -> Bytes =
+  bytes_concat_all([rec(v.span, b"var"), dump_ident(v.name), dump_list(v.fields, dump_ty)])
+
+pub fn dump_type_body(b: TypeDefBody) -> Bytes =
+  match b {
+    TDAlias(t) -> bytes_concat(word(b"alias"), dump_ty(t)),
+    TDSum(vs) -> bytes_concat(word(b"sum"), dump_list(vs, dump_variant)),
+  }
+
+pub fn dump_type(d: TypeDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"ty"), dump_vis(d.vis), dump_ident(d.name),
+                    dump_list(d.params, dump_ident), dump_type_body(d.body)])
+
+pub fn dump_op(o: OpDef) -> Bytes =
+  bytes_concat_all([rec(o.span, b"op"), dump_ident(o.name), dump_mode(o.mode),
+                    dump_bool(o.resource_param), dump_list(o.params, dump_ty),
+                    dump_ty(o.ret)])
+
+pub fn dump_effect(d: EffectDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"eff"), dump_vis(d.vis), dump_ident(d.name),
+                    dump_bool(d.is_nondet), dump_list(d.ops, dump_op)])
+
+pub fn dump_test(d: TestDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"tst"), rec(d.name_span, b"tnm"), payload(d.name),
+                    dump_bool(d.is_nondet), dump_expr(d.body)])
+
+pub fn dump_derive(d: DeriveDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"der"), dump_deriver(d.deriver),
+                    rec(d.deriver_span, b"dsp"), dump_ident(d.target)])
+
+pub fn dump_effect_set(d: EffectSetDef) -> Bytes =
+  bytes_concat_all([rec(d.span, b"set"), dump_ident(d.name),
+                    dump_list(d.atoms, dump_atom), dump_list(d.includes, dump_qname),
+                    dump_list(d.expansion, dump_atom)])
+
+pub fn dump_item(i: Item) -> Bytes =
+  match i {
+    IFn(d) -> dump_fn(d),
+    IType(d) -> dump_type(d),
+    IEffect(d) -> dump_effect(d),
+    ITest(d) -> dump_test(d),
+    ILaw(d) -> dump_law(d),
+    IDerive(d) -> dump_derive(d),
+    IEffectSet(d) -> dump_effect_set(d),
+  }
+
+pub fn dump_module(m: Module) -> Bytes =
+  bytes_concat(dump_list(m.imports, dump_import), dump_list(m.items, dump_item))
+
+// The whole answer: the tree, then every diagnostic in the order they were
+// raised. `ply run --json` renders this as a `String`, so it must stay printable
+// ASCII with no `"` and no `\`.
+pub fn dump(src: Bytes) -> String = {
+  let r = parse(src);
+  string_of_bytes(bytes_concat(dump_module(r.node), dump_diags(r.p.diags)))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// The area's own tests, in the language, in the shape `spikes/ply-lexer` uses:
+// an exact dump per input, named as an English sentence.
+//
+// **These pin the tree; the differential against `crates/ply-syntax` in
+// `harness/` pins the tree *and* the diagnostics.** The distinction is not
+// cosmetic and it was measured rather than assumed: a differential that reads
+// only the diagnostic list cannot see a wrong tree, and the mutation that
+// proves it is `recover_to_item`'s "already at an item start" test — deleting it
+// changes which items survive an error on four of twelve fixtures and changes
+// not one diagnostic. `GAPS.md` §P7.
+
+test "an import binds a module, an alias or a list of names" {
+  assert_eq(dump(b"import a.b\nimport c as d\nimport e (f, g)\n"),
+    "#3;0:10:imp;#2;7:8:ident;@61;9:10:ident;@62;%mod;11:24:imp;#1;18:19:ident;@63;%alias;23:24:ident;@64;25:40:imp;#1;32:33:ident;@65;%names;#2;35:36:ident;@66;38:39:ident;@67;#0;#0;")
+}
+
+test "a function carries generics, a row, a where clause and a spec" {
+  assert_eq(dump(b"pub fn f<a | e>(x: a) -> a / {io.read} where derivable(json, a) requires x { x }\n"),
+    "#0;#1;4:80:fn;%pub;7:8:ident;@66;%gen;#1;9:10:ident;@61;#1;13:14:ident;@65;#1;16:20:prm;16:17:ident;@78;?1;19:20:tvar;19:20:ident;@61;?1;25:26:tvar;25:26:ident;@61;?1;29:38:row;#1;30:37:atm;30:32:qname;?0;30:32:ident;@696f;%read;?0;#0;?0;#1;45:63:cst;%json;55:59:dsp;61:62:ident;@61;#1;64:74:spc;%requires;73:74:evar;73:74:qname;?0;73:74:ident;@78;75:80:eblk;#0;?1;77:78:evar;77:78:qname;?0;77:78:ident;@78;#0;")
+}
+
+test "a type with one uppercase name and no payload is an alias, not a sum" {
+  assert_eq(dump(b"type T = A\n"),
+    "#0;#1;0:10:ty;%priv;5:6:ident;@54;#0;%alias;9:10:tcon;9:10:qname;?0;9:10:ident;@41;#0;#0;")
+}
+
+test "`type Pair<a>= a` splits the `>=` into `>` and `=`" {
+  assert_eq(dump(b"type Pair<a>= a\n"),
+    "#0;#1;0:15:ty;%priv;5:9:ident;@50616972;#1;10:11:ident;@61;%alias;14:15:tvar;14:15:ident;@61;#0;")
+}
+
+test "an effect declares its operations with modes and resources" {
+  assert_eq(dump(b"nondet effect E {\n  read g[r](Int) -> Int\n  write s(x: Int) -> Int\n}\n"),
+    "#0;#1;0:68:eff;%priv;14:15:ident;@45;%true;#2;20:41:op;25:26:ident;@67;%read;%true;#1;30:33:tcon;30:33:qname;?0;30:33:ident;@496e74;#0;38:41:tcon;38:41:qname;?0;38:41:ident;@496e74;#0;44:66:op;50:51:ident;@73;%write;%false;#1;55:58:tcon;55:58:qname;?0;55:58:ident;@496e74;#0;63:66:tcon;63:66:qname;?0;63:66:ident;@496e74;#0;#0;")
+}
+
+test "an effect set collects atoms and the sets it includes" {
+  assert_eq(dump(b"effect set S = {a.read[k], Other}\n"),
+    "#0;#1;0:33:set;11:12:ident;@53;#1;16:25:atm;16:17:qname;?0;16:17:ident;@61;%read;?1;23:24:ident;@6b;#1;27:32:qname;?0;27:32:ident;@4f74686572;#0;#0;")
+}
+
+test "a law carries a host flag, binders, a guard and a body" {
+  assert_eq(dump(b"law/host \"l\" forall (a: Int) where a { a }\n"),
+    "#0;#1;0:42:law;9:12:lnm;@6c;%true;#1;21:27:bnd;21:22:ident;@61;24:27:tcon;24:27:qname;?0;24:27:ident;@496e74;#0;?1;35:36:evar;35:36:qname;?0;35:36:ident;@61;37:42:eblk;#0;?1;39:40:evar;39:40:qname;?0;39:40:ident;@61;#0;")
+}
+
+test "a failed item is abandoned and the next one still parses" {
+  assert_eq(dump(b"type T = { , }\nfn g() = 2\n"),
+    "#0;#1;15:25:fn;%priv;18:19:ident;@67;%gen;#0;#0;#0;?0;?0;#0;#0;24:25:elit;%int;@32;#1;!E0001:11:12:1:0;=11:12:1;")
+}
+
+test "recovery stops at the item start it is already on" {
+  assert_eq(dump(b"effect E {\nfn h() = 3\n"),
+    "#0;#1;11:21:fn;%priv;14:15:ident;@68;%gen;#0;#0;#0;?0;?0;#0;#0;20:21:elit;%int;@33;#1;!E0001:11:13:1:0;=11:13:1;")
+}
+
+test "recovery skips a whole bracketed run before resynchronising" {
+  assert_eq(dump(b"fn f(a: (fn)) = 1\nfn g() = 2\n"),
+    "#0;#1;18:28:fn;%priv;21:22:ident;@67;%gen;#0;#0;#0;?0;?0;#0;#0;27:28:elit;%int;@32;#2;!E0001:9:11:1:0;=9:11:1;!E0001:11:12:1:0;=11:12:1;")
+}
+
+test "an `import` after a definition is reported and still collected" {
+  assert_eq(dump(b"fn f() = 1\nimport a\n"),
+    "#1;11:19:imp;#1;18:19:ident;@61;%mod;#1;0:10:fn;%priv;3:4:ident;@66;%gen;#0;#0;#0;?0;?0;#0;#0;9:10:elit;%int;@31;#1;!E0001:11:17:2:1;=11:17:1;=0:10:0;")
+}
+
+test "`pub` on a test is reported and the test is parsed anyway" {
+  assert_eq(dump(b"pub test \"t\" { 1 }\n"),
+    "#0;#1;4:18:tst;9:12:tnm;@74;%false;13:18:eblk;#0;?1;15:16:elit;%int;@31;#1;!E0001:0:3:1:1;=0:3:1;")
+}
+
+test "an unknown deriver names the deriver's own span" {
+  assert_eq(dump(b"derive frobnicate for Order\n"),
+    "#0;#0;#1;!E0207:7:17:1:1;=7:17:1;")
+}
+
+test "recovery counts brackets, so an item keyword inside them is not one" {
+  assert_eq(dump(b"type T = 9 ( fn ) \nfn g() = 2\n"),
+    "#0;#1;19:29:fn;%priv;22:23:ident;@67;%gen;#0;#0;#0;?0;?0;#0;#0;28:29:elit;%int;@32;#1;!E0001:9:10:1:0;=9:10:1;")
+}
+
+test "`law` without a quoted label is not an item and `law` stays a name" {
+  assert_eq(dump(b"law x { 1 }\n"),
+    "#0;#0;#1;!E0001:0:3:1:0;=0:3:1;")
+}
+
+test "an import that selects names may not then rename the module" {
+  assert_eq(dump(b"import a (b) as c\n"),
+    "#0;#0;#1;!E0001:13:15:1:1;=13:15:1;")
+}
+
+test "`derive` needs a name after it before it opens an item" {
+  assert_eq(dump(b"derive + 1\n"),
+    "#0;#0;#1;!E0001:0:6:1:0;=0:6:1;")
+}
