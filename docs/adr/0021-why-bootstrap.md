@@ -95,14 +95,27 @@ to take.
 None of these are self-hosting work. All of them are defects that hurt every Ply
 program, and each is a precondition.
 
-1. **A lint for the field-order rule.** A growing container must be built in the
-   last sub-expression of its enclosing node or the program is quadratic
-   (`spikes/ply-lexer/GAPS.md` §1, mechanism at `rc.rs`'s `carry`). The rule is
-   **non-local** — it composes across call boundaries, so a correct callee goes
-   quadratic when its caller places the call in a non-final position. There is no
-   local property an author can check, which makes a lint the only fix rather
-   than the convenient one. It is already being paid in shipped code, in
-   `json.ply`'s serializer.
+1. ~~**A lint for the field-order rule.**~~ **Superseded by
+   [ADR 0024](0024-ownership-as-a-checked-property.md) (2026-08-28): the lint was
+   built and refuted by measurement, and the precondition is answered by
+   *checking* ownership rather than by warning about it.**
+
+   > **Withdrawn: "There is no local property an author can check, which makes a
+   > lint the only fix rather than the convenient one."** The first clause is
+   > right and the conclusion does not follow. A lint over this property is a
+   > partial oracle, and PR #41 measured what that means: it fired on
+   > `len(push([], i))`, which copies nothing (200/200 in place), and stayed
+   > silent on `{ a: s.a, b: push(s.a, i) }`, which is fully quadratic (0/200) —
+   > a false negative on the exact shape it existed for. "No local property an
+   > author can check" is an argument for putting the property in the *type*,
+   > which is what this record already did for effects.
+
+   The rest of the item stands and is the reason ADR 0024 exists: a growing
+   container must be built in the last sub-expression of its enclosing node or
+   the program is quadratic (`spikes/ply-lexer/GAPS.md` §1, mechanism at
+   `rc.rs`'s `carry`); the rule is **non-local**, so a correct callee goes
+   quadratic when its caller places the call in a non-final position; and it is
+   already being paid in shipped code, in `json.ply`'s serializer.
 2. **The nested-call ceiling.** 10,000, no flag. A parser needs it raised or
    needs the bound to stop being reachable by ordinary sequence recursion.
 3. **The fragment, entered at token granularity.** The profile in ADR 0020 §6.3
