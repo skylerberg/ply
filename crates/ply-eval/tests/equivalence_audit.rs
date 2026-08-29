@@ -2333,6 +2333,10 @@ test "a perform inside an iterate step" {
   assert_eq(handle { iterate({i: 0, acc: 0}, 41, step) }
             with { tally.bump[c](n) -> n + 2 },
             80)
+}
+"#,
+    );
+}
 
 /// A record update runs on both engines, and it runs on the *same* path the
 /// longhand does — because expansion in the parser makes it the same tree.
