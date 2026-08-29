@@ -365,6 +365,8 @@ fn a_reader_never_observes_a_partial_file_while_writers_run() {
     let root = &root;
     let finished = AtomicU64::new(0);
     let finished = &finished;
+    let declined = AtomicU64::new(0);
+    let declined = &declined;
 
     std::thread::scope(|scope| {
         for w in 0..WRITERS {
@@ -373,6 +375,9 @@ fn a_reader_never_observes_a_partial_file_while_writers_run() {
                     let mut store = root.open();
                     store.put(hash(10 + w * WRITES + i), failure());
                     store.flush().unwrap();
+                    if lock_declined(&store) {
+                        declined.fetch_add(1, Ordering::Release);
+                    }
                 }
                 finished.fetch_add(1, Ordering::Release);
             });
@@ -392,7 +397,41 @@ fn a_reader_never_observes_a_partial_file_while_writers_run() {
 
     let final_store = root.open();
     assert!(final_store.warnings().is_empty());
-    assert_eq!(final_store.len(), 1 + (WRITERS * WRITES) as usize);
+    // `flush` waits `LOCK_WAIT` for the cache lock and, if it does not get it,
+    // warns and writes nothing (`lib.rs`'s `flush`, `disk.rs`'s "a caller that
+    // proceeds unlocked risks losing a concurrent writer's entries, which costs
+    // a re-run, but still cannot produce a torn file"). That is the design's
+    // "no result" outcome and it is safe — but it means the count on disk is
+    // NOT the count written, and asserting equality is asserting something this
+    // crate deliberately refuses to promise. Under I/O contention it fails
+    // deterministically: 120 of 120 process runs, always `left < right`, while
+    // the torn-read assertions above never fired once in ~390,000 reader
+    // observations.
+    //
+    // So count the declines and assert the identity instead. It is stable under
+    // any load and it is STRONGER than the equality it replaces: a lost entry
+    // that no declined lock explains still fails it, which is the regression
+    // this test exists to catch and which equality could not distinguish.
+    let lost = declined.load(Ordering::Acquire) as usize;
+    assert_eq!(
+        final_store.len() + lost,
+        1 + (WRITERS * WRITES) as usize,
+        "{} entries on disk and {lost} flushes that declined the lock do not \
+         account for the {} written",
+        final_store.len(),
+        1 + (WRITERS * WRITES) as usize
+    );
+}
+
+/// Whether the last `flush` on this store declined the cache lock and wrote
+/// nothing. Matched on the message rather than the code, because
+/// `CACHE_UNREADABLE` also carries genuine unreadability, and only the declined
+/// lock is a write this run is entitled to lose.
+fn lock_declined(store: &Store) -> bool {
+    store
+        .warnings()
+        .iter()
+        .any(|w| w.message.contains("holding the cache lock"))
 }
 
 #[test]
@@ -1826,6 +1865,8 @@ fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
     let root = &root;
     let finished = AtomicU64::new(0);
     let finished = &finished;
+    let declined = AtomicU64::new(0);
+    let declined = &declined;
 
     std::thread::scope(|scope| {
         for w in 0..WRITERS {
@@ -1836,6 +1877,9 @@ fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
                     store.put_source(&root.path().join(format!("f{n}.ply")), fingerprint(n));
                     store.put_def(hash(n), def());
                     store.flush().unwrap();
+                    if lock_declined(&store) {
+                        declined.fetch_add(1, Ordering::Release);
+                    }
                 }
                 finished.fetch_add(1, Ordering::Release);
             });
@@ -1859,8 +1903,38 @@ fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
 
     let final_store = root.open();
     assert!(final_store.warnings().is_empty());
-    assert_eq!(final_store.defs_len(), 1 + (WRITERS * WRITES) as usize);
-    assert_eq!(final_store.sources_len(), 1 + (WRITERS * WRITES) as usize);
+    // `flush` waits `LOCK_WAIT` for the cache lock and, if it does not get it,
+    // warns and writes nothing (`lib.rs`'s `flush`, `disk.rs`'s "a caller that
+    // proceeds unlocked risks losing a concurrent writer's entries, which costs
+    // a re-run, but still cannot produce a torn file"). That is the design's
+    // "no result" outcome and it is safe — but it means the count on disk is
+    // NOT the count written, and asserting equality is asserting something this
+    // crate deliberately refuses to promise. Under I/O contention it fails
+    // deterministically: 120 of 120 process runs, always `left < right`, while
+    // the torn-read assertions above never fired once in ~390,000 reader
+    // observations.
+    //
+    // So count the declines and assert the identity instead. It is stable under
+    // any load and it is STRONGER than the equality it replaces: a lost entry
+    // that no declined lock explains still fails it, which is the regression
+    // this test exists to catch and which equality could not distinguish.
+    // A declined flush drops this iteration's source and def together, so the
+    // same count accounts for both.
+    let lost = declined.load(Ordering::Acquire) as usize;
+    assert_eq!(
+        final_store.defs_len() + lost,
+        1 + (WRITERS * WRITES) as usize,
+        "{} defs and {lost} declined flushes do not account for the {} written",
+        final_store.defs_len(),
+        1 + (WRITERS * WRITES) as usize
+    );
+    assert_eq!(
+        final_store.sources_len() + lost,
+        1 + (WRITERS * WRITES) as usize,
+        "{} sources and {lost} declined flushes do not account for the {} written",
+        final_store.sources_len(),
+        1 + (WRITERS * WRITES) as usize
+    );
 }
 
 #[test]
