@@ -1025,8 +1025,6 @@ Ranked, what would change the answer:
    > covers all three sites with counts, each bound armed against a revert of
    > **its own** literal — reverting `numbered` leaves the `trace` rows at 0
    > copies and vice versa, which was demonstrated rather than assumed.
-4. **A loop, or a raisable call ceiling.** §5.1 makes this the difference
-   between a portable parser and a rewritten one.
 4. ~~**A loop, or a raisable call ceiling.** §5.1 makes this the difference
    between a portable parser and a rewritten one.~~ **The loop is delivered and
    the raisable ceiling is refused, by ADR 0022 (2026-08-27).** `iterate(seed,
