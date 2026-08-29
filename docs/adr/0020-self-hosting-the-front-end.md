@@ -104,11 +104,27 @@ identifiers 39,429, keywords 5,256, strings 3,055, integers 2,483, byte strings
 
 The code citations behind §1's mechanism were checked and all hold:
 `rc::carry` at `crates/ply-eval/src/rc.rs:98`; `Env::take_unique_inner`'s
-`Rc::get_mut` refusal with its *"Refuses at the first shared link"* comment at
-`env.rs:133`; `DEFAULT_MAX_CALLS = 10_000` at `limit.rs:35`; and **exactly
-eight** `carry` call sites — `handler.rs:208`, `machine.rs:1007/1064/1094`,
-`frame.rs:107/142/263/301`. `crates/ply-std/ply/json.ply:589-599` is as
-described: the inner `push(acc, ..)` is argument 0 of 2 of `escape_runs`.
+`Rc::get_mut` refusal with its *"Refuses at the first shared link"* comment;
+`DEFAULT_MAX_CALLS = 10_000`; and **exactly eight** `carry` call sites, which is
+still eight. `crates/ply-std/ply/json.ply` is as described.
+
+> **Corrected while §7 item 3 was taken — one substantive error and four stale
+> line numbers.** This paragraph used to end: *"`crates/ply-std/ply/json.ply:589-599`
+> is as described: the inner `push(acc, ..)` is argument 0 of 2 of `escape_runs`."*
+> The inner `push` is argument 0 of 2 **of the outer `push`**, not of
+> `escape_runs`; `escape_runs` takes three arguments and the offending
+> sub-expression is nested inside its third. The distinction is the whole
+> mechanism — the outer `push` *is* `escape_runs`' last argument and was always
+> fine, which is why only one of the two copied. `GAPS.md` §1 states it
+> correctly and this paraphrase of it did not.
+>
+> The line numbers had drifted with later edits and are given above without
+> them. Re-read in this tree: `env.rs:131` for the refusal comment
+> (`take_unique_inner` begins at `:127`), not `env.rs:133`; `limit.rs:50` for
+> `DEFAULT_MAX_CALLS`, not `limit.rs:35` — `GAPS.md` §5 carries the same stale
+> `:35`; and `machine.rs:1035/1092/1122`, not `machine.rs:1007/1064/1094`. The
+> `handler.rs:208` and `frame.rs:107/142/263/301` sites are unmoved, and the
+> count is unchanged at eight.
 
 ### §1.1 The comparison is armed — checked with corruptions of my own
 
@@ -889,10 +905,126 @@ Ranked, what would change the answer:
    > visible only behind a flag is not visible at all. What survives is the item's
    > title: §1 must be made visible somewhere an author cannot miss it, which
    > ADR 0024 answers by putting it in the type rather than in a warning.
-3. **Fixing `escape_runs`** (§4.1). Shipped, quadratic, client-influenced input.
-   `GAPS.md` §1 records that the obvious fix — splitting so each `push` is last —
-   doubles the recursion depth and breaks the module at k = 8,000; the fix that
-   works is one `push` per escape in last-argument position.
+3. ~~**Fixing `escape_runs`** (§4.1). Shipped, quadratic, client-influenced
+   input. `GAPS.md` §1 records that the obvious fix — splitting so each `push`
+   is last — doubles the recursion depth and breaks the module at k = 8,000; the
+   fix that works is one `push` per escape in last-argument position.~~
+   **Taken.** `escape_runs` performs one `push` per escape, in last-argument
+   position, with the run and the escape that ends it merged by `bytes_concat`.
+
+   Counted in-process with `ply_eval::rc::stats()` on the shipped module, not on
+   a copy: whole-accumulator copies per encode went from **exactly k** to **0**,
+   at k = 1,000 / 2,000 / 4,000 / 8,000 / 16,000 / 32,000, and pushes from
+   2k + 1 to k + 1.
+
+   > **The fix is the machine engine's, and this item did not say so. Corrected
+   > 2026-08-27 by counting on both engines.** Every figure in this item — the
+   > paragraph above, the clock ratios below it, and the two further sites at
+   > the end — was taken on the **machine** engine and stated without naming
+   > one. Ply ships two, `--engine both` is the audit that catches one drifting
+   > from the other, and it compares *answers*: diagnostics, footprints, cell
+   > state. A divergence in **cost** passes it in silence, which is exactly what
+   > this is.
+   >
+   > On `--engine treewalk` `escape_runs` is **still quadratic after the fix**,
+   > and no spelling of it is not. The tree-walker runs no reference counting at
+   > all: it evaluates the AST, which carries no `Own` — that field is on the
+   > lowered `code::Node` only, and lowering is the step this engine does not
+   > have; `Interp::lookup` answers every `Var` with `v.clone()`; and `interp.rs`
+   > contains no `Env::take_unique` and no `rc::carry` call site, so a pending
+   > "frame" is a native stack frame holding the caller's scope by shared
+   > reference for the whole of every subexpression. The accumulator is
+   > therefore at two owners at every `push`, `Arc::get_mut` fails, and position
+   > cannot help.
+   >
+   > Counted on the shipped modules, after the fix, machine against tree-walker:
+   >
+   > | site | n | machine copies | treewalk copies |
+   > | :--- | ---: | ---: | ---: |
+   > | `json.ply` `escape_runs` | 1,000 → 8,000 | **0** at every size | **n + 1** at every size |
+   > | `router.ply` `numbered` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
+   > | `trace.ply` `append` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
+   >
+   > So all three of the survey's fixes are engine-conditional, not just this
+   > one. What the fix buys on the tree-walker is a halved constant: with
+   > `escape_runs` reverted the tree-walker copies 2k + 1 times, with it in place
+   > k + 1 — measured here, not reasoned about.
+   >
+   > On the clock, `ply test --no-cache --no-incremental`, minimum of 5, both
+   > engines back to back on one machine state at load 11–22 (the 4.0 the
+   > workstream pre-registered was waited for and never reached, as in round 1):
+   > over 1,000 → 8,000 escapes the machine grows **7.8x** where linear predicts
+   > 8x, and the tree-walker **82.8x** and **74.1x** across two series where
+   > quadratic predicts 64x. At k = 8,000 the tree-walker is **12.9x** slower
+   > than the machine on the same program; at k = 1,000, 1.2x. The reviewer who
+   > raised this measured 22.1 / 81.1 / 330.2 ms and 3.67x / 4.07x per doubling;
+   > the shape reproduces, the per-doubling ratios here are 4.85 / 2.98 / 5.73
+   > and 5.47 / 2.85 / 4.75, and **the pre-registered "≥ 3.0x at two consecutive
+   > doublings" rule is therefore not met at 2,000 → 4,000 in either series**.
+   > That is stated rather than smoothed: the verdict rests on the counts, which
+   > are exact at any load, and the clock corroborates the direction only.
+   >
+   > **Disclosed rather than fixed, and the reason is in `CONTRACTS.md`.**
+   > Reuse on the tree-walker needs the Perceus pass the machine gets at
+   > lowering — a backward liveness walk over the AST, a by-value scope threaded
+   > through a recursive evaluator, and a `carry` discipline that a walker
+   > holding `&Env` on the native stack has no way to express. That is a new
+   > evaluator feature, and §"Deleted with the machine" retires `Interp`,
+   > `Engine` and `--engine` outright. The disclosure carries an assertion so it
+   > cannot go stale in silence:
+   > `stdlib_accumulator_cost.rs::all_three_fixes_are_the_machine_engines_only`
+   > pins one copy per element on the tree-walker at all three sites, and names
+   > the documents to correct on the day it fails.
+
+   On the clock, which is the statistic §4.1 used: per-test milliseconds at
+   k = 1,000 / 2,000 / 4,000 / 8,000 were 13.6 / 40.9 / 134.5 / 497.0 before and
+   7.0 / 13.9 / 29.0 / 57.9 after — **3.29x and 3.70x** per doubling against
+   **2.09x and 2.00x**, and 8.6x faster at k = 8,000. §4.1 measured 3.14x and
+   3.59x for the same defect on a different machine, so it reproduced. **Both
+   series ran at load 16–19**: the machine never reached the load of 4.0 this
+   workstream pre-registered as the condition for starting a timed series, six
+   worktrees being on it throughout. The counted and bisected figures above are
+   what the claim rests on; these corroborate and are reported with that caveat
+   rather than as the pre-registered result.
+
+   **The depth was checked, not assumed.** The largest k that `encode_string`
+   completes under the 10,000-call budget is **9,993 before and 9,993 after**,
+   by bisection — the same integer. `GAPS.md` §1 column 3's refusal of the split
+   shape is confirmed here on the shipped module for the first time (the spike
+   measured a standalone reproduction): built that way, the same bisection gives
+   **4,996**, half the ceiling. So of the three shapes, only this one is both
+   linear and no deeper.
+
+   Behaviour is byte-identical over a 276-case corpus — all 256 code points
+   singly and in one string, every named escape form, a `\u00XX` control, `/`,
+   `é`, `😀`, escapes first, last and adjacent, and a 4,000-escape string —
+   compared against a binary kept aside from before the edit, on both engines:
+   one sha256 across all four captures.
+
+   The gate is `crates/ply-eval/tests/stdlib_accumulator_cost.rs::encoding_a_
+   string_of_escapes_copies_the_accumulator_a_constant_number_of_times`, which
+   asserts a **count** and so needs no `DEFERRED` row. It was seen red on the
+   shipped defect before the fix existed, and red again on a deliberate revert.
+
+   **Item 2 is still the general answer.** This fixes one instance; a survey of
+   `crates/ply-std/ply/` with the same counter found two more of the same shape
+   and fixed them — `trace.ply`'s `append` (the growing field first of three,
+   200/400/800 copies for 200/400/800 records, on a serving path) and
+   `router.ply`'s `numbered` (first of two, same counts, on the build-time table
+   check). `trace.ply`'s own comment had restated the reading `GAPS.md` §1
+   withdrew and is corrected in place. `db.ply` has 78 `push` sites and was
+   **not** measured; it is the obvious next place to point the counter.
+
+   > **Both of those were fixed and neither was gated, until 2026-08-27.** This
+   > paragraph reported two further fixes and named no test, and the sentence
+   > that stood in for one — *"`ply-corpus` is in the set because the survey
+   > changed `router.ply`, and its `what_the_route_table_costs_to_rebuild` is
+   > the test nearest that change; it passed"* — leans on a test that
+   > **asserts nothing**: it prints a microsecond figure and returns. It would
+   > have passed with both fixes reverted. `stdlib_accumulator_cost.rs` now
+   > covers all three sites with counts, each bound armed against a revert of
+   > **its own** literal — reverting `numbered` leaves the `trace` rows at 0
+   > copies and vice versa, which was demonstrated rather than assumed.
 4. ~~**A loop, or a raisable call ceiling.** §5.1 makes this the difference
    between a portable parser and a rewritten one.~~ **The loop is delivered and
    the raisable ceiling is refused, by ADR 0022 (2026-08-27).** `iterate(seed,

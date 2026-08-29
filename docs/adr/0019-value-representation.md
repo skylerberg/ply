@@ -244,7 +244,7 @@ document.
 > | --- | --- |
 > | 911.5 → **623.5** per request, 34,465 → **30,372** per `Machine` | the `fit:` line, `/health` |
 > | 1,083.9 → **775.4** | the `200 requests:` line, `/health` |
-> | 1,082 → **773.4**, and `README.md:363` now says 773 | `./target/release/w6-alloc --repo . --requests 200` |
+> | 1,082 → **773.4**, and `README.md:387` now says 773 | `./target/release/w6-alloc --repo . --requests 200` |
 > | 496.0 → **315.0** | the routing rung's `fit:` line |
 > | 372.4 → **194.4** argument vectors, 40.9% → 31.2% | `Vec<Value> — call arguments`, `/health` |
 > | 245.0 → **129.0**, 49.4% → 41.0% | the same, routing rung |
@@ -270,7 +270,7 @@ document.
 | --- | --- |
 | 911.5 allocations per `/health` request over SimNet, + 34,465 once per `Machine` | `cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture`, the `fit:` line of the `/health` section |
 | 1,083.9 allocations at a 200-request window on the same path | same run, `200 requests:` line. Reconciles with the slope: 911.5 + 34,465/200 = 1,083.8 |
-| 1,082 allocations per `/health`, the figure `README.md:363` states | `./target/release/w6-alloc --repo . --requests 200`; asserted to within 1% by `crates/ply-corpus/tests/w6_report_allocations.rs::the_readme_still_describes_this_request_path` |
+| 1,082 allocations per `/health`, the figure `README.md:387` states | `./target/release/w6-alloc --repo . --requests 200`; asserted to within 1% by `crates/ply-corpus/tests/w6_report_allocations.rs::the_readme_still_describes_this_request_path` |
 | `interp::literal` at 111.2 allocations at a 20-request window, fitting to 65.0 per request + 925 once per `Machine` | `cargo test -p ply-corpus --release --test w6_alloc_sites -- --nocapture`, the whole-request rung and the two-window fit under it |
 | 372.4 argument vectors per request, 40.9% | same run, `Vec<Value> — call arguments` |
 | at most 31.0 of those retained as `Ctor.args`; 341.4 transient, 37.5% | same run, the closing line of the `-- /health: the argument vector, by arity --` table. `enter_closure`'s `ClosureKind::Ctor` arm (`crates/ply-eval/src/machine.rs:1786`) is the only path that keeps one |
@@ -1060,7 +1060,7 @@ against the `O(log n)` `cmp` walks the insert it accompanies already pays.
 Measured on the request path rather than argued: `./target/release/w6-alloc
 --repo . --requests 200` reads **773.4** allocations per `/health`, three runs
 identical to the digit, the same figure as before this change and the one
-`README.md:363` states.
+`README.md:387` states.
 
 **Versioning.** A stored artifact's contents **do** move for a program that
 renders a `Map` with a `Decimal` key — `Value::render`'s output is cached as
