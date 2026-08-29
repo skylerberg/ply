@@ -43,26 +43,103 @@ protect you here.
 
 ### The shape it keeps taking: declared, registered, raised nowhere
 
-Four of the seven above and two more found since are the same defect wearing
+> **This section's own count did not check out.** The withdrawn opening,
+> verbatim: *"Four of the seven above and two more found since are the same
+> defect wearing different clothes"* — six, over a table with five rows. Only
+> **two** of the seven were ever in it, W1's footprint check and M8's
+> mitigation; `E0435` is not one of the seven at all, and items 14 and 15 were
+> found afterwards. The honest reading of the old table was two of the seven and
+> three found since. Corrected 2026-08-27, when the check below was built and
+> turned up a sixth.
+
+**Two of the seven above and four more found since** are the same defect wearing
 different clothes — a mechanism that is *named* everywhere a reader would look
 for it and *constructed* nowhere. Counted, so the count is checkable rather than
-rhetorical, and every one of them was found by grepping for the constructor
-rather than by reading the declaration:
+rhetorical:
 
 | the name | where it is declared | what constructs it |
 | --- | --- | --- |
 | `E0435 DB_SCHEMA_MISMATCH` | `ply-span`'s `codes`, its registry test, and `host.rs`'s reserved list | nothing — §"Do not state a guarantee you have not armed" |
 | W1's footprint check | advertised in the milestone's own report | nothing — it was never armed |
 | M8's mitigation | disclosed beside the unsoundness it was for | nothing that could fire |
-| `AssertionKind::RecursionLimit` | `ply-test/src/slice.rs:268`, mapped at `:284` | nothing — item 14 |
+| `AssertionKind::RecursionLimit` | `ply-test/src/slice.rs`'s `AssertionKind`, mapped by its `as_str` | nothing — item 14 |
 | `CausalSlice` / `Event::Perform` | `ply-test/src/slice.rs`, rendered by `report.rs`, read by `commands/test.rs:793`, specified by ADR 0004 | nothing outside `tests/bisect_audit.rs` — item 15 |
+| `Severity::Note` | `ply-span`'s `Severity`, rendered by `render.rs:73`, `ply-eval/src/differential.rs:803` and `ply-cli/src/commands/common.rs:55` | nothing — three renderers, no producer; found 2026-08-27 |
 
-The check that finds one takes a minute: `grep -rn '<TypeName>::<Variant>'` or
-`grep -rn '<ConstructorFn>' --include=*.rs`, and then read the hits for one that
-is not a test and not the declaration. Do it before you write "X is reported",
-and do it for the thing you are about to *rely on* as well — item 15 was found
-by asking whether item 11's defect could reach a user, and the answer was that
-the route does not exist.
+> **This section used to tell you to find one by hand, and the recipe does not
+> work.** The withdrawn advice, verbatim: *"The check that finds one takes a
+> minute: `grep -rn '<TypeName>::<Variant>'` or `grep -rn '<ConstructorFn>'
+> --include=*.rs`, and then read the hits for one that is not a test and not the
+> declaration."* Run it against the first row of its own table. `E0435` has
+> exactly one mention outside tests — `crates/ply-eval/src/host.rs`'s
+> `RESERVED_CODES`, a list of codes a *handler* may not answer with — so a sweep
+> for references outside tests reports it as referenced and reports it green,
+> and the registry row a reader would take as the second hit is itself inside
+> `#[cfg(test)] mod tests`. **A mention is not a construction.** Eighty-three
+> registered codes are also too many to re-read by hand once per change.
+
+**The check is a test now.** `crates/ply-span/tests/armed.rs` fails when a
+registered diagnostic code, or a variant of a covered enum, is constructed
+nowhere in production source. Its header carries the rule in full and the list
+of what it does not reach; the short version:
+
+- A code is **armed** iff a production source passes `codes::NAME` to
+  `Diagnostic::error` or `Diagnostic::warning`, literally or through a wrapper
+  listed in that file's `CODE_INDIRECTION` —
+  `every_registered_code_is_constructed_in_production`.
+- A variant is **armed** iff it appears in production outside a pattern
+  position. A `match` arm, an `if let`, a `while let`, a `matches!` and a `use`
+  path are consumers, and prove only that something *reads* it —
+  `every_variant_of_a_covered_enum_is_constructed_in_production`.
+- Production excludes `crates/*/tests/`, `benches/`, every `#[cfg(test)]` item,
+  and every module reached only through a `#[cfg(test)] mod` declaration. That
+  last one is load-bearing: `crates/ply-core/src/numerics.rs` carries no marker
+  of its own and is test-only solely because `lib.rs` says
+  `#[cfg(test)] mod numerics;`.
+
+  > **This clause said "block", and the gate did not deliver on the word.** The
+  > withdrawn wording, verbatim: *"every `#[cfg(test)]` block"*. The scanner
+  > walked from `#[cfg(test)]` to the first `{` **or `;`** and blanked only the
+  > `{` case, so an item whose header contains a `;` before its body was left
+  > in the production set — and one was, live in the tree:
+  > `crates/ply-eval/src/argv.rs`'s
+  > `#[cfg(test)] fn kept() -> [usize; CLASSES]`, where the `;` belongs to the
+  > array type. A `Diagnostic::error(codes::X, ..)` in that body armed `X` and
+  > the gate stayed green — the gate's own defect, wearing the gate's clothes.
+  > Nothing in that body armed anything, so no answer was wrong; it was luck,
+  > not the rule. Fixed 2026-08-27 in review: the walk steps over balanced
+  > `(..)` and `[..]`, and a `;`-terminated item that is not a `mod`
+  > declaration is blanked like any other. `mod x;` is still exempt, because
+  > the resolver reads it.
+  > `a_cfg_test_item_is_not_production_whatever_its_header_looks_like` fails
+  > against the old walk.
+- Something genuinely reserved goes in `UNARMED_CODES` or `UNARMED_VARIANTS`
+  **with a reason and a citation**. That is the whole point: it stops "reserved
+  on purpose" and "we forgot" looking identical.
+  `no_allowlist_entry_has_outlived_its_reason` fails on an entry naming
+  something now constructed, or no longer declared, so the excuse cannot outlive
+  the fact.
+- **It does not prove the construction site can execute.** Rows 2 and 3 above —
+  W1's footprint check and M8's mitigation — are unreachable-code defects, and
+  this check would not have caught either; nor would it catch a
+  `Diagnostic::error(codes::X, ..)` behind an `if false`. Reachability is **not
+  enforced** anywhere and is still yours to check by hand.
+
+Run with both allowlists empty, before either was filled, it reported twelve:
+`E0435`, `E0438`, six `AssertionKind` variants, three `Event` variants and
+`Severity::Note`. All twelve are allowlisted with reasons rather than fixed,
+because disposition belongs to whoever owns each: items 14 and 15 hold the nine
+`ply-test` variants open, `docs/adr/0014-w4-contract.md`'s audit note and
+§"Do not state a guarantee you have not armed" hold `E0435` and `E0438`, and
+`Severity::Note` is new here and undecided. It also turned up the mirror defect, *declared and not
+registered*: `REFERENCE_CYCLE` (`W0610`) was a `pub const` in `codes` with no
+registry row, 83 constants against 82 rows, and
+`the_code_registry_table_is_total_over_the_codes_module` now holds that closed.
+
+Do the by-hand version anyway for everything the check does not reach, and do it
+for the thing you are about to *rely on* as well — item 15 was found by asking
+whether item 11's defect could reach a user, and the answer was that the route
+does not exist.
 
 ## The loop
 
@@ -241,7 +318,8 @@ the 26 ran.
 | `shard table is total` | `.github/ci-shards.sh verify`, before anything compiles |
 | `cargo fmt --all --check` | the same command, and it must be silent |
 | `cargo clippy --workspace --all-targets` | with `-D warnings`, so the first warning is a failed run rather than a line in a log |
-| `test corpus` / `cli-eval` / `core` | the suite, three shards by package; the split is `.github/ci-shards.sh` |
+| `test corpus` / `cli-eval` / `core` | the suite, three shards by package; the split is `.github/ci-shards.sh`. The shard that holds `ply-cli` also re-runs `w5_shutdown` by name, and the shard that holds `ply-span` re-runs the six `TREE_CHECKS` by name — see the row below |
+| the `TREE_CHECKS` step, inside `test` | the six checks in `crates/ply-span/tests/armed.rs`, each by `--exact` name, asserting `test result: ok. 1 passed`. They already ran a moment earlier in the shard; this is what turns "the check still exists" into an exit code, because `cargo test --exact` over a name nothing defines reports `0 passed; 11 filtered out` and exits **0** |
 | `test ply-host (postgres)` | `ply-host`, with `PLY_PG_URL` and `PLY_TEST_DB` pointed at a `postgres:18.6` service container **and** `initdb`/`postgres`/`psql` on `PATH` — then it fails if any test printed a skip notice |
 | `wall-clock measurements` | the thirteen timing-sensitive tests, one at a time, single-threaded, alone on a runner |
 | `crates/ply-codegen-spike` | `cargo test --locked --release` on a pinned 1.94.0, in the spike's own workspace |
@@ -907,6 +985,12 @@ The test for whether you have armed something: **name the file and line that
 raises it, and the test that proves the raise.** If you cannot, write "not
 enforced" instead.
 
+For a diagnostic code and for a variant of a covered enum, that test is now
+mechanical: `crates/ply-span/tests/armed.rs` fails if nothing in production
+constructs it. It does not decide reachability — see §"The shape it keeps
+taking" for what it reaches and what it does not — so for anything shaped like
+W1's footprint check, the paragraph above still stands on its own.
+
 ### Mark what is checked
 
 A reader cannot tell an asserted invariant from an observation. Say which:
@@ -923,9 +1007,35 @@ That sentence is checkable in one grep. "The rename path is safe" is not.
 
 `crates/ply-span/src/lib.rs` holds every code as a `pub const` in `codes` **and**
 a registry table in its test module pairing the constant, its name and its
-literal number. The test asserts both that no code moved and that no two
-constants share a number. Add to both places, or the test fails — which is the
-intent.
+literal number. `every_registered_code_has_its_published_number` asserts both
+that no code moved and that no two constants share a number.
+
+> **This section said adding to only one place fails the test.** The withdrawn
+> sentence, verbatim: *"Add to both places, or the test fails — which is the
+> intent."* It was false in the direction that mattered. That test iterates the
+> *table*, so a constant added to `codes` and to no row was checked by nothing —
+> and one had been sitting that way: `REFERENCE_CYCLE` (`W0610`), out of numeric
+> order between `W0608` and `W0609` in the module, 83 constants against 82 rows.
+> Corrected 2026-08-27 by adding the missing row, which moves no number, and by
+> `the_code_registry_table_is_total_over_the_codes_module` in
+> `crates/ply-span/tests/armed.rs`, which makes the sentence true going forward.
+
+Three things a new code has to satisfy, each of them checked by a named test:
+
+1. a `pub const` in `codes` **and** a row in the registry table —
+   `the_code_registry_table_is_total_over_the_codes_module` for the row,
+   `every_registered_code_has_its_published_number` for the number;
+2. a `Diagnostic::error(codes::NAME, ..)` or `Diagnostic::warning(codes::NAME, ..)`
+   somewhere in production source —
+   `every_registered_code_is_constructed_in_production` — or a row in that
+   file's `UNARMED_CODES` giving the reason it is reserved and unraised, which
+   is where `E0435` and `E0438` are;
+3. if it reaches the constructor through a wrapper instead of literally, the
+   wrapper goes in `CODE_INDIRECTION` with a reason —
+   `every_diagnostic_constructor_call_names_its_code_literally`. There is
+   exactly one today, `Lexer::error` in `crates/ply-syntax/src/lexer.rs`, and it
+   is why `E0002 UNTERMINATED_STRING` is armed: with that list empty the check
+   reports `E0002` dead, and `E0002` is not dead.
 
 Ranges in use: `E0001`–`E0002` and `E01xx`–`E05xx` for errors (73 codes; the two
 single-digit ones are the generic pair and are easy to miss when you assume the
@@ -933,7 +1043,11 @@ range starts at `E01xx`), and `W0601`–`W0610` for warnings. There is also a
 reserved list in `crates/ply-eval/src/host.rs` (`DB_SCHEMA_MISMATCH` is at
 `:1106`) naming codes a *handler* may not answer with. A code appearing in
 `codes`, in the registry, and in that list is **still raised nowhere** — that is
-exactly `E0435`'s situation.
+exactly `E0435`'s situation, and that list is the reason a file-granularity grep
+calls `E0435` live. The reserved list is itself a real, armed restriction
+(`is_reserved_code`); it just is not a raise. Nothing has to be remembered here
+any more: `every_registered_code_is_constructed_in_production` fails on a code
+in that position unless `UNARMED_CODES` says why.
 
 ### A host handler
 
@@ -1615,6 +1729,17 @@ Recorded here so nobody spends an afternoon rediscovering them.
     **not** fixed, because deciding whether the fix is to construct the variant
     or to delete it is a `ply-test` design call and this change was in
     `ply-eval`.
+
+    **Held open by a test since 2026-08-27, and still not fixed.** The
+    disposition call has not been made; what changed is that the gap can no
+    longer quietly close by being forgotten. All six unbuilt variants — `Bool`,
+    `Panic`, `Runtime`, `UnhandledEffect`, `RecursionLimit`, `Deadlock` — are
+    rows in `UNARMED_VARIANTS` in `crates/ply-span/tests/armed.rs`, and
+    `no_allowlist_entry_has_outlived_its_reason` fails the moment one of them is
+    constructed or removed, so this item cannot go stale in silence. The line
+    numbers above have drifted with the file: `AssertionKind` is declared at
+    `slice.rs:275` today and `Eq` is built at `:345`. Neither `slice.rs` nor
+    anything else in `ply-test` was changed to add the check.
 15. **Nothing populates a `CausalSlice`, so `--trace` reports nothing.** Found
     2026-08-24 while checking whether item 11's seam defect could reach a user
     through `ply-test`. It cannot, and neither can anything else: the causal
@@ -1658,6 +1783,16 @@ Recorded here so nobody spends an afternoon rediscovering them.
     all. Measured on the fixture item 11's fix added: `handled` publishes `{}`
     and running it records `{tally.read[log], tally.write[log]}`. Corrected in
     place, with the withdrawn sentence beside it.
+
+    **Held open by a test since 2026-08-27, and still not fixed.**
+    `Event::Enter`, `Event::Return` and `Event::Perform` are rows in
+    `UNARMED_VARIANTS` in `crates/ply-span/tests/armed.rs`, reached by
+    `every_variant_of_a_covered_enum_is_constructed_in_production`. The type
+    with no producer is caught only through its variants: there is no general
+    "public constructor called only from tests" rule, because for a library
+    crate that has a large legitimate-API false-positive surface, so
+    `SliceBuilder` and `CausalSlice` themselves are **not enforced**. Nothing in
+    `ply-test` was changed.
 
 Items 9, 10 and 11 are closed; see the block at the end of item 10 and the one
 at the end of item 11 for the fixes, the measurements behind them and the tests

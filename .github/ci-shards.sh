@@ -11,11 +11,13 @@
 # the tree.
 #
 #   ci-shards.sh verify        every member is in exactly one shard, and every
-#                              deferred test exists where this table says
+#                              deferred test and every tree check exists where
+#                              this table says
 #   ci-shards.sh matrix        the JSON matrix for the parallel test job
 #   ci-shards.sh packages ID   `-p` arguments for one shard
 #   ci-shards.sh skips         `--skip` arguments the parallel shards need
 #   ci-shards.sh deferred      one `package target test` line per deferred test
+#   ci-shards.sh tree-checks   one `package target test` line per tree check
 
 set -euo pipefail
 
@@ -110,6 +112,35 @@ DEFERRED=(
   "ply-cli:w3_http_audit:routing_a_path_of_escapes_costs_its_length_and_not_its_square"
 )
 
+# Tests that fail on a property of the *tree* rather than of a run, as
+# `package:target:test`, with the same three-field spelling as `DEFERRED`.
+#
+# Not "gates" in the sense §"There is CI" uses that word — those are
+# dependencies that make a suite skip silently. These are checks whose subject
+# is the source tree itself.
+#
+# They are already inside `cargo test -p ply-span`, so the parallel shards run
+# them. They are named here as well for one reason: a check that stops running
+# reports nothing, and reporting nothing is indistinguishable from passing.
+# `verify` fails when a name here is not defined in the file this table says,
+# and the `test` job runs each by `--exact` name and asserts it actually ran —
+# so renaming one, deleting it, or filtering it away turns CI red instead of
+# quietly reducing what CI checks.
+#
+# All six are in `crates/ply-span/tests/armed.rs` and all six are one defect:
+# a mechanism declared and registered everywhere a reader would look for it and
+# constructed nowhere. CONTRIBUTING.md s"The shape it keeps taking: declared,
+# registered, raised nowhere" has the catalogue; that file's header has the rule
+# and the list of what it does not cover.
+TREE_CHECKS=(
+  "ply-span:armed:every_registered_code_is_constructed_in_production"
+  "ply-span:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
+  "ply-span:armed:every_diagnostic_constructor_call_names_its_code_literally"
+  "ply-span:armed:the_code_registry_table_is_total_over_the_codes_module"
+  "ply-span:armed:no_allowlist_entry_has_outlived_its_reason"
+  "ply-span:armed:ambiguous_enum_names_are_declared"
+)
+
 shard_packages() {
   local id=$1 entry
   for entry in "${SHARDS[@]}"; do
@@ -148,6 +179,15 @@ cmd_skips() {
 cmd_deferred() {
   local entry rest
   for entry in "${DEFERRED[@]}"; do
+    rest=${entry#*:}
+    printf '%s %s %s\n' "${entry%%:*}" "${rest%%:*}" "${rest#*:}"
+  done
+}
+
+# Same three-field split as `cmd_deferred`, for the same reason.
+cmd_tree_checks() {
+  local entry rest
+  for entry in "${TREE_CHECKS[@]}"; do
     rest=${entry#*:}
     printf '%s %s %s\n' "${entry%%:*}" "${rest%%:*}" "${rest#*:}"
   done
@@ -285,11 +325,35 @@ cmd_verify() {
     fi
   done < <(cmd_deferred)
 
+  # The same existence check as the deferred table, and it matters more here:
+  # a deferred test that vanishes only stops being skipped, while a tree check
+  # that vanishes stops being checked and says nothing.
+  while read -r package target test; do
+    file="$root/crates/$package/tests/$target.rs"
+    if [[ ! -f $file ]]; then
+      echo "FAIL: tree check '$test' names $file, which does not exist" >&2
+      failures=$((failures + 1))
+    elif ! grep -q "fn $test(" "$file"; then
+      echo "FAIL: $file has no 'fn $test(' — CI asserts a check nothing defines" >&2
+      failures=$((failures + 1))
+    fi
+    id=""
+    for entry in "${SHARDS[@]}"; do
+      for candidate in ${entry#*:}; do
+        [[ $candidate == "$package" ]] && id=${entry%%:*}
+      done
+    done
+    if [[ -z $id ]]; then
+      echo "FAIL: tree check '$test' is in '$package', which is in no shard" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(cmd_tree_checks)
+
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the shard table" >&2
     return 1
   fi
-  echo "${#all_members[@]} workspace members, each in exactly one shard; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#DEFERRED[@]} deferred tests, each present in the tree"
+  echo "${#all_members[@]} workspace members, each in exactly one shard; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#DEFERRED[@]} deferred tests and ${#TREE_CHECKS[@]} tree checks, each present in the tree"
 }
 
 case "${1:-}" in
@@ -298,8 +362,9 @@ case "${1:-}" in
   packages) cmd_packages "${2:?a shard id}" ;;
   skips) cmd_skips ;;
   deferred) cmd_deferred ;;
+  tree-checks) cmd_tree_checks ;;
   *)
-    echo "usage: ci-shards.sh {verify|matrix|packages ID|skips|deferred}" >&2
+    echo "usage: ci-shards.sh {verify|matrix|packages ID|skips|deferred|tree-checks}" >&2
     exit 2
     ;;
 esac
