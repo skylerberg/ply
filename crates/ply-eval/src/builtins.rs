@@ -514,7 +514,7 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
         Value::List(list) => match std::sync::Arc::get_mut(list) {
             Some(items) => {
                 items.push(x);
-                crate::rc::note_update(true);
+                crate::rc::note_update(true, span);
                 return Ok(Step::Done(xs));
             }
             None => {
@@ -526,7 +526,7 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
         },
         other => return Err(type_error(span, "`push`", "List", other)),
     };
-    crate::rc::note_update(false);
+    crate::rc::note_update(false, span);
     Ok(Step::Done(Value::list(copied)))
 }
 
