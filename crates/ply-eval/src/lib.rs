@@ -19,6 +19,7 @@ pub mod builtins;
 pub mod code;
 mod compiled;
 pub mod cont;
+pub mod costs;
 pub mod differential;
 mod env;
 pub mod escape;
@@ -55,6 +56,7 @@ pub use compiled::Compiled;
 pub use cont::{
     Continuation, Delimiter, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };
+pub use costs::{Cause as CostCause, Costs, DefKind as CostDefKind, Verdict as CostVerdict};
 pub use differential::{
     Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
     is_machine_only, machine_only_clause, machine_only_clauses,

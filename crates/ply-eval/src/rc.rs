@@ -63,7 +63,8 @@ use crate::arena::Slot;
 use crate::env::Env;
 use crate::value::Value;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use std::cell::RefCell;
+use rustc_hash::FxHashMap;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// How a variable occurrence takes its value.
@@ -177,6 +178,58 @@ thread_local! {
     /// The `(cell, site)` pairs already reported, so that one cycle is one
     /// warning however many times the write runs.
     static SEEN: RefCell<Vec<(Slot, Span)>> = const { RefCell::new(Vec::new()) };
+    /// Off unless [`record_sites`] armed it, and read once per update when it
+    /// is off. See [`sites`] for why this is not on by default.
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+    static SITES: RefCell<FxHashMap<Span, SiteCount>> = RefCell::new(FxHashMap::default());
+}
+
+/// What one `push` site did, over every time the corpus ran it.
+///
+/// The oracle a static cost analysis is judged against: a claim that an append
+/// does not copy is falsified by `copies > 0` at its span, and a claim that one
+/// does is falsified by `in_place > 0`. Both halves matter — a checker that
+/// only ever says "copies" is unfalsifiable in the other direction.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SiteCount {
+    pub in_place: u64,
+    pub copies: u64,
+}
+
+impl SiteCount {
+    pub fn total(&self) -> u64 {
+        self.in_place + self.copies
+    }
+
+    /// `None` when the site never ran, which is not zero.
+    pub fn rate(&self) -> Option<f64> {
+        if self.total() == 0 {
+            return None;
+        }
+        Some(self.in_place as f64 / self.total() as f64)
+    }
+}
+
+/// Arms or disarms per-site attribution of [`Stats::updates`].
+///
+/// **Diagnostics only, and off by default**, for the same reason the rest of
+/// this module's counters are: a map keyed by span costs a hash per append, and
+/// an append is on the request path. Armed, it answers [`sites`]; disarmed, an
+/// update reads one thread-local `bool` and does nothing else. Nothing here
+/// enters a value, a hash, a cache key or a seeded choice, so a program answers
+/// identically either way.
+pub fn record_sites(on: bool) {
+    let _ = RECORDING.try_with(|c| c.set(on));
+    if !on {
+        let _ = SITES.try_with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// What each `push` site has done since [`record_sites`] armed it.
+pub fn sites() -> Vec<(Span, SiteCount)> {
+    SITES
+        .try_with(|c| c.borrow().iter().map(|(k, v)| (*k, *v)).collect())
+        .unwrap_or_default()
 }
 
 fn bump(f: impl FnOnce(&mut Stats)) {
@@ -191,6 +244,7 @@ pub fn stats() -> Stats {
 /// Clears this thread's counters and the cycles it has reported.
 pub fn reset() {
     let _ = COUNTERS.try_with(|c| *c.borrow_mut() = Stats::default());
+    let _ = SITES.try_with(|c| c.borrow_mut().clear());
     let _ = CYCLES.try_with(|c| c.borrow_mut().clear());
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());
 }
@@ -202,11 +256,22 @@ pub(crate) fn note_take(moved: bool) {
     });
 }
 
-pub(crate) fn note_update(in_place: bool) {
+pub(crate) fn note_update(in_place: bool, span: Span) {
     bump(|s| {
         s.updates += 1;
         s.updates_in_place += u64::from(in_place);
     });
+    if RECORDING.try_with(Cell::get).unwrap_or(false) {
+        let _ = SITES.try_with(|c| {
+            let mut map = c.borrow_mut();
+            let entry = map.entry(span).or_default();
+            if in_place {
+                entry.in_place += 1;
+            } else {
+                entry.copies += 1;
+            }
+        });
+    }
 }
 
 /// Cycles reported so far, in the order they were built, and clears the list.
