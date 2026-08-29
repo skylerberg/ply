@@ -18,7 +18,8 @@
 > measure is a language that does not exist yet. What it does instead is show
 > that the alternative — predicting the cost rather than checking it — was built
 > and **refuted by measurement** (§2), and that the remaining design space is
-> closed by an argument rather than open to a benchmark (§3).
+> narrowed by an argument rather than by a benchmark (§3). *Narrowed*, not
+> closed: §3 carries a fourth door the first draft of this ADR missed.
 
 ---
 
@@ -107,6 +108,25 @@ what Ply wants:
    fast path is the only path. This is Rust, and it is the only door that keeps
    value semantics, O(1) indexing and native speed together.
 
+> **Narrowed (2026-08-28, by the decision-record sweep): the space is not as
+> closed as this section presents it.** Three doors are the ones this record
+> knows, and at least a fourth exists — **make the copy visible instead of the
+> ownership**. A `push` that is O(1) only in a linear argument position with the
+> copying case spelled differently (`push_copy`), or a narrow array type whose
+> only operations are append and freeze, puts the property in the type or the
+> error without a whole-value ownership check. It is smaller in scope and worse
+> ergonomically, and it fails differently — it moves the problem to conversion
+> sites. §6 dismisses a `Builder` type on ergonomic grounds; **that is not a
+> refutation**, and this ADR should not claim a closed space while a reviewer can
+> find an unrefuted door in a paragraph. Swift's `isKnownUniquelyReferenced` and
+> Koka's `fip` annotations live here.
+>
+> **And the claim door 3 actually earns is predictability, not speed.** Nothing
+> here prices a program written so that every genuine two-owner copy is explicit
+> against today's opportunistic `Arc::get_mut`. The two-owner case does not
+> disappear under any door; what changes is whether you can see it coming. That
+> is the real argument and it is the one to make.
+
 **Swift is the control that shows door 3 is required rather than merely
 available.** Swift has value semantics over a flat copy-on-write buffer — Ply's
 design exactly — and has Ply's trap exactly, as a well-known performance footgun
@@ -133,6 +153,15 @@ withdrawn here rather than deleted, because the shape of the error is the point.
 > the dispatch, at which point the index cost is fully exposed and permanent. A
 > decision that is correct about today's implementation, and silently assumes
 > today's implementation is the destination, is the error — not the number.
+
+**And the same number has a second trap in it, which this ADR nearly walked
+into.** "Every builtin body together at 1.3%" is a share measured *underneath*
+43.8% dispatch and 26.5% refcount traffic. Delete both — which is what compiling
+does — and the builtin share rises **by construction**. `push`'s O(n) copy is
+inside that 1.3%. So read carelessly, the profile this ADR cites says the shipped
+defect it was written about is negligible. ADR 0017 §R3 already states the general
+form — *"A window share is not a request cost"* — and it applies to the numerator
+here as much as to the denominator.
 
 This ADR asserts the general form, because the record contains more of it:
 **an interpreter ratio can settle a question about this evaluator and cannot
@@ -196,11 +225,34 @@ with the doc: *"It is an optimization hint and never a permission: see the modul
 comment for why a wrong `Owned` cannot change what a program means."* There are
 `Dead` sets, and `code.rs`'s lowering already threads liveness.
 
-So the static analysis half is built and running. It is advisory, unchecked, and
-invisible. **The change is to promote it from a hint to a guarantee and surface
-it**, which is a smaller distance than starting from nothing — and the fact that a
-wrong `Owned` currently cannot change what a program means is precisely what has
-to stop being true.
+> **Withdrawn (2026-08-28, by the decision-record sweep): "The change is to
+> promote it from a hint to a guarantee and surface it, which is a smaller
+> distance than starting from nothing."** The second clause is the error and it
+> understates the work badly. `rc.rs:41-47` states where correctness actually
+> comes from: `take_unique` "empties a binding only when every link from the head
+> of the chain down to that binding is uniquely owned … **A wrong `Owned`
+> therefore costs a wasted walk, never a wrong answer.**" The guarantee is
+> carried by a **dynamic guard**, and `Own` is permitted to be wrong precisely
+> because the guard is there. Promoting `Own` deletes the thing currently holding
+> the property up: the analysis has to become *sound* where today it is
+> deliberately allowed not to be. "The analysis half already exists" is true of
+> the dataflow skeleton and **false of any guarantee**.
+
+So what exists is a **dataflow skeleton and a place to hang the check**, not a
+half-built guarantee. That is still worth more than starting from nothing, and it
+is much less than this section first claimed.
+
+**Two further cautions from the same sweep, both about reading `rc.rs` as source
+material.** The same module doc records that multi-shot resumption is safe *because*
+"a resumed frame is cloned out of the continuation's shared segment, so its scope
+is shared, so nothing in it is ever taken" — a static owner analysis gets no such
+escape, and §9's continuation bullet is where that lands. And `carry` is an
+artifact of this evaluator's environment representation: a scope here is a
+persistent `Rc` chain shared by a closure, a continuation frame and the current
+evaluation, and **a compiled target with flat frames has no such chain**, so
+`carry` and the ratios attached to it do not survive the target. Designing the new
+analysis around them would be this ADR's own §4 error, committed inside the ADR
+that names it.
 
 ## §8 A sketch of the surface, explicitly not decided
 
