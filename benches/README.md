@@ -570,7 +570,11 @@ exactly on the projection `ply-test` applies. On `examples/` it reproduces the
 five groups and the `[179, 1, 2, 2, 2]` sizes `ply test --explain` prints.
 (A previous audit pass rewrote this list to `[175, 1, 2, 2, 2]`, calling `179`
 stale. That was the wrong direction and is reverted. Re-taken with
-`./target/release/ply test examples/ --explain --no-cache`, which prints
+`./target/release/ply test examples/ --explain --no-cache` — a **pre-built**
+binary over programs that import all eight `std` modules, so run
+`.github/binary-is-current.sh` before re-taking it; `CONTRIBUTING.md` §"The
+binary is an instrument too" says why `find crates -name '*.rs' -newer` would
+not have told you. It prints
 `176 of 186 region-isolated and free · 5 groups for the 10 shared tests` and
 then `group 0 · 179 tests`, followed by groups of 1, 2, 2 and 2.
 `179 + 1 + 2 + 2 + 2 = 186`, the whole selected set; the `175` variant sums to

@@ -608,6 +608,16 @@ cargo build --workspace --release
 ./examples/same-tests.sh
 ```
 
+> **It now says so rather than dying (2026-08-27).** The script's first act is
+> `.github/binary-is-current.sh`, which exits 2 with the `cargo build` line to
+> run when the binary is missing *or* is not built from this tree. The second
+> half matters more than the first: `desk.ply` imports all eight `std` modules
+> and those are `include_str!`ed into `ply`, so editing one changes what this
+> comparison means while moving no `.rs` file at all. Run
+> `.github/binary-is-current.sh` yourself before any measurement taken with a
+> pre-built binary — `CONTRIBUTING.md` §"The binary is an instrument too" is
+> the reproduction and the rule it replaces.
+
 Measured: **4.6s**, exit 0, and the tail is
 
 ```

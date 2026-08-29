@@ -27,6 +27,15 @@ per gap, ordered by what the existing measurements actually support.
 | 1.55× end to end from a fast execution strategy | ADR 0016 §"the second lever" |
 | 1,082 allocations per `/health`, 24% in `frame::dispatch` | `w6-alloc`, `w6_alloc_sites` |
 
+> **The served rung runs a pre-built binary (2026-08-27).** `mcts` itself is
+> built by cargo and is therefore current by construction, but its `--served`
+> denominator starts `target/release/ply` as a subprocess
+> (`crates/ply-codegen-spike/src/main.rs:558`) and checks only that the file
+> **exists**. `benches/kernel/mcts.ply` and `work.ply` import no `std` module,
+> so the kernel numbers are exposed to a stale interpreter and never to a stale
+> stdlib; the served rows are exposed to both. `CONTRIBUTING.md` §"The binary is
+> an instrument too" has the check and the full exposure list.
+
 ### What is assumed and not measured
 
 That an MCTS kernel's hot loop falls mostly inside the spike's compilable
