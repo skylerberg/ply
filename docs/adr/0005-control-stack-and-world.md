@@ -749,6 +749,16 @@ change that deletes the tree-walker, together with the fuel budget a tail loop
 would then need — with only one engine left, "a tail-recursive loop is a loop"
 becomes an available answer.
 
+> **Still the decision, and cited at last — see ADR 0022 (2026-08-27).** This
+> paragraph settled the tail-call question, and ADR 0020 §5.1, ADR 0021 §3 and
+> `spikes/ply-lexer/GAPS.md` §5 each re-derived it as an open problem without
+> citing it. ADR 0022 records that, and takes the **second half** of the
+> sentence above — the fuel budget — without the first: `iterate(seed, budget,
+> step)` elides no call, costs exactly one `Frame::IterateStep` on the machine
+> and one host-loop iteration on the tree-walker, and takes its bound as an
+> argument so a runaway is a diagnostic naming a number the program wrote.
+> **Tail-call elision stays out**, and this decision is not altered.
+
 `DEFAULT_MAX_FRAMES` stays as a resource limit on a heap that is nobody's native
 stack. A call costs at least one frame, so the call bound is reached first and
 the frame bound catches only a program that pends a million frames without

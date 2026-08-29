@@ -2158,3 +2158,182 @@ test "t" {
     assert!(at_runtime.message.ends_with("binds a continuation"));
     assert!(statically[0].message.ends_with("binds a continuation"));
 }
+
+// --- `iterate`, the one loop that is depth 1 however long it runs ------------
+
+/// The program both halves of the depth claim are made about: a loop of
+/// `n` steps, written once over `iterate` and once as the tail recursion it
+/// replaces, so the only difference between the two legs is the driver.
+fn loop_and_recursion(n: i64) -> (String, String) {
+    let driven = format!(
+        "fn step(s: {{ i: Int, acc: Int }}) -> Iter<{{ i: Int, acc: Int }}, Int> =\n  \
+         if s.i >= {n} {{ Stop(s.acc) }} else {{ Continue({{i: s.i + 1, acc: s.acc + s.i}}) }}\n\
+         test \"a loop of {n} steps\" {{ assert_eq(iterate({{i: 0, acc: 0}}, {}, step), {}) }}\n",
+        n + 1,
+        n * (n - 1) / 2,
+    );
+    let recursive = format!(
+        "fn walk(i: Int, acc: Int) -> Int = if i >= {n} {{ acc }} else {{ walk(i + 1, acc + i) }}\n\
+         test \"a loop of {n} steps\" {{ assert_eq(walk(0, 0), {}) }}\n",
+        n * (n - 1) / 2,
+    );
+    (driven, recursive)
+}
+
+/// **The claim the builtin exists for.** `iterate` rides the `Step::Apply`
+/// protocol, so the machine pushes one `Frame::IterateStep` and pops it again
+/// every round and the tree-walker keeps the loop on the host stack in
+/// `Interp::call_builtin`. Neither nests. A budget three orders of magnitude
+/// *below* `DEFAULT_MAX_CALLS` therefore runs a loop fifty times *above* it, on
+/// both engines, to the same answer.
+///
+/// The recursive leg is what makes that non-vacuous: the identical loop written
+/// as the tail recursion `iterate` replaces must raise at the same cap, or the
+/// cap is not measuring depth and the first half proves nothing.
+#[test]
+fn an_iterate_of_five_hundred_thousand_steps_is_depth_one_on_both_engines() {
+    let (driven, recursive) = loop_and_recursion(500_000);
+
+    // The arming leg first, so a cap that turned out to bound nothing fails
+    // here rather than passing silently above.
+    let (p, r) = load(&recursive);
+    for (engine, d) in [
+        (
+            "machine",
+            Machine::for_program(&p, &r).with_max_calls(8).eval_test(0),
+        ),
+        (
+            "treewalk",
+            Interp::for_program(&p, &r).with_max_calls(8).eval_test(0),
+        ),
+    ] {
+        let d = d.expect_err("500,000 nested calls do not fit in 8");
+        assert!(
+            d.message
+                .contains("recursion limit of 8 nested calls exceeded"),
+            "{engine}: {}",
+            d.message
+        );
+    }
+
+    let (p, r) = load(&driven);
+    Machine::for_program(&p, &r)
+        .with_max_calls(8)
+        .eval_test(0)
+        .expect("the machine pushes one frame per round and pops it again");
+    Interp::for_program(&p, &r)
+        .with_max_calls(8)
+        .eval_test(0)
+        .expect("the tree-walker drives the same protocol on its host stack");
+}
+
+/// The frame count, which the call count does not imply: a machine may be asked
+/// for a ceiling on its own pending frames, and a driver that accumulated one
+/// frame per round would pass the test above and fail this one.
+#[test]
+fn an_iterate_of_any_length_fits_under_a_frame_ceiling_that_bounds_nothing_else() {
+    let (driven, recursive) = loop_and_recursion(500_000);
+
+    let (p, r) = load(&recursive);
+    let d = Machine::for_program(&p, &r)
+        .with_max_frames(8)
+        .eval_test(0)
+        .expect_err("the recursion pends a frame a level and 500,000 do not fit in 8");
+    assert!(
+        d.message.contains("ceiling of 8 pending frames"),
+        "the control must run out of frames, not of something else: {}",
+        d.message
+    );
+
+    let (p, r) = load(&driven);
+    Machine::for_program(&p, &r)
+        .with_max_frames(8)
+        .eval_test(0)
+        .expect("the loop is one frame however many times it goes round");
+}
+
+/// A runaway is a diagnostic and not a hang — the property ADR 0005 §7.1
+/// removed tail-call elision to keep, and the reason `iterate`'s budget is an
+/// argument rather than a constant. There is no per-test timeout anywhere in
+/// `ply-test` or `ply-cli`, so an unbounded loop here would hang the suite.
+#[test]
+fn an_iterate_whose_step_never_stops_is_a_diagnostic_on_both_engines() {
+    agree_and_fail(
+        r#"
+fn never(s: Int) -> Iter<Int, Int> = Continue(s + 1)
+test "no Stop" { assert_eq(iterate(0, 5000, never), 0) }
+"#,
+        ply_span::codes::RUNTIME_ERROR,
+    );
+
+    let (p, r) = load(
+        r#"
+fn never(s: Int) -> Iter<Int, Int> = Continue(s + 1)
+test "no Stop" { assert_eq(iterate(0, 5000, never), 0) }
+"#,
+    );
+    let m = Machine::for_program(&p, &r).eval_test(0).unwrap_err();
+    let t = Interp::for_program(&p, &r).eval_test(0).unwrap_err();
+    assert_eq!(
+        m.message, t.message,
+        "the two engines phrase it differently"
+    );
+    assert!(
+        m.message
+            .contains("`iterate` took its budget of 5000 steps"),
+        "{}",
+        m.message
+    );
+    // Not phrased as a recursion limit: nothing nested, and four consumers
+    // classify on that string. See `limit::err_iterate_budget`.
+    assert!(!m.message.contains("recursion limit"), "{}", m.message);
+}
+
+/// A budget that is not a count of steps is refused before the loop starts,
+/// identically on both engines.
+#[test]
+fn an_iterate_budget_below_one_is_refused_by_both_engines() {
+    for budget in ["0", "-3"] {
+        let src = format!(
+            "fn step(s: Int) -> Iter<Int, Int> = Stop(s)\n\
+             test \"budget {budget}\" {{ assert_eq(iterate(0, {budget}, step), 0) }}\n"
+        );
+        agree_and_fail(&src, ply_span::codes::RUNTIME_ERROR);
+        let (p, r) = load(&src);
+        let m = Machine::for_program(&p, &r).eval_test(0).unwrap_err();
+        assert!(
+            m.message
+                .contains(&format!("`iterate` was given a budget of {budget}")),
+            "{}",
+            m.message
+        );
+    }
+}
+
+/// The surface `iterate` newly reaches. `cont.rs`'s `MapStep` records that a
+/// builtin's callback runs across a frame the tree-walker cannot re-enter, and
+/// `iterate`'s step is user code with an open row — so an effect performed
+/// inside one is the case that reaches the two engines' handler machinery from
+/// a position nothing put it in before. Asserted rather than inferred from the
+/// `fold` precedent.
+#[test]
+fn an_effect_performed_inside_an_iterate_step_agrees_on_both_engines() {
+    agree_and_pass(
+        r#"
+effect tally { write bump[c](n: Int) -> Int }
+
+fn step(s: { i: Int, acc: Int }) -> Iter<{ i: Int, acc: Int }, Int> / {tally.write[c]} =
+  if s.i >= 40 {
+    Stop(s.acc)
+  } else {
+    Continue({i: s.i + 1, acc: tally.bump[c](s.acc)})
+  }
+
+test "a perform inside an iterate step" {
+  assert_eq(handle { iterate({i: 0, acc: 0}, 41, step) }
+            with { tally.bump[c](n) -> n + 2 },
+            80)
+}
+"#,
+    );
+}

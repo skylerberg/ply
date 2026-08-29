@@ -687,8 +687,21 @@ configuration nobody meant.
 `max_stream_chunks` is the one bound on a *write*: the most chunks one
 `respond_chunked` produces. It lives here rather than in a constant because this
 record is where a program's bounds are readable, and it is a bound at all because
-every loop in Ply is a tail call charged against the evaluator's nested-call
-budget. Exhausting it terminates the message and answers `false`.
+a server that streams without one streams forever. Exhausting it terminates the
+message and answers `false`.
+
+> **Corrected by ADR 0022 (2026-08-27).** The second reason given here was
+> *"and it is a bound at all because every loop in Ply is a tail call charged
+> against the evaluator's nested-call budget"*. That was true of `stream_chunks`
+> and it made this field's largest usable value a fact about
+> `ply_eval::limit::DEFAULT_MAX_CALLS` rather than about HTTP —
+> `max_stream_chunks: 50000` raised `recursion limit of 10000 nested calls
+> exceeded`. `stream_chunks` and `stream_raw` now drive their loops with
+> `iterate`, which is depth 1 however long it runs, so the field bounds only
+> what it says it bounds. The sentence is **not** true of the whole language
+> either: `map`, `filter`, `fold`, `map_fold`, `bytes_position` and `iterate`
+> are all depth 1. It remains true of `serve` and `connection_loop` in the same
+> file, which ADR 0022 records as out of its scope.
 
 **The bound must cost the bound.** Every scan in the head parser passes a
 `Limits`-derived `max` to `bytes_scan` / `bytes_scan_until`, and the read loop

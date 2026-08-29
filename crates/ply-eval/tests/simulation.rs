@@ -775,3 +775,73 @@ test "two tasks that each allocate" {
             .collect::<Vec<_>>()
     );
 }
+
+/// **A scheduling point inside an `iterate` step.**
+///
+/// `iterate`'s loop is a `Frame::IterateStep` on the machine's control stack,
+/// and a `perform` inside its step is a scheduling point like any other — so a
+/// task suspended mid-loop must resume with its **countdown intact**, across a
+/// capture and a splice it does not control. `Frame::FoldStep` needs the same
+/// property and does not imply it: a fold's position is an index into a list
+/// that still exists, and this one is a number that lives only in the frame.
+///
+/// Two tasks, three rounds each, one shared cell, searched exhaustively. Every
+/// interleaving must finish and leave the counter between 3 (every read but the
+/// last lost) and 6 (none lost).
+///
+/// **Seen to fail:** with `next_iterate` decrementing the countdown by two, the
+/// budget runs out mid-loop and this goes red.
+#[test]
+fn two_iterate_loops_interleave_and_each_keeps_its_own_countdown() {
+    let c = compile(ITERATE_TASKS);
+    let explored = c.search(&dpor());
+    assert!(
+        explored.passed(),
+        "an interleaving of two `iterate` loops did not finish: {:?}",
+        explored.diagnostic.map(|d| d.message)
+    );
+    assert!(explored.exploration.exhaustive);
+    // More than one interleaving, or the search found no scheduling point
+    // inside the loop and the case is asserting nothing.
+    assert!(
+        explored.exploration.explored > 1,
+        "one interleaving is not a search: {}",
+        explored.exploration.explored
+    );
+}
+
+const ITERATE_TASKS: &str = r#"
+effect counter {
+  read  get[r]() -> Int
+  write put[r](v: Int) -> Unit
+}
+
+fn bump_n(k: Int) -> Unit / {counter.read[r], counter.write[r]} =
+  iterate({ left: k }, k + 1, |s: { left: Int }|
+    if s.left <= 0 {
+      Stop(())
+    } else {
+      let seen = counter.get[r]();
+      counter.put[r](seen + 1);
+      Continue({ left: s.left - 1 })
+    })
+
+test "two iterate loops" {
+  with_cell[n](0) { c ->
+    handle {
+      simulate {
+        let a = task.spawn(|| bump_n(3));
+        let b = task.spawn(|| bump_n(3));
+        task.join(a);
+        task.join(b);
+        // Each loop ran its own three rounds however they interleaved, so the
+        // counter is at least 3 — a shared countdown would stop one loop short.
+        assert(cell_get(c) >= 3 && cell_get(c) <= 6)
+      }
+    } with {
+      counter.get[r]() -> cell_get(c),
+      counter.put[r](v) -> cell_set(c, v),
+    }
+  }
+}
+"#;

@@ -245,6 +245,9 @@ impl Type {
     pub fn result(ok: Type, err: Type) -> Type {
         Type::Con(Symbol::new("Result"), vec![ok, err])
     }
+    pub fn iter(seed: Type, stop: Type) -> Type {
+        Type::Con(Symbol::new("Iter"), vec![seed, stop])
+    }
     /// A credential. Nothing in the language destructures one: it declares no
     /// constructors, so no pattern binds the payload, and no builtin over it
     /// returns the payload's type.

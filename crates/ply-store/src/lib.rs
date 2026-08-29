@@ -80,7 +80,14 @@ pub use schema::fingerprint as schema_fingerprint;
 /// No value moves — that is the argument for doing it — but the calls pending
 /// under a second reference to one do, so a test that recorded `E0502` at the
 /// recursion budget is not a test this evaluator still fails.
-pub const RUNTIME_VERSION: &str = "0.11.2";
+/// 0.12.0 adds `iterate`, an early-terminating loop driven by the same
+/// `Step::Apply` protocol `fold` rides. A bare `iterate` now denotes a builtin
+/// rather than being unresolved, the two engines answer a new pair of
+/// diagnostics — an exhausted budget and a budget below one — and neither says
+/// "recursion limit", which is what a consumer classifying on that string
+/// would have keyed on. A cached `Pass` written before this is a claim about a
+/// program in which `iterate` meant nothing.
+pub const RUNTIME_VERSION: &str = "0.12.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -113,7 +120,14 @@ pub const RUNTIME_VERSION: &str = "0.11.2";
 /// at the region rather than at itself, and a variant field declared as a
 /// concrete `Cell` is `E0446` where it used to be accepted. A cached interface
 /// written before that is an interface for a program this front end refuses.
-pub const FRONTEND_VERSION: &str = "0.15.0";
+/// 0.16.0 adds the prelude's fifth ADT, `Iter<s, r> = Continue(s) | Stop(r)`,
+/// and `iterate`'s scheme. `Iter` joins `builtin_types()`, so a project's own
+/// `type Iter` is `E0105` where it used to check; `iterate` gains a stored type
+/// where it used to be an unresolved name; and the prover's case split will
+/// now split on an `Iter`, because `prelude::ADTS` is what tells it the
+/// declaration is complete. A cached interface written before this is an
+/// interface for a program this front end reads differently.
+pub const FRONTEND_VERSION: &str = "0.16.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
