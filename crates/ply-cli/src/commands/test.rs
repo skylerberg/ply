@@ -24,6 +24,24 @@ use std::path::{Path, PathBuf};
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
     let engine: ply_eval::EngineChoice = args.engine.into();
+    // Before the store is opened, because a misspelled `--backend` must not
+    // leave a cache directory behind for a run that is about to refuse.
+    let backend = match backend_spec(args) {
+        Ok(spec) => spec,
+        Err(diagnostic) => {
+            if args.json {
+                emit_json(&json!({
+                    "command": "test",
+                    "ok": false,
+                    "exit_code": EXIT_COMPILE_ERROR,
+                    "diagnostics": [diagnostic_json(&diagnostic, &SourceMap::new())],
+                }));
+            } else {
+                print_diagnostics(std::slice::from_ref(&diagnostic), &SourceMap::new(), style);
+            }
+            return EXIT_COMPILE_ERROR;
+        }
+    };
     let no_cache = cache_bypassed(args);
     let mut cache = match Cache::open(&project_root(&args.path), no_cache) {
         Ok(cache) => cache,
@@ -177,17 +195,29 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // A factory rather than a handle: a reactor belongs to the thread its
     // machine runs on, and the runner builds a machine per worker.
     let runtime = hosts.runtime_factory();
+    // One per run, not one per worker: a backend may not borrow the program
+    // (`Machine`'s `compiled` field says why), so building one costs a copy of
+    // the AST and the workers share it. Built here, after the reload above may
+    // have replaced `loaded`, so the address `Compiled::describes` compares
+    // against is the program the run actually evaluates.
+    let fragment = backend
+        .is_some()
+        .then(|| ply_eval::Fragment::over(&loaded.program, &loaded.resolved, &loaded.check));
     let mut run = || {
-        ply_test::run(
+        let mut executor =
+            ply_test::InterpExecutor::new(&loaded.program, &loaded.resolved, &loaded.check)
+                .with_engine(engine)
+                .with_search(simulation.clone())
+                .with_hosts(hosting(&hosts, &runtime));
+        if let (Some(fragment), Some(spec)) = (fragment, backend.clone()) {
+            executor = executor.with_backend(fragment, spec);
+        }
+        ply_test::run_with(
             &plan.selection,
-            &loaded.program,
-            &loaded.resolved,
             &loaded.check,
             &hashes,
             &mut cache.store,
-            engine,
-            simulation.clone(),
-            hosting(&hosts, &runtime),
+            &executor,
         )
     };
     let mut report = match &pool {
@@ -215,18 +245,139 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     let view = HostView::of(&hosts, &plan, &loaded.check, &report);
-    let ok = report.is_success() && view.escapes.is_empty();
+    let backend_view = BackendView::of(backend.as_ref(), fragment, &report);
+    let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
     if args.json {
         emit_json(&report_json(
-            &loaded, &hashes, &plan, &report, args, workers, &warnings, &view, ok,
+            &loaded,
+            &hashes,
+            &plan,
+            &report,
+            args,
+            workers,
+            &warnings,
+            &view,
+            &backend_view,
+            ok,
         ));
     } else {
         print_human(
-            &loaded, &hashes, &plan, &report, args, workers, &warnings, &view, style,
+            &loaded,
+            &hashes,
+            &plan,
+            &report,
+            args,
+            workers,
+            &warnings,
+            &view,
+            &backend_view,
+            style,
         );
     }
     exit_code(ok)
+}
+
+/// What a compiled backend contributed to this run.
+///
+/// `None` everywhere when no backend was installed, which is every run that did
+/// not ask. Never a zeroed value: "no backend ran" and "a backend ran and
+/// entered nothing" are different claims, and the second is the null result ADR
+/// 0018 §0.5 records R4 reporting a 0.998x speedup over.
+struct BackendView {
+    /// What was asked for, rendered.
+    spec: Option<String>,
+    /// Definitions the backend had a body for.
+    fragment: usize,
+    /// Calls offered, offers naming a targeted definition, and answers a
+    /// mutation changed — over every worker.
+    offers: ply_eval::Offers,
+    /// Bodies entered natively and calls declined, summed over the tests.
+    entries: u64,
+    declines: u64,
+    /// Tests that entered native code and whose passes were written to the
+    /// result cache anyway. Empty in a correct run; see [`backend_escapes`].
+    escapes: Vec<Diagnostic>,
+}
+
+impl BackendView {
+    fn of(
+        spec: Option<&ply_eval::BackendSpec>,
+        fragment: Option<&'static ply_eval::Fragment>,
+        report: &RunReport,
+    ) -> BackendView {
+        let Some(spec) = spec else {
+            return BackendView {
+                spec: None,
+                fragment: 0,
+                offers: ply_eval::Offers::default(),
+                entries: 0,
+                declines: 0,
+                escapes: Vec::new(),
+            };
+        };
+        let entries = report
+            .results
+            .iter()
+            .filter_map(|r| r.backend)
+            .map(|b| b.entries)
+            .sum();
+        let declines = report
+            .results
+            .iter()
+            .filter_map(|r| r.backend)
+            .map(|b| b.declines)
+            .sum();
+        BackendView {
+            spec: Some(spec.describe()),
+            fragment: fragment.map_or(0, ply_eval::Fragment::len),
+            offers: fragment.map_or_else(Default::default, ply_eval::Fragment::offers),
+            entries,
+            declines,
+            escapes: backend_escapes(report),
+        }
+    }
+
+    fn installed(&self) -> bool {
+        self.spec.is_some()
+    }
+}
+
+/// A test that entered native code and whose pass was written to the result
+/// cache — the run caching a claim about a third execution strategy.
+///
+/// ADR 0026 §4.6's **stage two**, and the reason it exists beside the one-line
+/// clause in [`cache_bypassed`]: that clause covers a backend that arrives by
+/// the flag, and this one covers a backend that arrives by any route, because it
+/// reads what the machine *did* rather than what the arguments asked for. It is
+/// `cache_escapes` one field over — the same shape, the same `INTERNAL_ERROR`,
+/// and the same reason: the failure mode is silent and outlives the run that
+/// caused it.
+///
+/// The rule is the one on `Machine::set_compiled`: *"A run with a backend
+/// attached is a third execution strategy, and a cached `Pass` is a claim about
+/// the authoritative engine."*
+fn backend_escapes(report: &RunReport) -> Vec<Diagnostic> {
+    report
+        .results
+        .iter()
+        .filter(|r| {
+            r.recorded.as_ref().is_some_and(Record::is_written)
+                && r.backend.is_some_and(|b| b.entries > 0)
+        })
+        .map(|r| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "`{}` entered compiled code, and its pass was written to the result cache",
+                    r.name
+                ),
+            )
+            .note("a backend is a third execution strategy; a cached `Pass` is a claim about the authoritative engine")
+            .note("run `ply cache clear`: an entry written here would be believed by a later run with no backend")
+            .note("this is Ply's fault — the runner and the backend disagree about what this run may record")
+        })
+        .collect()
 }
 
 /// What the binding contributed to this run, threaded through both projections
@@ -332,8 +483,51 @@ fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<
 /// A stored `Pass` is a claim about what the authoritative engine did, so a run
 /// on any other engine may neither believe one nor leave one behind. Asking for
 /// a non-default engine therefore implies `--no-cache` without saying so.
+///
+/// **`--backend` is the third strategy and is read here for the same reason**,
+/// and it is read *separately* rather than through the engine. `--engine both`
+/// already bypasses the cache, so a backend installed on that path would be
+/// cache-safe by accident while a backend on the default `--engine machine`
+/// path would not — ADR 0026 §4.6 names that interlock as a trap and refuses to
+/// let enforcement rest on it. `a_backend_on_the_default_engine_bypasses_the_cache`
+/// is what holds this clause: delete it and that test goes red while every
+/// `--engine both` test stays green.
+///
+/// This is the *flag* half of the rule, and it covers only a backend that
+/// arrives by this flag. [`backend_escapes`] is the half that survives one
+/// arriving by any other route.
 fn cache_bypassed(args: &TestArgs) -> bool {
-    args.no_cache || ply_eval::EngineChoice::from(args.engine).bypasses_cache()
+    args.no_cache
+        || args.backend.is_some()
+        || ply_eval::EngineChoice::from(args.engine).bypasses_cache()
+}
+
+/// What `--backend` asked for, or the diagnostic that refuses it.
+///
+/// Two refusals, and the second is the interesting one. A spec that does not
+/// parse is a typo. `--engine treewalk --backend ..` is a request the seam
+/// cannot serve at all: the tree-walker has no compiled path, so the flag would
+/// be accepted and do nothing — which is `CONTRIBUTING.md` §"The one rule"'s
+/// defect shape, a mechanism named where a reader would look for it and
+/// constructed nowhere.
+fn backend_spec(args: &TestArgs) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
+    let Some(spec) = &args.backend else {
+        return Ok(None);
+    };
+    if args.engine == crate::cli::EngineArg::Treewalk {
+        return Err(Diagnostic::error(
+            codes::BACKEND_UNAVAILABLE,
+            "`--backend` needs an engine that can enter compiled code",
+        )
+        .note("the tree-walker has no compiled path, so a backend attached to it would be inert")
+        .note("use `--engine machine` (the default) or `--engine both`"));
+    }
+    ply_eval::backend::parse(spec).map(Some).map_err(|message| {
+        Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
+            "a wrong backend is a self-test: it exists so that a green run with a backend \
+                 attached can be read as evidence",
+        )
+    })
 }
 
 /// `--bisect never` goes *through* the diagnosis rather than around it, so that
@@ -581,6 +775,7 @@ fn print_human(
     workers: usize,
     warnings: &[Diagnostic],
     view: &HostView<'_>,
+    backend: &BackendView,
     style: Style,
 ) {
     let selection = &plan.selection;
@@ -666,9 +861,39 @@ fn print_human(
             );
         }
     }
+    // What the backend was asked and what it did with it, printed whether or not
+    // anything went wrong. A run that installed a backend and entered nothing is
+    // a null result, and the number that says so has to be in front of the
+    // reader rather than in `--json`.
+    if let Some(corruption) = &backend.spec {
+        let offers = backend.offers;
+        println!(
+            "{IND}{} {} · {} of {} offers entered · {} declined · {} in the fragment",
+            style.bold("backend"),
+            style.bold(args.backend.as_deref().unwrap_or("reference")),
+            backend.entries,
+            offers.offered,
+            backend.declines,
+            backend.fragment,
+        );
+        if corruption != "nothing" {
+            println!(
+                "{IND}{}",
+                style.dim(&format!(
+                    "wrong on purpose: {corruption} · {} {} changed · {} {} of the target",
+                    offers.fired,
+                    plural(offers.fired as usize, "answer"),
+                    offers.offered_target,
+                    plural(offers.offered_target as usize, "offer"),
+                ))
+            );
+        }
+    }
     if cache_bypassed(args) {
         let why = if args.no_cache {
             "--no-cache".to_string()
+        } else if args.backend.is_some() {
+            "--backend".to_string()
         } else {
             format!("--engine {}", args.engine.as_str())
         };
@@ -717,6 +942,10 @@ fn print_human(
         style,
     );
 
+    if !backend.escapes.is_empty() {
+        println!();
+        print_warnings(&backend.escapes, style);
+    }
     if !view.escapes.is_empty() {
         println!();
         print_warnings(&view.escapes, style);
@@ -1266,6 +1495,7 @@ fn report_json(
     workers: usize,
     warnings: &[Diagnostic],
     view: &HostView<'_>,
+    backend: &BackendView,
     ok: bool,
 ) -> Value {
     let sources = &loaded.sources;
@@ -1406,6 +1636,21 @@ fn report_json(
         // when no oracle ran: a consumer cannot tell "compared nothing" from
         // "there was nothing to compare with".
         "audit": report.audit,
+        // What a compiled backend was asked and what it did with it. Absent,
+        // never zeroed, when none was installed — for the same reason `audit`
+        // is: a consumer cannot tell "entered nothing" from "there was nothing
+        // to enter with". Added within v4 and not a bump; nothing changed
+        // meaning and nothing left.
+        "backend": backend.installed().then(|| json!({
+            "spec": args.backend,
+            "corruption": backend.spec,
+            "fragment": backend.fragment,
+            "offered": backend.offers.offered,
+            "offered_target": backend.offers.offered_target,
+            "fired": backend.offers.fired,
+            "entered": backend.entries,
+            "declined": backend.declines,
+        })),
         "selection": {
             "total": selection.total,
             "selected": selection.to_run.len(),
@@ -1432,7 +1677,10 @@ fn report_json(
         "failures": failures,
         // Not a warning: an entry that escaped here is believed by every later
         // run, so it fails this one.
-        "diagnostics": diagnostics_json(&view.escapes, sources),
+        "diagnostics": diagnostics_json(
+            &view.escapes.iter().chain(&backend.escapes).cloned().collect::<Vec<_>>(),
+            sources,
+        ),
         "warnings": warnings.iter().map(|w| diagnostic_json(w, sources)).collect::<Vec<_>>(),
     })
 }
@@ -1647,8 +1895,20 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )
         .expect("the fixture binds");
         let view = HostView::of(&hosts, plan, &loaded.check, report);
+        let backend = BackendView::of(None, None, report);
         let ok = report.is_success() && view.escapes.is_empty();
-        report_json(loaded, hashes, plan, report, args, workers, &[], &view, ok)
+        report_json(
+            loaded,
+            hashes,
+            plan,
+            report,
+            args,
+            workers,
+            &[],
+            &view,
+            &backend,
+            ok,
+        )
     }
 
     fn args_for(filter: Option<&str>) -> TestArgs {
@@ -1663,6 +1923,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             bisect: When::Auto,
             bisect_budget: 64,
             trace: When::Auto,
+            backend: None,
             host: false,
             tls: crate::cli::TlsOptions::default(),
             db: crate::db::DbOptions::default(),
@@ -2307,6 +2568,7 @@ test \"stuck\" {
             simulation: None,
             recorded: None,
             audited: None,
+            backend: None,
         };
         let plain = result_line(&result, &result.name, 44, Style::plain());
         assert!(plain.starts_with("FAIL "));
@@ -2340,6 +2602,7 @@ test \"stuck\" {
                 }),
                 recorded: None,
                 audited: None,
+                backend: None,
             })
             .expect("a simulated test has a line")
         };
@@ -2373,6 +2636,7 @@ test \"stuck\" {
             simulation: None,
             recorded: None,
             audited: None,
+            backend: None,
         };
         let column = |status| {
             result_line(&make(status), "n", 24, Style::plain())
@@ -2547,6 +2811,7 @@ test \"stuck\" {
                 simulation: None,
                 recorded: Some(Record::Under(vec![hashes.tests[index]])),
                 audited: None,
+                backend: None,
             }])
         };
 
@@ -2650,6 +2915,7 @@ test \"stuck\" {
             simulation: None,
             recorded: Some(Record::Under(vec![hashes.tests[index]])),
             audited: None,
+            backend: None,
         }]);
         let view = HostView::of(&hosts, &plan, &loaded.check, &recorded);
         assert_eq!(

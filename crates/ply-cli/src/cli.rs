@@ -382,6 +382,18 @@ pub struct TestArgs {
     #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
     pub engine: EngineArg,
 
+    /// Attach a compiled backend to the machine, so a call it accepts is
+    /// entered natively instead of evaluated.
+    ///
+    /// `reference` is a backend that answers correctly. `wrong:<mutation>` is
+    /// one that is wrong on purpose, so that a green run can be read as
+    /// evidence — one of `off-by-one`, `inverted`, `stale`, `wrong-type`,
+    /// `unoffered`, `exceeds-budget[={k}]` or `answers={int}`, each optionally
+    /// `@<definition>`. Under `--engine both` the backend is a third engine and
+    /// a disagreement fails the run. Never reads or writes the result cache.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
     /// Bind the real host handlers. Off by default, and the default is the
     /// point: a suite that silently acquires a live dependency is the failure
     /// mode this language exists to prevent. A test that reaches a bound

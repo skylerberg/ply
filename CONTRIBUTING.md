@@ -161,6 +161,24 @@ cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold
 cargo test --workspace                          # 9.5-29 min — 3,696 pass, 0 fail, 5 ignored
 ```
 
+> **The count moved on 2026-08-28 and this line is deliberately not rewritten
+> to a number nobody took.** ADR 0026's work adds **24** tests — 8 to
+> `ply-eval`'s `differential_corpus` (the eight wrong backends at corpus scale),
+> 14 in a new `ply-cli/tests/backend.rs`, 1 to `ply-span`'s `armed.rs` and 1 to
+> `ply-corpus`'s `w6` — so a full run should read **3,720**. That is arithmetic,
+> not a measurement: `--workspace` was not re-run for this change, on this file's
+> own rule that a figure belongs where it was taken. The per-package counts that
+> *were* taken are `cargo test -p ply-eval` at **1,014 passed / 0 failed / 1
+> ignored over 43 targets**, and `cargo test -p ply-cli --test backend` at 14/0.
+>
+> It also adds wall clock in one place worth naming: `cargo test -p ply-eval
+> --test differential_corpus` goes from seconds to **73.4s**, because five of the
+> eight corruptions sweep the whole 1,116-test corpus. An earlier run of the same
+> suite read 82.7s; both are **observations rather than figures**, taken at a
+> 1-minute load average of 8-9 against this file's own 4.0 gate. That is the
+> price of the seam having measured sensitivity inside `cargo test --workspace`
+> rather than in a crate on another toolchain.
+
 > **Re-taken after item 11's fix (2026-08-24).** The line above read `9.5-29
 > min — 3,690 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
 > --no-fail-fast -- --test-threads=2` now reports **3,696 passed / 0 failed / 5
@@ -1400,6 +1418,78 @@ Recorded here so nobody spends an afternoon rediscovering them.
    `src/rt.rs`, which is the JIT's calling convention, plus 6 warnings; the
    project's stated gate is `--workspace` and does not reach them.
 
+   > **Both figures in this entry are stale and are corrected here rather than
+   > rewritten above, 2026-08-28, because the block is a dated re-take and this
+   > is the next one.** Whole run captured, from `crates/ply-codegen-spike/`:
+   >
+   > ```
+   > $ cargo +1.94.0 test --release --no-fail-fast
+   > tests/entry_cost.rs    0 passed;  3 ignored     # a measurement, not a gate
+   > tests/hazards.rs      18 passed;  0 failed
+   > tests/mcts_kernel.rs   9 passed;  0 failed
+   > tests/mutations.rs    13 passed;  0 failed
+   > tests/spike.rs         9 passed;  0 failed
+   > ```
+   >
+   > **49 passed, 0 failed, 3 ignored**, over eight test binaries plus the
+   > doc-tests — so "45 tests across 8 targets" is wrong on the count, on
+   > `hazards` (16 → 18), on `mutations` (11 → 13), and it lists no
+   > `tests/entry_cost.rs` at all. `crates/ply-eval/src/compiled.rs`'s policing
+   > table already said 13 for `mutations`, so two documents disagreed about one
+   > crate and that one was right — which is this entry's own closing paragraph
+   > happening again, one re-take later.
+   >
+   > **And the crate is clippy-error-clean.** `cargo +1.94.0 clippy
+   > --all-targets` exits **0** with **zero errors and ten warnings** — five
+   > `arc_with_non_send_sync`, one unused import (`SLACK`,
+   > `tests/entry_cost.rs:54`), one `collapsible_match`, one
+   > `useless_conversion`, one `useless_vec`, one `type_complexity`. `grep -c
+   > not_unsafe_ptr_arg_deref` over the whole log is **0**, and the only
+   > suppression in `rt.rs` is `#![allow(clippy::missing_safety_doc)]`. The "13
+   > errors" figure is quoted a second time in `.github/workflows/ci.yml`'s
+   > `spike` job as its reason for building and testing but not linting; that
+   > reason no longer holds and is corrected there too.
+   >
+   > What the crate is *for* is now decided rather than pending:
+   > [ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.7 honours ADR 0016
+   > §3.5's refusal to promote it and **amends** §3.5's deletion requirement,
+   > because R5 already falsified that requirement's stated reason — the seam in
+   > `ply-eval` survives `rm -r` — replacing "delete it when W6 closes" with a
+   > condition: the spike goes when its eight wrong backends have been
+   > reproduced over the `Compiled` doubles in `crates/ply-eval/tests/` and run
+   > under `cargo test --workspace`.
+   >
+   > **The reproduction landed 2026-08-28 and the condition is NOT satisfied.
+   > The crate stays, and the reason is a measurement rather than a
+   > preference.** Seven of the eight configurations are reproduced over
+   > `ply_eval::backend::Reference` — five of them under `cargo test
+   > --workspace` in `crates/ply-eval/tests/differential_corpus.rs` at corpus
+   > scale, and `exceeds-budget=4` through `ply test` on a corpus built to
+   > outrun the machine's bound, with `answers=` standing on its offer count as
+   > it always has. The eighth does not survive the move, for a structural
+   > reason:
+   >
+   > | | the spike | the workspace |
+   > | --- | --- | --- |
+   > | the backend | cranelift, native frames, a fixed stack | a second tree-walker, `stacker`-grown frames on the heap |
+   > | `exceeds-budget` unbounded | `fatal runtime error: stack overflow`, **signal 6 in seconds**, reported from outside by `run_guarded` / `Ended::as_disagreement` | **no crash and no report** — the runaway grows the heap instead. Measured: no output and no exit in 45 seconds, killed by `timeout` |
+   >
+   > ADR 0026 §4.7's condition names *measured sensitivity*, and §7's fifth
+   > bullet predicted exactly this — *"The mutation harness may not survive the
+   > move … the condition names measured sensitivity and not a test count."* So
+   > the spike is still the only thing in this repository that has demonstrated
+   > that a backend which ignores its budget entirely would be noticed, and it
+   > stays until something else can. What would discharge it is a reporter
+   > outside the run — `run_guarded`'s shape, moved into the workspace, with a
+   > backend whose runaway actually dies.
+   >
+   > Everything else the condition asked for is done and is stronger than what
+   > it replaces on the axes that moved: the corpus is **1,116 real tests**
+   > rather than 2,396 generated cases, and `unoffered` is reported by 901 of
+   > them. The per-corruption numbers are in
+   > `crates/ply-eval/src/compiled.rs`'s policing table, printed by the tests
+   > that take them.
+
    Consequence, revised: ADR 0016's `11.67x` **is** re-takeable now, and R4 took
    it — `benches/w6-spike-r4.json`, at `11.68×` by the same expression, so the
    `read_line` half did not move. `ROADMAP.md` §"What is next" item 3 is
@@ -2114,20 +2204,83 @@ Recorded here so nobody spends an afternoon rediscovering them.
     > is a corpus that reaches the seam's effect gates. **The first bullet is
     > the one still open**, and it is open on purpose.
 
-    - **`ply test --engine both` cannot install a backend at all.** Still true
+    - ~~**`ply test --engine both` cannot install a backend at all.**~~ **Fixed
+      2026-08-28**, and the block below is left as it was written because it is
+      the record of what was true for four days. What it read is unchanged; what
+      it *claims* is withdrawn by the note under it.
+
+      **`ply test --engine both` cannot install a backend at all.** Still true
       and deliberately not fixed here — wiring a backend into the CLI is gated on
       item 9 and on the result-cache rule. What is new is that the claim is now
       written down as an inventory somebody can check rather than as a sentence:
       `crates/ply-eval/src/compiled.rs` §"What polices this seam, and what does
       not" counts it. `Compiled` and `set_compiled` occur **zero** times in
-      `crates/ply-cli`, source and tests both; all five `set_compiled` call sites
-      in the workspace are tests or the spike's own harness (2 in
-      `ply-codegen-spike/src/measure.rs`, 5 in its `hazards.rs`, 3 in its
-      `mutations.rs`, 27 in `ply-eval/src/compiled.rs`'s own tests, 2 in
-      `ply-eval/tests/differential_corpus.rs`). So the shipping CLI catches
-      **zero** of the eight deliberately wrong backends, and the rule that a
-      backend run must not populate the result cache is **unenforced because it
-      is unreachable**.
+      `crates/ply-cli`, source and tests both; all **42** `set_compiled` call
+      sites in the workspace are tests or the spike's own harness (27 in
+      `ply-eval/src/compiled.rs`'s own tests, 5 in
+      `ply-codegen-spike/tests/hazards.rs`, 3 in
+      `ply-eval/tests/differential_corpus.rs`, 3 in
+      `ply-eval/tests/equivalence_audit.rs`, 2 in
+      `ply-codegen-spike/tests/mutations.rs`, 2 in its `src/measure.rs`). So the
+      shipping CLI catches **zero** of the eight deliberately wrong backends, and
+      the rule that a backend run must not populate the result cache is
+      **unenforced because it is unreachable**.
+
+      > **The count and its own list were both wrong, corrected 2026-08-28.** It
+      > read *"all five `set_compiled` call sites in the workspace are tests or
+      > the spike's own harness (2 in `ply-codegen-spike/src/measure.rs`, 5 in
+      > its `hazards.rs`, 3 in its `mutations.rs`, 27 in
+      > `ply-eval/src/compiled.rs`'s own tests, 2 in
+      > `ply-eval/tests/differential_corpus.rs`)"* — a parenthetical summing to
+      > 39 introduced by the word "five", with `ply-eval/tests/equivalence_audit.rs`
+      > missing and two of the five per-file figures wrong.
+      > `grep -rn '\.set_compiled(' --include=*.rs` counts 42. **The claim the
+      > count decorates is unaffected and was re-checked one file at a time: all
+      > 42 are tests or the spike's harness, and the CLI still installs
+      > nothing.** [ADR 0026](docs/adr/0026-a-reachable-backend.md) §1.1 carries
+      > the re-take; §4.1 decides that a backend *is* reachable and §4.5 makes
+      > catching these eight from a shipping command the condition on any backend
+      > shipping at all, which is what closes this bullet.
+
+      > **Closed 2026-08-28, by building it.** `ply test --backend <spec>`
+      > installs one: `reference` is a backend that answers correctly —
+      > `ply_eval::backend::Reference`, a second tree-walker over the
+      > scalar-signature fragment, **not** a code generator and no cranelift in
+      > `Cargo.lock` — and `wrong:<mutation>` is one of the eight, so that a
+      > green run with a backend attached can be read as evidence. Under
+      > `--engine both` the backend is a **third** engine, compared against the
+      > plain machine rather than against the tree-walker, so a divergence
+      > reported is the backend's and nothing else's.
+      >
+      > **The shipping CLI catches seven of the eight configurations. It is
+      > seven and not eight, and the eighth is named rather than rounded up.**
+      > `crates/ply-cli/tests/backend.rs` is the standing form, 14 tests, and its
+      > header carries the table. What escapes is ignoring the budget *entirely*
+      > over a **non-terminating** recursion: that is not a wrong answer, the run
+      > never comes back, and every candidate reporter is inside the process it
+      > took down — measured at no output and no exit in 45 seconds against
+      > 0.03s for the run that reports. The spike's `run_guarded` is the reporter
+      > that can see it, from outside, and it is still the only one.
+      >
+      > Self-tested the way `mutations.rs` self-tests: replacing every
+      > `Mutation` with `Mutation::None` in `backend::parse` fails **7 of the
+      > 14** and leaves exactly the controls, the gate test and the two
+      > cache-rule tests green. Run 2026-08-28.
+      >
+      > **And the result-cache rule is armed, in both of ADR 0026 §4.6's
+      > stages, each seen to fail before it was believed.** `cache_bypassed`
+      > reads `--backend`, so a backend run on the *default* engine reads
+      > nothing from the store — delete that clause and a backend run over a
+      > warm cache reports `selected 0 of 5 (5 cached)` and `0 of 0 offers
+      > entered`, a green run over a backend that never ran. `ply_test::run_with`
+      > records `Record::Backend` for any test with a non-zero native entry
+      > count, so nothing is written whatever the flags said — delete that arm
+      > and `ply test` reports three `E0505 … entered compiled code, and its
+      > pass was written to the result cache` and exits 1. The source half is
+      > `crates/ply-span/tests/armed.rs`'s
+      > `a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache`,
+      > which fires on a **new route** rather than on a wrong answer: adding a
+      > `set_compiled` call to `crates/ply-cli/src/commands/run.rs` turns it red.
     - ~~**A backend that ignores its budget is a stack overflow, not a
       disagreement.**~~ **Closed (2026-08-24).** It read: *"`--mutate
       exceeds-budget` dies with `fatal runtime error: stack overflow`, exit 134,
