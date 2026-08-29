@@ -1587,15 +1587,24 @@ Recorded here so nobody spends an afternoon rediscovering them.
    keeps it and matches this file byte for byte. The MIT text differs from
    three independent copies
    (`scoped-tls-1.0.1`, `either-1.15.0`, `bit-set-0.8.0`) on **exactly one**
-   line, the copyright line, which reads `Copyright (c) 2026 Skyler Berg`.
+   line: those three carry a copyright line and this file carries none, so the
+   text begins at `Permission is hereby granted`.
 
-   **That copyright line is the one thing in this entry nothing in the tree can
-   check.** No file here names a holder or a year: no crate carries an `authors`
-   field and `grep -rn -i copyright` outside `Cargo.lock` found nothing before
-   these files existed. The holder is inferred from
-   `Cargo.toml:23 repository = "https://github.com/skylerberg/ply"` and the year
-   from the earliest date in the prose (`2026-02-11`). If the holder is an
-   entity, or the work predates 2026, that line is wrong and a human has to say
+   > **Withdrawn (2026-08-28): "the copyright line, which reads `Copyright (c)
+   > 2026 Skyler Berg`", and the paragraph justifying it — "That copyright line
+   > is the one thing in this entry nothing in the tree can check … The holder
+   > is inferred from `Cargo.toml:23 repository = …` and the year from the
+   > earliest date in the prose (`2026-02-11`). If the holder is an entity, or
+   > the work predates 2026, that line is wrong and a human has to say so."**
+   > A human said so: the line is removed rather than confirmed. The reasoning
+   > was sound and its conclusion was that the value was inferred, which is not
+   > a thing this repository asserts.
+
+   **What that costs, stated rather than glossed.** MIT's grant conventionally
+   names the party granting it, and this text now names nobody, so who licensed
+   the work is not stated in the file. `Cargo.toml:22`'s `MIT OR Apache-2.0`
+   and the repository URL are what remain. Restoring a holder is a one-line
+   edit whenever there is one to name; nothing in the tree checks it either way
    so — it is the only claim in this repository whose error has consequences
    outside it.
 
