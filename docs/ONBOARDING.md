@@ -1329,10 +1329,12 @@ Everything here cost this audit real time. In descending order of cost.
     itself. ~~`README.md:499`~~ was already stale when it was written — the file
     is 663 lines (658 then; this change added five below `## License`) and the
     licence is at **`README.md:656`**; line 499 is about type aliases. And the
-    copyright line, `Copyright (c) 2026 Skyler Berg`, is
-    **inferred** from `Cargo.toml:23`'s repository URL and the earliest date in
-    the prose, because nothing in the tree names a holder or a year. A human
-    should confirm it. The rest stands: all thirteen member crates inherit the
+    ~~copyright line, `Copyright (c) 2026 Skyler Berg`, is **inferred** from
+    `Cargo.toml:23`'s repository URL and the earliest date in the prose,
+    because nothing in the tree names a holder or a year. A human should
+    confirm it.~~ **A human did, on 2026-08-28, and the answer was to drop it:
+    `LICENSE-MIT` now carries no copyright line and begins at `Permission is
+    hereby granted`. CONTRIBUTING item 7 carries what that costs.** The rest stands: all thirteen member crates inherit the
     expression with `license.workspace = true`, and only
     `crates/ply-codegen-spike/Cargo.toml` declares no license, being its own
     workspace — still true, and deliberately left alone.
