@@ -1,0 +1,603 @@
+// Area 1 of the Ply parser spike: type expressions, generics, effect rows and
+// parameters. A port of `crates/ply-syntax/src/parser.rs` — `ty`, `ty_inner`,
+// `ty_body`, `fn_ty`, `ty_field`, `row`, `row_member`, `atom_rest`, `mode`,
+// `generics` and `param` — function for function.
+//
+// This is a leaf of the AST's sort dependency graph, checked field by field
+// against `ast.rs`: `TypeExpr` reaches `Ident`, `QName`, `TypeExpr` and
+// `RowExpr`, and neither `Expr` nor `Pattern`. That is what makes the area
+// independently buildable rather than merely independently assigned.
+//
+// It owns one of the three `deeper()` sites (`ty_inner`, `parser.rs:1035`), one
+// of the ten `no_brace` save/restores (`ty`, `parser.rs:1027`), and the first
+// use of `expect_gt` — `type Pair<a>= ..`, where `>=` has to become `>` then
+// `=`.
+
+import spine (Span, Ident, QName, Ctx, P, R, Ate, Acc, PDiag,
+              span_to, dummy_span, no_ident, no_qname,
+              unexpected, diag1, bail_with, error_here, unclosed,
+              kind, kind_at, cur_span, span_at, prev_span, at, at_eof,
+              at_ident_text, starts_upper, advance, bump, eat,
+              expect, expect_close, expect_ident, expect_gt,
+              with_no_brace, with_sets, deeper, shallower, qname, comma_list,
+              t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
+              t_comma, t_colon, t_dot, t_arrow, t_lt, t_gt, t_ge, t_pipe, t_slash,
+              num, rec, nlist, opt, payload, word, dump_list, dump_opt,
+              dump_ident, dump_qname, dump_diags, start)
+import lexer (Tok, TIdent, TPunct)
+
+// --- The AST ----------------------------------------------------------------
+
+// Anonymous records inline inside variants — the shape
+// `crates/ply-std/ply/http.ply:243 Line` already ships. There is no named-type
+// cycle here: `TypeExpr` recurses only through itself, through `List`, and
+// through inline structural records. `{name: Ident, ty: TypeExpr}` is written
+// inline rather than as a named `TyField`, because a named record alias in
+// mutual recursion with an ADT is the one shape the spike registered as a
+// go/no-go and nothing in `crates/ply-std/ply/` or `examples/` does. Inline, it
+// is not needed. `GAPS.md` §P1.
+//
+// `RowExpr` and `AtomExpr` *are* named, because the cycle runs
+// `TypeExpr -> RowExpr -> AtomExpr` and stops there.
+pub type TypeExpr =
+  | TVar(Ident)
+  | TCon({ span: Span, name: QName, args: List<TypeExpr> })
+  | TFn({ span: Span, params: List<TypeExpr>, ret: TypeExpr, effects: Option<RowExpr> })
+  | TRecord({ span: Span, fields: List<{ name: Ident, ty: TypeExpr }> })
+  | TUnit({ span: Span })
+  // No analogue in `ast.rs`: what a bailed `ty` answers. A placeholder that was
+  // a *valid* node — `TUnit`, say — would agree with a real `()` if it ever
+  // reached a compared dump, so the placeholder is a tag the reference can
+  // never emit and a leak shows up as a mismatch rather than as agreement.
+  | TBad({ span: Span })
+
+pub type Mode = MRead | MWrite | MBad
+
+// `effect` is a Ply keyword, so this field cannot be called what `ast.rs` calls
+// it. `GAPS.md` §P6.
+pub type AtomExpr = { eff: QName, mode: Mode, resource: Option<Ident>, span: Span }
+
+pub type RowExpr = { atoms: List<AtomExpr>, aliases: List<QName>,
+                     tail: Option<Ident>, span: Span }
+
+pub type RowMember = RMAtom(AtomExpr) | RMSet(QName)
+
+pub type Generics = { types: List<Ident>, effects: List<Ident> }
+
+pub type Param = { name: Ident, ty: Option<TypeExpr>, span: Span }
+
+// `TypeExpr::span()` (`ast.rs:733`), one arm per variant. The reference groups
+// five variants into one `|` arm because they share a field name; Ply's `match`
+// binds one pattern per arm, so it is six.
+pub fn ty_span(t: TypeExpr) -> Span =
+  match t {
+    TVar(i) -> i.span,
+    TCon(x) -> x.span,
+    TFn(x) -> x.span,
+    TRecord(x) -> x.span,
+    TUnit(x) -> x.span,
+    TBad(x) -> x.span,
+  }
+
+pub fn no_ty() -> TypeExpr = TBad({ span: dummy_span() })
+
+pub fn no_row() -> RowExpr = { atoms: [], aliases: [], tail: None, span: dummy_span() }
+
+pub fn no_atom() -> AtomExpr =
+  { eff: no_qname(), mode: MBad, resource: None, span: dummy_span() }
+
+pub fn no_generics() -> Generics = { types: [], effects: [] }
+
+pub fn no_param() -> Param = { name: no_ident(), ty: None, span: dummy_span() }
+
+fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
+
+// --- Modes ------------------------------------------------------------------
+
+// `read` and `write` are contextual: `lexer.ply` lexes them as identifiers and
+// nothing reserves them, which is what `at_ident_text` says in the reference.
+pub fn mode(c: Ctx, p: P) -> R<Mode> =
+  if p.bail { { p: p, node: MBad } }
+  else if at_ident_text(c, p, b"read") { { p: bump(c, p), node: MRead } }
+  else if at_ident_text(c, p, b"write") { { p: bump(c, p), node: MWrite } }
+  else { { p: error_here(c, p, b"`read` or `write` to start an operation"), node: MBad } }
+
+// --- Type expressions -------------------------------------------------------
+
+// One of the ten `mem::replace(&mut self.no_brace, ..)` sites. Inside a type a
+// `{` always opens a record type, never an arm block, whatever the enclosing
+// expression decided; the flag is saved into a `let` and written back, which is
+// what a `mem::replace` is without mutation.
+pub fn ty(c: Ctx, p: P) -> R<TypeExpr> =
+  if p.bail { { p: p, node: no_ty() } } else {
+    let r = ty_inner(c, with_no_brace(p, false));
+    { p: with_no_brace(r.p, p.no_brace), node: r.node }
+  }
+
+// One of the reference's three `deeper()` sites (`parser.rs:1035`). Recursion
+// here is grammar nesting and nothing else — every sequence below is one
+// `iterate`, which is depth 1 on both engines — so the stack is the type's own
+// nesting depth. ADR 0022 §2.
+fn ty_inner(c: Ctx, p: P) -> R<TypeExpr> =
+  if p.bail { { p: p, node: no_ty() } } else {
+    let d = deeper(c, p);
+    if d.bail { { p: d, node: no_ty() } } else {
+      let r = ty_body(c, d);
+      { p: shallower(r.p), node: r.node }
+    }
+  }
+
+// The reference matches on `TokenKind` directly. `lexer.ply` spells every
+// punctuator as `TPunct(b"name")`, so one `match` arm covers all of them and
+// the discrimination inside it is a chain of `Bytes` comparisons.
+// `spikes/ply-lexer/GAPS.md` §7 is the same shape, one level up.
+fn ty_body(c: Ctx, p: P) -> R<TypeExpr> = {
+  let st = cur_span(c, p);
+  match kind(c, p) {
+    TPunct(s) ->
+      if s == b"lparen" { ty_paren(c, p, st) }
+      else if s == b"lbrace" { ty_record(c, p) }
+      else { { p: error_here(c, p, b"a type"), node: no_ty() } },
+    TIdent(n) -> ty_named(c, p, st),
+    _ -> { p: error_here(c, p, b"a type"), node: no_ty() },
+  }
+}
+
+fn ty_paren(c: Ctx, p: P, st: Span) -> R<TypeExpr> = {
+  let o = advance(c, p);
+  if at(c, o.p, t_rparen()) {
+    let cl = advance(c, o.p);
+    let ar = eat(c, cl.p, t_arrow());
+    if ar.ok { fn_ty(c, ar.p, [], st) }
+    else { { p: ar.p, node: TUnit({ span: span_to(o.node, cl.node) }) } }
+  } else {
+    let ps = comma_list(c, o.p, t_rparen(), ty);
+    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)`");
+    if cl.p.bail { { p: cl.p, node: no_ty() } } else {
+      let ar = eat(c, cl.p, t_arrow());
+      if ar.ok { fn_ty(c, ar.p, ps.node, st) } else {
+        // `params.into_iter().next()` in the reference. There is no list index,
+        // no `head` and no `nth`, so taking the only element of a one-element
+        // list is a `match` on a fixed-length list pattern — the only indexing
+        // Ply has, and it reaches a fixed prefix and nothing else.
+        // `GAPS.md` §P2.
+        match ps.node {
+          [only] -> { p: ar.p, node: only },
+          // Ply has no tuple type. The note is counted, not spelled.
+          _ -> { p: bail_with(ar.p, diag1(unexpected(), span_to(o.node, cl.node), 1)),
+                 node: no_ty() },
+        }
+      }
+    }
+  }
+}
+
+fn ty_record(c: Ctx, p: P) -> R<TypeExpr> = {
+  let o = advance(c, p);
+  let fs = comma_list(c, o.p, t_rbrace(), ty_field);
+  let cl = expect_close(c, fs.p, t_rbrace(), o.node, b"`}`");
+  if cl.p.bail { { p: cl.p, node: no_ty() } }
+  else { { p: cl.p, node: TRecord({ span: span_to(o.node, cl.node), fields: fs.node }) } }
+}
+
+fn ty_named(c: Ctx, p: P, st: Span) -> R<TypeExpr> = {
+  let q = qname(c, p, b"a type");
+  if q.p.bail { { p: q.p, node: no_ty() } }
+  else if at(c, q.p, t_lt()) {
+    let o = advance(c, q.p);
+    let args = comma_list(c, o.p, t_gt(), ty);
+    let cl = expect_gt(c, args.p, b"`>` to close the type arguments");
+    if cl.p.bail { { p: cl.p, node: no_ty() } }
+    else { { p: cl.p,
+             node: TCon({ span: span_to(st, cl.node), name: q.node, args: args.node }) } }
+  }
+  // A type parameter is bound by the enclosing `<..>`, never by a module, so
+  // only a bare lowercase name can be one.
+  else if is_bare(q.node) && !starts_upper(q.node.name.name) {
+    { p: q.p, node: TVar(q.node.name) }
+  }
+  else { { p: q.p, node: TCon({ span: q.node.span, name: q.node, args: [] }) } }
+}
+
+fn fn_ty(c: Ctx, p: P, params: List<TypeExpr>, st: Span) -> R<TypeExpr> =
+  if p.bail { { p: p, node: no_ty() } } else {
+    let r = ty(c, p);
+    if r.p.bail { { p: r.p, node: no_ty() } } else {
+      let sl = eat(c, r.p, t_slash());
+      if !sl.ok {
+        { p: sl.p,
+          node: TFn({ span: span_to(st, ty_span(r.node)), params: params,
+                      ret: r.node, effects: None }) }
+      } else {
+        let e = row(c, sl.p);
+        if e.p.bail { { p: e.p, node: no_ty() } }
+        else { { p: e.p,
+                 node: TFn({ span: span_to(st, e.node.span), params: params,
+                             ret: r.node, effects: Some(e.node) }) } }
+      }
+    }
+  }
+
+fn ty_field(c: Ctx, p: P) -> R<{ name: Ident, ty: TypeExpr }> =
+  if p.bail { { p: p, node: { name: no_ident(), ty: no_ty() } } } else {
+    let n = expect_ident(c, p, b"a field name");
+    let co = expect(c, n.p, t_colon(), b"`:` after the field name");
+    if co.p.bail { { p: co.p, node: { name: no_ident(), ty: no_ty() } } } else {
+      let t = ty(c, co.p);
+      { p: t.p, node: { name: n.node, ty: t.node } }
+    }
+  }
+
+// --- Effect rows ------------------------------------------------------------
+
+// The accumulator has **two** growing lists, and the rule that a growing
+// container must be the last sub-expression of its enclosing node
+// (`spikes/ply-lexer/GAPS.md` §1) can be obeyed by only one field of one
+// literal. It is obeyed here by writing two literals, one per branch, because a
+// round grows `atoms` or `aliases` and never both. The rule is per-literal, not
+// per-type. `GAPS.md` §P3.
+type RowAcc = { p: P, aliases: List<QName>, atoms: List<AtomExpr> }
+
+type RowOut = { aliases: List<QName>, atoms: List<AtomExpr> }
+
+pub fn row(c: Ctx, p: P) -> R<RowExpr> =
+  if p.bail { { p: p, node: no_row() } } else {
+    let st = cur_span(c, p);
+    if at(c, p, t_lbrace()) { row_braced(c, p, st) } else {
+      // A whole row that is a bare name is still a row *variable*: a set is
+      // only ever written inside braces, so `/ e` keeps the meaning it has.
+      let t = expect_ident(c, p, b"an effect row: `{..}` or a row variable");
+      if t.p.bail { { p: t.p, node: no_row() } }
+      else { { p: t.p,
+               node: { atoms: [], aliases: [], tail: Some(t.node), span: t.node.span } } }
+    }
+  }
+
+fn row_braced(c: Ctx, p: P, st: Span) -> R<RowExpr> = {
+  let o = advance(c, p);
+  let ms = row_members(c, o.p, o.node);
+  if ms.p.bail { { p: ms.p, node: no_row() } } else {
+    let pi = eat(c, ms.p, t_pipe());
+    let tl = if pi.ok { expect_ident(c, pi.p, b"an effect row variable after `|`") }
+             else { { p: pi.p, node: no_ident() } };
+    if tl.p.bail { { p: tl.p, node: no_row() } } else {
+      let cl = expect_close(c, tl.p, t_rbrace(), o.node, b"`}` to close the effect row");
+      if cl.p.bail { { p: cl.p, node: no_row() } }
+      else { { p: cl.p,
+               node: { atoms: ms.node.atoms, aliases: ms.node.aliases,
+                       tail: if pi.ok { Some(tl.node) } else { None },
+                       span: span_to(st, cl.node) } } }
+    }
+  }
+}
+
+// Not `comma_list`: this loop stops on two tokens rather than one and its
+// element is a sum that goes to one of two lists.
+fn row_members(c: Ctx, p: P, open: Span) -> R<RowOut> =
+  iterate({ p: p, aliases: [], atoms: [] }, c.ntok - p.pos + 1, |s: RowAcc|
+    if s.p.bail { Stop({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } }) }
+    else if at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
+      Stop({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } })
+    }
+    else if at_eof(c, s.p) {
+      Stop({ p: unclosed(c, s.p, open, b"`}` to close the effect row"),
+             node: { aliases: s.aliases, atoms: s.atoms } })
+    }
+    else {
+      let m = row_member(c, s.p);
+      if m.p.bail { Stop({ p: m.p, node: { aliases: s.aliases, atoms: s.atoms } }) } else {
+        let e = eat(c, m.p, t_comma());
+        match m.node {
+          RMAtom(a) ->
+            if e.ok { Continue({ p: e.p, aliases: s.aliases, atoms: push(s.atoms, a) }) }
+            else { Stop({ p: e.p, node: { aliases: s.aliases, atoms: push(s.atoms, a) } }) },
+          RMSet(q) ->
+            if e.ok { Continue({ p: with_sets(e.p), atoms: s.atoms,
+                                 aliases: push(s.aliases, q) }) }
+            else { Stop({ p: with_sets(e.p),
+                          node: { atoms: s.atoms, aliases: push(s.aliases, q) } }) },
+        }
+      }
+    })
+
+// One member of a row or of an `effect set`. A `.` after the name makes it an
+// atom and nothing else can; one token of lookahead decides it, so no name is
+// reserved and `effect set` needs no keyword of its own.
+pub fn row_member(c: Ctx, p: P) -> R<RowMember> =
+  if p.bail { { p: p, node: RMSet(no_qname()) } } else {
+    let q = qname(c, p, b"an effect atom, or the name of an `effect set`");
+    if q.p.bail { { p: q.p, node: RMSet(no_qname()) } }
+    else if !at(c, q.p, t_dot()) { { p: q.p, node: RMSet(q.node) } }
+    else {
+      let a = atom_rest(c, bump(c, q.p), q.node);
+      { p: a.p, node: RMAtom(a.node) }
+    }
+  }
+
+// The atom after its effect name and the `.` have been consumed.
+pub fn atom_rest(c: Ctx, p: P, ef: QName) -> R<AtomExpr> =
+  if p.bail { { p: p, node: no_atom() } } else {
+    let m = mode(c, p);
+    if m.p.bail { { p: m.p, node: no_atom() } } else {
+      let r = if at(c, m.p, t_lbracket()) { atom_resource(c, m.p) }
+              else { { p: m.p, node: None } };
+      if r.p.bail { { p: r.p, node: no_atom() } }
+      else { { p: r.p,
+               node: { eff: ef, mode: m.node, resource: r.node,
+                       span: span_to(ef.span, prev_span(c, r.p)) } } }
+    }
+  }
+
+fn atom_resource(c: Ctx, p: P) -> R<Option<Ident>> = {
+  let o = advance(c, p);
+  let n = expect_ident(c, o.p, b"a resource name inside `[..]`");
+  if n.p.bail { { p: n.p, node: None } } else {
+    let cl = expect_close(c, n.p, t_rbracket(), o.node, b"`]`");
+    if cl.p.bail { { p: cl.p, node: None } } else { { p: cl.p, node: Some(n.node) } }
+  }
+}
+
+// --- Generics and parameters ------------------------------------------------
+
+type IdAcc = { p: P, out: List<Ident> }
+
+// Not `comma_list` either: the reference's two loops here stop on three tokens
+// rather than one — `>`, `>=` and `|` — because a `>=` has not been split yet
+// at this point.
+pub fn generics(c: Ctx, p: P) -> R<Generics> =
+  if p.bail { { p: p, node: no_generics() } } else {
+    let lt = expect(c, p, t_lt(), b"`<`");
+    if lt.p.bail { { p: lt.p, node: no_generics() } } else {
+      let ts = generic_names(c, lt.p, true);
+      if ts.p.bail { { p: ts.p, node: no_generics() } } else {
+        let pi = eat(c, ts.p, t_pipe());
+        let es = if pi.ok { generic_names(c, pi.p, false) } else { { p: pi.p, node: [] } };
+        if es.p.bail { { p: es.p, node: no_generics() } } else {
+          let gt = expect_gt(c, es.p, b"`>` to close the type parameter list");
+          if gt.p.bail { { p: gt.p, node: no_generics() } }
+          else { { p: gt.p, node: { types: ts.node, effects: es.node } } }
+        }
+      }
+    }
+  }
+
+fn generic_names(c: Ctx, p: P, stop_on_pipe: Bool) -> R<List<Ident>> =
+  iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: IdAcc|
+    if s.p.bail { Stop({ p: s.p, node: s.out }) }
+    else if at(c, s.p, t_gt()) || at(c, s.p, t_ge())
+            || (stop_on_pipe && at(c, s.p, t_pipe())) {
+      Stop({ p: s.p, node: s.out })
+    }
+    else if at_eof(c, s.p) {
+      Stop({ p: error_here(c, s.p, b"`>` to close the type parameter list"), node: s.out })
+    }
+    else {
+      let n = expect_ident(c, s.p,
+                if stop_on_pipe { b"a type parameter name" } else { b"an effect parameter name" });
+      if n.p.bail { Stop({ p: n.p, node: s.out }) } else {
+        let e = eat(c, n.p, t_comma());
+        if e.ok { Continue({ p: e.p, out: push(s.out, n.node) }) }
+        else { Stop({ p: e.p, node: push(s.out, n.node) }) }
+      }
+    })
+
+// Lives in this area rather than with items because both `fn_def` and
+// `lambda_expr` need it and it needs only `ty`.
+pub fn param(c: Ctx, p: P) -> R<Param> =
+  if p.bail { { p: p, node: no_param() } } else {
+    let n = expect_ident(c, p, b"a parameter name");
+    if n.p.bail { { p: n.p, node: no_param() } } else {
+      let co = eat(c, n.p, t_colon());
+      if !co.ok { { p: co.p, node: { name: n.node, ty: None, span: n.node.span } } } else {
+        let t = ty(c, co.p);
+        if t.p.bail { { p: t.p, node: no_param() } }
+        else { { p: t.p,
+                 node: { name: n.node, ty: Some(t.node),
+                         span: span_to(n.node.span, ty_span(t.node)) } } }
+      }
+    }
+  }
+
+// --- The dump ---------------------------------------------------------------
+
+pub fn dump_ty(t: TypeExpr) -> Bytes =
+  match t {
+    TVar(i) -> bytes_concat(rec(i.span, b"tvar"), dump_ident(i)),
+    TCon(x) -> bytes_concat_all([rec(x.span, b"tcon"), dump_qname(x.name),
+                                 dump_list(x.args, dump_ty)]),
+    TFn(x) -> bytes_concat_all([rec(x.span, b"tfn"), dump_list(x.params, dump_ty),
+                                dump_ty(x.ret), dump_opt(x.effects, dump_row)]),
+    TRecord(x) -> bytes_concat(rec(x.span, b"trec"), dump_list(x.fields, dump_ty_field)),
+    TUnit(x) -> rec(x.span, b"tuni"),
+    TBad(x) -> rec(x.span, b"tbad"),
+  }
+
+fn dump_ty_field(f: { name: Ident, ty: TypeExpr }) -> Bytes =
+  bytes_concat(dump_ident(f.name), dump_ty(f.ty))
+
+pub fn dump_row(r: RowExpr) -> Bytes =
+  bytes_concat_all([rec(r.span, b"row"), dump_list(r.atoms, dump_atom),
+                    dump_list(r.aliases, dump_qname), dump_opt(r.tail, dump_ident)])
+
+pub fn dump_atom(a: AtomExpr) -> Bytes =
+  bytes_concat_all([rec(a.span, b"atm"), dump_qname(a.eff), dump_mode(a.mode),
+                    dump_opt(a.resource, dump_ident)])
+
+pub fn dump_mode(m: Mode) -> Bytes =
+  match m { MRead -> word(b"read"), MWrite -> word(b"write"), MBad -> word(b"badmode") }
+
+// `Generics` has no span in `ast.rs`, so this leads with a word rather than a
+// record. Both lists still carry their length.
+pub fn dump_generics(g: Generics) -> Bytes =
+  bytes_concat_all([word(b"gen"), dump_list(g.types, dump_ident),
+                    dump_list(g.effects, dump_ident)])
+
+pub fn dump_param(pa: Param) -> Bytes =
+  bytes_concat_all([rec(pa.span, b"prm"), dump_ident(pa.name), dump_opt(pa.ty, dump_ty)])
+
+// --- The area's own entry point ---------------------------------------------
+
+// The reference exposes no `parse_ty`, so the whole-file differential reaches
+// this area through `fn t(x: <TY>) = 0`. This is the direct form, for the tests
+// below and for a probe that prices parsing a type and nothing else.
+pub fn dump_type_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = ty(s.c, s.p);
+  string_of_bytes(bytes_concat(dump_ty(r.node), dump_diags(r.p.diags)))
+}
+
+// `generics` and `param` are called only from `items.ply` and `exprs.ply`, so
+// without these two nothing in this area reaches them and `arm-types.sh` said
+// so: a mutation to `generic_names`' stop set left the suite green.
+pub fn dump_generics_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = generics(s.c, s.p);
+  string_of_bytes(bytes_concat(dump_generics(r.node), dump_diags(r.p.diags)))
+}
+
+pub fn dump_param_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = param(s.c, s.p);
+  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
+}
+
+
+// --- Tests ------------------------------------------------------------------
+//
+// The area's own. Every expectation was read off the reference's control flow
+// by hand before it was pinned, and each was seen to fail under a deliberate
+// corruption of the thing it watches (`arm-types.sh` beside this file). The
+// comparison that settles correctness is the differential against
+// `crates/ply-syntax` in `harness/`; these are what makes iterating on this
+// file possible at all.
+
+test "a bare uppercase name is a nullary constructor, a lowercase one a variable" {
+  assert_eq(dump_type_of(b"Int"),
+            "0:3:tcon;0:3:qname;?0;0:3:ident;@496e74;#0;#0;");
+  assert_eq(dump_type_of(b"a"),
+            "0:1:tvar;0:1:ident;@61;#0;")
+}
+
+test "unit, records and type arguments" {
+  assert_eq(dump_type_of(b"()"),
+            "0:2:tuni;#0;");
+  assert_eq(dump_type_of(b"{}"),
+            "0:2:trec;#0;#0;");
+  assert_eq(dump_type_of(b"List<a>"),
+            "0:7:tcon;0:4:qname;?0;0:4:ident;@4c697374;#1;5:6:tvar;5:6:ident;@61;#0;");
+  assert_eq(dump_type_of(b"{x: Int, y: a}"),
+            "0:14:trec;#2;1:2:ident;@78;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;9:10:ident;@79;12:13:tvar;12:13:ident;@61;#0;")
+}
+
+// `>>` is two `gt` tokens and not one: maximal munch pairs `>` only with `=`.
+test "nested type arguments close on two `>` tokens" {
+  assert_eq(dump_type_of(b"Map<K, List<V>>"),
+            "0:15:tcon;0:3:qname;?0;0:3:ident;@4d6170;#2;4:5:tcon;4:5:qname;?0;4:5:ident;@4b;#0;7:14:tcon;7:11:qname;?0;7:11:ident;@4c697374;#1;12:13:tcon;12:13:qname;?0;12:13:ident;@56;#0;#0;")
+}
+
+// `type Pair<a>= ..` lexes `>=` as one token. The reference splits it by
+// rewriting `tokens[pos]`; the spine records the position instead. Either way
+// the `>` it answers with is one byte wide, which the `0:7` span checks.
+test "a `>=` closing a type argument list is split into `>` and `=`" {
+  assert_eq(dump_type_of(b"Pair<a>="),
+            "0:7:tcon;0:4:qname;?0;0:4:ident;@50616972;#1;5:6:tvar;5:6:ident;@61;#0;")
+}
+
+// The counterpart in `patterns.ply` rewrites the span to cover the parens.
+// `ty_body` does not, and a dump that led with anything but the node's own span
+// could not tell the two apart.
+test "a parenthesised type keeps the inner node's own span" {
+  assert_eq(dump_type_of(b"(a)"),
+            "1:2:tvar;1:2:ident;@61;#0;")
+}
+
+test "function types, with and without an effect row" {
+  assert_eq(dump_type_of(b"(Int) -> Bool"),
+            "0:13:tfn;#1;1:4:tcon;1:4:qname;?0;1:4:ident;@496e74;#0;9:13:tcon;9:13:qname;?0;9:13:ident;@426f6f6c;#0;?0;#0;");
+  assert_eq(dump_type_of(b"() -> Int / e"),
+            "0:13:tfn;#0;6:9:tcon;6:9:qname;?0;6:9:ident;@496e74;#0;?1;12:13:row;#0;#0;?1;12:13:ident;@65;#0;")
+}
+
+test "an atom carries its mode and its resource, and the row carries its tail" {
+  assert_eq(dump_type_of(b"() -> Int / {db.read[users] | e}"),
+            "0:32:tfn;#0;6:9:tcon;6:9:qname;?0;6:9:ident;@496e74;#0;?1;12:32:row;#1;13:27:atm;13:15:qname;?0;13:15:ident;@6462;%read;?1;21:26:ident;@7573657273;#0;?1;30:31:ident;@65;#0;")
+}
+
+// An `effect set` name and an atom are told apart by one token of lookahead: a
+// `.` after the name makes it an atom and nothing else can. The two go to
+// different lists, so source order between a set and an atom is not recorded —
+// which is what `ast.rs` does too.
+test "a row separates the sets it names from the atoms it writes" {
+  assert_eq(dump_type_of(b"(Int) -> Bool / {Web, io.write}"),
+            "0:31:tfn;#1;1:4:tcon;1:4:qname;?0;1:4:ident;@496e74;#0;9:13:tcon;9:13:qname;?0;9:13:ident;@426f6f6c;#0;?1;16:31:row;#1;22:30:atm;22:24:qname;?0;22:24:ident;@696f;%write;?0;#1;17:20:qname;?0;17:20:ident;@576562;?0;#0;")
+}
+
+test "a module-qualified type keeps both halves" {
+  assert_eq(dump_type_of(b"m::T"),
+            "0:4:tcon;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@54;#0;#0;")
+}
+
+// Ply has no tuple type, so a parenthesised list with no `->` is one
+// diagnostic carrying one note, and not a type.
+test "a parenthesised list that is not a parameter list is refused with a note" {
+  assert_eq(dump_type_of(b"(Int, Bool)"),
+            "0:0:tbad;#1;!E0001:0:11:1:1;=0:11:1;")
+}
+
+test "an unclosed delimiter labels the opener as well as the offending token" {
+  assert_eq(dump_type_of(b"("),
+            "0:0:tbad;#1;!E0001:1:1:2:0;=1:1:1;=0:1:0;")
+}
+
+// The dedup rule in `push_diag` is what keeps these at one apiece: the
+// `expect_close` that follows trips at the same offset with the same code and
+// is dropped.
+test "a token that cannot start a type is one diagnostic and no more" {
+  assert_eq(dump_type_of(b"<"),
+            "0:0:tbad;#1;!E0001:0:1:1:0;=0:1:1;");
+  assert_eq(dump_type_of(b"{x: }"),
+            "0:0:tbad;#1;!E0001:4:5:1:0;=4:5:1;")
+}
+
+// `generics` and `param` are reached only from `items.ply` and `exprs.ply`, so
+// these fixtures exist because `arm-types.sh` found the gap: without them a
+// mutation to `generic_names`' stop set left the suite green.
+
+test "a type parameter list, with and without effect parameters" {
+  assert_eq(dump_generics_of(b"<a>"), "%gen;#1;1:2:ident;@61;#0;#0;");
+  assert_eq(dump_generics_of(b"<a, b>"), "%gen;#2;1:2:ident;@61;4:5:ident;@62;#0;#0;");
+  assert_eq(dump_generics_of(b"<a | e>"), "%gen;#1;1:2:ident;@61;#1;5:6:ident;@65;#0;");
+  assert_eq(dump_generics_of(b"<a, b | e, f>"),
+            "%gen;#2;1:2:ident;@61;4:5:ident;@62;#2;8:9:ident;@65;11:12:ident;@66;#0;")
+}
+
+// Both loops stop on `>`, on `>=` and — the first one — on `|`, so an empty
+// half of the list is not an error.
+test "either half of a type parameter list may be empty" {
+  assert_eq(dump_generics_of(b"<|e>"), "%gen;#0;#1;2:3:ident;@65;#0;");
+  assert_eq(dump_generics_of(b"<>"), "%gen;#0;#0;#0;");
+  assert_eq(dump_generics_of(b"<a"), "%gen;#0;#0;#1;!E0001:2:2:1:0;=2:2:1;")
+}
+
+test "a parameter's type is optional and its span ends where the type does" {
+  assert_eq(dump_param_of(b"x"), "0:1:prm;0:1:ident;@78;?0;#0;");
+  assert_eq(dump_param_of(b"x: Int"),
+            "0:6:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;#0;");
+  assert_eq(dump_param_of(b"x: (Int) -> Bool"),
+            "0:16:prm;0:1:ident;@78;?1;3:16:tfn;#1;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;12:16:tcon;12:16:qname;?0;12:16:ident;@426f6f6c;#0;?0;#0;");
+  assert_eq(dump_param_of(b"x:"), "0:0:prm;0:0:ident;@;?0;#1;!E0001:2:2:1:0;=2:2:1;")
+}
+
+// `expect_close` carries a secondary label on the opener and `expect` does not,
+// which is the whole difference between the two and is invisible to a fixture
+// that never leaves a delimiter open.
+test "an unclosed record type labels its opening brace; a `<` has no opener to label" {
+  assert_eq(dump_type_of(b"{x: Int"), "0:0:tbad;#1;!E0001:7:7:2:0;=7:7:1;=0:1:0;");
+  assert_eq(dump_type_of(b"List<a"), "0:0:tbad;#1;!E0001:6:6:1:0;=6:6:1;")
+}
+
+// `comma_list` breaks on the missing comma, then the close check sees `}`.
+test "a trailing comma in a record type is allowed" {
+  assert_eq(dump_type_of(b"{x: Int, }"),
+            "0:10:trec;#1;1:2:ident;@78;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;#0;")
+}
