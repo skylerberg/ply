@@ -74,7 +74,19 @@ pub fn parse_program<'a>(
 pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>> {
     let mut p = Parser::new(source, text);
     match p.expr() {
-        Ok(e) if p.at(&TokenKind::Eof) && p.diags.is_empty() => Ok(e),
+        Ok(mut e) if p.at(&TokenKind::Eof) && p.diags.is_empty() => {
+            // A bare expression has no module around it, so a record update here
+            // has no shape to resolve and every one refuses. It still runs: the
+            // alternative is an unexpanded node escaping to a caller that has no
+            // arm for it.
+            if p.uses_record_update {
+                crate::record_update::expand_bare(&mut e, &mut p.diags);
+            }
+            match p.diags.is_empty() {
+                true => Ok(e),
+                false => Err(p.diags),
+            }
+        }
         Ok(_) => {
             p.error_here("end of input after the expression");
             Err(p.diags)
@@ -96,6 +108,9 @@ struct Parser {
     /// that did neither skips the expansion walk entirely, so the feature costs
     /// nothing to a program that does not use it.
     uses_effect_sets: bool,
+    /// Whether the file wrote `{..b, ...}` anywhere. Same bargain as
+    /// `uses_effect_sets`: a file that did not write one never walks.
+    uses_record_update: bool,
 }
 
 impl Parser {
@@ -109,6 +124,7 @@ impl Parser {
             no_brace: false,
             depth: 0,
             uses_effect_sets: false,
+            uses_record_update: false,
         }
     }
 
@@ -286,6 +302,9 @@ impl Parser {
         };
         if self.uses_effect_sets {
             crate::effect_set::expand(&mut module, &mut self.diags);
+        }
+        if self.uses_record_update {
+            crate::record_update::expand(&mut module, &mut self.diags);
         }
         (module, self.diags)
     }
@@ -1481,7 +1500,12 @@ impl Parser {
     }
 
     /// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`.
+    /// `{..b, ...}` is a record update, and `..` cannot begin a statement, so
+    /// one token of lookahead settles it.
     fn at_record_literal(&self) -> bool {
+        if matches!(self.kind_at(1), TokenKind::DotDot) {
+            return true;
+        }
         matches!(self.kind_at(1), TokenKind::Ident(_))
             && matches!(self.kind_at(2), TokenKind::Colon | TokenKind::Comma)
     }
@@ -1489,21 +1513,92 @@ impl Parser {
     fn record_expr(&mut self) -> PResult<Expr> {
         let saved = std::mem::replace(&mut self.no_brace, false);
         let open = self.advance();
-        let r = self
-            .comma_list(&TokenKind::RBrace, Self::record_field)
-            .and_then(|fields| {
-                let close =
-                    self.expect_close(&TokenKind::RBrace, open, "`}` to close the record")?;
-                Ok(Expr {
-                    kind: ExprKind::Record { fields },
-                    span: open.to(close),
-                })
-            });
+        let r = self.record_body(open);
         self.no_brace = saved;
         r
     }
 
+    fn record_body(&mut self, open: Span) -> PResult<Expr> {
+        let base = if self.at(&TokenKind::DotDot) {
+            self.uses_record_update = true;
+            let b = self.record_update_base()?;
+            // `{..b}` is the whole expression when no comma follows; otherwise
+            // the comma separates the base from the fields that replace.
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma, "`,` after the record being updated")?;
+            }
+            Some(Box::new(b))
+        } else {
+            None
+        };
+        let fields = self.comma_list(&TokenKind::RBrace, Self::record_field)?;
+        let close = self.expect_close(&TokenKind::RBrace, open, "`}` to close the record")?;
+        let kind = match base {
+            Some(base) => ExprKind::RecordUpdate { base, fields },
+            None => ExprKind::Record { fields },
+        };
+        Ok(Expr {
+            kind,
+            span: open.to(close),
+        })
+    }
+
+    /// The base of an update is a **path** — `s`, `state.limits` — and not an
+    /// arbitrary expression.
+    ///
+    /// This is not a parser convenience. The expansion writes `base.f` once per
+    /// field it copies, exactly as the longhand does, so a base with a call or
+    /// a `perform` in it would run that base once per field. Restricting it to
+    /// a repeatable, pure path is what makes `{..b, a: 1}` and its longhand the
+    /// same definition rather than merely the same value.
+    fn record_update_base(&mut self) -> PResult<Expr> {
+        let dots = self.advance();
+        if matches!(self.kind(), TokenKind::Dot) {
+            // `...b`: `..` then `.`, which would otherwise report the useless
+            // "expected a name, found `.`".
+            let span = self.span();
+            self.push(
+                Diagnostic::error(
+                    codes::UNEXPECTED_TOKEN,
+                    "a record update is spelled `..`, not `...`",
+                )
+                .primary(dots.to(span), "one dot too many")
+                .note("`..` is the same token the record *pattern* `{a, ..}` uses"),
+            );
+            return Err(Bail);
+        }
+        let name = self.expect_ident("the record being updated")?;
+        let mut expr = Expr {
+            span: name.span,
+            kind: ExprKind::Var(name.into()),
+        };
+        while self.at(&TokenKind::Dot) {
+            self.advance();
+            let field = self.expect_ident("a field name")?;
+            expr = Expr {
+                span: expr.span.to(field.span),
+                kind: ExprKind::Field {
+                    base: Box::new(expr),
+                    field,
+                },
+            };
+        }
+        Ok(expr)
+    }
+
     fn record_field(&mut self) -> PResult<(Ident, Expr)> {
+        if self.at(&TokenKind::DotDot) {
+            let span = self.span();
+            self.push(
+                Diagnostic::error(
+                    codes::UNEXPECTED_TOKEN,
+                    "a record update has one base, written first",
+                )
+                .primary(span, "a second `..` here")
+                .note("write `{..b, x: 1, y: 2}`; two bases have no defined order of fields"),
+            );
+            return Err(Bail);
+        }
         let name = self.expect_ident("a field name")?;
         if self.eat(&TokenKind::Colon) {
             let value = self.expr()?;

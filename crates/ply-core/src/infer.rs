@@ -3189,6 +3189,17 @@ impl<'a> Checker<'a> {
                 (Type::Record(map), row)
             }
 
+            // A record update's type is its base's type, and that is arranged by
+            // expansion rather than by a rule here: by the time inference runs,
+            // `{..s, a: 1}` *is* the literal that copies `s`'s other fields, so
+            // the width is checked by the same exact-key-set unification every
+            // record literal meets. Inferring the sugar here as if it were a
+            // plain record would silently type a record of the wrong width.
+            ExprKind::RecordUpdate { .. } => unreachable!(
+                "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
+                 `no_record_update_survives_parse_module_anywhere_in_the_tree`"
+            ),
+
             ExprKind::Field { base, field } => {
                 let (bt, row) = self.infer(base);
                 let bt = self.subst.resolve_ty(&bt);
@@ -5984,6 +5995,10 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Refs<'a>) {
             }
         }
         ExprKind::Record { fields } => fields.iter().for_each(|(_, v)| collect_refs(v, out)),
+        ExprKind::RecordUpdate { base, fields } => {
+            collect_refs(base, out);
+            fields.iter().for_each(|(_, v)| collect_refs(v, out));
+        }
         ExprKind::Field { base, .. } => collect_refs(base, out),
         ExprKind::List { items } => items.iter().for_each(|i| collect_refs(i, out)),
         ExprKind::Perform { args, .. } => {

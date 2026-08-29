@@ -277,9 +277,23 @@ which of the two it was going to be.
 
 ## §2 No record update syntax
 
-`{...s, toks: xs}` does not exist. `PatternKind::Record` has a `rest` flag, so
-`..` is a *pattern* wildcard; there is no spread in a record **literal**
-(`crates/ply-syntax/src/parser.rs`, `record` expression).
+> **Closed by W4, and one sentence of it was wrong.** Record update now exists,
+> spelled `{..b, f: e}` — the same `..` the record *pattern* uses, not the `...`
+> this section guessed at. `docs/adr/0023-record-update.md` records the design.
+> Everything below is kept as written, with the two corrections it needs marked
+> where they apply.
+
+The text as it stood:
+
+> `{...s, toks: xs}` does not exist. `PatternKind::Record` has a `rest` flag, so
+> `..` is a *pattern* wildcard; there is no spread in a record **literal**
+> (`crates/ply-syntax/src/parser.rs`, `record` expression).
+
+`..` is now both, and unambiguously: a `{` followed by `..` begins a record
+update, because `..` cannot begin a statement. Expansion runs inside
+`ply_syntax::parse_module`, so `{..s, toks: xs}` and the field list it stands for
+are one definition with one `DefHash`
+(`crates/ply-hash/tests/audit.rs record_update_hashes_as_its_expansion`).
 
 Every state transition in `lexer.ply` therefore lists every field:
 
@@ -296,11 +310,59 @@ with record update would have had one obvious spelling and no positional trap,
 and a language with the positional trap and record update would at least have
 had one place to get it right.
 
-`std.http` pays this worse: `chunk_trailers` at `http.ply:1016-1029` writes out
+`std.http` paid this worse: `chunk_trailers` at `http.ply:1016-1029` wrote out
 all **thirteen** `Limits` fields in order to change one
-(`max_header_bytes: state.limits.max_trailer_bytes`). Adding a field to `Limits`
-forces an edit there, and forgetting it is a silently wrong limit rather than a
-type error.
+(`max_header_bytes: state.limits.max_trailer_bytes`). It is now one line, and
+the twelve fields it stops spelling are twelve it can no longer mispair.
+
+> **This paragraph's last sentence was wrong, and it is worth being exact about
+> which half.** It read:
+>
+> > Adding a field to `Limits` forces an edit there, and forgetting it is a
+> > silently wrong limit rather than a type error.
+>
+> The first half stands. The second does not. `crates/ply-core/src/unify.rs`
+> unifies two records by **exact key-set equality** and Ply has no width
+> subtyping, so a 13-field literal handed to `fields(buf, _, _, limits: Limits)`
+> where `Limits` has 14 fields cannot unify. Measured rather than argued: adding
+> one `max_probe: Int` field to `type Limits` and to `default_limits()` only, and
+> running `ply check crates/ply-std/ply/http.ply`, produces **four `E0201`
+> type errors** — at `chunk_trailers` and at three other sites this section did
+> not know about (`limits_with` at `:1666`, `limits_keeping` at `:2399`,
+> `limits_streaming` at `:2844`). So the tax was **four times larger** than
+> recorded and the *hazard* was smaller.
+>
+> The hazard that does survive is a **mispairing**, not an omission: all
+> thirteen fields are `Int`, so `max_body: state.limits.max_chunk_size`
+> type-checks and is a silently wrong bound in an HTTP server. That is what
+> record update removes structurally, and it is asserted at
+> `crates/ply-cli/tests/stdlib.rs
+> chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red
+> on exactly that swap while `ply check` stays green.
+>
+> The three sites named above were left hand-written for one round and are now
+> record updates too, over a `let base: Limits = default_limits();` lift. Their
+> line numbers are from `http.ply` as it stood when the experiment ran and no
+> longer point at anything; `default_limits` is the one site that still spells
+> `Limits` out, because it constructs from nothing and has no base to update.
+
+**The compounding with §1 is narrowed, not removed.** Copies are pure field
+reads that never grow, and the expansion emits them **first**, so a single-write
+update whose value grows — `{..s, toks: push(s.toks, t)}` — lands on §1's
+*linear* spelling with no thought required: there is nothing the expansion can
+put after it.
+
+The several-writes case is untouched. `{..s, toks: push(s.toks, t), pos: p}` is
+**still quadratic**, because `pos: p` is emitted after the growing `toks` and so
+the growing field is not last in the record node. `{..s, pos: p, toks:
+push(s.toks, t)}` puts it last and so lands on the *linear* spelling this
+section measured, and computes the same record value — but it is **not the
+same definition**, because written fields are emitted in the order written and
+field order is part of a record's hash, so choosing the linear spelling moves
+the `DefHash` and re-runs what reaches it. The rule left is narrower than
+before — *a growing field must be written last among the fields you write* —
+and it is **syntactic**, checkable at the update site with no types, which is
+what makes it lintable. The trap is not gone.
 
 ---
 

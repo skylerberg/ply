@@ -181,6 +181,13 @@ fn expr(e: &mut Expr, span: Span) {
                 expr(e, span);
             }
         }
+        ExprKind::RecordUpdate { base, fields } => {
+            expr(base, span);
+            for (n, e) in fields {
+                n.span = span;
+                expr(e, span);
+            }
+        }
         ExprKind::Field { base, field } => {
             expr(base, span);
             field.span = span;

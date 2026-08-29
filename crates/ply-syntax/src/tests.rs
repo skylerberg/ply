@@ -1351,6 +1351,16 @@ fn dump_expr(e: &Expr) -> String {
                 .collect();
             format!("(rec {})", fs.join(" "))
         }
+        // Only reachable from `dump_expr` on a tree taken before
+        // `record_update::expand` ran, which the parser's own tests do on
+        // purpose to check what was parsed rather than what it became.
+        ExprKind::RecordUpdate { base, fields } => {
+            let fs: Vec<_> = fields
+                .iter()
+                .map(|(n, v)| format!("({} {})", n.name, dump_expr(v)))
+                .collect();
+            format!("(update {} {})", dump_expr(base), fs.join(" "))
+        }
         ExprKind::Field { base, field } => format!("(field {} {})", dump_expr(base), field.name),
         ExprKind::List { items } => {
             let is: Vec<_> = items.iter().map(dump_expr).collect();
@@ -2382,4 +2392,326 @@ fn a_trailing_comma_in_a_set_is_accepted() {
         "(effect-set Web {db.read[users], log.write})\n\
          (fn f () -> Int / {db.read[users], log.write} 1)"
     );
+}
+
+// --- Record update -----------------------------------------------------------
+
+/// Whether an unexpanded [`ExprKind::RecordUpdate`] is anywhere in the tree.
+///
+/// Written out rather than reusing a generic walker so that the match is
+/// exhaustive with no `_` arm: the next expression kind added to the language
+/// has to decide here too, and a guard that silently stopped looking inside a
+/// new construct would be worth nothing.
+fn has_record_update(m: &Module) -> bool {
+    fn e(x: &Expr) -> bool {
+        match &x.kind {
+            ExprKind::RecordUpdate { .. } => true,
+            ExprKind::Lit(_) | ExprKind::Var(_) => false,
+            ExprKind::Binary { lhs, rhs, .. } => e(lhs) || e(rhs),
+            ExprKind::Unary { operand, .. } => e(operand),
+            ExprKind::Lambda { body, .. } => e(body),
+            ExprKind::App { func, args } => e(func) || args.iter().any(e),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => e(cond) || e(then_branch) || e(else_branch),
+            ExprKind::Match { scrutinee, arms } => {
+                e(scrutinee)
+                    || arms
+                        .iter()
+                        .any(|a| a.guard.as_ref().is_some_and(e) || e(&a.body))
+            }
+            ExprKind::Block { stmts, tail } => {
+                stmts.iter().any(|s| match s {
+                    Stmt::Let { value, .. } => e(value),
+                    Stmt::Expr(x) => e(x),
+                }) || tail.as_deref().is_some_and(e)
+            }
+            ExprKind::Record { fields } => fields.iter().any(|(_, v)| e(v)),
+            ExprKind::Field { base, .. } => e(base),
+            ExprKind::List { items } => items.iter().any(e),
+            ExprKind::Perform { args, .. } => args.iter().any(e),
+            ExprKind::Handle {
+                body,
+                clauses,
+                return_clause,
+            } => {
+                e(body)
+                    || clauses.iter().any(|c| e(&c.body))
+                    || return_clause.as_ref().is_some_and(|r| e(&r.body))
+            }
+            ExprKind::WithCell { init, body, .. } => e(init) || e(body),
+            ExprKind::WithRegion { body, .. } => e(body),
+            ExprKind::Simulate { body } => e(body),
+        }
+    }
+    m.items.iter().any(|item| match item {
+        Item::Fn(d) => d.spec.iter().any(|s| e(&s.expr)) || e(&d.body),
+        Item::Test(d) => e(&d.body),
+        Item::Law(d) => d.guard.as_ref().is_some_and(e) || e(&d.body),
+        Item::Type(_) | Item::Effect(_) | Item::Derive(_) | Item::EffectSet(_) => false,
+    })
+}
+
+/// **The guard behind every `unreachable!` arm downstream.**
+///
+/// `ply-hash`, `ply-core` and `ply-eval` each carry an arm for
+/// [`ExprKind::RecordUpdate`] that panics, because hashing, typing or lowering
+/// the sugar as if it were a plain record would drop the base's untouched fields
+/// — a wrong value, silently. Those arms are safe only because the node cannot
+/// escape `parse_module`, and "cannot" is this project's most dangerous word.
+/// So it is checked, over every `.ply` file in the repository plus a file that
+/// deliberately uses the syntax, on both parse entry points that return a
+/// `Module`.
+///
+/// Broken fixtures are included on purpose: `parse_recovering` hands back a
+/// partial tree, and the expansion has to run on the error path too.
+#[test]
+fn no_record_update_survives_parse_module_anywhere_in_the_tree() {
+    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            match path.is_dir() {
+                true => collect(&path, out),
+                false if path.extension().is_some_and(|x| x == "ply") => out.push(path),
+                false => {}
+            }
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate lives two levels below the repository root");
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    assert!(
+        files.len() > 100,
+        "only {} `.ply` files found under {}; the walk is not reaching the corpus",
+        files.len(),
+        root.display()
+    );
+
+    // The corpus does not yet use the syntax everywhere, so a file that does is
+    // appended: a guard that only ever saw programs without record updates would
+    // pass whether or not expansion ran at all.
+    const USES_IT: &str = "\
+type L = {a: Int, b: Int}
+type W = {lim: L, n: Int}
+fn f(w: W) -> L = {..w.lim, a: 1}
+fn g(l: L) -> L = {..l}
+fn h(l: L) -> List<L> = [{..l, b: 2}, {..l, a: 3}]
+fn k(l: L) -> L
+  requires g({..l, a: 1}).a == 1
+  ensures g({..l, b: 2}).b == 2
+= {..l, a: 1}
+test \"t\" { assert_eq(f({lim: {a: 0, b: 0}, n: 1}).a, 1) }
+test \"u\" { let l: L = {a: 0, b: 0}; assert_eq({..l, a: 7}.a, 7) }
+law \"c\" forall (l: L) where g({..l, a: 1}).a == 1 { g({..l, b: 2}).b == 2 }
+";
+    let mut sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| (p.display().to_string(), s))
+        })
+        .collect();
+    sources.push(("<uses record update>".to_string(), USES_IT.to_string()));
+
+    let mut saw_the_syntax = false;
+    for (name, source) in &sources {
+        if source.contains("{..") {
+            saw_the_syntax = true;
+        }
+        let (m, _) = parse_recovering(SRC, ModuleName::from_dotted("m"), source);
+        assert!(
+            !has_record_update(&m),
+            "an unexpanded record update escaped `parse_recovering` from {name}"
+        );
+        if let Ok(m) = parse(SRC, source) {
+            assert!(
+                !has_record_update(&m),
+                "an unexpanded record update escaped `parse` from {name}"
+            );
+        }
+    }
+    assert!(
+        saw_the_syntax,
+        "no source in this run contained `{{..`, so the guard proved nothing"
+    );
+}
+
+/// `parse_expr` has no module around it and so no shape to resolve. What it must
+/// not do is hand an unexpanded node to a caller — `ply-prove` parses spec
+/// clauses this way — so it refuses instead.
+#[test]
+fn parse_expr_refuses_a_record_update_rather_than_leaking_one() {
+    let d = crate::parser::parse_expr(SRC, "{..s, a: 1}")
+        .expect_err("a bare expression has no shape for the base");
+    assert!(
+        d.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
+        "{d:#?}"
+    );
+}
+
+#[test]
+fn a_record_update_parses_as_copies_then_writes() {
+    let m = ok("type R = {a: Int, b: Int, c: Int}\nfn f(s: R) -> R = {..s, c: 1}");
+    let Item::Fn(f) = &m.items[1] else {
+        panic!("expected a fn")
+    };
+    assert_eq!(
+        dump_expr(&f.body),
+        "(rec (a (field s a)) (b (field s b)) (c 1))"
+    );
+}
+
+/// The copies are sorted **by name**, and `a`/`b`/`c` cannot say so: every
+/// one-character field set orders identically under any comparator that compares
+/// length first and name second, so a suite written only in single letters
+/// passes whichever of the two ran.
+///
+/// **Both length directions, and that is not belt-and-braces.** One mixed-length
+/// pair rules out only the direction it happens to disagree with: `ab`/`b` puts
+/// the *longer* name first alphabetically, so a shortest-first comparator emits
+/// `b, ab` and fails — while a longest-first one emits `ab, b`, which is also
+/// what sorting by name emits, and passes. `a`/`bb` is the mirror pair and fails
+/// the other way. A comparator keyed on length in either direction is caught only
+/// by having both.
+#[test]
+fn copies_are_sorted_by_name_and_not_by_length() {
+    for (src, want, wrong) in [
+        (
+            "type R = {ab: Int, b: Int, c: Int}\nfn f(s: R) -> R = {..s, c: 1}",
+            "(rec (ab (field s ab)) (b (field s b)) (c 1))",
+            "shortest-first",
+        ),
+        (
+            "type R = {a: Int, bb: Int, c: Int}\nfn f(s: R) -> R = {..s, c: 1}",
+            "(rec (a (field s a)) (bb (field s bb)) (c 1))",
+            "longest-first",
+        ),
+    ] {
+        let m = ok(src);
+        let Item::Fn(f) = &m.items[1] else {
+            panic!("expected a fn")
+        };
+        assert_eq!(
+            dump_expr(&f.body),
+            want,
+            "a {wrong} comparator reverses this pair and passes every \
+             single-letter case in this file"
+        );
+    }
+}
+
+#[test]
+fn a_record_update_with_no_written_fields_copies_every_field() {
+    let m = ok("type R = {b: Int, a: Int}\nfn f(s: R) -> R = {..s}");
+    let Item::Fn(f) = &m.items[1] else {
+        panic!("expected a fn")
+    };
+    assert_eq!(dump_expr(&f.body), "(rec (a (field s a)) (b (field s b)))");
+}
+
+/// The sharpest trap in the pass. A binder that shadows an annotated one must
+/// *remove* the annotation, not keep it: expanding `{..s}` against the outer
+/// `s`'s shape would emit a record of some other type's width, and the reader
+/// would be looking at a diagnostic about a literal they did not write.
+#[test]
+fn a_shadowing_binder_refuses_rather_than_using_the_outer_type() {
+    for src in [
+        "type R = {a: Int, b: Int}\nfn f(s: R) -> Int = { let s = 3; {..s, a: 1}; 0 }",
+        "type R = {a: Int, b: Int}\nfn f(s: R) -> Int = match 1 { s -> { {..s, a: 1}; 0 } }",
+        "type R = {a: Int, b: Int}\nfn f(s: R) -> Int = { let g = |s| {..s, a: 1}; 0 }",
+    ] {
+        let diags = errs(src);
+        assert!(
+            diags.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
+            "expected E0116 for {src}, got {diags:#?}"
+        );
+    }
+}
+
+/// The outer binder is still the one in scope while the *value* of a `let` is
+/// elaborated, so `let s = {..s, a: 1}` updates the record it shadows.
+#[test]
+fn a_let_value_sees_the_binder_it_shadows() {
+    let m = ok("type R = {a: Int, b: Int}\nfn f(s: R) -> R = { let s: R = {..s, a: 1}; s }");
+    let Item::Fn(f) = &m.items[1] else {
+        panic!("expected a fn")
+    };
+    assert_eq!(
+        dump_expr(&f.body),
+        "(block (let s R (rec (b (field s b)) (a 1))) s)"
+    );
+}
+
+#[test]
+fn a_record_update_may_not_add_a_field() {
+    let diags = errs("type R = {a: Int}\nfn f(s: R) -> R = {..s, z: 1}");
+    assert!(
+        diags.iter().any(|d| d.code == codes::RECORD_UPDATE_FIELD),
+        "{diags:#?}"
+    );
+}
+
+#[test]
+fn a_base_whose_type_lives_in_another_module_is_refused() {
+    let diags = errs("import other.mod\nfn f(s: mod::Limits) -> Int = { {..s, a: 1}; 0 }");
+    assert!(
+        diags.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
+        "{diags:#?}"
+    );
+}
+
+#[test]
+fn a_generic_alias_is_refused_rather_than_guessed() {
+    let diags = errs("type P<t> = {fst: t, snd: t}\nfn f(p: P<Int>) -> P<Int> = {..p, fst: 1}");
+    assert!(
+        diags.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
+        "{diags:#?}"
+    );
+}
+
+#[test]
+fn an_alias_cycle_is_refused_rather_than_looping() {
+    let diags = errs("type A = B\ntype B = A\nfn f(x: A) -> Int = { {..x, a: 1}; 0 }");
+    assert!(
+        diags.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
+        "{diags:#?}"
+    );
+}
+
+#[test]
+fn a_second_base_and_a_three_dot_spelling_are_parse_errors() {
+    for src in [
+        "type R = {a: Int}\nfn f(s: R) -> R = {..s, ..s, a: 1}",
+        "type R = {a: Int}\nfn f(s: R) -> R = {...s, a: 1}",
+    ] {
+        let diags = errs(src);
+        assert!(
+            diags.iter().any(|d| d.code == codes::UNEXPECTED_TOKEN),
+            "expected a parse error for {src}, got {diags:#?}"
+        );
+    }
+}
+
+/// `{x}` is still a block and `{x: e}` is still a record: adding `..` to the
+/// lookahead must not have moved either.
+#[test]
+fn the_brace_disambiguation_is_unchanged() {
+    assert_eq!(expr("{x}"), "(block x)");
+    assert_eq!(expr("{x: 1}"), "(rec (x 1))");
+    assert_eq!(expr("{x, y}"), "(rec (x x) (y y))");
 }

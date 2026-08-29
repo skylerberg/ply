@@ -234,6 +234,7 @@ fn label(blocker: &Blocker) -> String {
         Blocker::Lambda => "lambda",
         Blocker::StringConcat => "string concatenation",
         Blocker::Region => "perform, handle or simulate",
+        Blocker::UnexpandedSugar => "a parse-time node expansion should have removed",
         Blocker::UndecidableMatchArm => "pattern outside the fragment",
         Blocker::DestructuringLet => "destructuring let",
         Blocker::FloatTerm => "a Float term (never proved)",

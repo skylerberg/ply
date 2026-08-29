@@ -481,6 +481,15 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
                 walk_expr(v, f);
             }
         }
+        // Row expansion runs before record-update expansion, so it walks the
+        // sugar rather than its expansion. The base is a path and carries no
+        // row; a replacement value is an arbitrary expression and can.
+        ExprKind::RecordUpdate { base, fields } => {
+            walk_expr(base, f);
+            for (_, v) in fields {
+                walk_expr(v, f);
+            }
+        }
         ExprKind::Field { base, .. } => walk_expr(base, f),
         ExprKind::List { items } => {
             for i in items {
@@ -514,7 +523,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
     })
 }
 
-fn grow<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn grow<T>(f: impl FnOnce() -> T) -> T {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)

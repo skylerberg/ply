@@ -401,6 +401,13 @@ impl<'a> Interp<'a> {
             ExprKind::Match { scrutinee, arms } => self.eval_match(scrutinee, arms, env),
             ExprKind::Block { stmts, tail } => self.eval_block(stmts, tail.as_deref(), env),
             ExprKind::Record { fields } => self.eval_record(fields, env),
+            // Both engines evaluate a record update through the ordinary record
+            // path, because expansion makes it the same tree. There is no second
+            // implementation here to disagree with the machine's.
+            ExprKind::RecordUpdate { .. } => unreachable!(
+                "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
+                 `no_record_update_survives_parse_module_anywhere_in_the_tree`"
+            ),
             ExprKind::Field { base, field } => self.eval_field(base, field, env),
             ExprKind::List { items } => self.eval_list(items, env),
             ExprKind::Perform {

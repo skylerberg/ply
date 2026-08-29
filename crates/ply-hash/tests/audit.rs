@@ -879,3 +879,134 @@ law/host \"f grows\"
         "a law's declaration moved a definition's hash"
     );
 }
+
+// Record update. The whole feature is one claim about hashing, so the test for
+// it lives here rather than beside the parser.
+
+/// **The record-update invariant.** `{..s, a: 1}` is not a new kind of
+/// expression; it is a way of writing one that already existed. If the two
+/// spellings hashed differently, adopting the sugar would move every definition
+/// that adopted it *and* split one value into two cache entries — two
+/// definitions computing the same thing, each re-running its own tests.
+///
+/// The expansion is pinned, not merely "some expansion": copies first, sorted by
+/// field name, then the written fields in the order written. The `assert_ne!` is
+/// what stops this test from passing vacuously under a hash that ignored field
+/// order — `swapping_two_record_fields_changes_the_hash` is the invariant it
+/// leans on, and a different order is genuinely a different definition.
+#[test]
+fn record_update_hashes_as_its_expansion() {
+    const SIG: &str = "fn f(s: {a: Int, b: Int, c: Int}) -> {a: Int, b: Int, c: Int} = ";
+    let sugar = format!("{SIG}{{..s, a: 1}}");
+    let expansion = format!("{SIG}{{b: s.b, c: s.c, a: 1}}");
+    let other_order = format!("{SIG}{{a: 1, b: s.b, c: s.c}}");
+
+    unchanged(
+        "record update against its canonical expansion",
+        &sugar,
+        &expansion,
+        "f",
+    );
+    assert_ne!(
+        def(&sugar, "f"),
+        def(&other_order, "f"),
+        "the sugar hashed the same as a *different* field order, so this test \
+         proves nothing about which expansion was emitted"
+    );
+
+    // Names of *differing length*, because `a`/`b`/`c` cannot tell
+    // lexicographic order apart from any comparator that ties-breaks on length
+    // first — and a longhand a reader writes from ADR 0023 §Decision 2 has to
+    // match the emitted order for real field names, not just short ones.
+    //
+    // Both directions. `aa`/`z` sorts the longer name first, so it catches a
+    // shortest-first comparator and *not* a longest-first one, which emits the
+    // same order sorting by name does. `a`/`zz` is the mirror.
+    const WIDE: &str = "type R = {aa: Int, z: Int, k: Int}\nfn f(s: R) -> R = ";
+    unchanged(
+        "record update with field names of differing length",
+        &format!("{WIDE}{{..s, k: 1}}"),
+        &format!("{WIDE}{{aa: s.aa, z: s.z, k: 1}}"),
+        "f",
+    );
+    const MIRROR: &str = "type R = {a: Int, zz: Int, k: Int}\nfn f(s: R) -> R = ";
+    unchanged(
+        "record update whose shorter field name sorts first",
+        &format!("{MIRROR}{{..s, k: 1}}"),
+        &format!("{MIRROR}{{a: s.a, zz: s.zz, k: 1}}"),
+        "f",
+    );
+}
+
+/// The copies are sorted by field name rather than emitted in the type's
+/// declaration order, so that `reordering_the_fields_of_a_record_type_is_free`
+/// keeps holding for a definition written with the sugar. Declaration-order
+/// expansion would make `type` field order load-bearing for every update.
+#[test]
+fn reordering_the_updated_type_is_still_free() {
+    unchanged(
+        "record type field order, through an update",
+        "type R = {a: Int, b: Int, c: Int}\nfn f(s: R) -> R = {..s, a: 1}",
+        "type R = {c: Int, b: Int, a: Int}\nfn f(s: R) -> R = {..s, a: 1}",
+        "f",
+    );
+}
+
+/// The shape is found by following this module's alias chain, and what comes out
+/// is the same expansion the reader would have written. The signature is held
+/// fixed so that only the body differs: a *type reference* is a reference and
+/// hashes as one, so `-> S` and `-> {a: Int, b: Int}` are legitimately different
+/// definitions and would mask what this test is about.
+#[test]
+fn updating_through_a_type_alias_hashes_as_its_expansion() {
+    const DECLS: &str = "type R = {a: Int, b: Int}\ntype S = R\n";
+    unchanged(
+        "alias between the binder and its record",
+        &format!("{DECLS}fn f(s: S) -> R = {{..s, a: 1}}"),
+        &format!("{DECLS}fn f(s: S) -> R = {{b: s.b, a: 1}}"),
+        "f",
+    );
+}
+
+/// A projected base is copied as written, once per field, exactly as the
+/// longhand copies it. This is the `chunk_trailers` shape.
+///
+/// `pp`/`q` rather than `p`/`q`: the copies have to be two names whose
+/// lexicographic order and whose length order **disagree**, or this test passes
+/// under either comparator and pins nothing about which one ran. `Limits`, the
+/// record this shape exists for, has thirteen field names of eight different
+/// lengths.
+///
+/// And then `p`/`qq` as well, because one pair only disagrees with length in one
+/// direction: `pp` before `q` is what sorting by name *and* sorting longest-first
+/// both emit, so that pair alone leaves a longest-first comparator green.
+#[test]
+fn a_projected_base_hashes_as_its_expansion() {
+    const DECLS: &str = "type L = {pp: Int, q: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
+    unchanged(
+        "update through a field projection",
+        &format!("{DECLS}fn f(w: W) -> L = {{..w.lim, r: 2}}"),
+        &format!("{DECLS}fn f(w: W) -> L = {{pp: w.lim.pp, q: w.lim.q, r: 2}}"),
+        "f",
+    );
+    const MIRROR: &str = "type L = {p: Int, qq: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
+    unchanged(
+        "projection whose shorter field name sorts first",
+        &format!("{MIRROR}fn f(w: W) -> L = {{..w.lim, r: 2}}"),
+        &format!("{MIRROR}fn f(w: W) -> L = {{p: w.lim.p, qq: w.lim.qq, r: 2}}"),
+        "f",
+    );
+}
+
+/// Changing which field an update replaces is a real change and must move the
+/// hash. Without this the invariance tests above could be satisfied by a hash
+/// that ignored the update entirely.
+#[test]
+fn changing_the_updated_field_changes_the_hash() {
+    changed(
+        "which field an update replaces",
+        "fn f(s: {a: Int, b: Int}) -> {a: Int, b: Int} = {..s, a: 1}",
+        "fn f(s: {a: Int, b: Int}) -> {a: Int, b: Int} = {..s, b: 1}",
+        "f",
+    );
+}
