@@ -546,6 +546,15 @@ pub mod codes {
     /// brand — is how a handle gets this far, so the fix is upstream of the
     /// boundary rather than at it.
     pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
+    /// A compiled backend a run asked for cannot be attached: the spec does not
+    /// name one, or the engine asked for has no compiled path to attach it to.
+    ///
+    /// Its own number rather than a usage error, because the two cases a reader
+    /// meets are different and the second is the one worth a code: a flag that
+    /// is accepted and does nothing is `CONTRIBUTING.md` §"The one rule"'s defect
+    /// shape, so `--engine treewalk --backend ..` is refused rather than
+    /// silently ignored.
+    pub const BACKEND_UNAVAILABLE: &str = "E0450";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero,
     /// integer overflow, a resource limit. The program is at fault and the
@@ -836,6 +845,7 @@ mod tests {
                 codes::REGION_ESCAPE_AT_BOUNDARY,
                 "E0449",
             ),
+            ("BACKEND_UNAVAILABLE", codes::BACKEND_UNAVAILABLE, "E0450"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),

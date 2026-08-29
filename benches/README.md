@@ -386,7 +386,17 @@ cargo run --release -p ply-corpus -- w6 benches/w6-ladder-r3.json benches/w6-spi
 ```
 
 `11.67x` and `11.68x`, and the verdict — `keep deferring M9` — is the same
-either way. The re-take is
+either way.
+
+> **The verdict string changed on 2026-08-28 and nothing behind it did.** It now
+> reads `keep deferring a code generator for this workload`, with the workload
+> printed under it, because
+> [ADR 0026](../docs/adr/0026-a-reachable-backend.md) §4.2 withdraws this
+> ladder's authority over **M9** while keeping every threshold, every number and
+> the verdict itself: `Ladder::missing` refuses any workload without all nine
+> served-HTTP rungs, so this instrument cannot have decided a question about the
+> language. Re-run today it still reads 35% (227.4µs of 658.9µs), a 1.53×
+> ceiling and a 1.46× projection. The re-take is
 `cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml -- --no-served --iterations 4000 --repeats 15 --half benches/w6-spike-r4.json`,
 run on a machine whose load average was 8.5 falling to 5.2. **Take it on a quiet
 machine.** The same command at `--repeats 7` under a load average of 9.6

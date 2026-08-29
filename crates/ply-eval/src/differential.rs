@@ -223,6 +223,35 @@ impl Divergence {
         .note(format!("{}: {}", right.as_str(), self.right))
         .note("a divergence is never a warning: the result cache would record whichever engine ran first")
     }
+
+    /// The same divergence, when the right-hand side is a machine with a
+    /// compiled backend attached and the left-hand side is the same machine
+    /// without one.
+    ///
+    /// A separate message rather than [`Divergence::to_diagnostic`] with a third
+    /// [`Engine`] variant, because it is a different claim. The two *engines*
+    /// disagreeing is a defect in one of two evaluators, and either could be
+    /// wrong. A backend disagreeing with the machine that offered it the call is
+    /// the **backend's**, always: `Machine::compiled_answer` hands a backend no
+    /// route back into the machine, so a wrong answer is the only thing it can
+    /// contribute. `crates/ply-eval/src/compiled.rs` says so in its own voice —
+    /// "a backend that answers an `Int` the definition would not have produced
+    /// is a wrong answer this boundary cannot detect" — and this is what detects
+    /// it.
+    pub fn to_backend_diagnostic(&self, span: Span) -> Diagnostic {
+        Diagnostic::error(
+            codes::ENGINE_DIVERGENCE,
+            format!(
+                "the compiled backend and `machine` disagree on `{}`",
+                self.subject
+            ),
+        )
+        .primary(span, format!("the backend's {} differs", self.detail.what()))
+        .note(format!("machine, no backend: {}", self.left))
+        .note(format!("machine with the backend: {}", self.right))
+        .note("the boundary checks a backend's answer for kind and nothing else, so a wrong value crosses it")
+        .note("re-run without `--backend` to confirm the two engines still agree without one")
+    }
 }
 
 impl fmt::Display for Divergence {

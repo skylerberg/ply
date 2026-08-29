@@ -1791,3 +1791,121 @@ fn a_codes_path_is_recognised_however_it_is_qualified() {
 //     `cfg(any(test, ..))` are asserted absent in `production_sources` rather
 //     than handled, so one appearing fails the gate instead of quietly
 //     widening what counts as production.
+
+// ----------------------------------------------- the compiled-backend tripwire
+
+/// Production files that install a compiled backend, and the reason each is
+/// allowed to, in the shape `UNARMED_CODES` uses and for the same reason: a
+/// route that appears without anybody deciding it should must look different
+/// from one that was decided on.
+///
+/// ADR 0026 §4.6 stage one. Until this arc, `Machine::set_compiled` had **no**
+/// production caller at all — every one of its 42 call sites was a test or
+/// `crates/ply-codegen-spike`'s own harness — and the rule that a backend run
+/// must not populate the result cache was, in `compiled.rs`'s own words,
+/// "unenforced *because it is unreachable*". It is reachable now, so the rule
+/// is armed, and this is the half that fires on **a new route** rather than on
+/// a wrong answer.
+const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
+    "crates/ply-test/src/lib.rs",
+    "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
+     was handed. It is the only route a shipping command has, and `ply test` arms the \
+     cache rule on it twice: `cache_bypassed` reads `args.backend` so nothing is read, \
+     and `run_with` records `Record::Backend` so nothing is written. \
+     crates/ply-cli/tests/backend.rs holds both, each seen to fail.",
+)];
+
+/// A backend installed by a route the cache rule does not know about.
+///
+/// `Machine::set_compiled`'s own doc comment stated this rule and its own
+/// unenforceability in one breath — *"That rule is **not enforced** for a
+/// backend — it is unreachable … The day a flag can, that line moves in the same
+/// change."* That day is this change, and this is what stops the next route
+/// arriving without the line moving with it.
+///
+/// **Seen to fail.** Adding `machine.set_compiled(backend);` to
+/// `crates/ply-cli/src/commands/run.rs` — a production file, a shipping command,
+/// and one with no cache rule at all — turns this red with *"installs a compiled
+/// backend and is not listed in BACKEND_INSTALLERS"*. Removing the
+/// `args.backend.is_some()` clause from `cache_bypassed` turns it red with the
+/// second assertion. Both were run.
+///
+/// What it does **not** prove is that the rule works, only that whoever adds a
+/// route is told about it. The rule working is
+/// `crates/ply-cli/tests/backend.rs`'s `a_backend_run_reads_no_cached_pass` and
+/// `a_backend_run_writes_no_pass`, which are behavioural and are the ones that
+/// go red if the enforcement is wrong rather than merely absent.
+#[test]
+fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
+    let Tree { sources, .. } = tree();
+    assert!(
+        sources.len() > 100,
+        "scanned {} production files — the scan root is wrong",
+        sources.len()
+    );
+
+    let installers: BTreeSet<&str> = sources
+        .iter()
+        .filter(|s| contains(&s.text, b".set_compiled("))
+        .map(|s| s.rel.as_str())
+        .collect();
+    let listed: BTreeSet<&str> = BACKEND_INSTALLERS.iter().map(|(path, _)| *path).collect();
+
+    let unlisted: Vec<&&str> = installers.difference(&listed).collect();
+    assert!(
+        unlisted.is_empty(),
+        "{unlisted:?} installs a compiled backend and is not listed in BACKEND_INSTALLERS.\n\n\
+             A run with a backend attached is a third execution strategy, and a cached `Pass` is \
+             a claim about the authoritative engine. Every route that can install one owes both \
+             halves of ADR 0026 \u{a7}4.6: the command must not READ the cache (a clause \
+             `cache_bypassed` can see) and the runner must not WRITE it (`Record::Backend`).\n\
+             Add the route here with the reason it is safe, and a test that has been seen to \
+             fail. Do NOT loosen this gate to make the entry disappear."
+    );
+    let stale: Vec<&&str> = listed.difference(&installers).collect();
+    assert!(
+        stale.is_empty(),
+        "BACKEND_INSTALLERS lists {stale:?}, which no longer installs a backend. Delete the \
+         row — an excuse that outlives its fact is what this file exists to prevent."
+    );
+
+    // The two halves, read off the production source that owes them. Lexical,
+    // like everything else here, and it proves the clause is present rather
+    // than that it is right.
+    let cli = sources
+        .iter()
+        .find(|s| s.rel == "crates/ply-cli/src/commands/test.rs")
+        .expect("ply test is production source");
+    let bypassed = between(&cli.text, b"fn cache_bypassed(", b"\n}");
+    assert!(
+        contains(&bypassed, b"backend"),
+        "`cache_bypassed` cannot see whether a backend was installed, so a backend run on the \
+         DEFAULT engine would read the result cache. `--engine both` already bypasses it, which \
+         is exactly why this must not rest on the engine: ADR 0026 \u{a7}4.6 names that interlock \
+         as a trap.\ncache_bypassed reads: {}",
+        String::from_utf8_lossy(&bypassed)
+    );
+
+    let runner = sources
+        .iter()
+        .find(|s| s.rel == "crates/ply-test/src/lib.rs")
+        .expect("the runner is production source");
+    assert!(
+        contains(&runner.text, b"Record::Backend"),
+        "the runner no longer records `Record::Backend`, so a test that entered native code can \
+         have its pass written. That is the half of the rule that survives a backend arriving by \
+         a route no flag names."
+    );
+}
+
+/// The text between the first `open` and the next `close` after it.
+fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
+    let Some(&from) = find_all(text, open).first() else {
+        return Vec::new();
+    };
+    let rest = &text[from..];
+    match find_all(rest, close).first() {
+        Some(&to) => rest[..to].to_vec(),
+        None => rest.to_vec(),
+    }
+}

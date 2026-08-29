@@ -59,10 +59,34 @@ POSTGRES_SHARD=postgres
 # crate in neither this list nor `members` is an accident: nothing builds it and
 # no job tests it, which is the failure this file exists to prevent.
 # Expanded as ${KNOWN_OUTSIDE[@]+...} everywhere below: bash 3.2, which is
-# /bin/bash on macOS, treats "${empty[@]}" as unset under `set -u`, and ADR 0016
-# 3.5 says this list is meant to become empty.
+# /bin/bash on macOS, treats "${empty[@]}" as unset under `set -u`, and this
+# list is meant to become empty.
+#
+# The reason attached to the one entry below was rewritten on 2026-08-28,
+# because the old one had stopped being true. It read: "its own workspace on
+# purpose, per ADR 0016 3.5, so that deferring M9 deletes it with rm -r". R5
+# falsified that: `rm -r crates/ply-codegen-spike` leaves the whole compiled
+# seam standing in `crates/ply-eval/src/compiled.rs`, so the deletion no longer
+# buys what ADR 0016 3.5 said it buys, and performing it today would remove the
+# only implementation of `Compiled` in existence and leave the declaration
+# behind. ADR 0026 4.7 amends 3.5 accordingly and makes the deletion
+# conditional on something checkable, which is what the entry now records.
+#
+# The reproduction was done on 2026-08-28 and the condition came back NOT
+# satisfied, so the entry is narrowed rather than deleted. Seven of the eight
+# configurations moved: five into crates/ply-eval/tests/differential_corpus.rs
+# over ply_eval::backend::Reference at corpus scale, exceeds-budget=4 through
+# `ply test --backend` in crates/ply-cli/tests/backend.rs, and answers= on the
+# offer count of zero that is its whole point. The eighth does not move, for a
+# structural reason: the spike's backend is native code on a fixed stack, so
+# ignoring the budget entirely CRASHES and run_guarded reports it from outside;
+# Reference is a tree-walker whose frames grow on the heap, so the same
+# corruption HANGS -- measured at no output and no exit in 45 seconds against
+# 0.03s for the run that reports. Nothing in the workspace can report a run that
+# never comes back, so the spike is still the only place that demonstration
+# lives.
 declare -a KNOWN_OUTSIDE=(
-  "ply-codegen-spike:its own workspace on purpose, per ADR 0016 3.5, so that deferring M9 deletes it with rm -r"
+  "ply-codegen-spike:its own workspace on purpose; per ADR 0026 4.7 it is deleted once ALL EIGHT of its wrong backends are reproduced in the workspace, and seven of eight is where 2026-08-28 left it -- the unbounded exceeds-budget runaway crashes under the spike's native frames and only hangs under a tree-walker, and a run that never comes back cannot be reported from inside it"
 )
 
 # Tests whose assertion reads a wall clock, as `package:target:test`, where
