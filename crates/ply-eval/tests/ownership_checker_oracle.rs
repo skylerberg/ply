@@ -733,49 +733,96 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
 ///
 /// Asserted against the counters as well as against the checker, so it cannot
 /// pass by both being wrong in the same direction.
+/// The checker's verdict is judged against what the run actually did, in both
+/// directions, over every exercised append in `std.json`.
+///
+/// > **Renamed and re-aimed (2026-08-29). This was
+/// > `the_shipped_quadratic_in_std_json_is_flagged_and_the_counters_confirm_it`,
+/// > and it asserted that the checker flags a copying append in `escape_runs`
+/// > "which is the shipped quadratic ADR 0024 §1 was written about".** That
+/// > subject no longer exists: `escape_runs` was made linear on PR #38 — one
+/// > `push` per escape in last-argument position — and the checker now reads it
+/// > `reuses` at both sites while the counters read 592 and 220 in place against
+/// > **0** copied. The checker was right and the test was stale, which is the
+/// > correct way round but still a red suite.
+/// >
+/// > Asserting the defect was always the weaker claim. What the oracle exists to
+/// > establish is that the static verdict and the dynamic count **agree**, and
+/// > agreement is falsifiable in both directions: a checker that says `Copies`
+/// > everywhere fails it as surely as one that says `Reuses` everywhere. That
+/// > property survives the standard library being fixed, which the old one could
+/// > not — and a test that a bug fix turns red is a test measuring the wrong
+/// > thing.
+///
+/// The non-vacuity floor is the load-bearing half. Both halves pass trivially
+/// over an empty site set, so the count of *exercised* sites is asserted before
+/// the agreement is.
+///
+/// **Armed, and the first two attempts missed.** Forcing `Verdict::Copies`
+/// everywhere does not compile, and flipping the `Res::Unique` arm compiles and
+/// changes **nothing here** — the six exercised sites in `std.json` all report
+/// through `Res::Param`, so a corruption of the arm they do not take proves
+/// only that the corruption was aimed wrong. Flipping `ParamState::Sole` to
+/// `Verdict::Copies` reddens it at **5 of 6** sites, and restoring it returns
+/// green. Recorded because "I corrupted the checker and the test held" is the
+/// sentence that would have shipped an unarmed oracle.
 #[test]
-fn the_shipped_quadratic_in_std_json_is_flagged_and_the_counters_confirm_it() {
+fn the_checker_and_the_counters_agree_on_every_append_in_std_json() {
     let loaded = load_std("std.json").expect("`std.json` must load");
     let costs = Costs::new(&loaded.program, &loaded.resolved);
     let report = costs.check();
     let defs = report.module(loaded.target);
-    let def = defs
-        .iter()
-        .find(|d| d.name.ends_with(".escape_runs"))
-        .expect("`std.json` must still define `escape_runs`");
     let oracle = run(&loaded);
 
-    let mut flagged = Vec::new();
-    for site in &def.sites {
-        let counted = oracle
-            .iter()
-            .find(|(s, _)| *s == site.span)
-            .map(|(_, c)| *c)
-            .unwrap_or_default();
-        println!(
-            "escape_runs json.ply:{}  {}  [{} in place / {} copied]  {}",
-            line_of(&loaded.map, site.span),
-            site.verdict.as_str(),
-            counted.in_place,
-            counted.copies,
-            site.reason,
-        );
-        if site.verdict == Verdict::Copies {
-            flagged.push((site.span, counted));
+    let mut exercised = 0usize;
+    let mut disagreements = Vec::new();
+    for def in defs.iter() {
+        for site in &def.sites {
+            let Some((_, counted)) = oracle.iter().find(|(s, _)| *s == site.span) else {
+                continue;
+            };
+            if counted.in_place + counted.copies == 0 {
+                continue;
+            }
+            exercised += 1;
+            let agrees = match site.verdict {
+                Verdict::Copies => counted.copies > 0,
+                Verdict::Reuses => counted.copies == 0,
+                _ => true,
+            };
+            if !agrees {
+                disagreements.push(format!(
+                    "{} json.ply:{}  said {}  ran [{} in place / {} copied]  {}",
+                    short(&def.name),
+                    line_of(&loaded.map, site.span),
+                    site.verdict.as_str(),
+                    counted.in_place,
+                    counted.copies,
+                    site.reason,
+                ));
+            }
         }
     }
 
+    // Non-vacuity first: an agreement over nothing agrees with anything, and
+    // that is this repository's signature defect.
+    //
+    // The floor is 5 against **6 exercised today**, measured rather than
+    // guessed — a first draft picked 10 out of the air and the floor caught it,
+    // which is the floor working. It is a staleness guard, not a target: it
+    // fires when this test stops reaching the module, and it is deliberately
+    // not set at 6, because a floor equal to the reading turns every ordinary
+    // change to `std.json` into a failure here.
     assert!(
-        !flagged.is_empty(),
-        "the checker found no copying append in `escape_runs`, which is the shipped \
-         quadratic ADR 0024 §1 was written about"
+        exercised >= 5,
+        "only {exercised} append site(s) in `std.json` were exercised, against 6 when \
+         this was written, so agreement over them says nothing about the checker"
     );
-    let confirmed = flagged.iter().any(|(_, c)| c.copies > 0);
     assert!(
-        confirmed,
-        "the checker flagged {} append(s) in `escape_runs` and the run copied at none \
-         of them, so the flag is the checker agreeing with itself",
-        flagged.len(),
+        disagreements.is_empty(),
+        "the checker and the run disagree at {} of {exercised} exercised site(s):\n{}",
+        disagreements.len(),
+        disagreements.join("\n"),
     );
 }
 
