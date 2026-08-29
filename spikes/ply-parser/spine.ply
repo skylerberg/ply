@@ -1,0 +1,913 @@
+// The parser's spine: token access, threaded state, diagnostics, the shared
+// sequence driver, and the dump encoder. A port of the `impl Parser` preamble
+// of `crates/ply-syntax/src/parser.rs` (`:110-260`, `:441-471`, `:2059-2075`).
+//
+// **Four agents write against this file, so its conventions are rules and not
+// preferences.** They are all here, in one place, because breaking any of them
+// is silent: three make a correct parser wrong, and one makes a correct parser
+// quadratic.
+//
+// ## Rule 1 — a parse function guards on `p.bail` at entry and answers `p`
+//
+// The reference's failure channel is `PResult<T> = Result<T, Bail>` where `Bail`
+// is a **zero-field struct** (`parser.rs:11`) — the diagnostic explaining the
+// failure is already in `self.diags`, so `Result<T, Bail>` is isomorphic to
+// `Option<T>` and the error carries nothing. That is what makes a `bail: Bool`
+// in the threaded state an exact encoding rather than a shortcut.
+//
+// Ply has no `?`, so `p.bail` replaces it, and the guard is one per **callee**
+// rather than one per **call site**. Every parse function is
+//
+//     fn thing(c: Ctx, p: P) -> R<Thing> =
+//       if p.bail { {p: p, node: no_thing()} } else { .. }
+//
+// and the invariant it buys is one sentence: **a parse function called with
+// `p.bail` true answers `p` unchanged and consumes nothing.** A caller may
+// therefore run its whole sequence of steps unguarded, exactly as the reference
+// does with `?`, and every step after the failing one is a no-op.
+//
+// The hazard this creates is a *forgotten* guard, which reads tokens past an
+// error and emits phantom diagnostics. `spikes/ply-lexer/GAPS.md` §12 recorded
+// that error accumulation cost the lexer nothing *because a lexer never fails*
+// and predicted it would bite a parser; this is where it bites, and it is why
+// the harness has a guard-deletion instrument that no lexer harness needed.
+//
+// `bail` is **cleared** at exactly the three places the reference matches on
+// `Err(Bail)` rather than propagating it with `?` — `run` twice and `imports`
+// once (`parser.rs:272, :278, :300`) — with `clear_bail`, below.
+//
+// ## Rule 2 — every sequence is one `iterate`, and the budget cannot fire
+//
+// `iterate(seed, budget, step)` is depth 1 on both engines (ADR 0022 §6.1), so
+// recursion is reserved for grammar nesting. The budget is always
+// `c.ntok - p.pos + 1`: every round that answers `Continue` consumes at least
+// one token, so a round count above the tokens that remain is unreachable. This
+// is `crates/ply-std/ply/http.ply:1584 stream_chunks`'s `fuel + 1` shape, and
+// ADR 0022 §1.3's reason for it applies here too — an exhausted budget is a
+// diagnostic, so it is a backstop, never the terminating condition.
+//
+// The contrast with `spikes/ply-lexer/lexer.ply` is the point of the spike:
+// that lexer's `fold(range(0, n + 1), ..)` cannot stop, so on `examples/desk.ply`
+// 140,108 of its 159,684 rounds are no-ops (GAPS.md §5, 87%) and the `range`
+// list is materialised in full. `iterate` stops on the real condition and
+// materialises nothing.
+//
+// ## Rule 3 — the growing field is written LAST in every record literal
+//
+// `spikes/ply-lexer/GAPS.md` §1, measured: a container built anywhere but in
+// the last sub-expression of its enclosing node is copied rather than updated
+// in place, which turns an accumulator into a quadratic. **Nothing in the
+// language says so and nothing checks it.**
+//
+// Here that means: `Acc<a>`'s `out` is last, `P`'s `diags` is last, and the
+// token-buffer fold's `m` is last. Every `P` in this file is built by one of
+// the `at_pos`/`with_*` constructors below rather than by a literal, so the
+// discipline is enforced in ten places instead of at ~300 call sites. **Do not
+// write a `P` literal.**
+//
+// ## Rule 4 — a `Tok` is compared with `==`, never destructured, unless you
+// need its payload
+//
+// `at(c, p, t_comma())` is the whole idiom. The 47 nullary constructors below
+// are the token vocabulary; they are functions because Ply has no constants.
+
+import lexer
+
+// --- Spans, names -----------------------------------------------------------
+
+// One file, so `ply_span::Span`'s `source: SourceId` is dropped: every span in
+// a run names the same file and a two-file span is unrepresentable anyway.
+pub type Span = { start: Int, end: Int }
+
+pub type Ident = { name: Bytes, span: Span }
+
+pub type QName = { module: Option<Ident>, name: Ident, span: Span }
+
+pub fn dummy_span() -> Span = { start: 0, end: 0 }
+
+pub fn sp(s: Int, e: Int) -> Span = { start: s, end: e }
+
+// `Span::to` (`ply_span/src/lib.rs:102`) minus the dummy and cross-file arms:
+// this parser makes no dummy spans and has one file.
+pub fn span_to(a: Span, b: Span) -> Span =
+  { start: if a.start < b.start { a.start } else { b.start },
+    end: if a.end > b.end { a.end } else { b.end } }
+
+pub fn no_ident() -> Ident = { name: b"", span: dummy_span() }
+
+pub fn no_qname() -> QName = { module: None, name: no_ident(), span: dummy_span() }
+
+pub fn bare(i: Ident) -> QName = { module: None, name: i, span: i.span }
+
+pub fn qualified(m: Ident, n: Ident) -> QName =
+  { module: Some(m), name: n, span: span_to(m.span, n.span) }
+
+// --- Diagnostics ------------------------------------------------------------
+
+// `ply_span::Diagnostic` carries `severity`, `code`, `message`, `labels` and
+// `notes`. Severity is `Error` at all 45 parser sites and message text is not
+// compared (see `harness/`), so what survives here is the **structural**
+// signature: the code, every label's span and primary flag, and how many notes
+// there are. That is wider than the lexer spike's code-plus-span, deliberately:
+// 45 diagnostic sites in `parser.rs` and almost every one of them is
+// `codes::UNEXPECTED_TOKEN`, so code and span alone is a weak signature for a
+// parser in a way it was not for a lexer.
+pub type Label = { start: Int, end: Int, primary: Bool }
+
+pub type PDiag = { code: Bytes, notes: Int, labels: List<Label> }
+
+pub fn unexpected() -> Bytes = b"E0001"
+pub fn unterminated() -> Bytes = b"E0002"
+pub fn duplicate_definition() -> Bytes = b"E0105"
+pub fn unknown_effect_set() -> Bytes = b"E0114"
+pub fn effect_set_cycle() -> Bytes = b"E0115"
+pub fn unknown_deriver() -> Bytes = b"E0207"
+
+pub fn diag1(code: Bytes, at: Span, notes: Int) -> PDiag =
+  { code: code, notes: notes,
+    labels: [{start: at.start, end: at.end, primary: true}] }
+
+pub fn diag2(code: Bytes, at: Span, also: Span, notes: Int) -> PDiag =
+  { code: code, notes: notes,
+    labels: [{start: at.start, end: at.end, primary: true},
+             {start: also.start, end: also.end, primary: false}] }
+
+// `Diagnostic::primary_span` (`ply_span/src/lib.rs:658`): the first primary
+// label, else the first label at all. The fallback is dead for every
+// diagnostic this parser or the Rust lexer raises — both always label a primary
+// first — and is written anyway because the reference's rule is what the
+// dedup in `push_diag` keys on.
+pub fn primary_span_of(d: PDiag) -> Span = {
+  let first = fold(d.labels, {seen: false, s: dummy_span()},
+    |a: {seen: Bool, s: Span}, l: Label|
+      if a.seen { a } else { {seen: true, s: {start: l.start, end: l.end}} });
+  let prim = fold(d.labels, {seen: false, s: dummy_span()},
+    |a: {seen: Bool, s: Span}, l: Label|
+      if a.seen || !l.primary { a } else { {seen: true, s: {start: l.start, end: l.end}} });
+  if prim.seen { prim.s } else { first.s }
+}
+
+// --- The token buffer -------------------------------------------------------
+
+// `Map<Int, Token>` and not `List<Token>`, because **the `List` surface has no
+// index**: `len, push, map, filter, fold, range, iterate` and nothing else
+// (`crates/ply-eval/src/builtins.rs:203+`). A parser is `tokens[pos]`,
+// `tokens[pos+1]` and `tokens[pos+2]` — `kind_at` is called with all three at
+// four sites in `parser.rs` — so there is no route to the reference's `Vec`
+// indexing at all. `spikes/ply-lexer/GAPS.md` §10 files the missing surface as
+// "starts to bite"; here it decides the data structure.
+//
+// `Map` is a `RedBlackTreeMap` (`crates/ply-eval/src/value.rs:48`), so every
+// peek is an O(log n) descent with a `Value::cmp` at each node where the
+// reference does one bounds-checked load.
+pub type Ctx = { ntok: Int, src: Bytes, toks: Map<Int, lexer::Token> }
+
+// The threaded state. `diags` is last and every constructor below keeps it
+// last; see Rule 3.
+//
+// Three fields are here that are not in the reference's `struct Parser`:
+//
+//   - `bail`, which is `PResult`'s error channel (Rule 1).
+//   - `gt_split`, which is `expect_gt`'s in-place token rewrite. `parser.rs:187`
+//     assigns `self.tokens[self.pos] = Token { kind: Eq, .. }` to split a `>=`
+//     into `>` then `=` for `type Pair<a>= ..`. The buffer here is immutable, so
+//     the rewrite is a position instead: `gt_split` names the index whose token
+//     now reads `eq` over `start+1..end`, and `tok_index` applies it on read.
+//     **One slot is enough, and that needs an argument the reference does not:**
+//     a split at index k is observable only at k (through `kind`) and at k+1
+//     (through `prev_span`), `pos` never moves backwards, and a second split at
+//     k' > k cannot be reached until `pos` is past k+1. Immutability turns a
+//     mutation into a claim about the lifetime of that mutation.
+//   - `last_code`/`last_span`, which are `self.diags.last()`. **There is no
+//     `last` on a `List` and no index to fake one with**, so the one fact the
+//     dedup rule in `push_diag` needs is carried beside the list.
+pub type P = {
+  pos: Int,
+  no_brace: Bool,
+  depth: Int,
+  gt_split: Int,
+  uses_sets: Bool,
+  bail: Bool,
+  last_code: Bytes,
+  last_span: Span,
+  diags: List<PDiag>,
+}
+
+// The universal answer: a node and the next state. `spikes/ply-lexer/GAPS.md`
+// §9 counted three record types in the lexer that existed only because Ply has
+// no tuples; a parser's commonest type *is* a pair, so this one record stands
+// in for the tuple at every one of the ~93 parse functions.
+pub type R<a> = { p: P, node: a }
+
+// `eat` answers a state and a `Bool`, which is the same tax again.
+pub type Ate = { p: P, ok: Bool }
+
+pub type Acc<a> = { p: P, out: List<a> }
+
+pub type Start = { c: Ctx, p: P }
+
+type Buf = { i: Int, m: Map<Int, lexer::Token> }
+
+type DAcc = { code: Bytes, span: Span, out: List<PDiag> }
+
+// `lex` then one fold to index the token list, because there is no way to index
+// it in place. The `m` field is last (Rule 3) and the map is persistent, so the
+// insert shares structure rather than copying — whether the positional tax of
+// GAPS.md §1 applies to a `Map` at all is UNMEASURED.
+pub fn start(src: Bytes) -> Start = {
+  let lx = lexer::lex(src);
+  let b = fold(lx.toks, {i: 0, m: map_new()},
+    |s: Buf, t: lexer::Token| {i: s.i + 1, m: map_insert(s.m, s.i, t)});
+  // Every diagnostic `ply_syntax::lexer` raises is built at one site
+  // (`lexer.rs:818`) as `Diagnostic::error(code, message).primary(span, label)`:
+  // exactly one primary label and no notes. `lexer.ply` carries only the code
+  // and the span, which is all that shape needs.
+  let d = fold(lx.diags, {code: b"", span: dummy_span(), out: []},
+    |a: DAcc, x: lexer::Diag|
+      { code: x.code, span: {start: x.start, end: x.end},
+        out: push(a.out, diag1(x.code, {start: x.start, end: x.end}, 0)) });
+  { c: { ntok: b.i, src: src, toks: b.m },
+    p: { pos: 0, no_brace: false, depth: 0, gt_split: -1, uses_sets: false,
+         bail: false, last_code: d.code, last_span: d.span, diags: d.out } }
+}
+
+// --- Constructing `P` -------------------------------------------------------
+//
+// Ply has no record-update syntax (`spikes/ply-lexer/GAPS.md` §2), so changing
+// one field means writing all nine. Nine fields times ~300 sites is 2,700
+// chances to put `diags` anywhere but last, so the literal is written here ten
+// times and nowhere else.
+
+pub fn at_pos(p: P, pos: Int) -> P =
+  { no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, bail: p.bail, last_code: p.last_code,
+    last_span: p.last_span, pos: pos, diags: p.diags }
+
+pub fn with_no_brace(p: P, b: Bool) -> P =
+  { pos: p.pos, depth: p.depth, gt_split: p.gt_split, uses_sets: p.uses_sets,
+    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
+    no_brace: b, diags: p.diags }
+
+pub fn with_depth(p: P, d: Int) -> P =
+  { pos: p.pos, no_brace: p.no_brace, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, bail: p.bail, last_code: p.last_code,
+    last_span: p.last_span, depth: d, diags: p.diags }
+
+pub fn with_gt_split(p: P, i: Int) -> P =
+  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, uses_sets: p.uses_sets,
+    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
+    gt_split: i, diags: p.diags }
+
+pub fn with_sets(p: P) -> P =
+  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
+    uses_sets: true, diags: p.diags }
+
+pub fn with_bail(p: P) -> P =
+  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, last_code: p.last_code, last_span: p.last_span,
+    bail: true, diags: p.diags }
+
+// The three `Err(Bail)` arms in `run` and `imports` (`parser.rs:272, :278,
+// :300`), and nothing else. `no_brace` and `depth` are reset by `run`'s loop
+// head (`:268-269`) rather than here.
+pub fn clear_bail(p: P) -> P =
+  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, last_code: p.last_code, last_span: p.last_span,
+    bail: false, diags: p.diags }
+
+// `run`'s loop head: `self.no_brace = false; self.depth = 0;`.
+pub fn fresh_item(p: P) -> P =
+  { pos: p.pos, gt_split: p.gt_split, uses_sets: p.uses_sets, bail: p.bail,
+    last_code: p.last_code, last_span: p.last_span, no_brace: false, depth: 0,
+    diags: p.diags }
+
+// `Parser::push` (`parser.rs:207`): a single mistake usually trips several
+// expectations at the same offset, so a diagnostic with the same code and the
+// same primary span as the one before it is dropped. This changes the list
+// exactly, so it is ported exactly.
+pub fn push_diag(p: P, d: PDiag) -> P = {
+  let s = primary_span_of(d);
+  if p.last_code == d.code && p.last_span.start == s.start && p.last_span.end == s.end {
+    p
+  } else {
+    { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+      uses_sets: p.uses_sets, bail: p.bail, last_code: d.code, last_span: s,
+      diags: push(p.diags, d) }
+  }
+}
+
+pub fn bail_with(p: P, d: PDiag) -> P = with_bail(push_diag(p, d))
+
+// --- Token access -----------------------------------------------------------
+
+fn eof_token() -> lexer::Token = { start: 0, end: 0, tok: lexer::TEof }
+
+// Absolute index, clamped to the buffer, with `expect_gt`'s split applied.
+// `map_get` cannot miss for an index in range; the `None` arm is the price of
+// `Map` having no total lookup.
+pub fn tok_index(c: Ctx, p: P, i: Int) -> lexer::Token = {
+  let j = if i < 0 { 0 } else if i > c.ntok - 1 { c.ntok - 1 } else { i };
+  let t = match map_get(c.toks, j) { Some(x) -> x, None -> eof_token() };
+  if j == p.gt_split {
+    { start: t.start + 1, end: t.end, tok: lexer::TPunct(b"eq") }
+  } else {
+    t
+  }
+}
+
+// `Parser::kind_at` (`parser.rs:117`): `(self.pos + n).min(len - 1)`.
+pub fn tok_at(c: Ctx, p: P, n: Int) -> lexer::Token = tok_index(c, p, p.pos + n)
+
+pub fn kind(c: Ctx, p: P) -> lexer::Tok = tok_at(c, p, 0).tok
+
+pub fn kind_at(c: Ctx, p: P, n: Int) -> lexer::Tok = tok_at(c, p, n).tok
+
+pub fn span_at(c: Ctx, p: P, n: Int) -> Span = {
+  let t = tok_at(c, p, n);
+  { start: t.start, end: t.end }
+}
+
+pub fn cur_span(c: Ctx, p: P) -> Span = span_at(c, p, 0)
+
+// `Parser::prev_span` (`parser.rs:125`): `self.pos.saturating_sub(1)`.
+pub fn prev_span(c: Ctx, p: P) -> Span = {
+  let t = tok_index(c, p, p.pos - 1);
+  { start: t.start, end: t.end }
+}
+
+// The bytes a token spans. This is the whole answer to the float hole
+// `spikes/ply-lexer/README.md` says an extender must close: a `Float` or
+// `Decimal` literal is carried as **the raw source over its span**, so this
+// parser never builds an `f64`, never normalises digits, and inherits nothing
+// from `lexer.ply`'s float normalisation.
+pub fn tok_bytes(c: Ctx, t: lexer::Token) -> Bytes = bytes_slice(c.src, t.start, t.end)
+
+// `Parser::advance` (`parser.rs:129`): answers the current span and moves on,
+// except at the last token, where it stays. No bail guard: this is an
+// accessor, and Rule 1 puts the guard on the parse function that reaches it.
+pub fn advance(c: Ctx, p: P) -> R<Span> =
+  { p: if p.pos + 1 < c.ntok { at_pos(p, p.pos + 1) } else { p },
+    node: cur_span(c, p) }
+
+pub fn at(c: Ctx, p: P, k: lexer::Tok) -> Bool = kind(c, p) == k
+
+pub fn at_eof(c: Ctx, p: P) -> Bool = kind(c, p) == lexer::TEof
+
+// `TokenKind::Ident(n) if n.as_str() == text`, which structural equality on the
+// constructor says exactly.
+pub fn at_ident_text(c: Ctx, p: P, text: Bytes) -> Bool =
+  kind(c, p) == lexer::TIdent(text)
+
+// `parser.rs:2078 starts_upper`, which decides whether a bare name in a pattern
+// is a constructor or a binder, and whether a name in a type is a constructor
+// or a variable.
+//
+// The reference asks `char::is_uppercase` — a Unicode property. Ply has no
+// character type and no Unicode table, so this is ASCII `A`..`Z`.
+// **On this parser the two cannot differ**, and the reason is upstream:
+// `lexer.ply` refuses any token whose first byte is >= 128 with its own
+// `X0001` (`spikes/ply-lexer/README.md` §"Where this disagrees on purpose"), so
+// an identifier reaching `starts_upper` has an ASCII first byte by
+// construction. The divergence is `lexer.ply`'s, already recorded there, and is
+// not a second one.
+pub fn starts_upper(name: Bytes) -> Bool =
+  bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
+
+pub fn is_str(c: Ctx, p: P) -> Bool =
+  match kind(c, p) { lexer::TStr(v) -> true, _ -> false }
+
+// `advance` where the span is not wanted. The reference writes `self.advance();`
+// and drops the value; with no statements and no mutation, dropping it is a
+// second function.
+pub fn bump(c: Ctx, p: P) -> P = advance(c, p).p
+
+pub fn dump_bool(b: Bool) -> Bytes = if b { word(b"true") } else { word(b"false") }
+
+pub fn is_ident(c: Ctx, p: P) -> Bool =
+  match kind(c, p) { lexer::TIdent(n) -> true, _ -> false }
+
+// --- Expecting --------------------------------------------------------------
+
+pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
+  if p.bail { { p: p, ok: false } }
+  else if at(c, p, k) { { p: advance(c, p).p, ok: true } }
+  else { { p: p, ok: false } }
+
+// `what` is the message the reference formats into the diagnostic. It is
+// carried at every site and never read: message text is not compared (see
+// `harness/`), and `TokenKind::describe`'s ~40 arms are the other half of what
+// building it would need. Carrying it is what makes turning messages on a
+// change to `error_here` alone rather than a rewrite of ~120 call sites.
+pub fn error_here(c: Ctx, p: P, what: Bytes) -> P =
+  bail_with(p, diag1(unexpected(), cur_span(c, p), 0))
+
+// `Parser::unclosed` (`parser.rs:166`): primary at the offending token,
+// secondary at the opening delimiter.
+pub fn unclosed(c: Ctx, p: P, open: Span, what: Bytes) -> P =
+  bail_with(p, diag2(unexpected(), cur_span(c, p), open, 0))
+
+pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> R<Span> =
+  if p.bail { { p: p, node: dummy_span() } }
+  else if at(c, p, k) { advance(c, p) }
+  else { { p: error_here(c, p, what), node: dummy_span() } }
+
+pub fn expect_close(c: Ctx, p: P, k: lexer::Tok, open: Span, what: Bytes) -> R<Span> =
+  if p.bail { { p: p, node: dummy_span() } }
+  else if at(c, p, k) { advance(c, p) }
+  else { { p: unclosed(c, p, open, what), node: dummy_span() } }
+
+pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> R<Ident> =
+  if p.bail { { p: p, node: no_ident() } }
+  else {
+    match kind(c, p) {
+      lexer::TIdent(n) -> {
+        let a = advance(c, p);
+        { p: a.p, node: {name: n, span: a.node} }
+      },
+      _ -> { p: error_here(c, p, what), node: no_ident() },
+    }
+  }
+
+// `Parser::expect_gt` (`parser.rs:187`). The `Ge` arm answers the first byte as
+// the `>` and leaves `pos` where it is, having rewritten the token under it to
+// `=` over the second byte; here the rewrite is `gt_split` and `tok_index`
+// applies it. See the note on `P`.
+pub fn expect_gt(c: Ctx, p: P, what: Bytes) -> R<Span> =
+  if p.bail { { p: p, node: dummy_span() } }
+  else if at(c, p, t_gt()) { advance(c, p) }
+  else if at(c, p, t_ge()) {
+    let s = cur_span(c, p);
+    { p: with_gt_split(p, p.pos), node: {start: s.start, end: s.start + 1} }
+  }
+  else { { p: error_here(c, p, what), node: dummy_span() } }
+
+// --- Depth ------------------------------------------------------------------
+
+// `MAX_DEPTH` (`parser.rs:23`). ADR 0020 §5.1's measured corpus maximum is 17.
+pub fn max_depth() -> Int = 128
+
+pub fn deeper(c: Ctx, p: P) -> P =
+  if p.bail { p } else {
+    let q = with_depth(p, p.depth + 1);
+    if q.depth <= max_depth() { q }
+    else { bail_with(q, diag1(unexpected(), cur_span(c, q), 1)) }
+  }
+
+pub fn shallower(p: P) -> P = with_depth(p, p.depth - 1)
+
+// --- The shared sequence driver ---------------------------------------------
+
+// `Parser::comma_list` (`parser.rs:2059`), called from fourteen sites, one for
+// each of eight distinct element types. Generic, higher-order, and its callback
+// handed on to `iterate` — the risk registered in
+// `/tmp/ply-parser-spike/PREREGISTRATION.md` §4.2 was that this would not
+// typecheck and would become eight hand-monomorphised copies. It typechecks.
+//
+// The budget `c.ntok - p.pos + 1` is a backstop that cannot fire: `item` either
+// consumes a token or sets `bail`, and the `eat` of the comma consumes another,
+// so a `Continue` costs at least one token. The reference's `while` has no such
+// backstop — an item that consumed nothing would hang it, where this reports.
+pub fn comma_list<a>(c: Ctx, p: P, close: lexer::Tok, item: (Ctx, P) -> R<a>) -> R<List<a>> =
+  if p.bail { { p: p, node: [] } } else {
+    iterate({p: p, out: []}, c.ntok - p.pos + 1, |s: Acc<a>|
+      if s.p.bail || at(c, s.p, close) || at_eof(c, s.p) {
+        Stop({p: s.p, node: s.out})
+      } else {
+        let r = item(c, s.p);
+        if r.p.bail {
+          Stop({p: r.p, node: s.out})
+        } else {
+          let e = eat(c, r.p, t_comma());
+          if e.ok {
+            Continue({p: e.p, out: push(s.out, r.node)})
+          } else {
+            Stop({p: e.p, node: push(s.out, r.node)})
+          }
+        }
+      })
+  }
+
+// --- Qualified names --------------------------------------------------------
+
+// `Parser::qname` (`parser.rs:442`). `::` rather than `.` because with `.` a
+// qualified name is token-identical to a perform and to a field access.
+pub fn qname(c: Ctx, p: P, what: Bytes) -> R<QName> =
+  if p.bail { { p: p, node: no_qname() } } else {
+    let first = expect_ident(c, p, what);
+    if first.p.bail { { p: first.p, node: no_qname() } }
+    else {
+      let cc = eat(c, first.p, t_coloncolon());
+      if !cc.ok { { p: cc.p, node: bare(first.node) } }
+      else {
+        let second = expect_ident(c, cc.p, b"a name after `::`");
+        if second.p.bail { { p: second.p, node: no_qname() } }
+        else if at(c, second.p, t_coloncolon()) {
+          { p: bail_with(second.p, diag1(unexpected(), cur_span(c, second.p), 1)),
+            node: no_qname() }
+        } else {
+          { p: second.p, node: qualified(first.node, second.node) }
+        }
+      }
+    }
+  }
+
+// --- The token vocabulary ---------------------------------------------------
+//
+// Ply has no constants, so each of these is a function and each use of one is
+// an interpreter call. `at(c, p, t_comma())` is four calls — `t_comma`, `at`,
+// `kind`, `tok_at`/`tok_index` — plus a `map_get`, where the reference is one
+// bounds-checked load and a discriminant compare. `spikes/ply-lexer/GAPS.md`
+// §11 saw the same shape on `at`; on a parser it is the innermost loop.
+
+pub fn t_lparen() -> lexer::Tok = lexer::TPunct(b"lparen")
+pub fn t_rparen() -> lexer::Tok = lexer::TPunct(b"rparen")
+pub fn t_lbrace() -> lexer::Tok = lexer::TPunct(b"lbrace")
+pub fn t_rbrace() -> lexer::Tok = lexer::TPunct(b"rbrace")
+pub fn t_lbracket() -> lexer::Tok = lexer::TPunct(b"lbracket")
+pub fn t_rbracket() -> lexer::Tok = lexer::TPunct(b"rbracket")
+pub fn t_comma() -> lexer::Tok = lexer::TPunct(b"comma")
+pub fn t_semi() -> lexer::Tok = lexer::TPunct(b"semi")
+pub fn t_colon() -> lexer::Tok = lexer::TPunct(b"colon")
+pub fn t_coloncolon() -> lexer::Tok = lexer::TPunct(b"coloncolon")
+pub fn t_dot() -> lexer::Tok = lexer::TPunct(b"dot")
+pub fn t_dotdot() -> lexer::Tok = lexer::TPunct(b"dotdot")
+pub fn t_underscore() -> lexer::Tok = lexer::TPunct(b"underscore")
+pub fn t_arrow() -> lexer::Tok = lexer::TPunct(b"arrow")
+pub fn t_eq() -> lexer::Tok = lexer::TPunct(b"eq")
+pub fn t_eqeq() -> lexer::Tok = lexer::TPunct(b"eqeq")
+pub fn t_bang() -> lexer::Tok = lexer::TPunct(b"bang")
+pub fn t_bangeq() -> lexer::Tok = lexer::TPunct(b"bangeq")
+pub fn t_lt() -> lexer::Tok = lexer::TPunct(b"lt")
+pub fn t_le() -> lexer::Tok = lexer::TPunct(b"le")
+pub fn t_gt() -> lexer::Tok = lexer::TPunct(b"gt")
+pub fn t_ge() -> lexer::Tok = lexer::TPunct(b"ge")
+pub fn t_plus() -> lexer::Tok = lexer::TPunct(b"plus")
+pub fn t_plusplus() -> lexer::Tok = lexer::TPunct(b"plusplus")
+pub fn t_minus() -> lexer::Tok = lexer::TPunct(b"minus")
+pub fn t_star() -> lexer::Tok = lexer::TPunct(b"star")
+pub fn t_slash() -> lexer::Tok = lexer::TPunct(b"slash")
+pub fn t_percent() -> lexer::Tok = lexer::TPunct(b"percent")
+pub fn t_ampamp() -> lexer::Tok = lexer::TPunct(b"ampamp")
+pub fn t_pipe() -> lexer::Tok = lexer::TPunct(b"pipe")
+pub fn t_pipepipe() -> lexer::Tok = lexer::TPunct(b"pipepipe")
+pub fn t_eof() -> lexer::Tok = lexer::TEof
+
+pub fn k_pub() -> lexer::Tok = lexer::TKw(b"pub")
+pub fn k_import() -> lexer::Tok = lexer::TKw(b"import")
+pub fn k_fn() -> lexer::Tok = lexer::TKw(b"fn")
+pub fn k_type() -> lexer::Tok = lexer::TKw(b"type")
+pub fn k_effect() -> lexer::Tok = lexer::TKw(b"effect")
+pub fn k_nondet() -> lexer::Tok = lexer::TKw(b"nondet")
+pub fn k_test() -> lexer::Tok = lexer::TKw(b"test")
+pub fn k_let() -> lexer::Tok = lexer::TKw(b"let")
+pub fn k_if() -> lexer::Tok = lexer::TKw(b"if")
+pub fn k_else() -> lexer::Tok = lexer::TKw(b"else")
+pub fn k_match() -> lexer::Tok = lexer::TKw(b"match")
+pub fn k_handle() -> lexer::Tok = lexer::TKw(b"handle")
+pub fn k_with() -> lexer::Tok = lexer::TKw(b"with")
+pub fn k_true() -> lexer::Tok = lexer::TKw(b"true")
+pub fn k_false() -> lexer::Tok = lexer::TKw(b"false")
+
+// --- The dump encoder -------------------------------------------------------
+//
+// A flat preorder linearisation, `;`-terminated, printable ASCII with no `"`
+// and no `\`. That constraint is not decoration: `ply run --json` renders a
+// `String` through `ply_eval::value::escape`, so a dump holding either
+// character would make the harness compare its own unescaper against the
+// parser (`spikes/ply-lexer/harness/src/lib.rs`, module doc).
+//
+//   S:E:TAG;    one node, span S..E; TAG fixes how many children follow
+//   #K;         a list of exactly K children follows
+//   ?0; / ?1;   an absent / present Option; ?1 is followed by one child
+//   @HEX;       an inline scalar payload, hex-encoded
+//   %WORD;      an enum arm
+//   !CODE:S:E:L:N;  a diagnostic: code, primary span, label count, note count
+//   =S:E:F;     one of that diagnostic's labels; F is 1 for primary
+//
+// Three properties make it structural rather than a bag of nodes: every list
+// emits its length, so a dropped element shifts every record after it; every
+// option emits presence, so a dropped `Option` cannot be absorbed; and every
+// node leads with its span, which is the hazard the lexer harness names first —
+// a parser with every tag right and every offset wrong would agree with a
+// span-blind comparator perfectly.
+
+pub fn num(i: Int) -> Bytes = bytes_of_string(int_to_string(i))
+
+pub fn rec(s: Span, tag: Bytes) -> Bytes =
+  bytes_concat_all([num(s.start), b":", num(s.end), b":", tag, b";"])
+
+pub fn nlist(k: Int) -> Bytes = bytes_concat_all([b"#", num(k), b";"])
+
+pub fn opt(present: Bool) -> Bytes = if present { b"?1;" } else { b"?0;" }
+
+pub fn word(w: Bytes) -> Bytes = bytes_concat_all([b"%", w, b";"])
+
+pub fn payload(b: Bytes) -> Bytes = bytes_concat_all([b"@", hex(b), b";"])
+
+// A node's dump is `bytes_concat_all([own_record, child, child, ..])` because
+// **there is no list concatenation**: `push` is the only way to grow a `List`,
+// so joining two `List<Bytes>` costs a fold. That makes the tree walk
+// O(n * depth) rather than O(n). At the corpus's measured nesting of 17 it is
+// fine, and it is `spikes/ply-lexer/GAPS.md` §10's missing surface again —
+// that file names `bytes_concat_all` as "the escape hatch that makes the token
+// dump linear" and notes there is no `List<a>` equivalent.
+pub fn dump_list<a>(xs: List<a>, f: (a) -> Bytes) -> Bytes =
+  bytes_concat(nlist(len(xs)), bytes_concat_all(map(xs, f)))
+
+pub fn dump_opt<a>(o: Option<a>, f: (a) -> Bytes) -> Bytes =
+  match o {
+    None -> opt(false),
+    Some(x) -> bytes_concat(opt(true), f(x)),
+  }
+
+pub fn dump_ident(i: Ident) -> Bytes = bytes_concat(rec(i.span, b"ident"), payload(i.name))
+
+pub fn dump_qname(q: QName) -> Bytes =
+  bytes_concat_all([rec(q.span, b"qname"), dump_opt(q.module, dump_ident), dump_ident(q.name)])
+
+pub fn dump_label(l: Label) -> Bytes =
+  bytes_concat_all([b"=", num(l.start), b":", num(l.end), b":",
+                    if l.primary { b"1" } else { b"0" }, b";"])
+
+pub fn dump_diag(d: PDiag) -> Bytes = {
+  let s = primary_span_of(d);
+  bytes_concat(
+    bytes_concat_all([b"!", d.code, b":", num(s.start), b":", num(s.end), b":",
+                      num(len(d.labels)), b":", num(d.notes), b";"]),
+    bytes_concat_all(map(d.labels, dump_label)))
+}
+
+pub fn dump_diags(ds: List<PDiag>) -> Bytes =
+  bytes_concat(nlist(len(ds)), bytes_concat_all(map(ds, dump_diag)))
+
+fn hex_digits() -> Bytes = b"0123456789abcdef"
+
+fn hex1(v: Int) -> Bytes = bytes_slice(hex_digits(), v, v + 1)
+
+fn hex2(v: Int) -> Bytes = bytes_concat(hex1(v / 16), hex1(v % 16))
+
+pub fn hex(b: Bytes) -> Bytes =
+  bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| hex2(bytes_at(b, i))))
+
+// --- The spine's own tests --------------------------------------------------
+//
+// These arm the spine on its own, before any area is written. Each one is a
+// property another agent's port depends on and would otherwise discover by
+// getting a wrong tree.
+
+fn probe(src: Bytes) -> Start = start(src)
+
+test "the token buffer is indexed from zero and ends with the EOF token" {
+  let s = probe(b"fn f");
+  assert_eq(s.c.ntok, 3);
+  assert_eq(kind_at(s.c, s.p, 0), lexer::TKw(b"fn"));
+  assert_eq(kind_at(s.c, s.p, 1), lexer::TIdent(b"f"));
+  assert_eq(kind_at(s.c, s.p, 2), lexer::TEof);
+}
+
+test "lookahead past the end clamps to the last token rather than failing" {
+  let s = probe(b"fn");
+  assert_eq(kind_at(s.c, s.p, 7), lexer::TEof);
+  assert_eq(span_at(s.c, s.p, 7).start, 2);
+}
+
+test "advance stops at the last token, so a parser at EOF cannot run away" {
+  let s = probe(b"fn");
+  let a = advance(s.c, advance(s.c, advance(s.c, s.p).p).p);
+  assert_eq(a.p.pos, 1);
+  assert_eq(at_eof(s.c, a.p), true);
+}
+
+test "prev_span at position zero is the first token, as saturating_sub says" {
+  let s = probe(b"fn f");
+  assert_eq(prev_span(s.c, s.p).start, 0);
+  assert_eq(prev_span(s.c, advance(s.c, s.p).p).end, 2);
+}
+
+test "a float literal is carried as the raw source over its span" {
+  let s = probe(b"1.50");
+  assert_eq(tok_bytes(s.c, tok_at(s.c, s.p, 0)), b"1.50");
+}
+
+test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
+  let s = probe(b">= x");
+  let g = expect_gt(s.c, s.p, b"`>`");
+  assert_eq(g.node.start, 0);
+  assert_eq(g.node.end, 1);
+  assert_eq(g.p.pos, 0);
+  assert_eq(kind(s.c, g.p), t_eq());
+  assert_eq(cur_span(s.c, g.p).start, 1);
+  assert_eq(cur_span(s.c, g.p).end, 2);
+  // and the `=` is then eaten like any other token, leaving `prev_span` on the
+  // rewritten half — the reason one `gt_split` slot is enough.
+  let a = advance(s.c, g.p);
+  assert_eq(prev_span(s.c, a.p).start, 1);
+  assert_eq(kind(s.c, a.p), lexer::TIdent(b"x"));
+}
+
+// Rule 1's invariant, and the shape this test has to have to watch it. A
+// bailed state must sit on a token the guarded function would otherwise
+// **accept**, or a missing guard raises a duplicate diagnostic at the same
+// span, `push_diag` drops it, and the test passes over a parser that is
+// reading tokens past an error. That is what the first version of this test
+// did; `arm-spine.sh` found it.
+test "a parse function called with bail true consumes nothing and reports nothing" {
+  let s = probe(b"fn f, > g");
+  let b0 = error_here(s.c, s.p, b"x");
+  let b1 = error_here(s.c, at_pos(s.p, 1), b"x");
+  let b2 = error_here(s.c, at_pos(s.p, 2), b"x");
+  let b3 = error_here(s.c, at_pos(s.p, 3), b"x");
+  assert_eq(b0.bail, true);
+  assert_eq(kind(s.c, b0), k_fn());
+  assert_eq(kind(s.c, b1), lexer::TIdent(b"f"));
+  assert_eq(kind(s.c, b2), t_comma());
+  assert_eq(kind(s.c, b3), t_gt());
+  assert_eq(expect(s.c, b0, k_fn(), b"`fn`").p.pos, 0);
+  assert_eq(expect_close(s.c, b0, k_fn(), sp(0, 0), b"`fn`").p.pos, 0);
+  assert_eq(expect_ident(s.c, b1, b"a name").p.pos, 1);
+  assert_eq(qname(s.c, b1, b"a name").p.pos, 1);
+  assert_eq(eat(s.c, b2, t_comma()).p.pos, 2);
+  assert_eq(eat(s.c, b2, t_comma()).ok, false);
+  assert_eq(expect_gt(s.c, b3, b"`>`").p.pos, 3);
+  assert_eq(deeper(s.c, b0).depth, 0);
+  assert_eq(comma_list(s.c, b1, t_rparen(), an_ident).p.pos, 1);
+  assert_eq(len(comma_list(s.c, b1, t_rparen(), an_ident).node), 0);
+  assert_eq(len(expect(s.c, b0, k_fn(), b"`fn`").p.diags), 1);
+  assert_eq(len(expect_ident(s.c, b1, b"a name").p.diags), 1);
+  assert_eq(len(qname(s.c, b1, b"a name").p.diags), 1);
+  assert_eq(len(deeper(s.c, b0).diags), 1);
+}
+
+test "two diagnostics with the same code and primary span collapse to one" {
+  let s = probe(b"fn f");
+  let a = error_here(s.c, s.p, b"one");
+  let b = push_diag(a, diag1(unexpected(), cur_span(s.c, s.p), 0));
+  assert_eq(len(b.diags), 1);
+  let c2 = push_diag(a, diag1(unexpected(), sp(9, 9), 0));
+  assert_eq(len(c2.diags), 2);
+  let d = push_diag(a, diag1(unterminated(), cur_span(s.c, s.p), 0));
+  assert_eq(len(d.diags), 2);
+}
+
+test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
+  // `Parser::new` seeds `self.diags` with the lexer's, so the first parser
+  // diagnostic is deduplicated against a *lexer* one. `&` alone is E0001 over
+  // 0..1 on both sides.
+  let s = probe(b"&");
+  assert_eq(len(s.p.diags), 1);
+  assert_eq(s.p.last_code, b"E0001");
+  assert_eq(s.p.last_span.start, 0);
+  let q = push_diag(s.p, diag1(unexpected(), sp(0, 1), 0));
+  assert_eq(len(q.diags), 1);
+}
+
+test "an unclosed delimiter carries a secondary label at the opener" {
+  let s = probe(b"( ]");
+  let u = unclosed(s.c, at_pos(s.p, 1), sp(0, 1), b"`)`");
+  assert_eq(len(u.diags), 1);
+  assert_eq(dump_diags(u.diags), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
+}
+
+test "deeper bails at MAX_DEPTH and the diagnostic carries its note" {
+  let s = probe(b"fn");
+  let deep = with_depth(s.p, max_depth());
+  let d = deeper(s.c, deep);
+  assert_eq(d.bail, true);
+  assert_eq(dump_diags(d.diags), b"#1;!E0001:0:2:1:1;=0:2:1;");
+  assert_eq(deeper(s.c, s.p).bail, false);
+  assert_eq(shallower(deeper(s.c, s.p)).depth, 0);
+}
+
+// A stand-in item parser: one identifier, so the driver can be tested before
+// any real element parser exists.
+fn an_ident(c: Ctx, p: P) -> R<Ident> = expect_ident(c, p, b"a name")
+
+test "comma_list reads a comma-separated run and stops at its closer" {
+  let s = probe(b"a, b, c)");
+  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  assert_eq(len(r.node), 3);
+  assert_eq(at(s.c, r.p, t_rparen()), true);
+  assert_eq(r.p.bail, false);
+}
+
+test "comma_list accepts an empty run and a trailing comma" {
+  let s = probe(b")");
+  assert_eq(len(comma_list(s.c, s.p, t_rparen(), an_ident).node), 0);
+  let t = probe(b"a, )");
+  let r = comma_list(t.c, t.p, t_rparen(), an_ident);
+  assert_eq(len(r.node), 1);
+  assert_eq(at(t.c, r.p, t_rparen()), true);
+}
+
+// The trailing comma is what makes this test watch the end-of-input stop.
+// Without it the run ends because the comma is missing, and deleting the
+// `at_eof` check leaves the test green — `arm-spine.sh` found that too.
+test "comma_list stops at end of input rather than running off the buffer" {
+  let s = probe(b"a, b,");
+  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  assert_eq(len(r.node), 2);
+  assert_eq(at_eof(s.c, r.p), true);
+  assert_eq(r.p.bail, false);
+  assert_eq(len(r.p.diags), 0);
+}
+
+test "two elements with no comma between them are one element and a stop" {
+  let s = probe(b"a b)");
+  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  assert_eq(len(r.node), 1);
+  assert_eq(kind(s.c, r.p), lexer::TIdent(b"b"));
+  assert_eq(r.p.bail, false);
+}
+
+test "an element that bails abandons the list and propagates the bail" {
+  let s = probe(b"a, 1, c)");
+  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  assert_eq(r.p.bail, true);
+  assert_eq(len(r.node), 1);
+  assert_eq(len(r.p.diags), 1);
+}
+
+test "a list emits its length, so a dropped element shifts what follows" {
+  let xs = [{name: b"a", span: sp(0, 1)}, {name: b"b", span: sp(2, 3)}];
+  assert_eq(dump_list(xs, dump_ident), b"#2;0:1:ident;@61;2:3:ident;@62;");
+  assert_eq(dump_list([], dump_ident), b"#0;");
+}
+
+test "span_to covers both spans whichever order they arrive in" {
+  assert_eq(span_to(sp(5, 10), sp(20, 25)), sp(5, 25));
+  assert_eq(span_to(sp(20, 25), sp(5, 10)), sp(5, 25));
+}
+
+test "the primary span is the first primary label, not the first label" {
+  let two = {code: unexpected(), notes: 0,
+             labels: [{start: 7, end: 8, primary: false},
+                      {start: 1, end: 2, primary: true}]};
+  assert_eq(primary_span_of(two), sp(1, 2));
+  let none = {code: unexpected(), notes: 0,
+              labels: [{start: 7, end: 8, primary: false}]};
+  assert_eq(primary_span_of(none), sp(7, 8));
+}
+
+// `law`, `derive`, `as`, `with_cell`, `with_region`, `simulate` and `resume`
+// are all contextual: they open a construct as identifiers and stay usable as
+// ordinary names. A test on `at_ident_text` that never sees a keyword would
+// not notice it matching one.
+test "at_ident_text matches an identifier and never a keyword" {
+  let s = probe(b"law type");
+  assert_eq(at_ident_text(s.c, s.p, b"law"), true);
+  assert_eq(at_ident_text(s.c, s.p, b"lav"), false);
+  assert_eq(is_ident(s.c, s.p), true);
+  let n = advance(s.c, s.p).p;
+  assert_eq(at_ident_text(s.c, n, b"type"), false);
+  assert_eq(is_ident(s.c, n), false);
+  assert_eq(at(s.c, n, k_type()), true);
+}
+
+test "starts_upper is the constructor-versus-binder decision, on ASCII" {
+  assert_eq(starts_upper(b"Some"), true);
+  assert_eq(starts_upper(b"Z"), true);
+  assert_eq(starts_upper(b"A"), true);
+  assert_eq(starts_upper(b"some"), false);
+  assert_eq(starts_upper(b"_x"), false);
+  assert_eq(starts_upper(b"["), false);
+  assert_eq(starts_upper(b"a"), false);
+  assert_eq(starts_upper(b""), false);
+}
+
+test "is_str is a string literal and not a byte string" {
+  let s = probe(b"\"a\" b\"a\" x");
+  assert_eq(is_str(s.c, s.p), true);
+  assert_eq(is_str(s.c, bump(s.c, s.p)), false);
+  assert_eq(is_str(s.c, bump(s.c, bump(s.c, s.p))), false);
+}
+
+test "bump moves one token and dump_bool tells the two booleans apart" {
+  let s = probe(b"a b");
+  assert_eq(kind(s.c, bump(s.c, s.p)), lexer::TIdent(b"b"));
+  assert_eq(dump_bool(true), b"%true;");
+  assert_eq(dump_bool(false), b"%false;");
+}
+
+test "the dump encoder emits printable ASCII with no quote and no backslash" {
+  let d = bytes_concat_all([
+    rec(sp(3, 9), b"efoo"), nlist(2), opt(true), opt(false),
+    word(b"pub"), payload(b"a\"b\\c\n"), dump_ident({name: b"x", span: sp(0, 1)})]);
+  assert_eq(d, b"3:9:efoo;#2;?1;?0;%pub;@6122625c630a;0:1:ident;@78;");
+}
+
+test "a qualified name and a bare one differ in the option, not only the span" {
+  let s = probe(b"orders::place");
+  let q = qname(s.c, s.p, b"a name");
+  assert_eq(dump_qname(q.node), b"0:13:qname;?1;0:6:ident;@6f7264657273;8:13:ident;@706c616365;");
+  let t = probe(b"place");
+  let b = qname(t.c, t.p, b"a name");
+  assert_eq(dump_qname(b.node), b"0:5:qname;?0;0:5:ident;@706c616365;");
+}
+
+test "a name with two `::` is a diagnostic with a note, and bails" {
+  let s = probe(b"a::b::c");
+  let q = qname(s.c, s.p, b"a name");
+  assert_eq(q.p.bail, true);
+  assert_eq(dump_diags(q.p.diags), b"#1;!E0001:4:6:1:1;=4:6:1;");
+}

@@ -1,0 +1,1204 @@
+// Area 3 of the Ply parser spike: expressions. A port of
+// `crates/ply-syntax/src/parser.rs:1211-1844` — `expr`, `scrutinee`, `bin_expr`,
+// `unary_expr`, `postfix_expr`, `primary_expr`, `call_args`, `opt_resource`,
+// `at_record_literal`, `record_expr`, `record_field`, `block_expr`,
+// `block_inner`, `let_stmt`, `lambda_expr`, `if_expr`, `match_expr`,
+// `match_arms`, `handle_expr`, `handle_rest`, `handle_clause`, `clause_param`,
+// `return_clause`, `with_cell_expr`, `with_region_expr`, `simulate_expr`, the
+// `bin_op` precedence table and `is_block_like` — function for function.
+//
+// This area owns the second of the reference's three `deeper()` sites
+// (`unary_expr`, `parser.rs:1244`), eight of its ten `no_brace` save/restores,
+// the four contextual-keyword decisions (`with_cell`, `with_region`, `simulate`,
+// `resume`), and `bin_expr`'s **iterate-the-left-spine / recurse-the-right-
+// operand** split. That last one is the concrete claim ADR 0022 §2 makes about
+// the reference, and it is the thing this area re-derives in Ply: a
+// left-associative chain of any length is one `iterate` at depth 1, and only a
+// *climb* in binding power adds a frame — of which there are six, because
+// `bin_op` declares six binding powers.
+//
+// Measured on this file, on a 5,000-term `+` chain: 9,999 nodes, the parser's own
+// `depth` high-water mark **1**. A recursive left spine would be 5,001 frames
+// against a ceiling of 10,000. `GAPS-exprs.md` §9.
+
+import spine (Span, Ident, QName, Ctx, P, R, Ate, Acc, Start, PDiag,
+              span_to, dummy_span, no_ident, bare,
+              unexpected, diag1, diag2, push_diag, with_bail, error_here, unclosed,
+              kind, kind_at, cur_span, prev_span, at, at_eof, at_ident_text,
+              advance, bump, eat, expect, expect_close, expect_ident,
+              with_no_brace, deeper, shallower, start, qname, comma_list,
+              t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
+              t_comma, t_semi, t_colon, t_dot, t_arrow, t_eq, t_pipe, t_pipepipe,
+              k_let, k_if, k_else, k_with,
+              rec, nlist, opt, word, dump_list, dump_opt, dump_ident, dump_qname,
+              dump_diags)
+import lexer (Tok, TIdent, TInt, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
+import types (TypeExpr, Param, ty, ty_span, param, dump_ty, dump_param)
+import patterns (Pattern, Lit, LInt, LBool, LStr, LBytes, LFloat, LDec, LUnit,
+                 pattern, pat_span, no_pattern, dump_pattern, dump_lit)
+
+// --- The tree ---------------------------------------------------------------
+//
+// The go/no-go the plan's risk section put first was whether the AST is
+// representable at all: `Expr` has to recurse through the **named** types `Stmt`,
+// `MatchArm`, `HandleClause` and `ReturnClause`, each of which recurses back into
+// `Expr`, and nothing in `crates/ply-std/ply/` or `examples/` does that. It
+// typechecks on the first attempt, ADT-to-ADT and ADT-to-named-record alike, so
+// none of the three fallbacks on the ladder was taken and `MatchArm` is the
+// reference's struct rather than an inline record. `GAPS-exprs.md` §1.
+//
+// `Box<Expr>` and `Option<Box<Expr>>` become `Expr` and `Option<Expr>`: Ply has
+// no box to spell and needs none.
+//
+// The field that grows is last in every variant that has one, and last in every
+// literal that builds one. `spikes/ply-lexer/GAPS.md` §1.
+pub type Expr =
+  | ELit({ span: Span, lit: Lit })
+  | EVar({ span: Span, name: QName })
+  | EBinary({ span: Span, op: Bytes, lhs: Expr, rhs: Expr })
+  | EUnary({ span: Span, op: Bytes, operand: Expr })
+  | ELambda({ span: Span, body: Expr, params: List<Param> })
+  | EApp({ span: Span, func: Expr, args: List<Expr> })
+  | EIf({ span: Span, cond: Expr, then_branch: Expr, else_branch: Expr })
+  | EMatch({ span: Span, scrutinee: Expr, arms: List<MatchArm> })
+  | EBlock({ span: Span, tail: Option<Expr>, stmts: List<Stmt> })
+  | ERecord({ span: Span, fields: List<RecField> })
+  | EField({ span: Span, base: Expr, field: Ident })
+  | EList({ span: Span, items: List<Expr> })
+  | EPerform({ span: Span, eff: QName, op: Ident, resource: Option<Ident>,
+               args: List<Expr> })
+  | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>,
+              clauses: List<HandleClause> })
+  | EWithCell({ span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr })
+  | EWithRegion({ span: Span, region: Ident, body: Expr })
+  | ESimulate({ span: Span, body: Expr })
+  | EBad({ span: Span })
+
+// `Vec<(Ident, Expr)>`. `spikes/ply-lexer/GAPS.md` §9's no-tuples tax again.
+pub type RecField = { name: Ident, value: Expr }
+
+pub type Stmt =
+  | SLet({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr })
+  | SExpr(Expr)
+
+pub type MatchArm = { pat: Pattern, guard: Option<Expr>, body: Expr, span: Span }
+
+pub type HandleClause = {
+  eff: QName,
+  op: Ident,
+  resource: Option<Ident>,
+  resume: Option<Ident>,
+  body: Expr,
+  span: Span,
+  params: List<Ident>,
+}
+
+pub type ReturnClause = { binder: Ident, body: Expr, span: Span }
+
+// What a guarded function answers when it is called on a bailed state. It is a
+// variant of its own, not a stand-in unit literal, so that a placeholder that
+// ever reached the dump would be *visible* there rather than reading as a real
+// `()`. `PBad` and `TBad` are the same decision in the other two areas.
+pub fn no_expr() -> Expr = EBad({ span: dummy_span() })
+
+fn no_clause() -> HandleClause =
+  { eff: bare(no_ident()), op: no_ident(), resource: None, resume: None,
+    body: no_expr(), span: dummy_span(), params: [] }
+
+fn no_return() -> ReturnClause =
+  { binder: no_ident(), body: no_expr(), span: dummy_span() }
+
+pub fn expr_span(e: Expr) -> Span =
+  match e {
+    ELit(v) -> v.span,
+    EVar(v) -> v.span,
+    EBinary(v) -> v.span,
+    EUnary(v) -> v.span,
+    ELambda(v) -> v.span,
+    EApp(v) -> v.span,
+    EIf(v) -> v.span,
+    EMatch(v) -> v.span,
+    EBlock(v) -> v.span,
+    ERecord(v) -> v.span,
+    EField(v) -> v.span,
+    EList(v) -> v.span,
+    EPerform(v) -> v.span,
+    EHandle(v) -> v.span,
+    EWithCell(v) -> v.span,
+    EWithRegion(v) -> v.span,
+    ESimulate(v) -> v.span,
+    EBad(v) -> v.span,
+  }
+
+// `primary_expr`'s parenthesised arm does `inner.span = open.to(close)`, which
+// needs every variant rewritten because there is no record update and the span
+// is inside the variant's payload. Eighteen arms to move one integer pair, and
+// `patterns.ply::set_pat_span` is the same function again for the same reason.
+fn set_span(e: Expr, s: Span) -> Expr =
+  match e {
+    ELit(v) -> ELit({ span: s, lit: v.lit }),
+    EVar(v) -> EVar({ span: s, name: v.name }),
+    EBinary(v) -> EBinary({ span: s, op: v.op, lhs: v.lhs, rhs: v.rhs }),
+    EUnary(v) -> EUnary({ span: s, op: v.op, operand: v.operand }),
+    ELambda(v) -> ELambda({ span: s, body: v.body, params: v.params }),
+    EApp(v) -> EApp({ span: s, func: v.func, args: v.args }),
+    EIf(v) -> EIf({ span: s, cond: v.cond, then_branch: v.then_branch,
+                    else_branch: v.else_branch }),
+    EMatch(v) -> EMatch({ span: s, scrutinee: v.scrutinee, arms: v.arms }),
+    EBlock(v) -> EBlock({ span: s, tail: v.tail, stmts: v.stmts }),
+    ERecord(v) -> ERecord({ span: s, fields: v.fields }),
+    EField(v) -> EField({ span: s, base: v.base, field: v.field }),
+    EList(v) -> EList({ span: s, items: v.items }),
+    EPerform(v) -> EPerform({ span: s, eff: v.eff, op: v.op, resource: v.resource,
+                              args: v.args }),
+    EHandle(v) -> EHandle({ span: s, body: v.body, ret: v.ret, clauses: v.clauses }),
+    EWithCell(v) -> EWithCell({ span: s, resource: v.resource, init: v.init,
+                                binder: v.binder, body: v.body }),
+    EWithRegion(v) -> EWithRegion({ span: s, region: v.region, body: v.body }),
+    ESimulate(v) -> ESimulate({ span: s, body: v.body }),
+    EBad(v) -> EBad({ span: s }),
+  }
+
+// `parser.rs:2083`. Expressions that end in `}` may stand as a statement with no
+// `;`, and this decides both `block_inner`'s statement rule and `match_arms`'s
+// comma rule.
+pub fn is_block_like(e: Expr) -> Bool =
+  match e {
+    EBlock(v) -> true,
+    EIf(v) -> true,
+    EMatch(v) -> true,
+    EHandle(v) -> true,
+    EWithCell(v) -> true,
+    EWithRegion(v) -> true,
+    ESimulate(v) -> true,
+    _ -> false,
+  }
+
+// --- The precedence table ---------------------------------------------------
+//
+// `parser.rs:2096 bin_op`, which is `Option<(BinOp, u8)>` there and a two-field
+// record here — no tuples. Fourteen operators over six binding powers; the six
+// is what bounds the recursion on the right operand.
+type Op = { op: Bytes, bp: Int }
+
+fn bin_op(k: Tok) -> Option<Op> =
+  match k {
+    TPunct(s) ->
+      if s == b"pipepipe" { Some({op: b"or", bp: 1}) }
+      else if s == b"ampamp" { Some({op: b"and", bp: 2}) }
+      else if s == b"eqeq" { Some({op: b"eq", bp: 3}) }
+      else if s == b"bangeq" { Some({op: b"ne", bp: 3}) }
+      else if s == b"lt" { Some({op: b"lt", bp: 3}) }
+      else if s == b"le" { Some({op: b"le", bp: 3}) }
+      else if s == b"gt" { Some({op: b"gt", bp: 3}) }
+      else if s == b"ge" { Some({op: b"ge", bp: 3}) }
+      else if s == b"plusplus" { Some({op: b"concat", bp: 4}) }
+      else if s == b"plus" { Some({op: b"add", bp: 5}) }
+      else if s == b"minus" { Some({op: b"sub", bp: 5}) }
+      else if s == b"star" { Some({op: b"mul", bp: 6}) }
+      else if s == b"slash" { Some({op: b"div", bp: 6}) }
+      else if s == b"percent" { Some({op: b"rem", bp: 6}) }
+      else { None },
+    _ -> None,
+  }
+
+fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
+
+// --- The grammar ------------------------------------------------------------
+
+pub fn expr(c: Ctx, p: P) -> R<Expr> = bin_expr(c, p, 1)
+
+// Inside an `if`/`match` scrutinee a `{` starts the arm block, never a record or
+// a block expression. The reference saves and restores with `mem::replace`; here
+// the flag is a field of the threaded state, saved into a `let` and written back
+// — and written back **on the bailing path too**, which is what `mem::replace`
+// gets for free and this shape has to remember.
+pub fn scrutinee(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let saved = p.no_brace;
+    let r = expr(c, with_no_brace(p, true));
+    { p: with_no_brace(r.p, saved), node: r.node }
+  }
+
+// `while let Some((op, bp)) = bin_op(self.kind())` — one `iterate`, so the left
+// spine costs no frames at all. The right operand recurses, at `bp + 1`, which
+// is what makes the operators left-associative and what bounds the depth by the
+// number of distinct binding powers rather than by the length of the input.
+fn bin_expr(c: Ctx, p: P, min_bp: Int) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let lhs = unary_expr(c, p);
+    if lhs.p.bail { lhs } else {
+      iterate(lhs, c.ntok - lhs.p.pos + 1, |s: R<Expr>|
+        match bin_op(kind(c, s.p)) {
+          None -> Stop(s),
+          Some(o) ->
+            if o.bp < min_bp { Stop(s) } else {
+              let a = advance(c, s.p);
+              let rhs = bin_expr(c, a.p, o.bp + 1);
+              if rhs.p.bail { Stop({p: rhs.p, node: s.node}) }
+              else {
+                Continue({p: rhs.p,
+                          node: EBinary({ span: span_to(expr_span(s.node),
+                                                        expr_span(rhs.node)),
+                                          op: o.op, lhs: s.node, rhs: rhs.node })})
+              }
+            },
+        })
+    }
+  }
+
+// The second of the reference's three `deeper()` sites.
+fn unary_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let d = deeper(c, p);
+    if d.bail { { p: d, node: no_expr() } } else {
+      let r = unary_body(c, d);
+      { p: shallower(r.p), node: r.node }
+    }
+  }
+
+fn unary_body(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let op = match kind(c, p) {
+      TPunct(s) -> if s == b"minus" { b"neg" } else if s == b"bang" { b"not" } else { b"" },
+      _ -> b"",
+    };
+    if op == b"" { postfix_expr(c, p) } else {
+      let st = advance(c, p);
+      let operand = unary_expr(c, st.p);
+      if operand.p.bail { { p: operand.p, node: no_expr() } }
+      else {
+        { p: operand.p,
+          node: EUnary({ span: span_to(st.node, expr_span(operand.node)),
+                         op: op, operand: operand.node }) }
+      }
+    }
+  }
+
+// `loop { match self.kind() { LParen => .., Dot => .., _ => break } }` — one
+// `iterate`, so `a.b.c(d).e(f)` of any length is depth 1.
+fn postfix_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let first = primary_expr(c, p);
+    if first.p.bail { first } else {
+      iterate(first, c.ntok - first.p.pos + 1, |s: R<Expr>|
+        if at(c, s.p, t_lparen()) {
+          let a = call_args(c, s.p);
+          if a.p.bail { Stop({p: a.p, node: s.node}) }
+          else {
+            Continue({p: a.p,
+                      node: EApp({ span: span_to(expr_span(s.node), a.close),
+                                   func: s.node, args: a.args })})
+          }
+        } else if at(c, s.p, t_dot()) {
+          let r = postfix_dot(c, s);
+          if r.p.bail { Stop(r) } else { Continue(r) }
+        } else {
+          Stop(s)
+        })
+    }
+  }
+
+// `db.get[users](k)` performs an effect; `r.f` reads a field. Only a name can be
+// an effect and an operation is always applied to a resource or an argument
+// list, so two tokens of lookahead past the `.` decide it and no name is
+// reserved.
+fn postfix_dot(c: Ctx, s: R<Expr>) -> R<Expr> = {
+  let is_perform = match s.node {
+    EVar(v) ->
+      match kind_at(c, s.p, 1) {
+        TIdent(n) -> at(c, s.p, t_dot()) && follows_op(kind_at(c, s.p, 2)),
+        _ -> false,
+      },
+    _ -> false,
+  };
+  let dot = advance(c, s.p);
+  if !is_perform {
+    let field = expect_ident(c, dot.p, b"a field name after `.`");
+    if field.p.bail { { p: field.p, node: s.node } }
+    else {
+      { p: field.p,
+        node: EField({ span: span_to(expr_span(s.node), field.node.span),
+                       base: s.node, field: field.node }) }
+    }
+  } else {
+    let eff = match s.node { EVar(v) -> v.name, _ -> bare(no_ident()) };
+    let op = expect_ident(c, dot.p, b"an operation name");
+    let res = opt_resource(c, op.p);
+    let a = call_args(c, res.p);
+    if a.p.bail { { p: a.p, node: s.node } }
+    else {
+      { p: a.p,
+        node: EPerform({ span: span_to(expr_span(s.node), a.close), eff: eff,
+                         op: op.node, resource: res.node, args: a.args }) }
+    }
+  }
+}
+
+fn follows_op(k: Tok) -> Bool = k == t_lbracket() || k == t_lparen()
+
+fn opt_resource(c: Ctx, p: P) -> R<Option<Ident>> =
+  if p.bail || !at(c, p, t_lbracket()) { { p: p, node: None } } else {
+    let o = advance(c, p);
+    let r = expect_ident(c, o.p, b"a resource name inside `[..]`");
+    let cl = expect_close(c, r.p, t_rbracket(), o.node, b"`]`");
+    { p: cl.p, node: if cl.p.bail { None } else { Some(r.node) } }
+  }
+
+// `(Vec<Expr>, Span)` in the reference: three things, so not even `R<a>` fits.
+type RArgs = { p: P, close: Span, args: List<Expr> }
+
+fn call_args(c: Ctx, p: P) -> RArgs =
+  if p.bail { { p: p, close: dummy_span(), args: [] } } else {
+    let saved = p.no_brace;
+    let o = expect(c, with_no_brace(p, false), t_lparen(),
+                   b"`(` to start the argument list");
+    let args = comma_list(c, o.p, t_rparen(), expr);
+    let cl = expect_close(c, args.p, t_rparen(), o.node, b"`)` to close the arguments");
+    // Restored on the bailing path as well: the reference's `self.no_brace =
+    // saved` sits before the `?`, not after it.
+    { p: with_no_brace(cl.p, saved), close: cl.node, args: args.node }
+  }
+
+fn lit_expr(c: Ctx, p: P, l: Lit) -> R<Expr> = {
+  let a = advance(c, p);
+  { p: a.p, node: ELit({ span: a.node, lit: l }) }
+}
+
+fn primary_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = cur_span(c, p);
+    match kind(c, p) {
+      TInt(v) -> lit_expr(c, p, LInt(v)),
+      // `lexer.ply`'s float and decimal payloads are discarded and the source is
+      // sliced instead — the same rule `patterns.ply` states for `Lit`, and the
+      // reason the float hole the lexer spike leaves open is closed here by
+      // removal rather than by a third normaliser.
+      TFloat(f) -> lit_expr(c, p, LFloat(src_over(c, st))),
+      TDec(m, sc) -> lit_expr(c, p, LDec(src_over(c, st))),
+      TStr(s) -> lit_expr(c, p, LStr(s)),
+      TBytes(b) -> lit_expr(c, p, LBytes(b)),
+      TKw(k) ->
+        if k == b"true" { lit_expr(c, p, LBool(true)) }
+        else if k == b"false" { lit_expr(c, p, LBool(false)) }
+        else if k == b"if" { if_expr(c, p) }
+        else if k == b"match" { match_expr(c, p) }
+        else if k == b"handle" { handle_expr(c, p) }
+        else { { p: error_here(c, p, b"an expression"), node: no_expr() } },
+      TIdent(n) -> primary_ident(c, p, n),
+      TPunct(s) ->
+        if s == b"lparen" { primary_paren(c, p) }
+        else if s == b"lbracket" { primary_list(c, p) }
+        else if s == b"lbrace" && !p.no_brace {
+          if at_record_literal(c, p) { record_expr(c, p) } else { block_expr(c, p) }
+        }
+        else if s == b"pipe" || s == b"pipepipe" { lambda_expr(c, p) }
+        else { { p: error_here(c, p, b"an expression"), node: no_expr() } },
+      _ -> { p: error_here(c, p, b"an expression"), node: no_expr() },
+    }
+  }
+
+// `with_cell`, `with_region` and `simulate` are contextual: each is an ordinary
+// identifier everywhere the shape below does not hold, so none is reserved and
+// no program loses a name. `simulate` additionally defers to `no_brace` — where
+// a `{` cannot open an expression it opens the enclosing construct's block, so
+// `if simulate { .. }` is a variable and a block, not a region.
+fn primary_ident(c: Ctx, p: P, name: Bytes) -> R<Expr> =
+  if name == b"with_cell" && kind_at(c, p, 1) == t_lbracket() {
+    with_cell_expr(c, p)
+  } else if name == b"with_region" && kind_at(c, p, 1) == t_lbracket() {
+    with_region_expr(c, p)
+  } else if name == b"simulate" && !p.no_brace && kind_at(c, p, 1) == t_lbrace() {
+    simulate_expr(c, p)
+  } else {
+    let q = qname(c, p, b"an expression");
+    { p: q.p, node: if q.p.bail { no_expr() } else { EVar({ span: q.node.span, name: q.node }) } }
+  }
+
+fn primary_paren(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let saved = p.no_brace;
+    let o = advance(c, with_no_brace(p, false));
+    let r = if at(c, o.p, t_rparen()) {
+      let cl = advance(c, o.p);
+      { p: cl.p, node: ELit({ span: span_to(o.node, cl.node), lit: LUnit }) }
+    } else {
+      let inner = expr(c, o.p);
+      if inner.p.bail { { p: inner.p, node: no_expr() } } else {
+        let cl = expect_close(c, inner.p, t_rparen(), o.node, b"`)` to close the group");
+        if cl.p.bail { { p: cl.p, node: no_expr() } }
+        else { { p: cl.p, node: set_span(inner.node, span_to(o.node, cl.node)) } }
+      }
+    };
+    { p: with_no_brace(r.p, saved), node: r.node }
+  }
+
+fn primary_list(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let saved = p.no_brace;
+    let o = advance(c, with_no_brace(p, false));
+    let items = comma_list(c, o.p, t_rbracket(), expr);
+    let cl = expect_close(c, items.p, t_rbracket(), o.node, b"`]` to close the list");
+    { p: with_no_brace(cl.p, saved),
+      node: if cl.p.bail { no_expr() }
+            else { EList({ span: span_to(o.node, cl.node), items: items.node }) } }
+  }
+
+// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`.
+fn at_record_literal(c: Ctx, p: P) -> Bool =
+  match kind_at(c, p, 1) {
+    TIdent(n) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
+    _ -> false,
+  }
+
+fn record_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let saved = p.no_brace;
+    let o = advance(c, with_no_brace(p, false));
+    let fields = comma_list(c, o.p, t_rbrace(), record_field);
+    let cl = expect_close(c, fields.p, t_rbrace(), o.node, b"`}` to close the record");
+    { p: with_no_brace(cl.p, saved),
+      node: if cl.p.bail { no_expr() }
+            else { ERecord({ span: span_to(o.node, cl.node), fields: fields.node }) } }
+  }
+
+fn record_field(c: Ctx, p: P) -> R<RecField> =
+  if p.bail { { p: p, node: {name: no_ident(), value: no_expr()} } } else {
+    let name = expect_ident(c, p, b"a field name");
+    if name.p.bail { { p: name.p, node: {name: name.node, value: no_expr()} } }
+    else {
+      let colon = eat(c, name.p, t_colon());
+      if colon.ok {
+        let v = expr(c, colon.p);
+        { p: v.p, node: {name: name.node, value: v.node} }
+      } else {
+        // `{x, y}` is `{x: x, y: y}`, and the shorthand's value takes the
+        // field's own span.
+        { p: colon.p,
+          node: {name: name.node,
+                 value: EVar({ span: name.node.span, name: bare(name.node) })} }
+      }
+    }
+  }
+
+pub fn block_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let saved = p.no_brace;
+    let r = block_inner(c, with_no_brace(p, false));
+    { p: with_no_brace(r.p, saved), node: r.node }
+  }
+
+// The statement loop. `tail` is set by the arm that sees `}` next, and the
+// loop's own head then ends it — exactly as the reference's `while` does.
+type BlockAcc = { p: P, tail: Option<Expr>, stmts: List<Stmt> }
+
+fn block_inner(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let o = expect(c, p, t_lbrace(), b"`{` to start a block");
+    if o.p.bail { { p: o.p, node: no_expr() } } else {
+      let body = iterate({p: o.p, tail: None, stmts: []}, c.ntok - o.p.pos + 1,
+        |s: BlockAcc|
+          if s.p.bail || at(c, s.p, t_rbrace()) { Stop(s) }
+          else if at_eof(c, s.p) {
+            Stop({p: unclosed(c, s.p, o.node, b"`}` to close the block"),
+                  tail: s.tail, stmts: s.stmts})
+          }
+          else if at(c, s.p, k_let()) {
+            let st = let_stmt(c, s.p);
+            if st.p.bail { Stop({p: st.p, tail: s.tail, stmts: s.stmts}) }
+            else { Continue({p: st.p, tail: s.tail, stmts: push(s.stmts, st.node)}) }
+          }
+          else { block_step(c, s, o.node) });
+      let cl = expect_close(c, body.p, t_rbrace(), o.node, b"`}` to close the block");
+      { p: cl.p,
+        node: if cl.p.bail { no_expr() }
+              else { EBlock({ span: span_to(o.node, cl.node), tail: body.tail,
+                              stmts: body.stmts }) } }
+    }
+  }
+
+fn block_step(c: Ctx, s: BlockAcc, open: Span) -> Iter<BlockAcc, BlockAcc> = {
+  let e = expr(c, s.p);
+  if e.p.bail { Stop({p: e.p, tail: s.tail, stmts: s.stmts}) } else {
+    let semi = eat(c, e.p, t_semi());
+    if semi.ok {
+      Continue({p: semi.p, tail: s.tail, stmts: push(s.stmts, SExpr(e.node))})
+    } else if at(c, semi.p, t_rbrace()) {
+      Continue({p: semi.p, tail: Some(e.node), stmts: s.stmts})
+    } else if is_block_like(e.node) {
+      Continue({p: semi.p, tail: s.tail, stmts: push(s.stmts, SExpr(e.node))})
+    } else if at_eof(c, semi.p) {
+      Stop({p: unclosed(c, semi.p, open, b"`}` to close the block"),
+            tail: s.tail, stmts: s.stmts})
+    } else {
+      Stop({p: error_here(c, semi.p,
+                          b"`;` to end the statement, or `}` to end the block"),
+            tail: s.tail, stmts: s.stmts})
+    }
+  }
+}
+
+fn let_stmt(c: Ctx, p: P) -> R<Stmt> =
+  if p.bail { { p: p, node: SExpr(no_expr()) } } else {
+    let st = advance(c, p);
+    let pat = pattern(c, st.p);
+    let colon = eat(c, pat.p, t_colon());
+    let t = if colon.ok {
+      let x = ty(c, colon.p);
+      { p: x.p, node: Some(x.node) }
+    } else {
+      { p: colon.p, node: None }
+    };
+    let eq = expect(c, t.p, t_eq(), b"`=` and an initializer");
+    let value = expr(c, eq.p);
+    let semi = expect(c, value.p, t_semi(), b"`;` to end the `let`");
+    { p: semi.p,
+      node: SLet({ span: span_to(st.node, semi.node), pat: pat.node, ty: t.node,
+                   value: value.node }) }
+  }
+
+fn lambda_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = cur_span(c, p);
+    // `||` is the empty parameter list, one token; `|` opens a real one.
+    let empty = eat(c, p, t_pipepipe());
+    let params = if empty.ok { { p: empty.p, node: [] } } else {
+      let bar = advance(c, empty.p);
+      let ps = comma_list(c, bar.p, t_pipe(), param);
+      let cl = expect(c, ps.p, t_pipe(), b"`|` to close the lambda parameters");
+      { p: cl.p, node: ps.node }
+    };
+    if params.p.bail { { p: params.p, node: no_expr() } } else {
+      let body = expr(c, params.p);
+      { p: body.p,
+        node: if body.p.bail { no_expr() }
+              else { ELambda({ span: span_to(st, expr_span(body.node)),
+                               body: body.node, params: params.node }) } }
+    }
+  }
+
+fn if_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let cond = scrutinee(c, st.p);
+    let then_branch = block_expr(c, cond.p);
+    if then_branch.p.bail { { p: then_branch.p, node: no_expr() } } else {
+      let els = eat(c, then_branch.p, k_else());
+      let else_branch = if !els.ok {
+        // No `else`: a `()` whose span is the empty range at the end of the
+        // `then` block. A real span, not a dummy one, and the whole `if`'s span
+        // then still ends where the `then` block does.
+        let end = expr_span(then_branch.node).end;
+        { p: els.p, node: ELit({ span: {start: end, end: end}, lit: LUnit }) }
+      } else if at(c, els.p, k_if()) {
+        // `else if` chains rather than nesting a block, which is one recursion
+        // per `else if` in the source and the reference's shape exactly.
+        if_expr(c, els.p)
+      } else {
+        block_expr(c, els.p)
+      };
+      if else_branch.p.bail { { p: else_branch.p, node: no_expr() } }
+      else {
+        { p: else_branch.p,
+          node: EIf({ span: span_to(st.node, expr_span(else_branch.node)),
+                      cond: cond.node, then_branch: then_branch.node,
+                      else_branch: else_branch.node }) }
+      }
+    }
+  }
+
+fn match_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let scrut = scrutinee(c, st.p);
+    let saved = scrut.p.no_brace;
+    let arms = match_arms(c, with_no_brace(scrut.p, false));
+    let back = with_no_brace(arms.p, saved);
+    { p: back,
+      node: if back.bail { no_expr() }
+            else { EMatch({ span: span_to(st.node, arms.close),
+                            scrutinee: scrut.node, arms: arms.arms }) } }
+  }
+
+type RArms = { p: P, close: Span, arms: List<MatchArm> }
+
+fn match_arms(c: Ctx, p: P) -> RArms =
+  if p.bail { { p: p, close: dummy_span(), arms: [] } } else {
+    let o = expect(c, p, t_lbrace(), b"`{` to start the match arms");
+    if o.p.bail { { p: o.p, close: dummy_span(), arms: [] } } else {
+      let body = iterate({p: o.p, out: []}, c.ntok - o.p.pos + 1, |s: Acc<MatchArm>|
+        if s.p.bail || at(c, s.p, t_rbrace()) { Stop(s) }
+        else if at_eof(c, s.p) {
+          Stop({p: unclosed(c, s.p, o.node, b"`}` to close the match arms"), out: s.out})
+        }
+        else { match_arm_step(c, s, o.node) });
+      let cl = expect_close(c, body.p, t_rbrace(), o.node, b"`}` to close the match arms");
+      { p: cl.p, close: cl.node, arms: body.out }
+    }
+  }
+
+fn match_arm_step(c: Ctx, s: Acc<MatchArm>, open: Span)
+  -> Iter<Acc<MatchArm>, Acc<MatchArm>> = {
+  let pat = pattern(c, s.p);
+  let gif = eat(c, pat.p, k_if());
+  let guard = if gif.ok {
+    let g = expr(c, gif.p);
+    { p: g.p, node: Some(g.node) }
+  } else {
+    { p: gif.p, node: None }
+  };
+  let arrow = expect(c, guard.p, t_arrow(), b"`->` and the arm body");
+  let body = expr(c, arrow.p);
+  if body.p.bail { Stop({p: body.p, out: s.out}) } else {
+    let arm = {pat: pat.node, guard: guard.node, body: body.node,
+               span: span_to(pat_span(pat.node), expr_span(body.node))};
+    // `if !self.eat(&Comma) && !self.at(&RBrace)` — the `eat` runs either way,
+    // so the comma is consumed before the test and the `&&` is not a shortcut.
+    let comma = eat(c, body.p, t_comma());
+    if comma.ok || at(c, comma.p, t_rbrace()) {
+      Continue({p: comma.p, out: push(s.out, arm)})
+    } else if at_eof(c, comma.p) {
+      Stop({p: unclosed(c, comma.p, open, b"`}` to close the match arms"),
+            out: push(s.out, arm)})
+    } else if !is_block_like(arm.body) {
+      Stop({p: error_here(c, comma.p, b"`,` between match arms, or `}` to end the match"),
+            out: push(s.out, arm)})
+    } else {
+      Continue({p: comma.p, out: push(s.out, arm)})
+    }
+  }
+}
+
+fn handle_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let saved = st.p.no_brace;
+    let r = handle_rest(c, with_no_brace(st.p, false), st.node);
+    { p: with_no_brace(r.p, saved), node: r.node }
+  }
+
+// The `return` clause rides beside the growing list rather than in it, because a
+// second one is a diagnostic rather than a second element.
+type HAcc = { p: P, ret: Option<ReturnClause>, clauses: List<HandleClause> }
+
+fn handle_rest(c: Ctx, p: P, st: Span) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let body = expr(c, p);
+    let w = expect(c, body.p, k_with(), b"`with` and then the handler clauses");
+    let o = expect(c, w.p, t_lbrace(), b"`{` to start the handler clauses");
+    if o.p.bail { { p: o.p, node: no_expr() } } else {
+      let acc = iterate({p: o.p, ret: None, clauses: []}, c.ntok - o.p.pos + 1, |s: HAcc|
+        if s.p.bail || at(c, s.p, t_rbrace()) { Stop(s) }
+        else if at_eof(c, s.p) {
+          Stop({p: unclosed(c, s.p, o.node, b"`}` to close the handler"),
+                ret: s.ret, clauses: s.clauses})
+        }
+        else { handle_step(c, s) });
+      let cl = expect_close(c, acc.p, t_rbrace(), o.node, b"`}` to close the handler");
+      { p: cl.p,
+        node: if cl.p.bail { no_expr() }
+              else { EHandle({ span: span_to(st, cl.node), body: body.node,
+                               ret: acc.ret, clauses: acc.clauses }) } }
+    }
+  }
+
+// `return` is contextual here too: it is a clause only when a name follows it.
+fn handle_step(c: Ctx, s: HAcc) -> Iter<HAcc, HAcc> =
+  if at_ident_text(c, s.p, b"return") && is_ident_at(c, s.p, 1) {
+    let rc = return_clause(c, s.p);
+    if rc.p.bail { Stop({p: rc.p, ret: s.ret, clauses: s.clauses}) } else {
+      let next = match s.ret {
+        None -> {p: rc.p, clauses: s.clauses, ret: Some(rc.node)},
+        // A duplicate `return` is reported and dropped; the parse does **not**
+        // bail, so the handler keeps its clauses and the first `return`.
+        Some(prev) ->
+          {p: push_diag(rc.p, diag2(unexpected(), rc.node.span, prev.span, 0)),
+           clauses: s.clauses, ret: s.ret},
+      };
+      let comma = eat(c, next.p, t_comma());
+      Continue({p: comma.p, ret: next.ret, clauses: next.clauses})
+    }
+  } else {
+    let cl = handle_clause(c, s.p);
+    if cl.p.bail { Stop({p: cl.p, ret: s.ret, clauses: s.clauses}) } else {
+      let comma = eat(c, cl.p, t_comma());
+      Continue({p: comma.p, ret: s.ret, clauses: push(s.clauses, cl.node)})
+    }
+  }
+
+fn is_ident_at(c: Ctx, p: P, n: Int) -> Bool =
+  match kind_at(c, p, n) { TIdent(x) -> true, _ -> false }
+
+fn handle_clause(c: Ctx, p: P) -> R<HandleClause> =
+  if p.bail { { p: p, node: no_clause() } } else {
+    let eff = qname(c, p, b"an effect name, or `return`");
+    let dot = expect(c, eff.p, t_dot(), b"`.` and the operation name");
+    let op = expect_ident(c, dot.p, b"an operation name");
+    let res = opt_resource(c, op.p);
+    let o = expect(c, res.p, t_lparen(), b"`(` to start the clause parameters");
+    let params = comma_list(c, o.p, t_rparen(), clause_param);
+    let cl = expect_close(c, params.p, t_rparen(), o.node,
+                          b"`)` to close the clause parameters");
+    // `resume` is a keyword only here, between a clause's `)` and its `->`.
+    // Nothing else is grammatical in that position, so consuming it on sight
+    // costs no ordinary name its meaning.
+    let resume = if !cl.p.bail && at_ident_text(c, cl.p, b"resume") {
+      let a = advance(c, cl.p);
+      let n = expect_ident(c, a.p, b"a name to bind the continuation to");
+      { p: n.p, node: Some(n.node) }
+    } else {
+      { p: cl.p, node: None }
+    };
+    let arrow = expect(c, resume.p, t_arrow(), b"`->` and the clause body");
+    let body = expr(c, arrow.p);
+    { p: body.p,
+      node: {eff: eff.node, op: op.node, resource: res.node, resume: resume.node,
+             body: body.node, span: span_to(eff.node.span, expr_span(body.node)),
+             params: params.node} }
+  }
+
+fn clause_param(c: Ctx, p: P) -> R<Ident> = expect_ident(c, p, b"a clause parameter name")
+
+fn return_clause(c: Ctx, p: P) -> R<ReturnClause> =
+  if p.bail { { p: p, node: no_return() } } else {
+    let st = advance(c, p);
+    let binder = expect_ident(c, st.p, b"a binder after `return`");
+    let arrow = expect(c, binder.p, t_arrow(), b"`->` and the `return` body");
+    let body = expr(c, arrow.p);
+    { p: body.p,
+      node: {binder: binder.node, body: body.node,
+             span: span_to(st.node, expr_span(body.node))} }
+  }
+
+fn with_cell_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let br = expect(c, st.p, t_lbracket(), b"`[` and a resource name");
+    let resource = expect_ident(c, br.p, b"a resource name inside `[..]`");
+    let rb = expect_close(c, resource.p, t_rbracket(), br.node, b"`]`");
+    if rb.p.bail { { p: rb.p, node: no_expr() } } else {
+      let saved = rb.p.no_brace;
+      let r = with_cell_rest(c, with_no_brace(rb.p, false), st.node, resource.node);
+      { p: with_no_brace(r.p, saved), node: r.node }
+    }
+  }
+
+fn with_cell_rest(c: Ctx, p: P, st: Span, resource: Ident) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let paren = expect(c, p, t_lparen(), b"`(` and the cell's initial value");
+    let init = expr(c, paren.p);
+    let rp = expect_close(c, init.p, t_rparen(), paren.node, b"`)` after the initial value");
+    let brace = expect(c, rp.p, t_lbrace(), b"`{` to start the cell's region");
+    let binder = expect_ident(c, brace.p, b"a name to bind the cell to");
+    let arrow = expect(c, binder.p, t_arrow(), b"`->` and the region body");
+    let body = expr(c, arrow.p);
+    let cl = expect_close(c, body.p, t_rbrace(), brace.node,
+                          b"`}` to close the cell's region");
+    { p: cl.p,
+      node: if cl.p.bail { no_expr() }
+            else { EWithCell({ span: span_to(st, cl.node), resource: resource,
+                               init: init.node, binder: binder.node, body: body.node }) } }
+  }
+
+fn with_region_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let br = expect(c, st.p, t_lbracket(), b"`[` and a region name");
+    let region = expect_ident(c, br.p, b"a region name inside `[..]`");
+    let rb = expect_close(c, region.p, t_rbracket(), br.node, b"`]`");
+    let body = block_expr(c, rb.p);
+    { p: body.p,
+      node: if body.p.bail { no_expr() }
+            else { EWithRegion({ span: span_to(st.node, expr_span(body.node)),
+                                 region: region.node, body: body.node }) } }
+  }
+
+fn simulate_expr(c: Ctx, p: P) -> R<Expr> =
+  if p.bail { { p: p, node: no_expr() } } else {
+    let st = advance(c, p);
+    let body = block_expr(c, st.p);
+    { p: body.p,
+      node: if body.p.bail { no_expr() }
+            else { ESimulate({ span: span_to(st.node, expr_span(body.node)),
+                               body: body.node }) } }
+  }
+
+// --- The dump ---------------------------------------------------------------
+
+pub fn dump_expr(e: Expr) -> Bytes =
+  match e {
+    ELit(v) -> bytes_concat(rec(v.span, b"elit"), dump_lit(v.lit)),
+    EVar(v) -> bytes_concat(rec(v.span, b"evar"), dump_qname(v.name)),
+    EBinary(v) -> bytes_concat_all([rec(v.span, b"ebin"), word(v.op),
+                                    dump_expr(v.lhs), dump_expr(v.rhs)]),
+    EUnary(v) -> bytes_concat_all([rec(v.span, b"eun"), word(v.op),
+                                   dump_expr(v.operand)]),
+    ELambda(v) -> bytes_concat_all([rec(v.span, b"elam"),
+                                    dump_list(v.params, dump_param),
+                                    dump_expr(v.body)]),
+    EApp(v) -> bytes_concat_all([rec(v.span, b"eapp"), dump_expr(v.func),
+                                 dump_list(v.args, dump_expr)]),
+    EIf(v) -> bytes_concat_all([rec(v.span, b"eif"), dump_expr(v.cond),
+                                dump_expr(v.then_branch), dump_expr(v.else_branch)]),
+    EMatch(v) -> bytes_concat_all([rec(v.span, b"emat"), dump_expr(v.scrutinee),
+                                   dump_list(v.arms, dump_arm)]),
+    EBlock(v) -> bytes_concat_all([rec(v.span, b"eblk"), dump_list(v.stmts, dump_stmt),
+                                   dump_opt(v.tail, dump_expr)]),
+    ERecord(v) -> bytes_concat(rec(v.span, b"erec"), dump_list(v.fields, dump_field)),
+    EField(v) -> bytes_concat_all([rec(v.span, b"efld"), dump_expr(v.base),
+                                   dump_ident(v.field)]),
+    EList(v) -> bytes_concat(rec(v.span, b"elst"), dump_list(v.items, dump_expr)),
+    EPerform(v) -> bytes_concat_all([rec(v.span, b"eprf"), dump_qname(v.eff),
+                                     dump_ident(v.op), dump_opt(v.resource, dump_ident),
+                                     dump_list(v.args, dump_expr)]),
+    EHandle(v) -> bytes_concat_all([rec(v.span, b"ehnd"), dump_expr(v.body),
+                                    dump_list(v.clauses, dump_clause),
+                                    dump_opt(v.ret, dump_return)]),
+    EWithCell(v) -> bytes_concat_all([rec(v.span, b"ecel"), dump_ident(v.resource),
+                                      dump_expr(v.init), dump_ident(v.binder),
+                                      dump_expr(v.body)]),
+    EWithRegion(v) -> bytes_concat_all([rec(v.span, b"ergn"), dump_ident(v.region),
+                                        dump_expr(v.body)]),
+    ESimulate(v) -> bytes_concat(rec(v.span, b"esim"), dump_expr(v.body)),
+    EBad(v) -> rec(v.span, b"ebad"),
+  }
+
+fn dump_field(f: RecField) -> Bytes =
+  bytes_concat(dump_ident(f.name), dump_expr(f.value))
+
+pub fn dump_stmt(s: Stmt) -> Bytes =
+  match s {
+    SLet(v) -> bytes_concat_all([rec(v.span, b"slet"), dump_pattern(v.pat),
+                                 dump_opt(v.ty, dump_ty), dump_expr(v.value)]),
+    SExpr(e) -> bytes_concat(rec(expr_span(e), b"sexp"), dump_expr(e)),
+  }
+
+pub fn dump_arm(m: MatchArm) -> Bytes =
+  bytes_concat_all([rec(m.span, b"arm"), dump_pattern(m.pat),
+                    dump_opt(m.guard, dump_expr), dump_expr(m.body)])
+
+pub fn dump_clause(h: HandleClause) -> Bytes =
+  bytes_concat_all([rec(h.span, b"hcl"), dump_qname(h.eff), dump_ident(h.op),
+                    dump_opt(h.resource, dump_ident),
+                    dump_list(h.params, dump_ident),
+                    dump_opt(h.resume, dump_ident), dump_expr(h.body)])
+
+pub fn dump_return(r: ReturnClause) -> Bytes =
+  bytes_concat_all([rec(r.span, b"rcl"), dump_ident(r.binder), dump_expr(r.body)])
+
+// --- The area's own entry point ---------------------------------------------
+//
+// `parse_expr` (`parser.rs:73`): one expression, then the input must be spent.
+// On a bail there is no tree — the reference answers `Err` and its partial node
+// never escapes — so the dump is the diagnostics alone.
+pub fn dump_expr_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = expr(s.c, s.p);
+  let fin = if r.p.bail || at_eof(s.c, r.p) { r.p }
+            else { error_here(s.c, r.p, b"end of input after the expression") };
+  let tree = if fin.bail { b"" } else { dump_expr(r.node) };
+  string_of_bytes(bytes_concat(tree, dump_diags(fin.diags)))
+}
+
+// The node count, for a probe that prices parsing and touches the whole result.
+// It must be total: a walk that short-circuits would price a parse whose tree was
+// never read.
+pub fn node_count(e: Expr) -> Int =
+  match e {
+    ELit(v) -> 1,
+    EVar(v) -> 1,
+    EBinary(v) -> 1 + node_count(v.lhs) + node_count(v.rhs),
+    EUnary(v) -> 1 + node_count(v.operand),
+    ELambda(v) -> 1 + len(v.params) + node_count(v.body),
+    EApp(v) -> 1 + node_count(v.func) + count_all(v.args),
+    EIf(v) -> 1 + node_count(v.cond) + node_count(v.then_branch)
+                + node_count(v.else_branch),
+    EMatch(v) -> 1 + node_count(v.scrutinee)
+                   + fold(v.arms, 0, |n: Int, m: MatchArm|
+                       n + 1 + count_opt(m.guard) + node_count(m.body)),
+    EBlock(v) -> 1 + fold(v.stmts, 0, |n: Int, s: Stmt| n + count_stmt(s))
+                   + count_opt(v.tail),
+    ERecord(v) -> 1 + fold(v.fields, 0, |n: Int, f: RecField| n + 1 + node_count(f.value)),
+    EField(v) -> 1 + node_count(v.base),
+    EList(v) -> 1 + count_all(v.items),
+    EPerform(v) -> 1 + count_all(v.args),
+    EHandle(v) -> 1 + node_count(v.body)
+                    + fold(v.clauses, 0, |n: Int, h: HandleClause|
+                        n + 1 + len(h.params) + node_count(h.body))
+                    + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) }),
+    EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
+    EWithRegion(v) -> 1 + node_count(v.body),
+    ESimulate(v) -> 1 + node_count(v.body),
+    EBad(v) -> 1,
+  }
+
+fn count_all(xs: List<Expr>) -> Int = fold(xs, 0, |n: Int, x: Expr| n + node_count(x))
+
+fn count_opt(o: Option<Expr>) -> Int = match o { None -> 0, Some(x) -> node_count(x) }
+
+fn count_stmt(s: Stmt) -> Int =
+  match s { SLet(v) -> 1 + node_count(v.value), SExpr(e) -> 1 + node_count(e) }
+
+pub fn parse_count(src: Bytes) -> Int = {
+  let s = start(src);
+  node_count(expr(s.c, s.p).node)
+}
+
+// Parse and touch nothing but the final position: the tree is still built (Ply
+// is strict) and then dropped. `parse_count` minus this is the cost of the walk,
+// which the Rust control does not do.
+pub fn parse_pos(src: Bytes) -> Int = {
+  let s = start(src);
+  expr(s.c, s.p).p.pos
+}
+
+// --- Tests ------------------------------------------------------------------
+
+test "a literal keeps its own span and its decoded value" {
+  assert_eq(dump_expr_of(b"1"), "0:1:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"true"), "0:4:elit;%bool;@31;#0;");
+  assert_eq(dump_expr_of(b"()"), "0:2:elit;%unit;#0;");
+  assert_eq(dump_expr_of(b"\"a\\n\""), "0:5:elit;%str;@610a;#0;");
+}
+
+test "a float and a decimal are the source text, and no value is ever built" {
+  assert_eq(dump_expr_of(b"1.5e-3"), "0:6:elit;%float;@312e35652d33;#0;");
+  assert_eq(dump_expr_of(b"1.50m"), "0:5:elit;%dec;@312e35306d;#0;");
+}
+
+test "precedence binds the tighter operator first and stays left-associative" {
+  assert_eq(dump_expr_of(b"1 + 2 * 3"),
+            "0:9:ebin;%add;0:1:elit;%int;@31;4:9:ebin;%mul;4:5:elit;%int;@32;8:9:elit;%int;@33;#0;");
+  assert_eq(dump_expr_of(b"1 - 2 - 3"),
+            "0:9:ebin;%sub;0:5:ebin;%sub;0:1:elit;%int;@31;4:5:elit;%int;@32;8:9:elit;%int;@33;#0;");
+}
+
+test "a long left-associative chain is one iterate and adds no frames" {
+  let whole = bytes_concat(bytes_concat_all(map(range(0, 400), |i: Int| b"1 + ")), b"1");
+  let s = start(whole);
+  let r = expr(s.c, s.p);
+  assert(!r.p.bail);
+  assert_eq(len(r.p.diags), 0);
+  // 401 terms, and the parser's `depth` is back to 0 with no ceiling hit. The
+  // high-water mark is measured separately; see `GAPS-exprs.md` §9.
+  assert_eq(r.p.depth, 0);
+  assert_eq(node_count(r.node), 801);
+}
+
+test "a unary operator nests, and a `-` before a literal is an operator here" {
+  // The opposite of `patterns.ply`, where `-1` is one literal: an expression has
+  // something to apply the operator to.
+  assert_eq(dump_expr_of(b"-1"), "0:2:eun;%neg;1:2:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"!x"), "0:2:eun;%not;1:2:evar;1:2:qname;?0;1:2:ident;@78;#0;");
+}
+
+test "application and field access chain left to right" {
+  assert_eq(dump_expr_of(b"f(1)(2)"),
+            "0:7:eapp;0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;#1;5:6:elit;%int;@32;#0;");
+  assert_eq(dump_expr_of(b"r.a.b"),
+            "0:5:efld;0:3:efld;0:1:evar;0:1:qname;?0;0:1:ident;@72;2:3:ident;@61;4:5:ident;@62;#0;");
+}
+
+test "a `.` before a name and an argument list is a perform, not a field read" {
+  assert_eq(dump_expr_of(b"db.get[users](k)"),
+            "0:16:eprf;0:2:qname;?0;0:2:ident;@6462;3:6:ident;@676574;?1;7:12:ident;@7573657273;#1;14:15:evar;14:15:qname;?0;14:15:ident;@6b;#0;");
+  assert_eq(dump_expr_of(b"db.get(k)"),
+            "0:9:eprf;0:2:qname;?0;0:2:ident;@6462;3:6:ident;@676574;?0;#1;7:8:evar;7:8:qname;?0;7:8:ident;@6b;#0;");
+  // Two tokens of lookahead is the whole difference: with no `(` or `[` after
+  // the name it is an ordinary field.
+  assert_eq(dump_expr_of(b"db.get"),
+            "0:6:efld;0:2:evar;0:2:qname;?0;0:2:ident;@6462;3:6:ident;@676574;#0;");
+}
+
+test "a brace after an `if` scrutinee opens the block, never a record" {
+  assert_eq(dump_expr_of(b"if x { 1 } else { 2 }"),
+            "0:21:eif;3:4:evar;3:4:qname;?0;3:4:ident;@78;5:10:eblk;#0;?1;7:8:elit;%int;@31;16:21:eblk;#0;?1;18:19:elit;%int;@32;#0;");
+}
+
+test "an `if` with no `else` gets a unit whose span is empty and at the end" {
+  assert_eq(dump_expr_of(b"if x { 1 }"),
+            "0:10:eif;3:4:evar;3:4:qname;?0;3:4:ident;@78;5:10:eblk;#0;?1;7:8:elit;%int;@31;10:10:elit;%unit;#0;");
+}
+
+test "`else if` chains rather than nesting a block" {
+  assert_eq(dump_expr_of(b"if a { 1 } else if b { 2 }"),
+            "0:26:eif;3:4:evar;3:4:qname;?0;3:4:ident;@61;5:10:eblk;#0;?1;7:8:elit;%int;@31;16:26:eif;19:20:evar;19:20:qname;?0;19:20:ident;@62;21:26:eblk;#0;?1;23:24:elit;%int;@32;26:26:elit;%unit;#0;");
+}
+
+test "`{x: e}` and `{x, y}` are records and `{x}` is a block" {
+  assert_eq(dump_expr_of(b"{a: 1}"), "0:6:erec;#1;1:2:ident;@61;4:5:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"{a, b}"),
+            "0:6:erec;#2;1:2:ident;@61;1:2:evar;1:2:qname;?0;1:2:ident;@61;4:5:ident;@62;4:5:evar;4:5:qname;?0;4:5:ident;@62;#0;");
+  assert_eq(dump_expr_of(b"{a}"),
+            "0:3:eblk;#0;?1;1:2:evar;1:2:qname;?0;1:2:ident;@61;#0;");
+}
+
+test "a block separates its statements from its tail" {
+  assert_eq(dump_expr_of(b"{ let x = 1; x }"),
+            "0:16:eblk;#1;2:12:slet;6:7:pvar;6:7:ident;@78;?0;10:11:elit;%int;@31;?1;13:14:evar;13:14:qname;?0;13:14:ident;@78;#0;");
+  assert_eq(dump_expr_of(b"{ 1; }"), "0:6:eblk;#1;2:3:sexp;2:3:elit;%int;@31;?0;#0;");
+}
+
+test "a block-like statement needs no semicolon and anything else does" {
+  assert_eq(dump_expr_of(b"{ if a { 1 } 2 }"),
+            "0:16:eblk;#1;2:12:sexp;2:12:eif;5:6:evar;5:6:qname;?0;5:6:ident;@61;7:12:eblk;#0;?1;9:10:elit;%int;@31;12:12:elit;%unit;?1;13:14:elit;%int;@32;#0;");
+  assert_eq(dump_expr_of(b"{ 1 2 }"), "#1;!E0001:4:5:1:0;=4:5:1;");
+}
+
+test "a lambda takes typed or untyped parameters, and `||` takes none" {
+  assert_eq(dump_expr_of(b"|x| x"),
+            "0:5:elam;#1;1:2:prm;1:2:ident;@78;?0;4:5:evar;4:5:qname;?0;4:5:ident;@78;#0;");
+  assert_eq(dump_expr_of(b"|| 1"), "0:4:elam;#0;3:4:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"|x: Int| x"),
+            "0:10:elam;#1;1:7:prm;1:2:ident;@78;?1;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;9:10:evar;9:10:qname;?0;9:10:ident;@78;#0;");
+}
+
+test "a match arm takes a guard and needs a comma unless its body is block-like" {
+  assert_eq(dump_expr_of(b"match x { 1 -> 2, _ -> 3 }"),
+            "0:26:emat;6:7:evar;6:7:qname;?0;6:7:ident;@78;#2;10:16:arm;10:11:plit;%int;@31;?0;15:16:elit;%int;@32;18:24:arm;18:19:pwld;?0;23:24:elit;%int;@33;#0;");
+  assert_eq(dump_expr_of(b"match x { y if y -> 1 }"),
+            "0:23:emat;6:7:evar;6:7:qname;?0;6:7:ident;@78;#1;10:21:arm;10:11:pvar;10:11:ident;@79;?1;15:16:evar;15:16:qname;?0;15:16:ident;@79;20:21:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"match x { 1 -> 2 _ -> 3 }"), "#1;!E0001:17:18:1:0;=17:18:1;");
+}
+
+test "a handler takes clauses, a resume binder and at most one `return`" {
+  assert_eq(dump_expr_of(b"handle f() with { e.op(a) resume k -> k(a), return v -> v }"),
+            "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;");
+  let two = dump_expr_of(b"handle f() with { return a -> a, return b -> b }");
+  assert(string_contains(two, "!E0001:33:46:2:0;=33:46:1;=18:31:0;"));
+}
+
+test "`with_cell`, `with_region` and `simulate` are contextual" {
+  assert_eq(dump_expr_of(b"with_cell[u](0) { s -> s }"),
+            "0:26:ecel;10:11:ident;@75;13:14:elit;%int;@30;18:19:ident;@73;23:24:evar;23:24:qname;?0;23:24:ident;@73;#0;");
+  assert_eq(dump_expr_of(b"with_region[r] { 1 }"),
+            "0:20:ergn;12:13:ident;@72;15:20:eblk;#0;?1;17:18:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"simulate { 1 }"),
+            "0:14:esim;9:14:eblk;#0;?1;11:12:elit;%int;@31;#0;");
+  // Each is an ordinary name wherever the shape does not hold.
+  assert_eq(dump_expr_of(b"simulate"),
+            "0:8:evar;0:8:qname;?0;0:8:ident;@73696d756c617465;#0;");
+  assert_eq(dump_expr_of(b"with_cell"),
+            "0:9:evar;0:9:qname;?0;0:9:ident;@776974685f63656c6c;#0;");
+}
+
+test "in a scrutinee a `{` is the arm block, so `simulate` is a name there" {
+  assert_eq(dump_expr_of(b"if simulate { 1 }"),
+            "0:17:eif;3:11:evar;3:11:qname;?0;3:11:ident;@73696d756c617465;12:17:eblk;#0;?1;14:15:elit;%int;@31;17:17:elit;%unit;#0;");
+}
+
+test "an argument list clears no_brace so a record may be written inside one" {
+  assert_eq(dump_expr_of(b"if f({a: 1}) { 2 }"),
+            "0:18:eif;3:12:eapp;3:4:evar;3:4:qname;?0;3:4:ident;@66;#1;5:11:erec;#1;6:7:ident;@61;9:10:elit;%int;@31;13:18:eblk;#0;?1;15:16:elit;%int;@32;18:18:elit;%unit;#0;");
+}
+
+test "a list expression, an empty one, and a qualified name" {
+  assert_eq(dump_expr_of(b"[1, 2]"),
+            "0:6:elst;#2;1:2:elit;%int;@31;4:5:elit;%int;@32;#0;");
+  assert_eq(dump_expr_of(b"[]"), "0:2:elst;#0;#0;");
+  assert_eq(dump_expr_of(b"m::f(1)"),
+            "0:7:eapp;0:4:evar;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@66;#1;5:6:elit;%int;@31;#0;");
+}
+
+test "a parenthesized expression takes the parentheses into its span" {
+  assert_eq(dump_expr_of(b"(1 + 2)"),
+            "0:7:ebin;%add;1:2:elit;%int;@31;5:6:elit;%int;@32;#0;");
+}
+
+test "an unclosed group reports against the opener as a secondary label" {
+  assert_eq(dump_expr_of(b"(1"), "#1;!E0001:2:2:2:0;=2:2:1;=0:1:0;");
+}
+
+test "one offset raises one diagnostic, which is `Parser::push`'s dedup rule" {
+  let s = start(b"*");
+  let r = expr(s.c, s.p);
+  assert(r.p.bail);
+  assert_eq(len(r.p.diags), 1);
+}
+
+// The design's one invariant, made testable rather than asserted: *a parse
+// function called with `p.bail` true answers `p` unchanged and consumes
+// nothing.* Every call below is on an input whose unguarded body would consume,
+// which is what lets the assertion fail — pick a non-consuming input and the
+// test is vacuous, which is how `postfix_expr` was green with no guard at all
+// until `f(1)` was changed to `1`. `GAPS-exprs.md` §4.
+fn bailed(s: Start) -> P = with_bail(s.p)
+
+fn untouched(p: P) -> Bool = p.pos == 0 && len(p.diags) == 0 && p.bail
+
+test "every parse function in this module leaves a bailed state alone" {
+  let lit = start(b"1 + 2");
+  assert(untouched(expr(lit.c, bailed(lit)).p));
+  assert(untouched(bin_expr(lit.c, bailed(lit), 1).p));
+  assert(untouched(unary_expr(lit.c, bailed(lit)).p));
+  assert(untouched(unary_body(lit.c, bailed(lit)).p));
+  assert(untouched(postfix_expr(lit.c, bailed(lit)).p));
+  assert(untouched(primary_expr(lit.c, bailed(lit)).p));
+  assert(untouched(scrutinee(lit.c, bailed(lit)).p));
+  let neg = start(b"-1");
+  assert(untouched(unary_body(neg.c, bailed(neg)).p));
+  let res = start(b"[u]");
+  assert(untouched(opt_resource(res.c, bailed(res)).p));
+  let args = start(b"(1)");
+  assert(untouched(call_args(args.c, bailed(args)).p));
+  let fld = start(b"a: 1");
+  assert(untouched(record_field(fld.c, bailed(fld)).p));
+  let recd = start(b"{a: 1}");
+  assert(untouched(record_expr(recd.c, bailed(recd)).p));
+  let blk = start(b"{ 1 }");
+  assert(untouched(block_expr(blk.c, bailed(blk)).p));
+  assert(untouched(block_inner(blk.c, bailed(blk)).p));
+  let arms = start(b"{ 1 -> 2 }");
+  assert(untouched(match_arms(arms.c, bailed(arms)).p));
+  let lt = start(b"let x = 1;");
+  assert(untouched(let_stmt(lt.c, bailed(lt)).p));
+  let iff = start(b"if a { 1 }");
+  assert(untouched(if_expr(iff.c, bailed(iff)).p));
+  let mat = start(b"match a { _ -> 1 }");
+  assert(untouched(match_expr(mat.c, bailed(mat)).p));
+  let hnd = start(b"handle f() with { }");
+  assert(untouched(handle_expr(hnd.c, bailed(hnd)).p));
+  let hrest = start(b"f() with { }");
+  assert(untouched(handle_rest(hrest.c, bailed(hrest), dummy_span()).p));
+  let hcl = start(b"e.op(a) -> a");
+  assert(untouched(handle_clause(hcl.c, bailed(hcl)).p));
+  let rcl = start(b"return v -> v");
+  assert(untouched(return_clause(rcl.c, bailed(rcl)).p));
+  let cp = start(b"a");
+  assert(untouched(clause_param(cp.c, bailed(cp)).p));
+  let lam = start(b"|x| x");
+  assert(untouched(lambda_expr(lam.c, bailed(lam)).p));
+  let cell = start(b"with_cell[u](0) { s -> s }");
+  assert(untouched(with_cell_expr(cell.c, bailed(cell)).p));
+  let crest = start(b"(0) { s -> s }");
+  assert(untouched(with_cell_rest(crest.c, bailed(crest), dummy_span(), no_ident()).p));
+  let rgn = start(b"with_region[r] { 1 }");
+  assert(untouched(with_region_expr(rgn.c, bailed(rgn)).p));
+  let sim = start(b"simulate { 1 }");
+  assert(untouched(simulate_expr(sim.c, bailed(sim)).p));
+}
+
+test "the node count walks every node of a small tree" {
+  assert_eq(parse_count(b"1 + 2 * 3"), 5);
+  assert_eq(parse_count(b"{ let x = 1; [x, x] }"), 6);
+}
+
+test "past MAX_DEPTH the parser reports rather than overflowing" {
+  let n = 200;
+  let deep = bytes_concat(bytes_concat_all(map(range(0, n), |i: Int| b"(")),
+                          bytes_concat(b"1", bytes_concat_all(map(range(0, n), |i: Int| b")"))));
+  let s = start(deep);
+  let r = expr(s.c, s.p);
+  assert(r.p.bail);
+  assert_eq(len(r.p.diags), 1);
+}
+
+test "just under MAX_DEPTH it does not" {
+  let n = 60;
+  let deep = bytes_concat(bytes_concat_all(map(range(0, n), |i: Int| b"(")),
+                          bytes_concat(b"1", bytes_concat_all(map(range(0, n), |i: Int| b")"))));
+  let s = start(deep);
+  let r = expr(s.c, s.p);
+  assert(!r.p.bail);
+  assert_eq(len(r.p.diags), 0);
+}

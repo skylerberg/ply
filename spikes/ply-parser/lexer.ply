@@ -1,0 +1,668 @@
+// A lexer for Ply, written in Ply. A spike; nothing in the workspace imports
+// it and nothing builds it.
+//
+// It is a port of `crates/ply-syntax/src/lexer.rs`, function for function, and
+// the point of writing it was to find out what the language cannot do. What it
+// could not do is written down in `GAPS.md` next to this file, and the places
+// where this lexer *knowingly* answers differently from the Rust one are listed
+// in `README.md` §"Where this disagrees on purpose".
+//
+// Shape, and why:
+//
+//   - The scan is one `fold` over `range(0, len + 1)` and not a recursion,
+//     because the shipping CLI caps a program at 10,000 nested calls with no
+//     flag to raise it, and `examples/desk.ply` alone is 19,576 tokens. `fold`
+//     is driven by the machine's step protocol, so it nests nothing.
+//   - Tokens accumulate in a `List<Token>`, and the field that grows is written
+//     **last** in every record literal that rebuilds the state. Why that is
+//     load-bearing is on `Scan` below; measured in `GAPS.md` §1.
+//
+// > **Corrected (verification pass, 2026-08-24). Both bullets above said
+// > something false and the second said it in the voice of a measurement.** The
+// > first read *"`examples/desk.ply` alone is 24,847 tokens"*; it is 19,576,
+// > which is what `GAPS.md` §5 and §15 say and what `plydump examples/desk.ply`
+// > counts. The second read: *"Tokens accumulate in a `Map<Int, Token>` and not
+// > a `List<Token>`, because `push(s.toks, t)` where `s` is a record is
+// > **quadratic**: the field read leaves the list aliased by the record it came
+// > out of, so `push` copies rather than updating in place. Measured;
+// > `GAPS.md` §1."* Two things wrong with it. The accumulator in this file is a
+// > `List<Token>` (see `Scan`, below) and has been since the `Map` came out.
+// > And the mechanism it gives is the one `GAPS.md` §1 explicitly withdraws:
+// > being in a record is not what causes the copy, position in the enclosing
+// > node is. The correct statement is 60 lines below this one, on `Scan`. This
+// > header is what a reader of the file meets first, so it was the most
+// > expensive place in the spike to leave a withdrawn claim standing.
+//   - `at` costs three calls where a `bytes_at_or(b, i, default)` builtin would
+//     cost one, and it is the most frequent thing in the file. `std.json` says
+//     the same thing at its own foot; this is a second sighting, not a new one.
+
+// --- Bytes the language cannot spell ----------------------------------------
+
+// Ply has no character type and no `byte_of_int`, so this 256-entry literal is
+// the only inverse of `bytes_at` there is. `\xNN` inside a byte string is the
+// only way to write a byte above `~`.
+fn all_bytes() -> Bytes = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+
+fn byte_of(v: Int) -> Bytes = bytes_slice(all_bytes(), v, v + 1)
+
+// Every byte that can begin or continue a UTF-8 sequence. Used as a scan
+// stop-set inside `b"..."`, where the Rust lexer refuses a non-ASCII character.
+fn high_bytes() -> Bytes = bytes_slice(all_bytes(), 128, 256)
+
+// --- Bounded peeking --------------------------------------------------------
+
+// The byte at `i`, or -1 off either end.
+fn at(src: Bytes, i: Int) -> Int =
+  if i < 0 || i >= bytes_len(src) { -1 } else { bytes_at(src, i) }
+
+// `bytes_scan` refuses a start past the end rather than clamping, so every scan
+// goes through these two.
+fn scan(src: Bytes, i: Int, set: Bytes) -> Int =
+  if i >= bytes_len(src) { bytes_len(src) } else { bytes_scan(src, i, set, bytes_len(src)) }
+
+fn scan_until(src: Bytes, i: Int, set: Bytes) -> Int =
+  if i >= bytes_len(src) { bytes_len(src) } else { bytes_scan_until(src, i, set, bytes_len(src)) }
+
+// --- Tokens -----------------------------------------------------------------
+
+// `TFloat` carries the literal's normalised text and not a `Float`, and `TDec`
+// carries the mantissa as digits and not a number, because Ply can build
+// neither: there is no `float_of_string`, and a `Decimal` mantissa is 96 bits
+// against `Int`'s 64. `GAPS.md` §3 and §4.
+pub type Tok =
+  | TIdent(Bytes)
+  | TInt(Int)
+  | TFloat(Bytes)
+  | TDec(Bytes, Int)
+  | TStr(Bytes)
+  | TBytes(Bytes)
+  | TKw(Bytes)
+  | TPunct(Bytes)
+  | TEof
+
+pub type Token = { start: Int, end: Int, tok: Tok }
+
+// `code` is the diagnostic code the Rust lexer raises at the same place:
+// `E0001` UNEXPECTED_TOKEN or `E0002` UNTERMINATED_STRING. `X0001` is this
+// lexer's own, for the one thing it refuses that the Rust lexer decides with a
+// Unicode table — README §"Where this disagrees on purpose".
+pub type Diag = { start: Int, end: Int, code: Bytes }
+
+pub type Lexed = { toks: List<Token>, diags: List<Diag> }
+
+// Ply has no record-update syntax, so every one of these lists all three
+// fields. `GAPS.md` §2.
+//
+// **The field order is load-bearing and the language gives no hint that it
+// is.** The field that grows must be the *last* one in the literal, because the
+// machine keeps a second reference to the environment while any sub-expression
+// of an enclosing node is still to come (`ply_eval::rc::carry`, called from
+// `machine.rs:1064` and `frame.rs:263`). A second reference means the record
+// `s` is not uniquely owned, so `push` cannot rewrite in place and copies the
+// whole list — once per token, which is quadratic. Moving `toks:` from the
+// third position to the last is the whole difference between a lexer that runs
+// and one that does not. Measured, in `GAPS.md` §1.
+type Scan = {
+  pos: Int,
+  diags: List<Diag>,
+  toks: List<Token>,
+}
+
+fn emit(s: Scan, start: Int, fin: Int, t: Tok) -> Scan =
+  { pos: fin,
+    diags: s.diags,
+    toks: push(s.toks, {start: start, end: fin, tok: t}) }
+
+fn err(s: Scan, start: Int, fin: Int, code: Bytes) -> Scan =
+  { pos: s.pos,
+    toks: s.toks,
+    diags: push(s.diags, {start: start, end: fin, code: code}) }
+
+fn seek(s: Scan, p: Int) -> Scan =
+  { pos: p, diags: s.diags, toks: s.toks }
+
+fn unexpected() -> Bytes = b"E0001"
+
+fn unterminated() -> Bytes = b"E0002"
+
+fn non_ascii() -> Bytes = b"X0001"
+
+// --- Character classes ------------------------------------------------------
+
+// The six ASCII characters `char::is_whitespace` accepts. It accepts more that
+// this cannot name; README §"Where this disagrees on purpose".
+fn ws() -> Bytes = b" \t\n\r\x0b\x0c"
+
+fn ident_chars() -> Bytes =
+  b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+fn digit_chars() -> Bytes = b"0123456789_"
+
+fn is_digit(c: Int) -> Bool = c >= 48 && c <= 57
+
+fn is_ident_start(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+
+fn is_ident_continue(c: Int) -> Bool = is_ident_start(c) || is_digit(c)
+
+// How many bytes the UTF-8 character starting at this lead byte occupies. The
+// file reached the Rust lexer as a `&str`, so a lead byte here is a real lead
+// byte; this exists only so that one refused character is one diagnostic with
+// the span the Rust lexer gives it, rather than one per continuation byte.
+fn utf8_len(c: Int) -> Int =
+  if c < 128 { 1 } else if c < 224 { 2 } else if c < 240 { 3 } else { 4 }
+
+// --- Trivia -----------------------------------------------------------------
+
+// Whitespace and `//` comments, to the first byte of the next token.
+//
+// One nested call per comment in a run of them, so a block of N comment lines
+// costs N frames. The deepest run in the corpus this is checked against is 135
+// lines, in `examples/desk.ply`; the bound is 10,000. `GAPS.md` §6.
+//
+// > **Corrected (verification pass, 2026-08-24).** This read *"136 lines"*.
+// > Counted over all 33 corpus files, treating a blank line as transparent
+// > exactly as `skip_trivia` does, the deepest run is **135**, which is the
+// > figure `GAPS.md` §6 carries. The conclusion is unchanged: 135 against a
+// > bound of 10,000.
+fn skip_trivia(src: Bytes, i: Int) -> Int = {
+  let j = scan(src, i, ws());
+  if at(src, j) == 47 && at(src, j + 1) == 47 {
+    skip_trivia(src, scan_until(src, j, b"\n"))
+  } else {
+    j
+  }
+}
+
+// --- The loop ---------------------------------------------------------------
+
+pub fn lex(src: Bytes) -> Lexed = {
+  let n = bytes_len(src);
+  let start = {pos: 0, diags: [], toks: []};
+  // Every step that has anything left to do consumes at least one byte, so
+  // `n + 1` steps is an upper bound on what a source of `n` bytes needs and the
+  // rest cost two calls each. Ply has no loop and no tail call, and `fold` over
+  // an eagerly built `range` is the only bounded iteration there is;
+  // `GAPS.md` §5.
+  let done = fold(range(0, n + 1), start, |s: Scan, i: Int| one(src, s));
+  let with_eof = emit(done, n, n, TEof);
+  { diags: with_eof.diags, toks: with_eof.toks }
+}
+
+fn one(src: Bytes, s: Scan) -> Scan = {
+  let n = bytes_len(src);
+  if s.pos >= n {
+    s
+  } else {
+    let start = skip_trivia(src, s.pos);
+    if start >= n { seek(s, n) } else { token_at(src, s, start) }
+  }
+}
+
+fn token_at(src: Bytes, s: Scan, start: Int) -> Scan = {
+  let c = bytes_at(src, start);
+  if is_digit(c) {
+    number(src, s, start)
+  } else if c == 98 && at(src, start + 1) == 34 {
+    bytes_body(src, s, start, start + 2, b"")
+  } else if is_ident_start(c) {
+    ident(src, s, start)
+  } else if c == 34 {
+    string_lit(src, s, start, start + 1, b"")
+  } else if c >= 128 {
+    // The Rust lexer asks `char::is_alphabetic` here. Ply cannot.
+    err(seek(s, start + utf8_len(c)), start, start + utf8_len(c), non_ascii())
+  } else {
+    punct(src, s, start, c)
+  }
+}
+
+// --- Identifiers and keywords -----------------------------------------------
+
+fn ident(src: Bytes, s: Scan, start: Int) -> Scan = {
+  let fin = scan(src, start, ident_chars());
+  let text = bytes_slice(src, start, fin);
+  if text == b"_" {
+    emit(s, start, fin, TPunct(b"underscore"))
+  } else if is_keyword(text) {
+    emit(s, start, fin, TKw(text))
+  } else {
+    emit(s, start, fin, TIdent(text))
+  }
+}
+
+// Ply cannot `match` on a string or a byte string, so a keyword table is a
+// chain of comparisons. Split by length first, so an identifier pays at most
+// five of them rather than fifteen. `GAPS.md` §7.
+fn is_keyword(t: Bytes) -> Bool = {
+  let k = bytes_len(t);
+  if k == 2 { t == b"fn" || t == b"if" }
+  else if k == 3 { t == b"pub" || t == b"let" }
+  else if k == 4 { t == b"type" || t == b"test" || t == b"else" || t == b"with" || t == b"true" }
+  else if k == 5 { t == b"match" || t == b"false" }
+  else if k == 6 { t == b"import" || t == b"effect" || t == b"nondet" || t == b"handle" }
+  else { false }
+}
+
+// --- Numbers ----------------------------------------------------------------
+
+// `1`, `1_000`, `1.5`, `1.5e-3`, `1.50m`. Which of the three numeric types a
+// literal has is decided here, exactly as `lexer.rs::number` decides it.
+type Num = {
+  start: Int,
+  whole: Bytes,
+  frac: Bytes,
+  hasf: Bool,
+  exp: Bytes,
+  hase: Bool,
+  cur: Int,
+}
+
+// `_` is a digit separator anywhere a digit may go, so a run of digits is one
+// scan over eleven bytes and the separators come out with two more calls.
+fn strip_us(b: Bytes) -> Bytes = bytes_concat_all(bytes_split(b, b"_"))
+
+fn number(src: Bytes, s: Scan, start: Int) -> Scan = {
+  let we = scan(src, start, digit_chars());
+  let whole = strip_us(bytes_slice(src, start, we));
+  // `..` is the range separator and `.` alone cannot open a field name, so a
+  // fraction is exactly a dot with a digit behind it.
+  let hasf = at(src, we) == 46 && is_digit(at(src, we + 1));
+  let fe = if hasf { scan(src, we + 1, digit_chars()) } else { we };
+  let frac = if hasf { strip_us(bytes_slice(src, we + 1, fe)) } else { b"" };
+  let es = exp_start(src, fe);
+  let ee = if es < 0 { fe } else { scan(src, es, digit_chars()) };
+  number_tail(
+    src,
+    s,
+    { start: start,
+      whole: whole,
+      frac: frac,
+      hasf: hasf,
+      exp: if es < 0 { b"" } else { exp_text(src, fe, es, ee) },
+      hase: es >= 0,
+      cur: ee })
+}
+
+// The first digit of an exponent, or -1: the `e` is consumed only when digits
+// actually follow, so `1e9` is a float and `1 else` is two tokens.
+fn exp_start(src: Bytes, i: Int) -> Int = {
+  let c = at(src, i);
+  if c != 101 && c != 69 {
+    -1
+  } else {
+    let d = at(src, i + 1);
+    let j = if d == 43 || d == 45 { i + 2 } else { i + 1 };
+    if is_digit(at(src, j)) { j } else { -1 }
+  }
+}
+
+fn exp_text(src: Bytes, e: Int, es: Int, ee: Int) -> Bytes =
+  bytes_concat(bytes_slice(src, e + 1, es), strip_us(bytes_slice(src, es, ee)))
+
+fn number_tail(src: Bytes, s: Scan, m: Num) -> Scan =
+  if at(src, m.cur) == 109 && !is_ident_continue(at(src, m.cur + 1)) {
+    decimal(s, m, m.cur + 1)
+  } else if is_ident_start(at(src, m.cur)) {
+    let fin = scan(src, m.cur, ident_chars());
+    number_value(err(s, m.start, fin, unexpected()), m, fin)
+  } else {
+    number_value(s, m, m.cur)
+  }
+
+fn number_value(s: Scan, m: Num, fin: Int) -> Scan =
+  if !m.hasf && !m.hase {
+    int_value(s, m, fin)
+  } else {
+    emit(s, m.start, fin, TFloat(float_text(m)))
+  }
+
+// The exact text `lexer.rs` hands to `f64::from_str`, digit for digit.
+fn float_text(m: Num) -> Bytes =
+  bytes_concat_all([
+    m.whole,
+    if m.hasf { b"." } else { b"" },
+    if m.hasf { m.frac } else { b"" },
+    if m.hase { b"e" } else { b"" },
+    if m.hase { m.exp } else { b"" },
+  ])
+
+// --- Integers ---------------------------------------------------------------
+
+// `Int` is 64-bit and its arithmetic is checked, so accumulating digits and
+// looking at the sign afterwards is not available: the multiply raises before
+// an overflow can be observed. The bound is decided on the digit string.
+fn int_max() -> Bytes = b"9223372036854775807"
+
+fn strip_zeros(b: Bytes) -> Bytes = {
+  let k = scan(b, 0, b"0");
+  if k >= bytes_len(b) { b"0" } else { bytes_slice(b, k, bytes_len(b)) }
+}
+
+fn int_value(s: Scan, m: Num, fin: Int) -> Scan = {
+  let d = strip_zeros(m.whole);
+  let k = bytes_len(d);
+  if k > 19 || (k == 19 && compare(d, int_max()) == Greater) {
+    emit(err(s, m.start, fin, unexpected()), m.start, fin, TInt(0))
+  } else {
+    emit(s, m.start, fin, TInt(int_of_digits(d)))
+  }
+}
+
+fn int_of_digits(d: Bytes) -> Int =
+  fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| a * 10 + (bytes_at(d, i) - 48))
+
+// --- Decimals ---------------------------------------------------------------
+
+// `rust_decimal`'s domain: a 96-bit mantissa and a scale of 0..=28. Neither
+// bound is checkable in `Int`, so both are decided on the digit string.
+fn dec_max() -> Bytes = b"79228162514264337593543950335"
+
+fn zero_dec() -> Tok = TDec(b"0", 0)
+
+fn decimal(s: Scan, m: Num, fin: Int) -> Scan =
+  if m.hase {
+    emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+  } else if bytes_len(m.frac) > 28 {
+    emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+  } else {
+    let d = strip_zeros(bytes_concat(m.whole, m.frac));
+    let k = bytes_len(d);
+    if k > 29 || (k == 29 && compare(d, dec_max()) == Greater) {
+      emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+    } else {
+      emit(s, m.start, fin, TDec(d, bytes_len(m.frac)))
+    }
+  }
+
+// --- String literals --------------------------------------------------------
+
+// One nested call per escape, and each one copies the text decoded so far, so a
+// string that is mostly escapes is quadratic. A run of ordinary text between
+// escapes is one scan and one slice however long it is. This is exactly what
+// `std.json` says about its own string parser, and for the same reason.
+fn str_stops() -> Bytes = b"\"\\\n"
+
+fn string_lit(src: Bytes, s: Scan, open: Int, i: Int, acc: Bytes) -> Scan = {
+  let stop = scan_until(src, i, str_stops());
+  let so_far = bytes_concat(acc, bytes_slice(src, i, stop));
+  let c = at(src, stop);
+  if c < 0 || c == 10 {
+    emit(err(s, open, stop, unterminated()), open, stop, TStr(so_far))
+  } else if c == 34 {
+    emit(s, open, stop + 1, TStr(so_far))
+  } else {
+    string_escape(src, s, open, stop, so_far)
+  }
+}
+
+fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan = {
+  let n = bytes_len(src);
+  let c = at(src, stop + 1);
+  if c < 0 {
+    emit(err(s, open, n, unterminated()), open, n, TStr(so_far))
+  } else if c == 110 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\n"))
+  } else if c == 116 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\t"))
+  } else if c == 114 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\r"))
+  } else if c == 48 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\x00"))
+  } else if c == 92 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\\"))
+  } else if c == 34 {
+    string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\""))
+  } else {
+    // The Rust lexer consumes one *character* here and pushes it; this consumes
+    // one character's worth of bytes and pushes them, which is the same answer.
+    //
+    // > **Corrected.** This comment used to end: *"which is the same answer for
+    // > every escape but reports a span one to three bytes shorter for a
+    // > non-ASCII one."* It does not. `utf8_len` widens the span to the whole
+    // > character, so `"a\\eb"` with a two-byte `e` gives span 2..5 and the
+    // > string `61c3a962` on **both** lexers, checked by
+    // > `harness/tests/agreement.rs::a_backslash_before_a_non_ascii_character_is_not_a_divergence`.
+    // > The claim was written from reading and was wrong; the three real
+    // > divergences are all at a token's first byte and are listed in README
+    // > §"Where this disagrees on purpose".
+    let w = utf8_len(c);
+    string_lit(
+      src,
+      err(s, stop, stop + 1 + w, unexpected()),
+      open,
+      stop + 1 + w,
+      bytes_concat(so_far, bytes_slice(src, stop + 1, stop + 1 + w)))
+  }
+}
+
+// --- Byte-string literals ---------------------------------------------------
+
+// `b"..."`, entered with `open` at the `b`. A source byte above `~` is refused
+// rather than encoded, because the bytes of this literal must not depend on how
+// the file was saved.
+fn bytes_stops() -> Bytes = bytes_concat(b"\"\\\n", high_bytes())
+
+fn bytes_body(src: Bytes, s: Scan, open: Int, i: Int, acc: Bytes) -> Scan = {
+  let stop = scan_until(src, i, bytes_stops());
+  let so_far = bytes_concat(acc, bytes_slice(src, i, stop));
+  let c = at(src, stop);
+  if c < 0 || c == 10 {
+    emit(err(s, open, stop, unterminated()), open, stop, TBytes(so_far))
+  } else if c == 34 {
+    emit(s, open, stop + 1, TBytes(so_far))
+  } else if c == 92 {
+    bytes_escape(src, s, open, stop, so_far)
+  } else {
+    let w = utf8_len(c);
+    bytes_body(src, err(s, stop, stop + w, unexpected()), open, stop + w, so_far)
+  }
+}
+
+fn bytes_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan = {
+  let n = bytes_len(src);
+  let c = at(src, stop + 1);
+  if c < 0 {
+    emit(err(s, open, n, unterminated()), open, n, TBytes(so_far))
+  } else if c == 110 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\n"))
+  } else if c == 116 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\t"))
+  } else if c == 114 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\r"))
+  } else if c == 48 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\x00"))
+  } else if c == 92 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\\"))
+  } else if c == 34 {
+    bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\""))
+  } else if c == 120 {
+    hex_escape(src, s, open, stop, so_far)
+  } else {
+    // Unlike a string's unknown escape, this one contributes no byte.
+    let w = utf8_len(c);
+    bytes_body(src, err(s, stop, stop + 1 + w, unexpected()), open, stop + 1 + w, so_far)
+  }
+}
+
+// `\xNN`. A malformed escape yields a zero byte and a diagnostic and consumes
+// only the digits that were actually there, so lexing resumes inside the
+// literal rather than swallowing its closing quote.
+fn hex_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan = {
+  let hi = hex_digit(at(src, stop + 2));
+  let lo = hex_digit(at(src, stop + 3));
+  if hi >= 0 && lo >= 0 {
+    bytes_body(src, s, open, stop + 4, bytes_concat(so_far, byte_of(hi * 16 + lo)))
+  } else {
+    let taken = if hi >= 0 { stop + 3 } else { stop + 2 };
+    bytes_body(
+      src,
+      err(s, stop, taken, unexpected()),
+      open,
+      taken,
+      bytes_concat(so_far, b"\x00"))
+  }
+}
+
+fn hex_digit(c: Int) -> Int =
+  if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 102 { c - 87 }
+  else if c >= 65 && c <= 70 { c - 55 }
+  else { -1 }
+
+// --- Punctuation ------------------------------------------------------------
+
+// Maximal munch, and a `&` that is not `&&` is an error with no token at all.
+fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan =
+  if c == 40 { emit(s, start, start + 1, TPunct(b"lparen")) }
+  else if c == 41 { emit(s, start, start + 1, TPunct(b"rparen")) }
+  else if c == 123 { emit(s, start, start + 1, TPunct(b"lbrace")) }
+  else if c == 125 { emit(s, start, start + 1, TPunct(b"rbrace")) }
+  else if c == 91 { emit(s, start, start + 1, TPunct(b"lbracket")) }
+  else if c == 93 { emit(s, start, start + 1, TPunct(b"rbracket")) }
+  else if c == 44 { emit(s, start, start + 1, TPunct(b"comma")) }
+  else if c == 59 { emit(s, start, start + 1, TPunct(b"semi")) }
+  else if c == 58 { pair(s, src, start, 58, b"coloncolon", b"colon") }
+  else if c == 46 { pair(s, src, start, 46, b"dotdot", b"dot") }
+  else if c == 61 { pair(s, src, start, 61, b"eqeq", b"eq") }
+  else if c == 33 { pair(s, src, start, 61, b"bangeq", b"bang") }
+  else if c == 60 { pair(s, src, start, 61, b"le", b"lt") }
+  else if c == 62 { pair(s, src, start, 61, b"ge", b"gt") }
+  else if c == 43 { pair(s, src, start, 43, b"plusplus", b"plus") }
+  else if c == 45 { pair(s, src, start, 62, b"arrow", b"minus") }
+  else if c == 42 { emit(s, start, start + 1, TPunct(b"star")) }
+  else if c == 47 { emit(s, start, start + 1, TPunct(b"slash")) }
+  else if c == 37 { emit(s, start, start + 1, TPunct(b"percent")) }
+  else if c == 124 { pair(s, src, start, 124, b"pipepipe", b"pipe") }
+  else if c == 38 {
+    if at(src, start + 1) == 38 {
+      emit(s, start, start + 2, TPunct(b"ampamp"))
+    } else {
+      err(seek(s, start + 1), start, start + 1, unexpected())
+    }
+  } else {
+    err(seek(s, start + 1), start, start + 1, unexpected())
+  }
+
+fn pair(s: Scan, src: Bytes, start: Int, second: Int, both: Bytes, single: Bytes) -> Scan =
+  if at(src, start + 1) == second {
+    emit(s, start, start + 2, TPunct(both))
+  } else {
+    emit(s, start, start + 1, TPunct(single))
+  }
+
+// --- The dump ---------------------------------------------------------------
+
+// `start:end:kind[:payload];` per token, then one `start:end:!:code;` per
+// diagnostic. Every character is printable ASCII and neither `"` nor `\`
+// occurs, so `ply run --json` renders the whole thing as a quoted string the
+// harness unwraps by removing the first and last character.
+//
+// `bytes_concat_all` is what keeps this linear: `++` in a fold would copy the
+// prefix once per token.
+pub fn dump(src: Bytes) -> String = {
+  let lx = lex(src);
+  string_of_bytes(bytes_concat(
+    bytes_concat_all(map(lx.toks, render_token)),
+    bytes_concat_all(map(lx.diags, render_diag))))
+}
+
+fn num(i: Int) -> Bytes = bytes_of_string(int_to_string(i))
+
+fn render_token(t: Token) -> Bytes =
+  bytes_concat_all([num(t.start), b":", num(t.end), b":", body(t.tok), b";"])
+
+fn render_diag(d: Diag) -> Bytes =
+  bytes_concat_all([num(d.start), b":", num(d.end), b":!:", d.code, b";"])
+
+fn body(t: Tok) -> Bytes =
+  match t {
+    TIdent(b) -> bytes_concat(b"i:", b),
+    TInt(v) -> bytes_concat(b"n:", num(v)),
+    TFloat(txt) -> bytes_concat(b"f:", txt),
+    TDec(m, sc) -> bytes_concat_all([b"d:", m, b":", num(sc)]),
+    TStr(b) -> bytes_concat(b"s:", hex(b)),
+    TBytes(b) -> bytes_concat(b"b:", hex(b)),
+    TKw(b) -> bytes_concat(b"k:", b),
+    TPunct(b) -> bytes_concat(b"p:", b),
+    TEof -> b"e",
+  }
+
+fn hex_digits() -> Bytes = b"0123456789abcdef"
+
+fn hex1(v: Int) -> Bytes = bytes_slice(hex_digits(), v, v + 1)
+
+fn hex2(v: Int) -> Bytes = bytes_concat(hex1(v / 16), hex1(v % 16))
+
+fn hex(b: Bytes) -> Bytes =
+  bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| hex2(bytes_at(b, i))))
+
+// --- Tests ------------------------------------------------------------------
+//
+// These are the lexer's own; the comparison against `crates/ply-syntax` is
+// `harness/tests/agreement.rs` and it is the one that matters.
+
+test "a keyword and an identifier that starts with one are different tokens" {
+  assert_eq(dump(b"fn fnord"), "0:2:k:fn;3:8:i:fnord;8:8:e;")
+}
+
+test "an underscore alone is a wildcard but prefixes an identifier" {
+  assert_eq(dump(b"_ _x"), "0:1:p:underscore;2:4:i:_x;4:4:e;")
+}
+
+test "an integer literal may be written with underscore separators" {
+  assert_eq(dump(b"1_000_000"), "0:9:n:1000000;9:9:e;")
+}
+
+test "an integer that does not fit in Int is a diagnostic and a zero" {
+  assert_eq(dump(b"99999999999999999999"), "0:20:n:0;20:20:e;0:20:!:E0001;")
+}
+
+test "a fraction or an exponent is what makes a literal a Float" {
+  assert_eq(dump(b"1 1.5 1e9 1_000.5 1.5e-3"),
+            "0:1:n:1;2:5:f:1.5;6:9:f:1e9;10:17:f:1000.5;18:24:f:1.5e-3;24:24:e;")
+}
+
+test "a Decimal keeps the trailing zero its scale stands for" {
+  assert_eq(dump(b"1.50m"), "0:5:d:150:2;5:5:e;")
+}
+
+test "a Decimal literal has no exponent" {
+  assert_eq(dump(b"1e3m"), "0:4:d:0:0;4:4:e;0:4:!:E0001;")
+}
+
+test "the escapes a string literal decodes" {
+  assert_eq(dump(b"\"a\\nb\\t\\\\\\\"\\r\\0\""), "0:16:s:610a62095c220d00;16:16:e;")
+}
+
+test "an unterminated string reports from its opening quote" {
+  assert_eq(dump(b"let s = \"oops\nlet t = 1"),
+            "0:3:k:let;4:5:i:s;6:7:p:eq;8:13:s:6f6f7073;14:17:k:let;18:19:i:t;20:21:p:eq;22:23:n:1;23:23:e;8:13:!:E0002;")
+}
+
+test "a byte literal takes the string escapes plus hex" {
+  assert_eq(dump(b"b\"GET \\r\\n\\x00\\xff\\\"\\\\\""), "0:23:b:474554200d0a00ff225c;23:23:e;")
+}
+
+test "a short hex escape is reported without swallowing the literal" {
+  assert_eq(dump(b"b\"\\xg1\" 7"), "0:7:b:006731;8:9:n:7;9:9:e;2:4:!:E0001;")
+}
+
+test "operators use maximal munch" {
+  assert_eq(dump(b"-> - ++ + == = != ! <= < >= > && || | .. ."),
+            "0:2:p:arrow;3:4:p:minus;5:7:p:plusplus;8:9:p:plus;10:12:p:eqeq;13:14:p:eq;"
+            ++ "15:17:p:bangeq;18:19:p:bang;20:22:p:le;23:24:p:lt;25:27:p:ge;28:29:p:gt;"
+            ++ "30:32:p:ampamp;33:35:p:pipepipe;36:37:p:pipe;38:40:p:dotdot;41:42:p:dot;42:42:e;")
+}
+
+test "a lone ampersand is reported and skipped" {
+  assert_eq(dump(b"a & b"), "0:1:i:a;4:5:i:b;5:5:e;2:3:!:E0001;")
+}
+
+test "a comment runs to the end of its line" {
+  assert_eq(dump(b"1 // two\n3"), "0:1:n:1;9:10:n:3;10:10:e;")
+}
+
+test "the end-of-file token sits at the end of the input" {
+  assert_eq(dump(b"abc"), "0:3:i:abc;3:3:e;")
+}
