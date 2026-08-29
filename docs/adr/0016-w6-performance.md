@@ -1278,6 +1278,28 @@ nothing else:
 > levers in ADR 0016 §4 are priced and the best of them measures at or below
 > 1.24x end to end.**
 
+> **This sentence no longer decides M9, and
+> [ADR 0026](0026-a-reachable-backend.md) §4.2 says why — measured, not
+> argued.** Its first clause is satisfiable only by a regression: at the
+> re-taken share a backend needs `k ≥ 29.36×` to clear the projection (it was
+> 17.76× against the first take's share, and the fragment already measures
+> 52.58× on the MCTS kernel), so a counterfactual run with every lever priced
+> and a 52.55× spike still returns `Defer` and reduces this whole sentence to
+> **"M9 reopens when the interpreter share reaches 50%"**. Nothing a backend does
+> moves that number. Worse, the share fell between the two ladders because the
+> *request* grew faster than the interpreter did — 209.3µs → 227.4µs against
+> 592.6µs → 658.9µs — so it moves with postgres and TLS rather than with Ply.
+> And it is 1.2 points above `S = 1/3`, below which `E ≥ 1.50` is impossible at
+> `k = ∞` while this sentence still reads as computed.
+>
+> What survives is the ladder's actual finding, and ADR 0026 §3 keeps it
+> unamended: **do not put a JIT in front of this HTTP stack.** What is withdrawn
+> is this sentence's authority over the *language's* backend question, which
+> §2.1 of that ADR shows this instrument structurally cannot be handed — it
+> refuses any ladder missing one of nine served-HTTP rungs, so a compute kernel
+> or a lexer answers `Undecided` by construction. ADR 0026 §4.3 replaces C1 and
+> C2 with criteria that can fire, keeps C3 and strengthens C4.
+
 Concretely, for a future contributor:
 
 1. **Price the six remaining levers in §4** as measured end-to-end speedups on

@@ -174,6 +174,30 @@
 //! No implementation of [`Compiled`] exists in this workspace. The doubles in
 //! this module's tests are what keep it exercised.
 //!
+//! > **Both of the last two paragraphs are withdrawn, 2026-08-28.** They read,
+//! > verbatim: *"a rule that is **not enforced**, because no shipping command
+//! > can install one"* and *"**No implementation of [`Compiled`] exists in this
+//! > workspace.** The doubles in this module's tests are what keep it
+//! > exercised."*
+//! >
+//! > One does now: [`crate::backend::Reference`], a backend whose compiled code
+//! > is a second tree-walker over a scalar-signature fragment, installed by
+//! > `ply test --backend`. It is not a code generator and ADR 0026 §4.7 promotes
+//! > nothing — `Cargo.lock` still holds no cranelift — but it is a real
+//! > implementor on the shipping side of this seam, and it is what makes the
+//! > *accept* path reachable from a command a user runs: over `examples/` and
+//! > `tests/fixtures/` it is offered 120,340 calls and enters **18,773** of
+//! > them.
+//! >
+//! > And the rule is enforced, in the two stages ADR 0026 §4.6 specifies:
+//! > `cache_bypassed` reads `--backend` so a backend run neither reads the
+//! > store, and `ply_test::run_with` records `Record::Backend` so it writes
+//! > nothing to it, with `backend_escapes` in `ply test` failing the run if a
+//! > `Pass` is written by a test that entered native code anyway. Both halves
+//! > were seen to fail before either was believed —
+//! > `crates/ply-cli/tests/backend.rs` records which corruption produced which
+//! > red.
+//!
 //! # What polices this seam, and what does not
 //!
 //! Counted rather than characterised, 2026-08-24, because
@@ -188,6 +212,44 @@
 //! | `crates/ply-codegen-spike/tests/hazards.rs`, `mcts_kernel.rs` | **25** tests over the real cranelift backend |
 //! | `mcts --mutate <corruption>` | the same eight corruptions at corpus scale — 2,396 generated cases; run by hand, nothing runs it for you |
 //!
+//! > **Two rows added and one re-taken (2026-08-28), because the seam acquired a
+//! > shipping implementor.** The `differential_corpus.rs` row read **6**; it is
+//! > **14**, the eight new ones being the same eight corruptions over
+//! > [`crate::backend::Reference`] at corpus scale, under `cargo test
+//! > --workspace` rather than under a crate with its own toolchain. Re-counted
+//! > from the run rather than by arithmetic: `cargo test -p ply-eval --test
+//! > differential_corpus` reports 14 passed in 73.4s (82.7s on an earlier run;
+//! > both at a load average of 8-9, so observations rather than figures), and
+//! > prints what each corruption did.
+//! >
+//! > One cross-check fell out of it and is worth keeping. The old
+//! > `backends::TreeWalker` double and the new shipping
+//! > [`crate::backend::Reference`] are different code reaching the seam by
+//! > different routes, and over the same corpus they enter it **18,773** times
+//! > each. The test counts differ — 1,012 against 1,116 — because the old
+//! > comparison is tree-walker against machine and counts a machine-only test as
+//! > refused, while the new one is machine against machine-with-a-backend and
+//! > has nothing to refuse.
+//! >
+//! > | polices it | what it is |
+//! > | --- | --- |
+//! > | `crates/ply-eval/tests/differential_corpus.rs` | **14** tests: the two hand-built backends, plus the eight corruptions over `Reference` on the same 1,116-test corpus |
+//! > | `crates/ply-cli/tests/backend.rs` | **14** tests through `ply test --backend`, which is the shipping command. Seven of the eight configurations are caught; the eighth escapes and the file says which and why |
+//! >
+//! > Measured sensitivity of the corpus-scale sweep, one run, 2026-08-28 —
+//! > printed by the tests rather than asserted, because §4.7's condition names a
+//! > measurement and a number that is asserted is a number nobody re-takes:
+//! >
+//! > | corruption | tests reporting it | answers changed |
+//! > | --- | ---: | ---: |
+//! > | `off-by-one` | 146 of 1,116 | 9,451 |
+//! > | `inverted` | 51 | 216 |
+//! > | `stale` | 259 | 501 |
+//! > | `wrong-type` | 515 | 460 |
+//! > | `unoffered` | 901 | 487 |
+//! > | `answers=` | **0, and that is the gate** — `offered_target` is 0 | 0 |
+//! > | `exceeds-budget=4` | **0 — nothing in this corpus outruns the machine's bound**, so the corruption has no decline to replace. Checked from `ply test` instead, on a corpus built to outrun it | 0 |
+//!
 //! > **Two rows re-taken (2026-08-24).** They read **32** and **5**. The effects
 //! > gate added four tests here — three for the gate and one for the transitive
 //! > closure behind it — and one to `differential_corpus.rs`. Re-counted from
@@ -198,19 +260,75 @@
 //!
 //! And what does not, which is the part worth writing down:
 //!
-//! - **`ply test --engine both` cannot install a backend at all.** `Compiled`
-//!   and `set_compiled` occur **zero** times in `crates/ply-cli` — source and
-//!   tests both. Every one of the five `set_compiled` call sites in the
-//!   workspace is a test or the spike's own harness. So the shipping CLI catches
-//!   **none** of the eight wrong backends, on any corpus, and `--engine both`
-//!   compares the tree-walker against the machine and nothing else. A backend is
-//!   reachable only from a test or from the spike's binaries.
-//! - **Nothing enforces the result-cache rule.** A run with a backend attached
-//!   is a third execution strategy whose results a cache must not keep; the rule
-//!   is unenforced *because it is unreachable* — see [`crate::Machine::set_compiled`].
-//!   Wiring a backend into the CLI is what would make it reachable, and it is
-//!   gated on the entry-point defect (`CONTRIBUTING.md` item 9) rather than on
-//!   this seam.
+//! - ~~**`ply test --engine both` cannot install a backend at all.**~~ **Closed
+//!   2026-08-28.** It read: *"`Compiled` and `set_compiled` occur **zero** times
+//!   in `crates/ply-cli` — source and tests both. Every one of the **42**
+//!   `set_compiled` call sites in the workspace is a test or the spike's own
+//!   harness. So the shipping CLI catches **none** of the eight wrong backends,
+//!   on any corpus, and `--engine both` compares the tree-walker against the
+//!   machine and nothing else. A backend is reachable only from a test or from
+//!   the spike's binaries."*
+//!
+//!   `ply test --backend <spec>` installs one, on any engine that has a compiled
+//!   path — `--engine treewalk --backend ..` is refused with `E0450` rather than
+//!   accepted and ignored. Under `--engine both` the backend is a **third**
+//!   engine, compared against the plain machine rather than against the
+//!   tree-walker, so a divergence reported is the backend's and nothing else's.
+//!   `Machine::set_compiled` has exactly one production caller,
+//!   `ply_test::InterpExecutor::machine_lowering`, and
+//!   `crates/ply-span/tests/armed.rs`'s
+//!   `a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache`
+//!   fails the day a second one appears without the cache rule moving with it.
+//!
+//!   **The shipping CLI catches seven of the eight configurations, not eight,
+//!   and the eighth is named rather than rounded up.** Ignoring the budget
+//!   *entirely* over a **non-terminating** recursion is not a wrong answer: the
+//!   run never comes back, and every candidate reporter is inside the process it
+//!   took down. Measured — no output and no exit in 45 seconds, against 0.03s
+//!   for the run that reports. `crates/ply-cli/tests/backend.rs`'s header has
+//!   the table.
+//!
+//!   > **The count was wrong and is corrected in place (2026-08-28).** It read
+//!   > *"Every one of the **five** `set_compiled` call sites in the workspace is
+//!   > a test or the spike's own harness."* `grep -rn '\.set_compiled('
+//!   > --include=*.rs` over the tree counts **42** across six files: this
+//!   > module's own tests 27, `ply-codegen-spike/tests/hazards.rs` 5,
+//!   > `ply-eval/tests/differential_corpus.rs` 3,
+//!   > `ply-eval/tests/equivalence_audit.rs` 3,
+//!   > `ply-codegen-spike/tests/mutations.rs` 2, and
+//!   > `ply-codegen-spike/src/measure.rs` 2. `CONTRIBUTING.md`'s copy of this
+//!   > bullet carries the same "five" over a parenthetical list that sums to 39
+//!   > and omits `equivalence_audit.rs` altogether; it is corrected there too.
+//!   > **The sentence the count sits inside is unaffected and was re-checked one
+//!   > file at a time: all 42 are tests or the spike's harness.** It is
+//!   > corrected anyway, because a number carried beside a true sentence is
+//!   > still a number the next reader re-quotes — which is how it got here.
+//! - ~~**Nothing enforces the result-cache rule.**~~ **Closed 2026-08-28.** It
+//!   read: *"A run with a backend attached is a third execution strategy whose
+//!   results a cache must not keep; the rule is unenforced *because it is
+//!   unreachable* — see [`crate::Machine::set_compiled`]."* Both halves of ADR
+//!   0026 §4.6 are armed and both were seen to fail: `cache_bypassed` reads
+//!   `--backend` (delete the clause and a backend run believes 5 cached passes
+//!   while entering **nothing**, which is the vacuous green this project
+//!   produces most), and `ply_test::run_with` records `Record::Backend` (delete
+//!   the arm and `ply test` reports three `E0505 … entered compiled code, and
+//!   its pass was written to the result cache` and exits 1).
+//!
+//!   > **Corrected in place (2026-08-28): the gate this bullet named is
+//!   > closed.** It read *"Wiring a backend into the CLI is what would make it
+//!   > reachable, and it is gated on the entry-point defect (`CONTRIBUTING.md`
+//!   > item 9) rather than on this seam."* Item 9 — the seam carrying one of the
+//!   > machine's two resource bounds — is marked **"Fixed 2026-08-24, together
+//!   > with item 10 — they were one defect"**, and the fix is recorded in this
+//!   > module's own budget bullet and in `Machine::with_max_frames`. The only
+//!   > gate this block named that is still open is the result-cache rule, and
+//!   > `docs/adr/0026-a-reachable-backend.md` §4.6 decides how
+//!   > it is armed: a source-level tripwire that fails the day `set_compiled`
+//!   > acquires a production caller without `cache_bypassed` growing a way to
+//!   > see it, and a `backend_escapes` diagnostic beside `cache_escapes` that
+//!   > M9 owes. ADR 0026 §4.1 answers the question this bullet was waiting on:
+//!   > a backend is reachable, and no backend ships before a shipping command
+//!   > can police one.
 //! - ~~**No corpus in the tree can exercise the published-row gate.**~~
 //!   **Closed (2026-08-24).** It read: *"`benches/kernel` declares no effect, so
 //!   every definition in it publishes an empty row and the gate has nothing to

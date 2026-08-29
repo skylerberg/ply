@@ -177,8 +177,20 @@ impl<'a> Interp<'a> {
     }
 
     pub fn with_max_calls(mut self, max_calls: usize) -> Self {
-        self.max_calls = max_calls.max(1);
+        self.set_max_calls(max_calls);
         self
+    }
+
+    /// The same bound, moved on an evaluator that already exists.
+    ///
+    /// [`Interp::call`] resets the call stack, so this is only ever read from an
+    /// empty one and a bound lowered under a live stack is not a case this can
+    /// reach. `crate::backend::Reference` is what needs it: a backend is handed
+    /// the machine's *remaining* nested calls per call, and re-building an
+    /// evaluator per entry to carry that number would make the seam's own
+    /// budget the most expensive thing about it.
+    pub fn set_max_calls(&mut self, max_calls: usize) {
+        self.max_calls = max_calls.max(1);
     }
 
     /// The atoms this engine performed at the last entry point.

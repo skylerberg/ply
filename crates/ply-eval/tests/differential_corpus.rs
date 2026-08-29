@@ -493,3 +493,284 @@ fn a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk() {
     );
     println!("answering backend: {entered} entered, {declined} declined, over {compared} tests");
 }
+
+// --- The eight wrong backends, at corpus scale ------------------------------
+//
+// ADR 0026 §6 item 3, and the condition §4.7 puts on deleting
+// `crates/ply-codegen-spike`: *"the eight wrong backends of `tests/mutations.rs`,
+// reproduced over the `Compiled` doubles in `crates/ply-eval/tests/`, running
+// under `cargo test --workspace`, with a corpus that has been seen to fail."*
+//
+// The doubles above are what made the *accept* path testable on real source.
+// These are what make it testable that a wrong answer on real source would be
+// **noticed** — which is a different claim, and the one `CONTRIBUTING.md` §"The
+// one rule" says this project keeps failing to check. Every test here follows
+// `mutations.rs`'s three steps and asserts the middle one first: the corruption
+// fired, and only then that something reported it.
+//
+// The backend is `ply_eval::Reference` rather than a hand-built double, because
+// `Mutation::Unoffered` needs a backend that can *miss* — one that answers
+// everything has no registry gap to corrupt — and because it is the same
+// backend `ply test --backend` installs, so a corruption caught here is caught
+// by a command a user can run.
+//
+// # Measured sensitivity
+//
+// Printed by every test below rather than asserted as a magic number, because
+// §4.7's condition names measured sensitivity and a count that is asserted is a
+// count nobody re-takes. What is asserted is that each corruption fired and that
+// at least one test reported it.
+
+use ply_eval::{BackendSpec, Fragment, Mutation, Offers};
+use std::sync::OnceLock;
+
+/// The corpora, loaded once and leaked, so that eight backends over one corpus
+/// cost one AST rather than eight.
+///
+/// `Fragment::over_static` is what makes that possible: a backend may not borrow
+/// (see `Machine`'s `compiled` field), and a caller that already holds a leaked
+/// program has paid for that once.
+type Loaded = (
+    String,
+    &'static Program,
+    &'static Resolved,
+    &'static ply_core::CheckOutput,
+);
+
+fn corpus() -> &'static [Loaded] {
+    static CORPUS: OnceLock<Vec<Loaded>> = OnceLock::new();
+    CORPUS.get_or_init(|| {
+        let root = workspace_root();
+        let mut out = Vec::new();
+        for (label, dir, files) in corpora(&root) {
+            let Some((program, resolved)) = load(&dir, &files) else {
+                continue;
+            };
+            let program: &'static Program = Box::leak(Box::new(program));
+            let resolved: &'static Resolved = Box::leak(Box::new(resolved));
+            let Ok(check) = ply_core::check_program(program, resolved) else {
+                continue;
+            };
+            out.push((label, program, resolved, Box::leak(Box::new(check)) as &_));
+        }
+        out
+    })
+}
+
+/// What one corruption did over every corpus on disk.
+struct Sweep {
+    compared: usize,
+    /// Tests where the machine with the backend and the machine without it
+    /// answered differently. This is the number that says the corpus can see.
+    diverged: usize,
+    entered: u64,
+    offers: Offers,
+    /// The first disagreement, whole, because a count nobody can read is a count
+    /// nobody checks.
+    first: Option<String>,
+}
+
+/// Every corpus, twice: once on a machine with no backend and once on a machine
+/// with `spec` attached, compared against each other.
+///
+/// Against the plain **machine** rather than against the tree-walker, and that
+/// is the whole of the care this needs: a divergence reported here is the
+/// backend's and nothing else's, which is the same arrangement
+/// `ply test --engine both --backend ..` runs.
+fn sweep(spec: BackendSpec) -> Sweep {
+    let mut out = Sweep {
+        compared: 0,
+        diverged: 0,
+        entered: 0,
+        offers: Offers::default(),
+        first: None,
+    };
+    for (label, program, resolved, check) in corpus() {
+        let fragment = Fragment::over_static(program, resolved, check);
+        let mut plain = Machine::new(program, resolved, check);
+        let mut backed = Machine::new(program, resolved, check);
+        backed.set_compiled(fragment.attach(&spec));
+
+        let report =
+            ply_eval::differential::compare_tests(&mut plain, &mut backed, &Fixture::empty());
+        out.compared += report.compared;
+        out.diverged += report.divergences.len();
+        if out.first.is_none()
+            && let Some(d) = report.divergences.first()
+        {
+            out.first = Some(format!("{label}: {d}"));
+        }
+        out.entered += backed.compiled_counts().0;
+        let seen = fragment.offers();
+        out.offers.offered += seen.offered;
+        out.offers.offered_target += seen.offered_target;
+        out.offers.fired += seen.fired;
+    }
+    out
+}
+
+#[track_caller]
+fn fires_and_is_caught(name: &str, mutation: Mutation, target: Option<&str>) -> Sweep {
+    let spec = BackendSpec {
+        mutation,
+        target: target.map(ply_span::Symbol::new),
+    };
+    let sweep = sweep(spec);
+    assert!(
+        sweep.compared > 0,
+        "{name}: no corpus ran, so this proves nothing"
+    );
+    assert!(
+        sweep.offers.fired > 0,
+        "{name}: the corruption never changed an answer over {} tests, so this run says nothing \
+         about the corpus that did not catch it ({} offers, {} entered)",
+        sweep.compared,
+        sweep.offers.offered,
+        sweep.entered
+    );
+    assert!(
+        sweep.diverged > 0,
+        "{name}: {} answers were changed over {} tests and nothing reported one",
+        sweep.offers.fired,
+        sweep.compared
+    );
+    println!(
+        "{name}: {} of {} tests reported it · {} answers changed · {} offers · {} entered\n  first: {}",
+        sweep.diverged,
+        sweep.compared,
+        sweep.offers.fired,
+        sweep.offers.offered,
+        sweep.entered,
+        sweep.first.as_deref().unwrap_or("-")
+    );
+    sweep
+}
+
+/// The control every other test here is read against: the wrapper is the
+/// backend, and the backend is honest.
+///
+/// Without this a red result below could be the *presence* of a backend rather
+/// than the corruption. The offer and entry counts are asserted for the reason
+/// `mutations.rs` asserts them: a green result over a seam nobody reached is the
+/// exact shape of vacuous pass this project produces most.
+#[test]
+fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
+    let sweep = sweep(BackendSpec::honest());
+    assert_eq!(
+        sweep.offers.fired, 0,
+        "the honest backend changed an answer"
+    );
+    assert_eq!(
+        sweep.diverged, 0,
+        "the honest backend disagreed with the machine: {:?}",
+        sweep.first
+    );
+    assert!(sweep.compared > 0);
+    assert!(
+        sweep.entered > 0,
+        "{} calls were offered over {} tests and none was entered, so every test below would be \
+         corrupting a seam nobody reaches",
+        sweep.offers.offered,
+        sweep.compared
+    );
+    println!(
+        "honest backend: {} entered of {} offered, over {} tests",
+        sweep.entered, sweep.offers.offered, sweep.compared
+    );
+}
+
+#[test]
+fn an_off_by_one_compiled_answer_is_caught_over_the_corpus() {
+    fires_and_is_caught("off-by-one", Mutation::OffByOne, None);
+}
+
+#[test]
+fn an_inverted_compiled_comparison_is_caught_over_the_corpus() {
+    fires_and_is_caught("inverted", Mutation::Inverted, None);
+}
+
+/// The one corruption that is invisible to a single call: every answer it gives
+/// was a correct answer to *some* call, so only a corpus that varies its
+/// arguments can see it.
+///
+/// ADR 0026 §7 named this as the mutation most likely not to survive the move
+/// out of the spike, because the spike's corpus *generates* cases and this one
+/// runs real programs. It survives, and the number it survives by is printed.
+#[test]
+fn a_stale_compiled_answer_is_caught_over_the_corpus() {
+    fires_and_is_caught("stale", Mutation::Stale, None);
+}
+
+#[test]
+fn a_wrong_kinded_compiled_answer_is_caught_over_the_corpus() {
+    fires_and_is_caught("wrong-type", Mutation::WrongType, None);
+}
+
+/// A backend answering for a definition it has no body for.
+///
+/// The gap this lives in is real on this corpus rather than constructed:
+/// `compiled::admit` gates on the shape of the **arguments** and never on the
+/// return type, so every `Int -> List<..>`, `Int -> String` and `Int -> Record`
+/// in `examples/` is offered and must be declined.
+#[test]
+fn an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus() {
+    fires_and_is_caught("unoffered", Mutation::Unoffered, None);
+}
+
+/// Accepting a call the machine must never offer.
+///
+/// **Not caught, and that is the finding rather than a gap** — the same one
+/// `crates/ply-codegen-spike/tests/mutations.rs` records. `handled` and
+/// `wrapper` in `tests/fixtures/self_handled_effect.ply` perform under a
+/// `handle` of their own, publish empty rows, and are refused by
+/// `Gate::InternalEffects`; a backend standing ready to answer one is never
+/// asked. What stands is the offer count, which is the fact the gate makes true,
+/// and the control beside it — the seam *was* reached — is what stops the zero
+/// being a backend nobody consulted.
+#[test]
+fn a_definition_that_performs_is_never_offered_to_a_wrong_backend() {
+    let sweep = sweep(BackendSpec {
+        mutation: Mutation::Answers(7),
+        target: Some(ply_span::Symbol::new("self_handled_effect.handled")),
+    });
+    assert_eq!(
+        sweep.offers.offered_target, 0,
+        "a definition that discharges its own effects was offered to a backend"
+    );
+    assert_eq!(sweep.offers.fired, 0);
+    assert_eq!(sweep.diverged, 0, "{:?}", sweep.first);
+    assert!(
+        sweep.offers.offered > 0 && sweep.entered > 0,
+        "the seam was never reached at all, so the zero above proves nothing"
+    );
+}
+
+/// Running past the machine's call budget instead of declining.
+///
+/// **Not fired on this corpus, and the reason is worth writing down**: nothing
+/// in `examples/` or `tests/fixtures/` recurses past `DEFAULT_MAX_CALLS`, so the
+/// honest backend never has to decline for want of budget and there is no
+/// decline for the corruption to replace. It is checked from the shipping
+/// command instead, on a corpus built to outrun the bound —
+/// `crates/ply-cli/tests/backend.rs`'s `DEEP` — and that is the only place in
+/// this workspace where this corruption fires.
+///
+/// Asserted rather than skipped, because "the corpus cannot exercise this" and
+/// "the corpus stopped exercising this" must not look alike: if a corpus ever
+/// does outrun the bound, this test fails and says so.
+#[test]
+fn the_budget_corruption_has_nothing_to_bite_on_this_corpus_and_says_so() {
+    let sweep = sweep(BackendSpec {
+        mutation: Mutation::ExceedsBudget(Some(4)),
+        target: None,
+    });
+    assert_eq!(
+        sweep.offers.fired, 0,
+        "a corpus in this tree now recurses past the machine's call bound, which is good news: \
+         the budget corruption fires here after all and this test's note is what needs updating"
+    );
+    assert!(
+        sweep.offers.offered > 0 && sweep.entered > 0,
+        "the seam was never reached at all"
+    );
+}

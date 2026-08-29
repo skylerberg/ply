@@ -33,6 +33,14 @@ use std::time::Duration;
 /// nothing changed meaning and nothing left. Both are absent rather than zeroed
 /// outside `--engine both`, so a consumer that has not been taught about them
 /// reads the run exactly as it did before.
+///
+/// `backend` was added the same way (2026-08-28, ADR 0026 §4.6): a top-level
+/// object naming the compiled backend `ply test --backend` installed, what it
+/// was offered and what it entered. Absent rather than zeroed when none was
+/// installed, for the reason `audit` is — a consumer cannot tell "entered
+/// nothing" from "there was nothing to enter with", and a speedup reported with
+/// zero entries is a null result. Nothing changed meaning and nothing left, so
+/// it is not a bump either.
 pub const SCHEMA_VERSION: u32 = 4;
 
 fn millis(d: Duration) -> f64 {

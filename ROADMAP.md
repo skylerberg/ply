@@ -1948,6 +1948,76 @@ ladder was re-taken after R3 and the verdict did not move
    > from a shipping command, which is M9 with an ADR, and ADR 0016 §3.5 still
    > requires the spike be deleted rather than promoted.
 
+   > **That decision is taken: [ADR 0026](docs/adr/0026-a-reachable-backend.md),
+   > 2026-08-28. This item is discharged; what it hands on is a shorter list.**
+   > The answer is **yes, reachable, and not today**, and the ground shifted
+   > rather than the verdict: M9 is no longer deferred by the W6 ladder, which
+   > §4.2 there **withdraws from the role**, because `Ladder::missing()` refuses
+   > any workload without all nine served-HTTP rungs (a compute kernel and a
+   > lexer both answer `Undecided`), because the share fell between the two
+   > ladders while the interpreter got *slower* — 209.3µs → 227.4µs against a
+   > request growing 592.6µs → 658.9µs — and because the reopen sentence's first
+   > clause is satisfiable only by a regression: a counterfactual with all seven
+   > levers priced and a 52.55× spike still returns `Defer`.
+   >
+   > It is deferred instead on two criteria that name work rather than a number
+   > that must rise — **C3**, nothing cheaper priced on the workload being
+   > decided (on `benches/kernel` that is ADR 0019 §5 item 5's `sqrt`/`ln` at an
+   > inferred ≈2.5×, unpriced end to end), and **C4**, which now requires the
+   > eight wrong backends be caught by a command a user can run. §4.5 makes that
+   > a precondition on any backend shipping at all: **a backend must be
+   > policeable before it is fast.** §4.6 arms the result-cache rule *before* a
+   > backend exists, and §4.7 honours ADR 0016 §3.5's refusal to promote the
+   > spike while **amending** its deletion requirement, whose stated reason R5
+   > had already falsified.
+   >
+   > One thing that ADR found and this file should carry: the basis for a
+   > compiled backend that is actually written down in this tree is **ADR 0021
+   > §4 item 3**, "the fragment, entered at token granularity", on the bootstrap
+   > critical path — not throughput on a served request, and not a
+   > compiled-workload target, which appears in no file here (§3.1).
+
+   > **And ADR 0026's §6 list is no longer entirely owed, 2026-08-28.** Items 1,
+   > 2, 3 and 6 are built; 4 is measured and refused; 5, 7 and 8 stand.
+   >
+   > - **1 — the ladder no longer claims M9, in code.** `w6::Verdict::label`
+   >   reads *"keep deferring a code generator for this workload"*, `Decision`
+   >   carries `workload`, and the rendered report prints it under the verdict.
+   >   No threshold and no arithmetic moved: `ply-corpus w6
+   >   benches/w6-ladder-r3.json benches/w6-spike-r4.json` reads the same 35%
+   >   (227.4µs of 658.9µs), the same 1.53× ceiling and the same `Defer`.
+   >   `a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone`
+   >   holds it, seen red both ways.
+   > - **2 and 6 — a backend is reachable and the cache rule is armed.**
+   >   `ply test --backend reference` installs `ply_eval::backend::Reference`;
+   >   `--backend wrong:<mutation>` installs one of the eight. Under `--engine
+   >   both` the backend is a third engine compared against the plain machine.
+   >   `backend_escapes` sits beside `cache_escapes`, `Record::Backend` beside
+   >   `Record::Host`, and `crates/ply-span/tests/armed.rs` carries the source
+   >   tripwire. §4.7 promotes nothing: `Cargo.lock` still has no cranelift and
+   >   `ply-cli` gains no dependency.
+   > - **3 — the eight are in the workspace**, over the shipping `Reference`
+   >   rather than over a hand-built double, because `unoffered` needs a backend
+   >   that can *miss*. Five fire on the workspace corpus at 1,116 tests;
+   >   `answers=` stands on an offer count of zero as it always has;
+   >   `exceeds-budget` needs a corpus that outruns the machine's bound and is
+   >   checked from `ply test`.
+   > - **4 — the spike is NOT deleted, and the condition is what refuses it.**
+   >   See the amended paragraph below.
+   >
+   > What `ply test --backend reference` costs is stated rather than rounded
+   > down, because it is a real property of this seam and not of this backend: a
+   > body the backend **declines** is re-run to exhaustion once per offer, so a
+   > recursion that outruns the machine's bound is O(n²). One test over a
+   > 20,000-deep ladder, `/usr/bin/time -p`, release binary checked current by
+   > `.github/binary-is-current.sh` first: **26.45s real / 18.28s user with
+   > `--backend reference`, against 0.04s real / 0.01s user with no backend**,
+   > 10,000 offers each re-running the remaining recursion. Taken at a 1-minute
+   > load average of 9.2 falling to 8.6 — well over the 4.0 gate — so these are
+   > **observations rather than figures**; the effect is three orders of
+   > magnitude and load does not reach it. A cranelift fragment has the same
+   > shape; it burns fuel per offer too.
+
    ~~and the ladder has not been re-taken since~~ — **it has now.**
    `benches/w6-ladder-r3.json` is the post-R3 take and the verdict machinery
    re-derives from it unchanged: interpreter share **35%** (34.3%–34.7%), ceiling
@@ -1967,6 +2037,40 @@ constant memo inside any open *scheduler* region, which CONTRACTS.md calls a
 defect rather than a rule and which costs a spawning service **1.78× on `/health`** — re-taken after R3, at
 273.0µs sequential against 488.7µs spawning on the same service, and printed by
 `ply-corpus w6` over `benches/w6-ladder-r3.json`.
+
+> **The first of those two is now a condition rather than an open obligation
+> ([ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.7, 2026-08-28).** §3.5's
+> refusal to *promote* the spike is honoured — nothing depends on it, `Cargo.lock`
+> still has no cranelift — and its *deletion* requirement is amended, because the
+> reason §3.5 gives for it ("nothing else in the workspace knows it existed") is
+> the half R5 falsified: the seam in `crates/ply-eval/src/compiled.rs` survives
+> the `rm -r`, so deleting the spike today removes the only implementation of
+> `Compiled` in existence and leaves the `pub` declaration behind. The spike goes
+> when its eight wrong backends have been reproduced over the `Compiled` doubles
+> in `crates/ply-eval/tests/` and run under `cargo test --workspace` — the only
+> measured sensitivity the seam has, re-taken 2026-08-28 at **1,649
+> disagreements** over 152,548 offered calls. `.github/ci-shards.sh`'s
+> `KNOWN_OUTSIDE` entry carries that condition now, in place of the reason that
+> stopped being true.
+>
+> > **The reproduction was done the same day and the condition came back
+> > NOT satisfied. The spike stays.** Seven of the eight configurations moved —
+> > five of them into `cargo test --workspace` at corpus scale (1,116 tests;
+> > `unoffered` reported by 901 of them, `wrong-type` by 515, `stale` by 259,
+> > `off-by-one` by 146, `inverted` by 51), `exceeds-budget=4` through `ply test`
+> > on a corpus that outruns the machine's bound, and `answers=` on the offer
+> > count of zero that is its whole point. The eighth does not move, for a
+> > structural reason rather than a missing afternoon: the spike's backend is
+> > native code on a fixed stack, so ignoring the budget entirely **crashes**
+> > and `run_guarded` reports the corpse from outside; `Reference` is a
+> > tree-walker whose frames grow on the heap, so the same corruption **hangs**
+> > — no output and no exit in 45 seconds, against 0.03s for the run that
+> > reports. Nothing in this workspace can report a run that never comes back.
+> >
+> > So the spike remains the only demonstration this repository has that a
+> > backend which ignores its budget entirely would be noticed, which is exactly
+> > what the condition names. `CONTRIBUTING.md` §"Things known to be broken"
+> > item 1 carries the table.
 
 The one thing a contributor should not do is re-argue M9 from the numbers in this
 file. They were measured, they are re-derivable from
