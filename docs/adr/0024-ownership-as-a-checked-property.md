@@ -1,7 +1,39 @@
 # ADR 0024 — Ownership as a checked property, not an inferred hint
 
-**Status:** accepted as a direction. It decides no syntax and no implementation.
+**Status:** accepted as a direction, and **its central mechanism was declined by
+[ADR 0025](0025-ownership-design.md) on a measurement.** Read that first.
 **Date:** 2026-08-28.
+
+> **Superseded in part (2026-08-29), and the part that went is the one this ADR
+> argued hardest for.** §5 decides that ownership becomes "a property the
+> compiler checks and the signature carries", and §8 sketches a parameter
+> marking to carry it. ADR 0025 built four independent designs against that
+> direction, all four put an inferred mode on the arrow, and it declined every
+> one — on a counterexample it measured rather than argued.
+>
+> `fn grow(acc: List<Int>, b: Bool) = len(push(acc, ..))` called under
+> `resume k -> k(true) + k(false)`: `acc` has exactly one occurrence, it is its
+> last use, and it is free in no closure, cell or record — so every rule in all
+> four proposals infers `own` — and an instrumented `push` reports **`owners = 2`
+> on both resumptions**. Under a *single tail* resumption it is 2 as well; with
+> no handler at all it is 1-of-1 in place. **So it is capture, not multiplicity:
+> any `perform` in the enclosing dynamic extent puts a second owner on the
+> value**, and `region_kind.rs`'s corpus figure is 113 regions, 0 `unique`, 113
+> `shared`. It fails a second time on caching, since that module documents
+> capture reachability as whole-program and explicitly not hash-keyable while a
+> mode in `Type::Fn` is cached per definition.
+>
+> ADR 0025 states the dilemma this leaves: a mode means either *"the caller does
+> not read this again"*, which is checkable and buys nothing, or *"one owner at
+> the call"*, which buys the append and is measured false. **Checkable and
+> useless, or useful and uncheckable.**
+>
+> **What survives, and it is most of the document.** §1's defect, §2's refutation
+> of the lint, §3's theorem and its three doors, §4's instrument error, and §5's
+> requirement that the absence of reuse become visible somewhere an author cannot
+> miss it. What ADR 0025 changes is *where* it becomes visible: reported and
+> falsifiable through `ply check --costs` and a per-site oracle, rather than
+> promised in a signature the language cannot honour.
 
 > **What this decides.** That whether a value is uniquely owned stops being a
 > runtime accident the evaluator discovers and becomes a **static property the
