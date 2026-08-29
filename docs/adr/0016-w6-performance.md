@@ -660,8 +660,35 @@ rather than leaving a shorter document:
      in" list breaks the promise explicitly.
    - **`bytes_slice` and `bytes_split` copy**, because `Value::Bytes` is
      `Arc<[u8]>` with no slicing.
-   - **`std.trace`'s `Sink` appends with `push`**, so the twin is O(n²) in the
-     records it holds.
+   - **`std.trace`'s `Sink` grows its record list in a non-final field** of the
+     record `append` returns, so the twin is O(n²) in the records it holds.
+
+     > **Corrected (mechanism sweep, 2026-08-28): the cost is right and the
+     > cause was not.** This read *"**`std.trace`'s `Sink` appends with
+     > `push`**, so the twin is O(n²) in the records it holds"*. The O(n²) stays
+     > on this list — it is exactly the kind of unflattering item this section
+     > forbids dropping — but `push` is not what makes it. `push` grows a `List`
+     > **in place** when the caller is its last owner (`Arc::get_mut`, in
+     > `crates/ply-eval/src/builtins.rs`) and copies the whole array only when
+     > something else can still see it, and what decides that is **position**:
+     > `rc::carry` (`crates/ply-eval/src/rc.rs:98`) hands a pending frame a live
+     > clone of the scope whenever any sub-expression of the enclosing node
+     > remains, and never asks what those sub-expressions read. `append` writes
+     > `{records: push(s.records, r), open: s.open, next: s.next}` — the growing
+     > field first of three — so the list is at two owners and is copied once per
+     > record. `spikes/ply-lexer/GAPS.md` §1 states the rule; ADR 0020 §5.2
+     > measures that it composes across call boundaries, so a correct callee is
+     > made quadratic by its caller.
+     >
+     > This matters to a limits list specifically. The old wording's only
+     > implied remedy is *avoid `push`*, which no one can act on — `push` is the
+     > language's sole list primitive and `trace.ply`'s own `cons` is written out
+     > of it. The real fix is one line of field order, and it is written on
+     > PR #38: 0 copies on that module at 200, 400 and 800 records — **on the
+     > machine engine only.** The tree-walker runs no reference counting at all,
+     > so under `--engine treewalk` the sink is quadratic whatever order is
+     > written, which makes this a limit of one engine rather than of the
+     > library.
    - **`--engine both` costs two runs.** The divergence guarantee is not free.
    - Whatever the ladder itself says. If the residue is 30%, that is a limit and
      it goes here.
@@ -1041,7 +1068,7 @@ predicted:
 | **The request path allocates far more times than it writes bytes.** | one `/health` request allocates **1,035 times and 0.124 MB** to produce a 107-byte response |
 | **The ladder's own residue is −7.8%.** | 592.6µs measured against 638.96µs attributed |
 | **No cancellation, no backpressure, no load shedding.** | no number; the absence is the statement |
-| **`std.trace`'s `Sink` appends with `push`**, so a collecting twin is O(n²) — ADR 0015 named it and W5 measured it. | not re-taken here |
+| **`std.trace`'s `Sink` grows its record list in a non-final field**, so a collecting twin is O(n²) — ADR 0015 named it and W5 measured it. (This cell read "**`std.trace`'s `Sink` appends with `push`**, so a collecting twin is O(n²)" until the 2026-08-28 mechanism sweep. The O(n²) is unchanged; `push` is not its cause — it grows a `List` in place when the caller is its last owner and copies when anything else can still see it — most often because the scope was carried past it, which is decided by the growing expression's *position* in its enclosing node. §5.3's block is the argument, and it is why the row's remedy is a field order rather than a different primitive.) | not re-taken here |
 
 ### 8.6 What was not measured
 

@@ -340,9 +340,40 @@ whole state back through a persistent map. Tests that use the double
 for speed will be disappointed; they use it for isolation and determinism, which
 it does deliver.
 
-**The tracing sink is quadratic in a test.** `std.trace`'s `Sink` appends with
-`push`, so a collecting twin holding N records is O(N²). W5 measured it; W6 did
-not re-take it.
+**The tracing sink is quadratic in a test.** `std.trace`'s `Sink` grows its
+record list in a **non-final** field of the record `append` returns, so a
+collecting twin holding N records is O(N²). W5 measured it; W6 did not re-take
+it.
+
+> **Corrected (mechanism sweep, 2026-08-28): the number is right and `push` is
+> not what makes it.** This read *"`std.trace`'s `Sink` appends with `push`, so a
+> collecting twin holding N records is O(N²)"*. The O(N²) stands. The attribution
+> to `push` does not, and it is the more expensive half of the sentence, because
+> the only lesson a reader can take from it — avoid `push` — is not available:
+> `push` is the language's sole list primitive and `trace.ply`'s own `cons` is
+> written out of it.
+>
+> `push` grows a `List` **in place** when the caller is its last owner
+> (`crates/ply-eval/src/builtins.rs`, `Arc::get_mut`) and copies the whole array
+> only when something else can still see it. Which branch runs is decided by
+> **position**: `rc::carry` (`crates/ply-eval/src/rc.rs:98`) hands a pending
+> frame a live clone of the scope whenever any sub-expression of the enclosing
+> node remains, and never asks what those remaining sub-expressions actually
+> read. `append` writes `{records: push(s.records, r), open: s.open, next:
+> s.next}` — the growing field first of three — so the scope is carried, the list
+> is at two owners, and the copy is taken once per record. Anything built
+> anywhere but the last sub-expression of its enclosing node pays this, and the
+> sub-expression that costs you the copy can be a literal constant; the rule
+> composes across calls, so a correctly written function is made quadratic by its
+> caller. `spikes/ply-lexer/GAPS.md` §1 is the rule, ADR 0020 §5.2 measures the
+> composition.
+>
+> The fix is therefore one line — move `records:` last — and it is written, on
+> PR #38: 0 copies on that module at 200, 400 and 800 records. **On the machine
+> engine only.** The tree-walker runs no reference counting at all
+> (`Interp::lookup` answers every `Var` with `v.clone()`, and `interp.rs` has no
+> `Env::take_unique` and no `rc::carry` call site), so under `--engine treewalk`
+> the sink stays quadratic whatever field order is written.
 
 **`bytes_slice` and `bytes_split` copy.** `Value::Bytes` is `Arc<[u8]>` with no
 slicing, so taking a sub-slice allocates. Response write counts and copies were

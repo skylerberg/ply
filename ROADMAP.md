@@ -1822,6 +1822,31 @@ the deletability of the spike, the falsification table's reproducibility, and th
 > > parser drives every sequence with a loop and bounds its own grammar nesting
 > > at 128. **Item 2 only.** Items 1, 3 and 4 are untouched, and ADR 0021's live
 > > objection — throughput at 12.6× — is untouched too.
+>
+> > **Audit note (mechanism sweep, 2026-08-28): item 1 is superseded, and this
+> > sentence is the pointer that still sends a reader at it.** The sentence
+> > above — *"0021 §4 is the critical path, and none of its four items are
+> > self-hosting work"* — remains true as written; what moved is item 1, *"a
+> > lint for the field-order rule"*. The lint was built (`W0611`, a field-order
+> > pass in `ply-core`, PR #41) and refuted by adversarial review against the
+> > interpreter's own counters: it fires on `len(push([], i))` at argument 0 of
+> > 2, which copies nothing, and is silent on `{a: s.a, b: push(s.a, i)}`, which
+> > is fully quadratic — a false negative on the exact shape it existed for. The
+> > pass is closed. **ADR 0024, "Ownership as a checked property, not an inferred
+> > hint", supersedes the item** (branch `adr/ownership`, PR #43; ADR 0021 §4
+> > item 1 is corrected in place on that branch, and neither the ADR nor the
+> > correction is in this tree yet). Its argument is that a lint is a partial
+> > oracle over a dynamic property, so the answer is to check ownership and carry
+> > it in the signature — the effect row's precedent — rather than to warn about
+> > it. **Item 1 only.** Items 3 and 4 are untouched.
+> >
+> > The underlying rule is unchanged and it is not a defect of `push`: a growing
+> > container must be built in the **last sub-expression of its enclosing node**
+> > or the program is quadratic, because `rc::carry`
+> > (`crates/ply-eval/src/rc.rs:98`) keeps the scope alive for whatever follows
+> > without asking what it reads. `push` itself grows a list in place whenever
+> > its caller is the last owner. A contributor arriving at item 1 should read
+> > ADR 0024 first and should not start by writing a better lint.
 
 **R3's decision rule fired on its second branch, and that is what sets this
 queue.** Allocations per `/health` came back at **1,082** against a pre-region

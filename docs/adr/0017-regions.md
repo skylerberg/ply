@@ -396,7 +396,46 @@ in place. The cost of that is the whole live arena, not one scope.
 
 A value that outlives its region is heap-allocated and reference-counted
 Perceus-style: the compiler inserts the operations and elides most of them
-statically, and a uniquely-owned value is mutated in place rather than copied.
+statically, and a value found uniquely owned **at the moment of the update** is
+mutated in place rather than copied. The finding is a runtime probe, the branch
+that fails it copies the whole value, and nothing here makes uniqueness a
+property a program can be written to have.
+
+> **Corrected (mechanism sweep, 2026-08-28): stated as a compile-time property,
+> and it is a dynamic test.** The sentence read: *"the compiler inserts the
+> operations and elides most of them statically, and **a uniquely-owned value is
+> mutated in place rather than copied**"*, unqualified, in the section a reader
+> comes to in order to ask whether Ply reuses memory. It answered yes
+> unconditionally.
+>
+> The test is dynamic. `push` reaches `Arc::get_mut`
+> (`crates/ply-eval/src/builtins.rs`) and rewrites in place only if the pointer
+> is unshared at that instant; otherwise it allocates and copies the whole array.
+> The compiler's entire contribution is `Own` on a `Var` node, and `Own`'s own
+> documentation (`crates/ply-eval/src/rc.rs:71-73`) says it is *"an optimization
+> hint and never a permission"* — a wrong `Owned` costs a wasted walk and can
+> never change an answer. That is the property which keeps `--engine both`
+> meaningful under this ADR, and it is exactly why nothing in this section is a
+> guarantee about cost.
+>
+> What decides sharing in practice is **position**. `rc::carry`
+> (`crates/ply-eval/src/rc.rs:98`) hands a pending frame a live clone of the
+> scope whenever any sub-expression of the enclosing node remains, and never asks
+> what those remaining sub-expressions read. So a value built anywhere but the
+> last sub-expression of its enclosing node is aliased when the probe runs and is
+> copied — once per element for a growing container, which is quadratic — and the
+> trailing sub-expression that costs the copy may be a literal constant. The rule
+> composes across call boundaries, so a correctly written callee is made
+> quadratic by its caller (`spikes/ply-lexer/GAPS.md` §1; ADR 0020 §5.2 is the
+> measurement).
+>
+> **This ADR therefore establishes no complexity guarantee.** It establishes that
+> in-place update is *available*; whether a given program gets it is a fact about
+> where its sub-expressions sit, decided at run time and reported nowhere. That
+> is the same shape the Context's correction block above had to record: the
+> region work is a safety property and "was never an allocation claim", and a
+> cost claim read out of this section is that same unmeasured inference one level
+> down. ADR 0018 §4 is where it was in fact read that way.
 
 Cycles are not collected. A cycle among escaped values leaks, and this ADR
 accepts that rather than adding a tracing collector — say so in the diagnostics
