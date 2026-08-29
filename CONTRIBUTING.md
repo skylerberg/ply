@@ -324,7 +324,7 @@ the 26 ran.
 | `test ply-host (postgres)` | `ply-host`, with `PLY_PG_URL` and `PLY_TEST_DB` pointed at a `postgres:18.6` service container **and** `initdb`/`postgres`/`psql` on `PATH` — then it fails if any test printed a skip notice |
 | `wall-clock measurements` | the thirteen timing-sensitive tests, one at a time, single-threaded, alone on a runner |
 | `crates/ply-codegen-spike` | `cargo test --locked --release` on a pinned 1.94.0, in the spike's own workspace |
-| `examples/same-tests.sh` | W4's exit criterion: a release `ply`, a cluster the script starts itself, and the twin compared against postgres byte for byte |
+| `examples/same-tests.sh` | W4's exit criterion: a release `ply` **the script now builds and freshness-checks itself** (the row used to read "a release `ply`", which was the job's build and not the script's), a cluster the script starts itself, and the twin compared against postgres byte for byte |
 | `CI` | one required check that fails unless every job above reported `success` |
 
 Three things follow, and the second is the one this project would regret not
@@ -403,7 +403,7 @@ above it pass vacuously. `ci-shards.sh packages nosuch` exits **1**.
 | `cargo clippy --locked --workspace --all-targets -- -D warnings` | **0**, 34.36s, zero lines beginning `warning` or `error` |
 | `cargo +1.94.0 test --locked --release` in `crates/ply-codegen-spike` | **0**, **45 tests** — `hazards.rs` 16, `mutations.rs` 11, `mcts_kernel.rs` 9, `spike.rs` 9 — 438.9s including the cold release build |
 | `cargo build --locked --release -p ply-cli` | **0** |
-| `./examples/same-tests.sh` | **0**, **29 requests byte-for-byte identical** between the twin and postgres, 5.63s, against a cluster the script started itself |
+| `./examples/same-tests.sh` | **0**, **29 requests byte-for-byte identical** between the twin and postgres, ~~5.63s~~ **UNMEASURED since 2026-08-27**, against a cluster the script started itself. The count is unchanged and re-taken; the wall clock is withdrawn rather than updated, because the script builds `ply-cli` in release itself now and 5.63s named a run that did not. It was not re-taken: the 1-minute load average on the machine that made the change read 30.5, the gate this project measures behind is 4.0, and §"Say how it was checked, or say it was not" prefers a hole with provenance to a number without |
 | the postgres job's live-test step | **0**, `10 passed` in **0.29s**, zero skip notices |
 | the postgres job's cluster step | **0**, `2 passed` in **2.87s**, zero skip notices |
 | the `test` job's `w5_shutdown` step | **0**, **8 passed**, guard matches |
@@ -533,7 +533,7 @@ The original four:
 | the pool | `PLY_TEST_DB='postgresql://ply@127.0.0.1:5432/ply_test?sslmode=disable' cargo test -p ply-host --lib db::pool`. **This is the worst of the five: 26 tests hide behind it and print *nothing* when it is unset** — not a skip line, not on stderr, nothing. Re-measured 2026-08-24 on the machine in `docs/ONBOARDING.md` §Provenance against a local postgres 18.3: unset gives `26 passed` in `0.00s`; set and reachable gives `26 passed` in `0.94s`; set and *unreachable* gives **`20 FAILED`** in `0.02s` with `E0431`, because `db/pool/tests.rs:41` does `.expect("the test database is reachable")`. So a wrong value is loud and only a missing one is silent — CI sets the variable, pre-flights it with `test -n` and a `psql SELECT 1`, and that combination does cover it. An earlier version of this row said the figure was `1.55s` while `ROADMAP.md` said `1.35s` for the same measurement; neither had been re-taken |
 | shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix. CI runs on `ubuntu-24.04`, so it is compiled there, and a step fails if that binary reports zero tests |
 | the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
-| `examples/desk.ply` or any host handler | `./examples/same-tests.sh` — build `--release` first, it does not build for you. CI runs it in a job of its own, so this one is now caught before a merge rather than only when you remember |
+| `examples/desk.ply` or any host handler | `./examples/same-tests.sh`. ~~build `--release` first, it does not build for you.~~ **It builds for you since 2026-08-27**, and refuses to run against a binary older than a source in its own dep-info, so the hand-build this row used to demand is now `--no-build` for the case where you meant a particular binary. That build is `--locked`, so a `Cargo.lock` that has fallen behind the manifests stops the script with cargo's own `cannot update the lock file ... because --locked was passed` instead of being rewritten under a run: `cargo build` once, then re-run. CI runs it in a job of its own, so this one is caught before a merge rather than only when you remember |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock ratio and runs by default. A busy machine can fail it.
@@ -1371,21 +1371,182 @@ Recorded here so nobody spends an afternoon rediscovering them.
    `benches/adr0018-mcts.json` and `docs/adr/0019-value-representation.md` §5.
    ADR 0016 records the toolchain wall at lines 764–767 and 1105–1106 and is
    otherwise unamended.
-2. **`examples/same-tests.sh` does not build the binary it runs.** It uses
-   `target/release/ply` (line 44) with no `cargo build` anywhere. **Still true,
-   and no longer silent (2026-08-27):** the script now calls
-   `.github/binary-is-current.sh` before anything else and exits 2 with the
-   `cargo build` line to run if the binary is not this tree. Seen to fail —
-   `touch crates/ply-std/ply/json.ply` and nothing else makes it print
-   `NEWER crates/ply-std/ply/json.ply` / `STALE target/release/ply` and exit 2
-   before it looks for `psql`; with the mtime restored it runs to *29 requests,
-   byte for byte identical* and exits 0. Building it here would be the better
-   fix and is still open; refusing to compare two services through a binary
-   nobody can attribute is the half that was cheap.
+2. ~~**`examples/same-tests.sh` does not build the binary it runs.** It uses
+   `target/release/ply` (line 44) with no `cargo build` anywhere.~~ **Fixed
+   2026-08-27.** The script runs
+   `cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli`
+   itself — `examples/serve.sh:160`'s exact form — and then, on that path and on
+   the new `--no-build` path alike, refuses to run against a binary that is
+   absent or older than a source listed in `target/release/ply.d`, cargo's own
+   dep-info for that binary, and then calls `.github/binary-is-current.sh`,
+   which additionally sees a stale `.ply` — `desk.ply` imports all eight `std`
+   modules and those are `include_str!`ed into `ply`, so editing one changes
+   what this comparison means while moving no `.rs` file. The build is the convenience; the refusal is the
+   load-bearing half.
+
+   **`--locked` was not on that line until a second pass the same day**, and this
+   entry quoted it without. It read:
+
+   >   The script runs
+   >   `cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli`
+   >   itself
+
+   An unlocked build re-resolves `Cargo.lock` when the manifests have moved past
+   it, silently, and in CI this build runs *after* `cargo build --locked --release
+   -p ply-cli` — so it could rewrite the very file that step had just vouched for
+   and leave the locked check worth nothing. Reproduced on this tree with one
+   `[[package]]` entry deleted from `Cargo.lock`:
+
+   ```
+   $ cargo build --release --manifest-path .../Cargo.toml -p ply-cli
+       Finished `release` profile [optimized] target(s) in 0.37s      # exit 0
+   # and Cargo.lock is byte-identical to the pre-deletion copy again:
+   # the build put the entry back without being asked
+
+   $ cargo build --locked --release --manifest-path .../Cargo.toml -p ply-cli
+   error: cannot update the lock file .../Cargo.lock because --locked was passed
+   to prevent this                                                   # exit 101
+   # and Cargo.lock is byte-identical to the deleted-entry copy: untouched
+   ```
+
+   `examples/serve.sh:160` needed the same flag and now carries it, because
+   `same-tests.sh` starts `serve.sh` **twice**: an unlocked build there is an
+   unlocked build on the CI path. Checked the same way, with a stub `cargo` on
+   `PATH` recording its argv and then running the real one: `serve.sh` handed it
+   `build --release --manifest-path .../Cargo.toml -p ply-cli`, and the stale lock
+   came back rewritten. What `--locked` costs is that a tree whose lock has
+   genuinely fallen behind must run `cargo build` once before measuring — the
+   bargain the `clippy` and `test` jobs already make.
+
+   Seen to fail before it was believed. Binary moved aside:
+   `./examples/same-tests.sh --no-build` exits **2** with `no release binary at
+   …/target/release/ply`. `crates/ply-cli/src/cli.rs` touched:
+   exits **2** with `…/target/release/ply is older than a source it was built
+   from:` and the path. Same stale tree without `--no-build`: rebuilds and exits
+   **0**, so the guard clears by re-running rather than standing in the way.
+   That run took 38.7s of wall clock, which is an **observation** and not a
+   figure: it was taken at a 1-minute load average of about 30 against the 4.0
+   gate in §"Gate on an idle machine before measuring, not after", the same
+   reason the row in §"What CI runs, and what each step is worth" withdraws
+   5.63s rather than replacing it.
+
+   `find crates -name '*.rs' -newer target/release/ply` — house rule 6's literal
+   form — is deliberately **not** the check. It walks `ply-corpus`,
+   `ply-codegen-spike` and every crate's `tests/`, none of which is in this
+   binary's graph. A guard that fires on an edit which cannot change the binary,
+   and that rebuilding cannot clear, gets commented out. What the dep-info form
+   does **not** catch is an edit and a build inside the same second;
+   §"A moving tree invalidates a correctness number" records that trap for
+   cargo's own fingerprints, this inherits a weaker form of it, and the script's
+   comment says so rather than claiming the instrument problem is closed.
+
+   **How big that graph is is no longer written down.** This paragraph carried a
+   figure that the script's comment carried too. It read:
+
+   >   the dep-info is 152 files across twelve crates and holds none
+   >   of those three
+
+   That was true when it was written and it is true today; it was also a number
+   that moves the day a crate is added, asserted here and in the guard's own
+   comment in `examples/same-tests.sh`, and checked by nothing. The script now **counts** it, from the same file it was
+   already reading, and prints what it counted before step 1. On 2026-08-27, on
+   the machine in `docs/ONBOARDING.md` §Provenance, that line read:
+
+   ```
+   instrument: 152 sources across 12 crates in target/release/ply.d, none newer than the binary
+   ```
+
+   which is a transcript of a run and not a figure to keep true.
+
+   Derive the same two numbers by hand:
+
+   ```
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' | grep -c .
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' |
+     grep -o '/crates/[^/]*/' | sort -u | wc -l
+   ```
+
+   and the "holds none of those three" half, which is `0`:
+
+   ```
+   sed -n '1s/^[^:]*://p' target/release/ply.d | tr ' ' '\n' |
+     grep -c 'ply-corpus\|ply-codegen-spike\|/tests/'
+   ```
+
+   Counting it closed a hole and not only a staleness risk. The loop had **no
+   floor**. Cargo writes `target: src src ...` on line 1 of a dep-info; a first
+   line that names no sources parses to an empty list, and a loop over an empty
+   list finds no stale file and pronounces fresh whatever binary you hand it.
+   Seen: with that line emptied, the round-1 script printed nothing about the
+   instrument at all and went straight into step 1; the script as it stands exits
+   **2** with `... named no sources, so nothing was compared against ...`. The
+   check is `sources >= 1` — a floor, like step 1's `passed >= 1` — never an
+   equality against 152, which would turn the script red the day a module is
+   added.
+
+   One thing this entry never said and should not be read as saying: CI was not
+   the exposure **for the binary**. `.github/workflows/ci.yml` has run
+   `cargo build --locked --release -p ply-cli` immediately before the script
+   since the job existed. That exposure was the **local** run, which §"If your
+   change touches" told you to work around by hand; that row is corrected too,
+   and so is the CI comment, whose stated rationale — "the script's own
+   requirement" — is no longer why the step is there.
+
+   CI *was* exposed on the other axis, and that is the `--locked` finding above:
+   until both scripts took the flag, the job's one locked build was followed by
+   three unlocked ones — `same-tests.sh`'s own, and `serve.sh`'s twice — any of
+   which could have re-resolved the lock the locked step had just checked.
+   Nothing is known to have happened. This is a hole that was open, not a run
+   that went wrong, and it is recorded as the former.
+
+   **No timing figure was taken for any of this.** Every statistic above is an
+   exit status, a `cmp` of two copies of a file, or a count derived from a file:
+   deterministic, N=1 per case, pre-registered before it had a value, in a file
+   written outside this repository. `uptime` before the first probe read
+
+   ```
+   22:13  up 64 days,  5:39, 9 users, load averages: 8.47 7.30 10.23
+   ```
+
+   and after the last, `10.14`, against this project's gate of 4.0 — so the two
+   withdrawn wall clocks, `5.63s` in §"What CI runs, and what each step is worth"
+   and `4.6s` in `docs/ONBOARDING.md` §4, stay **withdrawn**. Neither was
+   re-taken, neither was replaced by a guess, and the end-to-end run behind them
+   was re-run only for its **29 requests** and its exit **0**, which are counts
+   and not clocks.
+3. ~~**`examples/same-tests.sh` step 1 can be vacuous.** It passes
+
 3. **`examples/same-tests.sh` step 1 can be vacuous.** It passes
    `--no-incremental`, which disables only the front-end cache; on a warm
    `examples/.ply-cache` it prints `0 failed, 0 passed, 68 cached` and the script
-   exits 0. `--no-cache` is the flag that forces the run.
+   exits 0. `--no-cache` is the flag that forces the run.~~ **Fixed 2026-08-27,
+   and the diagnosis was right on both halves.** Re-measured on this tree, one
+   warm `examples/.ply-cache`, the two flags back to back:
+
+   ```
+   $ ply test examples/desk.ply --no-incremental   # the withdrawn step 1
+   0 failed, 0 passed, 68 cached (0.00s)           # exit 0
+   $ ply test examples/desk.ply --no-cache         # what step 1 passes now
+   0 failed, 68 passed, 0 cached (0.10s)           # exit 0
+   ```
+
+   Step 1 passes `--no-cache`. The flag alone is not the fix, though: a step
+   that trusts an exit status is one flag away from being vacuous again, so step
+   1 now **reads its own counts** and refuses on them — `cached == 0` and
+   `passed >= 1`, never `passed == 68`, so adding a test cannot turn the script
+   red. Seen to fail: with the flag reverted to `--no-incremental` on a warm
+   cache the script exits **1** with `step 1 served 68 test(s) from the result
+   cache`; with one `test` block in `examples/desk.ply` falsified (`4.00m` →
+   `4.01m` at `:2017`) it exits **1** at step 1 on `1 failed, 67 passed, 0
+   cached`, and exits 0 again once the file is restored from a byte copy and
+   `cmp`-verified.
+
+   The counts line is printed by `print_summary` at
+   `crates/ply-cli/src/commands/test.rs:1016`, not by
+   `ply_test::RunReport::summary` (`crates/ply-test/src/report.rs:220`) — the
+   two build the same shape and nothing pins either. So the guard **aborts**
+   when the line does not parse rather than skipping: a check that quietly
+   stopped matching would be this same defect one layer up.
 4. ~~**`README.md`'s `ply-corpus gen` invocation is missing the required
    `--out`** and fails verbatim.~~ **Fixed** at `README.md:97`, along with the
    missing positional corpus argument on the `ply-corpus bench` beside it.
@@ -1406,11 +1567,61 @@ Recorded here so nobody spends an afternoon rediscovering them.
    is named in no document in this repository. `docs/ONBOARDING.md` §2 has the
    measurement — 26 passed in 0.00s without it, 26 passed in 0.94s with it, and
    **20 of 26 failed** when it is set at a server that is not there.
-7. **No `LICENSE` or `LICENSE-APACHE` file exists** although `README.md:499` and
-   the workspace root `Cargo.toml:22` declare `MIT OR Apache-2.0`. The thirteen
-   member crates inherit it with `license.workspace = true` rather than each
-   carrying the SPDX expression, and `crates/ply-codegen-spike/Cargo.toml`
-   declares no license at all.
+7. ~~**No `LICENSE` or `LICENSE-APACHE` file exists** although `README.md:499`
+   and the workspace root `Cargo.toml:22` declare `MIT OR Apache-2.0`.~~
+   **Fixed 2026-08-27.** `LICENSE-MIT` and `LICENSE-APACHE` are at the
+   repository root, and `README.md`'s `## License` section names both. The two
+   manifest claims agree and always did — `Cargo.toml:22` is
+   `license = "MIT OR Apache-2.0"` and `README.md` says the same expression — so
+   both files were owed and both were written, not one chosen.
+
+   Provenance, because an invented licence text is worse than none: the Apache
+   text is byte-identical to three independent copies in
+   `~/.cargo/registry/src/index.crates.io-*/` (`async-channel-2.5.0`,
+   `either-1.15.0`, `scoped-tls-1.0.1`), **zero** differing lines, APPENDIX
+   retained with `Copyright [yyyy] [name of copyright owner]` as the published
+   template. Repeat that check against a crate picked at random and read the
+   result carefully: `syn-2.0.87`, `serde_json-1.0.151` and `rand-0.9.2` ship
+   the same 176 lines with the 25-line APPENDIX dropped, so they differ by
+   exactly that block and nothing else. `once_cell-1.21.4` is a fourth copy that
+   keeps it and matches this file byte for byte. The MIT text differs from
+   three independent copies
+   (`scoped-tls-1.0.1`, `either-1.15.0`, `bit-set-0.8.0`) on **exactly one**
+   line: those three carry a copyright line and this file carries none, so the
+   text begins at `Permission is hereby granted`.
+
+   > **Withdrawn (2026-08-28): "the copyright line, which reads `Copyright (c)
+   > 2026 Skyler Berg`", and the paragraph justifying it — "That copyright line
+   > is the one thing in this entry nothing in the tree can check … The holder
+   > is inferred from `Cargo.toml:23 repository = …` and the year from the
+   > earliest date in the prose (`2026-02-11`). If the holder is an entity, or
+   > the work predates 2026, that line is wrong and a human has to say so."**
+   > A human said so: the line is removed rather than confirmed. The reasoning
+   > was sound and its conclusion was that the value was inferred, which is not
+   > a thing this repository asserts.
+
+   **What that costs, stated rather than glossed.** MIT's grant conventionally
+   names the party granting it, and this text now names nobody, so who licensed
+   the work is not stated in the file. `Cargo.toml:22`'s `MIT OR Apache-2.0`
+   and the repository URL are what remain. Restoring a holder is a one-line
+   edit whenever there is one to name; nothing in the tree checks it either way
+   so — it is the only claim in this repository whose error has consequences
+   outside it.
+
+   ~~`README.md:499`~~ was already a stale reference when this item was
+   written: `README.md` is 663 lines — 658 when the item was written, before
+   this same change added five below `## License` — and line 499 is
+   mid-paragraph about type aliases and wire formats. The licence is at
+   **`README.md:656`**. The same stale reference is in `docs/ONBOARDING.md` §9
+   item 11 and is corrected there.
+
+   The rest of the entry stands and is **not** fixed: the thirteen member crates
+   inherit the expression with `license.workspace = true` rather than each
+   carrying the SPDX string, and `crates/ply-codegen-spike/Cargo.toml` still
+   declares no license at all. That last one is left alone on purpose — it is
+   `publish = false` in its own workspace, adding a key there is a code change
+   nobody asked for, and this pass fixed the absent files rather than the
+   manifest style.
 8. **`w6-alloc`'s `bytes_per_request` grows with the window and nobody knows
    why.** `./target/release/w6-alloc --repo . --requests N` reports 127,954
    bytes at N=200, 177,236 at 400 and 277,417 at 800 — total bytes growing
@@ -2029,9 +2240,16 @@ at the end of item 11 for the fixes, the measurements behind them and the tests
 that arm them. Items 12, 13, 14 and 15 are open — 12 as fixed-but-listed, 13 in
 its first bullet only.
 
-Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
+~~Items 2, 3, 4, 6 and 7 are one-line fixes this documentation pass did not make,
 because the rule is that code is what shipped and a documentation pass corrects
-documents. Item 5's comment was a document and was corrected; item 1 is a real
+documents.~~ **Items 2, 3 and 7 were made on 2026-08-27** by a pass that was
+allowed to touch code; 4 and 6 stand as written. None of the three turned out to
+be a one-line fix. Item 7 is two files whose text had to be checked against three
+independent copies each, plus a copyright line no measurement can settle. Items 2
+and 3 are a build, a freshness check and a counts check, because the one-line
+versions — add `cargo build`, change one flag — would each have left the script
+reporting a green result over an exit status nobody had made fail. Item 5's
+comment was a document and was corrected; item 1 is a real
 code defect and is reported, not fixed. Items 9 through 13 are R5's, found by
 the reviews of it: **three of the four review lenses pointed at R5 refuted the
 claim they were given**, and the documents they refuted are corrected in place

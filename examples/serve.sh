@@ -153,7 +153,12 @@ settings=(
   --drain-ms 30000
 )
 
-cargo build --release --manifest-path "$root/Cargo.toml" -p ply-cli
+# `--locked` for the same reason `same-tests.sh` passes it, and it matters more
+# here: `same-tests.sh` starts this script twice, so this line is on the CI path
+# too, and an unlocked build here would update the `Cargo.lock` that job's own
+# `--locked` step had just vouched for. Seen, with one `[[package]]` entry
+# deleted from the lock: this line rewrote the file and exited 0.
+cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli
 ply="$root/target/release/ply"
 
 if [ "$memory" -eq 1 ]; then

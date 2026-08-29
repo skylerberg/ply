@@ -599,12 +599,45 @@ It needs `psql` and `curl` on `PATH`. With no `--db` it also needs `initdb` and
 port 55433 and tears it down after**. It does not touch any cluster you already
 have.
 
-**Build the release binary first.** `same-tests.sh` uses `target/release/ply`
-and, unlike `serve.sh`, never builds it — on a fresh clone it dies at line 79
-with "No such file or directory":
+**It builds the release binary itself, since 2026-08-27.** This section used to
+open:
+
+> **Build the release binary first.** `same-tests.sh` uses `target/release/ply`
+> and, unlike `serve.sh`, never builds it — on a fresh clone it dies at line 79
+> with "No such file or directory":
+>
+> ```
+> cargo build --workspace --release
+> ./examples/same-tests.sh
+> ```
+
+Both halves are now wrong. The script runs `cargo build --locked --release -p
+ply-cli` itself, and it also refuses to run against a binary that is absent or
+older than a source in `target/release/ply.d` — so a stale instrument is an abort
+naming the file rather than a number you would have believed. It prints what it
+checked, derived from that file rather than written down. On 2026-08-27:
 
 ```
-cargo build --workspace --release
+instrument: 152 sources across 12 crates in target/release/ply.d, none newer than the binary
+```
+
+Both numbers come out of `target/release/ply.d` on the run that prints them, so
+a crate added tomorrow moves them without anyone editing this page.
+
+`--locked` arrived on a second pass the same day; this paragraph had said
+`cargo build --release -p ply-cli`, without it. An unlocked build re-resolves a
+`Cargo.lock` that has fallen behind the manifests and says nothing about it,
+which is not something a measuring script may do. If your lock is genuinely out
+of date the script now stops with cargo's own `cannot update the lock file ...
+because --locked was passed`; run `cargo build` once and re-run. Re-run on a worktree with
+no `target/` at all: exit 0, 29 requests, and the release build dominates the
+run — 54.8s of a 60.4s total. Those two are **observations**, not the figure
+withdrawn just above: the 1-minute load average went from 3.2 to 32.4 across
+that run and the gate is 4.0, so they say "the build is most of a cold run" and
+nothing narrower. `--no-build` skips the build for the case where you meant a
+specific binary; it does not skip the freshness check.
+
+```
 ./examples/same-tests.sh
 ```
 
@@ -618,7 +651,10 @@ cargo build --workspace --release
 > pre-built binary — `CONTRIBUTING.md` §"The binary is an instrument too" is
 > the reproduction and the rule it replaces.
 
-Measured: **4.6s**, exit 0, and the tail is
+~~Measured: **4.6s**~~ — withdrawn rather than updated. That figure named a run
+that did no building, and the script does now. It was not re-taken here: the
+1-minute load average was 30.5 against this project's gate of 4.0, and a number
+taken over that is not a number. Exit 0 and the tail are unchanged:
 
 ```
 == 3. the same requests to both, compared byte for byte ==
@@ -631,20 +667,39 @@ Measured: **4.6s**, exit 0, and the tail is
 29 requests, byte for byte identical between the twin and postgres.
 ```
 
-**Read step 1's counts, not just its exit code.** Step 1 runs
-`ply test examples/desk.ply --no-incremental`, and `--no-incremental` disables
-only the *front-end* cache — the result cache is untouched (`ply test --help`
-says so explicitly; `--no-cache` is what disables both). So on a warm
-`examples/.ply-cache` step 1 prints
+**Step 1 reads its own counts now.** This section used to say:
+
+> **Read step 1's counts, not just its exit code.** Step 1 runs
+> `ply test examples/desk.ply --no-incremental`, and `--no-incremental`
+> disables only the *front-end* cache — the result cache is untouched
+> (`ply test --help` says so explicitly; `--no-cache` is what disables both).
+> So on a warm `examples/.ply-cache` step 1 prints
+>
+> ```
+>    selected 0 of 68 (68 cached)
+>    0 failed, 0 passed, 68 cached (0.00s)
+> ```
+>
+> and the script still exits 0. Nothing ran. With a cold cache the same step
+> prints `0 failed, 68 passed, 0 cached (0.09s)`. If you are using step 1 as
+> evidence, run `ply cache clear` in `examples/` first.
+
+Every word of that was true, and it is what got the flag changed. Step 1 passes
+`--no-cache` since 2026-08-27, so the warm-cache reading above cannot happen,
+and it no longer needs you to read anything: it parses the counts line itself
+and exits **1** if `cached` is not 0 or if `passed` is 0. On a warm cache it now
+prints
 
 ```
-   selected 0 of 68 (68 cached)
-   0 failed, 0 passed, 68 cached (0.00s)
+   selected 68 of 68 (0 cached)
+   --no-cache: results were neither read nor recorded
+   0 failed, 68 passed, 0 cached (0.17s)
+   68 tests evaluated, 0 served from cache
 ```
 
-and the script still exits 0. Nothing ran. With a cold cache the same step
-prints `0 failed, 68 passed, 0 cached (0.09s)`. If you are using step 1 as
-evidence, run `ply cache clear` in `examples/` first.
+`ply cache clear` before running it is no longer necessary. The advice to read
+counts rather than exit codes still is, everywhere else: `ply test` exits 0 over
+a suite it did not run, and step 1 was the tree's purest instance of that.
 
 ### `serve.sh` — a service you can curl
 
@@ -655,9 +710,14 @@ evidence, run `ply cache clear` in `examples/` first.
 ```
 
 It copies `desk.ply` into `examples/.serve/` and rewrites one line *there*, so
-your working tree is not modified (`PLY_SERVE_OUT` moves that directory). Unlike
-`same-tests.sh` it does run `cargo build --release -p ply-cli` itself. It prints
-a generated `DESK_API_KEY` if you have not exported one.
+your working tree is not modified (`PLY_SERVE_OUT` moves that directory). It
+runs `cargo build --locked --release -p ply-cli` itself — ~~unlike
+`same-tests.sh`~~, a distinction that stopped existing on 2026-08-27 when
+`same-tests.sh` took the same line (`serve.sh:160`) and added a freshness check
+`serve.sh` does not have. `--locked` reached both lines together, and had to:
+`same-tests.sh` starts this script twice, so an unlocked build here is an
+unlocked build inside a run whose whole point is a tree that does not move.
+It prints a generated `DESK_API_KEY` if you have not exported one.
 
 Measured, `--memory` on port 8911:
 
@@ -1218,10 +1278,15 @@ Everything here cost this audit real time. In descending order of cost.
    outside `--workspace`, so it rots silently and has done so twice. Its
    `--half` invocation also needs `--bin ply-codegen-spike` now that the crate
    ships two binaries. §1.
-2. **`examples/same-tests.sh` never builds the binary it runs.** Build release
-   first or it dies on line 79. §4.
-3. **`--no-incremental` is not `--no-cache`.** `same-tests.sh` step 1 can print
-   `0 passed` and exit 0. §4.
+2. ~~**`examples/same-tests.sh` never builds the binary it runs.** Build release
+   first or it dies on line 79.~~ **Fixed 2026-08-27** — it builds `ply-cli` in
+   release itself and aborts on a binary that is absent or older than a source
+   in `target/release/ply.d`. §4.
+3. ~~**`--no-incremental` is not `--no-cache`.** `same-tests.sh` step 1 can print
+   `0 passed` and exit 0.~~ The distinction is real and still worth knowing —
+   `--no-incremental` disables the front-end cache only — but **step 1 stopped
+   depending on it on 2026-08-27**: it passes `--no-cache` and then refuses
+   unless it sees `cached == 0` and `passed >= 1`. §4.
 4. **`README.md`'s `ply-corpus gen` command omits the required `--out`** and
    fails verbatim. §5.
 5. **`serve.sh`'s `E0435` comment was false** — the error is raised nowhere.
@@ -1256,17 +1321,34 @@ Everything here cost this audit real time. In descending order of cost.
     only)`, and §2 itself opens with a `> **Superseded by ADR 0017.**` block at
     line 289. Read 0017 first, then 0005 for the parts 0017 kept — §3's
     resumption semantics stand unchanged.
-11. **No `LICENSE` file exists** (`ls LICENSE*` → no matches) although
+11. ~~**No `LICENSE` file exists** (`ls LICENSE*` → no matches) although
     `README.md:499` and the workspace root `Cargo.toml:22` declare
-    `MIT OR Apache-2.0`, and all thirteen member crates inherit it with
-    `license.workspace = true`. (Only `crates/ply-codegen-spike/Cargo.toml`
-    declares no license, being its own workspace.)
+    `MIT OR Apache-2.0`.~~ **Fixed 2026-08-27**: `LICENSE-MIT` and
+    `LICENSE-APACHE` are at the root, checked against three independent copies
+    each out of `~/.cargo/registry`. Two corrections to the withdrawn text
+    itself. ~~`README.md:499`~~ was already stale when it was written — the file
+    is 663 lines (658 then; this change added five below `## License`) and the
+    licence is at **`README.md:656`**; line 499 is about type aliases. And the
+    ~~copyright line, `Copyright (c) 2026 Skyler Berg`, is **inferred** from
+    `Cargo.toml:23`'s repository URL and the earliest date in the prose,
+    because nothing in the tree names a holder or a year. A human should
+    confirm it.~~ **A human did, on 2026-08-28, and the answer was to drop it:
+    `LICENSE-MIT` now carries no copyright line and begins at `Permission is
+    hereby granted`. CONTRIBUTING item 7 carries what that costs.** The rest stands: all thirteen member crates inherit the
+    expression with `license.workspace = true`, and only
+    `crates/ply-codegen-spike/Cargo.toml` declares no license, being its own
+    workspace — still true, and deliberately left alone.
 
-Items 2–5, 7 and 11 are one-line fixes. **Item 5 has since been made** — it was
-a false comment rather than a behaviour, so a documentation pass could fix it,
-and did. The rest are behaviour or absent files and are still open;
-`CONTRIBUTING.md` §"Things known to be broken" is where they are recorded for
-whoever takes them.
+~~Items 2–5, 7 and 11 are one-line fixes.~~ **Item 5 has since been made** — it
+was a false comment rather than a behaviour, so a documentation pass could fix
+it, and did. **Items 2, 3 and 11 were made on 2026-08-27**, and none of them was
+a one-line fix: the one-line versions (add a `cargo build`, change one flag, drop
+in a licence text) would each have shipped a check nobody had watched fail, or a
+copyright line nobody had sourced. For items 4 and 7 read
+`CONTRIBUTING.md` §"Things known to be broken", which is where all of these are
+tracked and where their current state is: its item 4 records the `--out` fix at
+`README.md:97`, which this list's item 4 above still describes as open, and its
+item 6 records `PLY_PG_URL` as half fixed — set in CI, set by nothing locally.
 
 ## 10. The documents, and what each is for
 
