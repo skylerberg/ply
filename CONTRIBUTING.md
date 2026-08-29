@@ -662,8 +662,27 @@ The house conventions:
   survives.
 - `ROADMAP.md` uses `> **Audit note (docs pass, <date>): <what it used to
   say>.**` blocks.
+- Any of them may carry a **wrong-instrument** block: `> **Corrected: this
+  number is right, and it is not the number that decides this.**` It keeps the
+  figure and withdraws the *inference*, naming the question the figure actually
+  answers.
 
-Both quote the withdrawn text verbatim. Do the same.
+All three quote the withdrawn text verbatim. Do the same.
+
+**Why the third one had to be named.** Every correction block written in this
+record before 2026-08-28 that moves a measurement moves a *magnitude* — 3.3% →
+28.6%, 1,082 → 773.4, 8.44× → 11.67×. The ones that move no measurement withdraw
+a claim (`DESIGN.md`'s "v0 restriction: tail-resumptive only") or an explanation
+(`spikes/ply-lexer-rc/fieldorder.ply`'s last-mention rule). Not one says *the
+wrong thing was measured*. So the convention was relentless at catching a wrong
+number and had no mechanism at all for catching a wrong instrument, which is how
+a whole tier of findings survived audits that are otherwise unforgiving. If your
+correction leaves every figure standing and moves what one of them was taken to
+prove, it is this kind, and it is the kind worth writing down. The template is
+ADR 0024 §4 (branch `adr/ownership`, PR #43): it keeps ADR 0020 §6.3's profile
+exactly as measured and withdraws what was concluded from it, because a share
+measured underneath an interpreter's dispatch settles a question about this
+evaluator and not about the language.
 
 **The cost of that convention, which you will pay before you understand it: a
 grep for a stale claim hits forever, and hits hardest in the document that
