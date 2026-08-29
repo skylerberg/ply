@@ -793,11 +793,36 @@ gives that, and it costs one `match`.
   stated rather than left to an implementation.
 - **Decoding costs the segment's length and never its square, and never
   recurses per escape.** `route` reaches `percent_decode` before it has decided
-  anything, so this is on the path of every request: an accumulator built with
-  `push` — which copies a `List` — made k escapes cost O(k²), measured at
+  anything, so this is on the path of every request: an accumulator grown with
+  `push` in a **non-final** sub-expression made k escapes cost O(k²), measured at
   125.8 ms for a 7,681-byte path of escapes against 0.1 ms for the same-length
   plain path, at a length the default `max_request_line` admits. §4's rule is
   not only about the head parser.
+
+  > **Corrected (mechanism sweep, 2026-08-28): the measurement stands, the
+  > parenthetical does not.** This read *"an accumulator built with `push` —
+  > **which copies a `List`** — made k escapes cost O(k²)"*. The 125.8 ms against
+  > 0.1 ms is re-affirmed, and so is everything §4 draws from it; only the cause
+  > is withdrawn. `push` does not copy a `List`. It grows one **in place** when
+  > the caller is its last owner — that is what `Arc::get_mut` decides in
+  > `crates/ply-eval/src/builtins.rs` — and copies the whole array only when
+  > something else still holds a reference. What put the old `percent_decode` in
+  > the copying branch was **position**: `rc::carry`
+  > (`crates/ply-eval/src/rc.rs:98`) hands a pending frame a live clone of the
+  > scope whenever any sub-expression of the enclosing node remains, and never
+  > asks what those remaining sub-expressions read — so an accumulator grown
+  > anywhere but last is at two owners by the time `push` looks, and the
+  > sub-expression that costs the copy can be a literal constant. The rule
+  > composes across call boundaries: a correctly written callee is made quadratic
+  > by its caller. `spikes/ply-lexer/GAPS.md` §1 is the rule; ADR 0020 §5.2 is
+  > the measurement of the composition.
+  >
+  > The difference is not pedantry, because *avoid `push`* is not a fix anyone
+  > can apply: `push` is the language's only list primitive and
+  > `crates/ply-std/ply/trace.ply`'s own `cons` is written out of it. The remedy
+  > that landed here removed the *accumulator* — one native split, one call per
+  > escape, one allocation for the join. Where an accumulator is the right shape,
+  > the fix is to build it in the last sub-expression of its enclosing node.
 - An invalid percent escape — `%` not followed by two hex digits — leaves the
   bytes as written rather than raising; a segment is a `String` and the request
   already parsed.

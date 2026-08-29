@@ -285,9 +285,23 @@ a level check at the call site buys every other language. The gap between it and
 turned off, and it is the number ADR 0015 §1.4 owes rather than promises away.
 
 **The twin's row is taken at a smaller count, and the count is printed.**
-`std.trace`'s `Sink` appends with `push`, so holding N records is O(N²); a twin
-row taken at twenty thousand would be a number about list append. A twin lives
-inside one test holding tens of records, which is the size it is priced at.
+`std.trace`'s `Sink` grows its record list in a non-final field of the record
+`append` returns, so holding N records is O(N²); a twin row taken at twenty
+thousand would be a number about that and not about tracing. A twin lives inside
+one test holding tens of records, which is the size it is priced at.
+
+> **Corrected (mechanism sweep, 2026-08-28): the reason for the small count is
+> right and `push` is not it.** This read *"`std.trace`'s `Sink` appends with
+> `push`, so holding N records is O(N²)"*. `push` grows a `List` in place when
+> the caller is its last owner and copies only when something else can still see
+> it, which is decided by the growing expression's **position** in its enclosing
+> node — `rc::carry` (`crates/ply-eval/src/rc.rs:98`) hands a pending frame a
+> live clone of the scope whenever a sub-expression remains, without asking what
+> it reads. `append` writes `records:` first of three fields, so the copy is
+> taken once per record. `README.md` §"Where this is not competitive" carries the
+> full argument, including that the one-line field-order fix on PR #38 removes it
+> **on the machine engine only**: the tree-walker runs no reference counting, so
+> `--engine treewalk` is quadratic whatever order is written.
 
 **A collecting sink never writes into a pipe.** A pipe nobody drains fills at
 64KiB and blocks the writer, so a server writing one JSON line per request into a

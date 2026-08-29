@@ -455,13 +455,56 @@ impl fmt::Debug for Step {
     }
 }
 
-/// `push`, with the reuse that is the point of reference counting.
+/// `push`, with the reuse that is the point of reference counting — and with the
+/// defect that reuse arrives attached to.
 ///
 /// A list the caller is the last owner of grows in place; one anybody else can
-/// still see is copied. The two answer the same value — that is what
-/// [`Arc::get_mut`] checks and why the choice is invisible — and they do not
-/// cost the same: appending in a fold copies the whole accumulator per element
-/// without this, which is quadratic in the list being built.
+/// still see is copied. The two answer the same value, which is what
+/// [`Arc::get_mut`] checks, and they do not cost the same: the copying branch is
+/// O(the list's current length), so a program that takes it once per element is
+/// quadratic in the list it is building.
+///
+/// **Which branch runs is decided by position, and not by anything at this call
+/// site.** A pending frame keeps a live clone of the caller's scope for as long
+/// as any sub-expression of its enclosing node is still to come — that is
+/// `rc::carry` (`crates/ply-eval/src/rc.rs`), which asks only *is another
+/// sub-expression left*, never *does it read this list*. So `push(xs, x)`
+/// written anywhere but the last sub-expression of its enclosing node finds
+/// `xs` at two owners and copies — and the trailing sub-expression that costs
+/// the copy may be a literal constant. The rule composes across call
+/// boundaries: a correctly written callee is made quadratic by its caller.
+/// `spikes/ply-lexer/GAPS.md` §1 states the rule and
+/// `docs/adr/0020-self-hosting-the-front-end.md` §5.2 measures the composition.
+///
+/// **Last position is necessary and not sufficient, and on the tree-walker it
+/// buys nothing at all.** Anything else that already holds the list keeps it at
+/// two owners however the call is placed: `{a: s.a, b: push(s.a, i)}` grows in
+/// the *last* field and is 0 of 200 updates in place, because the field before
+/// it put a second owner into the record being built — ADR 0024 §2 (branch
+/// `adr/ownership`) tables that shape and two more like it. And every case
+/// above is the machine's: the tree-walker runs no reference counting —
+/// `Interp::lookup` answers each `Var` with `v.clone()`, and `interp.rs` has no
+/// `rc::carry` call site and no `Env::take_unique` — so under
+/// `--engine treewalk` this function takes the copying branch whatever position
+/// the call is written in.
+///
+/// > **Corrected (mechanism sweep, 2026-08-28).** This read: *"The two answer
+/// > the same value — that is what [`Arc::get_mut`] checks and **why the choice
+/// > is invisible** — and they do not cost the same: appending in a fold copies
+/// > the whole accumulator per element without this, which is quadratic in the
+/// > list being built."* Every clause of that is true and the sentence they make
+/// > together is wrong, because it files the invisibility as the explanation of
+/// > a virtue. Invisibility here is a **defect of this function**: an author has
+/// > no way to see at the call which branch will run, and the difference between
+/// > them is asymptotic. This doc comment is the licence the quadratic JSON
+/// > serializer shipped under — `escape_runs` in `crates/ply-std/ply/json.ply`
+/// > nests its accumulating `push` as argument 0 of 2 of an outer `push`, so it
+/// > copies once per escape in a string a client chooses (measured on the
+/// > shipped module in ADR 0020 §4.1). The remedy the old wording invites — avoid `push` — does
+/// > not exist: `push` is the language's only list primitive and
+/// > `crates/ply-std/ply/trace.ply`'s own `cons` is written out of it. The
+/// > remedy that does exist is positional, and nothing in the type system, the
+/// > syntax or a diagnostic says so at the point an author needs it.
 ///
 /// [`Arc::get_mut`]: std::sync::Arc::get_mut
 fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {

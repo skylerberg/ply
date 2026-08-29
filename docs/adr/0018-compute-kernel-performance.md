@@ -629,9 +629,39 @@ lifetime, not a contiguous unboxed buffer.
 
 **The plan.** A primitive `Array<a>` with in-place update, region-allocated, with
 its brand preventing escape exactly as a cell's does. In-place update requires
-unique ownership, which is what R1/R2's region work already establishes — this is
-the first feature where that machinery pays for itself on performance rather than
-on safety.
+unique ownership, **which R1/R2's region work does not establish** — it is a
+missing prerequisite of this item rather than machinery the item inherits, and
+unless it is built the array copies exactly where a mutable array is supposed to
+be worth having.
+
+> **Corrected (mechanism sweep, 2026-08-28): a prerequisite was booked as
+> already paid.** This read *"In-place update requires unique ownership, **which
+> is what R1/R2's region work already establishes** — this is the first feature
+> where that machinery pays for itself on performance rather than on safety."*
+> The first clause is right; the attribution is not. Regions establish
+> **non-escape**: a brand stops a value outliving its region, which is a safety
+> property about lifetime. Non-escape is not non-aliasing. A region-allocated
+> value can be aliased freely *inside* its region, and that is exactly the case
+> that makes an update copy — `push` probes with `Arc::get_mut`
+> (`crates/ply-eval/src/builtins.rs`) at the moment of the update and copies the
+> whole value when anything else can still see it, and the commonest way a
+> second owner gets there is `rc::carry` (`crates/ply-eval/src/rc.rs:98`), which
+> hands a pending frame a live clone of the scope whenever any sub-expression of
+> the enclosing node remains. That is a positional fact about the call site and
+> its caller, entirely within one region, and no brand touches it.
+>
+> ADR 0017 §4 now says the same thing about itself: it makes in-place update
+> *available*, not guaranteed, and establishes no complexity claim. ADR 0017's
+> Context block had already warned about this shape once — the region work "was
+> never an allocation claim" — and this sentence is that claim being re-derived
+> one document over, which is how an unmeasured premise travels.
+>
+> **It bears on the ranking.** §0.5 item 4 calls §4 the largest lever this ADR
+> still identifies for this kernel. An `Array<a>` built on "the regions already
+> did it" would ship the same dynamic probe under a mutable-looking type, so this
+> item's real cost includes establishing uniqueness — statically, or by a rule an
+> author can check locally — and neither exists today. Until it does, §4 is a
+> larger item than it is priced as, not a smaller one.
 
 **What it interacts with.** The escape check must run on resolved types (W2 found
 the analogous hole reachable through a type alias). Derivation must refuse or
