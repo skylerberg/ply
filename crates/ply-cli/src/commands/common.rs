@@ -246,7 +246,6 @@ pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
 
-
 /// One engine's counters, and the cycle diagnostics that had to be rescued
 /// from the reset that took them.
 pub struct Counted<T> {
