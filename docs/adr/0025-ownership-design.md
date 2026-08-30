@@ -687,15 +687,33 @@ to claim this result.**
 | (d)/(a) < 6 | **7.56, stable** | **fail** |
 | index ratio < 5 | **7.07 at n = 64,000** | **fail** |
 
-The index criterion was also **ill-posed, and I found that out after measuring**:
-there is no list index builtin. `Builtin` is `Len, Push, Map, Filter, Fold,
-Range` for lists, and every `Value::List` access in the evaluator is `.iter()`,
-`.len()`, `.is_empty()` or `Arc::get_mut` — checked by grep across
+~~The index criterion was also **ill-posed, and I found that out after
+measuring**: there is no list index builtin. `Builtin` is `Len, Push, Map,
+Filter, Fold, Range` for lists, and every `Value::List` access in the evaluator
+is `.iter()`, `.len()`, `.is_empty()` or `Arc::get_mut` — checked by grep across
 `crates/ply-eval/src/*.rs`. **No Ply program can pay the index cost**, so the
 O(1) index that `Arc<Vec<Value>>` buys is unreachable from the language. That
 makes the criterion meaningless rather than met; it is recorded as a miss and not
 quietly dropped, because a criterion rewritten after seeing the number is not a
-criterion.
+criterion.~~
+
+> **Corrected in place (list index, 2026-08-30).** Every sentence above was true
+> when it was written and the miss it records stands — the criterion **was**
+> ill-posed at the time, and it is still recorded as a miss. What is no longer
+> true is the reason. `docs/adr/0027-a-list-index.md` adds `list_at`, so a Ply
+> program **can** now pay the index cost, the O(1) index that `Arc<Vec<Value>>`
+> buys is reachable from the language, and the criterion is well-posed for the
+> next taking. One caution for whoever takes it: ADR 0027 §7 measures a peek at
+> ~1.7 µs and finds it is **almost all interpreter dispatch** — a `map_get` peek
+> and a `list_at` peek cost the same to within 2% — so the index arm will price
+> a small term unless the backend has landed.
+>
+> That gives this ADR's own `Vector<T>` gate below a term it did not have when
+> the gate was fixed. A chunked structurally-shared vector would make `list_at`
+> O(log₃₂ n) where it is O(1) today, and there is now a builtin for that to be a
+> cost *of*. The gate's wording is unchanged — a bar moved after a measurement
+> is not a bar — but anyone re-taking it should price the index arm rather than
+> record it as meaningless a second time.
 
 So: **the representation change is not taken now.** It is the fallback, it is
 now priced, and the gate is fixed here, before the measurement, so a number

@@ -27,8 +27,17 @@ carries and the handed one is recorded beside it as withdrawn.
 **Claim 1 — Ply has no early-terminating loop, and that is a cost, not a
 missing convenience.** The list surface is exactly `len`, `push`, `map`,
 `filter`, `fold` and `range` (`crates/ply-eval/src/builtins.rs`). `fold` visits
-every element. So a search, a scan or a parse written over one runs to a
-conservative bound and no-ops after its real work is finished.
+every element.
+
+> **The enumeration in Claim 1 is a snapshot and has moved twice
+> (2026-08-30).** §1 of this ADR adds `iterate` to it, which is the whole point
+> of the document and is said below; `docs/adr/0027-a-list-index.md` has since
+> added `list_at`. The claim the sentence supports — that
+> `fold` visits every element and that this was a cost — is unaffected, and is
+> the reason the sentence is annotated rather than rewritten.
+
+So a search, a scan or a parse written over one runs to a conservative bound and
+no-ops after its real work is finished.
 
 **Claim 2 — the call ceiling has leaked out of the interpreter and into a
 public API.** `crates/ply-std/ply/http.ply`'s `Limits` record declared

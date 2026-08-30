@@ -1313,6 +1313,17 @@ impl Walk<'_, '_> {
                 Cause::MapEntry,
                 "`map_get` answers a clone the map still holds",
             )),
+            // The same fact as `map_get`'s, over a list. `list_at` answers a
+            // fresh `Some` around an element the list still holds, and
+            // `NodeKind::Match` binds an arm's binders to *the scrutinee's*
+            // owner — so the element reaches `push` under this verdict and not
+            // under the `Some`'s. Falling through to `_ => Owner::Fresh` would
+            // have `ply review` report an in-place append over a list every
+            // element of which is shared.
+            Builtin::ListAt => Owner::Blocked(Why::new(
+                Cause::Element,
+                "`list_at` answers a clone the list still holds",
+            )),
             Builtin::Fold => Owner::Unknown(Why::new(
                 Cause::Call,
                 "`fold` answers whatever its callback answered",

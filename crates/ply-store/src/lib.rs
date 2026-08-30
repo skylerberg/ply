@@ -87,7 +87,13 @@ pub use schema::fingerprint as schema_fingerprint;
 /// "recursion limit", which is what a consumer classifying on that string
 /// would have keyed on. A cached `Pass` written before this is a claim about a
 /// program in which `iterate` meant nothing.
-pub const RUNTIME_VERSION: &str = "0.12.0";
+/// 0.13.0 adds `list_at`, the list index. The hazard here is the opposite of a
+/// moved hash: `fn f(xs: List<Int>) -> Option<Int> = list_at(xs, 0)` normalizes
+/// to the same bytes before and after — a builtin call is `tag::FREE` plus a
+/// name, which is nothing but the name — and means `E0101 UNKNOWN_NAME` before
+/// and a value after. A cached `Pass` under that hash is a claim about the
+/// program in which the name meant nothing.
+pub const RUNTIME_VERSION: &str = "0.13.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -127,7 +133,15 @@ pub const RUNTIME_VERSION: &str = "0.12.0";
 /// now split on an `Iter`, because `prelude::ADTS` is what tells it the
 /// declaration is complete. A cached interface written before this is an
 /// interface for a program this front end reads differently.
-pub const FRONTEND_VERSION: &str = "0.16.0";
+/// 0.17.0 adds the scheme for `list_at`. It declares no type, so there is no
+/// `E0105` story as 0.16.0 had; what changes is that one bare name gains a
+/// stored type where it was unresolved, and a definition that calls it gains an
+/// interface where it used to have a diagnostic. Its hash does not move — a
+/// builtin call contributes no dependency, which
+/// `ply_hash::tests::builtins_and_unknown_names_are_not_dependencies` pins — so
+/// the cached interface under it is a stale entry rather than an unreachable
+/// one, and only this bump discards it.
+pub const FRONTEND_VERSION: &str = "0.17.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///
@@ -143,7 +157,18 @@ pub const FRONTEND_VERSION: &str = "0.16.0";
 /// 0.5.0 is `law/host`: a new discharge mode, with a new ceiling — `property`,
 /// structurally, because the static tier and the finite enumeration are both
 /// skipped for a body whose row is non-empty — and a new unattempted reason.
-pub const PROVER_VERSION: &str = "0.5.0";
+/// 0.6.0 puts `list_at` into `TOTAL_BUILTINS`, which is a change to the
+/// fragment: a call to it is now a value, so a term that contains one can be a
+/// value and an obligation over it can close where it used to be
+/// `Reason::Open`. No *existing* obligation changes its answer — an obligation
+/// mentioning the name did not check at all before this. **The change is also
+/// currently unobservable**: nothing over a `List` reaches the static tier at
+/// all, so no tier moves either way (ADR 0027 §2). Bumped anyway, because the
+/// rule for this constant is "any change to the fragment" and a bump that
+/// re-attempts obligations and re-runs no test costs a discharge and nothing
+/// else — and because a decision recorded is better than a side effect
+/// discovered.
+pub const PROVER_VERSION: &str = "0.6.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
 ///
