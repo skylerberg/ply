@@ -535,9 +535,10 @@ pub struct DbOptions {
     #[arg(long = "db-statement-cache", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
     pub statement_cache: Option<u32>,
 
-    /// `<module>.<fn>` — a nullary pure function returning a `Schema`, diffed
-    /// against the live database at bind time so a mismatch is `E0435` before
-    /// anything runs rather than `E0433` at the first statement.
+    /// `<module>.<fn>` — a nullary pure function returning a `Schema`, evaluated
+    /// at start-up for its table and column counts. Nothing compares it to the
+    /// live database: a mismatch is `E0433` at prepare time, per statement, on
+    /// first execution. `ply hosts` prints this `declared`, never `verified`.
     #[arg(long = "db-schema", value_name = "MODULE.FN", requires = "host")]
     pub schema: Option<String>,
 }
