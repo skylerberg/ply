@@ -20,6 +20,10 @@ it plainly.
 - [Where this is not competitive](#where-this-is-not-competitive)
 - [What is missing](#what-is-missing)
 
+**Writing Ply?** [`docs/GUIDE.md`](docs/GUIDE.md) is the user-facing manual —
+syntax, types, effects, tests, specs, the standard library, the CLI and the
+diagnostic codes, end to end.
+
 Every number below was taken on one machine — Apple M-series, macOS 24.6.0,
 release profile, PostgreSQL 18.3. The serving numbers are one run, in
 `benches/w6-ladder.json` and `benches/w6-spike.json`, taken by `ply-corpus
