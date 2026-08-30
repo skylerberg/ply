@@ -573,7 +573,11 @@ and the diagnostic for `(A, B)` says so and tells you to write a record.
 
 ### 5.4 Lists and maps
 
-`List<a>` is an immutable sequence, written `[a, b, c]`. It is homogeneous.
+`List<a>` is an immutable sequence, written `[a, b, c]`. It is homogeneous, and
+it is indexed by **position** — `list_at(xs, i)` (§6.7). Reach for a `Map<k, v>`
+when your keys are not positions. Not for the speed: a `Map<Int, v>` used as an
+array costs within about a tenth of what the list index costs (§6.7), so the
+reason to prefer the list is that a position is what you actually have.
 
 `Map<k, v>` is an immutable sorted map. It has no literal — build it from
 `map_new()` and `map_insert`, or from `map_of_entries` over a
@@ -875,7 +879,45 @@ the two spellings are one definition with one hash. Consequences:
 ```
 
 Lists are homogeneous. `push(xs, x)` appends and returns a new list; `len`,
-`map`, `filter`, `fold` and `range` are the rest of the surface (§13).
+`list_at`, `map`, `filter`, `fold` and `range` are the rest of the surface
+(§13).
+
+A list is indexed by position, and the index is **total**: it answers rather
+than raises.
+
+```ply
+fn third(xs: List<Int>) -> Option<Int> = list_at(xs, 2)
+
+fn third_or_zero(xs: List<Int>) -> Int =
+  match list_at(xs, 2) { Some(v) -> v, None -> 0 }
+
+test "an index inside the list, and one outside it" {
+  assert_eq(third([10, 20, 30]), Some(30));
+  assert_eq(third([10, 20]), None);
+  assert_eq(third_or_zero([10, 20]), 0)
+}
+```
+
+`list_at` answers `None` for an index at or past the end **and for a negative
+one**. So `list_at(xs, -1)` is `None`, not the last element — if you came from
+Python, that is the one thing to unlearn here. The last element is
+`list_at(xs, len(xs) - 1)`, and the first is `list_at(xs, 0)`; there is no
+`head` and no `last`, because those are the two lines you just read.
+
+An index costs the same whatever the position, on today's representation — a
+`List` is a contiguous array, so `list_at(xs, 0)` and `list_at(xs, 99999)` cost
+the same. That is a fact about the representation and not a promise: ADR 0025
+records the conditions under which a `List` becomes a chunked structurally
+shared vector, and an index over one of those is logarithmic rather than
+constant.
+
+**It is not, however, much faster than the `Map<Int, v>` you might reach for
+instead**, and the GUIDE says so because the number surprised the people who
+added it: about 1.7 µs a peek either way, almost all of it interpreter dispatch
+rather than container access. At 14,742 elements the two came out 2% apart,
+which is inside what that measurement could resolve; at 128,000, where it can,
+`list_at` is about a tenth ahead (ADR 0027 §7). Index a list because positions
+are what you have, not because you were promised a speed-up.
 
 `push` grows the list in place when the caller is its last owner, and copies
 otherwise. Which branch you get is decided by *position*: an accumulator written
@@ -896,6 +938,11 @@ budget like any other, so recursion is bounded: **10,000 nested calls**, after
 which the run reports a diagnostic naming the innermost frames rather than
 overflowing a stack. Write the bound into your program where a reader can see
 it, as `examples/hello.ply` does with `max_chunks()`.
+
+**Random access, when you want one element rather than all of them.**
+`list_at(xs, i)` (§13.2). There is no `for i in 0..n`; a sweep by index is
+`fold(range(0, len(xs)), ..)` with a `list_at` inside it, and the builtins below
+are what to reach for when you are visiting every element anyway.
 
 **The list builtins.** `map`, `filter`, `fold` and `range` visit every element
 and never stop early. The loop itself does not nest — one round is popped before
@@ -1765,11 +1812,38 @@ orders. `compare` is the same operation under a name you may shadow.
 | --- | --- |
 | `len<a>(xs: List<a>) -> Int` | |
 | `push<a>(xs: List<a>, x: a) -> List<a>` | appends; in place when the caller is the last owner |
+| `list_at<a>(xs: List<a>, i: Int) -> Option<a>` | `None` for a negative index or one at or past the end; `list_at(xs, len(xs) - 1)` is the last element |
 | `map<a, b \| e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e` | |
 | `filter<a \| e>(xs: List<a>, f: (a) -> Bool / e) -> List<a> / e` | |
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | visits every element |
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)`; empty when `hi <= lo` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | the early-exit loop (§6.9) |
+
+There is one index and no defaulting variant. A `list_at_or(xs, i, default)`
+was designed alongside `list_at` and refused: it has to be spelled with a
+`match` instead,
+
+```ply
+type Ctx = { toks: List<Int>, eof: Int }
+
+fn kind_at(c: Ctx, pos: Int, n: Int) -> Int =
+  match list_at(c.toks, pos + n) { Some(t) -> t, None -> c.eof }
+```
+
+and the whole case for a second builtin was that this `match` costs something on
+a hot path. It costs **0.34 µs per peek out of 1.66**, which is a 1.26× saving
+against a bar of 1.5× fixed before the number existed, so the second name was
+not worth it. ADR 0027 §7 has the measurement.
+
+`list_at` does not raise, and where that shows up is the prover. A `law` over a
+function that peeks with `list_at` runs its randomized cases and reaches
+`property`; the same law over a `bytes_at` peek hits an out-of-range case, the
+peek *raises*, and the obligation comes back `unattempted` — a gap rather than a
+weak tier (§11.3), with the definition reported as covered by no claim that
+holds. Guarding the `bytes_at` gets the `property` back, and that guard is the
+wrapper `std.json` and `std.db` each write by hand. That is the whole difference
+§19.4 warns about, and `docs/adr/0027-a-list-index.md` §2 has the two laws
+side by side.
 
 ### 13.3 Maps
 
@@ -2617,7 +2691,14 @@ rather than left to be discovered.
 * An accumulator written anywhere but the last position of its enclosing
   expression copies instead of growing in place.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
-* Slices and indices are never clamped.
+* `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
+  answers `None`. The two containers are indexed by different conventions on
+  purpose; §13.2 and §13.6 say which is which, and
+  `docs/adr/0027-a-list-index.md` says why.
+* A negative list index is **absent**, not counted from the end:
+  `list_at(xs, -1)` is `None`, not the last element.
+* Slices and indices are never clamped — and a list index is not clamped either:
+  an out-of-range one is absent, not the nearest element.
 
 ---
 
@@ -2652,8 +2733,10 @@ server.
 | [`docs/ONBOARDING.md`](ONBOARDING.md) | clone to first change, every command run and its output recorded |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | how the project works on itself |
 | [`ROADMAP.md`](../ROADMAP.md) | the milestone record |
-| `docs/adr/` | 26 decision records; each section above cites the one that specifies it |
+| `docs/adr/` | 27 decision records; each section above cites the one that specifies it |
 
 The ADRs most worth reading alongside this guide are 0006 (deterministic
 simulation), 0007 (specs), 0008 (the host effect boundary), 0010 (generic
-derivation), 0017 (regions), and 0022 (the call ceiling and `iterate`).
+derivation), 0017 (regions), 0022 (the call ceiling and `iterate`), and 0027
+(the list index, why `bytes_at` raises where `list_at` does not, and the
+measurement that refused a second builtin).

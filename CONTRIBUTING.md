@@ -1321,10 +1321,25 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is **twenty-two** files, `00NN-slug.md`, with **no index** — the
-numbers are the ordering. Number yours `0027` and up, and read the open pull
+`docs/adr/` is **twenty-seven** files, `00NN-slug.md`, with **no index** — the
+numbers are the ordering. Number yours `0028` and up, and read the open pull
 requests before you pick: counting the directory is necessary and is not
 sufficient.
+
+> **Corrected by the list index, 2026-08-30 — the third time this line has gone
+> stale, which is the point the block below is making.** It read:
+>
+> > `docs/adr/` is **twenty-two** files, `00NN-slug.md`, with **no index** — the
+> > numbers are the ordering. Number yours `0027` and up, and read the open pull
+> > requests before you pick: counting the directory is necessary and is not
+> > sufficient.
+>
+> The *count* had drifted by four while the *advice* stayed right, which is the
+> more dangerous of the two failure modes: a reader who trusts "twenty-two" and
+> does not run `ls docs/adr/*.md | wc -l` picks `0023` and collides with four
+> landed ADRs. `docs/adr/0027-a-list-index.md` is this change's, so the next
+> author wants `0028` — and should still run the count rather than trust this
+> sentence, for the reason it has now been wrong three times.
 
 > **Corrected by W4 round 2, which is the case the old wording could not
 > survive.** It read:
@@ -1369,6 +1384,8 @@ re-arguable. Name the files; see the warning in the gate table above.
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
+| the `Builtin` enum in `crates/ply-eval/src/builtins.rs` | **four checks at once, by omission.** `every_builtin_is_reachable_by_the_name_it_reports`, `exactly_the_callback_builtins_are_higher_order`, `tests::every_builtin_checks_its_argument_count` and `region_kind::tests::the_callback_builtins_are_the_six_this_module_knows` all *iterate* `Builtin::all()`, so a variant left out of `all()` is never named and therefore never checked by any of them — the suite stays green over a builtin nothing has looked at. Deleting `Builtin::ListAt` from `all()` was run against the reachability test on exactly that assumption and it stayed green. `builtin_all_is_complete_and_lists_each_name_once` was written for it; it pins the whole name list, so adding a builtin means adding its name there, and that is the point rather than the cost |
+| `Builtin::arity()` | **an arity that is too *wide*, and nothing else.** ~~Nothing that a well-typed program meets~~ — corrected 2026-08-30: `builtins::call` reads `b.arity()` on every call (`builtins.rs:558`; `region_kind.rs:1086` and `value.rs:169` read it too), so an arity *narrower* than the truth reddens every test that calls the builtin, at run time. `every_builtin_checks_its_argument_count` asserts the *declared* arity is enforced, not that it is right — giving `list_at` an arity of `(2, 3)` leaves it green, because `(2, 3)` still refuses one argument and still refuses four and no well-typed call can reach the third slot. `assert` and `range` are both `(1, 2)` over schemes of 1 and 2 arguments, i.e. the table has already drifted twice in exactly that direction. Pin the argument count where it bites, which is a `ply-core` test that a call with the wrong number of arguments does not check |
 | any public signature | `CONTRACTS.md`, which no test reads |
 | `examples/desk.ply` | `examples/serve.sh`, whose `rewrite()` (`serve.sh:103-112`) matches exact source lines with `grep -qF` and aborts loudly if one is missing — that abort is deliberate and is the good case. How many lines it rewrites depends on the mode: `--memory` rewrites two (`:122` and `:125`), `--tls` rewrites one (`:127`), and a plain `--db` run rewrites none |
 

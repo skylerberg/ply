@@ -734,3 +734,65 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
         _ => None,
     }
 }
+
+/// The tier cost of a **raising** accessor, which is the argument
+/// `docs/adr/0027-a-list-index.md` §2 rests the total `list_at` on — and which
+/// that record briefly struck as wrong before an adversarial review restored it.
+///
+/// A `property` is randomized execution. An unguarded peek through a raising
+/// accessor meets an out-of-range case, *raises*, and the obligation is
+/// `Unattempted(Gap::Raised)` — `W0604`, a gap rather than a weak tier. A total
+/// index has no such case, so the same law over `list_at` reaches `property`.
+/// The two peeks are written in the same shape, in one module, so the only
+/// difference between the arms is the convention the accessor follows.
+///
+/// The `bytes_at` arm is the control: without it a `list_at` that quietly began
+/// raising would show up as a missing `property` and nothing would say why, and
+/// with it a change that made *neither* arm raise fails here rather than
+/// silently agreeing.
+///
+/// Seen to fail: making `builtins::at` raise out of range the way `bytes_at`
+/// does — `Builtin::ListAt`'s arm replaced with the `out_of_range` diagnostic —
+/// turns the first assertion red with `Unattempted(Raised { ... })`.
+#[test]
+fn a_total_index_reaches_property_where_a_raising_one_is_a_gap() {
+    let dir = project(
+        r#"
+fn peek(xs: List<Int>, i: Int) -> Int =
+  match list_at(xs, i) { Some(v) -> v, None -> 0 }
+
+fn bpeek(b: Bytes, i: Int) -> Int = bytes_at(b, i)
+
+law "a total index peeks at every index"
+  forall (xs: List<Int>, i: Int) {
+    peek(xs, i) == peek(xs, i)
+  }
+
+law "a raising index does not"
+  forall (b: Bytes, i: Int) {
+    bpeek(b, i) == bpeek(b, i)
+  }
+"#,
+    );
+    let run = Run::of(dir.path());
+    assert_eq!(
+        run.tier("a total index peeks at every index"),
+        Some(Tier::Property),
+        "an unguarded `list_at` peek must survive randomized execution: {:?}",
+        run.find("a total index peeks at every index").1
+    );
+    assert!(
+        matches!(
+            run.find("a raising index does not").1,
+            Discharge::Unattempted(Gap::Raised { .. })
+        ),
+        "the control must raise, or the arm above is not being compared with \
+         anything and this test asserts a tier rather than a difference: {:?}",
+        run.find("a raising index does not").1
+    );
+    assert_eq!(
+        run.tier("a raising index does not"),
+        None,
+        "`Unattempted` is not a tier, and a raising peek must not acquire one"
+    );
+}

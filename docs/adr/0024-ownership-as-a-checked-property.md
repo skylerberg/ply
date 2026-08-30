@@ -333,10 +333,27 @@ the sketch is here only so the shape is arguable.
   becomes correct again, and door 2 is the cheaper answer. This ADR is a bet on
   the same world ADR 0021 §2 bets on, and it fails in the same world.
 - **If indexing turns out not to matter** — if real Ply programs iterate and fold
-  and rarely index. The current `List` surface has no index at all
+  and rarely index. ~~The current `List` surface has no index at all
   (`len/push/map/filter/fold/range`), which is *weak evidence for* that and was
-  briefly mistaken for strong evidence. Designing the container around an API
+  briefly mistaken for strong evidence.~~ Designing the container around an API
   that is small because the language is young is its own version of §4's error.
+
+  > **Withdrawn (list index, 2026-08-30).** The struck sentence is quoted above
+  > rather than deleted because the *shape* of its mistake outlived its content:
+  > it read the absence of an index as evidence about programs, and it was
+  > evidence about the surface. The surface had no index because nobody had
+  > added one. `spikes/ply-parser/GAPS.md` §1 then ranked that absence **first
+  > of fifteen** language gaps — *"a `List` has no index, and on a parser that
+  > is not a bite, it is the architecture"* — and the spike's token buffer had
+  > to be a `Map<Int, Token>` because `List` was not a container it could peek
+  > into. ~~`list_at` and `list_at_or` now exist
+  > (`docs/adr/0027-a-list-index.md`),~~ — **`list_at_or` does not exist**
+  > (corrected 2026-08-30, on review of the same change): ADR 0027 §7 refused it
+  > against a gate fixed before the measurement, so the surface gained exactly
+  > one name. `list_at` exists (`docs/adr/0027-a-list-index.md`),
+  > so this bullet's *if* is once again an open question about programs rather
+  > than a fact about the builtin table, and the sentence that follows the
+  > strikethrough is the half of the bullet that was right all along.
 - **If a fourth door exists.** The three in §3 are the ones this record knows.
   An argument that finds another is the most valuable refutation of this ADR.
 

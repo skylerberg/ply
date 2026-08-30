@@ -155,6 +155,120 @@ test "an accumulator threaded through a fold" {
 }
 "#;
 
+/// A `push` onto an element read out of a list by index. The list still holds
+/// the element, so every round copies — and `costs.rs` has to say so.
+///
+/// This is the pair's third shape and it exists because `result_owner`'s
+/// fallback is `_ => Owner::Fresh`: a builtin with no case of its own is
+/// *claimed* to hand back a value nothing else holds. `map_get` has a case for
+/// exactly this reason and the list index needs the same one. Without it the
+/// checker reports an in-place append over a list every element of which is
+/// shared, which is a wrong claim rather than a wrong answer — `costs.rs` is a
+/// checker and nothing else — and it is the kind of wrong claim no corpus
+/// measurement can see.
+///
+/// `NodeKind::Match` binds an arm's binders to the **scrutinee's** owner, so
+/// whatever `list_at` is classified as is what `row` carries into the `push`.
+/// That is the route by which the verdict is observable at all: the `Some` a
+/// peek answers is fresh, and the element inside it is not.
+///
+/// **The `push` is in last position on purpose, and the first version of this
+/// program was not.** It read
+///
+/// ```ignore
+/// Some(row) -> len(push(row, i)) + touch(rows, i + 1, n),
+/// ```
+///
+/// which the *position* rule already flags — `row` is a scope binding an
+/// enclosing frame still holds — so it answered `Copies` with the reason *"the
+/// scope binding `row` is still held by an enclosing frame"* whether or not
+/// `result_owner` had a `ListAt` arm at all. Deleting the arm left this test
+/// **green**, which is the defect the arm exists to prevent, wearing this
+/// file's own clothes. Moving the `push` into `head_plus`'s tail takes the
+/// position rule out of the answer, and `assert_reason_names_the_index` below
+/// pins that the verdict arrives by the route this test claims.
+const COPIES_VIA_LIST_AT: &str = r#"
+fn head_plus(rows: List<List<Int>>, i: Int) -> List<Int> =
+  match list_at(rows, 0) { Some(row) -> push(row, i), None -> [] }
+
+fn touch(rows: List<List<Int>>, i: Int, n: Int) -> Int =
+  if i >= n { 0 } else { len(head_plus(rows, i)) + touch(rows, i + 1, n) }
+
+test "an append onto an element matched out of an Option" {
+  assert_eq(touch([[1, 2, 3]], 0, 60), 240)
+}
+"#;
+
+/// The control for both: the identical loop, the identical helper, the
+/// identical `push` in the helper's tail — over a list the round built itself
+/// rather than one read out of a container.
+///
+/// Without it, a checker that answered `Copies` at every `push` would agree
+/// with the two above and have been checked by nothing. It is written in
+/// `COPIES_VIA_LIST_AT`'s shape down to the call in a non-last position, so the
+/// only thing that differs between the pair is **where the pushed list came
+/// from** — not the nesting, and not the position rule.
+const FRESH_LIST_IN_THE_SAME_SHAPE: &str = r#"
+fn head_plus(i: Int) -> List<Int> = push(range(0, 3), i)
+
+fn touch(rows: List<List<Int>>, i: Int, n: Int) -> Int =
+  if i >= n { 0 } else { len(head_plus(i)) + touch(rows, i + 1, n) }
+
+test "an append onto a list this round built" {
+  assert_eq(touch([[1, 2, 3]], 0, 60), 240)
+}
+"#;
+
+#[test]
+fn an_append_onto_an_indexed_element_is_flagged_and_the_counters_confirm_it() {
+    let p = inline(COPIES_VIA_LIST_AT);
+    let (verdict, reason, count) = only_site(&p);
+    println!("list_at: {verdict:?} — {reason}\n  {count:?}");
+    assert_eq!(
+        count.in_place, 0,
+        "the control is not copying after all: {count:?}, so this test arms nothing"
+    );
+    assert!(
+        count.copies >= 50,
+        "the loop must actually have run: {count:?}"
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Copies,
+        "the checker claimed an in-place append onto an element `list_at` read out of a \
+         list the program still holds, and the run copied {} times — reason given: {reason}",
+        count.copies
+    );
+    assert!(
+        reason.contains("list_at"),
+        "the verdict is `Copies`, but for a reason that is not the list index's: \
+         {reason}. A `Copies` reached by the position rule is the same answer by \
+         another route, and it is green with `result_owner`'s `ListAt` arm deleted — \
+         which is exactly what this test did until the program above was rewritten"
+    );
+}
+
+#[test]
+fn the_same_loop_over_a_list_it_built_itself_is_not_flagged() {
+    let p = inline(FRESH_LIST_IN_THE_SAME_SHAPE);
+    let (verdict, reason, count) = only_site(&p);
+    println!("fresh list in the same shape: {verdict:?} — {reason}\n  {count:?}");
+    assert_eq!(
+        count.copies, 0,
+        "the control is not linear after all: {count:?}, so this test arms nothing"
+    );
+    assert!(
+        count.in_place >= 50,
+        "the loop must actually have run: {count:?}"
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Reuses,
+        "the checker called an append onto a list this round built shared, which is the \
+         false positive that would send an author to insert `copy` — reason given: {reason}"
+    );
+}
+
 #[test]
 fn a_quadratic_append_is_flagged_and_the_counters_confirm_it() {
     let p = inline(QUADRATIC);

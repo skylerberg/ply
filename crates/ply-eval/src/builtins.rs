@@ -35,6 +35,18 @@ pub enum Builtin {
     AssertEq,
     Len,
     Push,
+    /// The list index, and the whole of it.
+    ///
+    /// A negative index and one at or past the end are both `None`: absent,
+    /// never the nearest element and never counted from the end. `bytes_at`
+    /// raises instead, and the two conventions are deliberate rather than
+    /// accidental — see `docs/adr/0027-a-list-index.md`.
+    ///
+    /// A `list_at_or(xs, i, default)` was designed beside this and **refused on
+    /// its own registered gate**: it had to be 1.5× faster per peek and it
+    /// measured 1.26×, because a peek in this interpreter is ~1.7 µs of
+    /// dispatch and the `Some` it saves is a fifth of that. ADR 0027 §7.
+    ListAt,
     Map,
     Filter,
     Fold,
@@ -133,6 +145,7 @@ impl Builtin {
             "assert_eq" => Builtin::AssertEq,
             "len" => Builtin::Len,
             "push" => Builtin::Push,
+            "list_at" => Builtin::ListAt,
             "map" => Builtin::Map,
             "filter" => Builtin::Filter,
             "fold" => Builtin::Fold,
@@ -206,6 +219,7 @@ impl Builtin {
             Builtin::AssertEq => "assert_eq",
             Builtin::Len => "len",
             Builtin::Push => "push",
+            Builtin::ListAt => "list_at",
             Builtin::Map => "map",
             Builtin::Filter => "filter",
             Builtin::Fold => "fold",
@@ -307,6 +321,7 @@ impl Builtin {
             | Builtin::SecretIsEmpty => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
+            | Builtin::ListAt
             | Builtin::Map
             | Builtin::Filter
             | Builtin::StringConcat
@@ -364,6 +379,7 @@ impl Builtin {
             Builtin::AssertEq,
             Builtin::Len,
             Builtin::Push,
+            Builtin::ListAt,
             Builtin::Map,
             Builtin::Filter,
             Builtin::Fold,
@@ -573,6 +589,12 @@ pub fn call(
         },
 
         Builtin::Push => push(args, span),
+
+        Builtin::ListAt => {
+            let xs = args[0].as_list(span, "`list_at`")?;
+            let i = args[1].as_int(span, "`list_at`")?;
+            Ok(Step::Done(option(at(xs, i).cloned())))
+        }
 
         Builtin::Map => {
             let items = args[0].as_list(span, "`map`")?.clone();
@@ -1050,6 +1072,22 @@ pub fn call(
             })))
         }
     }
+}
+
+/// Where a list index becomes a position.
+///
+/// A negative index is **absent**, not counted from the end: `usize::try_from`
+/// refuses it before `get` is reached. Counting from the end reads well until an
+/// arithmetic slip turns an intended index negative, at which point the program
+/// gets an element rather than the `None` that would have named the mistake.
+///
+/// `i as usize` would answer the same thing for every input — `-1` becomes
+/// `2^64 - 1`, which `get` refuses on any list that fits in memory — and that
+/// mutant is recorded as equivalent in `crates/ply-eval/tests/list_builtins.rs`
+/// rather than as a hole, because a test written to kill it would be a test of
+/// this line's spelling.
+fn at(xs: &[Value], i: i64) -> Option<&Value> {
+    usize::try_from(i).ok().and_then(|i| xs.get(i))
 }
 
 /// `Some(v)` or `None`, the prelude's.
@@ -2882,6 +2920,109 @@ mod tests {
         for b in Builtin::all() {
             assert_eq!(Builtin::from_name(b.name()), Some(*b));
         }
+    }
+
+    /// What [`Builtin::all`] lists, pinned — because until this was written,
+    /// **nothing checked that it was complete**.
+    ///
+    /// Every other table is checked by iterating `all()`:
+    /// [`every_builtin_is_reachable_by_the_name_it_reports`],
+    /// [`exactly_the_callback_builtins_are_higher_order`],
+    /// `tests::every_builtin_checks_its_argument_count` and
+    /// `region_kind::tests::the_callback_builtins_are_the_six_this_module_knows`
+    /// all start from it. So a variant *missing* from `all()` is invisible to
+    /// all four at once: it is never named, so it is never checked, and the
+    /// suite stays green over a builtin nothing has looked at. Deleting
+    /// `Builtin::ListAt` from `all()` was run against the reachability test on
+    /// the assumption that it would go red; it stayed green, which is what this
+    /// test exists to stop being true.
+    ///
+    /// It is the same shape as
+    /// [`exactly_the_callback_builtins_are_higher_order`] and carries the same
+    /// obligation: adding a builtin means adding its name here, and that is the
+    /// point rather than the cost.
+    #[test]
+    fn builtin_all_is_complete_and_lists_each_name_once() {
+        let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
+        names.sort_unstable();
+        let mut unique = names.clone();
+        unique.dedup();
+        assert_eq!(names, unique, "`Builtin::all()` lists a builtin twice");
+        assert_eq!(
+            names,
+            [
+                "assert",
+                "assert_eq",
+                "bytes_at",
+                "bytes_concat",
+                "bytes_concat_all",
+                "bytes_ends_with",
+                "bytes_index_of",
+                "bytes_index_of_byte",
+                "bytes_index_of_from",
+                "bytes_is_utf8",
+                "bytes_len",
+                "bytes_of_string",
+                "bytes_position",
+                "bytes_scan",
+                "bytes_scan_until",
+                "bytes_slice",
+                "bytes_split",
+                "bytes_starts_with",
+                "cell_get",
+                "cell_set",
+                "compare",
+                "compare_values",
+                "decimal_div",
+                "decimal_of_float",
+                "decimal_of_int",
+                "decimal_of_string",
+                "decimal_round",
+                "decimal_to_string",
+                "filter",
+                "float_of_decimal",
+                "fold",
+                "int_of_decimal",
+                "int_to_string",
+                "iterate",
+                "len",
+                "list_at",
+                "map",
+                "map_contains",
+                "map_entries",
+                "map_fold",
+                "map_get",
+                "map_insert",
+                "map_keys",
+                "map_len",
+                "map_merge",
+                "map_new",
+                "map_of_entries",
+                "map_remove",
+                "map_values",
+                "panic",
+                "push",
+                "range",
+                "secret_is_empty",
+                "secret_of_string",
+                "secret_verify",
+                "string_concat",
+                "string_contains",
+                "string_ends_with",
+                "string_find",
+                "string_len",
+                "string_lower",
+                "string_of_bytes",
+                "string_of_bytes_lossy",
+                "string_slice",
+                "string_split",
+                "string_starts_with",
+                "string_trim",
+                "string_upper",
+            ],
+            "a builtin was added to or removed from the enum without `Builtin::all()` being \
+             updated — every table driven by `all()` silently skips it until this list agrees"
+        );
     }
 
     fn run(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
