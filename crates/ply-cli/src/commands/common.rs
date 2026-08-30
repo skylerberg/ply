@@ -246,6 +246,128 @@ pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
 
+
+/// One engine's counters, and the cycle diagnostics that had to be rescued
+/// from the reset that took them.
+pub struct Counted<T> {
+    pub answer: T,
+    pub counters: ply_eval::rc::Stats,
+    /// Which evaluator [`Counted::counters`] came from.
+    pub engine: ply_eval::Engine,
+    /// Cycles reported *before* this engine ran, drained so that the reset
+    /// could not discard them. Empty except under `--engine both`.
+    pub carried_cycles: Vec<Diagnostic>,
+}
+
+/// What the reference-counting pass and the evaluator counted over one run.
+///
+/// ADR 0020 §9 recorded *"No deterministic counter turned out to exist — `ply
+/// run --json` reports no step, call or allocation count — so wall clock was
+/// unavoidable"*. [`ply_eval::rc::Stats`] had counted all of this since ADR
+/// 0017 §4 and was read by three test files and nothing else. This is its CLI
+/// surface, so that a claim about reuse can be a count instead of a clock.
+///
+/// **Whose number each one is**, because they are not all the runtime's:
+/// `dup_*` and `drop_*` are bumped by the *lowering pass* (`code.rs`'s
+/// `use_of`, `declare` and `released`), which only the machine runs — so under
+/// `--engine treewalk` they are zero and `elided` is `null`, and that is a true
+/// report rather than a missing one. `updates*`, `takes_*` and `cycles` are
+/// bumped by the evaluator as it runs.
+///
+/// `engine` names which evaluator produced them. It is not decoration: under
+/// `--engine both` the program is evaluated twice and a pooled figure would be
+/// two runs added together, so the counters are taken from the machine alone
+/// and this says so.
+///
+/// **The scope of `updates`.** `builtins.rs:460` and `:472` are the only two
+/// `rc::note_update` call sites in the tree, so `updates` counts `push` on a
+/// `List` and nothing else. `map_insert` is the same kind of operation and is
+/// not counted. See the correction on `Stats::updates`' own doc comment.
+///
+/// `in_place` and `elided` are `null` rather than `0.0` when their denominator
+/// is zero, following `Stats::elided`'s reasoning: a program that updated
+/// nothing has not failed to reuse anything, and a percentage would be a lie.
+///
+/// **`in_place` is `null` under `--engine treewalk` for a second reason**, and
+/// it is the same one that makes `elided` null there: the number would not be
+/// about the program. `interp.rs` calls nothing in `ply_eval::rc` — no `carry`,
+/// no `Env::take_unique` — so it never moves a value out of a scope, and every
+/// `push` whose list is read from a binding copies. The linear and the
+/// quadratic program of `tests/refcount_counters.rs` read 0.995 and 0.0 on the
+/// machine and **both read 0.0** on the tree-walker, so a reader comparing them
+/// there learns nothing and a reader who did not notice the engine learns
+/// something false. `updates` and `updates_in_place` stay: those are counts of
+/// what happened, not a claim about reuse.
+///
+/// Whole-run on the `ply run` path, and checked rather than assumed:
+/// `rc::COUNTERS` is thread-local, and Ply's own `spawn` is a cooperative task
+/// in `sched.rs`'s `Vec<Task>` rather than an OS thread, so every Ply
+/// expression a `ply run` evaluates runs on the machine's own thread. `ply
+/// test` is a different matter and deliberately has no counter surface: its
+/// workers are threads and a pooled figure there would be a function of the
+/// scheduler.
+pub fn counters_json(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> Value {
+    json!({
+        "engine": engine.as_str(),
+        "updates": stats.updates,
+        "updates_in_place": stats.updates_in_place,
+        "in_place": engine_in_place(stats, engine),
+        "takes_attempted": stats.takes_attempted,
+        "takes_moved": stats.takes_moved,
+        "dup_sites": stats.dup_sites,
+        "dup_emitted": stats.dup_emitted,
+        "drop_sites": stats.drop_sites,
+        "drop_emitted": stats.drop_emitted,
+        "elided": stats.elided(),
+        "cycles": stats.cycles,
+    })
+}
+
+/// The one-line human projection of [`counters_json`].
+///
+/// Printed beside the handshakes because it answers the same kind of question:
+/// what did this run actually do. `in_place` leads because it is the one an
+/// author can act on: it is the share of container updates the machine
+/// performed without copying.
+pub fn counters_line(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> String {
+    let pct = |v: Option<f64>| match v {
+        Some(v) => format!("{:.1}%", v * 100.0),
+        None => "n/a".to_string(),
+    };
+    format!(
+        "counters    {} · in place {} of {} ({}) · moved {} of {} · elided {}",
+        engine.as_str(),
+        stats.updates_in_place,
+        stats.updates,
+        pct(engine_in_place(stats, engine)),
+        stats.takes_moved,
+        stats.takes_attempted,
+        pct(stats.elided()),
+    )
+}
+
+/// [`ply_eval::rc::Stats::in_place`] where it says something about the program,
+/// and `None` where it says something about the evaluator. See
+/// [`counters_json`].
+fn engine_in_place(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> Option<f64> {
+    match engine {
+        ply_eval::Engine::Treewalk => None,
+        ply_eval::Engine::Machine => stats.in_place(),
+    }
+}
+
+/// Which evaluator's counters a single-engine run produced.
+///
+/// `EngineChoice::Both` has no answer here and is refused rather than guessed:
+/// `run.rs` reports `null` for that case, because the two engines do not count
+/// the same thing and their sum is not a figure about either.
+pub fn counted_engine(choice: ply_eval::EngineChoice) -> ply_eval::Engine {
+    match choice {
+        ply_eval::EngineChoice::Treewalk => ply_eval::Engine::Treewalk,
+        _ => ply_eval::Engine::Machine,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
