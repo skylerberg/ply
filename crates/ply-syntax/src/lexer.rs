@@ -125,6 +125,12 @@ pub enum TokenKind {
     Pipe,
     PipePipe,
 
+    /// `e?` — the postfix try operator (GUIDE §6.10). Added by
+    /// `docs/adr/0027-the-question-mark-operator.md`; no `.ply` file in the
+    /// tree contained a `?` outside a string or a comment before it, so the
+    /// token is strictly additive and no existing file tokenizes differently.
+    Question,
+
     Eof,
 }
 
@@ -178,6 +184,7 @@ impl TokenKind {
             TokenKind::AmpAmp => "&&",
             TokenKind::Pipe => "|",
             TokenKind::PipePipe => "||",
+            TokenKind::Question => "?",
             TokenKind::Ident(_)
             | TokenKind::Int(_)
             | TokenKind::Float(_)
@@ -774,6 +781,7 @@ impl<'a> Lexer<'a> {
             '*' => TokenKind::Star,
             '/' => TokenKind::Slash,
             '%' => TokenKind::Percent,
+            '?' => TokenKind::Question,
             '&' => {
                 if self.eat('&') {
                     TokenKind::AmpAmp

@@ -658,9 +658,31 @@ compared function-for-function either.
 - **§12 stops being free.** `GAPS.md` §12 records that error accumulation cost
   nothing *because a lexer never fails* — it answers with tokens beside
   diagnostics. A parser with error recovery does fail, and `json.ply` is the
-  preview: 57 of 129 functions returning `Result`, no `?`, no do-notation,
-  hand-written `decode_map`/`decode_and_then`, and one number literal split
-  across seven functions purely to bind an `Ok`.
+  preview: 57 of 129 functions returning `Result`, and hand-written
+  `decode_map`/`decode_and_then`.
+
+  > **The rest of this bullet is withdrawn.** It read:
+  >
+  > > … 57 of 129 functions returning `Result`, **no `?`, no do-notation**,
+  > > hand-written `decode_map`/`decode_and_then`, and **one number literal
+  > > split across seven functions purely to bind an `Ok`**.
+  >
+  > Two things. **`?` exists** as of `docs/adr/0027`, and `json.ply` now uses it
+  > at 7 sites; do-notation still does not exist and `?` is not it — `?` is
+  > sugar the parser expands into the `match` this file already wrote.
+  >
+  > And **the seven-function number chain has no `Ok` bind in it**. Checked
+  > function by function during that work: not one of `number`,
+  > `number_fraction`, `number_fraction_digits`, `number_exponent`,
+  > `exponent_first`, `number_exponent_digits`, `number_of` contains an
+  > `Ok`-binding arm or an `Err` rethrow. Each ends in a tail call inside a
+  > branch, because a check that fails must answer `Err` *there* while a check
+  > that passes carries on, and Ply has no early `return` with which to write
+  > that in one function. `?` collapses none of it, and the seven are unchanged
+  > by the conversion. The claim came from `spikes/ply-lexer/GAPS.md` §12, which
+  > is corrected in place for the same reason. **What the chain is evidence for
+  > is the absence of `return`, not the absence of `?`** — which matters to this
+  > ADR, because a self-hosted parser inherits it.
 - **§10 (the `List` surface)** starts to bite: list patterns, argument lists and
   match arms want index, `nth` and reverse, and there are none.
 

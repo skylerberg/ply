@@ -639,15 +639,43 @@ That maps onto Ply with no friction at all — the diagnostics are just a second
 list in the fold state, and there is no `Result` anywhere in `lexer.ply`.
 
 So the thing I was told to watch for did not bite **here**. It would bite a
-parser. In `std.json`, **58 of 129** `fn` definitions return a `Result<..>`
-(45%, counted by regex over the `fn NAME .. -> TYPE` headers, so treat it as
-close rather than exact); there is no `?` and no do-notation, so the module
-hand-writes `decode_map` and `decode_and_then` (`json.ply:99-112`); and one
-number literal is split across **seven** functions — `number`,
-`number_fraction`, `number_fraction_digits`, `number_exponent`,
-`exponent_first`, `number_exponent_digits`, `number_of` (`json.ply:450-511`) —
-purely to bind an `Ok` and carry on. A lexer is the one front-end phase that
-dodges this.
+parser. In `std.json`, **57 of 129** `fn` definitions return a `Result<..>`, and
+the module hand-writes `decode_map` and `decode_and_then` (`json.ply:99-112`).
+There was no `?` when this was written; there is one now (`docs/adr/0027`), and
+`json.ply` uses it at 7 sites. There is still no do-notation. A lexer is the one
+front-end phase that dodges any of this.
+
+> **Two sentences of this paragraph were wrong and are withdrawn.** It read:
+>
+> > In `std.json`, **58 of 129** `fn` definitions return a `Result<..>` (45%,
+> > counted by regex over the `fn NAME .. -> TYPE` headers, so treat it as close
+> > rather than exact); … and one number literal is split across **seven**
+> > functions — `number`, `number_fraction`, `number_fraction_digits`,
+> > `number_exponent`, `exponent_first`, `number_exponent_digits`, `number_of`
+> > (`json.ply:450-511`) — **purely to bind an `Ok` and carry on**.
+>
+> **The count is 57, not 58.** Re-derived twice, by two instruments, during the
+> `?` work (`docs/adr/0027`): 129 `fn` in the file, **57** returning `Result`, 2
+> returning `Option`. The hedge — "close rather than exact" — is what was off;
+> the number it hedged is available exactly. 57 is also what the brief for that
+> work and `docs/adr/0020` §5.2 already said.
+>
+> **And the seven-function chain contains no `Ok` bind at all.** Not one of
+> `number`, `number_fraction`, `number_fraction_digits`, `number_exponent`,
+> `exponent_first`, `number_exponent_digits` or `number_of` has an `Ok`-binding
+> arm or an `Err` rethrow. Every one of them ends in a **tail call inside a
+> branch**, because a check that fails must answer `Err` *there* and a check
+> that passes must carry on — and Ply has no early `return` with which to write
+> that in one function. `number_of`'s only `match` is on an `Option` whose
+> `None` maps to an `Err`, which is a mapping and not a bind.
+>
+> So the chain is split by the absence of an early **`return`**, not by the
+> absence of `?`, and `?` collapses **none** of it: the seven functions are
+> unchanged by the conversion in `docs/adr/0027`, which converted 7 sites
+> elsewhere in `json.ply`. The honest statement of `json.ply`'s cost is 7
+> convertible sites, 2 `Ok`-first combinators `ply-derive` depends on, 4 sites
+> that map their error and which `?` cannot express, and a codec half written
+> inside `decode:` lambdas where `?` is refused.
 
 ---
 

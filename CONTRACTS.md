@@ -8107,3 +8107,146 @@ branch's compiler with the **base** `http.ply` embedded hashes the base corpus t
 > *(Round 2: "as above" in that last sentence points at the paragraph as it stood
 > then — `chunk_trailers` alone, 40 of 206. The paragraph now reads 47 of 206,
 > because three more definitions were converted afterwards.)*
+
+## W4 — the `?` operator
+
+Full argument: `docs/adr/0027-the-question-mark-operator.md`. User-facing
+surface: GUIDE §6.10.
+
+### `ply-syntax` — landed
+
+```
+postfix      := primary { "(" args ")" | "." ident | "." op resource args | "?" }
+```
+
+`?` is a new token (`TokenKind::Question`) in the **tightest** precedence tier,
+beside `f(x)` and `r.field`, so `f(x)?.g` is `(f(x)?).g`, `-x?` is `-(x?)` and
+`a == b?` is `a == (b?)`. Ply has no ternary, so nothing else can claim the
+token, and **no `.ply` file in the tree contained a `?` outside a string or a
+comment** before this change — the lexical addition changes no existing file's
+token stream.
+
+```rust
+pub enum ExprKind {
+    // ...
+    Try { operand: Box<Expr> },
+}
+```
+
+**Parse-time only, exactly as `RecordUpdate` is.** `parse_module` runs
+`effect_set::expand`, then `record_update::expand`, then `try_op::expand`, and an
+unexpanded `ExprKind::Try` never escapes. `parse_expr` runs `expand_bare`, where
+every `?` refuses because there is no enclosing `fn` to read a return type off.
+
+**The pass order is load-bearing.** `record_update` reads written `let x: T`
+annotations to find a base's field list; a `?` expanded first would already have
+turned `let x: T = e?;` into an `Ok(x)` arm binder, which `bind_pattern` binds
+untyped, and a `{..x, f: 1}` after it would become a spurious `E0116`.
+
+The canonical expansion, **failure arm first**:
+
+```text
+region  C[e?]              =>  match e { Err(er) -> Err(er), Ok(x) -> C[x] }
+                               match e { None    -> None,    Some(x) -> C[x] }
+{ s..; let p = e?; rest }  =>  { s..; match e { Err(er) -> Err(er),
+                                                Ok(p)   -> { rest } } }
+```
+
+- **Failure first is measured, not chosen.** `normalize.rs` writes arms in source
+  order, so this parameter decides whether converting the corpus moves 129 hashes
+  or zero. The corpus writes the failure arm first **129 times to 3** for
+  `Result` and **11 to 6** for `Option`. One rule for both.
+- **The `let`-pattern case is required, not a convenience.** The general rule
+  would emit `Ok(t) -> { let p = t; rest }`, a different definition with a
+  different hash.
+- **Synthesized binders are `?0`, `?1`, …** — a `?` cannot occur in an
+  identifier, which is what `ModuleName::qualify` relies on for the same reason.
+  A binder named `t` would capture a `t` the author wrote in the expression it
+  wraps. Names are erased by de Bruijn levelling, so the counter costs no hash.
+- **The mode is the enclosing `fn`'s written return type**, followed through this
+  module's own `type` aliases to a head constructor, and no further — the ADR
+  0002 gate-1 restriction `record_update` and `effect set` both take.
+- **Position:** from the region root down to the `?`, every step unconditional
+  and everything evaluated before it `ply_syntax::ast::is_pure`. That predicate
+  **moved here from `ply-hash`'s `normalize.rs`** so that `?`'s safety rule and
+  `commutable_run`'s reordering rule are one implementation. The move was free:
+  `crates/ply-hash/tests/map.rs a_map_body_normalizes_to_a_pinned_hash` is
+  unmoved.
+
+### `ply-hash` — landed
+
+**Nothing.** No new tag, no encoding change, **no `FRONTEND_VERSION` and no
+`RUNTIME_VERSION` bump**. `e?` and the `match` it stands for are one definition
+with one `DefHash` (`crates/ply-hash/tests/audit.rs try_hashes_as_its_longhand`,
+which carries a reversed longhand and an `assert_ne!` so the pair cannot pass
+vacuously).
+
+ADR 0023's mixed-length field names have **no analogue here**: they exist because
+record-update copies are *sorted*, and match arms are not. What is pinned instead
+is that the emitted order is the corpus's and that reversing it is visible.
+
+### `ply-eval` and the machine — landed
+
+**Nothing.** Both evaluators have evaluated `Match` since W1, so `--engine both`
+compares two engines running a tree a human could have typed. There is no new
+node to disagree about, no unwind, no frame kind, and nothing to get wrong at a
+`handle` boundary. `interp.rs` and `code.rs` carry `unreachable!` arms; the
+defensive walks (`code.rs::barrier_binders`, `region_kind.rs`,
+`differential.rs`, `engine.rs`, `retarget.rs`, `prove/context.rs`) carry
+one-line recursion; `ply-prove`'s `lower.rs` records `Blocker::UnexpandedSugar`,
+sharing `RecordUpdate`'s, because a prover's safe answer is never a term it
+guessed.
+
+**Effect rows are untouched by construction.** The pass emits a `match` and two
+constructor applications, all pure, so the row of `C[e?]` is the row of the
+longhand. There is no row rule for `?` because there is no `?` after the parser
+(`crates/ply-core/tests/try_op.rs a_try_adds_nothing_to_the_row`).
+
+### New diagnostic codes — landed
+
+| code | constant | when | whose fault |
+| --- | --- | --- | --- |
+| E0118 | `TRY_SCOPE` | the enclosing `fn` has no return type this file can read as `Result` or `Option`: no `->`, another head, a type parameter, a generic alias, a cross-module name, a `test`/`law`/spec, a lambda, a `handle` clause or body, a `with_cell`/`with_region`/`simulate`, or a module that declares — or imports unqualified — its own `Ok`/`Err`/`Some`/`None` | the program's |
+| E0119 | `TRY_POSITION` | the `?`'s early exit would change what runs — something conditional between it and the region root, or something impure evaluated before it — or would discard a written `let` annotation | the program's |
+
+**No third code and no typing rule.** By the time inference runs, `e?` *is* the
+`match`, so a `Result<_, E1>` bound in a `-> Result<_, E2>` function is an
+ordinary `E0201`; `?` performs **no error conversion**, there being no `From` in
+Ply, and the eight corpus sites that map their error keep their `match`.
+
+Fixtures: `tests/fixtures/try_scope.ply`, `tests/fixtures/try_position.ply`,
+checked by `crates/ply-core/tests/try_op.rs
+the_fixtures_produce_the_codes_they_are_named_for`.
+
+### The conversion — landed
+
+139 sites: `db.ply` 128 (119 `Result` + 9 `Option`), `json.ply` 7, `http.ply` 1,
+`config.ply` 1, `router.ply` 1, `desk.ply` 1.
+
+| corpus | entries | moved |
+| --- | ---: | ---: |
+| `crates/ply-std/ply/` | 941 definitions + 270 tests | **0** |
+| `examples/` | 1,067 definitions + 362 tests | **0** |
+
+Taken twice, byte-identical; binary verified fresh by
+`.github/binary-is-current.sh`, which covers `.rs`, `.ply` and dep-info — the
+`.rs`-only shape of that check is what the record-update entry above records
+being caught by. `ply test --engine both` is `0 failed, 176 passed` over
+`crates/ply-std/ply` and `0 failed, 186 passed` over `examples`, on both sides.
+
+**Zero moved is a claim about the gate as much as about the change.** With the
+two arms emitted in the other order the same conversion moves **392 of 1,211**
+entries in `crates/ply-std/ply/`.
+
+**One site refused and was reverted.** `examples/desk.ply`'s `decoded` writes the
+canonical shape *inside a `fold` lambda*, and `?` refuses a lambda (`E0118`). The
+design phase recorded "0 of the 129 sites sit under a lambda"; it is **1**, and
+that is a measured cost of the restriction rather than a hole in it.
+
+**`ply-derive` emits no `?`, deliberately.** `crates/ply-derive/src/emit.rs`
+keeps emitting `json::decode_and_then(...)` and hand-written `Err(de) -> Err(de)`
+matches, so `generated_form_audit.rs` and `derivation_determinism_audit.rs` keep
+their pinned text verbatim. Putting `?` into generated code *would* be a
+`FRONTEND_VERSION` bump — gate 1 keys on raw file content, so a file whose bytes
+did not change would reuse a stale generated definition. `std.json`'s
+`decode_and_then` and `decode_map` therefore stay `pub` and unconverted.
