@@ -1244,9 +1244,24 @@ reader does not have to take it on trust:
 > prediction is 4x against 2x and load noise multiplies both columns roughly
 > equally, so the ratio is the load-robust statistic.
 
-No deterministic counter turned out to exist — `ply run --json` reports no step,
+~~No deterministic counter turned out to exist — `ply run --json` reports no step,
 call or allocation count — so wall clock was unavoidable and user CPU was used
-as the robust half. No run was discarded after the fact.
+as the robust half.~~ No run was discarded after the fact.
+
+> **Corrected (2026-08-30): one existed, and nothing outside `ply-eval` could
+> read it.** `ply_eval::rc::Stats` had counted `updates` against
+> `updates_in_place`, `dup_sites` against `dup_emitted`, and `takes_attempted`
+> against `takes_moved` since the reference-counting pass was written. It was
+> read by three test files and had **no CLI surface at all**, so this sentence
+> was true of the command and false of the codebase — and the consequence is the
+> one §6.1 now carries: a document that needed a count timed something instead,
+> at load 17–88, and its absolutes did not reproduce.
+>
+> `ply run --json` now reports them. `in_place` is **`null` on the tree-walker**
+> rather than `0.0`, because that engine runs no reference counting at all, and
+> a zero there reads as a fact about the program when it is a fact about the
+> engine. Under `--engine both` the whole object is `null`: the two engines do
+> not count the same thing, and their sum is a figure about neither.
 
 Commands, all from the worktree root:
 
