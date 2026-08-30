@@ -999,9 +999,10 @@ impl<'a> Interp<'a> {
   each costs **depth 1** however many rounds it runs, on both engines. A driver
   that nested would put the two engines' counts back into disagreement, which is
   the defect ADR 0005 §7.1 removed tail-call elision to prevent. ADR 0022.
-- Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `map`, `filter`, `fold`,
-  `iterate`, `range`, `int_to_string`, `string_concat`, `cell_get`, `cell_set`,
-  `panic`, plus the `Bytes` and text builtins in the host-boundary section below.
+- Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `list_at`, `map`,
+  `filter`, `fold`, `iterate`, `range`, `int_to_string`, `string_concat`,
+  `cell_get`, `cell_set`, `panic`, plus the `Bytes` and text builtins in the
+  host-boundary section below.
   A failing `assert`/`assert_eq` is `ASSERTION_FAILED` with a structured
   expected/actual message.
 - An `Interp` must be usable from a worker thread. If `Value` holds `Rc`, keep
@@ -4269,6 +4270,24 @@ The prover treats every one of these as opaque; the total ones are in
 `string_slice`, `string_split`, `string_find`, `string_of_bytes` — deliberately
 are not.
 
+The list index added by `docs/adr/0027-a-list-index.md` does **not** make it
+seven. `list_at` refuses no index — it answers `None` — so it is in
+`TOTAL_BUILTINS`. That `bytes_at` raises and `list_at` does not is the one place
+two containers in this language are indexed by different conventions, and ADR
+0027 §2 is the argument for it — the short version being that ~~a raising list
+index would be excluded from `TOTAL_BUILTINS`, which would block a `property`
+over any function that peeks, at every peek.~~
+
+**The outcome in that struck clause is right and its mechanism is wrong
+(corrected 2026-08-30).** The `TOTAL_BUILTINS` exclusion costs `proved`, and on
+a `List` that is currently a cost of nothing, because no `List`-valued term
+reaches the decidable fragment. What actually blocks a `property` over an
+unguarded raising peek is the *run*: the randomized case is out of range, the
+term raises, and the obligation is `unattempted` (`W0604`) rather than
+`property`. So the sentence keeps its conclusion — a raising list index would
+cost a `property` at every unguarded peek, and `list_at` does not — and drops
+`TOTAL_BUILTINS` from the reason. ADR 0027 §2 carries the two-law demonstration.
+
 ### `ply hosts`
 
 ```
@@ -4661,6 +4680,38 @@ All pure except `map_fold`; every `k` carries `derivable(ord, k)`.
 | `map_of_entries` | `(List<{key: k, value: v}>) -> Map<k, v>` |
 | `map_merge` | `(Map<k, v>, Map<k, v>) -> Map<k, v>` |
 | `map_fold` | `(Map<k, v>, b, (b, k, v) -> b / e) -> b / e` |
+
+### `List`
+
+`Value::List` is `Arc<Vec<Value>>`, so a position is a bounds-checked load and a
+clone of the element. All pure, all total.
+
+| builtin | type |
+| --- | --- |
+| `len` | `(List<a>) -> Int` |
+| `push` | `(List<a>, a) -> List<a>` |
+| `list_at` | `(List<a>, Int) -> Option<a>` |
+| `map` | `(List<a>, (a) -> b / e) -> List<b> / e` |
+| `filter` | `(List<a>, (a) -> Bool / e) -> List<a> / e` |
+| `fold` | `(List<a>, b, (b, a) -> b / e) -> b / e` |
+| `range` | `(Int, Int) -> List<Int>` |
+
+`list_at` answers `None` for a negative index and for one at or past the end. It
+does not clamp and it does not count from the end, so `list_at(xs, -1)` is
+`None` rather than the last element — which is `list_at(xs, len(xs) - 1)`. There
+is no `head` and no `last`: one primitive spells both, and `len` on an
+`Arc<Vec>` is O(1) so the second is not a traversal. ADR 0027.
+
+**There is deliberately no `list_at_or(xs, i, default)`**, and the reason is a
+number rather than a taste. It was designed beside `list_at` under a gate fixed
+before the measurement — it had to be 1.5× faster per peek to earn a second
+name — and it measured **1.26×** at 14,742 elements. A peek in this evaluator is
+~1.7 µs and is almost entirely interpreter dispatch; the `Some` allocation and
+the `match` that `_or` removes are 0.34 µs of it. The same measurement prices
+`map_get` at ~1.7 µs, i.e. **within about a tenth of `list_at`** — so a
+`Map<Int, v>` used as an array is not the cost it looks like either. (2% apart
+at 14,742 elements, which is inside that rig's resolution; 1.10× at 128,000,
+where it resolves. ADR 0027 §7.)
 
 The list side's early-exiting driver, which takes no list at all:
 

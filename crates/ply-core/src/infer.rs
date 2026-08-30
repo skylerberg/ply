@@ -710,6 +710,21 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
+            // The list index, in the shape `json.ply:800` and `db.ply:604`
+            // already recurse by hand. Total — it refuses no index — which is
+            // what puts it in `TOTAL_BUILTINS` where a raising index could not
+            // go. `bytes_at` raises; ADR 0027 §2 is why the two containers are
+            // indexed by different conventions.
+            (
+                "list_at",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![Type::list(ta.clone()), Type::int()],
+                    Type::option(ta.clone()),
+                    Row::empty(),
+                ),
+            ),
             (
                 "map",
                 poly(

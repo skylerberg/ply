@@ -455,13 +455,25 @@ one, confirmed; **closed by W4**, see `docs/adr/0023-record-update.md`, and the
 withdrawn there — it is a type error, and the surviving hazard is a mispairing),
 §7 (no `byte_of_int`; the 1,024-character table appears in
 `json.ply:627` and `lexer.ply:29` for the identical reason), §9 (no tuples),
-§10 (the `List` surface is `len/push/map/filter/fold/range` — confirmed against
-the builtin table: no index, concat, reverse, prepend or sort), §11
-(`bytes_at_or`, still **not measured**, as `GAPS.md` says).
+§10 (~~the `List` surface is `len/push/map/filter/fold/range` — confirmed against
+the builtin table: no index, concat, reverse, prepend or sort~~ — see the
+correction below), §11 (`bytes_at_or`, still **not measured**, as `GAPS.md`
+says).
 
 §12's count was re-derived: **57 of 129** `fn` definitions in `json.ply` return a
 `Result`, against the 58 `GAPS.md` reports with an explicit "close rather than
 exact" hedge. The hedge is honest and the figure stands.
+
+> **§10's enumeration is corrected (list index, 2026-08-30).** The struck text
+> was an accurate reading of the builtin table when it was written and is
+> quoted rather than deleted for that reason. Two builtins have been added to
+> the table since: `iterate` (`docs/adr/0022-the-call-ceiling.md`) and the index
+> this paragraph says is absent — `list_at` (`docs/adr/0027-a-list-index.md`).
+> The surface is now `len/push/list_at/map/filter/fold/range/iterate`, and **"no
+> index" is the half that is now false**; concat, reverse, prepend and sort are
+> still absent. §11's `bytes_at_or` is still not measured, and ADR 0027 §8 now
+> carries a prior against it: the equivalent *list* form was measured, missed a
+> 1.5× bar at 1.26×, and was refused.
 
 ### §4.5 Five stale claims in the merged tree, all fixed while this was written
 

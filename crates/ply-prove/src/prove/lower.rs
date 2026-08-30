@@ -57,6 +57,9 @@ const MAX_TERMS: usize = 20_000;
 /// `assert`, `assert_eq` and `panic` exist to raise. Every one of those is
 /// absent, so a proof cannot rest on it terminating.
 ///
+/// `list_at` is present: an index outside the list answers `None` rather than
+/// refusing, so it has no input it declines and a call to it is a value.
+///
 /// Absent for the same reason: `bytes_at`, `bytes_slice`, `string_slice`,
 /// `string_split`, `string_find` and `string_of_bytes` all have inputs they
 /// refuse, so a call to one is not a value until its argument is known. So do
@@ -66,6 +69,17 @@ const MAX_TERMS: usize = 20_000;
 const TOTAL_BUILTINS: &[&str] = &[
     "len",
     "push",
+    // The list index. Total for the reason `map_get` is: an index outside the
+    // list is an `Option`'s `None`, never a refusal, so a call is a value
+    // whatever its arguments turn out to be.
+    //
+    // **Correct and, today, inert.** Nothing over a `List` reaches the static
+    // tier at all — `law forall (i: Int) { len([10, 20, 30]) == 3 }` is
+    // `property`, while `i + 0 == i` beside it is `proved` — so removing this
+    // entry changes no tier that can currently be written. It is here because
+    // it is true and because a fragment with a list theory would need it, and
+    // ADR 0027 §2 records it as an unarmed change rather than as a gate.
+    "list_at",
     "int_to_string",
     "string_concat",
     "bytes_len",
