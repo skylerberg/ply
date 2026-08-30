@@ -4,6 +4,7 @@ pub mod lexer;
 pub mod parser;
 mod record_update;
 pub mod resolve;
+mod try_op;
 
 #[cfg(test)]
 mod numerics;

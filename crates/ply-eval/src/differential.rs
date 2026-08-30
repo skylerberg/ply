@@ -785,6 +785,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<Diagnostic>) {
             children.extend(fields.iter().map(|(_, v)| v));
         }
         ExprKind::Field { base, .. } => children.push(base),
+        ExprKind::Try { operand } => children.push(operand),
         ExprKind::List { items } => children.extend(items),
         ExprKind::Perform { args, .. } => children.extend(args),
         ExprKind::Handle {

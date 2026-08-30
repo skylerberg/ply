@@ -797,6 +797,15 @@ impl<'a, 't> Normalizer<'a, 't> {
                 "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_record_update_survives_parse_module_anywhere_in_the_tree`"
             ),
+            // The other arm that must never guess. A tag for `?` would make
+            // `e?` and the `match` it stands for two definitions computing one
+            // value, which is the thing this file exists to prevent, and it
+            // would be a `BODY_ENCODING` change on top. Expansion is upstream so
+            // that neither is representable.
+            ExprKind::Try { .. } => unreachable!(
+                "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
+                 `no_try_survives_parse_module_anywhere_in_the_tree`"
+            ),
             ExprKind::Field { base, field } => {
                 self.tag(tag::E_FIELD);
                 self.expr(base);
@@ -1080,48 +1089,13 @@ fn pattern_binders(p: &Pattern, out: &mut FxHashSet<Symbol>) -> usize {
     })
 }
 
-/// Evaluates without calling anything and without performing anything, so it
-/// cannot diverge and cannot be observed by, or observe, its neighbours. It can
-/// still fail — on overflow, on a divisor of zero, on an unmatched scrutinee —
-/// but a failure that happens in one order happens in every order, because a
-/// block evaluates all of its `let`s regardless.
-fn is_pure(e: &Expr) -> bool {
-    grow(|| match &e.kind {
-        ExprKind::App { .. }
-        | ExprKind::Perform { .. }
-        | ExprKind::Handle { .. }
-        | ExprKind::WithCell { .. }
-        | ExprKind::WithRegion { .. }
-        | ExprKind::Simulate { .. } => false,
-        ExprKind::Lit(_) | ExprKind::Var(_) => true,
-        ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
-        ExprKind::Unary { operand, .. } => is_pure(operand),
-        ExprKind::Lambda { body, .. } => is_pure(body),
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => is_pure(cond) && is_pure(then_branch) && is_pure(else_branch),
-        ExprKind::Match { scrutinee, arms } => {
-            is_pure(scrutinee)
-                && arms
-                    .iter()
-                    .all(|a| is_pure(&a.body) && a.guard.as_ref().is_none_or(is_pure))
-        }
-        ExprKind::Block { stmts, tail } => {
-            stmts.iter().all(|s| match s {
-                Stmt::Let { value, .. } => is_pure(value),
-                Stmt::Expr(e) => is_pure(e),
-            }) && tail.as_deref().is_none_or(is_pure)
-        }
-        ExprKind::Record { fields } => fields.iter().all(|(_, v)| is_pure(v)),
-        ExprKind::RecordUpdate { base, fields } => {
-            is_pure(base) && fields.iter().all(|(_, v)| is_pure(v))
-        }
-        ExprKind::Field { base, .. } => is_pure(base),
-        ExprKind::List { items } => items.iter().all(is_pure),
-    })
-}
+// `is_pure` used to live here. It moved to `ply_syntax::ast` (reached by the
+// glob above) in ADR 0027, so that `?` expansion and `commutable_run` ask *one*
+// implementation whether an expression may be reordered rather than two that can
+// drift apart — they are the same question, and a drift would mean
+// normalization reordering something `?` refused to, or the reverse. Nothing
+// else about it changed: `crates/ply-hash/tests/map.rs`'s pinned digest is the
+// guard on the move being free.
 
 /// Deliberately blind to scope: any occurrence of the name counts, even one that
 /// a nested binder would have shadowed. Over-reporting only costs a reordering
@@ -1164,6 +1138,7 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
             mentions(base, names) || fields.iter().any(|(_, v)| mentions(v, names))
         }
         ExprKind::Field { base, .. } => mentions(base, names),
+        ExprKind::Try { operand } => mentions(operand, names),
         ExprKind::List { items } => items.iter().any(|i| mentions(i, names)),
         ExprKind::Perform { args, .. } => args.iter().any(|a| mentions(a, names)),
         ExprKind::Handle {

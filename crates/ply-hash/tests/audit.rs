@@ -1010,3 +1010,119 @@ fn changing_the_updated_field_changes_the_hash() {
         "f",
     );
 }
+
+// The `?` operator. Same shape of claim as record update, and for the same
+// reason, so its test lives here too.
+
+/// **The `?` invariant.** `e?` is not a new kind of expression; it is a way of
+/// writing the `match` the corpus hand-writes 129 times. If the two spellings
+/// hashed differently, converting a site would move its `DefHash` and every
+/// dependent's, split one value into two cache entries, and turn "the module's
+/// behaviour is unchanged" from something shown into something asserted.
+///
+/// **The arm order is what this pins, and it is measured rather than chosen.**
+/// `normalize.rs` writes match arms in source order, so an expansion emitting
+/// `Ok` first would be a *different* definition — and the corpus writes the
+/// failure arm first 129 times to 3 for `Result`, 11 to 6 for `Option`. The
+/// longhand in each pair below is written failure-first for that reason; the
+/// `assert_ne!` against the reversed longhand is what stops the pair passing
+/// vacuously under a hash that ignored arm order.
+///
+/// ADR 0023's mixed-length field names have **no analogue here** and are
+/// deliberately not imitated: they exist because record-update copies are
+/// *sorted*, and a single-letter suite cannot tell sorting by name from sorting
+/// by length. Match arms are not sorted, so what has to be shown instead is that
+/// the order is the corpus's and that reversing it is visible. Binder *names*
+/// are erased by de Bruijn levelling, which is why the sugar's synthesized `?0`
+/// can equal a longhand's `x` at all — and the longhands below use ordinary
+/// names, so a levelling that leaked a name would fail every one of them.
+#[test]
+fn try_hashes_as_its_longhand() {
+    const DECLS: &str = "type E = {msg: Int}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
+    const SIG: &str = "fn f(n: Int) -> Result<Int, E> = ";
+
+    let sugar = format!("{DECLS}{SIG}Ok(g(n)?)");
+    let longhand = format!("{DECLS}{SIG}match g(n) {{ Err(er) -> Err(er), Ok(v) -> Ok(v) }}");
+    let reversed = format!("{DECLS}{SIG}match g(n) {{ Ok(v) -> Ok(v), Err(er) -> Err(er) }}");
+    unchanged("`?` against its longhand", &sugar, &longhand, "f");
+    assert_ne!(
+        def(&sugar, "f"),
+        def(&reversed, "f"),
+        "the sugar hashed the same as the *reversed* arm order, so this test \
+         proves nothing about which order was emitted"
+    );
+
+    // The `let`-bound shape, which is what every corpus conversion is: the
+    // `let`'s own pattern becomes the success arm's binder and the `let` is gone.
+    // The general rule would emit `Ok(t) -> { let a = t; ... }`, a different
+    // definition — `a_let_bound_try_puts_its_own_pattern_on_the_success_arm` in
+    // `ply-syntax` pins the tree, and this pins that the tree is the longhand's.
+    let bound = format!("{DECLS}{SIG}{{ let a = g(n)?; let b = g(a)?; Ok(a + b) }}");
+    let bound_long = format!(
+        "{DECLS}{SIG}match g(n) {{\n\
+           Err(er) -> Err(er),\n\
+           Ok(a) -> match g(a) {{ Err(e2) -> Err(e2), Ok(b) -> Ok(a + b) }},\n\
+         }}"
+    );
+    unchanged("two `?`s in a run", &bound, &bound_long, "f");
+
+    // `db.ply:1000`, verbatim in shape: the continuation is a tail call and the
+    // expansion leaves it in tail position.
+    let tail = format!("{DECLS}{SIG}g(g(n)?)");
+    let tail_long = format!("{DECLS}{SIG}match g(n) {{ Err(er) -> Err(er), Ok(c) -> g(c) }}");
+    unchanged("`?` in a tail-call argument", &tail, &tail_long, "f");
+
+    // `Option`, whose failure arm carries no payload.
+    const OPT: &str = "fn h(n: Int) -> Option<Int> = Some(n)\n";
+    let opt = format!("{OPT}fn f(n: Int) -> Option<Int> = {{ let a = h(n)?; Some(a + 1) }}");
+    let opt_long = format!(
+        "{OPT}fn f(n: Int) -> Option<Int> = match h(n) {{ None -> None, Some(a) -> Some(a + 1) }}"
+    );
+    let opt_rev = format!(
+        "{OPT}fn f(n: Int) -> Option<Int> = match h(n) {{ Some(a) -> Some(a + 1), None -> None }}"
+    );
+    unchanged("`?` in an `Option` function", &opt, &opt_long, "f");
+    assert_ne!(
+        def(&opt, "f"),
+        def(&opt_rev, "f"),
+        "`Option`'s arm order is not pinned by this pair"
+    );
+}
+
+/// Without this the invariance above could be satisfied by a hash that ignored
+/// what the `?` was applied to.
+#[test]
+fn changing_what_a_try_unwraps_changes_the_hash() {
+    const DECLS: &str = "type E = {msg: Int}\n\
+                         fn g(n: Int) -> Result<Int, E> = Ok(n)\n\
+                         fn g2(n: Int) -> Result<Int, E> = Ok(n + 1)\n";
+    changed(
+        "which call a `?` unwraps",
+        &format!("{DECLS}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)"),
+        &format!("{DECLS}fn f(n: Int) -> Result<Int, E> = Ok(g2(n)?)"),
+        "f",
+    );
+}
+
+/// `is_pure` moved out of `normalize.rs` into `ply_syntax::ast` so that `?`
+/// expansion and `commutable_run` ask one implementation whether an expression
+/// may be reordered. This is the invariant that says the move was free: a run of
+/// pure `let`s is still written in its sorted order, so which one the author
+/// typed first is still not part of the definition's identity.
+#[test]
+fn a_run_of_pure_lets_still_commutes_after_the_predicate_moved() {
+    unchanged(
+        "two pure `let`s in either order",
+        "fn f(x: Int, y: Int) -> Int = { let a = x + 1; let b = y + 2; a + b }",
+        "fn f(x: Int, y: Int) -> Int = { let b = y + 2; let a = x + 1; a + b }",
+        "f",
+    );
+    changed(
+        "two `let`s whose values call, in either order",
+        "fn g(n: Int) -> Int = n\n\
+         fn f(x: Int, y: Int) -> Int = { let a = g(x); let b = g(y); a + b }",
+        "fn g(n: Int) -> Int = n\n\
+         fn f(x: Int, y: Int) -> Int = { let b = g(y); let a = g(x); a + b }",
+        "f",
+    );
+}

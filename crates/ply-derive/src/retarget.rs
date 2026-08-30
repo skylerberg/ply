@@ -192,6 +192,7 @@ fn expr(e: &mut Expr, span: Span) {
             expr(base, span);
             field.span = span;
         }
+        ExprKind::Try { operand } => expr(operand, span),
         ExprKind::List { items } => {
             for i in items {
                 expr(i, span);

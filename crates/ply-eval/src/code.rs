@@ -467,6 +467,13 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
              `no_record_update_survives_parse_module_anywhere_in_the_tree`"
         ),
+        // Unreachable for the same reason and with the same guard: `?` is a
+        // `match` before it leaves the parser, so the machine has no early-exit
+        // node to get wrong at a `handle` boundary.
+        ExprKind::Try { .. } => unreachable!(
+            "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
+             `no_try_survives_parse_module_anywhere_in_the_tree`"
+        ),
         ExprKind::Field { base, field } => NodeKind::Field {
             base: lower_in(base, live),
             field: field.clone(),
@@ -806,6 +813,7 @@ fn barrier_binders(e: &Expr, out: &mut Vec<Symbol>) {
             }
         }
         ExprKind::Field { base, .. } => barrier_binders(base, out),
+        ExprKind::Try { operand } => barrier_binders(operand, out),
         ExprKind::List { items } => {
             for item in items {
                 barrier_binders(item, out);
