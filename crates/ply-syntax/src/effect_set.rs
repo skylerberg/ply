@@ -491,6 +491,11 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             }
         }
         ExprKind::Field { base, .. } => walk_expr(base, f),
+        // Row expansion runs before `?` expansion too, so it walks through the
+        // sugar. A `?` carries no row of its own — it is a `match` by the time
+        // anything else looks — but its operand is an ordinary expression and
+        // can.
+        ExprKind::Try { operand } => walk_expr(operand, f),
         ExprKind::List { items } => {
             for i in items {
                 walk_expr(i, f);

@@ -492,6 +492,7 @@ fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut
                 stack.extend(fields.iter().map(|(_, v)| v));
             }
             ExprKind::Field { base, .. } => stack.push(base),
+            ExprKind::Try { operand } => stack.push(operand),
             ExprKind::List { items } => stack.extend(items),
             ExprKind::Perform { args, .. } => stack.extend(args),
             ExprKind::Handle {

@@ -496,7 +496,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let base = self.lower(base);
                 self.terms.field(base, field.name.clone())
             }
-            ExprKind::RecordUpdate { .. } => {
+            ExprKind::RecordUpdate { .. } | ExprKind::Try { .. } => {
                 self.blocked(Blocker::UnexpandedSugar);
                 self.terms.sym(None)
             }

@@ -387,7 +387,7 @@ From loosest to tightest:
 | 5 | `+` `-` | left | `Int`, `Float` or `Decimal` |
 | 6 | `*` `/` `%` | left | `Int`, `Float` or `Decimal` |
 | — | unary `-`, unary `!` | prefix | numeric / `Bool` |
-| — | `f(x)`, `r.field`, `e.op[r](x)` | postfix | |
+| — | `f(x)`, `r.field`, `e.op[r](x)`, `e?` | postfix | |
 
 Notes that matter:
 
@@ -410,8 +410,13 @@ Notes that matter:
   operator and cannot be chained: a module binder is a single name.
 * `.` is field access, unless it is followed by an operation name and then a `[`
   or `(`, in which case it is an effect perform (§7.2).
+* `?` is postfix and binds tightest, so `f(x)?.field` is `(f(x)?).field`, `-x?`
+  is `-(x?)` and `a == b?` is `a == (b?)`. It is not a ternary — Ply has no
+  `?:` — and it is not an operator on a value: it is sugar the parser expands
+  (§6.10).
 
-`,` `;` `:` `->` `|` `=` `..` `_` `[` `]` `{` `}` `(` `)` complete the token set.
+`,` `;` `:` `->` `|` `=` `..` `_` `?` `[` `]` `{` `}` `(` `)` complete the token
+set.
 
 ---
 
@@ -657,7 +662,14 @@ Iter<s, r>    = Continue(s) | Stop(r)
 
 Constructor names are *not* globally reserved, so a module may declare its own
 `Stop` — at the cost of shadowing the prelude's and losing `iterate` in that
-module.
+module. A module that declares its own `Ok`, `Err`, `Some` or `None` also loses
+`?` (§6.10) in that module, because the expansion would name its constructors
+rather than the prelude's — and so does one that *imports* any of those four
+names unqualified (`import m (Err)`), which binds them the same way. Import the
+module and write `m::Err` instead, and `?` keeps working.
+
+`?` (§6.10) binds one of `Option` or `Result` inside a function that returns the
+same one.
 
 **`Secret<a>`** is a credential. It is introduced by `secret_of_string` and
 eliminated only by `secret_verify` (a constant-time comparison answering one
@@ -973,6 +985,135 @@ fn first_gap(xs: List<Int>) -> Int =
 `fold` over `range` does in one boxed integer per byte, and they stop early.
 `examples/hello.ply` records what that was worth: 84× the header bytes cost 39×
 the time as folds and 0.95× the time as scanners.
+
+### 6.10 `?`: binding a `Result` or an `Option`
+
+`std.db`'s expression parser, before and after:
+
+```ply
+fn parse_expr_text(s: String) -> Result<Expr, DbError> =
+  match lex_all(s) {
+    Err(e) -> Err(e),
+    Ok(ts) -> match parse_or(ts) {
+      Err(e) -> Err(e),
+      Ok(c) -> if len(c.rest) == 0 { Ok(c.value) }
+               else { Err(expected("the end of the expression", c.rest)) },
+    },
+  }
+```
+
+```ply
+fn parse_expr_text(s: String) -> Result<Expr, DbError> = {
+  let ts = lex_all(s)?;
+  let c = parse_or(ts)?;
+  if len(c.rest) == 0 { Ok(c.value) }
+  else { Err(expected("the end of the expression", c.rest)) }
+}
+```
+
+Those are the **same definition**. `?` is sugar: the parser rewrites `e?` into
+
+```ply
+match e { Err(er) -> Err(er), Ok(x) -> rest }
+```
+
+failure arm first, before anything else in the compiler sees the program — so
+the two spellings have one hash, one cache entry and one set of test results.
+That is the same bargain `{..b, f: e}` takes in §6.6. Converting `std.db`,
+`std.json`, `std.http`, `std.config`, `std.router` and `examples/desk.ply` to
+`?` — 139 sites — moved **no definition hash at all**.
+
+**Which constructors it names is read off the enclosing function's written
+return type.** `-> Result<..>` gives `Ok`/`Err`; `-> Option<..>` gives
+`Some`/`None`. Expansion follows this file's own `type` aliases to get there and
+goes no further, for §6.6's reason: a meaning read across a module boundary
+could go stale in a file that never changed.
+
+```ply
+fn int_value(text: String) -> Option<Int> = {
+  let d = decimal_of_string(text)?;
+  int_of_decimal(d, Down)
+}
+```
+
+**Where you may write one**, as a rule you can apply without knowing any types:
+`?` may stand wherever nothing conditional sits between it and the value the
+function returns, and wherever everything evaluated before it is pure — a
+literal, a variable, a field read, or an operator over those. `let x = e?;`
+always qualifies, and so does a `?` in the argument of a call whose other
+arguments are pure:
+
+```ply
+fn parse_or(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+  parse_or_more(parse_and(ts)?)
+```
+
+It composes with record destructuring, which is the tidiest way to return two
+things from a function that can fail:
+
+```ply
+fn f(i: Int) -> Result<Int, E> = {
+  let {p, node} = parse_thing(i)?;
+  Ok(p + node)
+}
+```
+
+#### What `?` does not do
+
+**It converts no errors.** There is no `From` in Ply and `?` does not invent
+one, so a `Result<_, E1>` bound inside a function returning `Result<_, E2>` is
+an ordinary `E0201` — the same one, in the same place, that the `match` it
+stands for would have got. A site that maps its error keeps its `match`:
+
+```ply
+Err(e) -> Err(in_index(index, e))     // `?` cannot express this; leave it
+```
+
+**It is not a `return`.** §19.2 still holds: there is no `return` statement and
+no `break`. `?` exits the expression it is written in and nothing more. It
+cannot leave a lambda, a `handle` clause or body, a `with_cell`, a `with_region`
+or a `simulate` — every one of those is `E0118`, because none of them has a
+written return type to read the constructors off:
+
+```ply
+fn decode_all(js: List<Json>, c: JsonCodec<a>) -> Result<List<a>, DecodeError> =
+  map(js, |j: Json| (c.decode)(j)?)   // E0118: a lambda has no written return
+                                      // type; `?` needs one. Name a function.
+```
+
+**It will not move work across a branch.** `?` lifts what it unwraps to the head
+of the statement it is written in, so a `?` inside an `if` branch, a `match` arm
+or the right operand of `&&` is `E0119` unless the branch is itself in return
+position. Bind it first:
+
+```ply
+fn f(n: Int, c: Bool) -> Result<Int, E> = {
+  let y = if c { g(n)? } else { 0 };   // E0119
+  Ok(y)
+}
+
+fn f(n: Int, c: Bool) -> Result<Int, E> =
+  if c { let y = g(n)?; Ok(y) } else { Ok(0) }   // fine: the branch returns
+```
+
+**It will not run an impure expression out of order.** `g(h(x), k(x)?)` is
+`E0119` — `h(x)` is written before the `?` and the expansion would evaluate it
+after. The lift is one line: `{ let a = h(x); g(a, k(x)?) }`.
+
+**It will not leave a nested block.** `let y = { let z = f(n); g(z)? };` is
+`E0119`, because lifting `g(z)` to the head of the statement would take it out
+of `z`'s scope. A block that is itself in return position — the body, or the
+tail of the body — is not nested in this sense, and a `?` in one is fine.
+
+**It will not name a constructor you rebound.** A module that declares its own
+`Ok`, `Err`, `Some` or `None` — or imports one of those names unqualified — is
+`E0118` at every `?`, because the `match` would name that binding instead of the
+prelude's (§5.7).
+
+**It will not swallow a written type.** `let x: T = e?;` is `E0119`: the
+expansion has no `let` left to carry `T` on. Write `let x = e?;`, or annotate
+the value being unwrapped. A `?` *inside* an annotated `let`'s value is fine —
+`let x: Int = g(n)? + 1;` keeps its annotation.
 
 ---
 
@@ -2506,6 +2647,8 @@ program.
 | `E0115` | an `effect set` cycle |
 | `E0116` | a record update whose base has no record shape this file can name |
 | `E0117` | a record update naming a field the base does not have |
+| `E0118` | a `?` whose enclosing function has no return type this file can read as `Result` or `Option` |
+| `E0119` | a `?` written where its early exit would change what runs, or would discard a written annotation |
 
 ### Types
 
@@ -2642,8 +2785,19 @@ rather than left to be discovered.
   `order_json` and module B calling `order_json_v2`, both type-checking, one type
   serializing two ways. The orphan rule is the coherence there is, and it is a
   local property.
-* **No tuples.** Use a record.
-* **No loops, no `break`, no early `return`.**
+* **No tuples.** Use a record. Destructure one with a record pattern —
+  `let {p, node} = f(x);` — which is what a tuple would have been for.
+* **No loops and no `break`.**
+
+  > **This bullet read "No loops, no `break`, no early `return`", and the third
+  > of those is now narrowed rather than wrong.** There is still no `return`
+  > statement: nothing in Ply transfers control out of a function. But `?`
+  > (§6.10) is an early exit, and it is the one the language has. It is not a
+  > control transfer — the parser rewrites it into a `match` — so it cannot
+  > leave a lambda, a handler, a region or a loop-shaped recursion, and it exits
+  > only the expression it is written in. Everything the original bullet was
+  > warning about still holds; what changed is that binding a `Result` no longer
+  > costs a `match`.
 * **No mutable variables.** Cells, in regions.
 * **No exceptions.** A failure is `E0502` and ends the run; recoverable failure is
   a `Result` or a domain type.
@@ -2684,6 +2838,13 @@ rather than left to be discovered.
   time failure rather than a compile error.
 * `{..b, f: e}` needs the base's shape to be readable from the same file, so a
   base whose type is declared in another module is `E0116`.
+* `?` refuses a lambda body (`E0118`), so a codec's `decode:` field cannot use
+  one — and neither can a `fold` accumulator that threads a `Result`, which is
+  where `examples/desk.ply` still writes the `match` out by hand.
+* `?` in a call argument refuses if anything impure is evaluated to its left
+  (`E0119`); the fix is a `let`.
+* `?` on a `let` with a written type is `E0119`. Drop the annotation, or put it
+  on the value being unwrapped.
 * Two tasks that each allocate are ordered by the search even when nothing in
   their rows conflicts, because allocation draws from one bump pointer.
 * A task that reads shared state and writes it back with no scheduler operation

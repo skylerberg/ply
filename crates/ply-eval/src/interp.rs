@@ -420,6 +420,14 @@ impl<'a> Interp<'a> {
                 "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_record_update_survives_parse_module_anywhere_in_the_tree`"
             ),
+            // Unreachable for the same reason: the tree-walker and the machine
+            // both evaluate the `match` `?` became, so there is no second
+            // implementation of an early exit here to disagree with the other
+            // engine's.
+            ExprKind::Try { .. } => unreachable!(
+                "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
+                 `no_try_survives_parse_module_anywhere_in_the_tree`"
+            ),
             ExprKind::Field { base, field } => self.eval_field(base, field, env),
             ExprKind::List { items } => self.eval_list(items, env),
             ExprKind::Perform {

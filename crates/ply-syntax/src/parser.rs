@@ -82,6 +82,13 @@ pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>>
             if p.uses_record_update {
                 crate::record_update::expand_bare(&mut e, &mut p.diags);
             }
+            // Every `?` here refuses: a bare expression has no enclosing `fn`,
+            // so there is no written return type to read `Ok`/`Err` off. It
+            // still runs, for `expand_bare`'s reason — the alternative is an
+            // unexpanded node escaping to a caller that has no arm for it.
+            if p.uses_try {
+                crate::try_op::expand_bare(&mut e, &mut p.diags);
+            }
             match p.diags.is_empty() {
                 true => Ok(e),
                 false => Err(p.diags),
@@ -111,6 +118,8 @@ struct Parser {
     /// Whether the file wrote `{..b, ...}` anywhere. Same bargain as
     /// `uses_effect_sets`: a file that did not write one never walks.
     uses_record_update: bool,
+    /// Whether the file wrote a `?` anywhere. Same bargain again.
+    uses_try: bool,
 }
 
 impl Parser {
@@ -125,6 +134,7 @@ impl Parser {
             depth: 0,
             uses_effect_sets: false,
             uses_record_update: false,
+            uses_try: false,
         }
     }
 
@@ -305,6 +315,18 @@ impl Parser {
         }
         if self.uses_record_update {
             crate::record_update::expand(&mut module, &mut self.diags);
+        }
+        // Last, by convention rather than by necessity. ADR 0027 first said the
+        // order was load-bearing, on the grounds that `record_update` reads
+        // written `let x: T` annotations and a `?` expanded first would have
+        // turned `let x: T = e?;` into an untyped `Ok(x)` arm binder — but that
+        // shape is refused outright (`try_op::Cx::annotated_let`, `E0119`), so
+        // no annotation is ever lost. Each pass walks through the other's node,
+        // and swapping the two moves no hash in either corpus. Nothing gates
+        // this order; the ADR's Decision 1 withdraws the claim that something
+        // does.
+        if self.uses_try {
+            crate::try_op::expand(&mut module, &mut self.diags);
         }
         (module, self.diags)
     }
@@ -1338,6 +1360,20 @@ impl Parser {
                             op,
                             resource,
                             args,
+                        },
+                        span,
+                    };
+                }
+                // Tightest tier, alongside `f(x)` and `r.field`, so `f(x)?.g`
+                // is `(f(x)?).g` and `-x?` is `-(x?)`. Ply has no ternary, so
+                // nothing else can claim the token.
+                TokenKind::Question => {
+                    let close = self.advance();
+                    let span = e.span.to(close);
+                    self.uses_try = true;
+                    e = Expr {
+                        kind: ExprKind::Try {
+                            operand: Box::new(e),
                         },
                         span,
                     };

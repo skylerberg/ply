@@ -958,6 +958,23 @@ pub enum ExprKind {
         base: Box<Expr>,
         field: Ident,
     },
+
+    /// `e?` — **parse-time only**, exactly as [`ExprKind::RecordUpdate`] is.
+    /// `crate::try_op::expand` rewrites every one of these into the `match` the
+    /// corpus hand-writes 129 times, before [`crate::parse_module`] returns, so
+    /// that `let x = e?;` and its longhand are one definition with one hash
+    /// rather than two spellings of one value.
+    ///
+    /// No crate downstream of `ply-syntax` can observe this variant, and that
+    /// is asserted over every `.ply` file in the tree plus a file that actually
+    /// writes a `?`: `crates/ply-syntax/src/tests.rs`
+    /// `no_try_survives_parse_module_anywhere_in_the_tree`. Neither evaluator
+    /// learns a node, no unwind exists to get wrong at a `handle` boundary, and
+    /// there is no row rule for `?` because there is no `?` after the parser.
+    Try {
+        operand: Box<Expr>,
+    },
+
     List {
         items: Vec<Expr>,
     },
@@ -1074,4 +1091,67 @@ pub enum PatternKind {
         items: Vec<Pattern>,
         rest: Option<Box<Pattern>>,
     },
+}
+
+/// Evaluates without calling anything and without performing anything, so it
+/// cannot diverge and cannot be observed by, or observe, its neighbours. It can
+/// still fail — on overflow, on a divisor of zero, on an unmatched scrutinee —
+/// but a failure that happens in one order happens in every order, because a
+/// block evaluates all of its `let`s regardless.
+///
+/// **One predicate, two callers, deliberately.** `ply_hash::normalize`'s
+/// `commutable_run` uses it to license writing a run of `let` statements in
+/// their sorted order, and [`crate::try_op`] uses it to license lifting a `?`'s
+/// operand to the head of its region. Both are the same question — *may these be
+/// reordered* — and the reason is the same one: a failure that happens in one
+/// order happens in every order, and a call or a `perform` breaks that. Two
+/// implementations of it could drift apart, and a drift would mean normalization
+/// reordering something `?` refused to, or the reverse.
+///
+/// This lived in `crates/ply-hash/src/normalize.rs` until ADR 0027 and moved
+/// here unchanged but for the [`ExprKind::Try`] arm, which is a variant that did
+/// not exist before. `crates/ply-hash/tests/map.rs`'s pinned digest is the guard
+/// on the move being free.
+pub fn is_pure(e: &Expr) -> bool {
+    crate::effect_set::grow(|| match &e.kind {
+        ExprKind::App { .. }
+        | ExprKind::Perform { .. }
+        | ExprKind::Handle { .. }
+        | ExprKind::WithCell { .. }
+        | ExprKind::WithRegion { .. }
+        | ExprKind::Simulate { .. } => false,
+        // Conservative, and only ever consulted before expansion: a `?` that is
+        // being asked about here is one the scan did not reach in evaluation
+        // order, which means it sits behind a conditional or inside a nested
+        // block, and both of those are refused. Saying `false` refuses; saying
+        // `true` would license lifting an operand across it.
+        ExprKind::Try { .. } => false,
+        ExprKind::Lit(_) | ExprKind::Var(_) => true,
+        ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
+        ExprKind::Unary { operand, .. } => is_pure(operand),
+        ExprKind::Lambda { body, .. } => is_pure(body),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_pure(cond) && is_pure(then_branch) && is_pure(else_branch),
+        ExprKind::Match { scrutinee, arms } => {
+            is_pure(scrutinee)
+                && arms
+                    .iter()
+                    .all(|a| is_pure(&a.body) && a.guard.as_ref().is_none_or(is_pure))
+        }
+        ExprKind::Block { stmts, tail } => {
+            stmts.iter().all(|s| match s {
+                Stmt::Let { value, .. } => is_pure(value),
+                Stmt::Expr(e) => is_pure(e),
+            }) && tail.as_deref().is_none_or(is_pure)
+        }
+        ExprKind::Record { fields } => fields.iter().all(|(_, v)| is_pure(v)),
+        ExprKind::RecordUpdate { base, fields } => {
+            is_pure(base) && fields.iter().all(|(_, v)| is_pure(v))
+        }
+        ExprKind::Field { base, .. } => is_pure(base),
+        ExprKind::List { items } => items.iter().all(is_pure),
+    })
 }
