@@ -215,6 +215,39 @@ every call site in the parser**: `let a = f(c, p); let b = g(c, a.p); ...` where
 the reference writes `let a = self.f()?; let b = self.g()?;`. One extra
 identifier and one extra field access per call, ~93 functions deep.
 
+> **Withdrawn in part (2026-08-30): the extra identifier and the extra field
+> access were avoidable, and this spike did not know it.** `let` takes any
+> pattern, records included, so the shape above is available today as
+>
+> ```ply
+> let {p, node} = f(c, p);
+> ```
+>
+> Verified on the shipping binary, including the renaming and `..` forms:
+> `let {a: renamed, ..} = mk();` binds and ignores the rest. The pattern table
+> in `docs/GUIDE.md` §6.3 has carried the forms all along; what it did not carry
+> was the *idiom* — that this is how a function returns several things — and
+> §6.1 now does, with a runnable example.
+>
+> **`grep -c 'let {'` over this spike's five modules answers 0, against 128
+> hand-threaded call sites.** So the 128 are this port's doing rather than the
+> language's, and the "one extra identifier and one extra field access per call"
+> is a cost it chose without knowing. Four agents wrote those modules
+> independently and none of them found the feature.
+>
+> **What survives, and it is most of the entry.** The count of tuple-substitute
+> *types* is real and unchanged, and destructuring does not reduce it: `R<a>`,
+> `Ate` and the rest still have to be declared and named, because Ply has no
+> anonymous pair *type*. And §P4's sharpest case is untouched — three of the
+> eight carry two lists and a state, which is §4's unsolvable shape whatever the
+> binding form.
+>
+> **The ranking is the part to distrust now.** This entry sits third of fifteen
+> on a tax that was two thirds avoidable, so a reader deciding what to build
+> from this list should read it as "declarations, and a threading cost this port
+> paid needlessly" rather than as a language gap of that size. That correction
+> is why no tuple feature was built.
+
 `GAPS-items.md` §P4 makes the sharpest version of the point: three of its eight
 tuple-substitutes are worse than a pair, because they carry **two lists and a
 state** — and a record that carries two growing lists is §4's unsolvable case.
