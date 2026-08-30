@@ -126,7 +126,7 @@ pub enum TokenKind {
     PipePipe,
 
     /// `e?` — the postfix try operator (GUIDE §6.10). Added by
-    /// `docs/adr/0027-the-question-mark-operator.md`; no `.ply` file in the
+    /// `docs/adr/0028-the-question-mark-operator.md`; no `.ply` file in the
     /// tree contained a `?` outside a string or a comment before it, so the
     /// token is strictly additive and no existing file tokenizes differently.
     Question,

@@ -1,7 +1,7 @@
 //! What `e?` does to a check, at the source level.
 //!
 //! Four claims, and the first is the reason the feature is shaped the way it is
-//! (`docs/adr/0027-the-question-mark-operator.md`):
+//! (`docs/adr/0028-the-question-mark-operator.md`):
 //!
 //! 1. **There is no typing rule for `?`, and no row rule either.** By the time
 //!    inference runs, `e?` *is* the `match` its longhand would have been, so its
