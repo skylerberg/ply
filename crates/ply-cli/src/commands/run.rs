@@ -1,6 +1,6 @@
 use super::common::{
-    IND, describe_schema, diagnostic_json, emit_json, location, plural, print_diagnostics,
-    report_bind_error, report_load_error,
+    IND, counted_engine, counters_json, describe_schema, diagnostic_json, emit_json, location,
+    plural, print_diagnostics, report_bind_error, report_load_error,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -158,6 +158,12 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let span = entry.span;
     let engine: EngineChoice = args.engine.into();
     let plan = crate::simulation::run_plan(args.seed.as_ref());
+    // The counters are process-wide and cumulative, so they mean nothing unless
+    // this run is the only thing they have seen. Reset immediately before, read
+    // immediately after, and report only when a single engine ran — under
+    // `--engine both` the sum would blend a machine with a tree-walker that does
+    // no reference counting at all, and a blended figure is worse than none.
+    ply_eval::rc::reset();
     let answer = evaluate(
         &loaded,
         engine,
@@ -167,6 +173,11 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &hosts,
         declared.as_ref(),
     );
+
+    let counters_value = match engine {
+        EngineChoice::Both => Value::Null,
+        _ => counters_json(&ply_eval::rc::stats(), counted_engine(engine)),
+    };
 
     // A cycle among escaped values is never collected (ADR 0017 §4), so the run
     // that built one is the only place a reader can be told it is there. It is
@@ -212,6 +223,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "entry": name,
                     "module": module,
                     "binding": hosts.label(),
+                    "counters": counters_value.clone(),
                     "hosts": hosts.summary_json(),
                     "value": rendered,
                     "configuration": hosts.configuration().to_json(),
@@ -252,6 +264,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                     "entry": name,
                     "module": module,
                     "binding": hosts.label(),
+                    "counters": counters_value.clone(),
                     "hosts": hosts.summary_json(),
                     "value": Value::Null,
                     "configuration": hosts.configuration().to_json(),
