@@ -727,6 +727,37 @@ A block is `{ statements... tail }`. Its value is the tail expression. The rules
 
 `let` shadowing is allowed. There is no mutable binding: `let` binds once.
 
+**"Any pattern" includes a record, and that is how a function returns several
+things.** Ply has no tuples and does not need them here: a function answers with
+a record, and the caller takes it apart in the `let` that receives it.
+
+```ply
+type Step = { value: Int, next: Int }
+
+fn advance(input: Bytes, at: Int) -> Step =
+  {value: bytes_at(input, at), next: at + 1}
+
+fn sum_two(input: Bytes) -> Int = {
+  let {value, next} = advance(input, 0);
+  let {value: second, ..} = advance(input, next);
+  value + second
+}
+```
+
+Three forms, all of them patterns from the table in §6.3 and all of them legal
+in a `let`:
+
+* `let {value, next} = ...` binds each field to its own name;
+* `let {value: second, ..} = ...` renames one and ignores the rest;
+* a record pattern must name **every** field or end with `..`, or it is `E0201`
+  — the type is the checklist, so adding a field to the record makes every
+  exhaustive pattern over it a compile error rather than a silent hole.
+
+The alternative — `let s = advance(input, 0); ... s.value ... s.next` — is legal
+and costs an identifier and a field access per call. Prefer the pattern; a
+five-thousand-line program written the other way is what prompted this
+paragraph.
+
 ### 6.2 `if`
 
 ```ply
