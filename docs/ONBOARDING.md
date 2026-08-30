@@ -1356,6 +1356,7 @@ item 6 records `PLY_PG_URL` as half fixed — set in CI, set by nothing locally.
 | --- | --- | --- |
 | [`README.md`](../README.md) | the measured claims, with corrections inline | first, for the numbers |
 | [`DESIGN.md`](../DESIGN.md) | the language and the reasoning; §"What of this is built" is the honest state table | you need to know what a mechanism *means* |
+| [`docs/GUIDE.md`](GUIDE.md) | the user-facing manual: syntax, types, effects, tests, specs, stdlib, CLI, every diagnostic code | you need to know how to *write* Ply |
 | [`ROADMAP.md`](../ROADMAP.md) | milestone-by-milestone record; **§"What is next" is the queue** | you need to know what to do |
 | [`CONTRACTS.md`](../CONTRACTS.md) | the crate-construction contract, 7,650 lines | you need a signature — and see §7 |
 | [`docs/adr/`](adr/) | **nineteen** decisions with their arguments, `00NN-slug.md`, no index | you want to know *why*, and are prepared for **16,353** lines (`cat docs/adr/*.md \| wc -l`, re-taken 2026-08-21 by the second regression audit; it read 16,100 before ADR 0019 §7; this row said "seventeen decisions" and "14,785 lines", which was true before ADR 0018 and ADR 0019 existed, and before that said 24k, which is the whole prose surface and not the ADRs) |
