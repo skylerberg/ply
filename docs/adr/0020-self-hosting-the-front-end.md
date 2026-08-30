@@ -10,15 +10,39 @@ Status: **rejected for now, with two pieces of the spike kept.**
 > preconditions that would change this answer.
 
 - **Rejected:** writing Ply's front end in Ply on today's interpreter. §6 prices
-  it. The blocker is throughput, not expressiveness, and the compiled fragment
-  cannot be assumed to close the gap — §6.3 says why, and what would measure it.
-- **Accepted:** §1's finding is a defect in shipped code and is tracked as one,
-  not as a spike observation. `crates/ply-std/ply/json.ply`'s `escape_runs` is
-  quadratic in a client-chosen input; re-measured on the shipped module in §4.1.
+  it. The blocker is throughput, not expressiveness. **This decision stands and
+  the evidence for it has strengthened** — see the block below.
+- ~~**Accepted:** §1's finding is a defect in shipped code and is tracked as one…
+  `escape_runs` is quadratic in a client-chosen input.~~ **Fixed** (§7 item 3).
 - **Accepted:** the differential-harness pattern in `spikes/ply-lexer/harness`
   is the right shape for pricing any future port, with the amendment in §3.2.
-- **Not decided here:** whether the fragment should grow to cover a front end.
-  §6.3 states the one measurement that would settle it and does not take it.
+  Re-used, and it held: `spikes/ply-parser/harness` is built on it.
+- ~~**Not decided here:** whether the fragment should grow to cover a front
+  end.~~ **Decided elsewhere:** [ADR 0026](0026-a-reachable-backend.md).
+
+> ## What has happened since, and what a reader should not trust
+>
+> This document was written on **2026-08-24** and re-run rather than re-read.
+> Five later documents have moved parts of it, and the corrections are in place
+> throughout — but the *pricing* in §6 is the reason anyone reads this ADR, and
+> §6.1 and §6.2 were both overtaken. **Read this block before §6.**
+>
+> | what moved | where | now |
+> | --- | --- | --- |
+> | §5.1's premise — that a recursive-descent parser recurses per element | ADR 0022 | **refuted.** `parser.rs` drives every sequence with a loop; `iterate` gives Ply the same shape at depth 1 |
+> | §6.1's throughput figures | `spikes/ply-parser` | **do not reproduce.** Both engines 2–3× faster than recorded; the *ratio* holds |
+> | §6.2's multiplier, assumed at 5–10× | `spikes/ply-parser` | **measured at 2.62** for lex+parse, with two of six phases written |
+> | §6.2's premise — lexing is 10–20% of front-end time | `spikes/ply-parser` | **wrong.** It is 30–40% after two phases |
+> | §6.3's 11.68× on `read_line`-shaped code | ADR 0026 | **`read_line` cannot cross the seam.** §6.3's own arithmetic rests on a function `admit` refuses on its first line |
+> | §7 item 2, "a lint … is the only one" | [0024](0024-ownership-as-a-checked-property.md), [0025](0025-ownership-design.md) | **refuted.** The lint was built and failed in both directions |
+> | §4.1's `push` mechanism | mechanism sweep | **`push` does not copy a `List`.** Sharing decides it, and sharing is decided by position |
+>
+> **The decision is not one of the things that moved, and the case for it is
+> stronger than this document makes it.** §6.1 priced one phase at 12.6× the
+> Rust front end. Two phases now measure at **30×** — 3.01 s user against 0.10 s
+> for six Rust phases, no extrapolation. Redoing §6.2's own arithmetic on
+> today's measured lexer term gives **58–115×** against the 60–130× below:
+> both absolute halves halved and the ratio did not move.
 
 This ADR reviews the spike at `spikes/ply-lexer/`, merged as `73ebd1c`. It was
 written by re-running the spike rather than by reading its write-up. Where a
@@ -683,6 +707,28 @@ modules, 333,595 bytes of project source and 45,041 tokens — is **0.21 s user 
 That is **~215,000 tokens/s for the whole front end**, against ~17,000 tokens/s
 for a Ply lexer alone: **12.6x slower for the first phase of six.**
 
+> **The absolutes here do not reproduce; the ratio does (2026-08-29,
+> `spikes/ply-parser` §13).** All three figures were re-taken **in one sitting**
+> — this section's were not, and its own §9 records load 17–88 across the series.
+>
+> | | §6.1 | re-taken |
+> | --- | ---: | ---: |
+> | Ply lexer through `dump`, this section's probe shape | ~17,000 tok/s | **26,083–36,462** |
+> | `ply check examples/` cold | 0.21 s user | **0.10 s user** |
+> | Rust front end ÷ Ply lexer | 12.6× | **10.0–13.4×** |
+>
+> **Both engines are 2–3× faster than recorded and the ratio between them is
+> not**, so the 12.6× headline survives its own sensitivity note while every
+> absolute under it is wrong by two to three times. One cause is identified
+> rather than guessed: the `dump` step this section timed *with* the lexer is
+> **15–22% of the figure it produced**, so ~17,000 tok/s charged the Ply lexer
+> with a rendering step worth about a fifth of its own cost.
+>
+> Nothing in §6.2 or §7 turns on the absolutes — they are used to form a ratio,
+> and the ratio held. The lesson is §9's own, arriving from outside: figures
+> taken across sittings at load 17–88 are not comparable with each other, and
+> this section compared them anyway.
+
 ### §6.2 Assumed
 
 To get from a lexer to a front end needs a multiplier, and there is no way to
@@ -695,6 +741,28 @@ phases after lexing are the ones that build records and lists, which is where
 
 At that rate `ply check examples/` — 45,041 tokens, 0.21 s today — becomes
 **13–27 seconds**. Roughly **60–130x**.
+
+> **The multiplier is no longer assumed (2026-08-29). It is 2.62 for two phases
+> of six, and this section's *premise* is the part that was wrong.**
+> `spikes/ply-parser` ports the parser and measures lex+parse ÷ lex at **2.62**
+> over `examples/`, 2.49–3.31 per file — and lexing is **still 30–40% of
+> front-end time after two phases**, against the "10–20%" this section borrowed
+> from conventional compilers and built the 5–10× band on.
+>
+> **The band itself is not refuted**, and the honest statement is narrower than
+> either direction: at 2.62 for two phases, 5–10× overall requires the four
+> unwritten phases to cost **1.5–4.6× what parsing cost**, which is plausible —
+> `resolve.rs` is 62% of `parser.rs` and inference is larger. Two phases of six
+> cannot say whether the band is optimistic or pessimistic, and the spike
+> declines to.
+>
+> **What replaces the projection is a measurement.** Ply lex+parse over the
+> identical 13 files `ply check` reads costs **3.01 s user** against **0.10 s**
+> for six Rust phases: **30×, two phases against six**, warm 301×. And redoing
+> this section's own arithmetic on the re-taken lexer term gives 5.8–11.5 s and
+> **58–115×** against the 60–130× below — both absolute halves halved, the ratio
+> unmoved. So the sentence that follows is *more* true than when it was written,
+> on better evidence, and it is the one thing here that did not need correcting.
 
 That is the answer to whether this is acceptable for the loop it is meant to make
 fast, and it is not close. `CONTRIBUTING.md` §"The loop" puts
@@ -717,7 +785,24 @@ code. That file holds raw microsecond pairs, not a ratio: 11.68x is the most
 conservative expression in it — interpreter *best* against spike *worst*,
 minimised across its five inputs (`5.8615625 / 0.5019375`). The optimistic
 reading of the same file is 14.2x. Re-derived here from the file rather than
-quoted from `CONTRIBUTING.md`. Applying that to 1,700–3,400 tokens/s would give 20,000–40,000
+quoted from `CONTRIBUTING.md`.
+
+> **`read_line` cannot cross the seam (2026-08-29, ADR 0026 §3).** This
+> paragraph's 11.68× is measured on `read_line`-shaped kernel code, and
+> `crates/ply-std/ply/http.ply`'s `read_line` is
+> `fn read_line(buf: Bytes, ..) -> Line`. `crossable` is `Int | Bool`, and
+> `admit`'s first line is
+> `if !args.iter().all(crossable) { return Err(Gate::ArgumentShape) }`. The
+> spike's own `measure.rs` labels its path *"a direct native call, outside any
+> machine"*.
+>
+> So the number is real and it is **not a number about this seam**: the
+> arithmetic below applies a speedup measured outside the machine to a function
+> the machine's own gate refuses on its first line. It is not that the transfer
+> is unmeasured — for this shape it is **unmeasurable** without widening
+> `crossable`. The conclusion the paragraph draws is unaffected in direction
+> (the fragment does not make a self-hosted front end competitive on the cold
+> path) and its magnitude should not be quoted. Applying that to 1,700–3,400 tokens/s would give 20,000–40,000
 tokens/s and a 1.1–2.3 s `ply check examples/` — still **5–11x** worse than
 today's 0.21 s. So even at its full measured speedup the fragment does not make a
 self-hosted front end competitive on the cold path.
@@ -860,6 +945,15 @@ cannot express one — it expressed a lexer that agrees with the reference on
 is meant to make fast, and §6.3 shows the fragment cannot be assumed to close
 that.
 
+> **Still the decision, on better evidence (2026-08-29).** The 60–130× was a
+> projection from an assumed multiplier. `spikes/ply-parser` wrote the parser and
+> measured it: **30× for two phases against six**, no extrapolation, and 58–115×
+> when this section's own arithmetic is redone on re-taken figures. Ply now also
+> *expresses* a parser — 763 inputs, 780,456 bytes, 126,565 nodes, **zero
+> disagreements** with `ply_syntax` — so the "not because Ply cannot express one"
+> clause covers two phases rather than one. The rejection was right and it is the
+> throughput objection, alone, that carries it.
+
 Ranked, what would change the answer:
 
 1. ~~**An attribution run splitting the Ply lexer's time between builtin bodies
@@ -874,6 +968,17 @@ Ranked, what would change the answer:
    after — §6.3). What is left is a per-entry constant that arithmetic puts
    under 1% of current lexing time, so this is now *confirm the expectation*
    rather than *check for a cliff*.
+
+   > **Overtaken (2026-08-29, [ADR 0026](0026-a-reachable-backend.md)).** This
+   > item asks for the fragment's throughput at one entry per token. Two things
+   > have to happen before that measurement means anything, and neither had when
+   > this was written. **A lexer's arguments are `Bytes`, and `crossable` is
+   > `Int | Bool`** — the same gate that refuses `read_line` in §6.3 refuses a
+   > lexer's per-token functions, so today the entry rate is not "one per token",
+   > it is **zero**. And a backend is now reachable from a shipping command,
+   > which is what makes such a measurement takeable at all. So the item stands
+   > as the right question and its precondition moved: widen `crossable`, or
+   > measure something whose arguments already cross.
 2. **Making §1 visible.** A lint, a `--explain` line, anything that says *this
    `push` will copy*. `GAPS.md` calls this the highest-value change and this
    review agrees, for two reasons the spike could not see. §4.1 shows the trap
@@ -908,6 +1013,14 @@ Ranked, what would change the answer:
    > visible only behind a flag is not visible at all. What survives is the item's
    > title: §1 must be made visible somewhere an author cannot miss it, which
    > ADR 0024 answers by putting it in the type rather than in a warning.
+   >
+   > **And ADR 0025 then declined that answer's mechanism**, on a measurement:
+   > a parameter with one occurrence, its last use, free in no closure, cell or
+   > record still reports `owners = 2` under a resumption — and under a *single
+   > tail* resumption too, so it is capture rather than multiplicity. What
+   > survives across both is this item's title, not its remedy: §1 must be
+   > visible somewhere an author cannot miss it. `ply check --costs` and a
+   > per-site oracle are where that landed.
 3. ~~**Fixing `escape_runs`** (§4.1). Shipped, quadratic, client-influenced
    input. `GAPS.md` §1 records that the obvious fix — splitting so each `push`
    is last — doubles the recursion depth and breaks the module at k = 8,000; the
@@ -1131,9 +1244,24 @@ reader does not have to take it on trust:
 > prediction is 4x against 2x and load noise multiplies both columns roughly
 > equally, so the ratio is the load-robust statistic.
 
-No deterministic counter turned out to exist — `ply run --json` reports no step,
+~~No deterministic counter turned out to exist — `ply run --json` reports no step,
 call or allocation count — so wall clock was unavoidable and user CPU was used
-as the robust half. No run was discarded after the fact.
+as the robust half.~~ No run was discarded after the fact.
+
+> **Corrected (2026-08-30): one existed, and nothing outside `ply-eval` could
+> read it.** `ply_eval::rc::Stats` had counted `updates` against
+> `updates_in_place`, `dup_sites` against `dup_emitted`, and `takes_attempted`
+> against `takes_moved` since the reference-counting pass was written. It was
+> read by three test files and had **no CLI surface at all**, so this sentence
+> was true of the command and false of the codebase — and the consequence is the
+> one §6.1 now carries: a document that needed a count timed something instead,
+> at load 17–88, and its absolutes did not reproduce.
+>
+> `ply run --json` now reports them. `in_place` is **`null` on the tree-walker**
+> rather than `0.0`, because that engine runs no reference counting at all, and
+> a zero there reads as a fact about the program when it is a fact about the
+> engine. Under `--engine both` the whole object is `null`: the two engines do
+> not count the same thing, and their sum is a figure about neither.
 
 Commands, all from the worktree root:
 
