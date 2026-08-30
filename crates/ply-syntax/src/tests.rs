@@ -1362,6 +1362,9 @@ fn dump_expr(e: &Expr) -> String {
             format!("(update {} {})", dump_expr(base), fs.join(" "))
         }
         ExprKind::Field { base, field } => format!("(field {} {})", dump_expr(base), field.name),
+        // Only reachable on a tree taken before `try_op::expand` ran, which the
+        // parser's own tests do on purpose.
+        ExprKind::Try { operand } => format!("(try {})", dump_expr(operand)),
         ExprKind::List { items } => {
             let is: Vec<_> = items.iter().map(dump_expr).collect();
             if is.is_empty() {
@@ -2394,6 +2397,688 @@ fn a_trailing_comma_in_a_set_is_accepted() {
     );
 }
 
+/// Every `.ply` file under `dir`, skipping dotted directories and `target`.
+/// Shared by the two escape guards, which must both walk the whole corpus.
+fn collect_ply(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        match path.is_dir() {
+            true => collect_ply(&path, out),
+            false if path.extension().is_some_and(|x| x == "ply") => out.push(path),
+            false => {}
+        }
+    }
+}
+
+// --- The `?` operator --------------------------------------------------------
+
+/// Whether an unexpanded [`ExprKind::Try`] is anywhere in the tree.
+///
+/// Written out rather than reusing a generic walker for
+/// [`has_record_update`]'s reason: the match is exhaustive with no `_`, so the
+/// next expression kind added to the language has to decide here too.
+fn has_try(m: &Module) -> bool {
+    fn e(x: &Expr) -> bool {
+        match &x.kind {
+            ExprKind::Try { .. } => true,
+            ExprKind::Lit(_) | ExprKind::Var(_) => false,
+            ExprKind::Binary { lhs, rhs, .. } => e(lhs) || e(rhs),
+            ExprKind::Unary { operand, .. } => e(operand),
+            ExprKind::Lambda { body, .. } => e(body),
+            ExprKind::App { func, args } => e(func) || args.iter().any(e),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => e(cond) || e(then_branch) || e(else_branch),
+            ExprKind::Match { scrutinee, arms } => {
+                e(scrutinee)
+                    || arms
+                        .iter()
+                        .any(|a| a.guard.as_ref().is_some_and(e) || e(&a.body))
+            }
+            ExprKind::Block { stmts, tail } => {
+                stmts.iter().any(|s| match s {
+                    Stmt::Let { value, .. } => e(value),
+                    Stmt::Expr(x) => e(x),
+                }) || tail.as_deref().is_some_and(e)
+            }
+            ExprKind::Record { fields } => fields.iter().any(|(_, v)| e(v)),
+            ExprKind::RecordUpdate { base, fields } => e(base) || fields.iter().any(|(_, v)| e(v)),
+            ExprKind::Field { base, .. } => e(base),
+            ExprKind::List { items } => items.iter().any(e),
+            ExprKind::Perform { args, .. } => args.iter().any(e),
+            ExprKind::Handle {
+                body,
+                clauses,
+                return_clause,
+            } => {
+                e(body)
+                    || clauses.iter().any(|c| e(&c.body))
+                    || return_clause.as_ref().is_some_and(|r| e(&r.body))
+            }
+            ExprKind::WithCell { init, body, .. } => e(init) || e(body),
+            ExprKind::WithRegion { body, .. } => e(body),
+            ExprKind::Simulate { body } => e(body),
+        }
+    }
+    m.items.iter().any(|item| match item {
+        Item::Fn(d) => d.spec.iter().any(|s| e(&s.expr)) || e(&d.body),
+        Item::Test(d) => e(&d.body),
+        Item::Law(d) => d.guard.as_ref().is_some_and(e) || e(&d.body),
+        Item::Type(_) | Item::Effect(_) | Item::Derive(_) | Item::EffectSet(_) => false,
+    })
+}
+
+/// The body of the only `fn` in a module that parsed clean, dumped.
+fn body_of(src: &str) -> String {
+    let m = ok(src);
+    let Some(Item::Fn(f)) = m.items.iter().rev().find(|i| matches!(i, Item::Fn(_))) else {
+        panic!("expected a fn")
+    };
+    dump_expr(&f.body)
+}
+
+fn codes_of(src: &str) -> Vec<&'static str> {
+    errs(src).iter().map(|d| d.code).collect()
+}
+
+/// A `fn` returning `Result` whose body is `f(x)?`, and a mode-establishing
+/// preamble every fixture below shares.
+const PRE: &str = "type E = {msg: String}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
+
+#[test]
+fn try_expands_to_a_match_with_the_failure_arm_first() {
+    assert_eq!(
+        body_of(&format!("{PRE}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)")),
+        "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) (arm (ctor Ok ?0) (call Ok ?0)))"
+    );
+}
+
+/// `None` carries no payload, so its arm is a bare constructor on both sides.
+#[test]
+fn an_option_returning_function_gets_the_option_constructors() {
+    assert_eq!(
+        body_of("fn h(n: Int) -> Option<Int> = Some(n)\nfn f(n: Int) -> Option<Int> = Some(h(n)?)"),
+        "(match (call h n) (arm (ctor None) None) (arm (ctor Some ?0) (call Some ?0)))"
+    );
+}
+
+/// The shape every conversion in the corpus takes: the `let`'s own pattern
+/// becomes the success arm's binder and the `let` itself is gone, so the sugar
+/// and the hand-written `match` are one definition.
+///
+/// The general rule would emit `Ok(t) -> { let a = t; ... }` here, which is a
+/// *different* definition with a different hash. That is what this pins.
+#[test]
+fn a_let_bound_try_puts_its_own_pattern_on_the_success_arm() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ let a = g(n)?; Ok(a) }}"
+        )),
+        "(block (match (call g n) (arm (ctor Err ?0) (call Err ?0)) \
+         (arm (ctor Ok a) (block (call Ok a)))))"
+    );
+}
+
+/// The parser spike's §3 "pair" shape, spelled without a tuple. This is the
+/// feature the brief's cautionary tale is about: record destructuring exists and
+/// composes with `?` for free, because the `let`'s pattern is what moves.
+#[test]
+fn a_try_composes_with_record_destructuring() {
+    assert_eq!(
+        body_of(
+            "type P = {p: Int, node: Int}\n\
+             fn q(n: Int) -> Result<P, Int> = Ok({p: n, node: n})\n\
+             fn f(n: Int) -> Result<Int, Int> = { let {p, node} = q(n)?; Ok(p + node) }"
+        ),
+        "(block (match (call q n) (arm (ctor Err ?0) (call Err ?0)) \
+         (arm (ctor Ok (prec (p p) (node node))) (block (call Ok (+ p node))))))"
+    );
+}
+
+/// The block splits at the statement carrying the `?`, and everything after it
+/// — statements *and* tail — becomes the success arm's body. Statements before
+/// it do not move, which is why they need no purity condition.
+#[test]
+fn a_block_splits_at_the_statement_carrying_the_try() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ let z = n + 1; let a = g(z)?; let w = a + 1; Ok(w) }}"
+        )),
+        "(block (let z (+ n 1)) (match (call g z) (arm (ctor Err ?0) (call Err ?0)) \
+         (arm (ctor Ok a) (block (let w (+ a 1)) (call Ok w)))))"
+    );
+}
+
+/// Two `?`s in one run nest, outer first, and each success arm's body is itself
+/// a return position — which is what keeps the continuation in tail position.
+#[test]
+fn two_tries_in_a_row_nest_in_the_order_written() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ let a = g(n)?; let b = g(a)?; Ok(a + b) }}"
+        )),
+        "(block (match (call g n) (arm (ctor Err ?1) (call Err ?1)) (arm (ctor Ok a) \
+         (block (match (call g a) (arm (ctor Err ?0) (call Err ?0)) \
+         (arm (ctor Ok b) (block (call Ok (+ a b)))))))))"
+    );
+}
+
+/// `parse_or(ts)?` in the argument of a call whose function is a bare name: the
+/// prefix is one `Var`, which is pure, so the lift is admitted and the
+/// continuation stays a tail call. `db.ply:1000` is this shape exactly.
+#[test]
+fn a_try_in_a_call_argument_with_a_pure_prefix_is_lifted() {
+    assert_eq!(
+        body_of(&format!("{PRE}fn f(n: Int) -> Result<Int, E> = g(g(n)?)")),
+        "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) (arm (ctor Ok ?0) (call g ?0)))"
+    );
+}
+
+/// A branch of an `if` in return position is a return position of its own, so a
+/// `?` there stays inside the branch and is never lifted across the condition.
+#[test]
+fn a_try_in_a_return_position_branch_stays_in_the_branch() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int, c: Bool) -> Result<Int, E> = if c {{ Ok(g(n)?) }} else {{ Ok(0) }}"
+        )),
+        "(if c (block (match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+         (arm (ctor Ok ?0) (call Ok ?0)))) (block (call Ok 0)))"
+    );
+}
+
+/// The condition, by contrast, runs unconditionally, so the `if` node itself is
+/// the region root and the whole `if` moves into the success arm.
+#[test]
+fn a_try_in_a_condition_wraps_the_whole_if() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = if g(n)? > 0 {{ Ok(1) }} else {{ Ok(2) }}"
+        )),
+        "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+         (arm (ctor Ok ?0) (if (> ?0 0) (block (call Ok 1)) (block (call Ok 2)))))"
+    );
+}
+
+/// Postfix, in the tightest tier alongside `f(x)` and `r.field`: `g(n)?.msg` is
+/// `(g(n)?).msg`, `-x?` is `-(x?)` and `a == b?` is `a == (b?)`. Ply has no
+/// ternary, so nothing else can claim the token.
+///
+/// Read off the **expanded** tree, because that is the only tree a test can see:
+/// what is scrutinised says where the `?` bound. A `?` that bound looser would
+/// put the whole `g(n).msg`, `-x` or `a == b` into the scrutinee instead.
+#[test]
+fn question_binds_tighter_than_field_access_and_unary_minus() {
+    let pre = "type E = {msg: Int}\n\
+               fn r(n: Int) -> Result<E, E> = Ok({msg: n})\n\
+               fn g(n: Int) -> Result<Int, E> = Ok(n)\n\
+               fn gg(n: Int) -> Result<Result<Int, E>, E> = Ok(Ok(n))\n";
+    for (src, want) in [
+        (
+            "Ok(r(n)?.msg)",
+            "(match (call r n) (arm (ctor Err ?1) (call Err ?1)) \
+             (arm (ctor Ok ?0) (call Ok (field ?0 msg))))",
+        ),
+        (
+            "Ok(-g(n)?)",
+            "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+             (arm (ctor Ok ?0) (call Ok (neg ?0))))",
+        ),
+        (
+            "Ok(n == g(n)?)",
+            "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+             (arm (ctor Ok ?0) (call Ok (== n ?0))))",
+        ),
+        (
+            "Ok(gg(n)??)",
+            "(match (call gg n) (arm (ctor Err ?1) (call Err ?1)) \
+             (arm (ctor Ok ?0) (match ?0 (arm (ctor Err ?3) (call Err ?3)) \
+             (arm (ctor Ok ?2) (call Ok ?2)))))",
+        ),
+    ] {
+        assert_eq!(
+            body_of(&format!("{pre}fn f(n: Int) -> Result<Int, E> = {src}")),
+            want,
+            "for {src}"
+        );
+    }
+}
+
+// --- What `?` refuses, and with which code ----------------------------------
+
+/// `?` reads the mode off the enclosing function's **written** return type,
+/// because the parser has no types. Everything that has no such type is refused
+/// with a note naming the actual rule, rather than one message for six causes.
+#[test]
+fn a_try_with_no_readable_return_type_is_e0118() {
+    for (what, src) in [
+        ("no `->` at all", format!("{PRE}fn f(n: Int) = g(n)?")),
+        (
+            "a head that is neither",
+            format!("{PRE}fn f(n: Int) -> Int = g(n)?"),
+        ),
+        (
+            "a type parameter",
+            format!("{PRE}fn f<a>(n: Int, d: a) -> a = g(n)?"),
+        ),
+        (
+            "a generic alias declared here",
+            format!("{PRE}type Box<a> = {{v: a}}\nfn f(n: Int) -> Box<Int> = g(n)?"),
+        ),
+        (
+            "a record type",
+            format!("{PRE}fn f(n: Int) -> {{v: Int}} = g(n)?"),
+        ),
+        (
+            "a lambda body",
+            format!("{PRE}fn f(n: Int) -> Result<Int, E> = Ok((|x: Int| g(x)?)(n))"),
+        ),
+        (
+            "a `with_region` body",
+            format!("{PRE}fn f(n: Int) -> Result<Int, E> = with_region[r] {{ Ok(g(n)?) }}"),
+        ),
+        (
+            "a `simulate` body",
+            format!("{PRE}fn f(n: Int) -> Result<Int, E> = simulate {{ Ok(g(n)?) }}"),
+        ),
+        ("a `test`", format!("{PRE}test \"t\" {{ g(1)? }}")),
+        (
+            "a `law`",
+            format!("{PRE}law \"l\" forall (n: Int) {{ g(n)? == 1 }}"),
+        ),
+        (
+            "a `requires`",
+            format!("{PRE}fn f(n: Int) -> Result<Int, E> requires g(n)? > 0 = Ok(n)"),
+        ),
+    ] {
+        assert_eq!(
+            codes_of(&src),
+            vec![codes::TRY_SCOPE],
+            "{what} should be `E0118`"
+        );
+    }
+}
+
+/// An alias chain in this file is followed; one that leaves it is not, for
+/// `record_update`'s reason — gate 1 skips a file whose bytes are unchanged, so
+/// a meaning read across a module boundary could go stale in a file that never
+/// moved.
+#[test]
+fn a_local_alias_to_result_is_followed_and_a_foreign_one_is_not() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}type R = Result<Int, E>\ntype R2 = R\nfn f(n: Int) -> R2 = Ok(g(n)?)"
+        )),
+        "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) (arm (ctor Ok ?0) (call Ok ?0)))"
+    );
+    assert_eq!(
+        codes_of(&format!(
+            "import std.json\n{PRE}fn f(n: Int) -> json::Json = g(n)?"
+        )),
+        vec![codes::TRY_SCOPE]
+    );
+}
+
+/// GUIDE §5.7: constructor names are not reserved, so a module may declare its
+/// own `Ok` — and expanding a `?` in one would build a `match` naming *that*
+/// constructor. No corpus module does it; every `?` in one that does is refused
+/// rather than silently captured.
+#[test]
+fn a_module_that_declares_its_own_ok_refuses_every_try() {
+    assert_eq!(
+        codes_of(&format!(
+            "{PRE}type Mine = Ok(Int) | Nope\nfn f(n: Int) -> Result<Int, E> = Ok(g(n)?)"
+        )),
+        vec![codes::TRY_SCOPE]
+    );
+}
+
+/// The four names the expansion emits are not reserved, and a `type` is not the
+/// only way to bind one: `import m (Err)` binds `Err` **unqualified**, in the
+/// same `Namespace::Value` a declared constructor lives in. A module that does
+/// it captures the synthesized `match` exactly as a declaring one does, so it is
+/// refused for the same reason and with the same code.
+///
+/// **Found by review, and it was a real hole**: before this, such a module
+/// expanded and the author got `E0201`/`E0205` on a `match` they never wrote,
+/// pointing at their own `?`.
+#[test]
+fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
+    let lib = "pub type Weird<a, e> = Err(e) | Fine(a)\n";
+    for name in ["Ok", "Err", "Some", "None"] {
+        let app = format!("import lib ({name})\n{PRE}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)");
+        let diags = crate::parse_program(vec![
+            (SRC, ModuleName::from_dotted("lib"), lib),
+            (SourceId(1), ModuleName::from_dotted("app"), app.as_str()),
+        ])
+        .expect_err("the expansion would name the imported constructor");
+        assert!(
+            diags.iter().any(|d| d.code == codes::TRY_SCOPE),
+            "importing `{name}` unqualified should refuse `?`; got {:?}",
+            diags.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+    }
+    // The module binder alone captures nothing: `lib::Err` is qualified.
+    let app = format!("import lib\n{PRE}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)");
+    crate::parse_program(vec![
+        (SRC, ModuleName::from_dotted("lib"), lib),
+        (SourceId(1), ModuleName::from_dotted("app"), app.as_str()),
+    ])
+    .expect("an unqualified import binds nothing the expansion emits");
+}
+
+/// A statement whose whole value is a `?` binds nothing, so the success arm
+/// takes a **wildcard** and the statement itself is gone.
+///
+/// This is a canonicality rule and nothing else pins it: no `.ply` in the corpus
+/// writes a bare `e?;`, so the corpus hash gate is silent here, and dropping the
+/// case entirely leaves a compiler that still runs the program correctly while
+/// emitting `Ok(?0) -> { ?0; rest }` — **a different definition with a different
+/// hash**. Verified by deleting the arm: every one of the 354 tests in
+/// `ply-syntax`, `ply-core/try_op`, `ply-hash/audit` and `ply-eval/equivalence_audit`
+/// stayed green and `f`'s digest moved.
+#[test]
+fn a_bare_try_statement_binds_nothing_and_keeps_the_wildcard() {
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ g(n)?; Ok(1) }}"
+        )),
+        "(block (match (call g n) (arm (ctor Err ?0) (call Err ?0)) \
+         (arm (ctor Ok _) (block (call Ok 1)))))"
+    );
+}
+
+/// `sequence` walks a call's parts **left to right**, and that direction is the
+/// whole of the impure-prefix rule for the one shape GUIDE §6.10 spells out:
+/// "`g(h(x), k(x)?)` is `E0119` — `h(x)` is written before the `?` and the
+/// expansion would evaluate it after."
+///
+/// Both directions are asserted, because only the pair pins an *order*. The
+/// refusal alone is satisfied by a scan that refuses everything, and the lift
+/// alone by a scan that lifts everything.
+///
+/// **Found by review as an unarmed gate.** Reversing the iteration reddened
+/// nothing across all four suites, and `a_try_with_an_impure_prefix_is_e0119`
+/// cannot reach it: every prefix it writes is a `Binary` left operand, which
+/// `scan` handles on a different arm.
+#[test]
+fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
+    let pre =
+        format!("{PRE}fn side(n: Int) -> Int = n + 1\nfn two(a: Int, b: Int) -> Int = a + b\n");
+    // Impure to the *left* of the `?`: refused, because the lift would run
+    // `g(n)` before `side(n)`.
+    assert_eq!(
+        codes_of(&format!(
+            "{pre}fn f(n: Int) -> Result<Int, E> = Ok(two(side(n), g(n)?))"
+        )),
+        vec![codes::TRY_POSITION]
+    );
+    // Impure to the *right* of it: lifted, because nothing moves across
+    // anything — `g(n)` already runs first.
+    assert_eq!(
+        body_of(&format!(
+            "{pre}fn f(n: Int) -> Result<Int, E> = Ok(two(g(n)?, side(n)))"
+        )),
+        "(match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+         (arm (ctor Ok ?0) (call Ok (call two ?0 (call side n)))))"
+    );
+}
+
+/// GUIDE §6.10 names six barriers a `?` may not cross and says every one is
+/// `E0118`. `a_try_with_no_readable_return_type_is_e0118` covers three of them;
+/// these are the other three, each with its own `under(..)` string in `sweep`.
+///
+/// **Found by review**: dropping the `handle`-clause barrier — so that a `?`
+/// there fell through to the position refusal and answered `E0119` — reddened
+/// nothing.
+#[test]
+fn a_try_inside_a_handler_or_a_cell_is_e0118() {
+    let eff = "effect ctr { write bump() -> Int }\n";
+    for (what, src) in [
+        (
+            "a `handle` body",
+            format!(
+                "{eff}{PRE}fn f(n: Int) -> Result<Int, E> = handle Ok(g(n)?) with {{ ctr.bump() -> 0 }}"
+            ),
+        ),
+        (
+            "a `handle` clause",
+            format!(
+                "{eff}{PRE}fn f(n: Int) -> Result<Int, E> = \
+                 handle Ok(ctr.bump()) with {{ ctr.bump() -> {{ let q = g(n)?; 0 }} }}"
+            ),
+        ),
+        (
+            "a `handle` return clause",
+            format!(
+                "{eff}{PRE}fn f(n: Int) -> Result<Int, E> = \
+                 handle Ok(1) with {{ ctr.bump() -> 0, return x -> {{ let q = g(n)?; x }} }}"
+            ),
+        ),
+        (
+            "a `with_cell` body",
+            format!(
+                "{PRE}fn f(n: Int) -> Result<Int, E> = \
+                 with_cell[k](0) {{ c -> Ok(g(n)?) }}"
+            ),
+        ),
+    ] {
+        assert_eq!(
+            codes_of(&src),
+            vec![codes::TRY_SCOPE],
+            "{what} should be `E0118`"
+        );
+    }
+}
+
+/// The float is the whole risk, and this is the rule that closes it: expansion
+/// lifts the operand to the head of its region, so anything evaluated before it
+/// must be reorderable — which is `is_pure`, the predicate normalization already
+/// uses to license reordering a run of `let`s.
+///
+/// **Six prefixes, and the last four are the ones that test the predicate.**
+/// A suite written only over a call and a `perform` says nothing about whether
+/// `is_pure` was consulted at all: `scan` answers `Impure` for an `App` and a
+/// `Perform` *structurally*, without asking. Replacing the predicate with
+/// `|_| true` leaves both of those cases refused and every one of the other
+/// tests in this file green — which is exactly what it did, and is why the four
+/// below exist. Each puts the impurity somewhere only `is_pure` looks: inside a
+/// branch, inside an arm, behind a `&&`, and inside a nested block.
+#[test]
+fn a_try_with_an_impure_prefix_is_e0119() {
+    let eff = "effect ctr { read now() -> Int }\n";
+    let side = "fn side(n: Int) -> Int = n + 1\n";
+    for (what, src) in [
+        (
+            "a call to its left",
+            format!("{PRE}{side}fn f(n: Int) -> Result<Int, E> = Ok(side(n) + g(n)?)"),
+        ),
+        (
+            "a `perform` to its left",
+            format!(
+                "{eff}{PRE}fn f(n: Int) -> Result<Int, E> / {{ctr.read}} = Ok(ctr.now() + g(n)?)"
+            ),
+        ),
+        (
+            "an `if` whose branch calls",
+            format!(
+                "{PRE}{side}fn f(n: Int) -> Result<Int, E> = \
+                 Ok(if n > 0 {{ side(n) }} else {{ 0 }} + g(n)?)"
+            ),
+        ),
+        (
+            "a `match` whose arm calls",
+            format!(
+                "{PRE}{side}fn f(n: Int) -> Result<Int, E> = \
+                 Ok(match n {{ 0 -> side(n), _ -> 0 }} + g(n)?)"
+            ),
+        ),
+        (
+            "a call behind a `&&`, which the scan may not enter",
+            format!(
+                "{PRE}{side}fn f(n: Int, c: Bool) -> Result<Int, E> = \
+                 Ok(if c && side(n) > 0 {{ 1 }} else {{ 0 }} + g(n)?)"
+            ),
+        ),
+        (
+            "a nested block whose statement calls",
+            format!(
+                "{PRE}{side}fn f(n: Int) -> Result<Int, E> = \
+                 Ok({{ let z = side(n); z }} + g(n)?)"
+            ),
+        ),
+    ] {
+        assert_eq!(
+            codes_of(&src),
+            vec![codes::TRY_POSITION],
+            "{what} should be `E0119`"
+        );
+    }
+}
+
+/// Nothing conditional may sit between the region root and the `?`. Lifting one
+/// out of a branch would run its operand on a path that does not reach it, and
+/// the row would not notice: a row is a set and does not see order.
+#[test]
+fn a_try_behind_a_conditional_is_e0119() {
+    for src in [
+        format!(
+            "{PRE}fn f(n: Int, c: Bool) -> Result<Int, E> = {{ let y = if c {{ g(n)? }} else {{ 0 }}; Ok(y) }}"
+        ),
+        format!("{PRE}fn f(n: Int, c: Bool) -> Result<Int, E> = Ok(if c {{ g(n)? }} else {{ 0 }})"),
+        format!(
+            "{PRE}fn f(n: Int, c: Bool) -> Result<Int, E> = Ok(match c {{ true -> g(n)?, false -> 0 }})"
+        ),
+        format!(
+            "{PRE}fn f(n: Int, c: Bool) -> Result<Int, E> = Ok(if c && g(n)? > 0 {{ 1 }} else {{ 0 }})"
+        ),
+        format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = match n {{ m if g(m)? > 0 -> Ok(1), _ -> Ok(2) }}"
+        ),
+    ] {
+        assert_eq!(codes_of(&src), vec![codes::TRY_POSITION], "for {src}");
+    }
+}
+
+/// The expansion has no `let` left to carry the annotation on, and a written
+/// annotation must not evaporate. Measured cost: zero — the whole corpus has
+/// three annotated `let`s and none is on a convertible site.
+///
+/// A `?` *inside* an annotated `let`'s value is fine, because the `let` survives
+/// the split: only the case where the `?` is the whole value is refused.
+#[test]
+fn a_try_that_is_the_whole_value_of_an_annotated_let_is_e0119() {
+    assert_eq!(
+        codes_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ let a: Int = g(n)?; Ok(a) }}"
+        )),
+        vec![codes::TRY_POSITION]
+    );
+    assert_eq!(
+        body_of(&format!(
+            "{PRE}fn f(n: Int) -> Result<Int, E> = {{ let a: Int = g(n)? + 1; Ok(a) }}"
+        )),
+        "(block (match (call g n) (arm (ctor Err ?1) (call Err ?1)) \
+         (arm (ctor Ok ?0) (block (let a Int (+ ?0 1)) (call Ok a)))))"
+    );
+}
+
+/// **The guard behind every `unreachable!` arm downstream.**
+///
+/// `ply-hash`, `ply-core` and `ply-eval` each carry an arm for
+/// [`ExprKind::Try`] that panics, because hashing, typing or evaluating a `?` as
+/// anything but the `match` it stands for would be a second account of what it
+/// means. Those arms are safe only because the node cannot escape
+/// `parse_module`, and "cannot" is this project's most dangerous word.
+///
+/// **The appended file is not a nicety.** No `.ply` in the tree wrote a `?`
+/// before this change, so without it the guard would pass whether or not the
+/// expansion ran at all — which is the record-update guard's own comment, and
+/// the same trap.
+#[test]
+fn no_try_survives_parse_module_anywhere_in_the_tree() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate lives two levels below the repository root");
+    let mut files = Vec::new();
+    collect_ply(root, &mut files);
+    assert!(
+        files.len() > 100,
+        "only {} `.ply` files found under {}; the walk is not reaching the corpus",
+        files.len(),
+        root.display()
+    );
+
+    const USES_IT: &str = "\
+type E = {msg: String}
+type A = Result<Int, E>
+fn g(n: Int) -> Result<Int, E> = Ok(n)
+fn h(n: Int) -> Option<Int> = Some(n)
+fn a(n: Int) -> Result<Int, E> = Ok(g(n)?)
+fn b(n: Int) -> A = { let x = g(n)?; let y = g(x)?; Ok(x + y) }
+fn c(n: Int) -> Option<Int> = { let x = h(n)?; Some(x) }
+fn d(n: Int) -> Result<Int, E> = g(g(n)?)
+fn e(n: Int, c: Bool) -> Result<Int, E> = if c { Ok(g(n)?) } else { Ok(0) }
+fn refused_scope(n: Int) -> Int = g(n)?
+fn refused_position(n: Int, c: Bool) -> Result<Int, E> = Ok(if c { g(n)? } else { 0 })
+fn refused_lambda(n: Int) -> Result<Int, E> = Ok((|x: Int| g(x)?)(n))
+test \"t\" { assert_eq(g(1)?, 1) }
+law \"l\" forall (n: Int) { g(n)? == n }
+";
+    let mut sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| (p.display().to_string(), s))
+        })
+        .collect();
+    sources.push(("<uses `?`>".to_string(), USES_IT.to_string()));
+
+    let mut saw_the_syntax = false;
+    for (name, source) in &sources {
+        if name.starts_with("<uses") {
+            saw_the_syntax = true;
+        }
+        let (m, _) = parse_recovering(SRC, ModuleName::from_dotted("m"), source);
+        assert!(
+            !has_try(&m),
+            "an unexpanded `?` escaped `parse_recovering` from {name}"
+        );
+        if let Ok(m) = parse(SRC, source) {
+            assert!(
+                !has_try(&m),
+                "an unexpanded `?` escaped `parse` from {name}"
+            );
+        }
+    }
+    assert!(
+        saw_the_syntax,
+        "no source in this run wrote a `?`, so the guard proved nothing"
+    );
+}
+
+/// `parse_expr` has no `fn` around it and so no written return type. What it
+/// must not do is hand an unexpanded node to a caller — `ply-prove` parses spec
+/// clauses this way — so it refuses instead.
+#[test]
+fn parse_expr_refuses_a_try_rather_than_leaking_one() {
+    let d = crate::parser::parse_expr(SRC, "g(1)?")
+        .expect_err("a bare expression has no return type to read a mode off");
+    assert!(d.iter().any(|d| d.code == codes::TRY_SCOPE), "{d:#?}");
+}
+
 // --- Record update -----------------------------------------------------------
 
 /// Whether an unexpanded [`ExprKind::RecordUpdate`] is anywhere in the tree.
@@ -2430,6 +3115,7 @@ fn has_record_update(m: &Module) -> bool {
             }
             ExprKind::Record { fields } => fields.iter().any(|(_, v)| e(v)),
             ExprKind::Field { base, .. } => e(base),
+            ExprKind::Try { operand } => e(operand),
             ExprKind::List { items } => items.iter().any(e),
             ExprKind::Perform { args, .. } => args.iter().any(e),
             ExprKind::Handle {
@@ -2469,31 +3155,12 @@ fn has_record_update(m: &Module) -> bool {
 /// partial tree, and the expansion has to run on the error path too.
 #[test]
 fn no_record_update_survives_parse_module_anywhere_in_the_tree() {
-    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "target" {
-                continue;
-            }
-            match path.is_dir() {
-                true => collect(&path, out),
-                false if path.extension().is_some_and(|x| x == "ply") => out.push(path),
-                false => {}
-            }
-        }
-    }
-
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("the crate lives two levels below the repository root");
     let mut files = Vec::new();
-    collect(root, &mut files);
+    collect_ply(root, &mut files);
     assert!(
         files.len() > 100,
         "only {} `.ply` files found under {}; the walk is not reaching the corpus",

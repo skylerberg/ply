@@ -2372,6 +2372,109 @@ test "the sugar and the longhand compute one value" {
     );
 }
 
+/// A `?` runs on both engines, and it runs on the *same* path the `match` does —
+/// because expansion in the parser makes it the same tree.
+///
+/// This is `a_record_update_agrees_with_its_longhand_on_both_engines`'s claim
+/// for `docs/adr/0027`, and the alternative it rules out is worse here: a real
+/// early-return node would have needed an unwind in the tree-walker's handler
+/// stack *and* one in the machine's segment capture, which is exactly where
+/// these two implementations can encode one language two ways. Both engines
+/// carry an `unreachable!` for `ExprKind::Try` instead, guarded by
+/// `no_try_survives_parse_module_anywhere_in_the_tree`.
+#[test]
+fn a_try_agrees_with_its_longhand_on_both_engines() {
+    agree_and_pass(
+        r#"
+type E = {msg: Int}
+
+fn step(n: Int) -> Result<Int, E> = if n < 0 { Err({msg: n}) } else { Ok(n + 1) }
+fn maybe(n: Int) -> Option<Int> = if n < 0 { None } else { Some(n + 1) }
+
+fn sugar(n: Int) -> Result<Int, E> = { let a = step(n)?; let b = step(a)?; Ok(a + b) }
+fn longhand(n: Int) -> Result<Int, E> =
+  match step(n) {
+    Err(er) -> Err(er),
+    Ok(a) -> match step(a) { Err(er) -> Err(er), Ok(b) -> Ok(a + b) },
+  }
+
+fn tail_sugar(n: Int) -> Result<Int, E> = step(step(n)?)
+fn tail_longhand(n: Int) -> Result<Int, E> =
+  match step(n) { Err(er) -> Err(er), Ok(c) -> step(c) }
+
+fn opt_sugar(n: Int) -> Option<Int> = { let a = maybe(n)?; Some(a + 1) }
+fn opt_longhand(n: Int) -> Option<Int> =
+  match maybe(n) { None -> None, Some(a) -> Some(a + 1) }
+
+test "the sugar and the longhand compute one value, on the failing path too" {
+  assert_eq(sugar(3), longhand(3));
+  assert_eq(sugar(3), Ok(9));
+  assert_eq(sugar(0 - 1), longhand(0 - 1));
+  assert_eq(sugar(0 - 1), Err({msg: 0 - 1}));
+  assert_eq(tail_sugar(3), tail_longhand(3));
+  assert_eq(tail_sugar(0 - 1), tail_longhand(0 - 1));
+  assert_eq(opt_sugar(3), opt_longhand(3));
+  assert_eq(opt_sugar(0 - 1), None)
+}
+"#,
+    );
+}
+
+/// **A `?` that fails stops the work after it, and it does so on both engines.**
+///
+/// This is the case a value comparison alone would miss: `sugar` and `longhand`
+/// could agree on `Err` while one of them had already performed the second step.
+/// The footprint is counted rather than assumed, which is what
+/// `a_replacement_value_performs_once_on_both_engines` learned to do below.
+#[test]
+fn a_failing_try_skips_what_follows_it_on_both_engines() {
+    agree_and_pass(
+        r#"
+type E = {msg: Int}
+effect counter { write bump[n]() -> Int }
+
+fn step(n: Int) -> Result<Int, E> / {counter.write[n]} = {
+  let seen = counter.bump[n]();
+  if n < 0 { Err({msg: n}) } else { Ok(n + 1) }
+}
+
+fn two(n: Int) -> Result<Int, E> / {counter.write[n]} = {
+  let a = step(n)?;
+  let b = step(a)?;
+  Ok(a + b)
+}
+
+test "the second step does not run when the first fails" {
+  with_cell[t](0) { c ->
+    {
+      let bad = handle {
+        two(0 - 1)
+      } with {
+        counter.bump[n]() -> { cell_set(c, cell_get(c) + 1); 0 }
+      };
+      assert_eq(bad, Err({msg: 0 - 1}));
+      assert_eq(cell_get(c), 1)
+    }
+  }
+}
+
+test "both steps run when the first succeeds" {
+  with_cell[t](0) { c ->
+    {
+      let good = handle {
+        two(3)
+      } with {
+        counter.bump[n]() -> { cell_set(c, cell_get(c) + 1); 0 }
+      };
+      assert_eq(good, Ok(9));
+      assert_eq(cell_get(c), 2)
+    }
+  }
+}
+"#,
+    );
+}
+
 /// A replacement value may perform, and it performs exactly once — the base is
 /// copied field-wise, so an effect in a *written* field is not duplicated by the
 /// twelve copies beside it.

@@ -1022,6 +1022,7 @@ fn children(e: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         ExprKind::Field { base, .. } => f(base),
+        ExprKind::Try { operand } => f(operand),
         ExprKind::List { items } => {
             for item in items {
                 f(item);

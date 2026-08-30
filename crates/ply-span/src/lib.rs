@@ -263,6 +263,28 @@ pub mod codes {
     /// A record update names a field the base does not have. Update replaces;
     /// it does not widen, because the result's type is the base's type.
     pub const RECORD_UPDATE_FIELD: &str = "E0117";
+    /// A `?` whose enclosing function has no return type this file can read as
+    /// `Result` or `Option`, so the expansion has no constructors to name.
+    ///
+    /// `?` is expanded in the parser (`docs/adr/0027`), which runs before
+    /// inference — the driver hashes before it infers (ADR 0002) — so the mode
+    /// is read off the **written** `->` of the enclosing `fn`, following this
+    /// file's own `type` aliases and nothing across a module boundary, for the
+    /// reason [`RECORD_UPDATE_SHAPE`] gives. A lambda, a `handle` clause, a
+    /// region, a `test`, a `law` and a spec expression all have no such type
+    /// and are refused with a note saying which.
+    pub const TRY_SCOPE: &str = "E0118";
+    /// A `?` written where its early exit would change what runs, or would
+    /// discard something written.
+    ///
+    /// Expansion lifts the `?`'s operand to the head of its region, so anything
+    /// evaluated before it in that region has to be pure (the predicate is
+    /// `ply_syntax::is_pure`, the same one normalization uses to license
+    /// reordering a run of `let`s) and nothing conditional may sit between the
+    /// region root and the `?`. `let x: T = e?;` is refused here too: the
+    /// expansion has no `let` left to carry `T` on, and a written annotation
+    /// must not evaporate.
+    pub const TRY_POSITION: &str = "E0119";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -750,6 +772,8 @@ mod tests {
             ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
             ("RECORD_UPDATE_SHAPE", codes::RECORD_UPDATE_SHAPE, "E0116"),
             ("RECORD_UPDATE_FIELD", codes::RECORD_UPDATE_FIELD, "E0117"),
+            ("TRY_SCOPE", codes::TRY_SCOPE, "E0118"),
+            ("TRY_POSITION", codes::TRY_POSITION, "E0119"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
