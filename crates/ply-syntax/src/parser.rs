@@ -316,7 +316,7 @@ impl Parser {
         if self.uses_record_update {
             crate::record_update::expand(&mut module, &mut self.diags);
         }
-        // Last, by convention rather than by necessity. ADR 0027 first said the
+        // Last, by convention rather than by necessity. ADR 0028 first said the
         // order was load-bearing, on the grounds that `record_update` reads
         // written `let x: T` annotations and a `?` expanded first would have
         // turned `let x: T = e?;` into an untyped `Ok(x)` arm binder — but that

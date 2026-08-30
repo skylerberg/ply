@@ -472,7 +472,7 @@ impl Cx<'_> {
                 // still here and this walk goes through it. The reason once
                 // given for that order — that a `?` expanded first would have
                 // turned `let x: T = e?;` into an untyped `Ok(x)` arm binder —
-                // is withdrawn in ADR 0027 Decision 1: that shape is refused,
+                // is withdrawn in ADR 0028 Decision 1: that shape is refused,
                 // not expanded. This arm is what makes the order free, so it
                 // stays whichever way the two are sequenced.
                 ExprKind::Try { operand } => self.expr(operand),

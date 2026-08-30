@@ -163,6 +163,7 @@ TREE_CHECKS=(
   "ply-span:armed:the_code_registry_table_is_total_over_the_codes_module"
   "ply-span:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span:armed:ambiguous_enum_names_are_declared"
+  "ply-span:armed:no_two_adrs_share_a_number"
 )
 
 shard_packages() {

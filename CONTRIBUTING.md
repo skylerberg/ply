@@ -1322,9 +1322,20 @@ comments record why each of the three non-obvious ones (`rustls`,
 ### An ADR
 
 `docs/adr/` is **twenty-seven** files, `00NN-slug.md`, with **no index** — the
-numbers are the ordering. Number yours `0028` and up, and read the open pull
-requests before you pick: counting the directory is necessary and is not
-sufficient.
+numbers are the ordering. Pick the next free one — and **nothing you have to
+remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
+fails when two files share a number, so the check catches you rather than a
+reader finding an ambiguous `ADR NNNN` citation months later.
+
+> **Corrected again (2026-08-30), and this time by a test rather than by better
+> advice.** The line above read *"Number yours `0028` and up, and read the open
+> pull requests before you pick: counting the directory is necessary and is not
+> sufficient."* That was itself the correction to *"count the directory"*, which
+> had failed when two branches wrote `0022`. It then failed the same way: two
+> branches wrote `0027`, because **both were created before either pull request
+> existed**, so there was nothing to read. Advice that assumes a contributor can
+> see the other contributor's work is not advice this repository can follow —
+> its changes are written in parallel worktrees that cannot see one another.
 
 > **Corrected by the list index, 2026-08-30 — the third time this line has gone
 > stale, which is the point the block below is making.** It read:

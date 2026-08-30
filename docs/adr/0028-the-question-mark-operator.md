@@ -1,4 +1,4 @@
-# ADR 0027 — The `?` operator
+# ADR 0028 — The `?` operator
 
 Status: accepted — implemented in W4.
 Date: 2026-08-30
