@@ -1695,10 +1695,20 @@ Recorded here so nobody spends an afternoon rediscovering them.
    missing positional corpus argument on the `ply-corpus bench` beside it.
    `benches/README.md` always had the correct form.
 5. ~~**`examples/serve.sh` claims `--db-schema` refuses with `E0435`.**~~
-   **Fixed.** It claimed that and nothing raises `E0435`; the comment at
+   **Fixed, twice.** It claimed that and nothing raises `E0435`; the comment at
    `examples/serve.sh:37-54` now records the claim, the grep that refutes it, and
-   the error you actually get. Kept in this list because the *code* gap — no
-   schema check at bind time — is still open; only the false comment was closed.
+   the error you actually get. That 2026-08-17 pass then **missed the widest
+   instance of the same claim**: `--db-schema`'s own help text at
+   `crates/ply-cli/src/db.rs:538-541` told everyone who ran `ply run --help` that
+   the schema is "diffed against the live database at bind time so a mismatch is
+   `E0435` before anything runs". The `serve.sh` comment had even *named* that
+   line, and filed it as "prose describing the check as future work" — it was
+   neither prose nor future work but shipped interface text, and reading a doc
+   comment as a comment rather than as UI is how it survived a pass looking
+   straight at it. Corrected 2026-08-30, to agree with `schema_line`
+   (`db.rs:1035`), the refusal note (`db.rs:877`) and the `Declared` state's own
+   comment (`db.rs:734-738`). Kept in this list because the *code* gap — no
+   schema check at bind time — is still open; only the false claims were closed.
 6. ~~**`PLY_PG_URL` is set by nothing in the repository**, so ten postgres
    tests pass without running by default.~~ **Half fixed.**
    `.github/workflows/ci.yml` sets it, at a service container, and fails the run

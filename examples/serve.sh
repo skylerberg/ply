@@ -42,11 +42,17 @@
 # "refuses at bind time with `E0435` if the live database is not the one
 # `desk.ply` describes". It does not, and never did. `E0435 DB_SCHEMA_MISMATCH`
 # is raised nowhere: `grep -rn 'E0435\|DB_SCHEMA_MISMATCH' crates/ --include='*.rs'`
-# returns five hits and none is a raise — `crates/ply-span/src/lib.rs:428`
-# defines the constant, `:801` registers it (inside `#[cfg(test)] mod tests`),
-# `crates/ply-eval/src/host.rs:1106`
-# lists it as reserved, and `crates/ply-cli/src/artifact.rs:253` and
-# `crates/ply-cli/src/db.rs:539` are prose describing the check as future work.
+# returns twelve hits and none is a raise — `crates/ply-span/src/lib.rs:441`
+# defines the constant, `:825` registers it (inside `#[cfg(test)] mod tests`),
+# `crates/ply-eval/src/host.rs:1106` lists it as reserved,
+# `crates/ply-span/tests/armed.rs` pins it as reserved-and-never-constructed, and
+# `crates/ply-cli/src/artifact.rs:253` and `crates/ply-eval/src/limit.rs:99` are
+# prose. (The hit count and the two `ply-span` line numbers above were stale from
+# 2026-08-17 and are corrected here too.) This list used to end with
+# `crates/ply-cli/src/db.rs:539`, called "prose describing the check as future
+# work". That was wrong twice over: it was `--db-schema`'s own `--help` text, so
+# it made this same withdrawn claim to every operator, and calling it prose is
+# what let it survive this very audit. Corrected 2026-08-30.
 # What `--db-schema` actually does is resolve the name, check it is a nullary
 # function returning a `Schema`, evaluate it, and read its table and column
 # counts; it never opens a connection to compare. A mismatch surfaces later as
