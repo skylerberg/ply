@@ -1909,3 +1909,49 @@ fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
         None => rest.to_vec(),
     }
 }
+
+/// Two ADRs may not share a number.
+///
+/// **Advice failed twice before this test existed.** `CONTRIBUTING.md` §"Adding
+/// things" said to number an ADR by counting the directory; two branches then
+/// wrote `0022` without seeing each other. It was corrected to say counting is
+/// "necessary and is not sufficient — read the open pull requests"; two
+/// branches then wrote `0027` without seeing each other, because both were
+/// created before either pull request existed, so there was nothing to read.
+///
+/// A rule a contributor has to remember, in a repository whose changes are
+/// written in parallel worktrees that cannot see one another, is not a rule.
+/// This is the same move `every_registered_code_is_constructed_in_production`
+/// makes for the code registry: stop advising, and check.
+#[test]
+fn no_two_adrs_share_a_number() {
+    let dir = workspace_root().join("docs/adr");
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("docs/adr must be readable") {
+        let name = entry.expect("a readable entry").file_name();
+        let name = name.to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".md") else {
+            continue;
+        };
+        let Some((number, _)) = stem.split_once('-') else {
+            panic!("`docs/adr/{name}` is not `NNNN-slug.md`, so nothing can order it");
+        };
+        seen.entry(number.to_string()).or_default().push(name);
+    }
+    assert!(
+        !seen.is_empty(),
+        "no ADRs found — this test is reading the wrong directory"
+    );
+    let clashes: Vec<String> = seen
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(n, files)| format!("{n}: {}", files.join(", ")))
+        .collect();
+    assert!(
+        clashes.is_empty(),
+        "two ADRs share a number, so a citation of the form `ADR {}` is ambiguous \
+         and one of them has to be renumbered:\n  {}",
+        clashes[0].split(':').next().unwrap_or("NNNN"),
+        clashes.join("\n  ")
+    );
+}

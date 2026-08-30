@@ -8110,7 +8110,7 @@ branch's compiler with the **base** `http.ply` embedded hashes the base corpus t
 
 ## W4 — the `?` operator
 
-Full argument: `docs/adr/0027-the-question-mark-operator.md`. User-facing
+Full argument: `docs/adr/0028-the-question-mark-operator.md`. User-facing
 surface: GUIDE §6.10.
 
 ### `ply-syntax` — landed

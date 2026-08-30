@@ -1108,7 +1108,7 @@ pub enum PatternKind {
 /// implementations of it could drift apart, and a drift would mean normalization
 /// reordering something `?` refused to, or the reverse.
 ///
-/// This lived in `crates/ply-hash/src/normalize.rs` until ADR 0027 and moved
+/// This lived in `crates/ply-hash/src/normalize.rs` until ADR 0028 and moved
 /// here unchanged but for the [`ExprKind::Try`] arm, which is a variant that did
 /// not exist before. `crates/ply-hash/tests/map.rs`'s pinned digest is the guard
 /// on the move being free.
