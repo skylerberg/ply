@@ -200,17 +200,31 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // the AST and the workers share it. Built here, after the reload above may
     // have replaced `loaded`, so the address `Compiled::describes` compares
     // against is the program the run actually evaluates.
-    let fragment = backend
-        .is_some()
-        .then(|| ply_eval::Fragment::over(&loaded.program, &loaded.resolved, &loaded.check));
+    let provider = match backend.as_ref().map(|spec| build_backend(spec, &loaded)) {
+        None => None,
+        Some(Ok(provider)) => Some(provider),
+        Some(Err(diagnostic)) => {
+            if args.json {
+                emit_json(&json!({
+                    "command": "test",
+                    "ok": false,
+                    "exit_code": EXIT_COMPILE_ERROR,
+                    "diagnostics": [diagnostic_json(&diagnostic, &loaded.sources)],
+                }));
+            } else {
+                print_diagnostics(std::slice::from_ref(&diagnostic), &loaded.sources, style);
+            }
+            return EXIT_COMPILE_ERROR;
+        }
+    };
     let mut run = || {
         let mut executor =
             ply_test::InterpExecutor::new(&loaded.program, &loaded.resolved, &loaded.check)
                 .with_engine(engine)
                 .with_search(simulation.clone())
                 .with_hosts(hosting(&hosts, &runtime));
-        if let (Some(fragment), Some(spec)) = (fragment, backend.clone()) {
-            executor = executor.with_backend(fragment, spec);
+        if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
+            executor = executor.with_backend(provider, spec);
         }
         ply_test::run_with(
             &plan.selection,
@@ -245,7 +259,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     let view = HostView::of(&hosts, &plan, &loaded.check, &report);
-    let backend_view = BackendView::of(backend.as_ref(), fragment, &report);
+    let backend_view = BackendView::of(backend.as_ref(), provider, &report);
     let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
     if args.json {
@@ -287,8 +301,15 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
 struct BackendView {
     /// What was asked for, rendered.
     spec: Option<String>,
+    /// Which backend answered — `reference` or `cranelift`. Read off the
+    /// provider that was actually installed rather than off the flag, so a
+    /// report cannot name a backend the run did not build.
+    name: &'static str,
     /// Definitions the backend had a body for.
     fragment: usize,
+    /// What the provider spent compiling, if it compiles anything. `None` for
+    /// one that does not — see `ply_eval::Provider::compilation`.
+    compiled: Option<ply_eval::Compilation>,
     /// Calls offered, offers naming a targeted definition, and answers a
     /// mutation changed — over every worker.
     offers: ply_eval::Offers,
@@ -303,13 +324,15 @@ struct BackendView {
 impl BackendView {
     fn of(
         spec: Option<&ply_eval::BackendSpec>,
-        fragment: Option<&'static ply_eval::Fragment>,
+        provider: Option<&'static dyn ply_eval::Provider>,
         report: &RunReport,
     ) -> BackendView {
         let Some(spec) = spec else {
             return BackendView {
                 spec: None,
+                name: "",
                 fragment: 0,
+                compiled: None,
                 offers: ply_eval::Offers::default(),
                 entries: 0,
                 declines: 0,
@@ -328,13 +351,42 @@ impl BackendView {
             .filter_map(|r| r.backend)
             .map(|b| b.declines)
             .sum();
+        let mut escapes = backend_escapes(report);
+        // A worker whose backend failed to build declines every call, so the
+        // run would be green over a seam nothing reached. Reported beside the
+        // cache escapes because it is the same class of defect — a rule about
+        // this run that only the run can see — and it fails the run for the
+        // same reason.
+        let unbuilt = provider.map_or(0, ply_eval::Provider::unbuilt);
+        if unbuilt > 0 {
+            escapes.push(
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "{unbuilt} worker(s) could not build the `{}` backend, and every call \
+                         they were offered was declined",
+                        provider.map_or("", ply_eval::Provider::name)
+                    ),
+                )
+                .note(
+                    "the backend was built once before the run started, so this cannot be a host \
+                     that has no code generator",
+                )
+                .note(
+                    "this is Ply's fault — a run that installs a backend and silently does not \
+                     have one is green over a seam nothing reached",
+                ),
+            );
+        }
         BackendView {
             spec: Some(spec.describe()),
-            fragment: fragment.map_or(0, ply_eval::Fragment::len),
-            offers: fragment.map_or_else(Default::default, ply_eval::Fragment::offers),
+            name: provider.map_or(spec.kind.as_str(), ply_eval::Provider::name),
+            fragment: provider.map_or(0, ply_eval::Provider::len),
+            compiled: provider.and_then(ply_eval::Provider::compilation),
+            offers: provider.map_or_else(Default::default, ply_eval::Provider::offers),
             entries,
             declines,
-            escapes: backend_escapes(report),
+            escapes,
         }
     }
 
@@ -528,6 +580,47 @@ fn backend_spec(args: &TestArgs) -> Result<Option<ply_eval::BackendSpec>, Diagno
                  attached can be read as evidence",
         )
     })
+}
+
+/// The run's backend, built once, or the diagnostic that refuses it.
+///
+/// One provider per run and not one per worker: a backend may not borrow the
+/// program (`Machine`'s `compiled` field says why), so building one costs a copy
+/// of the AST and the workers share it.
+///
+/// **The cranelift arm is fallible and the reference arm is not, and that
+/// asymmetry is the point.** A code generator can fail for reasons a
+/// tree-walker cannot — a host with no cranelift backend for its architecture,
+/// or a fixpoint that cannot close — and the only place those can still be
+/// *said* is before the run starts. A backend that failed to build and declined
+/// every call would leave a green run over a seam nothing reached, which is
+/// `CONTRIBUTING.md` §"The one rule"'s defect shape.
+fn build_backend(
+    spec: &ply_eval::BackendSpec,
+    loaded: &Loaded,
+) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    match spec.kind {
+        ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(
+            &loaded.program,
+            &loaded.resolved,
+            &loaded.check,
+        )),
+        ply_eval::BackendKind::Cranelift => {
+            ply_codegen::Cranelift::over(&loaded.program, &loaded.resolved, &loaded.check)
+                .map(|unit| unit as &'static dyn ply_eval::Provider)
+                .map_err(|error| {
+                    Diagnostic::error(
+                        codes::BACKEND_UNAVAILABLE,
+                        format!("the cranelift backend could not be built: {error:#}"),
+                    )
+                    .note(
+                        "a backend that failed to build would decline every call, so the run is \
+                         refused rather than reported green over a seam nothing reached",
+                    )
+                    .note("`--backend reference` needs no code generator and runs anywhere")
+                })
+        }
+    }
 }
 
 /// `--bisect never` goes *through* the diagnosis rather than around it, so that
@@ -870,12 +963,27 @@ fn print_human(
         println!(
             "{IND}{} {} · {} of {} offers entered · {} declined · {} in the fragment",
             style.bold("backend"),
-            style.bold(args.backend.as_deref().unwrap_or("reference")),
+            style.bold(backend.name),
             backend.entries,
             offers.offered,
             backend.declines,
             backend.fragment,
         );
+        // Printed apart from the entry counts because it is what the backend
+        // cost rather than what it did, and because the two halves scale
+        // differently: the analysis is paid once and the code generation is
+        // paid per worker.
+        if let Some(c) = backend.compiled {
+            println!(
+                "{IND}{}",
+                style.dim(&format!(
+                    "compiled {} unit(s) in {:.1}ms, after {:.1}ms deciding what to compile",
+                    c.units,
+                    c.codegen_nanos as f64 / 1e6,
+                    c.analysis_nanos as f64 / 1e6,
+                ))
+            );
+        }
         if corruption != "nothing" {
             println!(
                 "{IND}{}",
@@ -1643,11 +1751,15 @@ fn report_json(
         // meaning and nothing left.
         "backend": backend.installed().then(|| json!({
             "spec": args.backend,
+            "name": backend.name,
             "corruption": backend.spec,
             "fragment": backend.fragment,
             "offered": backend.offers.offered,
             "offered_target": backend.offers.offered_target,
             "fired": backend.offers.fired,
+            "analysis_nanos": backend.compiled.map(|c| c.analysis_nanos),
+            "codegen_nanos": backend.compiled.map(|c| c.codegen_nanos),
+            "units": backend.compiled.map(|c| c.units),
             "entered": backend.entries,
             "declined": backend.declines,
         })),

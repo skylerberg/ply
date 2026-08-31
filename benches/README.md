@@ -636,7 +636,7 @@ request. ADR 0018 is ordered on the assumption that an MCTS inner loop is
 assumption must be tested before anything is built. This is that test.
 
 ```
-cd crates/ply-codegen-spike && cargo +1.94.0 build --release
+cd crates/ply-codegen-spike && cargo build --release   # 1.93.1; was +1.94.0 before cranelift 0.132.3
 ./crates/ply-codegen-spike/target/release/mcts \
     --dir benches/kernel --iterations 100 --inner 3 --repeats 21 \
     --out benches/adr0018-mcts.json
@@ -661,7 +661,7 @@ each one does, and its own test pins that correspondence.
 | agreement | every scalar-argument function against generated inputs, plus whole searches, against **both** shipped evaluators, before anything is timed. Deterministic. |
 | the ladder | four compiled sets, each a superset of the last, timed end to end against the interpreter — and since R5 they are *leaves* the interpreter drops into rather than drivers it is entered from. Every rung carries its entry and decline counts, and a rung with zero entries is printed as a null result. |
 | the same fragment with the tree removed | `mcts.playouts`, which is inside the fragment top to bottom and crosses nothing. |
-| `--only agreement` | stops after the census, the agreement corpus and the entry counts, and takes no wall clock at all. |
+| `--only agreement` | stops after the census, the agreement corpus and the entry counts, and takes no wall clock at all. **Currently exits 1 with 42 disagreements — see `CONTRIBUTING.md` §"Things known to be broken" item 18. Agreement runs before anything is timed and `bail!`s, so every invocation in this section, `--only entries` and the full ladder included, refuses until that is fixed.** |
 | where the interpreter's time goes | the fragment's share of executed work. |
 | the ceiling | Amdahl over the two measured numbers above, and nothing else. |
 | the bound compiled code now carries | run as a subprocess, because before R5 observing it meant watching a process die. |

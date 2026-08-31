@@ -52,7 +52,10 @@ pub use arena::{Arena, RegionKind};
 // splits a request's surviving argument vectors at the free list's widest class
 // and must split at the same number this crate serves.
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
-pub use backend::{Fragment, Mutant, Mutation, Offers, Reference, Spec as BackendSpec};
+pub use backend::{
+    Compilation, Counters, Fragment, Kind as BackendKind, Mutant, Mutation, Offers, Policed,
+    Provider, Reference, Spec as BackendSpec,
+};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Code, Lowering, Node, NodeKind, lower};
 pub use compiled::Compiled;

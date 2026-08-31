@@ -8,9 +8,29 @@
 //! Anything else is **refused by name**. A spike that silently fell back to the
 //! interpreter for part of a body would report a ratio for a program it did not
 //! compile, which is the one failure mode that would make the number worthless.
+//!
+//! # Provenance, and what changed
+//!
+//! Ported from `crates/ply-codegen-spike/src/jit.rs` on 2026-08-31, close to
+//! unchanged: `crate::program::Loaded` became [`crate::source::Source`], which
+//! is the same three accessors over a program a shipping command already
+//! loaded rather than one this file loads for itself, and the type this module
+//! produces was renamed `Compiled` -> [`Unit`] so that `ply_eval::Compiled` —
+//! the trait it is offered through — can be named without qualification. That
+//! is the whole diff.
+//!
+//! **The paragraph above is now a claim about a shipping crate rather than
+//! about a spike, and it is a stronger claim in one place.** A silent fallback
+//! would have made a *number* worthless; it would now make an *answer* wrong,
+//! because `ply_eval::Machine` enters this code and believes what it returns.
+//! What stops it is the same mechanism — [`Denotes::Uncompiled`] refuses the
+//! caller at compile time, so the compiled set is closed under calls — and
+//! `crates/ply-codegen/tests/fragment.rs`'s
+//! `the_compiled_set_is_closed_under_calls` is what checks it by compiling the
+//! fixpoint's answer a second time and asserting it refuses nothing.
 
-use crate::program::Loaded;
 use crate::rt::{self, Ctx, Tables};
+use crate::source::Source;
 use anyhow::{Result, anyhow};
 use cranelift_codegen::Context as ClifContext;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -94,9 +114,27 @@ struct Helpers {
 /// long as this does. Nothing frees the executable pages — `JITModule` unmaps
 /// only through `unsafe fn free_memory(self)` and nothing calls it — so dropping
 /// one leaks. That is a spike, not a design; it is written down here because the
-/// bare `fn` pointer [`Compiled::entry`] returns carries no lifetime and would
+/// bare `fn` pointer [`Unit::entry`] returns carries no lifetime and would
 /// otherwise look safe.
-pub struct Compiled {
+///
+/// > **"That is a spike, not a design" no longer excuses it, 2026-08-31.** This
+/// > type is in a shipping binary now, so the leak is a property of `ply test
+/// > --backend cranelift` and is stated as one rather than deferred: **one unit
+/// > per worker per group is compiled and none is freed until the process
+/// > exits.** Over `examples/` at the default `-j` that is 18 units in a run
+/// > lasting about a second.
+/// >
+/// > Why it is tolerated rather than fixed here, and what would change it.
+/// > `free_memory` is an `unsafe fn` because it invalidates every function
+/// > pointer the module handed out, and [`crate::backend::Bodies`] hands them to
+/// > a machine — so a correct `Drop` needs a proof that no [`Entry`] outlives
+/// > the `Unit`, which this type does not carry (`Bodies`'s `_code` field is the
+/// > informal version of it). The bound is `units × code size` for the life of
+/// > one command invocation, and `ply` is a command rather than a server.
+/// > **It would stop being tolerable the moment a long-running process installs
+/// > a backend** — `ply serve` does not and may not, per ADR 0026 §4.7 — or the
+/// > moment units are compiled per test rather than per worker.
+pub struct Unit {
     module: JITModule,
     entries: HashMap<String, (FuncId, usize)>,
     tables: Rc<Tables>,
@@ -106,7 +144,7 @@ pub struct Compiled {
     pub compile_nanos: u128,
 }
 
-impl Compiled {
+impl Unit {
     pub fn entry(&self, name: &str) -> Option<Entry> {
         let (id, _) = self.entries.get(name)?;
         let ptr = self.module.get_finalized_function(*id);
@@ -178,11 +216,11 @@ impl Jit {
     ///
     /// The compiled set is therefore **closed under calls** — which is the whole
     /// of what R5 changed here. See [`Denotes::Uncompiled`].
-    pub fn compile(loaded: &'static Loaded, names: &[&str]) -> Result<Compiled> {
+    pub fn compile(loaded: &'static Source, names: &[&str]) -> Result<Unit> {
         Jit::compile_with(loaded, names, Opts::default())
     }
 
-    pub fn compile_with(loaded: &'static Loaded, names: &[&str], opts: Opts) -> Result<Compiled> {
+    pub fn compile_with(loaded: &'static Source, names: &[&str], opts: Opts) -> Result<Unit> {
         let (mut jit, bodies, started) = Jit::prepare(loaded, names, opts)?;
         let mut clif = ClifContext::new();
         let mut fctx = FunctionBuilderContext::new();
@@ -210,7 +248,7 @@ impl Jit {
             .iter()
             .map(|(name, (id, arity, _))| (name.clone(), (*id, *arity)))
             .collect();
-        Ok(Compiled {
+        Ok(Unit {
             module: jit.module,
             entries,
             tables: Rc::new(Tables {
@@ -234,9 +272,9 @@ impl Jit {
     /// under calls needs all of them, because dropping one function can refuse
     /// its callers on the next round.
     ///
-    /// Nothing is finalized and no [`Compiled`] is produced: a refused function
+    /// Nothing is finalized and no [`Unit`] is produced: a refused function
     /// is declared and never defined, and finalizing that is an error.
-    pub fn refusals(loaded: &'static Loaded, names: &[&str], opts: Opts) -> Result<Vec<Refused>> {
+    pub fn refusals(loaded: &'static Source, names: &[&str], opts: Opts) -> Result<Vec<Refused>> {
         let (mut jit, bodies, _) = Jit::prepare(loaded, names, opts)?;
         let mut out = Vec::new();
         for (name, params, body, module_index) in &bodies {
@@ -283,7 +321,7 @@ impl Jit {
     /// build the module, register the runtime symbols, declare every function
     /// so that a call between two of them resolves, and lower each body.
     fn prepare(
-        loaded: &'static Loaded,
+        loaded: &'static Source,
         names: &[&str],
         opts: Opts,
     ) -> Result<(Jit, Vec<Body>, std::time::Instant)> {
@@ -359,7 +397,7 @@ impl Jit {
         &mut self,
         clif: &mut ClifContext,
         fctx: &mut FunctionBuilderContext,
-        loaded: &'static Loaded,
+        loaded: &'static Source,
         name: &str,
         params: &[Symbol],
         body: &Code,
@@ -567,7 +605,7 @@ enum Denotes {
     /// machine's `reset()`: the caller's handler stack, trail, region
     /// generations and footprint discarded, silently. Refusing the caller
     /// instead makes the compiled set closed under calls, which is the property
-    /// `crate::entry::SpikeBodies` needs to promise the machine that a native
+    /// `crate::backend::Bodies` needs to promise the machine that a native
     /// body cannot reach anything the machine is holding.
     Uncompiled(String),
     Ctor(usize, usize),
@@ -578,7 +616,7 @@ enum Denotes {
 struct Fx<'a, 'b> {
     jit: &'a mut Jit,
     builder: FunctionBuilder<'b>,
-    loaded: &'static Loaded,
+    loaded: &'static Source,
     ctx: cranelift_codegen::ir::Value,
     failure: cranelift_codegen::ir::Block,
     function: String,
@@ -812,27 +850,29 @@ impl Fx<'_, '_> {
                 let b = self.kind_of(else_branch, scope)?;
                 if a == b { a } else { Kind::Boxed }
             }
-            NodeKind::Block { stmts, tail } => match tail {
-                None => Kind::Boxed,
-                Some(t) => {
-                    let mut inner = scope.clone();
-                    for s in stmts.iter() {
-                        if let Stmt::Let { pat, value, .. } = s
-                            && let PatternKind::Var(name) = &pat.kind
-                        {
-                            let kind = self.kind_of(value, &inner)?;
-                            inner.push((
-                                name.name.clone(),
-                                Val {
-                                    kind,
-                                    v: cranelift_codegen::ir::Value::from_u32(0),
-                                },
-                            ));
-                        }
+            // A block with no tail answers `Unit`, which is boxed, so it falls
+            // through to the arm below rather than restating it.
+            NodeKind::Block {
+                stmts,
+                tail: Some(t),
+            } => {
+                let mut inner = scope.clone();
+                for s in stmts.iter() {
+                    if let Stmt::Let { pat, value, .. } = s
+                        && let PatternKind::Var(name) = &pat.kind
+                    {
+                        let kind = self.kind_of(value, &inner)?;
+                        inner.push((
+                            name.name.clone(),
+                            Val {
+                                kind,
+                                v: cranelift_codegen::ir::Value::from_u32(0),
+                            },
+                        ));
                     }
-                    self.kind_of(t, &inner)?
                 }
-            },
+                self.kind_of(t, &inner)?
+            }
             _ => Kind::Boxed,
         })
     }
