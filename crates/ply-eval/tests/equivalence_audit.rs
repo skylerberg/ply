@@ -168,7 +168,7 @@ test "lists" {
   assert_eq(len([]), 0);
   assert_eq(len([1, 2, 3]), 3);
   assert_eq(push([1], 2), [1, 2]);
-  assert_eq(range(3), [0, 1, 2]);
+  assert_eq(range(0, 3), [0, 1, 2]);
   assert_eq(range(2, 5), [2, 3, 4]);
   assert_eq(range(5, 2), [])
 }
@@ -306,7 +306,7 @@ test "len of an int" { assert_eq(len(1), 0) }
 test "push onto an int" { assert_eq(push(1, 2), []) }
 test "int_to_string of a list" { assert_eq(int_to_string([1]), "") }
 test "string_concat of ints" { assert_eq(string_concat(1, 2), "") }
-test "a huge range" { assert_eq(len(range(20000000)), 0) }
+test "a huge range" { assert_eq(len(range(0, 20000000)), 0) }
 test "map over an int" { assert_eq(map(1, |x| x), []) }
 test "filter with a non-boolean predicate" { assert_eq(filter([1], |x| x), []) }
 test "a non-boolean if condition" { assert_eq(if 1 { 1 } else { 2 }, 1) }
@@ -641,7 +641,7 @@ test "a handler installed inside the callback does not leak to the next element"
 test "nested higher-order builtins each perform" {
   assert_eq(
     handle {
-      map([1, 2], |x| fold(range(3), x, |acc, y| acc + y * state.get[s]()))
+      map([1, 2], |x| fold(range(0, 3), x, |acc, y| acc + y * state.get[s]()))
     } with { state.get[s]() -> 1 },
     [4, 5])
 }
@@ -702,7 +702,7 @@ test "a cell stored inside an enclosing cell outlives its region" {
 }
 
 test "a cell in a loop allocates one entry per iteration" {
-  assert_eq(fold(range(4), 0, |acc, i| with_cell[s](i) { c -> acc + cell_get(c) }), 6)
+  assert_eq(fold(range(0, 4), 0, |acc, i| with_cell[s](i) { c -> acc + cell_get(c) }), 6)
 }
 
 test "two handlers backed by two cells do not interfere" {
@@ -734,7 +734,7 @@ test "tail recursion in an if branch" { assert_eq(loop_(500, 0), 125250) }
 test "mutual recursion" { assert(even_(500)); assert(!odd_(500)) }
 
 fn last_of(xs: List<Int>) -> Int = match xs { [x] -> x, [_, ..r] -> last_of(r), [] -> 0 }
-test "tail recursion in a match arm" { assert_eq(last_of(range(500)), 499) }
+test "tail recursion in a match arm" { assert_eq(last_of(range(0, 500)), 499) }
 
 fn sum_block(n: Int, acc: Int) -> Int = { let next = acc + n; if n == 0 { next } else { sum_block(n - 1, next) } }
 test "tail recursion in a block tail" { assert_eq(sum_block(500, 0), 125250) }
@@ -1300,7 +1300,7 @@ mod fuzz {
                     let acc = self.fresh("acc");
                     let y = self.fresh("y");
                     let step = self.scoped(&[&acc, &y], &[], |g| g.int(depth - 1));
-                    format!("fold(range(3), {seed}, |{acc}, {y}| {step})")
+                    format!("fold(range(0, 3), {seed}, |{acc}, {y}| {step})")
                 }
                 19 => {
                     let body = self.int(depth - 1);

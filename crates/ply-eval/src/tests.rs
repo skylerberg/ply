@@ -1225,10 +1225,14 @@ fn filter_requires_a_boolean_predicate() {
     assert!(d.message.contains("Bool"), "{}", d.message);
 }
 
+/// `range` takes two arguments and always did to the checker; this suite used
+/// to call it with one, which is how a builtin can be covered here and
+/// unreachable from every program the checker accepts (ADR 0029). Both bounds
+/// are now written.
 #[test]
 fn range_builds_half_open_intervals_and_refuses_runaways() {
     assert_eq!(
-        eval(callv("range", vec![int(3)])).unwrap().render(),
+        eval(callv("range", vec![int(0), int(3)])).unwrap().render(),
         "[0, 1, 2]"
     );
     assert_eq!(
@@ -1239,10 +1243,18 @@ fn range_builds_half_open_intervals_and_refuses_runaways() {
         eval(callv("range", vec![int(5), int(2)])).unwrap().render(),
         "[]"
     );
-    assert_eq!(eval(callv("range", vec![int(0)])).unwrap().render(), "[]");
+    assert_eq!(
+        eval(callv("range", vec![int(0), int(0)])).unwrap().render(),
+        "[]"
+    );
     let d = err(callv("range", vec![int(0), int(i64::MAX)]));
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(d.message.contains("exceeds the limit"), "{}", d.message);
+    // One argument is an arity error now, and the deleted arm is why.
+    assert_eq!(
+        err(callv("range", vec![int(3)])).code,
+        codes::ARITY_MISMATCH
+    );
 }
 
 #[test]
@@ -1653,12 +1665,28 @@ fn a_user_definition_shadows_a_builtin_of_the_same_name() {
     }
 }
 
+/// The message is a parameter now, not an optional trailing argument: source
+/// writes `assert(c)` and `ply_syntax::defaults` splices `None` in, so what
+/// reaches here always has two. This suite used to call it with one, which is
+/// exactly how the arm below stayed unreachable from source for the whole
+/// history of the language (ADR 0029).
 #[test]
 fn assert_passes_on_true_and_reports_its_message_on_false() {
-    assert!(eval(callv("assert", vec![boolean(true)])).is_ok());
+    // A nullary constructor is a bare name, not a nullary call.
+    let none = || var("None");
+    assert!(eval(callv("assert", vec![boolean(true), none()])).is_ok());
+
+    // No message: the diagnostic carries no note to explain itself with.
+    let bare = err(callv("assert", vec![boolean(false), none()]));
+    assert_eq!(bare.code, codes::ASSERTION_FAILED);
+    assert!(bare.notes.is_empty(), "{:?}", bare.notes);
+
     let d = err(callv(
         "assert",
-        vec![boolean(false), string("balance must be positive")],
+        vec![
+            boolean(false),
+            callv("Some", vec![string("balance must be positive")]),
+        ],
     ));
     assert_eq!(d.code, codes::ASSERTION_FAILED);
     assert!(
@@ -1669,8 +1697,12 @@ fn assert_passes_on_true_and_reports_its_message_on_false() {
         d.notes
     );
     assert_eq!(
-        err(callv("assert", vec![int(1)])).code,
+        err(callv("assert", vec![int(1), none()])).code,
         codes::RUNTIME_ERROR
+    );
+    assert_eq!(
+        err(callv("assert", vec![boolean(false)])).code,
+        codes::ARITY_MISMATCH
     );
 }
 
@@ -1814,7 +1846,9 @@ fn values_render_readably_for_a_report_reader() {
             .render(),
         "{a: 1, b: 2}"
     );
-    let long = eval(callv("range", vec![int(40)])).unwrap().render();
+    let long = eval(callv("range", vec![int(0), int(40)]))
+        .unwrap()
+        .render();
     assert!(long.ends_with("… 8 more]"), "{long}");
 }
 

@@ -1169,7 +1169,7 @@ mod tests {
                                 callv(
                                     "filter",
                                     vec![
-                                        callv("range", vec![int(6)]),
+                                        callv("range", vec![int(0), int(6)]),
                                         lam(
                                             &["x"],
                                             bin(

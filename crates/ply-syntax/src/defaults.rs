@@ -407,10 +407,7 @@ impl Qualify<'_> {
                 if !q.is_bare() || self.bound.contains(q.symbol()) {
                     return;
                 }
-                let Ok(binding) = self
-                    .resolved
-                    .lookup(self.owner, Namespace::Value, &q.clone())
-                else {
+                let Some(binding) = self.resolved.find(self.owner, Namespace::Value, q) else {
                     // A builtin or a prelude constructor: in reach everywhere,
                     // so it needs no qualifying and gets none.
                     return;
@@ -739,6 +736,12 @@ impl Cx<'_> {
             return;
         }
 
+        // Kept so that a call this pass cannot complete is left exactly as it
+        // was written. A half-filled `args` would be a call whose arguments sit
+        // in the wrong positions, and while the diagnostic below stops the run,
+        // nothing should have to rely on that to avoid reading one.
+        let written: Vec<Expr> = args.clone();
+        let was_named = !named.is_empty();
         let mut slots: Vec<Option<Expr>> = sig.params.iter().map(|_| None).collect();
         for (i, a) in args.drain(..).enumerate() {
             slots[i] = Some(a);
@@ -799,27 +802,43 @@ impl Cx<'_> {
                     self.implicit.push(edge.clone());
                 }
             }
-            out.push(respan(default.clone(), span));
+            // Keeping the default's own span, not the call's. The expression
+            // is written in the callee, so that is where a diagnostic about it
+            // belongs — reporting at the call site names text the author of
+            // that file never wrote, once per call. Spans are not normalized,
+            // so this does not affect the identity `f(x)` and `f(x, d)` share.
+            out.push(default.clone());
         }
 
         if !missing.is_empty() {
-            self.diags.push(
-                Diagnostic::error(
-                    codes::MISSING_ARGUMENT,
-                    format!(
-                        "this call leaves {} unfilled",
-                        list(missing.iter().copied())
-                    ),
-                )
-                .primary(span, "no argument and no default")
-                .note("pass it positionally, or by name as `<parameter>: <value>`"),
-            );
-            // Leave what was written rather than a half-built call: a later pass
-            // reading a call this one could not complete should see the source.
+            // A call with no names in it that leaves a hole is under-applied,
+            // which was `E0202` from inference before defaults existed and
+            // stays `E0202` now. Hand back exactly what was written and let
+            // inference say so in the words it has always used: this pass
+            // changing either the code or the phase of an error that predates
+            // it would be a regression, and `ply-eval`'s
+            // `every_builtins_failure_mode` is the audit that catches one.
+            //
+            // With a name in play there is nothing to hand back — a call
+            // written `f(b: 2)` cannot be spelled positionally — so that is the
+            // one shape needing a diagnostic of its own.
+            if was_named {
+                self.diags.push(
+                    Diagnostic::error(
+                        codes::MISSING_ARGUMENT,
+                        format!(
+                            "this call leaves {} unfilled",
+                            list(missing.iter().copied())
+                        ),
+                    )
+                    .primary(span, "no argument and no default")
+                    .note("pass it positionally, or by name as `<parameter>: <value>`"),
+                );
+            }
             let ExprKind::App { args, .. } = &mut e.kind else {
                 unreachable!("just matched")
             };
-            *args = out;
+            *args = written;
             return;
         }
 
@@ -843,12 +862,16 @@ impl Cx<'_> {
         if q.is_bare() && self.scope.contains(q.symbol()) {
             return None;
         }
-        match self.resolved.lookup(self.module, Namespace::Value, q) {
-            Ok(binding) => self.signatures.get(&binding.qualified).cloned(),
-            // Unresolved: a builtin, or a name whose own diagnostic is
-            // somebody else's. `builtin_signature` answers `None` for the
-            // second, which leaves the call exactly as written.
-            Err(_) => q.is_bare().then(|| builtin_signature(q.symbol())).flatten(),
+        // `find` and not `lookup`: this runs on every call in the program and
+        // most of them are builtins, which resolve to nothing here. `lookup`
+        // would build — and this would discard — a diagnostic for each,
+        // including a scan of every module for one that exports the name.
+        match self.resolved.find(self.module, Namespace::Value, q) {
+            Some(binding) => self.signatures.get(&binding.qualified).cloned(),
+            // A builtin, or a name whose own diagnostic is somebody else's.
+            // `builtin_signature` answers `None` for the second, which leaves
+            // the call exactly as written.
+            None => q.is_bare().then(|| builtin_signature(q.symbol())).flatten(),
         }
     }
 
@@ -868,36 +891,6 @@ impl Cx<'_> {
             PatternKind::Lit(_) | PatternKind::Wildcard => {}
         })
     }
-}
-
-/// A spliced default reports at the call site that omitted it, not at the
-/// signature that supplied it: the reader is looking at the call.
-fn respan(mut e: Expr, span: Span) -> Expr {
-    struct S(Span);
-    impl S {
-        fn go(&self, e: &mut Expr) {
-            grow(|| {
-                e.span = self.0;
-                match &mut e.kind {
-                    ExprKind::App { func, args, named } => {
-                        self.go(func);
-                        args.iter_mut().for_each(|a| self.go(a));
-                        named.iter_mut().for_each(|n| self.go(&mut n.value));
-                    }
-                    ExprKind::Binary { lhs, rhs, .. } => {
-                        self.go(lhs);
-                        self.go(rhs);
-                    }
-                    ExprKind::Unary { operand, .. } => self.go(operand),
-                    ExprKind::List { items } => items.iter_mut().for_each(|i| self.go(i)),
-                    ExprKind::Record { fields } => fields.iter_mut().for_each(|(_, v)| self.go(v)),
-                    _ => {}
-                }
-            })
-        }
-    }
-    S(span).go(&mut e);
-    e
 }
 
 fn list<'a>(mut names: impl Iterator<Item = &'a str>) -> String {

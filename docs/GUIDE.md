@@ -889,8 +889,13 @@ greet("ada", greeting: "hey")      // by name — the same definition as above
 The rule is one sentence: **positional arguments fill parameters left to right,
 and any parameter left over must be named or have a default.** A positional
 argument after a named one is `E0124`; a name that is not a parameter, or one
-given twice, is `E0123`; a parameter with neither an argument nor a default is
-`E0125`.
+given twice, is `E0123`.
+
+Leaving a parameter with neither an argument nor a default is `E0202`, the same
+arity mismatch it has always been — writing `f(1)` where `f` takes two is
+under-application whether or not defaults exist. The one exception is a hole
+left when a *name* was used, as in `f(b: 2)` with `a` unfilled: that call cannot
+be read as a positional one, so it is `E0125` and names the parameter.
 
 Names are erased before anything hashes, so the second and third lines above are
 one definition. A named argument needs a callee reached *by name*: a call
@@ -2691,6 +2696,12 @@ program.
 | `E0117` | a record update naming a field the base does not have |
 | `E0118` | a `?` whose enclosing function has no return type this file can read as `Result` or `Option` |
 | `E0119` | a `?` written where its early exit would change what runs, or would discard a written annotation |
+| `E0120` | a parameter default written where no call could fill it in — on a lambda, an operation or a handler clause |
+| `E0121` | a parameter default that is not a pure, closed expression, or that names another parameter of the same signature |
+| `E0122` | a default on a `pub fn` mentioning a name its module does not export |
+| `E0123` | a named argument that names no parameter, or names one twice |
+| `E0124` | a positional argument after a named one |
+| `E0125` | a parameter left unfilled by a call that used a name (plain under-application stays `E0202`) |
 
 ### Types
 

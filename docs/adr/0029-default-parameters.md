@@ -182,8 +182,27 @@ parameters are bound in.
 
 Positional arguments fill parameters left to right; any parameter left over must
 be named or have a default. `E0123` for a name that is not a parameter or is
-given twice, `E0124` for a positional after a named one, `E0125` for a parameter
-with neither.
+given twice, `E0124` for a positional after a named one.
+
+**`E0125` is narrower than it first was, and an existing audit is why.** It was
+raised for any unfilled parameter, which quietly took over a case that predates
+this feature: `f(1)` where `f` takes two is under-application, and it was
+`E0202` from *inference* long before defaults existed. Reporting it here changed
+both the code and the phase, and
+`ply-eval:equivalence_audit:every_builtins_failure_mode` — written to fail when
+"a case changed its mind about which failure it produces" — went red on exactly
+that. It was right to.
+
+So a call with no names in it that leaves a hole is handed back exactly as
+written, and inference reports `E0202` in the words it always used. `E0125` is
+kept for the one shape that genuinely has no predecessor: a hole with a *named*
+argument in play, where the call cannot be spelled positionally and there is
+nothing to hand back.
+
+| written | reported |
+| --- | --- |
+| `f(1)`, `f` takes two | `E0202`, from inference, unchanged |
+| `f(b: 2)`, `a` unfilled | `E0125`, from this pass |
 
 Ordering is the *parser's* to enforce, because it is a property of the text.
 Which names are legal needs the callee's signature and is `defaults::expand`'s.
@@ -208,7 +227,62 @@ is narrowed to `(2, 2)` and the one-argument arm is deleted. **This ADR does not
 recover `range(5)`, and says so** rather than leaving the feature looking as
 though it closed both halves of what prompted it.
 
-## Decision 6 — An additive hash tag, so no existing hash moves
+## Decision 6 — A spliced default keeps its own span, and identical diagnostics are one
+
+The first draft gave every spliced default the *call's* span, on the reasoning
+that the reader is looking at the call. Measured against a wrong default with
+three omitting call sites, that produced:
+
+```
+4 errors
+  1 × type mismatch: parameter default   → at the default
+  3 × type mismatch: argument type       → at src/main.ply:3, :4, :5
+```
+
+Three of the four named text whose author wrote nothing wrong. The default is
+written in the callee, so a diagnostic about it belongs there; the span is now
+the one it was written at. Spans are not normalized, so this does not touch the
+identity `f(x)` and `f(x, d)` share.
+
+That leaves the count. A bad default is checked once where it is written and
+again in every call that omitted it — the splice is a copy, so each copy fails
+the same unification — which is `1 + <call sites>` renderings of one mistake,
+now all pointing at the same characters.
+
+The obvious fix is for the checker to skip an argument it knows came from a
+default. **That is exactly the knowledge Decision 1 keeps out of `ply-core`**,
+and buying a diagnostic with it would put a notion of defaults into the crate
+this ADR spent its first decision keeping clear. So the fix goes where the
+question is only *do these two diagnostics differ*: `check_program_with` now
+drops exact repeats — same code, severity, message, and every label's span and
+text — preserving order. Two complaints a reader cannot tell apart are not two
+pieces of information.
+
+```
+2 errors   (independent of how many call sites omit the argument)
+```
+
+## The parser's stack budget, which this nearly spent
+
+`pathological_nesting_is_a_diagnostic_rather_than_a_stack_overflow` went red on
+`[[[[…20,000…]]]]`, and the failure was **order-dependent**: the bracket case
+overflowed only when the parenthesis case had run before it in the same test.
+That is the signature of a margin, not a runaway — `MAX_DEPTH` was still doing
+its job, and there was simply less headroom than there had been.
+
+The cause is that `postfix_expr` runs once per level of a nested expression, so
+its frame is paid per level and a program's whole nesting depth is bounded by
+how large that frame is. Adding a named-argument list to the call branch, an
+`ExprKind::App` built in place, and a `Diagnostic` builder in the `perform`
+branch was enough to cost the margin — the compiler reserves stack for every
+branch of the `match`, taken or not.
+
+`f(..)` and `e.op[r](..)` now build in `#[inline(never)]` helpers, and the two
+new diagnostics in `call_args` and `perform_on` are `#[cold]`. Nothing about the
+language changed; a feature that adds a field to a node on the recursion path
+owes this check, and this ADR records it because the next one will owe it too.
+
+## Decision 7 — An additive hash tag, so no existing hash moves
 
 `normalize.rs`'s `fn_def` writes `opt(p.ty)` per parameter, which emits
 `tag::NONE` or `tag::SOME`. A parameter carrying a default writes a **new**

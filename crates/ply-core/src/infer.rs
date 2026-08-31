@@ -96,7 +96,7 @@ pub fn check_program_with(
     // exist: it answers a question about a definition's callees.
     c.mark_internal_effects(program);
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
-        Err(c.diags)
+        Err(deduplicated(c.diags))
     } else {
         Ok(CheckOutput {
             defs: c.defs,
@@ -107,6 +107,37 @@ pub fn check_program_with(
             modules: c.modules,
         })
     }
+}
+
+/// Diagnostics that render identically are one diagnostic to a reader.
+///
+/// Order is preserved and only exact repeats are dropped — same code, same
+/// severity, same message, and every label the same span and text. Two
+/// complaints a reader cannot tell apart are not two pieces of information.
+///
+/// The case that made this worth doing is a parameter default with a type
+/// error. It is checked once where it is written and again in each call that
+/// omitted it — the splice is a copy, so each copy fails the same unification —
+/// and every one of them points at the same text, because a spliced default
+/// keeps the span it was written at. That is `1 + <call sites>` renderings of
+/// one mistake. Nothing downstream may know which argument came from a default
+/// (ADR 0029 keeps that knowledge inside `ply_syntax::defaults`), so the fix
+/// belongs here, where the question is only whether two diagnostics differ.
+fn deduplicated(diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let key = |d: &Diagnostic| {
+        (
+            d.code,
+            format!("{:?}", d.severity),
+            d.message.clone(),
+            d.labels
+                .iter()
+                .map(|l| (l.span, l.message.clone(), l.primary))
+                .collect::<Vec<_>>(),
+            d.notes.clone(),
+        )
+    };
+    let mut seen = std::collections::HashSet::new();
+    diags.into_iter().filter(|d| seen.insert(key(d))).collect()
 }
 
 /// How many arguments the prelude's signature for `name` takes, or `None` if

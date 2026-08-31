@@ -184,6 +184,31 @@ impl Resolved {
         self.index.get(name.as_symbol()).copied()
     }
 
+    /// [`Self::lookup`] without the diagnostic: whether the name denotes
+    /// something, and what.
+    ///
+    /// The two answer the same question; `lookup` additionally answers *why
+    /// not*, and building that answer is not free — `unknown_bare` scans every
+    /// module for one that exports the name, to suggest an import. A caller
+    /// that only wants the binding must not pay for a suggestion it discards,
+    /// and [`crate::defaults`] asks this of every call in the program, most of
+    /// which are builtins and resolve to nothing here.
+    pub fn find(&self, module: usize, ns: Namespace, q: &QName) -> Option<&Binding> {
+        let scope = self.scopes.get(module)?;
+        let Some(binder) = &q.module else {
+            return scope.get(ns, q.symbol());
+        };
+        let &(owner, _) = scope.modules.get(&binder.name)?;
+        if !self.declarations[owner]
+            .get(ns, q.symbol())?
+            .vis
+            .is_public()
+        {
+            return None;
+        }
+        self.declared[owner].get(ns, q.symbol())
+    }
+
     /// A bare name must already have failed local lookup — locals are not in
     /// scope here and win unconditionally. A qualified name never consults the
     /// current module's scope at all.
