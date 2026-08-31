@@ -45,8 +45,8 @@ impl Compiled {
             .enumerate()
             .map(|(i, (name, text))| (SourceId(i as u32), ModuleName::from_dotted(name), *text))
             .collect();
-        let program = ply_syntax::parse_program(inputs).expect("the sample should parse");
-        let resolved = resolve(&program).expect("the sample should resolve");
+        let mut program = ply_syntax::parse_program(inputs).expect("the sample should parse");
+        let resolved = resolve(&mut program).expect("the sample should resolve");
         let check = check_program(&program, &resolved).expect("the sample should typecheck");
         Compiled {
             program,

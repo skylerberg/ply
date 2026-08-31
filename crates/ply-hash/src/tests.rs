@@ -45,6 +45,7 @@ fn call(func: Expr, args: Vec<Expr>) -> Expr {
     e(ExprKind::App {
         func: Box::new(func),
         args,
+        named: Vec::new(),
     })
 }
 
@@ -79,6 +80,7 @@ fn param(name: &str) -> Param {
     Param {
         name: id(name),
         ty: None,
+        default: None,
         span: Span::DUMMY,
     }
 }
@@ -87,6 +89,7 @@ fn typed_param(name: &str, ty: &str) -> Param {
     Param {
         name: id(name),
         ty: Some(ty_con(ty, vec![])),
+        default: None,
         span: Span::DUMMY,
     }
 }
@@ -2303,6 +2306,7 @@ fn param_of(name: &str, ty: TypeExpr) -> Param {
     Param {
         name: id(name),
         ty: Some(ty),
+        default: None,
         span: Span::DUMMY,
     }
 }

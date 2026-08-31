@@ -672,8 +672,15 @@ impl Cx<'_> {
             }
             ExprKind::Unary { operand, .. } => self.scan(operand),
 
-            ExprKind::App { func, args } => {
-                match self.sequence(std::iter::once(func.as_mut()).chain(args.iter_mut())) {
+            ExprKind::App { func, args, named } => {
+                // Named arguments scan after the positional ones because that
+                // is the order they were written in; `defaults::expand` has not
+                // run yet and cannot, so this is the only order there is.
+                match self.sequence(
+                    std::iter::once(func.as_mut())
+                        .chain(args.iter_mut())
+                        .chain(named.iter_mut().map(|n| &mut n.value)),
+                ) {
                     found @ Scan::Found(_) => found,
                     // The call itself is impure, whatever its parts were.
                     _ => Scan::Impure,
@@ -775,10 +782,13 @@ impl Cx<'_> {
                 }
                 ExprKind::Unary { operand, .. } => self.sweep(operand, scope, barrier),
                 ExprKind::Lambda { body, .. } => self.sweep(body, scope, under("a lambda")),
-                ExprKind::App { func, args } => {
+                ExprKind::App { func, args, named } => {
                     self.sweep(func, scope, barrier);
                     for a in args {
                         self.sweep(a, scope, barrier);
+                    }
+                    for n in named {
+                        self.sweep(&mut n.value, scope, barrier);
                     }
                 }
                 ExprKind::If {
@@ -911,6 +921,7 @@ impl Cx<'_> {
                         kind: ExprKind::App {
                             func: Box::new(var(Ident::new(fail, span))),
                             args: vec![var(binder)],
+                            named: Vec::new(),
                         },
                     },
                 )

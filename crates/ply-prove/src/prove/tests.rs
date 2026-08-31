@@ -23,8 +23,8 @@ pub(super) fn fixture(source: &str) -> Fixture {
         Ok(module) => module,
         Err(diagnostics) => panic!("parse: {:?}", messages(&diagnostics)),
     };
-    let program = Program::single(module);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = Program::single(module);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(resolved) => resolved,
         Err(diagnostics) => panic!("resolve: {:?}", messages(&diagnostics)),
     };

@@ -19,11 +19,11 @@ use ply_syntax::resolve::{Resolved, resolve};
 fn load(src: &str) -> (Program, Resolved) {
     let mut map = SourceMap::new();
     let id: SourceId = map.add("audit.ply", src.to_string());
-    let program = match parse_program([(id, ModuleName::from_dotted("audit"), src)]) {
+    let mut program = match parse_program([(id, ModuleName::from_dotted("audit"), src)]) {
         Ok(p) => p,
         Err(ds) => panic!("the audit program must parse: {ds:#?}\n{src}"),
     };
-    let resolved = resolve(&program).expect("the audit program must resolve");
+    let resolved = resolve(&mut program).expect("the audit program must resolve");
     (program, resolved)
 }
 
@@ -1464,11 +1464,11 @@ fn load_modules(files: &[(&str, &str)]) -> (Program, Resolved) {
             (id, ModuleName::from_dotted(*name), *src)
         })
         .collect();
-    let program = match parse_program(inputs) {
+    let mut program = match parse_program(inputs) {
         Ok(p) => p,
         Err(ds) => panic!("the audit program must parse: {ds:#?}"),
     };
-    let resolved = resolve(&program).expect("the audit program must resolve");
+    let resolved = resolve(&mut program).expect("the audit program must resolve");
     (program, resolved)
 }
 
@@ -1756,9 +1756,10 @@ mod honest {
         /// The program is leaked because a backend may not borrow one — see the
         /// `compiled` field on `Machine`.
         pub fn over(program: &Program) -> Budgeted {
-            let copy: &'static Program = Box::leak(Box::new(program.clone()));
+            let copy: &'static mut Program = Box::leak(Box::new(program.clone()));
             let resolved: &'static Resolved =
                 Box::leak(Box::new(resolve(copy).expect("it resolved once already")));
+            let copy: &'static Program = copy;
             Budgeted {
                 program: std::ptr::from_ref(program),
                 copy,

@@ -754,7 +754,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<Diagnostic>) {
         ExprKind::Unary { operand, .. } => children.push(operand),
         ExprKind::Binary { lhs, rhs, .. } => children.extend([lhs.as_ref(), rhs.as_ref()]),
         ExprKind::Lambda { body, .. } => children.push(body),
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             children.push(func);
             children.extend(args);
         }

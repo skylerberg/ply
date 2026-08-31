@@ -655,7 +655,13 @@ impl Reconstruction {
     /// definition that hash names. Anything the encoding cannot carry surfaces
     /// here as a refusal rather than as a program that quietly differs.
     fn verify(&self, bodies: &BodySet) -> Result<(), Vec<Diagnostic>> {
-        let resolved = ply_syntax::resolve(&self.program).map_err(|diags| {
+        // `resolve` also fills defaults and named arguments, which needs the
+        // program mutably. On a *reconstructed* program that is a no-op — the
+        // encoding only ever held calls that were already positional and fully
+        // applied — so the copy it expands is equal to the one hashed below,
+        // and re-hashing the original is still the round-trip this checks.
+        let mut expanded = self.program.clone();
+        let resolved = ply_syntax::resolve(&mut expanded).map_err(|diags| {
             vec![
                 corrupt("the reconstructed program does not resolve").note(format!(
                     "first: {}",
@@ -860,17 +866,18 @@ impl Decoder<'_> {
         self.row_params += effect_count;
 
         let count = self.c.u32()?;
-        let annotations = self.repeat(count, |d| d.opt(Self::type_expr))?;
+        let annotations = self.repeat(count, Self::param_slot)?;
         let ret = self.opt(Self::type_expr)?;
         let effects = self.opt(Self::row)?;
         let constraints = self.constraints()?;
 
         let params = annotations
             .into_iter()
-            .map(|ty| {
+            .map(|(ty, default)| {
                 let param = Param {
                     name: ident(local_name(self.values)),
                     ty,
+                    default,
                     span: Span::DUMMY,
                 };
                 self.values += 1;
@@ -1034,6 +1041,23 @@ impl Decoder<'_> {
             tag::NONE => Ok(None),
             tag::SOME => f(self).map(Some),
             other => Err(bad(format!("tag {other} is not an optional marker"))),
+        }
+    }
+
+    /// One `fn` parameter's annotation and default.
+    ///
+    /// Shares its first byte with [`Self::opt`]: a parameter with no default
+    /// opens with `NONE`/`SOME` exactly as it did before defaults existed,
+    /// which is what keeps every hash written before them valid.
+    fn param_slot(&mut self) -> Decoded<(Option<TypeExpr>, Option<Expr>)> {
+        match self.c.u8()? {
+            tag::NONE => Ok((None, None)),
+            tag::SOME => Ok((Some(self.type_expr()?), None)),
+            tag::PARAM_DEFAULT => {
+                let ty = self.opt(Self::type_expr)?;
+                Ok((ty, Some(self.expr()?)))
+            }
+            other => Err(bad(format!("tag {other} does not open a parameter"))),
         }
     }
 
@@ -1299,6 +1323,9 @@ impl Decoder<'_> {
                         let param = Param {
                             name: ident(local_name(self.values)),
                             ty,
+                            // A lambda parameter cannot carry one, so the
+                            // encoding has none to hold.
+                            default: None,
                             span: Span::DUMMY,
                         };
                         self.values += 1;
@@ -1315,6 +1342,9 @@ impl Decoder<'_> {
                 ExprKind::App {
                     func,
                     args: self.repeat(count, Self::expr)?,
+                    // The encoding never held a named argument: `resolve`
+                    // placed every one before anything hashed.
+                    named: Vec::new(),
                 }
             }
             tag::E_IF => ExprKind::If {

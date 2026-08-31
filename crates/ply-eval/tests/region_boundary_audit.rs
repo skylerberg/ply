@@ -44,9 +44,9 @@ struct Compiled {
 impl Compiled {
     fn new(src: &str) -> Compiled {
         let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved =
-            resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
         Compiled {
@@ -58,9 +58,9 @@ impl Compiled {
 
     fn refused(src: &str) -> Vec<Diagnostic> {
         let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved =
-            resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         check_program(&program, &resolved).err().unwrap_or_default()
     }
 

@@ -50,9 +50,10 @@ fn lookup(key: Int) -> Int / {db.read[users]} = db.get[users](key) + shade(Red)
 "#;
 
 fn compile(source: &str) -> (HashOutput, BodySet) {
-    let program = ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
-        .expect("it should parse");
-    let resolved = ply_syntax::resolve(&program).expect("it should resolve");
+    let mut program =
+        ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
+            .expect("it should parse");
+    let resolved = ply_syntax::resolve(&mut program).expect("it should resolve");
     check_program(&program, &resolved).expect("it should check");
     hash_program_with_bodies(&program, &resolved).expect("it should hash")
 }
@@ -82,11 +83,11 @@ fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
     assert_eq!(store.bodies_len(), every_hash(&hashes).len());
 
     let reopened = root.open();
-    let rebuilt = reopened
+    let mut rebuilt = reopened
         .reconstruct(every_hash(&hashes))
         .expect("the stored bodies should rebuild");
 
-    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should check");
 
     let lookup = hashes.defs[&Symbol::new("m.lookup")];

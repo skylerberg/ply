@@ -58,8 +58,8 @@ fn stub() -> Int = handle work() with {
 fn program() -> (Program, CheckOutput) {
     let module = parse_module(SourceId(0), ModuleName::from_dotted("sig"), SOURCE)
         .expect("the declaration parses");
-    let program = Program::single(module);
-    let resolved = resolve(&program).expect("one module with no imports resolves");
+    let mut program = Program::single(module);
+    let resolved = resolve(&mut program).expect("one module with no imports resolves");
     let check = check_program(&program, &resolved).expect("the declaration typechecks");
     (program, check)
 }

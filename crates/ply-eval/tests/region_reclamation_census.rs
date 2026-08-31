@@ -86,7 +86,7 @@ fn what_the_examples_reclaim_and_what_they_have_to_hold() {
         ply_derive::expand_program(&mut program).is_empty(),
         "the examples expand"
     );
-    let resolved = resolve(&program).expect("the examples resolve");
+    let resolved = resolve(&mut program).expect("the examples resolve");
     let check = ply_core::check_program(&program, &resolved).expect("the examples typecheck");
 
     let mut census = Census::default();

@@ -386,10 +386,10 @@ test "the shapes all evaluate" {
 fn load(name: &str, src: &str) -> Result<(Program, Resolved)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
-    let program = parse_program([(id, ModuleName::from_dotted(name), src)])
+    let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])
         .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
     let resolved =
-        resolve(&program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
+        resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
     Ok((program, resolved))
 }
 

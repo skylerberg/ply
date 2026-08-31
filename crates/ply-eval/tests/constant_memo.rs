@@ -27,11 +27,11 @@ struct Compiled {
 
 fn compile(source: &str) -> Compiled {
     let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let program = match ply_syntax::parse_program(inputs) {
+    let mut program = match ply_syntax::parse_program(inputs) {
         Ok(p) => p,
         Err(d) => panic!("did not parse: {d:#?}"),
     };
-    let resolved = match resolve(&program) {
+    let resolved = match resolve(&mut program) {
         Ok(r) => r,
         Err(d) => panic!("did not resolve: {d:#?}"),
     };

@@ -22,10 +22,10 @@ struct Compiled {
 }
 
 fn compile(source: &str) -> Compiled {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("parses");
-    let resolved = resolve(&program).expect("resolves");
+    let resolved = resolve(&mut program).expect("resolves");
     let check = check_program(&program, &resolved).expect("checks");
     Compiled {
         program,

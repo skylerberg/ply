@@ -18,8 +18,8 @@ pub(crate) struct Fixture {
 impl Fixture {
     pub(crate) fn compile(src: &str) -> Fixture {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let program = Program::single(module);
-        let resolved = ply_syntax::resolve(&program)
+        let mut program = Program::single(module);
+        let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = ply_core::check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));

@@ -405,7 +405,7 @@ impl Loaded {
         if !expanded.is_empty() {
             return Err(diagnostics("expanding a `derive`", &expanded));
         }
-        let resolved = ply_syntax::resolve::resolve(&program)
+        let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the service", &d))?;
         let check = ply_core::check_program(&program, &resolved)
             .map_err(|d| diagnostics("checking the service", &d))?;

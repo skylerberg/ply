@@ -104,7 +104,7 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
     if !ply_derive::expand_program(&mut program).is_empty() {
         return None;
     }
-    let resolved = resolve(&program).ok()?;
+    let resolved = resolve(&mut program).ok()?;
     Some((program, resolved))
 }
 
@@ -380,10 +380,11 @@ mod backends {
 
     impl TreeWalker {
         pub fn over(program: &Program) -> TreeWalker {
-            let copy: &'static Program = Box::leak(Box::new(program.clone()));
+            let copy: &'static mut Program = Box::leak(Box::new(program.clone()));
             let resolved: &'static Resolved = Box::leak(Box::new(
                 resolve(copy).expect("the corpus resolved once already"),
             ));
+            let copy: &'static Program = copy;
             TreeWalker {
                 program: std::ptr::from_ref(program),
                 inner: RefCell::new(Interp::for_program(copy, resolved)),

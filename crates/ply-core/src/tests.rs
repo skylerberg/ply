@@ -53,6 +53,7 @@ fn app(func: Expr, args: Vec<Expr>) -> Expr {
     ex(ExprKind::App {
         func: Box::new(func),
         args,
+        named: Vec::new(),
     })
 }
 
@@ -67,6 +68,7 @@ fn lambda(params: &[&str], body: Expr) -> Expr {
             .map(|p| Param {
                 name: id(p),
                 ty: None,
+                default: None,
                 span: any(),
             })
             .collect(),
@@ -253,6 +255,7 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
                 .map(|p| Param {
                     name: id(p),
                     ty: None,
+                    default: None,
                     span: any(),
                 })
                 .collect(),
@@ -1129,6 +1132,7 @@ fn e0412_points_through_a_call_when_the_perform_is_indirect() {
             ExprKind::App {
                 func: Box::new(var("stamp")),
                 args: vec![],
+                named: Vec::new(),
             },
             55,
         )),
@@ -2016,8 +2020,8 @@ fn parse_program(files: &[(&str, &str)]) -> Program {
 }
 
 fn check_files(files: &[(&str, &str)]) -> CheckOutput {
-    let program = parse_program(files);
-    let resolved = ply_syntax::resolve(&program)
+    let mut program = parse_program(files);
+    let resolved = ply_syntax::resolve(&mut program)
         .unwrap_or_else(|d| panic!("expected resolution to succeed: {}", render(&d)));
     match crate::check_program(&program, &resolved) {
         Ok(out) => out,
@@ -2026,8 +2030,8 @@ fn check_files(files: &[(&str, &str)]) -> CheckOutput {
 }
 
 fn check_files_err(files: &[(&str, &str)]) -> Vec<Diagnostic> {
-    let program = parse_program(files);
-    match ply_syntax::resolve(&program) {
+    let mut program = parse_program(files);
+    match ply_syntax::resolve(&mut program) {
         Err(diags) => diags,
         Ok(resolved) => match crate::check_program(&program, &resolved) {
             Ok(_) => panic!("expected failure, but the program checked"),
@@ -2710,6 +2714,7 @@ fn a_region_that_reaches_one_through_a_call_is_e0416_as_well() {
         ExprKind::App {
             func: Box::new(var("inner")),
             args: vec![],
+            named: Vec::new(),
         },
         71,
     );
@@ -3333,8 +3338,8 @@ fn laws_are_indexed_in_program_order() {
 #[test]
 fn a_restored_definition_still_has_its_clauses_typed() {
     let src = "fn withdraw(a: Int, n: Int) -> Int requires n > 0 ensures result == a - n = a - n";
-    let program = parse_program(&[("ledger", src)]);
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let mut program = parse_program(&[("ledger", src)]);
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     let first = crate::check_program(&program, &resolved).expect("checks");
 
     let known = Known {
@@ -3363,8 +3368,8 @@ fn a_restored_definition_still_has_its_clauses_typed() {
     // And the restored path still judges the clause, rather than accepting it
     // because nothing constrained the types it was checked against.
     let broken = "fn withdraw(a: Int, n: Int) -> Int ensures result == \"x\" = a - n";
-    let program = parse_program(&[("ledger", broken)]);
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let mut program = parse_program(&[("ledger", broken)]);
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     let diags = crate::check_program_with(&program, &resolved, &known)
         .expect_err("a clause comparing Int to String is a mismatch");
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
