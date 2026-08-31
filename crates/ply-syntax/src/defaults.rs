@@ -49,6 +49,10 @@ struct ParamInfo {
     /// Already qualified against the module that wrote it, so splicing it into
     /// any caller means what it meant where it was written.
     default: Option<Expr>,
+    /// The module binders [`qualify`] introduced, which every module the
+    /// default lands in has to carry — including the one that wrote it, which
+    /// does not import itself.
+    imports: Vec<(Symbol, usize)>,
 }
 
 /// A callee's parameters, plus the module that wrote them — needed because the
@@ -78,20 +82,39 @@ fn builtin_signature(name: &Symbol) -> Option<Signature> {
                 ParamInfo {
                     name: Symbol::new("cond"),
                     default: None,
+                    imports: Vec::new(),
                 },
                 ParamInfo {
                     name: Symbol::new("message"),
                     // A prelude constructor, which is in every module's reach
-                    // without an import — so this one needs no qualifying.
+                    // without an import — so this one needs no qualifying, and
+                    // brings no module in with it.
                     default: Some(Expr {
                         kind: ExprKind::Var(crate::ast::QName::bare(Ident::new("None", span))),
                         span,
                     }),
+                    imports: Vec::new(),
                 },
             ],
         }),
         _ => None,
     }
+}
+
+/// The shape this pass believes a builtin has: how many parameters, and how
+/// many of them carry a default.
+///
+/// `None` for a builtin with no defaults, which is every one but `assert` —
+/// this table holds only the exceptions, so an absent name means "exactly
+/// applied, nothing to fill".
+///
+/// Public for one reader: the cross-crate audit in `ply_eval` that checks this
+/// table, `Builtin::arity` and the prelude's schemes still agree. They did not,
+/// for `assert` and `range`, from the first commit until ADR 0029.
+pub fn builtin_shape(name: &str) -> Option<(usize, usize)> {
+    let sig = builtin_signature(&Symbol::new(name))?;
+    let defaults = sig.params.iter().filter(|p| p.default.is_some()).count();
+    Some((sig.params.len(), defaults))
 }
 
 pub(crate) fn expand(program: &mut Program, resolved: &mut Resolved, diags: &mut Vec<Diagnostic>) {
@@ -113,10 +136,8 @@ pub(crate) fn expand(program: &mut Program, resolved: &mut Resolved, diags: &mut
             cx.item(item);
         }
         let implicit = std::mem::take(&mut cx.implicit);
-        for (binder, owner) in implicit {
-            if let Some(scope) = resolved.scopes.get_mut(*m) {
-                scope.modules.entry(binder).or_insert((owner, Span::DUMMY));
-            }
+        for (binder, target) in implicit {
+            bind_module(resolved, *m, binder, target);
         }
     }
     program.modules = items.into_iter().map(|(_, module)| module).collect();
@@ -126,28 +147,218 @@ pub(crate) fn expand(program: &mut Program, resolved: &mut Resolved, diags: &mut
 /// qualified against the module that wrote it.
 fn collect(
     program: &Program,
-    resolved: &Resolved,
+    resolved: &mut Resolved,
     diags: &mut Vec<Diagnostic>,
 ) -> IndexMap<Symbol, Signature> {
     let mut out = IndexMap::new();
+    let mut owner_imports: Vec<(usize, Symbol, usize)> = Vec::new();
     for (m, module) in program.modules.iter().enumerate() {
         for item in &module.items {
             let Item::Fn(def) = item else { continue };
+            let names: Vec<&Symbol> = def.params.iter().map(|p| &p.name.name).collect();
             let params = def
                 .params
                 .iter()
-                .map(|p| ParamInfo {
-                    name: p.name.name.clone(),
-                    default: p
-                        .default
-                        .as_ref()
-                        .map(|d| qualify(d, m, resolved, def.vis.is_public(), diags)),
+                .map(|p| {
+                    let Some(d) = p.default.as_ref().filter(|d| admissible(d, &names, diags))
+                    else {
+                        return ParamInfo {
+                            name: p.name.name.clone(),
+                            default: None,
+                            imports: Vec::new(),
+                        };
+                    };
+                    let (default, imports) = qualify(d, m, resolved, def.vis.is_public(), diags);
+                    // The writing module needs the binder as much as any caller
+                    // does: the checker types this default where it was
+                    // written, and a module does not import itself.
+                    for (binder, target) in &imports {
+                        owner_imports.push((m, binder.clone(), *target));
+                    }
+                    ParamInfo {
+                        name: p.name.name.clone(),
+                        default: Some(default),
+                        imports,
+                    }
                 })
                 .collect();
             out.insert(module.name.qualify(&def.name.name), Signature { params });
         }
     }
+    for (module, binder, target) in owner_imports {
+        bind_module(resolved, module, binder, target);
+    }
     out
+}
+
+/// Records that `module` now reaches `target` under `binder`.
+///
+/// The binder is the target's own dotted module name, which no written import
+/// can produce — a written binder is one identifier and contains no `.` — so
+/// this can neither capture a name the file uses nor be captured by one.
+fn bind_module(resolved: &mut Resolved, module: usize, binder: Symbol, target: usize) {
+    if let Some(scope) = resolved.scopes.get_mut(module) {
+        scope.modules.entry(binder).or_insert((target, Span::DUMMY));
+    }
+}
+
+/// Whether a default may be spliced at all, reporting why not.
+///
+/// Two rules, both about the same thing — *the expression is copied into the
+/// caller, so it has to mean there what it means here*:
+///
+/// * it is pure and closed in the structural sense
+///   ([`crate::ast::is_default_expr`]): no call but a constructor's, no
+///   `perform`, no `handle`. A call would run at the caller rather than here.
+/// * it names none of its own signature's parameters. Those do not exist at a
+///   call site, and the failure is quiet rather than loud when a parameter
+///   shares its name with a global — the mention would bind to the global and
+///   the program would compile, meaning something nobody wrote.
+///
+/// Refused here rather than in the checker so that nothing is spliced before
+/// the reason it should not be is reported. What the checker adds is the
+/// default's *type*, which needs inference and cannot be answered here.
+fn admissible(e: &Expr, params: &[&Symbol], diags: &mut Vec<Diagnostic>) -> bool {
+    if !crate::ast::is_default_expr(e) {
+        diags.push(
+            Diagnostic::error(
+                codes::DEFAULT_NOT_PURE,
+                "a parameter default must be a pure, closed expression",
+            )
+            .primary(e.span, "this runs, rather than being a value")
+            .note(
+                "the default is copied into every call that omits the argument, so a call                  or a `perform` in it would run at the caller and not here",
+            )
+            .note("a literal, a constructor applied to literals, a record or a list is fine"),
+        );
+        return false;
+    }
+    let mut mentioned = Vec::new();
+    mentions(e, params, &mut mentioned);
+    if let Some(name) = mentioned.first() {
+        diags.push(
+            Diagnostic::error(
+                codes::DEFAULT_NOT_PURE,
+                format!("a parameter default cannot mention `{name}`"),
+            )
+            .primary(e.span, "names a parameter of this same signature")
+            .note("a call site has no such binding for the default to be copied into"),
+        );
+        return false;
+    }
+    true
+}
+
+/// Which of `params` the expression mentions free. Binders inside the default
+/// shadow, so a lambda whose own parameter is called `n` does not count.
+fn mentions(e: &Expr, params: &[&Symbol], out: &mut Vec<Symbol>) {
+    struct M<'a> {
+        params: &'a [&'a Symbol],
+        bound: Vec<Symbol>,
+    }
+    impl M<'_> {
+        fn go(&mut self, e: &Expr, out: &mut Vec<Symbol>) {
+            grow(|| match &e.kind {
+                ExprKind::Var(q) => {
+                    if q.is_bare()
+                        && !self.bound.contains(q.symbol())
+                        && self.params.contains(&q.symbol())
+                    {
+                        out.push(q.symbol().clone());
+                    }
+                }
+                ExprKind::Lambda { params, body } => {
+                    let mark = self.bound.len();
+                    for p in params {
+                        self.bound.push(p.name.name.clone());
+                    }
+                    self.go(body, out);
+                    self.bound.truncate(mark);
+                }
+                ExprKind::App { func, args, named } => {
+                    self.go(func, out);
+                    args.iter().for_each(|a| self.go(a, out));
+                    named.iter().for_each(|n| self.go(&n.value, out));
+                }
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    self.go(lhs, out);
+                    self.go(rhs, out);
+                }
+                ExprKind::Unary { operand, .. } => self.go(operand, out),
+                ExprKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    self.go(cond, out);
+                    self.go(then_branch, out);
+                    self.go(else_branch, out);
+                }
+                ExprKind::Match { scrutinee, arms } => {
+                    self.go(scrutinee, out);
+                    for arm in arms {
+                        let mark = self.bound.len();
+                        binders(&arm.pat, &mut self.bound);
+                        if let Some(g) = &arm.guard {
+                            self.go(g, out);
+                        }
+                        self.go(&arm.body, out);
+                        self.bound.truncate(mark);
+                    }
+                }
+                ExprKind::Block { stmts, tail } => {
+                    let mark = self.bound.len();
+                    for s in stmts {
+                        match s {
+                            Stmt::Let { pat, value, .. } => {
+                                self.go(value, out);
+                                binders(pat, &mut self.bound);
+                            }
+                            Stmt::Expr(e) => self.go(e, out),
+                        }
+                    }
+                    if let Some(t) = tail {
+                        self.go(t, out);
+                    }
+                    self.bound.truncate(mark);
+                }
+                ExprKind::Record { fields } => fields.iter().for_each(|(_, v)| self.go(v, out)),
+                ExprKind::RecordUpdate { base, fields } => {
+                    self.go(base, out);
+                    fields.iter().for_each(|(_, v)| self.go(v, out));
+                }
+                ExprKind::Field { base, .. } => self.go(base, out),
+                ExprKind::List { items } => items.iter().for_each(|i| self.go(i, out)),
+                ExprKind::Try { operand } => self.go(operand, out),
+                ExprKind::Perform { args, .. } => args.iter().for_each(|a| self.go(a, out)),
+                ExprKind::Handle { body, .. }
+                | ExprKind::WithCell { body, .. }
+                | ExprKind::WithRegion { body, .. }
+                | ExprKind::Simulate { body } => self.go(body, out),
+                ExprKind::Lit(_) => {}
+            })
+        }
+    }
+    M {
+        params,
+        bound: Vec::new(),
+    }
+    .go(e, out);
+}
+
+fn binders(p: &Pattern, out: &mut Vec<Symbol>) {
+    grow(|| match &p.kind {
+        PatternKind::Var(n) => out.push(n.name.clone()),
+        PatternKind::Ctor { args, .. } => args.iter().for_each(|a| binders(a, out)),
+        PatternKind::Record { fields, .. } => fields.iter().for_each(|(_, p)| binders(p, out)),
+        PatternKind::List { items, rest } => {
+            items.iter().for_each(|i| binders(i, out));
+            if let Some(r) = rest {
+                binders(r, out);
+            }
+        }
+        PatternKind::Lit(_) | PatternKind::Wildcard => {}
+    })
 }
 
 /// Rewrites a default's free names to the form they keep in any caller.
@@ -165,17 +376,18 @@ fn qualify(
     resolved: &Resolved,
     public: bool,
     diags: &mut Vec<Diagnostic>,
-) -> Expr {
+) -> (Expr, Vec<(Symbol, usize)>) {
     let mut q = Qualify {
         owner,
         resolved,
         public,
         bound: Vec::new(),
+        imports: Vec::new(),
         diags,
     };
     let mut out = e.clone();
     q.expr(&mut out);
-    out
+    (out, q.imports)
 }
 
 struct Qualify<'a> {
@@ -183,6 +395,8 @@ struct Qualify<'a> {
     resolved: &'a Resolved,
     public: bool,
     bound: Vec<Symbol>,
+    /// The module binders this default now needs, wherever it is spliced.
+    imports: Vec<(Symbol, usize)>,
     diags: &'a mut Vec<Diagnostic>,
 }
 
@@ -224,7 +438,11 @@ impl Qualify<'_> {
                 else {
                     return;
                 };
-                q.module = Some(Ident::new(module.clone(), q.span));
+                let binder = module.clone();
+                if !self.imports.iter().any(|(b, _)| *b == binder) {
+                    self.imports.push((binder.clone(), owner));
+                }
+                q.module = Some(Ident::new(binder, q.span));
             }
             ExprKind::Lambda { params, body } => {
                 let mark = self.bound.len();
@@ -564,10 +782,24 @@ impl Cx<'_> {
         let mut missing: Vec<&str> = Vec::new();
         let mut out = Vec::with_capacity(slots.len());
         for (slot, p) in slots.into_iter().zip(&sig.params) {
-            match slot.or_else(|| p.default.clone().map(|d| respan(d, span))) {
-                Some(v) => out.push(v),
-                None => missing.push(p.name.as_str()),
+            if let Some(written) = slot {
+                out.push(written);
+                continue;
             }
+            let Some(default) = &p.default else {
+                missing.push(p.name.as_str());
+                continue;
+            };
+            // The default may name something in the module that wrote it, and
+            // this one may never have imported that module. Record the binder
+            // so the walk can add it: without this the splice is a reference
+            // the caller is not allowed to make.
+            for edge in &p.imports {
+                if !self.implicit.contains(edge) {
+                    self.implicit.push(edge.clone());
+                }
+            }
+            out.push(respan(default.clone(), span));
         }
 
         if !missing.is_empty() {

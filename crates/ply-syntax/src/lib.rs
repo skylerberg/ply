@@ -1,5 +1,5 @@
 pub mod ast;
-mod defaults;
+pub mod defaults;
 mod effect_set;
 pub mod lexer;
 pub mod parser;
