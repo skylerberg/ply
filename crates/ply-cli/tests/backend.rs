@@ -78,6 +78,36 @@
 //! offer count, and it is what
 //! [`a_backend_is_never_offered_a_definition_that_performs`] asserts.
 //!
+//! > **Re-taken whole, 2026-08-31, when `Machine::compiled_answer` began
+//! > deciding an answer from the definition's declared RETURN type.** The
+//! > corpus changed — `label` was added and `pair` moved inside the fragment,
+//! > see [`CORPUS`] — so every row is a different measurement and none is
+//! > carried. A ninth backend joins them, `wrong:handle`, which is **not** one
+//! > of ADR 0026 §4.5's eight: it attacks the thing that widening gave up,
+//! > which is that no `Value::Cell` could come back at all.
+//! >
+//! > One run each through `target/release/ply`, `-j 1 --no-cache --json`, the
+//! > binary checked `current` by `.github/binary-is-current.sh` first. Every row
+//! > reads `offered 6 · entered 5 · declined 1` except `unoffered`, which
+//! > answers the one it should have declined:
+//! >
+//! > | `--backend` | fired | tests that reported it |
+//! > | --- | ---: | --- |
+//! > | `wrong:off-by-one` | 2 | `double doubles`, `triple triples` |
+//! > | `wrong:inverted` | 1 | `even is even` |
+//! > | `wrong:stale` | 3 | `even is even`, `triple triples`, `a pair has two` |
+//! > | `wrong:wrong-type` | 3 | `double doubles`, `even is even`, `triple triples` |
+//! > | `wrong:unoffered` | 1 | `a label is a word` — `E0501 expected "n", found 7` |
+//! > | `wrong:handle` | 2 | **1 of the 2** — `a pair holds its number`, and that is the row to read twice |
+//! > | `reference` | 0 | 0 failed, which is the control |
+//! >
+//! > `wrong:handle` fires twice and one test notices. The other firing is
+//! > `a pair has two`, whose assertion is `len(pair(7)) == 2`: a list with a
+//! > forged cell in its head is still two long. That is not a weakness in the
+//! > corruption, it is the measure of what a corpus has to *look at* to catch
+//! > one — and it is why `a pair holds its number` was added beside it rather
+//! > than instead of it.
+//!
 //! # Why `-j 1`
 //!
 //! A backend is built per worker, so `wrong:stale` — whose whole corruption is
@@ -98,11 +128,36 @@ use tempfile::TempDir;
 /// - `double`, `triple` — `Int -> Int`, inside the fragment, for `off-by-one`,
 ///   `wrong-type` and `stale`.
 /// - `even` — `Int -> Bool`, for `inverted`.
-/// - `pair` — `Int -> List<Int>`. The machine **offers** it, because
-///   `compiled::admit` gates on the shape of the arguments and never on the
-///   return type, and the backend has no body for it because its signature is
-///   not scalar. That gap is where `unoffered` lives; without a definition in it
-///   the corruption has nothing to invent an answer for.
+/// - `pair` — `Int -> List<Int>`, and `label` — `Int -> String`. The machine
+///   **offers** both, because `compiled::admit` gates on the arguments; `label`
+///   is the one the backend has no body for. That gap is where `unoffered`
+///   lives; without a definition in it the corruption has nothing to invent an
+///   answer for.
+///
+///   > **`pair` moved sides on 2026-08-31 and `label` is its replacement.** The
+///   > bullet read, verbatim: *"`pair` — `Int -> List<Int>`. The machine
+///   > **offers** it, because `compiled::admit` gates on the shape of the
+///   > arguments and never on the return type, and the backend has no body for
+///   > it because its signature is not scalar. That gap is where `unoffered`
+///   > lives; without a definition in it the corruption has nothing to invent an
+///   > answer for."*
+///   >
+///   > `Machine::compiled_answer` now decides an answer from the definition's
+///   > declared **return** type, so `List<Int>` is carried and `pair` is inside
+///   > the fragment. Both tests that read this gap failed rather than passing
+///   > quietly, which is what they are for:
+///   > `an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test`
+///   > with `"fired":0 … "declined":0`, and
+///   > [`the_honest_backend_agrees_over_the_corpus_and_enters_it`] with *"the
+///   > honest backend declined nothing, so the registry-miss path … is
+///   > unexercised"*. `label` returns a `String`, which is one of ADR 0019 §5
+///   > item 4's three kinds and is deliberately outside the fragment in both
+///   > directions, so the gap is a leaf-set fact rather than a container fact
+///   > and the next container widening will not close it too.
+///   >
+///   > `pair` is **kept**, and its second test added, because a definition that
+///   > answers a container through the shipping command is exactly what the
+///   > widening added and what `wrong:handle` needs to bite on.
 /// - `handled` — performs two operations and discharges both under its own
 ///   `handle`, so it publishes an **empty** row and is refused by
 ///   `Gate::InternalEffects` rather than by the row gate. It is the target
@@ -122,6 +177,8 @@ fn even(x: Int) -> Bool = x % 2 == 0
 fn triple(x: Int) -> Int = x * 3
 
 fn pair(x: Int) -> List<Int> = [x, x]
+
+fn label(x: Int) -> String = "n"
 
 fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
   let b = tally.base[log]();
@@ -144,6 +201,8 @@ test "double doubles" { assert_eq(double(4), 8) }
 test "even is even" { assert(even(4)) }
 test "triple triples" { assert_eq(triple(5), 15) }
 test "a pair has two" { assert_eq(len(pair(7)), 2) }
+test "a pair holds its number" { assert_eq(pair(7), [7, 7]) }
+test "a label is a word" { assert_eq(label(7), "n") }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
 "#;
 
@@ -340,16 +399,47 @@ fn a_bool_where_an_int_belongs_crosses_the_seam_and_is_caught_by_ply_test() {
 
 /// 5. An answer for a definition the backend has no body for.
 ///
-/// The machine offers every pure, scalar-**argument** call it makes, so most of
-/// what a backend sees are names it has nothing to say about. Declining is the
-/// whole of its contract there, and `pair` is the definition in this corpus that
-/// is offered and outside the fragment.
+/// The machine offers every pure call whose arguments cross, so most of what a
+/// backend sees are names it has nothing to say about. Declining is the whole of
+/// its contract there, and `label` is the definition in this corpus that is
+/// offered and outside the fragment.
+///
+/// > **The target moved on 2026-08-31 and the sentence above is corrected in
+/// > place.** It read: *"and `pair` is the definition in this corpus that is
+/// > offered and outside the fragment"*, and the assertion below read
+/// > `caught.contains(&"m.a pair has two".to_string())`. `pair` answers a
+/// > `List<Int>` and a container return is now inside the fragment, so this test
+/// > failed with `"fired":0` — correctly, and that is the whole value of step 2.
 #[test]
 fn an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test() {
     let dir = project(CORPUS);
     let caught = fires_and_is_caught(dir.path(), "wrong:unoffered");
     assert!(
-        caught.contains(&"m.a pair has two".to_string()),
+        caught.contains(&"m.a label is a word".to_string()),
+        "{caught:?}"
+    );
+}
+
+/// 9. A handle into this run's world, inside an otherwise honest container answer.
+///
+/// Not one of ADR 0026 §4.5's eight. It exists because the 2026-08-31 widening
+/// of `Machine::compiled_answer` gave up a structural claim — while the answer
+/// test read the answer's discriminant, no `Value::Cell` could come back at all
+/// — and replaced it with the declared return type plus the answer's top-level
+/// kind. `pair` answers a `List<Int>`; this corruption returns a list of the
+/// right kind with a `Value::Cell` in its head, and the seam believes it.
+///
+/// What catches it is the program, downstream, exactly as for a wrong `Int`:
+/// `assert_eq(pair(7), [7, 7])` compares a cell against a number. `len(pair(7))`
+/// does **not** catch it, which is why the second test on `pair` was added with
+/// this one — a corpus that only measures a container's length cannot see what
+/// is in it.
+#[test]
+fn a_forged_handle_inside_a_container_answer_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    let caught = fires_and_is_caught(dir.path(), "wrong:handle");
+    assert!(
+        caught.contains(&"m.a pair holds its number".to_string()),
         "{caught:?}"
     );
 }
@@ -531,7 +621,10 @@ fn a_backend_run_writes_no_pass() {
         0,
         "a run with no backend believed a pass a backend run recorded: {plain}"
     );
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 5, "{plain}");
+    // Seven: `CORPUS` gained `label` and a second test on `pair` on 2026-08-31
+    // (see [`CORPUS`]'s note). This assertion read `5` and failed with
+    // `left: 7 / right: 5`, which is a corpus-size fact and not a cache fact.
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), 7, "{plain}");
 }
 
 // --- The flag itself --------------------------------------------------------
@@ -981,7 +1074,11 @@ fn a_code_generator_run_writes_no_pass() {
         0,
         "a run with no backend believed a pass a code generator run recorded: {plain}"
     );
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 5, "{plain}");
+    // Derived from the corpus rather than written down: this read `5` and went
+    // stale the moment two tests were added to `CORPUS`, failing a test whose
+    // subject — the cache rule above — was still holding.
+    let in_corpus = CORPUS.matches("test \"").count() as u64;
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), in_corpus, "{plain}");
 }
 
 // --- The grammar -------------------------------------------------------------

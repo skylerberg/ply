@@ -306,6 +306,46 @@ impl<'a> Interp<'a> {
         for arg in &args {
             crate::escape::check(&boundary, arg, span)?;
         }
+        self.call_within(name, args, span)
+    }
+
+    /// The same call **without** the entry-point boundary check, for a caller
+    /// that is not an entry point.
+    ///
+    /// The one such caller is `crate::backend::Reference`, which is handed a
+    /// call the machine is in the middle of and answers it on this evaluator.
+    /// `escape::check` asks "does this argument carry a [`Value::Cell`],
+    /// [`Value::Task`] or [`Value::Continuation`]", and
+    /// `compiled::admit` has already answered it: every argument that reaches a
+    /// backend is either childless — an `i64`, a `bool`, an `Arc<[u8]>` — or of
+    /// a declared type `compiled::CarriedTypes` cleared of reaching any of those
+    /// three at any depth. Asking again is not a second opinion; it is the same
+    /// question asked of the value instead of the type, which is precisely the
+    /// **O(value) walk per call** ADR 0030 and `crate::census` measured as
+    /// unaffordable on a real front end and which the type gate exists to avoid.
+    ///
+    /// Measured rather than reasoned, on the ADR 0030 workload
+    /// (`spikes/ply-parser` parsing `examples/`, 13 files, 333,851 bytes,
+    /// `ply test <dir> --no-cache -j 1 --filter probe.parse --backend
+    /// reference`): with the widened argument gate and this check on every
+    /// entry, **14.94 s**; without it, the figure recorded in
+    /// `crate::backend::Reference`'s header. Nothing else differs between the
+    /// two runs and both report the same entry count.
+    ///
+    /// It is **not** a check being dropped for speed. The boundary this refuses
+    /// at is `Boundary::EntryPoint`, and a compiled entry is not one: the
+    /// interpreter's own inner calls — `apply` on a closure inside a body — do
+    /// not run it either, and routing a backend's entry through the entry-point
+    /// spelling also reset a `Trace` and closed program regions that belonged to
+    /// the surrounding run. What keeps a handle out of a backend is
+    /// `compiled::admit`, and `a_cell_touching_caller_agrees_slot_for_slot_with_an_entered_callee`
+    /// is where that is asserted end to end.
+    pub(crate) fn call_within(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
         self.reset();
         let sym = Symbol::new(name);
         let f = self.globals.get(&sym).cloned().ok_or_else(|| {

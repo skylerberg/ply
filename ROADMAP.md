@@ -2041,6 +2041,167 @@ ladder was re-taken after R3 and the verdict did not move
    > calls against today's 8.631% at O(1) per call, the deep value walk reaches
    > 10.4% and does not finish on this workload, and `Str` buys nothing.
 
+   > **Audit note (2026-08-31): the choice was taken, and the two facts above
+   > that are about *what refuses* are withdrawn.** The type-level argument gate
+   > ships as `compiled::CarriedTypes` behind a new `Gate::ArgumentType`, and on
+   > the same workload the seam goes from admitting **12.205%** of body calls to
+   > **84.014%** — the counterfactual said 82.855% and was accurate to 1.2 pp.
+   > (12.205% and 8.631% are the same gate on two denominators; ADR 0030 §6's
+   > amendment shows the arithmetic.)
+   >
+   > *"**100.00%** of refusals are `Gate::ArgumentShape` over **3,048,368
+   > `Record`** arguments"* is withdrawn: records cross. What refuses now is
+   > **98.51% `Gate::Anonymous`** — 380,176 lambdas — and 5,764 calls whose
+   > argument *is* a closure. Every other gate refuses **zero**. The obstacle on
+   > a front end was never effects and is no longer the argument shape; it is
+   > the lambda, and `jit.rs::admissible_builtin` refusing all six higher-order
+   > builtins on its first branch is the shape of it.
+   >
+   > *"the single call that matters is refused on its **return** type"* stands
+   > and is now the largest thing left: **79.7%** of admitted calls are offered
+   > and declined on the return, 1,273,832 of them. The measured speedup goes
+   > **1.089× → 1.170×** and the ceiling **1.121× → 1.294×**.
+   >
+   > **What that is against the gap is deliberately not restated here.** ADR
+   > 0030 §3's 26.9× came from a Rust arm interleaved run-by-run with the Ply
+   > arms in one sitting, and no such sitting was available for this change: the
+   > machine carried another workstream at a load of 6 to 9 throughout, above
+   > this project's 4.0 gate, and an attempt to re-take the Rust arm read 0.01 s
+   > — the *warm* figure, because `ply check` had already cached — which is not
+   > the arm §3 used. A ratio computed from ADR 0030's Rust number and this
+   > change's Ply number would be two sittings divided by each other. The two
+   > figures that are safe are the ones above, both of which are ratios *within*
+   > one counterbalanced series with a 0.000% null control.
+   >
+   > §4.5's precondition and ADR 0016 §3.5 are still untouched: 1.294× is still
+   > not a reason to take cranelift into `Cargo.lock`.
+
+   > **Audit note (2026-08-31, later the same day): the return type was taken
+   > too, and the sentence above about it is withdrawn.** *"the single call that
+   > matters is refused on its **return** type … **79.7%** of admitted calls are
+   > offered and declined on the return, 1,273,832 of them"* — that is now
+   > **zero** on this workload. `Machine::compiled_answer` decides an answer
+   > from the definition's declared return type the way `admit` decides an
+   > argument, and `ply test <W1> --backend reference` goes
+   >
+   > ```
+   > before  306931 of 1580763 offers entered · 1273832 declined · 146 in the fragment
+   > after        26 of      26 offers entered ·       0 declined · 413 in the fragment
+   > ```
+   >
+   > **The entry count fell by four orders of magnitude and that is the win.**
+   > `items.parse` is entered once per file — 13 of the 26 — and its whole
+   > subtree runs inside that entry. It is PR #30's shape (crossings 721 → 1),
+   > and ADR 0030 §1 predicted it in those words before it was observed. The
+   > share of body calls a backend can *answer* goes **17.033% → 84.014%** of
+   > 2,414,170, which is every call the seam admits.
+   >
+   > **Three things a reader will get wrong unless they are said here.**
+   >
+   > 1. **The run gets SLOWER**, 1.71×, and against the unbacked machine it goes
+   >    from 1.165× faster to 1.47× slower. That is what a total collapse does
+   >    when the only backend in the tree is a tree-walker: ADR 0030 §5 measured
+   >    `Reference` at 3.63× faster *per body call inside its fragment* and
+   >    1.51× slower *as a whole engine over this program*, and the second
+   >    number now governs. The speed claim moved entirely into the ceiling.
+   > 2. **The ceiling is the result.** `f`, the share of the unbacked run an
+   >    infinitely fast backend would delete, goes **22.97% → 97.53%**, measured
+   >    in-gate (load 2.98 → 2.05) with a 0.353% null control. `1/(1−f)` is 40×
+   >    and is not a resolvable number that close to 1; the model-free statement
+   >    is `B − r` = 0.07 s of 4.15 s, i.e. **98.3% of the backed run is inside
+   >    `enter`**. §4.5's precondition and ADR 0016 §3.5 are still untouched —
+   >    but "1.294× is not a reason to take cranelift into `Cargo.lock`" is now
+   >    the wrong sentence to quote, and what would have to be argued instead is
+   >    whether a real code generator can compile `items.parse` at all.
+   > 3. **`Gate::Anonymous` refuses 0 with the backend attached, and the lambda
+   >    wall is stepped over rather than solved.** The machine makes **26 body
+   >    calls** in the whole run against 1,964,958 before, of which 378,431 were
+   >    lambda refusals — the lambdas are inside the entry now. What that leaves
+   >    is a *code generator* problem: `jit.rs::admissible_builtin` refuses all
+   >    six higher-order builtins, so a cranelift backend would decline the very
+   >    entry this change opens. See ADR 0030 §6.4.
+   >
+   >    > **Priced, 2026-08-31 — nothing above is withdrawn, ADR 0030 §10.**
+   >    > *"Stepped over rather than solved"* is right and does not say by how
+   >    > much. Narrowing the backend's registry to the definitions a
+   >    > *callback-free* code generator could compile — 223 of the front end's
+   >    > 426, its 36 callback users and everything whose call closure reaches
+   >    > one removed — and re-running the same counterbalanced series gives
+   >    > **61.06%** of body calls covered against 100%, and a ceiling of
+   >    > **2.074×** against an `f` of 99.65% that `1/(1−f)` can no longer
+   >    > resolve. So the lambdas are worth roughly the whole of what the two
+   >    > levers bought, and they are worth it **to a code generator and not to
+   >    > the seam**: `Gate::Anonymous` refuses 0 with a backend attached and
+   >    > 380,176 without one, and under the callback-free registry it refuses
+   >    > 380,176 *again* — a fragment closed under calls with no callback user
+   >    > in it cannot hide a lambda, so for such a backend those refusals are
+   >    > irreducible.
+   >    >
+   >    > The narrow escape — a `fold` whose callback is a **named** definition
+   >    > rather than an anonymous lambda — was measured and **not built**: 38
+   >    > of the front end's 43 higher-order call sites pass a lambda written at
+   >    > the call site, all 28 sites inside `closure(items.parse)` do, and
+   >    > applying the widening moves the compilable fixpoint from 223 to 223.
+   >    >
+   >    > One thing the callback-free fragment is strictly **better** at, and it
+   >    > is the audit note above's own subject: the three corruptions the
+   >    > collapse switched off on W1 all fire again under it and are all
+   >    > caught — `off-by-one` 17,599 entries, `inverted` 6,009,842,
+   >    > `unoffered` 26, each **13 failed, 0 passed**. A workload that enters
+   >    > one call per file cannot police a corruption of a scalar answer; one
+   >    > that enters half a million leaves can.
+   >
+   > And the cost, stated because it is the thing this widening gave up: the
+   > machine no longer proves structurally that no handle comes back. A
+   > container answer is checked for its **kind** and not for its contents, so a
+   > backend that puts a `Cell` inside a well-kinded record is believed. A ninth
+   > wrong backend, `ply test --backend wrong:handle`, exists so that limit has
+   > something standing on it: 388 answers changed over `examples/` and
+   > `tests/fixtures/`, **237 of 1,127** tests report it, 890 do not.
+
+   > **Audit note (2026-08-31, end of the day): the closed fragment measured end
+   > to end, and one bound above is withdrawn.**
+   > [ADR 0031](docs/adr/0031-the-closed-fragment.md). Ten arms, ten blocks,
+   > every arm in every position once, in gate (load 2.84 → 1.63), null control
+   > **0.352%** against an effect of 46.1%.
+   >
+   > - **The ceiling is 56.8× and it is now resolvable.** ADR 0030 §6.3 could
+   >   only say that `1/(1−f)` *"is not a resolvable quantity"* at `f` = 97.53%.
+   >   A second instrument that shares no mechanism with the doubling one — a
+   >   **floor arm**, the same command with a `--filter` that selects no test,
+   >   which still typechecks all seven modules — measures the residue directly:
+   >   `F` = **0.05 s** of `A` = 2.84 s. The two agree on the linear quantity to
+   >   **0.36%** (`t` 2.780 against `A − F` 2.790), and a third — the runner's
+   >   own per-test milliseconds, 2,782.2 ms — lands on the same number to 0.08%.
+   >   Model-free: `B − r` = 0.06 s of 4.15, so **98.6% of the backed run is
+   >   inside `enter`**.
+   > - **The brief's "5–7× if the fragment closed" is a lower bound by an order
+   >   of magnitude**, and ADR 0030 §4's *"an infinitely fast backend … could
+   >   never take it below **24.0×**, 11.2% of the absolute gap"* is **withdrawn
+   >   as a bound on this fragment**: it was a bound on a fragment admitting
+   >   8.6% of body calls, and this one admits every call it is offered.
+   > - **The gap, re-taken with the Rust arm interleaved.** 2.84 s against a cold
+   >   `ply check examples` of 0.09 s is **31.6×**; with the shipping tree-walker
+   >   backend attached it is **46.1×**, i.e. the backend *opens* the absolute gap
+   >   by 47.6% of its width; the whole of that gap — `A − Rn` = 2.750 s against
+   >   `A − F` = 2.790 s — is now **inside the fragment**. And the cold arm ADR
+   >   0030 §3 spelled with `rm -rf $root/.ply-cache` was never cold: the
+   >   front-end cache is written **beside the target** (`examples/.ply-cache`),
+   >   which is why §6.3's re-take read the warm 0.01 s.
+   > - **What a code generator can actually reach is 2.10×**, not 56.8× — ADR
+   >   0030 §10's callback-free registry re-measured independently in the same
+   >   sitting (§10 read 2.074×). The difference between the two is the price of
+   >   `jit.rs`'s three refusals, and it is the largest number left in this line
+   >   of work. **The next piece of work is in `crates/ply-codegen-spike`, not in
+   >   `crates/ply-eval`: the seam is closed.**
+   > - **W1 is retired as a policing workload.** `off-by-one`, `inverted` and
+   >   `unoffered` fire **0** times on it and pass vacuously, and a fourth case
+   >   joins them — `wrong:answers=7@lexer.at` now gets **zero offers**, because
+   >   `lexer.at` is inside `items.parse`. Every mutation that fires is still
+   >   caught, on `examples/`: 95, 74, 138, 115, 119 and 68 failures for the six
+   >   that fire. `--engine both --backend reference` audits 13 of 13 on W1 and
+   >   166 of 186 on `examples/`, 0 failed.
+
    > **And ADR 0026's §6 list is no longer entirely owed, 2026-08-28.** Items 1,
    > 2, 3 and 6 are built; 4 is measured and refused; 5, 7 and 8 stand.
    >
