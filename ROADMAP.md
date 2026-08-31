@@ -1977,6 +1977,32 @@ ladder was re-taken after R3 and the verdict did not move
    > critical path — not throughput on a served request, and not a
    > compiled-workload target, which appears in no file here (§3.1).
 
+   > **Audit note (2026-08-30): "entered at token granularity" has been measured
+   > on the front end itself, and the ceiling it buys is 1.121×.**
+   > [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md). With the seam
+   > widened to `Bytes`, `ply test --backend reference` over
+   > `spikes/ply-parser` parsing `examples/` — the corpus GAPS.md §13/§13R took
+   > the gap on — enters **190,618 times, 4.23 per token**, and takes the run
+   > from 2.70 s to 2.48 s: **1.089×** measured, counterbalanced arms, null
+   > control at 0.000%. That moves the Ply front end from **26.9×** the Rust
+   > front end to 24.8×, and an *infinitely fast* backend over the same fragment
+   > could never take it below **24.0×**.
+   >
+   > Two things fall out that this list should carry. **Effects are not the
+   > obstacle on a front end**: `Gate::PublishedRow` and `Gate::InternalEffects`
+   > refuse **zero** calls, and **100.00%** of refusals are `Gate::ArgumentShape`
+   > over **3,048,368 `Record`** arguments. And the single call that matters is
+   > refused on its **return** type — `lexer.lex` is admitted 13 times, once per
+   > file, and declined 13 times, and accepting it would have replaced the other
+   > 188,779 entries with nothing.
+   >
+   > Nothing in ADR 0030 re-opens M9 and it argues that it does not: 1.121× is
+   > not a reason to take cranelift into `Cargo.lock`, and §4.5's precondition
+   > and ADR 0016 §3.5 are untouched. What it hands on is a *choice between
+   > widenings*, priced: the type-level argument gate reaches **82.855%** of body
+   > calls against today's 8.631% at O(1) per call, the deep value walk reaches
+   > 10.4% and does not finish on this workload, and `Str` buys nothing.
+
    > **And ADR 0026's §6 list is no longer entirely owed, 2026-08-28.** Items 1,
    > 2, 3 and 6 are built; 4 is measured and refused; 5, 7 and 8 stand.
    >

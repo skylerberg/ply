@@ -82,7 +82,9 @@
 //!   continuation can be captured beneath a native activation and no handler
 //!   clause can resume into one.
 //! - **Cells, regions, tasks.** No arena crosses, and neither does a
-//!   `Value::Cell`, `Value::Task` or `Value::Continuation` — see [`crossable`].
+//!   `Value::Cell`, `Value::Task` or `Value::Continuation` — see [`crossable`],
+//!   which carries only kinds that hold no `Value` inside them and so cannot
+//!   reach one of these at any depth either.
 //! - **Diagnostics.** A backend cannot raise. A body that would fail answers
 //!   `None` and the machine raises its own diagnostic from its own evaluation, so
 //!   the code, message, spans, labels and notes are the interpreter's by
@@ -186,8 +188,28 @@
 //! > nothing — `Cargo.lock` still holds no cranelift — but it is a real
 //! > implementor on the shipping side of this seam, and it is what makes the
 //! > *accept* path reachable from a command a user runs: over `examples/` and
-//! > `tests/fixtures/` it is offered 120,340 calls and enters **18,773** of
+//! > `tests/fixtures/` it is offered 625,767 calls and enters **446,346** of
 //! > them.
+//! >
+//! > > **Re-taken after the `Bytes` widening (2026-08-30).** This read *"it is
+//! > > offered 120,340 calls and enters **18,773** of them"*, and the figures
+//! > > moved by more than the corpus did: measured on the same day, on the same
+//! > > tree, with [`crossable`] narrowed back to `Int | Bool` and then widened,
+//! > > `differential_corpus.rs`'s honest sweep goes 122,617 offered / 18,773
+//! > > entered to **625,767 offered / 446,346 entered** — 23.8x the entries,
+//! > > and the share of offers that are actually answered goes 15.3% -> 71.3%.
+//! > > Through the shipping command, `ply test examples --engine both --backend
+//! > > reference` goes from a fragment of 51 definitions entering **768** calls
+//! > > to one of 153 entering **62,388**.
+//! > >
+//! > > **Entries rose, and that is the opposite of PR #30's result**, which is
+//! > > worth stating rather than celebrating. PR #30 widened a fragment until
+//! > > the interpreter stopped driving a search's loop, and its crossings
+//! > > *fell* — 721 to 1 — because one entry swallowed the whole search. This
+//! > > widening moves [`crossable`] and nothing else, so the fragment is still
+//! > > not closed under calls and the interpreter still drives every loop: what
+//! > > grows is the number of admissible **leaves**, one crossing each. Both are
+//! > > coverage; only PR #30's shape is speed.
 //! >
 //! > And the rule is enforced, in the two stages ADR 0026 §4.6 specifies:
 //! > `cache_bypassed` reads `--backend` so a backend run neither reads the
@@ -206,7 +228,7 @@
 //!
 //! | polices it | what it is |
 //! | --- | --- |
-//! | this module's tests | **36** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity |
+//! | this module's tests | **38** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity, and the two kinds of `Bytes` crossing |
 //! | `crates/ply-eval/tests/differential_corpus.rs` | **6** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
 //! | `crates/ply-codegen-spike/tests/mutations.rs` | **13** tests, eight deliberately wrong backends, each asserted to have *fired* before it is asserted to be caught |
 //! | `crates/ply-codegen-spike/tests/hazards.rs`, `mcts_kernel.rs` | **25** tests over the real cranelift backend |
@@ -363,10 +385,16 @@ pub trait Compiled {
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
     ///
-    /// `args` are [`Value::Int`] and [`Value::Bool`] only and the answer must be
-    /// too; the machine checks both sides and evaluates the definition itself
-    /// when either fails, so an unsound backend produces a slow program rather
-    /// than a wrong one.
+    /// `args` are [`Value::Int`], [`Value::Bool`] and [`Value::Bytes`] only and
+    /// the answer must be too; the machine checks both sides and evaluates the
+    /// definition itself when either fails, so an unsound backend produces a
+    /// slow program rather than a wrong one.
+    ///
+    /// A `Bytes` is `Arc<[u8]>` and is borrowed for the length of the call —
+    /// read-only it is a `(ptr, len)` pair and costs a backend nothing. A
+    /// backend that wants to *keep* one clones an `Arc` and pays the refcount;
+    /// a backend that wants to *produce* one needs an allocator, and one that
+    /// has none simply declines, which is what a registry miss already is.
     ///
     /// `budget` is at least 1 and is the nested calls left before the machine's
     /// `max_calls`. A body that would recurse past it answers `None`; the machine
@@ -390,8 +418,8 @@ pub trait Compiled {
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
 }
 
-/// What may cross this boundary, in either direction: the unboxed scalar kinds
-/// and nothing else.
+/// What may cross this boundary, in either direction: the two unboxed scalars
+/// and [`Value::Bytes`].
 ///
 /// The list is short on purpose, and every exclusion closes a hazard rather than
 /// being conservative for its own sake.
@@ -405,14 +433,72 @@ pub trait Compiled {
 /// - No [`Value::Secret`]: a credential cannot reach a constant pool or a
 ///   `format!` in code the machine did not write.
 /// - Nothing that can reach a [`Value::Cell`], [`Value::Task`],
-///   [`Value::Continuation`] or [`Value::Closure`], so no handle into this run's
-///   world crosses and no heap value is cloned across — which is also why the
-///   unique-ownership path `frame.rs` sets up has nothing to lose here.
+///   [`Value::Continuation`] or [`Value::Closure`] **at any depth**, so no handle
+///   into this run's world crosses.
 ///
 /// This is a capability cut as much as a safety one: nothing taking or returning
 /// a `List`, `Map`, `Record`, `Str` or `Float` can be entered at all.
+///
+/// # Why a *shallow* test, and what it costs to widen it again
+///
+/// This decides from the top-level discriminant alone, and for the three kinds
+/// it carries that is not an approximation: an `i64`, a `bool` and an
+/// `Arc<[u8]>` hold no [`Value`] at all, so "this argument cannot reach a
+/// closure, a cell, a task, a continuation or a secret" follows from the
+/// discriminant and needs no walk. That is the whole of the licence
+/// [`internally_effectful`] takes when it argues its published fact is
+/// sufficient.
+///
+/// It does not extend. A [`Value::List`], [`Value::Map`], [`Value::Record`] or
+/// [`Value::Ctor`] holds `Value`s, so admitting one on its discriminant lets a
+/// [`Value::Closure`] across one field deep and the effects gate acquires a hole
+/// exactly that deep. Widening to a container therefore means a **deep** walk —
+/// O(value) on every call, including the ones that go on to decline — or a test
+/// over the definition's declared parameter types instead of over the values,
+/// which would put the [`CheckOutput`] lookup ahead of the shape gate and
+/// reverse the cost claim [`admit`] documents. Neither is done here.
+/// `a_container_is_refused_on_its_discriminant_whatever_it_holds` is the
+/// tripwire: add a container kind to this `matches!` and it goes red.
+///
+/// Which of the two, measured rather than left as a choice: the deep walk does
+/// **not finish** on the ported Ply front end — the state record it would walk
+/// per call transitively holds the token list — and bounded at 256 nodes it
+/// reaches 18.5% of calls against the type test's 82.6%, with the whole gap
+/// attributable to the budget rather than to anything a walk would have found.
+/// `crate::census`'s module header carries the table and the run. The ordering
+/// this doc calls a reversal is the price of the design that works, and it is a
+/// per-definition precompute rather than a per-call lookup.
+///
+/// > **Widened to carry [`Value::Bytes`] (2026-08-30).** The first line read
+/// > *"What may cross this boundary, in either direction: the unboxed scalar
+/// > kinds and nothing else"*, and the last bullet read, verbatim:
+/// >
+/// > > *"Nothing that can reach a [`Value::Cell`], [`Value::Task`],
+/// > > [`Value::Continuation`] or [`Value::Closure`], so no handle into this
+/// > > run's world crosses and **no heap value is cloned across** — which is
+/// > > also why the unique-ownership path `frame.rs` sets up has nothing to
+/// > > lose here."*
+/// >
+/// > Both halves of that trailing clause are withdrawn and neither was load
+/// > bearing. A `Bytes` **is** a heap value — `Arc<[u8]>`, `value.rs`, "Slicing
+/// > copies" — so a backend that keeps one past the call pays a refcount, which
+/// > is a cost and not a hazard. And there is no unique-ownership path in
+/// > `frame.rs` to lose: the in-place branches are `Arc::get_mut` in
+/// > [`crate::builtins`]'s `push` and in `value.rs`'s dismantler, and they run
+/// > over `List`, `Record` and `Secret`. **None of them runs over `Bytes`**, so
+/// > a `Bytes` crossing cannot push any of them onto its copying branch.
+/// >
+/// > Why this kind and not the others, stated so it can be argued with. ADR 0026
+/// > §3 records the seam refusing `fn read_line(buf: Bytes, ..) -> Line` on its
+/// > first line, and a census over the ported Ply front end
+/// > (`spikes/ply-parser`) puts **353,248** `Bytes` arguments in the way of
+/// > calls that clear every other gate — a lexer's arguments are `Bytes` and
+/// > nothing else about the workload changes that. `Str` is the same shape and
+/// > is **not** admitted, because it is one of the three kinds ADR 0019 §5
+/// > item 4's defect is about and the census scores it at +0.0 pp on that same
+/// > workload: the hazard is real and the return is zero.
 pub(crate) fn crossable(value: &Value) -> bool {
-    matches!(value, Value::Int(_) | Value::Bool(_))
+    matches!(value, Value::Int(_) | Value::Bool(_) | Value::Bytes(_))
 }
 
 /// Which gate refused a call, named rather than collapsed into `None`.
@@ -475,12 +561,30 @@ pub(crate) enum Gate {
 /// - A closure fetched out of a cell is reached through a `Value::Cell`, which
 ///   [`crossable`] also refuses, and a cell cannot outlive the `with_cell` that
 ///   made it.
+/// - A closure **inside** an argument is refused with the argument. Every kind
+///   [`crossable`] carries is childless — an `i64`, a `bool`, an `Arc<[u8]>` —
+///   so there is no "inside" for one to be in, and the shallow discriminant
+///   test is exact for this purpose rather than merely conservative.
 ///
-/// So a definition admitted here takes only [`Value::Int`] and [`Value::Bool`],
-/// which carry no code, and the only code it can run is code some definition it
-/// names contains. That is an argument, not a proof and not a measurement; what
-/// **is** measured is that deleting either gate turns tests red, and the
-/// deletion table in this module's test header records which.
+/// So a definition admitted here takes only [`Value::Int`], [`Value::Bool`] and
+/// [`Value::Bytes`], none of which carry code, and the only code it can run is
+/// code some definition it names contains. That is an argument, not a proof and
+/// not a measurement; what **is** measured is that deleting either gate turns
+/// tests red, and the deletion table in this module's test header records which.
+///
+/// > **Corrected in place (2026-08-30), when [`crossable`] widened.** The
+/// > paragraph above read: *"So a definition admitted here takes only
+/// > [`Value::Int`] and [`Value::Bool`], which carry no code"*, and the bullet
+/// > list had two entries rather than three. The conclusion is unchanged and
+/// > the **third bullet is what keeps it true**: this argument does not rest on
+/// > the *shortness* of [`crossable`]'s list, it rests on every kind in that
+/// > list being childless. A widening that admits a [`Value::List`],
+/// > [`Value::Map`], [`Value::Record`] or [`Value::Ctor`] on its discriminant
+/// > breaks this gate one field deep, and no amount of transitivity in
+/// > `ply_core::DefInfo::internally_effectful` repairs it — the fact is about
+/// > the call graph, and a closure arriving in a record is not on it. Anyone
+/// > widening this further owes a deep walk or a type-level test, and owes it
+/// > *here*, not in a backend.
 fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
@@ -529,10 +633,32 @@ pub(crate) fn admit<'a>(
     max_calls: usize,
     calls: usize,
 ) -> Result<(&'a Symbol, usize), Gate> {
+    admit_with(
+        closure,
+        args,
+        in_simulate,
+        check,
+        max_calls,
+        calls,
+        crossable,
+    )
+}
+
+/// [`admit`] with the argument test supplied, so a census can ask what a wider
+/// [`crossable`] would admit without a second copy of the other six gates.
+pub(crate) fn admit_with<'a>(
+    closure: &'a Closure,
+    args: &[Value],
+    in_simulate: bool,
+    check: Option<&CheckOutput>,
+    max_calls: usize,
+    calls: usize,
+    carries: impl Fn(&Value) -> bool,
+) -> Result<(&'a Symbol, usize), Gate> {
     if !matches!(closure.kind, ClosureKind::Code { .. }) {
         return Err(Gate::NotLoweredCode);
     }
-    if !args.iter().all(crossable) {
+    if !args.iter().all(carries) {
         return Err(Gate::ArgumentShape);
     }
     if in_simulate {
@@ -607,6 +733,7 @@ pub(crate) fn admit<'a>(
 /// |---|---|
 /// | the [`ClosureKind::Code`] test | `a_body_this_machine_did_not_lower_is_refused_by_the_kind_gate`, `a_tree_walker_closure_with_a_program_wide_name_is_never_offered` |
 /// | the [`crossable`] test on arguments | 5, incl. `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `a_secret_is_never_offered_and_never_accepted` |
+/// | `Value::List(_)` **added** to [`crossable`] — the widening this seam must not take without a deep walk | 5, of which `a_container_is_refused_on_its_discriminant_whatever_it_holds` is the one that names the reason |
 /// | the `in_simulate` test | `a_call_inside_a_simulate_region_is_refused_by_the_region_gate`, `nothing_is_offered_inside_a_simulate_region` |
 /// | the name test, replaced by a fabricated empty [`Symbol`] | `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`, **and nothing else** |
 /// | the published-row test | 4: `a_definition_that_opens_its_own_simulate_region_is_never_offered`, `a_definition_whose_published_row_is_not_empty_is_never_offered`, `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`, `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate` |
@@ -708,6 +835,7 @@ mod tests {
     use ply_syntax::ast::{BinOp, Expr, ExprKind, Item, Program};
     use ply_syntax::resolve::Resolved;
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -1192,6 +1320,71 @@ mod tests {
         }
         assert_eq!(gate(&c, &subject, &[Value::Int(21)]), admitted());
         assert_eq!(gate(&c, &subject, &[Value::Bool(true)]), admitted());
+        assert_eq!(
+            gate(&c, &subject, &[Value::bytes(b"GET / HTTP/1.1\r\n")]),
+            admitted(),
+            "a `Bytes` argument is refused, and a lexer has no other kind"
+        );
+    }
+
+    /// The `Bytes` widening, end to end through the machine rather than through
+    /// [`admit`]: in as an argument, and out as an answer.
+    ///
+    /// Both halves are asserted because they are different mechanisms —
+    /// [`admit`]'s [`crossable`] test on `args` and `Machine::compiled_answer`'s
+    /// [`crossable`] test on the answer — and before 2026-08-30 both refused.
+    /// ADR 0026 §3 is the reason this is a test and not a footnote: it recorded
+    /// `fn read_line(buf: Bytes, ..) -> Line` being refused on `admit`'s first
+    /// line, which made the `E = 1.46x` projection the M9 deferral rests on a
+    /// projection about a function the seam would not enter.
+    #[test]
+    fn a_bytes_crosses_in_as_an_argument_and_out_as_an_answer() {
+        // `head` takes whatever it is given and hands it straight back, so the
+        // machine's own answer is a `Bytes` too and the comparison below is
+        // between two answers of the same kind.
+        let c = checked(vec![fn_def("head", &["b"], var("b"))]);
+        let call = callv("head", vec![bytes(b"GET /orders HTTP/1.1")]);
+
+        // The control: no backend, and the machine's own answer.
+        assert_eq!(
+            ok(c.machine().eval_expr_for_test(&call)),
+            Value::bytes(b"GET /orders HTTP/1.1")
+        );
+
+        // In. The backend declines, so the answer is still the machine's, and
+        // what is asserted is what it was handed.
+        let backend = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&call)),
+            Value::bytes(b"GET /orders HTTP/1.1")
+        );
+        assert_eq!(
+            backend.offers()[0].args,
+            vec![Value::bytes(b"GET /orders HTTP/1.1")],
+            "the `Bytes` did not reach the backend"
+        );
+        assert_eq!(machine.compiled_counts(), (0, 1));
+        drop(machine);
+
+        // Out. A `Bytes` answer is accepted rather than refused, and this is
+        // the accept path: the value the program sees is the backend's.
+        //
+        // It is also, deliberately, a *wrong* answer — `head` would have
+        // answered the argument — and the boundary takes it, which is the
+        // property this module's header states plainly and `--engine both` is
+        // there to catch. `an_answer_this_boundary_refuses_is_declined_and_the_body_is_evaluated`
+        // is the same shape for the kinds that are still refused.
+        let backend = Double::answering(&c.program, "head", Value::bytes(b"HTTP/1.1 200"));
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&call)),
+            Value::bytes(b"HTTP/1.1 200")
+        );
+        assert_eq!(machine.compiled_counts(), (1, 0));
+        assert_eq!(machine.compiled_refusals(), 0);
     }
 
     /// Inside a `simulate` region every cell touch and every allocation is an
@@ -2049,17 +2242,91 @@ mod tests {
     }
 
     #[test]
-    fn crossable_admits_the_two_scalar_kinds_and_nothing_else() {
+    fn crossable_admits_the_two_scalars_and_bytes_and_nothing_else() {
         assert!(crossable(&Value::Int(0)));
         assert!(crossable(&Value::Bool(false)));
+        assert!(crossable(&Value::bytes(b"GET /orders HTTP/1.1")));
+        assert!(
+            crossable(&Value::bytes(b"")),
+            "an empty `Bytes` is a `Bytes`"
+        );
         for refused in [
             Value::Float(0.0),
             Value::str("s"),
             Value::Unit,
             Value::List(Default::default()),
             Value::Secret(Arc::new(Value::Int(1))),
+            Value::Secret(Arc::new(Value::bytes(b"hunter2"))),
         ] {
             assert!(!crossable(&refused), "{refused:?} crossed the boundary");
+        }
+    }
+
+    /// The property that makes [`crossable`]'s shallow test a sound one, asked
+    /// of the containers rather than of the scalars.
+    ///
+    /// [`internally_effectful`]'s transitivity argument rests on nothing that
+    /// carries code crossing, and it reaches that conclusion from the *kinds*
+    /// [`crossable`] carries being childless. A `List`, `Map`, `Record` or
+    /// `Ctor` is not: each of these holds a `Closure` one step down, and a
+    /// widening that admitted them on their discriminant would hand a backend a
+    /// value that can `perform` while the effects gate reported it could not.
+    ///
+    /// So this is a tripwire rather than a description. Add any one of these
+    /// kinds to [`crossable`]'s `matches!` and this test goes red, which is the
+    /// prompt to write the deep walk or the type-level test instead. **Seen to
+    /// fail, 2026-08-30**: `Value::List(_)` added to the `matches!` reds
+    /// **5** of this module's tests — this one first and on the `List` row,
+    /// with the message below, and then
+    /// `crossable_admits_the_two_scalars_and_bytes_and_nothing_else`,
+    /// `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`,
+    /// `a_call_taking_a_non_scalar_is_never_offered` and
+    /// `an_answer_this_boundary_refuses_is_declined_and_the_body_is_evaluated`.
+    /// Four of those five would red for *any* widening; this one is the only
+    /// one that reds for the reason that matters, which is why it exists.
+    #[test]
+    fn a_container_is_refused_on_its_discriminant_whatever_it_holds() {
+        let closure = Value::Closure(Arc::new(code_closure(
+            None,
+            &["y"],
+            bin(BinOp::Mul, var("y"), int(2)),
+        )));
+        let mut fields = BTreeMap::new();
+        fields.insert(Symbol::new("f"), closure.clone());
+        let map = crate::value::Map::new().insert(Value::Int(0), closure.clone());
+
+        for (kind, holding) in [
+            ("List", Value::List(Arc::new(vec![closure.clone()]))),
+            ("Record", Value::Record(Arc::new(fields))),
+            (
+                "Ctor",
+                Value::Ctor {
+                    name: Symbol::new("Wrap"),
+                    args: Arc::new(vec![closure.clone()]),
+                },
+            ),
+            ("Map", Value::Map(map)),
+        ] {
+            assert!(
+                !crossable(&holding),
+                "a `{kind}` holding a `Closure` crossed the boundary, so \
+                 `internally_effectful`'s argument now has a hole one field deep"
+            );
+        }
+
+        // The control: the containers are refused for their kind and not for
+        // what they happen to hold, so an empty one is refused too. Without
+        // this, a `crossable` that walked into containers and refused only the
+        // closure would pass the loop above.
+        for empty in [
+            Value::List(Default::default()),
+            Value::Record(Arc::new(BTreeMap::new())),
+            Value::Ctor {
+                name: Symbol::new("None"),
+                args: Arc::new(Vec::new()),
+            },
+        ] {
+            assert!(!crossable(&empty), "{empty:?} crossed the boundary");
         }
     }
 
