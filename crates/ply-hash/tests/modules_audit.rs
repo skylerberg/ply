@@ -26,8 +26,8 @@ fn program_of(files: &[(&str, &str)]) -> Program {
 
 #[track_caller]
 fn hashes(files: &[(&str, &str)]) -> HashOutput {
-    let program = program_of(files);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = program_of(files);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };
@@ -38,8 +38,8 @@ fn hashes(files: &[(&str, &str)]) -> HashOutput {
 /// Both are consulted because the contract splits the work: `resolve` finds
 /// import-level faults and the checker finds reference-level ones.
 fn errors(files: &[(&str, &str)]) -> Vec<&'static str> {
-    let program = program_of(files);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = program_of(files);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(resolved) => resolved,
         Err(diags) => return diags.iter().map(|d| d.code).collect(),
     };

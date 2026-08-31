@@ -788,3 +788,98 @@ fn const_str_replace(text: &str, from: &str, to: &str) -> String {
     assert!(text.contains(from), "`{from}` is not in the fixture");
     text.replace(from, to)
 }
+
+const PALETTE: &str = r#"
+pub type Color = Red | Green
+
+pub fn paint(what: String, shade: Color = Red) -> String =
+  match shade {
+    Red -> string_concat(what, " red"),
+    Green -> string_concat(what, " green"),
+  }
+"#;
+
+const WALL: &str = r#"
+import palette
+
+pub fn wall() -> String = palette::paint("wall")
+pub fn given() -> String = palette::paint("wall", palette::Green)
+
+test "the default crosses the module boundary" {
+  assert_eq(wall(), "wall red")
+}
+"#;
+
+/// **The stale-expansion hazard ADR 0023 refused record update over, checked
+/// where defaults do cross the boundary.**
+///
+/// `wall.ply`'s bytes never change. Its call to `paint` was expanded against a
+/// default written in `palette.ply`, so if gate 1 let it skip, the tree would
+/// hold an expansion of a default that no longer exists — and unlike a stale
+/// name, that is a wrong *value*, silently.
+///
+/// What makes it safe is that a default is part of the callee's `DefHash`, so
+/// the exports digest of the module declaring it moves and the importer is
+/// refused. Both halves are asserted: the importer is re-parsed, and the
+/// incremental snapshot is byte-identical to a from-scratch check.
+#[test]
+fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "palette.ply", PALETTE);
+    write(dir.path(), "wall.ply", WALL);
+
+    let cold = agree(dir.path(), "cold");
+    let before = cold.hashes.defs[&ply_span::Symbol::new("wall.wall")];
+
+    // Only the default moves. Every other byte of both files is untouched, and
+    // `wall.ply` is not touched at all.
+    edit(
+        dir.path(),
+        "palette.ply",
+        "shade: Color = Red",
+        "shade: Color = Green",
+    );
+
+    let after = agree(dir.path(), "default edit");
+    assert!(
+        after.frontend.parsed() > 1,
+        "only {} file(s) were parsed: the importer skipped, and its call still \
+         carries the old default",
+        after.frontend.parsed()
+    );
+    assert_ne!(
+        before,
+        after.hashes.defs[&ply_span::Symbol::new("wall.wall")],
+        "`wall` was expanded against a default that changed, so its hash has to move"
+    );
+}
+
+/// The identity the whole design rests on, at the level a user sees: three
+/// spellings of one call are one definition with one hash, so adopting a
+/// default or a name re-runs nothing.
+#[test]
+fn the_three_spellings_of_one_call_are_one_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.ply",
+        r#"
+pub fn greet(name: String, greeting: String = "hello") -> String =
+  string_concat(greeting, name)
+
+pub fn omitted() -> String = greet("ada")
+pub fn written() -> String = greet("ada", "hello")
+pub fn by_name() -> String = greet("ada", greeting: "hello")
+pub fn different() -> String = greet("ada", "hi")
+"#,
+    );
+    let loaded = agree(dir.path(), "cold");
+    let of = |n: &str| loaded.hashes.defs[&ply_span::Symbol::new(format!("m.{n}"))];
+    assert_eq!(of("omitted"), of("written"));
+    assert_eq!(of("omitted"), of("by_name"));
+    assert_ne!(
+        of("omitted"),
+        of("different"),
+        "a call that really does pass another value must not collide with one that does not"
+    );
+}

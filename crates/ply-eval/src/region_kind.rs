@@ -613,7 +613,7 @@ impl<'a> Analysis<'a> {
                     out.refs.push(name);
                 }
             }
-            ExprKind::App { func, args } => {
+            ExprKind::App { func, args, .. } => {
                 self.walk_call(e.span, func, args, ctx, out);
             }
             ExprKind::Lambda { params, body } => {
@@ -975,7 +975,7 @@ fn children(e: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         ExprKind::Unary { operand, .. } => f(operand),
         ExprKind::Lambda { body, .. } => f(body),
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             f(func);
             for arg in args {
                 f(arg);

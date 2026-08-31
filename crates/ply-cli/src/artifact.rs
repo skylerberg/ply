@@ -695,7 +695,7 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     // `reconstruct_named` is where the reference closure is checked: a body
     // naming a hash the artifact does not hold has no name the program could
     // give it.
-    let rebuilt = reconstruct_named(&set, &namespace).map_err(|diags| {
+    let mut rebuilt = reconstruct_named(&set, &namespace).map_err(|diags| {
         vec![
             invalid(
                 path,
@@ -704,7 +704,11 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
             .note(first_note(&diags)),
         ]
     })?;
-    let resolved = ply_syntax::resolve(&rebuilt.program).map_err(|diags| {
+    // Mutable because `resolve` also fills defaults. On a reconstructed
+    // program that changes nothing — the encoding held only positional, fully
+    // applied calls — but it must run, so that a decoded body and a source one
+    // reach the checker in the same shape.
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).map_err(|diags| {
         vec![invalid(path, "the artifact's definitions do not resolve").note(first_note(&diags))]
     })?;
     let check = ply_core::check_program(&rebuilt.program, &resolved).map_err(|diags| {
@@ -773,7 +777,7 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
     if !diags.is_empty() {
         return Err(diags);
     }
-    let resolved = ply_syntax::resolve(&program)?;
+    let resolved = ply_syntax::resolve(&mut program)?;
     let check = ply_core::check_program(&program, &resolved)?;
 
     // The sources are believed only if they build the artifact they arrived in.

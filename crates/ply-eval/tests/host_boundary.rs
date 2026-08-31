@@ -33,10 +33,10 @@ struct Compiled {
 }
 
 fn compile(source: &str) -> Compiled {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("the fixture parses");
-    let resolved = resolve(&program).expect("the fixture resolves");
+    let resolved = resolve(&mut program).expect("the fixture resolves");
     let check = check_program(&program, &resolved).expect("the fixture typechecks");
     Compiled {
         program,
@@ -680,10 +680,10 @@ test "a det test reaching a socket" {
   net.send[socket](1)
 }
 "#;
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("parses");
-    let resolved = resolve(&program).expect("resolves");
+    let resolved = resolve(&mut program).expect("resolves");
     let diagnostics =
         check_program(&program, &resolved).expect_err("a det test may not reach a nondet effect");
     assert!(

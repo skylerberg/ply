@@ -96,7 +96,7 @@ pub fn check_program_with(
     // exist: it answers a question about a definition's callees.
     c.mark_internal_effects(program);
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
-        Err(c.diags)
+        Err(deduplicated(c.diags))
     } else {
         Ok(CheckOutput {
             defs: c.defs,
@@ -109,6 +109,62 @@ pub fn check_program_with(
     }
 }
 
+/// Diagnostics that render identically are one diagnostic to a reader.
+///
+/// Order is preserved and only exact repeats are dropped — same code, same
+/// severity, same message, and every label the same span and text. Two
+/// complaints a reader cannot tell apart are not two pieces of information.
+///
+/// The case that made this worth doing is a parameter default with a type
+/// error. It is checked once where it is written and again in each call that
+/// omitted it — the splice is a copy, so each copy fails the same unification —
+/// and every one of them points at the same text, because a spliced default
+/// keeps the span it was written at. That is `1 + <call sites>` renderings of
+/// one mistake. Nothing downstream may know which argument came from a default
+/// (ADR 0029 keeps that knowledge inside `ply_syntax::defaults`), so the fix
+/// belongs here, where the question is only whether two diagnostics differ.
+fn deduplicated(diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let key = |d: &Diagnostic| {
+        (
+            d.code,
+            format!("{:?}", d.severity),
+            d.message.clone(),
+            d.labels
+                .iter()
+                .map(|l| (l.span, l.message.clone(), l.primary))
+                .collect::<Vec<_>>(),
+            d.notes.clone(),
+        )
+    };
+    let mut seen = std::collections::HashSet::new();
+    diags.into_iter().filter(|d| seen.insert(key(d))).collect()
+}
+
+/// How many arguments the prelude's signature for `name` takes, or `None` if
+/// the prelude declares no such name.
+///
+/// Exists so that a *third* table over the builtins can be checked against this
+/// one. Their arities live in `ply_eval::builtins`, their defaults in
+/// `ply_syntax::defaults`, and their types here; for the whole of this
+/// language's history `assert` and `range` disagreed between the first two and
+/// this one, and no well-typed program could reach the arms the disagreement
+/// stranded. `ply_eval`, which can see all three, is the only place that test
+/// can live, and this is what it reads.
+pub fn prelude_arity(name: &str) -> Option<usize> {
+    let program = Program {
+        modules: Vec::new(),
+    };
+    let resolved = Resolved::default();
+    let known = Known::default();
+    let c = Checker::new(&program, &resolved, &known);
+    match &c.env.lookup(&Symbol::new(name))?.ty {
+        Type::Fn { params, .. } => Some(params.len()),
+        // A prelude name that is not a function — none today, and a count is
+        // not the question to ask of one.
+        _ => None,
+    }
+}
+
 pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
     let mut program = Program::single(module.clone());
     // A `derive` is expanded before anything is resolved, here as in the
@@ -117,7 +173,7 @@ pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
     if !diags.is_empty() {
         return Err(diags);
     }
-    let resolved = resolve(&program)?;
+    let resolved = resolve(&mut program)?;
     check_program_with(&program, &resolved, &Known::default())
 }
 
@@ -679,7 +735,17 @@ impl<'a> Checker<'a> {
             };
 
         let entries: Vec<(&str, Scheme)> = vec![
-            ("assert", mono(vec![Type::bool()], Type::unit())),
+            // Two parameters, the second defaulted to `None` by
+            // `ply_syntax::defaults`. The evaluator has carried the message
+            // arm since the first commit; until this signature widened, no
+            // well-typed program could reach it.
+            (
+                "assert",
+                mono(
+                    vec![Type::bool(), Type::option(Type::string())],
+                    Type::unit(),
+                ),
+            ),
             (
                 "assert_eq",
                 poly(
@@ -2352,6 +2418,17 @@ impl<'a> Checker<'a> {
         self.assumed = self.constraints_in_force(&def.constraints);
         self.performs.clear();
 
+        // Defaults first, *outside* the scope the parameters are bound in: a
+        // default is copied into call sites, where this function's parameters
+        // do not exist, so it must not be able to see them here either.
+        // `ply_syntax::defaults` refuses one that names a sibling parameter
+        // outright; this is the half that gives the value a type.
+        for (p, t) in def.params.iter().zip(&sig.params) {
+            let Some(default) = &p.default else { continue };
+            let (got, _) = self.infer(default);
+            self.expect(default.span, t, &got, "parameter default");
+        }
+
         self.env.push();
         for (p, t) in def.params.iter().zip(&sig.params) {
             self.env.bind(p.name.name.clone(), Scheme::mono(t.clone()));
@@ -3155,7 +3232,10 @@ impl<'a> Checker<'a> {
                 )
             }
 
-            ExprKind::App { func, args } => self.infer_app(e, func, args),
+            // `named` is empty: `defaults::expand` cleared it in `resolve`,
+            // and `no_named_argument_survives_resolve_anywhere_in_the_tree`
+            // is what makes that an invariant rather than a hope.
+            ExprKind::App { func, args, .. } => self.infer_app(e, func, args),
 
             ExprKind::If {
                 cond,
@@ -5987,7 +6067,7 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Refs<'a>) {
         }
         ExprKind::Unary { operand, .. } => collect_refs(operand, out),
         ExprKind::Lambda { body, .. } => collect_refs(body, out),
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             collect_refs(func, out);
             args.iter().for_each(|a| collect_refs(a, out));
         }

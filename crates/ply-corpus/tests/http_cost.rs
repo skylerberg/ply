@@ -65,7 +65,7 @@ impl Bench {
         let mut program = ply_syntax::parse_program(inputs).expect("the shipped modules parse");
         let diags = ply_derive::expand_program(&mut program);
         assert!(diags.is_empty(), "{diags:#?}");
-        let resolved = resolve(&program).expect("the shipped modules resolve");
+        let resolved = resolve(&mut program).expect("the shipped modules resolve");
         let check = match ply_core::check_program(&program, &resolved) {
             Ok(check) => check,
             Err(d) => {
@@ -252,7 +252,7 @@ fn a_whole_request_through_the_host_boundary() {
         .collect();
     let mut program = ply_syntax::parse_program(inputs).expect("it parses");
     assert!(ply_derive::expand_program(&mut program).is_empty());
-    let resolved = resolve(&program).expect("it resolves");
+    let resolved = resolve(&mut program).expect("it resolves");
     let check = ply_core::check_program(&program, &resolved)
         .unwrap_or_else(|d| panic!("{:#?}", d.iter().take(3).collect::<Vec<_>>()));
 

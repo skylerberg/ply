@@ -65,8 +65,8 @@ struct Compiled {
 impl Compiled {
     fn new(src: &str) -> Compiled {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let program = ply_syntax::ast::Program::single(module);
-        let resolved = ply_syntax::resolve(&program)
+        let mut program = ply_syntax::ast::Program::single(module);
+        let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = ply_core::check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));

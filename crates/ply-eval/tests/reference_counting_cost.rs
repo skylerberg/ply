@@ -104,7 +104,7 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
     if !ply_derive::expand_program(&mut program).is_empty() {
         return None;
     }
-    let resolved = resolve(&program).ok()?;
+    let resolved = resolve(&mut program).ok()?;
     Some((program, resolved))
 }
 

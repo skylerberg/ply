@@ -423,7 +423,9 @@ impl<'a> Dumper<'a> {
                 self.list(params, Self::param);
                 self.expr(body);
             }
-            ExprKind::App { func, args } => {
+            // `named` is empty: `defaults::expand` places every named argument
+            // in `resolve`, which runs before anything here sees a tree.
+            ExprKind::App { func, args, .. } => {
                 self.rec(e.span, "eapp");
                 self.expr(func);
                 self.list(args, Self::expr);

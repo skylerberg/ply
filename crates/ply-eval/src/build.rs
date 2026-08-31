@@ -65,6 +65,7 @@ pub fn call(func: Expr, args: Vec<Expr>) -> Expr {
     ex(ExprKind::App {
         func: Box::new(func),
         args,
+        named: Vec::new(),
     })
 }
 
@@ -99,6 +100,7 @@ pub fn param(name: &str) -> Param {
     Param {
         name: id(name),
         ty: None,
+        default: None,
         span: sp(),
     }
 }
@@ -418,7 +420,7 @@ pub fn standalone(items: Vec<Item>) -> (Program, Resolved) {
 }
 
 pub fn standalone_module(module: Module) -> (Program, Resolved) {
-    let program = Program::single(module);
-    let resolved = resolve(&program).expect("a module with no imports resolves");
+    let mut program = Program::single(module);
+    let resolved = resolve(&mut program).expect("a module with no imports resolves");
     (program, resolved)
 }

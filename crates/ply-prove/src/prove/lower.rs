@@ -457,7 +457,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 self.blocked(Blocker::Lambda);
                 self.terms.sym(None)
             }
-            ExprKind::App { func, args } => self.application(func, args),
+            ExprKind::App { func, args, .. } => self.application(func, args),
             ExprKind::If {
                 cond,
                 then_branch,

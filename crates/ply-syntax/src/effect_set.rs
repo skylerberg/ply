@@ -436,10 +436,13 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             }
             walk_expr(body, f);
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, named } => {
             walk_expr(func, f);
             for a in args {
                 walk_expr(a, f);
+            }
+            for n in named {
+                walk_expr(&mut n.value, f);
             }
         }
         ExprKind::If {

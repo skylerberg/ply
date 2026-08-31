@@ -157,7 +157,7 @@ fn load(src: &str, roots: &[&str]) -> (Program, Resolved) {
         ply_derive::expand_program(&mut program).is_empty(),
         "derive expansion must not diagnose"
     );
-    let resolved = resolve(&program).expect("the probe must resolve");
+    let resolved = resolve(&mut program).expect("the probe must resolve");
     (program, resolved)
 }
 

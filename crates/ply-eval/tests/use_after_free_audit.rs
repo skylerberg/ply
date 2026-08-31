@@ -65,9 +65,9 @@ impl Compiled {
             .enumerate()
             .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
             .collect();
-        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved =
-            resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
         Compiled {
@@ -80,9 +80,9 @@ impl Compiled {
     #[track_caller]
     fn refused(src: &str) -> Vec<Diagnostic> {
         let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved =
-            resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         match check_program(&program, &resolved) {
             Ok(_) => panic!("this reaches a region's slots and was accepted:\n{src}"),
             Err(d) => d,

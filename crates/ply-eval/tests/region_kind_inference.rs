@@ -17,11 +17,11 @@ use ply_syntax::resolve::{Resolved, resolve};
 fn load(src: &str) -> (Program, Resolved) {
     let mut map = SourceMap::new();
     let id: SourceId = map.add("kinds.ply", src.to_string());
-    let program = match parse_program([(id, ModuleName::from_dotted("kinds"), src)]) {
+    let mut program = match parse_program([(id, ModuleName::from_dotted("kinds"), src)]) {
         Ok(p) => p,
         Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
     };
-    let resolved = resolve(&program).expect("the probe must resolve");
+    let resolved = resolve(&mut program).expect("the probe must resolve");
     (program, resolved)
 }
 
@@ -756,7 +756,7 @@ fn the_split_over_the_repositorys_own_examples() {
         ply_derive::expand_program(&mut program).is_empty(),
         "the examples expand"
     );
-    let resolved = resolve(&program).expect("the examples resolve");
+    let resolved = resolve(&mut program).expect("the examples resolve");
 
     let regions = infer(&program, &resolved);
     println!(
@@ -824,11 +824,11 @@ fn regions_over(modules: &[(&str, &str)]) -> Regions {
         .zip(modules)
         .map(|(&id, (name, src))| (id, ModuleName::from_dotted(name), *src))
         .collect();
-    let program = match parse_program(inputs) {
+    let mut program = match parse_program(inputs) {
         Ok(p) => p,
         Err(ds) => panic!("the probe must parse: {ds:#?}"),
     };
-    let resolved = resolve(&program).expect("the probe must resolve");
+    let resolved = resolve(&mut program).expect("the probe must resolve");
     infer(&program, &resolved)
 }
 

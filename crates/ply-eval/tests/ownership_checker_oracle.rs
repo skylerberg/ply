@@ -96,7 +96,7 @@ fn load(entry: &ModuleName, path: PathBuf, text: String) -> Option<Loaded> {
     if !ply_derive::expand_program(&mut program).is_empty() {
         return None;
     }
-    let resolved = resolve(&program).ok()?;
+    let resolved = resolve(&mut program).ok()?;
     let target = program.index_of(entry)?;
     Some(Loaded {
         program,

@@ -27,10 +27,10 @@ fn check(source: &str) -> CheckOutput {
 /// The same, inside a named module, so every effect the source declares is
 /// program-wide `<module>.<name>` as a real load produces it.
 fn qualified(module: &str, source: &str) -> CheckOutput {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted(module), source)])
             .expect("the fixture parses");
-    let resolved = ply_syntax::resolve::resolve(&program).expect("the fixture resolves");
+    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
     ply_core::check_program(&program, &resolved).expect("the fixture typechecks")
 }
 
@@ -574,7 +574,7 @@ fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
 /// exactly what E0422 exists to refuse.
 #[test]
 fn one_registration_over_two_declarations_of_the_name_is_e0422() {
-    let program = ply_syntax::parse_program(vec![
+    let mut program = ply_syntax::parse_program(vec![
         (
             SourceId(0),
             ModuleName::from_dotted("a"),
@@ -587,7 +587,7 @@ fn one_registration_over_two_declarations_of_the_name_is_e0422() {
         ),
     ])
     .expect("the fixture parses");
-    let resolved = ply_syntax::resolve::resolve(&program).expect("the fixture resolves");
+    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
     let check = ply_core::check_program(&program, &resolved).expect("the fixture typechecks");
 
     let diagnostics = registry(vec![op("db", "get", named("users"))])

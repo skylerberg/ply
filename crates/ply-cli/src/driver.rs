@@ -657,9 +657,13 @@ impl<'s> Driver<'s> {
         &mut self,
     ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
         let modules: Vec<Module> = self.files.iter().filter_map(|f| f.ast.clone()).collect();
-        let program = Program { modules };
+        // Mutable because `resolve` fills every call's defaults and places its
+        // named arguments. That has to happen here, between parsing and
+        // hashing: `f(x)` and `f(x, 1)` are one definition only if
+        // normalization sees one call.
+        let mut program = Program { modules };
         let resolved =
-            timed(&mut self.phases.resolve, || resolve(&program)).map_err(|diagnostics| {
+            timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
                 LoadError {
                     sources: self.sources.clone(),
                     diagnostics,

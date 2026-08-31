@@ -296,6 +296,14 @@ impl Known {
 /// already has a scheme by the time its bodies are walked. Definition-level
 /// mutual recursion inside one module still goes through the existing SCC path;
 /// across modules it cannot arise, because an import cycle was already rejected.
+/// How many arguments the prelude's signature for `name` takes.
+///
+/// See [`infer::prelude_arity`]: it exists for the cross-crate audit that keeps
+/// the three builtin tables from disagreeing the way `assert` and `range` did.
+pub fn prelude_arity(name: &str) -> Option<usize> {
+    infer::prelude_arity(name)
+}
+
 pub fn check_program(
     program: &Program,
     resolved: &Resolved,

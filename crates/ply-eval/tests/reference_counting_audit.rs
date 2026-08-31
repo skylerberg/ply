@@ -41,11 +41,11 @@ use ply_syntax::resolve::resolve;
 fn passes(src: &str) -> rc::Stats {
     let mut map = SourceMap::new();
     let id: SourceId = map.add("rc.ply", src.to_string());
-    let program = match parse_program([(id, ModuleName::from_dotted("rc"), src)]) {
+    let mut program = match parse_program([(id, ModuleName::from_dotted("rc"), src)]) {
         Ok(p) => p,
         Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
     };
-    let resolved = resolve(&program).expect("the probe must resolve");
+    let resolved = resolve(&mut program).expect("the probe must resolve");
     if let Err(ds) = ply_core::check_program(&program, &resolved) {
         panic!("the probe must check: {ds:#?}\n{src}");
     }

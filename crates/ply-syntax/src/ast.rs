@@ -524,6 +524,14 @@ pub struct Derived {
     pub target: Symbol,
 }
 
+/// One `name: value` argument at a call site.
+#[derive(Clone, Debug)]
+pub struct NamedArg {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
+}
+
 /// Type parameters and effect-row parameters, written `<a, b | e>`.
 #[derive(Clone, Debug, Default)]
 pub struct Generics {
@@ -535,6 +543,14 @@ pub struct Generics {
 pub struct Param {
     pub name: Ident,
     pub ty: Option<TypeExpr>,
+    /// What a call that does not fill this parameter passes instead. Only a
+    /// `fn` parameter may carry one: a lambda has no name for a call to omit an
+    /// argument *of*, so the parser refuses it there.
+    ///
+    /// The expression is spliced into the caller by
+    /// [`crate::defaults::expand`], which is why it must be pure and closed —
+    /// the checker enforces both, and this field holds whatever was written.
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -919,6 +935,16 @@ pub enum ExprKind {
     App {
         func: Box<Expr>,
         args: Vec<Expr>,
+        /// Arguments written `name: value`, which follow every positional one.
+        ///
+        /// **Empty everywhere except between the parser and
+        /// [`crate::defaults::expand`]**, which places each into the slot its
+        /// name selects and clears this. Nothing downstream reads it, and
+        /// `no_named_argument_survives_resolve_anywhere_in_the_tree`
+        /// (`crate::tests`) is what entitles them not to: a hash, a type and
+        /// an evaluation all see one fully-positional call, so `f(x, m: 1)`
+        /// and `f(x, 1)` are one definition.
+        named: Vec<NamedArg>,
     },
     If {
         cond: Box<Expr>,
@@ -1154,4 +1180,73 @@ pub fn is_pure(e: &Expr) -> bool {
         ExprKind::Field { base, .. } => is_pure(base),
         ExprKind::List { items } => items.iter().all(is_pure),
     })
+}
+
+/// Whether an expression may be a parameter's default: [`is_pure`], widened to
+/// admit a *constructor* application.
+///
+/// The widening is the whole reason this is a second predicate rather than a
+/// call to the first. `is_pure` answers "may this be reordered", and for that
+/// question every [`ExprKind::App`] is impure — a call runs. A default is asked
+/// something narrower: *does copying this into a call site change what it
+/// means*. `Some(0)` copies fine, and it is the default a program reaches for
+/// first, so refusing it would leave `Option`-shaped parameters — the case that
+/// motivated this — unable to state their own absent value.
+///
+/// A constructor is recognised the way the rest of the grammar recognises one,
+/// by its leading uppercase (`crate::parser`'s `starts_upper`, the same rule
+/// patterns and types use). Nothing else about the callee is known here:
+/// expansion runs after resolution and re-checks that the name really denotes a
+/// constructor, so a lowercase-shy function called `Foo` is caught there rather
+/// than admitted here.
+///
+/// This is the *structural* half of the rule. That a default mentions no
+/// parameter and no local is the scope half, and it belongs to the checker,
+/// which knows what is in scope.
+pub fn is_default_expr(e: &Expr) -> bool {
+    crate::effect_set::grow(|| match &e.kind {
+        ExprKind::App { func, args, named } => {
+            named.is_empty()
+                && matches!(&func.kind, ExprKind::Var(q) if is_ctor_name(q.symbol()))
+                && args.iter().all(is_default_expr)
+        }
+        ExprKind::Perform { .. }
+        | ExprKind::Handle { .. }
+        | ExprKind::WithCell { .. }
+        | ExprKind::WithRegion { .. }
+        | ExprKind::Simulate { .. }
+        | ExprKind::Try { .. } => false,
+        ExprKind::Lit(_) | ExprKind::Var(_) => true,
+        ExprKind::Binary { lhs, rhs, .. } => is_default_expr(lhs) && is_default_expr(rhs),
+        ExprKind::Unary { operand, .. } => is_default_expr(operand),
+        ExprKind::Lambda { body, .. } => is_default_expr(body),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_default_expr(cond) && is_default_expr(then_branch) && is_default_expr(else_branch),
+        ExprKind::Match { scrutinee, arms } => {
+            is_default_expr(scrutinee)
+                && arms.iter().all(|a| {
+                    is_default_expr(&a.body) && a.guard.as_ref().is_none_or(is_default_expr)
+                })
+        }
+        ExprKind::Block { stmts, tail } => {
+            stmts.iter().all(|s| match s {
+                Stmt::Let { value, .. } => is_default_expr(value),
+                Stmt::Expr(e) => is_default_expr(e),
+            }) && tail.as_deref().is_none_or(is_default_expr)
+        }
+        ExprKind::Record { fields } => fields.iter().all(|(_, v)| is_default_expr(v)),
+        ExprKind::RecordUpdate { base, fields } => {
+            is_default_expr(base) && fields.iter().all(|(_, v)| is_default_expr(v))
+        }
+        ExprKind::Field { base, .. } => is_default_expr(base),
+        ExprKind::List { items } => items.iter().all(is_default_expr),
+    })
+}
+
+/// The grammar's constructor rule: a leading uppercase letter.
+pub fn is_ctor_name(name: &Symbol) -> bool {
+    name.as_str().chars().next().is_some_and(char::is_uppercase)
 }

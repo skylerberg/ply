@@ -256,7 +256,7 @@ fn collect_spans(e: &ply_syntax::ast::Expr, out: &mut Vec<Span>) {
             }
             collect_spans(body, out);
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             collect_spans(func, out);
             for a in args {
                 collect_spans(a, out);
