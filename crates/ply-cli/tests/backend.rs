@@ -1074,7 +1074,11 @@ fn a_code_generator_run_writes_no_pass() {
         0,
         "a run with no backend believed a pass a code generator run recorded: {plain}"
     );
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 5, "{plain}");
+    // Derived from the corpus rather than written down: this read `5` and went
+    // stale the moment two tests were added to `CORPUS`, failing a test whose
+    // subject — the cache rule above — was still holding.
+    let in_corpus = CORPUS.matches("test \"").count() as u64;
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), in_corpus, "{plain}");
 }
 
 // --- The grammar -------------------------------------------------------------
