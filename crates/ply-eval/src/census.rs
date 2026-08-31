@@ -80,6 +80,83 @@
 //! owes a re-measurement of that ordering and a per-definition cache, and owes
 //! it before the first line of a backend.
 //!
+//! > **Taken, and the debt discharged (2026-08-31).** The widening this table
+//! > chose is `compiled::CarriedTypes`, reached through
+//! > `compiled::Gate::ArgumentType`. Both obligations above were paid: the
+//! > per-definition cache is that type, built once per `CheckOutput` behind a
+//! > `OnceCell` on the machine, and the ordering was re-measured rather than
+//! > argued — the type gate sits **below** the row and effects gates, not above
+//! > the shape gate, because above them it masks their refusal of an unpublished
+//! > name and two of this seam's tripwires went red saying so.
+//! >
+//! > **Two of the four numbers in the table above are now *measurements* of the
+//! > shipping gate rather than counterfactuals, and they do not agree with the
+//! > counterfactual.** Re-taken on the same two workloads on 2026-08-31, as a
+//! > share of body calls with no backend attached (so the denominator is the
+//! > whole program in every row):
+//! >
+//! > | | Ply parser (W1) | `ply test examples` (W2) |
+//! > | --- | ---: | ---: |
+//! > | before — `Int\|Bool\|Bytes` on the value | 12.205% | 25.442% |
+//! > | **after — declared parameter types, shipping** | **84.014%** | **26.235%** |
+//! > | the counterfactual this table predicted (`type_gated`) | 84.014% | 84.135% |
+//! >
+//! > On the front end the gate lands exactly on its own counterfactual. On
+//! > `examples/` it lands **58 pp short**, and the census now says why in one
+//! > line rather than leaving it to be guessed: the new `blocking_types`
+//! > histogram attributes every `ArgumentType` refusal to the first uncarried
+//! > head in the declared parameter type, and over `examples/` it reads
+//! > **`String` 108,925 · `Var` 10,867 · `Decimal` 1,504 · `Fn` 346**. The
+//! > shortfall is **89.5% `String`**, which is not the type test being
+//! > conservative — it is `compiled::crossable`'s leaf set, deliberately
+//! > unchanged at `Int | Bool | Bytes` so that this widening moves containers
+//! > and no hazard (ADR 0019 §5 item 4). The `Var` row is the whole cost of
+//! > refusing generics rather than resolving them at the call site: **4.4% of
+//! > body calls on `examples/`, and 0 on the front end**.
+//! >
+//! > The counterfactual row is kept and is not withdrawn: it is the ladder's
+//! > answer to a different question — "what would a rung with *these value
+//! > kinds* allow" — and the gap between it and the shipping row is exactly the
+//! > leaf set, which is the next thing anyone widening this will reach for.
+//!
+//! > **The ARGUMENT number stopped being the interesting one on the same day
+//! > (2026-08-31).** Everything above is about what the seam **admits**. What a
+//! > backend can *answer* is a second question this module has always counted
+//! > and nobody had read: `admitted_carried_sig`, which additionally requires
+//! > the declared **return** type to be carried. On the front end the two were
+//! > **2,028,230 and 411,216** — 84.014% admitted, **17.033% answerable**. Four
+//! > of every five admitted calls were offered and declined on the return, and
+//! > ADR 0030 §1 had already named the most valuable one: `lex(Bytes) -> Scan`,
+//! > offered thirteen times and declined thirteen times.
+//! >
+//! > `Machine::compiled_answer` now decides an answer the way `admit` decides an
+//! > argument, and on this workload the two numbers meet: **admitted 2,028,230,
+//! > answerable 2,028,230**. The `offered and declined` line this module prints
+//! > goes 1,617,014 -> 0 there, and over `examples/` from 4,690 to 3,330 —
+//! > `String`, `Float` and `Decimal` returns, which are deliberately outside the
+//! > fragment in both directions.
+//! >
+//! > **The number to read after that change is not a share at all, it is the
+//! > entry count, and it FALLS.** `ply test <W1> --backend reference` goes from
+//! > **306,931 of 1,580,763 offers entered** to **26 of 26**, because
+//! > `items.parse` is entered once per file and its whole subtree runs inside
+//! > that entry. That is PR #30's shape — crossings 721 -> 1 when a fragment
+//! > widened until one entry swallowed an MCTS search — and it is the win rather
+//! > than a regression: a call share cannot see it, because entering a call
+//! > removes its subtree from this module's denominator as well as from its
+//! > numerator. Every share quoted in this header is therefore taken **with no
+//! > backend attached**, and after this change that is not a convention but a
+//! > requirement: with one attached the front-end denominator collapses from
+//! > 2,414,170 body calls to 26.
+//! >
+//! > `carried_sig_walked` was added in the same change and is the one counter
+//! > here that checks the seam against itself rather than against a
+//! > counterfactual: it asks `admitted_carried_sig`'s question by **walking**
+//! > the declared types at every call, where the shipping predicate reads a
+//! > per-definition table built once. `seam_census.rs` asserts they are equal
+//! > over the whole corpus, because a precompute can be right about a rule and
+//! > stale about a program.
+//!
 //! # Every number above is a CALL share. One time share exists, and it is here
 //!
 //! This module counts calls, and a call share is not a time share.
@@ -93,6 +170,39 @@
 //! nothing here says where. Whoever quotes the 82.855% as what a widening is
 //! worth is quoting a call share; the time it buys has not been measured and
 //! this module cannot measure it.
+//!
+//! > **One of those three clauses is withdrawn (2026-08-31), and the other two
+//! > stand.** Withdrawn: *"the time it buys has not been measured"*. It has been
+//! > measured twice since — ADR 0030 §6.3 for the answer widening (`f`
+//! > 22.97% -> 97.53%) and §10 for the lambda wall (a registry narrowed to the
+//! > callback-free fragment reads `f` = 51.77%, ceiling **2.074×**, against
+//! > 99.65% for one that can enter the root). Standing: *"this module cannot
+//! > measure it"*, and it is why both readings were taken from **outside the
+//! > process**, by the two-binary method §4 built because `ply-eval` may not
+//! > carry a clock.
+//! >
+//! > **What stands, and it is what the paragraph was for: a call share is not a
+//! > time share, and the saturation it warned about is now on the record.** §10
+//! > registered a prediction that the callback-free fragment would cover under
+//! > 30% of body calls; it covers **61.06%**, and its ceiling is 2.074× rather
+//! > than anything near the 99.65% the full fragment reaches. 61% of the calls,
+//! > 52% of the time, and 2.07x rather than 282x — the relation between the two
+//! > columns saturates exactly as this paragraph said it must, and the ratio
+//! > that governs is the one measured on the arm in front of you rather than
+//! > the 1.25 above.
+//! >
+//! > > **And the ceiling `1/(1-f)` could not be resolved at `f` = 97.53%, which
+//! > > [ADR 0031](../../../docs/adr/0031-the-closed-fragment.md) §3 fixes with a
+//! > > second instrument rather than a better estimate.** A **floor arm** — the
+//! > > same command with a `--filter` that selects no test, which still
+//! > > typechecks all seven modules and runs no body — measures the residue
+//! > > directly instead of inferring it: `F` = **0.05 s** against `A` = 2.84 s,
+//! > > so `A/F` = **56.8x**, and the two instruments agree on the linear
+//! > > quantity `t` to **0.36%** (2.780 against 2.790) while their multipliers
+//! > > sit 17% apart. Both readings of this module's own arm are reproduced
+//! > > there: the callback-free ceiling re-measures at **2.104x** against §10's
+//! > > 2.074x, and the entry line `495152 of 1049245 offers entered` to the
+//! > > call.
 
 use crate::compiled::Gate;
 use std::collections::BTreeMap;
@@ -128,6 +238,18 @@ pub fn snapshot() -> (u64, u64, u64, BTreeMap<&'static str, u64>) {
     )
 }
 
+/// What the shipping type gate alone admits, for the test that reads it against
+/// `admitted`. See [`Counts::type_gated_shipping`].
+pub fn type_gated_shipping() -> u64 {
+    cell().lock().expect("census").type_gated_shipping
+}
+
+/// [`Counts::carried_sig_walked`], for the test that reads it against
+/// `admitted_carried_sig`.
+pub fn carried_sig_walked() -> u64 {
+    cell().lock().expect("census").carried_sig_walked
+}
+
 #[derive(Default)]
 pub struct Counts {
     pub body_calls: u64,
@@ -138,11 +260,27 @@ pub struct Counts {
     /// seam — what `backend::Reference` would actually answer rather than be
     /// offered and decline.
     pub admitted_carried_sig: u64,
+    /// The same question asked by a **walk** over the declared types rather
+    /// than by reading `compiled::CarriedTypes`'s per-definition table.
+    ///
+    /// The two must be equal, and they are two routes to one predicate rather
+    /// than one route counted twice: `admitted_carried_sig` goes through
+    /// `backend::carried_signature` -> `CarriedTypes::signature_carried`, which
+    /// reads the `Denotes` computed once per definition when the table was
+    /// built; this one calls `CarriedTypes::carries` on every parameter and on
+    /// the return type at the call. A gap means the precompute and the walk
+    /// disagree, which is the failure mode a per-definition cache has and a
+    /// per-call test does not. `seam_census.rs` reads them off a corpus.
+    pub carried_sig_walked: u64,
     pub frame_ceiling: u64,
     pub gates: BTreeMap<&'static str, u64>,
     /// For `ArgumentShape`: every argument `compiled::crossable` refuses, by
     /// kind.
     pub blocking_args: BTreeMap<&'static str, u64>,
+    /// For `ArgumentType`: what in the declared parameter types refused it —
+    /// see `compiled::CarriedTypes::refusal`. One entry per refused call, the
+    /// first offending head only.
+    pub blocking_types: BTreeMap<&'static str, u64>,
     /// Admitted calls by name.
     pub admitted_names: BTreeMap<String, u64>,
     /// Refused calls by `name @ gate`.
@@ -169,6 +307,20 @@ pub struct Counts {
     /// to be carried, which is what a backend needs to hand something back.
     pub type_gated: u64,
     pub type_gated_and_return: u64,
+    /// The type gate **as it ships** — `compiled::CarriedTypes` — asked with the
+    /// value-kind test removed, so the two halves of `Gate::ArgumentShape` and
+    /// `Gate::ArgumentType` can be separated.
+    ///
+    /// On a program the checker accepted this must equal `admitted`: a value's
+    /// kind follows its declared type, so the kind test refuses nothing the type
+    /// test admits. A gap is not a bug in the gate — it is defence in depth
+    /// firing — but it is a fact worth reading off a corpus rather than
+    /// assuming, which is why it is counted.
+    ///
+    /// It differs from `type_gated` above, which is the counterfactual at the
+    /// widest LADDER rung and therefore admits `String`, `Float` and `Decimal`
+    /// leaves the shipping gate refuses.
+    pub type_gated_shipping: u64,
     /// Calls a backend actually *entered*, by name — the subset of
     /// `admitted_names` whose name the backend's registry also holds. Written
     /// from `backend::Reference::enter`, so it is empty unless a backend is
@@ -232,6 +384,7 @@ pub(crate) fn gate_name(gate: Gate) -> &'static str {
     match gate {
         Gate::NotLoweredCode => "NotLoweredCode",
         Gate::ArgumentShape => "ArgumentShape",
+        Gate::ArgumentType => "ArgumentType",
         Gate::SimulateRegion => "SimulateRegion",
         Gate::Anonymous => "Anonymous",
         Gate::PublishedRow => "PublishedRow",
@@ -286,9 +439,14 @@ pub fn report() -> String {
         pct(c.admitted, c.body_calls)
     ));
     out.push_str(&format!(
-        "  of which carried-sig    {}  ({:.4}% of body calls)  <- what `Reference` would answer\n",
+        "  of which carried-sig    {}  ({:.4}% of body calls)  <- what `Reference` would answer\n\
+         \x20 carried-sig by walk   {}  (equal = {})\n\
+         \x20 offered and declined  {}  <- admitted, but the declared RETURN type is not carried\n",
         c.admitted_carried_sig,
-        pct(c.admitted_carried_sig, c.body_calls)
+        pct(c.admitted_carried_sig, c.body_calls),
+        c.carried_sig_walked,
+        c.carried_sig_walked == c.admitted_carried_sig,
+        c.admitted - c.admitted_carried_sig,
     ));
     out.push_str(&format!("refused                   {refused}\n"));
     let mut sum = 0;
@@ -313,6 +471,12 @@ pub fn report() -> String {
     for (k, n) in args {
         out.push_str(&format!("  {k:<12} {n:>12}\n"));
     }
+    out.push_str("uncarried declared parameter types (ArgumentType refusals only, first head):\n");
+    let mut tys: Vec<_> = c.blocking_types.iter().collect();
+    tys.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (k, n) in tys {
+        out.push_str(&format!("  {k:<14} {n:>12}\n"));
+    }
     out.push_str(&format!(
         "counterfactual: what a wider `crossable` would admit (DEEP rungs walk to a budget of {} nodes)\n",
         deep_budget()
@@ -328,11 +492,17 @@ pub fn report() -> String {
     }
     out.push_str(&format!(
         "type-level gate (declared parameter types, O(1) per call after a per-definition \
-         precompute)\n  params carried {} ({:.3}%)   params+return carried {} ({:.3}%)\n",
+         precompute)\n  params carried {} ({:.3}%)   params+return carried {} ({:.3}%)\n  \
+         SHIPPING type gate alone {} ({:.3}%)   admitted {} ({:.3}%)   equal = {}\n",
         c.type_gated,
         pct(c.type_gated, c.body_calls),
         c.type_gated_and_return,
-        pct(c.type_gated_and_return, c.body_calls)
+        pct(c.type_gated_and_return, c.body_calls),
+        c.type_gated_shipping,
+        pct(c.type_gated_shipping, c.body_calls),
+        c.admitted,
+        pct(c.admitted, c.body_calls),
+        c.type_gated_shipping == c.admitted
     ));
     out.push_str(
         "why the widest DEEP rung refuses what the shallow one carries (first offending kind):\n",
@@ -388,6 +558,24 @@ fn pct(a: u64, b: u64) -> f64 {
 /// cannot tell the two apart from the head alone, so any nominal type is
 /// admitted exactly when **both** `Record` and `Ctor` are allowed. A `Type::Var`
 /// is refused: an unresolved variable can be anything, including a closure.
+///
+/// > **Corrected in place (2026-08-31): the nominal fallback admitted three
+/// > types it must not.** `Cell`, `Task` and `Secret` are `Type::Con`s with a
+/// > name and arguments exactly as `Option` is, so the `_ =>` arm read them as
+/// > ordinary nominal types and carried them at any rung allowing both `Record`
+/// > and `Ctor` — including the rung named **"no world-handle"**, whose whole
+/// > content is that a world handle does not cross. Measured on the tree this
+/// > was found on: `ply test examples --no-cache -j 1` reports 20 `Secret`
+/// > refusals from the DEEP walk's blocker histogram, against a shallow
+/// > `type_carries` that admitted them, so the type-level row of ADR 0030 §6 is
+/// > over-counted by at most that. It moved no figure quoted in that ADR to
+/// > three digits and it is corrected anyway, because the number is what the
+/// > next widening is chosen on.
+/// >
+/// > This function stays the LADDER's instrument — it answers "what would a
+/// > rung with *these value kinds* allow" — and is not what ships.
+/// > `compiled::CarriedTypes` is the shipping rule, and it walks a declaration's
+/// > constructors rather than approximating a nominal type by its head.
 pub(crate) fn type_carries(ty: &ply_core::ty::Type, allowed: &[&str]) -> bool {
     use ply_core::ty::Type;
     let has = |k: &str| allowed.contains(&k);
@@ -406,6 +594,8 @@ pub(crate) fn type_carries(ty: &ply_core::ty::Type, allowed: &[&str]) -> bool {
                 "Unit" => "Unit",
                 "List" => "List",
                 "Map" => "Map",
+                // Not nominal types, whatever their shape says.
+                "Cell" | ply_core::prelude::TASK_TYPE | ply_core::ty::SECRET => return false,
                 _ => {
                     return has("Record")
                         && has("Ctor")

@@ -608,6 +608,7 @@ fn sweep(spec: BackendSpec) -> Sweep {
         out.offers.fired += seen.fired;
         out.offers.bytes_in += seen.bytes_in;
         out.offers.bytes_out += seen.bytes_out;
+        out.offers.containers_out += seen.containers_out;
     }
     out
 }
@@ -700,15 +701,47 @@ fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
          arguments and no returns",
         sweep.offers.bytes_in
     );
+    // The 2026-08-31 widening of the ANSWER test, asserted for the reason the
+    // two above are: a return type nothing on disk returns leaves every green
+    // in this file a green over a seam the change did not reach.
+    assert!(
+        sweep.offers.containers_out > 0,
+        "not one entered call answered a `List`, `Map`, `Record` or `Ctor` over {} tests, so \
+         the widening of `Machine::compiled_answer`'s answer test is inert on every corpus on \
+         disk and this file's greens say nothing about it",
+        sweep.compared
+    );
     println!(
         "honest backend: {} entered of {} offered, over {} tests · {} offers carried a `Bytes` \
-         argument · {} answered a `Bytes`",
+         argument · {} answered a `Bytes` · {} answered a container",
         sweep.entered,
         sweep.offers.offered,
         sweep.compared,
         sweep.offers.bytes_in,
-        sweep.offers.bytes_out
+        sweep.offers.bytes_out,
+        sweep.offers.containers_out
     );
+}
+
+/// The ninth wrong backend, and the one the 2026-08-31 answer widening made
+/// possible: a container answer of exactly the right kind with a
+/// [`ply_eval::Value::Cell`] in its first position.
+///
+/// This is not one of ADR 0026 §4.5's eight. It exists because the widening
+/// gave up a *structural* claim — while the answer test read the answer's
+/// discriminant, no `Value::Cell` could come back at all — and replaced it with
+/// a claim about the declared return type plus the answer's top-level kind. A
+/// backend that respects the kind and not the interior is the shape that
+/// difference makes reachable, and a limit named in a header with nothing
+/// standing on it is a limit nobody re-checks.
+///
+/// What it says, and what it does not: a red here means the corpus *notices*,
+/// not that the seam refused. `Machine::compiled_answer` believes this answer —
+/// `compiled::CarriedTypes::answer_crosses` reads a kind — and what reports it
+/// is the independent engine, exactly as for a wrong `Int`.
+#[test]
+fn a_handle_forged_into_a_container_answer_is_caught_over_the_corpus() {
+    fires_and_is_caught("handle", Mutation::Handle, None);
 }
 
 #[test]

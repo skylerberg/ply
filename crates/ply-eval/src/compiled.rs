@@ -85,6 +85,64 @@
 //!   `Value::Cell`, `Value::Task` or `Value::Continuation` — see [`crossable`],
 //!   which carries only kinds that hold no `Value` inside them and so cannot
 //!   reach one of these at any depth either.
+//!
+//!   > **Re-argued, not withdrawn (2026-08-31): the conclusion is the same and
+//!   > the reason is no longer "childless".** The clause *"see [`crossable`],
+//!   > which carries only kinds that hold no `Value` inside them and so cannot
+//!   > reach one of these at any depth either"* is true of an **answer**, which
+//!   > is what [`crossable`] still decides, and false of an **argument**: a
+//!   > [`Value::Record`], [`Value::Ctor`], [`Value::List`] and [`Value::Map`]
+//!   > all cross in now, and every one of them holds `Value`s.
+//!   >
+//!   > What keeps a handle out of them is [`CarriedTypes`]: an argument crosses
+//!   > only when its definition's **declared parameter type** cannot
+//!   > transitively reach a `Cell`, `Task`, `Secret` or function type — decided
+//!   > once per program over the declared types rather than once per call over
+//!   > the values — **or** when the value is an `i64`, a `bool` or an
+//!   > `Arc<[u8]>`, where the old childless argument still applies unchanged.
+//!   > Both are conjoined with the value's kind, which must be the one its
+//!   > declared type denotes, so a definition declared `(Int) -> Int` handed a
+//!   > list by `Machine::call` is refused on the kind rather than licensed by
+//!   > the type.
+//!   >
+//!   > **Both ends now, and the second end is where this bullet stops being
+//!   > structural (2026-08-31).** The block above says [`crossable`] "still
+//!   > decides" the answer; it does not. `Machine::compiled_answer` reads
+//!   > [`CarriedTypes::answer_crosses`], which is the same two clauses at the
+//!   > other end: the declared **return** type is carried and the answer is of
+//!   > the kind it denotes, **or** the answer is childless and [`crossable`]
+//!   > carries it exactly as before.
+//!   >
+//!   > That is a genuine narrowing and it is the price of ADR 0030 §1's
+//!   > collapse. An *argument* is a value the machine's own evaluation built
+//!   > under a checker that accepted the program, so its interior follows its
+//!   > declared type and the type test is a fact about the value. An *answer* is
+//!   > built by the backend, so the same test is a fact about what the backend
+//!   > was **supposed** to build. A backend that answers a `Record` of the right
+//!   > kind holding a [`Value::Cell`] is believed here, and what reports it is
+//!   > the independent engine — the class this module has always said it cannot
+//!   > see, now one member wider. `backend::Mutation::Handle` is the ninth wrong
+//!   > backend, added with this change so the limit has something standing on
+//!   > it: over `examples/` and `tests/fixtures/` it changes **388** answers and
+//!   > **237 of 1,127** tests report it, the first as `E0502` "`bytes_concat_all`
+//!   > expects Bytes, but got Cell". 890 do not.
+//!   >
+//!   > What it bought, on ADR 0030's workload: `items.parse` is entered **once
+//!   > per file**, entries go **306,931 -> 26**, and the share of body calls a
+//!   > backend can answer goes **17.033% -> 84.014%** — from 24.1% of the
+//!   > admitted set to all of it.
+//!   >
+//!   > This is the widening ADR 0030 §9.2 chose over a deep value walk and over
+//!   > `Str`, and the reason it is a type test rather than a walk is measured
+//!   > rather than argued: the walk **does not finish** on the ported Ply front
+//!   > end (`crate::census`'s header). What it bought on that workload —
+//!   > `spikes/ply-parser` parsing `examples/`, 13 files, 333,851 bytes:
+//!   > [`Gate::ArgumentShape`]'s 100.00%-of-refusals monopoly ends and the seam
+//!   > goes from admitting **294,656 of 2,414,170 body calls (12.205%)** to
+//!   > **2,028,230 (84.014%)**, against ADR 0030 §6's counterfactual of
+//!   > 82.855%. The residue is **98.5% [`Gate::Anonymous`]** — 380,176 lambdas
+//!   > — and 5,764 `Closure` arguments, which is the whole of it: no other gate
+//!   > refuses a single call on that workload.
 //! - **Diagnostics.** A backend cannot raise. A body that would fail answers
 //!   `None` and the machine raises its own diagnostic from its own evaluation, so
 //!   the code, message, spans, labels and notes are the interpreter's by
@@ -275,6 +333,33 @@
 //! > | --- | --- |
 //! > | `crates/ply-eval/tests/differential_corpus.rs` | **14** tests: the two hand-built backends, plus the eight corruptions over `Reference` on the same 1,116-test corpus |
 //! > | `crates/ply-cli/tests/backend.rs` | **14** tests through `ply test --backend`, which is the shipping command. Seven of the eight configurations are caught; the eighth escapes and the file says which and why |
+//!
+//! > **Re-taken again the same day, for the ANSWER test (2026-08-31).** Three
+//! > rows move and none is a new file. Re-counted from the runs rather than by
+//! > arithmetic:
+//! >
+//! > | polices it | what it is |
+//! > | --- | --- |
+//! > | this module's tests | **51**, from 44. Seven came with the answer test, and the split is the point: three are the widening itself — a record answer crossing, an answer whose kind is not its declared return's, a closure-bearing return refused — and **four are the SUBTREE**, which is a different claim from any of the 44. An entered call used to be a leaf over scalars; `items.parse` is now entered once per file and hides 2.4 million calls, so the effects gate, the `simulate` gate, the budget and the offer count all had to be re-asked of a subtree rather than of a call |
+//! > | `crates/ply-eval/tests/differential_corpus.rs` | **15**, from 14: `backend::Mutation::Handle`, the ninth wrong backend, which exists because the answer widening gave up a structural claim |
+//! > | `crates/ply-cli/tests/backend.rs` | **15**, from 14, the same ninth through the shipping command. Its corpus changed too — `pair(Int) -> List<Int>` moved *inside* the fragment and `label(Int) -> String` replaced it as the definition [`Mutation::Unoffered`] bites on. Two tests failed rather than passing quietly when it moved |
+//! >
+//! > `cargo test -p ply-eval --lib` reports **553 passed / 0 failed / 1
+//! > ignored**.
+//!
+//! > **The first row re-taken and one row added (2026-08-31), for the type
+//! > gate.** The `this module's tests` row read **38**; it is **44** —
+//! > [`Gate::ArgumentType`] brought six, one for each thing a type test has to
+//! > decide that a discriminant test never had to: a closure-bearing record, a
+//! > recursive type, a recursive type that reaches a closure, a type variable, a
+//! > value whose kind is not its declared type's, and a world handle wearing a
+//! > nominal type's shape. Re-counted from the run rather than by arithmetic:
+//! > `cargo test -p ply-eval --lib compiled::` reports 44, and `--lib` alone
+//! > reports **546 passed / 0 failed / 1 ignored**.
+//! >
+//! > | polices it | what it is |
+//! > | --- | --- |
+//! > | `crates/ply-eval/tests/seam_census.rs` | **1** test, and the only one that reads the type gate against a *corpus*: that it refuses something over `examples/` at all — 121,642 calls — and that the kind half refuses nothing the type half admits. Both were seen red, and by which corruption is recorded there |
 //! >
 //! > Measured sensitivity of the corpus-scale sweep, one run, 2026-08-28 —
 //! > printed by the tests rather than asserted, because §4.7's condition names a
@@ -390,8 +475,10 @@
 
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
+use ply_core::ty::{SECRET, TyVar, Type};
 use ply_span::Symbol;
 use ply_syntax::ast::Program;
+use rustc_hash::FxHashMap;
 
 /// A source of natively compiled bodies for a program's definitions.
 pub trait Compiled {
@@ -403,10 +490,35 @@ pub trait Compiled {
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
     ///
-    /// `args` are [`Value::Int`], [`Value::Bool`] and [`Value::Bytes`] only and
-    /// the answer must be too; the machine checks both sides and evaluates the
-    /// definition itself when either fails, so an unsound backend produces a
-    /// slow program rather than a wrong one.
+    /// The machine checks both sides and evaluates the definition itself when
+    /// either fails, so an unsound backend produces a slow program rather than a
+    /// wrong one. What each side is checked against is [`crossable_argument_kind`]
+    /// plus [`CarriedTypes`] on the way in and [`CarriedTypes::answer_crosses`]
+    /// on the way out — in both directions, the definition's declared type and
+    /// the value's kind.
+    ///
+    /// > **Corrected in place (2026-08-31), and it was stale on the argument
+    /// > side before this change as well.** It read: *"`args` are
+    /// > [`Value::Int`], [`Value::Bool`] and [`Value::Bytes`] only and the
+    /// > answer must be too; the machine checks both sides and evaluates the
+    /// > definition itself when either fails, so an unsound backend produces a
+    /// > slow program rather than a wrong one."* Arguments stopped being those
+    /// > three when [`Gate::ArgumentType`] shipped and the answer stopped being
+    /// > those three when [`CarriedTypes::answer_crosses`] did. This is the
+    /// > trait's own contract — the one paragraph a backend author reads before
+    /// > writing anything — so it is now spelled by reference to the two tests
+    /// > rather than by a list that goes stale with them.
+    ///
+    /// **The obligation the second widening added, stated here because this is
+    /// where a backend author is.** A container answer is checked for its
+    /// top-level kind and not for its contents. A backend answering a `Record`,
+    /// `List`, `Map` or `Ctor` must put in it only what a value of the
+    /// definition's declared return type could hold: no [`Value::Cell`],
+    /// [`Value::Task`], [`Value::Continuation`], [`Value::Closure`] or
+    /// [`Value::Secret`], at any depth. The machine cannot see a violation —
+    /// walking the answer is O(value) per entry and does not finish on a real
+    /// front end, which is the measurement `crate::census`'s header carries —
+    /// and `--engine both` is what catches one.
     ///
     /// A `Bytes` is `Arc<[u8]>` and is borrowed for the length of the call —
     /// read-only it is a `(ptr, len)` pair and costs a backend nothing. A
@@ -478,6 +590,59 @@ pub trait Compiled {
 /// `a_container_is_refused_on_its_discriminant_whatever_it_holds` is the
 /// tripwire: add a container kind to this `matches!` and it goes red.
 ///
+/// > **This function is now the ANSWER test only, and the paragraph above is
+/// > withdrawn for the argument direction (2026-08-31).** It read, verbatim:
+/// > *"Neither is done here.
+/// > `a_container_is_refused_on_its_discriminant_whatever_it_holds` is the
+/// > tripwire: add a container kind to this `matches!` and it goes red."*
+/// >
+/// > The second of the two is now done, for arguments:
+/// > [`crossable_argument_kind`] plus [`CarriedTypes`], reached through
+/// > [`Gate::ArgumentType`]. The tripwire named above is withdrawn with the
+/// > rule it guarded and replaced by
+/// > `a_closure_bearing_record_is_refused_on_its_declared_type`, which fires on
+/// > the hazard rather than on the discriminant — the record crossing is the
+/// > point of the change, and what must not cross is a record whose *declared
+/// > type* can hold code.
+/// >
+/// > `crossable` itself is **unchanged**, and deliberately: it is what
+/// > `Machine::compiled_answer` tests the answer with, and an answer has no
+/// > declared type the machine has checked the backend against. Widening it is
+/// > the *return* half of ADR 0030 §9.2 and is not taken here — the ADR's own
+/// > finding is that the return type is where the collapse is (`lex(Bytes) ->
+/// > Scan`, one accepted call per file, refused because `Scan` is a record), and
+/// > the reason it is not taken with this change is stated where the cost is:
+/// > a value-level answer test over containers is the deep walk again, on the
+/// > returned value, and the parser returns its whole state record from every
+/// > one of ~200,000 calls. What would replace it is a *type*-level answer test,
+/// > which moves a machine-side check into a backend obligation. That is a
+/// > different decision from this one and is left to be taken on its own
+/// > evidence.
+///
+/// > **The decision above was taken the next day, and one sentence of it is
+/// > wrong rather than superseded (2026-08-31).** The block above is left whole
+/// > because it is the argument this change had to answer. What is **withdrawn**
+/// > is its first clause — *"`crossable` itself is **unchanged**, and
+/// > deliberately: it is what `Machine::compiled_answer` tests the answer
+/// > with"* — and this one sentence, which is false as written:
+/// >
+/// > > *"an answer has no declared type the machine has checked the backend
+/// > > against"*
+/// >
+/// > It has one: the definition's declared **return** type, published in the
+/// > same [`CheckOutput`] the parameter types come from. What it does not have
+/// > is a *value the machine built*, which is the real asymmetry and is not the
+/// > one that sentence names. [`CarriedTypes::answer_crosses`] is the type-level
+/// > answer test the last sentence asks for, taken on the evidence the ADR
+/// > recorded — 79.7% of admitted calls offered and declined on the return, and
+/// > `lexer.lex` declined thirteen times out of thirteen.
+/// >
+/// > `crossable` **is** still unchanged, and is now the *childless* clause of
+/// > both tests rather than the whole of either: it is what makes each widening
+/// > a strict superset of the rule before it, which is why an `Int` answer is
+/// > still believed for a definition declared `-> Scan` and why two of the eight
+/// > wrong backends still have something to fire on.
+///
 /// Which of the two, measured rather than left as a choice: the deep walk does
 /// **not finish** on the ported Ply front end — the state record it would walk
 /// per call transitively holds the token list — and bounded at 256 nodes it
@@ -519,6 +684,519 @@ pub(crate) fn crossable(value: &Value) -> bool {
     matches!(value, Value::Int(_) | Value::Bool(_) | Value::Bytes(_))
 }
 
+/// The `Value` kinds a *carried type* can denote, which is what an argument's
+/// discriminant is tested against.
+///
+/// This is the cheap half of the argument gate and it runs first, so a call
+/// carrying a `Str`, a `Float`, a `Decimal`, a `Secret`, a `Closure`, a `Cell`,
+/// a `Task` or a `Continuation` is still refused on one discriminant test per
+/// argument and never hashes a [`Symbol`] into [`CheckOutput::defs`]. What it
+/// is **not** is a soundness argument on its own: a `Record` clears it and a
+/// `Record` holds `Value`s. [`CarriedTypes`] is what decides whether this
+/// definition's records may hold code, and the two are conjuncts.
+///
+/// On a program the checker accepted this test refuses nothing
+/// [`CarriedTypes`] admits — a value whose type is `Int` is a [`Value::Int`] —
+/// so it is defence in depth rather than a filter, and it is measured as such:
+/// `census`'s `type_gated_shipping` counts the calls the type gate alone would
+/// admit and a corpus run asserts it equals `admitted`. It bites on a call the
+/// machine reaches without a type, which is what `Machine::call` is
+/// (`a_secret_is_never_offered_and_never_accepted` reaches the hook through it),
+/// and on a hand-built `Closure` wearing a name whose definition has another
+/// signature.
+pub(crate) fn crossable_argument_kind(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_)
+            | Value::Bool(_)
+            | Value::Bytes(_)
+            | Value::List(_)
+            | Value::Map(_)
+            | Value::Record(_)
+            | Value::Ctor { .. }
+    )
+}
+
+/// Which definitions' **declared parameter types** cannot reach a world handle,
+/// decided once per program rather than once per call.
+///
+/// # Why a type and not a value
+///
+/// [`crossable`] answers "can *this value* reach a [`Value::Cell`],
+/// [`Value::Task`], [`Value::Continuation`] or [`Value::Closure`]" by refusing
+/// every kind that holds a `Value` at all. Widening it to containers on the
+/// discriminant is unsound one field deep, and the two sound alternatives were
+/// measured against each other before either was built
+/// (`crate::census`'s header): a **deep value walk** does not finish on the
+/// ported Ply front end — the state record it walks per call transitively holds
+/// the token list — and bounded at 256 nodes reaches 18.5% of calls, against
+/// this test's 82.6%, with the whole gap attributable to the budget. So the
+/// question is asked of the *type*, where it is a property of a published
+/// scheme and is therefore computable once.
+///
+/// # The rule
+///
+/// A type is **carried** when no value of it can transitively hold code or a
+/// handle into this run's world:
+///
+/// - `Int`, `Bool`, `Bytes` — carried, and childless. This is [`crossable`]'s
+///   list exactly: the widening is through containers and adds no leaf kind.
+/// - `List<t>`, `Map<k, v>`, and a record type `{ f: t, .. }` — carried exactly
+///   when every element, key and field type is.
+/// - A declared sum type `T<a, ..>` — carried when **the declaration** is
+///   carried (below) and every type argument at *this occurrence* is.
+/// - `Float`, `Decimal`, `String`, `Unit` — **refused**, and not because they reach a
+///   handle. They are ADR 0019 §5 item 4's three kinds, which the codegen spike
+///   lowers as `Int`; the leaf set here is exactly [`crossable`]'s, so this
+///   change widens the fragment through containers and moves no hazard.
+///   `crate::census`'s ladder prices admitting them and the ADR records that
+///   `Str` buys +0.0 pp on a front end.
+/// - `Cell<r, t>`, `Task<t>`, `Secret<t>` — refused by name. These are the ones
+///   a nominal fallback gets wrong: they are `Type::Con`s like any other, and a
+///   pass that admitted "any nominal type" would admit a cell.
+/// - A function type — refused. This is the closure case, and it is the whole
+///   reason the record widening needs a type test rather than a discriminant.
+/// - A type **variable** — refused. See "Generics" below.
+/// - Anything else — refused, because a head this pass does not recognise is a
+///   head it cannot argue about.
+///
+/// A **declaration** `type T<p, ..> = C1(f, ..) | C2(..)` is carried when every
+/// field type of every constructor is carried, with an occurrence of one of
+/// `T`'s own parameters counting as carried. That is sound because every
+/// occurrence of `T` checks its arguments: substituting a carried argument for a
+/// parameter that stood for "carried" leaves the field carried, and a
+/// declaration that puts a *function type* under its own parameter — `type
+/// T<a> = N(T<(Int) -> Int>)` — is refused when the occurrence inside it checks
+/// its argument. So this needs no substitution and no instantiation, which is
+/// what makes it a per-program table rather than a per-call one.
+///
+/// # Recursive types terminate, and by construction
+///
+/// A record alias cannot be recursive at all — `infer.rs` expands aliases and
+/// answers `type alias `X` expands into itself` for a cycle — so every
+/// [`Type::Record`] this pass sees is a finite tree. A **sum** type can be
+/// recursive, and `type Tree<a> = Leaf | Node(a, Tree<a>)` is the ordinary
+/// case rather than a corner.
+///
+/// The declarations are therefore solved as a **fixpoint over names** rather
+/// than by walking a type into itself: every declared type starts carried, and
+/// a pass that finds an uncarried field lowers it, repeated until nothing
+/// moves. Lowering only ever removes, so it terminates in at most one round per
+/// declaration. `carries` itself then never recurses into a declaration — it
+/// reads `decls` — so the only recursion it does is over a use-site type
+/// expression, which is finite. `a_recursive_type_is_decided_rather_than_walked_into_itself`
+/// and `a_recursive_type_that_reaches_a_closure_is_refused` are the two sides.
+///
+/// # Generics: refused, not resolved at the call site
+///
+/// A parameter declared `List<a>` can hold a closure at some call site however
+/// first-order the value in front of it happens to be, so the type alone cannot
+/// clear it. The alternative is to resolve `a` from the *values* — which is the
+/// deep walk this design exists to avoid, at the same cost and on the same
+/// arguments. What refusing costs is measured rather than assumed: on
+/// `ply test examples` the type gate reaches 84.1% against a shallow kind test's
+/// 91.8%, and `Type::Var` is the whole of that gap; on the ported front end the
+/// two rungs are equal to three digits, because a front end's parameters are
+/// declared at concrete first-order types.
+///
+/// # Cost, and where the gate sits
+///
+/// One [`FxHashMap`] lookup per call that gets past the kind test, against the
+/// zero the discriminant test cost — the ordering [`admit`] documented is
+/// genuinely reversed for a container argument, and
+/// `the_shape_gate_is_reached_before_the_row_is_looked_up` records what
+/// survives of the old claim. The walk over declared types happens once per
+/// [`CheckOutput`], behind a `OnceCell` on the machine, so a run that never
+/// offers a call never pays for it.
+///
+/// [`Gate::ArgumentType`] is deliberately **last** rather than first, which
+/// costs two lookups on the calls it refuses and is worth them. Put above the
+/// row gate it refuses an unpublished name — `self.params` has no entry — and
+/// so *masks* [`Gate::PublishedRow`]'s refusal of one, which is the defect this
+/// module's test header spends four paragraphs on: a new gate above an old one
+/// makes the old one's deletion invisible, and
+/// `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`
+/// and `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`
+/// both went red on `Err(ArgumentType)` when it was tried there. Ordering by
+/// cost would have bought two hash lookups on 17% of calls and paid for them in
+/// a tripwire nobody would have noticed going quiet.
+pub(crate) struct CarriedTypes {
+    /// A declared sum type's own parameters and the field types of every one of
+    /// its constructors, by program-wide type name. Record types are absent:
+    /// they are aliases and are expanded before a [`Type`] exists.
+    decls: FxHashMap<Symbol, Decl>,
+    /// The fixpoint over [`CarriedTypes::decls`]: whether a value of that type
+    /// can reach a world handle, its type arguments left to each occurrence.
+    safe: FxHashMap<Symbol, bool>,
+    /// Per definition, its declared signature read as [`Denotes`]. Absent means
+    /// the name publishes no function type at all.
+    sigs: FxHashMap<Symbol, Sig>,
+}
+
+/// One definition's declared signature, with every position answered once.
+///
+/// Both ends are here rather than only the parameters, and they are read by two
+/// different tests at two different moments: `params` by [`Gate::ArgumentType`]
+/// before a backend is called, `ret` by `Machine::compiled_answer` after it has
+/// answered. Keeping them in one entry is what makes the two ends the same
+/// question asked twice rather than two rules that can drift — which they did
+/// between 2026-08-30 and 2026-08-31, when the parameter half moved to types and
+/// the return half stayed on values.
+struct Sig {
+    /// One entry per declared parameter: the `Value` kind that parameter's type
+    /// denotes when it is carried, and `None` when it is not.
+    params: Vec<Option<Denotes>>,
+    /// The same for the declared return type.
+    ret: Option<Denotes>,
+}
+
+struct Decl {
+    vars: Vec<TyVar>,
+    fields: Vec<Type>,
+}
+
+/// The one `Value` kind a carried type denotes.
+///
+/// A carried type has exactly one, which is what lets the argument test be a
+/// discriminant comparison rather than a walk: `Int` is a [`Value::Int`], a
+/// record type is a [`Value::Record`], a declared sum type is a
+/// [`Value::Ctor`]. Comparing it is what keeps an ill-typed value out of a
+/// backend on a route that carries no types — `Machine::call`, which
+/// `a_secret_is_never_offered_and_never_accepted` reaches the hook through, and
+/// a hand-built [`Closure`] wearing a published name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Denotes {
+    Int,
+    Bool,
+    Bytes,
+    List,
+    Map,
+    Record,
+    Ctor,
+}
+
+impl Denotes {
+    fn matches(self, value: &Value) -> bool {
+        match self {
+            Denotes::Int => matches!(value, Value::Int(_)),
+            Denotes::Bool => matches!(value, Value::Bool(_)),
+            Denotes::Bytes => matches!(value, Value::Bytes(_)),
+            Denotes::List => matches!(value, Value::List(_)),
+            Denotes::Map => matches!(value, Value::Map(_)),
+            Denotes::Record => matches!(value, Value::Record(_)),
+            Denotes::Ctor => matches!(value, Value::Ctor { .. }),
+        }
+    }
+}
+
+impl CarriedTypes {
+    /// The table for `check`, or an empty one — which admits nothing — for a
+    /// machine built without a `CheckOutput`, for the reason
+    /// [`Gate::PublishedRow`] refuses one: a machine that cannot read the fact
+    /// has not been told it holds.
+    pub(crate) fn over(check: Option<&CheckOutput>) -> CarriedTypes {
+        let mut table = CarriedTypes {
+            decls: FxHashMap::default(),
+            safe: FxHashMap::default(),
+            sigs: FxHashMap::default(),
+        };
+        let Some(check) = check else { return table };
+        for ctor in check.ctors.values() {
+            let decl = table
+                .decls
+                .entry(ctor.type_name.clone())
+                .or_insert_with(|| Decl {
+                    vars: ctor.scheme.ty_vars.clone(),
+                    fields: Vec::new(),
+                });
+            decl.fields.extend(ctor.fields.iter().cloned());
+        }
+        table.safe = table.decls.keys().map(|n| (n.clone(), true)).collect();
+        // Lowering only ever removes, so this settles; the bound is one round
+        // per declaration and the loop asserts nothing about how many it took.
+        loop {
+            let lowered: Vec<Symbol> = table
+                .decls
+                .iter()
+                .filter(|(name, decl)| {
+                    table.safe[*name]
+                        && !decl
+                            .fields
+                            .iter()
+                            .all(|f| table.carries(f, Some(&decl.vars)))
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if lowered.is_empty() {
+                break;
+            }
+            for name in lowered {
+                table.safe.insert(name, false);
+            }
+        }
+        let flags: Vec<(Symbol, Sig)> = check
+            .defs
+            .iter()
+            .filter_map(|(name, def)| match &def.scheme.ty {
+                Type::Fn { params, ret, .. } => Some((
+                    name.clone(),
+                    Sig {
+                        params: params.iter().map(|t| table.denotes(t)).collect(),
+                        ret: table.denotes(ret),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        table.sigs.extend(flags);
+        table
+    }
+
+    /// The `Value` kind `ty` denotes, when `ty` is carried.
+    fn denotes(&self, ty: &Type) -> Option<Denotes> {
+        if !self.carries(ty, None) {
+            return None;
+        }
+        match ty {
+            Type::Record(_) => Some(Denotes::Record),
+            Type::Con(name, _) => Some(match name.as_str() {
+                "Int" => Denotes::Int,
+                "Bool" => Denotes::Bool,
+                "Bytes" => Denotes::Bytes,
+                "List" => Denotes::List,
+                "Map" => Denotes::Map,
+                // `carries` cleared it and it is none of the builtin heads, so
+                // it is a declared sum type and its values are constructors.
+                _ => Denotes::Ctor,
+            }),
+            // `carries` refuses both of these, so this is unreachable rather
+            // than conservative — it is spelled out so that a future kind added
+            // to `carries` without an entry here is refused rather than
+            // silently denoting whatever the arm above it did.
+            Type::Var(_) | Type::Fn { .. } => None,
+        }
+    }
+
+    /// Whether `ty` is carried. `decl_vars` is `Some` only while walking a
+    /// declaration's own field types, where an occurrence of one of that
+    /// declaration's parameters stands for "whatever this type is instantiated
+    /// at", and every occurrence checks that instantiation itself.
+    pub(crate) fn carries(&self, ty: &Type, decl_vars: Option<&[TyVar]>) -> bool {
+        match ty {
+            Type::Var(v) => decl_vars.is_some_and(|vars| vars.contains(v)),
+            Type::Fn { .. } => false,
+            Type::Record(fields) => fields.values().all(|t| self.carries(t, decl_vars)),
+            Type::Con(name, args) => match name.as_str() {
+                "Int" | "Bool" | "Bytes" => args.is_empty(),
+                "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
+                // ADR 0019 §5 item 4's three, and the leaf set is deliberately
+                // `crossable`'s exactly rather than one kind wider — `Unit`
+                // included, which holds nothing and is refused anyway so that
+                // the leaf set is the same list in both directions.
+                "Float" | "Decimal" | "String" | "Unit" => false,
+                // A world handle and a credential are `Type::Con`s like any
+                // other. Named here because the fallback below would otherwise
+                // read them as ordinary nominal types.
+                "Cell" | ply_core::prelude::TASK_TYPE | SECRET => false,
+                _ => match self.decls.get(name) {
+                    Some(decl) => {
+                        decl.vars.len() == args.len()
+                            && self.safe.get(name).copied().unwrap_or(false)
+                            && args.iter().all(|t| self.carries(t, decl_vars))
+                    }
+                    None => false,
+                },
+            },
+        }
+    }
+
+    /// One entry per declared parameter of `name`. `None` is what a name
+    /// publishing no function type gets, and an unknown name with it.
+    fn params(&self, name: &Symbol) -> Option<&[Option<Denotes>]> {
+        self.sigs.get(name).map(|sig| sig.params.as_slice())
+    }
+
+    /// Why [`Gate::ArgumentType`] refused this call: the head of the first thing
+    /// in the first offending parameter's declared type that is not carried, or
+    /// the value's kind when the parameter *is* carried and the value is not of
+    /// the kind it denotes.
+    ///
+    /// Measurement scaffolding, called only from `crate::census`. "A gate
+    /// refuses 67% of a corpus" is a number; *what* it refuses is the fact a
+    /// roadmap is read off, and on `ply test examples` the two answers are
+    /// different roadmaps — a leaf set one kind wider, or resolving generics at
+    /// the call site, are opposite pieces of work.
+    pub(crate) fn refusal(
+        &self,
+        check: Option<&CheckOutput>,
+        name: &Symbol,
+        args: &[Value],
+    ) -> &'static str {
+        let Some(flags) = self.params(name) else {
+            return "<no signature>";
+        };
+        if flags.len() != args.len() {
+            return "<arity>";
+        }
+        let declared = check
+            .and_then(|c| c.defs.get(name))
+            .map(|d| &d.scheme.ty)
+            .and_then(|ty| match ty {
+                Type::Fn { params, .. } => Some(params.as_slice()),
+                _ => None,
+            });
+        for (i, (denotes, value)) in flags.iter().zip(args).enumerate() {
+            if denotes.is_some_and(|d| d.matches(value)) || crossable(value) {
+                continue;
+            }
+            if denotes.is_some() {
+                return "<kind mismatch>";
+            }
+            return declared
+                .and_then(|ps| ps.get(i))
+                .and_then(|ty| self.blocker(ty, None))
+                .unwrap_or("<unknown>");
+        }
+        "<none>"
+    }
+
+    /// The head of the first part of `ty` that is not carried.
+    fn blocker(&self, ty: &Type, decl_vars: Option<&[TyVar]>) -> Option<&'static str> {
+        match ty {
+            Type::Var(v) if decl_vars.is_some_and(|vars| vars.contains(v)) => None,
+            Type::Var(_) => Some("Var"),
+            Type::Fn { .. } => Some("Fn"),
+            Type::Record(fields) => fields.values().find_map(|t| self.blocker(t, decl_vars)),
+            Type::Con(name, args) => match name.as_str() {
+                "Int" | "Bool" | "Bytes" => None,
+                "List" | "Map" => args.iter().find_map(|t| self.blocker(t, decl_vars)),
+                "Float" => Some("Float"),
+                "Decimal" => Some("Decimal"),
+                "String" => Some("String"),
+                "Unit" => Some("Unit"),
+                "Cell" => Some("Cell"),
+                ply_core::prelude::TASK_TYPE => Some("Task"),
+                SECRET => Some("Secret"),
+                _ => match self.decls.get(name) {
+                    None => Some("<undeclared>"),
+                    Some(decl) if decl.vars.len() != args.len() => Some("<type arity>"),
+                    Some(decl) if !self.safe.get(name).copied().unwrap_or(false) => decl
+                        .fields
+                        .iter()
+                        .find_map(|f| self.blocker(f, Some(&decl.vars)))
+                        .or(Some("<declaration>")),
+                    Some(_) => args.iter().find_map(|t| self.blocker(t, decl_vars)),
+                },
+            },
+        }
+    }
+
+    /// Whether `args` may cross as `name`'s arguments.
+    ///
+    /// Per position, and the two clauses are independently sound, which is why
+    /// the weaker one is allowed to rescue the stronger:
+    ///
+    /// - the declared parameter type is carried **and the value is of the kind
+    ///   that type denotes** — no value of that type holds code or a handle,
+    ///   whatever this particular value is; **or**
+    /// - the value is an [`i64`], a [`bool`] or an `Arc<[u8]>` — childless, so
+    ///   it reaches nothing at any depth whatever its declared type says.
+    ///
+    /// The kind comparison in the first clause is what makes it a claim about
+    /// *this* call rather than about the program: `Machine::call` can hand a
+    /// definition declared `(Int) -> Int` a [`Value::List`] holding a
+    /// [`Value::Closure`], and without it the declared `Int` would license the
+    /// list across. `a_value_whose_kind_is_not_its_declared_types_is_refused`
+    /// is the tripwire.
+    ///
+    /// The second clause is what keeps this a **widening** rather than a trade.
+    /// Without it a generic definition called at a scalar — `fn settle<a>(r:
+    /// Result<R<a>, P>, d: a)`, and a front end is full of them — would be
+    /// refused on its `Type::Var` where the value test admitted it, and the
+    /// change would lose coverage in one place while gaining it in another.
+    /// `a_generic_definition_called_at_a_scalar_is_still_admitted` is the
+    /// tripwire; deleting the clause turns it red.
+    fn args_cross(&self, name: &Symbol, args: &[Value]) -> bool {
+        let Some(flags) = self.params(name) else {
+            return false;
+        };
+        flags.len() == args.len()
+            && flags.iter().zip(args).all(|(denotes, value)| {
+                denotes.is_some_and(|d| d.matches(value)) || crossable(value)
+            })
+    }
+
+    /// Whether `value` may cross back as `name`'s answer.
+    ///
+    /// The mirror of [`CarriedTypes::args_cross`] at one position, and
+    /// deliberately the same two clauses in the same order:
+    ///
+    /// - the declared **return** type is carried and the answer is of the kind
+    ///   that type denotes; **or**
+    /// - the answer is an [`i64`], a [`bool`] or an `Arc<[u8]>` — childless, so
+    ///   it reaches nothing at any depth whatever the declaration says.
+    ///
+    /// The second clause is [`crossable`] unchanged, which is what makes this a
+    /// strict widening of the test `Machine::compiled_answer` used to run: every
+    /// answer the old rule accepted is still accepted, including the ones whose
+    /// declared return type says something else. That last part is not an
+    /// oversight and it is load bearing for two of the eight wrong backends:
+    /// `backend::Mutation::WrongType` answers a `Bool` where the definition
+    /// returns an `Int`, and `backend::Mutation::Answers` answers an `Int` for a
+    /// definition returning anything at all. Both are wrong *answers*, which is
+    /// the class this boundary has always said it cannot see and `--engine both`
+    /// catches; refusing them here would police a wrong answer with a kind test
+    /// and would leave the corpus-scale mutations with nothing to fire on.
+    ///
+    /// # What this stops being able to prove, stated where the cost is
+    ///
+    /// For an `Int`, a `Bool` and a `Bytes` the old rule was exact: those kinds
+    /// hold no [`Value`], so "nothing that can reach a [`Value::Cell`],
+    /// [`Value::Task`], [`Value::Continuation`], [`Value::Closure`] or
+    /// [`Value::Secret`] came back" followed from the discriminant. For a
+    /// container it does not: this test reads the *top-level* kind and the
+    /// declared type, and a declared type is a fact about what the **program**
+    /// can build, not about what a backend actually put in the record.
+    ///
+    /// So a backend that answers `Record { toks: [Cell(..)] }` for a definition
+    /// declared `-> Lexed` is believed here. That is a **new obligation on a
+    /// backend** and it is the one thing this widening genuinely gives up; it is
+    /// written into this module's header as a limit rather than argued away, and
+    /// `backend::Mutation::Handle` is the ninth wrong backend that exists to say
+    /// what does and does not catch it.
+    ///
+    /// The argument direction does not have this hole, and the asymmetry is
+    /// worth naming: an *argument* is a value the machine's own evaluation built
+    /// under a checker that accepted the program, so its interior follows its
+    /// declared type. An *answer* is built by the backend.
+    pub(crate) fn answer_crosses(&self, name: &Symbol, value: &Value) -> bool {
+        self.sigs
+            .get(name)
+            .and_then(|sig| sig.ret)
+            .is_some_and(|d| d.matches(value))
+            || crossable(value)
+    }
+
+    /// Whether every position of `name`'s declared signature is carried — the
+    /// registry question, asked of a definition rather than of a call.
+    ///
+    /// `backend::carried_signature` is this and nothing else, so a backend's
+    /// fragment and this seam's two tests are the same table read three times
+    /// rather than three predicates that can drift. They did drift once: between
+    /// 2026-08-30 and 2026-08-31 the parameter half was a type test here and a
+    /// value test there, and the registry had to spell both.
+    ///
+    /// A registry holding a definition the machine will refuse to hear from is
+    /// not merely untidy: the body runs, the answer is thrown away and the
+    /// machine evaluates it again, which is the 26.45 s against 0.04 s ADR 0026
+    /// §3 measured for a declined body.
+    pub(crate) fn signature_carried(&self, name: &Symbol) -> bool {
+        self.sigs
+            .get(name)
+            .is_some_and(|sig| sig.ret.is_some() && sig.params.iter().all(Option::is_some))
+    }
+}
+
 /// Which gate refused a call, named rather than collapsed into `None`.
 ///
 /// A refusal that carries no reason is a refusal any *other* gate can satisfy,
@@ -535,11 +1213,49 @@ pub(crate) enum Gate {
     /// Not a body this machine lowered: a tree-walker closure, a constructor or
     /// a builtin.
     NotLoweredCode,
-    /// An argument this boundary does not carry — see [`crossable`].
+    /// An argument whose *kind* this boundary does not carry — see
+    /// [`crossable_argument_kind`]. Decided from the value alone, with no
+    /// lookup.
+    ///
+    /// > **Narrowed (2026-08-31), when the argument test became a type test.**
+    /// > This read: *"An argument this boundary does not carry — see
+    /// > [`crossable`]."* It was the whole of the argument gate; it is now the
+    /// > cheap half of it, and [`Gate::ArgumentType`] is the half that decides
+    /// > what a container may hold.
     ArgumentShape,
+    /// A declared parameter type that can reach a [`Value::Cell`],
+    /// [`Value::Task`], [`Value::Continuation`], [`Value::Closure`] or
+    /// [`Value::Secret`] — or a definition whose declared arity is not the one
+    /// the machine is calling. See [`CarriedTypes`].
+    ArgumentType,
     /// Inside a `simulate` region.
     SimulateRegion,
     /// A body with no program-wide name: a lambda.
+    ///
+    /// **It is a *naming* gate, not a callback gate, and the distinction is what
+    /// anyone widening it will get wrong (measured 2026-08-31, ADR 0030 §10).**
+    /// [`admit`] needs a name here because every gate below it is a lookup keyed
+    /// by one — `memo::pure_by_published_row`, [`internally_effectful`],
+    /// [`CarriedTypes::args_cross`] — and [`Compiled::enter`] is keyed by one
+    /// too. A lambda publishes none of those facts and offers no key, so
+    /// admitting one needs a stable per-lambda identity **and** per-lambda
+    /// published facts, neither of which exists. That is also why the deletion
+    /// recorded in this enum's own doc was invisible: a fabricated empty
+    /// [`Symbol`] passes *this* gate and is then refused by
+    /// [`Gate::PublishedRow`], which is a lookup that misses.
+    ///
+    /// **What it costs the SEAM on a front end is 0, and what it costs a code
+    /// generator is nearly everything.** Without a backend attached it is 98.51%
+    /// of refusals on ADR 0030's workload — 380,176 lambdas of 2,414,170 body
+    /// calls. With
+    /// `--backend reference` attached it refuses **0**, because `items.parse` is
+    /// entered once per file and every lambda is inside that entry. The obstacle
+    /// moved to a code generator, where it is three refusals rather than one
+    /// (`jit.rs`: the higher-order builtin, the lambda expression, and the call
+    /// through a local binding), and ADR 0030 §10 prices it: a backend narrowed
+    /// to the definitions a callback-free code generator could compile covers
+    /// 61.06% of body calls and has a ceiling of **2.074×**, against an `f` of
+    /// 99.65% for one that can enter the root.
     Anonymous,
     /// The published effect row is non-empty, or there is no row to read at all.
     PublishedRow,
@@ -603,6 +1319,33 @@ pub(crate) enum Gate {
 /// > the call graph, and a closure arriving in a record is not on it. Anyone
 /// > widening this further owes a deep walk or a type-level test, and owes it
 /// > *here*, not in a backend.
+///
+/// > **The debt above is discharged and the third bullet is re-taken
+/// > (2026-08-31).** The widening the paragraph warned about — a
+/// > [`Value::Record`] or [`Value::Ctor`] admitted as an argument — is taken,
+/// > and it is the type-level test the last sentence demanded rather than the
+/// > discriminant it forbade. The bullet read: *"A closure **inside** an
+/// > argument is refused with the argument. Every kind [`crossable`] carries is
+/// > childless — an `i64`, a `bool`, an `Arc<[u8]>` — so there is no "inside"
+/// > for one to be in, and the shallow discriminant test is exact for this
+/// > purpose rather than merely conservative."*
+/// >
+/// > That is no longer how it is refused, and the conclusion is unchanged. A
+/// > container argument now crosses, so there **is** an "inside"; what keeps a
+/// > closure out of it is [`CarriedTypes`], which refuses any declared
+/// > parameter type that can transitively reach a function type. The
+/// > conservatism moved from the value to the type: a record whose declared
+/// > type holds a closure is refused whatever the record in front of it happens
+/// > to hold, which is strictly the rule the old bullet wanted and could not
+/// > afford to compute on values.
+/// >
+/// > What it rests on that the old bullet did not: that the machine is running a
+/// > program the checker accepted, so a value's kind follows its declared type.
+/// > [`crossable_argument_kind`] is the second conjunct that keeps a bare
+/// > [`Value::Closure`], [`Value::Cell`], [`Value::Task`],
+/// > [`Value::Continuation`] or [`Value::Secret`] out on its discriminant even
+/// > when a name's declared signature says otherwise, which is the case
+/// > `Machine::call` can construct and a hand-built [`Closure`] can too.
 fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
@@ -615,7 +1358,14 @@ fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
 /// Split out of `Machine::compiled_answer` so that each gate is a fact a test
 /// can assert directly. The machine half of the seam is the two lines around it:
 /// the backend lookup, which is what a machine with no backend fails, and the
-/// [`crossable`] test on the answer.
+/// [`CarriedTypes::answer_crosses`] test on the answer.
+///
+/// > **Corrected in place (2026-08-31).** The last clause read *"and the
+/// > [`crossable`] test on the answer"*. [`crossable`] is now one of that test's
+/// > two clauses rather than the whole of it. The answer test stays out of
+/// > [`Gate`] for the reason the frame ceiling does: a [`Gate`] is a property of
+/// > the CANDIDATE, decided before a backend is called, and an answer does not
+/// > exist yet at that point.
 ///
 /// The gates are ordered cheapest and most-discriminating first, and
 /// [`Gate::ArgumentShape`] deliberately precedes the row lookup: with a backend
@@ -623,6 +1373,27 @@ fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
 /// discriminant test per argument and never hashes a [`Symbol`] into
 /// [`CheckOutput::defs`]. That ordering is a cost claim, so
 /// `the_shape_gate_is_reached_before_the_row_is_looked_up` asserts it.
+///
+/// > **Half withdrawn (2026-08-31), when the argument test became a type
+/// > test.** The sentence above read, verbatim: *"with a backend attached, a
+/// > call taking a **record**, a list or a string is refused on one discriminant
+/// > test per argument and never hashes a [`Symbol`] into
+/// > [`CheckOutput::defs`]"*. A record is exactly the case that no longer holds:
+/// > a `Record`, `Ctor`, `List`, `Map` or `Unit` argument now clears
+/// > [`Gate::ArgumentShape`] and is decided by [`Gate::ArgumentType`], which
+/// > hashes the name into [`CarriedTypes`] first. The half that stands is the
+/// > half `Str` and `Float` are in — a `Str`, `Float`, `Decimal`, `Secret`,
+/// > `Closure`, `Cell`, `Task` or `Continuation` argument is still refused with
+/// > no lookup at all, and that is what
+/// > `the_shape_gate_is_reached_before_the_row_is_looked_up` now asserts,
+/// > against a name no definition publishes so that a lookup would be visible.
+/// >
+/// > What the reversal costs is one [`FxHashMap`] lookup per call that gets past
+/// > the kind test, and `crate::census`'s header registered the debt before the
+/// > widening was taken: *"Whoever takes that widening owes a re-measurement of
+/// > that ordering and a per-definition cache."* The cache is
+/// > [`CarriedTypes`], built once per [`CheckOutput`] behind a `OnceCell` on
+/// > the machine; ADR 0030 §9.2 is where the debt is recorded.
 ///
 /// - **[`Gate::NotLoweredCode`]**: a tree-walker closure carries a program-wide
 ///   name (`interp.rs:118`) over a body that is a deep clone rather than a node
@@ -635,6 +1406,15 @@ fn internally_effectful(check: Option<&CheckOutput>, name: &Symbol) -> bool {
 ///   explored. `record_cell_access` and `record_alloc_access` are no-ops outside
 ///   one, so this single gate is the whole partial-order story: a compiled body
 ///   cannot fail to record what nothing is recording.
+/// - **[`Gate::ArgumentType`]**: the other half of the argument test, and the
+///   one that decides what a container may hold. It needs the name, which is
+///   why it sits below [`Gate::Anonymous`] rather than beside
+///   [`Gate::ArgumentShape`]; it also refuses a call whose argument count is not
+///   the definition's declared parameter count, because the mapping from
+///   arguments to declared types is positional and a mismatch has no mapping.
+///   `Machine::enter_code` raises on that before the hook is reached, so the
+///   arity clause is unreachable through the machine and is asserted through
+///   [`admit`] directly.
 /// - **[`Gate::PublishedRow`]**: necessary and not sufficient, exactly as the
 ///   memo's note says — an empty row still permits a definition that opens its
 ///   own `with_cell`. Outside a `simulate` region that allocation is
@@ -648,6 +1428,7 @@ pub(crate) fn admit<'a>(
     args: &[Value],
     in_simulate: bool,
     check: Option<&CheckOutput>,
+    types: &CarriedTypes,
     max_calls: usize,
     calls: usize,
 ) -> Result<(&'a Symbol, usize), Gate> {
@@ -656,19 +1437,27 @@ pub(crate) fn admit<'a>(
         args,
         in_simulate,
         check,
+        Some(types),
         max_calls,
         calls,
-        crossable,
+        crossable_argument_kind,
     )
 }
 
-/// [`admit`] with the argument test supplied, so a census can ask what a wider
-/// [`crossable`] would admit without a second copy of the other six gates.
+/// [`admit`] with the two argument tests supplied, so a census can ask what a
+/// wider argument rung would admit without a second copy of the other six
+/// gates.
+///
+/// `types` is `None` for a counterfactual rung that is decided from values
+/// alone — which is what every rung of `census::LADDER` is, and what this seam
+/// itself was before 2026-08-31.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn admit_with<'a>(
     closure: &'a Closure,
     args: &[Value],
     in_simulate: bool,
     check: Option<&CheckOutput>,
+    types: Option<&CarriedTypes>,
     max_calls: usize,
     calls: usize,
     carries: impl Fn(&Value) -> bool,
@@ -688,6 +1477,11 @@ pub(crate) fn admit_with<'a>(
     }
     if internally_effectful(check, name) {
         return Err(Gate::InternalEffects);
+    }
+    if let Some(types) = types
+        && !types.args_cross(name, args)
+    {
+        return Err(Gate::ArgumentType);
     }
     let budget = max_calls.checked_sub(calls).ok_or(Gate::Budget)?;
     if budget == 0 {
@@ -754,10 +1548,93 @@ pub(crate) fn admit_with<'a>(
 /// | `Value::List(_)` **added** to [`crossable`] — the widening this seam must not take without a deep walk | 5, of which `a_container_is_refused_on_its_discriminant_whatever_it_holds` is the one that names the reason |
 /// | the `in_simulate` test | `a_call_inside_a_simulate_region_is_refused_by_the_region_gate`, `nothing_is_offered_inside_a_simulate_region` |
 /// | the name test, replaced by a fabricated empty [`Symbol`] | `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate`, **and nothing else** |
-/// | the published-row test | 4: `a_definition_that_opens_its_own_simulate_region_is_never_offered`, `a_definition_whose_published_row_is_not_empty_is_never_offered`, `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`, `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate` |
+/// | the published-row test | 4: `a_definition_that_opens_its_own_simulate_region_is_never_offered`, `a_definition_whose_published_row_is_not_empty_is_never_offered`, `a_row_that_is_not_empty_and_a_row_that_is_missing_are_both_refused_by_the_row_gate`, `an_anonymous_body_is_refused_by_the_name_gate_rather_than_by_the_row_gate` — **re-taken 2026-08-31: 6**, see below |
 /// | the [`internally_effectful`] test | 4: `a_definition_that_discharges_its_own_effects_is_refused_by_the_internal_effects_gate`, `a_definition_that_only_calls_one_that_discharges_its_own_effects_is_refused_too`, `nothing_that_performs_under_its_own_handler_is_offered_to_a_backend`, `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop` — **and 2 more outside this suite**, see below |
 /// | the `budget == 0` test | `the_last_nested_call_is_refused_by_the_budget_gate`, `the_budget_is_the_machines_remaining_depth_and_never_reaches_zero` |
 /// | `checked_sub` weakened to `saturating_sub` | **nothing — 531 still green** |
+///
+/// > **[`Gate::ArgumentType`]'s rows (2026-08-31).** The argument test is now
+/// > two gates and the second is a *type* test, so it gets a table of its own.
+/// > Every row was run one at a time against `cargo test -p ply-eval --lib
+/// > compiled::` — **44 tests** — with the file `touch`ed, `Compiling ply-eval`
+/// > confirmed in the output before the result was believed, the file restored
+/// > from a saved copy afterwards and the digest checked. Raw logs:
+/// > `/tmp/arc-typegate/red.*.log`.
+/// >
+/// > | Corruption | Red |
+/// > |---|---|
+/// > | `CarriedTypes::args_cross` stubbed to `true` — the whole gate | **6**: `a_closure_bearing_record_is_refused_on_its_declared_type`, `a_recursive_type_that_reaches_a_closure_is_refused`, `a_value_whose_kind_is_not_its_declared_types_is_refused`, `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_call_taking_a_non_scalar_is_never_offered`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate` |
+/// > | `Denotes::matches` dropped — a carried declared type licenses a value of **any** kind | **2**: `a_value_whose_kind_is_not_its_declared_types_is_refused`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate` |
+/// > | the childless-value clause dropped — the `crossable(value)` half of `args_cross` | **4**: `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_bytes_crosses_in_as_an_argument_and_out_as_an_answer`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `an_entered_definition_that_opens_its_own_region_skips_an_allocation` |
+/// > | the declaration fixpoint replaced by a **single pass** | `a_recursive_type_that_reaches_a_closure_is_refused`, **and nothing else** |
+/// > | `Type::Var` admitted | **2**: `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_call_taking_a_non_scalar_is_never_offered` |
+/// > | a nominal type read off its **head** — no declaration walk, `Cell`/`Task`/`Secret` unnamed | **2**: `a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type`, `a_recursive_type_that_reaches_a_closure_is_refused` |
+/// > | `CarriedTypes::carries` made to recurse **into a declaration** instead of reading the fixpoint | `a_recursive_type_is_decided_rather_than_walked_into_itself` **overflows the stack** — `has overflowed its stack / fatal runtime error: stack overflow, aborting`, SIGABRT, the whole binary down |
+/// >
+/// > Two rows are worth reading twice. The **single pass** row is thin the way
+/// > `mark_internal_effects`'s fixpoint row is thin, and for the same reason:
+/// > one round settles `type Bad = BLeaf((Int) -> Int) | BNode(Bad)`, and only
+/// > the mutually recursive `Ping`/`Pong` pair — where the function type is two
+/// > declarations away — can tell a pass from a fixpoint. The **recursion** row
+/// > is the only one in either table that does not produce a failed assertion:
+/// > it takes the process down, which is what "the precompute must terminate"
+/// > means when it is false.
+/// >
+/// > Two more were run at corpus scale rather than here, and are recorded in
+/// > `crates/ply-eval/tests/seam_census.rs` beside the assertion they red:
+/// > `Value::Record` removed from [`crossable_argument_kind`] (882,207 ==
+/// > 859,104) and the `args_cross` stub again (1,293,678 == 1,207,996). The
+/// > corruption that does **not** red anything there — dropping
+/// > `Denotes::matches` — is recorded too, because it is the one a reader
+/// > reaches for first.
+///
+/// > **The ANSWER test's rows (2026-08-31).** `Machine::compiled_answer` reads
+/// > [`CarriedTypes::answer_crosses`] rather than [`crossable`], so a
+/// > definition answering a record can be entered. Same protocol as above: one
+/// > corruption at a time against `cargo test -p ply-eval --lib compiled::` —
+/// > **51 tests** — the file `touch`ed, `Compiling ply-eval` confirmed in the
+/// > output before the result was believed, the file restored from a saved copy
+/// > and the digest checked. Raw logs: `/tmp/arc-return/red.*.log`.
+/// >
+/// > | Corruption | Red |
+/// > |---|---|
+/// > | [`CarriedTypes::answer_crosses`] stubbed to `true` — the whole answer test | **5**: `a_record_answer_crosses_back_under_its_declared_return_type`, `an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_childless`, `a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks`, `an_answer_this_boundary_refuses_is_declined_and_the_body_is_evaluated`, **`a_secret_is_never_offered_and_never_accepted`** |
+/// > | [`Denotes::matches`] dropped from it — a carried declared *return* licenses an answer of **any** kind | **4**: the same, less the closure-bearing one |
+/// > | the childless clause dropped — the `crossable(value)` half | **3**: `a_bytes_crosses_in_as_an_argument_and_out_as_an_answer`, `an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_childless`, `an_entered_definition_that_opens_its_own_region_skips_an_allocation` |
+/// > | `sig.ret.is_some()` dropped from [`CarriedTypes::signature_carried`] — the registry claims a definition the machine will refuse | `a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks`, **and nothing else** |
+/// > | `Reference::run`'s `inner.set_max_calls(fuel)` weakened to `fuel.max(10_000)` — a backend that overspends inside a subtree | `an_entered_subtree_is_bounded_by_the_budget_it_was_handed_and_not_by_its_entry`, **and nothing else** |
+/// >
+/// > The first row's fifth entry is the one worth reading twice.
+/// > `a_secret_is_never_offered_and_never_accepted` is a test about a
+/// > **credential**, and it goes red on a corruption of the answer test because
+/// > that test is what refuses a [`Value::Secret`] coming *back*. Nothing about
+/// > declared return types is involved: `Secret` is refused by the childless
+/// > clause failing, which is [`crossable`] doing in 2026-08-31 what it did
+/// > before. It is the clearest evidence that the widening is a superset and not
+/// > a swap.
+/// >
+/// > A sixth corruption is recorded at corpus scale in
+/// > `crates/ply-eval/tests/seam_census.rs`: `Sig::ret` filled with
+/// > `Some(Denotes::Int)` instead of `table.denotes(ret)`, so the precompute and
+/// > a walk over the same declared types disagree — 681,277 == 882,207, 200,930
+/// > apart. And a ninth wrong backend, `backend::Mutation::Handle`, is in
+/// > `crates/ply-eval/tests/differential_corpus.rs` and
+/// > `crates/ply-cli/tests/backend.rs`; it is not a deletion but an addition,
+/// > because what the widening gave up needed a test that did not exist.
+///
+/// > **The published-row row re-taken again (2026-08-31): 4 -> 6.** Two tests
+/// > joined it and neither is a new claim about the row gate — they are two
+/// > *other* claims that turn out to rest on it, which is what a re-take is for.
+/// > `a_definition_that_calls_one_that_opens_a_simulate_region_is_never_offered`
+/// > is new with the answer widening and is a **subtree** claim: an entered call
+/// > now hides everything under it, so "this definition does not open a
+/// > `simulate` region" has to mean "nothing it can reach opens one", and the
+/// > mechanism that delivers that is the row rather than anything in this
+/// > module — `sim.read` escapes, so it propagates to every caller. Under the
+/// > deletion the offer list reads `["outer", "searched", "double"]` against
+/// > `["double"]`. `the_shape_gate_is_reached_before_the_row_is_looked_up` is
+/// > the other, and it was re-taken by the argument widening without this table
+/// > being re-run against it.
 ///
 /// The fact [`Gate::InternalEffects`] reads is computed in another crate, so it
 /// gets two rows of its own. `ply_core::infer`'s `Checker::mark_internal_effects`
@@ -959,6 +1836,45 @@ mod tests {
         fn machine(&self) -> Machine<'_> {
             Machine::new(&self.program, &self.resolved, &self.check)
         }
+
+        fn types(&self) -> CarriedTypes {
+            CarriedTypes::over(Some(&self.check))
+        }
+    }
+
+    /// The same thing from source, because the argument gate is now a question
+    /// about *declared types* and `crate::build`'s `fn_def` cannot write one.
+    ///
+    /// One anonymous module, so names stay bare and every helper above reads the
+    /// same as it does over a hand-built AST.
+    fn checked_source(source: &str) -> Checked {
+        let mut program = ply_syntax::parse_program(vec![(
+            ply_span::SourceId(0),
+            ply_syntax::ast::ModuleName::anonymous(),
+            source,
+        )])
+        .expect("the fixture must parse");
+        let resolved =
+            ply_syntax::resolve::resolve(&mut program).expect("the fixture must resolve");
+        let check = match check_program(&program, &resolved) {
+            Ok(check) => check,
+            Err(ds) => panic!("the program under test does not check: {ds:#?}"),
+        };
+        Checked {
+            program,
+            resolved,
+            check,
+        }
+    }
+
+    /// A `Code` closure standing for `name` at its declared arity, so [`admit`]
+    /// can be asked about a definition the fixture declares.
+    fn named(c: &Checked, name: &str) -> Closure {
+        let params: Vec<&str> = match &c.check.defs[&Symbol::new(name)].scheme.ty {
+            ply_core::ty::Type::Fn { params, .. } => (0..params.len()).map(|_| "p").collect(),
+            other => panic!("{name} publishes {other:?} rather than a function type"),
+        };
+        code_closure(Some(name), &params, int(0))
     }
 
     /// `Result<Value, Diagnostic>` has no `PartialEq`, and the comparison this
@@ -1280,8 +2196,16 @@ mod tests {
     /// The name is rendered because what a test wants to say is "offered as
     /// `double`", and `Symbol` is not what it wants to write.
     fn gate(c: &Checked, closure: &Closure, args: &[Value]) -> Result<(String, usize), Gate> {
-        admit(closure, args, false, Some(&c.check), DEFAULT_MAX_CALLS, 0)
-            .map(|(name, budget)| (name.as_str().to_string(), budget))
+        admit(
+            closure,
+            args,
+            false,
+            Some(&c.check),
+            &CarriedTypes::over(Some(&c.check)),
+            DEFAULT_MAX_CALLS,
+            0,
+        )
+        .map(|(name, budget)| (name.as_str().to_string(), budget))
     }
 
     /// What every gate test below reads its refusal against: this call, on this
@@ -1319,6 +2243,18 @@ mod tests {
     }
 
     /// The kinds this boundary carries, asked of the gate rather than of a run.
+    ///
+    /// > **One row moved to another gate (2026-08-31).** The loop below read
+    /// > `[Value::Float(1.0), Value::str("21"), Value::Unit,
+    /// > Value::List(Default::default()), Value::Secret(..)]` against
+    /// > `Err(Gate::ArgumentShape)` for all five. A `List` is no longer refused
+    /// > on its discriminant — [`crossable_argument_kind`] carries it and
+    /// > [`Gate::ArgumentType`] decides it — so it is asserted below against the
+    /// > gate that now refuses it, on this fixture because `double`'s parameter
+    /// > is declared `Int` and a list is not one. Moving it rather than deleting
+    /// > it is the point: the *behaviour* is unchanged and only the reason is,
+    /// > and a test that had been left asserting `ArgumentShape` would have gone
+    /// > on passing for a gate it no longer named.
     #[test]
     fn an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate() {
         let c = checked(vec![double_def()]);
@@ -1327,7 +2263,6 @@ mod tests {
             Value::Float(1.0),
             Value::str("21"),
             Value::Unit,
-            Value::List(Default::default()),
             Value::Secret(Arc::new(Value::Int(21))),
         ] {
             assert_eq!(
@@ -1336,6 +2271,11 @@ mod tests {
                 "{refused:?} was carried across the boundary"
             );
         }
+        assert_eq!(
+            gate(&c, &subject, &[Value::List(Default::default())]),
+            Err(Gate::ArgumentType),
+            "a `List` where `Int` is declared crossed the boundary"
+        );
         assert_eq!(gate(&c, &subject, &[Value::Int(21)]), admitted());
         assert_eq!(gate(&c, &subject, &[Value::Bool(true)]), admitted());
         assert_eq!(
@@ -1349,12 +2289,25 @@ mod tests {
     /// [`admit`]: in as an argument, and out as an answer.
     ///
     /// Both halves are asserted because they are different mechanisms —
-    /// [`admit`]'s [`crossable`] test on `args` and `Machine::compiled_answer`'s
-    /// [`crossable`] test on the answer — and before 2026-08-30 both refused.
-    /// ADR 0026 §3 is the reason this is a test and not a footnote: it recorded
-    /// `fn read_line(buf: Bytes, ..) -> Line` being refused on `admit`'s first
-    /// line, which made the `E = 1.46x` projection the M9 deferral rests on a
-    /// projection about a function the seam would not enter.
+    /// [`admit`]'s argument test and `Machine::compiled_answer`'s answer test —
+    /// and before 2026-08-30 both refused. ADR 0026 §3 is the reason this is a
+    /// test and not a footnote: it recorded `fn read_line(buf: Bytes, ..) ->
+    /// Line` being refused on `admit`'s first line, which made the `E = 1.46x`
+    /// projection the M9 deferral rests on a projection about a function the
+    /// seam would not enter.
+    ///
+    /// > **Corrected in place (2026-08-31): both mechanisms were named
+    /// > [`crossable`] and neither is any more.** The sentence read *"[`admit`]'s
+    /// > [`crossable`] test on `args` and `Machine::compiled_answer`'s
+    /// > [`crossable`] test on the answer"*. The first is
+    /// > [`crossable_argument_kind`] plus [`Gate::ArgumentType`]; the second is
+    /// > [`CarriedTypes::answer_crosses`]. What this test still asserts is
+    /// > unchanged, and it is worth knowing why: `head` is declared
+    /// > `(Bytes) -> Bytes`, so both ends clear on the **childless** clause,
+    /// > which is [`crossable`] itself. That is what makes this test the control
+    /// > for both widenings — it goes red if either one stops being a superset
+    /// > of the rule it replaced, and it did go red when the childless clause was
+    /// > deleted from `answer_crosses`.
     #[test]
     fn a_bytes_crosses_in_as_an_argument_and_out_as_an_answer() {
         // `head` takes whatever it is given and hands it straight back, so the
@@ -1414,7 +2367,15 @@ mod tests {
         let subject = double_closure();
         let args = [Value::Int(21)];
         assert_eq!(
-            admit(&subject, &args, true, Some(&c.check), DEFAULT_MAX_CALLS, 0),
+            admit(
+                &subject,
+                &args,
+                true,
+                Some(&c.check),
+                &CarriedTypes::over(Some(&c.check)),
+                DEFAULT_MAX_CALLS,
+                0
+            ),
             Err(Gate::SimulateRegion)
         );
         assert_eq!(gate(&c, &subject, &args), admitted());
@@ -1489,6 +2450,7 @@ mod tests {
                 &[Value::Int(21)],
                 false,
                 None,
+                &CarriedTypes::over(None),
                 DEFAULT_MAX_CALLS,
                 0
             ),
@@ -1512,8 +2474,10 @@ mod tests {
         let c = checked(vec![double_def()]);
         let subject = double_closure();
         let args = [Value::Int(21)];
+        let types = CarriedTypes::over(Some(&c.check));
         let at = |max: usize, calls: usize| {
-            admit(&subject, &args, false, Some(&c.check), max, calls).map(|(_, budget)| budget)
+            admit(&subject, &args, false, Some(&c.check), &types, max, calls)
+                .map(|(_, budget)| budget)
         };
         assert_eq!(at(8, 8), Err(Gate::Budget));
         // Not evidence for `checked_sub` over `saturating_sub`: both answer
@@ -1543,6 +2507,21 @@ mod tests {
         assert_eq!(
             gate(&c, &anonymous, &[Value::str("21")]),
             Err(Gate::ArgumentShape)
+        );
+        // Re-taken for the type gate (ADR 0030 §9.2 registered this debt): a
+        // `Record` argument is NOT in the lookup-free half any more. Under a
+        // name no definition publishes it now reaches the row gate, which is the
+        // cost the widening pays and is asserted rather than described.
+        let record = Value::Record(Arc::new(BTreeMap::new()));
+        assert_eq!(
+            gate(&c, &unknown, std::slice::from_ref(&record)),
+            Err(Gate::PublishedRow),
+            "a `Record` argument is still refused before the row is looked up, so              the cost claim this test re-takes did not actually change"
+        );
+        assert_eq!(
+            gate(&c, &anonymous, &[record]),
+            Err(Gate::Anonymous),
+            "a `Record` argument under an anonymous body is still refused before              the name gate"
         );
     }
 
@@ -2302,50 +3281,333 @@ mod tests {
     /// `an_answer_this_boundary_refuses_is_declined_and_the_body_is_evaluated`.
     /// Four of those five would red for *any* widening; this one is the only
     /// one that reds for the reason that matters, which is why it exists.
+    ///
+    /// > **Withdrawn whole and replaced (2026-08-31), because the rule it
+    /// > guarded is gone.** The test was
+    /// > `a_container_is_refused_on_its_discriminant_whatever_it_holds`, and it
+    /// > asserted `!crossable(&holding)` for a `List`, `Record`, `Ctor` and
+    /// > `Map` each holding a `Closure`, plus an empty one of each as the
+    /// > control, under the doc above — which is kept verbatim because it is the
+    /// > argument this change had to answer, not a sentence that turned out to
+    /// > be wrong.
+    /// >
+    /// > A container argument now crosses; the prompt in the doc's third
+    /// > paragraph was taken, and the type-level test is what took it. The
+    /// > tripwire has to move with the rule: refusing a `Record` **on its
+    /// > discriminant** is no longer a property this seam has, and a test
+    /// > asserting it would have to be deleted rather than corrected the day the
+    /// > widening landed — which is exactly the shape this project's rules
+    /// > forbid. What replaces it asserts the hazard rather than the mechanism:
+    /// > a record whose **declared type** can hold code must not cross, however
+    /// > ordinary the record in front of it looks.
+    ///
+    /// The empty control the old test carried survives here and matters more
+    /// than it did: a rule that walked the *value* would carry an empty
+    /// closure-bearing record, because an empty one holds no closure. `Box`'s
+    /// value below is a real record with a real closure in it and `EmptyBox`'s
+    /// is a record of one `Int`, and both are refused for their type.
     #[test]
-    fn a_container_is_refused_on_its_discriminant_whatever_it_holds() {
-        let closure = Value::Closure(Arc::new(code_closure(
-            None,
-            &["y"],
-            bin(BinOp::Mul, var("y"), int(2)),
-        )));
+    fn a_closure_bearing_record_is_refused_on_its_declared_type() {
+        let c = checked_source(
+            "type Box = { run: (Int) -> Int, tag: Int }\n\
+             type Plain = { tag: Int }\n\
+             fn use_box(b: Box) -> Int = b.tag\n\
+             fn use_plain(p: Plain) -> Int = p.tag\n",
+        );
         let mut fields = BTreeMap::new();
-        fields.insert(Symbol::new("f"), closure.clone());
-        let map = crate::value::Map::new().insert(Value::Int(0), closure.clone());
+        fields.insert(
+            Symbol::new("run"),
+            Value::Closure(Arc::new(code_closure(
+                None,
+                &["y"],
+                bin(BinOp::Mul, var("y"), int(2)),
+            ))),
+        );
+        fields.insert(Symbol::new("tag"), Value::Int(1));
+        let holding = Value::Record(Arc::new(fields));
 
-        for (kind, holding) in [
-            ("List", Value::List(Arc::new(vec![closure.clone()]))),
-            ("Record", Value::Record(Arc::new(fields))),
-            (
-                "Ctor",
-                Value::Ctor {
-                    name: Symbol::new("Wrap"),
-                    args: Arc::new(vec![closure.clone()]),
-                },
+        assert_eq!(
+            gate(&c, &named(&c, "use_box"), &[holding]),
+            Err(Gate::ArgumentType),
+            "a record whose declared type holds a `Closure` crossed the boundary, so \
+             `internally_effectful`'s argument now has a hole one field deep"
+        );
+
+        // The same record *shape* under a declared type that cannot hold code:
+        // `tag` alone. This is the control that says the refusal above is the
+        // type's and not the kind's — without it, a `crossable_argument_kind`
+        // that had simply kept refusing `Record` would pass the assertion above.
+        let mut plain = BTreeMap::new();
+        plain.insert(Symbol::new("tag"), Value::Int(1));
+        assert_eq!(
+            gate(
+                &c,
+                &named(&c, "use_plain"),
+                &[Value::Record(Arc::new(plain))]
             ),
-            ("Map", Value::Map(map)),
-        ] {
-            assert!(
-                !crossable(&holding),
-                "a `{kind}` holding a `Closure` crossed the boundary, so \
-                 `internally_effectful`'s argument now has a hole one field deep"
+            Ok(("use_plain".to_string(), DEFAULT_MAX_CALLS)),
+            "a record of `Int` did not cross, so the widening bought nothing"
+        );
+
+        // And the empty one, which is where a value walk would have differed:
+        // an empty `Box` holds no closure and is refused anyway, because the
+        // question asked is about the type.
+        assert_eq!(
+            gate(
+                &c,
+                &named(&c, "use_box"),
+                &[Value::Record(Arc::new(BTreeMap::new()))]
+            ),
+            Err(Gate::ArgumentType),
+            "an empty record under a closure-bearing declared type crossed"
+        );
+    }
+
+    /// A declared sum type is decided from its constructors' field types, and a
+    /// type that mentions itself must not make that decision recurse.
+    ///
+    /// Termination here is structural rather than budgeted, which is the whole
+    /// difference from the deep *value* walk `crate::census` prices: the
+    /// declarations are solved as a fixpoint over **names** — every declared
+    /// type starts carried and a pass lowers the ones with an uncarried field,
+    /// repeated until nothing moves — so `CarriedTypes::carries` never recurses
+    /// into a declaration at all. It only walks a use-site type expression,
+    /// which is finite because a recursive *record alias* is a compile error
+    /// (`type alias `X` expands into itself`) and a recursive *sum* type is a
+    /// name.
+    ///
+    /// `Tree` below is directly recursive and `Even`/`Odd` are mutually
+    /// recursive, because one round of a fixpoint settles the first and only a
+    /// real iteration settles the second.
+    #[test]
+    fn a_recursive_type_is_decided_rather_than_walked_into_itself() {
+        let c = checked_source(
+            "type Tree = | Leaf | Node(Tree, Int)\n\
+             type Even = | EZero | ESucc(Odd)\n\
+             type Odd = | OSucc(Even)\n\
+             fn use_tree(t: Tree) -> Int = 0\n\
+             fn use_even(e: Even) -> Int = 0\n",
+        );
+        let leaf = Value::Ctor {
+            name: Symbol::new("Leaf"),
+            args: Arc::new(Vec::new()),
+        };
+        assert_eq!(
+            gate(&c, &named(&c, "use_tree"), &[leaf]),
+            Ok(("use_tree".to_string(), DEFAULT_MAX_CALLS)),
+            "a recursive type of carried fields was refused"
+        );
+        let zero = Value::Ctor {
+            name: Symbol::new("EZero"),
+            args: Arc::new(Vec::new()),
+        };
+        assert_eq!(
+            gate(&c, &named(&c, "use_even"), &[zero]),
+            Ok(("use_even".to_string(), DEFAULT_MAX_CALLS)),
+            "a mutually recursive pair of carried types was refused"
+        );
+    }
+
+    /// The other side of it: recursion must not make a type that *does* reach a
+    /// closure look carried.
+    ///
+    /// The fixpoint's assumption is "carried until shown otherwise", so a cycle
+    /// that reaches a function type has to be found by iteration rather than
+    /// hidden by the cycle. `Bad` reaches one directly; `Ping`/`Pong` reach one
+    /// only through the pair, which a single pass over the declarations settles
+    /// the wrong way.
+    #[test]
+    fn a_recursive_type_that_reaches_a_closure_is_refused() {
+        let c = checked_source(
+            "type Bad = | BLeaf((Int) -> Int) | BNode(Bad)\n\
+             type Ping = | PNil | PCons(Pong)\n\
+             type Pong = | QNil | QCons(Ping, (Int) -> Int)\n\
+             fn use_bad(b: Bad) -> Int = 0\n\
+             fn use_ping(p: Ping) -> Int = 0\n",
+        );
+        for (name, ctor) in [("use_bad", "BNode"), ("use_ping", "PNil")] {
+            let value = Value::Ctor {
+                name: Symbol::new(ctor),
+                args: Arc::new(Vec::new()),
+            };
+            assert_eq!(
+                gate(&c, &named(&c, name), &[value]),
+                Err(Gate::ArgumentType),
+                "{name} took a value whose declared type reaches a closure"
             );
         }
+    }
 
-        // The control: the containers are refused for their kind and not for
-        // what they happen to hold, so an empty one is refused too. Without
-        // this, a `crossable` that walked into containers and refused only the
-        // closure would pass the loop above.
-        for empty in [
-            Value::List(Default::default()),
-            Value::Record(Arc::new(BTreeMap::new())),
-            Value::Ctor {
-                name: Symbol::new("None"),
-                args: Arc::new(Vec::new()),
-            },
-        ] {
-            assert!(!crossable(&empty), "{empty:?} crossed the boundary");
+    /// Generics: refused on the type, and rescued by the value when the value is
+    /// childless.
+    ///
+    /// A `Type::Var` can be instantiated at a closure at some call site, so the
+    /// declared type cannot clear it and this gate does not try — which is the
+    /// design decision `CarriedTypes`'s header argues, and the whole of the gap
+    /// between the type gate and a shallow kind test on `ply test examples`
+    /// (84.1% against 91.8%).
+    ///
+    /// The second clause of `args_cross` is why this change is a widening rather
+    /// than a trade: `Int`, `Bool` and `Bytes` are childless, so a *value* of one
+    /// crosses whatever its declared type says, and a generic definition called
+    /// at a scalar — which the value test admitted before this change — goes on
+    /// being admitted. Delete that clause and this test goes red on its first
+    /// assertion.
+    #[test]
+    fn a_type_variable_parameter_is_refused_unless_the_value_is_childless() {
+        let c = checked_source(
+            "fn poly<a>(x: a, n: Int) -> Int = n\n\
+             fn ints(xs: List<Int>) -> Int = len(xs)\n",
+        );
+        // The decision itself, asked of the type rather than of a call, because
+        // the two assertions below are both satisfied by a rule that admits
+        // `Type::Var` and is rescued by the kind comparison. This one is not.
+        let types = c.types();
+        let ply_core::ty::Type::Fn { params, .. } = &c.check.defs[&Symbol::new("poly")].scheme.ty
+        else {
+            panic!("poly publishes no function type");
+        };
+        assert!(
+            matches!(params[0], ply_core::ty::Type::Var(_)),
+            "the fixture stopped being generic: {:?}",
+            params[0]
+        );
+        assert!(
+            !types.carries(&params[0], None),
+            "a `Type::Var` is carried, so a closure passed at that position would cross"
+        );
+        assert!(
+            types.carries(&params[1], None),
+            "the control failed: `Int` is not carried"
+        );
+
+        let poly = named(&c, "poly");
+        assert_eq!(
+            gate(&c, &poly, &[Value::Int(1), Value::Int(2)]),
+            Ok(("poly".to_string(), DEFAULT_MAX_CALLS)),
+            "a generic definition called at a scalar stopped being admitted, so \
+             the type gate is a trade and not a widening"
+        );
+        assert_eq!(
+            gate(
+                &c,
+                &poly,
+                &[Value::List(Arc::new(vec![Value::Int(1)])), Value::Int(2)]
+            ),
+            Err(Gate::ArgumentType),
+            "a container crossed under a `Type::Var`, which can be a closure"
+        );
+        // And the same container under a declared `List<Int>` does cross, so the
+        // refusal above is the variable's and not the list's.
+        assert_eq!(
+            gate(
+                &c,
+                &named(&c, "ints"),
+                &[Value::List(Arc::new(vec![Value::Int(1)]))]
+            ),
+            Ok(("ints".to_string(), DEFAULT_MAX_CALLS))
+        );
+    }
+
+    /// A declared type licenses a value only when the value is of the kind that
+    /// type denotes.
+    ///
+    /// The type gate reasons from the checker's answer, and `Machine::call` is
+    /// the route that can carry a value the checker never saw — it is how
+    /// `a_secret_is_never_offered_and_never_accepted` reaches the hook at all. A
+    /// definition declared `(Int) -> Int` handed a `List` holding a `Closure`
+    /// would otherwise be licensed across by its own declared `Int`.
+    #[test]
+    fn a_value_whose_kind_is_not_its_declared_types_is_refused() {
+        let c = checked_source("fn twice(x: Int) -> Int = x * 2\n");
+        let holding = Value::List(Arc::new(vec![Value::Closure(Arc::new(code_closure(
+            None,
+            &["y"],
+            var("y"),
+        )))]));
+        assert_eq!(
+            gate(&c, &named(&c, "twice"), &[holding]),
+            Err(Gate::ArgumentType),
+            "a `List` holding a `Closure` crossed under a declared `Int`"
+        );
+        assert_eq!(
+            gate(&c, &named(&c, "twice"), &[Value::Int(21)]),
+            Ok(("twice".to_string(), DEFAULT_MAX_CALLS))
+        );
+    }
+
+    /// `Cell`, `Task` and `Secret` are `Type::Con`s with a name and arguments,
+    /// exactly as `Option` is, so a rule that read "any nominal type is a record
+    /// or a constructor" would carry all three — and the third is a credential
+    /// while the first two are handles into this run's world.
+    ///
+    /// This is the corner a *value* test never had to think about, because no
+    /// `Value::Cell` was ever admitted on its discriminant. A type test has to
+    /// name them, and `crate::census::type_carries` had this hole until this
+    /// change: its own header records the correction.
+    #[test]
+    fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
+        let c = checked_source(
+            "fn holds_cell(c: Cell<Int>) -> Int = 1\n\
+             fn holds_secret(s: Secret<Int>) -> Int = 1\n\
+             fn holds_fn(g: (Int) -> Int) -> Int = g(1)\n\
+             fn holds_int(n: Int) -> Int = n\n",
+        );
+        let types = c.types();
+        for name in ["holds_cell", "holds_secret", "holds_fn"] {
+            let ty = &c.check.defs[&Symbol::new(name)].scheme.ty;
+            let ply_core::ty::Type::Fn { params, .. } = ty else {
+                panic!("{name} publishes no function type");
+            };
+            assert!(
+                !types.carries(&params[0], None),
+                "{name}'s declared parameter type {:?} is carried",
+                params[0]
+            );
         }
+        let ply_core::ty::Type::Fn { params, .. } =
+            &c.check.defs[&Symbol::new("holds_int")].scheme.ty
+        else {
+            panic!("holds_int publishes no function type");
+        };
+        assert!(
+            types.carries(&params[0], None),
+            "the control failed: `Int` is not carried, so the loop above says nothing"
+        );
+    }
+
+    /// A record argument reaching a real backend through a real machine, which
+    /// is what every gate assertion above is a proxy for.
+    ///
+    /// Before 2026-08-31 the machine offered a backend nothing at all here: the
+    /// argument is a `Value::Record` and `crossable` refused it on its
+    /// discriminant. ADR 0030 §1 measured what that cost — **3,236,823 `Record`
+    /// arguments** refused on the ported Ply front end, against 190,703 calls
+    /// admitted in total.
+    #[test]
+    fn a_record_argument_reaches_a_backend_through_the_machine() {
+        let c = checked_source(
+            "type Pair = { a: Int, b: Bytes }\n\
+             fn first(p: Pair) -> Int = p.a\n\
+             test \"t\" { assert(first({a: 7, b: b\"x\"}) == 7) }\n",
+        );
+        let backend = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        let call = callv(
+            "first",
+            vec![record(vec![("a", int(7)), ("b", bytes(b"x"))])],
+        );
+        assert_eq!(ok(machine.eval_expr_for_test(&call)), Value::Int(7));
+        assert_eq!(backend.names(), vec!["first"]);
+        assert_eq!(
+            backend.offers()[0].args,
+            vec![Value::Record(Arc::new(BTreeMap::from([
+                (Symbol::new("a"), Value::Int(7)),
+                (Symbol::new("b"), Value::bytes(b"x")),
+            ])))],
+            "the record the machine offered is not the one the call built"
+        );
     }
 
     /// An arity mismatch is the machine's diagnostic, phrased from
@@ -2455,6 +3717,377 @@ mod tests {
                 "`{name}` is pure at every hop and was refused anyway"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The ANSWER test, 2026-08-31. Six tests, and the first three are the
+    // widening while the last three are the thing the widening changes: an
+    // entered call is no longer a leaf, so every gate has to hold over a
+    // SUBTREE and that is a different claim.
+    // ---------------------------------------------------------------------
+
+    /// A definition answering a record is entered and its answer is used.
+    ///
+    /// This is ADR 0030 §1's finding closed. `lex(Bytes) -> Scan` cleared every
+    /// gate on the ported front end and was declined 13 times — once per file —
+    /// because `Machine::compiled_answer` tested the answer's discriminant with
+    /// [`crossable`] and a `Scan` is a `Value::Record`. The registry had no body
+    /// for it for the same reason. Both ends now read the declared return type.
+    ///
+    /// The control is the second half: the same backend answering the same
+    /// record for a definition declared `-> Int` is refused, so what admits the
+    /// first is the declaration and not the kind.
+    #[test]
+    fn a_record_answer_crosses_back_under_its_declared_return_type() {
+        let c = checked_source(
+            "type Scan = { at: Int, tok: Bytes }\n\
+             fn scan(i: Int) -> Scan = { at: i, tok: b\"x\" }\n\
+             fn count(i: Int) -> Int = i\n",
+        );
+        let answer = record_value(&[("at", Value::Int(7)), ("tok", Value::bytes(b"x"))]);
+
+        let backend = Double::answering(&c.program, "scan", answer.clone());
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("scan", vec![int(1)]))),
+            answer,
+            "a record answer was refused under a declared return type that carries it"
+        );
+        assert_eq!(machine.compiled_counts(), (1, 0));
+        assert_eq!(machine.compiled_refusals(), 0);
+        drop(machine);
+
+        let backend = Double::answering(&c.program, "count", answer.clone());
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("count", vec![int(3)]))),
+            Value::Int(3),
+            "a record answer was believed for a definition declared `-> Int`"
+        );
+        assert_eq!(machine.compiled_counts(), (0, 1));
+        assert_eq!(machine.compiled_refusals(), 1);
+    }
+
+    /// A carried declared return type licenses one `Value` kind, not any.
+    ///
+    /// The tripwire on [`Denotes`] in the answer direction, and the mirror of
+    /// `a_value_whose_kind_is_not_its_declared_types_is_refused`. Delete the
+    /// kind comparison from `CarriedTypes::answer_crosses` and a definition
+    /// declared `-> Scan` may answer a `Value::List` holding a `Closure`, which
+    /// is a route back into this run's world through a gate that reads a type.
+    ///
+    /// The `Int` control below is not decoration: an `Int` answer for a
+    /// definition declared `-> Scan` is *still admitted*, by the childless
+    /// clause, because that is exactly today's rule and two of the eight wrong
+    /// backends are built on it. Widening the answer test must not quietly
+    /// narrow it.
+    #[test]
+    fn an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_childless() {
+        let c = checked_source(
+            "type Scan = { at: Int, tok: Bytes }\n\
+             fn scan(i: Int) -> Scan = { at: i, tok: b\"x\" }\n",
+        );
+        let holding = Value::List(Arc::new(vec![Value::Closure(Arc::new(code_closure(
+            None,
+            &["y"],
+            var("y"),
+        )))]));
+        let types = c.types();
+        let scan = Symbol::new("scan");
+        assert!(
+            !types.answer_crosses(&scan, &holding),
+            "a `List` holding a `Closure` came back under a declared `-> Scan`"
+        );
+        assert!(
+            types.answer_crosses(
+                &scan,
+                &record_value(&[("at", Value::Int(0)), ("tok", Value::bytes(b""))])
+            ),
+            "the record the declaration denotes was refused, so the widening bought nothing"
+        );
+        assert!(
+            types.answer_crosses(&scan, &Value::Int(0)),
+            "the childless clause was lost: `Mutation::WrongType` and `Mutation::Answers` both \
+             answer an `Int` for a definition that returns something else, and refusing it here \
+             would police a wrong answer with a kind test"
+        );
+    }
+
+    /// A declared return type that can hold code is not answered for at all.
+    ///
+    /// The return half of `a_closure_bearing_record_is_refused_on_its_declared_type`,
+    /// and it is enforced twice over: `CarriedTypes::signature_carried` keeps the
+    /// definition out of a backend's registry, and `answer_crosses` refuses the
+    /// record if a backend answers one anyway. The second is what this asserts,
+    /// because the first is a backend's choice and this seam does not get to
+    /// depend on one.
+    #[test]
+    fn a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks() {
+        let c = checked_source(
+            "type Box = { run: (Int) -> Int, tag: Int }\n\
+             type Plain = { tag: Int }\n\
+             fn make_box(n: Int) -> Box = { run: |y: Int| y, tag: n }\n\
+             fn make_plain(n: Int) -> Plain = { tag: n }\n",
+        );
+        let types = c.types();
+        // A record with no closure in it, under a declared type that can hold
+        // one. A value walk would carry this; the question asked is about the
+        // type, so it is refused.
+        let innocent = record_value(&[("tag", Value::Int(1))]);
+        assert!(
+            !types.answer_crosses(&Symbol::new("make_box"), &innocent),
+            "a record came back under a declared return type that can hold a `Closure`"
+        );
+        assert!(
+            types.answer_crosses(&Symbol::new("make_plain"), &innocent),
+            "the control failed: a record of `Int` was refused too"
+        );
+        assert!(
+            !types.signature_carried(&Symbol::new("make_box")),
+            "a backend's registry would hold a definition the machine will not hear from"
+        );
+        assert!(types.signature_carried(&Symbol::new("make_plain")));
+    }
+
+    /// Entering a call now hides its whole subtree, and the effects gate has to
+    /// hold over the subtree rather than over the entry.
+    ///
+    /// Before the answer test read declared types, a definition returning a
+    /// record could not be entered, so an entered body was a leaf-ish thing over
+    /// scalars. `items.parse` is now entered **once per file** and every call it
+    /// makes runs inside that entry, where the machine sees nothing: no
+    /// `perform` is recorded, no `Access` reaches a scheduler, no cell touch is
+    /// counted. So "this definition performs nothing" has to mean "nothing this
+    /// definition can reach performs anything".
+    ///
+    /// It does, and it did before this change — `DefInfo::internally_effectful`
+    /// is a fixpoint over the call graph and
+    /// `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`
+    /// holds it at four hops, through a mutually recursive pair and through a
+    /// lambda. What is new is that the *consequence* of that fixpoint being
+    /// wrong grew from one call to a program. This test is the same claim asked
+    /// the way the widening makes it matter: the machine offers the outer
+    /// definition, and if it were entered the inner `perform` would be lost.
+    #[test]
+    fn an_entered_subtree_is_refused_for_an_effect_two_hops_down_that_it_would_hide() {
+        let c = self_handled();
+        // `wrapper` calls `handled`, which discharges `state.get` under its own
+        // handler. Running it performs; its published row says it does not.
+        let mut machine = c.machine();
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("wrapper", vec![int(1)]))),
+            Value::Int(2)
+        );
+        assert_eq!(
+            machine.trace().performs(),
+            1,
+            "the fixture is wrong: nothing was performed, so hiding the subtree would cost \
+             nothing"
+        );
+        drop(machine);
+
+        // And the machine offers it to nobody, so the subtree is never hidden.
+        let backend = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("wrapper", vec![int(1)]))),
+            Value::Int(2)
+        );
+        assert!(
+            !backend.names().iter().any(|n| n == "wrapper"),
+            "a definition whose subtree performs was offered: {:?}",
+            backend.names()
+        );
+        assert_eq!(
+            machine.trace().performs(),
+            1,
+            "the atoms the interpreter records were lost"
+        );
+    }
+
+    /// The same claim for the deterministic scheduler, and this one is a gate
+    /// away from where a reader looks for it.
+    ///
+    /// [`Gate::SimulateRegion`] reads the **machine's** state — it refuses a
+    /// call made *inside* a live `simulate` region — and says nothing about a
+    /// definition that opens one. For a definition that opens its own, the row
+    /// gate is what refuses it (`a_definition_that_opens_its_own_simulate_region_is_never_offered`,
+    /// which reads `sim.read` out of the fixture's footprint first). Over a
+    /// subtree the question is the two-hop one: does a definition that merely
+    /// *calls* one that opens a `simulate` region get entered, hiding every
+    /// `Access` the search depends on?
+    ///
+    /// It does not, and the mechanism is the row rather than anything in this
+    /// module: `sim.read` is an escaping atom, so it propagates to every caller
+    /// that does not discharge it. The footprint is read out of the fixture
+    /// before the run, so a change that made `simulate` publish nothing turns
+    /// this red rather than making it vacuous.
+    #[test]
+    fn a_definition_that_calls_one_that_opens_a_simulate_region_is_never_offered() {
+        let c = checked(vec![
+            double_def(),
+            fn_def(
+                "searched",
+                &["n"],
+                ex(ExprKind::Simulate {
+                    body: Box::new(bin(BinOp::Add, var("n"), int(1))),
+                }),
+            ),
+            fn_def("outer", &["n"], callv("searched", vec![var("n")])),
+        ]);
+        assert!(
+            !c.check.defs[&Symbol::new("outer")].footprint.is_empty(),
+            "the fixture is wrong: a definition two hops from a `simulate` published an empty \
+             row, so the row gate would clear it and the subtree would be hidden"
+        );
+
+        let backend = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(backend.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&bin(
+                BinOp::Add,
+                callv("outer", vec![int(1)]),
+                callv("double", vec![int(0)]),
+            ))),
+            Value::Int(2)
+        );
+        assert_eq!(
+            backend.names(),
+            vec!["double"],
+            "a definition that reaches a `simulate` region two hops down was offered"
+        );
+    }
+
+    /// The budget bounds the whole entered subtree, not the entry.
+    ///
+    /// `budget` is the machine's remaining nested calls and is handed over once.
+    /// While an entered body was a leaf that mattered little; now one entry can
+    /// swallow a recursion of any depth, and if the bound were charged per
+    /// *entry* rather than per *nested call inside it* a native run would answer
+    /// where the machine raises.
+    ///
+    /// Run against the real [`crate::backend::Reference`] rather than a double,
+    /// because the claim is about how a backend spends the number it is handed —
+    /// a double that ignored `budget` would pass any assertion a double could
+    /// make. The two arms must produce the *same diagnostic*, which is what
+    /// `limit.rs` exists to keep true of both engines.
+    #[test]
+    fn an_entered_subtree_is_bounded_by_the_budget_it_was_handed_and_not_by_its_entry() {
+        let c = checked_source(
+            "fn down(n: Int) -> Int = if n <= 0 { 0 } else { down(n - 1) + 1 }\n\
+             fn top(n: Int) -> Int = down(n)\n",
+        );
+        let call = callv("top", vec![int(400)]);
+
+        let bare = Machine::new(&c.program, &c.resolved, &c.check).with_max_calls(50);
+        let mut bare = bare;
+        let without = bare.eval_expr_for_test(&call);
+        assert!(
+            rendered(&without).contains("recursion limit of 50 nested calls exceeded"),
+            "the fixture is wrong: the machine did not reach its own bound: {}",
+            rendered(&without)
+        );
+        drop(bare);
+
+        let fragment = crate::backend::Fragment::over(&c.program, &c.resolved, &c.check);
+        assert!(
+            fragment.holds(&Symbol::new("top")) && fragment.holds(&Symbol::new("down")),
+            "the fixture is wrong: the backend has no body for the recursion under test"
+        );
+        let mut backed = Machine::new(&c.program, &c.resolved, &c.check).with_max_calls(50);
+        backed.set_compiled(fragment.attach(&crate::backend::Spec::honest()));
+        let with = backed.eval_expr_for_test(&call);
+        assert_eq!(
+            rendered(&with),
+            rendered(&without),
+            "an entered subtree outran the machine's bound and answered where the machine raises"
+        );
+        assert_eq!(
+            backed.compiled_counts().0,
+            0,
+            "the backend answered a call whose subtree cannot fit the budget"
+        );
+
+        // The control: the same program under a budget the recursion fits, so
+        // the refusal above is the bound's and not the fixture's.
+        let mut ok_run = Machine::new(&c.program, &c.resolved, &c.check);
+        ok_run.set_compiled(fragment.attach(&crate::backend::Spec::honest()));
+        assert_eq!(
+            ok(ok_run.eval_expr_for_test(&call)),
+            Value::Int(400),
+            "the recursion does not fit the default bound either, so nothing above is about the \
+             budget"
+        );
+        assert!(ok_run.compiled_counts().0 > 0);
+    }
+
+    /// What a collapse actually is, at unit scale: the machine offers the entry
+    /// and never sees anything under it.
+    ///
+    /// The measurement this stands in for is on the ported front end
+    /// (`spikes/ply-parser`, 13 files, 333,851 bytes): entries fall from
+    /// **306,931 to 26** while the share of body calls a backend can answer
+    /// rises from **17.03% to 84.01%**, because `items.parse` is entered once
+    /// per file and its ~2.4 million inner calls run inside that entry. A
+    /// falling entry count is the win and not a regression — it is PR #30's
+    /// shape, where a fragment widened until one crossing swallowed a whole
+    /// search and crossings went 721 to 1.
+    ///
+    /// Asserted here rather than only measured there, because a number in a
+    /// report is not a tripwire.
+    #[test]
+    fn an_entered_call_hides_its_subtree_and_the_machine_offers_none_of_it() {
+        let c = checked_source(
+            "type Scan = { at: Int }\n\
+             fn leaf(i: Int) -> Int = i + 1\n\
+             fn middle(i: Int) -> Int = leaf(i) + leaf(i)\n\
+             fn outer(i: Int) -> Scan = { at: middle(i) }\n",
+        );
+        // Declining, so the machine evaluates everything itself: this is the
+        // set of calls the seam is offered when nothing is entered.
+        let declining = Double::declining(&c.program);
+        let mut machine = c.machine();
+        machine.set_compiled(declining.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("outer", vec![int(1)]))),
+            record_value(&[("at", Value::Int(4))])
+        );
+        assert_eq!(
+            declining.names(),
+            vec!["outer", "middle", "leaf", "leaf"],
+            "the fixture is wrong: the subtree this entry would hide is not offered without it"
+        );
+        drop(machine);
+
+        // Answering, and the same expression offers exactly one call.
+        let answering =
+            Double::answering(&c.program, "outer", record_value(&[("at", Value::Int(4))]));
+        let mut machine = c.machine();
+        machine.set_compiled(answering.clone());
+        assert_eq!(
+            ok(machine.eval_expr_for_test(&callv("outer", vec![int(1)]))),
+            record_value(&[("at", Value::Int(4))])
+        );
+        assert_eq!(
+            answering.names(),
+            vec!["outer"],
+            "the entry did not swallow its subtree"
+        );
+        assert_eq!(machine.compiled_counts(), (1, 0));
+    }
+
+    /// A record `Value` from a list of fields, which no helper in
+    /// [`crate::build`] answers because that module builds `Expr`s.
+    fn record_value(fields: &[(&str, Value)]) -> Value {
+        let mut map = BTreeMap::new();
+        for (name, value) in fields {
+            map.insert(Symbol::new(name), value.clone());
+        }
+        Value::Record(Arc::new(map))
     }
 
     /// A `Float` in flight is what `crossable` refuses; this is the same

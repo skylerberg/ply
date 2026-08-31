@@ -40,7 +40,7 @@ use ply_syntax::ast::{
 };
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -214,6 +214,19 @@ pub struct Machine<'a> {
     compiled_entries: Cell<u64>,
     compiled_declines: Cell<u64>,
     compiled_refusals: Cell<u64>,
+    /// Which definitions' declared parameter types cannot reach a world handle
+    /// — `compiled::Gate::ArgumentType`'s table.
+    ///
+    /// Lazily, for the reason `lowered` and `region_kinds` are lazy: building it
+    /// is a pass over every constructor and every definition in the program, and
+    /// a machine that never offers a call must not pay for one. `OnceCell`
+    /// rather than a field so `compiled_answer` and `census_call` can stay
+    /// `&self`, which is what makes a decline provably free.
+    ///
+    /// Scoped to this machine rather than to the program, unlike `lowering`: it
+    /// is a property of the `CheckOutput`, and a machine handed none builds an
+    /// empty table that admits nothing.
+    carried_types: OnceCell<crate::compiled::CarriedTypes>,
     /// At-most-once host operations answered in this entry point.
     host_ops: u64,
     /// What this entry point reached across the boundary, and the authority on
@@ -346,6 +359,7 @@ impl<'a> Machine<'a> {
             compiled_entries: Cell::new(0),
             compiled_declines: Cell::new(0),
             compiled_refusals: Cell::new(0),
+            carried_types: OnceCell::new(),
             host_ops: 0,
             host_use: HostUse::default(),
             declared: None,
@@ -2075,7 +2089,13 @@ impl<'a> Machine<'a> {
     /// refusal carrying no reason is a refusal some *other* gate can satisfy,
     /// and one of these was unarmed for exactly that reason. What is left here
     /// is the machine's own half — the backend lookup, which is the whole of the
-    /// shipping cost, and the [`crate::compiled::crossable`] test on the answer.
+    /// shipping cost, and the [`crate::compiled::CarriedTypes::answer_crosses`]
+    /// test on the answer.
+    ///
+    /// > **Corrected in place (2026-08-31).** This read *"and the
+    /// > [`crate::compiled::crossable`] test on the answer"*, which was the
+    /// > whole of it until the answer test began reading the definition's
+    /// > declared return type.
     ///
     /// The [`Frame::Call`] at the call site is pushed *after* `enter` returns.
     /// That is sound only because `enter` is handed no route back into this
@@ -2091,6 +2111,7 @@ impl<'a> Machine<'a> {
             args,
             !self.sims.is_empty(),
             self.check,
+            self.carried_types(),
             self.max_calls,
             self.stack.calls(),
         );
@@ -2100,22 +2121,37 @@ impl<'a> Machine<'a> {
             .as_ref()
             .map(|n| n.as_str().to_string())
             .unwrap_or_else(|| "<anonymous>".to_string());
-        let carried_sig = match (&outcome, self.check) {
-            (Ok((n, _)), Some(check)) => check
-                .defs
-                .get(*n)
-                .is_some_and(|d| crate::backend::carried_signature(&d.scheme.ty)),
+        let carried_sig = match &outcome {
+            Ok((n, _)) => crate::backend::carried_signature(self.carried_types(), n),
+            _ => false,
+        };
+        // The same predicate by the other route: a walk over the declared types
+        // rather than the per-definition `Denotes` the table precomputed. See
+        // `census::Counts::carried_sig_walked`.
+        let carried_sig_walked = match (&outcome, self.check) {
+            (Ok((n, _)), Some(check)) => check.defs.get(*n).is_some_and(|d| match &d.scheme.ty {
+                ply_core::ty::Type::Fn { params, ret, .. } => {
+                    params.iter().all(|t| self.carried_types().carries(t, None))
+                        && self.carried_types().carries(ret, None)
+                }
+                _ => false,
+            }),
             _ => false,
         };
         let blocking: Vec<&'static str> =
             if matches!(outcome, Err(crate::compiled::Gate::ArgumentShape)) {
                 args.iter()
-                    .filter(|v| !crate::compiled::crossable(v))
+                    .filter(|v| !crate::compiled::crossable_argument_kind(v))
                     .map(crate::census::value_kind)
                     .collect()
             } else {
                 Vec::new()
             };
+        let blocking_type: Option<&'static str> =
+            matches!(outcome, Err(crate::compiled::Gate::ArgumentType)).then(|| {
+                let name = closure.name.as_ref().expect("the name gate ran first");
+                self.carried_types().refusal(self.check, name, args)
+            });
         let ladder: Vec<(&'static str, bool, bool)> = crate::census::LADDER
             .iter()
             .map(|(label, kinds, deep)| {
@@ -2124,6 +2160,7 @@ impl<'a> Machine<'a> {
                     args,
                     !self.sims.is_empty(),
                     self.check,
+                    None,
                     self.max_calls,
                     self.stack.calls(),
                     |v| {
@@ -2166,6 +2203,7 @@ impl<'a> Machine<'a> {
                 args,
                 !self.sims.is_empty(),
                 self.check,
+                None,
                 self.max_calls,
                 self.stack.calls(),
                 |_| true,
@@ -2184,10 +2222,31 @@ impl<'a> Machine<'a> {
             _ => (false, false),
         };
 
+        // The SHIPPING type gate, asked with the value-kind test removed. On a
+        // program the checker accepted this must equal `admitted`: a value's
+        // kind follows its declared type, so the kind test refuses nothing the
+        // type test admits. It is counted rather than argued —
+        // `the_kind_test_refuses_nothing_the_type_test_admits_over_a_corpus`
+        // reads the two numbers off a corpus run.
+        let type_gated_shipping = crate::compiled::admit_with(
+            closure,
+            args,
+            !self.sims.is_empty(),
+            self.check,
+            Some(self.carried_types()),
+            self.max_calls,
+            self.stack.calls(),
+            |_| true,
+        )
+        .is_ok();
+
         crate::census::with(|c| {
             c.body_calls += 1;
             if type_gated {
                 c.type_gated += 1;
+            }
+            if type_gated_shipping {
+                c.type_gated_shipping += 1;
             }
             if type_gated_and_return {
                 c.type_gated_and_return += 1;
@@ -2212,6 +2271,9 @@ impl<'a> Machine<'a> {
                     if carried_sig {
                         c.admitted_carried_sig += 1;
                     }
+                    if carried_sig_walked {
+                        c.carried_sig_walked += 1;
+                    }
                     *c.admitted_names.entry(name).or_default() += 1;
                 }
                 Err(gate) => {
@@ -2221,9 +2283,18 @@ impl<'a> Machine<'a> {
                     for k in &blocking {
                         *c.blocking_args.entry(k).or_default() += 1;
                     }
+                    if let Some(k) = blocking_type {
+                        *c.blocking_types.entry(k).or_default() += 1;
+                    }
                 }
             }
         });
+    }
+
+    /// `Gate::ArgumentType`'s table, built on first need and then kept.
+    fn carried_types(&self) -> &crate::compiled::CarriedTypes {
+        self.carried_types
+            .get_or_init(|| crate::compiled::CarriedTypes::over(self.check))
     }
 
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
@@ -2245,6 +2316,7 @@ impl<'a> Machine<'a> {
             args,
             !self.sims.is_empty(),
             self.check,
+            self.carried_types(),
             self.max_calls,
             self.stack.calls(),
         )
@@ -2260,7 +2332,13 @@ impl<'a> Machine<'a> {
         );
 
         match answer {
-            Some(value) if crate::compiled::crossable(&value) => {
+            // The answer test, and it is `admit`'s argument test asked once more
+            // at the other end: the declared RETURN type is carried and the
+            // answer is of the kind it denotes, or the answer is childless and
+            // the old `crossable` rule carries it unchanged. See
+            // `CarriedTypes::answer_crosses`, which also records what a
+            // container answer stops proving.
+            Some(value) if self.carried_types().answer_crosses(name, &value) => {
                 self.compiled_entries.set(self.compiled_entries.get() + 1);
                 Some(value)
             }
