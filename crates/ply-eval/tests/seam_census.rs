@@ -199,4 +199,78 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         "the census counted a different set from the one the backend was handed"
     );
     assert_eq!(body - admitted, refused, "the gate histogram does not sum");
+
+    // The two halves of the argument test, separated over a corpus.
+    //
+    // `Gate::ArgumentType` decides an argument from its definition's declared
+    // parameter type and `Gate::ArgumentShape` decides it from the value's
+    // discriminant, and on a program the checker accepted the second refuses
+    // nothing the first admits: a value whose declared type is `Int` is a
+    // `Value::Int`. That is an argument about the type system, so it is read off
+    // a corpus rather than believed — `type_gated_shipping` is the type gate
+    // asked with the kind test removed, and any gap between it and `admitted` is
+    // defence in depth actually firing on real source, which is a fact worth
+    // seeing rather than a failure.
+    //
+    // Seen to fail, and by the corruption that can move the two apart rather
+    // than by the one a reader reaches for first. Deleting `Denotes::matches`
+    // from `CarriedTypes::args_cross` — so a declared type licenses a value of
+    // **any** kind — leaves this assertion GREEN, because both sides read the
+    // same `args_cross` and move together; that was tried first and is recorded
+    // so nobody tries it again. What is red is a corruption of the OTHER half:
+    //
+    //   `Value::Record(_)` removed from `compiled::crossable_argument_kind`
+    //     -> 882207 == 859104, "the kind gate refused 23103 call(s) the
+    //        declared types admitted"
+    //   `CarriedTypes::args_cross` stubbed to `true`
+    //     -> 1293678 == 1207996, 85682 apart
+    //
+    // Both measured on this corpus on 2026-08-31, with `Compiling ply-eval`
+    // confirmed in the output and the file restored and digest-checked after.
+    // The vacuity assertion below reds under the stub too, one assertion later.
+    let type_gated = ply_eval::census::type_gated_shipping();
+    assert_eq!(
+        type_gated,
+        admitted,
+        "the type gate and the kind gate disagree over this corpus: the kind gate refused          {} call(s) the declared types admitted",
+        type_gated.saturating_sub(admitted)
+    );
+
+    // The two ends of the seam's one table, over a corpus.
+    //
+    // `admitted_carried_sig` reads `CarriedTypes`'s per-definition `Denotes`,
+    // computed once when the table was built; `carried_sig_walked` calls
+    // `CarriedTypes::carries` on every declared parameter and on the declared
+    // return type at the call. They are the same predicate by two routes, and
+    // the point of counting both is that a per-definition PRECOMPUTE has a
+    // failure mode a per-call walk does not — it can be stale, or built from a
+    // different `CheckOutput`, and nothing about a run says so.
+    //
+    // Seen to fail, by a corruption that touches ONE route: `CarriedTypes::over`
+    // filling `Sig::ret` with `Some(Denotes::Int)` instead of
+    // `table.denotes(ret)`, so every definition's return looks carried to the
+    // precompute and the walk disagrees. Measured 2026-08-31 with `Compiling
+    // ply-eval` confirmed and the file restored and digest-checked after:
+    //
+    //   "the declared-type walk and the per-definition precompute disagree over
+    //    this corpus by 200930 call(s)"  left: 681277  right: 882207
+    //
+    // A corruption of `CarriedTypes::carries` itself would NOT red this: both
+    // routes read that function, so they move together. That is the shape of
+    // what this assertion can and cannot see, and it is why it is a
+    // precompute-versus-walk check rather than a check on the rule.
+    let walked = ply_eval::census::carried_sig_walked();
+    assert_eq!(
+        walked,
+        scalar,
+        "the declared-type walk and the per-definition precompute disagree over this corpus by \
+         {} call(s)",
+        walked.abs_diff(scalar)
+    );
+
+    // And the gate is not vacuous on this corpus: it refuses something.
+    assert!(
+        gates.get("ArgumentType").copied().unwrap_or(0) > 0,
+        "`Gate::ArgumentType` refused nothing over the whole corpus, so this run says          nothing about it: {gates:?}"
+    );
 }

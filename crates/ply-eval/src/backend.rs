@@ -32,7 +32,10 @@
 //!
 //! - [`Reference`] — a backend whose "compiled code" is a second tree-walker
 //!   over its own copy of the program, restricted to a **carried-signature
-//!   fragment** — every parameter and the return type in `Int | Bool | Bytes`.
+//!   fragment** — every parameter and the return type carried by
+//!   `compiled::CarriedTypes`. (It read *"every parameter and the return type in
+//!   `Int | Bool | Bytes`"* until 2026-08-31; see the two blocks below, which
+//!   are the two halves of that moving.)
 //!   It answers the right value for every call the seam admits and
 //!   inside its fragment, which is what makes the *accept* path reachable from a
 //!   command a user runs. It is slower than the machine and says so; it exists
@@ -56,6 +59,28 @@
 //!   >
 //!   > *"It exists to be policed, not to be fast"* stands, and the second clause
 //!   > is now a statement about intent rather than about speed.
+//!   >
+//!   > > **And on 2026-08-31 the withdrawal was itself withdrawn, on a
+//!   > > measurement, because the fragment stopped being made of leaves.** The
+//!   > > sentence *"the whole run is **1.089x** faster with it attached"* was
+//!   > > true of a fragment of 306,931 scalar leaves. With the answer test
+//!   > > reading declared return types, `items.parse` is entered **once per
+//!   > > file** and this backend runs the whole program — so the number that
+//!   > > governs is no longer the per-body-call one (3.63x faster) but the
+//!   > > whole-engine one the same paragraph already records (**1.51x
+//!   > > slower**). Measured on the same workload, in-gate, min user CPU of 6
+//!   > > counterbalanced runs, null control 0.353%: `ply test <W1> --backend
+//!   > > reference` goes **2.43 s -> 4.15 s**, and against the unbacked machine
+//!   > > **1.165x faster -> 1.47x slower**. Observed 1.47x against the
+//!   > > predicted 1.51x.
+//!   > >
+//!   > > *"It is slower than the machine"* is therefore true again, of the case
+//!   > > that now matters, and *"it exists to be policed, not to be fast"* is
+//!   > > the sentence that has never needed amending. What the widening bought
+//!   > > is not this backend's speed but the **ceiling**: `f`, the share of the
+//!   > > run an infinitely fast backend would delete, goes 22.97% -> 97.53%, and
+//!   > > `B - r` = 0.07 s of 4.15 s says 98.3% of the backed run is inside
+//!   > > `enter`. ADR 0030 §6.3.
 //! - [`Mutation`] and [`Mutant`] — the eight configurations of
 //!   `crates/ply-codegen-spike/src/wrong.rs`, reproduced over [`Reference`]
 //!   rather than over a cranelift fragment, so `cargo test --workspace` and
@@ -89,6 +114,90 @@
 //! > The spike may not be depended on (ADR 0016 §3.5), which is why its
 //! > registry was never the definition of this one and is now visibly not.
 //!
+//! > **The two ends parted company (2026-08-31).** The paragraph above still
+//! > reads *"every parameter **and** the return type `Int`, `Bool` or
+//! > `Bytes`"*, and that is now true of the return only. `compiled::admit`
+//! > decides an argument from the definition's **declared parameter type**
+//! > (`Gate::ArgumentType`), so this registry's parameter half reads
+//! > `compiled::CarriedTypes` and a definition taking a record is in the
+//! > fragment. Its **return** half is unchanged, because
+//! > `Machine::compiled_answer` still tests the *answer's* discriminant against
+//! > `compiled::crossable` and an answer has no declared type the machine has
+//! > checked the backend against.
+//! >
+//! > That asymmetry is not tidy and it is where the next lever is. Measured on
+//! > ADR 0030's workload (`spikes/ply-parser` parsing `examples/`): the seam
+//! > admits **2,028,230** calls and this registry has a body for **411,216** of
+//! > them, so **79.7% of admitted calls are offered and declined on the return
+//! > type**. ADR 0030 §1 named the single most valuable one — `lex(Bytes) ->
+//! > Scan`, thirteen calls, one per file, which between them *"would have
+//! > replaced the other 188,779 entries"*. Widening the answer test needs
+//! > either a deep walk on the
+//! > returned value — which the parser's state record makes exactly as
+//! > unaffordable as the argument walk was — or a *type*-level answer test,
+//! > which moves a machine-side check into a backend obligation. Neither is
+//! > taken here.
+//! >
+//! > What the parameter half bought, end to end, through the shipping command:
+//! > entries **190,617 -> 306,931**, `ply test <W1> --backend reference`
+//! > **2.61 s -> 2.41 s** min user CPU of 6 counterbalanced runs against an
+//! > unbacked arm at 2.82 s, so the measured speedup goes **1.077x -> 1.170x**
+//! > and the ceiling an infinitely fast backend could reach goes **1.106x ->
+//! > 1.29x**. The null control — the same command under two labels — is
+//! > 0.000%. `/tmp/arc-typegate/S4.log`, `S5.log`, `S5c.log`.
+//!
+//! > **The two ends are back together, 2026-08-31, and the asymmetry the block
+//! > above called "the next lever" is gone.** These two sentences are
+//! > **withdrawn**: *"Its **return** half is unchanged, because
+//! > `Machine::compiled_answer` still tests the *answer's* discriminant against
+//! > `compiled::crossable` and an answer has no declared type the machine has
+//! > checked the backend against."* and *"Neither is taken here."*
+//! >
+//! > The second of the two routes that paragraph named is taken:
+//! > `compiled::CarriedTypes::answer_crosses`, a type-level answer test. So
+//! > [`carried_signature`] is now `CarriedTypes::signature_carried` and nothing
+//! > else — one table, read by the registry, by `Gate::ArgumentType` and by the
+//! > answer test alike, which is what stops the three drifting the way the two
+//! > ends drifted for a day.
+//! >
+//! > **What it bought, and the number to read is the entry count falling.** On
+//! > the same workload, through the same command: **306,931 entries of 1,580,763
+//! > offers becomes 26 of 26**. `items.parse` is entered **thirteen times, once
+//! > per file**, and every one of the 2.4 million body calls under it runs
+//! > inside that entry. ADR 0030 §1 predicted exactly this and named the price
+//! > of not having it: *"One accepted call per file would have replaced the
+//! > other 188,779 entries."*
+//! >
+//! > **A falling entry count is the win.** It is PR #30's shape — a fragment
+//! > widened until one crossing swallowed a whole MCTS search, crossings 721 ->
+//! > 1 — and the header block above this one is where that was written down as
+//! > *"only PR #30's shape is speed"*, against a `Bytes` widening whose entries
+//! > rose. This one is that shape. The coverage number that rises beside it is
+//! > the share of body calls this registry can **answer**: **17.033% ->
+//! > 84.014%** of 2,414,170, which is every call the seam admits. The gap this
+//! > module's header opens with — offered and declined on the return — is
+//! > **79.7% -> 0.0%** on a front end.
+//! >
+//! > **And the run gets slower, which is the point rather than a caveat.** With
+//! > one entry per file this backend *is* the engine, and it is a tree-walker:
+//! > `ply test <W1> --backend reference` goes 2.43 s -> 4.15 s. What the
+//! > widening bought is measured in the ceiling instead — `f` 22.97% -> 97.53%,
+//! > `B - r` = 0.07 s of 4.15 s — and in what a corpus can then still see, which
+//! > is where ADR 0030 §6.4 reports that three of the eight corruptions stop
+//! > firing on this workload because it no longer enters a single scalar answer.
+//! > They are still caught over `examples/` and `tests/fixtures/`, which is why
+//! > the eight live there and not on a front end.
+//! >
+//! > It is not zero everywhere and the gap is deliberately not closed: over
+//! > `examples/` and `tests/fixtures/` an honest sweep still declines 195,806 of
+//! > 635,637 offers, because `String`, `Float` and `Decimal` are outside the
+//! > fragment in both directions (ADR 0019 §5 item 4). That is what
+//! > [`Mutation::Unoffered`] still lives in, and
+//! > `crates/ply-cli/tests/backend.rs` had to be given a `String`-returning
+//! > definition when `pair(Int) -> List<Int>` moved inside the fragment and left
+//! > it with nothing to bite on. Both of that file's tests on the gap failed
+//! > rather than passing quietly, which is the whole value of `fired`.
+//!
 //! # The budget is honoured by construction
 //!
 //! `budget` is the machine's remaining nested calls. [`Reference`] runs the body
@@ -113,13 +222,13 @@ use crate::compiled::Compiled;
 use crate::interp::Interp;
 use crate::value::Value;
 use ply_core::CheckOutput;
-use ply_core::ty::Type;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One run's backend: the program it answers for, the definitions it has bodies
@@ -144,9 +253,14 @@ pub struct Fragment {
     program: &'static Program,
     resolved: &'static Resolved,
     check: &'static CheckOutput,
-    /// The scalar-signature definitions, by program-wide name.
+    /// The carried-signature definitions, by program-wide name.
     members: BTreeSet<Symbol>,
     counters: Counters,
+    /// The seam's own table, built once here and read on every answer. It is
+    /// the same table `Machine::compiled_answer` consults, computed from the
+    /// same `CheckOutput`, so a backend cannot answer a kind the machine will
+    /// then refuse — see `Reference::run`.
+    types: crate::compiled::CarriedTypes,
 }
 
 /// What one run's backend was asked, summed over every worker.
@@ -168,6 +282,7 @@ pub struct Counters {
     fired: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    containers_out: AtomicU64,
 }
 
 impl Counters {
@@ -205,7 +320,16 @@ impl Counters {
             fired: self.fired.load(Ordering::Relaxed),
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
             bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            containers_out: self.containers_out.load(Ordering::Relaxed),
         }
+    }
+
+    /// One answer that carried a container out. Counted apart from
+    /// [`Counters::note_bytes_out`] because the type gate admits containers and
+    /// `crossable` does not, so the two answer different questions about the
+    /// same seam.
+    pub fn note_container_out(&self) {
+        self.containers_out.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -233,6 +357,17 @@ pub struct Offers {
     /// `Bytes` argument that crosses in and never comes back out would mean the
     /// widening bought arguments and not returns.
     pub bytes_out: u64,
+    /// Entered calls that answered a `List`, `Map`, `Record` or `Ctor`, counted
+    /// before any mutation touches the answer.
+    ///
+    /// The same claim as `bytes_in`/`bytes_out` for the 2026-08-31 widening of
+    /// the ANSWER test. A record return that no corpus on disk exercises leaves
+    /// every green in `differential_corpus.rs` a green over a seam nothing new
+    /// reached, which is the vacuous pass `CONTRIBUTING.md` §"The one rule"
+    /// names — and it is the likelier shape here than it was for `Bytes`, since
+    /// a definition that returns a record is also a definition whose whole
+    /// subtree now runs natively.
+    pub containers_out: u64,
 }
 
 impl Fragment {
@@ -283,12 +418,8 @@ impl Fragment {
         resolved: &'static Resolved,
         check: &'static CheckOutput,
     ) -> &'static Fragment {
-        let members = check
-            .defs
-            .iter()
-            .filter(|(_, def)| carried_signature(&def.scheme.ty))
-            .map(|(name, _)| name.clone())
-            .collect();
+        let types = crate::compiled::CarriedTypes::over(Some(check));
+        let members = registry(check, &types, restriction());
         Box::leak(Box::new(Fragment {
             origin,
             program,
@@ -296,6 +427,7 @@ impl Fragment {
             check,
             members,
             counters: Counters::default(),
+            types,
         }))
     }
 
@@ -479,8 +611,89 @@ pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
     }
 }
 
-/// Every parameter and the return type `Int`, `Bool` or `Bytes`, which is the
-/// whole of what `compiled::crossable` carries.
+/// The definitions this backend has a body for: every one whose declared
+/// signature the seam carries, intersected with `only` when a measurement has
+/// narrowed the registry.
+///
+/// Split out of [`Fragment::build`] so the narrowing is a function a test can
+/// call rather than a branch a test would have to set an environment variable
+/// to reach — `cargo test` runs its cases as threads in one process and an
+/// environment variable set in one is read by all of them.
+fn registry(
+    check: &CheckOutput,
+    types: &crate::compiled::CarriedTypes,
+    only: Option<&BTreeSet<Symbol>>,
+) -> BTreeSet<Symbol> {
+    check
+        .defs
+        .keys()
+        .filter(|name| carried_signature(types, name))
+        .filter(|name| only.is_none_or(|only| only.contains(*name)))
+        .cloned()
+        .collect()
+}
+
+/// Measurement scaffolding: a registry narrowed to a named set, off unless
+/// `PLY_BACKEND_ONLY` is set in the environment. Read once per process.
+///
+/// It exists to price a *different backend's* limit than this one's. `Reference`
+/// is a tree-walker, so it can run anything the seam admits — including a
+/// `fold` whose step is a lambda, which is the one construct
+/// `ply-codegen-spike`'s `jit.rs` refuses on its first branch
+/// (`admissible_builtin`) and then propagates to every caller
+/// (`Denotes::Uncompiled` refuses the enclosing function rather than emitting a
+/// trampoline, so the compiled set is closed under calls). After the 2026-08-31
+/// answer widening the whole of a Ply front-end run happens inside **one**
+/// entry, `items.parse`, and that entry sits above 27 definitions that call a
+/// callback builtin — so the question "what would a code generator that cannot
+/// compile a callback reach here" cannot be answered by attaching this backend
+/// as it stands. ADR 0030 §10 is the answer, and this filter is the instrument
+/// that took it: 220 definitions rather than 413, 495,152 entries rather than
+/// 26, 61.06% of body calls covered rather than 100%, and a ceiling of 2.074×
+/// rather than an `f` of 99.65%.
+///
+/// > **Re-measured independently, 2026-08-31 — ADR 0031 §5.2.** A ten-arm,
+/// > ten-block series taken for a different purpose reproduces the entry line
+/// > (`495152 of 1049245 offers entered · 554093 declined · 220 in the
+/// > fragment`) to the call and reads the ceiling at **2.104×** against 2.074×.
+/// > Nothing above is withdrawn; the number this instrument exists to take is
+/// > now two measurements a day apart that agree to 1.4%.
+///
+/// The narrowing can only **decline more**: `Reference::run` still checks the
+/// seam's own tests on the way in and out, `Mutation` still wraps it, and a name
+/// that is not in the registry is a registry miss, which is a path the corpus
+/// already exercises. So it cannot change an answer, only which answers are the
+/// backend's — which is why it is a filter here and not a second `Reference`.
+///
+/// Deliberately **not** a `--backend` spec: a spec is a user-facing promise, and
+/// this is an instrument. `PLY_SEAM_CENSUS` is the precedent — measurement
+/// scaffolding in this crate, off by default, named in the run's provenance.
+fn restriction() -> Option<&'static BTreeSet<Symbol>> {
+    static ONLY: OnceLock<Option<BTreeSet<Symbol>>> = OnceLock::new();
+    ONLY.get_or_init(|| {
+        std::env::var("PLY_BACKEND_ONLY")
+            .ok()
+            .map(|list| names_in(&list))
+    })
+    .as_ref()
+}
+
+/// A comma-separated list of program-wide names, as a set.
+///
+/// Empty entries are dropped rather than becoming an empty [`Symbol`] no
+/// definition carries, so a trailing comma is not a silently different
+/// experiment from the same list without one.
+fn names_in(list: &str) -> BTreeSet<Symbol> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(Symbol::new)
+        .collect()
+}
+
+/// Every position of the declared signature carried by
+/// `compiled::CarriedTypes` — which is the machine's own two tests read off a
+/// definition instead of off a call.
 ///
 /// Read off the published scheme rather than off the body: a fragment is a
 /// static fact a registry is built from, and a backend that decided per call
@@ -503,26 +716,42 @@ pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
 /// > gap [`Mutation::Unoffered`] lives in; widening this narrows that gap
 /// > without closing it, and `an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus`
 /// > is what fails if it ever does close.
-pub(crate) fn carried_signature(ty: &Type) -> bool {
-    let Type::Fn { params, ret, .. } = ty else {
-        return false;
-    };
-    params.iter().chain([ret.as_ref()]).all(is_carried)
-}
-
-/// The declared types whose values `compiled::crossable` carries.
+/// > **The parameter half widened with the seam (2026-08-31).** This read
+/// > *"Every parameter and the return type `Int`, `Bool` or `Bytes`"* and was
+/// > `params.iter().chain([ret.as_ref()]).all(is_carried)` — one predicate for
+/// > both ends. It is now two, because the two ends stopped being the same
+/// > question. `compiled::admit` decides an **argument** from the declared
+/// > parameter type (`Gate::ArgumentType`), so a definition taking a record can
+/// > be offered; `Machine::compiled_answer` still decides an **answer** from
+/// > the returned value's discriminant, so a definition returning a record
+/// > still cannot be answered and this registry must not claim it.
+/// >
+/// > Keeping the two in step is what `an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus`
+/// > is for: the gap between "offered" and "has a body" is where
+/// > [`Mutation::Unoffered`] lives, and this change **widens** that gap rather
+/// > than closing it — every definition that takes a record and returns one is
+/// > now offered and declined. ADR 0030 §1 measured what that costs on a front
+/// > end: `lexer.lex` is offered 13 times and declined 13 times, and one
+/// > accepted call per file would have replaced the other 188,779 entries.
 ///
-/// `Bytes` is the third, and it is a nominal type with no arguments exactly as
-/// `Int` and `Bool` are, so nothing about the shape of this test changes with
-/// it. A `Type::Var` is refused for the reason it is refused everywhere else
-/// here: an unresolved variable can be instantiated at a closure.
-fn is_carried(ty: &Type) -> bool {
-    match ty {
-        Type::Con(name, args) => {
-            args.is_empty() && matches!(name.as_str(), "Int" | "Bool" | "Bytes")
-        }
-        _ => false,
-    }
+/// > **The return half moved the next day and this whole function is now one
+/// > line (2026-08-31).** It was
+/// > `params.iter().all(|p| types.carries(p, None)) && is_carried(ret)`, and the
+/// > private helper `is_carried` — *"The declared types whose values
+/// > `compiled::crossable` carries … `Int` | `Bool` | `Bytes`"* — is **deleted**
+/// > with the rule it spelled, not left as an unused predicate that reads like a
+/// > second opinion. What replaces both is
+/// > `compiled::CarriedTypes::signature_carried`, so the registry, the argument
+/// > gate and the answer test are three readers of one per-definition table
+/// > rather than three predicates that must be kept in agreement by hand. They
+/// > were not, for a day, and the block above is that day.
+/// >
+/// > `crates/ply-eval/tests/seam_census.rs` reads the table against a **walk**
+/// > over the same declared types on every admitted call, over the whole corpus,
+/// > because a precompute has a failure mode a per-call test does not: it can be
+/// > right about a rule and stale about a program.
+pub(crate) fn carried_signature(types: &crate::compiled::CarriedTypes, name: &Symbol) -> bool {
+    types.signature_carried(name)
 }
 
 /// A backend whose compiled code is a second tree-walker.
@@ -555,12 +784,28 @@ impl Reference {
     fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
         let mut inner = self.inner.try_borrow_mut().ok()?;
         inner.set_max_calls(fuel);
-        match inner.call(name.as_str(), args.to_vec(), Span::DUMMY) {
-            Ok(value @ Value::Bytes(_)) => {
-                self.fragment.counters.note_bytes_out();
+        // `call_within` and not `call`: a compiled entry is not an entry point,
+        // and the entry-point spelling walks every argument looking for a handle
+        // the seam has already refused — an O(value) walk per entry, which is
+        // the cost the type gate exists to avoid. Its doc carries the
+        // measurement.
+        let answer = inner.call_within(name.as_str(), args.to_vec(), Span::DUMMY);
+        // The machine's own answer test, asked here so the two cannot disagree:
+        // a backend that answered a kind `compiled_answer` will go on to refuse
+        // would run a whole body for nothing and have it evaluated again.
+        match answer {
+            Ok(value) if self.fragment.types.answer_crosses(name, &value) => {
+                match &value {
+                    Value::Bytes(_) => {
+                        self.fragment.counters.note_bytes_out();
+                    }
+                    Value::List(_) | Value::Map(_) | Value::Record(_) | Value::Ctor { .. } => {
+                        self.fragment.counters.note_container_out();
+                    }
+                    _ => {}
+                }
                 Some(value)
             }
-            Ok(value @ (Value::Int(_) | Value::Bool(_))) => Some(value),
             // A registry hit whose body raised, or answered something this
             // boundary does not carry. Declining is the contract: the machine
             // re-evaluates and raises its own diagnostic, which is what makes
@@ -641,6 +886,18 @@ impl Compiled for Reference {
 /// | [`Mutation::Unoffered`] | a backend may not answer for a body it does not have |
 /// | [`Mutation::ExceedsBudget`] | `budget` is the machine's bound and not a hint |
 /// | [`Mutation::Answers`] | a call the machine must never offer at all |
+/// | [`Mutation::Handle`] | a container answer holds no handle into this run's world |
+///
+/// > **A ninth, added 2026-08-31 with the widening of the ANSWER test.** The
+/// > eight above are ADR 0026 §4.5's, and every one of them attacks a *value*.
+/// > [`Mutation::Handle`] attacks the thing the answer test stopped being able
+/// > to prove: while `Machine::compiled_answer` tested the answer's discriminant
+/// > against `compiled::crossable`, a `Value::Cell` could not come back at all,
+/// > and the invariant was structural. It now tests the declared **return** type
+/// > and the answer's top-level kind, so a record whose declared type cannot
+/// > hold a cell can nonetheless come back holding one if a backend puts one
+/// > there. This mutation is that backend. What catches it is measured in
+/// > `crates/ply-eval/tests/differential_corpus.rs` rather than asserted here.
 ///
 /// The last one is not a backend defect and cannot be demonstrated by a backend
 /// alone: `compiled::admit` refuses any definition whose published
@@ -680,6 +937,18 @@ pub enum Mutation {
     /// the machine must decline — and it only ever gets the chance if a gate in
     /// `compiled::admit` is removed.
     Answers(i64),
+    /// A handle into this run's world, inside an otherwise honest container
+    /// answer: the first field of a `Record`, the first argument of a `Ctor`,
+    /// or the head of a `List` is replaced by a `Value::Cell`.
+    ///
+    /// The kind the machine checks — `Record`, `Ctor`, `List` — is untouched, so
+    /// this is the exact shape the widened answer test cannot see. The slot is
+    /// `Slot::new(0, 0)`, which names a real position at a generation the arena
+    /// has not handed out; a cell read through it answers what any other stale
+    /// slot answers rather than aliasing a live one, so this mutation is a
+    /// forgery and not a use-after-free. That is deliberate: the claim under
+    /// test is "a handle came back", not "memory was corrupted".
+    Handle,
 }
 
 impl Mutation {
@@ -702,6 +971,9 @@ impl Mutation {
                 format!("bodies run with {k}x the budget the machine allowed")
             }
             Mutation::Answers(v) => format!("the target is answered `{v}` unconditionally"),
+            Mutation::Handle => {
+                "container answers come back holding a cell from this run's world".to_string()
+            }
         }
     }
 }
@@ -800,7 +1072,7 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
         return Err(format!(
             "unknown backend `{spec}`; one of `reference`, `cranelift`, or \
              `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
-             wrong-type, unoffered, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
+             wrong-type, unoffered, handle, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
              @<definition>"
         ));
     };
@@ -818,6 +1090,7 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
         ("stale", None) => Mutation::Stale,
         ("wrong-type", None) => Mutation::WrongType,
         ("unoffered", None) => Mutation::Unoffered,
+        ("handle", None) => Mutation::Handle,
         ("exceeds-budget", None) => Mutation::ExceedsBudget(None),
         ("exceeds-budget", Some(k)) => Mutation::ExceedsBudget(Some(
             k.parse()
@@ -830,7 +1103,8 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
         _ => {
             return Err(format!(
                 "unknown mutation `{head}`; one of off-by-one, inverted, stale, wrong-type, \
-                 unoffered, exceeds-budget[={{k}}], answers={{int}}, each optionally @<definition>"
+                 unoffered, handle, exceeds-budget[={{k}}], answers={{int}}, each optionally \
+                 @<definition>"
             ));
         }
     };
@@ -902,6 +1176,38 @@ impl Mutant {
     }
 }
 
+/// `value` with a world handle in its first position, or `None` if it has no
+/// position to put one in.
+///
+/// The answer's top-level kind is preserved, because that is the whole point:
+/// `Machine::compiled_answer` checks the kind against the declared return type
+/// and this passes that check.
+fn forge_handle(value: &Value) -> Option<Value> {
+    let handle = Value::Cell(crate::arena::Slot::new(0, 0));
+    match value {
+        Value::Record(fields) => {
+            let mut fields = (**fields).clone();
+            let key = fields.keys().next().cloned()?;
+            fields.insert(key, handle);
+            Some(Value::Record(std::sync::Arc::new(fields)))
+        }
+        Value::Ctor { name, args } if !args.is_empty() => {
+            let mut args = (**args).clone();
+            args[0] = handle;
+            Some(Value::Ctor {
+                name: name.clone(),
+                args: std::sync::Arc::new(args),
+            })
+        }
+        Value::List(items) if !items.is_empty() => {
+            let mut items = (**items).clone();
+            items[0] = handle;
+            Some(Value::List(std::sync::Arc::new(items)))
+        }
+        _ => None,
+    }
+}
+
 impl Compiled for Mutant {
     fn describes(&self, program: &Program) -> bool {
         self.inner.describes(program)
@@ -943,6 +1249,13 @@ impl Compiled for Mutant {
             (Mutation::WrongType, Some(Value::Bytes(ref b))) => {
                 self.fire(Value::Int(b.len() as i64))
             }
+            (Mutation::Handle, Some(value)) => match forge_handle(&value) {
+                Some(forged) => self.fire(forged),
+                // A scalar answer has nowhere to put one. Not a firing, and
+                // deliberately not counted as one: `fires_and_is_caught` reads
+                // `fired` to decide whether a green says anything.
+                None => Some(value),
+            },
             (Mutation::Stale, Some(value)) => {
                 let stale = self.previous.borrow_mut().replace(value.clone());
                 match stale {
@@ -967,5 +1280,70 @@ impl Compiled for Mutant {
             }
             (_, answer) => answer,
         }
+    }
+}
+
+/// The registry narrowing, which is measurement scaffolding and is therefore the
+/// easiest thing in this file to get quietly wrong.
+///
+/// Both tests were seen red before they were believed, and the corruption that
+/// reds each is named on it. The instrument's own failure mode is the one this
+/// project calls the signature defect: a narrowed run that entered *everything*
+/// still reports `0 failed`, and the number it would then produce is the
+/// unnarrowed one wearing the narrowed one's label.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ply_span::SourceId;
+    use ply_syntax::ast::ModuleName;
+    use ply_syntax::resolve::resolve;
+
+    fn checked(text: &str) -> (Program, Resolved, CheckOutput) {
+        let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), text)];
+        let mut program = ply_syntax::parse_program(inputs).expect("parses");
+        let resolved = resolve(&mut program).expect("resolves");
+        let check = ply_core::check_program(&program, &resolved).expect("typechecks");
+        (program, resolved, check)
+    }
+
+    const SRC: &str = "
+fn one(n: Int) -> Int = n + 1
+fn two(n: Int) -> Int = n + 2
+fn three(n: Int) -> Int = n + 3
+";
+
+    /// Delete the `only.is_none_or(..)` filter in [`registry`] and this reads
+    /// three against three: the narrowed run is the unnarrowed one under a
+    /// different label, which is exactly the reading a time series would then
+    /// attribute to the narrowing.
+    #[test]
+    fn a_narrowed_registry_holds_only_the_names_it_was_given() {
+        let (_program, _resolved, check) = checked(SRC);
+        let types = crate::compiled::CarriedTypes::over(Some(&check));
+        let whole = registry(&check, &types, None);
+        assert_eq!(whole.len(), 3, "the unnarrowed registry is the control");
+
+        let only = names_in("m.one, m.three");
+        let narrowed = registry(&check, &types, Some(&only));
+        let held: Vec<&str> = narrowed.iter().map(|n| n.as_str()).collect();
+        assert_eq!(held, ["m.one", "m.three"]);
+
+        // It intersects rather than replaces: a name that is not in the fragment
+        // to begin with is not added by asking for it.
+        let wishful = names_in("m.one,m.nonesuch");
+        let narrowed = registry(&check, &types, Some(&wishful));
+        let held: Vec<&str> = narrowed.iter().map(|n| n.as_str()).collect();
+        assert_eq!(held, ["m.one"]);
+    }
+
+    /// Drop the `filter(|name| !name.is_empty())` and `"m.one,"` asks for a
+    /// definition named by the empty string, which no program has — silently a
+    /// different experiment from `"m.one"`.
+    #[test]
+    fn a_trailing_comma_is_the_same_experiment_as_no_trailing_comma() {
+        assert_eq!(names_in("m.one,"), names_in("m.one"));
+        assert_eq!(names_in(" m.one , m.two "), names_in("m.one,m.two"));
+        assert!(names_in("").is_empty());
+        assert!(names_in(",,").is_empty());
     }
 }

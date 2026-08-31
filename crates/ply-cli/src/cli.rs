@@ -385,14 +385,15 @@ pub struct TestArgs {
     /// Attach a compiled backend to the machine, so a call it accepts is
     /// entered natively instead of evaluated.
     ///
-    /// `cranelift` is a code generator: it compiles the `Int`/`Bool` fragment
+    /// `cranelift` is a code generator: it compiles the carried fragment
     /// to machine code at startup and the machine drops into it at the leaves.
     /// `reference` answers correctly by tree-walking a second time, and is what
     /// runs where there is no code generator.
     ///
     /// `[<backend>:]wrong:<mutation>` is a backend that is wrong on purpose, so
     /// that a green run can be read as evidence — one of `off-by-one`,
-    /// `inverted`, `stale`, `wrong-type`, `unoffered`, `exceeds-budget[={k}]` or
+    /// `inverted`, `stale`, `wrong-type`, `unoffered`, `handle`,
+    /// `exceeds-budget[={k}]` or
     /// `answers={int}`, each optionally `@<definition>`. A bare `wrong:` wraps
     /// `reference`. Under `--engine both` the backend is a third engine and a
     /// disagreement fails the run. Never reads or writes the result cache.

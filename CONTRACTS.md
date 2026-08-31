@@ -7890,6 +7890,20 @@ is also the honest reading of item 11's *"latent rather than live"*: on this
 tree what stops those eleven is the argument shape, not — as the entry said —
 that the only backend refuses `handle` at compile time.
 
+> **Narrowed 2026-08-31, when the argument test became a type test.** *"every
+> call those eleven definitions make in this corpus is already refused by
+> `Gate::ArgumentShape`"* now holds for one of its three reasons rather than
+> three. A `Record` and a `List` cross this seam — `Gate::ArgumentType` decides
+> them from the declared parameter type — and what still refuses `desk.under`
+> is its **closure** parameter, `body: () -> a / {Serving | e}`, on the value's
+> discriminant with no lookup. Re-measured over `examples/` either side of the
+> widening: `Gate::InternalEffects` goes **54 → 91** refusals and
+> `Gate::PublishedRow` **385 → 1,144**. More calls reach both effect gates and
+> both refuse every one; nothing that discharges its own effects became
+> enterable, and
+> `a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`
+> is still what says so.
+
 ## W4 — record update
 
 ### `ply-syntax` — landed
