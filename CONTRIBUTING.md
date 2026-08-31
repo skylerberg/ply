@@ -606,6 +606,7 @@ The original four:
 | the pool | `PLY_TEST_DB='postgresql://ply@127.0.0.1:5432/ply_test?sslmode=disable' cargo test -p ply-host --lib db::pool`. **This is the worst of the five: 26 tests hide behind it and print *nothing* when it is unset** — not a skip line, not on stderr, nothing. Re-measured 2026-08-24 on the machine in `docs/ONBOARDING.md` §Provenance against a local postgres 18.3: unset gives `26 passed` in `0.00s`; set and reachable gives `26 passed` in `0.94s`; set and *unreachable* gives **`20 FAILED`** in `0.02s` with `E0431`, because `db/pool/tests.rs:41` does `.expect("the test database is reachable")`. So a wrong value is loud and only a missing one is silent — CI sets the variable, pre-flights it with `test -n` and a `psql SELECT 1`, and that combination does cover it. An earlier version of this row said the figure was `1.55s` while `ROADMAP.md` said `1.35s` for the same measurement; neither had been re-taken |
 | shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix. CI runs on `ubuntu-24.04`, so it is compiled there, and a step fails if that binary reports zero tests |
 | the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
+| the Ply parser spike's differential can still go **red** | `./spikes/ply-parser/run.sh --arm` — 22 mutations, 299s on a 10-core machine. CI runs `run.sh` and not `--arm`, so what CI checks is that the comparison is green and **not** that it could ever have failed. The mutation table is also the thing that goes stale: a corruption whose anchor text has moved is scored `NOT APPLIED`, which is a real finding and one only this command reports. `.github/workflows/ci.yml`'s `parser-spike` comment carries the measurement and the trade |
 | `examples/desk.ply` or any host handler | `./examples/same-tests.sh`. ~~build `--release` first, it does not build for you.~~ **It builds for you since 2026-08-27**, and refuses to run against a binary older than a source in its own dep-info, so the hand-build this row used to demand is now `--no-build` for the case where you meant a particular binary. That build is `--locked`, so a `Cargo.lock` that has fallen behind the manifests stops the script with cargo's own `cannot update the lock file ... because --locked was passed` instead of being rewritten under a run: `cargo build` once, then re-run. CI runs it in a job of its own, so this one is caught before a merge rather than only when you remember |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
@@ -2517,6 +2518,81 @@ Recorded here so nobody spends an afternoon rediscovering them.
     `SliceBuilder` and `CausalSlice` themselves are **not enforced**. Nothing in
     `ply-test` was changed.
 
+16. **`spikes/ply-lexer/run.sh` reaches no test at all: its harness does not
+    compile.** Found 2026-08-30 while repairing the same defect one directory
+    over.
+
+    ```
+    $ ./spikes/ply-lexer/run.sh
+    error[E0004]: non-exhaustive patterns:
+      `&ply_syntax::lexer::TokenKind::Question` not covered
+      --> src/lib.rs:66:11
+    ```
+
+    `TokenKind::Question` arrived with ADR 0028 and that harness has a `match`
+    with no `_` arm — which is the design working, not failing: the build stops
+    rather than the comparison going quietly green. What failed is that
+    **nothing ran the build**. That spike is in no CI job, and the figures ADR
+    0020 §6.1, ADR 0021 and ADR 0022 quote from it — the lexer's throughput, the
+    whole basis of §6.2's multiplier — cannot be re-taken until it is fixed.
+    Its `lexer.ply` also still has no arm for byte 63, so `?` lexes as an
+    error there.
+
+    **Not fixed here**, and the reason is scope rather than difficulty: it is a
+    second spike with its own corpus and its own measurement obligations, and
+    fixing it under another change's cover would produce exactly the undated,
+    unmeasured figures this file's §"The one rule" is about. It is registered
+    where CI is configured — `.github/ci-shards.sh`'s `SPIKES_OUTSIDE_CI` — so
+    `plan` prints the reason on every run, and moving it to `SPIKE_JOBS` is the
+    one-line change that turns the repair into a required check.
+
+17. ~~**`spikes/ply-parser` is in no CI job and its differential is red.**~~
+    **Fixed 2026-08-30, and recorded because the prediction was in the spike's
+    own README before it happened.** Four language features landed after that
+    spike was taken; its harness stopped compiling on two new `ExprKind`
+    variants, `tests/fields.rs` began failing on a field the AST had gained, and
+    28 of its 763 corpus inputs — **70.2% of the corpus by bytes** — disagreed
+    with `ply_syntax`. Nothing said so, because `spikes/` was in no shard, the
+    harness declares its own `[workspace]`, and `.github/ci-shards.sh` named
+    neither.
+
+    What was done: the comparison moved to `ply_syntax::parse_unexpanded`, a
+    new `#[doc(hidden)]` entry point that answers the tree the **grammar** built
+    before `effect_set`, `record_update` and `try_op` rewrite it, and the Ply
+    parser learned to *parse* `?`, `{..b, f: e}`, named arguments and default
+    parameters without expanding any of them.
+    `spikes/ply-parser/GAPS.md` §11R.D is the decision, §11R.X what it cost.
+    `run.sh --arm` exits 0: 766 inputs, 0 disagreements, 0 tolerances, 22
+    mutations armed.
+
+    **And there is a job.** `.github/workflows/ci.yml`'s `parser-spike`, gated
+    on `fmt`/`clippy` and named in the `ci` aggregate's `needs:`, watched to
+    fail three ways and to stay green on a control first. `ci-shards.sh verify`
+    now covers `spikes/` as well as `crates/`, so the *next* spike that nobody
+    wires up fails the `plan` job instead of rotting quietly — which is the part
+    of this entry that generalises.
+
+    > **Corrected on review, 2026-08-30.** The job does go red three ways and
+    > stays green on the control — but *"watched to fail three ways"* was
+    > written about the wrong step in two of the three. Re-run: all three
+    > corruptions are caught by `test-items.sh`, `run.sh` **exits 1** rather
+    > than 101, and the differential is never reached. The job's own comment in
+    > `ci.yml` carries the withdrawn text and the measured replacement. Three
+    > further defects were found on review and fixed: the job installed the
+    > toolchain with **no `components:`** while `run.sh` runs `cargo fmt` and
+    > `cargo clippy` (`dtolnay/rust-toolchain` installs `--profile minimal`, so
+    > neither binary would have existed and the job could not have passed);
+    > `ci-shards.sh verify` never checked that the job it names actually runs
+    > *that* spike's `run.sh`; and `run.sh` **exited 0** over a differential
+    > that ran no tests at all, watched both ways with `#[ignore]` on the seven
+    > tests in `agreement.rs`.
+
+    **What it does not cover, stated because a green job invites the opposite
+    reading:** the job runs `run.sh` and **not** `run.sh --arm`. The 22
+    mutations cost 299s locally and each re-runs the whole comparison; they stay
+    a by-hand obligation and belong in §"The suite proves less than it looks
+    like it proves"'s table, which now lists them.
+
 Items 9, 10 and 11 are closed; see the block at the end of item 10 and the one
 at the end of item 11 for the fixes, the measurements behind them and the tests
 that arm them. Items 12, 13, 14 and 15 are open — 12 as fixed-but-listed, 13 in
@@ -2560,6 +2636,14 @@ longer true, and the current state is:**
   bullet — no shipping command can install a backend — is deliberately left
   open, because closing it is gated on the result-cache rule; what changed is
   that it is now an inventory somebody can check.
+- **16 is open and is deliberately not fixed here.** `spikes/ply-lexer`'s
+  harness does not compile, so its `run.sh` reaches no test. It is registered in
+  `.github/ci-shards.sh`'s `SPIKES_OUTSIDE_CI`, which prints the reason on every
+  `plan` run.
+- **17 is fixed (2026-08-30)**, and the *class* of it is closed rather than the
+  instance: `ci-shards.sh verify` now fails on any directory under `spikes/`
+  that no CI job runs and no entry excuses, so 16 is visible because of 17's
+  fix.
 
 ## Style
 

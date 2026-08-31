@@ -33,11 +33,156 @@
 //! `ast.rs` has to be given a dump here or this file stops compiling, where a
 //! wildcard would silently emit nothing and the comparison would stay green
 //! over a field nobody reached.
+//!
+//! > **And a `..` is a `_` for fields.** The sentence above is about *variants*
+//! > and it was read as though it covered *fields*, which it does not: a
+//! > struct-variant pattern that ends in `..` absorbs a new field exactly the
+//! > way a `_` absorbs a new variant, in silence, with no compile error. That
+//! > is what happened to `ExprKind::App`'s keyword-argument list (see
+//! > `dumper_boundaries` below and `../GAPS.md` §11R.N), and `tests/fields.rs`
+//! > did not catch it because a doc comment about effect sets happened to
+//! > contain the word.
+//! >
+//! > **Re-counted 2026-08-30, after that hole was closed.** Four `..` patterns
+//! > remain and **not one of them is in the dump**:
+//! >
+//! > * `Lit::Decimal { .. }` in `Dumper::lit`, whose two absorbed fields are
+//! >   the two entries of `tests/fields.rs`'s `EXPECTED_ABSENT` — a decimal is
+//! >   dumped as the source over its own span, deliberately, and if it grew a
+//! >   third field that test would report it.
+//! > * three in `Dumper::rows_of_ty`, which is the row **walk** and emits
+//! >   nothing at all; its own comment says it answers a different question and
+//! >   must not drift into the dump.
+//! >
+//! > The two that used to sit on the sugar nodes are gone with their
+//! > `unreachable!()` arms, and the `App` one is gone with the hole. The rule
+//! > this note exists to state is unchanged: **write out every field, and if
+//! > you write `..`, say here why the compiler will never tell you it grew.**
+//!
+//! # What this comparison covers, and what it does not
+//!
+//! `../GAPS-harness.md` §H2 is the enforced list and `../GAPS.md` §11R.D is the
+//! argument; [`dumper_boundaries`] is the one-screen version, kept next to the
+//! code it describes so that changing the code and not the claim is awkward.
 
-use ply_span::{Diagnostic, SourceId, Span, Symbol};
+use ply_span::{Diagnostic, SourceId, Span};
 use ply_syntax::ast::*;
-use ply_syntax::parse_recovering;
-use std::collections::HashMap;
+use ply_syntax::parse_unexpanded;
+
+/// **What the differential compares, and what it structurally cannot see.**
+///
+/// Empty on purpose: this is documentation that has to live beside the dumper,
+/// because the failure it is about is a claim drifting away from the code that
+/// was supposed to back it. `../GAPS-harness.md` §H2 is the enforced list;
+/// `../GAPS.md` §11R.D is the argument for the boundary and §11R.X what taking
+/// it cost; this is the summary.
+///
+/// # 1. Where the tree is read from, and why that is the whole question
+///
+/// [`reference_dump`] enters at [`ply_syntax::parse_unexpanded`]. That is
+/// `Parser::new(source, text).run_unexpanded(name)`: the grammar and the
+/// recovery loop, and **not** the three rewrites `Parser::run` performs after
+/// them, each gated on a `uses_*` flag:
+///
+/// | pass | lines | rewrites |
+/// | --- | ---: | --- |
+/// | `effect_set::expand` | 538 | splices a set's atoms into every row that names it |
+/// | `record_update::expand` | 530 | `{..b, f: e}` into a plain `Record` |
+/// | `try_op::expand` | 1,019 | `e?` into the `match` it stands for |
+///
+/// A **fourth** pass, `defaults::expand` (912 lines), fills unwritten arguments
+/// from the callee's signature and clears `App`'s keyword-argument list. It is
+/// **not** a parser pass and cannot become one: a defaulted argument's
+/// expression lives in the callee's *module*, so it needs the whole program,
+/// and it therefore runs inside [`ply_syntax::resolve`] (`resolve.rs:453`) — a
+/// phase this file never calls.
+///
+/// So the tree reaching this dumper is **pre** all four. Every boundary below
+/// follows from that one sentence.
+///
+/// > **Corrected 2026-08-30.** This section said the tree was *"**post** the
+/// > first three and **pre** the fourth"*, which was true of
+/// > `parse_recovering`, the entry point this file used until that day. The
+/// > port implements the grammar and none of the rewrites, so a post-rewrite
+/// > comparison measured four things at once and reported 28 of 763 inputs
+/// > disagreeing — 70.2% of the corpus by bytes — over sugar the port never
+/// > claimed to expand. `../GAPS.md` §11R.D is the decision and its cost.
+///
+/// **A warning to whoever edits this comment.** It used to be worse than this:
+/// `tests/fields.rs` read the whole of this file as a bag of words, so writing
+/// the bare name of an `ast.rs` field anywhere here — a doc comment included —
+/// told that test the field was covered, and drafting this very block once
+/// flipped its verdict from "one field is not dumped" to "every field is
+/// dumped". That test now strips `//` and `///` before matching, so prose here
+/// is inert and the names below no longer have to be spelled around. **The
+/// limit it does not close is still open**: naming a field is not emitting one,
+/// so a field read into a binding and never pushed to the output is green
+/// there. `../arm-harness.sh` is what catches that, and nothing else does.
+///
+/// # 2. What is compared
+///
+/// Every node in preorder with **its own span**; every list's length; every
+/// `Option`'s presence; every enum arm; every scalar payload. Then every
+/// diagnostic's code, primary span, label count, note count, and each label's
+/// own span and primary flag — 828 diagnostics over the 766-input corpus, with
+/// **no tolerance of any kind**. The one this harness used to grant, for
+/// `effect_set::expand`'s appended diagnostics, is deleted along with the pass
+/// that made it necessary.
+///
+/// # 3. What is not, in the order it costs
+///
+/// 1. **The three rewrites above — 2,087 lines of Rust that nothing in this
+///    spike tests.** This is the largest item and it is permanent under the
+///    decision. It is *measured*, not asserted:
+///    `tests/agreement.rs`'s
+///    `the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics`
+///    reports what the three add to the corpus — **7 diagnostics** (E0114 ×4,
+///    E0115 ×2, E0105 ×1, on 7 mined fixtures) and **3,974 nodes**
+///    (`db.ply` 2,137, `desk.ply` 1,028, `http.ply` 279, `json.ply` 119,
+///    `router.ply` 11, `config.ply` 11) — and pins the diagnostic figure so it
+///    cannot grow quietly. All seven were already excused by the tolerance the
+///    move deleted, so **no diagnostic this differential ever compared was
+///    given up**. `record_update` and `try_op` raise none anywhere in the
+///    corpus, so no error path of theirs was ever verified here.
+/// 2. **`defaults::expand`**, which was never in the comparison and cannot be,
+///    for the reason in §1. Note the direction: this is why the keyword
+///    arguments and fallback expressions below are *live* in this tree rather
+///    than already placed.
+/// 3. **Diagnostic message text and severity.** ~134 sites carry a
+///    `what: Bytes` that nothing reads. Every parser diagnostic is
+///    `Severity::Error`, so a warning added to the parser would be invisible.
+/// 4. **`FnDef::derived`** — the parser can only write `None`, and this file
+///    **asserts** that rather than skipping it.
+/// 5. **`Lit::Decimal`'s two numeric fields, and `Lit::Float`'s value.** Both
+///    sides dump the raw source over the literal's own span, because Ply can
+///    build neither an `f64` nor an `i128` from digits. This *removes* a
+///    normaliser where the lexer spike's float hole added one.
+///
+/// > **Two items left this list on 2026-08-30 and are recorded because what
+/// > they cost is the point.** `ExprKind::App`'s keyword-argument list was
+/// > absorbed by a `..` and emitted **nowhere**: `g(1, b: 2)`, `g(1, c: 2)` and
+/// > `g(1, b: h(2))` produced byte-identical dumps, so a port that read three
+/// > tokens and threw them away would have passed. `Param`'s
+/// > fallback-expression field was the same feature's other half. Both are
+/// > dumped now — the first as a `narg` node with its own span inside a
+/// > length-carrying list, the second as an `Option` under `prm` — and
+/// > `../arm-harness.sh` #17 and #20 are the two mutations that watch them.
+/// > Neither is reached by the mined corpus, which contains zero of either;
+/// > both are reached by `../fixtures/13-named-arguments-and-defaults.ply`,
+/// > which is therefore load-bearing.
+///
+/// # 4. The two tests that guard this list, and the exact limit of each
+///
+/// * **No `match` in this file has a `_` arm**, so a variant added to `ast.rs`
+///   stops the file compiling. It did: `RecordUpdate` and `Try` broke the build
+///   when they landed, which is the bit-rot `../README.md` §6 predicted.
+///   **The limit: `..` is a `_` for fields, and no compiler error attends it.**
+///   That limit cost this comparison a whole field for two days.
+/// * **`tests/fields.rs`** reads `ast.rs` and requires every field of every
+///   parsed type to be *named* in this file, with comments stripped from both
+///   sides first. **The limit, measured:** naming is not emitting — renaming a
+///   binding to `init: i0` keeps it green.
+pub mod dumper_boundaries {}
 
 /// The whole answer for one file: the tree, then every diagnostic in the order
 /// the parser raised them.
@@ -50,79 +195,147 @@ use std::collections::HashMap;
 /// closes the hole `spikes/ply-lexer/README.md` names by removing the
 /// normalisation from the comparison rather than adding a third normaliser.
 pub fn reference_dump(text: &str) -> String {
-    let (module, diags) = parse_recovering(SourceId(0), ModuleName::anonymous(), text);
-    let mut d = Dumper {
-        text,
-        out: String::new(),
-        unexpand: None,
-    };
-    d.list(&module.imports, Dumper::import);
-    d.list(&module.items, Dumper::item);
-    d.diags(&diags);
-    d.out
-}
-
-/// The same dump with `effect_set::expand`'s effect on the **tree** projected
-/// back out: every row's atoms truncated to the ones that were written, and
-/// every set's `expansion` emitted empty.
-///
-/// This exists because `items.ply` does not port the expander — the plan ranked
-/// it last and the spike did not reach it — and `examples/desk.ply` is 21% of
-/// the corpus by bytes and the one file in the tree that uses sets. Without
-/// this the honest options are to drop that file or to compare it against a
-/// pass the port does not have; this is the third, and it is a projection of
-/// the reference's *own output*, not a re-implementation:
-///
-/// * `expand` appends to `row.atoms`, in order, one set's `expansion` per
-///   entry of `row.aliases`. Those expansions are sitting in the tree, filled
-///   in by `write_back`, so how many atoms were appended is read off rather
-///   than recomputed. A set that was refused, one on a cycle, one named from
-///   another module and one that does not exist all contribute an empty
-///   expansion, which is exactly the zero atoms `expand` splices for them.
-/// * `write_back` gives the expansion to the **first** declaration of a name
-///   and to no later one, so the map here is built first-wins.
-///
-/// It is **not** applied to diagnostics: `expand` raises `E0105`, `E0114` and
-/// `E0115` of its own, `items.ply` raises `E0114` for its own reasons, and
-/// telling those apart by code would be guessing. A caller comparing an input
-/// that uses sets therefore compares trees here and states the diagnostics
-/// separately. `../GAPS-harness.md` §H4 carries the numbers.
-pub fn reference_dump_unexpanded(text: &str) -> String {
-    let (module, diags) = parse_recovering(SourceId(0), ModuleName::anonymous(), text);
-    let mut expansions: HashMap<Symbol, usize> = HashMap::new();
+    let (module, diags) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
+    // The one observable difference between the two entry points that is a
+    // *field* rather than a node: `effect_set::expand`'s `write_back` fills this
+    // in, so an empty one is evidence the pass did not run. Asserted rather than
+    // assumed, for `Dumper::fn_def`'s reason — if the pass ever moves back
+    // inside the grammar, the comparison should stop rather than quietly agree
+    // about a list that both sides happen to leave empty.
     for item in &module.items {
         if let Item::EffectSet(d) = item {
-            expansions
-                .entry(d.name.name.clone())
-                .or_insert(d.expansion.len());
+            assert!(
+                d.expansion.is_empty(),
+                "`parse_unexpanded` handed back an effect set whose `expansion` is filled \
+                 in, so `effect_set::expand` has run and this is no longer the tree the \
+                 grammar built"
+            );
         }
     }
+    dump_of(text, &module, &diags)
+}
+
+/// The dump of one already-parsed module. Split out of [`reference_dump`] so
+/// that [`nodes_the_rewrites_add`] can point it at a tree from the *other*
+/// entry point without a second copy of the encoder.
+fn dump_of(text: &str, module: &Module, diags: &[Diagnostic]) -> String {
     let mut d = Dumper {
         text,
         out: String::new(),
-        unexpand: Some(expansions),
     };
     d.list(&module.imports, Dumper::import);
     d.list(&module.items, Dumper::item);
-    d.diags(&diags);
+    d.diags(diags);
     d.out
 }
 
-/// Whether `parse_recovering` ran `effect_set::expand` over this file.
+/// **The tree half of the same cost: how many nodes the three rewrites add.**
 ///
-/// It is private to `ply-syntax` and it runs *inside* `Parser::run`, so the
-/// reference tree for a file that uses sets is post-expansion while
-/// `items.ply` — which does not port the expander — answers the written row.
-/// The corpus test uses this to state the boundary rather than to hide it: a
-/// file it reports `true` for is compared with its rows excluded and the
-/// exclusion is counted and printed.
+/// [`diagnostics_the_rewrites_add`] says what leaves the comparison on the
+/// diagnostic side. This says it on the node side, which is the side `../GAPS.md`
+/// §11R.D could only state in *lines of Rust*: `effect_set` splices a set's
+/// atoms into every row that names it, `record_update` writes one field copy per
+/// field it did not replace, and `try_op` writes a whole `match`. All three only
+/// ever add, so this is non-negative, and it is exactly the tree this
+/// differential does not look at.
+///
+/// The expanded tree is dumped with the **same** encoder, which is sound: it
+/// holds no `Try` and no `RecordUpdate` — that is what expansion means — so
+/// every arm it reaches is one that was there before those two variants existed.
+pub fn nodes_the_rewrites_add(text: &str) -> usize {
+    let (before, bd) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
+    let (after, ad) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
+    let b = node_count(&dump_of(text, &before, &bd));
+    let a = node_count(&dump_of(text, &after, &ad));
+    assert!(
+        a >= b,
+        "the rewrites removed {} node(s), which none of them can do",
+        b - a
+    );
+    a - b
+}
+
+// > **WITHDRAWN 2026-08-30 — the projection is gone, not merely unused.**
+// > `reference_dump_unexpanded` stood here, and `../GAPS-harness.md` §H4 was
+// > its cost. It read:
+// >
+// > > *"The same dump with `effect_set::expand`'s effect on the **tree**
+// > > projected back out: every row's atoms truncated to the ones that were
+// > > written, and every set's `expansion` emitted empty. This exists because
+// > > `items.ply` does not port the expander … and `examples/desk.ply` is 21%
+// > > of the corpus by bytes and the one file in the tree that uses sets.
+// > > Without this the honest options are to drop that file or to compare it
+// > > against a pass the port does not have; this is the third, and it is a
+// > > projection of the reference's *own output*, not a re-implementation: …
+// > > `expand` appends to `row.atoms`, in order, one set's `expansion` per
+// > > entry of `row.aliases`. Those expansions are sitting in the tree, filled
+// > > in by `write_back`, so how many atoms were appended is read off rather
+// > > than recomputed … It is **not** applied to diagnostics: `expand` raises
+// > > `E0105`, `E0114` and `E0115` of its own, `items.ply` raises `E0114` for
+// > > its own reasons, and telling those apart by code would be guessing."*
+// >
+// > Every sentence of that was true of a comparison entered at
+// > `parse_recovering`. This file enters at `parse_unexpanded`, where
+// > `effect_set::expand` **has not run**, so there is nothing to project: the
+// > rows already hold only the atoms that were written and every set's
+// > `expansion` is already empty. `Dumper::effect_set` now *asserts* that
+// > rather than emitting a zero for it, which is strictly stronger — a
+// > projection is a claim about a pass, an assertion is a check on one.
+// >
+// > What went with it: the whole diagnostic tolerance the last paragraph
+// > describes. `tests/agreement.rs`'s `only_the_expanders_diagnostics` was four
+// > conjuncts wide and excused 7 mined inputs; `expand` raising nothing means
+// > there is nothing to excuse, and the comparison is now exact on every
+// > diagnostic of every input. `../GAPS-harness.md` §H4 records the arithmetic.
+
+/// **What the pre-expansion comparison gives up, as data rather than as prose.**
+///
+/// Every diagnostic code `parse_recovering` raises for this input that
+/// [`parse_unexpanded`] does not, in order. Those are exactly the diagnostics
+/// the three rewrites raise, because the two entry points differ by nothing
+/// else: `Parser::run` is `Parser::run_unexpanded` plus three gated calls, and
+/// each can only append.
+///
+/// This is the **only** place in the harness that reaches
+/// `ply_syntax::parse_recovering`, and it reaches it to measure a cost, never
+/// to compare against it. It answers codes and not a dump, deliberately: a dump
+/// would invite somebody to diff it, and the whole argument of `../GAPS.md`
+/// §11R.D is that the post-rewrite tree is a different subject.
+///
+/// `tests/agreement.rs`'s `the_rewrites_this_comparison_gives_up_raise_exactly_
+/// these_diagnostics` is the caller, and it pins the total over the corpus.
+pub fn diagnostics_the_rewrites_add(text: &str) -> Vec<String> {
+    let (_, before) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
+    let (_, after) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
+    assert!(
+        after.len() >= before.len(),
+        "the rewrites removed a diagnostic, which no pass can do: {} before, {} after",
+        before.len(),
+        after.len()
+    );
+    after[before.len()..]
+        .iter()
+        .map(|d| d.code.to_string())
+        .collect()
+}
+
+/// Whether this file would have had `effect_set::expand` run over it, had the
+/// comparison entered at `parse_recovering`.
+///
+/// Kept after the projection went, and its job changed: it used to *select* the
+/// projected dump, and it now only names the files whose comparison used to be
+/// weaker than the rest. `tests/agreement.rs`'s
+/// `the_one_file_that_used_to_need_a_projection_is_now_compared_whole` is the
+/// only caller, and it asserts that the set is still exactly `desk.ply` — so if
+/// a second file starts using effect sets, the test that says "and it is
+/// compared whole like everything else" is re-read rather than silently widened.
 ///
 /// This mirrors `parser.rs`'s own `uses_effect_sets` from the outside: the flag
 /// is set by writing an `effect set` item or by naming one in a row, and after
 /// the parse those are exactly a non-empty `EffectSetDef` list and a non-empty
 /// `RowExpr::aliases`.
 pub fn uses_effect_sets(text: &str) -> bool {
-    let (module, _) = parse_recovering(SourceId(0), ModuleName::anonymous(), text);
+    let (module, _) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let mut found = module.items.iter().any(|i| matches!(i, Item::EffectSet(_)));
     walk_rows(&module, &mut |r: &RowExpr| {
         if !r.aliases.is_empty() {
@@ -137,7 +350,6 @@ fn walk_rows(module: &Module, f: &mut impl FnMut(&RowExpr)) {
     let mut d = Dumper {
         text: "",
         out: String::new(),
-        unexpand: None,
     };
     d.rows_of_module(module, f);
 }
@@ -145,9 +357,6 @@ fn walk_rows(module: &Module, f: &mut impl FnMut(&RowExpr)) {
 struct Dumper<'a> {
     text: &'a str,
     out: String,
-    /// `Some(name -> expansion length)` in the projected mode described on
-    /// [`reference_dump_unexpanded`]; `None` in the plain one.
-    unexpand: Option<HashMap<Symbol, usize>>,
 }
 
 impl<'a> Dumper<'a> {
@@ -321,21 +530,11 @@ impl<'a> Dumper<'a> {
         }
     }
 
+    /// Every atom the row **wrote**, which is every atom it holds: no set has
+    /// been spliced into it, because `effect_set::expand` did not run.
     fn row(&mut self, r: &RowExpr) {
         self.rec(r.span, "row");
-        let written = match &self.unexpand {
-            None => r.atoms.len(),
-            Some(map) => {
-                let appended: usize = r
-                    .aliases
-                    .iter()
-                    .filter(|q| q.is_bare())
-                    .filter_map(|q| map.get(q.symbol()))
-                    .sum();
-                r.atoms.len().saturating_sub(appended)
-            }
-        };
-        self.list(&r.atoms[..written], Self::atom);
+        self.list(&r.atoms, Self::atom);
         self.list(&r.aliases, Self::qname);
         self.opt(r.tail.as_ref(), Self::ident);
     }
@@ -355,10 +554,16 @@ impl<'a> Dumper<'a> {
         self.list(&g.effects, Self::ident);
     }
 
+    /// The fallback expression is dumped like any other `Option`, and that is a
+    /// change: it arrived with ADR 0029 and nothing emitted it until
+    /// `../GAPS.md` §11R.D moved this comparison to the pre-rewrite tree.
+    /// `tests/fields.rs` was failing on it, which is why `../run.sh` stopped
+    /// before reaching the differential at all (§11R.S).
     fn param(&mut self, p: &Param) {
         self.rec(p.span, "prm");
         self.ident(&p.name);
         self.opt(p.ty.as_ref(), Self::ty);
+        self.opt(p.default.as_ref(), Self::expr);
     }
 
     // --- patterns -----------------------------------------------------------
@@ -423,12 +628,29 @@ impl<'a> Dumper<'a> {
                 self.list(params, Self::param);
                 self.expr(body);
             }
-            // `named` is empty: `defaults::expand` places every named argument
-            // in `resolve`, which runs before anything here sees a tree.
-            ExprKind::App { func, args, .. } => {
+            // Every `name: value` argument, with its own span, its name and
+            // its value — and the list's length, so a call that dropped one
+            // could not be absorbed.
+            //
+            // Not dumping this was the defect `../GAPS.md` §11R.N measured:
+            // `g(1, b: 2)`, `g(1, c: 3)` and `g(1, b: h(2))` produced
+            // byte-identical dumps, so a port that read the three tokens and
+            // threw them away would have passed. The comment this replaces
+            // argued the field was empty here — "`defaults::expand` places
+            // every named argument in `resolve`, which runs before anything
+            // here sees a tree" — and had the phase order backwards:
+            // `defaults::expand` runs in `resolve`, which is *after* this and
+            // which this file never calls.
+            //
+            // Note what did NOT fix it: `tests/fields.rs` reported `named` as
+            // covered throughout, because the word appears in a doc comment
+            // about effect sets. That test now strips comments (see its
+            // header); this arm is what actually emits the field.
+            ExprKind::App { func, args, named } => {
                 self.rec(e.span, "eapp");
                 self.expr(func);
                 self.list(args, Self::expr);
+                self.list(named, Self::named_arg);
             }
             ExprKind::If {
                 cond,
@@ -510,17 +732,31 @@ impl<'a> Dumper<'a> {
                 self.expr(body);
             }
 
-            // Two nodes that cannot reach a dumper: both are sugar the parser
-            // expands before `parse_recovering` returns (ADR 0023, ADR 0028),
-            // and a refused one is rewritten to its operand rather than kept.
-            // The arms exist because this `match` has no `_`, which is what
-            // stopped this file compiling when the two variants were added --
-            // the bit-rot `README.md` §6 predicted, working as designed.
-            ExprKind::RecordUpdate { .. } => {
-                unreachable!("`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`")
+            // > **Withdrawn 2026-08-30.** These two arms were
+            // > `unreachable!()`, under: *"Two nodes that cannot reach a
+            // > dumper: both are sugar the parser expands before
+            // > `parse_recovering` returns (ADR 0023, ADR 0028) … The arms
+            // > exist because this `match` has no `_`, which is what stopped
+            // > this file compiling when the two variants were added -- the
+            // > bit-rot `README.md` §6 predicted, working as designed."*
+            // >
+            // > Every clause of that is still true **of `parse_recovering`**,
+            // > and this file no longer enters there: it enters at
+            // > `parse_unexpanded`, where both nodes are exactly what the
+            // > grammar built and neither rewrite has run. So the two arms
+            // > that were unreachable are now the two that carry 70.2% of the
+            // > corpus by bytes. `../GAPS.md` §11R.D is the decision.
+            ExprKind::RecordUpdate { base, fields } => {
+                self.rec(e.span, "erup");
+                self.expr(base);
+                self.list(fields, |d, (n, v)| {
+                    d.ident(n);
+                    d.expr(v);
+                });
             }
-            ExprKind::Try { .. } => {
-                unreachable!("`e?` is expanded away by `ply_syntax::parse_module`")
+            ExprKind::Try { operand } => {
+                self.rec(e.span, "etry");
+                self.expr(operand);
             }
         }
     }
@@ -543,6 +779,15 @@ impl<'a> Dumper<'a> {
                 self.expr(e);
             }
         }
+    }
+
+    /// A named argument carries **its own span** as well as its name and its
+    /// value: `E0123` and `E0124` both point at exactly that span, and nothing
+    /// else in the dump would pin it.
+    fn named_arg(&mut self, n: &NamedArg) {
+        self.rec(n.span, "narg");
+        self.ident(&n.name);
+        self.expr(&n.value);
     }
 
     fn arm(&mut self, m: &MatchArm) {
@@ -694,15 +939,18 @@ impl<'a> Dumper<'a> {
         self.ident(&d.target);
     }
 
+    /// The `expansion` list is `effect_set::expand`'s own output, written back
+    /// into the tree by `write_back`, so entering at `parse_unexpanded` makes it
+    /// always empty. The **check** that it is lives at [`reference_dump`] rather
+    /// than here, because it is a claim about which entry point was used and not
+    /// about how a node is encoded — [`nodes_the_rewrites_add`] deliberately
+    /// dumps an expanded tree through this same encoder, and must not trip it.
     fn effect_set(&mut self, d: &EffectSetDef) {
         self.rec(d.span, "set");
         self.ident(&d.name);
         self.list(&d.atoms, Self::atom);
         self.list(&d.includes, Self::qname);
-        match self.unexpand {
-            None => self.list(&d.expansion, Self::atom),
-            Some(_) => self.nlist(0),
-        }
+        self.list(&d.expansion, Self::atom);
     }
 
     fn item(&mut self, i: &Item) {

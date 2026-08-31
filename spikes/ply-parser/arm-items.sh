@@ -108,9 +108,15 @@ probe "an effect set is recognised without its third token" \
   'pub fn at_effect_set_start(c: Ctx, p: P) -> Bool =
   false && at(c, p, k_effect())'
 
+# The anchor here named `body.node`, which stopped existing when `?` replaced
+# the `bail` flag and `fn_def` began destructuring its callee's answer
+# (`let {p, node: body} = fn_body(c, p)?`). It reported MUTATION MISSED from
+# that day until 2026-08-30 -- a corruption that tests nothing and says so, but
+# only to a reader of the last column. Re-anchored, not dropped: it is the only
+# probe in this file aimed at an item's span.
 probe 'a FnDef span stops at its own keyword' \
-  'body: body.node, span: span_to(st.node, expr_span(body.node)) } }' \
-  'body: body.node, span: st.node } }'
+  'body: body, span: span_to(st.node, expr_span(body)) } })' \
+  'body: body, span: st.node } })'
 
 probe "an import kind reports names and alias interchangeably" \
   'INames(ns) -> at_ident_text(c, p, b"as"),' \

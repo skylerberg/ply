@@ -351,6 +351,14 @@ Both were fixed by adding fixtures (`dump_generics_of`, `dump_param_of`, and
 lexer spike's finding repeated: `arm-spine.sh`'s header records six such tests
 in the spine.
 
+> **`dump_param_of` moved on 2026-08-30** and so did the `param` it drives, to
+> `exprs.ply`, because a parameter's default is an expression (ADR 0029;
+> `../GAPS.md` §11R.X). This area's own suite therefore no longer reaches
+> `param` at all — the second bullet above is now true of it as well as of
+> `generics`, and `test-exprs.sh` is where those four tests run. Nothing about
+> the first two bullets' *finding* changes; what changed is which area's
+> entry-point list has to carry it.
+
 ## §P9 A1-M4 — every accumulator in this area is linear
 
 `PREREGISTRATION.md` §1 M4 registers the prediction **linear**, ratio per

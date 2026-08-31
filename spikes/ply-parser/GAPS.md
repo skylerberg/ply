@@ -825,6 +825,549 @@ alternative — an asserted input-level tolerance in the `desk.ply` shape — wo
 turn the suite green while making "0 disagreements" mean something narrower than
 it means above, and is refused for that reason.
 
+### §11R.D The decision: **compare pre-expansion**, and what that does and does not cover
+
+**Taken 2026-08-30, from the tree in `~/.worktrees/ply/spike-parser-ci`, with every
+figure below re-measured here rather than quoted from above.** The paragraph
+immediately preceding this one framed the choice as two options — port the passes,
+or assert a tolerance — and refused the second. **There is a third it did not
+consider: read the reference's tree *before* the passes run.** It is the option
+`reference_dump_unexpanded` already takes for `effect_set`, generalised from a
+projection to an entry point, and it is the one taken here.
+
+#### Four corrections to the framing, each measured
+
+**1. There are three passes in the parser, not four. `defaults::expand` is not a
+parser pass and never can be.** It is called from `resolve.rs:453`, inside
+`resolve`, and `defaults.rs`'s own header gives the reason:
+
+> *"A default lives in the **callee's** module, so matching a call against a
+> signature needs the whole program — which the parser, running one file at a
+> time, does not have. `resolve` is the first point that does"*
+
+So with respect to named arguments and default parameters the harness is
+**already** comparing a pre-expansion tree and has no choice about it: it enters
+at `parse_recovering`, and `defaults::expand` runs two phases later. A
+post-expansion comparison of *those* would require porting `resolve` — a
+whole-program name resolver — which is not this spike and not the next one
+either. The question is only ever about the three passes `Parser::run` gates:
+`effect_set` (538), `record_update` (530), `try_op` (1,019).
+
+**2. §H4's projection method is not available for the other two, and that is a
+property of the passes.** `reference_dump_unexpanded` can un-expand effect sets
+because `effect_set::expand` **records its own output in the tree** —
+`write_back` fills `EffectSetDef::expansion`, so how many atoms were spliced is
+*read off*. Neither of the other two records anything, and both headers state the
+opposite as the design goal: record update *"rewrites every one into the plain
+`ExprKind::Record` a reader would have written by hand"*, and `?` into *"the
+`match` the corpus already hand-writes **129 times**"* — precisely so that sugar
+and longhand carry one hash. A projection would therefore have to **guess** which
+`Record` was an update and which `match` was a `?`, and it would be wrong on all
+129. §H4 cannot be repeated here; it was not an oversight that it was not.
+
+**3. 22 of the 28 disagreements are a lexer byte, not an expansion.** Re-run
+first-hand: 22 mined + `desk` + `config`, `db`, `http`, `json`, `router` = 28,
+exactly the set above. But every one of the 22 mined fixtures is a **Rust format
+string** mined out of `tests.rs` — `{src:?}`, `{ds:#?}`, `{v:?}f` — and each
+disagreement is a *diagnostic count*: the reference lexes `TokenKind::Question`
+and says nothing, `lexer.ply`'s `punct` has no arm for byte 63 at all and raises
+an extra `E0001` there. Fixture `#309` is the shape:
+
+```
+  rust: #1   !E0001:0:8:1:0
+  ply : #2   !E0001:31:32:1:0   !E0001:0:8:1:0
+```
+
+Offset 31 is the `?`. **Not one of the 22 contains the try operator**; the mined
+half of the corpus holds **zero** real uses of `?` and **zero** of `{..`. Those
+22 are closed by the one line §11R already calls trivial.
+
+**4. The 70.2% is carried by six files and 143 sugar tokens.** Counted with the
+reference's own lexer over all 47 corpus files:
+
+| file | `?` tokens | `{ ..` | bytes |
+| --- | ---: | ---: | ---: |
+| `crates/ply-std/ply/db.ply` | 128 | 0 | 130,191 |
+| `crates/ply-std/ply/json.ply` | 7 | 0 | 67,326 |
+| `crates/ply-std/ply/http.ply` | **1** | **4** | 126,475 |
+| `crates/ply-std/ply/config.ply` | **1** | 0 | 8,683 |
+| `crates/ply-std/ply/router.ply` | **1** | 0 | 55,585 |
+| `examples/desk.ply` | **1** | 0 | 159,939 |
+| | **139** | **4** | **548,199** |
+
+**`examples/desk.ply` is 159,939 bytes and leaves the comparison for a single `?`
+on line 654.** `config`, `router` and `http` are one each. The byte-weighted loss
+is not proportional to feature use and never was — 143 tokens cost 548,199 bytes,
+and 548,199 of the 548,739 lost bytes (99.90%) are these six files.
+`examples/twin_divergence_audit.ply` and `crates/ply-std/ply/router.ply` both
+contain `?` **in text** and agree; the reference lexer finds 0 and 1 `Question`
+tokens in them respectively, because the rest sit inside strings and comments.
+Grepping the corpus for `?` would have mis-attributed both.
+
+#### The decision, and the argument
+
+**Compare the tree `Parser::run` builds, before `effect_set`, `record_update` and
+`try_op` rewrite it.** Four reasons, in the order they carry weight:
+
+1. **It gives up no coverage the differential has.** Measured, not asserted: the
+   differential verifies `try_op::expand` on **0** inputs and
+   `record_update::expand` on **0** inputs today — every input carrying either
+   sugar is in the disagreeing set — and it verifies `effect_set::expand` on
+   **0** by construction, because §H4 projects it out of the one file that uses
+   it. **Pre-expansion moves the covered count from 0 to 0.** What it moves is
+   the corpus, from 29.8% of bytes to substantially all of it.
+2. **Post-expansion is a second parser.** `record_update.rs` (530) +
+   `try_op.rs` (1,019) = 1,549 lines of Rust, at §14's measured Ply÷Rust parser
+   ratio of **1.73 total / 1.27 code**, is **~2,680 Ply lines** against a whole
+   Ply parser of 3,650. And 1.73 is a **floor** here: it was measured on
+   recursive descent over a token stream, where these are tree **rewrites** over
+   an immutable AST — §7's worst case, where every unchanged node is rebuilt by
+   hand. Add `effect_set` to close §H4 as well and it is ~3,611. §11R's own
+   sentence stands and this only sharpens it: *that is a second spike, not a
+   repair.*
+3. **It makes the differential measure one thing.** As it stands a disagreement
+   cannot say whether the parser or a rewrite is wrong, and §H3's sixteen
+   mutations are all parser mutations — a seventeenth aimed at an expander has
+   nothing on the port's side to hit. Pre-expansion also *creates* the artifact a
+   later expansion spike would need: a pre-expansion reference tree, which does
+   not exist today at any public entry point.
+4. **The port is already producing the pre-expansion tree, and the diff shows
+   it.** On `router.ply` the two trees are identical for 3,138 records and part
+   at exactly the rewrite:
+
+   ```
+   rust: 10326:10391:eblk  #0   ?1  10338:10362:emat  10338:10361:eapp …
+   ply : 10326:10391:eblk  #1  10330:10363:slet  10334:10335:pvar …  10338:10361:eapp …
+   ```
+
+   The reference turned `let d = decimal_of_string(text)?;` into a `match` with
+   zero statements and the match as the block's tail; `exprs.ply` kept the `let`
+   it read. Same spans, same `eapp`, same everything else. The port is not wrong
+   about this file — it is being compared against a later phase.
+
+#### What it costs, in the shape §H4 states its cost
+
+Three things leave the comparison, and they are written into `GAPS-harness.md`
+§H2 as item 5 so they are enforced-by-listing rather than remembered:
+
+| | lines of Rust | corpus diagnostics it raises | what leaves |
+| --- | ---: | ---: | --- |
+| `effect_set::expand` | 538 | **9** (E0114 ×6, E0115 ×2, E0105 ×1) | the tree effect §H4 already projects out, and 7 of the 9 that §H4's tolerance already excuses |
+| `record_update::expand` | 530 | **0** | canonical field order, `E0116`/`E0117` |
+| `try_op::expand` | 1,019 | **0** | the `match` shape, the `let` split, `E0118`/`E0119` |
+| *(`defaults::expand`, for completeness)* | 912 | — | never in the comparison; runs in `resolve` |
+
+**The diagnostic half costs 9 of 833 (1.1%), and 7 of those 9 are excused
+today.** `record_update` and `try_op` raise **zero** diagnostics anywhere in the
+763 inputs — measured by counting `!E0116`/`!E0117`/`!E0118`/`!E0119` in the
+reference dump of every input — so the differential has never seen one of their
+error paths and pre-expansion gives up none. The 2,087 lines of tree rewriting
+do leave permanently, and nothing in this spike will test them; that is the
+honest price and it is item 5's job to keep saying so.
+
+> **Corrected on implementing it, 2026-08-30: the diagnostic half costs 7, not
+> 9, and the table's `effect_set` row is wrong by the same two.** The nine were
+> counted by grepping `E0114`/`E0115`/`E0105` out of the reference's dump, which
+> attributes a diagnostic by its **code**. Differencing the two entry points
+> directly — `parse_recovering`'s diagnostics minus `parse_unexpanded`'s, which
+> is the only way to attribute one to a *pass* — gives **E0114 ×4, E0115 ×2,
+> E0105 ×1 = 7**, on 7 mined fixtures and no other input. The two missing
+> `E0114`s are `items.ply`'s own refusal of `pub effect set`, which shares the
+> code and is raised by the **grammar**, on both sides, and was never
+> `effect_set::expand`'s.
+>
+> This makes the argument stronger and it is worth saying why rather than just
+> correcting the number. Those 7 are **exactly** the 7 that §H4's tolerance
+> excused. So the diagnostic cost of pre-expansion is not "7 of 9 were already
+> excused" — it is **all of them were**, and the set of diagnostics this
+> differential ever actually compared did not change by one.
+>
+> `harness/tests/agreement.rs`'s
+> `the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics` pins
+> the 7 and prints the seven fixtures. **And it takes the half this section
+> could only state in lines of Rust**: the same three passes add **3,974 nodes**
+> over the corpus — `db.ply` 2,137, `desk.ply` 1,028, `http.ply` 279, `json.ply`
+> 119, `router.ply` 11, `config.ply` 11 — which is the tree the comparison does
+> not look at, as a number.
+
+**One cost is not free and must be stated: the reference crate has to grow an
+entry point.** `lib.rs` declares `mod effect_set; mod record_update; mod try_op;`
+privately and all three `expand` functions are `pub(crate)`, so **no external
+crate can decline them.** A pre-expansion comparison therefore needs `ply-syntax`
+to expose the unexpanded tree — one function, `#[doc(hidden)]`, with a test that
+no shipping caller reaches it. That is a change to a shipping crate made for a
+spike, it is the single real cost of this choice, and it is smaller than 2,680
+lines of Ply by three orders of magnitude.
+
+#### §11R's own list, re-priced under the decision
+
+> Withdrawn as the only reading, not as fact: *"**What restoring it would take**,
+> in order: a `?` byte in `lexer.ply` (trivial); postfix `?` and an `ERecord`
+> base in `exprs.ply` (modest); and then `try_op::expand` (1,008 lines of Rust)
+> and `record_update::expand` (529) ported into Ply. **1,537 lines — larger than
+> the `effect_set::expand` (535) this spike declined and priced in §11.**"*
+
+Every number in it is right and the line counts are off by one or two against
+today's files (1,019 / 530 / 538 as of this measurement). What it does not say is
+that **the list has a semicolon in it that is a decision point.** The first two
+items restore 99.90% of the lost bytes on their own; the third is needed only if
+the comparison is taken *after* the rewrites. Under the decision above the work
+is the first two, plus named arguments and default parameters, which §11R does
+not mention at all because §11R did not know `App` had grown a field:
+
+| what `spikes/ply-parser/*.ply` must learn | where | est. Ply lines |
+| --- | --- | ---: |
+| the `?` byte → `TPunct(b"question")` | `lexer.ply` `punct`, byte 63 | 1 (+1 accessor) |
+| `ETry({span, operand})` + postfix `?` | `exprs.ply` `postfix_expr`, and arms in `expr_span`, `with_span`, `dump_expr`, `node_count` | ~14 |
+| `ERecordUpdate({span, base, fields})` + `{..b, f: e}` | `exprs.ply` `at_record_literal`, `record_expr_inner`, same four total matches | ~26 |
+| `NamedArg` + `EApp.named` + `positional_after_named` + the `perform` refusal | `exprs.ply` `call_args_inner`; the 2-token lookahead already exists as `kind_at(c, p, n)` | ~45 |
+| `Param.default` | `types.ply:72/96/373` and `dump_param` | ~20, **and a layering decision** |
+| **total** | | **~110** |
+
+**The `Param.default` row is the only one that is not mechanical**, and it is
+worth naming because it is a cost of the split this spike chose rather than of
+the feature. `types.ply:371` says why `param` lives there:
+
+> *"Lives in this area rather than with items because both `fn_def` and
+> `lambda_expr` need it and **it needs only `ty`**."*
+
+A default is an **expression**, so that stops being true: `param` would need
+`expr`, which is above it. Either `param` moves into `exprs.ply` or it takes the
+expression parser as an argument. The reference has no such problem — its `param`
+is in `parser.rs` with everything else — so this is a line item the Ply÷Rust
+ratios of §14 do not capture, and §9's "small missing pieces" is where it belongs
+if it is paid.
+
+**~110 Ply lines against ~2,680.** That is the decision.
+
+### §11R.N A fourth feature landed and the differential cannot see it — `App.named`, and a field test that is green because of an English word
+
+`ExprKind::App` gained a third field, `named: Vec<NamedArg>` (ADR 0029), so
+**every call in the corpus changed shape**, not only the ones that use a named
+argument. The reference dumper takes it like this — `harness/src/lib.rs:426`:
+
+```rust
+// `named` is empty: `defaults::expand` places every named argument
+// in `resolve`, which runs before anything here sees a tree.
+ExprKind::App { func, args, .. } => {
+    self.rec(e.span, "eapp");
+    self.expr(func);
+    self.list(args, Self::expr);
+}
+```
+
+**That comment is false, and the `..` is the hole it excuses.** The harness's
+entry point is `parse_recovering`, which is `Parser::new(source, text).run(name)`
+and nothing else; `defaults::expand` is called from `resolve.rs:453`, in a phase
+the harness never runs. `resolve` does not run "before anything here sees a
+tree" — it runs after, and only for callers that ask for it. So `named` is
+**not** empty here, and the `..` drops it on the floor.
+
+**Seen, not reasoned about.** Three probes, each a pair of inputs of identical
+length so that no span moves, through `refdump`:
+
+| | | |
+| --- | --- | --- |
+| `g(1, b: 2)` vs `g(1, b: 3)` | dumps **byte-identical** | the argument's **value** is invisible |
+| `g(1, b: 2)` vs `g(1, c: 2)` | dumps **byte-identical** | the argument's **name** is invisible |
+| `g(1, b: h(2))` vs `g(1, b: k(9))` | dumps **byte-identical** | an entire **call subtree** inside one is invisible |
+
+The dump of `g(1, b: 2)` is `…:eapp; …:evar; …; #1; 55:56:elit;%int;@31;` — one
+positional argument, and of `b: 2` not a node, not an ident, not a span. **A Ply
+parser that lexed `b`, `:`, `2` and threw all three away would produce a
+byte-identical dump and the differential would pass.** That is the cheapest way
+to make a named argument agree, and nothing in this spike would notice it had
+been taken.
+
+**Why `harness/tests/fields.rs` did not catch it, which is the part worth
+reading twice.** That test exists for exactly this class — its own header says
+*"a tree comparison that passes under a dropped field is worth nothing and this
+project has shipped that exact defect before"* — and it passes over `App::named`
+today. It checks that a field is **named** somewhere in `src/lib.rs`, by
+whole-word split. The word `named` occurs twice in that file and **neither
+occurrence is a dump**: once in the comment above, and once at line 79, in the
+doc comment for the *effect-set* projection, as ordinary English —
+
+> *"A set that was refused, one on a cycle, one **named** from another module and
+> one that does not exist all contribute an empty expansion"*
+
+**Armed, and seen to go red.** Corrupting only prose, in three steps, with the
+test re-run after each: rewriting line 426's `` `named` is empty `` to
+`this field is empty` — still green over `App::named`; rewriting the rest of
+that line so `named argument` becomes `keyword arg` — still green; and only on
+rewriting line 79's `one named from` to `one written in`, leaving zero
+whole-word occurrences in the file, does it report
+
+```
+left:  {("ExprKind", "named"), ("Lit", "mantissa"), ("Lit", "scale"), ("Param", "default")}
+right: {("Lit", "mantissa"), ("Lit", "scale")}
+```
+
+`src/lib.rs` was restored byte-identical afterwards and the verdict re-checked.
+**The field test's green over `App::named` is bought by a sentence about effect
+sets.** §H2 already carries the limit that produced this — *"It checks that a
+field is **named**, not that it is **emitted**"* — recorded when renaming a
+binding was found to defeat it. This is the same limit reached by a second road,
+and the second road is worse: the first needed someone to edit the dumper, this
+one needs nobody to do anything.
+
+**`Param::default` is the same feature's other half and it is *not* excused —
+the test fails on it right now**, and that changes where `run.sh` stops (§11R.S).
+
+#### The finding that arrived by accident: writing this section flipped the test
+
+The `dumper_boundaries` doc added to `harness/src/lib.rs` for §11R.D names the
+fields it is about, the way documentation does. Naming them **changed
+`fields.rs`'s verdict**, because that test reads the whole file as a bag of
+whole words and does not care whether a word is code, a comment, or a sentence:
+
+| `harness/src/lib.rs` | `fields.rs` says |
+| --- | --- |
+| as found | `left: {("Lit","mantissa"), ("Lit","scale"), ("Param","default")}` — **fails**, correctly, on the one field that is not dumped |
+| with the new prose, first draft | `left: {}` — **every field of `ast.rs` reported as covered**, including the two that are deliberately absent |
+
+The three words that did it were `default`, `mantissa` and `scale`, written in
+sentences *stating that those fields are not dumped*. One of them was not even a
+field reference: the phrase *"a default lives in the callee's module"*, quoting
+`defaults.rs`'s own header, was enough to mark `Param::default` covered.
+
+**So the test can be turned green by describing the hole it exists to report.**
+It is now green-adjacent in both directions — silent on `App::named` because of
+an unrelated sentence, and silenceable on any field by writing a true sentence
+about it. The prose in `dumper_boundaries` spells all three names around
+("`Param`'s fallback-expression field", "`Lit::Decimal`'s two numeric fields")
+and carries a warning not to add them back, and the verdict above was re-checked
+byte-for-byte against the one taken before any edit. **That is a workaround and
+it is recorded as one.** The repair is to make `fields.rs` scan what the dumper
+*emits* rather than what it *mentions* — at minimum, strip `//` and `///` lines
+before matching, which alone would have caught `App::named` — and it is the
+first item of work this phase hands on.
+
+**What it costs today: nothing measurable, and that is the trap.** The 763-input
+corpus contains **zero** named arguments and **zero** default parameters — every
+call parsed to `named.len() == 0` and every `Param.default` to `None`. So the
+blindness is currently free, and it will not stay free: re-mining
+`crates/ply-syntax/src/tests.rs` with this spike's own `mine-fixtures.py` yields
+**889 fixtures against the checked-in 716** (33,826 bytes against 22,737), and
+**2 of the 173 new ones carry 6 `NamedArg` nodes and 2 carry 3 `Param.default`s**
+— including `tests.rs`'s own `f(x, m: 1)`. The corpus is frozen at the moment
+the spike was taken, nothing asserts it is current, and the day it is refreshed
+those six subtrees enter a comparison that cannot see them.
+
+### §11R.S Corrected in place: `run.sh` no longer reaches the differential, and the gate that stops it first is one nobody has read
+
+§11R opens:
+
+> Withdrawn: *"**`./spikes/ply-parser/run.sh` exits 101 at the differential.**"*
+
+and `README.md` §Status says the same thing more strongly:
+
+> Withdrawn: *"`run.sh` exits **101**, at the differential **and only there**.
+> Everything before it passes: instrument current, **110** in-language tests
+> (112 → 110; two suites became unwritable when `bail` did, `GAPS.md` §2),
+> harness `--lib` 10 + **`--test fields` 1**, `cargo fmt --check` and `clippy -D
+> warnings` clean."*
+
+**It exits 101 one step earlier, at `cargo test --test fields`.** Every step of
+`run.sh` was run individually, in its own order, on 2026-08-30:
+
+| `run.sh` step | today |
+| --- | --- |
+| `cargo build --release -p ply-cli` | ok, 32.68s |
+| `.github/binary-is-current.sh` | `current  target/release/ply  (157 inputs checked)` |
+| `test-items.sh` | **0 failed, 110 passed** (119 since the four features were ported) |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test --lib` | **10 passed** |
+| `cargo test --test fields` | **FAILS** — `("Param", "default")` |
+| `cargo test --test agreement` | **never reached by `run.sh`** |
+
+So the two figures the README pairs are no longer both true: `--lib 10` still is,
+`--test fields 1` is not. The failure is the honest one — `Param` gained a
+`default` field (ADR 0029) that the reference dumper names nowhere, and the test
+built to say so says so:
+
+```
+a field of a parsed AST type is not named anywhere in the reference dumper.
+left:  {("Lit", "mantissa"), ("Lit", "scale"), ("Param", "default")}
+right: {("Lit", "mantissa"), ("Lit", "scale")}
+```
+
+**Two consequences, and the second is the one that matters.** First, §11R's
+"28 of 763 disagree" is still exactly right — run directly, bypassing `run.sh`,
+the differential reports **22 of 716 mined + 1 of 13 examples (`desk`) + 5 of 8
+stdlib**, with §H4's tolerance excusing 7 mined inputs (E0114 ×4, E0115 ×2,
+E0105 ×1) — but **`run.sh` no longer prints it**, so the one command README §6
+names as the thing that would notice the bit-rot now stops before reaching its
+own headline. Second, **`fields.rs` failed on `Param::default` while passing on
+`App::named`**, and those two fields arrived in the same ADR. A field test that
+catches one half of one feature and is defeated on the other half by an unrelated
+English sentence (§11R.N) is not a boundary; it is a coin.
+
+**The instrument's other blind spot, found while checking it.**
+`.github/binary-is-current.sh` is sound and reports `current` — its dep-info arm
+covers 144 `.rs` and all eight `crates/ply-std/ply/*.ply`, which is what it
+claims. But nothing anywhere checks that
+`fixtures/reference-tests.corpus` is current with respect to
+`crates/ply-syntax/src/tests.rs`, which `mine-fixtures.py` generates it from.
+`agreement.rs` asserts only `fixtures.len() > 700`. It is 716; re-mining today
+gives 889 (§11R.N). **The corpus is a checked-in artifact of a generator with no
+freshness gate, in a spike with no CI job** — the same class as the binary this
+repository built a whole script to catch, one directory over.
+
+---
+
+### §11R.X Implementing it: what the decision cost, and the four things taking it found
+
+**Done 2026-08-30, in `~/.worktrees/ply/spike-parser-ci`. `run.sh --arm` exits
+0.** §11R.D decided; this is what carrying it out actually took, including the
+places the decision's own arithmetic was wrong. Pre-registered at
+`/tmp/ply-preg/PREREG-restore-differential.md` before any number below existed.
+
+#### What was written, against §11R.D's estimate of ~110 Ply lines
+
+| §11R.D's row | estimate | actual | where |
+| --- | ---: | ---: | --- |
+| the `?` byte → `TPunct(b"question")` | 1 (+1) | **1** + 2 of comment + 1 test | `lexer.ply` `punct` |
+| `ETry` + postfix `?` | ~14 | **12** | `exprs.ply` `postfix_expr` and four `match`es |
+| `ERecordUpdate` + `{..b, f: e}` | ~26 | **45** | `exprs.ply`, and it needed `record_update_base` and `record_field`'s second-`..` refusal, which §11R.D did not list |
+| `NamedArg` + `EApp.named` + ordering + the `perform` refusal | ~45 | **58** | `exprs.ply` `call_args_inner`, `call_arg`, `split_args`, `refuse_named` |
+| `Param.default` | ~20 **+ a layering decision** | **48**, and the decision was forced | `exprs.ply`, moved out of `types.ply` |
+| — | — | **6** | `spine.ply`: `t_question` and three diagnostic codes |
+| **total** | **~110** | **~170** | |
+
+**The estimate was 35% low and every line of the overrun is in the two rows
+§11R.D flagged as uncertain.** The three mechanical rows came in at 13 against
+an estimated 15.
+
+**The layering decision was not a choice.** §11R.D wrote it as "either `param`
+moves into `exprs.ply` or it takes the expression parser as an argument". The
+second is not available: `Param` gains a field of type `Option<Expr>`, and
+`Expr` is declared in `exprs.ply`, which imports `types.ply`. A module cannot
+name a type from a module that imports it. So the **type** must move, and the
+parser and dumper move with it. `types.ply` keeps a withdrawal note where the
+declaration stood, quoting the sentence — *"it needs only `ty`"* — that stopped
+being true.
+
+#### The reference-crate cost, which §11R.D called the single real one
+
+`crates/ply-syntax` grew `#[doc(hidden)] pub fn parse_unexpanded`, and `run` was
+split into `parse_all` (the grammar and the recovery loop) plus the four lines
+that gate the three rewrites, so that **the gate is the only difference** between
+the two entry points and there is no second copy of the loop.
+`parse_unexpanded_is_reached_by_no_shipping_caller` walks every `.rs` under
+`crates/` and fails if any file but the three that are allowed to names it. Seen
+to fail: appending `// parse_unexpanded` to `crates/ply-eval/src/lib.rs` reports
+that file by path, and it was restored.
+
+#### Four findings, in the order they arrived
+
+**1. The differential went green on the first run, over the whole corpus.** No
+`.ply` file was edited to make a corpus file agree — the same property the
+original spike claims for itself in README §2. What was edited afterwards was
+six in-language expectation strings, all of them the two new `#0;`/`?0;` records
+the dump grammar gained, and one of those was a `prm` inside a `fn` — which is
+how the `Param` move was confirmed not to have changed anything else.
+
+**2. §11R.D's diagnostic price was wrong by two, in the direction that helps.**
+See the correction inside §11R.D above: 7, not 9, and all 7 were already excused.
+The lesson is about method rather than about effect sets — **a diagnostic cannot
+be attributed to a pass by its code**, because two passes may share one, and
+`items.ply` and `effect_set::expand` both raise `E0114`.
+
+**3. An assertion written for the comparison caught a measurement, not a bug —
+and that is why it moved.** `Dumper::effect_set` was given
+`assert!(d.expansion.is_empty())` to replace §H4's projection. It fired
+immediately, on `nodes_the_rewrites_add`, which deliberately dumps an *expanded*
+tree through the same encoder to price what leaves. The assertion was right and
+its **location** was wrong: "which entry point produced this tree" is a property
+of `reference_dump`, not of how a node is encoded. It moved there, and the note
+on `Dumper::effect_set` now says so. Recorded because the assertion was armed by
+accident — it went red before anybody tried to make it.
+
+**4. `fields.rs`'s repair is done, and it is the item this phase was handed.**
+§11R.N ended: *"The repair is to make `fields.rs` scan what the dumper *emits*
+rather than what it *mentions* — at minimum, strip `//` and `///` lines before
+matching, which alone would have caught `App::named` — and it is the first item
+of work this phase hands on."* The minimum is taken: `code_only` strips `//` and
+`///` from **both** files before matching, `a_field_named_only_in_a_comment_does_not_count_as_covered`
+arms it with the two shapes that caused the defect, and the field count is
+re-taken at **149 fields across 30 parsed types, 2 deliberately absent** (it
+said 144/29). The `dumper_boundaries` workaround — spelling `default`,
+`mantissa` and `scale` *around* rather than writing them — is no longer load-
+bearing, and its warning is corrected in place rather than deleted, because the
+larger limit it names is untouched: **naming is still not emitting.** A field
+read into a binding and never pushed to the output is green here, and
+`arm-harness.sh` is the only thing that would catch it.
+
+#### Two things found by running the generator, neither of them the parser
+
+**`mine-fixtures.py` requires every string literal in `crates/ply-syntax/src/tests.rs`
+to be printable ASCII, and nothing said so until one was not.** Adding
+`parse_unexpanded_is_reached_by_no_shipping_caller` with an em dash in its
+assertion message stopped the corpus generator with a bare `AssertionError`
+printing the whole literal. The miner takes *every* string literal in that file
+by design — §"The extraction is mechanical" argues for it — so its ASCII rule is
+a constraint on the **reference crate's test messages**, imposed by a spike, and
+written down nowhere. The message was changed to ASCII with a comment saying
+why; the alternative — teaching the miner to skip or escape non-ASCII — is a
+change to what the corpus contains and is not made under this heading.
+
+**The corpus is still stale, and by more than §11R.N measured.** Re-mining today
+gives **898 fixtures, 34,487 bytes** against the checked-in **716 / 22,737**
+(§11R.N read 889 / 33,826 before this session's own test literals were added).
+`agreement.rs` asserts only `fixtures.len() > 700`. **Deliberately not
+re-mined**: it would take the differential from 766 inputs to 948, which is a
+change a reviewer should see on its own rather than folded into this one, and
+the real fix is a freshness gate rather than a one-off regeneration. What *has*
+changed is the consequence: §11R.N's warning was that re-mining would bring 6
+`NamedArg` and 3 `Param.default` subtrees into a comparison that could not see
+them. It can see them now. So this is a stale artifact rather than a blind spot,
+which is a strictly smaller problem — and it is the first item this phase hands
+on, ahead of anything in §11R.D.
+
+#### And two arming scripts had a mutation that tested itself, both pre-existing
+
+Found by running all four per-area `arm-*.sh` scripts to check that moving
+`param` had not invalidated anything. It had not. Two of their mutations were
+already dead, in files this change did not touch:
+
+| script | mutation | why it had stopped landing |
+| --- | --- | --- |
+| `arm-types.sh` | *an uppercase bare name in a pattern becomes a binder* | its anchor began `else if is_bare(q.node) &&`; `patterns.ply:206` reads `if is_bare(q.node) &&` and always has. A typo, live since the script was written. |
+| `arm-items.sh` | *a `FnDef` span stops at its own keyword* | its anchor named `body.node`, which stopped existing when ADR 0028's `?` replaced the `bail` flag and `fn_def` began destructuring — `let {p, node: body} = fn_body(c, p)?`. |
+
+Both re-anchored rather than dropped, with the reason written above each, and
+both now **arm**. Neither is one of `arm-harness.sh`'s registered sixteen, so
+neither figure in §H3 or README §2 moves.
+
+**What is worth taking from it is the reporting shape, not the two typos.**
+Both scripts *did* say so — `MUTATION DID NOT LAND` and `MUTATION MISSED` — and
+both still exited 0 on the run that said it, so the message sat in a log nobody
+read. `arm-harness.sh` is the one that gets this right: `NOT APPLIED` counts as
+`invalid`, and the script's last line is
+`[ "$survived" -eq 0 ] && [ "$invalid" -eq 0 ]`. The other three should adopt
+it; that is a handed-on item and not done here.
+
+#### What is now watched that was not
+
+| | before | after |
+| --- | --- | --- |
+| inputs compared | 735 of 763 | **766 of 766** |
+| bytes compared | 232,634 (29.8%) | **786,957 (100%)** |
+| tolerances | 1, four conjuncts wide, 7 inputs | **0** |
+| `App`'s keyword arguments | invisible: `g(1, b: 2)`, `g(1, c: 2)` and `g(1, b: h(2))` dumped identically | a `narg` node with its own span, in a length-carrying list |
+| `Param`'s fallback expression | not dumped; `fields.rs` failing on it | an `Option` in `prm`, with the expression under it |
+| `?` and `{..b, f: e}` | unlexable, unparsable | `etry` and `erup`, 95/95 tag coverage |
+| mutations | 16, unrunnable against a red baseline | **22 armed, 0 survived, 0 invalid** |
+| CI | none, anywhere | `parser-spike`, required through `ci`'s `needs:` |
+
+**And what is not.** 2,087 lines of `effect_set.rs`, `record_update.rs` and
+`try_op.rs` are outside this comparison permanently — 7 diagnostics and 3,974
+nodes of it, measured. `defaults::expand`'s 912 lines never were in it and
+cannot be. That is `GAPS-harness.md` §H2 item 5's job to keep saying, and it now
+has a test's output to say it with.
+
 ---
 
 ## §12 The entries that are not gaps: `iterate`, and an AST that turned out to be representable

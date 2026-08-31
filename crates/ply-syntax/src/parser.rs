@@ -58,6 +58,47 @@ pub fn parse_recovering(
     Parser::new(source, text).run(name)
 }
 
+/// **The tree before `effect_set`, `record_update` and `try_op` rewrite it.**
+/// Not for compiling anything: it is here so that a *second* parser can be
+/// compared against this one over what the **grammar** decided, rather than
+/// over what three later passes made of it.
+///
+/// [`parse_recovering`] runs the grammar and then three rewrites
+/// ([`Parser::run`]). Each is a tree-to-tree pass and none of them is parsing:
+/// `effect_set` splices a set's atoms into every row that names it,
+/// `record_update` turns `{..b, f: e}` into the plain [`ast::ExprKind::Record`]
+/// a reader would have written by hand, and `try_op` turns `e?` into the
+/// `match` it stands for. All three are `pub(crate)` in private modules, so no
+/// external caller can decline them, and that is the only reason this function
+/// exists.
+///
+/// **Who calls it.** `spikes/ply-parser`, and nothing else. That spike is a
+/// hand port of *this file* into Ply, differentially compared node for node and
+/// diagnostic for diagnostic over every `.ply` in the tree; it ports the
+/// grammar and not the three rewrites, so a post-rewrite comparison would be
+/// measuring four things at once and does today report 28 of 763 inputs
+/// disagreeing over sugar the port never claimed to expand.
+/// `spikes/ply-parser/GAPS.md` §11R.D is the decision and its cost, and
+/// `spikes/ply-parser/harness/src/lib.rs`'s `dumper_boundaries` states what the
+/// resulting comparison does and does not cover.
+///
+/// **What it is not.** It is not an editor entry point and not a public API:
+/// the two variants it lets through are `unreachable!()` in `ply-hash`,
+/// `ply-core` and `ply-eval`, and the invariants asserted by
+/// `no_try_survives_parse_module_anywhere_in_the_tree` and its record-update
+/// twin are invariants of [`parse_recovering`], not of this. A caller that
+/// hands this tree to anything downstream gets a panic, and that is the design.
+/// `parse_unexpanded_is_reached_by_no_shipping_caller` (`crate::tests`) fails
+/// if any crate in the workspace starts naming it.
+#[doc(hidden)]
+pub fn parse_unexpanded(
+    source: SourceId,
+    name: ModuleName,
+    text: &str,
+) -> (Module, Vec<Diagnostic>) {
+    Parser::new(source, text).run_unexpanded(name)
+}
+
 /// Each input becomes its own module. Nothing is concatenated: a name in one
 /// file is invisible in another until it is exported and imported.
 pub fn parse_program<'a>(
@@ -338,31 +379,7 @@ impl Parser {
     }
 
     fn run(mut self, name: ModuleName) -> (Module, Vec<Diagnostic>) {
-        let source = self.source;
-        let mut imports = self.imports();
-        let mut items = Vec::new();
-        while !self.at_eof() {
-            self.no_brace = false;
-            self.depth = 0;
-            if self.at(&TokenKind::Kw(Kw::Import)) {
-                self.import_out_of_order(items.first());
-                match self.import_decl() {
-                    Ok(decl) => imports.push(decl),
-                    Err(Bail) => self.recover_to_item(),
-                }
-                continue;
-            }
-            match self.item() {
-                Ok(item) => items.push(item),
-                Err(Bail) => self.recover_to_item(),
-            }
-        }
-        let mut module = Module {
-            name,
-            source,
-            imports,
-            items,
-        };
+        let mut module = self.parse_all(name);
         if self.uses_effect_sets {
             crate::effect_set::expand(&mut module, &mut self.diags);
         }
@@ -382,6 +399,52 @@ impl Parser {
             crate::try_op::expand(&mut module, &mut self.diags);
         }
         (module, self.diags)
+    }
+
+    /// [`run`](Self::run) with the three rewrites above **not** run: the tree
+    /// exactly as the grammar built it, `ExprKind::Try` and
+    /// `ExprKind::RecordUpdate` still in it and every effect row still holding
+    /// only the atoms that were written.
+    ///
+    /// Reached from outside the crate only through [`parse_unexpanded`], which
+    /// carries the whole argument for why it exists. Nothing in the workspace
+    /// calls it and `parse_unexpanded_is_reached_by_no_shipping_caller`
+    /// (`crate::tests`) is what keeps that true.
+    fn run_unexpanded(mut self, name: ModuleName) -> (Module, Vec<Diagnostic>) {
+        let module = self.parse_all(name);
+        (module, self.diags)
+    }
+
+    /// The grammar and the recovery loop, with no rewrite after them. Split out
+    /// of [`run`](Self::run) so that the four lines which gate the rewrites are
+    /// the *only* difference between the expanded and unexpanded entry points —
+    /// a second copy of this loop would be a second parser to keep in step.
+    fn parse_all(&mut self, name: ModuleName) -> Module {
+        let source = self.source;
+        let mut imports = self.imports();
+        let mut items = Vec::new();
+        while !self.at_eof() {
+            self.no_brace = false;
+            self.depth = 0;
+            if self.at(&TokenKind::Kw(Kw::Import)) {
+                self.import_out_of_order(items.first());
+                match self.import_decl() {
+                    Ok(decl) => imports.push(decl),
+                    Err(Bail) => self.recover_to_item(),
+                }
+                continue;
+            }
+            match self.item() {
+                Ok(item) => items.push(item),
+                Err(Bail) => self.recover_to_item(),
+            }
+        }
+        Module {
+            name,
+            source,
+            imports,
+            items,
+        }
     }
 
     /// Every `import` precedes every item, so the import table is complete

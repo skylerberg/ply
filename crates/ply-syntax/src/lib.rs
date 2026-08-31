@@ -12,5 +12,7 @@ mod numerics;
 #[cfg(test)]
 mod tests;
 
-pub use parser::{parse, parse_expr, parse_module, parse_program, parse_recovering};
+pub use parser::{
+    parse, parse_expr, parse_module, parse_program, parse_recovering, parse_unexpanded,
+};
 pub use resolve::resolve;

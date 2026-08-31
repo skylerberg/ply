@@ -2,7 +2,7 @@
 #
 # Arms the differential in `harness/`.
 #
-#   ./spikes/ply-parser/arm-harness.sh          # every mutation
+#   ./spikes/ply-parser/arm-harness.sh          # every mutation (22 of them)
 #   ./spikes/ply-parser/arm-harness.sh 4 7      # just these
 #
 # House rule 6: "the signature defect here is a green result over unexplored
@@ -25,9 +25,28 @@
 #
 # The mutations are chosen to be the three classes the brief names -- a dropped
 # field, a wrong span, a swapped associativity -- plus one per structural
-# property the dump grammar claims to have, plus one per tolerance the harness
-# grants. In particular #13 corrupts a row's atoms, which is the only thing
-# standing behind clause 2 of `only_the_expanders_diagnostics`.
+# property the dump grammar claims to have, plus one per feature the port
+# learned on 2026-08-30.
+#
+# **Two changes to the table on 2026-08-30, both recorded rather than done
+# quietly.**
+#
+#   * #7 was `types.ply|s/node: { name: n, ty: Some(t),/node: { name: n, ty:
+#     None,/`, and its anchor no longer exists: `param` moved to `exprs.ply`
+#     when a parameter gained a default expression (`GAPS.md` 11R.D). It is
+#     REPLACED, not dropped, by the same corruption at the same parser in its
+#     new home -- a parameter's type annotation parsed and discarded -- so the
+#     property it watches is unchanged.
+#   * #17 through #22 are new, one per dump edge the port gained: the named
+#     argument list, `ETry`'s span, `ERecordUpdate`'s base, `Param`'s default,
+#     `E0124`, and the `?` byte itself. #17 is the one worth naming: it is
+#     exactly the port `GAPS.md` 11R.N showed would have PASSED before this
+#     change -- one that reads `name`, `:`, `value` and throws all three away.
+#
+# #13 corrupts a row's atoms. Its old description said it stood behind clause 2
+# of `only_the_expanders_diagnostics`; that tolerance is gone with the
+# projection, and the mutation now watches `desk.ply`'s rows directly, which is
+# a stronger thing for it to watch.
 # No `pipefail`. `printf '%s' "$big" | grep -q x` sets the pipeline's status to
 # printf's SIGPIPE under it, because grep exits at the first match and closes the
 # pipe -- so a mutation with a lot of output reads as "no match". The first run
@@ -52,7 +71,7 @@ mutations=(
 "exprs.ply|s/bin_expr(c, a.p, o.bp + 1)/bin_expr(c, a.p, o.bp)/|SWAPPED ASSOCIATIVITY: binary operators become right-associative|the tree shape, at every binary operator"
 "exprs.ply|s/{op: b\"add\", bp: 5}/{op: b\"add\", bp: 6}/|SWAPPED PRECEDENCE: \`+\` binds as tightly as \`*\`|the tree shape, where two binding powers meet"
 "spine.ply|s/Stop(Ok({p: e.p, node: push(s.out, r.node)}))/Stop(Ok({p: e.p, node: s.out}))/|a DROPPED LIST ELEMENT: every comma list loses its last member|every list emits its length"
-"types.ply|s/node: { name: n, ty: Some(t),/node: { name: n, ty: None,/|a DROPPED OPTION: a parameter's type annotation is parsed and discarded|every Option emits its presence"
+"exprs.ply|s/node: Some(t) })/node: None })/|a DROPPED OPTION: a parameter's type annotation is parsed and discarded|every Option emits its presence"
 "spine.ply|s/l.code == d.code \&\& ls.start == s.start \&\& ls.end == s.end/l.code == d.code/|a WIDENED DEDUP: two diagnostics with one code at two places become one|the diagnostic list, and its length"
 "spine.ply|s/{start: also.start, end: also.end, primary: false}/{start: also.start, end: also.end, primary: true}/|a WRONG PRIMARY FLAG: a secondary label claims to be primary|each label's primary flag, and the primary span derived from it"
 "patterns.ply|s/LInt(v) -> bytes_concat(word(b\"int\"), payload(num(v)))/LInt(v) -> bytes_concat(word(b\"int\"), payload(num(0 - v)))/|a WRONG SCALAR: every integer literal is dumped negated|every scalar payload"
@@ -62,6 +81,12 @@ mutations=(
 "spine.ply|s/{ p: with_gt_split(p, p.pos), node: {start: s.start, end: s.start + 1} }/{ p: p, node: {start: s.start, end: s.start + 1} }/|a LOST TOKEN REWRITE: \`>=\` closing a type parameter list no longer leaves an \`=\` behind|the \`type Pair<a>= a\` split, and everything after it in the file"
 "items.ply|s/rec(d.span, b\"tst\"), rec(d.name_span, b\"tnm\")/rec(d.span, b\"tst\"), rec(d.span, b\"tnm\")/|a WRONG SPAN on a leaf: a test's label span becomes the whole item's|every node leads with its own span"
 "exprs.ply|s/dump_opt(v.tail, dump_expr)/dump_opt(None, dump_expr)/|a DROPPED TAIL: a block's tail expression is never emitted|every Option emits its presence"
+"exprs.ply|s/named: push(s.named, n)/named: s.named/|a DISCARDED NAMED ARGUMENT: \`name: value\` is lexed, parsed and thrown away|the named-argument list's length, which nothing emitted before 2026-08-30 (GAPS.md 11R.N)"
+"exprs.ply|s/span: span_to(expr_span(s.node), q.node)/span: expr_span(s.node)/|a WRONG SPAN on the try operator: the \`?\` byte falls outside its own node|every node leads with its own span"
+"exprs.ply|s/Some(b) -> ERecordUpdate({ span: sp, base: b, fields: fields })/Some(b) -> ERecord({ span: sp, fields: fields })/|a COLLAPSED SUGAR NODE: \`{..b, f: e}\` becomes a plain record and the base vanishes|every enum arm, and the node the port must NOT expand"
+"exprs.ply|s/if allow { Ok({ p: p, node: Some(e) }) }/if allow { Ok({ p: p, node: None }) }/|a DROPPED OPTION: a parameter's default expression is parsed and discarded|every Option emits its presence"
+"exprs.ply|s/Some(f) -> push_diag(s.p, diag2(argument_order(), expr_span(e), f, 1)),/Some(f) -> s.p,/|a MISSING DIAGNOSTIC: a positional argument after a named one is no longer refused|the diagnostic list, and its length"
+"lexer.ply|s/TPunct(b\"question\")/TPunct(b\"percent\")/|a WRONG TOKEN: the \`?\` byte lexes as \`%\`|the token vocabulary the parser is built on"
 )
 
 want=("${@:-}"); [ $# -eq 0 ] && want=()
