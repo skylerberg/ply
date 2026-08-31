@@ -1321,7 +1321,7 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is **twenty-seven** files, `00NN-slug.md`, with **no index** — the
+`docs/adr/` is **twenty-nine** files, `00NN-slug.md`, with **no index** — the
 numbers are the ordering. Pick the next free one — and **nothing you have to
 remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
 fails when two files share a number, so the check catches you rather than a

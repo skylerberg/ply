@@ -165,6 +165,25 @@ fn credited(a: Account, amount: Int) -> Account {
 }
 ```
 
+A parameter may carry a default, which a call is then free to leave out:
+
+```ply
+fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account =
+  {name: a.name, balance: a.balance + amount}
+```
+
+The default is spliced into the call before anything else sees it, so
+`credit(a, 5)` and `credit(a, 5, None)` are the *same definition* with the same
+hash and the same cache entry — adopting a default re-runs nothing. It has to be
+a value rather than something that runs: a literal, a constructor applied to
+literals, a record or a list. A call or a `perform` in a default would run at
+the caller rather than where it was written, and is `E0121`. It also may not
+mention the signature's other parameters, which do not exist at a call site.
+
+Only a `fn` may carry one. A lambda is reached through a value rather than by
+name, so there is no signature for a call to be matched against, and a default
+written on one is `E0120`.
+
 Everything is a value and everything is immutable. `credit` does not modify the
 account it is given; it builds a new one. There are no loops, so `fold`, `map`,
 `filter` and recursion are how you iterate (§6.9).
@@ -858,6 +877,25 @@ anything about types. So calling a function stored in a record field needs
 parentheses around the field access. `int_json().decode(j)` needs none, because
 its base is a call rather than a variable.
 
+An argument may be given by name, which is how a parameter that is not last
+gets filled without writing out the ones before it:
+
+```ply
+greet("ada")                       // greeting takes its default
+greet("ada", "hey")                // positional
+greet("ada", greeting: "hey")      // by name — the same definition as above
+```
+
+The rule is one sentence: **positional arguments fill parameters left to right,
+and any parameter left over must be named or have a default.** A positional
+argument after a named one is `E0124`; a name that is not a parameter, or one
+given twice, is `E0123`; a parameter with neither an argument nor a default is
+`E0125`.
+
+Names are erased before anything hashes, so the second and third lines above are
+one definition. A named argument needs a callee reached *by name*: a call
+through a value, a lambda or a constructor is positional only.
+
 There is no partial application and no operator section. There is no method
 syntax: `x.f(y)` is not `f(x, y)`.
 
@@ -1414,8 +1452,12 @@ test "a well-formed request line is split into its three parts" {
 A `test` has a quoted label and a block body. It cannot be `pub`, cannot be
 referenced, and takes no arguments. Two assertions exist:
 
-* `assert(cond: Bool) -> Unit`
+* `assert(cond: Bool, message: Option<String> = None) -> Unit`
 * `assert_eq<a>(actual: a, expected: a) -> Unit`
+
+`assert`'s message is a defaulted parameter, so `assert(ok)` is the common
+form and `assert(ok, Some("why"))` — or `assert(ok, message: Some("why"))` —
+attaches a note to the failure report.
 
 `assert_eq`'s failure report gives both values, and the **first structural
 difference** inside them when they are compound:
@@ -1943,7 +1985,7 @@ orders. `compare` is the same operation under a name you may shadow.
 
 | signature | notes |
 | --- | --- |
-| `assert(cond: Bool) -> Unit` | |
+| `assert(cond: Bool, message: Option<String> = None) -> Unit` | the message becomes a note on the failure |
 | `assert_eq<a>(actual: a, expected: a) -> Unit` | reports both values and the first structural difference |
 | `panic<a>(message: String) -> a` | raises `E0502` |
 
