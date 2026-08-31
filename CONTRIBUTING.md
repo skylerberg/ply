@@ -318,27 +318,37 @@ baseline.
 > them. Assume the person before you did not."* That was true until 2026-08-24,
 > when `.github/workflows/ci.yml` was added.
 
-`.github/workflows/ci.yml` runs on every push and every pull request, on every
-branch and not only the default one. It runs the three commands above, and it
-opens all five of the gates the next section describes — which is most of why it
-exists, because a gate that returns a *passing* result when its dependency is
-absent is the thing a human is least likely to notice. It **asserts** four of
-them open by a notice the job greps for: `PLY_PG_URL`, `cluster::available()`,
-`#![cfg(unix)]` and the spike each fail a job if the gate is shut. `PLY_TEST_DB`
-has no notice — those 26 tests print nothing at all when they skip — so it is
-asserted a different way, and the measurement behind it is in the gate table
-below: a *wrong* value fails 20 of the 26 loudly, because the harness expects
-the database to be reachable, and a *missing* value is caught by the job's
-`test -n` pre-flight. What no one can show after the fact is a log line saying
-the 26 ran.
+`.github/workflows/ci.yml` runs on every pull request, and on pushes to `main`.
+It runs the three commands above, and it opens all five of the gates the next
+section describes — which is most of why it exists, because a gate that returns
+a *passing* result when its dependency is absent is the thing a human is least
+likely to notice. It **asserts** four of them open by a notice the job greps
+for: `PLY_PG_URL`, `cluster::available()`, `#![cfg(unix)]` and the spike each
+fail a job if the gate is shut. `PLY_TEST_DB` has no notice — those 26 tests
+print nothing at all when they skip — so it is asserted a different way, and the
+measurement behind it is in the gate table below: a *wrong* value fails 20 of
+the 26 loudly, because the harness expects the database to be reachable, and a
+*missing* value is caught by the job's `test -n` pre-flight. What no one can
+show after the fact is a log line saying the 26 ran.
+
+> **Corrected 2026-08-30: it used to run on every push too, and that ran the
+> whole workflow twice.** The withdrawn text, verbatim: *"runs on every push and
+> every pull request, on every branch and not only the default one."* That was
+> accurate and it was also a bug. A push to a branch with a PR open fired both
+> triggers, and the `concurrency` group cannot collapse them because it keys on
+> `github.ref` — `refs/heads/<branch>` for one and `refs/pull/<n>/merge` for the
+> other. Over the 20 runs before the fix, every branch commit has a matched
+> pair, each a full run of the identical jobs over the identical tree. `push` is
+> now filtered to the default branch. What that gives up is CI on a branch with
+> no PR open yet.
 
 | job | what it runs |
 | --- | --- |
 | `shard table is total` | `.github/ci-shards.sh verify`, before anything compiles |
 | `cargo fmt --all --check` | the same command, and it must be silent |
 | `cargo clippy --workspace --all-targets` | with `-D warnings`, so the first warning is a failed run rather than a line in a log |
-| `test corpus` / `cli-eval` / `core` | the suite, three shards by package; the split is `.github/ci-shards.sh`. The shard that holds `ply-cli` also re-runs `w5_shutdown` by name, and the shard that holds `ply-span` re-runs the six `TREE_CHECKS` by name — see the row below |
-| the `TREE_CHECKS` step, inside `test` | the six checks in `crates/ply-span/tests/armed.rs`, each by `--exact` name, asserting `test result: ok. 1 passed`. They already ran a moment earlier in the shard; this is what turns "the check still exists" into an exit code, because `cargo test --exact` over a name nothing defines reports `0 passed; 11 filtered out` and exits **0** |
+| `test corpus` / `eval` / `cli` | the suite, three shards by package; the split is `.github/ci-shards.sh`. The shard that holds `ply-cli` also re-runs `w5_shutdown` by name, and the shard that holds `ply-span` re-runs the seven `TREE_CHECKS` by name — see the row below. Both steps key on *which shard holds the package*, not on a shard name, which is why renaming `cli-eval` to `eval`/`cli` on 2026-08-30 moved neither |
+| the `TREE_CHECKS` step, inside `test` | the seven checks in `crates/ply-span/tests/armed.rs`, each by `--exact` name, asserting `test result: ok. 1 passed`. They already ran a moment earlier in the shard; this is what turns "the check still exists" into an exit code, because `cargo test --exact` over a name nothing defines reports `0 passed; 11 filtered out` and exits **0** |
 | `test ply-host (postgres)` | `ply-host`, with `PLY_PG_URL` and `PLY_TEST_DB` pointed at a `postgres:18.6` service container **and** `initdb`/`postgres`/`psql` on `PATH` — then it fails if any test printed a skip notice |
 | `wall-clock measurements` | the thirteen timing-sensitive tests, one at a time, single-threaded, alone on a runner |
 | `crates/ply-codegen-spike` | `cargo test --locked --release` on a pinned 1.94.0, in the spike's own workspace |
@@ -380,17 +390,49 @@ merge, not that it is closed where you are standing. Run the outer loop anyway.
 
 Two things about the shape, and one about how much to trust any of it.
 
-The three shards are cut from a measurement, not a guess. `cargo test -p
-<package>` on the machine in `docs/ONBOARDING.md` §Provenance, warm target,
-`-j 2 -- --test-threads=2` to approximate a two-core hosted runner, 2026-08-24:
-`ply-corpus` **289s**, `ply-cli` **149s**, `ply-eval` **137s**, `ply-store`
-32s, `ply-hash` 15s, `ply-test` 13s, `ply-core` 8s, `ply-span` 5s, `ply-prove`
-4s, `ply-syntax` 3s, `ply-std` 2s, `ply-derive` 1s — 658s summed, of which
-`ply-corpus` is 44%. That one package is the floor: no arrangement of `-p` flags
-finishes sooner than it does, so a fourth shard would buy nothing and pay the
-dependency build again. The numbers are that machine's and the ordering is what
-the table depends on; re-take with `cargo test -p <package>` if a package grows
-a slow suite, and move it.
+The three shards are cut from a measurement, not a guess, and the measurement
+is now taken **in CI** rather than locally — the hosted runner is the machine
+the balance is for. From run 33338854134 (2026-08-30), differencing consecutive
+`Running <binary>` lines in each job log so the figure is test execution without
+the ~39s dependency build: `ply-corpus` **426s**, `ply-eval` **404s**, `ply-cli`
+**200s**, `ply-host` ~60s, and the other nine packages **16s** summed.
+`ply-corpus` is the floor — no arrangement of `-p` flags finishes sooner than
+its slowest package — so three parallel shards at 426s / 404s / 216s sits on it,
+and a fourth would buy nothing and pay the dependency build again.
+
+> **Corrected 2026-08-30: the previous cut was measured on the wrong machine and
+> had gone stale, and the shard it produced was the slowest thing in CI.** The
+> withdrawn text, verbatim: *"`cargo test -p <package>` on the machine in
+> `docs/ONBOARDING.md` §Provenance, warm target, `-j 2 -- --test-threads=2` to
+> approximate a two-core hosted runner, 2026-08-24: `ply-corpus` **289s**,
+> `ply-cli` **149s**, `ply-eval` **137s**, `ply-store` 32s, `ply-hash` 15s,
+> `ply-test` 13s, `ply-core` 8s, `ply-span` 5s, `ply-prove` 4s, `ply-syntax` 3s,
+> `ply-std` 2s, `ply-derive` 1s — 658s summed, of which `ply-corpus` is 44%.
+> That one package is the floor: no arrangement of `-p` flags finishes sooner
+> than it does, so a fourth shard would buy nothing and pay the dependency build
+> again."* The floor argument survives; the arrangement had stopped sitting on
+> the floor. `ply-eval` roughly tripled — 137s to 404s — so the `cli-eval` shard
+> became 604s against a 426s floor while the `core` shard finished its 1,604
+> tests in **16s**: one runner idle for ten minutes while another held the whole
+> run up. `-j 2 -- --test-threads=2` on a 10-core laptop is also a poorer
+> instrument for a hosted runner than the runner's own logs, which is why the
+> re-take is from CI.
+
+The numbers are the runner's and the ordering is what the table depends on;
+re-take if a package grows a slow suite, and move it. **The figures above
+predate `[profile.dev] opt-level = 2`**, which cut the binary dominating the
+`eval` shard by most of an order of magnitude and should be expected to make
+these jobs compile-bound rather than test-bound.
+
+Re-taken after that change, and worth only what its provenance is worth: the
+three shards run **locally** — a 10-core laptop, not the two-core runner they
+are balanced for — at 1-minute load between 6 and 24, against the threshold of
+4 that §"Gate on an idle machine before measuring, not after" sets. `corpus`
+120s / 197 tests, `eval` 69s / 1,033, `cli` 41s / 2,319, all three exit 0. That
+is a shape, not a set of figures, and the shape is that `ply-corpus` stops being
+level with `ply-eval` and becomes the clear long pole at roughly 1.7x it — which
+is the ordering the table already assumes, so nothing moves on it. **A re-take
+on a two-core runner at load < 4 has not been done.**
 
 **And the part that is not checked. This is a ledger, not a blanket.** An
 earlier draft of this paragraph said *"every command in `ci.yml` was run on that
@@ -400,12 +442,25 @@ everything above."* It was withdrawn the same day it was written, because
 on. What follows is what has an exit code against the file as it stands, taken
 on the machine in `docs/ONBOARDING.md` §Provenance, 2026-08-24.
 
+> **The same thing has now happened to part of this ledger, and it is left
+> standing with the boundary named rather than re-run.** The 2026-08-30 change
+> that split `cli-eval` into `eval` and `cli` and set `[profile.dev] opt-level =
+> 2` moves three of the rows below: the `corpus`, `core` and `cli-eval` shard
+> rows name a partition that no longer exists, and **every** wall clock in the
+> table was taken at `opt-level = 0`. The exit codes and the *counts* are
+> unaffected by the profile — 196 / 1521 / 1669 tests and their filtered totals
+> are what the packages contain, not how fast they run — and the packages
+> themselves only moved between shards, so the sum is the same suite. What has
+> no exit code against the current file is the three shard rows as *shard* rows
+> and every second figure in the table. Re-running the ledger against the
+> current `ci.yml` has **not** been done.
+
 **Static checks, all exit 0.** `actionlint` 1.7.12 over `ci.yml` with its
 `shellcheck` integration active; `python3 -c "yaml.safe_load(...)"`, which
 parses and reports nine jobs; `shellcheck` over `.github/ci-shards.sh`; and
 `ci-shards.sh verify`, which reports *13 workspace members, each in exactly one
-shard; 1 crate deliberately outside; 13 deferred tests, each present in the
-tree*. `verify`'s failure paths were exercised too, eight of them, each exiting
+shard; 1 crate(s) deliberately outside; 13 deferred tests and 7 tree checks,
+each present in the tree*. `verify`'s failure paths were exercised too, eight of them, each exiting
 1 with a named reason: a member in no shard, a member in two, a shard naming a
 non-member, a deferred test renamed, a deferred test in a missing target, a
 `KNOWN_OUTSIDE` entry for a crate not in the tree, an unexcused crate directory
