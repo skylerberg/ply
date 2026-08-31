@@ -254,6 +254,29 @@ refuses the call before the row is looked up, for a reason that has nothing to d
 with `list_at`. **The compiled fragment and this feature do not meet on the
 workload that motivates the feature.**
 
+> **Withdrawn 2026-08-31: they meet, and on exactly that shape.** The bolded
+> sentence and the two before it are no longer true of this tree. `crossable`
+> grew `Bytes` (2026-08-30) and then the argument test stopped being a value
+> test at all: `compiled::Gate::ArgumentType` decides an argument from the
+> definition's **declared parameter type**, so a `List<Token>` parameter is
+> carried when `Token` is — which it is, being a record of `Int`s and a
+> constructor.
+>
+> Measured on the ported front end (`spikes/ply-parser` parsing `examples/`,
+> `PLY_SEAM_CENSUS=1 ply test <dir> --no-cache -j 1 --filter probe.parse`), the
+> two definitions this ADR is named for are now among the most-admitted in the
+> whole corpus: **`spine.tok_index` 232,041 and `spine.tok_at` 231,729 admitted
+> calls**, both taking the `Ctx` record whose `toks` field is the `List<Token>`
+> this feature indexes. The seam's admitted share on that workload goes from
+> **12.205%** of body calls to **84.014%**.
+>
+> What is unchanged is the sentence's *reason* one level down: `list_at` is a
+> builtin, `Gate::NotLoweredCode` still refuses it as a callee, and
+> `jit.rs::admissible_builtin` still admits it only through its `_ => Ok(())`
+> arm. The two features meet because the **caller** became admissible, not
+> because anything about `list_at` did. ADR 0030 §6's amendment carries the
+> before/after.
+
 Where a definition *is* admitted and happens to contain a `list_at`,
 `crates/ply-codegen-spike/src/jit.rs::admissible_builtin` admits it through its
 `_ => Ok(())` arm and it runs through `rt.rs::rt_builtin` →
