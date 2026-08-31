@@ -105,47 +105,45 @@ echo "== the parse itself =="
 
 arm "a lowercase bare name in a type becomes a constructor" types \
   'else if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    { p: q.p, node: TVar(q.node.name) }' \
+    Ok({ p: q.p, node: TVar(q.node.name) })' \
   'else if false {
-    { p: q.p, node: TVar(q.node.name) }'
+    Ok({ p: q.p, node: TVar(q.node.name) })'
 
 arm "an uppercase bare name in a pattern becomes a binder" patterns \
   'else if is_bare(q.node) && !starts_upper(q.node.name.name) {' \
   'else if is_bare(q.node) {'
 
 arm "a \`.\` no longer distinguishes an atom from an effect set" types \
-  'else if !at(c, q.p, t_dot()) { { p: q.p, node: RMSet(q.node) } }' \
-  'else if true { { p: q.p, node: RMSet(q.node) } }'
+  'if !at(c, p, t_dot()) { Ok({ p: p, node: RMSet(q) }) }' \
+  'if true { Ok({ p: p, node: RMSet(q) }) }'
 
 arm "the type parameter list no longer stops at \`|\`" types \
   '|| (stop_on_pipe && at(c, s.p, t_pipe()))' \
   '|| (false && at(c, s.p, t_pipe()))'
 
 arm "an atom ends at the current token rather than the previous one" types \
-  'span: span_to(ef.span, prev_span(c, r.p))' \
-  'span: span_to(ef.span, cur_span(c, r.p))'
+  'span: span_to(ef.span, prev_span(c, p))' \
+  'span: span_to(ef.span, cur_span(c, p))'
 
 arm "a parenthesised pattern keeps the inner node's span" patterns \
-  'else { { p: cl.p, node: set_pat_span(inner.node, span_to(o.node, cl.node)) } }' \
-  'else { { p: cl.p, node: inner.node } }'
+  'Ok({ p: cl.p, node: set_pat_span(inner.node, span_to(o.node, cl.node)) })' \
+  'Ok({ p: cl.p, node: inner.node })'
 
 arm "a negative integer pattern is not negated" patterns \
-  'TInt(v) -> { p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) },' \
-  'TInt(v) -> { p: a.p, node: PLit({ span: s, lit: LInt(v) }) },'
+  'TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),' \
+  'TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(v) }) }),'
 
 arm "a negative float pattern is sliced over the number token, not the pattern" patterns \
-  'TFloat(f) -> { p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) },' \
-  'TFloat(f) -> { p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, span_to(a.node, a.node))) }) },'
+  'TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) }),' \
+  'TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, span_to(a.node, a.node))) }) }),'
 
 arm "the record-pattern shorthand binds with the whole record's span" patterns \
-  'else { { p: co.p, node: PVar({ span: n.node.span, name: n.node }) } };' \
-  'else { { p: co.p, node: PVar({ span: open, name: n.node }) } };'
+  'else { Ok({ p: co.p, node: PVar({ span: n.node.span, name: n.node }) }) };' \
+  'else { Ok({ p: co.p, node: PVar({ span: open, name: n.node }) }) };'
 
 arm "a \`..\` with a name binds a wildcard instead" patterns \
-  'let i = expect_ident(c, d.p, b"a name after `..`");
-          { p: i.p, node: PVar({ span: i.node.span, name: i.node }) }' \
-  'let i = expect_ident(c, d.p, b"a name after `..`");
-          { p: i.p, node: PWild({ span: i.node.span }) }'
+  'Ok(i) -> Ok({ p: i.p, node: PVar({ span: i.node.span, name: i.node }) }),' \
+  'Ok(i) -> Ok({ p: i.p, node: PWild({ span: i.node.span }) }),'
 
 echo
 echo "== the diagnostics =="
@@ -155,43 +153,29 @@ arm "the no-tuple-type diagnostic loses its note" types \
   'diag1(unexpected(), span_to(o.node, cl.node), 0)'
 
 arm "an unclosed record type loses the label on its opening brace" types \
-  'let cl = expect_close(c, fs.p, t_rbrace(), o.node, b"`}`");' \
-  'let cl = expect(c, fs.p, t_rbrace(), b"`}`");'
+  'let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}`")?;' \
+  'let {p, node: cl} = expect(c, p, t_rbrace(), b"`}`")?;'
 
 arm "an unclosed list pattern loses the label on its opening bracket" patterns \
-  'let cl = expect_close(c, b.p, t_rbracket(), o.node, b"`]` to close the list pattern");' \
-  'let cl = expect(c, b.p, t_rbracket(), b"`]` to close the list pattern");'
+  'let {p, node: cl} = expect_close(c, p, t_rbracket(), o.node, b"`]` to close the list pattern")?;' \
+  'let {p, node: cl} = expect(c, p, t_rbracket(), b"`]` to close the list pattern")?;'
 
 echo
-echo "== the bail guards: 6 of 50 are killable =="
-
-arm "the guard on \`ty_record\`'s close result" types \
-  'let cl = expect_close(c, fs.p, t_rbrace(), o.node, b"`}`");
-  if cl.p.bail { { p: cl.p, node: no_ty() } }' \
-  'let cl = expect_close(c, fs.p, t_rbrace(), o.node, b"`}`");
-  if false { { p: cl.p, node: no_ty() } }'
-
-echo
-echo "== equivalent mutants: the other 44 =="
-echo "   Registered arming instrument 4 was 'delete one \`if p.bail\` guard and"
-echo "   confirm the error fixtures go red'. These three do not, and the reason"
-echo "   is measured rather than guessed: see GAPS-types.md §P7."
-
-equiv "the guard at the top of \`ty\`" types \
-  'pub fn ty(c: Ctx, p: P) -> R<TypeExpr> =
-  if p.bail { { p: p, node: no_ty() } } else {' \
-  'pub fn ty(c: Ctx, p: P) -> R<TypeExpr> =
-  if false { { p: p, node: no_ty() } } else {'
-
-equiv "the guard at the top of \`pattern\`" patterns \
-  'pub fn pattern(c: Ctx, p: P) -> R<Pattern> =
-  if p.bail { { p: p, node: no_pattern() } } else {' \
-  'pub fn pattern(c: Ctx, p: P) -> R<Pattern> =
-  if false { { p: p, node: no_pattern() } } else {'
-
-equiv "the call-site guard in \`ty_field\`" types \
-  'if co.p.bail { { p: co.p, node: { name: no_ident(), ty: no_ty() } } } else {' \
-  'if false { { p: co.p, node: { name: no_ident(), ty: no_ty() } } } else {'
+echo "== the bail guards: withdrawn, because there are none =="
+echo "   > **Withdrawn (ADR 0028, 2026-08-30).** Four mutations stood here"
+echo "   > under two headings, \`== the bail guards: 6 of 50 are killable ==\`"
+echo "   > and \`== equivalent mutants: the other 44 ==\`. One was an \`arm\`"
+echo "   > (the guard on \`ty_record\`s close result) and three were"
+echo "   > \`equiv\`s (the guards at the top of \`ty\` and \`pattern\`, and the"
+echo "   > call-site guard in \`ty_field\`), each replacing an \`if p.bail\`"
+echo "   > with \`if false\`. The block said: \"Registered arming instrument 4"
+echo "   > was delete one \\\`if p.bail\\\` guard and confirm the error fixtures"
+echo "   > go red. These three do not, and the reason is measured rather than"
+echo "   > guessed: see GAPS-types.md \u00a7P7.\""
+echo "   >"
+echo "   > \`?\` removed the flag, so there is no guard to delete in either"
+echo "   > file. GAPS-types.md \u00a7P7s 0-of-10 is a finding about a design"
+echo "   > this area no longer has."
 
 restore
 echo

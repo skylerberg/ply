@@ -3,7 +3,7 @@
 # three sorts below it in the AST's DAG. `items.ply` reaches all three, so
 # unlike `test-spine.sh` this is the whole parser.
 #
-#   ./spikes/ply-parser/test-items.sh              # 112 in-language tests
+#   ./spikes/ply-parser/test-items.sh              # 110 in-language tests
 #   ./spikes/ply-parser/test-items.sh --keep       # leave the project behind
 #
 # With --keep it prints the directory, which `diff-items.py` and `arm-items.sh`

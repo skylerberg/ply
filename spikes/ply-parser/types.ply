@@ -15,11 +15,12 @@
 
 import spine (Span, Ident, QName, Ctx, P, R, Ate, Acc, PDiag,
               span_to, dummy_span, no_ident, no_qname,
-              unexpected, diag1, bail_with, error_here, unclosed,
+              unexpected, diag1, push_diag, error_here, unclosed,
               kind, kind_at, cur_span, span_at, prev_span, at, at_eof,
               at_ident_text, starts_upper, advance, bump, eat,
               expect, expect_close, expect_ident, expect_gt,
               with_no_brace, with_sets, deeper, shallower, qname, comma_list,
+              settle, failed,
               t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
               t_comma, t_colon, t_dot, t_arrow, t_lt, t_gt, t_ge, t_pipe, t_slash,
               num, rec, nlist, opt, payload, word, dump_list, dump_opt,
@@ -45,10 +46,14 @@ pub type TypeExpr =
   | TFn({ span: Span, params: List<TypeExpr>, ret: TypeExpr, effects: Option<RowExpr> })
   | TRecord({ span: Span, fields: List<{ name: Ident, ty: TypeExpr }> })
   | TUnit({ span: Span })
-  // No analogue in `ast.rs`: what a bailed `ty` answers. A placeholder that was
-  // a *valid* node — `TUnit`, say — would agree with a real `()` if it ever
-  // reached a compared dump, so the placeholder is a tag the reference can
-  // never emit and a leak shows up as a mismatch rather than as agreement.
+  // No analogue in `ast.rs`: the stand-in a caller that cannot propagate a
+  // failure has to name. A placeholder that was a *valid* node — `TUnit`, say —
+  // would agree with a real `()` if it ever reached a compared dump, so the
+  // placeholder is a tag the reference can never emit and a leak shows up as a
+  // mismatch rather than as agreement. Since ADR 0028 the only callers that
+  // need one are `dump_type_of` and the entry points beside it, where `settle`
+  // asks for it: a parse function propagates with `?` and names no placeholder
+  // at all.
   | TBad({ span: Span })
 
 pub type Mode = MRead | MWrite | MBad
@@ -96,11 +101,10 @@ fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 
 // `read` and `write` are contextual: `lexer.ply` lexes them as identifiers and
 // nothing reserves them, which is what `at_ident_text` says in the reference.
-pub fn mode(c: Ctx, p: P) -> R<Mode> =
-  if p.bail { { p: p, node: MBad } }
-  else if at_ident_text(c, p, b"read") { { p: bump(c, p), node: MRead } }
-  else if at_ident_text(c, p, b"write") { { p: bump(c, p), node: MWrite } }
-  else { { p: error_here(c, p, b"`read` or `write` to start an operation"), node: MBad } }
+pub fn mode(c: Ctx, p: P) -> Result<R<Mode>, P> =
+  if at_ident_text(c, p, b"read") { Ok({ p: bump(c, p), node: MRead }) }
+  else if at_ident_text(c, p, b"write") { Ok({ p: bump(c, p), node: MWrite }) }
+  else { Err(error_here(c, p, b"`read` or `write` to start an operation")) }
 
 // --- Type expressions -------------------------------------------------------
 
@@ -108,125 +112,123 @@ pub fn mode(c: Ctx, p: P) -> R<Mode> =
 // `{` always opens a record type, never an arm block, whatever the enclosing
 // expression decided; the flag is saved into a `let` and written back, which is
 // what a `mem::replace` is without mutation.
-pub fn ty(c: Ctx, p: P) -> R<TypeExpr> =
-  if p.bail { { p: p, node: no_ty() } } else {
-    let r = ty_inner(c, with_no_brace(p, false));
-    { p: with_no_brace(r.p, p.no_brace), node: r.node }
+// A `?` cannot stand here and the reason is worth naming: `self.no_brace =
+// saved` has to run on **both** paths, and `?` is an early exit that skips what
+// follows it. `parser.rs:1069` writes `let r = self.ty_inner(); self.no_brace =
+// saved; r` for exactly that reason — it does not write `?` either. This is one
+// of the ten sites where the two ports agree on *not* using the operator.
+pub fn ty(c: Ctx, p: P) -> Result<R<TypeExpr>, P> =
+  match ty_inner(c, with_no_brace(p, false)) {
+    Err(q) -> Err(with_no_brace(q, p.no_brace)),
+    Ok(r) -> Ok({ p: with_no_brace(r.p, p.no_brace), node: r.node }),
   }
 
 // One of the reference's three `deeper()` sites (`parser.rs:1035`). Recursion
 // here is grammar nesting and nothing else — every sequence below is one
 // `iterate`, which is depth 1 on both engines — so the stack is the type's own
 // nesting depth. ADR 0022 §2.
-fn ty_inner(c: Ctx, p: P) -> R<TypeExpr> =
-  if p.bail { { p: p, node: no_ty() } } else {
-    let d = deeper(c, p);
-    if d.bail { { p: d, node: no_ty() } } else {
-      let r = ty_body(c, d);
-      { p: shallower(r.p), node: r.node }
-    }
+// `deeper` takes the `?`; `shallower` is the same both-paths restore as `ty`'s,
+// and `parser.rs:1075` writes it the same way — `self.deeper()?;` and then
+// `let r = self.ty_body(); self.depth -= 1; r`.
+fn ty_inner(c: Ctx, p: P) -> Result<R<TypeExpr>, P> = {
+  let d = deeper(c, p)?;
+  match ty_body(c, d) {
+    Err(q) -> Err(shallower(q)),
+    Ok(r) -> Ok({ p: shallower(r.p), node: r.node }),
   }
+}
 
 // The reference matches on `TokenKind` directly. `lexer.ply` spells every
 // punctuator as `TPunct(b"name")`, so one `match` arm covers all of them and
 // the discrimination inside it is a chain of `Bytes` comparisons.
 // `spikes/ply-lexer/GAPS.md` §7 is the same shape, one level up.
-fn ty_body(c: Ctx, p: P) -> R<TypeExpr> = {
+fn ty_body(c: Ctx, p: P) -> Result<R<TypeExpr>, P> = {
   let st = cur_span(c, p);
   match kind(c, p) {
     TPunct(s) ->
       if s == b"lparen" { ty_paren(c, p, st) }
       else if s == b"lbrace" { ty_record(c, p) }
-      else { { p: error_here(c, p, b"a type"), node: no_ty() } },
+      else { Err(error_here(c, p, b"a type")) },
     TIdent(n) -> ty_named(c, p, st),
-    _ -> { p: error_here(c, p, b"a type"), node: no_ty() },
+    _ -> Err(error_here(c, p, b"a type")),
   }
 }
 
-fn ty_paren(c: Ctx, p: P, st: Span) -> R<TypeExpr> = {
+fn ty_paren(c: Ctx, p: P, st: Span) -> Result<R<TypeExpr>, P> = {
   let o = advance(c, p);
   if at(c, o.p, t_rparen()) {
     let cl = advance(c, o.p);
     let ar = eat(c, cl.p, t_arrow());
     if ar.ok { fn_ty(c, ar.p, [], st) }
-    else { { p: ar.p, node: TUnit({ span: span_to(o.node, cl.node) }) } }
+    else { Ok({ p: ar.p, node: TUnit({ span: span_to(o.node, cl.node) }) }) }
   } else {
-    let ps = comma_list(c, o.p, t_rparen(), ty);
-    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)`");
-    if cl.p.bail { { p: cl.p, node: no_ty() } } else {
-      let ar = eat(c, cl.p, t_arrow());
-      if ar.ok { fn_ty(c, ar.p, ps.node, st) } else {
-        // `params.into_iter().next()` in the reference. There is no list index,
-        // no `head` and no `nth`, so taking the only element of a one-element
-        // list is a `match` on a fixed-length list pattern — the only indexing
-        // Ply has, and it reaches a fixed prefix and nothing else.
-        // `GAPS.md` §P2.
-        match ps.node {
-          [only] -> { p: ar.p, node: only },
-          // Ply has no tuple type. The note is counted, not spelled.
-          _ -> { p: bail_with(ar.p, diag1(unexpected(), span_to(o.node, cl.node), 1)),
-                 node: no_ty() },
-        }
+    let ps = comma_list(c, o.p, t_rparen(), ty)?;
+    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)`")?;
+    let ar = eat(c, cl.p, t_arrow());
+    if ar.ok { fn_ty(c, ar.p, ps.node, st) } else {
+      // `params.into_iter().next()` in the reference.
+      //
+      // > **Withdrawn in part (ADR 0027).** This note read: *"There is no list
+      // > index, no `head` and no `nth`, so taking the only element of a
+      // > one-element list is a `match` on a fixed-length list pattern."* There
+      // > is an index now. The `match` is kept anyway, because what this arm
+      // > needs is *"exactly one element"* and not *"the first element"* — the
+      // > list pattern says that in one line and `list_at` would need a `len`
+      // > beside it. `GAPS.md` §P2.
+      match ps.node {
+        [only] -> Ok({ p: ar.p, node: only }),
+        // Ply has no tuple type. The note is counted, not spelled.
+        _ -> Err(push_diag(ar.p, diag1(unexpected(), span_to(o.node, cl.node), 1))),
       }
     }
   }
 }
 
-fn ty_record(c: Ctx, p: P) -> R<TypeExpr> = {
+fn ty_record(c: Ctx, p: P) -> Result<R<TypeExpr>, P> = {
   let o = advance(c, p);
-  let fs = comma_list(c, o.p, t_rbrace(), ty_field);
-  let cl = expect_close(c, fs.p, t_rbrace(), o.node, b"`}`");
-  if cl.p.bail { { p: cl.p, node: no_ty() } }
-  else { { p: cl.p, node: TRecord({ span: span_to(o.node, cl.node), fields: fs.node }) } }
+  let {p, node: fs} = comma_list(c, o.p, t_rbrace(), ty_field)?;
+  let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}`")?;
+  Ok({ p: p, node: TRecord({ span: span_to(o.node, cl), fields: fs }) })
 }
 
-fn ty_named(c: Ctx, p: P, st: Span) -> R<TypeExpr> = {
-  let q = qname(c, p, b"a type");
-  if q.p.bail { { p: q.p, node: no_ty() } }
-  else if at(c, q.p, t_lt()) {
+fn ty_named(c: Ctx, p: P, st: Span) -> Result<R<TypeExpr>, P> = {
+  let q = qname(c, p, b"a type")?;
+  if at(c, q.p, t_lt()) {
     let o = advance(c, q.p);
-    let args = comma_list(c, o.p, t_gt(), ty);
-    let cl = expect_gt(c, args.p, b"`>` to close the type arguments");
-    if cl.p.bail { { p: cl.p, node: no_ty() } }
-    else { { p: cl.p,
-             node: TCon({ span: span_to(st, cl.node), name: q.node, args: args.node }) } }
+    let args = comma_list(c, o.p, t_gt(), ty)?;
+    let cl = expect_gt(c, args.p, b"`>` to close the type arguments")?;
+    Ok({ p: cl.p,
+         node: TCon({ span: span_to(st, cl.node), name: q.node, args: args.node }) })
   }
   // A type parameter is bound by the enclosing `<..>`, never by a module, so
   // only a bare lowercase name can be one.
   else if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    { p: q.p, node: TVar(q.node.name) }
+    Ok({ p: q.p, node: TVar(q.node.name) })
   }
-  else { { p: q.p, node: TCon({ span: q.node.span, name: q.node, args: [] }) } }
+  else { Ok({ p: q.p, node: TCon({ span: q.node.span, name: q.node, args: [] }) }) }
 }
 
-fn fn_ty(c: Ctx, p: P, params: List<TypeExpr>, st: Span) -> R<TypeExpr> =
-  if p.bail { { p: p, node: no_ty() } } else {
-    let r = ty(c, p);
-    if r.p.bail { { p: r.p, node: no_ty() } } else {
-      let sl = eat(c, r.p, t_slash());
-      if !sl.ok {
-        { p: sl.p,
-          node: TFn({ span: span_to(st, ty_span(r.node)), params: params,
-                      ret: r.node, effects: None }) }
-      } else {
-        let e = row(c, sl.p);
-        if e.p.bail { { p: e.p, node: no_ty() } }
-        else { { p: e.p,
-                 node: TFn({ span: span_to(st, e.node.span), params: params,
-                             ret: r.node, effects: Some(e.node) }) } }
-      }
-    }
+fn fn_ty(c: Ctx, p: P, params: List<TypeExpr>, st: Span) -> Result<R<TypeExpr>, P> = {
+  let {p, node: r} = ty(c, p)?;
+  let sl = eat(c, p, t_slash());
+  if !sl.ok {
+    Ok({ p: sl.p,
+         node: TFn({ span: span_to(st, ty_span(r)), params: params,
+                     ret: r, effects: None }) })
+  } else {
+    let {p, node: e} = row(c, sl.p)?;
+    Ok({ p: p,
+         node: TFn({ span: span_to(st, e.span), params: params,
+                     ret: r, effects: Some(e) }) })
   }
+}
 
-fn ty_field(c: Ctx, p: P) -> R<{ name: Ident, ty: TypeExpr }> =
-  if p.bail { { p: p, node: { name: no_ident(), ty: no_ty() } } } else {
-    let n = expect_ident(c, p, b"a field name");
-    let co = expect(c, n.p, t_colon(), b"`:` after the field name");
-    if co.p.bail { { p: co.p, node: { name: no_ident(), ty: no_ty() } } } else {
-      let t = ty(c, co.p);
-      { p: t.p, node: { name: n.node, ty: t.node } }
-    }
-  }
+fn ty_field(c: Ctx, p: P) -> Result<R<{ name: Ident, ty: TypeExpr }>, P> = {
+  let {p, node: n} = expect_ident(c, p, b"a field name")?;
+  let {p, ..} = expect(c, p, t_colon(), b"`:` after the field name")?;
+  let {p, node: t} = ty(c, p)?;
+  Ok({ p: p, node: { name: n, ty: t } })
+}
 
 // --- Effect rows ------------------------------------------------------------
 
@@ -240,102 +242,93 @@ type RowAcc = { p: P, aliases: List<QName>, atoms: List<AtomExpr> }
 
 type RowOut = { aliases: List<QName>, atoms: List<AtomExpr> }
 
-pub fn row(c: Ctx, p: P) -> R<RowExpr> =
-  if p.bail { { p: p, node: no_row() } } else {
-    let st = cur_span(c, p);
-    if at(c, p, t_lbrace()) { row_braced(c, p, st) } else {
-      // A whole row that is a bare name is still a row *variable*: a set is
-      // only ever written inside braces, so `/ e` keeps the meaning it has.
-      let t = expect_ident(c, p, b"an effect row: `{..}` or a row variable");
-      if t.p.bail { { p: t.p, node: no_row() } }
-      else { { p: t.p,
-               node: { atoms: [], aliases: [], tail: Some(t.node), span: t.node.span } } }
-    }
+pub fn row(c: Ctx, p: P) -> Result<R<RowExpr>, P> = {
+  let st = cur_span(c, p);
+  if at(c, p, t_lbrace()) { row_braced(c, p, st) } else {
+    // A whole row that is a bare name is still a row *variable*: a set is
+    // only ever written inside braces, so `/ e` keeps the meaning it has.
+    let {p, node: t} = expect_ident(c, p, b"an effect row: `{..}` or a row variable")?;
+    Ok({ p: p,
+         node: { atoms: [], aliases: [], tail: Some(t), span: t.span } })
   }
+}
 
-fn row_braced(c: Ctx, p: P, st: Span) -> R<RowExpr> = {
+fn row_braced(c: Ctx, p: P, st: Span) -> Result<R<RowExpr>, P> = {
   let o = advance(c, p);
-  let ms = row_members(c, o.p, o.node);
-  if ms.p.bail { { p: ms.p, node: no_row() } } else {
-    let pi = eat(c, ms.p, t_pipe());
-    let tl = if pi.ok { expect_ident(c, pi.p, b"an effect row variable after `|`") }
-             else { { p: pi.p, node: no_ident() } };
-    if tl.p.bail { { p: tl.p, node: no_row() } } else {
-      let cl = expect_close(c, tl.p, t_rbrace(), o.node, b"`}` to close the effect row");
-      if cl.p.bail { { p: cl.p, node: no_row() } }
-      else { { p: cl.p,
-               node: { atoms: ms.node.atoms, aliases: ms.node.aliases,
-                       tail: if pi.ok { Some(tl.node) } else { None },
-                       span: span_to(st, cl.node) } } }
-    }
-  }
+  let {p, node: ms} = row_members(c, o.p, o.node)?;
+  let pi = eat(c, p, t_pipe());
+  // The `?` goes on the *variable*, not inside the `if`: a `?` in a branch that
+  // is not itself in return position is `E0119`, and this `if` is a `let`'s
+  // value. Binding first is the lift GUIDE §6.10 names.
+  let opt_tail = if pi.ok { expect_ident(c, pi.p, b"an effect row variable after `|`") }
+                 else { Ok({ p: pi.p, node: no_ident() }) };
+  let {p, node: tl} = opt_tail?;
+  let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}` to close the effect row")?;
+  Ok({ p: p,
+       node: { atoms: ms.atoms, aliases: ms.aliases,
+               tail: if pi.ok { Some(tl) } else { None },
+               span: span_to(st, cl) } })
 }
 
 // Not `comma_list`: this loop stops on two tokens rather than one and its
 // element is a sum that goes to one of two lists.
-fn row_members(c: Ctx, p: P, open: Span) -> R<RowOut> =
+fn row_members(c: Ctx, p: P, open: Span) -> Result<R<RowOut>, P> =
   iterate({ p: p, aliases: [], atoms: [] }, c.ntok - p.pos + 1, |s: RowAcc|
-    if s.p.bail { Stop({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } }) }
-    else if at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
-      Stop({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } })
+    if at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
+      Stop(Ok({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } }))
     }
     else if at_eof(c, s.p) {
-      Stop({ p: unclosed(c, s.p, open, b"`}` to close the effect row"),
-             node: { aliases: s.aliases, atoms: s.atoms } })
+      Stop(Err(unclosed(c, s.p, open, b"`}` to close the effect row")))
     }
     else {
-      let m = row_member(c, s.p);
-      if m.p.bail { Stop({ p: m.p, node: { aliases: s.aliases, atoms: s.atoms } }) } else {
-        let e = eat(c, m.p, t_comma());
-        match m.node {
-          RMAtom(a) ->
-            if e.ok { Continue({ p: e.p, aliases: s.aliases, atoms: push(s.atoms, a) }) }
-            else { Stop({ p: e.p, node: { aliases: s.aliases, atoms: push(s.atoms, a) } }) },
-          RMSet(q) ->
-            if e.ok { Continue({ p: with_sets(e.p), atoms: s.atoms,
-                                 aliases: push(s.aliases, q) }) }
-            else { Stop({ p: with_sets(e.p),
-                          node: { atoms: s.atoms, aliases: push(s.aliases, q) } }) },
-        }
+      match row_member(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(m) -> {
+          let e = eat(c, m.p, t_comma());
+          match m.node {
+            RMAtom(a) ->
+              if e.ok { Continue({ p: e.p, aliases: s.aliases, atoms: push(s.atoms, a) }) }
+              else { Stop(Ok({ p: e.p, node: { aliases: s.aliases, atoms: push(s.atoms, a) } })) },
+            RMSet(q) ->
+              if e.ok { Continue({ p: with_sets(e.p), atoms: s.atoms,
+                                   aliases: push(s.aliases, q) }) }
+              else { Stop(Ok({ p: with_sets(e.p),
+                               node: { atoms: s.atoms, aliases: push(s.aliases, q) } })) },
+          }
+        },
       }
     })
 
 // One member of a row or of an `effect set`. A `.` after the name makes it an
 // atom and nothing else can; one token of lookahead decides it, so no name is
 // reserved and `effect set` needs no keyword of its own.
-pub fn row_member(c: Ctx, p: P) -> R<RowMember> =
-  if p.bail { { p: p, node: RMSet(no_qname()) } } else {
-    let q = qname(c, p, b"an effect atom, or the name of an `effect set`");
-    if q.p.bail { { p: q.p, node: RMSet(no_qname()) } }
-    else if !at(c, q.p, t_dot()) { { p: q.p, node: RMSet(q.node) } }
-    else {
-      let a = atom_rest(c, bump(c, q.p), q.node);
-      { p: a.p, node: RMAtom(a.node) }
-    }
-  }
-
-// The atom after its effect name and the `.` have been consumed.
-pub fn atom_rest(c: Ctx, p: P, ef: QName) -> R<AtomExpr> =
-  if p.bail { { p: p, node: no_atom() } } else {
-    let m = mode(c, p);
-    if m.p.bail { { p: m.p, node: no_atom() } } else {
-      let r = if at(c, m.p, t_lbracket()) { atom_resource(c, m.p) }
-              else { { p: m.p, node: None } };
-      if r.p.bail { { p: r.p, node: no_atom() } }
-      else { { p: r.p,
-               node: { eff: ef, mode: m.node, resource: r.node,
-                       span: span_to(ef.span, prev_span(c, r.p)) } } }
-    }
-  }
-
-fn atom_resource(c: Ctx, p: P) -> R<Option<Ident>> = {
-  let o = advance(c, p);
-  let n = expect_ident(c, o.p, b"a resource name inside `[..]`");
-  if n.p.bail { { p: n.p, node: None } } else {
-    let cl = expect_close(c, n.p, t_rbracket(), o.node, b"`]`");
-    if cl.p.bail { { p: cl.p, node: None } } else { { p: cl.p, node: Some(n.node) } }
+pub fn row_member(c: Ctx, p: P) -> Result<R<RowMember>, P> = {
+  let {p, node: q} = qname(c, p, b"an effect atom, or the name of an `effect set`")?;
+  if !at(c, p, t_dot()) { Ok({ p: p, node: RMSet(q) }) }
+  else {
+    let {p, node: a} = atom_rest(c, bump(c, p), q)?;
+    Ok({ p: p, node: RMAtom(a) })
   }
 }
+
+// The atom after its effect name and the `.` have been consumed.
+pub fn atom_rest(c: Ctx, p: P, ef: QName) -> Result<R<AtomExpr>, P> = {
+  let {p, node: m} = mode(c, p)?;
+  let {p, node: r} = atom_resource(c, p)?;
+  Ok({ p: p,
+       node: { eff: ef, mode: m, resource: r,
+               span: span_to(ef.span, prev_span(c, p)) } })
+}
+
+// The `[..]` test moved inside from the one call site above, so that the caller
+// is a chain of `?` rather than an `if` whose branches would each need one.
+fn atom_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
+  if !at(c, p, t_lbracket()) { Ok({ p: p, node: None }) } else {
+    let o = advance(c, p);
+    let {p, node: n} = expect_ident(c, o.p, b"a resource name inside `[..]`")?;
+    let {p, ..} = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
+    Ok({ p: p, node: Some(n) })
+  }
 
 // --- Generics and parameters ------------------------------------------------
 
@@ -344,59 +337,49 @@ type IdAcc = { p: P, out: List<Ident> }
 // Not `comma_list` either: the reference's two loops here stop on three tokens
 // rather than one — `>`, `>=` and `|` — because a `>=` has not been split yet
 // at this point.
-pub fn generics(c: Ctx, p: P) -> R<Generics> =
-  if p.bail { { p: p, node: no_generics() } } else {
-    let lt = expect(c, p, t_lt(), b"`<`");
-    if lt.p.bail { { p: lt.p, node: no_generics() } } else {
-      let ts = generic_names(c, lt.p, true);
-      if ts.p.bail { { p: ts.p, node: no_generics() } } else {
-        let pi = eat(c, ts.p, t_pipe());
-        let es = if pi.ok { generic_names(c, pi.p, false) } else { { p: pi.p, node: [] } };
-        if es.p.bail { { p: es.p, node: no_generics() } } else {
-          let gt = expect_gt(c, es.p, b"`>` to close the type parameter list");
-          if gt.p.bail { { p: gt.p, node: no_generics() } }
-          else { { p: gt.p, node: { types: ts.node, effects: es.node } } }
-        }
-      }
-    }
-  }
+pub fn generics(c: Ctx, p: P) -> Result<R<Generics>, P> = {
+  let {p, ..} = expect(c, p, t_lt(), b"`<`")?;
+  let {p, node: ts} = generic_names(c, p, true)?;
+  let pi = eat(c, p, t_pipe());
+  let opt_es = if pi.ok { generic_names(c, pi.p, false) } else { Ok({ p: pi.p, node: [] }) };
+  let {p, node: es} = opt_es?;
+  let {p, ..} = expect_gt(c, p, b"`>` to close the type parameter list")?;
+  Ok({ p: p, node: { types: ts, effects: es } })
+}
 
-fn generic_names(c: Ctx, p: P, stop_on_pipe: Bool) -> R<List<Ident>> =
+fn generic_names(c: Ctx, p: P, stop_on_pipe: Bool) -> Result<R<List<Ident>>, P> =
   iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: IdAcc|
-    if s.p.bail { Stop({ p: s.p, node: s.out }) }
-    else if at(c, s.p, t_gt()) || at(c, s.p, t_ge())
-            || (stop_on_pipe && at(c, s.p, t_pipe())) {
-      Stop({ p: s.p, node: s.out })
+    if at(c, s.p, t_gt()) || at(c, s.p, t_ge())
+       || (stop_on_pipe && at(c, s.p, t_pipe())) {
+      Stop(Ok({ p: s.p, node: s.out }))
     }
     else if at_eof(c, s.p) {
-      Stop({ p: error_here(c, s.p, b"`>` to close the type parameter list"), node: s.out })
+      Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
     }
     else {
-      let n = expect_ident(c, s.p,
-                if stop_on_pipe { b"a type parameter name" } else { b"an effect parameter name" });
-      if n.p.bail { Stop({ p: n.p, node: s.out }) } else {
-        let e = eat(c, n.p, t_comma());
-        if e.ok { Continue({ p: e.p, out: push(s.out, n.node) }) }
-        else { Stop({ p: e.p, node: push(s.out, n.node) }) }
+      match expect_ident(c, s.p,
+              if stop_on_pipe { b"a type parameter name" } else { b"an effect parameter name" }) {
+        Err(q) -> Stop(Err(q)),
+        Ok(n) -> {
+          let e = eat(c, n.p, t_comma());
+          if e.ok { Continue({ p: e.p, out: push(s.out, n.node) }) }
+          else { Stop(Ok({ p: e.p, node: push(s.out, n.node) })) }
+        },
       }
     })
 
 // Lives in this area rather than with items because both `fn_def` and
 // `lambda_expr` need it and it needs only `ty`.
-pub fn param(c: Ctx, p: P) -> R<Param> =
-  if p.bail { { p: p, node: no_param() } } else {
-    let n = expect_ident(c, p, b"a parameter name");
-    if n.p.bail { { p: n.p, node: no_param() } } else {
-      let co = eat(c, n.p, t_colon());
-      if !co.ok { { p: co.p, node: { name: n.node, ty: None, span: n.node.span } } } else {
-        let t = ty(c, co.p);
-        if t.p.bail { { p: t.p, node: no_param() } }
-        else { { p: t.p,
-                 node: { name: n.node, ty: Some(t.node),
-                         span: span_to(n.node.span, ty_span(t.node)) } } }
-      }
-    }
+pub fn param(c: Ctx, p: P) -> Result<R<Param>, P> = {
+  let {p, node: n} = expect_ident(c, p, b"a parameter name")?;
+  let co = eat(c, p, t_colon());
+  if !co.ok { Ok({ p: co.p, node: { name: n, ty: None, span: n.span } }) } else {
+    let {p, node: t} = ty(c, co.p)?;
+    Ok({ p: p,
+         node: { name: n, ty: Some(t),
+                 span: span_to(n.span, ty_span(t)) } })
   }
+}
 
 // --- The dump ---------------------------------------------------------------
 
@@ -442,7 +425,7 @@ pub fn dump_param(pa: Param) -> Bytes =
 // below and for a probe that prices parsing a type and nothing else.
 pub fn dump_type_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = ty(s.c, s.p);
+  let r = settle(ty(s.c, s.p), no_ty());
   string_of_bytes(bytes_concat(dump_ty(r.node), dump_diags(r.p.diags)))
 }
 
@@ -451,13 +434,13 @@ pub fn dump_type_of(src: Bytes) -> String = {
 // so: a mutation to `generic_names`' stop set left the suite green.
 pub fn dump_generics_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = generics(s.c, s.p);
+  let r = settle(generics(s.c, s.p), no_generics());
   string_of_bytes(bytes_concat(dump_generics(r.node), dump_diags(r.p.diags)))
 }
 
 pub fn dump_param_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = param(s.c, s.p);
+  let r = settle(param(s.c, s.p), no_param());
   string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
 }
 
