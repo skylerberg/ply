@@ -39,7 +39,7 @@ impl Loaded {
             return Err(report("expanding a `derive`", &expanded));
         }
         let resolved =
-            ply_syntax::resolve::resolve(&ast).map_err(|d| report("resolving the stdlib", &d))?;
+            ply_syntax::resolve::resolve(&mut ast).map_err(|d| report("resolving the stdlib", &d))?;
         let check = ply_core::check_program(&ast, &resolved)
             .map_err(|d| report("checking the stdlib", &d))?;
         Ok(Loaded {
@@ -107,7 +107,7 @@ impl Loaded {
             return Err(report("expanding a `derive`", &expanded));
         }
         let resolved =
-            ply_syntax::resolve::resolve(&ast).map_err(|d| report("resolving the program", &d))?;
+            ply_syntax::resolve::resolve(&mut ast).map_err(|d| report("resolving the program", &d))?;
         let check = ply_core::check_program(&ast, &resolved)
             .map_err(|d| report("checking the program", &d))?;
         Ok(Loaded {
