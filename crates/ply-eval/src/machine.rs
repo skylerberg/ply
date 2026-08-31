@@ -1936,6 +1936,9 @@ impl<'a> Machine<'a> {
                 self.enter_code(closure, &params, body, env, module, args, span)
             }
             ClosureKind::Ctor { name, arity } => {
+                if crate::census::enabled() {
+                    crate::census::with(|c| c.ctor_calls += 1);
+                }
                 if *arity != args.len() {
                     return Err(arity_error(span, &format!("`{name}`"), *arity, args.len()));
                 }
@@ -1947,6 +1950,13 @@ impl<'a> Machine<'a> {
             }
             ClosureKind::Builtin(b) => {
                 let b = *b;
+                if crate::census::enabled() {
+                    let label: &'static str = b.name();
+                    crate::census::with(|c| {
+                        c.builtin_calls += 1;
+                        *c.builtin_names.entry(label).or_default() += 1;
+                    });
+                }
                 self.call_builtin(b, args, span)
             }
         }
@@ -1982,6 +1992,9 @@ impl<'a> Machine<'a> {
             },
             _ => false,
         };
+        if crate::census::enabled() {
+            self.census_call(closure, &args);
+        }
         if let Some(value) = self.compiled_answer(closure, &args) {
             // The interpreted path moves these into the callee's `Env`; a scalar
             // carries no refcount and no `Drop`, so dropping them here is the
@@ -2070,6 +2083,149 @@ impl<'a> Machine<'a> {
     /// `note_step_site`, `err_call_limit` and [`Stack::calls`] have no reader to
     /// serve. Give a backend a callback and that push must move above `enter`,
     /// and the bailout stops being free.
+    /// The seam's census: which gate would refuse this call, counted whether or
+    /// not a backend is attached. See `crate::census`.
+    fn census_call(&self, closure: &Closure, args: &[Value]) {
+        let outcome = crate::compiled::admit(
+            closure,
+            args,
+            !self.sims.is_empty(),
+            self.check,
+            self.max_calls,
+            self.stack.calls(),
+        );
+        let frame_ceiling = self.max_frames.is_some();
+        let name = closure
+            .name
+            .as_ref()
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|| "<anonymous>".to_string());
+        let carried_sig = match (&outcome, self.check) {
+            (Ok((n, _)), Some(check)) => check
+                .defs
+                .get(*n)
+                .is_some_and(|d| crate::backend::carried_signature(&d.scheme.ty)),
+            _ => false,
+        };
+        let blocking: Vec<&'static str> =
+            if matches!(outcome, Err(crate::compiled::Gate::ArgumentShape)) {
+                args.iter()
+                    .filter(|v| !crate::compiled::crossable(v))
+                    .map(crate::census::value_kind)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let ladder: Vec<(&'static str, bool, bool)> = crate::census::LADDER
+            .iter()
+            .map(|(label, kinds, deep)| {
+                let ok = crate::compiled::admit_with(
+                    closure,
+                    args,
+                    !self.sims.is_empty(),
+                    self.check,
+                    self.max_calls,
+                    self.stack.calls(),
+                    |v| {
+                        if *deep {
+                            crate::census::kind_in_deep(v, kinds)
+                        } else {
+                            crate::census::kind_in(v, kinds)
+                        }
+                    },
+                );
+                let returnable = match (&ok, self.check) {
+                    (Ok((n, _)), Some(check)) => check.defs.get(*n).is_some_and(|d| {
+                        matches!(&d.scheme.ty, ply_core::ty::Type::Fn { ret, .. }
+                            if crate::census::type_carries(ret, kinds))
+                    }),
+                    _ => false,
+                };
+                (*label, ok.is_ok(), returnable)
+            })
+            .collect();
+        // The widest rung, attributed: only for calls the shallow twin carries
+        // and the deep one does not, so this counts the gap and nothing else.
+        let (widest_label, widest_kinds, _) =
+            crate::census::LADDER[crate::census::LADDER.len() - 1];
+        let deep_blocker = (ladder
+            .iter()
+            .any(|(l, ok, _)| *l == "4 no world-handle  shallow" && *ok)
+            && !ladder.iter().any(|(l, ok, _)| *l == widest_label && *ok))
+        .then(|| {
+            args.iter()
+                .find_map(|v| crate::census::deep_blocker(v, widest_kinds))
+                .unwrap_or("<none>")
+        });
+        // The type-level alternative to a deep walk: every gate but the shape
+        // one, and the arguments decided from the declared parameter types.
+        let (_, widest_kinds_t, _) = crate::census::LADDER[crate::census::LADDER.len() - 1];
+        let (type_gated, type_gated_and_return) = match (
+            crate::compiled::admit_with(
+                closure,
+                args,
+                !self.sims.is_empty(),
+                self.check,
+                self.max_calls,
+                self.stack.calls(),
+                |_| true,
+            ),
+            self.check,
+        ) {
+            (Ok((n, _)), Some(check)) => match check.defs.get(n).map(|d| &d.scheme.ty) {
+                Some(ply_core::ty::Type::Fn { params, ret, .. }) => {
+                    let ps = params
+                        .iter()
+                        .all(|t| crate::census::type_carries(t, widest_kinds_t));
+                    (ps, ps && crate::census::type_carries(ret, widest_kinds_t))
+                }
+                _ => (false, false),
+            },
+            _ => (false, false),
+        };
+
+        crate::census::with(|c| {
+            c.body_calls += 1;
+            if type_gated {
+                c.type_gated += 1;
+            }
+            if type_gated_and_return {
+                c.type_gated_and_return += 1;
+            }
+            if let Some(k) = deep_blocker {
+                *c.deep_blockers.entry(k).or_default() += 1;
+            }
+            for (label, ok, returnable) in &ladder {
+                if *ok {
+                    *c.widened.entry(label).or_default() += 1;
+                    if *returnable {
+                        *c.widened_returnable.entry(label).or_default() += 1;
+                    }
+                }
+            }
+            if frame_ceiling {
+                c.frame_ceiling += 1;
+            }
+            match &outcome {
+                Ok(_) => {
+                    c.admitted += 1;
+                    if carried_sig {
+                        c.admitted_carried_sig += 1;
+                    }
+                    *c.admitted_names.entry(name).or_default() += 1;
+                }
+                Err(gate) => {
+                    let g = crate::census::gate_name(*gate);
+                    *c.gates.entry(g).or_default() += 1;
+                    *c.refused_names.entry(format!("{name} @ {g}")).or_default() += 1;
+                    for k in &blocking {
+                        *c.blocking_args.entry(k).or_default() += 1;
+                    }
+                }
+            }
+        });
+    }
+
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
         let backend = self.compiled.as_ref()?;
         // A native body pends no frames, so it cannot honour a ceiling counted

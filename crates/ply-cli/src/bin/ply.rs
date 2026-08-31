@@ -7,5 +7,9 @@ fn main() {
             .error(clap::error::ErrorKind::ArgumentConflict, conflict)
             .exit();
     }
-    std::process::exit(ply_cli::execute(cli));
+    let code = ply_cli::execute(cli);
+    if ply_eval::census::enabled() {
+        eprint!("{}", ply_eval::census::report());
+    }
+    std::process::exit(code);
 }

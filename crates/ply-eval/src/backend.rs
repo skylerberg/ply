@@ -16,11 +16,31 @@
 //! generator. What it provides:
 //!
 //! - [`Reference`] — a backend whose "compiled code" is a second tree-walker
-//!   over its own copy of the program, restricted to a **scalar-signature
-//!   fragment**. It answers the right value for every call the seam admits and
+//!   over its own copy of the program, restricted to a **carried-signature
+//!   fragment** — every parameter and the return type in `Int | Bool | Bytes`.
+//!   It answers the right value for every call the seam admits and
 //!   inside its fragment, which is what makes the *accept* path reachable from a
 //!   command a user runs. It is slower than the machine and says so; it exists
 //!   to be policed, not to be fast.
+//!
+//!   > **Half of that is withdrawn on a measurement, 2026-08-30 (ADR 0030).**
+//!   > *"It is slower than the machine"* is true of the case ADR 0026 measured —
+//!   > a body this backend **declines** is re-run to exhaustion once per offer,
+//!   > 26.45 s against 0.04 s over a 20,000-deep ladder — and false of the case
+//!   > that decides whether entering is worth anything. Over the Ply front end
+//!   > (`spikes/ply-parser` parsing `examples/`, 333,851 bytes) it takes 190,618
+//!   > entries covering 296,316 body calls and does them in **0.0800 s against
+//!   > the machine's 0.2900 s — 270 ns a body call against 979, 3.63× faster** —
+//!   > and the whole run is **1.089×** faster with it attached, counterbalanced
+//!   > arms, null control at 0.000%. The mechanism is not that a tree-walker is a
+//!   > better engine: run as one over the same program it is 1.51× *slower*, and
+//!   > 3.11× slower over the lexer alone. It is that the machine's per-call
+//!   > protocol (ADR 0020 §6.3: step, dispatch and refcount, 70.3% of executed
+//!   > time) is nearly the whole cost of a body made of scalars and `Bytes`,
+//!   > which is exactly what this fragment is.
+//!   >
+//!   > *"It exists to be policed, not to be fast"* stands, and the second clause
+//!   > is now a statement about intent rather than about speed.
 //! - [`Mutation`] and [`Mutant`] — the eight configurations of
 //!   `crates/ply-codegen-spike/src/wrong.rs`, reproduced over [`Reference`]
 //!   rather than over a cranelift fragment, so `cargo test --workspace` and
@@ -37,11 +57,22 @@
 //! declined. That gap is where [`Mutation::Unoffered`] lives, and a backend that
 //! answered for everything would have no gap to corrupt.
 //!
-//! So [`Reference`]'s fragment is the one ADR 0019 §5 describes and
-//! `crates/ply-codegen-spike/src/measure.rs` registers: **the definitions whose
-//! whole signature is scalar** — every parameter and the return type `Int` or
-//! `Bool`. It is a static fact about a published scheme, computed once per run.
+//! So [`Reference`]'s fragment is **the definitions whose whole signature is
+//! carried by the seam** — every parameter and the return type `Int`, `Bool` or
+//! `Bytes`, which is `compiled::crossable`'s list read off a published scheme
+//! rather than off a value. It is a static fact, computed once per run.
 //! Everything else is a registry miss and is declined without being run.
+//!
+//! > **Widened with the seam (2026-08-30).** This read: *"So [`Reference`]'s
+//! > fragment is the one ADR 0019 §5 describes and
+//! > `crates/ply-codegen-spike/src/measure.rs` registers: **the definitions
+//! > whose whole signature is scalar** — every parameter and the return type
+//! > `Int` or `Bool`."* Two things are withdrawn. The list is no longer two
+//! > kinds, and the fragment is no longer *the one the spike registers*: the
+//! > spike's `entry::scalar_signature` is unchanged at `Int | Bool`, so the two
+//! > registries have deliberately parted company and this one is the wider.
+//! > The spike may not be depended on (ADR 0016 §3.5), which is why its
+//! > registry was never the definition of this one and is now visibly not.
 //!
 //! # The budget is honoured by construction
 //!
@@ -103,6 +134,8 @@ pub struct Fragment {
     offered: AtomicU64,
     offered_target: AtomicU64,
     fired: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
 }
 
 /// What a run's backend was asked and what it did with it.
@@ -116,6 +149,19 @@ pub struct Offers {
     /// Calls whose answer a mutation actually changed. Zero means a run said
     /// nothing about the corpus that did not catch it.
     pub fired: u64,
+    /// Offers carrying at least one [`Value::Bytes`] argument.
+    ///
+    /// The widening of `compiled::crossable` is inert unless this is non-zero on
+    /// real source, and a corpus run that is green over a seam nothing new
+    /// reached is the vacuous pass `CONTRIBUTING.md` §"The one rule" names. So
+    /// it is counted rather than assumed, and
+    /// `differential_corpus.rs`'s honest-backend test asserts it.
+    pub bytes_in: u64,
+    /// Entered calls that answered a [`Value::Bytes`], counted before any
+    /// mutation touches the answer. The other direction of the same claim: a
+    /// `Bytes` argument that crosses in and never comes back out would mean the
+    /// widening bought arguments and not returns.
+    pub bytes_out: u64,
 }
 
 impl Fragment {
@@ -169,7 +215,7 @@ impl Fragment {
         let members = check
             .defs
             .iter()
-            .filter(|(_, def)| scalar_signature(&def.scheme.ty))
+            .filter(|(_, def)| carried_signature(&def.scheme.ty))
             .map(|(name, _)| name.clone())
             .collect();
         Box::leak(Box::new(Fragment {
@@ -181,6 +227,8 @@ impl Fragment {
             offered: AtomicU64::new(0),
             offered_target: AtomicU64::new(0),
             fired: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
         }))
     }
 
@@ -202,6 +250,20 @@ impl Fragment {
             offered: self.offered.load(Ordering::Relaxed),
             offered_target: self.offered_target.load(Ordering::Relaxed),
             fired: self.fired.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+        }
+    }
+
+    /// One offer, counted, and whether it carried a `Bytes` in.
+    ///
+    /// Both `enter` implementations below route through this rather than
+    /// touching `offered` themselves, so the two counters cannot drift apart the
+    /// day a third implementation appears.
+    fn note_offer(&self, args: &[Value]) {
+        self.offered.fetch_add(1, Ordering::Relaxed);
+        if args.iter().any(|a| matches!(a, Value::Bytes(_))) {
+            self.bytes_in.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -225,24 +287,47 @@ impl Fragment {
     }
 }
 
-/// Every parameter and the return type `Int` or `Bool`, which is the whole of
-/// what `compiled::crossable` carries.
+/// Every parameter and the return type `Int`, `Bool` or `Bytes`, which is the
+/// whole of what `compiled::crossable` carries.
 ///
 /// Read off the published scheme rather than off the body: a fragment is a
 /// static fact a registry is built from, and a backend that decided per call
 /// whether it had a body would be deciding it from the arguments the machine
 /// already gated on.
-fn scalar_signature(ty: &Type) -> bool {
+///
+/// > **Renamed and widened (2026-08-30).** This was `scalar_signature` over
+/// > `Int | Bool`, and the name became a lie the moment `compiled::crossable`
+/// > grew a third kind that is not a scalar. What it has always meant is "every
+/// > position in this signature is a kind the seam carries", so it is now named
+/// > that and reads its list from the same place the seam does.
+/// >
+/// > The widening is what turns a class of *offered and declined* call into an
+/// > entered one, and that class was the majority: over `examples/` and
+/// > `tests/fixtures/` before this change, 122,853 calls cleared every gate and
+/// > 19,009 had a signature this predicate accepted — **84.5% of admitted calls
+/// > were offered and then declined on the return type**, `std.router.hex_char`
+/// > (`Int -> Bytes`, 65,560 calls) and `std.router.escaped` (32,780) being most
+/// > of it. `compiled::admit` gates arguments and never the return, which is the
+/// > gap [`Mutation::Unoffered`] lives in; widening this narrows that gap
+/// > without closing it, and `an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus`
+/// > is what fails if it ever does close.
+pub(crate) fn carried_signature(ty: &Type) -> bool {
     let Type::Fn { params, ret, .. } = ty else {
         return false;
     };
-    params.iter().chain([ret.as_ref()]).all(is_scalar)
+    params.iter().chain([ret.as_ref()]).all(is_carried)
 }
 
-fn is_scalar(ty: &Type) -> bool {
+/// The declared types whose values `compiled::crossable` carries.
+///
+/// `Bytes` is the third, and it is a nominal type with no arguments exactly as
+/// `Int` and `Bool` are, so nothing about the shape of this test changes with
+/// it. A `Type::Var` is refused for the reason it is refused everywhere else
+/// here: an unresolved variable can be instantiated at a closure.
+fn is_carried(ty: &Type) -> bool {
     match ty {
         Type::Con(name, args) => {
-            args.is_empty() && (name.as_str() == "Int" || name.as_str() == "Bool")
+            args.is_empty() && matches!(name.as_str(), "Int" | "Bool" | "Bytes")
         }
         _ => false,
     }
@@ -290,6 +375,10 @@ impl Reference {
         let mut inner = self.inner.try_borrow_mut().ok()?;
         inner.set_max_calls(fuel);
         match inner.call(name.as_str(), args.to_vec(), Span::DUMMY) {
+            Ok(value @ Value::Bytes(_)) => {
+                self.fragment.bytes_out.fetch_add(1, Ordering::Relaxed);
+                Some(value)
+            }
             Ok(value @ (Value::Int(_) | Value::Bool(_))) => Some(value),
             // A registry hit whose body raised, or answered something this
             // boundary does not carry. Declining is the contract: the machine
@@ -306,8 +395,28 @@ impl Compiled for Reference {
     }
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.fragment.offered.fetch_add(1, Ordering::Relaxed);
-        self.answer(name, args, budget)
+        self.fragment.note_offer(args);
+        let answer = self.answer(name, args, budget);
+        // Measurement scaffolding, off unless `PLY_SEAM_CENSUS` is set. It
+        // records the name of a call that was *entered* and not of one that was
+        // merely offered: a registry miss is a hash lookup and no evaluation, so
+        // `answer.is_some()` is load-bearing, and dropping it reports the
+        // offered set under the entered set's name — deleted and re-run, it
+        // turns `32 distinct, 188792 entries` into `33 distinct, 188805` and
+        // lists `lexer.lex`, which is declined every time it is offered
+        // (ADR 0030 §7).
+        //
+        // It is a count and it may not become a duration. This crate may not
+        // read the host's clock at all — `simulated_handlers.rs`'s
+        // `the_evaluator_reads_no_host_clock_and_no_host_entropy` bans the type
+        // by name from this source, and it caught a first version of exactly
+        // this measurement (ADR 0030 §4). What a backend *costs* is measured
+        // from outside the process.
+        if crate::census::enabled() && answer.is_some() {
+            let label = name.as_str().to_string();
+            crate::census::with(|c| *c.entered_names.entry(label).or_default() += 1);
+        }
+        answer
     }
 }
 
@@ -322,7 +431,7 @@ impl Compiled for Reference {
 /// | [`Mutation::OffByOne`] | a compiled arithmetic result is checked, not assumed |
 /// | [`Mutation::Inverted`] | so is a compiled comparison |
 /// | [`Mutation::Stale`] | an answer is tied to *this* call's arguments |
-/// | [`Mutation::WrongType`] | the seam marshals a kind as well as a value |
+/// | [`Mutation::WrongType`] | the seam marshals a kind as well as a value — over all three kinds it carries, `Bytes` included |
 /// | [`Mutation::Unoffered`] | a backend may not answer for a body it does not have |
 /// | [`Mutation::ExceedsBudget`] | `budget` is the machine's bound and not a hint |
 /// | [`Mutation::Answers`] | a call the machine must never offer at all |
@@ -345,8 +454,9 @@ pub enum Mutation {
     /// This call answers what the *previous* entered call answered.
     Stale,
     /// The same information in the wrong kind — `Bool` where the definition
-    /// returns `Int`, and `Int` where it returns `Bool`. Both are crossable, so
-    /// the seam carries them and whatever notices has to be downstream of it.
+    /// returns `Int`, `Int` where it returns `Bool`, and the length where it
+    /// returns `Bytes`. All three are crossable, so the seam carries them and
+    /// whatever notices has to be downstream of it.
     WrongType,
     /// Answers for a name this backend has no body for, instead of declining.
     /// The invented answer is the first `Int` argument, which is the shape a
@@ -373,7 +483,9 @@ impl Mutation {
             Mutation::OffByOne => "every `Int` answer is one too high".to_string(),
             Mutation::Inverted => "every `Bool` answer is inverted".to_string(),
             Mutation::Stale => "every answer is the previous call's".to_string(),
-            Mutation::WrongType => "`Int` answers come back as `Bool` and back".to_string(),
+            Mutation::WrongType => {
+                "`Int` answers come back as `Bool` and back, and `Bytes` as its length".to_string()
+            }
             Mutation::Unoffered => {
                 "names with no compiled body are answered rather than declined".to_string()
             }
@@ -467,6 +579,39 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
 }
 
 /// A backend that is wrong on purpose, wrapped around one that is not.
+///
+/// # What these eight police, and what they do not
+///
+/// **They police [`Reference`]. They do not police [`Compiled`].** The field
+/// below is the whole argument: `inner` is a concrete `Rc<Reference>`, not an
+/// `Rc<dyn Compiled>`, and it is that way because two of the eight need
+/// operations the trait does not have. [`Mutation::Unoffered`] asks the
+/// *registry* — `fragment.holds(name)` — whether a body exists at all, which is
+/// the difference between a decline and a name that was never compiled; that
+/// difference is the gap the mutation lives in. [`Mutation::ExceedsBudget`]
+/// re-runs the body on fuel that is deliberately **not** the machine's budget,
+/// through `Reference::run`, which is private to this module. [`Compiled`] is
+/// `describes` and `enter` (`compiled.rs`) and nothing else, so neither
+/// operation can be asked of an arbitrary backend.
+///
+/// The consequence is worth stating where the next backend's author will meet
+/// it, because the shipping path hides it. `ply test`'s one install route is
+/// `ply_test::InterpExecutor::with_backend`, and its parameter is a
+/// `&'static Fragment` rather than a `dyn Compiled` — so the only backends a
+/// user can attach are the ones [`Fragment::attach`] builds, which is
+/// [`Reference`] and these wrappers over it. **A second implementation of
+/// [`Compiled`] — a code generator, say — cannot currently be handed to a
+/// shipping command at all, and if it could, none of the eight would be
+/// wrapping it.**
+///
+/// ADR 0026 §4.5 makes catching the eight from a shipping command the condition
+/// on *any* backend shipping — *"a backend must be policeable before it is
+/// fast"* — and `crates/ply-cli/tests/backend.rs`'s fourteen green tests are
+/// routinely read as that condition discharged. They discharge it for one
+/// backend. Lifting these onto something a second backend can satisfy means a
+/// trait carrying the registry query and the run-with-arbitrary-fuel, and
+/// `with_backend` taking that instead of a concrete type. Recorded 2026-08-30,
+/// unfixed, and annotated in ADR 0026 §4.5 in the same change.
 pub struct Mutant {
     inner: Rc<Reference>,
     mutation: Mutation,
@@ -488,7 +633,7 @@ impl Compiled for Mutant {
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
         let fragment = self.inner.fragment;
-        fragment.offered.fetch_add(1, Ordering::Relaxed);
+        fragment.note_offer(args);
         if self.target.as_ref().is_some_and(|t| t != name) {
             return self.inner.answer(name, args, budget);
         }
@@ -515,6 +660,13 @@ impl Compiled for Mutant {
             (Mutation::Inverted, Some(Value::Bool(b))) => self.fire(Value::Bool(!b)),
             (Mutation::WrongType, Some(Value::Int(n))) => self.fire(Value::Bool(n != 0)),
             (Mutation::WrongType, Some(Value::Bool(b))) => self.fire(Value::Int(i64::from(b))),
+            // The third kind the seam carries, and the arm that keeps this
+            // mutation's claim true of it. `Int` is crossable, so the machine
+            // accepts this answer and hands it to the program: whatever notices
+            // is downstream of the boundary, which is the whole point.
+            (Mutation::WrongType, Some(Value::Bytes(ref b))) => {
+                self.fire(Value::Int(b.len() as i64))
+            }
             (Mutation::Stale, Some(value)) => {
                 let stale = self.previous.borrow_mut().replace(value.clone());
                 match stale {

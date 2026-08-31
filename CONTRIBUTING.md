@@ -1490,6 +1490,38 @@ Recorded here so nobody spends an afternoon rediscovering them.
    invocation, and every command in `benches/README.md` §"What `mcts` adds"
    carries it.
 
+   > **True of this crate, and routinely re-quoted as a fact about cranelift,
+   > which it is not. Measured 2026-08-30.** The 1.94.0 floor is a property of
+   > the version pinned three lines up in `Cargo.toml`. From the crates.io
+   > index, `rust-version` per release: `cranelift-jit` `0.132.0`–`0.132.3`
+   > declare **1.93.0**; 1.94.0 first appears at `0.133.0`. `-codegen`,
+   > `-frontend`, `-module` and `-native` share the boundary exactly.
+   >
+   > Run, not read: with `cranelift-jit = "=0.132.3"` on this machine's default
+   > `stable` (**rustc 1.93.1** — the version `.github/workflows/ci.yml` pins in
+   > six jobs), a probe emits and **calls** native code for the body of
+   > `lexer.is_digit`, `is_digit(47,48,53,57,58,97) = [0,1,1,1,0,0]`, whole
+   > cranelift stack built clean in 23.86s on aarch64-apple-darwin. Seen to fail
+   > first: flipping one expected answer reports the JIT's real output against
+   > it.
+   >
+   > **This does not make the spike buildable on 1.93.1 and no invocation here
+   > changes.** Downgrading the pin to `=0.132.3` leaves **11 compile errors, all
+   > in `src/jit.rs`** — `ir::MemFlagsData`, eight `iadd_imm_s`/`icmp_imm_s`
+   > sites (the `_s` suffix arrived in 0.133), and two `stack_load`/`stack_addr`
+   > signature changes. Naming and arity drift rather than missing capability,
+   > but not ported, so nothing here says a twelfth is not behind the eleventh.
+   > `+1.94.0` remains the invocation for this crate as it is pinned.
+   >
+   > What the correction is *for* is the inference the record kept drawing from
+   > this sentence — that a compiled backend forces the workspace toolchain.
+   > [ADR 0026](docs/adr/0026-a-reachable-backend.md) §5's *"One is forced by
+   > M9"* is withdrawn there on the same measurement. The cost that does **not**
+   > go away: an optional, default-off cranelift dependency still puts 31
+   > packages into the shipping `Cargo.lock` and takes `grep -c cranelift
+   > Cargo.lock` from 0 to 44, feature **off**, crate excluded from
+   > `workspace.members`.
+
    Why it rotted is unchanged and the consequence is not: the crate declares its
    own `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
    `cargo clippy --workspace --all-targets` still do not touch it — but since
@@ -2339,7 +2371,7 @@ Recorded here so nobody spends an afternoon rediscovering them.
       > **Closed 2026-08-28, by building it.** `ply test --backend <spec>`
       > installs one: `reference` is a backend that answers correctly —
       > `ply_eval::backend::Reference`, a second tree-walker over the
-      > scalar-signature fragment, **not** a code generator and no cranelift in
+      > carried-signature fragment, **not** a code generator and no cranelift in
       > `Cargo.lock` — and `wrong:<mutation>` is one of the eight, so that a
       > green run with a backend attached can be read as evidence. Under
       > `--engine both` the backend is a **third** engine, compared against the
@@ -2360,6 +2392,19 @@ Recorded here so nobody spends an afternoon rediscovering them.
       > `Mutation` with `Mutation::None` in `backend::parse` fails **7 of the
       > 14** and leaves exactly the controls, the gate test and the two
       > cache-rule tests green. Run 2026-08-28.
+      >
+      > > **"scalar-signature" corrected to "carried-signature", 2026-08-30.**
+      > > `compiled::crossable` now carries `Value::Bytes` as well as the two
+      > > scalars — a lexer's arguments are `Bytes` and ADR 0026 §3 records the
+      > > seam refusing `read_line` on `admit`'s first line — so
+      > > `backend::scalar_signature` was renamed `carried_signature` and reads
+      > > `Int | Bool | Bytes`. All fourteen tests in
+      > > `crates/ply-cli/tests/backend.rs` still pass unchanged, seven of eight
+      > > still caught, and the eighth escapes for the same reason. What moved
+      > > is what the fragment reaches: `ply test examples --engine both
+      > > --backend reference` goes from 51 definitions and **768** entries to
+      > > 153 definitions and **62,388**, measured either side on 2026-08-30 by
+      > > narrowing the seam back and rebuilding.
       >
       > **And the result-cache rule is armed, in both of ADR 0026 §4.6's
       > stages, each seen to fail before it was believed.** `cache_bypassed`
