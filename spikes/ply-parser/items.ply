@@ -5,27 +5,34 @@
 // This area sits at the top of the AST's sort DAG (it reaches types, patterns
 // and expressions and none of them reaches back), and it owns **all** of the
 // recovery machinery: `run`'s abandon-and-resynchronise loop, `recover_to_item`,
-// and every "this cannot be `pub`" diagnostic. So it is the area where the
-// `bail: Bool` design either holds or does not, and the one whose testing is
-// fixture-driven rather than corpus-driven — no real `.ply` file in the tree
-// reaches a single line of the recovery half.
+// and every "this cannot be `pub`" diagnostic — the one whose testing is
+// fixture-driven rather than corpus-driven, since no real `.ply` file in the
+// tree reaches a single line of the recovery half.
 //
 // Two shapes recur and both are the spine's:
 //
-//   * every function opens `if p.bail { { p: p, node: <placeholder> } }`, which
-//     is what replaces `?`;
+//   * every parse function answers `Result<R<..>, P>` and its callers chain
+//     with `?`;
 //   * every sequence is one `iterate` with the budget `remaining tokens + 1`, a
 //     backstop that cannot fire.
+//
+// > **Withdrawn (ADR 0028, 2026-08-30).** The first shape read: *"every function
+// > opens `if p.bail { { p: p, node: <placeholder> } }`, which is what replaces
+// > `?`"*, and the paragraph above it called this *"the area where the `bail:
+// > Bool` design either holds or does not"*. There is a `?` now; the flag is
+// > gone and so are this module's 21 guards. What the module still owns is the
+// > recovery half, and that is now three `match`es on `Err` rather than three
+// > calls to `clear_bail`.
 
 import spine (Span, Ident, QName, Ctx, P, R, Acc, PDiag, Label, Ate, Start,
               span_to, dummy_span, no_ident, no_qname, bare, qualified,
               unexpected, unknown_deriver, unknown_effect_set,
-              diag1, diag2, push_diag, bail_with, error_here, unclosed,
+              diag1, diag2, push_diag, error_here, unclosed,
               kind, kind_at, cur_span, span_at, prev_span, at, at_eof,
               at_ident_text, is_ident, is_str, starts_upper,
               advance, bump, eat, expect, expect_close, expect_ident, expect_gt,
-              with_bail, clear_bail, with_no_brace, with_depth, with_sets,
-              fresh_item, start, qname, comma_list,
+              with_no_brace, with_depth, with_sets,
+              fresh_item, start, qname, comma_list, settle, failed,
               t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
               t_comma, t_colon, t_dot, t_eq, t_lt, t_gt, t_ge, t_pipe,
               t_slash, t_arrow,
@@ -143,10 +150,18 @@ pub type Module = { imports: List<ImportDecl>, items: List<Item> }
 
 // --- Placeholders -----------------------------------------------------------
 //
-// The price of a bail flag: a function that has failed still has to answer a
-// value of its return type, so every sort needs a constructible zero. `M6`
-// counts these. In the reference each of them is the `Err(Bail)` that `?`
-// propagates and costs nothing to write.
+// > **Withdrawn in part (ADR 0028, 2026-08-30).** This read: *"The price of a
+// > bail flag: a function that has failed still has to answer a value of its
+// > return type, so every sort needs a constructible zero. `M6` counts these.
+// > In the reference each of them is the `Err(Bail)` that `?` propagates and
+// > costs nothing to write."*
+// >
+// > A failing parse function now answers `Err(p)` and names no zero, so the
+// > price is not paid on the failure path any more. What still uses these is
+// > the *other* thing they were for: a construct that is genuinely absent
+// > (`no_generics()` for a `fn` with no `<..>`) and `settle` at the module's
+// > entry point, where a `test` cannot write `?`. `M6`'s count is a count of a
+// > design that no longer exists.
 
 pub fn no_import() -> ImportDecl = { path: [], kind: IModule, span: dummy_span() }
 
@@ -254,9 +269,10 @@ pub fn is_close(k: Tok) -> Bool = k == t_rparen() || k == t_rbrace() || k == t_r
 // terminates in at most `ntok - pos` rounds however the grammar behaved, and the
 // budget below cannot fire.
 //
-// It is also the only place in this area that must run with `bail` **cleared**,
-// which the two callers do: recovery is what happens after the failure is
-// caught, and a guarded `bump` would refuse to move.
+// It is also where a failure is *caught* rather than propagated, which its two
+// callers do with a `match` on `Err`. Under the old flag design they had first
+// to call `clear_bail`, because a guarded `bump` would have refused to move;
+// with `?` the caught state is an ordinary `P` and there is nothing to clear.
 pub fn recover_to_item(c: Ctx, p: P) -> P = {
   // Both callers consume the leading keyword before they can fail, so already
   // being at an item start means progress was made and the token belongs to the
@@ -276,43 +292,41 @@ pub fn recover_to_item(c: Ctx, p: P) -> P = {
 
 // --- Imports ----------------------------------------------------------------
 
-pub fn import_name(c: Ctx, p: P) -> R<Ident> =
+pub fn import_name(c: Ctx, p: P) -> Result<R<Ident>, P> =
   expect_ident(c, p, b"a name to import from the module")
 
 // `import a.b.c` — the dotted path. `parser.rs:325`.
-pub fn import_path(c: Ctx, p: P, first: Ident) -> R<List<Ident>> =
+pub fn import_path(c: Ctx, p: P, first: Ident) -> Result<R<List<Ident>>, P> =
   iterate({ p: p, out: [first] }, c.ntok - p.pos + 1, |s: Acc<Ident>|
-    if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
+    {
       let d = eat(c, s.p, t_dot());
-      if !d.ok { Stop({ p: d.p, node: s.out }) } else {
-        let n = expect_ident(c, d.p, b"another module path segment after `.`");
-        if n.p.bail { Stop({ p: n.p, node: s.out }) }
-        else { Continue({ p: n.p, out: push(s.out, n.node) }) }
+      if !d.ok { Stop(Ok({ p: d.p, node: s.out })) } else {
+        match expect_ident(c, d.p, b"another module path segment after `.`") {
+          Err(q) -> Stop(Err(q)),
+          Ok(n) -> Continue({ p: n.p, out: push(s.out, n.node) }),
+        }
       }
     })
 
 // `as` is contextual: it stays usable as an ordinary identifier.
 // `parser.rs:331-350`.
-pub fn import_kind(c: Ctx, p: P) -> R<ImportKind> =
-  if p.bail { { p: p, node: IModule } }
-  else if at_ident_text(c, p, b"as") {
+pub fn import_kind(c: Ctx, p: P) -> Result<R<ImportKind>, P> =
+  if at_ident_text(c, p, b"as") {
     let a = advance(c, p);
-    let n = expect_ident(c, a.p, b"a name to bind the module as, after `as`");
-    if n.p.bail { { p: n.p, node: IModule } } else { { p: n.p, node: IAlias(n.node) } }
+    let n = expect_ident(c, a.p, b"a name to bind the module as, after `as`")?;
+    Ok({ p: n.p, node: IAlias(n.node) })
   }
   else if at(c, p, t_lparen()) {
     let o = advance(c, p);
-    let names = comma_list(c, o.p, t_rparen(), import_name);
-    let cl = expect_close(c, names.p, t_rparen(), o.node, b"`)` to close the imported names");
-    if cl.p.bail { { p: cl.p, node: IModule } }
-    else if len(names.node) == 0 {
+    let names = comma_list(c, o.p, t_rparen(), import_name)?;
+    let cl = expect_close(c, names.p, t_rparen(), o.node, b"`)` to close the imported names")?;
+    if len(names.node) == 0 {
       // An empty list imports nothing: one primary label over `(..)`, one note.
-      { p: with_bail(push_diag(cl.p, diag1(unexpected(), span_to(o.node, cl.node), 1))),
-        node: IModule }
+      Err(push_diag(cl.p, diag1(unexpected(), span_to(o.node, cl.node), 1)))
     }
-    else { { p: cl.p, node: INames(names.node) } }
+    else { Ok({ p: cl.p, node: INames(names.node) }) }
   }
-  else { { p: p, node: IModule } }
+  else { Ok({ p: p, node: IModule }) }
 
 // `import m as x (a, b)` renames *and* selects, which is two bindings for one
 // declaration. `parser.rs:352-372`.
@@ -323,49 +337,55 @@ pub fn imports_both(c: Ctx, p: P, k: ImportKind) -> Bool =
     IModule -> false,
   }
 
-pub fn import_decl(c: Ctx, p: P) -> R<ImportDecl> =
-  if p.bail { { p: p, node: no_import() } } else {
-    let st = advance(c, p);
-    let first = expect_ident(c, st.p, b"a module path after `import`");
-    if first.p.bail { { p: first.p, node: no_import() } } else {
-      let path = import_path(c, first.p, first.node);
-      if path.p.bail { { p: path.p, node: no_import() } } else {
-        let k = import_kind(c, path.p);
-        if k.p.bail { { p: k.p, node: no_import() } }
-        else if imports_both(c, k.p, k.node) {
-          { p: with_bail(push_diag(k.p, diag1(unexpected(), cur_span(c, k.p), 1))),
-            node: no_import() }
-        }
-        else {
-          { p: k.p,
-            node: { path: path.node, kind: k.node,
-                    span: span_to(st.node, prev_span(c, k.p)) } }
-        }
-      }
-    }
+pub fn import_decl(c: Ctx, p: P) -> Result<R<ImportDecl>, P> = {
+  let st = advance(c, p);
+  let {p, node: first} = expect_ident(c, st.p, b"a module path after `import`")?;
+  let {p, node: path} = import_path(c, p, first)?;
+  let {p, node: k} = import_kind(c, p)?;
+  if imports_both(c, p, k) {
+    Err(push_diag(p, diag1(unexpected(), cur_span(c, p), 1)))
   }
+  else {
+    Ok({ p: p,
+         node: { path: path, kind: k,
+                 span: span_to(st.node, prev_span(c, p)) } })
+  }
+}
 
 // Every `import` precedes every item, so the import table is complete before any
 // body is parsed. `parser.rs:295`.
+// One of the three places the reference matches on `Err(Bail)` instead of
+// propagating it (`parser.rs:300`). Here that is the `Err` arm of a `match`, and
+// the state the arm binds is what `clear_bail` used to make: a failure carries
+// its `P`, so recovery has the diagnostics and the position it needs and there
+// is no flag left to clear.
 pub fn imports(c: Ctx, p: P) -> R<List<ImportDecl>> =
   iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<ImportDecl>|
     if !at(c, s.p, k_import()) { Stop({ p: s.p, node: s.out }) } else {
-      let d = import_decl(c, s.p);
-      if d.p.bail { Continue({ p: recover_to_item(c, clear_bail(d.p)), out: s.out }) }
-      else { Continue({ p: d.p, out: push(s.out, d.node) }) }
+      match import_decl(c, s.p) {
+        Err(q) -> Continue({ p: recover_to_item(c, q), out: s.out }),
+        Ok(d) -> Continue({ p: d.p, out: push(s.out, d.node) }),
+      }
     })
 
 // Reported rather than silently accepted: a later pass would otherwise have to
 // look ahead to know what a name in an earlier body could mean. `parser.rs:308`.
 //
-// The secondary label points at the **first** item, and `Vec::first` is not
-// available: the `List` surface has no index and no head. Rather than fold the
-// item list on every out-of-order import, `run`'s accumulator carries the first
-// item's span as it goes — O(1) instead of O(n), at the cost of one more field
-// threaded through the loop. `GAPS.md` §P3.
-pub fn import_out_of_order(c: Ctx, p: P, first_item: Option<Span>) -> P =
+// The secondary label points at the **first** item.
+//
+// > **Withdrawn (ADR 0027, 2026-08-30).** This note read: *"`Vec::first` is not
+// > available: the `List` surface has no index and no head. Rather than fold
+// > the item list on every out-of-order import, `run`'s accumulator carries the
+// > first item's span as it goes — O(1) instead of O(n), at the cost of one
+// > more field threaded through the loop."*
+// >
+// > `items.first()` is `list_at(items, 0)`. ADR 0027 §7 refused a `list_head`
+// > builtin and this is why it did not need one: the index answers it, in O(1),
+// > with no fold and no extra field. `ModAcc` is three fields, and this takes
+// > the `Option<Item>` the caller already has instead of a span it computed.
+pub fn import_out_of_order(c: Ctx, p: P, first_item: Option<Item>) -> P =
   match first_item {
-    Some(s) -> push_diag(p, diag2(unexpected(), cur_span(c, p), s, 1)),
+    Some(i) -> push_diag(p, diag2(unexpected(), cur_span(c, p), item_span(i), 1)),
     None -> push_diag(p, diag1(unexpected(), cur_span(c, p), 1)),
   }
 
@@ -382,53 +402,46 @@ pub fn deriver_of(name: Bytes) -> Option<Deriver> =
 
 pub type RDeriver = { p: P, node: Deriver }
 
-pub fn deriver(c: Ctx, p: P, name: Ident) -> RDeriver =
-  if p.bail { { p: p, node: DJson } } else {
-    match deriver_of(name.name) {
-      Some(d) -> { p: p, node: d },
-      None -> { p: with_bail(push_diag(p, diag1(unknown_deriver(), name.span, 1))),
-                node: DJson },
-    }
+pub fn deriver(c: Ctx, p: P, name: Ident) -> Result<RDeriver, P> =
+  match deriver_of(name.name) {
+    Some(d) -> Ok({ p: p, node: d }),
+    None -> Err(push_diag(p, diag1(unknown_deriver(), name.span, 1))),
   }
 
 // `parser.rs:660`.
-pub fn constraint(c: Ctx, p: P) -> R<Constraint> =
-  if p.bail { { p: p, node: no_constraint() } } else {
-    let start = cur_span(c, p);
-    if !at_ident_text(c, p, b"derivable") {
-      { p: error_here(c, p, b"`derivable(<deriver>, <type parameter>)`"), node: no_constraint() }
-    } else {
-      let a = advance(c, p);
-      let o = expect(c, a.p, t_lparen(), b"`(` after `derivable`");
-      let n = expect_ident(c, o.p, b"a deriver name");
-      let d = deriver(c, n.p, n.node);
-      let cm = expect(c, d.p, t_comma(), b"`,` and the type parameter");
-      let pa = expect_ident(c, cm.p, b"the type parameter the constraint is about");
-      let cl = expect_close(c, pa.p, t_rparen(), o.node, b"`)` to close `derivable`");
-      if cl.p.bail { { p: cl.p, node: no_constraint() } }
-      else {
-        { p: cl.p,
-          node: { deriver: d.node, deriver_span: n.node.span, param: pa.node,
-                  span: span_to(start, cl.node) } }
-      }
-    }
+pub fn constraint(c: Ctx, p: P) -> Result<R<Constraint>, P> = {
+  let start = cur_span(c, p);
+  if !at_ident_text(c, p, b"derivable") {
+    Err(error_here(c, p, b"`derivable(<deriver>, <type parameter>)`"))
+  } else {
+    let a = advance(c, p);
+    let {p, node: o} = expect(c, a.p, t_lparen(), b"`(` after `derivable`")?;
+    let {p, node: n} = expect_ident(c, p, b"a deriver name")?;
+    let {p, node: d} = deriver(c, p, n)?;
+    let {p, ..} = expect(c, p, t_comma(), b"`,` and the type parameter")?;
+    let {p, node: pa} = expect_ident(c, p, b"the type parameter the constraint is about")?;
+    let {p, node: cl} = expect_close(c, p, t_rparen(), o, b"`)` to close `derivable`")?;
+    Ok({ p: p,
+         node: { deriver: d, deriver_span: n.span, param: pa,
+                 span: span_to(start, cl) } })
   }
+}
 
 // `where derivable(json, a), derivable(ord, k)`, between the effect row and any
 // `requires`. Contextual: the grammar admits nothing but `=`, `{`, `requires`
 // and `ensures` at this position, so no ordinary name loses its meaning.
 // `parser.rs:646`.
-pub fn where_clause(c: Ctx, p: P) -> R<List<Constraint>> =
-  if p.bail || !at_ident_text(c, p, b"where") { { p: p, node: [] } } else {
+pub fn where_clause(c: Ctx, p: P) -> Result<R<List<Constraint>>, P> =
+  if !at_ident_text(c, p, b"where") { Ok({ p: p, node: [] }) } else {
     let a = advance(c, p);
     iterate({ p: a.p, out: [] }, c.ntok - a.p.pos + 1, |s: Acc<Constraint>|
-      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
-        let cn = constraint(c, s.p);
-        if cn.p.bail { Stop({ p: cn.p, node: s.out }) } else {
+      match constraint(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(cn) -> {
           let cm = eat(c, cn.p, t_comma());
-          if !cm.ok { Stop({ p: cm.p, node: push(s.out, cn.node) }) }
+          if !cm.ok { Stop(Ok({ p: cm.p, node: push(s.out, cn.node) })) }
           else { Continue({ p: cm.p, out: push(s.out, cn.node) }) }
-        }
+        },
       })
   }
 
@@ -442,141 +455,155 @@ pub fn spec_kind_at(c: Ctx, p: P) -> Option<SpecKind> =
   else if at_ident_text(c, p, b"ensures") { Some(SEnsures) }
   else { None }
 
-pub fn spec_clauses(c: Ctx, p: P) -> R<List<SpecClause>> =
-  if p.bail { { p: p, node: [] } } else {
-    iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<SpecClause>|
-      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
-        match spec_kind_at(c, s.p) {
-          None -> Stop({ p: s.p, node: s.out }),
-          Some(k) -> {
-            let a = advance(c, s.p);
-            // Parsed like an `if` condition: a `{` closes the clause and opens
-            // the function's block body, so `ensures p(x) { .. }` is a clause
-            // plus a body and never a record literal.
-            let e = scrutinee(c, a.p);
-            if e.p.bail { Stop({ p: e.p, node: s.out }) }
-            else {
-              Continue({ p: e.p,
-                         out: push(s.out, { kind: k, expr: e.node,
-                                            span: span_to(a.node, expr_span(e.node)) }) })
-            }
-          },
+pub fn spec_clauses(c: Ctx, p: P) -> Result<R<List<SpecClause>>, P> =
+  iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<SpecClause>|
+    match spec_kind_at(c, s.p) {
+      None -> Stop(Ok({ p: s.p, node: s.out })),
+      Some(k) -> {
+        let a = advance(c, s.p);
+        // Parsed like an `if` condition: a `{` closes the clause and opens
+        // the function's block body, so `ensures p(x) { .. }` is a clause
+        // plus a body and never a record literal.
+        match scrutinee(c, a.p) {
+          Err(q) -> Stop(Err(q)),
+          Ok(e) ->
+            Continue({ p: e.p,
+                       out: push(s.out, { kind: k, expr: e.node,
+                                          span: span_to(a.node, expr_span(e.node)) }) }),
         }
-      })
-  }
+      },
+    })
 
-pub fn fn_body(c: Ctx, p: P) -> R<Expr> =
-  if p.bail { { p: p, node: no_expr() } } else {
-    let e = eat(c, p, t_eq());
-    if e.ok { expr(c, e.p) }
-    else if at(c, e.p, t_lbrace()) { block_expr(c, e.p) }
-    else { { p: error_here(c, e.p, b"`=` or `{` to start the function body"), node: no_expr() } }
+// > **The one load-bearing guard `GAPS.md` §2 wrote out, and it is gone.** That
+// > entry's worked example is `fn f() -> Int where derivable(zz, a) = 1`:
+// > `deriver` bailed with `E0207`, `where_clause` and `spec_clauses` stopped,
+// > and then *"`fn_body` runs with `bail` set; `eat(t_eq())` refuses because
+// > `eat` guards — but `at(c, e.p, t_lbrace())` is an **ordinary predicate that
+// > answers `false`**, so control reaches `error_here`, which the spine does not
+// > guard, and a phantom `E0001` at 32..33 appears that the reference never
+// > raises."*
+// >
+// > The guard that stopped it was `if p.bail` on this function, one of the 20 of
+// > 83 the sweep could show mattered. `?` removes the shape: `where_clause`'s
+// > failure leaves `fn_def` at its `?` and `fn_body` is never entered. The
+// > entry's own closing sentence — *"This is a class of bug that cannot exist in
+// > the reference, where `?` returns before the caller is entered"* — is now
+// > true here too.
+pub fn fn_body(c: Ctx, p: P) -> Result<R<Expr>, P> = {
+  let e = eat(c, p, t_eq());
+  if e.ok { expr(c, e.p) }
+  else if at(c, e.p, t_lbrace()) { block_expr(c, e.p) }
+  else { Err(error_here(c, e.p, b"`=` or `{` to start the function body")) }
+}
+
+// Three optional pieces of a `fn` header, each its own function so that its `?`
+// sits in a return position rather than inside a `let`'s `if` (`E0119`).
+fn opt_generics(c: Ctx, p: P) -> Result<R<Generics>, P> =
+  if !at(c, p, t_lt()) { Ok({ p: p, node: no_generics() }) } else { generics(c, p) }
+
+fn opt_ret(c: Ctx, p: P) -> Result<R<Option<TypeExpr>>, P> = {
+  let ar = eat(c, p, t_arrow());
+  if !ar.ok { Ok({ p: ar.p, node: None }) } else {
+    let {p, node: t} = ty(c, ar.p)?;
+    Ok({ p: p, node: Some(t) })
   }
+}
+
+fn opt_row(c: Ctx, p: P) -> Result<R<Option<RowExpr>>, P> = {
+  let sl = eat(c, p, t_slash());
+  if !sl.ok { Ok({ p: sl.p, node: None }) } else {
+    let {p, node: r} = row(c, sl.p)?;
+    Ok({ p: p, node: Some(r) })
+  }
+}
 
 // `parser.rs:680`.
-pub fn fn_def(c: Ctx, p: P, vis: Vis) -> R<FnDef> =
-  if p.bail { { p: p, node: no_fn() } } else {
-    let st = advance(c, p);
-    let name = expect_ident(c, st.p, b"a function name after `fn`");
-    let g = if at(c, name.p, t_lt()) { generics(c, name.p) }
-            else { { p: name.p, node: no_generics() } };
-    let o = expect(c, g.p, t_lparen(), b"`(` to start the parameter list");
-    let ps = comma_list(c, o.p, t_rparen(), param);
-    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)` to close the parameter list");
-    let ar = eat(c, cl.p, t_arrow());
-    let ret = if ar.ok { let t = ty(c, ar.p); { p: t.p, node: Some(t.node) } }
-              else { { p: ar.p, node: None } };
-    let sl = eat(c, ret.p, t_slash());
-    let eff = if sl.ok { let r = row(c, sl.p); { p: r.p, node: Some(r.node) } }
-              else { { p: sl.p, node: None } };
-    let cs = where_clause(c, eff.p);
-    let sp = spec_clauses(c, cs.p);
-    let body = fn_body(c, sp.p);
-    if body.p.bail { { p: body.p, node: no_fn() } }
-    else {
-      { p: body.p,
-        node: { vis: vis, name: name.node, generics: g.node, params: ps.node,
-                ret: ret.node, effects: eff.node, constraints: cs.node, spec: sp.node,
-                body: body.node, span: span_to(st.node, expr_span(body.node)) } }
-    }
-  }
+pub fn fn_def(c: Ctx, p: P, vis: Vis) -> Result<R<FnDef>, P> = {
+  let st = advance(c, p);
+  let {p, node: name} = expect_ident(c, st.p, b"a function name after `fn`")?;
+  let {p, node: g} = opt_generics(c, p)?;
+  let {p, node: o} = expect(c, p, t_lparen(), b"`(` to start the parameter list")?;
+  let {p, node: ps} = comma_list(c, p, t_rparen(), param)?;
+  let {p, ..} = expect_close(c, p, t_rparen(), o, b"`)` to close the parameter list")?;
+  let {p, node: ret} = opt_ret(c, p)?;
+  let {p, node: eff} = opt_row(c, p)?;
+  let {p, node: cs} = where_clause(c, p)?;
+  let {p, node: sp} = spec_clauses(c, p)?;
+  let {p, node: body} = fn_body(c, p)?;
+  Ok({ p: p,
+       node: { vis: vis, name: name, generics: g, params: ps,
+               ret: ret, effects: eff, constraints: cs, spec: sp,
+               body: body, span: span_to(st.node, expr_span(body)) } })
+}
 
 // --- `law` ------------------------------------------------------------------
 
 // A binder's type is mandatory: inferring it would make a law's meaning depend
 // on how its body happened to be written. `parser.rs:810`.
-pub fn binder(c: Ctx, p: P) -> R<Binder> =
-  if p.bail { { p: p, node: no_binder() } } else {
-    let name = expect_ident(c, p, b"a binder name");
-    let co = expect(c, name.p, t_colon(), b"`:` and a type - a `forall` binder must be annotated");
-    let t = ty(c, co.p);
-    if t.p.bail { { p: t.p, node: no_binder() } }
-    else {
-      { p: t.p,
-        node: { name: name.node, ty: t.node,
-                span: span_to(name.node.span, ty_span(t.node)) } }
-    }
-  }
+pub fn binder(c: Ctx, p: P) -> Result<R<Binder>, P> = {
+  let {p, node: name} = expect_ident(c, p, b"a binder name")?;
+  let {p, ..} = expect(c, p, t_colon(), b"`:` and a type - a `forall` binder must be annotated")?;
+  let {p, node: t} = ty(c, p)?;
+  Ok({ p: p,
+       node: { name: name, ty: t,
+               span: span_to(name.span, ty_span(t)) } })
+}
 
 pub type RBinders = { p: P, node: List<Binder> }
 
-pub fn law_binders(c: Ctx, p: P) -> RBinders =
-  if !at_ident_text(c, p, b"forall") { { p: p, node: [] } } else {
+pub fn law_binders(c: Ctx, p: P) -> Result<RBinders, P> =
+  if !at_ident_text(c, p, b"forall") { Ok({ p: p, node: [] }) } else {
     let a = advance(c, p);
-    let o = expect(c, a.p, t_lparen(), b"`(` to start the `forall` binders");
-    let bs = comma_list(c, o.p, t_rparen(), binder);
-    let cl = expect_close(c, bs.p, t_rparen(), o.node, b"`)` to close the binders");
-    if cl.p.bail { { p: cl.p, node: [] } }
-    else if len(bs.node) == 0 {
+    let {p, node: o} = expect(c, a.p, t_lparen(), b"`(` to start the `forall` binders")?;
+    let {p, node: bs} = comma_list(c, p, t_rparen(), binder)?;
+    let {p, node: cl} = expect_close(c, p, t_rparen(), o, b"`)` to close the binders")?;
+    if len(bs) == 0 {
       // A law with no binders is a ground claim: one primary over `(..)`, one
       // note.
-      { p: with_bail(push_diag(cl.p, diag1(unexpected(), span_to(o.node, cl.node), 1))),
-        node: [] }
+      Err(push_diag(p, diag1(unexpected(), span_to(o, cl), 1)))
     }
-    else { { p: cl.p, node: bs.node } }
+    else { Ok({ p: p, node: bs }) }
   }
 
 pub type RStr = { p: P, name: Bytes, span: Span }
 
 // A quoted label. `TokenKind::Str` carries the decoded text, which `lexer.ply`
 // carries as `TStr(Bytes)`.
-pub fn quoted(c: Ctx, p: P, what: Bytes) -> RStr =
-  if p.bail { { p: p, name: b"", span: dummy_span() } } else {
-    match kind(c, p) {
-      TStr(s) -> { p: bump(c, p), name: s, span: cur_span(c, p) },
-      _ -> { p: error_here(c, p, what), name: b"", span: dummy_span() },
-    }
+pub fn quoted(c: Ctx, p: P, what: Bytes) -> Result<RStr, P> =
+  match kind(c, p) {
+    TStr(s) -> Ok({ p: bump(c, p), name: s, span: cur_span(c, p) }),
+    _ -> Err(error_here(c, p, what)),
   }
 
 // `parser.rs:754`.
-pub fn law_def(c: Ctx, p: P) -> R<LawDef> =
-  if p.bail { { p: p, node: no_law_def() } } else {
-    let st = advance(c, p);
-    let sl = eat(c, st.p, t_slash());
-    let h = if !sl.ok { { p: sl.p, node: false } }
-            else if !at_ident_text(c, sl.p, b"host") { { p: error_here(c, sl.p, b"`host` after `law/`"), node: false } }
-            else { { p: advance(c, sl.p).p, node: true } };
-    let nm = quoted(c, h.p, b"a quoted law label");
-    if nm.p.bail { { p: nm.p, node: no_law_def() } } else {
-      let bs = law_binders(c, nm.p);
-      if bs.p.bail { { p: bs.p, node: no_law_def() } } else {
-        let w = eat(c, bs.p, t_pipe());
-        let g = if at_ident_text(c, bs.p, b"where") {
-                  let a = advance(c, bs.p);
-                  let e = scrutinee(c, a.p);
-                  { p: e.p, node: Some(e.node) }
-                } else { { p: bs.p, node: None } };
-        let body = block_expr(c, g.p);
-        if body.p.bail { { p: body.p, node: no_law_def() } }
-        else {
-          { p: body.p,
-            node: { name: nm.name, name_span: nm.span, host: h.node, binders: bs.node,
-                    guard: g.node, body: body.node,
-                    span: span_to(st.node, expr_span(body.node)) } }
-        }
-      }
-    }
+type RHost = { p: P, node: Bool }
+
+fn law_host(c: Ctx, p: P) -> Result<RHost, P> = {
+  let sl = eat(c, p, t_slash());
+  if !sl.ok { Ok({ p: sl.p, node: false }) }
+  else if !at_ident_text(c, sl.p, b"host") { Err(error_here(c, sl.p, b"`host` after `law/`")) }
+  else { Ok({ p: advance(c, sl.p).p, node: true }) }
+}
+
+fn law_guard(c: Ctx, p: P) -> Result<R<Option<Expr>>, P> =
+  if !at_ident_text(c, p, b"where") { Ok({ p: p, node: None }) } else {
+    let a = advance(c, p);
+    let {p, node: e} = scrutinee(c, a.p)?;
+    Ok({ p: p, node: Some(e) })
   }
+
+pub fn law_def(c: Ctx, p: P) -> Result<R<LawDef>, P> = {
+  let st = advance(c, p);
+  let {p, node: h} = law_host(c, st.p)?;
+  let nm = quoted(c, p, b"a quoted law label")?;
+  let {p, node: bs} = law_binders(c, nm.p)?;
+  let {p, node: g} = law_guard(c, p)?;
+  let {p, node: body} = block_expr(c, p)?;
+  Ok({ p: p,
+       node: { name: nm.name, name_span: nm.span, host: h, binders: bs,
+               guard: g, body: body,
+               span: span_to(st.node, expr_span(body)) } })
+}
 
 // --- `type` -----------------------------------------------------------------
 
@@ -592,145 +619,143 @@ pub fn looks_like_variants(c: Ctx, p: P) -> Bool =
   }
 
 // `parser.rs:906`.
-pub fn variants(c: Ctx, p: P) -> R<List<VariantDef>> =
-  if p.bail { { p: p, node: [] } } else {
-    let lead = eat(c, p, t_pipe());
-    iterate({ p: lead.p, out: [] }, c.ntok - lead.p.pos + 1, |s: Acc<VariantDef>|
-      if s.p.bail { Stop({ p: s.p, node: s.out }) } else {
-        let name = expect_ident(c, s.p, b"a variant name");
-        if name.p.bail { Stop({ p: name.p, node: s.out }) } else {
-          let fs = if !at(c, name.p, t_lparen()) { { p: name.p, node: [] } }
-                   else {
-                     let o = advance(c, name.p);
-                     let l = comma_list(c, o.p, t_rparen(), ty);
-                     let cl = expect_close(c, l.p, t_rparen(), o.node, b"`)` to close the variant fields");
-                     { p: cl.p, node: l.node }
-                   };
-          if fs.p.bail { Stop({ p: fs.p, node: s.out }) } else {
-            let v = { name: name.node, fields: fs.node,
-                      span: span_to(name.node.span, prev_span(c, fs.p)) };
-            let pi = eat(c, fs.p, t_pipe());
-            if !pi.ok { Stop({ p: pi.p, node: push(s.out, v) }) }
-            else { Continue({ p: pi.p, out: push(s.out, v) }) }
-          }
-        }
-      })
+fn variant_fields(c: Ctx, p: P) -> Result<R<List<TypeExpr>>, P> =
+  if !at(c, p, t_lparen()) { Ok({ p: p, node: [] }) } else {
+    let o = advance(c, p);
+    let {p, node: l} = comma_list(c, o.p, t_rparen(), ty)?;
+    let {p, ..} = expect_close(c, p, t_rparen(), o.node, b"`)` to close the variant fields")?;
+    Ok({ p: p, node: l })
   }
+
+pub fn variants(c: Ctx, p: P) -> Result<R<List<VariantDef>>, P> = {
+  let lead = eat(c, p, t_pipe());
+  iterate({ p: lead.p, out: [] }, c.ntok - lead.p.pos + 1, |s: Acc<VariantDef>|
+    match expect_ident(c, s.p, b"a variant name") {
+      Err(q) -> Stop(Err(q)),
+      Ok(name) -> match variant_fields(c, name.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(fs) -> {
+          let v = { name: name.node, fields: fs.node,
+                    span: span_to(name.node.span, prev_span(c, fs.p)) };
+          let pi = eat(c, fs.p, t_pipe());
+          if !pi.ok { Stop(Ok({ p: pi.p, node: push(s.out, v) })) }
+          else { Continue({ p: pi.p, out: push(s.out, v) }) }
+        },
+      },
+    })
+}
 
 // The type parameter list of a `type`, which is spelled out at `parser.rs:863`
 // rather than shared with `generics` because a `type` takes no effect
 // parameters.
-pub fn type_params(c: Ctx, p: P) -> R<List<Ident>> =
-  if !at(c, p, t_lt()) { { p: p, node: [] } } else {
+pub fn type_params(c: Ctx, p: P) -> Result<R<List<Ident>>, P> =
+  if !at(c, p, t_lt()) { Ok({ p: p, node: [] }) } else {
     let o = advance(c, p);
-    let ns = iterate({ p: o.p, out: [] }, c.ntok - o.p.pos + 1, |s: Acc<Ident>|
-      if s.p.bail || at(c, s.p, t_gt()) || at(c, s.p, t_ge()) {
-        Stop({ p: s.p, node: s.out })
-      } else if at_eof(c, s.p) {
-        Stop({ p: error_here(c, s.p, b"`>` to close the type parameter list"), node: s.out })
-      } else {
-        let n = expect_ident(c, s.p, b"a type parameter name");
-        if n.p.bail { Stop({ p: n.p, node: s.out }) } else {
-          let cm = eat(c, n.p, t_comma());
-          if !cm.ok { Stop({ p: cm.p, node: push(s.out, n.node) }) }
-          else { Continue({ p: cm.p, out: push(s.out, n.node) }) }
-        }
-      });
-    let g = expect_gt(c, ns.p, b"`>` to close the type parameter list");
-    { p: g.p, node: ns.node }
+    let {p, node: ns} = iterate({ p: o.p, out: [] }, c.ntok - o.p.pos + 1, |s: Acc<Ident>|
+                                if at(c, s.p, t_gt()) || at(c, s.p, t_ge()) {
+                                                   Stop(Ok({ p: s.p, node: s.out }))
+                                                   } else if at_eof(c, s.p) {
+                                Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
+                                } else {
+              match expect_ident(c, s.p, b"a type parameter name") {
+                                                              Err(q) -> Stop(Err(q)),
+                                                              Ok(n) -> {
+                    let cm = eat(c, n.p, t_comma());
+                    if !cm.ok { Stop(Ok({ p: cm.p, node: push(s.out, n.node) })) }
+                    else { Continue({ p: cm.p, out: push(s.out, n.node) }) }
+                    },
+                                                              }
+              })?;
+    let {p, ..} = expect_gt(c, p, b"`>` to close the type parameter list")?;
+    Ok({ p: p, node: ns })
   }
 
 // `parser.rs:860`.
-pub fn type_def(c: Ctx, p: P, vis: Vis) -> R<TypeDef> =
-  if p.bail { { p: p, node: no_type_def() } } else {
-    let st = advance(c, p);
-    let name = expect_ident(c, st.p, b"a type name after `type`");
-    let ps = type_params(c, name.p);
-    let eq = expect(c, ps.p, t_eq(), b"`=` after the type name");
-    if eq.p.bail { { p: eq.p, node: no_type_def() } } else {
-      let body = if looks_like_variants(c, eq.p) {
-                   let v = variants(c, eq.p);
-                   { p: v.p, node: TDSum(v.node) }
-                 } else {
-                   let t = ty(c, eq.p);
-                   { p: t.p, node: TDAlias(t.node) }
-                 };
-      if body.p.bail { { p: body.p, node: no_type_def() } }
-      else {
-        { p: body.p,
-          node: { vis: vis, name: name.node, params: ps.node, body: body.node,
-                  span: span_to(st.node, prev_span(c, body.p)) } }
-      }
-    }
+type RTypeBody = { p: P, node: TypeDefBody }
+
+fn type_body(c: Ctx, p: P) -> Result<RTypeBody, P> =
+  if looks_like_variants(c, p) {
+    let v = variants(c, p)?;
+    Ok({ p: v.p, node: TDSum(v.node) })
+  } else {
+    let t = ty(c, p)?;
+    Ok({ p: t.p, node: TDAlias(t.node) })
   }
+
+pub fn type_def(c: Ctx, p: P, vis: Vis) -> Result<R<TypeDef>, P> = {
+  let st = advance(c, p);
+  let {p, node: name} = expect_ident(c, st.p, b"a type name after `type`")?;
+  let {p, node: ps} = type_params(c, p)?;
+  let {p, ..} = expect(c, p, t_eq(), b"`=` after the type name")?;
+  let {p, node: body} = type_body(c, p)?;
+  Ok({ p: p,
+       node: { vis: vis, name: name, params: ps, body: body,
+               span: span_to(st.node, prev_span(c, p)) } })
+}
 
 // --- `effect` ---------------------------------------------------------------
 
 // An operation parameter may be written `name: Type` for documentation; only the
 // type is part of the signature. `parser.rs:981`.
-pub fn op_param(c: Ctx, p: P) -> R<TypeExpr> =
-  if p.bail { { p: p, node: no_ty() } } else {
-    let p2 = if is_ident(c, p) && kind_at(c, p, 1) == t_colon() {
-               bump(c, bump(c, p))
-             } else { p };
-    ty(c, p2)
-  }
+pub fn op_param(c: Ctx, p: P) -> Result<R<TypeExpr>, P> = {
+  let p2 = if is_ident(c, p) && kind_at(c, p, 1) == t_colon() {
+             bump(c, bump(c, p))
+           } else { p };
+  ty(c, p2)
+}
 
 // `parser.rs:947`.
-pub fn op_def(c: Ctx, p: P) -> R<OpDef> =
-  if p.bail { { p: p, node: no_op() } } else {
-    let start = cur_span(c, p);
-    let m = mode(c, p);
-    let name = expect_ident(c, m.p, b"an operation name");
-    let rp = if !at(c, name.p, t_lbracket()) { { p: name.p, node: false } }
-             else {
-               let o = advance(c, name.p);
-               let r = expect_ident(c, o.p, b"a resource parameter name inside `[..]`");
-               let cl = expect_close(c, r.p, t_rbracket(), o.node, b"`]`");
-               { p: cl.p, node: true }
-             };
-    let o = expect(c, rp.p, t_lparen(), b"`(` to start the operation parameters");
-    let ps = comma_list(c, o.p, t_rparen(), op_param);
-    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)` to close the operation parameters");
-    let ar = expect(c, cl.p, t_arrow(), b"`->` and a return type");
-    let ret = ty(c, ar.p);
-    if ret.p.bail { { p: ret.p, node: no_op() } }
-    else {
-      { p: ret.p,
-        node: { name: name.node, mode: m.node, resource_param: rp.node, params: ps.node,
-                ret: ret.node, span: span_to(start, ty_span(ret.node)) } }
-    }
+type RFlag = { p: P, node: Bool }
+
+fn op_resource_param(c: Ctx, p: P) -> Result<RFlag, P> =
+  if !at(c, p, t_lbracket()) { Ok({ p: p, node: false }) } else {
+    let o = advance(c, p);
+    let {p, ..} = expect_ident(c, o.p, b"a resource parameter name inside `[..]`")?;
+    let {p, ..} = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
+    Ok({ p: p, node: true })
   }
+
+pub fn op_def(c: Ctx, p: P) -> Result<R<OpDef>, P> = {
+  let start = cur_span(c, p);
+  let {p, node: m} = mode(c, p)?;
+  let {p, node: name} = expect_ident(c, p, b"an operation name")?;
+  let {p, node: rp} = op_resource_param(c, p)?;
+  let {p, node: o} = expect(c, p, t_lparen(), b"`(` to start the operation parameters")?;
+  let {p, node: ps} = comma_list(c, p, t_rparen(), op_param)?;
+  let {p, ..} = expect_close(c, p, t_rparen(), o, b"`)` to close the operation parameters")?;
+  let {p, ..} = expect(c, p, t_arrow(), b"`->` and a return type")?;
+  let {p, node: ret} = ty(c, p)?;
+  Ok({ p: p,
+       node: { name: name, mode: m, resource_param: rp, params: ps,
+               ret: ret, span: span_to(start, ty_span(ret)) } })
+}
 
 // `parser.rs:926`. The operation list has no separator, so this is the one
 // sequence in the area that is neither a `comma_list` nor `|`-separated: it
 // stops on `}` or end of input, and on a failed operation.
-pub fn op_defs(c: Ctx, p: P) -> R<List<OpDef>> =
+pub fn op_defs(c: Ctx, p: P) -> Result<R<List<OpDef>>, P> =
   iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<OpDef>|
-    if s.p.bail || at(c, s.p, t_rbrace()) || at_eof(c, s.p) {
-      Stop({ p: s.p, node: s.out })
+    if at(c, s.p, t_rbrace()) || at_eof(c, s.p) {
+      Stop(Ok({ p: s.p, node: s.out }))
     } else {
-      let o = op_def(c, s.p);
-      if o.p.bail { Stop({ p: o.p, node: s.out }) }
-      else { Continue({ p: o.p, out: push(s.out, o.node) }) }
+      match op_def(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(o) -> Continue({ p: o.p, out: push(s.out, o.node) }),
+      }
     })
 
-pub fn effect_def(c: Ctx, p: P, vis: Vis) -> R<EffectDef> =
-  if p.bail { { p: p, node: no_effect_def() } } else {
-    let start = cur_span(c, p);
-    let nd = eat(c, p, k_nondet());
-    let ef = expect(c, nd.p, k_effect(), b"`effect` after `nondet`");
-    let name = expect_ident(c, ef.p, b"an effect name after `effect`");
-    let o = expect(c, name.p, t_lbrace(), b"`{` to start the operation list");
-    let ops = op_defs(c, o.p);
-    let cl = expect_close(c, ops.p, t_rbrace(), o.node, b"`}` to close the operation list");
-    if cl.p.bail { { p: cl.p, node: no_effect_def() } }
-    else {
-      { p: cl.p,
-        node: { vis: vis, name: name.node, is_nondet: nd.ok, ops: ops.node,
-                span: span_to(start, cl.node) } }
-    }
-  }
+pub fn effect_def(c: Ctx, p: P, vis: Vis) -> Result<R<EffectDef>, P> = {
+  let start = cur_span(c, p);
+  let nd = eat(c, p, k_nondet());
+  let {p, ..} = expect(c, nd.p, k_effect(), b"`effect` after `nondet`")?;
+  let {p, node: name} = expect_ident(c, p, b"an effect name after `effect`")?;
+  let {p, node: o} = expect(c, p, t_lbrace(), b"`{` to start the operation list")?;
+  let {p, node: ops} = op_defs(c, p)?;
+  let {p, node: cl} = expect_close(c, p, t_rbrace(), o, b"`}` to close the operation list")?;
+  Ok({ p: p,
+       node: { vis: vis, name: name, is_nondet: nd.ok, ops: ops,
+               span: span_to(start, cl) } })
+}
 
 // --- `effect set` -----------------------------------------------------------
 
@@ -744,25 +769,27 @@ pub type SetAcc = { p: P, includes: List<QName>, atoms: List<AtomExpr> }
 
 pub type RSetMembers = { p: P, includes: List<QName>, atoms: List<AtomExpr> }
 
-pub fn set_members(c: Ctx, p: P, open: Span) -> RSetMembers =
+pub fn set_members(c: Ctx, p: P, open: Span) -> Result<RSetMembers, P> =
   iterate({ p: p, includes: [], atoms: [] }, c.ntok - p.pos + 1, |s: SetAcc|
-    if s.p.bail || at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
-      Stop({ p: s.p, includes: s.includes, atoms: s.atoms })
+    if at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
+      Stop(Ok({ p: s.p, includes: s.includes, atoms: s.atoms }))
     } else if at_eof(c, s.p) {
-      Stop({ p: unclosed(c, s.p, open, b"`}` to close the effect set"), includes: s.includes, atoms: s.atoms })
+      Stop(Err(unclosed(c, s.p, open, b"`}` to close the effect set")))
     } else {
-      let m = row_member(c, s.p);
-      if m.p.bail { Stop({ p: m.p, includes: s.includes, atoms: s.atoms }) } else {
-        let next = match m.node {
-          RMAtom(a) -> { p: m.p, includes: s.includes, atoms: push(s.atoms, a) },
-          RMSet(q) -> { p: m.p, atoms: s.atoms, includes: push(s.includes, q) },
-        };
-        let cm = eat(c, next.p, t_comma());
-        if !cm.ok {
-          Stop({ p: cm.p, includes: next.includes, atoms: next.atoms })
-        } else {
-          Continue({ p: cm.p, includes: next.includes, atoms: next.atoms })
-        }
+      match row_member(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(m) -> {
+          let next = match m.node {
+            RMAtom(a) -> { p: m.p, includes: s.includes, atoms: push(s.atoms, a) },
+            RMSet(q) -> { p: m.p, atoms: s.atoms, includes: push(s.includes, q) },
+          };
+          let cm = eat(c, next.p, t_comma());
+          if !cm.ok {
+            Stop(Ok({ p: cm.p, includes: next.includes, atoms: next.atoms }))
+          } else {
+            Continue({ p: cm.p, includes: next.includes, atoms: next.atoms })
+          }
+        },
       }
     })
 
@@ -773,76 +800,63 @@ pub fn set_members(c: Ctx, p: P, open: Span) -> RSetMembers =
 // pass is 521 lines and is the fifth thing in this spike's build order, which is
 // to say it is not done. `README.md` records the two fallbacks and the size of
 // the exclusion.
-pub fn effect_set_def(c: Ctx, p: P) -> R<EffectSetDef> =
-  if p.bail { { p: p, node: no_effect_set() } } else {
-    let st = advance(c, with_sets(p));
-    let sk = advance(c, st.p);
-    let name = expect_ident(c, sk.p, b"a name for the effect set, after `effect set`");
-    let eq = expect(c, name.p, t_eq(), b"`=` after the effect set's name");
-    let o = expect(c, eq.p, t_lbrace(), b"`{` to open the effect set's members");
-    if o.p.bail { { p: o.p, node: no_effect_set() } } else {
-      let ms = set_members(c, o.p, o.node);
-      if ms.p.bail { { p: ms.p, node: no_effect_set() } }
-      else if at(c, ms.p, t_pipe()) {
-        // A set denotes a ground set of atoms, so there is no tail to abstract
-        // over and `| e` here would have no meaning to give: one primary, one
-        // note.
-        { p: with_bail(push_diag(ms.p, diag1(unexpected(), cur_span(c, ms.p), 1))),
-          node: no_effect_set() }
-      } else {
-        let cl = expect_close(c, ms.p, t_rbrace(), o.node, b"`}` to close the effect set");
-        if cl.p.bail { { p: cl.p, node: no_effect_set() } }
-        else {
-          { p: cl.p,
-            node: { name: name.node, atoms: ms.atoms, includes: ms.includes,
-                    expansion: [], span: span_to(st.node, cl.node) } }
-        }
-      }
-    }
+pub fn effect_set_def(c: Ctx, p: P) -> Result<R<EffectSetDef>, P> = {
+  let st = advance(c, with_sets(p));
+  let sk = advance(c, st.p);
+  let {p, node: name} = expect_ident(c, sk.p, b"a name for the effect set, after `effect set`")?;
+  let {p, ..} = expect(c, p, t_eq(), b"`=` after the effect set's name")?;
+  let {p, node: o} = expect(c, p, t_lbrace(), b"`{` to open the effect set's members")?;
+  let ms = set_members(c, p, o)?;
+  if at(c, ms.p, t_pipe()) {
+    // A set denotes a ground set of atoms, so there is no tail to abstract
+    // over and `| e` here would have no meaning to give: one primary, one
+    // note.
+    Err(push_diag(ms.p, diag1(unexpected(), cur_span(c, ms.p), 1)))
+  } else {
+    let {p, node: cl} = expect_close(c, ms.p, t_rbrace(), o, b"`}` to close the effect set")?;
+    Ok({ p: p,
+         node: { name: name, atoms: ms.atoms, includes: ms.includes,
+                 expansion: [], span: span_to(st.node, cl) } })
   }
+}
 
 // --- `derive` ---------------------------------------------------------------
 
 // `derive json for Order`. `parser.rs:604`.
-pub fn derive_def(c: Ctx, p: P) -> R<DeriveDef> =
-  if p.bail { { p: p, node: no_derive_def() } } else {
-    let st = advance(c, p);
-    let name = expect_ident(c, st.p, b"a deriver name after `derive`");
-    let d = deriver(c, name.p, name.node);
-    if d.p.bail { { p: d.p, node: no_derive_def() } }
-    else if !at_ident_text(c, d.p, b"for") {
-      { p: error_here(c, d.p, b"`for` and the type to derive for"), node: no_derive_def() }
-    } else {
-      let f = advance(c, d.p);
-      let target = expect_ident(c, f.p, b"the type to derive for, after `for`");
-      if target.p.bail { { p: target.p, node: no_derive_def() } }
-      else {
-        { p: target.p,
-          node: { deriver: d.node, deriver_span: name.node.span, target: target.node,
-                  span: span_to(st.node, prev_span(c, target.p)) } }
-      }
-    }
+pub fn derive_def(c: Ctx, p: P) -> Result<R<DeriveDef>, P> = {
+  let st = advance(c, p);
+  let {p, node: name} = expect_ident(c, st.p, b"a deriver name after `derive`")?;
+  let {p, node: d} = deriver(c, p, name)?;
+  if !at_ident_text(c, p, b"for") {
+    Err(error_here(c, p, b"`for` and the type to derive for"))
+  } else {
+    let f = advance(c, p);
+    let {p, node: target} = expect_ident(c, f.p, b"the type to derive for, after `for`")?;
+    Ok({ p: p,
+         node: { deriver: d, deriver_span: name.span, target: target,
+                 span: span_to(st.node, prev_span(c, p)) } })
   }
+}
 
 // --- `test` -----------------------------------------------------------------
 
-pub fn test_def(c: Ctx, p: P) -> R<TestDef> =
-  if p.bail { { p: p, node: no_test_def() } } else {
-    let st = advance(c, p);
-    let sl = eat(c, st.p, t_slash());
-    let nd = if !sl.ok { { p: sl.p, node: false } }
-             else { let k = expect(c, sl.p, k_nondet(), b"`nondet` after `test/`"); { p: k.p, node: true } };
-    let nm = quoted(c, nd.p, b"a quoted test name");
-    if nm.p.bail { { p: nm.p, node: no_test_def() } } else {
-      let body = block_expr(c, nm.p);
-      if body.p.bail { { p: body.p, node: no_test_def() } }
-      else {
-        { p: body.p,
-          node: { name: nm.name, name_span: nm.span, is_nondet: nd.node, body: body.node,
-                  span: span_to(st.node, expr_span(body.node)) } }
-      }
-    }
+fn test_nondet(c: Ctx, p: P) -> Result<RFlag, P> = {
+  let sl = eat(c, p, t_slash());
+  if !sl.ok { Ok({ p: sl.p, node: false }) } else {
+    let {p, ..} = expect(c, sl.p, k_nondet(), b"`nondet` after `test/`")?;
+    Ok({ p: p, node: true })
   }
+}
+
+pub fn test_def(c: Ctx, p: P) -> Result<R<TestDef>, P> = {
+  let st = advance(c, p);
+  let {p, node: nd} = test_nondet(c, st.p)?;
+  let nm = quoted(c, p, b"a quoted test name")?;
+  let {p, node: body} = block_expr(c, nm.p)?;
+  Ok({ p: p,
+       node: { name: nm.name, name_span: nm.span, is_nondet: nd, body: body,
+               span: span_to(st.node, expr_span(body)) } })
+}
 
 // --- `item` -----------------------------------------------------------------
 
@@ -852,59 +866,58 @@ pub fn test_def(c: Ctx, p: P) -> R<TestDef> =
 pub fn no_pub(p: P, code: Bytes, s: Option<Span>, notes: Int) -> P =
   match s { Some(sp) -> push_diag(p, diag1(code, sp, notes)), None -> p }
 
-pub fn item_at(c: Ctx, p: P, vis: Vis, pub_span: Option<Span>) -> R<Item> =
+pub fn item_at(c: Ctx, p: P, vis: Vis, pub_span: Option<Span>) -> Result<R<Item>, P> =
   if at(c, p, k_fn()) {
-    let d = fn_def(c, p, vis);
-    { p: d.p, node: IFn(d.node) }
+    let d = fn_def(c, p, vis)?;
+    Ok({ p: d.p, node: IFn(d.node) })
   }
   else if at(c, p, k_type()) {
-    let d = type_def(c, p, vis);
-    { p: d.p, node: IType(d.node) }
+    let d = type_def(c, p, vis)?;
+    Ok({ p: d.p, node: IType(d.node) })
   }
   else if at_effect_set_start(c, p) {
     // Two notes: an `effect set` is module-local, and a set expanding across a
     // module boundary would leave a stale published row behind.
-    let d = effect_set_def(c, no_pub(p, unknown_effect_set(), pub_span, 2));
-    { p: d.p, node: IEffectSet(d.node) }
+    let d = effect_set_def(c, no_pub(p, unknown_effect_set(), pub_span, 2))?;
+    Ok({ p: d.p, node: IEffectSet(d.node) })
   }
   else if at(c, p, k_effect()) || at(c, p, k_nondet()) {
-    let d = effect_def(c, p, vis);
-    { p: d.p, node: IEffect(d.node) }
+    let d = effect_def(c, p, vis)?;
+    Ok({ p: d.p, node: IEffect(d.node) })
   }
   else if at(c, p, k_test()) {
-    let d = test_def(c, no_pub(p, unexpected(), pub_span, 1));
-    { p: d.p, node: ITest(d.node) }
+    let d = test_def(c, no_pub(p, unexpected(), pub_span, 1))?;
+    Ok({ p: d.p, node: ITest(d.node) })
   }
   else if at_law_start(c, p) {
-    let d = law_def(c, no_pub(p, unexpected(), pub_span, 1));
-    { p: d.p, node: ILaw(d.node) }
+    let d = law_def(c, no_pub(p, unexpected(), pub_span, 1))?;
+    Ok({ p: d.p, node: ILaw(d.node) })
   }
   else if at_derive_start(c, p) {
-    let d = derive_def(c, no_pub(p, unexpected(), pub_span, 1));
-    { p: d.p, node: IDerive(d.node) }
+    let d = derive_def(c, no_pub(p, unexpected(), pub_span, 1))?;
+    Ok({ p: d.p, node: IDerive(d.node) })
   }
-  else { { p: error_here(c, p, b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, or `derive`"), node: no_item() } }
+  else { Err(error_here(c, p, b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, or `derive`")) }
 
-pub fn item(c: Ctx, p: P) -> R<Item> =
-  if p.bail { { p: p, node: no_item() } } else {
-    if at(c, p, k_pub()) {
-      let a = advance(c, p);
-      item_at(c, a.p, VPub, Some(a.node))
-    } else {
-      item_at(c, p, VPriv, None)
-    }
+pub fn item(c: Ctx, p: P) -> Result<R<Item>, P> =
+  if at(c, p, k_pub()) {
+    let a = advance(c, p);
+    item_at(c, a.p, VPub, Some(a.node))
+  } else {
+    item_at(c, p, VPriv, None)
   }
 
 // --- `run` ------------------------------------------------------------------
 
 // The module accumulator. **Two lists grow here too**, and `items` takes the
 // last slot because it is the one that grows on every file: an out-of-order
-// `import` is an error path and the corpus has none. `first` carries the first
-// item's span so that `import_out_of_order` can point at it without a `Vec::first`
-// the `List` surface does not have.
+// `import` is an error path and the corpus has none.
+//
+// A fourth field stood here, `first: Option<Span>`, because
+// `import_out_of_order` had no way to read `items.first()`. ADR 0027's
+// `list_at` reads it, so the field is gone.
 pub type ModAcc = {
   p: P,
-  first: Option<Span>,
   imports: List<ImportDecl>,
   items: List<Item>,
 }
@@ -919,31 +932,26 @@ pub type RModule = { p: P, node: Module }
 // budget below cannot fire.
 pub fn run(c: Ctx, p: P) -> RModule = {
   let leading = imports(c, p);
-  let done = iterate({ p: leading.p, first: None, imports: leading.node, items: [] },
+  let done = iterate({ p: leading.p, imports: leading.node, items: [] },
                      c.ntok - leading.p.pos + 2,
                      |s: ModAcc|
     if at_eof(c, s.p) { Stop(s) } else {
       // `run` resets both per-item pieces of state at the top of every round.
       let p0 = fresh_item(s.p);
       if at(c, p0, k_import()) {
-        let warned = import_out_of_order(c, p0, s.first);
-        let d = import_decl(c, warned);
-        if d.p.bail {
-          Continue({ p: recover_to_item(c, clear_bail(d.p)), first: s.first,
-                     items: s.items, imports: s.imports })
-        } else {
-          Continue({ p: d.p, first: s.first, items: s.items,
-                     imports: push(s.imports, d.node) })
+        let warned = import_out_of_order(c, p0, list_at(s.items, 0));
+        match import_decl(c, warned) {
+          Err(q) -> Continue({ p: recover_to_item(c, q),
+                               items: s.items, imports: s.imports }),
+          Ok(d) -> Continue({ p: d.p, items: s.items,
+                              imports: push(s.imports, d.node) }),
         }
       } else {
-        let it = item(c, p0);
-        if it.p.bail {
-          Continue({ p: recover_to_item(c, clear_bail(it.p)), first: s.first,
-                     imports: s.imports, items: s.items })
-        } else {
-          let f = match s.first { None -> Some(item_span(it.node)), Some(x) -> Some(x) };
-          Continue({ p: it.p, first: f, imports: s.imports,
-                     items: push(s.items, it.node) })
+        match item(c, p0) {
+          Err(q) -> Continue({ p: recover_to_item(c, q),
+                               imports: s.imports, items: s.items }),
+          Ok(it) -> Continue({ p: it.p, imports: s.imports,
+                               items: push(s.items, it.node) }),
         }
       }
     });

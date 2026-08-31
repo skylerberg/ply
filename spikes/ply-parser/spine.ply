@@ -7,34 +7,52 @@
 // is silent: three make a correct parser wrong, and one makes a correct parser
 // quadratic.
 //
-// ## Rule 1 — a parse function guards on `p.bail` at entry and answers `p`
+// ## Rule 1 — a parse function answers `Result<R<Thing>, P>` and propagates with `?`
 //
 // The reference's failure channel is `PResult<T> = Result<T, Bail>` where `Bail`
 // is a **zero-field struct** (`parser.rs:11`) — the diagnostic explaining the
 // failure is already in `self.diags`, so `Result<T, Bail>` is isomorphic to
-// `Option<T>` and the error carries nothing. That is what makes a `bail: Bool`
-// in the threaded state an exact encoding rather than a shortcut.
+// `Option<T>` and the error carries nothing.
 //
-// Ply has no `?`, so `p.bail` replaces it, and the guard is one per **callee**
-// rather than one per **call site**. Every parse function is
+// Here the error carries the **state**, because Ply threads it rather than
+// mutating it: `Err(p)` is the parser at the point it gave up, diagnostics and
+// all. `Bail`'s emptiness is `self` still being reachable in Rust; `P` in the
+// `Err` is the same fact spelled out. Every parse function is
 //
-//     fn thing(c: Ctx, p: P) -> R<Thing> =
-//       if p.bail { {p: p, node: no_thing()} } else { .. }
+//     fn thing(c: Ctx, p: P) -> Result<R<Thing>, P> = {
+//       let a = step_one(c, p)?;
+//       let b = step_two(c, a.p)?;
+//       Ok({ p: b.p, node: .. })
+//     }
 //
-// and the invariant it buys is one sentence: **a parse function called with
-// `p.bail` true answers `p` unchanged and consumes nothing.** A caller may
-// therefore run its whole sequence of steps unguarded, exactly as the reference
-// does with `?`, and every step after the failing one is a no-op.
+// and the guard is on the **call site**, where the reference puts it, rather
+// than on the callee.
 //
-// The hazard this creates is a *forgotten* guard, which reads tokens past an
-// error and emits phantom diagnostics. `spikes/ply-lexer/GAPS.md` §12 recorded
-// that error accumulation cost the lexer nothing *because a lexer never fails*
-// and predicted it would bite a parser; this is where it bites, and it is why
-// the harness has a guard-deletion instrument that no lexer harness needed.
+// > **Withdrawn (ADR 0028, 2026-08-30).** This rule read: *"a parse function
+// > guards on `p.bail` at entry and answers `p` … Ply has no `?`, so `p.bail`
+// > replaces it, and the guard is one per **callee** rather than one per **call
+// > site** … the invariant it buys is one sentence: **a parse function called
+// > with `p.bail` true answers `p` unchanged and consumes nothing.** … The
+// > hazard this creates is a *forgotten* guard, which reads tokens past an
+// > error and emits phantom diagnostics."*
+// >
+// > The premise — *"Ply has no `?`"* — is no longer true, and `GAPS.md` §2 is
+// > what ADR 0028 was written from: 63 of this parser's 83 guards could not be
+// > shown to matter. `?` does not make them verifiable; it makes them
+// > **unwritable**. There is no `bail` field, so there is no guard to forget,
+// > no invariant for a reader to maintain, and no phantom diagnostic from an
+// > unguarded predicate answering `false` after a failure.
+// >
+// > Two consequences a reader should expect. **The bail-invariant test below is
+// > gone**, because the property it watched is not expressible: see the note
+// > where it stood. And **a save/restore around a fallible call cannot be
+// > written with `?`** — `no_brace` and `depth` must be put back on both paths,
+// > which is a `match`, and is exactly the shape `parser.rs:1398 ty` writes for
+// > the same reason.
 //
-// `bail` is **cleared** at exactly the three places the reference matches on
-// `Err(Bail)` rather than propagating it with `?` — `run` twice and `imports`
-// once (`parser.rs:272, :278, :300`) — with `clear_bail`, below.
+// The three places the reference matches on `Err(Bail)` rather than
+// propagating it (`run` twice and `imports` once, `parser.rs:272, :278, :300`)
+// are three `match`es in `items.ply`, where `clear_bail` used to be called.
 //
 // ## Rule 2 — every sequence is one `iterate`, and the budget cannot fire
 //
@@ -59,11 +77,12 @@
 // in place, which turns an accumulator into a quadratic. **Nothing in the
 // language says so and nothing checks it.**
 //
-// Here that means: `Acc<a>`'s `out` is last, `P`'s `diags` is last, and the
-// token-buffer fold's `m` is last. Every `P` in this file is built by one of
-// the `at_pos`/`with_*` constructors below rather than by a literal, so the
-// discipline is enforced in ten places instead of at ~300 call sites. **Do not
-// write a `P` literal.**
+// Here that means: `Acc<a>`'s `out` is last and `P`'s `diags` is last. (A third
+// case, "the token-buffer fold's `m` is last", went with the fold: the buffer
+// is `lexer.ply`'s `List<Token>` itself since ADR 0027.) Every `P` in this file
+// is built by one of the `at_pos`/`with_*` constructors below rather than by a
+// literal, so the discipline is enforced in nine places instead of at ~300 call
+// sites. **Do not write a `P` literal.**
 //
 // ## Rule 4 — a `Tok` is compared with `==`, never destructured, unless you
 // need its payload
@@ -149,25 +168,31 @@ pub fn primary_span_of(d: PDiag) -> Span = {
 
 // --- The token buffer -------------------------------------------------------
 
-// `Map<Int, Token>` and not `List<Token>`, because **the `List` surface has no
-// index**: `len, push, map, filter, fold, range, iterate` and nothing else
-// (`crates/ply-eval/src/builtins.rs:203+`). A parser is `tokens[pos]`,
-// `tokens[pos+1]` and `tokens[pos+2]` — `kind_at` is called with all three at
-// four sites in `parser.rs` — so there is no route to the reference's `Vec`
-// indexing at all. `spikes/ply-lexer/GAPS.md` §10 files the missing surface as
-// "starts to bite"; here it decides the data structure.
+// `List<Token>`, indexed with `list_at`.
 //
-// `Map` is a `RedBlackTreeMap` (`crates/ply-eval/src/value.rs:48`), so every
-// peek is an O(log n) descent with a `Value::cmp` at each node where the
-// reference does one bounds-checked load.
-pub type Ctx = { ntok: Int, src: Bytes, toks: Map<Int, lexer::Token> }
+// > **Withdrawn (ADR 0027, 2026-08-30).** This file read: *"`Map<Int, Token>`
+// > and not `List<Token>`, because **the `List` surface has no index**:
+// > `len, push, map, filter, fold, range, iterate` and nothing else
+// > (`crates/ply-eval/src/builtins.rs:203+`) … so there is no route to the
+// > reference's `Vec` indexing at all"*, and *"`Map` is a `RedBlackTreeMap`
+// > (`crates/ply-eval/src/value.rs:48`), so every peek is an O(log n) descent
+// > with a `Value::cmp` at each node where the reference does one
+// > bounds-checked load."*
+// >
+// > The premise is no longer true. `list_at<a>(xs: List<a>, i: Int) -> Option<a>`
+// > is a builtin, added by ADR 0027 with `GAPS.md` §1 — this file's own
+// > complaint — as its opening citation. `lexer.ply`'s `List<Token>` is now the
+// > token buffer directly: no fold, no `Buf`, no red-black descent. What
+// > survives from the old note is the `Option`: `list_at` is total, so an
+// > out-of-range peek is a `match` the reader writes, and `tok_index` clamps
+// > before it asks, exactly as `Parser::kind_at` does.
+pub type Ctx = { ntok: Int, src: Bytes, toks: List<lexer::Token> }
 
 // The threaded state. `diags` is last and every constructor below keeps it
 // last; see Rule 3.
 //
 // Three fields are here that are not in the reference's `struct Parser`:
 //
-//   - `bail`, which is `PResult`'s error channel (Rule 1).
 //   - `gt_split`, which is `expect_gt`'s in-place token rewrite. `parser.rs:187`
 //     assigns `self.tokens[self.pos] = Token { kind: Eq, .. }` to split a `>=`
 //     into `>` then `=` for `type Pair<a>= ..`. The buffer here is immutable, so
@@ -178,18 +203,24 @@ pub type Ctx = { ntok: Int, src: Bytes, toks: Map<Int, lexer::Token> }
 //     (through `prev_span`), `pos` never moves backwards, and a second split at
 //     k' > k cannot be reached until `pos` is past k+1. Immutability turns a
 //     mutation into a claim about the lifetime of that mutation.
-//   - `last_code`/`last_span`, which are `self.diags.last()`. **There is no
-//     `last` on a `List` and no index to fake one with**, so the one fact the
-//     dedup rule in `push_diag` needs is carried beside the list.
+//
+// > **Withdrawn (ADR 0027, 2026-08-30).** Two more fields stood here:
+// > *"`last_code`/`last_span`, which are `self.diags.last()`. **There is no
+// > `last` on a `List` and no index to fake one with**, so the one fact the
+// > dedup rule in `push_diag` needs is carried beside the list."*
+// >
+// > There is now. `last` is `list_at(xs, len(xs) - 1)`, which is O(1) on
+// > `Value::List`'s `Arc<Vec<Value>>`, so `push_diag` reads the previous
+// > diagnostic off the list it already holds. The two fields are gone, and with
+// > them their copy in each of the eight constructors below. ADR 0027 §7
+// > refused a `list_last` builtin; the two-argument spelling is what closes
+// > `GAPS.md` §1's third row, and it needs no wrapper.
 pub type P = {
   pos: Int,
   no_brace: Bool,
   depth: Int,
   gt_split: Int,
   uses_sets: Bool,
-  bail: Bool,
-  last_code: Bytes,
-  last_span: Span,
   diags: List<PDiag>,
 }
 
@@ -206,109 +237,100 @@ pub type Acc<a> = { p: P, out: List<a> }
 
 pub type Start = { c: Ctx, p: P }
 
-type Buf = { i: Int, m: Map<Int, lexer::Token> }
-
-type DAcc = { code: Bytes, span: Span, out: List<PDiag> }
-
-// `lex` then one fold to index the token list, because there is no way to index
-// it in place. The `m` field is last (Rule 3) and the map is persistent, so the
-// insert shares structure rather than copying — whether the positional tax of
-// GAPS.md §1 applies to a `Map` at all is UNMEASURED.
+// `lex`, and the token list *is* the buffer. The fold that indexed it into a
+// `Map` is gone with the `Buf` that carried it, and so is the `DAcc` that
+// carried the last lexer diagnostic beside the list.
 pub fn start(src: Bytes) -> Start = {
   let lx = lexer::lex(src);
-  let b = fold(lx.toks, {i: 0, m: map_new()},
-    |s: Buf, t: lexer::Token| {i: s.i + 1, m: map_insert(s.m, s.i, t)});
   // Every diagnostic `ply_syntax::lexer` raises is built at one site
   // (`lexer.rs:818`) as `Diagnostic::error(code, message).primary(span, label)`:
   // exactly one primary label and no notes. `lexer.ply` carries only the code
   // and the span, which is all that shape needs.
-  let d = fold(lx.diags, {code: b"", span: dummy_span(), out: []},
-    |a: DAcc, x: lexer::Diag|
-      { code: x.code, span: {start: x.start, end: x.end},
-        out: push(a.out, diag1(x.code, {start: x.start, end: x.end}, 0)) });
-  { c: { ntok: b.i, src: src, toks: b.m },
+  let d = map(lx.diags,
+    |x: lexer::Diag| diag1(x.code, {start: x.start, end: x.end}, 0));
+  { c: { ntok: len(lx.toks), src: src, toks: lx.toks },
     p: { pos: 0, no_brace: false, depth: 0, gt_split: -1, uses_sets: false,
-         bail: false, last_code: d.code, last_span: d.span, diags: d.out } }
+         diags: d } }
 }
 
 // --- Constructing `P` -------------------------------------------------------
 //
 // Ply has no record-update syntax (`spikes/ply-lexer/GAPS.md` §2), so changing
-// one field means writing all nine. Nine fields times ~300 sites is 2,700
-// chances to put `diags` anywhere but last, so the literal is written here ten
-// times and nowhere else.
+// one field means writing all six — nine before ADR 0027 took `last_code` and
+// `last_span` out and ADR 0028 took `bail`. Six fields times ~300 sites is
+// 1,800 chances to put `diags` anywhere but last, so the literal is written
+// here seven times and nowhere else.
 
 pub fn at_pos(p: P, pos: Int) -> P =
   { no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-    uses_sets: p.uses_sets, bail: p.bail, last_code: p.last_code,
-    last_span: p.last_span, pos: pos, diags: p.diags }
+    uses_sets: p.uses_sets, pos: pos, diags: p.diags }
 
 pub fn with_no_brace(p: P, b: Bool) -> P =
   { pos: p.pos, depth: p.depth, gt_split: p.gt_split, uses_sets: p.uses_sets,
-    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
     no_brace: b, diags: p.diags }
 
 pub fn with_depth(p: P, d: Int) -> P =
   { pos: p.pos, no_brace: p.no_brace, gt_split: p.gt_split,
-    uses_sets: p.uses_sets, bail: p.bail, last_code: p.last_code,
-    last_span: p.last_span, depth: d, diags: p.diags }
+    uses_sets: p.uses_sets, depth: d, diags: p.diags }
 
 pub fn with_gt_split(p: P, i: Int) -> P =
   { pos: p.pos, no_brace: p.no_brace, depth: p.depth, uses_sets: p.uses_sets,
-    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
     gt_split: i, diags: p.diags }
 
 pub fn with_sets(p: P) -> P =
   { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-    bail: p.bail, last_code: p.last_code, last_span: p.last_span,
     uses_sets: true, diags: p.diags }
-
-pub fn with_bail(p: P) -> P =
-  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-    uses_sets: p.uses_sets, last_code: p.last_code, last_span: p.last_span,
-    bail: true, diags: p.diags }
-
-// The three `Err(Bail)` arms in `run` and `imports` (`parser.rs:272, :278,
-// :300`), and nothing else. `no_brace` and `depth` are reset by `run`'s loop
-// head (`:268-269`) rather than here.
-pub fn clear_bail(p: P) -> P =
-  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-    uses_sets: p.uses_sets, last_code: p.last_code, last_span: p.last_span,
-    bail: false, diags: p.diags }
 
 // `run`'s loop head: `self.no_brace = false; self.depth = 0;`.
 pub fn fresh_item(p: P) -> P =
-  { pos: p.pos, gt_split: p.gt_split, uses_sets: p.uses_sets, bail: p.bail,
-    last_code: p.last_code, last_span: p.last_span, no_brace: false, depth: 0,
-    diags: p.diags }
+  { pos: p.pos, gt_split: p.gt_split, uses_sets: p.uses_sets,
+    no_brace: false, depth: 0, diags: p.diags }
 
 // `Parser::push` (`parser.rs:207`): a single mistake usually trips several
 // expectations at the same offset, so a diagnostic with the same code and the
 // same primary span as the one before it is dropped. This changes the list
 // exactly, so it is ported exactly.
+//
+// `self.diags.last()` is `list_at(p.diags, len(p.diags) - 1)` (ADR 0027), which
+// is where the two fields this state used to carry went. `None` is the empty
+// list, where the reference's `last()` is `None` too and nothing is dropped.
 pub fn push_diag(p: P, d: PDiag) -> P = {
   let s = primary_span_of(d);
-  if p.last_code == d.code && p.last_span.start == s.start && p.last_span.end == s.end {
-    p
-  } else {
+  let dup = match list_at(p.diags, len(p.diags) - 1) {
+    Some(l) -> {
+      let ls = primary_span_of(l);
+      l.code == d.code && ls.start == s.start && ls.end == s.end
+    },
+    None -> false,
+  };
+  if dup { p } else {
     { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-      uses_sets: p.uses_sets, bail: p.bail, last_code: d.code, last_span: s,
-      diags: push(p.diags, d) }
+      uses_sets: p.uses_sets, diags: push(p.diags, d) }
   }
 }
 
-pub fn bail_with(p: P, d: PDiag) -> P = with_bail(push_diag(p, d))
+// Reading both halves of a `Result<R<a>, P>` where a `?` cannot stand — a
+// `test` and a `law` are both `E0118`. `settle` answers the state either way
+// and the node or a stand-in; `failed` answers which arm it was.
+pub fn settle<a>(r: Result<R<a>, P>, d: a) -> R<a> =
+  match r { Ok(x) -> x, Err(q) -> { p: q, node: d } }
+
+pub fn failed<a>(r: Result<R<a>, P>) -> Bool =
+  match r { Ok(x) -> false, Err(q) -> true }
 
 // --- Token access -----------------------------------------------------------
 
 fn eof_token() -> lexer::Token = { start: 0, end: 0, tok: lexer::TEof }
 
 // Absolute index, clamped to the buffer, with `expect_gt`'s split applied.
-// `map_get` cannot miss for an index in range; the `None` arm is the price of
-// `Map` having no total lookup.
+// The clamp is `Parser::kind_at`'s own `.min(len - 1)` and `prev_span`'s
+// `saturating_sub(1)`, so it is the reference's rule and not `list_at`'s: the
+// token a clamped read answers is observable. `list_at` cannot miss after the
+// clamp; the `None` arm is the price of a total index, and is reached only on
+// an empty buffer, which `lexer.ply` never produces — it always ends `TEof`.
 pub fn tok_index(c: Ctx, p: P, i: Int) -> lexer::Token = {
   let j = if i < 0 { 0 } else if i > c.ntok - 1 { c.ntok - 1 } else { i };
-  let t = match map_get(c.toks, j) { Some(x) -> x, None -> eof_token() };
+  let t = match list_at(c.toks, j) { Some(x) -> x, None -> eof_token() };
   if j == p.gt_split {
     { start: t.start + 1, end: t.end, tok: lexer::TPunct(b"eq") }
   } else {
@@ -389,9 +411,11 @@ pub fn is_ident(c: Ctx, p: P) -> Bool =
 
 // --- Expecting --------------------------------------------------------------
 
+// `eat` cannot fail — it answers whether the token was there — so it is the one
+// member of this family that is not a `Result`. It also no longer guards: with
+// `?` there is no state in which a caller can reach it after a failure.
 pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
-  if p.bail { { p: p, ok: false } }
-  else if at(c, p, k) { { p: advance(c, p).p, ok: true } }
+  if at(c, p, k) { { p: advance(c, p).p, ok: true } }
   else { { p: p, ok: false } }
 
 // `what` is the message the reference formats into the diagnostic. It is
@@ -400,59 +424,52 @@ pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
 // building it would need. Carrying it is what makes turning messages on a
 // change to `error_here` alone rather than a rewrite of ~120 call sites.
 pub fn error_here(c: Ctx, p: P, what: Bytes) -> P =
-  bail_with(p, diag1(unexpected(), cur_span(c, p), 0))
+  push_diag(p, diag1(unexpected(), cur_span(c, p), 0))
 
 // `Parser::unclosed` (`parser.rs:166`): primary at the offending token,
 // secondary at the opening delimiter.
 pub fn unclosed(c: Ctx, p: P, open: Span, what: Bytes) -> P =
-  bail_with(p, diag2(unexpected(), cur_span(c, p), open, 0))
+  push_diag(p, diag2(unexpected(), cur_span(c, p), open, 0))
 
-pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> R<Span> =
-  if p.bail { { p: p, node: dummy_span() } }
-  else if at(c, p, k) { advance(c, p) }
-  else { { p: error_here(c, p, what), node: dummy_span() } }
+pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> Result<R<Span>, P> =
+  if at(c, p, k) { Ok(advance(c, p)) }
+  else { Err(error_here(c, p, what)) }
 
-pub fn expect_close(c: Ctx, p: P, k: lexer::Tok, open: Span, what: Bytes) -> R<Span> =
-  if p.bail { { p: p, node: dummy_span() } }
-  else if at(c, p, k) { advance(c, p) }
-  else { { p: unclosed(c, p, open, what), node: dummy_span() } }
+pub fn expect_close(c: Ctx, p: P, k: lexer::Tok, open: Span, what: Bytes) -> Result<R<Span>, P> =
+  if at(c, p, k) { Ok(advance(c, p)) }
+  else { Err(unclosed(c, p, open, what)) }
 
-pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> R<Ident> =
-  if p.bail { { p: p, node: no_ident() } }
-  else {
-    match kind(c, p) {
-      lexer::TIdent(n) -> {
-        let a = advance(c, p);
-        { p: a.p, node: {name: n, span: a.node} }
-      },
-      _ -> { p: error_here(c, p, what), node: no_ident() },
-    }
+pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> Result<R<Ident>, P> =
+  match kind(c, p) {
+    lexer::TIdent(n) -> {
+      let a = advance(c, p);
+      Ok({ p: a.p, node: {name: n, span: a.node} })
+    },
+    _ -> Err(error_here(c, p, what)),
   }
 
 // `Parser::expect_gt` (`parser.rs:187`). The `Ge` arm answers the first byte as
 // the `>` and leaves `pos` where it is, having rewritten the token under it to
 // `=` over the second byte; here the rewrite is `gt_split` and `tok_index`
 // applies it. See the note on `P`.
-pub fn expect_gt(c: Ctx, p: P, what: Bytes) -> R<Span> =
-  if p.bail { { p: p, node: dummy_span() } }
-  else if at(c, p, t_gt()) { advance(c, p) }
+pub fn expect_gt(c: Ctx, p: P, what: Bytes) -> Result<R<Span>, P> =
+  if at(c, p, t_gt()) { Ok(advance(c, p)) }
   else if at(c, p, t_ge()) {
     let s = cur_span(c, p);
-    { p: with_gt_split(p, p.pos), node: {start: s.start, end: s.start + 1} }
+    Ok({ p: with_gt_split(p, p.pos), node: {start: s.start, end: s.start + 1} })
   }
-  else { { p: error_here(c, p, what), node: dummy_span() } }
+  else { Err(error_here(c, p, what)) }
 
 // --- Depth ------------------------------------------------------------------
 
 // `MAX_DEPTH` (`parser.rs:23`). ADR 0020 §5.1's measured corpus maximum is 17.
 pub fn max_depth() -> Int = 128
 
-pub fn deeper(c: Ctx, p: P) -> P =
-  if p.bail { p } else {
-    let q = with_depth(p, p.depth + 1);
-    if q.depth <= max_depth() { q }
-    else { bail_with(q, diag1(unexpected(), cur_span(c, q), 1)) }
-  }
+pub fn deeper(c: Ctx, p: P) -> Result<P, P> = {
+  let q = with_depth(p, p.depth + 1);
+  if q.depth <= max_depth() { Ok(q) }
+  else { Err(push_diag(q, diag1(unexpected(), cur_span(c, q), 1))) }
+}
 
 pub fn shallower(p: P) -> P = with_depth(p, p.depth - 1)
 
@@ -465,58 +482,57 @@ pub fn shallower(p: P) -> P = with_depth(p, p.depth - 1)
 // typecheck and would become eight hand-monomorphised copies. It typechecks.
 //
 // The budget `c.ntok - p.pos + 1` is a backstop that cannot fire: `item` either
-// consumes a token or sets `bail`, and the `eat` of the comma consumes another,
-// so a `Continue` costs at least one token. The reference's `while` has no such
-// backstop — an item that consumed nothing would hang it, where this reports.
-pub fn comma_list<a>(c: Ctx, p: P, close: lexer::Tok, item: (Ctx, P) -> R<a>) -> R<List<a>> =
-  if p.bail { { p: p, node: [] } } else {
-    iterate({p: p, out: []}, c.ntok - p.pos + 1, |s: Acc<a>|
-      if s.p.bail || at(c, s.p, close) || at_eof(c, s.p) {
-        Stop({p: s.p, node: s.out})
-      } else {
-        let r = item(c, s.p);
-        if r.p.bail {
-          Stop({p: r.p, node: s.out})
-        } else {
+// consumes a token or answers `Err`, and the `eat` of the comma consumes
+// another, so a `Continue` costs at least one token. The reference's `while` has
+// no such backstop — an item that consumed nothing would hang it, where this
+// reports.
+//
+// The `?` this loop cannot write is the point of `GAPS.md` §2's second half: a
+// lambda has no written return type, so `item(c, s.p)?` is `E0118` (ADR 0028,
+// Decision 5). The `match` below is what stands in its place, and it is one of
+// twenty-one in the five modules — every `iterate` step is a lambda.
+pub fn comma_list<a>(c: Ctx, p: P, close: lexer::Tok,
+                     item: (Ctx, P) -> Result<R<a>, P>) -> Result<R<List<a>>, P> =
+  iterate({p: p, out: []}, c.ntok - p.pos + 1, |s: Acc<a>|
+    if at(c, s.p, close) || at_eof(c, s.p) {
+      Stop(Ok({p: s.p, node: s.out}))
+    } else {
+      match item(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(r) -> {
           let e = eat(c, r.p, t_comma());
           if e.ok {
             Continue({p: e.p, out: push(s.out, r.node)})
           } else {
-            Stop({p: e.p, node: push(s.out, r.node)})
+            Stop(Ok({p: e.p, node: push(s.out, r.node)}))
           }
-        }
-      })
-  }
+        },
+      }
+    })
 
 // --- Qualified names --------------------------------------------------------
 
 // `Parser::qname` (`parser.rs:442`). `::` rather than `.` because with `.` a
 // qualified name is token-identical to a perform and to a field access.
-pub fn qname(c: Ctx, p: P, what: Bytes) -> R<QName> =
-  if p.bail { { p: p, node: no_qname() } } else {
-    let first = expect_ident(c, p, what);
-    if first.p.bail { { p: first.p, node: no_qname() } }
-    else {
-      let cc = eat(c, first.p, t_coloncolon());
-      if !cc.ok { { p: cc.p, node: bare(first.node) } }
-      else {
-        let second = expect_ident(c, cc.p, b"a name after `::`");
-        if second.p.bail { { p: second.p, node: no_qname() } }
-        else if at(c, second.p, t_coloncolon()) {
-          { p: bail_with(second.p, diag1(unexpected(), cur_span(c, second.p), 1)),
-            node: no_qname() }
-        } else {
-          { p: second.p, node: qualified(first.node, second.node) }
-        }
-      }
+pub fn qname(c: Ctx, p: P, what: Bytes) -> Result<R<QName>, P> = {
+  let {p, node: first} = expect_ident(c, p, what)?;
+  let cc = eat(c, p, t_coloncolon());
+  if !cc.ok { Ok({ p: cc.p, node: bare(first) }) }
+  else {
+    let {p, node: second} = expect_ident(c, cc.p, b"a name after `::`")?;
+    if at(c, p, t_coloncolon()) {
+      Err(push_diag(p, diag1(unexpected(), cur_span(c, p), 1)))
+    } else {
+      Ok({ p: p, node: qualified(first, second) })
     }
   }
+}
 
 // --- The token vocabulary ---------------------------------------------------
 //
 // Ply has no constants, so each of these is a function and each use of one is
 // an interpreter call. `at(c, p, t_comma())` is four calls — `t_comma`, `at`,
-// `kind`, `tok_at`/`tok_index` — plus a `map_get`, where the reference is one
+// `kind`, `tok_at`/`tok_index` — plus a `list_at`, where the reference is one
 // bounds-checked load and a discriminant compare. `spikes/ply-lexer/GAPS.md`
 // §11 saw the same shape on `at`; on a parser it is the innermost loop.
 
@@ -692,7 +708,7 @@ test "a float literal is carried as the raw source over its span" {
 
 test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
   let s = probe(b">= x");
-  let g = expect_gt(s.c, s.p, b"`>`");
+  let g = settle(expect_gt(s.c, s.p, b"`>`"), dummy_span());
   assert_eq(g.node.start, 0);
   assert_eq(g.node.end, 1);
   assert_eq(g.p.pos, 0);
@@ -706,38 +722,30 @@ test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
   assert_eq(kind(s.c, a.p), lexer::TIdent(b"x"));
 }
 
-// Rule 1's invariant, and the shape this test has to have to watch it. A
-// bailed state must sit on a token the guarded function would otherwise
-// **accept**, or a missing guard raises a duplicate diagnostic at the same
-// span, `push_diag` drops it, and the test passes over a parser that is
-// reading tokens past an error. That is what the first version of this test
-// did; `arm-spine.sh` found it.
-test "a parse function called with bail true consumes nothing and reports nothing" {
-  let s = probe(b"fn f, > g");
-  let b0 = error_here(s.c, s.p, b"x");
-  let b1 = error_here(s.c, at_pos(s.p, 1), b"x");
-  let b2 = error_here(s.c, at_pos(s.p, 2), b"x");
-  let b3 = error_here(s.c, at_pos(s.p, 3), b"x");
-  assert_eq(b0.bail, true);
-  assert_eq(kind(s.c, b0), k_fn());
-  assert_eq(kind(s.c, b1), lexer::TIdent(b"f"));
-  assert_eq(kind(s.c, b2), t_comma());
-  assert_eq(kind(s.c, b3), t_gt());
-  assert_eq(expect(s.c, b0, k_fn(), b"`fn`").p.pos, 0);
-  assert_eq(expect_close(s.c, b0, k_fn(), sp(0, 0), b"`fn`").p.pos, 0);
-  assert_eq(expect_ident(s.c, b1, b"a name").p.pos, 1);
-  assert_eq(qname(s.c, b1, b"a name").p.pos, 1);
-  assert_eq(eat(s.c, b2, t_comma()).p.pos, 2);
-  assert_eq(eat(s.c, b2, t_comma()).ok, false);
-  assert_eq(expect_gt(s.c, b3, b"`>`").p.pos, 3);
-  assert_eq(deeper(s.c, b0).depth, 0);
-  assert_eq(comma_list(s.c, b1, t_rparen(), an_ident).p.pos, 1);
-  assert_eq(len(comma_list(s.c, b1, t_rparen(), an_ident).node), 0);
-  assert_eq(len(expect(s.c, b0, k_fn(), b"`fn`").p.diags), 1);
-  assert_eq(len(expect_ident(s.c, b1, b"a name").p.diags), 1);
-  assert_eq(len(qname(s.c, b1, b"a name").p.diags), 1);
-  assert_eq(len(deeper(s.c, b0).diags), 1);
-}
+// > **Withdrawn with the rule it watched (ADR 0028, 2026-08-30).** A test stood
+// > here called *"a parse function called with bail true consumes nothing and
+// > reports nothing"*. It built four bailed states with `error_here`, each on a
+// > token the function under test would otherwise **accept**, and asserted that
+// > `expect`, `expect_close`, `expect_ident`, `qname`, `eat`, `expect_gt`,
+// > `deeper` and `comma_list` all left `pos` and `diags` alone. Its header said
+// > why it had to be built that way: *"a bailed state must sit on a token the
+// > guarded function would otherwise **accept**, or a missing guard raises a
+// > duplicate diagnostic at the same span, `push_diag` drops it, and the test
+// > passes over a parser that is reading tokens past an error. That is what the
+// > first version of this test did; `arm-spine.sh` found it."*
+// >
+// > **The property is now unstateable, which is the whole of ADR 0028's claim.**
+// > There is no bailed `P` to hand a parse function: a failure is an `Err(P)`
+// > that a caller cannot pass on as an argument. The test is deleted rather
+// > than rewritten because there is nothing left for it to watch, and a test
+// > that asserts a type-level impossibility is a green result over unexplored
+// > space. `GAPS.md` §2's sweep — 83 guards, 63 unverifiable — has no successor
+// > here for the same reason.
+// >
+// > What did *not* go with it: `spine.ply`'s remaining tests still watch the
+// > propagation itself. "an element that bails abandons the list and propagates
+// > the bail", below, is the one that would notice `comma_list` swallowing an
+// > `Err`.
 
 test "two diagnostics with the same code and primary span collapse to one" {
   let s = probe(b"fn f");
@@ -756,8 +764,12 @@ test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
   // 0..1 on both sides.
   let s = probe(b"&");
   assert_eq(len(s.p.diags), 1);
-  assert_eq(s.p.last_code, b"E0001");
-  assert_eq(s.p.last_span.start, 0);
+  let last = match list_at(s.p.diags, len(s.p.diags) - 1) {
+    Some(l) -> l,
+    None -> diag1(b"", dummy_span(), 0),
+  };
+  assert_eq(last.code, b"E0001");
+  assert_eq(primary_span_of(last).start, 0);
   let q = push_diag(s.p, diag1(unexpected(), sp(0, 1), 0));
   assert_eq(len(q.diags), 1);
 }
@@ -769,33 +781,39 @@ test "an unclosed delimiter carries a secondary label at the opener" {
   assert_eq(dump_diags(u.diags), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
 }
 
-test "deeper bails at MAX_DEPTH and the diagnostic carries its note" {
+test "deeper fails at MAX_DEPTH and the diagnostic carries its note" {
   let s = probe(b"fn");
   let deep = with_depth(s.p, max_depth());
-  let d = deeper(s.c, deep);
-  assert_eq(d.bail, true);
-  assert_eq(dump_diags(d.diags), b"#1;!E0001:0:2:1:1;=0:2:1;");
-  assert_eq(deeper(s.c, s.p).bail, false);
-  assert_eq(shallower(deeper(s.c, s.p)).depth, 0);
+  match deeper(s.c, deep) {
+    Ok(q) -> assert(false),
+    Err(q) -> assert_eq(dump_diags(q.diags), b"#1;!E0001:0:2:1:1;=0:2:1;"),
+  };
+  match deeper(s.c, s.p) {
+    Ok(q) -> assert_eq(shallower(q).depth, 0),
+    Err(q) -> assert(false),
+  };
 }
 
 // A stand-in item parser: one identifier, so the driver can be tested before
 // any real element parser exists.
-fn an_ident(c: Ctx, p: P) -> R<Ident> = expect_ident(c, p, b"a name")
+fn an_ident(c: Ctx, p: P) -> Result<R<Ident>, P> = expect_ident(c, p, b"a name")
+
+// The three lists a test wants out of a `Result` without a `?` it cannot write.
+fn idents(r: Result<R<List<Ident>>, P>) -> R<List<Ident>> = settle(r, [])
 
 test "comma_list reads a comma-separated run and stops at its closer" {
   let s = probe(b"a, b, c)");
-  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  let r = idents(comma_list(s.c, s.p, t_rparen(), an_ident));
   assert_eq(len(r.node), 3);
   assert_eq(at(s.c, r.p, t_rparen()), true);
-  assert_eq(r.p.bail, false);
+  assert_eq(failed(comma_list(s.c, s.p, t_rparen(), an_ident)), false);
 }
 
 test "comma_list accepts an empty run and a trailing comma" {
   let s = probe(b")");
-  assert_eq(len(comma_list(s.c, s.p, t_rparen(), an_ident).node), 0);
+  assert_eq(len(idents(comma_list(s.c, s.p, t_rparen(), an_ident)).node), 0);
   let t = probe(b"a, )");
-  let r = comma_list(t.c, t.p, t_rparen(), an_ident);
+  let r = idents(comma_list(t.c, t.p, t_rparen(), an_ident));
   assert_eq(len(r.node), 1);
   assert_eq(at(t.c, r.p, t_rparen()), true);
 }
@@ -805,27 +823,30 @@ test "comma_list accepts an empty run and a trailing comma" {
 // `at_eof` check leaves the test green — `arm-spine.sh` found that too.
 test "comma_list stops at end of input rather than running off the buffer" {
   let s = probe(b"a, b,");
-  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  let r = idents(comma_list(s.c, s.p, t_rparen(), an_ident));
   assert_eq(len(r.node), 2);
   assert_eq(at_eof(s.c, r.p), true);
-  assert_eq(r.p.bail, false);
+  assert_eq(failed(comma_list(s.c, s.p, t_rparen(), an_ident)), false);
   assert_eq(len(r.p.diags), 0);
 }
 
 test "two elements with no comma between them are one element and a stop" {
   let s = probe(b"a b)");
-  let r = comma_list(s.c, s.p, t_rparen(), an_ident);
+  let r = idents(comma_list(s.c, s.p, t_rparen(), an_ident));
   assert_eq(len(r.node), 1);
   assert_eq(kind(s.c, r.p), lexer::TIdent(b"b"));
-  assert_eq(r.p.bail, false);
+  assert_eq(failed(comma_list(s.c, s.p, t_rparen(), an_ident)), false);
 }
 
-test "an element that bails abandons the list and propagates the bail" {
+test "an element that fails abandons the list and propagates the failure" {
   let s = probe(b"a, 1, c)");
   let r = comma_list(s.c, s.p, t_rparen(), an_ident);
-  assert_eq(r.p.bail, true);
-  assert_eq(len(r.node), 1);
-  assert_eq(len(r.p.diags), 1);
+  assert_eq(failed(r), true);
+  // The `Err` carries the state, so the diagnostic that ended the list is
+  // still readable — which is what `Bail`'s zero fields could not have done
+  // had the reference threaded its state instead of mutating it.
+  assert_eq(len(settle(r, []).p.diags), 1);
+  assert_eq(len(settle(r, []).node), 0);
 }
 
 test "a list emits its length, so a dropped element shifts what follows" {
@@ -898,16 +919,16 @@ test "the dump encoder emits printable ASCII with no quote and no backslash" {
 
 test "a qualified name and a bare one differ in the option, not only the span" {
   let s = probe(b"orders::place");
-  let q = qname(s.c, s.p, b"a name");
+  let q = settle(qname(s.c, s.p, b"a name"), no_qname());
   assert_eq(dump_qname(q.node), b"0:13:qname;?1;0:6:ident;@6f7264657273;8:13:ident;@706c616365;");
   let t = probe(b"place");
-  let b = qname(t.c, t.p, b"a name");
+  let b = settle(qname(t.c, t.p, b"a name"), no_qname());
   assert_eq(dump_qname(b.node), b"0:5:qname;?0;0:5:ident;@706c616365;");
 }
 
-test "a name with two `::` is a diagnostic with a note, and bails" {
+test "a name with two `::` is a diagnostic with a note, and fails" {
   let s = probe(b"a::b::c");
   let q = qname(s.c, s.p, b"a name");
-  assert_eq(q.p.bail, true);
-  assert_eq(dump_diags(q.p.diags), b"#1;!E0001:4:6:1:1;=4:6:1;");
+  assert_eq(failed(q), true);
+  assert_eq(dump_diags(settle(q, no_qname()).p.diags), b"#1;!E0001:4:6:1:1;=4:6:1;");
 }
