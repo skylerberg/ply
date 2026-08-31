@@ -1,11 +1,26 @@
 // Area 3 of the Ply parser spike: expressions. A port of
 // `crates/ply-syntax/src/parser.rs:1211-1844` — `expr`, `scrutinee`, `bin_expr`,
-// `unary_expr`, `postfix_expr`, `primary_expr`, `call_args`, `opt_resource`,
-// `at_record_literal`, `record_expr`, `record_field`, `block_expr`,
-// `block_inner`, `let_stmt`, `lambda_expr`, `if_expr`, `match_expr`,
-// `match_arms`, `handle_expr`, `handle_rest`, `handle_clause`, `clause_param`,
-// `return_clause`, `with_cell_expr`, `with_region_expr`, `simulate_expr`, the
-// `bin_op` precedence table and `is_block_like` — function for function.
+// `unary_expr`, `postfix_expr`, `primary_expr`, `call_args`, `call_arg`,
+// `opt_resource`, `at_record_literal`, `record_expr`, `record_body`,
+// `record_update_base`, `record_field`, `block_expr`, `block_inner`,
+// `let_stmt`, `param_inner`, `fn_param`, `param`, `lambda_expr`, `if_expr`,
+// `match_expr`, `match_arms`, `handle_expr`, `handle_rest`, `handle_clause`,
+// `clause_param`, `return_clause`, `with_cell_expr`, `with_region_expr`,
+// `simulate_expr`, the `bin_op` precedence table and `is_block_like` —
+// function for function.
+//
+// **What it does NOT port, and this is the spike's boundary rather than an
+// omission.** `ExprKind::RecordUpdate` and `ExprKind::Try` are built here and
+// **not** expanded: `record_update::expand` and `try_op::expand` are separate
+// passes that `Parser::run` performs *after* the grammar, and the differential
+// compares against `ply_syntax::parse_unexpanded`, which is that grammar's own
+// output. Likewise a named argument is parsed and kept; `defaults::expand`
+// places it, and that runs two phases later in `resolve`. `../GAPS.md` §11R.D
+// is the decision and what it does and does not cover.
+//
+// **`param` lives here since 2026-08-30**, moved out of `types.ply` because a
+// parameter's default is an expression. The note where it stood says why it
+// could not stay.
 //
 // This area owns the second of the reference's three `deeper()` sites
 // (`unary_expr`, `parser.rs:1244`), eight of its ten `no_brace` save/restores,
@@ -25,16 +40,18 @@ import spine (Span, Ident, QName, Ctx, P, R, Ate, Acc, Start, PDiag,
               span_to, dummy_span, no_ident, bare,
               unexpected, diag1, diag2, push_diag, error_here, unclosed,
               settle, failed,
+              default_not_allowed, unknown_argument_name, argument_order,
               kind, kind_at, cur_span, prev_span, at, at_eof, at_ident_text,
               advance, bump, eat, expect, expect_close, expect_ident,
               with_no_brace, deeper, shallower, start, qname, comma_list,
               t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
-              t_comma, t_semi, t_colon, t_dot, t_arrow, t_eq, t_pipe, t_pipepipe,
+              t_comma, t_semi, t_colon, t_dot, t_dotdot, t_arrow, t_eq,
+              t_pipe, t_pipepipe, t_question,
               k_let, k_if, k_else, k_with,
               rec, nlist, opt, word, dump_list, dump_opt, dump_ident, dump_qname,
               dump_diags)
 import lexer (Tok, TIdent, TInt, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
-import types (TypeExpr, Param, ty, ty_span, param, dump_ty, dump_param)
+import types (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LBool, LStr, LBytes, LFloat, LDec, LUnit,
                  pattern, pat_span, no_pattern, dump_pattern, dump_lit)
 
@@ -59,11 +76,21 @@ pub type Expr =
   | EBinary({ span: Span, op: Bytes, lhs: Expr, rhs: Expr })
   | EUnary({ span: Span, op: Bytes, operand: Expr })
   | ELambda({ span: Span, body: Expr, params: List<Param> })
-  | EApp({ span: Span, func: Expr, args: List<Expr> })
+  | EApp({ span: Span, func: Expr, named: List<NamedArg>, args: List<Expr> })
   | EIf({ span: Span, cond: Expr, then_branch: Expr, else_branch: Expr })
   | EMatch({ span: Span, scrutinee: Expr, arms: List<MatchArm> })
   | EBlock({ span: Span, tail: Option<Expr>, stmts: List<Stmt> })
   | ERecord({ span: Span, fields: List<RecField> })
+  // `{..b, f: e}` and `e?` (ADR 0023, ADR 0028). Both are **parse-time only**
+  // in the reference: `record_update::expand` and `try_op::expand` rewrite
+  // every one of them away inside `Parser::run`, so no crate downstream of
+  // `ply-syntax` can observe either. This port stops at the grammar and
+  // therefore *keeps* them, which is the whole of `GAPS.md` §11R.D's decision:
+  // the comparison is against `parse_unexpanded`, the reference's own
+  // pre-rewrite tree, and these two variants are where the two trees would
+  // otherwise part.
+  | ERecordUpdate({ span: Span, base: Expr, fields: List<RecField> })
+  | ETry({ span: Span, operand: Expr })
   | EField({ span: Span, base: Expr, field: Ident })
   | EList({ span: Span, items: List<Expr> })
   | EPerform({ span: Span, eff: QName, op: Ident, resource: Option<Ident>,
@@ -77,6 +104,29 @@ pub type Expr =
 
 // `Vec<(Ident, Expr)>`. `spikes/ply-lexer/GAPS.md` §9's no-tuples tax again.
 pub type RecField = { name: Ident, value: Expr }
+
+// `ast.rs`'s `NamedArg`. One argument written `name: value`, which the parser
+// keeps beside the positional ones and `defaults::expand` later places into the
+// slot its name selects — in `resolve`, two phases past anything this port
+// does. So this list is **never** empty-by-construction here the way it is
+// everywhere downstream, and dumping it is not optional: `g(1, b: 2)` and
+// `g(1, c: 3)` are different programs. `GAPS.md` §11R.N is the measurement of
+// what it cost while nothing dumped it.
+pub type NamedArg = { name: Ident, value: Expr, span: Span }
+
+// `parser.rs`'s `enum Arg`: what one comma-separated member of an argument list
+// turned out to be.
+type Arg = | APos(Expr) | ANamed(NamedArg)
+
+// A `fn` parameter, which may carry `= <expr>`; a lambda parameter, which may
+// not. `ast.rs`'s `Param`.
+//
+// **This type lives here rather than in `types.ply`, and that is a move.** Its
+// former home says why in a withdrawn note: a parameter used to need only `ty`,
+// and a default is an *expression*, so it now needs the area above. `GAPS.md`
+// §11R.D priced this row as "the only one that is not mechanical".
+pub type Param = { name: Ident, ty: Option<TypeExpr>, default: Option<Expr>,
+                   span: Span }
 
 pub type Stmt =
   | SLet({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr })
@@ -122,6 +172,8 @@ pub fn expr_span(e: Expr) -> Span =
     EMatch(v) -> v.span,
     EBlock(v) -> v.span,
     ERecord(v) -> v.span,
+    ERecordUpdate(v) -> v.span,
+    ETry(v) -> v.span,
     EField(v) -> v.span,
     EList(v) -> v.span,
     EPerform(v) -> v.span,
@@ -143,12 +195,14 @@ fn set_span(e: Expr, s: Span) -> Expr =
     EBinary(v) -> EBinary({ span: s, op: v.op, lhs: v.lhs, rhs: v.rhs }),
     EUnary(v) -> EUnary({ span: s, op: v.op, operand: v.operand }),
     ELambda(v) -> ELambda({ span: s, body: v.body, params: v.params }),
-    EApp(v) -> EApp({ span: s, func: v.func, args: v.args }),
+    EApp(v) -> EApp({ span: s, func: v.func, named: v.named, args: v.args }),
     EIf(v) -> EIf({ span: s, cond: v.cond, then_branch: v.then_branch,
                     else_branch: v.else_branch }),
     EMatch(v) -> EMatch({ span: s, scrutinee: v.scrutinee, arms: v.arms }),
     EBlock(v) -> EBlock({ span: s, tail: v.tail, stmts: v.stmts }),
     ERecord(v) -> ERecord({ span: s, fields: v.fields }),
+    ERecordUpdate(v) -> ERecordUpdate({ span: s, base: v.base, fields: v.fields }),
+    ETry(v) -> ETry({ span: s, operand: v.operand }),
     EField(v) -> EField({ span: s, base: v.base, field: v.field }),
     EList(v) -> EList({ span: s, items: v.items }),
     EPerform(v) -> EPerform({ span: s, eff: v.eff, op: v.op, resource: v.resource,
@@ -283,13 +337,22 @@ fn postfix_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
         Ok(a) ->
           Continue({p: a.p,
                     node: EApp({ span: span_to(expr_span(s.node), a.close),
-                                 func: s.node, args: a.args })}),
+                                 func: s.node, named: a.named, args: a.args })}),
       }
     } else if at(c, s.p, t_dot()) {
       match postfix_dot(c, s) {
         Err(q) -> Stop(Err(q)),
         Ok(r) -> Continue(r),
       }
+    } else if at(c, s.p, t_question()) {
+      // Tightest tier, in this same loop and alongside `f(x)` and `r.field`,
+      // so `f(x)?.g` is `(f(x)?).g` and `-x?` is `-(x?)` — the unary is a
+      // level up, in `unary_body`. `parser.rs`'s comment for this arm is the
+      // argument: Ply has no ternary, so nothing else can claim the token.
+      let q = advance(c, s.p);
+      Continue({p: q.p,
+                node: ETry({ span: span_to(expr_span(s.node), q.node),
+                             operand: s.node })})
     } else {
       Stop(Ok(s))
     })
@@ -319,7 +382,11 @@ fn postfix_dot(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
     let {p, node: op} = expect_ident(c, dot.p, b"an operation name")?;
     let {p, node: res} = opt_resource(c, p)?;
     let a = call_args(c, p)?;
-    Ok({ p: a.p,
+    // An operation has no defaults to fill and a handler clause binds exactly
+    // what it declares, so there is nothing for a name to select: one `E0123`
+    // per named argument, and the arguments themselves are dropped — which is
+    // what `ExprKind::Perform` does too, having no field for them.
+    Ok({ p: refuse_named(a.p, a.named),
          node: EPerform({ span: span_to(expr_span(s.node), a.close), eff: eff,
                           op: op, resource: res, args: a.args }) })
   }
@@ -335,8 +402,16 @@ fn opt_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
     Ok({ p: p, node: Some(r) })
   }
 
-// `(Vec<Expr>, Span)` in the reference: three things, so not even `R<a>` fits.
-type RArgs = { p: P, close: Span, args: List<Expr> }
+// `(Vec<Expr>, Vec<NamedArg>, Span)` in the reference: four things, so not
+// even `R<a>` fits. `args` is last because it is the one that grows on the hot
+// path; see the spine's Rule 3.
+type RArgs = { p: P, close: Span, named: List<NamedArg>, args: List<Expr> }
+
+// `no_named_arguments_on_a_perform` (`parser.rs:280`): one diagnostic per
+// named argument, each with the argument's own span primary and one note.
+fn refuse_named(p: P, named: List<NamedArg>) -> P =
+  fold(named, p, |q: P, n: NamedArg|
+    push_diag(q, diag1(unknown_argument_name(), n.span, 1)))
 
 // Restored on the failing path as well: the reference's `self.no_brace = saved`
 // sits *after* the `?`s and runs whichever way they went. That is why the body
@@ -346,16 +421,69 @@ fn call_args(c: Ctx, p: P) -> Result<RArgs, P> = {
   let saved = p.no_brace;
   match call_args_inner(c, with_no_brace(p, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(a) -> Ok({ p: with_no_brace(a.p, saved), close: a.close, args: a.args }),
+    Ok(a) -> Ok({ p: with_no_brace(a.p, saved), close: a.close,
+                  named: a.named, args: a.args }),
   }
 }
 
 fn call_args_inner(c: Ctx, p: P) -> Result<RArgs, P> = {
   let {p, node: o} = expect(c, p, t_lparen(), b"`(` to start the argument list")?;
-  let {p, node: args} = comma_list(c, p, t_rparen(), expr)?;
+  let {p, node: parsed} = comma_list(c, p, t_rparen(), call_arg)?;
   let {p, node: cl} = expect_close(c, p, t_rparen(), o, b"`)` to close the arguments")?;
-  Ok({ p: p, close: cl, args: args })
+  let sp = split_args(p, parsed);
+  Ok({ p: sp.p, close: cl, named: sp.named, args: sp.args })
 }
+
+// `name: value` is a named argument; anything else is positional.
+//
+// The lookahead is two tokens and cannot be one: `f(x)` and `f(x: 1)` share a
+// first token, and `x` alone is an ordinary variable reference. `kind_at`
+// already reaches two ahead, so this costs nothing the spine did not have.
+fn call_arg(c: Ctx, p: P) -> Result<R<Arg>, P> =
+  match kind(c, p) {
+    TIdent(n) ->
+      if kind_at(c, p, 1) == t_colon() { named_arg(c, p, n) }
+      else { positional_arg(c, p) },
+    _ -> positional_arg(c, p),
+  }
+
+fn positional_arg(c: Ctx, p: P) -> Result<R<Arg>, P> = {
+  let {p, node: e} = expr(c, p)?;
+  Ok({ p: p, node: APos(e) })
+}
+
+fn named_arg(c: Ctx, p: P, text: Bytes) -> Result<R<Arg>, P> = {
+  let name = { name: text, span: cur_span(c, p) };
+  let a = advance(c, p);
+  let b = advance(c, a.p);
+  let {p, node: v} = expr(c, b.p)?;
+  Ok({ p: p,
+       node: ANamed({ name: name, value: v,
+                      span: span_to(name.span, expr_span(v)) }) })
+}
+
+// The partition, and the one rule the **parser** owns about names: ordering.
+// Which names are legal needs the callee's signature and is `defaults::expand`'s
+// business, two phases away. `first` is `named.first()` in the reference — the
+// span the secondary label points at — carried explicitly because reading it
+// back off a list being built would be `list_at(.., 0)` on every positional.
+type Split = { p: P, first: Option<Span>, named: List<NamedArg>, args: List<Expr> }
+
+fn split_args(p: P, parsed: List<Arg>) -> Split =
+  fold(parsed, { p: p, first: None, named: [], args: [] }, |s: Split, a: Arg|
+    match a {
+      APos(e) ->
+        { first: s.first, named: s.named,
+          p: match s.first {
+               None -> s.p,
+               Some(f) -> push_diag(s.p, diag2(argument_order(), expr_span(e), f, 1)),
+             },
+          args: push(s.args, e) },
+      ANamed(n) ->
+        { p: s.p, args: s.args,
+          first: match s.first { None -> Some(n.span), Some(f) -> Some(f) },
+          named: push(s.named, n) },
+    })
 
 fn lit_expr(c: Ctx, p: P, l: Lit) -> Result<R<Expr>, P> = {
   let a = advance(c, p);
@@ -447,10 +575,14 @@ fn primary_list_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
 }
 
 // `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`.
+// `{..b, ...}` is a record update, and `..` cannot begin a statement, so one
+// token of lookahead settles that one.
 fn at_record_literal(c: Ctx, p: P) -> Bool =
-  match kind_at(c, p, 1) {
-    TIdent(n) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
-    _ -> false,
+  if kind_at(c, p, 1) == t_dotdot() { true } else {
+    match kind_at(c, p, 1) {
+      TIdent(n) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
+      _ -> false,
+    }
   }
 
 fn record_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
@@ -463,12 +595,68 @@ fn record_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
 
 fn record_expr_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   let o = advance(c, p);
-  let {p, node: fields} = comma_list(c, o.p, t_rbrace(), record_field)?;
+  let {p, node: base} = record_base(c, o.p)?;
+  let {p, node: fields} = comma_list(c, p, t_rbrace(), record_field)?;
   let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}` to close the record")?;
-  Ok({ p: p, node: ERecord({ span: span_to(o.node, cl), fields: fields }) })
+  let sp = span_to(o.node, cl);
+  Ok({ p: p,
+       node: match base {
+         None -> ERecord({ span: sp, fields: fields }),
+         Some(b) -> ERecordUpdate({ span: sp, base: b, fields: fields }),
+       } })
 }
 
-fn record_field(c: Ctx, p: P) -> Result<R<RecField>, P> = {
+// `{..b}` is the whole expression when no comma follows; otherwise the comma
+// separates the base from the fields that replace. Its own function so that its
+// `?`s sit in a return position, which is `let_ty`'s reason.
+fn record_base(c: Ctx, p: P) -> Result<R<Option<Expr>>, P> =
+  if !at(c, p, t_dotdot()) { Ok({ p: p, node: None }) } else {
+    let {p, node: b} = record_update_base(c, p)?;
+    if at(c, p, t_rbrace()) { Ok({ p: p, node: Some(b) }) } else {
+      let {p, ..} = expect(c, p, t_comma(), b"`,` after the record being updated")?;
+      Ok({ p: p, node: Some(b) })
+    }
+  }
+
+// The base of an update is a **path** — `s`, `state.limits` — and not an
+// arbitrary expression, because the expansion writes `base.f` once per field it
+// copies. That is `record_update::expand`'s reason and this port does not run
+// it, but the *grammar* is the grammar: a base with a call in it is a syntax
+// error on both sides or on neither.
+//
+// One `iterate` for the `.f.g` tail, so a path of any length is depth 1.
+fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
+  let dots = advance(c, p);
+  if at(c, dots.p, t_dot()) {
+    // `...b`: `..` then `.`, which would otherwise report the useless
+    // "expected a name, found `.`".
+    Err(push_diag(dots.p,
+                  diag1(unexpected(), span_to(dots.node, cur_span(c, dots.p)), 1)))
+  } else {
+    let {p, node: name} = expect_ident(c, dots.p, b"the record being updated")?;
+    iterate({ p: p, node: EVar({ span: name.span, name: bare(name) }) },
+            c.ntok - p.pos + 1, |s: R<Expr>|
+      if !at(c, s.p, t_dot()) { Stop(Ok(s)) } else {
+        let d = advance(c, s.p);
+        match expect_ident(c, d.p, b"a field name") {
+          Err(q) -> Stop(Err(q)),
+          Ok(f) ->
+            Continue({ p: f.p,
+                       node: EField({ span: span_to(expr_span(s.node), f.node.span),
+                                      base: s.node, field: f.node }) }),
+        }
+      })
+  }
+}
+
+fn record_field(c: Ctx, p: P) -> Result<R<RecField>, P> =
+  if at(c, p, t_dotdot()) {
+    // A record update has one base, written first; two have no defined order
+    // of fields.
+    Err(push_diag(p, diag1(unexpected(), cur_span(c, p), 1)))
+  } else { record_field_named(c, p) }
+
+fn record_field_named(c: Ctx, p: P) -> Result<R<RecField>, P> = {
   let {p, node: name} = expect_ident(c, p, b"a field name")?;
   let colon = eat(c, p, t_colon());
   if colon.ok {
@@ -561,6 +749,64 @@ fn let_stmt(c: Ctx, p: P) -> Result<R<Stmt>, P> = {
        node: SLet({ span: span_to(st.node, semi), pat: pat, ty: t,
                     value: value }) })
 }
+
+// A `fn` parameter, which may carry `= <expr>`.
+pub fn fn_param(c: Ctx, p: P) -> Result<R<Param>, P> = param_inner(c, p, true)
+
+// A lambda parameter, which may not. A default exists so that a *call* can
+// leave the argument out, and a lambda is reached through a value rather than
+// through a name a call site could match against a signature.
+pub fn param(c: Ctx, p: P) -> Result<R<Param>, P> = param_inner(c, p, false)
+
+// > **Moved here from `types.ply` (ADR 0029, 2026-08-30).** That file's note on
+// > `param` read: *"Lives in this area rather than with items because both
+// > `fn_def` and `lambda_expr` need it and **it needs only `ty`**."* Both halves
+// > of that sentence were true and the second stopped being: a default is an
+// > **expression**, so `param` needs `expr`, which is here. The reference has no
+// > such problem — its `param_inner` sits in `parser.rs` with everything else —
+// > so this is a cost of the five-way split this spike chose, and `GAPS.md`
+// > §11R.D registered it as the one row of the restoration that is not
+// > mechanical.
+fn param_inner(c: Ctx, p: P, allow_default: Bool) -> Result<R<Param>, P> = {
+  let {p, node: n} = expect_ident(c, p, b"a parameter name")?;
+  let {p, node: t} = param_ty(c, p)?;
+  let {p, node: d} = param_default(c, p, allow_default)?;
+  // `default.map(span).or_else(|| ty.map(span)).unwrap_or(name.span)`. Note
+  // which way the refusal falls: a *refused* default answers `None`, so the
+  // span of a lambda parameter written `|x = 1|` stops at `x` and does not
+  // cover the `= 1` the parser read and threw away.
+  let end = match d {
+    Some(e) -> expr_span(e),
+    None -> match t { Some(x) -> ty_span(x), None -> n.span },
+  };
+  Ok({ p: p, node: { name: n, ty: t, default: d, span: span_to(n.span, end) } })
+}
+
+// The optional `: T` and the optional `= e`, each its own function so that its
+// `?` sits in a return position — `let_ty`'s reason again.
+fn param_ty(c: Ctx, p: P) -> Result<R<Option<TypeExpr>>, P> = {
+  let co = eat(c, p, t_colon());
+  if !co.ok { Ok({ p: co.p, node: None }) } else {
+    let {p, node: t} = ty(c, co.p)?;
+    Ok({ p: p, node: Some(t) })
+  }
+}
+
+// Parsed either way, so that a default written on a lambda is refused with the
+// reason rather than with "expected `,` or `|`".
+fn param_default(c: Ctx, p: P, allow: Bool) -> Result<R<Option<Expr>>, P> =
+  if !at(c, p, t_eq()) { Ok({ p: p, node: None }) } else {
+    let eq = advance(c, p);
+    let {p, node: e} = expr(c, eq.p)?;
+    if allow { Ok({ p: p, node: Some(e) }) } else {
+      Ok({ p: push_diag(p, diag1(default_not_allowed(),
+                                 span_to(eq.node, expr_span(e)), 1)),
+           node: None })
+    }
+  }
+
+pub fn no_param() -> Param =
+  { name: no_ident(), ty: None, default: None, span: dummy_span() }
 
 // `||` is the empty parameter list, one token; `|` opens a real one. Its own
 // function for `let_ty`'s reason.
@@ -842,7 +1088,8 @@ pub fn dump_expr(e: Expr) -> Bytes =
                                     dump_list(v.params, dump_param),
                                     dump_expr(v.body)]),
     EApp(v) -> bytes_concat_all([rec(v.span, b"eapp"), dump_expr(v.func),
-                                 dump_list(v.args, dump_expr)]),
+                                 dump_list(v.args, dump_expr),
+                                 dump_list(v.named, dump_named)]),
     EIf(v) -> bytes_concat_all([rec(v.span, b"eif"), dump_expr(v.cond),
                                 dump_expr(v.then_branch), dump_expr(v.else_branch)]),
     EMatch(v) -> bytes_concat_all([rec(v.span, b"emat"), dump_expr(v.scrutinee),
@@ -850,6 +1097,9 @@ pub fn dump_expr(e: Expr) -> Bytes =
     EBlock(v) -> bytes_concat_all([rec(v.span, b"eblk"), dump_list(v.stmts, dump_stmt),
                                    dump_opt(v.tail, dump_expr)]),
     ERecord(v) -> bytes_concat(rec(v.span, b"erec"), dump_list(v.fields, dump_field)),
+    ERecordUpdate(v) -> bytes_concat_all([rec(v.span, b"erup"), dump_expr(v.base),
+                                          dump_list(v.fields, dump_field)]),
+    ETry(v) -> bytes_concat(rec(v.span, b"etry"), dump_expr(v.operand)),
     EField(v) -> bytes_concat_all([rec(v.span, b"efld"), dump_expr(v.base),
                                    dump_ident(v.field)]),
     EList(v) -> bytes_concat(rec(v.span, b"elst"), dump_list(v.items, dump_expr)),
@@ -870,6 +1120,16 @@ pub fn dump_expr(e: Expr) -> Bytes =
 
 fn dump_field(f: RecField) -> Bytes =
   bytes_concat(dump_ident(f.name), dump_expr(f.value))
+
+// A named argument carries **its own span** as well as its name and its value,
+// because the two diagnostics that point at one (`E0123`, `E0124`) point at
+// exactly that span and nothing else in the dump would fix it.
+fn dump_named(n: NamedArg) -> Bytes =
+  bytes_concat_all([rec(n.span, b"narg"), dump_ident(n.name), dump_expr(n.value)])
+
+pub fn dump_param(pa: Param) -> Bytes =
+  bytes_concat_all([rec(pa.span, b"prm"), dump_ident(pa.name),
+                    dump_opt(pa.ty, dump_ty), dump_opt(pa.default, dump_expr)])
 
 pub fn dump_stmt(s: Stmt) -> Bytes =
   match s {
@@ -907,6 +1167,24 @@ pub fn dump_expr_of(src: Bytes) -> String = {
   string_of_bytes(bytes_concat(tree, dump_diags(fin.diags)))
 }
 
+// `param` is called only from `items.ply` and from `lambda_params`, so without
+// this nothing in this area reaches it directly. Moved here from `types.ply`
+// with the parser it drives.
+pub fn dump_param_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = settle(param(s.c, s.p), no_param());
+  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
+}
+
+// The same for a `fn`'s parameter, which is a different function: it is the
+// one that allows `= <expr>`, and the difference between the two is a
+// diagnostic that no lambda in the corpus raises.
+pub fn dump_fn_param_of(src: Bytes) -> String = {
+  let s = start(src);
+  let r = settle(fn_param(s.c, s.p), no_param());
+  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
+}
+
 // The node count, for a probe that prices parsing and touches the whole result.
 // It must be total: a walk that short-circuits would price a parse whose tree was
 // never read.
@@ -916,8 +1194,9 @@ pub fn node_count(e: Expr) -> Int =
     EVar(v) -> 1,
     EBinary(v) -> 1 + node_count(v.lhs) + node_count(v.rhs),
     EUnary(v) -> 1 + node_count(v.operand),
-    ELambda(v) -> 1 + len(v.params) + node_count(v.body),
-    EApp(v) -> 1 + node_count(v.func) + count_all(v.args),
+    ELambda(v) -> 1 + count_params(v.params) + node_count(v.body),
+    EApp(v) -> 1 + node_count(v.func) + count_all(v.args)
+                 + fold(v.named, 0, |n: Int, a: NamedArg| n + 1 + node_count(a.value)),
     EIf(v) -> 1 + node_count(v.cond) + node_count(v.then_branch)
                 + node_count(v.else_branch),
     EMatch(v) -> 1 + node_count(v.scrutinee)
@@ -926,6 +1205,10 @@ pub fn node_count(e: Expr) -> Int =
     EBlock(v) -> 1 + fold(v.stmts, 0, |n: Int, s: Stmt| n + count_stmt(s))
                    + count_opt(v.tail),
     ERecord(v) -> 1 + fold(v.fields, 0, |n: Int, f: RecField| n + 1 + node_count(f.value)),
+    ERecordUpdate(v) -> 1 + node_count(v.base)
+                          + fold(v.fields, 0, |n: Int, f: RecField|
+                              n + 1 + node_count(f.value)),
+    ETry(v) -> 1 + node_count(v.operand),
     EField(v) -> 1 + node_count(v.base),
     EList(v) -> 1 + count_all(v.items),
     EPerform(v) -> 1 + count_all(v.args),
@@ -940,6 +1223,12 @@ pub fn node_count(e: Expr) -> Int =
   }
 
 fn count_all(xs: List<Expr>) -> Int = fold(xs, 0, |n: Int, x: Expr| n + node_count(x))
+
+// A parameter is one node plus whatever its default holds. Lambdas refuse a
+// default, so this is `len` on every lambda and is written the long way anyway:
+// the same function counts a `fn`'s parameters through `items.ply`.
+pub fn count_params(ps: List<Param>) -> Int =
+  fold(ps, 0, |n: Int, pa: Param| n + 1 + count_opt(pa.default))
 
 fn count_opt(o: Option<Expr>) -> Int = match o { None -> 0, Some(x) -> node_count(x) }
 
@@ -960,6 +1249,106 @@ pub fn parse_pos(src: Bytes) -> Int = {
 }
 
 // --- Tests ------------------------------------------------------------------
+
+// The four features ADR 0023, ADR 0028 and ADR 0029 added after this spike was
+// taken. Every expectation below was derived from the reference's control flow
+// and the dump grammar before it was run, the way the rest of this file was;
+// the whole-file agreement over 766 inputs is the independent check.
+
+test "the try operator is a node of its own and takes the `?` into its span" {
+  assert_eq(dump_expr_of(b"x?"),
+            "0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
+  // Tightest tier: `f(x)?` is `(f(x))?` and `x??` nests left.
+  assert_eq(dump_expr_of(b"x??"),
+            "0:3:etry;0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
+}
+
+test "the try operator binds tighter than a unary and than any binary" {
+  // `-x?` is `-(x?)`: the `eun` is outside.
+  assert_eq(dump_expr_of(b"-x?"),
+            "0:3:eun;%neg;1:3:etry;1:2:evar;1:2:qname;?0;1:2:ident;@78;#0;");
+  // `x? + y` is `(x?) + y`.
+  assert_eq(dump_expr_of(b"x? + y"),
+            "0:6:ebin;%add;0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;"
+            ++ "5:6:evar;5:6:qname;?0;5:6:ident;@79;#0;")
+}
+
+test "a record update carries its base, and `{..b}` needs no comma" {
+  assert_eq(dump_expr_of(b"{..b, x: 1}"),
+            "0:11:erup;3:4:evar;3:4:qname;?0;3:4:ident;@62;#1;6:7:ident;@78;"
+            ++ "9:10:elit;%int;@31;#0;");
+  assert_eq(dump_expr_of(b"{..b}"),
+            "0:5:erup;3:4:evar;3:4:qname;?0;3:4:ident;@62;#0;#0;")
+}
+
+test "the base of a record update is a path and not an expression" {
+  // `s.inner` is an `efld` chain built by `record_update_base`'s own loop.
+  assert_eq(dump_expr_of(b"{..s.i, x: 1}"),
+            "0:13:erup;3:6:efld;3:4:evar;3:4:qname;?0;3:4:ident;@73;5:6:ident;@69;"
+            ++ "#1;8:9:ident;@78;11:12:elit;%int;@31;#0;");
+  // `...b` is one dot too many, and says so rather than "expected a name".
+  assert_eq(dump_expr_of(b"{...b}"), "#1;!E0001:1:4:1:1;=1:4:1;");
+  // A second `..` has no defined order of fields.
+  assert_eq(dump_expr_of(b"{..a, ..b}"), "#1;!E0001:6:8:1:1;=6:8:1;")
+}
+
+test "a named argument is a node with its own span, its name and its value" {
+  assert_eq(dump_expr_of(b"f(1, b: 2)"),
+            "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;"
+            ++ "#1;5:9:narg;5:6:ident;@62;8:9:elit;%int;@32;#0;");
+  // The two-token lookahead: `f(x)` is positional and `f(x: 1)` is not.
+  assert_eq(dump_expr_of(b"f(x)"),
+            "0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:evar;2:3:qname;?0;"
+            ++ "2:3:ident;@78;#0;#0;")
+}
+
+// Both of these keep their **tree** as well as raising: neither `E0124` nor
+// `E0123` bails, so the call is still built and `dump_expr_of` still prints it.
+// (Written first as diagnostics alone, which was wrong about this parser and
+// not about the reference: `positional_after_named` and
+// `no_named_arguments_on_a_perform` both `push` and carry on.)
+test "a positional argument after a named one is refused, once each" {
+  // One diagnostic per offending positional, each pointing back at the FIRST
+  // named argument as its secondary label -- so the second one names 2:6 too.
+  assert_eq(dump_expr_of(b"f(a: 1, 2)"),
+            "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;8:9:elit;%int;@32;"
+            ++ "#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;"
+            ++ "#1;!E0124:8:9:2:1;=8:9:1;=2:6:0;");
+  assert_eq(dump_expr_of(b"f(a: 1, 2, 3)"),
+            "0:13:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#2;8:9:elit;%int;@32;"
+            ++ "11:12:elit;%int;@33;#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;"
+            ++ "#2;!E0124:8:9:2:1;=8:9:1;=2:6:0;!E0124:11:12:2:1;=11:12:1;=2:6:0;")
+}
+
+test "an effect operation takes no named argument" {
+  // `ExprKind::Perform` has no field for one, so the argument is dropped as
+  // well as refused: the `eprf` below carries zero arguments.
+  assert_eq(dump_expr_of(b"d.op(k: 1)"),
+            "0:10:eprf;0:1:qname;?0;0:1:ident;@64;2:4:ident;@6f70;?0;#0;"
+            ++ "#1;!E0123:5:9:1:1;=5:9:1;")
+}
+
+test "a parameter's type and its default are both optional" {
+  assert_eq(dump_param_of(b"x"), "0:1:prm;0:1:ident;@78;?0;?0;#0;");
+  assert_eq(dump_param_of(b"x: Int"),
+            "0:6:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;?0;#0;");
+  assert_eq(dump_param_of(b"x: (Int) -> Bool"),
+            "0:16:prm;0:1:ident;@78;?1;3:16:tfn;#1;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;12:16:tcon;12:16:qname;?0;12:16:ident;@426f6f6c;#0;?0;?0;#0;");
+  assert_eq(dump_param_of(b"x:"), "0:0:prm;0:0:ident;@;?0;?0;#1;!E0001:2:2:1:0;=2:2:1;")
+}
+
+test "a fn parameter may carry a default and a lambda parameter may not" {
+  assert_eq(dump_fn_param_of(b"x: Int = 1"),
+            "0:10:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;"
+            ++ "?1;9:10:elit;%int;@31;#0;");
+  assert_eq(dump_fn_param_of(b"x = 1"),
+            "0:5:prm;0:1:ident;@78;?0;?1;4:5:elit;%int;@31;#0;");
+  // Refused, and the refusal costs the parameter's span the `= 1` it read:
+  // `default` is `None`, so the span falls back to the type's end.
+  assert_eq(dump_param_of(b"x: Int = 1"),
+            "0:6:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;"
+            ++ "?0;#1;!E0120:7:10:1:1;=7:10:1;")
+}
 
 test "a literal keeps its own span and its decoded value" {
   assert_eq(dump_expr_of(b"1"), "0:1:elit;%int;@31;#0;");
@@ -1002,7 +1391,7 @@ test "a unary operator nests, and a `-` before a literal is an operator here" {
 
 test "application and field access chain left to right" {
   assert_eq(dump_expr_of(b"f(1)(2)"),
-            "0:7:eapp;0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;#1;5:6:elit;%int;@32;#0;");
+            "0:7:eapp;0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;#0;#1;5:6:elit;%int;@32;#0;#0;");
   assert_eq(dump_expr_of(b"r.a.b"),
             "0:5:efld;0:3:efld;0:1:evar;0:1:qname;?0;0:1:ident;@72;2:3:ident;@61;4:5:ident;@62;#0;");
 }
@@ -1055,10 +1444,10 @@ test "a block-like statement needs no semicolon and anything else does" {
 
 test "a lambda takes typed or untyped parameters, and `||` takes none" {
   assert_eq(dump_expr_of(b"|x| x"),
-            "0:5:elam;#1;1:2:prm;1:2:ident;@78;?0;4:5:evar;4:5:qname;?0;4:5:ident;@78;#0;");
+            "0:5:elam;#1;1:2:prm;1:2:ident;@78;?0;?0;4:5:evar;4:5:qname;?0;4:5:ident;@78;#0;");
   assert_eq(dump_expr_of(b"|| 1"), "0:4:elam;#0;3:4:elit;%int;@31;#0;");
   assert_eq(dump_expr_of(b"|x: Int| x"),
-            "0:10:elam;#1;1:7:prm;1:2:ident;@78;?1;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;9:10:evar;9:10:qname;?0;9:10:ident;@78;#0;");
+            "0:10:elam;#1;1:7:prm;1:2:ident;@78;?1;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;?0;9:10:evar;9:10:qname;?0;9:10:ident;@78;#0;");
 }
 
 test "a match arm takes a guard and needs a comma unless its body is block-like" {
@@ -1071,7 +1460,7 @@ test "a match arm takes a guard and needs a comma unless its body is block-like"
 
 test "a handler takes clauses, a resume binder and at most one `return`" {
   assert_eq(dump_expr_of(b"handle f() with { e.op(a) resume k -> k(a), return v -> v }"),
-            "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;");
+            "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;");
   let two = dump_expr_of(b"handle f() with { return a -> a, return b -> b }");
   assert(string_contains(two, "!E0001:33:46:2:0;=33:46:1;=18:31:0;"));
 }
@@ -1097,7 +1486,7 @@ test "in a scrutinee a `{` is the arm block, so `simulate` is a name there" {
 
 test "an argument list clears no_brace so a record may be written inside one" {
   assert_eq(dump_expr_of(b"if f({a: 1}) { 2 }"),
-            "0:18:eif;3:12:eapp;3:4:evar;3:4:qname;?0;3:4:ident;@66;#1;5:11:erec;#1;6:7:ident;@61;9:10:elit;%int;@31;13:18:eblk;#0;?1;15:16:elit;%int;@32;18:18:elit;%unit;#0;");
+            "0:18:eif;3:12:eapp;3:4:evar;3:4:qname;?0;3:4:ident;@66;#1;5:11:erec;#1;6:7:ident;@61;9:10:elit;%int;@31;#0;13:18:eblk;#0;?1;15:16:elit;%int;@32;18:18:elit;%unit;#0;");
 }
 
 test "a list expression, an empty one, and a qualified name" {
@@ -1105,7 +1494,7 @@ test "a list expression, an empty one, and a qualified name" {
             "0:6:elst;#2;1:2:elit;%int;@31;4:5:elit;%int;@32;#0;");
   assert_eq(dump_expr_of(b"[]"), "0:2:elst;#0;#0;");
   assert_eq(dump_expr_of(b"m::f(1)"),
-            "0:7:eapp;0:4:evar;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@66;#1;5:6:elit;%int;@31;#0;");
+            "0:7:eapp;0:4:evar;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@66;#1;5:6:elit;%int;@31;#0;#0;");
 }
 
 test "a parenthesized expression takes the parentheses into its span" {

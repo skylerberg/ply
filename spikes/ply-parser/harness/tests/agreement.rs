@@ -13,13 +13,28 @@
 //! payload; then every diagnostic's code, primary span, label count, note
 //! count, and each label's own span and primary flag.
 //!
+//! **Which tree.** `ply_syntax::parse_unexpanded`, not `parse_recovering`: the
+//! module as the **grammar** built it, before `effect_set`, `record_update` and
+//! `try_op` rewrite it. Those three are tree-to-tree passes and none of them is
+//! parsing; the port implements the grammar and does not claim them.
+//! `../GAPS.md` §11R.D is the decision, its cost and the four measurements
+//! behind it, and `src/lib.rs`'s `dumper_boundaries` is the one-screen version.
+//!
 //! **What is not.** Diagnostic *message text* and *severity*: `items.ply`
 //! carries a `what: Bytes` at all ~120 sites and never reads it, and turning
 //! messages on additionally needs `TokenKind::describe`'s forty arms.
 //! `FnDef::derived`, which the parser can only write `None` — asserted rather
-//! than skipped, in `src/lib.rs`. And, for a file that uses `effect set`,
-//! `effect_set::expand`'s effect on the tree, which `reference_dump_unexpanded`
-//! projects out and which this file counts and prints rather than hides.
+//! than skipped, in `src/lib.rs`. And the three rewrites above, which nothing
+//! in this spike tests and which `../GAPS-harness.md` §H2 item 5 keeps saying
+//! so.
+//!
+//! > **Withdrawn 2026-08-30.** The paragraph above ended: *"And, for a file
+//! > that uses `effect set`, `effect_set::expand`'s effect on the tree, which
+//! > `reference_dump_unexpanded` projects out and which this file counts and
+//! > prints rather than hides."* There is no projection any more and nothing to
+//! > project: the pass does not run. What it cost — a four-conjunct tolerance
+//! > excusing 7 mined inputs — is gone with it, and every diagnostic of every
+//! > input is now compared exactly.
 //!
 //! Nothing here skips. If the `ply` binary is missing the tests fail and say
 //! how to build it; `CONTRIBUTING.md` §"The suite proves less than it looks
@@ -27,8 +42,7 @@
 //! to be a fifth.
 
 use ply_parser_spike_harness::{
-    DumpedDiag, bundle, byte_literal, node_count, records, reference_dump,
-    reference_dump_unexpanded, split_diags, uses_effect_sets,
+    bundle, byte_literal, node_count, records, reference_dump, uses_effect_sets,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,11 +270,6 @@ struct Tally {
     records: usize,
     nodes: usize,
     diagnostics: usize,
-    projected: usize,
-    /// Inputs whose trees agree and whose only difference is a diagnostic
-    /// `effect_set::expand` raised, and how many such diagnostics there were.
-    expander_inputs: usize,
-    expander_diags: usize,
 }
 
 impl Tally {
@@ -274,79 +283,42 @@ impl Tally {
 
     fn report(&self, what: &str) {
         println!(
-            "  {what}: {} inputs, {} bytes, {} records, {} nodes, {} diagnostics, \
-             {} with expansion projected out",
-            self.inputs, self.bytes, self.records, self.nodes, self.diagnostics, self.projected
+            "  {what}: {} inputs, {} bytes, {} records, {} nodes, {} diagnostics",
+            self.inputs, self.bytes, self.records, self.nodes, self.diagnostics
         );
-        if self.expander_inputs > 0 {
-            println!(
-                "  {what}: {} of those agree on the tree but not on {} diagnostic(s) that \
-                 `effect_set::expand` raises and the port does not",
-                self.expander_inputs, self.expander_diags
-            );
-        }
     }
 }
 
-/// The reference dump for one input, and whether the projection was needed.
-///
-/// A file that names no set takes the plain dump, and the projection is not
-/// silently applied to it: `uses_effect_sets` is asked first, the count is
-/// carried in the tally, and every test prints it.
-fn reference_for(text: &str, tally: &mut Tally) -> String {
-    if uses_effect_sets(text) {
-        tally.projected += 1;
-        reference_dump_unexpanded(text)
-    } else {
-        reference_dump(text)
-    }
-}
-
-/// Whether a disagreement is exactly `effect_set::expand`'s diagnostics and
-/// nothing else.
-///
-/// `reference_dump_unexpanded` projects the expander out of the **tree** but
-/// deliberately not out of the diagnostics: `expand` raises `E0105`, `E0114`
-/// and `E0115`, `items.ply` raises `E0114` for reasons of its own, and telling
-/// those apart by code alone would be guessing. So this checks the shape
-/// instead, and every clause has to hold:
-///
-/// 1. the input actually names or declares an `effect set`;
-/// 2. the two **trees** are identical, so nothing structural is being waved
-///    through;
-/// 3. the Ply parser's diagnostics are a **prefix** of the reference's — which
-///    they must be, because `expand` runs after the whole parse and can only
-///    append; and
-/// 4. every diagnostic beyond that prefix carries an effect-set code.
-///
-/// Anything else is a real disagreement and fails. This is the whole of the
-/// tolerance in this harness, it is four conjuncts wide, and `../arm-harness.sh`
-/// corrupts a row's atoms to confirm clause 2 is load-bearing.
-fn only_the_expanders_diagnostics(text: &str, want: &str, got: &str) -> Option<Vec<DumpedDiag>> {
-    if !uses_effect_sets(text) {
-        return None;
-    }
-    let (want_tree, want_ds) = split_diags(want)?;
-    let (got_tree, got_ds) = split_diags(got)?;
-    if want_tree != got_tree || got_ds.len() > want_ds.len() {
-        return None;
-    }
-    if want_ds[..got_ds.len()] != got_ds[..] {
-        return None;
-    }
-    let extra = want_ds[got_ds.len()..].to_vec();
-    if extra.is_empty() {
-        return None;
-    }
-    if extra
-        .iter()
-        .all(|d| ["E0105", "E0114", "E0115"].contains(&d.code.as_str()))
-    {
-        Some(extra)
-    } else {
-        None
-    }
-}
+// > **Withdrawn 2026-08-30 — both of them, and nothing replaces either.**
+// > `reference_for` chose between two dumps and `only_the_expanders_diagnostics`
+// > was this harness's one tolerance. Their headers read:
+// >
+// > > *"The reference dump for one input, and whether the projection was
+// > > needed. A file that names no set takes the plain dump, and the projection
+// > > is not silently applied to it: `uses_effect_sets` is asked first, the
+// > > count is carried in the tally, and every test prints it."*
+// >
+// > > *"Whether a disagreement is exactly `effect_set::expand`'s diagnostics
+// > > and nothing else … So this checks the shape instead, and every clause has
+// > > to hold: 1. the input actually names or declares an `effect set`; 2. the
+// > > two **trees** are identical …; 3. the Ply parser's diagnostics are a
+// > > **prefix** of the reference's — which they must be, because `expand` runs
+// > > after the whole parse and can only append; and 4. every diagnostic beyond
+// > > that prefix carries an effect-set code. Anything else is a real
+// > > disagreement and fails. This is the whole of the tolerance in this
+// > > harness, it is four conjuncts wide …"*
+// >
+// > The comparison entered at `parse_recovering`, where `expand` had run.
+// > It enters at `parse_unexpanded`, where it has not — so there is no
+// > projection to choose and no appended diagnostic to excuse. `check_all`
+// > below now has exactly two outcomes per input, agree or fail, and the
+// > `assert_eq!(tally.expander_inputs, 7)` that pinned the hole so it could not
+// > grow is gone because the hole is.
+// >
+// > **What this gave back, measured rather than asserted:** 7 mined fixtures
+// > that agreed only by tolerance now agree exactly, and 9 diagnostics
+// > (E0114 x6, E0115 x2, E0105 x1) leave the corpus with the pass that raised
+// > them. `../GAPS-harness.md` §H4.
 
 fn check_all(inputs: &[(String, Vec<u8>)], label: &str, batch: usize) -> Tally {
     let project = Project::new(label);
@@ -358,25 +330,12 @@ fn check_all(inputs: &[(String, Vec<u8>)], label: &str, batch: usize) -> Tally {
         for ((name, bytes), got) in chunk.iter().zip(actual) {
             let text = String::from_utf8(bytes.clone())
                 .unwrap_or_else(|e| panic!("{name} is not UTF-8: {e}"));
-            let want = reference_for(&text, &mut tally);
+            let want = reference_dump(&text);
             match first_difference(&want, &got) {
                 None => tally.add(bytes, &want),
-                Some(diff) => match only_the_expanders_diagnostics(&text, &want, &got) {
-                    Some(extra) => {
-                        tally.add(bytes, &got);
-                        tally.expander_diags += extra.len();
-                        tally.expander_inputs += 1;
-                        println!(
-                            "  tree agrees, {} expander diagnostic(s) the port does not raise: \
-                             {name} {:?}",
-                            extra.len(),
-                            extra.iter().map(|d| &d.code).collect::<Vec<_>>()
-                        );
-                    }
-                    None => failures.push(format!(
-                        "the Ply parser and `ply_syntax` disagree on {name}:\n{diff}"
-                    )),
-                },
+                Some(diff) => failures.push(format!(
+                    "the Ply parser and `ply_syntax` disagree on {name}:\n{diff}"
+                )),
             }
         }
     }
@@ -478,47 +437,201 @@ fn the_ply_parser_agrees_with_ply_syntax_on_the_reference_own_test_inputs() {
     let tally = check_all(&inputs, "mined", 180);
     assert_eq!(tally.inputs, inputs.len());
     tally.report("mined from crates/ply-syntax/src/tests.rs");
-    // Pinned, so that a mutation which turns a real disagreement into an
-    // "expander diagnostic" one cannot pass by widening this hole.
-    assert_eq!(
-        tally.expander_inputs, 7,
-        "the number of fixtures excused by the expander boundary moved; it is a hole in \
-         the comparison and it does not get to grow quietly"
-    );
+    // > **Withdrawn 2026-08-30.** This stood here, and it was the right shape
+    // > for a comparison that had a hole in it:
+    // >
+    // > > *"Pinned, so that a mutation which turns a real disagreement into an
+    // > > 'expander diagnostic' one cannot pass by widening this hole.
+    // > > `assert_eq!(tally.expander_inputs, 7, "the number of fixtures excused
+    // > > by the expander boundary moved; it is a hole in the comparison and it
+    // > > does not get to grow quietly")`"*
+    // >
+    // > There is no such category any more: `effect_set::expand` does not run,
+    // > so no input is excused and the seven that were are compared exactly.
+    // > A pin at 0 would be a pin on a variable that no longer exists.
 }
 
 // --- what the comparison does not reach ------------------------------------
 
-/// The `effect set` boundary, stated as a number rather than a footnote.
+/// The `effect set` boundary, kept as a test after the boundary went.
 ///
-/// `items.ply` does not port `effect_set::expand`, so for a file that uses sets
-/// the reference tree is compared with that pass projected back out. This test
-/// pins how much of the corpus that is, so the figure in the write-up cannot
-/// drift away from the tree: exactly one file, and this asserts which.
+/// This used to pin how much of the corpus was compared with
+/// `effect_set::expand` projected back out — 21.2% of corpus bytes, one file.
+/// Nothing is projected now, and the assertion that matters is the opposite
+/// one: the file that used to need a weaker comparison gets the same one as
+/// everything else, and its trees agree under it. Kept rather than deleted for
+/// two reasons: the *set* of such files is still worth watching (a second one
+/// would mean a second file whose history a reader should know), and deleting
+/// the test would delete the only place the old boundary is named next to the
+/// code that used to have it.
 #[test]
-fn exactly_one_corpus_file_needs_the_expansion_projected_out() {
+fn the_one_file_that_used_to_need_a_projection_is_now_compared_whole() {
     let mut using: Vec<String> = Vec::new();
     let mut total = 0usize;
-    let mut projected_bytes = 0usize;
+    let mut set_bytes = 0usize;
     for dir in ["examples", "crates/ply-std/ply"] {
         for path in ply_files(&repo_root().join(dir)) {
             let text = std::fs::read_to_string(&path).expect("UTF-8");
             total += text.len();
             if uses_effect_sets(&text) {
-                projected_bytes += text.len();
+                set_bytes += text.len();
                 using.push(path.display().to_string());
             }
         }
     }
     println!(
-        "  expansion projected out of {} of {} corpus bytes ({:.1}%): {:?}",
-        projected_bytes,
+        "  `effect set` is used by {} of {} corpus bytes ({:.1}%): {:?} — compared whole, \
+         with no projection and no tolerance",
+        set_bytes,
         total,
-        100.0 * projected_bytes as f64 / total as f64,
+        100.0 * set_bytes as f64 / total as f64,
         using
     );
     assert_eq!(using.len(), 1, "{using:?}");
     assert!(using[0].ends_with("desk.ply"), "{using:?}");
+
+    // Not merely that it is compared: that comparing it works. The whole point
+    // of the projection was that this file's rows did not match, so the claim
+    // "it is compared whole now" has to be an exit code rather than a sentence.
+    let desk = std::fs::read(&using[0]).expect("desk.ply");
+    let want = reference_dump(&String::from_utf8(desk.clone()).expect("UTF-8"));
+    let project = Project::new("desk-whole");
+    let got = project.dumps(&[desk]).remove(0);
+    assert!(
+        first_difference(&want, &got).is_none(),
+        "{}",
+        first_difference(&want, &got).unwrap_or_default()
+    );
+}
+
+/// **The cost of `../GAPS.md` §11R.D, taken here rather than asserted there.**
+///
+/// The comparison is against the tree before `effect_set`, `record_update` and
+/// `try_op` rewrite it, so every diagnostic those three raise leaves it. §11R.D
+/// argued that this is cheap and an argument in a document is exactly the thing
+/// that goes stale, so this is the same claim as an exit code, over every input
+/// the differential compares.
+///
+/// **And taking it corrected the argument.** §11R.D priced the loss at *"9
+/// (E0114 ×6, E0115 ×2, E0105 ×1)"*, counted by grepping those three codes out
+/// of the reference's dump. Differencing the two entry points directly — the
+/// only way to attribute a diagnostic to a pass rather than to a code — gives
+/// **7**, on 7 mined fixtures: E0114 ×4, E0115 ×2, E0105 ×1. The two extra
+/// `E0114`s belong to `items.ply`'s own refusal of `pub effect set`, which
+/// shares the code and is raised by the **grammar** on both sides.
+///
+/// So the price is not 9 of 835 but **7 of 835 (0.84%), and all seven are the
+/// ones the deleted tolerance already excused**. Nothing that this differential
+/// ever actually compared is given up.
+///
+/// It also states the *tree* half, which no count can: `record_update` and
+/// `try_op` rewrite nodes and raise nothing on this corpus, so what leaves is
+/// 2,087 lines of Rust that nothing in this spike tests. `../GAPS-harness.md`
+/// §H2 item 5 is the enforced list; this is the number beside it.
+#[test]
+fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut inputs = 0usize;
+    let mut affected: Vec<String> = Vec::new();
+    let mut note =
+        |name: &str, text: &str, counts: &mut std::collections::BTreeMap<String, usize>| {
+            let added = ply_parser_spike_harness::diagnostics_the_rewrites_add(text);
+            if !added.is_empty() {
+                affected.push(format!("{name} {added:?}"));
+            }
+            for code in added {
+                *counts.entry(code).or_default() += 1;
+            }
+        };
+    for dir in ["examples", "crates/ply-std/ply"] {
+        for path in ply_files(&repo_root().join(dir)) {
+            inputs += 1;
+            note(
+                &path.display().to_string(),
+                &std::fs::read_to_string(&path).expect("UTF-8"),
+                &mut counts,
+            );
+        }
+    }
+    for path in ply_files(&spike_dir().join("fixtures")) {
+        inputs += 1;
+        note(
+            &path.display().to_string(),
+            &std::fs::read_to_string(&path).expect("UTF-8"),
+            &mut counts,
+        );
+    }
+    let mined = std::fs::read_to_string(spike_dir().join("fixtures/reference-tests.corpus"))
+        .expect("UTF-8");
+    for (i, f) in bundle(&mined).iter().enumerate() {
+        inputs += 1;
+        note(&format!("reference-tests.corpus#{i}"), f, &mut counts);
+    }
+    let total: usize = counts.values().sum();
+    println!(
+        "  the three rewrites raise {total} diagnostic(s) over {inputs} inputs, on {} of them: \
+         {counts:?}",
+        affected.len()
+    );
+    for a in &affected {
+        println!("    {a}");
+    }
+    // Pinned so it cannot grow quietly, and so that a rewrite gaining an error
+    // path the differential will never see is a failing test rather than a
+    // paragraph nobody re-reads. Update it deliberately, with the reason.
+    assert_eq!(
+        counts,
+        [
+            ("E0105".to_string(), 1usize),
+            ("E0114".to_string(), 4),
+            ("E0115".to_string(), 2),
+        ]
+        .into_iter()
+        .collect(),
+        "the set of diagnostics this comparison gives up has moved. Every one of them is \
+         raised by `effect_set`, `record_update` or `try_op` — the three passes the port \
+         does not implement — and `../GAPS.md` §11R.D priced the decision at exactly this \
+         list. Re-take the price before changing the number."
+    );
+
+    // The tree half, printed rather than pinned: it moves whenever a `.ply` in
+    // the tree gains or loses a `?`, which is not a fact about this spike.
+    let mut added = 0usize;
+    let mut biggest: Vec<(usize, String)> = Vec::new();
+    for dir in ["examples", "crates/ply-std/ply"] {
+        for path in ply_files(&repo_root().join(dir)) {
+            let n = ply_parser_spike_harness::nodes_the_rewrites_add(
+                &std::fs::read_to_string(&path).expect("UTF-8"),
+            );
+            added += n;
+            if n > 0 {
+                biggest.push((n, path.display().to_string()));
+            }
+        }
+    }
+    for path in ply_files(&spike_dir().join("fixtures")) {
+        added += ply_parser_spike_harness::nodes_the_rewrites_add(
+            &std::fs::read_to_string(&path).expect("UTF-8"),
+        );
+    }
+    for f in bundle(&mined) {
+        added += ply_parser_spike_harness::nodes_the_rewrites_add(&f);
+    }
+    biggest.sort();
+    biggest.reverse();
+    println!(
+        "  and they add {added} node(s) the comparison therefore does not see; by file: {:?}",
+        biggest
+            .iter()
+            .map(|(n, p)| format!("{n} {}", p.rsplit('/').next().unwrap_or(p)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        added > 0,
+        "the rewrites add no node anywhere in the corpus, so either no `.ply` in the tree \
+         uses `?` or `{{..}}` any more — in which case this whole decision costs nothing and \
+         should be re-read — or this measurement has stopped working"
+    );
 }
 
 /// Which node tags the whole comparison reaches, and which it does not.
@@ -531,12 +644,7 @@ fn exactly_one_corpus_file_needs_the_expansion_projected_out() {
 fn the_comparison_reaches_every_tag_the_reference_side_can_emit() {
     let mut seen: Vec<String> = Vec::new();
     let mut push = |text: &str| {
-        let d = if uses_effect_sets(text) {
-            reference_dump_unexpanded(text)
-        } else {
-            reference_dump(text)
-        };
-        seen.extend(ply_parser_spike_harness::tags(&d));
+        seen.extend(ply_parser_spike_harness::tags(&reference_dump(text)));
     };
     for dir in ["examples", "crates/ply-std/ply"] {
         for path in ply_files(&repo_root().join(dir)) {
@@ -583,13 +691,21 @@ fn the_comparison_reaches_every_tag_the_reference_side_can_emit() {
 
 /// Every tag the **reference** side of this dump can emit.
 ///
+/// Three arrived on 2026-08-30 with `../GAPS.md` §11R.D's move to the
+/// pre-rewrite tree: `erup` and `etry` are the two variants that used to be
+/// `unreachable!()` in `src/lib.rs`, and `narg` is `App`'s keyword-argument
+/// list, which nothing emitted at all. `narg` is reached by
+/// `fixtures/13-named-arguments-and-defaults.ply` and by nothing else in the
+/// corpus — the mined half has zero named arguments — so if that fixture is
+/// deleted this test is what says the coverage figure fell.
+///
 /// The three placeholder tags the Ply side has and `ast.rs` does not — `tbad`,
 /// `pbad`, `ebad` — and the two placeholder words `%badmode` and `%badlit` are
 /// deliberately absent: nothing in `ply_syntax` produces them, so the reference
 /// dump cannot, and listing them would make the coverage figure unreachable by
 /// construction. That the Ply side agrees anyway is the evidence that no
 /// placeholder escapes into a tree the reference builds a real node for.
-const EMITTABLE: [&str; 92] = [
+const EMITTABLE: [&str; 95] = [
     // nodes
     "arm",
     "atm",
@@ -612,7 +728,9 @@ const EMITTABLE: [&str; 92] = [
     "eprf",
     "erec",
     "ergn",
+    "erup",
     "esim",
+    "etry",
     "eun",
     "evar",
     "fn",
@@ -621,6 +739,7 @@ const EMITTABLE: [&str; 92] = [
     "imp",
     "law",
     "lnm",
+    "narg",
     "op",
     "pctr",
     "plit",

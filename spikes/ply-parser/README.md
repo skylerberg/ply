@@ -30,16 +30,28 @@ diagnostic for diagnostic** over every `.ply` file in the tree.
 
 | | |
 | --- | --- |
-| `lexer.ply` | Copied **unmodified** from `spikes/ply-lexer`; byte-identical, and needed no edit. |
+| `lexer.ply` | Was copied unmodified from `spikes/ply-lexer`. **No longer byte-identical: one arm, three lines.** See below. |
 | `spine.ply` | Token access, the threaded state `P`, diagnostics, `comma_list`, `qname`, the dump encoder. |
 | `types.ply` | Type expressions, generics, effect rows, parameters. |
 | `patterns.ply` | Pattern forms and literals. |
 | `exprs.ply` | Expressions, precedence, blocks, `handle`. |
 | `items.ply` | `fn`/`type`/`effect`/`test`/`law`/`derive`/`effect set`, imports, and `run`. |
-| `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. |
+| `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. It enters `ply_syntax` at `parse_unexpanded`, so the two sides are the same phase; `GAPS.md` §11R.D. |
 | `fixtures/` | 26 hand-written `.ply` plus `reference-tests.corpus` — 716 inputs mined from the reference's own tests. |
 | `GAPS.md` | **The point of the spike.** Consolidates the five area files below and takes the multiplier. |
 | `GAPS-{spine,types,exprs,items,harness}.md` | The per-area records, kept: each carries its own measurements and every run of them. |
+
+> **Corrected 2026-08-30.** The `lexer.ply` row read: *"Copied **unmodified**
+> from `spikes/ply-lexer`; byte-identical, and needed no edit."* It needed one:
+> `punct` has no arm for byte 63, so `?` — which became a token after both
+> spikes were taken (ADR 0028) — lexed as an error. The two files now differ by
+> that arm, a two-line comment and one test. **`spikes/ply-lexer` still has the
+> hole**, and worse: as of 2026-08-30 `spikes/ply-lexer/run.sh` reaches no test
+> at all, because its harness does not compile —
+> `non-exhaustive patterns: &ply_syntax::lexer::TokenKind::Question not covered`
+> at its `src/lib.rs:66`. That spike is what ADR 0020 §6.1, ADR 0021 and ADR
+> 0022 quote throughput from. It is recorded in `.github/ci-shards.sh`'s
+> `SPIKES_OUTSIDE_CI` and it is **not** fixed here.
 
 3,650 lines of Ply against `parser.rs`'s 2,114. Written by four agents in
 parallel against one shared spine; `lexer + spine + types + patterns + exprs +
@@ -70,17 +82,106 @@ module in the directory and four agents wrote into this one at once.
 | `fixtures/reference-tests.corpus` (mined) | 716 | 19,491 | 8,918 | 2,034 | 793 |
 | **total** | **763** | **780,456** | **252,881** | **126,565** | **833** |
 
-> **WITHDRAWN 2026-08-30.** *"Disagreements: 0."* — **the differential is red on
-> 28 of the 763 inputs, which is 70.2% of the corpus by bytes**, and it was red
+> **WITHDRAWN 2026-08-30, and then repaired the same day. Both halves are below,
+> because the first is what the second is evidence about.**
+>
+> *"Disagreements: 0."* was false when it was read: **the differential was red on
+> 28 of the 763 inputs, 70.2% of the corpus by bytes**, and it had been red
 > before the three language features were converted into the port. `?` and
 > `{..b, f: e}` became *syntax* after this spike was taken (ADR 0028, ADR 0023)
-> and the Ply parser can neither lex nor parse them. The disagreeing set is
+> and the Ply parser could neither lex nor parse them. The disagreeing set was
 > **identical before and after the port** (checked by running the differential
-> against both trees). 735 inputs still agree tree-and-diagnostics byte for byte,
-> and the table above is the tally as it stood on 2026-08-28. **`GAPS.md` §11R has
-> the numbers, the cause and what restoring it would cost.**
+> against both trees). `GAPS.md` §11R has that record and §11R.D the decision
+> taken from it.
+>
+> **It is green again, and against a different tree.** The comparison now enters
+> at `ply_syntax::parse_unexpanded` — the module as the *grammar* built it,
+> before `effect_set`, `record_update` and `try_op` rewrite it — and the Ply
+> parser learned to **parse** `?`, `{..b, f: e}`, named arguments and default
+> parameters without expanding any of them. That is §11R.D's decision and the
+> table below is the tally it produces. The one above is kept as the 2026-08-28
+> reading, not deleted.
 
-**Disagreements: 0.** Node-tag coverage **92 of 92**. `examples/clock.ply` agreed
+### As it stands, 2026-08-30
+
+| | inputs | bytes | dump records | nodes | diagnostics |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `examples/*.ply` | 13 | 333,851 | 92,969 | 44,769 | 0 |
+| `crates/ply-std/ply/*.ply` | 8 | 422,886 | 157,119 | 77,092 | 0 |
+| `fixtures/*.ply` (hand-written) | **29** | 10,729 | 4,230 | 1,662 | 60 |
+| `fixtures/reference-tests.corpus` (mined) | 716 | 19,491 | 8,951 | 2,034 | 768 |
+| **total** | **766** | **786,957** | **263,269** | **125,557** | **828** |
+
+> **Corrected 2026-08-30, by adding the column up.** The `dump records` total
+> read **262,269**, and it was the only cell in either table that its own column
+> does not sum to: 92,969 + 157,119 + 4,230 + 8,951 is **263,269**. A
+> thousand-off transcription, found by re-running `run.sh` and adding the four
+> printed tallies; every other cell in this table reproduces exactly. The four
+> per-row figures were right, so nothing downstream of them moves — but the
+> total is the number a reader quotes, and it was wrong.
+
+**Disagreements: 0. Tolerances: 0** — the one this harness had is gone with the
+pass it excused. Node-tag coverage **95 of 95**.
+
+**Read the two tables together, because three numbers moved and only one of them
+moved for a reason that is about this spike.**
+
+* **766 against 763.** The 763 are all still there and all agree: 13 + 8 + 716 is
+  unchanged and the 26 hand-written fixtures are unchanged. Three fixtures were
+  **added** — `12-try-and-record-update.ply`, `13-named-arguments-and-defaults.ply`
+  and `35-err-named-arguments-and-updates.ply` — because the corpus contained
+  **zero** named arguments and **zero** default parameters, so the port could
+  have read those tokens and thrown them away and nothing would have gone red
+  (`GAPS.md` §11R.N measured exactly that). Mutation #17 is the demonstration:
+  it is that port, and it now disagrees.
+* **786,957 bytes against 780,456.** 5,585 of the difference is the three new
+  fixtures. The remaining +916 is the tree's own files changing since
+  2026-08-28: `examples/` fell 32 bytes and `crates/ply-std/ply/` grew 948.
+* **125,557 nodes against 126,565, and this one is the decision.** Restricted to
+  the same 763 inputs the figure is **124,450**. It is lower because the three
+  rewrites are not run, and by exactly how much is measured rather than
+  reasoned: `the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics`
+  reports **3,974 nodes** added by the rewrites over all 766 inputs, 3,585 of
+  them in `examples/` and `crates/ply-std/ply/` — 2,137 in `db.ply` alone.
+  **The node count went up, not down** — but by how much depends on a
+  reconstruction, and the two readings are not strictly comparable. See the
+  correction below.
+
+  > **Corrected 2026-08-30, twice over.** The bullet ended: *"**Measured like
+  > for like, the node count went up, not down:** 124,450 + 3,585 = 128,035
+  > post-rewrite on today's files, against 126,565 on 2026-08-28's."* Two things
+  > are wrong with that arithmetic and they push in opposite directions.
+  >
+  > 1. **3,585 is not what the rewrites add to the 763.** It is what they add to
+  >    `examples/` and `crates/ply-std/ply/`, which is 21 of the 763. The other
+  >    742 add 134 more — 3 in `fixtures/23-err-pub-where-it-cannot-go.ply` and
+  >    131 across the mined bundle — so the figure over the 763 is **3,719**
+  >    (measured per file with `nodes_the_rewrites_add`; the 766-input total of
+  >    3,974 is 3,719 plus the 255 the three new fixtures add). The
+  >    reconstruction is 124,450 + 3,719 = **128,169**.
+  > 2. **Adding all three rewrites back overshoots**, because 126,565 was not a
+  >    post-*all-three* figure. On 2026-08-28 the comparison entered at
+  >    `parse_recovering` — `record_update` and `try_op` had run — but
+  >    `effect_set::expand`'s effect on the tree was **projected back out** for
+  >    the one file that uses sets, `examples/desk.ply`. So desk's effect-set
+  >    atoms are already absent from 126,565 and must not be added twice.
+  >
+  > What survives either way is the sign, and it survives with margin. Drop
+  > **all** of `desk.ply`'s 1,028 — a deliberate over-correction, since one `?`
+  > and one `{..` in that file are not the expander's — and the reconstruction
+  > is still 124,450 + 2,691 = **127,141 against 126,565**. `db.ply` alone
+  > accounts for 2,137 of it and names no effect set, so no reading of this
+  > makes the count fall. **The direction was right; the number was not, and the
+  > word "measured" was doing work that a reconstruction cannot do.**
+
+**What the comparison gives up, as an exit code rather than a paragraph.** The
+three rewrites raise **7** diagnostics over the corpus — E0114 ×4, E0115 ×2,
+E0105 ×1, on 7 mined fixtures — and add the 3,974 nodes above. That 7 is pinned
+by a test, and taking it corrected `GAPS.md` §11R.D, which had said 9: two of
+the E0114s are `items.ply`'s own refusal of `pub effect set`, which shares the
+code and is raised by the grammar on both sides. **All seven were already
+excused by the tolerance this change deleted**, so nothing the differential ever
+actually compared was given up. `examples/clock.ply` agreed
 byte for byte on the first attempt and so did every file up to `db.ply` (135,285
 bytes, 63,215 records); **not one line of any area's `.ply` file was edited to
 make the corpus agree.**
@@ -95,23 +196,44 @@ than being silently skipped.
 
 ### The comparison is armed
 
-> **This figure can no longer be re-taken as written.** `arm-harness.sh` requires
-> a green baseline (lines 83–89) and refuses to run against the red differential
-> above, so the count below is the one taken on 2026-08-28. A successor sweep that
-> does not need green — it compares disagreement *sets* — is in `GAPS.md` §2, and
-> it found **13 of the 26 remaining error-propagation sites unwatched**, 8 of them
-> demonstrably so. The sixteen below all corrupt the tree the parser builds when
-> it *succeeds*; not one corrupts what it does when a sub-parse fails.
+> **The note that stood here is spent.** It read: *"This figure can no longer be
+> re-taken as written. `arm-harness.sh` requires a green baseline (lines 83–89)
+> and refuses to run against the red differential above, so the count below is
+> the one taken on 2026-08-28."* The baseline is green, the script ran, and the
+> figure below is today's. The successor sweep it points at is still the honest
+> caveat and is unchanged: `GAPS.md` §2 found **13 of the 26 remaining
+> error-propagation sites unwatched**, 8 of them demonstrably so. Every mutation
+> below corrupts the tree the parser builds when it *succeeds*; not one corrupts
+> what it does when a sub-parse fails.
 
-`./arm-harness.sh`: **16 mutations, 16 armed, 0 survived, 0 invalid.** The three
-classes ADR 0020 asks for, plus one per structural property claimed — dropped
-field, wrong span, swapped associativity, swapped precedence, dropped list
-element, widened dedup key, secondary label claiming primary, negated payload,
-collapsed qualifier, dropped `pub`, lost `>=` split.
+`./arm-harness.sh`: **22 mutations, 22 armed, 0 survived, 0 invalid**, taken
+2026-08-30, 299 s. The three classes ADR 0020 asks for, plus one per structural
+property claimed — dropped field, wrong span, swapped associativity, swapped
+precedence, dropped list element, widened dedup key, secondary label claiming
+primary, negated payload, collapsed qualifier, dropped `pub`, lost `>=` split —
+plus six added with the four features: a discarded named argument, a wrong span
+on `?`, `{..b}` collapsed to a plain record, a discarded default expression, a
+missing `E0124`, and the `?` byte lexing as `%`.
+
+**One of the sixteen was replaced rather than dropped, and it is recorded in the
+table itself.** #7 named `types.ply`'s `param`, which moved to `exprs.ply` when a
+parameter gained a default expression; the replacement is the identical
+corruption at the identical parser in its new home, so the property it watches —
+*every `Option` emits its presence* — is unchanged. The other fifteen anchors
+still apply as written.
 
 `harness/tests/fields.rs` covers what a dump-vs-dump comparison structurally
-cannot: it reads `ast.rs`, takes all **144 fields of the 29 parsed types**, and
+cannot: it reads `ast.rs`, takes all **149 fields of the 30 parsed types**, and
 requires each to be named in the dumper (2 absent by design).
+
+> **Corrected 2026-08-30: it said 144 fields of 29 types, and it said it while
+> being defeated by an English sentence.** The count is 149/30. More importantly
+> the test read `src/lib.rs` *whole*, comments included, so `ExprKind::App`'s
+> keyword-argument field counted as covered because an unrelated doc comment
+> about effect sets contained the word — and the test could be silenced on any
+> field by writing a true sentence about it. It now strips `//` and `///` before
+> matching, on both files. `GAPS.md` §11R.N is the measurement; the repair is
+> armed by `a_field_named_only_in_a_comment_does_not_count_as_covered`.
 
 **Two findings from arming, both kept rather than fixed away**, and both in
 `GAPS.md` §15: one mutation **survived all 763 inputs** while tag coverage read
@@ -124,6 +246,34 @@ arming script itself **mis-scored three armed mutations as INVALID** because
 ## 3. What is NOT covered
 
 Four things, each a number rather than a footnote.
+
+> **Corrected 2026-08-30 (morning): it is now seven, and item 2 is one of a set
+> of three.** `record_update::expand` (530 lines) and `try_op::expand` (1,019)
+> run inside `Parser::run` beside the `effect_set::expand` of item 2 and are not
+> ported either, which is the entire 28-input / 70.2%-of-bytes disagreement §2
+> above now reports. `ExprKind::App` also gained a keyword-argument field and
+> `Param` a fallback-expression field (ADR 0029) that the reference dumper emits
+> nowhere — a named argument is currently **invisible** to the comparison.
+>
+> **Corrected again the same day, after the decision was implemented.** Three of
+> those seven are closed and one changed shape:
+>
+> * **Item 2 is withdrawn as written and replaced by item 2′ below.** Nothing is
+>   projected any more, because `effect_set::expand` does not run: the
+>   comparison enters at `parse_unexpanded`. The four-conjunct tolerance and its
+>   asserted count of 7 are deleted.
+> * **The two undumped fields are dumped.** `Param`'s fallback expression is an
+>   `Option` in the `prm` record; a named argument is a `narg` node with its own
+>   span, its name and its value, in a list that carries its length. Mutations
+>   #17 and #20 are the evidence.
+> * **The three rewrites leaving the comparison is the new item 2′**, and it is
+>   larger than what it replaces: 2,087 lines of Rust that nothing in this spike
+>   tests, priced at 7 diagnostics and 3,974 nodes over the corpus, both
+>   measured by a test rather than asserted here.
+>
+> `GAPS.md` §11R.D is the decision and its argument, §11R.N the field that was
+> invisible, §11R.X what implementing it cost and what it found.
+> `GAPS-harness.md` §H2 is the enforced list.
 
 1. **Diagnostic message text and severity are not compared.** Every site carries
    a `what: Bytes` that nothing reads — 134 call sites in the reference. Turning
@@ -298,6 +448,26 @@ does not reach it, so **this will bit-rot exactly as `crates/ply-codegen-spike`
 did**: the next change to `ply_syntax::ast` will break `harness/src/lib.rs` and no
 workspace command will notice. `run.sh` is the one command that would.
 
+> **This paragraph was a prediction and it came true, so it is now a record.**
+> Between 2026-08-28 and 2026-08-30 four language features landed. The
+> `harness/src/lib.rs` `match` over `ExprKind` stopped compiling on two new
+> variants, exactly as written above; the differential went red on 28 of 763
+> inputs; `tests/fields.rs` began failing on a field the AST had gained; and
+> nothing said any of it, because **`run.sh` was in no CI job at all**.
+>
+> **There is a job now.** `.github/workflows/ci.yml`'s `parser-spike` runs
+> `./spikes/ply-parser/run.sh` on every pull request, gated on `fmt` and
+> `clippy` like every other expensive job and named in the `ci` aggregate's
+> `needs:` so that a skipped run is a red tick rather than a green one. It was
+> watched to fail three ways and to stay green on a control before it was
+> believed; the four runs are recorded in the job's own comment.
+>
+> **And the check one level up.** `.github/ci-shards.sh verify` now covers
+> `spikes/` the way it covers `crates/`: a directory there that no job runs and
+> no entry excuses fails the `plan` job. That is what would have caught this in
+> the first place, and it is what now says out loud that `spikes/ply-lexer` is
+> in the same condition and worse.
+
 `harness/` depends on `ply-syntax` **by path**, so it is compared against the tree
 it sits in rather than against a copy. `harness/target/` and `.ply-cache/` are
 both covered by `.gitignore`.
@@ -306,8 +476,36 @@ both covered by `.gitignore`.
 
 ## Status
 
-Taken 2026-08-28, in `~/.worktrees/ply/spike-ply-parser`, on the machine in
-`docs/ONBOARDING.md` §Provenance at load 3.80–9.40.
+### 2026-08-30, in `~/.worktrees/ply/spike-parser-ci` — green, armed, and in CI
+
+- `./spikes/ply-parser/run.sh --arm` exits **0**.
+- **119 in-language tests**, in Ply, across the six modules — 110 plus nine
+  written for the four features: the `?` token and its tier, the record-update
+  base and its two refusals, a named argument and the two diagnostics that point
+  at one, and a parameter's default with the lambda refusal that has no span.
+- The differential: **766 inputs, 786,957 bytes, 0 disagreements, 0
+  tolerances**, tag coverage **95/95**. Of those, the 763 that §2's first table
+  counted are all present and all agree; three fixtures were added for the two
+  features the corpus contained none of.
+- Arming: **22 armed, 0 survived, 0 invalid**, 299 s. One of the original
+  sixteen was replaced (its anchor moved with `param`) and six were added.
+- `harness/tests/fields.rs`: **2 passed** — the field test, and the test that
+  arms its comment-stripping repair.
+- The comparison is against `ply_syntax::parse_unexpanded`, a `#[doc(hidden)]`
+  entry point added to a shipping crate for this spike. That is the single real
+  cost of the decision and `crates/ply-syntax/src/tests.rs`'s
+  `parse_unexpanded_is_reached_by_no_shipping_caller` is what keeps it to one
+  caller; it was watched to fail by naming the function in `ply-eval`.
+- **In CI**: `parser-spike`, required through the `ci` job's `needs:`. Local
+  cost, on the machine in `docs/ONBOARDING.md` §Provenance at load 6–10:
+  **34.5 s wall / 259 s CPU** for the cold `--locked --release -p ply-cli`
+  build, **18.2 s wall / 32.6 s CPU** for everything after it. **The two-core
+  runner figure has not been taken.**
+- **No git command was run.**
+
+### 2026-08-28, in `~/.worktrees/ply/spike-ply-parser`
+
+On the machine in `docs/ONBOARDING.md` §Provenance at load 3.80–9.40.
 
 - `./spikes/ply-parser/run.sh --arm` exits **0**.
 - 112 in-language tests, in Ply, across the five modules.
@@ -315,22 +513,38 @@ Taken 2026-08-28, in `~/.worktrees/ply/spike-ply-parser`, on the machine in
   92/92.
 - Arming: **16 armed, 0 survived, 0 invalid.**
 
-**Re-checked 2026-08-30, after `list_at`, `?` and `let` destructuring were
-converted into the port. Three of those five lines no longer hold, and the two
-that do were re-run rather than quoted:**
+**Re-checked 2026-08-30 morning, after `list_at`, `?` and `let` destructuring
+were converted into the port. Three of those five lines no longer hold, and the
+two that do were re-run rather than quoted. This block is the *diagnosis*; the
+block above it is what was done about it the same day, and the two lines below
+marked SUPERSEDED are the ones the repair moved:**
 
-- `run.sh` exits **101**, at the differential and only there. Everything before it
-  passes: instrument current, **110** in-language tests (112 → 110; two suites
-  became unwritable when `bail` did, `GAPS.md` §2), harness `--lib` 10 + `--test
-  fields` 1, `cargo fmt --check` and `clippy -D warnings` clean.
-- The differential: **735 of 763 inputs agree, 28 disagree — 70.2% of the corpus
-  by bytes.** Not caused by the port: the disagreeing set is identical when the
-  same differential is run against the pre-port tree. Cause and cost in `GAPS.md`
-  §11R.
+- **SUPERSEDED — `run.sh` exits 0 now** (`--arm` included), and `fields.rs`
+  passes because `Param`'s fallback expression is dumped. What follows is the
+  diagnosis as it stood, kept because it is the reason the entry point moved.
+  `run.sh` exited **101** — but **not** at the differential, and this line was
+  corrected rather than replaced. It read: *"at the differential and only there.
+  Everything before it passes: instrument current, **110** in-language tests
+  (112 → 110; two suites became unwritable when `bail` did, `GAPS.md` §2),
+  harness `--lib` 10 + `--test fields` 1, `cargo fmt --check` and `clippy -D
+  warnings` clean."* Every step was re-run individually on 2026-08-30 and all of
+  those hold **except the last**: `cargo test --test fields` **fails**, on
+  `("Param", "default")` — a field ADR 0029 added to the AST that the reference
+  dumper names nowhere. `fields.rs` runs *before* the differential in `run.sh`,
+  so **the differential is no longer reached by the one command that runs it**,
+  and the 28-input figure below was taken by invoking it directly. `GAPS.md`
+  §11R.S has the step-by-step.
+- **SUPERSEDED — 766 of 766 agree.** As diagnosed: the differential was **735 of
+  763 agreeing, 28 disagreeing — 70.2% of the corpus by bytes.** Not caused by
+  the port: the disagreeing set was identical when the same differential ran
+  against the pre-port tree. Cause and cost in `GAPS.md` §11R; the decision that
+  closed it in §11R.D, and what implementing it cost in §11R.X.
 - Arming, re-taken by substitution: `arm-harness.sh` refuses a red baseline by
   design, so each of the 16 was applied to the ported source and scored on whether
   the disagreeing **set** changed. **All 16 still apply and all 16 still go red**,
-  changing between 29 and 152 inputs — the port disarmed none of them.
+  changing between 29 and 152 inputs — the port disarmed none of them. (Run
+  normally against the green baseline on 2026-08-30 evening, 15 of the 16 apply
+  unchanged and the sixteenth was replaced; see §2.)
 - But the 16 watch one half of the parser. A successor sweep over the sites `?`
   could not convert — 26 hand-written `Stop(Err(q))` propagations — found **13 of
   26 change nothing across all 763 inputs**, 8 of them demonstrably not equivalent

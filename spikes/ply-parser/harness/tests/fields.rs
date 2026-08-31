@@ -15,7 +15,28 @@
 //! `ast.rs` tomorrow fails here on the day it is added rather than being
 //! absorbed into a green comparison.
 //!
-//! The exceptions are listed by name, with a reason each, and there are five.
+//! # Comments are stripped from both sides, and that is a repair
+//!
+//! It used to read `src/lib.rs` whole, comments included, and `../GAPS.md`
+//! §11R.N is what that cost: `ExprKind::App`'s keyword-argument field was
+//! reported covered for as long as it was not dumped, because the word
+//! happened to appear in a doc comment **about effect sets** — *"one named from
+//! another module"*. The same defect ran the other way too: drafting
+//! `src/lib.rs`'s `dumper_boundaries` block named three fields in passing and
+//! flipped this test's verdict from "one field is not dumped" to "every field
+//! is dumped", which meant the test could be silenced by writing a true
+//! sentence about the hole it exists to report.
+//!
+//! `code_only` below deletes every `//` and `///` line and every trailing `//`
+//! comment before the match. That alone would have caught `App::named` on the
+//! day it landed. It is applied to `ast.rs` as well, so a field mentioned only
+//! in a doc comment there is not invented either.
+//!
+//! **What it still does not do**, unchanged and worth restating: naming is not
+//! emitting. Renaming a binding — `init: i0` — keeps it green, and a field
+//! read into a variable and never pushed to the output is green too. The
+//! repair narrows the false-negative half; the false-positive half is what
+//! `../arm-harness.sh` is for.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -27,6 +48,25 @@ fn read(rel: &str) -> String {
         .expect("<root>/spikes/ply-parser/harness")
         .join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+/// Every line with its comments removed: a `//` or `///` line becomes empty and
+/// a trailing `// ...` is cut.
+///
+/// Deliberately naive — it does not know about `//` inside a string literal, so
+/// a string holding `// x` would lose its tail. That is safe in the direction
+/// that matters: this can only make the text it scans *smaller*, so it can only
+/// report a field absent that a comment would have hidden. A false "absent" is
+/// a failing test somebody reads; a false "present" is the defect the whole
+/// file exists for.
+fn code_only(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `Type::field` for every named field of every struct and struct-like enum
@@ -91,12 +131,18 @@ fn fields_of_ast(src: &str) -> BTreeSet<(String, String)> {
 /// comparing `numerics.rs` against nothing at all — the same substitution
 /// `spikes/ply-lexer/harness/src/lib.rs` makes for floats, and made here in the
 /// direction that removes a normaliser instead of adding one.
+///
+/// > **A third entry stood here until 2026-08-30** and it was not a decision:
+/// > `("Param", "default")` was reported absent and this test **failed** on it,
+/// > which is why `../run.sh` stopped one step before the differential
+/// > (`../GAPS.md` §11R.S). It was never added to this list. The field is
+/// > dumped now, so the list is back to the two that are here on purpose.
 const EXPECTED_ABSENT: [(&str, &str); 2] = [("Lit", "mantissa"), ("Lit", "scale")];
 
 #[test]
 fn every_field_of_every_parsed_ast_type_is_named_in_the_reference_dumper() {
-    let ast = read("crates/ply-syntax/src/ast.rs");
-    let dumper = read("spikes/ply-parser/harness/src/lib.rs");
+    let ast = code_only(&read("crates/ply-syntax/src/ast.rs"));
+    let dumper = code_only(&read("spikes/ply-parser/harness/src/lib.rs"));
     let fields = fields_of_ast(&ast);
     assert!(
         fields.len() > 100,
@@ -128,8 +174,39 @@ fn every_field_of_every_parsed_ast_type_is_named_in_the_reference_dumper() {
     );
     assert_eq!(
         got, expected,
-        "a field of a parsed AST type is not named anywhere in the reference dumper. \
-         The differential cannot see that: both sides would agree about a field neither \
-         emits. Dump it, or add it to EXPECTED_ABSENT with the reason."
+        "a field of a parsed AST type is not named anywhere in the reference dumper's \
+         CODE (comments are stripped before this match; see the header). The differential \
+         cannot see that: both sides would agree about a field neither emits. Dump it, or \
+         add it to EXPECTED_ABSENT with the reason."
+    );
+}
+
+/// The repair itself, armed.
+///
+/// `code_only` is the whole of what makes the test above stronger than the one
+/// it replaces, so it gets a test that fails if it stops removing comments. The
+/// two shapes are the two that actually caused the defect: a `///` line naming
+/// a field it does not dump, and a trailing `//` on a line of real code.
+#[test]
+fn a_field_named_only_in_a_comment_does_not_count_as_covered() {
+    let code = code_only(
+        "/// one named from another module contributes an empty expansion\n\
+         fn f() { let x = 1; } // and a default lives in the callee's module\n\
+         self.opt(p.ty.as_ref(), Self::ty);\n",
+    );
+    let words: Vec<&str> = code
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .collect();
+    assert!(
+        !words.contains(&"named"),
+        "the `///` line survived stripping: {code:?}"
+    );
+    assert!(
+        !words.contains(&"default"),
+        "the trailing `//` survived stripping: {code:?}"
+    );
+    assert!(
+        words.contains(&"ty"),
+        "stripping ate the code as well: {code:?}"
     );
 }
