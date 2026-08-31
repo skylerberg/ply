@@ -91,6 +91,35 @@ Measured cold, into an empty `CARGO_TARGET_DIR`. A cold build prints **157**
 | debug | `cargo build --workspace` | **16.8s** | 16.56s |
 | release | `cargo build --workspace --release` | **58.3s** | 53.85s |
 
+> **A plain build got bigger on 2026-08-31, and this is what changed.** The
+> workspace gained `crates/ply-codegen`, a cranelift code generator behind
+> `ply test --backend cranelift`, and `crates/ply-cli` depends on it
+> **unconditionally — there is no feature flag to turn it off**. `Cargo.lock`
+> went from 250 packages to **282**: 31 cranelift-attributable dependencies plus
+> the crate itself.
+>
+> **Nothing above about the toolchain changes.** cranelift 0.132.3 declares
+> `rust-version = "1.93.0"`, which is below the 1.93.1 this sentence already
+> says works, so `cargo build`, `cargo test` and `cargo clippy` still need
+> exactly one toolchain and it is the one you have. (0.133 and later require
+> 1.94.0. The pins in `crates/ply-codegen/Cargo.toml` are deliberate and say so;
+> bumping past 0.132 is a toolchain decision, not a dependency bump.)
+>
+> **What it costs.** The marginal build time of the whole cranelift tree,
+> measured by cleaning exactly the 32 packages the change added and rebuilding:
+> **16.26 s wall / 63.01 s user** release, **18.55 s / 95.54 s** debug, min of 3
+> windows each, on the machine in §Provenance. The null control — cleaning
+> `ply-codegen` alone with cranelift left built — is 0.70 s, so the window is
+> measuring cranelift and not the crate. Load was 6.4–9.9 throughout, above this
+> project's 4.0 measuring gate, so treat these as observations rather than
+> figures; the decision they informed had a pre-registered threshold of 60 s and
+> is not close.
+>
+> **The four cold rows in the table above have NOT been re-taken since**, so
+> expect them to be low by roughly the marginal figures. They are left rather
+> than adjusted, because a number arrived at by adding two measurements taken
+> under different conditions is worse than a number with a caveat.
+
 Warm (nothing changed) is **0.11s** debug and **0.15s** release, re-measured;
 this line said 0.25s for both, which is the right order of magnitude and was not
 re-taken when it was written. There is no build script to run, no code generation
@@ -99,6 +128,13 @@ step, no submodule, no `make`. Three binaries land:
 - `target/{debug,release}/ply` — the language driver
 - `target/{debug,release}/ply-corpus` — the measurement harness
 - `target/release/w6-alloc` — an allocation counter used by one W6 test
+
+The `ply` binary carries a cranelift code generator since 2026-08-31, reachable
+as `ply test --backend cranelift`. It is off unless a run names it: a plain
+`ply test` installs no backend at all, and a run that installs one neither reads
+nor writes the result cache. `ply test --help` has the grammar;
+`docs/adr/0026-a-reachable-backend.md` §4.9 has what it reaches and what it
+costs, including the workload where it is a **net loss**.
 
 **Use the release binary for anything you intend to time.** The debug
 interpreter is dominated by `debug_assertions`; ADR 0016 §1.6 refuses to mix the
@@ -118,7 +154,21 @@ treat 13.7s as the first-run cost and not as what you will see.
 
 There is no `rustfmt.toml` and no `clippy.toml`; both run on defaults.
 
-### `crates/ply-codegen-spike` builds again, but only on `+1.94.0`
+### `crates/ply-codegen-spike` builds again, and since 2026-08-31 on the pinned toolchain
+
+> **Corrected in place (cranelift port, 2026-08-31).** This heading read
+> *"`crates/ply-codegen-spike` builds again, but only on `+1.94.0`"*, and the
+> `+1.94.0` in every command below it was load-bearing while cranelift 0.134.3
+> was the dependency. **The crate now depends on cranelift 0.132.3, which
+> declares `rust-version = "1.93.0"`, so it builds on the default 1.93.1 and
+> `+1.94.0` is no longer needed anywhere in this repository.** Drop the prefix
+> from every invocation quoted below; they are otherwise unchanged, and the
+> transcripts are left as they were taken. `.github/workflows/ci.yml`'s `spike`
+> job is on 1.93.1 with the rest.
+>
+> One thing that section does not tell you and item 18 of `CONTRIBUTING.md`
+> §"Things known to be broken" does: `cargo test --release` here is green while
+> `mcts --dir benches/kernel --only agreement` exits 1 with 42 disagreements.
 
 > **Corrected (R4 integration pass, 2026-08-21). This section said the spike
 > "no longer compiles, on any toolchain available here", and that half of it is
@@ -1279,10 +1329,14 @@ not re-argue M9 from the numbers in either.** Re-measure.
 
 Everything here cost this audit real time. In descending order of cost.
 
-1. **`crates/ply-codegen-spike` needs `+1.94.0`, and nothing in the workspace
-   compiles it** — one wall of the two is gone as of R4 (the crate builds and
-   its tests pass), but the toolchain wall stands and the crate is still
-   outside `--workspace`, so it rots silently and has done so twice. Its
+1. ~~**`crates/ply-codegen-spike` needs `+1.94.0`**~~, **and nothing in the
+   workspace compiles it** — one wall of the two is gone as of R4 (the crate
+   builds and its tests pass); the **toolchain wall is gone too as of
+   2026-08-31**, when the crate moved to cranelift 0.132.3 and its CI job to
+   1.93.1. This item read *"the toolchain wall stands"*. The crate is still
+   outside `--workspace`, so it rots silently and has done so twice — and a
+   third way that no toolchain would have caught: its agreement corpus is red
+   and `cargo test` does not run it (`CONTRIBUTING.md` item 18). Its
    `--half` invocation also needs `--bin ply-codegen-spike` now that the crate
    ships two binaries. §1.
 2. ~~**`examples/same-tests.sh` never builds the binary it runs.** Build release

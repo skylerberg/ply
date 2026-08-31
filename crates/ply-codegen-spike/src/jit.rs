@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use cranelift_codegen::Context as ClifContext;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
+    AbiParam, Block, BlockArg, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
     types,
 };
 use cranelift_codegen::settings::{self, Configurable};
@@ -392,10 +392,10 @@ impl Jit {
         // subtract, branch, store — on a path a real backend pays for a stack
         // check anyway.
         let fuel = fx.load_fuel();
-        let spent = fx.builder.ins().iadd_imm_s(fuel, -1);
+        let spent = fx.builder.ins().iadd_imm(fuel, -1);
         let go = fx.builder.create_block();
         let exhausted = fx.builder.create_block();
-        let none_left = fx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, spent, 0);
+        let none_left = fx.builder.ins().icmp_imm(IntCC::SignedLessThan, spent, 0);
         fx.builder.ins().brif(none_left, exhausted, &[], go, &[]);
         fx.builder.switch_to_block(exhausted);
         fx.builder.seal_block(exhausted);
@@ -407,12 +407,10 @@ impl Jit {
 
         let mut scope = Vec::new();
         for (i, p) in params.iter().enumerate() {
-            let handle = fx.builder.ins().load(
-                types::I64,
-                MemFlagsData::trusted(),
-                args_ptr,
-                (i * 8) as i32,
-            );
+            let handle =
+                fx.builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
             scope.push((
                 p.clone(),
                 Val {
@@ -427,7 +425,7 @@ impl Jit {
         // The only path that gives the nested call back. `failure` does not, and
         // must not: a failed entry is abandoned whole and `Ctx::begin` reseeds.
         let left = fx.load_fuel();
-        let restored = fx.builder.ins().iadd_imm_s(left, 1);
+        let restored = fx.builder.ins().iadd_imm(left, 1);
         fx.store_fuel(restored);
         fx.builder.ins().return_(&[handle]);
 
@@ -436,8 +434,7 @@ impl Jit {
         fx.builder.ins().return_(&[zero]);
 
         fx.builder.seal_all_blocks();
-        let config = fx.jit.module.target_config();
-        fx.builder.finalize(config);
+        fx.builder.finalize();
         Ok(())
     }
 }
@@ -621,13 +618,13 @@ impl Fx<'_, '_> {
     fn load_fuel(&mut self) -> cranelift_codegen::ir::Value {
         self.builder
             .ins()
-            .load(types::I64, MemFlagsData::trusted(), self.ctx, FUEL_OFFSET)
+            .load(types::I64, MemFlags::trusted(), self.ctx, FUEL_OFFSET)
     }
 
     fn store_fuel(&mut self, v: cranelift_codegen::ir::Value) {
         self.builder
             .ins()
-            .store(MemFlagsData::trusted(), v, self.ctx, FUEL_OFFSET);
+            .store(MemFlags::trusted(), v, self.ctx, FUEL_OFFSET);
     }
 
     /// After every call that can fail: one load and one branch, which is what a
@@ -636,7 +633,7 @@ impl Fx<'_, '_> {
         let failed =
             self.builder
                 .ins()
-                .load(types::I64, MemFlagsData::trusted(), self.ctx, FAILED_OFFSET);
+                .load(types::I64, MemFlags::trusted(), self.ctx, FAILED_OFFSET);
         let next = self.builder.create_block();
         self.builder
             .ins()
@@ -706,9 +703,7 @@ impl Fx<'_, '_> {
             3,
         ));
         for (i, h) in handles.iter().enumerate() {
-            self.builder
-                .ins()
-                .stack_store(types::I64, *h, slot, (i * 8) as i32);
+            self.builder.ins().stack_store(*h, slot, (i * 8) as i32);
         }
         self.builder.ins().stack_addr(types::I64, slot, 0)
     }
@@ -884,7 +879,7 @@ impl Fx<'_, '_> {
                         let a = self.as_int(value);
                         let overflowed = self.builder.create_block();
                         let ok = self.builder.create_block();
-                        let is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
+                        let is_min = self.builder.ins().icmp_imm(IntCC::Equal, a, i64::MIN);
                         self.builder.ins().brif(is_min, overflowed, &[], ok, &[]);
                         self.builder.switch_to_block(overflowed);
                         self.builder.seal_block(overflowed);
@@ -1406,7 +1401,7 @@ impl Fx<'_, '_> {
                     let b = self.boxed(literal);
                     let eq = self.helper(self.jit.helpers.equal, &[a, b]);
                     self.check();
-                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, eq, 0)
+                    self.builder.ins().icmp_imm(IntCC::NotEqual, eq, 0)
                 };
                 self.builder.ins().brif(eq, hit, &[], miss, &[]);
             }
@@ -1428,7 +1423,7 @@ impl Fx<'_, '_> {
                     .ins()
                     .iconst(types::I64, i64::from(rest.is_none()));
                 let fits = self.helper(self.jit.helpers.list_fits, &[v, len, exact]);
-                let fits = self.builder.ins().icmp_imm_s(IntCC::NotEqual, fits, 0);
+                let fits = self.builder.ins().icmp_imm(IntCC::NotEqual, fits, 0);
                 self.builder.ins().brif(fits, hit, &[], miss, &[]);
             }
             PatternKind::Ctor { name, args } => {
@@ -1465,7 +1460,7 @@ impl Fx<'_, '_> {
         let v = self.boxed(value);
         let index = self.builder.ins().iconst(types::I64, index as i64);
         let is = self.helper(self.jit.helpers.ctor_is, &[v, index]);
-        let is = self.builder.ins().icmp_imm_s(IntCC::NotEqual, is, 0);
+        let is = self.builder.ins().icmp_imm(IntCC::NotEqual, is, 0);
         self.builder.ins().brif(is, hit, &[], miss, &[]);
     }
 
