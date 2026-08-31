@@ -21,7 +21,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// A sequential accept loop that reads one request, answers it, and closes.
@@ -67,11 +67,16 @@ fn main() -> Int / {net.write[listener], net.write[conn], signal.read} = {
 }
 "#;
 
+/// How many ports [`Server::start_with`] will try before it gives up. See the
+/// note there for why one was not enough.
+const PORT_ATTEMPTS: usize = 3;
+
 /// A port nothing is listening on right now.
 ///
 /// Racy by construction — it is released before the server takes it — and that
 /// is why nothing here uses a fixed one: colliding with a developer's own
-/// service would be the confusing failure.
+/// service would be the confusing failure. [`Server::start_with`] retries, so
+/// the race is paid for in a respawn rather than in a red run.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
     let port = listener.local_addr().expect("an address").port();
@@ -100,7 +105,35 @@ impl Server {
         Server::start_with(SERVER, flags)
     }
 
+    /// Starts the server, retrying on a fresh port if the one `free_port`
+    /// handed over was taken before `ply run` could claim it.
+    ///
+    /// **Losing that race is expected; losing it silently for a minute was
+    /// not.** `free_port` is racy by construction — its own comment says so —
+    /// and `net.listen` on a taken port exits immediately, which
+    /// `wait_until_listening` could not tell from a server that had not
+    /// finished starting. So the failure cost the full 60-second budget and
+    /// then reported the port and nothing else. Observed on `main` at
+    /// 54a568d: one workspace run lost the race and spent **60.02s** failing,
+    /// and the same binary passed in **2.07s** on the next run. Three ports
+    /// rather than one because the retry is the fix; the budget was never the
+    /// problem.
     fn start_with(source: &str, flags: &[&str]) -> Server {
+        let mut refused = Vec::new();
+        for _ in 0..PORT_ATTEMPTS {
+            let mut server = Server::spawn(source, flags);
+            match server.wait_until_listening() {
+                Ok(()) => return server,
+                Err(why) => refused.push(why),
+            }
+        }
+        panic!(
+            "`ply run --host` never answered a probe, on {PORT_ATTEMPTS} ports:\n\n{}",
+            refused.join("\n\n")
+        );
+    }
+
+    fn spawn(source: &str, flags: &[&str]) -> Server {
         let dir = tempfile::tempdir().expect("a temp dir");
         let port = free_port();
         write(dir.path(), &source.replace("PORT", &port.to_string()));
@@ -116,33 +149,64 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .expect("`ply run` starts");
-        let server = Server {
+        Server {
             child,
             port,
             _dir: dir,
-        };
-        server.wait_until_listening();
-        server
+        }
     }
 
     /// The probe is a whole request and response, not a bare connect. The
     /// server is a *sequential* accept loop, so a connection opened and
     /// abandoned would hold it inside `net.recv` for that operation's own
     /// deadline and every case below would be waiting on a probe.
-    fn wait_until_listening(&self) {
+    ///
+    /// A child that has *exited* is reported at once rather than waited out.
+    /// That is the difference between the two failures this can have — the
+    /// port was taken, or `ply run --host` is broken — and the message that
+    /// named only the port could not tell them apart.
+    fn wait_until_listening(&mut self) -> Result<(), String> {
         let until = Instant::now() + Duration::from_secs(60);
         while Instant::now() < until {
+            if let Some(status) = self.child.try_wait().expect("the child's status") {
+                return Err(self.epitaph(status));
+            }
             if let Ok(mut probe) =
                 TcpStream::connect_timeout(&self.address(), Duration::from_millis(200))
             {
                 let _ = probe.set_read_timeout(Some(Duration::from_secs(10)));
                 if request(&mut probe).contains("200 OK") {
-                    return;
+                    return Ok(());
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("the server never bound 127.0.0.1:{}", self.port);
+        Err(format!(
+            "127.0.0.1:{}: the process was still running after 60s and never answered a probe",
+            self.port
+        ))
+    }
+
+    /// What the child said before it exited. The pipes are drained rather than
+    /// summarised: a failure here is rare enough that the whole of what the
+    /// binary printed is what a reader wants, and both pipes are at EOF
+    /// already because the process is gone.
+    fn epitaph(&mut self, status: ExitStatus) -> String {
+        let mut out = String::new();
+        let mut err = String::new();
+        if let Some(mut pipe) = self.child.stdout.take() {
+            let _ = pipe.read_to_string(&mut out);
+        }
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut err);
+        }
+        format!(
+            "127.0.0.1:{}: `ply run --host` exited {status} without binding\n  stdout: \
+             {}\n  stderr: {}",
+            self.port,
+            out.trim(),
+            err.trim()
+        )
     }
 
     fn address(&self) -> std::net::SocketAddr {

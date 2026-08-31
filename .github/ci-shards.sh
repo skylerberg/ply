@@ -2,9 +2,28 @@
 #
 # The table CI's test jobs are cut from, and the check that the cut is total.
 #
-# `cargo test --workspace` is 915.8s of in-target time — the `test result:`
-# lines summed, excluding compilation — so CI runs it as several jobs rather
-# than one. A partition is a chance to lose a package silently,
+# `cargo test --workspace` is 178.1s of in-target time — the `test result:`
+# lines summed, excluding compilation — and CI runs it as several jobs rather
+# than one.
+#
+# **That figure read 915.8s until 2026-08-31 and the 5x is two changes, neither
+# of them this table's.** `[profile.dev] opt-level = 2` landed in the root
+# manifest, which that file records at 6.5x on one binary; and the two
+# allocation-attribution suites in `ply-corpus` stopped symbolicating a
+# backtrace per allocation, which is 86.6s to 9.2s of the total on its own —
+# `r4_value_construction` 46.2s to 6.7s and `w6_alloc_sites` 40.4s to 2.6s.
+# Re-taken on the machine in docs/ONBOARDING.md §Provenance at a load below 4,
+# on this tree both ways: 246.9s with those two reverted, 178.1s with them.
+#
+# **The sharding decision below has NOT been re-derived from the new figure,
+# and it is the obvious thing to check next** — the more so because 86.6s of
+# what just came off was `ply-corpus`, which is the shard the split below is
+# built around as the long pole. 178.1s of in-target time is a ten-core
+# reading; the runners are two-core, where `ply-corpus` and `ply-eval` measured
+# 90.7s and 144.0s with `-j 2 -- --test-threads=2` on that same machine — taken
+# at 54a568d, before cranelift shipped and before the change above, so they are
+# the shape and not the figures. Whether three shards is still the right number
+# is an open question and this comment is not an answer to it. A partition is a chance to lose a package silently,
 # which is this repository's most expensive defect class, so the partition lives
 # here once and `verify` reads the workspace members out of `Cargo.toml` and
 # fails if a member is in no shard, in two shards, or named here and absent from

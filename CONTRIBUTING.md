@@ -158,19 +158,40 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # 9.5-29 min — 3,696 pass, 0 fail, 5 ignored
+cargo test --workspace                          # 3m 02s — 3,878 pass, 0 fail, 5 ignored
 ```
 
-> **Re-taken 2026-08-31, as one command after the last edit of the compiled
-> seam's answer-test change:** `cargo fmt --all --check` silent, `cargo clippy
-> --workspace --all-targets` **0 warnings**, `cargo test --workspace` **3,868
-> passed / 0 failed / 5 ignored over 167 test targets**. This is a measurement
-> and not arithmetic — the source digests were taken before the run and checked
-> equal after it, so nothing moved under it. The `3,696` above is left as the
-> line this file has carried, because the number it is compared against below
-> was taken with a different command (`--no-fail-fast -- --test-threads=2`) and
-> replacing one with the other would be the conflation the block underneath
-> warns about.
+> **Re-taken 2026-08-31, and both halves of that line had drifted.** It read
+> **9.5-29 min — 3,696 pass, 0 fail, 5 ignored**, and the block above already
+> recorded that the count had moved to a predicted **3,720** that nobody took.
+> It is now **3,878**, which is that prediction plus growth nobody re-took
+> either.
+>
+> Measured as `/usr/bin/time -p cargo test --locked --workspace
+> --no-fail-fast` from an already-built `target/` on the machine in
+> `docs/ONBOARDING.md` §Provenance, at a 1-minute load below §"Gate on an idle
+> machine"'s threshold of 4. **Both rows are this tree** — the same commit with
+> only `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted — so the
+> pair isolates the change and nothing else:
+>
+> | | wall | user | sys | in-target |
+> | --- | --- | --- | --- | --- |
+> | without the memoised resolve | 250.5s | 322.1s | 40.4s | 246.9s |
+> | with it | **182.3s** | 226.9s | 24.9s | 178.1s |
+>
+> **3,878 passed, 0 failed, 5 ignored across 171 targets (157 binaries + 14
+> doc-test suites)** on both — it moves wall clock and moves no count. The two
+> targets are **46.2s -> 6.7s** and **40.4s -> 2.6s**; that is 77.4s against a
+> 68.2s move in the total, and the 9s of daylight is run-to-run noise
+> elsewhere, not a saving that went missing.
+>
+> The 9.5-29 min range is not withdrawn as a lie about its own day: it predates
+> `[profile.dev] opt-level = 2`, which the root `Cargo.toml` records at 6.5x on
+> one binary, and it predates cranelift shipping. Those are not measurements of
+> the same tree.
+>
+> **One run each, not a best-of-N.** The spread `docs/ONBOARDING.md` §2 records
+> for this command is wide, so treat 182.3s as the reading and not as the value.
 
 > **The count moved on 2026-08-28 and this line is deliberately not rewritten
 > to a number nobody took.** ADR 0026's work adds **24** tests — 8 to
@@ -311,6 +332,11 @@ baseline.
 > `ply-corpus/tests/r4_value_construction.rs` takes **70.9s in debug and 25.6s
 > in release**, because it captures a backtrace per allocation. It is not
 > `ignored`, and the figures it is documented to print are the release ones.
+>
+> > **Fixed 2026-08-31, and it was the resolve rather than the capture.**
+> > Memoising symbolication per code address takes that target to **6.7s** in a
+> > debug workspace run, with every figure it prints unchanged. The release
+> > comparison above has not been re-taken against the new code.
 
 > **The counts moved twice and the reason is in the tree both times, not in the
 > suite.** They read 3,566 / 147 / 324.5s, then 3,584 / 150 / 352.4s. R3 added
@@ -820,38 +846,6 @@ half carries your claim, an unresolved timing number is a caveat in a harmless
 place — say `UNMEASURED` and check in the raw windows so a reader can re-cut
 them. That is a better artifact than a number of unknown provenance sitting
 where the hole was.
-
-### The two seam instruments, and the vacuity trap both of them set
-
-`crates/ply-eval` carries two environment-gated measurement knobs. Neither is a
-`--backend` spec and neither should become one: a spec is a user-facing promise,
-these are instruments.
-
-- **`PLY_SEAM_CENSUS=1`** — `crates/ply-eval/src/census.rs`. Counts what the
-  compiled seam is offered and which gate refused it, printed on stderr at exit.
-  Every **coverage** share must be taken with **no backend attached**: entering a
-  call hides its whole subtree, so it shrinks numerator and denominator together.
-  Since the 2026-08-31 answer widening that is a requirement rather than a
-  convention — with a backend attached the Ply front end's denominator collapses
-  from 2,414,170 body calls to 26.
-- **`PLY_BACKEND_ONLY=<comma-separated program-wide names>`** —
-  `crates/ply-eval/src/backend.rs`. Narrows `Reference`'s registry to those
-  names. It exists to price a *different* backend's limit with the one that
-  ships: `Reference` is a tree-walker and can run anything the seam admits, so
-  the only way to ask "what would a code generator that cannot compile a callback
-  reach" is to take the callback users away from it. ADR 0030 §10 is that
-  measurement. Narrowing can only add declines, so it cannot change an answer —
-  `--engine both` audits 13 of 13 with 0 failed under it.
-
-**The trap is the same for both and it is this project's signature defect.** A
-census that was never enabled prints nothing and a narrowing that never applied
-enters everything, and in both cases the run still says `0 failed` — so the
-number you write down is the *unrestricted* one wearing the restricted one's
-label. Check the instrument fired, in the run's own output, and check in the
-reading: `ply test` prints `N in the fragment` and `X of Y offers entered` on
-every backend run, and the difference between `26 of 26 · 413 in the fragment`
-and `495152 of 1049245 · 220 in the fragment` is what says the variable reached
-the process. Both readings belong in the log, not just the one you wanted.
 
 ### A moving tree invalidates a correctness number, and only an instrument says so
 
@@ -1423,18 +1417,11 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is **thirty-one** files, `00NN-slug.md`, with **no index** — the
+`docs/adr/` is **twenty-nine** files, `00NN-slug.md`, with **no index** — the
 numbers are the ordering. Pick the next free one — and **nothing you have to
 remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
 fails when two files share a number, so the check catches you rather than a
 reader finding an ambiguous `ADR NNNN` citation months later.
-
-> **The count has now been stale a fourth time (2026-08-31), which is the whole
-> argument for the test below it.** It read *"`docs/adr/` is **twenty-nine**
-> files"* while the directory held **thirty**; ADR 0031 makes it thirty-one. The
-> *advice* has been right since the test arrived and the *count* beside it has
-> gone wrong every time an ADR landed — so read the number as prose and
-> `ls docs/adr/*.md | wc -l` as the answer.
 
 > **Corrected again (2026-08-30), and this time by a test rather than by better
 > advice.** The line above read *"Number yours `0028` and up, and read the open
@@ -1500,7 +1487,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
 | `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today, on the default toolchain since the move to cranelift 0.132.3 (this used to read `cargo +1.94.0 test --release`): `cd crates/ply-codegen-spike && cargo test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
-| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
+| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
@@ -2256,29 +2243,6 @@ Recorded here so nobody spends an afternoon rediscovering them.
     everything that exists here; what it costs is a definition that both
     discharges its own effects and takes scalars, which is what the fixture is.
 
-    > **Narrowed 2026-08-31, when the argument test became a type test.** The
-    > sentence *"They are never offered because they take and return records,
-    > lists and closures, and `Gate::ArgumentShape` precedes both effect
-    > gates"* is now true for one of its three reasons. A record and a list
-    > cross this seam: `compiled::Gate::ArgumentShape` carries them and
-    > `compiled::Gate::ArgumentType` decides them from the declared type. What
-    > still refuses `desk.under` is the **closure** — its second parameter is
-    > declared `body: () -> a / {Serving | e}`, so the argument is a
-    > `Value::Closure` and the kind gate refuses it with no lookup, ahead of the
-    > effect gates exactly as the sentence says.
-    >
-    > The effect gates are consequently doing more work than they were, which is
-    > the point of writing this down rather than leaving the old sentence to be
-    > re-quoted. Measured on the same corpus either side of the widening,
-    > `PLY_SEAM_CENSUS=1 ply test examples --no-cache -j 1`:
-    > `Gate::InternalEffects` goes **54 -> 91** refusals and
-    > `Gate::PublishedRow` **385 -> 1,144**. Both gates were reached by more
-    > calls, both refused every one of them, and no definition that discharges
-    > its own effects became enterable — `tests/fixtures/self_handled_effect.ply`
-    > is still refused on the corpus path and
-    > `a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`
-    > is still what says so.
-
     **One thing the fix nearly got wrong, recorded because it was found by
     reading and not by the suite.** `mark_internal_effects` indexes definitions
     by program-wide name, and the first draft let a module's *second* `fn f`
@@ -2550,38 +2514,6 @@ Recorded here so nobody spends an afternoon rediscovering them.
       > > --backend reference` goes from 51 definitions and **768** entries to
       > > 153 definitions and **62,388**, measured either side on 2026-08-30 by
       > > narrowing the seam back and rebuilding.
-      > >
-      > > > **Re-taken after the type gate, 2026-08-31, by the same method — a
-      > > > binary built from this tree with the gate narrowed back.** `ply test
-      > > > examples --no-cache -j 1 --engine both --backend reference` goes
-      > > > from **153** definitions in the fragment to **180**, and from
-      > > > 55,693 entered of 58,425 offers to **56,379 entered of 60,223**.
-      > > > The fragment grew by 27 definitions and the entries by 686, which
-      > > > is small beside the front end's 190,617 -> 306,931 and is the
-      > > > finding rather than a disappointment: `examples/` is a corpus of
-      > > > `String` and `Decimal`, and this widening deliberately did not move
-      > > > the leaf set. `crates/ply-eval/src/census.rs`'s header attributes
-      > > > it — 108,925 of the 121,642 `Gate::ArgumentType` refusals are
-      > > > `String`. All fourteen tests in `crates/ply-cli/tests/backend.rs`
-      > > > still pass unchanged.
-      > > >
-      > > > > **Re-taken again after the ANSWER test, 2026-08-31, and the last
-      > > > > sentence above is withdrawn for it.** *"All fourteen tests in
-      > > > > `crates/ply-cli/tests/backend.rs` still pass unchanged"* — two of
-      > > > > them **failed**, correctly, and that file is now fifteen tests
-      > > > > over a changed corpus. `Machine::compiled_answer` decides an
-      > > > > answer from the declared **return** type, so `pair(Int) ->
-      > > > > List<Int>` moved *inside* the fragment and
-      > > > > `Mutation::Unoffered` — which needs a definition that is offered
-      > > > > and has no body — lost the only one that corpus had.
-      > > > > `label(Int) -> String` replaces it, and the fifteenth test is
-      > > > > `wrong:handle`, a ninth wrong backend for the hazard this
-      > > > > widening created: a container answer is checked for its kind and
-      > > > > not for its contents. On `examples/` the fragment goes **180 ->
-      > > > > 220** definitions and 56,379 entered of 60,223 offers to
-      > > > > **56,703 of 59,435**; on the ported front end it goes **306,931
-      > > > > entries -> 26**, one `items.parse` per file, which is the whole
-      > > > > point and is PR #30's shape.
       >
       > **And the result-cache rule is armed, in both of ADR 0026 §4.6's
       > stages, each seen to fail before it was believed.** `cache_bypassed`

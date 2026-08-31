@@ -296,9 +296,32 @@ Measured, from an already-built `target/`:
 
 | | |
 | --- | --- |
-| wall clock | **339s** (5m 39s); re-taken at **324.5s**, after R3 at **352.4s** (5m 52s) and **359.7s**, and after the regression audit that followed it at **399.6s** (6m 40s) and **406.9s**, and after R4 at **569.3s** (9m 29s) — six runs of one command on one machine, which is the spread to expect. The last of them was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
-| result | **3,696 passed, 0 failed, 5 ignored** |
-| targets | **155** — 142 test binaries + 13 doc-test suites |
+| wall clock | **182.3s** (3m 02s). The readings this replaces, in order: **339s** (5m 39s), **324.5s**, after R3 **352.4s** (5m 52s) and **359.7s**, after the regression audit that followed it **399.6s** (6m 40s) and **406.9s**, and after R4 **569.3s** (9m 29s) — seven runs of one command on one machine, which is the spread to expect. The 569.3s reading was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
+| result | **3,878 passed, 0 failed, 5 ignored** |
+| targets | **171** — 157 test binaries + 14 doc-test suites |
+
+> **Re-taken 2026-08-31, and every row moved.** They read **3,696 passed, 0
+> failed, 5 ignored** across **155** targets (**142** binaries + 13 doc-test
+> suites) at a wall clock topping out at 569.3s. Taken as `/usr/bin/time -p
+> cargo test --locked --workspace --no-fail-fast`, from an already-built
+> `target/`, at a 1-minute load below §"Gate on an idle machine"'s threshold of
+> 4: **182.29s real, 226.88s user, 24.85s sys**, and **178.1s** of in-target
+> time summed from the `test result:` lines.
+>
+> Two different things moved and they should not be read as one. **The counts
+> drifted** — 3,696 to 3,878, 142 binaries to 157, 13 doc-test suites to 14 —
+> which is fifteen binaries and 182 tests of growth that nothing re-took;
+> `CONTRIBUTING.md` §"The loop" had predicted 3,720 by arithmetic and said in
+> writing that it was arithmetic, and cranelift shipping added the rest.
+>
+> **The wall clock moved for two reasons**, and only the second is measured
+> here as a pair. `[profile.dev] opt-level = 2` landed after the 569.3s
+> reading; that is the root `Cargo.toml`'s measurement, not this one. The
+> change this block is part of was measured **on this tree, both ways** — the
+> same commit with `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted
+> and then restored — at **250.5s without it against 182.3s with it**. The
+> 569.3s row was not re-taken against any intermediate tree and nothing here
+> claims it was.
 
 > **Re-taken 2026-08-24, and it had drifted two readings behind.** The rows
 > above read **3,661 passed, 0 failed, 5 ignored** across **156** targets
@@ -316,8 +339,10 @@ Measured, from an already-built `target/`:
 > resolved here.
 
 That reproduces `README.md`'s Status paragraph exactly, count for count. It is
-the longest thing in this file; **budget ten minutes now** — see the R4 block
-below for which target grew and by how much — and do not run it under load.
+the longest thing in this file; **budget three minutes now** — and do not run it
+under load. It said *ten* until 2026-08-31, on the R4 block below, whose target
+is the one the same change made 7x faster; that block is left standing because
+the number it explains is still the number it was.
 
 > **Re-taken 2026-08-21, after R4.** The result row read **3,597 / 0 / 4** and
 > the target row **151 — 138 + 13**. R4 added four test binaries —
@@ -342,7 +367,22 @@ below for which target grew and by how much — and do not run it under load.
 > `r4_value_construction` captures a backtrace per allocation over 20-, 200- and
 > 400-request windows, and it takes **70.9s under `cargo test` (debug) against
 > 25.6s under `cargo test --release`**. It is not `ignored`, and the numbers it
-> is documented to print are release numbers. (An earlier draft of this block
+> is documented to print are release numbers.
+>
+> > **Both halves of that were fixed on 2026-08-31 rather than budgeted
+> > around.** The backtrace is still captured per allocation; what was
+> > *resolved* per allocation now is not. `Backtrace::force_capture()` followed
+> > by `format!("{bt}")` symbolicates every frame on the stack, and the set of
+> > code addresses that allocate is small and fixed, so the same names were
+> > being resolved hundreds of thousands of times. Memoising the resolve per
+> > address takes this target from **46.2s to 6.7s** inside a workspace run,
+> > and `w6_alloc_sites` — which does the same thing and which cranelift
+> > shipping had pushed to 40.4s — from **40.4s to 2.6s**. Every figure the two
+> > files report is **byte for byte identical** across the change, checked by
+> > diffing their `--nocapture` output rather than by trusting that the
+> > assertions still pass. The debug/release gap this block warns about is
+> > therefore much smaller than 2.8x now, and **has not been re-taken**: the
+> > release side of it is a 2026-08-21 reading against the old code. (An earlier draft of this block
 > said 255.2s for the debug side. That was this target's `finished in` line from
 > a workspace run taken while a second `cargo build --release` was competing for
 > the machine, and it is a reading of the load, not of the target — the same
