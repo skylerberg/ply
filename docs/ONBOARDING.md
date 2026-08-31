@@ -937,9 +937,16 @@ about it.
 > file" lists the jobs.
 
 **What it settles.** `cargo fmt --all --check`, `cargo clippy --workspace
---all-targets -- -D warnings` and the whole test suite run on every push and
-every pull request. So do four of the five gates §2 describes — the ones that
-return a *passing* result when their dependency is absent:
+--all-targets -- -D warnings` and the whole test suite run on every pull
+request, and on every push to `main`. So do four of the five gates §2 describes
+— the ones that return a *passing* result when their dependency is absent:
+
+> **Corrected 2026-08-30: "every push" was accurate and was also a bug.** The
+> withdrawn wording: *"run on every push and every pull request."* Unfiltered,
+> a push to a branch with a PR open ran the entire workflow twice, because the
+> `concurrency` group keys on `github.ref` and the two triggers do not share
+> one. `push` is now filtered to the default branch. A branch with no PR open
+> yet gets no CI, which is the case this gives up.
 
 - `PLY_PG_URL` is set at a `postgres:18.6` service container, and the job then
   runs the ten live tests with `--nocapture` and **fails if it finds the notice

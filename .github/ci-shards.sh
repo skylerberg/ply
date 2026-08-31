@@ -25,30 +25,62 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Shard id, then its packages.
 #
-# Balanced against measured `cargo test -p <package>` wall clock — warm target,
-# `-j 2 -- --test-threads=2` to approximate a two-core hosted runner, on the
-# machine in docs/ONBOARDING.md §Provenance (Apple M4, 10 cores, rustc 1.93.1),
+# Balanced against what the shards actually cost **in CI**, which is the machine
+# the balance is for. Taken from run 33338854134 (ubuntu-24.04, 2026-08-30) by
+# differencing the timestamps of consecutive `Running <binary>` lines in each
+# job log, so each figure is test execution only — the ~39s dependency build
+# every shard pays is excluded, and per-binary startup is counted in:
+#
+#   ply-corpus 426s   ply-eval 404s   ply-cli 200s   ply-host ~60s
+#   the other nine packages, summed: 16s
+#
+# **The previous table's basis had drifted and the split it produced was the
+# slowest thing in CI.** It read, from `cargo test -p <package>` on the machine
+# in docs/ONBOARDING.md §Provenance, warm target, `-j 2 -- --test-threads=2`,
 # 2026-08-24:
 #
 #   ply-corpus 289s   ply-cli 149s   ply-eval 137s   ply-store  32s
 #   ply-hash    15s   ply-test 13s   ply-core   8s   ply-span    5s
 #   ply-syntax   3s   ply-prove 4s   ply-std    2s   ply-derive  1s
 #
-# 658s summed, and `ply-corpus` alone is 44% of it, so three shards is the
-# useful number: a fourth cannot finish sooner than that one package takes, and
-# every extra shard pays the dependency build again. Splitting `ply-corpus`
-# further would mean partitioning by test target, which would give up the
-# property `verify` checks — that every *package* is somewhere.
+#   "658s summed, and `ply-corpus` alone is 44% of it, so three shards is the
+#   useful number: a fourth cannot finish sooner than that one package takes,
+#   and every extra shard pays the dependency build again."
 #
-# Your figures will differ; the ordering is what this table depends on. Re-take
-# with `cargo test -p <package>` if a package grows a slow suite, and move it.
+# The floor argument is still sound; the arrangement had stopped sitting on the
+# floor. `ply-eval` roughly tripled (137s -> 404s), so `cli-eval` became 604s
+# against `ply-corpus`'s 426s floor, while `core` finished its 1,604 tests in
+# **16s** — one runner idle for ten minutes while another held the whole run up.
+# Splitting `ply-eval` off and folding the nine fast packages in with `ply-cli`
+# puts the three parallel shards at 426s / 404s / 216s, which is the floor, and
+# keeps the shard count at three so no extra dependency build is paid.
+#
+# The figures above were taken **before** `[profile.dev] opt-level = 2` landed
+# in the root manifest -- the root `Cargo.toml`'s profile block holds that
+# measurement, its provenance and its caveats. Expect the jobs to become
+# compile-bound rather than test-bound.
+#
+# Re-taken after the profile change, but **on the wrong machine and above the
+# load gate**: the three shards run locally (Apple M4, 10 cores, so not the
+# two-core runner these are balanced for) at 1-minute load between 6 and 24
+# against CONTRIBUTING.md s"Gate on an idle machine"'s threshold of 4 --
+# `corpus` 120s / 197 tests, `eval` 69s / 1,033, `cli` 41s / 2,319. Treat those
+# as a shape and not as figures. The shape is that `ply-corpus` stops being
+# level with `ply-eval` and becomes the clear long pole, roughly 1.7x it, which
+# is the ordering this table already assumes. **A re-take on a two-core runner
+# at load < 4 has not been done**, and it is what would justify moving anything.
+#
+# Your figures will differ; re-take with `cargo test -p <package>` if a package
+# grows a slow suite, and move it. Splitting `ply-corpus` further would mean
+# partitioning by test target, which would give up the property `verify` checks
+# — that every *package* is somewhere.
 #
 # `ply-host` is a shard of its own because it is the only package that needs a
 # database. The postgres job runs it and no other job does.
 SHARDS=(
   "corpus:ply-corpus"
-  "cli-eval:ply-cli ply-eval"
-  "core:ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
+  "eval:ply-eval"
+  "cli:ply-cli ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
   "postgres:ply-host"
 )
 
@@ -151,11 +183,18 @@ DEFERRED=(
 # so renaming one, deleting it, or filtering it away turns CI red instead of
 # quietly reducing what CI checks.
 #
-# All six are in `crates/ply-span/tests/armed.rs` and all six are one defect:
+# All seven are in `crates/ply-span/tests/armed.rs`. Six of them are one defect:
 # a mechanism declared and registered everywhere a reader would look for it and
 # constructed nowhere. CONTRIBUTING.md s"The shape it keeps taking: declared,
 # registered, raised nowhere" has the catalogue; that file's header has the rule
 # and the list of what it does not cover.
+#
+# The seventh, `no_two_adrs_share_a_number`, is a different kind and was added
+# in ad74275: its subject is the `docs/adr/` filenames rather than a mechanism
+# in the source. It sits here because the file it lives in is the tree-check
+# file and the reason for naming it here is identical -- a check that stops
+# running reports nothing. This comment said "all six" for two commits after it
+# landed, which is the staleness this table exists to make expensive.
 TREE_CHECKS=(
   "ply-span:armed:every_registered_code_is_constructed_in_production"
   "ply-span:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
