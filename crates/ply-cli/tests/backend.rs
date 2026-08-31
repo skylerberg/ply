@@ -19,9 +19,16 @@
 //!
 //! # What is caught, and what escapes
 //!
+//! **Two backends, and the table is per backend rather than per seam.** ADR
+//! 0026 §4.5 is a condition on *any* backend — what a corruption can bite
+//! depends on which definitions the backend has a body for — so `reference` and
+//! `cranelift` are run through the whole table separately and the counts are
+//! reported separately. The `cranelift` half is §"The eight, over the code
+//! generator" below.
+//!
 //! Measured on this corpus, 2026-08-28, one run each. **Seven of the eight
-//! configurations are caught. One escapes**, and saying which is the point of
-//! counting rather than claiming eight:
+//! configurations are caught by `reference`. One escapes**, and saying which is
+//! the point of counting rather than claiming eight:
 //!
 //! | `--backend` | fired | caught by |
 //! | --- | ---: | --- |
@@ -35,16 +42,33 @@
 //! | `wrong:answers=<int>@<effectful>` | 0 | **not offered at all** — `offered_target` is 0, which is the gate |
 //! | `wrong:exceeds-budget` over a *non-terminating* recursion | — | **nothing. It escapes.** |
 //!
-//! The last row is the honest answer and it is the same finding the spike
-//! recorded one layer down. An unbounded native runaway is not a wrong answer:
-//! the process never comes back, and every candidate reporter is inside it.
-//! Measured rather than reasoned — `ply test --backend wrong:exceeds-budget`
-//! over `fn spin(n: Int) -> Int = 1 + spin(n + 1)` produced **no output and did
-//! not exit within 45 seconds**, against 0.03s for the run that reports. The
-//! reporter has to be outside the process, which is what
-//! `ply_codegen_spike::wrong::run_guarded` is; `ply test` is the process. There
-//! is no standing test for it here, deliberately: the only shape one could take
-//! is a wall clock and a child that grows the heap until it is killed.
+//! The last row is the honest answer **about `reference`**, and it is the same
+//! finding the spike recorded one layer down. An unbounded runaway on a
+//! tree-walker is not a wrong answer: the process never comes back, and every
+//! candidate reporter is inside it. Measured rather than reasoned —
+//! `ply test --backend wrong:exceeds-budget` over
+//! `fn spin(n: Int) -> Int = 1 + spin(n + 1)` produced **no output and did not
+//! exit within 45 seconds**, against 0.03s for the run that reports.
+//!
+//! > **That row moved on 2026-08-31, and it moved because the backend changed
+//! > rather than because the harness did.** The paragraph above continued:
+//! > *"The reporter has to be outside the process, which is what
+//! > `ply_codegen_spike::wrong::run_guarded` is; `ply test` is the process.
+//! > There is no standing test for it here, deliberately: the only shape one
+//! > could take is a wall clock and a child that grows the heap until it is
+//! > killed."*
+//! >
+//! > The first sentence is still true and is the reason the new test works:
+//! > every test in this file already runs `ply` as a **child**, so the reporter
+//! > is outside the process by construction. What was missing was a backend
+//! > whose runaway *dies* instead of hanging. `cranelift` is native code on a
+//! > fixed stack: the same corruption over the same corpus aborts with
+//! > `fatal runtime error: stack overflow` and exit **134**, in **0.02 s**
+//! > (two runs, release binary), against `reference`'s no-output-in-45-seconds.
+//! > A dead child is a fact a parent can assert; a hang is not.
+//! > [`the_unbounded_runaway_dies_under_a_code_generator_and_hangs_under_a_tree_walker`]
+//! > is that test, and it is a wall clock only in the direction that cannot
+//! > produce a false green.
 //!
 //! `wrong:answers=` is the seventh corruption and it is **not** caught, in the
 //! sense that nothing goes red — and that is the finding rather than a gap,
@@ -545,4 +569,464 @@ fn an_unknown_backend_is_refused_rather_than_ignored() {
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["ok"], Value::Bool(false), "{report}");
     assert_eq!(report["diagnostics"][0]["code"], "E0450", "{report}");
+}
+
+// --- The eight, over the code generator -------------------------------------
+//
+// ADR 0026 §4.5's condition — *"No backend may ship until `ply test --engine
+// both` can attach one and catch the eight"* — is a condition on **a** backend,
+// and until 2026-08-31 there was one. `ply_eval::backend::Mutant` wrapped a
+// concrete `Rc<Reference>`, so a second implementation of `Compiled` could not
+// be corrupted even if it could be installed. `ply_eval::Policed` is the trait
+// that fixed it and `ply_codegen::Cranelift` is the second implementation.
+//
+// **Measured, 2026-08-31, one run each, release binary, on this file's `CORPUS`
+// and `DEEP` unless a row says otherwise.** The `fragment` column is the point
+// of running the table twice: a corruption can only bite a definition the
+// backend has a body for, and the two backends hold different sets.
+//
+// | `--backend` | fired | caught |
+// | --- | ---: | --- |
+// | `cranelift` (the control) | 0 | — · 3 of 4 offers entered, fragment 3 |
+// | `cranelift:wrong:off-by-one` | 2 | `double doubles`, `triple triples` |
+// | `cranelift:wrong:inverted` | 1 | `even is even` |
+// | `cranelift:wrong:stale` | 2 | `even is even`, `triple triples` |
+// | `cranelift:wrong:wrong-type` | 3 | all three scalar tests |
+// | `cranelift:wrong:unoffered` | 1 | `a pair has two` |
+// | `cranelift:wrong:exceeds-budget=4` | 1 | the ladder, on the verdict axis |
+// | `cranelift:wrong:exceeds-budget`, terminating | 1 | the same |
+// | `cranelift:wrong:answers=<int>@<effectful>` | 0 | **not offered** — the gate |
+// | `cranelift:wrong:exceeds-budget`, NON-terminating | — | **the child dies, exit 134** |
+//
+// So **eight of the eight configurations are accounted for under `cranelift`**,
+// against seven under `reference`, and the one that moved is the last row.
+// `answers=` is still not "caught" in the sense of something going red, and
+// that is still the finding rather than a gap: what stands is an offer count of
+// zero, which is a claim about `compiled::admit`'s gates and not about a
+// backend.
+
+/// The control for everything below: the honest code generator is green, changes
+/// no answer, and **enters bodies**.
+///
+/// The third clause is the one that makes the others worth anything. ADR 0018
+/// §0.5 records R4 reporting a 0.998x speedup over a backend that entered
+/// nothing, and a corruption of a backend nobody reaches is a mutation of
+/// nothing.
+#[test]
+fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
+    let dir = project(CORPUS);
+    let report = run(dir.path(), Some("cranelift"));
+
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+    assert_eq!(u64_at(&report, &["summary", "failed"]), 0, "{report}");
+    assert_eq!(report["backend"]["name"], "cranelift", "{report}");
+    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
+    assert!(
+        u64_at(&report, &["backend", "entered"]) > 0,
+        "the code generator entered nothing, so the seam was never reached: {}",
+        report["backend"]
+    );
+    assert!(
+        u64_at(&report, &["backend", "declined"]) > 0,
+        "the code generator declined nothing, so the registry-miss path — which is what \
+         `wrong:unoffered` corrupts — is unexercised: {}",
+        report["backend"]
+    );
+    assert!(
+        u64_at(&report, &["backend", "fragment"]) > 0,
+        "{}",
+        report["backend"]
+    );
+    // A code generator compiled something, and the report says how much it
+    // cost. `reference` reports no compilation at all, which is the difference
+    // `ply_eval::Provider::compilation` returns `Option` to express.
+    assert!(
+        u64_at(&report, &["backend", "units"]) > 0,
+        "no unit was compiled, so `cranelift` installed something that is not a code generator: {}",
+        report["backend"]
+    );
+    let plain = run(dir.path(), Some("reference"));
+    assert!(
+        plain["backend"]["units"].is_null(),
+        "the tree-walker reported a compilation: {}",
+        plain["backend"]
+    );
+}
+
+#[test]
+fn an_off_by_one_in_compiled_code_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:off-by-one");
+    assert!(
+        caught.contains(&"m.double doubles".to_string()),
+        "{caught:?}"
+    );
+}
+
+#[test]
+fn an_inverted_comparison_in_compiled_code_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:inverted");
+    assert!(caught.contains(&"m.even is even".to_string()), "{caught:?}");
+}
+
+#[test]
+fn a_stale_answer_from_compiled_code_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    fires_and_is_caught(dir.path(), "cranelift:wrong:stale");
+}
+
+#[test]
+fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:wrong-type");
+    assert!(
+        caught.contains(&"m.double doubles".to_string()),
+        "{caught:?}"
+    );
+}
+
+/// The registry-miss path, over a backend whose registry is much smaller than
+/// the tree-walker's.
+///
+/// `pair` returns a `List<Int>`, so `compiled::admit` offers it — it gates on
+/// the shape of the *arguments* and never on the return type — and the code
+/// generator has no body for it. That gap is where this corruption lives, and
+/// it is **wider** here than under `reference`: this fragment is `Int`/`Bool`
+/// only, so `Bytes` signatures fall in it too.
+#[test]
+fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
+    let dir = project(CORPUS);
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:unoffered");
+    assert!(
+        caught.contains(&"m.a pair has two".to_string()),
+        "{caught:?}"
+    );
+}
+
+/// The fuel prologue is four instructions in every compiled body — load,
+/// subtract, branch, store — and this is what says they are load-bearing.
+///
+/// The control is the same one the tree-walker's test uses: the corpus is red
+/// on its own, with both engines raising the same bound and no backend blamed.
+#[test]
+fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
+    let dir = project(DEEP);
+    let control = run(dir.path(), Some("cranelift"));
+    assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
+    assert!(
+        caught(&control).is_empty(),
+        "the honest code generator was blamed for a corpus that is red on its own: {control}"
+    );
+    assert!(
+        u64_at(&control, &["backend", "declined"]) > 0,
+        "the honest code generator never declined, so the budget it is about to ignore was never \
+         honoured either: {}",
+        control["backend"]
+    );
+
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:exceeds-budget=4");
+    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
+}
+
+#[test]
+fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
+    let dir = project(DEEP);
+    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:exceeds-budget");
+    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
+}
+
+/// Accepting a call the machine must never offer, over the code generator.
+///
+/// Unchanged from the tree-walker's answer, and it should be: the gate is
+/// `compiled::admit`'s and not a backend's. `handled` performs two operations
+/// under a `handle` of its own, `Gate::InternalEffects` refuses it, and the
+/// mutant stands ready to answer a call it is never asked.
+#[test]
+fn compiled_code_is_never_offered_a_definition_that_performs() {
+    let dir = project(CORPUS);
+    let report = run(dir.path(), Some("cranelift:wrong:answers=99@m.handled"));
+
+    assert_eq!(
+        u64_at(&report, &["backend", "offered_target"]),
+        0,
+        "a definition that discharges its own effects was offered to a backend: {}",
+        report["backend"]
+    );
+    assert!(
+        u64_at(&report, &["backend", "offered"]) > 0,
+        "the seam was never reached at all, so the count above proves nothing: {}",
+        report["backend"]
+    );
+    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+}
+
+/// A recursion with no base case, under a backend that ignores its budget
+/// **entirely**. The eighth configuration, and the one ADR 0026 §4.7 recorded as
+/// living nowhere in this workspace.
+///
+/// That record read, of the tree-walker: *"`Reference` is a tree-walker whose
+/// frames grow on the heap through `stacker`, so the same corruption does not
+/// crash — it **hangs**, measured at no output and no exit in 45 seconds against
+/// 0.03s for the run that reports. A harness can run it as a child; what it
+/// cannot do is tell a hang from work, and a wall clock is not a
+/// disagreement."*
+///
+/// Every word of that is still true of `reference`, and this test asserts it
+/// alongside the other arm rather than taking it on trust. What changed is the
+/// backend: native frames sit on a fixed stack, so ignoring the budget
+/// **kills the process** instead of hanging it, and a dead child is a fact its
+/// parent can read. Both halves are here because the contrast is the finding:
+/// one arm must die, the other must not, and a run in which both die would mean
+/// the corpus rather than the backend is doing it.
+///
+/// # Why this is not a wall-clock test in the direction that matters
+///
+/// The timeout can only turn a **hang into a failure**, never a failure into a
+/// pass. The cranelift arm asserts the child died; if a future change made it
+/// hang instead, the timeout fires and this goes red. The tree-walker arm
+/// asserts the child was *still running* at the deadline; a machine so slow
+/// that a correct run had not finished in ten seconds would be the only false
+/// red, and the run being timed produces its first output in 0.03 s.
+#[test]
+fn the_unbounded_runaway_dies_under_a_code_generator_and_hangs_under_a_tree_walker() {
+    use std::process::{Command as Raw, Stdio};
+    use std::time::{Duration, Instant};
+
+    const SPIN: &str = r#"
+fn spin(n: Int) -> Int = 1 + spin(n + 1)
+
+test "a runaway" { assert_eq(spin(0), 0) }
+"#;
+    let dir = project(SPIN);
+
+    /// Runs one arm as a child and reports whether it ended, and how.
+    fn arm(dir: &Path, backend: &str, limit: Duration) -> Option<std::process::ExitStatus> {
+        let mut child = Raw::new(assert_cmd::cargo::cargo_bin("ply"))
+            .args(["test", "--engine", "both", "-j", "1", "--color", "never"])
+            .arg("--backend")
+            .arg(backend)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the `ply` binary runs");
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = child.try_wait().expect("the child is waitable") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // The control: the honest code generator over the same corpus comes back,
+    // and comes back red with the machine's own bound. Without this, a death
+    // below could be the corpus rather than the corruption.
+    let honest = arm(dir.path(), "cranelift", Duration::from_secs(60))
+        .expect("the honest code generator finished");
+    assert!(
+        !honest.success(),
+        "a recursion with no base case passed: {honest:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            honest.signal(),
+            None,
+            "the honest code generator died by signal on a corpus it should refuse politely"
+        );
+    }
+
+    // The corruption, over native frames: it dies, and quickly.
+    let corrupted = arm(
+        dir.path(),
+        "cranelift:wrong:exceeds-budget",
+        Duration::from_secs(60),
+    )
+    .expect(
+        "a backend that ignores its budget over a recursion with no base case did not come back \
+         within 60s — under native frames it is supposed to die, and a hang here means the fuel \
+         prologue is being honoured by something that claims not to",
+    );
+    assert!(
+        !corrupted.success(),
+        "a backend that ignored its budget entirely reported success: {corrupted:?}"
+    );
+    // **Died, not merely failed**, and the distinction is what stops this
+    // passing vacuously. Watched: with the code generator's fragment forced
+    // empty, the corruption has no body to run past its budget, the run comes
+    // back red with the machine's own `recursion limit` — and `!success()`
+    // alone still held. Nine other tests in this file went red on that
+    // corruption and this one did not, which is why the signal is asserted.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(
+            corrupted.signal().is_some(),
+            "the corrupted run ended with an ordinary exit status ({corrupted:?}). Under native \
+             frames ignoring the budget is supposed to take the process down; an orderly exit \
+             means the corruption bit nothing — check that the fragment is not empty"
+        );
+    }
+
+    // And the other arm, so that the contrast is asserted rather than recalled:
+    // the same corruption over heap-grown frames does NOT come back.
+    assert!(
+        arm(dir.path(), "wrong:exceeds-budget", Duration::from_secs(10)).is_none(),
+        "the tree-walker's unbounded runaway now terminates. That is a change in `Reference` and \
+         it makes ADR 0026 §4.7's account of why this configuration lived nowhere obsolete — \
+         update that section rather than this assertion"
+    );
+}
+
+// --- The result-cache rule, over the code generator --------------------------
+
+/// ADR 0026 §4.6 again, on the backend that arrived after it was written.
+///
+/// Both stages are backend-agnostic by construction — `cache_bypassed` reads
+/// `args.backend`, which is a string, and `backend_escapes` reads the entry
+/// count the *machine* recorded — so this is a check that the arming did not
+/// quietly depend on which backend was installed. It is run rather than
+/// reasoned because "it must still hold" is the sentence this project's
+/// §"The one rule" is about.
+#[test]
+fn a_code_generator_run_reads_no_cached_pass() {
+    let dir = project(CORPUS);
+    let warm = ply(dir.path()).arg("test").arg("--json").output().unwrap();
+    let warm: Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(warm["ok"], Value::Bool(true), "{warm}");
+
+    let again = ply(dir.path()).arg("test").arg("--json").output().unwrap();
+    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert!(
+        u64_at(&again, &["summary", "cached"]) > 0,
+        "the cache never warmed, so this test cannot tell a backend run that ignored it from one \
+         that had nothing to ignore: {again}"
+    );
+
+    // The default engine, deliberately: `--engine both` already bypasses the
+    // cache, so a backend installed on that path would be cache-safe for a
+    // reason that has nothing to do with backends.
+    let out = ply(dir.path())
+        .arg("test")
+        .arg("--backend")
+        .arg("cranelift")
+        .arg("-j")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["no_cache"], Value::Bool(true), "{report}");
+    assert_eq!(
+        u64_at(&report, &["summary", "cached"]),
+        0,
+        "a code generator run believed a pass the authoritative engine earned: {report}"
+    );
+    assert!(
+        u64_at(&report, &["backend", "entered"]) > 0,
+        "nothing entered native code, so no rule about entering it was exercised: {}",
+        report["backend"]
+    );
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .is_some_and(|d| d.is_empty()),
+        "{report}"
+    );
+}
+
+/// The write half, in a project of its own **because the read half warms the
+/// cache**.
+///
+/// Sharing a directory between the two would make this assertion vacuous in the
+/// worst way: the plain run at the end would find five cached passes left by the
+/// warming runs and the test would be reporting the warming rather than the
+/// backend. Watched: written as one test over one directory, it fails with
+/// `left: 5, right: 0` on a tree where the rule holds perfectly.
+#[test]
+fn a_code_generator_run_writes_no_pass() {
+    let dir = project(CORPUS);
+    let out = ply(dir.path())
+        .arg("test")
+        .arg("--backend")
+        .arg("cranelift")
+        .arg("-j")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+    assert!(
+        u64_at(&report, &["backend", "entered"]) > 0,
+        "nothing entered native code, so no rule about entering it was exercised: {}",
+        report["backend"]
+    );
+
+    // A later run with no backend has to run every test again, because the code
+    // generator run left nothing behind.
+    let plain = ply(dir.path()).arg("test").arg("--json").output().unwrap();
+    let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
+    assert_eq!(
+        u64_at(&plain, &["summary", "cached"]),
+        0,
+        "a run with no backend believed a pass a code generator run recorded: {plain}"
+    );
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), 5, "{plain}");
+}
+
+// --- The grammar -------------------------------------------------------------
+
+/// A corruption may name the backend it wraps, and a bare `wrong:` still means
+/// the tree-walker.
+///
+/// The default is a compatibility choice and it is the conservative one: every
+/// `--backend wrong:` invocation recorded in this repository was taken against
+/// `reference`, and silently re-pointing them at a code generator would change
+/// what a re-run of a logged experiment measures. Asserted on the `name` field
+/// of the artifact, which is read off the provider that was actually installed
+/// rather than off the flag.
+#[test]
+fn a_bare_wrong_prefix_still_names_the_tree_walker() {
+    let dir = project(CORPUS);
+    let bare = run(dir.path(), Some("wrong:off-by-one"));
+    assert_eq!(bare["backend"]["name"], "reference", "{bare}");
+    let named = run(dir.path(), Some("reference:wrong:off-by-one"));
+    assert_eq!(named["backend"]["name"], "reference", "{named}");
+    let generated = run(dir.path(), Some("cranelift:wrong:off-by-one"));
+    assert_eq!(generated["backend"]["name"], "cranelift", "{generated}");
+}
+
+/// A misspelled backend is refused rather than falling back to one that works.
+///
+/// Two spellings, and the second is the one worth pinning: `cranelift:reference`
+/// parses a backend prefix and then finds no corruption, which must be a refusal
+/// and not a silent installation of either half.
+#[test]
+fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
+    let dir = project(CORPUS);
+    for spec in ["cranelift:reference", "clif", "cranelift:wrong:off-by-two"] {
+        let out = ply(dir.path())
+            .arg("test")
+            .arg("--backend")
+            .arg(spec)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["ok"], Value::Bool(false), "`{spec}`: {report}");
+        assert_eq!(
+            report["diagnostics"][0]["code"], "E0450",
+            "`{spec}`: {report}"
+        );
+    }
 }

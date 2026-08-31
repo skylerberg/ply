@@ -1061,6 +1061,38 @@ built.
 
 *Catalogue item 13, first bullet. The largest of the three.*
 
+> **Overtaken by events, twice, and left standing as a dated survey — 2026-08-31.**
+> This section was a survey of a seam **nothing shipping implemented**, and every
+> option it costs is written from that position. Two changes since have moved
+> the ground under it, and this note is here so that a reader arriving from the
+> table of contents does not cost an ARM that has already been paid for.
+>
+> * **2026-08-28.** `ply_eval::backend::Reference` — a tree-walking backend —
+>   and `ply test --backend`. ADR 0026 §4.5 and §4.6.
+> * **2026-08-31.** `crates/ply-codegen` — a **cranelift JIT** in the shipping
+>   workspace, `ply test --backend cranelift`, 31 cranelift packages in
+>   `Cargo.lock`, no feature flag and no second toolchain. ADR 0026 §4.7 and
+>   §4.9.
+>
+> Three specific rows below are now false and are named rather than edited,
+> because this document's own header says it corrects no other file and the same
+> discipline applies to correcting itself out of a survey into a status page:
+>
+> * §3.1's *"the only two real implementors are in the spike, which does not
+>   build on this tree's toolchain (cranelift 0.134.3 needs rustc 1.94.0)"* —
+>   there are two shipping implementors, and the spike builds on 1.93.1 since
+>   it moved to cranelift 0.132.3.
+> * §3.3's *"the result-cache rule, armed | unwritten"* — it is written, in both
+>   of ADR 0026 §4.6's stages, and each has been watched to fail.
+> * §3.3's *"**Tests that would go red:** none, directly — which is itself the
+>   finding. There is no test asserting the CLI *cannot* attach a backend"* —
+>   there are 28, in `crates/ply-cli/tests/backend.rs`, asserting what happens
+>   when it does.
+>
+> §3.4's DELETE-A costing is the part that survives intact and is still the best
+> account of what `rm -r crates/ply-codegen-spike` costs; ADR 0026 §4.7 records
+> the deletion condition as met and names the two open findings that hold it.
+
 ### 3.1 What is actually there
 
 **The headline claim holds exactly, and it is the strongest evidence in this

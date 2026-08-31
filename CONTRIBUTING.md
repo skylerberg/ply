@@ -351,8 +351,8 @@ show after the fact is a log line saying the 26 ran.
 | the `TREE_CHECKS` step, inside `test` | the seven checks in `crates/ply-span/tests/armed.rs`, each by `--exact` name, asserting `test result: ok. 1 passed`. They already ran a moment earlier in the shard; this is what turns "the check still exists" into an exit code, because `cargo test --exact` over a name nothing defines reports `0 passed; 11 filtered out` and exits **0** |
 | `test ply-host (postgres)` | `ply-host`, with `PLY_PG_URL` and `PLY_TEST_DB` pointed at a `postgres:18.6` service container **and** `initdb`/`postgres`/`psql` on `PATH` — then it fails if any test printed a skip notice |
 | `wall-clock measurements` | the thirteen timing-sensitive tests, one at a time, single-threaded, alone on a runner |
-| `crates/ply-codegen-spike` | `cargo test --locked --release` on a pinned 1.94.0, in the spike's own workspace |
-| `examples/same-tests.sh` | W4's exit criterion: a release `ply` **the script now builds and freshness-checks itself** (the row used to read "a release `ply`", which was the job's build and not the script's), a cluster the script starts itself, and the twin compared against postgres byte for byte |
+| `crates/ply-codegen-spike` | `cargo test --locked --release` in the spike's own workspace. This cell read *"on a pinned 1.94.0"*; the pin moved to **1.93.1** with the crate's move to cranelift 0.132.3 on 2026-08-31 and this row was missed in that change |
+| `examples/same-tests.sh` | W4's exit criterion: a release `ply` **the script now builds and freshness-checks itself** (the row used to read "a release `ply`", which was the job's build and not the script's), a cluster the script starts itself, and the twin compared against postgres byte for byte. **It also runs the code generator over `examples/` on the engine pair** — `ply test examples --engine both --backend cranelift`, which is the only check in this repository that reads compiled answers against an independent evaluator at corpus scale, plus the assertion that it entered anything at all |
 | `CI` | one required check that fails unless every job above reported `success` |
 
 Three things follow, and the second is the one this project would regret not
@@ -474,8 +474,10 @@ above it pass vacuously. `ci-shards.sh packages nosuch` exits **1**.
 | --- | --- |
 | `cargo fmt --all --check` | **0**, silent |
 | `cargo clippy --locked --workspace --all-targets -- -D warnings` | **0**, 34.36s, zero lines beginning `warning` or `error` |
-| `cargo +1.94.0 test --locked --release` in `crates/ply-codegen-spike` | **0**, **45 tests** — `hazards.rs` 16, `mutations.rs` 11, `mcts_kernel.rs` 9, `spike.rs` 9 — 438.9s including the cold release build |
-| `cargo build --locked --release -p ply-cli` | **0** |
+| `cargo test --locked --release` in `crates/ply-codegen-spike` | **0**, **49 tests** — `hazards.rs` 18, `mutations.rs` 13, `mcts_kernel.rs` 9, `spike.rs` 9, plus 3 ignored in `entry_cost.rs` — re-taken 2026-08-31 on the default 1.93.1 after the move to cranelift 0.132.3. This row read *"`cargo +1.94.0 test --locked --release` ... **45 tests** — `hazards.rs` 16, `mutations.rs` 11, `mcts_kernel.rs` 9, `spike.rs` 9 — 438.9s including the cold release build"*; the toolchain prefix is gone and the counts had moved under it. **It does not reach the agreement corpus — see item 18.** |
+| `cargo build --locked --release -p ply-cli` | **0**. Since 2026-08-31 this builds cranelift too — `ply-cli` depends on `ply-codegen`, unconditionally and with no feature flag. Marginal cost measured before the decision was taken: **16.26 s wall / 63.01 s user**, min of 3 windows, release, cleaning exactly the 32 packages the change added; see §"Things known to be broken" item 1 |
+| `ply test examples --engine both --backend cranelift` | **0**, 186 passed, **696 of 62,660 offers entered**, fragment 27, 6 units compiled. Watched to fail two ways: `--backend cranelift:wrong:off-by-one` exits 1 with 629 changed answers and 11 tests reporting them, and forcing the fragment empty exits 1 on *"the code generator entered nothing, so the run above is green over a seam no call reached"* |
+| `cargo test -p ply-codegen` | **0**, **11 tests** — `fragment.rs` 9 over the standard library, `kernel.rs` 2 over `benches/kernel` |
 | `./examples/same-tests.sh` | **0**, **29 requests byte-for-byte identical** between the twin and postgres, ~~5.63s~~ **UNMEASURED since 2026-08-27**, against a cluster the script started itself. The count is unchanged and re-taken; the wall clock is withdrawn rather than updated, because the script builds `ply-cli` in release itself now and 5.63s named a run that did not. It was not re-taken: the 1-minute load average on the machine that made the change read 30.5, the gate this project measures behind is 4.0, and §"Say how it was checked, or say it was not" prefers a hole with provenance to a number without |
 | the postgres job's live-test step | **0**, `10 passed` in **0.29s**, zero skip notices |
 | the postgres job's cluster step | **0**, `2 passed` in **2.87s**, zero skip notices |
@@ -596,7 +598,7 @@ two that matter and carries the measurement for the fifth. The short version:
 >
 > | if your change touches | you must also run |
 > | --- | --- |
-> | anything in `crates/ply-codegen-spike` | `cd crates/ply-codegen-spike && cargo +1.94.0 fmt --check && cargo +1.94.0 clippy --all-targets && cargo +1.94.0 test --release` — the toolchain is not optional, `cranelift 0.134.3` and `wasmtime 47.0.3` require rustc 1.94.0 and the default here is 1.93.1. And **never** pipe it: `cargo build 2>&1 \| tail` reports `tail`'s exit status, so a failed build reads as a successful one. |
+> | anything in `crates/ply-codegen-spike` | `cd crates/ply-codegen-spike && cargo fmt --check && cargo clippy --all-targets && cargo test --release` — **on the default 1.93.1; no `+1.94.0` and no second toolchain (2026-08-31).** This cell used to read *"`cargo +1.94.0 fmt --check && cargo +1.94.0 clippy --all-targets && cargo +1.94.0 test --release` — the toolchain is not optional, `cranelift 0.134.3` and `wasmtime 47.0.3` require rustc 1.94.0 and the default here is 1.93.1"*. The crate moved to `cranelift 0.132.3`, which declares `rust-version = "1.93.0"`, and pulls `wasmtime-internal-* 45.0.3` rather than 47.0.3; both build on the pinned 1.93.1. And **never** pipe it: `cargo build 2>&1 \| tail` reports `tail`'s exit status, so a failed build reads as a successful one. |
 
 The original four:
 
@@ -607,6 +609,7 @@ The original four:
 | shutdown, drain, signals | anything; but know that `crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]` and compiles to nothing off Unix. CI runs on `ubuntu-24.04`, so it is compiled there, and a step fails if that binary reports zero tests |
 | the served request path or its cost | `./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`, and see §"Things known to be broken". **Name the two files, never `benches/*.json`.** `benches/` holds three since R3, `w6` merges what it is given field by field on a last-wins basis, and the glob expands alphabetically — so `ply-corpus w6 benches/*.json` renders the **pre-region** ladder, dated `2026-08-16`, with `1035 times and 0.124 MB` in its boxing lever, exactly as if R3 had not happened. Checked by running it. `benches/README.md` §"There are two ladders" says which file is which |
 | the Ply parser spike's differential can still go **red** | `./spikes/ply-parser/run.sh --arm` — 22 mutations, 299s on a 10-core machine. CI runs `run.sh` and not `--arm`, so what CI checks is that the comparison is green and **not** that it could ever have failed. The mutation table is also the thing that goes stale: a corruption whose anchor text has moved is scored `NOT APPLIED`, which is a real finding and one only this command reports. `.github/workflows/ci.yml`'s `parser-spike` comment carries the measurement and the trade |
+| `crates/ply-codegen`, `crates/ply-eval/src/{backend,compiled,code}.rs` | `cargo test -p ply-codegen -p ply-cli --test backend` **and** `./target/release/ply test examples --engine both --backend cranelift`, in that order. The unit tests use corpora of five and forty-four definitions; the second command is 186 tests against the shipped standard library and is the only place a wrong `Int` out of compiled code is read against an independent evaluator at scale. Freshness-check the binary first — `.github/binary-is-current.sh target/release/ply` — which does cover this crate: touching `crates/ply-codegen/src/jit.rs` takes it from `current (163 inputs checked)` to `NEWER … STALE`, run rather than assumed. **A stale binary here is not a hypothetical:** the fragment-size numbers in this file were once taken against a `ply` built from a deliberately corrupted `scalar_signature` and read as `fragment 0` on `benches/kernel`; they are `fragment 25, 2,974 of 3,097 offers entered` on a current one |
 | `examples/desk.ply` or any host handler | `./examples/same-tests.sh`. ~~build `--release` first, it does not build for you.~~ **It builds for you since 2026-08-27**, and refuses to run against a binary older than a source in its own dep-info, so the hand-build this row used to demand is now `--no-build` for the case where you meant a particular binary. That build is `--locked`, so a `Cargo.lock` that has fallen behind the manifests stops the script with cargo's own `cannot update the lock file ... because --locked was passed` instead of being rewritten under a run: `cargo build` once, then re-run. CI runs it in a job of its own, so this one is caught before a merge rather than only when you remember |
 
 Also: `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
@@ -1446,7 +1449,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-hash/src/normalize.rs` | **every cached result everywhere.** The bytes are the identity. A change here is a cache-format change; see `CACHE_VERSION_CHANGED` (`W0603`). |
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
-| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today: `cd crates/ply-codegen-spike && cargo +1.94.0 test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
+| `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today, on the default toolchain since the move to cranelift 0.132.3 (this used to read `cargo +1.94.0 test --release`): `cd crates/ply-codegen-spike && cargo test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
 | how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
@@ -1521,6 +1524,29 @@ Recorded here so nobody spends an afternoon rediscovering them.
    > packages into the shipping `Cargo.lock` and takes `grep -c cranelift
    > Cargo.lock` from 0 to 44, feature **off**, crate excluded from
    > `workspace.members`.
+   >
+   > > **Both of those numbers were taken on 2026-08-31 and both are exactly
+   > > right, which is worth saying because a prediction that survives contact
+   > > is rarer here than one that does not.** `crates/ply-codegen` is now a
+   > > workspace member and `crates/ply-cli` depends on it: the lock went from
+   > > **250 packages to 282** — 31 new dependencies plus `ply-codegen` itself,
+   > > 0 removed, diffed against the unmodified lock in the main checkout — and
+   > > `grep -c cranelift Cargo.lock` is **44**.
+   > >
+   > > What did *not* happen is the "optional, default-off" half. There is no
+   > > feature flag. The choice was pre-registered with a threshold before the
+   > > cost was known — under 60 s of marginal build time means no flag, 60 s or
+   > > over means a default-**on** flag with a documented off path — and the
+   > > marginal cost came back at **16.26 s wall / 63.01 s user** (min of 3,
+   > > release, after `cargo clean -p` of exactly the 32 added packages; null
+   > > control, cleaning `ply-codegen` alone, 0.70 s) and **18.55 s / 95.54 s**
+   > > on the dev profile `cargo test` uses. Load was 6.4–9.9 throughout, above
+   > > this file's own gate, so those are **observations**; the decision is
+   > > robust to that because load inflates wall clock and the threshold is 3.7×
+   > > above the reading. The reason the flag was never on the table in the
+   > > *off* position is this file's §"The one rule": the spike rotted twice
+   > > sitting off the default path, and a feature CI ran once a milestone would
+   > > be the same mistake with a shorter name.
 
    Why it rotted is unchanged and the consequence is not: the crate declares its
    own `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
@@ -1613,6 +1639,24 @@ Recorded here so nobody spends an afternoon rediscovering them.
    `benches/adr0018-mcts.json` and `docs/adr/0019-value-representation.md` §5.
    ADR 0016 records the toolchain wall at lines 764–767 and 1105–1106 and is
    otherwise unamended.
+
+   > **The toolchain wall is gone (2026-08-31), and this whole entry can be read
+   > in the past tense on that point.** Every `+1.94.0` above was true of
+   > `cranelift 0.134.3`. The crate now depends on **cranelift 0.132.3**, whose
+   > manifest declares `rust-version = "1.93.0"` — below this workspace's pinned
+   > 1.93.1 — so `cargo fmt --check`, `cargo clippy --all-targets` and
+   > `cargo test --locked --release` all run here on the default toolchain, and
+   > `.github/workflows/ci.yml`'s `spike` job installs 1.93.1 with every other
+   > job. 0.133+ declares 1.94.0 and is not the route. Re-taken on 1.93.1 the
+   > same day: **49 passed, 0 failed, 3 ignored**, identical per-binary to the
+   > 0.134.3 run, and `cargo clippy --release --all-targets` exits 0 with zero
+   > errors. The eleven `src/jit.rs` API sites the move needed are listed in the
+   > `spike` job's comment.
+   >
+   > **This entry should not be read as saying the crate is now sound.** It says
+   > the crate compiles and its tests pass, and that was always a narrower claim
+   > than it looks: no test here runs the agreement corpus, which is red at 42
+   > disagreements on both cranelift versions. **Item 18.**
 2. ~~**`examples/same-tests.sh` does not build the binary it runs.** It uses
    `target/release/ply` (line 44) with no `cargo build` anywhere.~~ **Fixed
    2026-08-27.** The script runs
@@ -2388,6 +2432,34 @@ Recorded here so nobody spends an afternoon rediscovering them.
       > 0.03s for the run that reports. The spike's `run_guarded` is the reporter
       > that can see it, from outside, and it is still the only one.
       >
+      > > **The last two sentences are withdrawn, 2026-08-31, and what withdrew
+      > > them is a second backend rather than a better harness.** They read:
+      > > *"every candidate reporter is inside the process it took down … The
+      > > spike's `run_guarded` is the reporter that can see it, from outside,
+      > > and it is still the only one."* The first clause was never quite
+      > > right and the second stopped being true: **every** test in
+      > > `crates/ply-cli/tests/backend.rs` already runs `ply` as a child, so
+      > > the reporter has always been outside the process. What was missing was
+      > > a backend whose runaway *dies* rather than hanging.
+      > >
+      > > `--backend cranelift:wrong:exceeds-budget` over
+      > > `fn spin(n: Int) -> Int = 1 + spin(n + 1)` aborts with
+      > > `fatal runtime error: stack overflow`, **exit 134, in 0.02 s** — two
+      > > runs, release binary — against `reference`'s no-output-and-no-exit in
+      > > 45 s over the same corpus. Native frames sit on a fixed stack;
+      > > `stacker`-grown frames do not.
+      > > `the_unbounded_runaway_dies_under_a_code_generator_and_hangs_under_a_tree_walker`
+      > > asserts both arms, so the contrast is checked rather than recalled,
+      > > and it asserts the child died **by signal** rather than merely failing
+      > > — watched to fail with the fragment forced empty, where `!success()`
+      > > alone still held while nine other tests went red.
+      > >
+      > > So **eight of the eight configurations are now accounted for under
+      > > `cranelift`**, against seven under `reference`, inside
+      > > `cargo test --workspace`. That is ADR 0026 §4.7's deletion condition
+      > > met; the spike is **not** deleted in the same change and §4.7 says
+      > > why.
+      >
       > Self-tested the way `mutations.rs` self-tests: replacing every
       > `Mutation` with `Mutation::None` in `backend::parse` fails **7 of the
       > 14** and leaves exactly the controls, the gate test and the two
@@ -2637,6 +2709,73 @@ Recorded here so nobody spends an afternoon rediscovering them.
     mutations cost 299s locally and each re-runs the whole comparison; they stay
     a by-hand obligation and belong in §"The suite proves less than it looks
     like it proves"'s table, which now lists them.
+
+18. **`crates/ply-codegen-spike`'s agreement corpus is red, and
+    `cargo test --release` does not say so.** Found 2026-08-31 while porting the
+    crate to cranelift 0.132.3, by running the command
+    `benches/README.md` §"What `mcts` adds" documents:
+
+    ```
+    $ cd crates/ply-codegen-spike
+    $ ./target/release/mcts --dir ../../benches/kernel --only agreement
+    ...
+       DISAGREEMENT  mcts.heap case 87: the boundary carried an argument kind it
+       refuses (85 entries and 0 failed bodies became 85 and 1)
+       ... and 30 more
+    Error: 42 disagreement(s): a faster wrong answer prices nothing
+    ```
+
+    **42 disagreements, exit 1.** All 42 are the refused-kind check in
+    `src/bin/mcts.rs::verify`, none are `compare_answers` divergences, and the
+    run is deterministic — three runs byte-identical, `md5
+    c0893d75e378b64339b8ec0746e95220`.
+
+    **This is not the port.** It reproduces exactly on cranelift 0.134.3 built
+    with `+1.94.0` from source with no edit in it, and the ported build's output
+    is byte-identical to it — same md5, same 42, same per-function entry counts.
+    The port is the reason it was *found*, not the reason it is red.
+
+    **What made it invisible.** Three things at once, and each is worth knowing
+    on its own. The crate's CI job runs `cargo test --locked --release`, which
+    is green — **49 passed, 0 failed, 3 ignored** — because no test in the crate
+    runs the agreement corpus; it is a `main`, not a `#[test]`. The published
+    figures come from a binary rather than from a run: the `mcts` in the working
+    checkout's `target/release/` was built **2026-08-24 15:11**, 33 source files
+    under `crates/ply-{codegen-spike,eval,core}/src` are newer than it, and it
+    still answers `0 disagreements` and `56,876 entries` — the pre-widening
+    number — because it is a binary for source that no longer exists. And
+    `.github/binary-is-current.sh`, which exists for exactly this, cannot judge
+    it: it reports `UNKNOWN ... no target/release/mcts.d`, because cargo writes
+    dep-info into `target/release/deps/` under a hashed name and the `.d` it
+    does write for this binary lists only `src/bin/mcts.rs` — not the library
+    the binary is mostly made of. `find <sources> -newer <binary>` is what
+    answered the question here, which is the shape that script's own header
+    calls blind. **Both instruments were wrong in the same direction: toward
+    green.**
+
+    **What it blocks.** `mcts` runs agreement before it times anything and
+    `bail!`s on the first disagreement — deliberately, "Correctness first" — so
+    `--only entries` and the full ladder
+    (`--iterations 100 --inner 3 --repeats 21`) both refuse. **ADR 0018 §0.5's
+    6.199× cannot be re-taken on any cranelift version until this is fixed**,
+    and it was not re-taken on 0.132.3 for that reason.
+
+    **What is NOT in doubt.** The corpus's sensitivity is intact and was
+    re-checked rather than assumed: `--mutate off-by-one` takes it to **1,692**
+    disagreements over 26 subjects and `--mutate inverted` to **215** over 25,
+    against 42 unmutated. So the 42 is a fingerprint with teeth, and the
+    byte-identical agreement output either side of the cranelift move is
+    evidence about the port rather than a constant.
+
+    Not fixed here. Fixing it means deciding whether `verify`'s refused-kind
+    check is right and the backend wrong, or the reverse: the check compares
+    `harness.bodies.declines().failed`, which is a **global** counter, against a
+    per-function entry count, and every one of the 42 has the entry count
+    unchanged and only the global `failed` moving. Its own comment says the
+    totals cannot serve — *"a call that raises on a refused kind may
+    legitimately have entered other functions first"* — which is the argument
+    for `entries_for(harness, &name)` beside it, and the `failed` half did not
+    get the same treatment.
 
 Items 9, 10 and 11 are closed; see the block at the end of item 10 and the one
 at the end of item 11 for the fixes, the measurements behind them and the tests

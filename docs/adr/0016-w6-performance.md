@@ -589,6 +589,90 @@ another is that input's, so the weakest one is the claim.
   > to enter compiled code", and no ADR recorded the amendment until this block.
   > It costs 0.0 allocations per `/health` request (`benches/r5-timing/`
   > §1) and 237.87 predictable branch tests, and it buys nothing that ships.
+
+  > **Corrected in place (cranelift port, 2026-08-31): the version in this
+  > bullet is now wrong.** The withdrawn phrase is *"with `cranelift-jit` and
+  > `cranelift-codegen` as **optional** dependencies at `0.134.3`"*.
+  > `crates/ply-codegen-spike` now depends on **cranelift 0.132.3**, and on five
+  > cranelift crates rather than two — `-jit`, `-codegen`, `-frontend`,
+  > `-module`, `-native` — none of them optional, because the arrangement this
+  > bullet describes (a cargo feature in `ply-corpus`, in one file) was never
+  > built; R5's correction above already records that the spike is a separate
+  > crate instead.
+  >
+  > **The move is downward and that is the point.** 0.132.3 declares
+  > `rust-version = "1.93.0"`, below the 1.93.1 this workspace and its CI jobs
+  > pin, so the spike builds on the shipping toolchain and
+  > `.github/workflows/ci.yml`'s `spike` job no longer installs a second one.
+  > Versions 0.133+ declare 1.94.0 and are deliberately not the route. Eleven
+  > API sites in `src/jit.rs` moved with it, each checked against both cranelift
+  > source trees rather than accepted from a compiler suggestion; the agreement
+  > run's entire output is byte-identical either side of the move.
+  >
+  > **Every prohibition in this section still stands, unamended, and this change
+  > does not reach any of them.** "It may **not** be wired into `ply run`,
+  > `ply test` or any other command" is intact: no shipping command reaches the
+  > spike, `crates/ply-cli` gained nothing, `cargo check --workspace` and
+  > `cargo test --workspace` still do not build this crate, and
+  > `grep -c cranelift Cargo.lock` is still **0**. A maintainer authorisation to
+  > take cranelift into the shipping workspace exists and was **not exercised
+  > here**; recording it as exercised would be recording a decision this change
+  > did not make. The clause that authorisation would amend is this bullet's
+  > first sentence, and amending it is the business of the change that actually
+  > wires a backend to a command.
+
+  > **Amended, 2026-08-31, by the change that wires a backend to a command.**
+  > The paragraph above named the condition under which this bullet's first
+  > sentence would be amended and this is that change, so the amendment is made
+  > here rather than deferred again.
+  >
+  > **What is withdrawn**, and it is the sentence a reader of this section will
+  > have been relying on:
+  >
+  > > It may **not** be wired into `ply run`, `ply test` or any other command.
+  > > It lives behind a `codegen-spike` cargo feature in `ply-corpus`, in one
+  > > file, with `cranelift-jit` and `cranelift-codegen` as **optional**
+  > > dependencies at `0.134.3` — so that deferring M9 deletes one feature block
+  > > and one dependency line, and nothing else in the workspace knows it
+  > > existed.
+  >
+  > **What replaces it, and what does not.** A cranelift code generator is
+  > wired into `ply test`, as `--backend cranelift`, in a **new** crate:
+  > `crates/ply-codegen`, a workspace member that `crates/ply-cli` depends on
+  > unconditionally. It ports `crate::jit` and `crate::rt` from the spike and
+  > implements `ply_eval::Compiled` and `ply_eval::Policed` over the seam.
+  > `Cargo.lock` gains 31 cranelift-attributable packages and
+  > `grep -c cranelift Cargo.lock` goes from 0 to 44 — both figures predicted
+  > exactly by `CONTRIBUTING.md` §"Things known to be broken" item 1 before they
+  > were taken.
+  >
+  > **`crates/ply-codegen-spike` is not what was wired, and every prohibition in
+  > this section still binds it.** The spike is still not a workspace member,
+  > still has its own `[workspace]`, is still depended on by nothing, and is
+  > still not reachable from any command. The new crate does not depend on it
+  > and does not import from it; what it took is source, copied and adapted,
+  > with the provenance recorded in each file's header. So the sentence "it may
+  > not be wired into any command" is withdrawn **as a prohibition on a compiled
+  > backend in general** and stands unchanged **as a prohibition on this crate**.
+  >
+  > **What authorised it.** Two things, and neither alone. A maintainer decision
+  > to take the cranelift dependency into the shipping workspace — recorded in
+  > ADR 0026 §4.7, which is where the ADR-level permission lives. And the
+  > measurement that made it cost what it costs rather than what this bullet
+  > assumed: 0.132.3 builds on the pinned 1.93.1, so the toolchain premise
+  > behind "optional" and "deletes one dependency line" is gone.
+  >
+  > **What the withdrawn sentence was protecting, and whether it survives.** The
+  > stated reason was cheap deletion — "deferring M9 deletes one feature block
+  > and one dependency line". R5 already falsified that for the seam
+  > (`compiled.rs` survives any deletion), and this change ends it for the
+  > dependency: deferring M9 is now a real revert rather than a line. **That
+  > cost is accepted rather than argued away.** What replaces cheap deletion as
+  > the protection is the thing this section could not have asked for in W6,
+  > because nothing implemented `Compiled` then: ADR 0026 §4.5's condition that
+  > a backend be **policeable** before it is fast, discharged for this backend
+  > in `crates/ply-cli/tests/backend.rs` — eight of eight configurations
+  > accounted for, each seen to fire and each seen to be caught.
 - It may **not** report a ratio whose two sides did different work — for
   instance an interpreter column that includes `Machine::call` entry where the
   spike column does not. Rung 1 is measured precisely so that cost is known and

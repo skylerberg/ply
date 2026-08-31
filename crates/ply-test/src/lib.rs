@@ -632,10 +632,10 @@ pub struct InterpExecutor<'a> {
     /// wearing. `None` — the default, and every run that did not ask — is what
     /// keeps the seam inert.
     ///
-    /// The [`ply_eval::Fragment`] is the run's, leaked once, and shared by every
-    /// worker; the `Rc<dyn Compiled>` built from it is a worker's, because a
-    /// backend evaluates on the thread its machine runs on.
-    backend: Option<(&'static ply_eval::Fragment, ply_eval::BackendSpec)>,
+    /// The [`ply_eval::Provider`] is the run's, leaked once, and shared by
+    /// every worker; the `Rc<dyn Compiled>` built from it is a worker's,
+    /// because a backend evaluates on the thread its machine runs on.
+    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     search: Search,
     /// This program's region kinds, shared by every engine this run builds.
     /// The analysis is a whole-program one and a run builds an engine per
@@ -893,21 +893,33 @@ impl<'a> InterpExecutor<'a> {
     /// a `Pass` was written by a test that entered native code anyway. See
     /// ADR 0026 §4.6.
     ///
-    /// **The parameter is a `Fragment` and not a `dyn Compiled`, and that is the
-    /// limit of what a shipping command can install.** Every backend this can
-    /// build comes from `Fragment::attach`, which is `ply_eval::backend::Reference`
-    /// or one of the eight corruptions wrapping it. A second implementation of
-    /// `Compiled` — a code generator — does not fit through here, and the eight
-    /// would not be wrapping it if it did, because two of them need a registry
-    /// query and a run on fuel that is not the machine's budget, neither of
-    /// which is on the trait. See `ply_eval::backend::Mutant`'s header and
-    /// ADR 0026 §4.5, annotated 2026-08-30.
+    /// **The parameter is a `dyn Provider`, and it was a concrete `Fragment`
+    /// until 2026-08-31.** This paragraph read:
+    ///
+    /// > **The parameter is a `Fragment` and not a `dyn Compiled`, and that is
+    /// > the limit of what a shipping command can install.** Every backend this
+    /// > can build comes from `Fragment::attach`, which is
+    /// > `ply_eval::backend::Reference` or one of the eight corruptions wrapping
+    /// > it. A second implementation of `Compiled` — a code generator — does not
+    /// > fit through here, and the eight would not be wrapping it if it did,
+    /// > because two of them need a registry query and a run on fuel that is not
+    /// > the machine's budget, neither of which is on the trait. See
+    /// > `ply_eval::backend::Mutant`'s header and ADR 0026 §4.5, annotated
+    /// > 2026-08-30.
+    ///
+    /// Every clause of that was true and the last sentence named the fix.
+    /// `ply_eval::Provider` is the run-scoped source of per-worker backends and
+    /// `ply_eval::Policed` carries the two operations the corruptions need, so
+    /// `ply_codegen::Cranelift` fits through here and the eight wrap it. What
+    /// does **not** change is the obligation: catching the eight is a condition
+    /// on each backend separately, because what a corruption can bite depends
+    /// on which definitions the backend has a body for.
     pub fn with_backend(
         mut self,
-        fragment: &'static ply_eval::Fragment,
+        provider: &'static dyn ply_eval::Provider,
         spec: ply_eval::BackendSpec,
     ) -> Self {
-        self.backend = Some((fragment, spec));
+        self.backend = Some((provider, spec));
         self
     }
 
@@ -960,8 +972,8 @@ impl<'a> InterpExecutor<'a> {
     /// A backend for one worker, or `None` when this run installs none. Built on
     /// the worker's own thread, because a backend is `Rc` all the way down.
     fn backend(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
-        let (fragment, spec) = self.backend.as_ref()?;
-        Some(fragment.attach(spec))
+        let (provider, spec) = self.backend.as_ref()?;
+        Some(provider.attach(spec))
     }
 
     /// The same machine, lowering into `lowering` rather than into a cache of
