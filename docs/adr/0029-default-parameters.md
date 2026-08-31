@@ -106,12 +106,33 @@ read across a boundary would leave a stale expansion behind in a file that never
 moved. It priced the restriction at about one site in ten and accepted it.
 
 **That argument does not carry here, and the difference is not a judgment
-call.** Gate 1's second condition (`driver.rs`) walks `fingerprint.deps` — every
-free name the file references, with the hash it had — and refuses any file whose
-referent moved. A default is part of the callee's `DefHash`; a spliced default
-is a reference the caller now makes. Both halves are in `hashes.deps`, so
-editing a default re-parses and re-expands every caller. Record update had no
-such edge to ride: a record's field list is not a reference.
+call.** A default is part of the callee's `DefHash`, and a spliced default is a
+reference the caller now makes — so *two* of gate 1's conditions cover it, where
+record update had neither. A record's field list is not a reference.
+
+- `fingerprint.deps` holds every free name the file references with the hash it
+  had, and a spliced default puts the callee there.
+- `fingerprint.imports` holds a digest per imported module, and `exports_digest`
+  covers each exported **name and its hash** — so a moved default moves the
+  digest of the module that declares it.
+
+**Which one fires was observed rather than reasoned about, and it is the second.
+This section first claimed `deps`.** Editing only the default in a two-module
+project, with the importer's bytes untouched:
+
+```
+$ ply check . --explain
+   front end
+     checked   src/main.ply import `src.palette` changed
+     checked   src/palette.ply content changed
+     rechecked src.main.wall
+```
+
+`src/main.ply` is refused by the import edge, re-parsed, and re-expanded; its
+test then fails against the *new* default rather than passing against a stale
+one. The `deps` condition would have caught it too, and is the one that survives
+if the digest ever stops covering hashes — but the run says `import`, so this
+says `import`.
 
 Accepting the restriction here would also have cost far more than one site in
 ten. The motivating case is `assert`, which every module calls.
