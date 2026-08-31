@@ -86,6 +86,9 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<HashMap<Key, Count>> = RefCell::new(HashMap::new());
+    /// Code address -> the `ply_*` names at it. Written inside the allocator
+    /// under `INSIDE`, so what it allocates is not counted as the program's.
+    static NAMES: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
     static TOTAL: Cell<usize> = const { Cell::new(0) };
     static BYTES: Cell<usize> = const { Cell::new(0) };
 }
@@ -134,27 +137,53 @@ static ALLOCATOR: Tracing = Tracing;
 /// `RawVec::grow` names the allocator rather than the code that wanted the
 /// room, and in a release build the frame that would have named the type has
 /// been inlined away.
+///
+/// **The resolve is memoised per code address, and that is the whole of why
+/// this file is no longer the slowest target in the workspace.** It read
+/// `Backtrace::force_capture()` and then `format!("{bt}")`, which symbolicates
+/// every frame on the stack — and it did that on *every allocation*, for a
+/// stack whose depth is the interpreter's recursion depth. The set of
+/// addresses that allocate is small and fixed, so the same names were being
+/// resolved hundreds of thousands of times. Walking the stack is cheap;
+/// naming a frame is not, so the walk stays per-allocation and the naming
+/// moves behind [`NAMES`].
 fn frames() -> String {
-    let bt = std::backtrace::Backtrace::force_capture();
-    let text = format!("{bt}");
     let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let Some(at) = line.find(": ") else { continue };
-        let name = line[at + 2..].trim();
-        if !name.starts_with("ply_") || name.contains("r4_value_construction") {
-            continue;
-        }
-        let cut = name.rfind("::h").map(|i| &name[..i]).unwrap_or(name);
-        out.push(cut.to_string());
-        if out.len() == 3 {
-            break;
-        }
-    }
+    backtrace::trace(|frame| {
+        out.extend(named(frame));
+        out.len() < 3
+    });
+    out.truncate(3);
     if out.is_empty() {
         "<no ply frame>".to_string()
     } else {
         out.join(" < ")
     }
+}
+
+/// The `ply_*` names at one frame, or empty for a frame this file drops.
+///
+/// A `Vec` rather than an `Option` because one address can carry several
+/// inlined frames, which is what the `Display` this replaced printed as
+/// several lines — dropping all but the first would change the attribution
+/// rather than only its cost.
+fn named(frame: &backtrace::Frame) -> Vec<String> {
+    let ip = frame.ip() as usize;
+    if let Some(hit) = NAMES.with(|c| c.borrow().get(&ip).cloned()) {
+        return hit;
+    }
+    let mut found: Vec<String> = Vec::new();
+    backtrace::resolve_frame(frame, |symbol| {
+        let Some(name) = symbol.name() else { return };
+        let name = name.to_string();
+        if !name.starts_with("ply_") || name.contains("r4_value_construction") {
+            return;
+        }
+        let cut = name.rfind("::h").map(|i| &name[..i]).unwrap_or(&name);
+        found.push(cut.to_string());
+    });
+    NAMES.with(|c| c.borrow_mut().insert(ip, found.clone()));
+    found
 }
 
 fn repo() -> PathBuf {

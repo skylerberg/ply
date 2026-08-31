@@ -604,8 +604,9 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,696 tests across 155 targets** (142 test
-binaries plus 13 doc-test suites); all pass on an unloaded machine. Five are
+`cargo test --workspace` runs **3,878 tests across 171 targets** (157 test
+binaries plus 14 doc-test suites) in **3m 02s**; all pass on an unloaded
+machine. Five are
 marked `ignored`: four are timing benchmarks you run on purpose (three in
 `ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
 doc-test, not a benchmark. Those counts were **3,206 across 123** here and had
@@ -678,6 +679,17 @@ not been re-taken as the tree grew.
 > > > > a warm `target/` and that is a different measurement from any of the
 > > > > single-run numbers in this chain.
 >
+> **Re-taken 2026-08-31.** The sentence above read **3,696 tests across 155
+> targets** (142 binaries plus 13 doc-test suites) and carried no wall clock.
+> Measured as `/usr/bin/time -p cargo test --locked --workspace
+> --no-fail-fast` from an already-built `target/` at a load under 4:
+> **3,878 passed, 0 failed, 5 ignored** across **157** binaries plus 14
+> doc-test suites, in **182.29s real / 226.88s user**. Fifteen binaries and 182
+> tests are growth nothing re-took, cranelift shipping among it. The wall clock
+> is new to this sentence and is one run, not a best-of-N; `docs/ONBOARDING.md`
+> §2 carries the spread and the pair of readings — **250.5s without this change
+> and 182.3s with it, both on this tree** — that the paragraph below is about.
+>
 > The fifth `ignored` is
 > `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,
 > a timing benchmark that prints its own recipe exactly as the three in
@@ -692,6 +704,12 @@ not been re-taken as the tree grew.
 > captures a backtrace per allocation over 20-, 200- and 400-request windows,
 > and it takes **70.9s in debug against 25.6s in release** — the profile
 > `cargo test --workspace` runs is the slow one. Budget accordingly.
+>
+> > **No longer, as of 2026-08-31.** The capture was never the expensive half;
+> > the *resolve* was, and it ran per allocation rather than per code address.
+> > That target is **6.7s** in a debug workspace run now, down from 46.2s, and
+> > every figure it prints is unchanged. The release comparison has not been
+> > re-taken.
 
 > **Re-taken after R3 (2026-08-17), which added three test binaries.** This
 > sentence read **3,566 across 147** (134 binaries). R3 landed
