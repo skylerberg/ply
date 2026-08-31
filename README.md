@@ -604,136 +604,38 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` runs **3,878 tests across 171 targets** (157 test
-binaries plus 14 doc-test suites) in **3m 02s**; all pass on an unloaded
-machine. Five are
-marked `ignored`: four are timing benchmarks you run on purpose (three in
-`ply-corpus --test http_cost`, one in `ply-eval`'s lib tests) and the fifth is a
-doc-test, not a benchmark. Those counts were **3,206 across 123** here and had
-not been re-taken as the tree grew.
+`cargo test --workspace` takes about **three minutes** on an unloaded machine,
+and all of it passes.
 
-> **Re-taken (R4 integration pass, 2026-08-21), which added four test binaries
-> and the first `ignored` test outside `http_cost`.** This read **3,597 passed,
-> 0 failed, 4 ignored** across **151** targets (138 binaries). R4 landed
-> `ply-eval/tests/literal_value_sharing.rs` (8 tests),
-> `ply-eval/tests/literal_sharing.rs` (6),
-> `ply-eval/tests/ctor_value_sharing.rs` (6) and
-> `ply-corpus/tests/r4_value_construction.rs` (9), plus tests inside existing
-> binaries; the integration pass added one rule to the last of those. Re-taken
-> as `cargo test --workspace --no-fail-fast`, summing the `test result:` lines:
-> **3,644 passed, 0 failed, 5 ignored**, with `grep -c '^     Running'` →
-> **142** and `grep -c '^   Doc-tests'` → 13, so **155 targets**.
->
-> > **Re-taken again (second regression audit, 2026-08-21); the sentence above
-> > carries this reading and this block carries the one it replaced, 3,644
-> > across 155.** The audit that
-> > armed `ply-eval/tests/value_semantics_audit.rs` added a binary and did not
-> > move this paragraph, and the fixes it drove added three more tests. Same
-> > command, same pipelines: **3,661 passed, 0 failed, 5 ignored** across
-> > **156 targets** (**143** binaries + 13 doc-test suites). The wall clock is
-> > **1,087.3s (18m 7s) real, 1,174.4s user**, `/usr/bin/time -p`, one run on a
-> > machine whose load average ran 4 to 12 — nearly double the 569.3s below, on
-> > the same tree plus four tests, which is what a loaded machine does to this
-> > figure and is the reason the counts are the part to trust.
-> >
-> > > **Re-taken again (frame-ceiling change, `CONTRIBUTING.md` items 9 and 10,
-> > > 2026-08-24). The sentence above already carried these counts when this
-> > > change came to re-take them, with no block saying where they came from;
-> > > this block is that provenance.** Same command, same pipelines:
-> > > **3,690 passed, 0 failed, 5 ignored** across **155 targets** (**142**
-> > > binaries + 13 doc-test suites). This change accounts for three of the +29
-> > > over 3,661; the rest is other work that landed in the same tree and did
-> > > not re-take this paragraph.
-> > >
-> > > The binaries read **142**, as they did two readings ago, not the **143**
-> > > directly above. This run did not cause that and did not chase it down, so
-> > > read 142 as the measurement and the 143 as unexplained — not as a
-> > > deletion.
-> > >
-> > > The wall clock is **1,735.2s (28m 55s) real, 1,548.7s user**,
-> > > `/usr/bin/time -p`, one run on a machine whose load average ran **24 to
-> > > 43** with several unrelated builds running throughout. User time *below*
-> > > real time is the giveaway: this run spent minutes waiting for cores
-> > > rather than using them, so the figure describes the machine and not the
-> > > tree. The counts are the part to trust.
-> > >
-> > > > **Re-taken again (item 11's fix, 2026-08-24). The sentence above this
-> > > > chain now carries 3,696 / 155 / 142; this block is where that came
-> > > > from.** It read **3,690 passed, 0 failed, 5 ignored** across the same
-> > > > 155 targets. The **+6 is this change and nothing else**, attributed per
-> > > > package rather than by subtraction: `cargo test -p ply-eval --lib` goes
-> > > > 527 → 531, `-p ply-eval --test differential_corpus` 5 → 6, and
-> > > > `-p ply-core --lib` 204 → 205. Targets and binaries do not move — every
-> > > > new test joins a target that already existed.
-> > > >
-> > > > Taken **twice by two methods on one frozen tree**: one
-> > > > `cargo test --workspace` run, and `.github/ci-shards.sh`'s four shards
-> > > > summed (1,528 + 1,688 + 199 + 281). Both give 3,696 / 0 / 5 across
-> > > > 142 + 13. `CONTRIBUTING.md` §"The loop" has the shard table and the
-> > > > provenance, which is longer than usual for a reason: three earlier
-> > > > attempts at this number were void — two killed by the machine, one
-> > > > whose log turned out to hold two runs at once.
-> > > >
-> > > > No wall clock is offered for comparison with the figures above. Four
-> > > > agents shared the machine throughout; the shards summed to 577.3s from
-> > > > a warm `target/` and that is a different measurement from any of the
-> > > > single-run numbers in this chain.
->
-> **Re-taken 2026-08-31.** The sentence above read **3,696 tests across 155
-> targets** (142 binaries plus 13 doc-test suites) and carried no wall clock.
-> Measured as `/usr/bin/time -p cargo test --locked --workspace
-> --no-fail-fast` from an already-built `target/` at a load under 4:
-> **3,878 passed, 0 failed, 5 ignored** across **157** binaries plus 14
-> doc-test suites, in **182.29s real / 226.88s user**. Fifteen binaries and 182
-> tests are growth nothing re-took, cranelift shipping among it. The wall clock
-> is new to this sentence and is one run, not a best-of-N; `docs/ONBOARDING.md`
-> §2 carries the spread and the pair of readings — **250.5s without this change
-> and 182.3s with it, both on this tree** — that the paragraph below is about.
->
-> The fifth `ignored` is
-> `ply-eval` lib `interp::tests::a_cached_mention_against_the_allocation_it_replaces`,
-> a timing benchmark that prints its own recipe exactly as the three in
-> `http_cost` do; the other four are unchanged.
->
-> **The wall clock is 569.3s (9m 29s) real, 726.6s user**, `/usr/bin/time -p` on
-> one run from an already-built `target/` — and that run was **not on an idle
-> machine**, unlike the ones in the block below, so read it as an upper-ish
-> bound. The `test result:` lines sum to **478.5s** of in-target time across the
-> 155 targets, which excludes compilation. One target dominates
-> the increase: `r4_value_construction` is an allocation attribution that
-> captures a backtrace per allocation over 20-, 200- and 400-request windows,
-> and it takes **70.9s in debug against 25.6s in release** — the profile
-> `cargo test --workspace` runs is the slow one. Budget accordingly.
->
-> > **No longer, as of 2026-08-31.** The capture was never the expensive half;
-> > the *resolve* was, and it ran per allocation rather than per code address.
-> > That target is **6.7s** in a debug workspace run now, down from 46.2s, and
-> > every figure it prints is unchanged. The release comparison has not been
-> > re-taken.
+**It is deliberately not described here by a test count.** This paragraph used
+to carry one, re-taken through a chain of nested blocks each recording what the
+last one read. Every one of those re-takes found the number stale, none of them
+was found by anything failing, and the last found it fifteen binaries and 182
+tests behind. A figure that only ever moves, that nothing checks, and that has
+to be re-taken by hand after any change that adds a test is maintenance, not
+evidence. `docs/ONBOARDING.md` §Provenance keeps the counts that have *not*
+drifted — the ones that say something about what the language does rather than
+about how many tests exist.
 
-> **Re-taken after R3 (2026-08-17), which added three test binaries.** This
-> sentence read **3,566 across 147** (134 binaries). R3 landed
-> `ply-eval/tests/region_kind_sharing.rs` (4 tests),
-> `ply-eval/tests/lowering_sharing.rs` (3) and
-> `ply-corpus/tests/region_kind_hoisted.rs` (2), and added nine more inside
-> existing binaries; nothing re-took the paragraph with them. Re-taken as
-> `cargo test --workspace`, summing the `test result:` lines: **3,584 passed,
-> 0 failed, 4 ignored**, with `grep -c '^     Running'` → 137 and
-> `grep -c '^   Doc-tests'` → 13.
+A few tests are marked `ignored`. They are timing benchmarks you run on purpose
+rather than gates — the ones in `ply-corpus --test http_cost` and
+`interp::tests::a_cached_mention_against_the_allocation_it_replaces` in
+`ply-eval`'s lib tests — plus one doc-test, which is not a benchmark. Each
+benchmark prints the command that runs it. `docs/ONBOARDING.md` §2 has the wall
+clock and its spread, which is wide: readings on this one command have ranged
+from three minutes to twenty-nine, and the high ones describe a loaded machine
+rather than the tree.
 
-> **Re-taken again (regression audit, 2026-08-17).** The block above is what
-> R3 measured and it did not survive the audit that followed it. That audit
-> landed `ply-eval/tests/hoist_staleness_audit.rs` — a binary R3's count could
-> not have included — and the fixes for what it found added three more tests:
-> one in that file, one in `ply-corpus/tests/w6_report_allocations.rs`, and the
-> first doc-test `ply-eval` has ever had, a `compile_fail` example pinning
-> `Lowering<'a>`'s invariance. Re-taken the same way, on the same machine:
-> **3,597 passed, 0 failed, 4 ignored** in **399.6s** (6m 40s) and again at
-> **406.9s**, with `grep -c '^     Running'` → **138** and
-> `grep -c '^   Doc-tests'` → 13. Two runs on an idle machine, not a best-of-N.
+> **One target used to dominate that spread, and no longer does.**
+> `r4_value_construction` attributes every allocation in a request to the code
+> that asked for it, which meant a backtrace per allocation; it read **70.9s in
+> debug against 25.6s in release**, and the profile `cargo test --workspace`
+> runs is the slow one. The capture was never the expensive half — the
+> *resolve* was, and it ran per allocation rather than per code address. That
+> target is **6.7s** in a debug workspace run now, down from 46.2s, with every
+> figure it prints unchanged. The release comparison has not been re-taken.
 
-One caveat the old sentence implied away: the `ignored` set is not the
-whole of the timing-sensitive suite —
+And `ignored` is not the whole of the timing-sensitive suite —
 `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock growth ratio and runs by default, and it failed for us on
 a machine that was busy compiling something else. On a quiet machine it passes.

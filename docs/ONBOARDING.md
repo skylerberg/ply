@@ -37,20 +37,21 @@ Everything below was measured on **2026-08-17**:
 | toolchain | `rustc 1.93.1 (01f6ddf75 2026-02-11)`, `cargo 1.93.1` |
 | postgres | PostgreSQL 18.3 (Homebrew), running on `:5432` |
 
-Your wall clocks will differ. The **counts** — 3,661 tests, 5,000 tests
-selected down to 157, 7 obligations, 25 host handlers, 29 agreeing requests —
-should not. If a count differs on your machine, that is a finding; open it as
-one. (The test count read 3,597 before R4, 3,644 after it, and is the only one
-of the five that has ever moved; the other four were re-taken on 2026-08-21 and are unchanged —
+Your wall clocks will differ. The **counts** — 5,000 tests selected down to
+157, 7 obligations, 25 host handlers, 29 agreeing requests — should not. If one
+differs on your machine, that is a finding; open it as one. Each is a property
+of what the language does, and each was re-taken on 2026-08-21 unchanged:
 `ply prove examples/desk.ply` → 7, `ply hosts examples/desk.ply --host` → 25,
-`examples/same-tests.sh` → 29.)
+`examples/same-tests.sh` → 29.
 
-> **The test count moved twice on 2026-08-17 and the others did not.** It read
-> 3,566 until R3 added three test binaries, then 3,584 until the regression audit
-> after R3 added a fourth and its fixes added three tests (§2). The other four
-> were re-taken on the same day against this tree and are unchanged: 5,000 → 157
-> from `ply-corpus bench`, and 7 / 25 / 29 from `ply prove examples/desk.ply`,
-> `ply hosts examples/desk.ply --host` and `examples/same-tests.sh`.
+> **A fifth count used to head that list — how many tests the suite runs — and
+> it was dropped on 2026-08-31.** It is the only one of the five that ever
+> moved, and it moved on every reading: 3,566, 3,584, 3,597, 3,644, 3,661,
+> 3,690, 3,696, 3,878. That is not a reproducibility check that kept catching
+> something, it is a number that grows whenever anyone adds a test, and each
+> re-take was hand work that nothing in the tree would have failed without.
+> The four above are different in kind: they answer "does this machine agree
+> with mine about what Ply *does*", and the answer has been yes every time.
 
 ## 0. What Ply is, in ninety seconds
 
@@ -292,146 +293,64 @@ input pairs it was computed from and `ply-corpus w6` recomputes it from the file
 cargo test --workspace
 ```
 
-Measured, from an already-built `target/`:
+Measured as `/usr/bin/time -p cargo test --locked --workspace --no-fail-fast`,
+from an already-built `target/`, at a 1-minute load below §"Gate on an idle
+machine"'s threshold of 4: **182.29s real, 226.88s user, 24.85s sys**, and
+**178.1s** of in-target time summed from the `test result:` lines.
 
-| | |
-| --- | --- |
-| wall clock | **182.3s** (3m 02s). The readings this replaces, in order: **339s** (5m 39s), **324.5s**, after R3 **352.4s** (5m 52s) and **359.7s**, after the regression audit that followed it **399.6s** (6m 40s) and **406.9s**, and after R4 **569.3s** (9m 29s) — seven runs of one command on one machine, which is the spread to expect. The 569.3s reading was taken on a machine that was **not idle**; see the block below for why it is here anyway. |
-| result | **3,878 passed, 0 failed, 5 ignored** |
-| targets | **171** — 157 test binaries + 14 doc-test suites |
+**Budget three minutes**, and do not run it under load. It said *ten* until
+2026-08-31.
 
-> **Re-taken 2026-08-31, and every row moved.** They read **3,696 passed, 0
-> failed, 5 ignored** across **155** targets (**142** binaries + 13 doc-test
-> suites) at a wall clock topping out at 569.3s. Taken as `/usr/bin/time -p
-> cargo test --locked --workspace --no-fail-fast`, from an already-built
-> `target/`, at a 1-minute load below §"Gate on an idle machine"'s threshold of
-> 4: **182.29s real, 226.88s user, 24.85s sys**, and **178.1s** of in-target
-> time summed from the `test result:` lines.
+**This section deliberately does not record how many tests there are.** It used
+to, in a table row and a chain of blocks re-taking it, and the number was found
+stale on every one of those re-takes — never by anything failing, and the last
+time by fifteen binaries and 182 tests. Nothing in the tree checks it, so
+keeping it current was hand work that bought nothing. §Provenance keeps the
+counts that have earned their place by *not* moving.
+
+> **The wall clock's spread is the thing to know about, and most of it is the
+> machine rather than the tree.** Readings on this one command, oldest first:
+> 339s, 324.5s, 352.4s, 359.7s, 399.6s, 406.9s, 569.3s, 1,087.3s, 1,735.2s,
+> and now 182.3s. The two worst are not the tree getting slower — 1,087.3s was
+> taken at a load average of 4 to 12, and 1,735.2s at **24 to 43** with several
+> unrelated builds running, where *user time below real time* is the giveaway
+> that the run spent minutes waiting for cores rather than using them. Take
+> this figure on an idle machine or do not take it.
 >
-> Two different things moved and they should not be read as one. **The counts
-> drifted** — 3,696 to 3,878, 142 binaries to 157, 13 doc-test suites to 14 —
-> which is fifteen binaries and 182 tests of growth that nothing re-took;
-> `CONTRIBUTING.md` §"The loop" had predicted 3,720 by arithmetic and said in
-> writing that it was arithmetic, and cranelift shipping added the rest.
+> The drop to 182.3s is two changes. `[profile.dev] opt-level = 2` landed after
+> the 569.3s reading; that is the root `Cargo.toml`'s measurement, not this
+> one. The second was measured here **on one tree, both ways** — the same
+> commit with `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted and
+> then restored — at **250.5s without it against 182.3s with it**. No
+> intermediate tree was re-taken and nothing here claims one was.
+
+> **One target used to be most of it.** `r4_value_construction` attributes
+> every allocation to the code that asked for it over 20-, 200- and
+> 400-request windows, and it read **70.9s under `cargo test` (debug) against
+> 25.6s under `cargo test --release`** — it is not `ignored`, and the numbers
+> it is documented to print are the release ones.
 >
-> **The wall clock moved for two reasons**, and only the second is measured
-> here as a pair. `[profile.dev] opt-level = 2` landed after the 569.3s
-> reading; that is the root `Cargo.toml`'s measurement, not this one. The
-> change this block is part of was measured **on this tree, both ways** — the
-> same commit with `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted
-> and then restored — at **250.5s without it against 182.3s with it**. The
-> 569.3s row was not re-taken against any intermediate tree and nothing here
-> claims it was.
-
-> **Re-taken 2026-08-24, and it had drifted two readings behind.** The rows
-> above read **3,661 passed, 0 failed, 5 ignored** across **156** targets
-> (**143** binaries + 13 doc-test suites). That was already stale before item
-> 11's fix: `CONTRIBUTING.md` recorded **3,690 / 0 / 5** across **155** (**142**
-> + 13) after the frame-ceiling change and this file was not moved with it, so
-> "reproduces `README.md` exactly, count for count" had stopped being true —
-> which is the failure this line exists to make visible and did not. Both files
-> now read **3,696 / 0 / 5** across **155** (**142** + 13), taken twice: once as
-> `cargo test --workspace` and once as `.github/ci-shards.sh`'s four shards, in
-> an `rsync`ed copy digested before and after. `CONTRIBUTING.md` §"The loop"
-> carries the shard table and §"A moving tree invalidates a correctness number"
-> carries why it was done that way. The binary count is **142**, not 143 — the
-> unreconciled difference `CONTRIBUTING.md` records is unchanged and is not
-> resolved here.
-
-That reproduces `README.md`'s Status paragraph exactly, count for count. It is
-the longest thing in this file; **budget three minutes now** — and do not run it
-under load. It said *ten* until 2026-08-31, on the R4 block below, whose target
-is the one the same change made 7x faster; that block is left standing because
-the number it explains is still the number it was.
-
-> **Re-taken 2026-08-21, after R4.** The result row read **3,597 / 0 / 4** and
-> the target row **151 — 138 + 13**. R4 added four test binaries —
-> `ply-eval/tests/literal_value_sharing.rs` (8 tests),
-> `ply-eval/tests/literal_sharing.rs` (6),
-> `ply-eval/tests/ctor_value_sharing.rs` (6),
-> `ply-corpus/tests/r4_value_construction.rs` (9) — and tests inside existing
-> ones. Re-taken as `cargo test --workspace --no-fail-fast`, summing the
-> `test result:` lines: **3,644 / 0 / 5**, `grep -c '^     Running'` → **142**,
-> `grep -c '^   Doc-tests'` → 13.
+> > **Fixed 2026-08-31 rather than budgeted around.** The backtrace is still
+> > captured per allocation; what was *resolved* per allocation now is not.
+> > `Backtrace::force_capture()` followed by `format!("{bt}")` symbolicates
+> > every frame on the stack, and the set of code addresses that allocate is
+> > small and fixed, so the same names were being resolved hundreds of
+> > thousands of times. Memoising the resolve per address takes this target
+> > from **46.2s to 6.7s** inside a workspace run, and `w6_alloc_sites` —
+> > which does the same thing, and which cranelift shipping had pushed to
+> > 40.4s — from **40.4s to 2.6s**. Every figure the two files report is **byte
+> > for byte identical** across the change, checked by diffing their
+> > `--nocapture` output rather than by trusting that the assertions still
+> > pass. The debug/release gap above is therefore much smaller than 2.8x now
+> > and **has not been re-taken**: its release side is a 2026-08-21 reading
+> > against the old code.
 >
-> **The wall clock was re-taken once and the conditions were not clean.**
-> `/usr/bin/time -p cargo test --workspace --no-fail-fast` from an already-built
-> `target/`: **569.31s real** (9m 29s), 726.64s user. That run was **not on an
-> idle machine** — a documentation pass was reading and rebuilding beside it —
-> so treat it as an upper-ish bound rather than a clean figure, and it is one
-> run, not a best-of-N. Summing the `test result:` lines instead gives **478.5s**
-> of in-target time, which excludes compilation and is a lower bound.
->
-> One target is most of the increase and it is worth knowing about before you
-> start:
-> `r4_value_construction` captures a backtrace per allocation over 20-, 200- and
-> 400-request windows, and it takes **70.9s under `cargo test` (debug) against
-> 25.6s under `cargo test --release`**. It is not `ignored`, and the numbers it
-> is documented to print are release numbers.
->
-> > **Both halves of that were fixed on 2026-08-31 rather than budgeted
-> > around.** The backtrace is still captured per allocation; what was
-> > *resolved* per allocation now is not. `Backtrace::force_capture()` followed
-> > by `format!("{bt}")` symbolicates every frame on the stack, and the set of
-> > code addresses that allocate is small and fixed, so the same names were
-> > being resolved hundreds of thousands of times. Memoising the resolve per
-> > address takes this target from **46.2s to 6.7s** inside a workspace run,
-> > and `w6_alloc_sites` — which does the same thing and which cranelift
-> > shipping had pushed to 40.4s — from **40.4s to 2.6s**. Every figure the two
-> > files report is **byte for byte identical** across the change, checked by
-> > diffing their `--nocapture` output rather than by trusting that the
-> > assertions still pass. The debug/release gap this block warns about is
-> > therefore much smaller than 2.8x now, and **has not been re-taken**: the
-> > release side of it is a 2026-08-21 reading against the old code. (An earlier draft of this block
-> said 255.2s for the debug side. That was this target's `finished in` line from
-> a workspace run taken while a second `cargo build --release` was competing for
-> the machine, and it is a reading of the load, not of the target — the same
-> line in an unloaded run is 70.88s and the target run on its own is 69.35s.
-> Re-taken rather than left standing, because a 3.6x error in the one figure
-> this block exists to warn about is worse than no warning.)
->
-> The fifth `ignored` is new: `ply-eval` lib
-> `interp::tests::a_cached_mention_against_the_allocation_it_replaces`, a timing
-> benchmark that prints its own recipe the way the three in `http_cost` do.
-
-> **Re-taken again 2026-08-21, by the second regression audit.** The table above
-> now reads **3,661 / 0 / 5** across **156** targets (**143** binaries + 13
-> doc-test suites) — the block below this one is the R4 reading and is left as
-> it was. Four tests arrived after it: the regression audit before this one
-> added `ply-eval/tests/value_semantics_audit.rs` (a whole binary, 14 tests then
-> and 15 now) without moving these counts, and the fixes for what it found added
-> `map_order.rs::a_decimal_anywhere_under_a_key_is_canonical`,
-> `value_semantics_audit.rs::canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it`
-> and
-> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
-> Same command, same pipelines. The wall clock re-take is **1,087.3s (18m 7s)
-> real, 1,174.4s user**, `/usr/bin/time -p`, one run, on a machine whose load
-> average ran **4 to 12** — nearly double the 569.3s below on four more tests,
-> which is what a shared machine does to this figure. The counts are the part
-> that should not move.
-
-> **Re-taken 2026-08-17, after R3.** This table read **3,566 passed** across
-> **147** targets (134 binaries), and the paragraph under it said 134. R3 added
-> three test binaries — `ply-eval/tests/region_kind_sharing.rs`,
-> `ply-eval/tests/lowering_sharing.rs`,
-> `ply-corpus/tests/region_kind_hoisted.rs` — and nine more tests inside
-> existing ones. Re-taken as `time cargo test --workspace`, summing the
-> `test result:` lines: 3,584 / 0 / 4 in 352.4s, with `grep -c '^     Running'`
-> → 137 and `grep -c '^   Doc-tests'` → 13. The wall clock is one run on an
-> otherwise idle machine and is not a best-of-N.
-
-> **Re-taken again 2026-08-17, after the regression audit that followed R3.**
-> That audit landed a fourteenth new binary,
-> `ply-eval/tests/hoist_staleness_audit.rs` (10 tests), which is why `Running`
-> reads 138 rather than 137 — the block above was written before that file
-> existed and is not wrong about what it measured. Fixing the two defects it
-> found added three more: one in that file
-> (`a_declared_unique_over_a_local_shadowing_a_definition_is_refused`), one in
-> `ply-corpus/tests/w6_report_allocations.rs`
-> (`the_readme_still_describes_this_request_path`), and the first doc-test
-> `ply-eval` has ever had — a `compile_fail` example on `Lowering`, because a
-> variance is a compile-time property no `#[test]` can observe. Re-taken the same
-> way: **3,597 / 0 / 4 in 399.6s**, re-taken at **406.9s**, `Running` → **138**, `Doc-tests` → 13.
+> An earlier draft of that block said **255.2s** for the debug side. That was
+> the target's `finished in` line from a run taken while a `cargo build
+> --release` competed for the machine — a reading of the load, not of the
+> target, against 70.88s for the same line unloaded. It is left here because a
+> 3.6x error in the one figure a block exists to warn about is worse than no
+> warning, and because it is the same lesson as the spread above.
 
 ### Five things a green suite does not prove
 
@@ -1190,9 +1109,9 @@ So the checked/written boundary is:
   the_readme_still_describes_this_request_path`. See the section above for why
   that one and nothing else.
 - Behavioural invariants stated as tests, e.g. the rename invariant at
-  `ply-cli/tests/cli.rs:145`. There are 3,661 tests; how many of them pin a
-  documented guarantee rather than an implementation detail is **not measured
-  and no document claims a figure for it.**
+  `ply-cli/tests/cli.rs:145`. How many of the suite's tests pin a documented
+  guarantee rather than an implementation detail is **not measured and no
+  document claims a figure for it.**
 - Anything you can re-run from this file. The loop numbers, the selection table,
   the obligation counts, the host-handler counts and `same-tests.sh`'s 29
   agreements all reproduced in this audit.

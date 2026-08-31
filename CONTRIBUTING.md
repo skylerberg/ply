@@ -158,194 +158,71 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # 3m 02s — 3,878 pass, 0 fail, 5 ignored
+cargo test --workspace                          # about 3 min; must be 0 failed
 ```
 
-> **Re-taken 2026-08-31, and both halves of that line had drifted.** It read
-> **9.5-29 min — 3,696 pass, 0 fail, 5 ignored**, and the block above already
-> recorded that the count had moved to a predicted **3,720** that nobody took.
-> It is now **3,878**, which is that prediction plus growth nobody re-took
-> either.
->
-> Measured as `/usr/bin/time -p cargo test --locked --workspace
-> --no-fail-fast` from an already-built `target/` on the machine in
-> `docs/ONBOARDING.md` §Provenance, at a 1-minute load below §"Gate on an idle
-> machine"'s threshold of 4. **Both rows are this tree** — the same commit with
-> only `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted — so the
-> pair isolates the change and nothing else:
+**No test count here, on purpose.** This line used to carry one and a chain of
+blocks re-taking it. It was found stale on every re-take, never by anything
+failing, and the last time by fifteen binaries and 182 tests. Nothing in the
+tree checks it, so keeping it current was hand work that bought nothing —
+`docs/ONBOARDING.md` §Provenance says which counts *are* worth keeping and why
+this one is not. What matters at this line is that nothing failed.
+
+> **The wall clock, re-taken 2026-08-31.** It read **9.5-29 min**. Measured as
+> `/usr/bin/time -p cargo test --locked --workspace --no-fail-fast` from an
+> already-built `target/`, at a 1-minute load below §"Gate on an idle machine"'s
+> threshold of 4. **Both rows are one tree** — the same commit with
+> `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted, then restored —
+> so the pair isolates one change and nothing else:
 >
 > | | wall | user | sys | in-target |
 > | --- | --- | --- | --- | --- |
 > | without the memoised resolve | 250.5s | 322.1s | 40.4s | 246.9s |
 > | with it | **182.3s** | 226.9s | 24.9s | 178.1s |
 >
-> **3,878 passed, 0 failed, 5 ignored across 171 targets (157 binaries + 14
-> doc-test suites)** on both — it moves wall clock and moves no count. The two
-> targets are **46.2s -> 6.7s** and **40.4s -> 2.6s**; that is 77.4s against a
-> 68.2s move in the total, and the 9s of daylight is run-to-run noise
-> elsewhere, not a saving that went missing.
->
-> The 9.5-29 min range is not withdrawn as a lie about its own day: it predates
-> `[profile.dev] opt-level = 2`, which the root `Cargo.toml` records at 6.5x on
-> one binary, and it predates cranelift shipping. Those are not measurements of
-> the same tree.
+> The two targets are **46.2s -> 6.7s** and **40.4s -> 2.6s**; that is 77.4s
+> against a 68.2s move in the total, and the 9s of daylight is run-to-run noise
+> elsewhere, not a saving that went missing. The 9.5-29 min range is not
+> withdrawn as a lie about its own day — it predates `[profile.dev] opt-level =
+> 2`, which the root `Cargo.toml` records at 6.5x on one binary, and it predates
+> cranelift shipping. Those are not measurements of the same tree.
 >
 > **One run each, not a best-of-N.** The spread `docs/ONBOARDING.md` §2 records
 > for this command is wide, so treat 182.3s as the reading and not as the value.
 
-> **The count moved on 2026-08-28 and this line is deliberately not rewritten
-> to a number nobody took.** ADR 0026's work adds **24** tests — 8 to
-> `ply-eval`'s `differential_corpus` (the eight wrong backends at corpus scale),
-> 14 in a new `ply-cli/tests/backend.rs`, 1 to `ply-span`'s `armed.rs` and 1 to
-> `ply-corpus`'s `w6` — so a full run should read **3,720**. That is arithmetic,
-> not a measurement: `--workspace` was not re-run for this change, on this file's
-> own rule that a figure belongs where it was taken. The per-package counts that
-> *were* taken are `cargo test -p ply-eval` at **1,014 passed / 0 failed / 1
-> ignored over 43 targets**, and `cargo test -p ply-cli --test backend` at 14/0.
->
-> It also adds wall clock in one place worth naming: `cargo test -p ply-eval
-> --test differential_corpus` goes from seconds to **73.4s**, because five of the
-> eight corruptions sweep the whole 1,116-test corpus. An earlier run of the same
-> suite read 82.7s; both are **observations rather than figures**, taken at a
-> 1-minute load average of 8-9 against this file's own 4.0 gate. That is the
+> **ADR 0026 added wall clock in one place worth naming.** `cargo test -p
+> ply-eval --test differential_corpus` went from seconds to **73.4s**, because
+> five of the eight corruptions sweep the whole corpus. An earlier run of the
+> same suite read 82.7s; both are **observations rather than figures**, taken at
+> a 1-minute load average of 8-9 against this file's own 4.0 gate. That is the
 > price of the seam having measured sensitivity inside `cargo test --workspace`
 > rather than in a crate on another toolchain.
 
-> **Re-taken after item 11's fix (2026-08-24).** The line above read `9.5-29
-> min — 3,690 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
-> --no-fail-fast -- --test-threads=2` now reports **3,696 passed / 0 failed / 5
-> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
-> **1,172.3s real / 1,168.4s user** by `/usr/bin/time -p`, with `fmt --all
-> --check` silent and `clippy --workspace --all-targets` at zero. The wall clock
-> is an upper bound as usual — another agent was building on this machine.
->
-> **The +6 is all of item 11's, and it was attributed per package rather than
-> subtracted.** An earlier draft of this block hedged — *"The +6 is not
-> attributable to this change alone and is not claimed to be … Reading a
-> per-target diff against a tree that no longer exists is how you would
-> attribute the rest, and this pass did not do it."* — and then named exactly
-> six tests, which is the whole of the +6. The three package counts were taken
-> on both sides while the change was being built, so no diff against a vanished
-> tree is needed:
->
-> | suite | before | after |
-> | --- | --- | --- |
-> | `cargo test -p ply-eval --lib` | 527 | 531 |
-> | `cargo test -p ply-eval --test differential_corpus` | 5 | 6 |
-> | `cargo test -p ply-core --lib` | 204 | 205 |
->
-> The 527 is not this pass's word for it either: `compiled.rs`'s test-module
-> header recorded *"a re-run reads 527 green"* when the frame-ceiling change
-> took the 3,690. Four of the six are the effects gate's own — including
-> `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`,
-> the only one that catches a propagation stopping after one hop — one is the
-> corpus test, and one is `ply-core`'s for the duplicate-`fn` hazard
-> `mark_internal_effects` would otherwise panic on.
->
-> **Taken twice, by two methods, and they agree.** The figure above is one
-> `--workspace` run. It was also taken as `.github/ci-shards.sh`'s four shards,
-> each into its own log, from a `rsync`ed copy under `/tmp` that no other
-> session could reach — `ci-shards.sh verify` reports *13 workspace members,
-> each in exactly one shard*, so the four sum to the workspace:
->
-> | shard | passed | failed | ignored | binaries | doc-tests | real |
-> | --- | --- | --- | --- | --- | --- | --- |
-> | `core` | 1,528 | 0 | 0 | 41 | 9 | 38.2s |
-> | `cli-eval` | 1,688 | 0 | 1 | 77 | 2 | 240.7s |
-> | `corpus` | 199 | 0 | 3 | 16 | 1 | 235.2s |
-> | `postgres` | 281 | 0 | 1 | 8 | 1 | 44.2s |
-> | **sum** | **3,696** | **0** | **5** | **142** | **13** | **558.2s** |
->
-> The shard set was run **twice**, on two frozen copies taken either side of the
-> last documentation edit, and the five counts are identical both times
-> (1,528 / 1,688 / 199 / 281 and the 142 + 13 split); only the wall clocks moved
-> — 577.3s the first time, 558.2s the second, which is what a machine with three
-> other agents on it does to a wall clock and does not do to a count. Those are
-> sequential shards from a warm `target/` and are not comparable with the
-> single-run figure above. `PLY_PG_URL` was not set for any of the three runs,
-> so the `postgres` shard's ten live tests passed without running — the gate
-> every unqualified reading in this file was taken under.
->
-> **Both runs were instrumented and an earlier one was not, which is the part
-> worth copying.** The earlier attempt reported 3,689 / **6 failed**, the six
-> being exactly the tests that go red when `Gate::InternalEffects` is deleted,
-> with the gate present in the file throughout — traced to
-> `crates/ply-core/src/infer.rs` being rewritten *during* the run, so cargo
-> built `ply-core` from a file that was mid-edit. Nothing in the log said so.
-> Who was writing is not established and the honest reading is in §"A moving
-> tree invalidates a correctness number": a background `cargo test --workspace`
-> and a foreground mutation in the same session will do this to you without any
-> second party. The runs above digest every non-`target/`, non-`.ply-cache/`
-> file before and after; the copy's digest was identical across the run
-> (`da4c6109…` for the final one), and its `.rs`, `.ply` and `.toml` matched the
-> worktree's when the run started. Take the digest — a wrong red costs an
-> afternoon, and a wrong **green** is what this file exists to prevent.
+> **Before trusting any long run, read §"A moving tree invalidates a
+> correctness number".** A run taken while the tree moves under it reports a
+> result about no tree at all, and nothing in the log says so. That section has
+> the three ways it has happened here and the checks that catch each.
 
-**All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
---all --check` silent and exit 0, `clippy --workspace --all-targets` **zero**
-warnings and zero errors, `cargo test --workspace --no-fail-fast` **3,644 passed
-/ 0 failed / 5 ignored** across **155 targets** (142 binaries + 13 doc-test
-suites). If you introduce the first warning, that is a regression, not a
-baseline.
+**All three are currently clean**: `fmt --all --check` silent and exit 0,
+`clippy --workspace --all-targets` **zero** warnings and zero errors,
+`cargo test --workspace --no-fail-fast` **0 failed**. If you introduce the first
+warning, that is a regression, not a baseline.
 
-> **Re-taken after the frame-ceiling fix (2026-08-24).** The line above read
-> `9.5-18 min — 3,661 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
-> --no-fail-fast -- --test-threads=2` now reports **3,690 passed / 0 failed / 5
-> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
-> **1,735.2s real / 1,548.7s user** by `/usr/bin/time -p`. That wall clock was
-> taken on a machine at load 25–43 with three other agents building and testing
-> on it, so it is an upper bound and not comparable with the older figures; the
-> counts are deterministic and are. The +29 is three tests from §"Things known
-> to be broken" items 9, 10 and 13's close and twenty-six from the per-gate
-> tests item 13's close added. `fmt --all --check` silent, `clippy --workspace
-> --all-targets` zero warnings and zero errors, both re-run on the same tree.
-> Two caveats worth carrying. The heaviest new test peaks near 4.2 GiB — see
-> §"The suite proves less than it looks like it proves". And the **binary count
-> is 142 here where the reading above it is 143, and this pass could not account
-> for the difference**: every `tests/*.rs` in every workspace member appears in
-> the run except the five under `crates/ply-codegen-spike/`, which are excluded
-> by design because that crate declares its own `[workspace]` (item 1), and
-> `value_semantics_audit` — the binary the 143 reading added — is present and
-> ran. Recorded rather than reconciled, because "the count moved and I guessed
-> why" is the failure this file is about.
+> **Two caveats worth carrying.** The heaviest test peaks near **4.2 GiB** — see
+> §"The suite proves less than it looks like it proves". And `PLY_PG_URL` was
+> not set for most readings in this file, so the `postgres` shard's ten live
+> tests passed **without running** — the gate every unqualified reading here was
+> taken under.
 
-> **Re-verified again (second regression audit, 2026-08-21).** `fmt --all
-> --check` silent and exit 0; `clippy --workspace --all-targets` zero lines
-> matching `warning` or `error`; `cargo test --workspace --no-fail-fast`
-> **3,661 passed / 0 failed / 5 ignored** across **156 targets** (**143**
-> binaries + 13 doc-test suites), **1,087.3s real** on a machine at load 4–12.
-> The four new tests are one binary the audit before it added
-> (`ply-eval/tests/value_semantics_audit.rs`) and three the fixes for what it
-> found added: two in `ply-eval/tests/map_order.rs` and
-> `value_semantics_audit.rs`, and
-> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
-
-> **Re-taken after R4 (2026-08-21).** The line read `~6.5 min — 3,597 pass, 0
-> fail, 4 ignored` and the paragraph `3,597 / 0 / 4 across 151 targets in
-> 399.6s, and again at 406.9s`. R4 added four test binaries; §"Things known to
-> be broken" and `docs/ONBOARDING.md` §2 name them. The wall clock re-take is
-> **569.3s (9m 29s) real, 726.6s user**, `/usr/bin/time -p` on one run from an
-> already-built `target/` — and that run was **not on an idle machine**, so it
-> is an upper-ish bound rather than the clean figure the older ones are. The
-> `test result:` lines sum to 478.5s of in-target time, excluding compilation.
-> The reason the estimate went up is one target:
-> `ply-corpus/tests/r4_value_construction.rs` takes **70.9s in debug and 25.6s
-> in release**, because it captures a backtrace per allocation. It is not
+> **One target used to dominate the wall clock.**
+> `ply-corpus/tests/r4_value_construction.rs` took **70.9s in debug and 25.6s in
+> release**, because it captured a backtrace per allocation. It is not
 > `ignored`, and the figures it is documented to print are the release ones.
 >
 > > **Fixed 2026-08-31, and it was the resolve rather than the capture.**
 > > Memoising symbolication per code address takes that target to **6.7s** in a
 > > debug workspace run, with every figure it prints unchanged. The release
 > > comparison above has not been re-taken against the new code.
-
-> **The counts moved twice and the reason is in the tree both times, not in the
-> suite.** They read 3,566 / 147 / 324.5s, then 3,584 / 150 / 352.4s. R3 added
-> three test binaries and nine tests inside existing ones; the audit after it
-> added `ply-eval/tests/hoist_staleness_audit.rs`, and the fixes for what it
-> found added three more tests — including the first doc-test `ply-eval` has
-> ever had, a `compile_fail` example that is the only way to assert a variance.
-> `README.md`'s Status paragraph and `docs/ONBOARDING.md` §2 carry the same
-> re-take and the list of files.
 
 ### There is CI, and it is younger than most of this file
 
