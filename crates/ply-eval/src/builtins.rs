@@ -289,10 +289,16 @@ impl Builtin {
     /// Inclusive `(min, max)` argument counts.
     pub fn arity(self) -> (usize, usize) {
         match self {
-            Builtin::Assert => (1, 2),
-            Builtin::Range => (1, 2),
-            // Ply has no top-level constants, so the empty map is a call.
+            // Every builtin is exactly applied. `assert` and `range` were the
+            // only two that were not: `assert` took an optional message the
+            // checker's signature had no room for, and `range` an optional
+            // lower bound, so both second arms were unreachable from source
+            // for as long as they existed. `assert`'s message is now a
+            // defaulted parameter (`ply_syntax::defaults`) and `range`'s lower
+            // bound is written out, which is shorter than the `range(hi: n)` a
+            // leading default would have forced.
             Builtin::MapNew => (0, 0),
+            // Ply has no top-level constants, so the empty map is a call.
             Builtin::Len
             | Builtin::IntToString
             | Builtin::CellGet
@@ -345,7 +351,9 @@ impl Builtin {
             | Builtin::Compare
             | Builtin::CompareValues
             | Builtin::IntOfDecimal
-            | Builtin::SecretVerify => (2, 2),
+            | Builtin::SecretVerify
+            | Builtin::Assert
+            | Builtin::Range => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
             | Builtin::BytesSlice
@@ -571,7 +579,7 @@ pub fn call(
             if args[0].as_bool(span, "`assert`")? {
                 return Ok(Step::Done(Value::Unit));
             }
-            Err(assert_failure(args.get(1), span))
+            Err(assert_failure(&args[1], span))
         }
 
         Builtin::AssertEq => {
@@ -620,13 +628,8 @@ pub fn call(
         }
 
         Builtin::Range => {
-            let (lo, hi) = match args.len() {
-                1 => (0, args[0].as_int(span, "`range`")?),
-                _ => (
-                    args[0].as_int(span, "`range`")?,
-                    args[1].as_int(span, "`range`")?,
-                ),
-            };
+            let lo = args[0].as_int(span, "`range`")?;
+            let hi = args[1].as_int(span, "`range`")?;
             if hi <= lo {
                 return Ok(Step::Done(Value::list(Vec::new())));
             }
@@ -1665,15 +1668,26 @@ pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagno
     diag
 }
 
-/// The `ASSERTION_FAILED` for a bare `assert`, whose optional second argument
-/// is the message the author wanted the reader to see.
-pub fn assert_failure(message: Option<&Value>, span: Span) -> Diagnostic {
+/// The `ASSERTION_FAILED` for a failing `assert`, whose second argument is the
+/// message the author wanted the reader to see.
+///
+/// `None` is what a call that wrote no message passes: the parameter is
+/// `Option<String>` defaulted to `None`, spliced in at the call site, so this
+/// sees an argument either way rather than an absent one.
+pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
         "assertion failed: condition is false",
     )
     .primary(span, "this condition evaluated to false");
-    if let Some(message) = message {
+    let carried = match message {
+        Value::Ctor { name, args, .. } if name.as_str() == "Some" => args.first(),
+        Value::Ctor { .. } => None,
+        // A message that is not an `Option` at all can only come from a call
+        // this evaluator was handed without a check in front of it.
+        other => Some(other),
+    };
+    if let Some(message) = carried {
         diag = diag.note(match message {
             Value::Str(s) => s.to_string(),
             other => other.render(),
@@ -2919,6 +2933,67 @@ mod tests {
     fn every_builtin_is_reachable_by_the_name_it_reports() {
         for b in Builtin::all() {
             assert_eq!(Builtin::from_name(b.name()), Some(*b));
+        }
+    }
+
+    /// **The test this repository went its whole history without.**
+    ///
+    /// A builtin is described in three places, in three crates that cannot see
+    /// each other: its argument count here, its type in `ply_core::infer`'s
+    /// prelude, and its defaults in `ply_syntax::defaults`. Nothing checked
+    /// that the three agreed, and for `assert` and `range` they did not — this
+    /// file said `(1, 2)` and the checker said one parameter and two. The
+    /// second arm of each was therefore unreachable from any program the
+    /// checker would accept, and stayed that way from the first commit until
+    /// ADR 0029. It was found by a reader who nearly documented the evaluator's
+    /// behaviour as the language's.
+    ///
+    /// This is the check that makes the next such drift a red test rather than
+    /// a wrong sentence in a manual. It is deliberately an *equality*: after
+    /// ADR 0029 no builtin has a variable arity, and one that acquires one has
+    /// to come here and say why.
+    #[test]
+    fn every_builtin_agrees_on_its_arity_everywhere() {
+        for b in Builtin::all() {
+            let (min, max) = b.arity();
+            assert_eq!(
+                min,
+                max,
+                "`{}` has a variable arity; every builtin is exactly applied, and a call \
+                 that leaves an argument out is filled by `ply_syntax::defaults` before \
+                 anything here sees it",
+                b.name()
+            );
+
+            // A builtin the prelude does not type cannot be called at all, so
+            // the two tables have to cover the same set.
+            let typed = ply_core::prelude_arity(b.name()).unwrap_or_else(|| {
+                panic!(
+                    "`{}` is a builtin with no scheme in the prelude: no program can call it",
+                    b.name()
+                )
+            });
+            assert_eq!(
+                typed,
+                max,
+                "`{}` takes {max} arguments here and {typed} in the prelude's scheme. \
+                 Whichever is larger, the extra arm is unreachable from source.",
+                b.name()
+            );
+
+            if let Some((params, defaults)) = ply_syntax::defaults::builtin_shape(b.name()) {
+                assert_eq!(
+                    params,
+                    max,
+                    "`{}`'s defaults table describes {params} parameters, its arity {max}",
+                    b.name()
+                );
+                assert!(
+                    defaults > 0,
+                    "`{}` is in the defaults table with no default in it",
+                    b.name()
+                );
+            }
         }
     }
 

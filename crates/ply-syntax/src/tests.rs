@@ -3382,3 +3382,159 @@ fn the_brace_disambiguation_is_unchanged() {
     assert_eq!(expr("{x: 1}"), "(rec (x 1))");
     assert_eq!(expr("{x, y}"), "(rec (x x) (y y))");
 }
+
+/// Whether any call in the module still carries a named argument, or any
+/// parameter a default that was never matched against a call.
+fn has_named_argument(m: &Module) -> bool {
+    fn e(x: &Expr) -> bool {
+        crate::effect_set::grow(|| match &x.kind {
+            ExprKind::App { func, args, named } => {
+                !named.is_empty() || e(func) || args.iter().any(e)
+            }
+            ExprKind::Lit(_) | ExprKind::Var(_) => false,
+            ExprKind::Binary { lhs, rhs, .. } => e(lhs) || e(rhs),
+            ExprKind::Unary { operand, .. } => e(operand),
+            ExprKind::Lambda { body, .. } => e(body),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => e(cond) || e(then_branch) || e(else_branch),
+            ExprKind::Match { scrutinee, arms } => {
+                e(scrutinee)
+                    || arms
+                        .iter()
+                        .any(|a| e(&a.body) || a.guard.as_ref().is_some_and(e))
+            }
+            ExprKind::Block { stmts, tail } => {
+                stmts.iter().any(|s| match s {
+                    Stmt::Let { value, .. } => e(value),
+                    Stmt::Expr(x) => e(x),
+                }) || tail.as_deref().is_some_and(e)
+            }
+            ExprKind::Record { fields } => fields.iter().any(|(_, v)| e(v)),
+            ExprKind::RecordUpdate { base, fields } => e(base) || fields.iter().any(|(_, v)| e(v)),
+            ExprKind::Field { base, .. } => e(base),
+            ExprKind::List { items } => items.iter().any(e),
+            ExprKind::Try { operand } => e(operand),
+            ExprKind::Perform { args, .. } => args.iter().any(e),
+            ExprKind::Handle {
+                body,
+                clauses,
+                return_clause,
+            } => {
+                e(body)
+                    || clauses.iter().any(|c| e(&c.body))
+                    || return_clause.as_ref().is_some_and(|r| e(&r.body))
+            }
+            ExprKind::WithCell { init, body, .. } => e(init) || e(body),
+            ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => e(body),
+        })
+    }
+    m.items.iter().any(|item| match item {
+        Item::Fn(d) => e(&d.body) || d.spec.iter().any(|s| e(&s.expr)),
+        Item::Test(d) => e(&d.body),
+        Item::Law(d) => e(&d.body) || d.guard.as_ref().is_some_and(e),
+        _ => false,
+    })
+}
+
+/// **The invariant four other crates are built on.**
+///
+/// `ply-hash`, `ply-core`, `ply-eval` and `ply-prove` all read
+/// `ExprKind::App`'s positional `args` and none of them reads `named`, on the
+/// strength of `defaults::expand` having placed every one. That is what makes
+/// `f(x, m: 1)` and `f(x, 1)` one definition rather than two, and it is the
+/// same guarantee `parse_module` gives record update — checked the same way,
+/// over the same corpus.
+///
+/// The appended source is not decoration. The tree's own `.ply` files use no
+/// named arguments yet, so a guard that saw only them would pass whether or not
+/// the pass ran at all.
+#[test]
+fn no_named_argument_survives_resolve_anywhere_in_the_tree() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate lives two levels below the repository root");
+    let mut files = Vec::new();
+    collect_ply(root, &mut files);
+    assert!(
+        files.len() > 100,
+        "only {} `.ply` files found; the walk is not reaching the corpus",
+        files.len()
+    );
+
+    const USES_IT: &str = "\
+fn greet(name: String, greeting: String = \"hello\", mark: String = \"!\") -> String =
+  string_concat(greeting, string_concat(name, mark))
+fn a() -> String = greet(\"ada\")
+fn b() -> String = greet(\"ada\", \"hi\")
+fn c() -> String = greet(\"ada\", greeting: \"hey\")
+fn d() -> String = greet(\"ada\", mark: \"?\", greeting: \"yo\")
+fn e() -> Unit = assert(a() == b(), Some(\"differ\"))
+fn f() -> Unit = assert(a() == b(), message: Some(\"differ\"))
+fn g() -> List<String> = [greet(\"x\"), greet(\"y\", mark: \".\")]
+test \"t\" { assert_eq(a(), \"helloada!\") }
+";
+
+    let mut sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| (p.display().to_string(), s))
+        })
+        .collect();
+    sources.push(("<uses named arguments>".to_string(), USES_IT.to_string()));
+
+    let mut saw_the_syntax = false;
+    for (name, source) in &sources {
+        let Ok(module) = parse(SRC, source) else {
+            continue;
+        };
+        if has_named_argument(&module) {
+            saw_the_syntax = true;
+        }
+        let mut program = Program::single(module);
+        let Ok(_) = crate::resolve(&mut program) else {
+            continue;
+        };
+        for module in &program.modules {
+            assert!(
+                !has_named_argument(module),
+                "a named argument survived `resolve` from {name}"
+            );
+        }
+    }
+    assert!(
+        saw_the_syntax,
+        "no source in this run carried a named argument into `resolve`, so the guard \
+         proved nothing"
+    );
+}
+
+/// The other half: a call that omitted an argument really did gain the default,
+/// rather than being left short for someone else to trip over.
+#[test]
+fn an_omitted_argument_is_filled_with_the_default() {
+    let module = parse(
+        SRC,
+        "fn greet(name: String, greeting: String = \"hello\") -> String =\n  \
+         string_concat(greeting, name)\n\
+         fn a() -> String = greet(\"ada\")\n\
+         fn b() -> String = greet(\"ada\", greeting: \"hey\")\n",
+    )
+    .expect("it parses");
+    let mut program = Program::single(module);
+    crate::resolve(&mut program).expect("it resolves");
+    let items = &program.modules[0].items;
+    let Item::Fn(a) = &items[1] else {
+        panic!("expected `a`")
+    };
+    let Item::Fn(b) = &items[2] else {
+        panic!("expected `b`")
+    };
+    assert_eq!(dump_expr(&a.body), "(call greet \"ada\" \"hello\")");
+    assert_eq!(dump_expr(&b.body), "(call greet \"ada\" \"hey\")");
+}

@@ -109,6 +109,31 @@ pub fn check_program_with(
     }
 }
 
+/// How many arguments the prelude's signature for `name` takes, or `None` if
+/// the prelude declares no such name.
+///
+/// Exists so that a *third* table over the builtins can be checked against this
+/// one. Their arities live in `ply_eval::builtins`, their defaults in
+/// `ply_syntax::defaults`, and their types here; for the whole of this
+/// language's history `assert` and `range` disagreed between the first two and
+/// this one, and no well-typed program could reach the arms the disagreement
+/// stranded. `ply_eval`, which can see all three, is the only place that test
+/// can live, and this is what it reads.
+pub fn prelude_arity(name: &str) -> Option<usize> {
+    let program = Program {
+        modules: Vec::new(),
+    };
+    let resolved = Resolved::default();
+    let known = Known::default();
+    let c = Checker::new(&program, &resolved, &known);
+    match &c.env.lookup(&Symbol::new(name))?.ty {
+        Type::Fn { params, .. } => Some(params.len()),
+        // A prelude name that is not a function — none today, and a count is
+        // not the question to ask of one.
+        _ => None,
+    }
+}
+
 pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
     let mut program = Program::single(module.clone());
     // A `derive` is expanded before anything is resolved, here as in the
@@ -679,7 +704,17 @@ impl<'a> Checker<'a> {
             };
 
         let entries: Vec<(&str, Scheme)> = vec![
-            ("assert", mono(vec![Type::bool()], Type::unit())),
+            // Two parameters, the second defaulted to `None` by
+            // `ply_syntax::defaults`. The evaluator has carried the message
+            // arm since the first commit; until this signature widened, no
+            // well-typed program could reach it.
+            (
+                "assert",
+                mono(
+                    vec![Type::bool(), Type::option(Type::string())],
+                    Type::unit(),
+                ),
+            ),
             (
                 "assert_eq",
                 poly(
@@ -2351,6 +2386,17 @@ impl<'a> Checker<'a> {
         self.row_params = sig.row_params.clone();
         self.assumed = self.constraints_in_force(&def.constraints);
         self.performs.clear();
+
+        // Defaults first, *outside* the scope the parameters are bound in: a
+        // default is copied into call sites, where this function's parameters
+        // do not exist, so it must not be able to see them here either.
+        // `ply_syntax::defaults` refuses one that names a sibling parameter
+        // outright; this is the half that gives the value a type.
+        for (p, t) in def.params.iter().zip(&sig.params) {
+            let Some(default) = &p.default else { continue };
+            let (got, _) = self.infer(default);
+            self.expect(default.span, t, &got, "parameter default");
+        }
 
         self.env.push();
         for (p, t) in def.params.iter().zip(&sig.params) {
