@@ -26,14 +26,49 @@ is printed by the run; none is claimed.
 **Disagreements: 0**, on everything above, with one boundary stated in §H4 and
 priced there.
 
+> **Re-taken 2026-08-30, against `ply_syntax::parse_unexpanded`. The table above
+> is the 2026-08-28 reading and is kept; this is the standing one.**
+>
+> | | inputs | bytes | dump records | nodes | diagnostics |
+> | --- | ---: | ---: | ---: | ---: | ---: |
+> | `examples/*.ply` | 13 | 333,851 | 92,969 | 44,769 | 0 |
+> | `crates/ply-std/ply/*.ply` | 8 | 422,886 | 157,119 | 77,092 | 0 |
+> | `fixtures/*.ply` (hand-written) | **29** | 10,729 | 4,230 | 1,662 | 60 |
+> | `fixtures/reference-tests.corpus` (mined) | 716 | 19,491 | 8,951 | 2,034 | 768 |
+> | **total** | **766** | **786,957** | **263,269** | **125,557** | **828** |
+>
+> **The `dump records` total read 262,269 until it was added up on 2026-08-30**
+> — 92,969 + 157,119 + 4,230 + 8,951 is 263,269, and this was the one cell in
+> either table that its column does not sum to. Corrected here and in
+> `../README.md` §2, which carries the note.
+>
+> **Disagreements: 0. Tolerances: 0** — §H4's is gone with the pass it excused.
+> The three inputs added are fixtures for named arguments and default
+> parameters, of which the 763 contained **none**. `../README.md` §2 decomposes
+> every number that moved, including why the node count is *lower* here and
+> *higher* under a like-for-like measure.
+
 A **node** is a `S:E:TAG;` record — one AST node with its own span. A **record**
 is any unit of the dump, so the extra 126,316 are list lengths, option presence
 flags, enum arms and scalar payloads: the structure that makes a dropped element
 shift everything after it rather than being absorbed.
 
+> **126,316 is the 2026-08-28 table's figure** (252,881 − 126,565), and it sits
+> below both tables, which reads as though it were the standing one. On the
+> 2026-08-30 table the same subtraction is 263,269 − 125,557 = **137,712**. The
+> sentence's claim is about what a record *is* and is unchanged; only the
+> arithmetic in it is dated, and it is left where it stands rather than
+> re-pointed, because the paragraph belongs to the table above it.
+
 **Node-tag coverage: 92 of 92.** Every tag the reference side of this dump can
 emit is reached, and `the_comparison_reaches_every_tag_the_reference_side_can_emit`
 fails if that stops being true. §H3 is about why that is not a stopping rule.
+
+> **95 of 95 as of 2026-08-30.** Three tags arrived with the move to the
+> pre-rewrite tree: `erup` and `etry`, the two variants the dumper used to
+> answer `unreachable!()` for, and `narg`, which nothing emitted at all. `narg`
+> is reached by exactly one fixture, so the coverage figure and §H3's mutation
+> #17 rest on the same file — which is what that test's own note now says.
 
 ### The order it was built in, because it is the answer to "does it work"
 
@@ -66,11 +101,50 @@ areas were written against `parser.rs` by hand and they were right.
    `spikes/ply-lexer/harness` makes for floats, made here in the direction that
    **removes** a normaliser rather than adding a second one to check the first.
 
+5. **The three expansion passes `Parser::run` runs, and the fourth it does
+   not.** Added 2026-08-30; `../GAPS.md` §11R.D is the decision this states the
+   cost of. `parse_recovering` — this harness's entry point — is
+   `Parser::run`, which rewrites the module it just built:
+   `effect_set::expand` (538 lines), `record_update::expand` (530),
+   `try_op::expand` (1,019). The port implements none, which is the whole of
+   the 28-input, 70.2%-of-bytes disagreement. §H4 projects the first back out;
+   the other two **cannot be projected**, because they deliberately produce
+   trees indistinguishable from hand-written ones (`record_update` writes "the
+   plain `ExprKind::Record` a reader would have written by hand", `try_op` "the
+   `match` the corpus already hand-writes 129 times"). The decision is to
+   compare the **pre-expansion** tree, which puts all **2,087 lines**
+   permanently outside this comparison. Priced: **9 of 833 diagnostics (1.1%)**
+   are raised by any of them, all nine by `effect_set` (E0114 x6, E0115 x2,
+   E0105 x1) and seven of those already excused by §H4's asserted tolerance;
+   `record_update` and `try_op` raise **zero** anywhere in the 763 inputs, so
+   no error path of theirs has ever been verified here and none is given up.
+   A **fourth** pass, `defaults::expand` (912), was never in the comparison and
+   cannot be: it runs in `resolve` (`resolve.rs:453`), because a defaulted
+   argument's expression lives in the *callee's* module and needs the whole
+   program.
+6. **`ExprKind::App`'s keyword-argument field.** Absorbed by a `..` in the
+   dumper's `App` arm and emitted nowhere, so a named argument's name, its
+   value and any subtree inside it are invisible: `g(1, b: 2)`, `g(1, c: 2)`
+   and `g(1, b: h(2))` all dump byte-identically. The comment that excused it
+   claimed `defaults::expand` had already cleared the field; it has not, as
+   item 5 says. Costs nothing on today's corpus (zero named arguments in 763
+   inputs) and stops being free the moment the fixture bundle is re-mined:
+   `../GAPS.md` §11R.N has the numbers.
+7. **`Param`'s fallback-expression field.** The same feature's other half, also
+   not emitted — and, unlike item 6, **not excused**: `fields.rs` fails on it
+   today, which is why `../run.sh` stops before the differential (§11R.S).
+
 That list is enforced, not remembered: `harness/tests/fields.rs` reads `ast.rs`,
-takes all **144 fields of the 29 types the parser builds**, and requires each to
-be named in the reference dumper. Two are absent by design and are listed with
-their reason. Deleting `self.boolean(o.resource_param)` from the dumper was seen
-to fail it.
+takes every field of every type the parser builds, and requires each to be named
+in the reference dumper. Deleting `self.boolean(o.resource_param)` from the
+dumper was seen to fail it.
+
+> **Corrected in place 2026-08-30.** The two counts above were:
+> *"takes all **144 fields of the 29 types the parser builds** ... **Two** are
+> absent by design and are listed with their reason."* Re-run today it prints
+> **149 fields across 30 parsed types**, and **three** are absent — the third
+> being `Param`'s fallback-expression field, which is item 7 and is a genuine
+> failure rather than a design exception.
 
 > **The limit of that test, found by trying to arm it the first way.** Renaming
 > the *binding* — `ExprKind::WithCell { init: i0, .. }` — leaves the field name
@@ -78,6 +152,38 @@ to fail it.
 > not that it is **emitted**. That is the whole class it is claimed to cover: a
 > field added to `ast.rs` that nobody ever wrote down. A field written down and
 > then not used needs the mutations of §H3.
+
+> **The same limit, reached twice more, and both are worse than the first.**
+> The renaming above at least required someone to edit the dumper.
+> *(a)* `ExprKind`'s keyword-argument field (item 6) is reported as covered
+> because the word appears in two **doc comments**, one of them about effect
+> sets and not about that field at all. Armed by rewriting only prose: the test
+> keeps passing over it through two edits and reports it only when the last
+> whole-word occurrence anywhere in the file is gone.
+> *(b)* Writing §H2 item 5-7 and the `dumper_boundaries` doc **flipped the
+> test's verdict from "one field is not dumped" to "every field is dumped"**,
+> because sentences saying a field is not emitted contain that field's name.
+> The prose therefore spells three names around, and says so where it does it.
+> **The test matches words, and words are what documentation is made of.** The
+> repair — strip `//` and `///` lines before matching, or check emission
+> instead — is `../GAPS.md` §11R.N's handed-on item.
+
+> **The handed-on item is done, 2026-08-30, and it closes (a) and (b) and not
+> the first limit.** `code_only` strips `//` and `///` from **both** files
+> before the match, so prose about a field no longer covers it: `App::named`
+> would have failed on the day it landed, which is the whole of (a), and a true
+> sentence about a hole can no longer silence the test, which is (b). Armed by
+> `a_field_named_only_in_a_comment_does_not_count_as_covered`, with the two
+> shapes that caused the defect — a `///` line and a trailing `//` — plus an
+> assertion that the stripper does not eat the code as well.
+>
+> **The first limit is untouched and is not reachable this way.** The
+> `init: i0` rename still passes: naming is not emitting, and only §H3's
+> mutations catch a field written down and never used. The `dumper_boundaries`
+> workaround — spelling `default`, `mantissa` and `scale` *around* — is no
+> longer load-bearing, and its warning is corrected in place rather than
+> deleted, because the sentence it protects against is now harmless and the
+> sentence it *cannot* protect against is still the one above.
 
 ---
 
@@ -87,6 +193,13 @@ to fail it.
 directory and runs the whole differential against it. **16 armed, 0 survived, 0
 invalid** — on the second pass. Both of those numbers have a story and both are
 the point.
+
+> **Re-taken 2026-08-30: 22 armed, 0 survived, 0 invalid, 299 s**, over 766
+> inputs against `parse_unexpanded`. The table below is the 2026-08-28 run and
+> its counts are that run's; today's are in the second table under it. One of
+> the sixteen was **replaced and not dropped** — #7's anchor moved out of
+> `types.ply` when `param` did (`../GAPS.md` §11R.X) — and six were added, one
+> per dump edge the port gained.
 
 | # | the corruption | inputs that disagreed |
 | ---: | --- | ---: |
@@ -107,12 +220,71 @@ the point.
 | 15 | a test's label span becomes the whole item's | 30 |
 | 16 | a block's tail expression is never emitted | 53 |
 
+### 2026-08-30, over 766 inputs, against the pre-rewrite tree
+
+| # | the corruption | inputs that disagreed |
+| ---: | --- | ---: |
+| 1 | a fn's `where` constraints are parsed and thrown away | 3 |
+| 2 | a fn's effect row is never emitted | 133 |
+| 3 | a parenthesised pattern keeps its inner span | 1 |
+| 4 | binary operators become **right-associative** | 11 |
+| 5 | `+` binds as tightly as `*` | 4 |
+| 6 | every comma list loses its last member | 93 |
+| 7 | **(replaced)** a parameter's type annotation is discarded, at `exprs.ply`'s `param_ty` | 57 |
+| 8 | the diagnostic dedup widens from code+span to code | 125 |
+| 9 | a secondary label claims to be primary | 20 |
+| 10 | every integer literal is dumped negated | 98 |
+| 11 | `store::place` loses its module | 17 |
+| 12 | `pub` is consumed and the item comes out private | 25 |
+| 13 | an effect-row atom loses its resource label | 29 |
+| 14 | `>=` closing a type parameter list stops splitting | 2 |
+| 15 | a test's label span becomes the whole item's | 31 |
+| 16 | a block's tail expression is never emitted | 55 |
+| **17** | **a named argument is lexed, parsed and thrown away** | **2** |
+| 18 | the `?` operator's node is one byte short of its own `?` | 7 |
+| 19 | `{..b, f: e}` collapses to a plain record and the base vanishes | 3 |
+| 20 | a parameter's default expression is discarded | 1 |
+| 21 | a positional argument after a named one is no longer refused | 1 |
+| 22 | the `?` byte lexes as `%` | 7 |
+
+> **Corrected on review, 2026-08-30: rows 18 and 19 read `2` and `7`.** Two
+> `run.sh --arm` runs on the same tree, an hour apart, both report **#18 = 7**
+> and **#19 = 3**, and both readings decompose: #18 disagrees on every input
+> holding a postfix `?` — `db`, `desk`, `http`, `json`, `router`, `config` and
+> `fixtures/12` — while #19 disagrees only where `{..b, ...}` is *written*,
+> which is `fixtures/12`, `fixtures/35` and `examples/desk.ply`. The withdrawn
+> pair is the same two numbers with the larger one on the wrong row. Nothing
+> else in the table moved: rows 1-17 and 20-22 reproduce exactly.
+>
+> The correction makes the table *stronger* on #18 and *weaker* on #19, and the
+> weaker half is the one to carry forward: `{..b, f: e}` is written in three
+> inputs in the whole tree, two of which are fixtures added on 2026-08-30.
+
+**#17 is the one to read.** It is precisely the port §H2 item 6 said would pass:
+one that reads `name`, `:` and `value` and throws all three away. Before
+2026-08-30 it disagreed on **0** inputs. It disagrees on 2 now, and both are
+fixtures written in the same change — which is the honest reading of it: the
+mutation is armed by a fixture, not by the corpus, because the corpus contains
+no named argument at all.
+
+**#17, #20 and #21 each disagree on exactly one or two inputs**, and that is the
+weakest column in this table. A single fixture is all that stands between each
+of those three properties and a silent hole.
+
 The brief asked for three classes — a dropped field, a wrong span, a swapped
 associativity. Those are #1/#2/#13/#16, #3/#15, and #4. The rest are one per
 structural property the dump grammar claims: list lengths (#1, #6), option
 presence (#2, #7, #16), enum arms (#12), scalar payloads (#10), spans (#3, #15),
 diagnostic shape (#8, #9), and the one tolerance the harness grants (#13, which
 corrupts precisely the row atoms `examples/desk.ply`'s projection compares).
+
+> **Corrected 2026-08-30.** The parenthetical on #13 named a tolerance that no
+> longer exists: `examples/desk.ply` has no projection now, it is compared
+> whole. #13 corrupts its row atoms **directly**, which is a stronger thing to
+> watch than a projection's clause 2, and it still disagrees on 29 inputs. The
+> six added mutations cover the four dump edges the port gained — the
+> named-argument list (#17), `ETry`'s span (#18), `ERecordUpdate`'s base (#19),
+> `Param`'s default (#20) — plus one diagnostic (#21) and one token (#22).
 
 ### The finding: #3 survived, and tag coverage did not notice
 
@@ -151,6 +323,32 @@ is the same defect class as the thing it is there to prevent.
 ---
 
 ## §H4 The `effect set` boundary, priced
+
+> **SUPERSEDED 2026-08-30, and the whole section is kept because the successor's
+> argument depends on it.** There is no projection any more: the comparison
+> enters at `ply_syntax::parse_unexpanded`, so `effect_set::expand` does not run
+> and there is nothing to project back out. `reference_dump_unexpanded`, the
+> four-conjunct tolerance `only_the_expanders_diagnostics`, and the
+> `assert_eq!(tally.expander_inputs, 7)` that pinned it are all deleted; each
+> left a withdrawal note where it stood.
+>
+> **What the tolerance excused turned out to be exactly what pre-expansion gives
+> up.** Measured by differencing the two entry points: the three passes raise
+> **7** diagnostics over the corpus, E0114 ×4 + E0115 ×2 + E0105 ×1, on the same
+> 7 mined fixtures this section's last table counts. So the honest successor to
+> the table below is: **0 files projected, 0 inputs excused, 7 diagnostics
+> permanently outside the comparison, and 3,974 nodes.** `examples/desk.ply` is
+> now compared whole and agrees whole, which
+> `the_one_file_that_used_to_need_a_projection_is_now_compared_whole` asserts by
+> running the comparison rather than by saying so.
+>
+> **The reason this section cannot simply be repeated for the other two passes**
+> is the load-bearing part and it is unchanged: `effect_set::expand` records its
+> own output in `EffectSetDef::expansion`, which is what makes a projection
+> possible at all. `record_update` and `try_op` record nothing, by design.
+> `../GAPS.md` §11R.D §2.
+>
+> The section as it stood:
 
 `items.ply` does not port `crates/ply-syntax/src/effect_set.rs` (521 lines: a
 cycle search with an explicit stack, a post-order fixed point, a canonicalising

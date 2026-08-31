@@ -3538,3 +3538,102 @@ fn an_omitted_argument_is_filled_with_the_default() {
     assert_eq!(dump_expr(&a.body), "(call greet \"ada\" \"hello\")");
     assert_eq!(dump_expr(&b.body), "(call greet \"ada\" \"hey\")");
 }
+
+/// **`parse_unexpanded` is for one spike, and this is what keeps it there.**
+///
+/// [`crate::parse_unexpanded`] hands out a tree with `ExprKind::Try` and
+/// `ExprKind::RecordUpdate` still in it. Every crate downstream of this one has
+/// an `unreachable!()` arm for both, on the strength of
+/// `no_try_survives_parse_module_anywhere_in_the_tree` and its record-update
+/// twin — and those two guards are about [`crate::parse_recovering`]. They say
+/// nothing whatever about this entry point, which is precisely why it is
+/// `#[doc(hidden)]` and why a caller inside the workspace would be a defect
+/// rather than a use.
+///
+/// So the guard here is not about trees at all: it reads the workspace's own
+/// Rust and fails if the name appears anywhere but the two places it is allowed
+/// to. `spikes/ply-parser` is outside the cargo workspace and is not walked.
+///
+/// **The limit, stated rather than left to be discovered.** This is lexical. A
+/// caller reaching the function through a re-export under another name, or
+/// through `parser::` by a path this grep does not spell, would not be seen.
+/// It catches the case that will actually happen — somebody finds a public
+/// function and calls it — and it is the same class of check as
+/// `crates/ply-span/tests/armed.rs`, whose header says the same thing about
+/// itself.
+#[test]
+fn parse_unexpanded_is_reached_by_no_shipping_caller() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate lives two levels below the repository root");
+    let crates = root.join("crates");
+
+    // Where the name is allowed: the definition, and this test.
+    let allowed = [
+        crates.join("ply-syntax/src/parser.rs"),
+        crates.join("ply-syntax/src/lib.rs"),
+        crates.join("ply-syntax/src/tests.rs"),
+    ];
+
+    fn collect_rs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect_rs(&crates, &mut files);
+    assert!(
+        files.len() > 100,
+        "only {} `.rs` files found under {}; the walk is not reaching the workspace and \
+         this test would pass over anything",
+        files.len(),
+        crates.display()
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut saw_the_definition = false;
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !text.contains("parse_unexpanded") {
+            continue;
+        }
+        if allowed.iter().any(|a| a == path) {
+            saw_the_definition = true;
+            continue;
+        }
+        offenders.push(path.display().to_string());
+    }
+    assert!(
+        saw_the_definition,
+        // ASCII only, and not by preference: `spikes/ply-parser/mine-fixtures.py`
+        // mines every string literal in this file into its fixture bundle and
+        // asserts each is printable ASCII, so an em dash here stops the corpus
+        // generator with a bare `AssertionError`. Found by running it.
+        "no file under {} names `parse_unexpanded`, so either it has been renamed or this \
+         walk stopped reaching the crate that defines it; either way the check below is \
+         vacuous",
+        crates.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "`parse_unexpanded` hands out a tree holding `ExprKind::Try` and \
+         `ExprKind::RecordUpdate`, which every crate downstream of `ply-syntax` treats as \
+         `unreachable!()`. It exists for `spikes/ply-parser` and for nothing else. \
+         These files name it: {offenders:?}"
+    );
+}

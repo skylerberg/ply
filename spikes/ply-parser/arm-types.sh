@@ -109,9 +109,15 @@ arm "a lowercase bare name in a type becomes a constructor" types \
   'else if false {
     Ok({ p: q.p, node: TVar(q.node.name) })'
 
+# The `else ` at the front of this anchor was a typo, not a moved line:
+# `patterns.ply:206` reads `if is_bare(q.node) && ..` and always has, so this
+# mutation reported MUTATION DID NOT LAND -- it tested itself and not the
+# parser -- from the day it was written until 2026-08-30. Found by running the
+# script while checking that moving `param` out of `types.ply` had not
+# invalidated anything here; it had not, and this was already broken.
 arm "an uppercase bare name in a pattern becomes a binder" patterns \
-  'else if is_bare(q.node) && !starts_upper(q.node.name.name) {' \
-  'else if is_bare(q.node) {'
+  'if is_bare(q.node) && !starts_upper(q.node.name.name) {' \
+  'if is_bare(q.node) {'
 
 arm "a \`.\` no longer distinguishes an atom from an effect set" types \
   'if !at(c, p, t_dot()) { Ok({ p: p, node: RMSet(q) }) }' \
