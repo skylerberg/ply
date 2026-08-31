@@ -3504,3 +3504,35 @@ fn a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_
         render(&diags)
     );
 }
+
+/// One mistake is one diagnostic, however many places repeat it.
+///
+/// A parameter default is checked where it is written and again in every call
+/// that omitted it — the splice is a copy, so each copy fails the same
+/// unification, and each points at the same characters because a spliced
+/// default keeps the span it was written at. Without deduplication that is
+/// `1 + <call sites>` renderings of one error, growing with the size of the
+/// program rather than with the number of mistakes in it.
+#[test]
+fn one_mistake_is_not_reported_once_per_call_site() {
+    let src = "fn f(a: Int, b: Int = \"not an int\") -> Int = a + b\n\
+               fn one() -> Int = f(1)\n\
+               fn two() -> Int = f(2)\n\
+               fn three() -> Int = f(3)\n";
+    let diags = check_src_err(src);
+    assert_eq!(
+        diags.len(),
+        2,
+        "expected the default's own error and one for the spliced copies, got {:#?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert!(
+        diags.iter().all(|d| d.code == codes::TYPE_MISMATCH),
+        "{diags:#?}"
+    );
+
+    // And the count does not grow with the program: a fourth caller adds no
+    // fifth diagnostic.
+    let more = check_src_err(&format!("{src}fn four() -> Int = f(4)\n"));
+    assert_eq!(more.len(), 2, "{more:#?}");
+}
