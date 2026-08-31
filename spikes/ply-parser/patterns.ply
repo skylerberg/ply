@@ -15,11 +15,11 @@
 
 import spine (Span, Ident, QName, Ctx, P, R, Ate, Acc, PDiag,
               span_to, dummy_span, no_ident, no_qname,
-              unexpected, diag1, bail_with, error_here, unclosed,
+              unexpected, diag1, push_diag, error_here, unclosed,
               kind, kind_at, cur_span, span_at, prev_span, at, at_eof,
               starts_upper, advance, bump, eat, tok_bytes, tok_at,
               expect, expect_close, expect_ident,
-              deeper, shallower, qname, comma_list,
+              deeper, shallower, qname, comma_list, settle, failed,
               t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
               t_comma, t_colon, t_dotdot, t_minus, t_underscore,
               k_true, k_false,
@@ -85,7 +85,7 @@ pub type Pattern =
   | PCtor({ span: Span, name: QName, args: List<Pattern> })
   | PRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
   | PList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
-  // No analogue in `ast.rs`; what a bailed `pattern` answers. See `types.ply`.
+  // No analogue in `ast.rs`; the stand-in `settle` asks for. See `types.ply`.
   | PBad({ span: Span })
 
 pub fn pat_span(x: Pattern) -> Span =
@@ -120,18 +120,17 @@ fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 // --- Patterns ---------------------------------------------------------------
 
 // The third of the reference's three `deeper()` sites (`parser.rs:1846`).
-pub fn pattern(c: Ctx, p: P) -> R<Pattern> =
-  if p.bail { { p: p, node: no_pattern() } } else {
-    let d = deeper(c, p);
-    if d.bail { { p: d, node: no_pattern() } } else {
-      let r = pattern_body(c, d);
-      { p: shallower(r.p), node: r.node }
-    }
+pub fn pattern(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
+  let d = deeper(c, p)?;
+  match pattern_body(c, d) {
+    Err(q) -> Err(shallower(q)),
+    Ok(r) -> Ok({ p: shallower(r.p), node: r.node }),
   }
+}
 
-fn lit_pat(c: Ctx, p: P, l: Lit) -> R<Pattern> = {
+fn lit_pat(c: Ctx, p: P, l: Lit) -> Result<R<Pattern>, P> = {
   let a = advance(c, p);
-  { p: a.p, node: PLit({ span: a.node, lit: l }) }
+  Ok({ p: a.p, node: PLit({ span: a.node, lit: l }) })
 }
 
 fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
@@ -139,7 +138,7 @@ fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
 fn is_num_tok(t: Tok) -> Bool =
   match t { TInt(v) -> true, TFloat(f) -> true, TDec(m, sc) -> true, _ -> false }
 
-fn pattern_body(c: Ctx, p: P) -> R<Pattern> = {
+fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let st = cur_span(c, p);
   match kind(c, p) {
     TInt(v) -> lit_pat(c, p, LInt(v)),
@@ -152,12 +151,12 @@ fn pattern_body(c: Ctx, p: P) -> R<Pattern> = {
     TKw(k) ->
       if k == b"true" { lit_pat(c, p, LBool(true)) }
       else if k == b"false" { lit_pat(c, p, LBool(false)) }
-      else { { p: error_here(c, p, b"a pattern"), node: no_pattern() } },
+      else { Err(error_here(c, p, b"a pattern")) },
     TIdent(n) -> pattern_named(c, p, st),
     TPunct(s) ->
       if s == b"underscore" {
         let a = advance(c, p);
-        { p: a.p, node: PWild({ span: a.node }) }
+        Ok({ p: a.p, node: PWild({ span: a.node }) })
       }
       // A negative literal is one pattern rather than an operator applied to
       // one, because a pattern is not an expression and there is nothing to
@@ -166,12 +165,12 @@ fn pattern_body(c: Ctx, p: P) -> R<Pattern> = {
       else if s == b"lparen" { pattern_paren(c, p) }
       else if s == b"lbracket" { list_pattern(c, p) }
       else if s == b"lbrace" { record_pattern(c, p) }
-      else { { p: error_here(c, p, b"a pattern"), node: no_pattern() } },
-    _ -> { p: error_here(c, p, b"a pattern"), node: no_pattern() },
+      else { Err(error_here(c, p, b"a pattern")) },
+    _ -> Err(error_here(c, p, b"a pattern")),
   }
 }
 
-fn neg_lit(c: Ctx, p: P, st: Span) -> R<Pattern> = {
+fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
   let m = advance(c, p);
   let a = advance(c, m.p);
   let s = span_to(st, a.node);
@@ -179,49 +178,44 @@ fn neg_lit(c: Ctx, p: P, st: Span) -> R<Pattern> = {
   // negate at all: their payload is the raw source over `s`, which already has
   // the `-` in it.
   match kind(c, m.p) {
-    TInt(v) -> { p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) },
-    TFloat(f) -> { p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) },
-    TDec(mm, sc) -> { p: a.p, node: PLit({ span: s, lit: LDec(src_over(c, s)) }) },
+    TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),
+    TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) }),
+    TDec(mm, sc) -> Ok({ p: a.p, node: PLit({ span: s, lit: LDec(src_over(c, s)) }) }),
     // Unreachable: `is_num_tok` on `kind_at(1)` is what reached this function.
     // The reference writes `unreachable!()`; Ply has no expression that stands
     // for "cannot happen" and has the arm's type, so the arm answers a literal
     // the reference can never build. `GAPS.md` §P5.
-    _ -> { p: a.p, node: PLit({ span: s, lit: LBad }) },
+    _ -> Ok({ p: a.p, node: PLit({ span: s, lit: LBad }) }),
   }
 }
 
-fn pattern_paren(c: Ctx, p: P) -> R<Pattern> = {
+fn pattern_paren(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let o = advance(c, p);
   if at(c, o.p, t_rparen()) {
     let cl = advance(c, o.p);
-    { p: cl.p, node: PLit({ span: span_to(o.node, cl.node), lit: LUnit }) }
+    Ok({ p: cl.p, node: PLit({ span: span_to(o.node, cl.node), lit: LUnit }) })
   } else {
-    let inner = pattern(c, o.p);
-    if inner.p.bail { { p: inner.p, node: no_pattern() } } else {
-      let cl = expect_close(c, inner.p, t_rparen(), o.node, b"`)`");
-      if cl.p.bail { { p: cl.p, node: no_pattern() } }
-      else { { p: cl.p, node: set_pat_span(inner.node, span_to(o.node, cl.node)) } }
-    }
+    let inner = pattern(c, o.p)?;
+    let cl = expect_close(c, inner.p, t_rparen(), o.node, b"`)`")?;
+    Ok({ p: cl.p, node: set_pat_span(inner.node, span_to(o.node, cl.node)) })
   }
 }
 
-fn pattern_named(c: Ctx, p: P, st: Span) -> R<Pattern> = {
-  let q = qname(c, p, b"a pattern");
-  if q.p.bail { { p: q.p, node: no_pattern() } }
-  else if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    { p: q.p, node: PVar({ span: st, name: q.node.name }) }
+fn pattern_named(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
+  let q = qname(c, p, b"a pattern")?;
+  if is_bare(q.node) && !starts_upper(q.node.name.name) {
+    Ok({ p: q.p, node: PVar({ span: st, name: q.node.name }) })
   }
   else if at(c, q.p, t_lparen()) {
     let o = advance(c, q.p);
-    let args = comma_list(c, o.p, t_rparen(), pattern);
+    let args = comma_list(c, o.p, t_rparen(), pattern)?;
     let cl = expect_close(c, args.p, t_rparen(), o.node,
-                          b"`)` to close the constructor arguments");
-    if cl.p.bail { { p: cl.p, node: no_pattern() } }
-    else { { p: cl.p,
-             node: PCtor({ span: span_to(st, cl.node), name: q.node, args: args.node }) } }
+                          b"`)` to close the constructor arguments")?;
+    Ok({ p: cl.p,
+         node: PCtor({ span: span_to(st, cl.node), name: q.node, args: args.node }) })
   }
-  else { { p: q.p,
-           node: PCtor({ span: span_to(st, q.node.span), name: q.node, args: [] }) } }
+  else { Ok({ p: q.p,
+              node: PCtor({ span: span_to(st, q.node.span), name: q.node, args: [] }) }) }
 }
 
 // --- List patterns ----------------------------------------------------------
@@ -232,46 +226,46 @@ type ListAcc = { p: P, rest: Option<Pattern>, items: List<Pattern> }
 
 type ListOut = { rest: Option<Pattern>, items: List<Pattern> }
 
-fn list_pattern(c: Ctx, p: P) -> R<Pattern> = {
+fn list_pattern(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let o = advance(c, p);
-  let b = list_items(c, o.p, o.node);
-  if b.p.bail { { p: b.p, node: no_pattern() } } else {
-    let cl = expect_close(c, b.p, t_rbracket(), o.node, b"`]` to close the list pattern");
-    if cl.p.bail { { p: cl.p, node: no_pattern() } }
-    else { { p: cl.p,
-             node: PList({ span: span_to(o.node, cl.node), rest: b.node.rest,
-                           items: b.node.items }) } }
-  }
+  let {p, node: b} = list_items(c, o.p, o.node)?;
+  let {p, node: cl} = expect_close(c, p, t_rbracket(), o.node, b"`]` to close the list pattern")?;
+  Ok({ p: p,
+       node: PList({ span: span_to(o.node, cl), rest: b.rest,
+                     items: b.items }) })
 }
 
-fn list_items(c: Ctx, p: P, open: Span) -> R<ListOut> =
+fn list_items(c: Ctx, p: P, open: Span) -> Result<R<ListOut>, P> =
   iterate({ p: p, rest: None, items: [] }, c.ntok - p.pos + 1, |s: ListAcc|
-    if s.p.bail { Stop({ p: s.p, node: { rest: s.rest, items: s.items } }) }
-    else if at(c, s.p, t_rbracket()) { Stop({ p: s.p, node: { rest: s.rest, items: s.items } }) }
+    if at(c, s.p, t_rbracket()) { Stop(Ok({ p: s.p, node: { rest: s.rest, items: s.items } })) }
     else if at_eof(c, s.p) {
-      Stop({ p: unclosed(c, s.p, open, b"`]` to close the list pattern"),
-             node: { rest: s.rest, items: s.items } })
+      Stop(Err(unclosed(c, s.p, open, b"`]` to close the list pattern")))
     }
     else if at(c, s.p, t_dotdot()) {
       let d = advance(c, s.p);
       let bound = match kind(c, d.p) {
-        TIdent(n) -> {
-          let i = expect_ident(c, d.p, b"a name after `..`");
-          { p: i.p, node: PVar({ span: i.node.span, name: i.node }) }
+        TIdent(n) -> match expect_ident(c, d.p, b"a name after `..`") {
+          Err(q) -> Err(q),
+          Ok(i) -> Ok({ p: i.p, node: PVar({ span: i.node.span, name: i.node }) }),
         },
-        _ -> { p: d.p, node: PWild({ span: d.node }) },
+        _ -> Ok({ p: d.p, node: PWild({ span: d.node }) }),
       };
-      // `self.eat(&TokenKind::Comma);` — the reference drops the answer, so a
-      // trailing comma after `..` is allowed and an element after it is not.
-      Stop({ p: eat(c, bound.p, t_comma()).p,
-             node: { items: s.items, rest: Some(bound.node) } })
+      match bound {
+        Err(q) -> Stop(Err(q)),
+        // `self.eat(&TokenKind::Comma);` — the reference drops the answer, so a
+        // trailing comma after `..` is allowed and an element after it is not.
+        Ok(b) -> Stop(Ok({ p: eat(c, b.p, t_comma()).p,
+                           node: { items: s.items, rest: Some(b.node) } })),
+      }
     }
     else {
-      let it = pattern(c, s.p);
-      if it.p.bail { Stop({ p: it.p, node: { rest: s.rest, items: s.items } }) } else {
-        let e = eat(c, it.p, t_comma());
-        if e.ok { Continue({ p: e.p, rest: s.rest, items: push(s.items, it.node) }) }
-        else { Stop({ p: e.p, node: { rest: s.rest, items: push(s.items, it.node) } }) }
+      match pattern(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(it) -> {
+          let e = eat(c, it.p, t_comma());
+          if e.ok { Continue({ p: e.p, rest: s.rest, items: push(s.items, it.node) }) }
+          else { Stop(Ok({ p: e.p, node: { rest: s.rest, items: push(s.items, it.node) } })) }
+        },
       }
     })
 
@@ -281,49 +275,49 @@ type RecAcc = { p: P, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> }
 
 type RecOut = { rest: Bool, fields: List<{ name: Ident, pat: Pattern }> }
 
-fn record_pattern(c: Ctx, p: P) -> R<Pattern> = {
+fn record_pattern(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let o = advance(c, p);
-  let b = record_fields(c, o.p, o.node);
-  if b.p.bail { { p: b.p, node: no_pattern() } } else {
-    let cl = expect_close(c, b.p, t_rbrace(), o.node, b"`}` to close the record pattern");
-    if cl.p.bail { { p: cl.p, node: no_pattern() } }
-    else { { p: cl.p,
-             node: PRecord({ span: span_to(o.node, cl.node), rest: b.node.rest,
-                             fields: b.node.fields }) } }
-  }
+  let {p, node: b} = record_fields(c, o.p, o.node)?;
+  let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}` to close the record pattern")?;
+  Ok({ p: p,
+       node: PRecord({ span: span_to(o.node, cl), rest: b.rest,
+                       fields: b.fields }) })
 }
 
-fn record_fields(c: Ctx, p: P, open: Span) -> R<RecOut> =
+fn record_fields(c: Ctx, p: P, open: Span) -> Result<R<RecOut>, P> =
   iterate({ p: p, rest: false, fields: [] }, c.ntok - p.pos + 1, |s: RecAcc|
-    if s.p.bail { Stop({ p: s.p, node: { rest: s.rest, fields: s.fields } }) }
-    else if at(c, s.p, t_rbrace()) { Stop({ p: s.p, node: { rest: s.rest, fields: s.fields } }) }
+    if at(c, s.p, t_rbrace()) { Stop(Ok({ p: s.p, node: { rest: s.rest, fields: s.fields } })) }
     else if at_eof(c, s.p) {
-      Stop({ p: unclosed(c, s.p, open, b"`}` to close the record pattern"),
-             node: { rest: s.rest, fields: s.fields } })
+      Stop(Err(unclosed(c, s.p, open, b"`}` to close the record pattern")))
     }
     else {
       let dd = eat(c, s.p, t_dotdot());
       if dd.ok {
-        Stop({ p: eat(c, dd.p, t_comma()).p, node: { fields: s.fields, rest: true } })
+        Stop(Ok({ p: eat(c, dd.p, t_comma()).p, node: { fields: s.fields, rest: true } }))
       } else {
-        let n = expect_ident(c, s.p, b"a field name");
-        if n.p.bail { Stop({ p: n.p, node: { rest: s.rest, fields: s.fields } }) } else {
-          let co = eat(c, n.p, t_colon());
-          // The shorthand `{x}` binds `x` with the *name's* span and not a
-          // wider one.
-          let f = if co.ok { pattern(c, co.p) }
-                  else { { p: co.p, node: PVar({ span: n.node.span, name: n.node }) } };
-          if f.p.bail { Stop({ p: f.p, node: { rest: s.rest, fields: s.fields } }) } else {
-            let e = eat(c, f.p, t_comma());
-            if e.ok {
-              Continue({ p: e.p, rest: s.rest,
-                         fields: push(s.fields, { name: n.node, pat: f.node }) })
-            } else {
-              Stop({ p: e.p,
-                     node: { rest: s.rest,
-                             fields: push(s.fields, { name: n.node, pat: f.node }) } })
+        match expect_ident(c, s.p, b"a field name") {
+          Err(q) -> Stop(Err(q)),
+          Ok(n) -> {
+            let co = eat(c, n.p, t_colon());
+            // The shorthand `{x}` binds `x` with the *name's* span and not a
+            // wider one.
+            let f = if co.ok { pattern(c, co.p) }
+                    else { Ok({ p: co.p, node: PVar({ span: n.node.span, name: n.node }) }) };
+            match f {
+              Err(q) -> Stop(Err(q)),
+              Ok(fv) -> {
+                let e = eat(c, fv.p, t_comma());
+                if e.ok {
+                  Continue({ p: e.p, rest: s.rest,
+                             fields: push(s.fields, { name: n.node, pat: fv.node }) })
+                } else {
+                  Stop(Ok({ p: e.p,
+                            node: { rest: s.rest,
+                                    fields: push(s.fields, { name: n.node, pat: fv.node }) } }))
+                }
+              },
             }
-          }
+          },
         }
       }
     })
@@ -353,7 +347,7 @@ fn dump_pat_field(f: { name: Ident, pat: Pattern }) -> Bytes =
 // -> 0 }`; this is the direct form, for the tests below.
 pub fn dump_pattern_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = pattern(s.c, s.p);
+  let r = settle(pattern(s.c, s.p), no_pattern());
   string_of_bytes(bytes_concat(dump_pattern(r.node), dump_diags(r.p.diags)))
 }
 

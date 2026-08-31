@@ -84,96 +84,64 @@ arm "expect_gt answers the whole >= as the >" \
   'node: {start: s.start, end: s.start + 1} }' \
   'node: {start: s.start, end: s.end} }'
 
-# 2. Rule 1's guard, at each function that touches a token before its first
-#    guarded callee. This failure mode has no analogue in the lexer spike:
-#    GAPS.md §12 records that error accumulation cost the lexer nothing
-#    because a lexer never fails.
-arm "bail guard deleted from expect" \
-  'pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> R<Span> =
-  if p.bail {' \
-  'pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> R<Span> =
-  if false {'
-
-arm "bail guard deleted from expect_close" \
-  'pub fn expect_close(c: Ctx, p: P, k: lexer::Tok, open: Span, what: Bytes) -> R<Span> =
-  if p.bail {' \
-  'pub fn expect_close(c: Ctx, p: P, k: lexer::Tok, open: Span, what: Bytes) -> R<Span> =
-  if false {'
-
-arm "bail guard deleted from expect_ident" \
-  'pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> R<Ident> =
-  if p.bail {' \
-  'pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> R<Ident> =
-  if false {'
-
-arm "bail guard deleted from expect_gt" \
-  'pub fn expect_gt(c: Ctx, p: P, what: Bytes) -> R<Span> =
-  if p.bail {' \
-  'pub fn expect_gt(c: Ctx, p: P, what: Bytes) -> R<Span> =
-  if false {'
-
-arm "bail guard deleted from eat" \
-  'pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
-  if p.bail {' \
-  'pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
-  if false {'
-
-arm "bail guard deleted from deeper" \
-  'pub fn deeper(c: Ctx, p: P) -> P =
-  if p.bail { p } else {' \
-  'pub fn deeper(c: Ctx, p: P) -> P =
-  if false { p } else {'
-
-# The second equivalent mutant, for the same reason as `qname`'s: the
-# `iterate` step's own first test is `s.p.bail`, so a bailed `comma_list` with
-# no entry guard stops on round one with an empty list and an untouched state.
-equiv "bail guard deleted from comma_list (redundant behind the step's own test)" \
-  'pub fn comma_list<a>(c: Ctx, p: P, close: lexer::Tok, item: (Ctx, P) -> R<a>) -> R<List<a>> =
-  if p.bail {' \
-  'pub fn comma_list<a>(c: Ctx, p: P, close: lexer::Tok, item: (Ctx, P) -> R<a>) -> R<List<a>> =
-  if false {'
-
-# `qname`'s own guard is an EQUIVALENT MUTANT and this is the interesting
-# result of the whole script. `qname` touches no token before calling
-# `expect_ident`, which is guarded; `eat` is guarded; so with the entry guard
-# deleted, a bailed `qname` still consumes nothing and reports nothing. The
-# guard is therefore not defence, it is *the discipline that makes the
-# invariant checkable without a call-graph argument*. It also means the
-# guard-deletion instrument is weaker than a raw count of ~93 guards suggests:
-# every guard on a function whose first act is a guarded call is unkillable.
-equiv "bail guard deleted from qname (redundant behind expect_ident's)" \
-  'pub fn qname(c: Ctx, p: P, what: Bytes) -> R<QName> =
-  if p.bail {' \
-  'pub fn qname(c: Ctx, p: P, what: Bytes) -> R<QName> =
-  if false {'
+# 2. > **Withdrawn (ADR 0028, 2026-08-30): eight mutations that cannot be
+#    > written any more.** This block held six `arm`s and two `equiv`s, all of
+#    > the shape *"bail guard deleted from `expect`"* — replacing
+#    > `pub fn expect(..) -> R<Span> =\n  if p.bail {` with `if false {` — for
+#    > `expect`, `expect_close`, `expect_ident`, `expect_gt`, `eat` and
+#    > `deeper`, plus two registered as **equivalent** mutants for `comma_list`
+#    > and `qname`. Its header read: *"Rule 1's guard, at each function that
+#    > touches a token before its first guarded callee. This failure mode has no
+#    > analogue in the lexer spike: GAPS.md §12 records that error accumulation
+#    > cost the lexer nothing because a lexer never fails."*
+#    >
+#    > And `qname`'s carried the finding: *"`qname`'s own guard is an EQUIVALENT
+#    > MUTANT and this is the interesting result of the whole script … the
+#    > guard-deletion instrument is weaker than a raw count of ~93 guards
+#    > suggests: every guard on a function whose first act is a guarded call is
+#    > unkillable."*
+#    >
+#    > **There is no guard to delete.** `?` replaced the flag, so `p.bail` does
+#    > not exist, no function opens with one, and a mutation that removes a
+#    > guard has nothing to remove. That is ADR 0028's claim in its strongest
+#    > form: the 63-of-83 unverifiable guards `GAPS.md` §2 measured are not now
+#    > verifiable, they are **unwritable**. The eight lines are deleted rather
+#    > than rewritten because a mutation that cannot be applied arms nothing,
+#    > and `arm()` above scores it as a failure — correctly.
 
 # 3. Parser::push's dedup rule, which changes the diagnostic list exactly.
 arm "dedup rule: every diagnostic is kept" \
-  'if p.last_code == d.code && p.last_span.start == s.start && p.last_span.end == s.end {' \
-  'if false {'
+  'if dup { p } else {' \
+  'if false { p } else {'
 
 arm "dedup rule: keyed on the code alone, not the span" \
-  'p.last_code == d.code && p.last_span.start == s.start && p.last_span.end == s.end' \
-  'p.last_code == d.code'
+  'l.code == d.code && ls.start == s.start && ls.end == s.end' \
+  'l.code == d.code'
 
+# The two fields this used to corrupt are gone (ADR 0027): `push_diag` reads
+# `list_at(p.diags, len(p.diags) - 1)` instead. Corrupting the *index* is the
+# same corruption — it makes the rule look at the wrong diagnostic, which for a
+# one-element list is none at all.
 arm "the lexer's diagnostics do not seed the dedup key" \
-  'bail: false, last_code: d.code, last_span: d.span, diags: d.out' \
-  'bail: false, last_code: b"", last_span: dummy_span(), diags: d.out'
+  'match list_at(p.diags, len(p.diags) - 1) {' \
+  'match list_at(p.diags, len(p.diags)) {'
 
 # 4. The sequence driver, in the ways it can be subtly wrong.
-arm "comma_list: a bailed element is pushed rather than abandoned" \
-  'if r.p.bail {
-          Stop({p: r.p, node: s.out})' \
-  'if r.p.bail {
-          Stop({p: r.p, node: push(s.out, r.node)})'
+# The "bailed element is pushed" mutation went with the flag: an element that
+# fails is an `Err` the loop cannot look inside, so there is no node to push.
+arm "comma_list: a failing element is swallowed rather than propagated" \
+  'Err(q) -> Stop(Err(q)),
+        Ok(r) -> {' \
+  'Err(q) -> Stop(Ok({p: q, node: s.out})),
+        Ok(r) -> {'
 
 arm "comma_list: the last element before the closer is dropped" \
-  'Stop({p: e.p, node: push(s.out, r.node)})' \
-  'Stop({p: e.p, node: s.out})'
+  'Stop(Ok({p: e.p, node: push(s.out, r.node)}))' \
+  'Stop(Ok({p: e.p, node: s.out}))'
 
 arm "comma_list: end of input is not a stop condition" \
-  'if s.p.bail || at(c, s.p, close) || at_eof(c, s.p) {' \
-  'if s.p.bail || at(c, s.p, close) {'
+  'if at(c, s.p, close) || at_eof(c, s.p) {' \
+  'if at(c, s.p, close) {'
 
 arm "comma_list: a missing comma does not end the list" \
   'let e = eat(c, r.p, t_comma());
@@ -247,17 +215,19 @@ arm "a diagnostic drops its note count" \
 # 9. Qualified names: the module half is what tells `orders::place` from
 #    `place`, and both spell the same span if the qualifier is dropped.
 arm "a qualified name loses its module qualifier" \
-  '{ p: second.p, node: qualified(first.node, second.node) }' \
-  '{ p: second.p, node: bare(second.node) }'
+  'Ok({ p: p, node: qualified(first, second) })' \
+  'Ok({ p: p, node: bare(second) })'
 
 arm "a name with two coloncolons is accepted rather than reported" \
-  'else if at(c, second.p, t_coloncolon()) {' \
-  'else if false {'
+  'if at(c, p, t_coloncolon()) {
+      Err(push_diag' \
+  'if false {
+      Err(push_diag'
 
 # 10. Depth, which is the one thing standing between the corpus and ADR 0022 §8.
-arm "deeper never bails, however deep the nesting" \
-  'if q.depth <= max_depth() { q }' \
-  'if true { q }'
+arm "deeper never fails, however deep the nesting" \
+  'if q.depth <= max_depth() { Ok(q) }' \
+  'if true { Ok(q) }'
 
 # 11. `starts_upper`, which decides constructor-versus-binder at every bare name
 #     in a pattern and every bare name in a type.

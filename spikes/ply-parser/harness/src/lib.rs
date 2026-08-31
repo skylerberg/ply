@@ -509,6 +509,19 @@ impl<'a> Dumper<'a> {
                 self.rec(e.span, "esim");
                 self.expr(body);
             }
+
+            // Two nodes that cannot reach a dumper: both are sugar the parser
+            // expands before `parse_recovering` returns (ADR 0023, ADR 0028),
+            // and a refused one is rewritten to its operand rather than kept.
+            // The arms exist because this `match` has no `_`, which is what
+            // stopped this file compiling when the two variants were added --
+            // the bit-rot `README.md` §6 predicted, working as designed.
+            ExprKind::RecordUpdate { .. } => {
+                unreachable!("`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`")
+            }
+            ExprKind::Try { .. } => {
+                unreachable!("`e?` is expanded away by `ply_syntax::parse_module`")
+            }
         }
     }
 

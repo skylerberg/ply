@@ -73,12 +73,12 @@ probe "recover_to_item's bracket-depth counter" \
   'let d = if is_open(k) { s.depth }'
 
 probe "the out-of-order import loses its secondary label" \
-  'Some(s) -> push_diag(p, diag2(unexpected(), cur_span(c, p), s, 1)),' \
-  'Some(s) -> push_diag(p, diag1(unexpected(), cur_span(c, p), 1)),'
+  'Some(i) -> push_diag(p, diag2(unexpected(), cur_span(c, p), item_span(i), 1)),' \
+  'Some(i) -> push_diag(p, diag1(unexpected(), cur_span(c, p), 1)),'
 
 probe "the pub-on-a-test diagnostic loses its note" \
-  'let d = test_def(c, no_pub(p, unexpected(), pub_span, 1));' \
-  'let d = test_def(c, no_pub(p, unexpected(), pub_span, 0));'
+  'let d = test_def(c, no_pub(p, unexpected(), pub_span, 1))?;' \
+  'let d = test_def(c, no_pub(p, unexpected(), pub_span, 0))?;'
 
 probe "the deriver table accepts any name" \
   '  else if name == b"ord" { Some(DOrd) }
@@ -87,8 +87,10 @@ probe "the deriver table accepts any name" \
   else { Some(DJson) }'
 
 probe "an effect set may carry a row variable" \
-  'else if at(c, ms.p, t_pipe()) {' \
-  'else if false {'
+  'if at(c, ms.p, t_pipe()) {
+    // A set denotes' \
+  'if false {
+    // A set denotes'
 
 probe "looks_like_variants treats every name as a sum" \
   'starts_upper(n) && (kind_at(c, p, 1) == t_lparen() || kind_at(c, p, 1) == t_pipe()),' \
@@ -116,27 +118,22 @@ probe "an import kind reports names and alias interchangeably" \
 
 probe "op_param eats the documentation name it should skip" \
   'let p2 = if is_ident(c, p) && kind_at(c, p, 1) == t_colon() {
-               bump(c, bump(c, p))
-             } else { p };' \
+             bump(c, bump(c, p))
+           } else { p };' \
   'let p2 = p;'
 
-probe "the bail guard on fn_body is deleted" \
-  'pub fn fn_body(c: Ctx, p: P) -> R<Expr> =
-  if p.bail {' \
-  'pub fn fn_body(c: Ctx, p: P) -> R<Expr> =
-  if false {'
-
-probe "the bail guard on law_def is deleted" \
-  'pub fn law_def(c: Ctx, p: P) -> R<LawDef> =
-  if p.bail {' \
-  'pub fn law_def(c: Ctx, p: P) -> R<LawDef> =
-  if false {'
-
-probe "the bail guard on item is deleted" \
-  'pub fn item(c: Ctx, p: P) -> R<Item> =
-  if p.bail {' \
-  'pub fn item(c: Ctx, p: P) -> R<Item> =
-  if false {'
+# > **Withdrawn (ADR 0028, 2026-08-30): three probes that cannot be applied.**
+# > They stood here as `probe "the bail guard on fn_body is deleted"`,
+# > `.. on law_def ..` and `.. on item ..`, each replacing `if p.bail {` at the
+# > head of the function with `if false {`. `fn_body`'s is the one `GAPS.md` §2
+# > quotes at length as **the** load-bearing guard in the whole parser: with it
+# > gone, `at(c, e.p, t_lbrace())` answered `false` on a bailed state and a
+# > phantom `E0001` appeared that the reference never raises.
+# >
+# > `?` deletes the shape rather than the guard. `where_clause`'s failure now
+# > leaves `fn_def` at its `?`, so `fn_body` is never entered and there is no
+# > `if p.bail` anywhere to turn into `if false`. See the note above `fn_body`
+# > in `items.ply`.
 
 restore
 echo
