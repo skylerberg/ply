@@ -313,6 +313,79 @@ harness floor **0.9995×**, nothing-enterable rung **0.9758×**.
 
 **6.199×, 10th–90th percentile [6.143, 6.226], over 21 of 21 surviving paired
 windows, 2,162 native entries.** Pre-registered verdict **`entry-paid-off`**.
+
+> **Not re-taken on cranelift 0.132.3, and the reason is a blocked instrument
+> rather than a busy machine (2026-08-31).** The spike moved from cranelift
+> 0.134.3 to 0.132.3 so that it builds on this repository's pinned 1.93.1. The
+> obvious question — does the older cranelift generate materially worse code —
+> was pre-registered before the port with this section's own command, statistic,
+> window filter, load gate and controls taken over verbatim, and then **could
+> not be run**: `mcts` verifies agreement before it times anything and `bail!`s
+> on the first disagreement, and the agreement corpus is currently red at **42
+> disagreements**, so `--iterations 100 --inner 3 --repeats 21` exits 1 without
+> reaching a clock. `CONTRIBUTING.md` §"Things known to be broken" item 18 has
+> the defect.
+>
+> **The red is not the port's.** It reproduces on cranelift 0.134.3 built with
+> `+1.94.0` from unmodified source, and the ported build's agreement output is
+> byte-identical to the unported one — same `md5
+> c0893d75e378b64339b8ec0746e95220`, same 42 disagreements, same per-function
+> entry counts. So the port is a null result on everything this instrument can
+> still see, and **6.199× stands as a 0.134.3 figure that no one has yet
+> checked on 0.132.3.** Nothing here should be read as evidence that the two
+> versions generate equally fast code; it is evidence that they generate the
+> same *answers*, which is a different claim.
+>
+> The machine also failed this section's own load gate at the moment of the
+> attempt — 1-minute average 4.65 against the pre-registered 4.5 — so even a
+> green corpus would have produced `refused-machine-busy` rather than a ratio.
+> Both facts are recorded because either alone would have been enough.
+>
+> > **A cranelift 0.132.3 number on this kernel now exists, and it is not this
+> > one (2026-08-31).** `crates/ply-codegen` compiles `benches/kernel` from a
+> > shipping command, and `ply test benches/kernel --backend cranelift` is
+> > **4.871×** against no backend — min of 21 windows, arms interleaved, null
+> > control at 1.008×/1.004×, load 5.8 against a 4.0 gate so an observation and
+> > not a figure. `--backend reference` on the same series is 3.217×.
+> >
+> > **It does not replace 6.199× and must not be quoted as a re-take of it.**
+> > Four differences, and each of them widens the denominator: this measures a
+> > whole `ply test` invocation — front end, hashing, cache check, test harness
+> > — where 6.199× measures the kernel body alone; it pays 13.2 ms of JIT
+> > compilation inside the window; it runs the corpus's eight tests rather than
+> > `--iterations 100 --inner 3`; and it enters 2,974 times rather than 2,162.
+> > The two numbers are not in tension and neither is evidence about the other.
+> >
+> > What it does settle is a smaller thing this ADR could not: **the fragment
+> > over this kernel is intact under 0.132.3 and under a fresh implementation of
+> > the seam.** `crates/ply-codegen/tests/kernel.rs` compiles all 44 of the
+> > kernel's definitions as one closed unit with **zero refusals**, registers 25
+> > of them as enterable, and the search answers through compiled code. The
+> > blocked instrument above is still blocked and item 18 is still open.
+> >
+> > > **Re-taken by an adversarial review the same day, and it replicates:
+> > > 4.927x** against no backend, `--backend reference` 3.247x, null control
+> > > 1.005x/1.003x, N = 15 -- with the five arms **rotated one slot per window**
+> > > rather than run in a fixed order inside each rotation, which is the one
+> > > design change the review made and the one that would have exposed a
+> > > position confound had there been one. Load 8.63 -> 8.15, so an observation
+> > > on the same terms. Every caveat above survives unchanged: this is still
+> > > not a re-take of 6.199x, still a whole-`ply test` denominator, and item 18
+> > > still blocks the instrument that produces 6.199x. This is now the only
+> > > compiled-Ply speedup in this repository that two people have measured
+> > > independently.
+
+<!-- Corrected in place (adversarial review, 2026-08-31): this paragraph is the
+tail of the "**6.199x, 10th-90th percentile ...**" paragraph above the inserted
+blocks, written before them. The 2026-08-31 port inserted its blockquote in the
+middle of that paragraph without a blank line after it, and Markdown's lazy
+continuation then rendered these five lines INSIDE the quoted block -- so
+6.199x's monotonicity and its two independent replications read as part of a
+block about a measurement that was never taken. Nothing is reworded; the blank
+line restores them to body text. The identical mistake was made in
+docs/adr/0026-a-reachable-backend.md 4.7 by the same change and is corrected
+there too. -->
+
 The ladder is monotone in entries and the aggregate is filter-independent. Two
 reviewers replicated the top rung independently on busier machines — 6.215×
 at load 5.3–6.8 and 6.240× at load 12–16, both formally void under the

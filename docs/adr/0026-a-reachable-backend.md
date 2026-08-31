@@ -15,6 +15,18 @@ it owes. Supersedes nothing.
 > no dependency, `Cargo.lock` gains no cranelift, no workspace toolchain moves,
 > and `crates/ply-codegen-spike` is neither promoted nor deleted.
 >
+> > **Half of that last sentence is withdrawn, 2026-08-31, by the change §4.7
+> > authorised.** Withdrawn: *"`ply-cli` gains no dependency, `Cargo.lock` gains
+> > no cranelift"*. `crates/ply-cli` now depends on `crates/ply-codegen`, a
+> > cranelift JIT behind `ply test --backend cranelift`, and `Cargo.lock` holds
+> > 31 cranelift packages. **What still stands, verbatim: "no workspace
+> > toolchain moves"** — cranelift 0.132.3 declares `rust-version = "1.93.0"`
+> > and this repository is on one toolchain everywhere — **and
+> > "`crates/ply-codegen-spike` is neither promoted nor deleted"**: it is still
+> > outside the workspace, depended on by nothing, and `ply-codegen` does not
+> > import from it. §4.7 is the record of the authorisation being exercised and
+> > §4.9 is what the code generator reaches and costs.
+>
 > What ships is `ply_eval::backend::Reference` — a backend whose compiled code is
 > a **second tree-walker** over the scalar-signature fragment §1.4 describes,
 > installed by `ply test --backend`. It is not a code generator and it is slower
@@ -794,6 +806,35 @@ the record has been assuming.
 > > rather than fixed because lifting the mutations is a change to production
 > > source with its own review, and because the clause it qualifies is the
 > > gate M9 has to pass rather than one this ADR passed.
+> >
+> > > **Fixed 2026-08-31, by the change that added a second backend, and the
+> > > diagnosis above is what it was fixed against.** The two operations that
+> > > block was written about are now `ply_eval::Policed::holds` and
+> > > `ply_eval::Policed::run_with_fuel`; `Mutant`'s field is an
+> > > `Rc<dyn Policed>`; and `InterpExecutor::with_backend` takes a
+> > > `&'static dyn ply_eval::Provider` — a run-scoped, `Send + Sync` source of
+> > > per-worker backends — instead of a concrete `&'static Fragment`.
+> > > `ply_codegen::Cranelift` is the second implementation and the eight wrap
+> > > it through the same `ply_eval::backend::wrap` every provider calls.
+> > >
+> > > **This clause is discharged per backend, not per seam, and that is why
+> > > the table is run twice.** What a corruption can bite depends on which
+> > > definitions the backend has a body for, and the two fragments are very
+> > > different: over `crates/ply-cli/tests/backend.rs`'s corpus `Reference`
+> > > holds 5 definitions where `cranelift` holds 3, and over `examples/` the
+> > > two hold **153** and **27**. So `crates/ply-cli/tests/backend.rs` runs
+> > > every configuration against each installed backend and reports the counts
+> > > separately — 28 tests where there were 14.
+> > >
+> > > **The counts, and the one that moved.** `reference` catches **seven of
+> > > eight**, unchanged. `cranelift` accounts for **eight of eight**, and the
+> > > eighth is the row §4.7 below says lives nowhere: an unbounded runaway over
+> > > a non-terminating recursion. It is not caught by a disagreement — it
+> > > cannot be, the process dies — it is caught by the process dying, in
+> > > **0.02 s with exit 134**, where the tree-walker produces no output and no
+> > > exit in 45 s. Every test in that file already ran `ply` as a child, so the
+> > > reporter was always outside the process; what was missing was a backend
+> > > whose runaway dies rather than hangs.
 
 **No backend may ship until `ply test --engine both` can attach one and catch the
 eight.** Not because policing is more valuable than speed, but because it is
@@ -909,6 +950,29 @@ backend does.**
   the reason to specify it now is that stage one alone would let M9 ship the
   cheap version and call the rule enforced.
 
+> **Both stages re-checked against a code generator, 2026-08-31, and both hold
+> — but "it must still hold" is the sentence §"The one rule" is about, so each
+> was broken again rather than reasoned about.**
+>
+> The arming is backend-agnostic by construction and that is what was tested,
+> not assumed: `cache_bypassed` reads `args.backend`, which is a string, and
+> `backend_escapes` reads the entry count the **machine** recorded, which is a
+> number no backend supplies. Neither has a branch on which provider was
+> installed.
+>
+> | corruption | what went red, with `--backend cranelift` |
+> | --- | --- |
+> | delete `args.backend.is_some()` from `cache_bypassed` | `a_code_generator_run_reads_no_cached_pass`: the run reports `no_cache: false`, `cached: 5`, and a backend with `entered: 0, units: 0` — a green run over a code generator that never compiled anything |
+> | make the `Record::Backend` arm unreachable in `ply_test::run_with` | `a_code_generator_run_writes_no_pass`: three `E0505 … entered compiled code, and its pass was written to the result cache`, exit 1 |
+> | add a `set_compiled` call to `crates/ply-codegen/src/backend.rs` | the stage-one tripwire: *"[\"crates/ply-codegen/src/backend.rs\"] installs a compiled backend and is not listed in BACKEND_INSTALLERS"* — so `armed.rs`'s production-source scan does reach the new crate, which was the thing worth checking |
+>
+> One defect was found by doing this rather than by reading. The read half and
+> the write half were first written as **one** test over one project directory:
+> the read half warms the cache, so the write half's closing assertion found
+> five cached passes left by the warming and reported `left: 5, right: 0` on a
+> tree where the rule holds perfectly. They are two tests over two directories
+> now, and the reason is in the second one's doc comment.
+
 ADR 0016 §2.2's own objection lands squarely on the flag half and is not answered
 here: `RUNTIME_VERSION` (`ply-store/src/lib.rs:90`, `"0.12.0"`) keys
 `(RUNTIME_VERSION, DefHash) -> Outcome`, so **an opt-in JIT is an opt-in cache**,
@@ -927,9 +991,93 @@ may not treat it as resolved. It is listed in §5.
 **That clause is honoured without qualification and this ADR promotes nothing.**
 `ply-cli` gains no dependency, `Cargo.lock` gains no cranelift, no workspace
 toolchain moves, and §4.3's criteria are not written to let the spike through
-them. The spike is 6,909 lines of source built to price a ceiling, its `rt.rs` is
+them.
+
+> **Superseded within the day, and left standing because the sequence is the
+> record.** The block below was written by the port that moved the *spike* to
+> cranelift 0.132.3 and correctly said the maintainer authorisation had not been
+> exercised. The change that follows it exercised the authorisation; the
+> amendment is the block after next, headed **"Amended, 2026-08-31 (second
+> change of the day)"**. Read both: the first says what a toolchain port did
+> not do, and the second says what wiring a backend to a command did.
+>
+> **Still true on 2026-08-31, and one of the three is now true more strongly
+> than it was written.** `crates/ply-codegen-spike` moved from cranelift 0.134.3
+> to **0.132.3**, which declares `rust-version = "1.93.0"` and therefore builds
+> on the 1.93.1 this workspace already pins. So "no workspace toolchain moves"
+> holds, and in addition the *spike's* toolchain moved onto the workspace's:
+> `.github/workflows/ci.yml`'s `spike` job no longer installs 1.94.0, and this
+> repository is on one toolchain everywhere for the first time since the job was
+> written. Re-checked rather than recalled: `ply-cli` gains no dependency, and
+> `grep -c cranelift Cargo.lock` is **0**.
+>
+> **Nothing in that move exercises the permission this paragraph withholds.**
+> The spike is still not a workspace member, `cargo check --workspace` and
+> `cargo test --workspace` still do not reach it, it is still not linted into
+> the workspace gate, and no shipping command can install a backend. A
+> maintainer authorisation to take cranelift into the shipping workspace exists;
+> it was not exercised, and this block is not the record of exercising it.
+
+<!-- Corrected in place (adversarial review, 2026-08-31): the three sentences
+below are the tail of this section's OPENING paragraph, written 2026-08-28. The
+port's inserted block above swallowed the first of them onto its own last line,
+and Markdown's lazy continuation then pulled the other two into the blockquote
+with it — so the whole judgement rendered as part of a block that the amendment
+after it explicitly withdraws. It was never quoted and never withdrawn. Nothing
+is reworded; only the quoting is undone. -->
+
+The spike is 6,909 lines of source built to price a ceiling, its `rt.rs` is
 a JIT calling convention, and it has bit-rotted twice while nothing noticed. It
 is not a shipping component and the path to one does not run through it.
+
+> **Amended, 2026-08-31 (second change of the day). The authorisation is
+> exercised, and this block is the record of exercising it.**
+>
+> **Withdrawn**, from the block above, is exactly this:
+>
+> > A maintainer authorisation to take cranelift into the shipping workspace
+> > exists; it was not exercised, and this block is not the record of exercising
+> > it.
+>
+> and, from the paragraph this section opens with, this:
+>
+> > **That clause is honoured without qualification and this ADR promotes
+> > nothing.** `ply-cli` gains no dependency, `Cargo.lock` gains no cranelift, no
+> > workspace toolchain moves, and §4.3's criteria are not written to let the
+> > spike through them.
+>
+> **What is now true, checked rather than recalled.** `ply-cli` **gains a
+> dependency**: `ply-codegen`, unconditional, no feature flag. `Cargo.lock`
+> **gains cranelift**: 250 packages to 282, 31 new dependencies plus the crate
+> itself, 0 removed, and `grep -c cranelift Cargo.lock` is **44**.
+> `ply test --backend cranelift` installs a code generator.
+>
+> **What still holds, and is the half worth naming.**
+>
+> - **No workspace toolchain moves.** cranelift 0.132.3 declares
+>   `rust-version = "1.93.0"`; every job in `.github/workflows/ci.yml` is on
+>   1.93.1; a default `cargo build` and a default `cargo test` need no second
+>   toolchain. 0.133+ requires 1.94.0 and is deliberately not the route — a
+>   version bump past 0.132 is a toolchain decision, and
+>   `crates/ply-codegen/Cargo.toml` says so where the pins are.
+> - **The spike is not promoted.** §3.5's *"It may not be kept because it
+>   works … not a promotion of a spike"* is honoured literally: the spike is
+>   still not a workspace member, still depended on by nothing, still unreachable
+>   from any command, and `crates/ply-codegen` does not import from it. What
+>   moved is **source**, copied and adapted, with the provenance in each file's
+>   header. A new crate built from a spike's source is not the spike being kept
+>   because it works; it is the spike being read.
+> - **§4.5's condition is met before speed is argued.** The code generator was
+>   made policeable in the same change that made it installable — the mutations
+>   were lifted onto `ply_eval::Policed` first, and the eight configurations run
+>   against it in `crates/ply-cli/tests/backend.rs`. Nothing in this change
+>   quotes a ratio that was not taken against a backend the eight can corrupt.
+>
+> **What is not authorised by this and was not done.** Nothing here permits a
+> backend on `ply run`, on `ply serve` or on the default `ply test`: a backend
+> is installed only when `--backend` names one, and a run that installs one
+> neither reads nor writes the result cache. §4.6's interlock is unchanged and
+> ADR 0016 §2.2's cache-key objection is still open (§5).
 
 §3.5's *other* clause is the deletion requirement, whose stated reason is:
 
@@ -1025,6 +1173,55 @@ undone in ADR 0016 §11 and again in `ROADMAP.md` §"What is next":
 > §"Things known to be broken" item 1, so that "the spike is still here" and
 > "the eighth mutant is still not reproduced" stay the same sentence.
 
+> **The condition is met, 2026-08-31, and the spike is still not deleted. Both
+> halves of that sentence are decisions and both are recorded here.**
+>
+> The eighth row of the table above — `exceeds-budget` unbounded over a
+> non-terminating body, *"nowhere"* — is now somewhere.
+> `ply test --backend cranelift:wrong:exceeds-budget` over
+> `fn spin(n: Int) -> Int = 1 + spin(n + 1)` aborts with
+> `fatal runtime error: stack overflow`, **exit 134, in 0.02 s** (two runs,
+> release binary), against `reference`'s no output and no exit in 45 s over the
+> same corpus.
+>
+> The block above named exactly what would discharge it — *"a reporter outside
+> the run **and** a backend whose runaway actually dies"* — and was half wrong
+> about which half was missing. The reporter was never absent: every test in
+> `crates/ply-cli/tests/backend.rs` runs `ply` as a child through `assert_cmd`,
+> so `run_guarded`'s shape has been in the workspace since that file was
+> written. What was missing was only the second half, and a code generator
+> supplies it, because native frames sit on a fixed stack.
+> `the_unbounded_runaway_dies_under_a_code_generator_and_hangs_under_a_tree_walker`
+> asserts **both** arms, so the contrast is checked rather than remembered, and
+> it asserts the child died *by signal* rather than merely failing — the weaker
+> assertion was watched passing under a deliberately emptied fragment while nine
+> other tests went red, which is why the signal is the assertion.
+>
+> **So all eight configurations are accounted for inside
+> `cargo test --workspace`, and this amendment's deletion condition is
+> satisfied.** It is not acted on in this change, for two reasons that are
+> narrow and are meant to expire:
+>
+> 1. **The spike is the only home of a measurement that is currently red and
+>    unexplained.** `CONTRIBUTING.md` §"Things known to be broken" **item 18**
+>    records `crates/ply-codegen-spike`'s agreement corpus reporting **42
+>    disagreements** on both cranelift versions, with the defect plausibly in the
+>    harness's own refused-kind check rather than in the backend. Deleting the
+>    crate deletes the evidence for an open finding before anybody has decided
+>    what it means. `crates/ply-codegen/tests/kernel.rs` reproduces the kernel
+>    *fragment* but not that corpus.
+> 2. **ADR 0018 §0.5's 6.199× has no other instrument.** The figure is quoted in
+>    three documents and `crates/ply-codegen-spike/src/bin/mcts.rs` is the only
+>    thing that produces it. `ply test benches/kernel --backend cranelift` is a
+>    different measurement of a related thing — **4.871×** against no backend,
+>    min of 21 interleaved windows — and it does not replace it.
+>
+> **This is a permission, not a schedule, and it has expired once before.** The
+> deletion requirement in ADR 0016 §11 sat undone for two milestones because
+> nothing named a condition. The condition here is now *met*, so what stands
+> between the spike and `rm -r` is the two items above and nothing else. Item 18
+> is the one to close first, and closing it is what should carry the deletion.
+
 **This is the third document to touch this obligation, and that is a reason for
 suspicion rather than for confidence.** The difference claimed here, and it
 should be held to it: ADR 0016 §11 and `ROADMAP.md` both recorded a deletion that
@@ -1061,6 +1258,190 @@ And the honest cost of keeping it, which §7 turns into a way this can be wrong:
 taken**, on either binary, although both existed. ADR 0018 §0.5 says so about
 itself. 0.0 allocations is not 0 cost, and this ADR does not take that
 measurement either.
+
+### 4.9 What the code generator costs and what it reaches — measured, 2026-08-31
+
+Added by the change that built it, because §6's obligations were written as
+obligations and this is the first section of this document that reports results
+from a shipping command rather than from a harness.
+
+**Read this first, and it is the sentence this section exists to make
+unavoidable: on the front-end-shaped workload the code generator is a net
+loss.** ADR 0030 predicted the front end would be the worst case and it is worse
+than that prediction, for a reason that prediction did not price.
+
+#### The pre-registration
+
+`/tmp/cranelift-m9/PRE-REGISTERED.md`, written before any binary ran, with one
+amendment made before any number existed and marked as such. It fixes five
+statistics, their run counts and their decision rules, including two that were
+written to permit an unwelcome answer: *"`entered == 0` on all three is a NULL
+RESULT and is reported as one in the first sentence of the report"*, and *"A
+cranelift result AT OR BELOW `Reference`'s is the PREDICTED outcome and is
+reported as a confirmation, not as a failure. No arm is re-run to get a better
+number."*
+
+#### What it reaches
+
+`ply test <corpus> --engine both --no-cache -j 1 --json`, one run each, on a
+binary `.github/binary-is-current.sh` reported `current (163 inputs checked)`
+first. Both corpora are **green on `--engine both` with the backend installed**,
+which is the correctness result and the reason the speed rows are worth reading
+at all.
+
+| corpus | backend | definitions with a body | offers | entered | share |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `examples/` (186 tests) | `reference` | 153 | 58,425 | 55,693 | 95.3% |
+| `examples/` | `cranelift` | **27** | 62,660 | **696** | **1.1%** |
+| `benches/kernel` (8 tests) | `reference` | 25 | 3,097 | 2,974 | 96.0% |
+| `benches/kernel` | `cranelift` | **25** | 3,097 | **2,974** | **96.0%** |
+
+**The two rows are the finding.** On a compute kernel the code generator reaches
+exactly what the tree-walker reaches — the fixpoint refuses *nothing* in
+`benches/kernel`, all 44 definitions compile as one closed unit. On a program
+built out of the standard library it reaches 1.1%, and
+`crates/ply-codegen/tests/fragment.rs`'s census says why, ranked: **`++` (68
+definitions), `fold` (33), `map` (28), a lambda (18)**. That is ADR 0018 §0's
+roadmap re-derived on the shipping standard library, four milestones later,
+unchanged in its ordering.
+
+#### What it costs
+
+Per run, and split because the halves scale differently — the analysis is
+whole-program and paid once, the code generation is paid per worker because a
+compiled unit owns a constant pool of `Value`s and a `Value` is `Rc` all the way
+down:
+
+| corpus | analysis (once) | codegen | units |
+| --- | ---: | ---: | ---: |
+| `examples/` | **382 ms** | 496 ms | 6 (at `-j 1`) |
+| `examples/`, default `-j` | 379 ms | 2,633 ms | 18 |
+| `benches/kernel` | 0.65 ms | 13.2 ms | 2 |
+
+Both are printed by `ply test` itself — `compiled N unit(s) in X ms, after Y ms
+deciding what to compile` — rather than living only here.
+
+#### Speed, and the load caveat stated before the numbers
+
+`ply test <corpus> --engine machine --no-cache -j 1`, **21 windows per arm,
+arms interleaved one window at a time in rotation**, min of 21 reported, with
+two arms that are the *same command under different labels* as the null control.
+
+**The 1-minute load average was 5.79–12.2 across both series, against this
+project's 4.0 gate. These are observations and not figures**, and
+`CONTRIBUTING.md` §"Gate on an idle machine before measuring, not after" is
+right that they should have been taken behind the gate. What makes the ordering
+safe anyway is the null control, which is in the series rather than argued: the
+two identical arms landed within **0.8%** of each other on the kernel and
+**0.2%** on `examples/`, against differences of 387% and 176%.
+
+| corpus | `reference` | `cranelift` | null control |
+| --- | ---: | ---: | ---: |
+| `benches/kernel` | 3.217× | **4.871×** | 1.008× / 1.004× |
+| `examples/` | 1.106× | **0.363×** | 1.002× / 1.000× |
+
+All against no backend at all. Three things follow.
+
+1. **`reference` on `examples/` came back at 1.106×, against ADR 0030's 1.0887×
+   on the Ply front end.** Different corpus, different command, same order —
+   which is the closest thing to a replication either measurement has.
+2. **`cranelift` on the kernel is 4.871×, and 1.514× faster than `reference`
+   there.** ADR 0018 §0.5's 6.199× is a different measurement — the spike's own
+   harness, body-only, no front end, no cache check, no JIT compile in the
+   window — and this does not replace it. What this is, is the first speedup
+   from compiled Ply code that a user can reproduce with a documented command.
+3. **`cranelift` on `examples/` is 0.363×, which is 2.76× *slower* than running
+   no backend.** That is not noise and it is not a mystery: 878 ms of the
+   1,319 ms window is the analysis plus six units of code generation, and what
+   it buys is entry on 1.1% of offers. The brief for this work predicted "at
+   most about 3%" on the front end from ADR 0030's ceiling; the honest result is
+   that per-run compilation costs more than the ceiling is worth on that
+   workload.
+
+> **Corrected in place (adversarial review, 2026-08-31). Both series above
+> replicate. What does not survive is item 3's last sentence, because
+> `examples/` is not the front end and this ADR reached for ADR 0030's ceiling
+> over a corpus that ceiling was not about.**
+>
+> **Re-taken independently**, five arms, **rotated one slot per window** rather
+> than run in a fixed order inside each rotation, min of N, ratio against no
+> backend. The rotation is the one thing changed from the design above: it puts
+> every arm in every position, so that a within-rotation position effect and an
+> arm effect cannot be confused. They agree, which is the useful result — the
+> fixed order above was hiding nothing.
+>
+> | corpus | `reference` | `cranelift` | null control | N |
+> | --- | ---: | ---: | ---: | ---: |
+> | `benches/kernel` (this ADR: 3.217× / 4.871×) | 3.247× | **4.927×** | 1.005× / 1.003× | 15 |
+> | `examples/` (this ADR: 1.106× / 0.363×) | 1.088× | **0.353×** | 0.999× / 0.996× | 15 |
+> | **`spikes/ply-parser`, ADR 0030's own workload** | **1.087×** | **0.969×** | 0.999× / 1.002× | 9 |
+>
+> **The third row is the one this section was missing.** ADR 0030's workload is
+> `spikes/ply-parser/` driven by a generated `probe.ply` over `examples/*.ply` as
+> 13 byte literals, run as
+> `ply test <dir> --no-cache -j 1 --filter probe.parse` — its §"The workload"
+> gives the recipe, and it separately calls `examples/` *"the workspace's own
+> test corpus and not a program anyone is trying to make fast"*. Rebuilt from
+> that recipe: 13 files, **333,851 bytes**, byte count identical to ADR 0030's.
+>
+> Three things follow, and the first two are corrections in this ADR's favour.
+>
+> 1. **On the real front end the code generator is 0.969×, a 3.2% loss — not
+>    2.76× slower.** The 0.363× is sound as a fact about `ply test examples/`
+>    and is an artefact of corpus length as a fact about anything else: that run
+>    is 468 ms carrying 382 ms of fixpoint, so the fixed cost *is* the window.
+>    ADR 0030's workload runs 2.85 s and the same fixed cost is a sixth of it.
+>    **The sign item 3 reports is right; its magnitude is not transferable.**
+> 2. **`reference` came back at 1.087× against ADR 0030's 1.0887×.** Item 1
+>    above offers `examples/`'s 1.106× as *"the closest thing to a replication
+>    either measurement has"*, and was careful to say the corpus differed. It no
+>    longer has to be: this is the same corpus, the same command and the same
+>    figure to three decimal places, which is a real replication and makes the
+>    1.106× agreement a coincidence between two different workloads rather than
+>    evidence.
+> 3. **What actually costs the code generator the front end is the fragment, and
+>    it is narrower than `Reference`'s.** Over that corpus `--backend reference`
+>    enters **190,617 of 190,703 offers, 69 definitions in the fragment**;
+>    `--backend cranelift` enters **89,912 of 294,538, 6 definitions**. 89,912 is
+>    exactly the figure ADR 0030 names as the **pre-`Bytes`-widening `Int | Bool`
+>    rung**. So `crates/ply-codegen` reaches less than half of what the seam's
+>    tree-walker reaches on the workload ADR 0021's bootstrapping goal turns on.
+>    That is a fourth route out and it is not on the list below: **widening the
+>    code generator's fragment to what `Reference` already reaches**. It is the
+>    only one of the four whose size is known in advance — 100,705 entries the
+>    tree-walker takes and the code generator refuses, on this corpus, today.
+>    Nothing measured is above ADR 0030's 1.121× ceiling and none of this
+>    challenges it.
+>
+> Load 5.73–8.63 across all three series, **above the 4.0 gate**, so these are
+> observations on the same terms as the ones above them. Pre-registration written
+> before this reviewer's instrument produced any number, with the front-end arm
+> added as a dated amendment before *its* numbers existed:
+> `/tmp/cranelift-review/PRE-REGISTERED.md`; raw series
+> `/tmp/cranelift-review/R1-kernel.txt`, `R1-examples.txt`, `R4-frontend.txt`.
+
+#### What would change item 3, and what was deliberately not done
+
+Three routes, none measured, all named so that the next change starts from a
+list rather than from the number:
+
+- **Compile fewer definitions.** The unit compiles the whole closed set —
+  1,067 candidates over `examples/`, of which 27 are enterable. Only definitions
+  reachable from an enterable one can ever run, and pruning to that closure
+  would cut both halves. It needs a call graph the fixpoint currently discards.
+- **Compile once instead of once per worker.** The blocker is named in
+  `ply_codegen::Cranelift`'s header: a `Value` is `Rc`. Making the constant pool
+  shareable is a second representation of every constant, or an `Arc` audit of
+  `Value`, and neither was attempted.
+- **Compile lazily, on the first offer a worker actually receives.** Cheapest of
+  the three and helps least on these corpora, where the workers that exist do
+  get offers.
+
+**None of this is a reason to have deferred.** §4.5's whole argument is that
+policeability comes before speed, and the seam is now policed by eight
+configurations against a real code generator from a command a user runs. A slow
+backend that is checked is the thing this ADR asked for; a fast one that is not
+is what it refused.
 
 ---
 

@@ -308,6 +308,44 @@ a resource.
 **Still deferred — decided by W6 against criteria written before the numbers
 existed. The reason is not the one that carried this milestone through M0–M8.**
 
+> **Read this before the rest of this section: a code generator ships as of
+> 2026-08-31, and the heading above is not yet wrong.** `ply test --backend
+> cranelift` installs `ply_codegen::Cranelift`, a real cranelift JIT in the
+> shipping workspace — 31 new packages in `Cargo.lock`, no feature flag, no
+> second toolchain, `crates/ply-cli` depending on `crates/ply-codegen`. It
+> compiles the ADR 0016 §3.2 fragment and the machine enters it.
+>
+> **What that discharges is ADR 0026 §4.5's precondition, not M9's criteria.**
+> §4.5 is *"a backend must be policeable before it is fast"*, and it is now
+> discharged for a code generator: the eight wrong backends run against it from
+> a shipping command, eight of eight accounted for, in
+> `crates/ply-cli/tests/backend.rs`. **C3 is untouched** — nothing cheaper has
+> been priced on the workload being decided, and ADR 0019 §5 item 5's
+> `sqrt`/`ln` is still unpriced end to end.
+>
+> **And the honest headline, which belongs here rather than only in the ADR:**
+> on `benches/kernel` the code generator is **4.871×** against no backend, min
+> of 21 interleaved windows. On `examples/` it is **0.363×** — 2.76× *slower*
+> than no backend — because it enters 1.1% of offers there and pays 382 ms of
+> analysis plus 83 ms per worker of code generation on every run. ADR 0026 §4.9
+> has the pre-registration, the null control, the load caveat and the three
+> named routes out. This milestone still has to be argued on its criteria and
+> the argument is not "there is a code generator now".
+
+> **Both re-taken independently on rotated arms, 2026-08-31, and one line above
+> is corrected.** `benches/kernel` **4.927×** and `examples/` **0.353×** — the
+> two figures replicate. What does not is calling `examples/` the front end.
+> ADR 0030's front end is `spikes/ply-parser` parsing `examples/*.ply` as 13
+> byte literals, a 2.85 s run rather than a 468 ms one, and **on that corpus the
+> code generator is 0.969× — a 3.2% loss, not 2.76× slower**, while `reference`
+> comes back at **1.087×** against ADR 0030's published 1.0887×. The sign this
+> paragraph reports is right; the magnitude was an artefact of measuring a short
+> corpus where the fixpoint is most of the window. **The real obstacle is
+> narrower than the timing suggests and is a fourth route out**: on the front end
+> `reference` enters 190,617 offers over 69 definitions and `cranelift` enters
+> 89,912 over 6 — the code generator's fragment is *smaller than the
+> tree-walker's*. ADR 0026 §4.9 carries the correction and the series.
+
 The old reason was that the interpreter is not the bottleneck. In a *test* run
 that is still true, but by far less than this file used to claim. **The
 `3.3% of a warm run` (10.4ms of 310.7ms) this paragraph carried, and the `93%`
@@ -2067,7 +2105,11 @@ defect rather than a rule and which costs a spawning service **1.78× on `/healt
 > **The first of those two is now a condition rather than an open obligation
 > ([ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.7, 2026-08-28).** §3.5's
 > refusal to *promote* the spike is honoured — nothing depends on it, `Cargo.lock`
-> still has no cranelift — and its *deletion* requirement is amended, because the
+> still has no cranelift *(the parenthetical stopped being true on 2026-08-31:*
+> `crates/ply-codegen` *is a cranelift JIT in the shipping workspace and*
+> `grep -c cranelift Cargo.lock` *answers 44. The clause it supports —* nothing
+> depends on the spike *— is unchanged, and ADR 0026 §4.7 records the condition
+> below as **met**)* — and its *deletion* requirement is amended, because the
 > reason §3.5 gives for it ("nothing else in the workspace knows it existed") is
 > the half R5 falsified: the seam in `crates/ply-eval/src/compiled.rs` survives
 > the `rm -r`, so deleting the spike today removes the only implementation of

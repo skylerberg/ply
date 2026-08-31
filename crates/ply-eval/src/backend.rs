@@ -15,6 +15,21 @@
 //! This module is that condition discharged, and it is deliberately not a code
 //! generator. What it provides:
 //!
+//! > **A code generator arrived on 2026-08-31 and this module is what polices
+//! > it.** `crates/ply-codegen` implements [`Compiled`] and [`Policed`] over
+//! > the same seam, and `ply test --backend cranelift` installs it. Nothing
+//! > below is withdrawn — this module is still not a code generator and
+//! > [`Reference`] is still what runs where there is none — but two shapes here
+//! > changed to make a second backend possible, and they are the reason to read
+//! > [`Provider`] and [`Policed`] before adding a third:
+//! >
+//! > * [`Mutant`] wraps an `Rc<dyn Policed>` instead of an `Rc<Reference>`, so
+//! >   the eight corruptions apply to any backend rather than to this one.
+//! > * The counters moved out of [`Fragment`] into [`Counters`], which a
+//! >   [`Provider`] owns and hands to every backend it builds — otherwise a
+//! >   second backend would be policed by mutations reporting a different run's
+//! >   numbers.
+//!
 //! - [`Reference`] — a backend whose "compiled code" is a second tree-walker
 //!   over its own copy of the program, restricted to a **carried-signature
 //!   fragment** — every parameter and the return type in `Int | Bool | Bytes`.
@@ -131,11 +146,67 @@ pub struct Fragment {
     check: &'static CheckOutput,
     /// The scalar-signature definitions, by program-wide name.
     members: BTreeSet<Symbol>,
+    counters: Counters,
+}
+
+/// What one run's backend was asked, summed over every worker.
+///
+/// Split out of [`Fragment`] when a second [`Provider`] appeared, and the split
+/// is the point rather than tidiness: [`Mutant`] reads these counters, so a
+/// backend that carried its own private set would be policed by mutations that
+/// reported a different run's numbers. A [`Provider`] owns one of these and
+/// hands it to every backend it builds.
+///
+/// Atomic because the workers are threads and the numbers are the run's rather
+/// than a worker's. They are what makes "the corruption fired" checkable
+/// *before* "the corruption was caught", which is the middle step of
+/// `crates/ply-cli/tests/backend.rs`'s three and the one usually missing.
+#[derive(Default)]
+pub struct Counters {
     offered: AtomicU64,
     offered_target: AtomicU64,
     fired: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+}
+
+impl Counters {
+    /// One offer, counted, and whether it carried a `Bytes` in.
+    ///
+    /// Every [`Compiled::enter`] built over a [`Provider`] routes through this
+    /// rather than touching `offered` itself, so the two counters cannot drift
+    /// apart the day a third backend appears.
+    pub fn note_offer(&self, args: &[Value]) {
+        self.offered.fetch_add(1, Ordering::Relaxed);
+        if args.iter().any(|a| matches!(a, Value::Bytes(_))) {
+            self.bytes_in.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An answered [`Value::Bytes`], counted before any mutation touches it.
+    pub fn note_bytes_out(&self) {
+        self.bytes_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An offer naming the one definition a targeted mutation corrupts.
+    pub fn note_offered_target(&self) {
+        self.offered_target.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An answer a mutation actually changed.
+    pub fn note_fired(&self) {
+        self.fired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn offers(&self) -> Offers {
+        Offers {
+            offered: self.offered.load(Ordering::Relaxed),
+            offered_target: self.offered_target.load(Ordering::Relaxed),
+            fired: self.fired.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// What a run's backend was asked and what it did with it.
@@ -224,11 +295,7 @@ impl Fragment {
             resolved,
             check,
             members,
-            offered: AtomicU64::new(0),
-            offered_target: AtomicU64::new(0),
-            fired: AtomicU64::new(0),
-            bytes_in: AtomicU64::new(0),
-            bytes_out: AtomicU64::new(0),
+            counters: Counters::default(),
         }))
     }
 
@@ -246,44 +313,169 @@ impl Fragment {
     }
 
     pub fn offers(&self) -> Offers {
-        Offers {
-            offered: self.offered.load(Ordering::Relaxed),
-            offered_target: self.offered_target.load(Ordering::Relaxed),
-            fired: self.fired.load(Ordering::Relaxed),
-            bytes_in: self.bytes_in.load(Ordering::Relaxed),
-            bytes_out: self.bytes_out.load(Ordering::Relaxed),
-        }
-    }
-
-    /// One offer, counted, and whether it carried a `Bytes` in.
-    ///
-    /// Both `enter` implementations below route through this rather than
-    /// touching `offered` themselves, so the two counters cannot drift apart the
-    /// day a third implementation appears.
-    fn note_offer(&self, args: &[Value]) {
-        self.offered.fetch_add(1, Ordering::Relaxed);
-        if args.iter().any(|a| matches!(a, Value::Bytes(_))) {
-            self.bytes_in.fetch_add(1, Ordering::Relaxed);
-        }
+        self.counters.offers()
     }
 
     /// A backend for one worker's machine, built on that worker's own thread.
-    ///
-    /// [`Mutation::None`] with no target is the honest backend and is *not*
-    /// wrapped: a wrapper that is inert is still a wrapper, and the control this
-    /// module's tests read every other result against has to be the unwrapped
-    /// thing.
     pub fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
-        let reference = Rc::new(Reference::new(self));
-        match (&spec.mutation, &spec.target) {
-            (Mutation::None, None) => reference,
-            _ => Rc::new(Mutant {
-                inner: reference,
-                mutation: spec.mutation.clone(),
-                target: spec.target.clone(),
-                previous: RefCell::new(None),
-            }),
-        }
+        wrap(Rc::new(Reference::new(self)), spec)
+    }
+}
+
+/// A run's source of backends: one per run, shared by every worker, and the
+/// only route a shipping command has to install one.
+///
+/// **This trait is what ADR 0026 §4.5's 2026-08-30 note said had to exist**, and
+/// the note is worth quoting because the gap it names is exactly what the trait
+/// closes:
+///
+/// > `ply test`'s only install route is `InterpExecutor::with_backend`, whose
+/// > signature is `(&'static ply_eval::Fragment, BackendSpec)` — a `Fragment`,
+/// > not a `dyn Compiled` … So **the eight corruptions police one implementation
+/// > of `Compiled` and there is no route by which a second one is offered to
+/// > them.**
+///
+/// `Send + Sync` because a `ply test` run installs one backend per worker
+/// thread and every one of them adds to the same [`Counters`]. `'static`
+/// because [`crate::Machine::set_compiled`] takes a `'static` trait object, for
+/// the dropck reason its own field documents.
+///
+/// [`attach`](Provider::attach) is called **on the worker's own thread**: a
+/// backend is `Rc` all the way down, and a code generator's compile is work a
+/// worker does for itself rather than work a run does once and shares.
+pub trait Provider: Send + Sync {
+    /// This provider's backend for one worker, corrupted as `spec` asks.
+    fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled>;
+
+    /// What `--backend` calls this, for a report a user reads.
+    fn name(&self) -> &'static str;
+
+    /// How many definitions this provider has a body for.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What every worker's backend was asked, summed.
+    fn offers(&self) -> Offers;
+
+    /// What this provider spent compiling, or `None` for one that compiles
+    /// nothing.
+    ///
+    /// **`None` rather than a zeroed [`Compilation`], and the difference is not
+    /// cosmetic.** [`Fragment`] builds an `Interp` per worker and could count
+    /// them, but it could not time them: this crate may not read the host's
+    /// clock at all — `crates/ply-eval/tests/simulated_handlers.rs`'s
+    /// `the_evaluator_reads_no_host_clock_and_no_host_entropy` bans the type by
+    /// name from this source, and it has caught a measurement before (ADR 0030
+    /// §4). A zero here would read as "the tree-walker takes no time to build",
+    /// which is a claim nothing in this crate is allowed to make.
+    fn compilation(&self) -> Option<Compilation> {
+        None
+    }
+
+    /// Workers this provider could not build a backend for.
+    ///
+    /// Zero for a provider that cannot fail — [`Fragment`] builds an
+    /// [`Interp`], which is infallible — and the default reflects that. A code
+    /// generator can fail on a worker, and a worker with no bodies declines
+    /// every call, so a run that reported green over one would be green over a
+    /// seam nothing reached. `ply test` turns a non-zero count into an
+    /// `INTERNAL_ERROR` and fails.
+    fn unbuilt(&self) -> u64 {
+        0
+    }
+}
+
+impl Provider for Fragment {
+    fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
+        Fragment::attach(self, spec)
+    }
+
+    fn name(&self) -> &'static str {
+        "reference"
+    }
+
+    fn len(&self) -> usize {
+        Fragment::len(self)
+    }
+
+    fn offers(&self) -> Offers {
+        Fragment::offers(self)
+    }
+}
+
+/// What a run spent turning a program into compiled code.
+///
+/// Split into the two halves because they scale differently and a single total
+/// hides which one a reader is looking at: the analysis is whole-program and is
+/// paid **once**, and the code generation is paid **per worker**, because a
+/// compiled unit owns a constant pool of [`Value`]s and a `Value` is `Rc` all
+/// the way down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compilation {
+    /// Nanoseconds deciding *what* to compile. Whole-program, paid once per
+    /// run.
+    pub analysis_nanos: u64,
+    /// Nanoseconds inside the code generator, summed over every backend built.
+    pub codegen_nanos: u64,
+    /// Backends built.
+    ///
+    /// One per worker that was asked for one, **plus one** for a provider that
+    /// compiles a unit up front to prove it can — which is why a `-j 1` run
+    /// reports two. `ply_codegen::Cranelift::over` does exactly that, so that
+    /// "this host has no cranelift backend" is a diagnostic before the run
+    /// rather than a worker that silently declines every call.
+    pub units: u64,
+}
+
+/// A backend the eight corruptions can wrap.
+///
+/// [`Compiled`] is `describes` and `enter` and nothing else, which is not enough
+/// to be policed: two of the eight need operations that are not on it.
+/// [`Mutation::Unoffered`] asks the **registry** whether a body exists at all,
+/// which is the difference between a decline and a name that was never compiled
+/// — and that difference is the gap the mutation lives in.
+/// [`Mutation::ExceedsBudget`] re-runs the body on fuel that is deliberately
+/// **not** the machine's budget. So a backend that only implements [`Compiled`]
+/// can be installed and cannot be corrupted, which is a backend nothing has
+/// checked.
+///
+/// The three methods here are exactly those two plus the honest answer, and
+/// `enter` is deliberately **not** one of them: [`Compiled::enter`] counts an
+/// offer, and a mutant that called it would count every offer twice.
+pub trait Policed: Compiled {
+    /// The run's counters, which every backend over one provider shares.
+    fn counters(&self) -> &'static Counters;
+
+    /// Whether this backend has a body for `name` at all.
+    fn holds(&self, name: &Symbol) -> bool;
+
+    /// The honest answer for a call, **without** counting an offer.
+    fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
+
+    /// The body on an arbitrary bound, whatever the machine allowed. The only
+    /// caller is [`Mutation::ExceedsBudget`], which is the corruption of the
+    /// bound.
+    fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value>;
+}
+
+/// One worker's backend, corrupted as `spec` asks — the one place a [`Mutant`]
+/// is built, so that no provider can install a wrapper the others do not.
+///
+/// [`Mutation::None`] with no target is the honest backend and is *not*
+/// wrapped: a wrapper that is inert is still a wrapper, and the control every
+/// other result is read against has to be the unwrapped thing.
+pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
+    match (&spec.mutation, &spec.target) {
+        (Mutation::None, None) => inner,
+        _ => Rc::new(Mutant {
+            inner,
+            mutation: spec.mutation.clone(),
+            target: spec.target.clone(),
+            previous: RefCell::new(None),
+        }),
     }
 }
 
@@ -356,19 +548,8 @@ impl Reference {
         }
     }
 
-    /// The honest answer: the body, run under exactly the machine's remaining
-    /// call budget, or `None` for a registry miss, a non-scalar answer, or a
-    /// body that raised — including the body that raised *because* it outran the
-    /// budget, which is the decline the machine's own bound depends on.
-    fn answer(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
-        if !self.fragment.holds(name) {
-            return None;
-        }
-        self.run(name, args, fuel)
-    }
-
     /// The body with an arbitrary bound, whatever the registry says. The only
-    /// caller outside [`Reference::answer`] is [`Mutation::ExceedsBudget`],
+    /// caller outside [`Policed::answer`] is [`Mutation::ExceedsBudget`],
     /// which is the corruption of the bound, and [`Mutation::Unoffered`], which
     /// is the corruption of the registry.
     fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
@@ -376,7 +557,7 @@ impl Reference {
         inner.set_max_calls(fuel);
         match inner.call(name.as_str(), args.to_vec(), Span::DUMMY) {
             Ok(value @ Value::Bytes(_)) => {
-                self.fragment.bytes_out.fetch_add(1, Ordering::Relaxed);
+                self.fragment.counters.note_bytes_out();
                 Some(value)
             }
             Ok(value @ (Value::Int(_) | Value::Bool(_))) => Some(value),
@@ -389,14 +570,39 @@ impl Reference {
     }
 }
 
+impl Policed for Reference {
+    fn counters(&self) -> &'static Counters {
+        &self.fragment.counters
+    }
+
+    fn holds(&self, name: &Symbol) -> bool {
+        self.fragment.holds(name)
+    }
+
+    /// The honest answer: the body, run under exactly the machine's remaining
+    /// call budget, or `None` for a registry miss, a non-scalar answer, or a
+    /// body that raised — including the body that raised *because* it outran the
+    /// budget, which is the decline the machine's own bound depends on.
+    fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
+        if !self.fragment.holds(name) {
+            return None;
+        }
+        self.run(name, args, budget)
+    }
+
+    fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
+        self.run(name, args, fuel)
+    }
+}
+
 impl Compiled for Reference {
     fn describes(&self, program: &Program) -> bool {
         self.fragment.origin == std::ptr::from_ref(program) as usize
     }
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.fragment.note_offer(args);
-        let answer = self.answer(name, args, budget);
+        self.fragment.counters.note_offer(args);
+        let answer = Policed::answer(self, name, args, budget);
         // Measurement scaffolding, off unless `PLY_SEAM_CENSUS` is set. It
         // records the name of a call that was *entered* and not of one that was
         // merely offered: a registry miss is a hash lookup and no evaluation, so
@@ -500,9 +706,41 @@ impl Mutation {
     }
 }
 
+/// Which of the backends a command can install.
+///
+/// This enum names a **choice a command makes**, not an implementation this
+/// crate holds: `ply-eval` implements [`Reference`] and depends on no code
+/// generator. [`Kind::Cranelift`] is served by `crates/ply-codegen`, which
+/// implements [`Provider`] over the same seam, and it is named here because the
+/// `--backend` grammar is one grammar and splitting it across two crates would
+/// give a user two half-answers to `--backend nonsense`.
+///
+/// A `ply-cli` built without a code generator refuses [`Kind::Cranelift`] with a
+/// diagnostic that says so; it does not silently install the tree-walker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    /// [`Reference`]: a second tree-walker over the carried-signature fragment.
+    #[default]
+    Reference,
+    /// `ply_codegen::Cranelift`: native code, compiled at install time.
+    Cranelift,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Reference => "reference",
+            Kind::Cranelift => "cranelift",
+        }
+    }
+}
+
 /// Which backend a command was asked for, and which definition it corrupts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spec {
+    /// Which backend answers. The mutations wrap whichever it is — see
+    /// [`Policed`].
+    pub kind: Kind,
     pub mutation: Mutation,
     /// The one definition to corrupt, or every one of them. A whole-corpus
     /// mutation says whether the corpus notices *at all*; a targeted one says
@@ -525,19 +763,45 @@ impl Spec {
 
 /// Parses a `--backend` argument.
 ///
-/// `reference` is the honest backend. `wrong:<mutation>[@<function>]` is one of
-/// the eight, plus `=<int>` for the two that carry a number. Named rather than
-/// positional so a run's provenance says what was broken:
-/// `wrong:off-by-one@store.total` in a log is a reproducible experiment.
+/// `reference` and `cranelift` are the two honest backends.
+/// `wrong:<mutation>[@<function>]` is one of the eight, plus `=<int>` for the
+/// two that carry a number. Named rather than positional so a run's provenance
+/// says what was broken: `wrong:off-by-one@store.total` in a log is a
+/// reproducible experiment.
+///
+/// A corruption may name the backend it wraps —
+/// `cranelift:wrong:off-by-one@store.total` — and a bare `wrong:` keeps meaning
+/// `reference:wrong:`, which is what it meant before a second backend existed.
+/// That default is a compatibility choice and it is the conservative one: every
+/// `--backend wrong:` invocation recorded in this repository was taken against
+/// the tree-walker, and silently re-pointing them at a code generator would
+/// change what a re-run of a logged experiment measures.
 pub fn parse(spec: &str) -> Result<Spec, String> {
-    if spec == "reference" {
-        return Ok(Spec::honest());
+    // A bare backend name, honest. Handled before the prefix split so that
+    // `reference:cranelift` and `cranelift:reference` — which are spellings of
+    // nothing — fall through to the refusal below instead of quietly installing
+    // one half of themselves.
+    match spec {
+        "reference" => return Ok(Spec::honest()),
+        "cranelift" => {
+            return Ok(Spec {
+                kind: Kind::Cranelift,
+                ..Spec::honest()
+            });
+        }
+        _ => {}
     }
-    let Some(rest) = spec.strip_prefix("wrong:") else {
+    let (backend, rest) = match spec.split_once(':') {
+        Some(("cranelift", rest)) => (Kind::Cranelift, rest),
+        Some(("reference", rest)) => (Kind::Reference, rest),
+        _ => (Kind::Reference, spec),
+    };
+    let Some(rest) = rest.strip_prefix("wrong:") else {
         return Err(format!(
-            "unknown backend `{spec}`; one of `reference`, or `wrong:<mutation>` where \
-             <mutation> is off-by-one, inverted, stale, wrong-type, unoffered, \
-             exceeds-budget[={{k}}] or answers={{int}}, each optionally @<definition>"
+            "unknown backend `{spec}`; one of `reference`, `cranelift`, or \
+             `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
+             wrong-type, unoffered, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
+             @<definition>"
         ));
     };
     let (head, target) = match rest.split_once('@') {
@@ -575,45 +839,57 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
             "`wrong:answers=` needs a target: `wrong:answers=302@orders.measured`".to_string(),
         );
     }
-    Ok(Spec { mutation, target })
+    Ok(Spec {
+        kind: backend,
+        mutation,
+        target,
+    })
 }
 
 /// A backend that is wrong on purpose, wrapped around one that is not.
 ///
-/// # What these eight police, and what they do not
+/// # What these eight police
 ///
-/// **They police [`Reference`]. They do not police [`Compiled`].** The field
-/// below is the whole argument: `inner` is a concrete `Rc<Reference>`, not an
-/// `Rc<dyn Compiled>`, and it is that way because two of the eight need
-/// operations the trait does not have. [`Mutation::Unoffered`] asks the
-/// *registry* — `fragment.holds(name)` — whether a body exists at all, which is
-/// the difference between a decline and a name that was never compiled; that
-/// difference is the gap the mutation lives in. [`Mutation::ExceedsBudget`]
-/// re-runs the body on fuel that is deliberately **not** the machine's budget,
-/// through `Reference::run`, which is private to this module. [`Compiled`] is
-/// `describes` and `enter` (`compiled.rs`) and nothing else, so neither
-/// operation can be asked of an arbitrary backend.
+/// **They police any [`Policed`] backend, which is what changed on 2026-08-31.**
+/// This block read, until then:
 ///
-/// The consequence is worth stating where the next backend's author will meet
-/// it, because the shipping path hides it. `ply test`'s one install route is
-/// `ply_test::InterpExecutor::with_backend`, and its parameter is a
-/// `&'static Fragment` rather than a `dyn Compiled` — so the only backends a
-/// user can attach are the ones [`Fragment::attach`] builds, which is
-/// [`Reference`] and these wrappers over it. **A second implementation of
-/// [`Compiled`] — a code generator, say — cannot currently be handed to a
-/// shipping command at all, and if it could, none of the eight would be
-/// wrapping it.**
+/// > **They police [`Reference`]. They do not police [`Compiled`].** The field
+/// > below is the whole argument: `inner` is a concrete `Rc<Reference>`, not an
+/// > `Rc<dyn Compiled>`, and it is that way because two of the eight need
+/// > operations the trait does not have. [`Mutation::Unoffered`] asks the
+/// > *registry* — `fragment.holds(name)` — whether a body exists at all, which
+/// > is the difference between a decline and a name that was never compiled;
+/// > that difference is the gap the mutation lives in.
+/// > [`Mutation::ExceedsBudget`] re-runs the body on fuel that is deliberately
+/// > **not** the machine's budget, through `Reference::run`, which is private to
+/// > this module. [`Compiled`] is `describes` and `enter` (`compiled.rs`) and
+/// > nothing else, so neither operation can be asked of an arbitrary backend.
+/// >
+/// > The consequence is worth stating where the next backend's author will meet
+/// > it, because the shipping path hides it. `ply test`'s one install route is
+/// > `ply_test::InterpExecutor::with_backend`, and its parameter is a
+/// > `&'static Fragment` rather than a `dyn Compiled` — so the only backends a
+/// > user can attach are the ones [`Fragment::attach`] builds, which is
+/// > [`Reference`] and these wrappers over it. **A second implementation of
+/// > [`Compiled`] — a code generator, say — cannot currently be handed to a
+/// > shipping command at all, and if it could, none of the eight would be
+/// > wrapping it.**
 ///
-/// ADR 0026 §4.5 makes catching the eight from a shipping command the condition
-/// on *any* backend shipping — *"a backend must be policeable before it is
-/// fast"* — and `crates/ply-cli/tests/backend.rs`'s fourteen green tests are
-/// routinely read as that condition discharged. They discharge it for one
-/// backend. Lifting these onto something a second backend can satisfy means a
-/// trait carrying the registry query and the run-with-arbitrary-fuel, and
-/// `with_backend` taking that instead of a concrete type. Recorded 2026-08-30,
-/// unfixed, and annotated in ADR 0026 §4.5 in the same change.
+/// The diagnosis was right and the fix is the one it named: the two operations
+/// it lists are now [`Policed::holds`] and [`Policed::run_with_fuel`], `inner`
+/// is an `Rc<dyn Policed>`, and `with_backend` takes a [`Provider`] instead of a
+/// concrete type. `ply_codegen::Cranelift` is the second implementation, and it
+/// is wrapped by these eight through the same `wrap` every provider calls.
+///
+/// **What that does not do is make one backend's result another's.** ADR 0026
+/// §4.5 is a condition on *any* backend, and it is discharged per backend: the
+/// count of how many of the eight are caught is a property of the backend under
+/// them, because what a corruption can bite depends on which definitions the
+/// backend has a body for. `crates/ply-cli/tests/backend.rs` runs the whole
+/// table against each installed backend rather than against one, for exactly
+/// that reason.
 pub struct Mutant {
-    inner: Rc<Reference>,
+    inner: Rc<dyn Policed>,
     mutation: Mutation,
     target: Option<Symbol>,
     previous: RefCell<Option<Value>>,
@@ -621,7 +897,7 @@ pub struct Mutant {
 
 impl Mutant {
     fn fire(&self, value: Value) -> Option<Value> {
-        self.inner.fragment.fired.fetch_add(1, Ordering::Relaxed);
+        self.inner.counters().note_fired();
         Some(value)
     }
 }
@@ -632,17 +908,17 @@ impl Compiled for Mutant {
     }
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        let fragment = self.inner.fragment;
-        fragment.note_offer(args);
+        let counters = self.inner.counters();
+        counters.note_offer(args);
         if self.target.as_ref().is_some_and(|t| t != name) {
             return self.inner.answer(name, args, budget);
         }
-        fragment.offered_target.fetch_add(1, Ordering::Relaxed);
+        counters.note_offered_target();
 
         // The two that answer without an honest answer to corrupt.
         match &self.mutation {
             Mutation::Answers(value) => return self.fire(Value::Int(*value)),
-            Mutation::Unoffered if !fragment.holds(name) => {
+            Mutation::Unoffered if !self.inner.holds(name) => {
                 let invented = args
                     .iter()
                     .find(|v| matches!(v, Value::Int(_)))
@@ -679,12 +955,12 @@ impl Compiled for Mutant {
             }
             // A body that fits its budget answers the same either way; the
             // mutation is only visible where the honest backend declined.
-            (Mutation::ExceedsBudget(times), None) if fragment.holds(name) => {
+            (Mutation::ExceedsBudget(times), None) if self.inner.holds(name) => {
                 let fuel = match times {
                     None => usize::MAX,
                     Some(k) => budget.saturating_mul(*k as usize),
                 };
-                match self.inner.run(name, args, fuel) {
+                match self.inner.run_with_fuel(name, args, fuel) {
                     Some(value) => self.fire(value),
                     None => None,
                 }

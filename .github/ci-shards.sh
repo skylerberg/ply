@@ -79,10 +79,24 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 #
 # `ply-host` is a shard of its own because it is the only package that needs a
 # database. The postgres job runs it and no other job does.
+#
+# `ply-codegen` joined the `cli` shard on 2026-08-31 and it costs that shard
+# almost nothing to run and something real to build: its own suite is 9 tests in
+# ~1.2s, and the ~31 cranelift packages behind it are a dependency build every
+# shard that builds `ply-cli` now pays anyway, because `ply-cli` depends on it.
+# It is in the same shard as `ply-cli` on purpose rather than by balance: the
+# tests that decide whether a code generator is policeable are
+# `crates/ply-cli/tests/backend.rs`, and a partition that could run one without
+# the other would let half of ADR 0026 §4.5's condition go green alone.
+#
+# **This table's own gate caught the omission.** Adding the crate without
+# adding it here failed `ci-shards.sh verify` with *"workspace member
+# 'ply-codegen' is in no shard, so CI never tests it"* — which is the failure
+# this file exists to produce, observed rather than assumed.
 SHARDS=(
   "corpus:ply-corpus"
   "eval:ply-eval"
-  "cli:ply-cli ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
+  "cli:ply-cli ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std ply-codegen"
   "postgres:ply-host"
 )
 
@@ -119,8 +133,23 @@ POSTGRES_SHARD=postgres
 # 0.03s for the run that reports. Nothing in the workspace can report a run that
 # never comes back, so the spike is still the only place that demonstration
 # lives.
+# **The condition is MET as of 2026-08-31 and the entry is still here.** The
+# note below read, until then: "seven of eight is where 2026-08-28 left it --
+# the unbounded exceeds-budget runaway crashes under the spike's native frames
+# and only hangs under a tree-walker, and a run that never comes back cannot be
+# reported from inside it". The workspace now has a backend with native frames:
+# `ply test --backend cranelift:wrong:exceeds-budget` over a recursion with no
+# base case aborts, exit 134, in 0.02s, and `ply-cli/tests/backend.rs` has
+# always run `ply` as a child so the reporter was never the problem. Eight of
+# eight, under `cargo test --workspace`.
+#
+# What holds the entry is no longer the condition. It is that deleting the crate
+# deletes the only instrument for two open things: CONTRIBUTING.md item 18's 42
+# unexplained agreement disagreements, and ADR 0018 0.5's 6.199x, which nothing
+# else produces. ADR 0026 4.7 records both and says item 18 should carry the
+# deletion.
 declare -a KNOWN_OUTSIDE=(
-  "ply-codegen-spike:its own workspace on purpose; per ADR 0026 4.7 it is deleted once ALL EIGHT of its wrong backends are reproduced in the workspace, and seven of eight is where 2026-08-28 left it -- the unbounded exceeds-budget runaway crashes under the spike's native frames and only hangs under a tree-walker, and a run that never comes back cannot be reported from inside it"
+  "ply-codegen-spike:its own workspace on purpose; ADR 0026 4.7's deletion condition -- ALL EIGHT wrong backends reproduced in the workspace -- was MET on 2026-08-31 by crates/ply-codegen, so what keeps this crate is no longer the condition but the two open findings only it can measure: CONTRIBUTING.md item 18's 42 agreement disagreements and ADR 0018 0.5's 6.199x kernel figure. Closing item 18 is what should carry the rm -r"
 )
 
 # Tests whose assertion reads a wall clock, as `package:target:test`, where

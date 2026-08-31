@@ -617,6 +617,7 @@ fn fires_and_is_caught(name: &str, mutation: Mutation, target: Option<&str>) -> 
     let spec = BackendSpec {
         mutation,
         target: target.map(ply_span::Symbol::new),
+        ..BackendSpec::honest()
     };
     let sweep = sweep(spec);
     assert!(
@@ -773,6 +774,7 @@ fn a_definition_that_performs_is_never_offered_to_a_wrong_backend() {
     let sweep = sweep(BackendSpec {
         mutation: Mutation::Answers(7),
         target: Some(ply_span::Symbol::new("self_handled_effect.handled")),
+        ..BackendSpec::honest()
     });
     assert_eq!(
         sweep.offers.offered_target, 0,
@@ -804,6 +806,7 @@ fn the_budget_corruption_has_nothing_to_bite_on_this_corpus_and_says_so() {
     let sweep = sweep(BackendSpec {
         mutation: Mutation::ExceedsBudget(Some(4)),
         target: None,
+        ..BackendSpec::honest()
     });
     assert_eq!(
         sweep.offers.fired, 0,

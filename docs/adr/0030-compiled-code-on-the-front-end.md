@@ -6,6 +6,93 @@ note, both annotated in place. Supersedes nothing. Adds no dependency, moves no
 toolchain pin, promotes nothing: `grep -c cranelift Cargo.lock` still answers
 **0**.
 
+> **The last clause is a fact about this ADR's change and stopped being a fact
+> about the tree on 2026-08-31.** `grep -c cranelift Cargo.lock` now answers
+> **44**: `crates/ply-codegen` puts a cranelift JIT behind `ply test --backend
+> cranelift` (ADR 0026 §4.7, §4.9). Nothing measured below changes — every
+> figure here is `ply_eval::backend::Reference` on the front end and was
+> re-taken independently as **1.106×** over `examples/` by the change that
+> added the code generator, against the **1.0887×** published here.
+>
+> One thing this ADR predicted is worth marking as **confirmed and then some**.
+> §5 reasons that a real code generator can add at most about 3% over
+> `Reference` on the front end. Measured: on `examples/` the code generator is
+> **0.363×** — 2.76× *slower* than no backend at all — because it enters 1.1%
+> of offers there and pays per-run compilation for the privilege. The ceiling
+> was right and the sign was worse than the ceiling suggested. ADR 0026 §4.9.
+
+> **Corrected in place (adversarial review, 2026-08-31): the block above
+> measured the wrong corpus and called it this ADR's workload. The correction
+> is more favourable to the code generator, not less, which is why it is worth
+> stating precisely.**
+>
+> **Withdrawn**, and it is two sentences:
+>
+> > every figure here is `ply_eval::backend::Reference` on the front end and was
+> > re-taken independently as **1.106×** over `examples/` by the change that
+> > added the code generator, against the **1.0887×** published here.
+>
+> > §5 reasons that a real code generator can add at most about 3% over
+> > `Reference` on the front end. Measured: on `examples/` the code generator is
+> > **0.363×** — 2.76× *slower* than no backend at all — because it enters 1.1%
+> > of offers there and pays per-run compilation for the privilege.
+>
+> **Why they are wrong.** `ply test examples/` is not this ADR's workload and
+> this document says so twice. §"The workload, and it is the one the gap was
+> measured on" names `spikes/ply-parser/` — six modules, 4,979 lines of Ply,
+> parsing `examples/*.ply` as **13 byte literals**, 333,851 bytes — driven by
+> `ply test <dir> --no-cache -j 1 --filter probe.parse`. And §"Why this ADR
+> exists" separately calls `examples/` *"the workspace's own test corpus and not
+> a program anyone is trying to make fast"*. The two are different programs: the
+> A arm of §2.2 is **2.70 s** of user CPU, `ply test examples/`'s is **0.44 s**.
+> So `1.106×` was never a re-take of `1.0887×`, and `0.363×` was never a
+> measurement of what a code generator does to the front end. The agreement
+> between 1.106 and 1.0887 is a coincidence of ratio between two different
+> workloads.
+>
+> **The front end, re-taken on this ADR's own corpus and command.** Rebuilt from
+> the recipe above — 13 files, 333,851 bytes, byte count identical to this
+> document's — five arms, **rotated one slot per window** so every arm occupies
+> every position, N = 9, min of 9, ratio against no backend:
+>
+> | arm | min wall | min user | ratio (wall) |
+> | --- | ---: | ---: | ---: |
+> | no backend | 2,845.2 ms | 2,815.9 ms | 1.0000× |
+> | `--backend reference` | 2,616.8 ms | 2,592.6 ms | **1.0873×** |
+> | `--backend cranelift` | 2,937.9 ms | 2,912.9 ms | **0.9685×** |
+> | null control A | 2,846.8 ms | 2,813.0 ms | 0.9994× |
+> | null control B | 2,840.5 ms | 2,811.5 ms | 1.0017× |
+>
+> **`Reference` replicates this ADR exactly: 1.0873× against the 1.0887×
+> published here**, on an independent instrument, by a different person, four
+> months of tree-churn later. The two null arms are within 0.2%, so the series
+> is sensitive to the 8.7% it reports.
+>
+> **And the code generator on the real front end is 0.9685× — a 3.2% net loss,
+> not a 176% one.** The withdrawn figure was dominated by fixed cost on a short
+> window: `examples/` is a 468 ms run carrying 382 ms of fixpoint plus per-worker
+> code generation, so the compile is most of the window. This ADR's workload runs
+> for 2.85 s and the same fixed cost is a sixth of it. **The direction the
+> withdrawn block reported is right and its magnitude was an artefact of corpus
+> length.**
+>
+> **Nothing here contradicts §4's ceiling, and the reason is the entry count.**
+> Over this corpus `--backend reference` enters **190,617 of 190,703 offers with
+> 69 definitions in the fragment** — §1's 190,618, reproduced. `--backend
+> cranelift` enters **89,912 of 294,538, with 6 definitions in the fragment**.
+> **89,912 is exactly the number §"Why this ADR exists" names as the
+> pre-`Bytes`-widening `Int | Bool` rung.** The code generator's fragment on the
+> front end is *narrower than `Reference`'s*: it reaches less than half the
+> entries and pays a compile for them. That is a fact about `crates/ply-codegen`
+> and not about the ceiling, which remains **1.121×** for a backend that enters
+> what `Reference` enters, infinitely fast. Nothing measured has been above it.
+>
+> Load 5.79 → 5.73 across the series, **above this project's 4.0 gate**, so these
+> are observations and not figures — on the same terms, and with the same
+> defect, as the block they correct. Pre-registration and raw series:
+> `/tmp/cranelift-review/PRE-REGISTERED.md` (Amendment 1, written before any
+> timing for this corpus existed) and `/tmp/cranelift-review/R4-frontend.txt`.
+
 **The one sentence.** With the seam widened to `Bytes`, the shipping backend
 enters the Ply front end **190,618 times over `examples/`** — 4.23 entries per
 token, not the zero the record projected — and that buys a **measured 1.089×**

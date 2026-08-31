@@ -416,6 +416,36 @@ speed: the tree-walker is 2.82x faster on the request path.
 > wrong backends, and `ply test` catches seven of them. Nothing about this
 > makes Ply faster, and a run with a backend attached neither reads nor writes
 > the result cache.
+>
+> > **"The backend that ships today is `reference`" is withdrawn, 2026-08-31.**
+> > A second one ships: `--backend cranelift` is a real cranelift JIT
+> > (`crates/ply-codegen`), compiled into the `ply` binary with no feature flag
+> > and no second toolchain. The rest of the paragraph stands for `reference`
+> > and the last sentence stands for both.
+> >
+> > What it is worth, and both halves are measured rather than promised. On
+> > `benches/kernel` — a compute loop, which is almost entirely inside the
+> > fragment — it is **4.871×** against no backend, and it enters 96.0% of the
+> > calls it is offered. On `examples/` — a program built out of the standard
+> > library, which is almost entirely outside it — it enters **1.1%** and the
+> > run is **2.76× slower**, because compiling costs more per run than entering
+> > 1.1% of calls saves. Min of 21 interleaved windows, null control inside the
+> > series, taken above this project's load gate and labelled as observations;
+> > [ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.9 is the full account.
+> >
+> > **Corrected 2026-08-31 by an independent re-take on rotated arms.** Both
+> > figures replicate (4.927× and 0.353×). But `examples/` is a 468 ms run whose
+> > fixed compile cost is most of the window, so *2.76× slower* does not
+> > generalise: on the Ply **front end** — `spikes/ply-parser`, the workload
+> > [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md) measured, 2.85 s
+> > — the code generator is **0.969×**, a 3.2% loss. It still loses, and it loses
+> > because its fragment there covers **6** definitions against `reference`'s
+> > **69**. §4.9 has both series.
+> >
+> > `ply test` catches **eight of eight** wrong backends under `cranelift`
+> > against seven under `reference`. The eighth is a backend that ignores the
+> > call budget over a recursion with no base case: on native frames it dies,
+> > and a dead child is something the test harness can see.
 
 **The request-path allocation count is large.** One `/health` request makes
 **773 allocations and 108,200 bytes** to produce a 107-byte response.

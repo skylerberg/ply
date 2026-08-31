@@ -191,6 +191,24 @@
 //! > `tests/fixtures/` it is offered 625,767 calls and enters **446,346** of
 //! > them.
 //! >
+//! > > **Two of those clauses are withdrawn, 2026-08-31.** *"It is not a code
+//! > > generator"* and *"`Cargo.lock` still holds no cranelift"* were true of
+//! > > the only implementor there was. There are two now: `ply_codegen::Bodies`
+//! > > is a **cranelift JIT**, in the shipping workspace, installed by
+//! > > `ply test --backend cranelift`, and `Cargo.lock` holds 31 cranelift
+//! > > packages. ADR 0026 §4.7 records the authorisation being exercised; ADR
+//! > > 0016 §3.5's prohibition is amended there in the same change, and it still
+//! > > binds `crates/ply-codegen-spike`, which remains outside the workspace and
+//! > > is depended on by nothing.
+//! > >
+//! > > What that changes about **this file** is one sentence and it is worth
+//! > > being exact: [`Compiled`] now has a second implementor whose `enter`
+//! > > runs machine code, so every guarantee in the seven gates below is being
+//! > > relied on by something that cannot be reasoned about by reading Ply. The
+//! > > gates are unchanged and none of them was widened for it — the code
+//! > > generator's own registry is **narrower** than [`crossable`], `Int | Bool`
+//! > > against `Int | Bool | Bytes`, because it has no `Bytes` path.
+//! >
 //! > > **Re-taken after the `Bytes` widening (2026-08-30).** This read *"it is
 //! > > offered 120,340 calls and enters **18,773** of them"*, and the figures
 //! > > moved by more than the corpus did: measured on the same day, on the same
