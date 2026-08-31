@@ -899,7 +899,7 @@ impl Literals {
                     }
                     stack.push(operand);
                 }
-                ExprKind::App { func, args } => {
+                ExprKind::App { func, args, .. } => {
                     stack.push(func);
                     stack.extend(args);
                 }

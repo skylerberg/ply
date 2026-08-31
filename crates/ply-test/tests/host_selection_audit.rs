@@ -79,8 +79,8 @@ struct Compiled {
 impl Compiled {
     fn new(source: &str) -> Compiled {
         let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-        let program = ply_syntax::parse_program(inputs).expect("the fixture parses");
-        let resolved = ply_syntax::resolve(&program).expect("the fixture resolves");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
+        let resolved = ply_syntax::resolve(&mut program).expect("the fixture resolves");
         let check = ply_core::check_program(&program, &resolved).expect("the fixture typechecks");
         let hashes =
             ply_hash::hash_program(&program, &resolved, &check).expect("the fixture hashes");

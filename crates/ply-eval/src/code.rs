@@ -395,7 +395,7 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
                 body,
             }
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             let args = lower_all(args, live);
             let func = lower_in(func, live);
             NodeKind::App { func, args }
@@ -762,7 +762,7 @@ fn barrier_binders(e: &Expr, out: &mut Vec<Symbol>) {
             barrier_binders(lhs, out);
             barrier_binders(rhs, out);
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             barrier_binders(func, out);
             for a in args {
                 barrier_binders(a, out);

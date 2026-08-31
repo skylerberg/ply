@@ -13,10 +13,11 @@ use ply_span::{Diagnostic, SourceId, codes};
 use ply_syntax::ast::ModuleName;
 
 fn check(source: &str) -> Result<crate::CheckOutput, Vec<Diagnostic>> {
-    let program = ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
-        .unwrap_or_else(|d| panic!("did not parse: {d:#?}"));
+    let mut program =
+        ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
+            .unwrap_or_else(|d| panic!("did not parse: {d:#?}"));
     let resolved =
-        ply_syntax::resolve(&program).unwrap_or_else(|d| panic!("did not resolve: {d:#?}"));
+        ply_syntax::resolve(&mut program).unwrap_or_else(|d| panic!("did not resolve: {d:#?}"));
     check_program(&program, &resolved)
 }
 

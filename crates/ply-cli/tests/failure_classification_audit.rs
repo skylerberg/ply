@@ -150,12 +150,30 @@ fn every_language_defined_runtime_failure_is_a_program_error() {
             "assertion failed",
         ),
         (
-            // One argument, not two: `Builtin::Assert` accepts an optional
-            // message at run time but the checker's signature does not, so the
-            // two-argument form is a type error rather than a red test.
+            // One argument written, two passed: `message` defaults to `None`
+            // and `ply_syntax::defaults` splices it in before this runs.
+            //
+            // This comment used to say the opposite — that the evaluator took
+            // an optional message "but the checker's signature does not, so
+            // the two-argument form is a type error rather than a red test".
+            // That was true, and was the only place in the tree that said so.
+            // ADR 0029 closed it by widening the signature rather than by
+            // deleting the arm.
             "a failing assert",
             "fn no() -> Bool = false\n\
              test \"holds\" { assert(no()) }\n",
+            "assertion failed",
+        ),
+        (
+            "a failing assert carrying its message",
+            "fn no() -> Bool = false\n\
+             test \"holds\" { assert(no(), Some(\"the balance must be positive\")) }\n",
+            "assertion failed",
+        ),
+        (
+            "a failing assert whose message was given by name",
+            "fn no() -> Bool = false\n\
+             test \"holds\" { assert(no(), message: Some(\"by name\")) }\n",
             "assertion failed",
         ),
     ];

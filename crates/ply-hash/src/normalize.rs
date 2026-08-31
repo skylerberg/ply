@@ -47,6 +47,17 @@ pub(crate) mod tag {
 
     pub const NONE: u8 = 10;
     pub const SOME: u8 = 11;
+    /// A `fn` parameter carrying a default, written *in place of* the
+    /// [`NONE`]/[`SOME`] its type annotation would otherwise open with, and
+    /// followed by that annotation and the default expression.
+    ///
+    /// Deliberately not a field appended to every parameter. A parameter with
+    /// no default writes the byte it wrote before this tag existed, so adding
+    /// defaults to the language moved **no** definition's hash — ADR 0023
+    /// refused to touch this stream at all precisely because "a cache-format
+    /// change moves every cached result everywhere", and an additive tag is how
+    /// that is avoided rather than paid.
+    pub const PARAM_DEFAULT: u8 = 13;
 
     pub const FN: u8 = 20;
     pub const TYPE_ALIAS: u8 = 21;
@@ -406,8 +417,17 @@ impl<'a, 't> Normalizer<'a, 't> {
             self.row_params.push(&g.name);
         }
         self.len(d.params.len());
+        // Before the parameter names reach `self.values`, which is what a
+        // default must not see: it is closed, and a mention of a sibling
+        // parameter is `E0121` rather than a de Bruijn level.
         for p in &d.params {
-            self.opt(p.ty.as_ref(), Self::type_expr);
+            if let Some(default) = &p.default {
+                self.tag(tag::PARAM_DEFAULT);
+                self.opt(p.ty.as_ref(), Self::type_expr);
+                self.expr(default);
+            } else {
+                self.opt(p.ty.as_ref(), Self::type_expr);
+            }
         }
         self.opt(d.ret.as_ref(), Self::type_expr);
         self.opt(d.effects.as_ref(), Self::row);
@@ -544,6 +564,10 @@ impl<'a, 't> Normalizer<'a, 't> {
         for g in &owner.generics.effects {
             self.row_params.push(&g.name);
         }
+        // A parameter's default is not written here, and that is the claim: an
+        // obligation is about what the body promises, and a default changes
+        // what *callers* pass rather than what the promise says. The owner's
+        // parameters enter as binders, which is all a clause can mention.
         self.len(owner.params.len());
         for p in &owner.params {
             self.values.push(&p.name.name);
@@ -739,7 +763,7 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.expr(body);
                 self.values.truncate(mark);
             }
-            ExprKind::App { func, args } => {
+            ExprKind::App { func, args, .. } => {
                 self.tag(tag::E_APP);
                 self.expr(func);
                 self.len(args.len());
@@ -1109,7 +1133,7 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
         ExprKind::Lambda { params, body } => {
             params.iter().any(|p| names.contains(&p.name.name)) || mentions(body, names)
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             mentions(func, names) || args.iter().any(|a| mentions(a, names))
         }
         ExprKind::If {

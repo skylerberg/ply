@@ -184,6 +184,31 @@ impl Resolved {
         self.index.get(name.as_symbol()).copied()
     }
 
+    /// [`Self::lookup`] without the diagnostic: whether the name denotes
+    /// something, and what.
+    ///
+    /// The two answer the same question; `lookup` additionally answers *why
+    /// not*, and building that answer is not free — `unknown_bare` scans every
+    /// module for one that exports the name, to suggest an import. A caller
+    /// that only wants the binding must not pay for a suggestion it discards,
+    /// and [`crate::defaults`] asks this of every call in the program, most of
+    /// which are builtins and resolve to nothing here.
+    pub fn find(&self, module: usize, ns: Namespace, q: &QName) -> Option<&Binding> {
+        let scope = self.scopes.get(module)?;
+        let Some(binder) = &q.module else {
+            return scope.get(ns, q.symbol());
+        };
+        let &(owner, _) = scope.modules.get(&binder.name)?;
+        if !self.declarations[owner]
+            .get(ns, q.symbol())?
+            .vis
+            .is_public()
+        {
+            return None;
+        }
+        self.declared[owner].get(ns, q.symbol())
+    }
+
     /// A bare name must already have failed local lookup — locals are not in
     /// scope here and win unconditionally. A qualified name never consults the
     /// current module's scope at all.
@@ -345,7 +370,15 @@ impl Resolved {
 ///
 /// Reference-site failures are not found here — bodies are walked by the
 /// consumer, which calls [`Resolved::lookup`] and reports what it returns.
-pub fn resolve(program: &Program) -> Result<Resolved, Vec<Diagnostic>> {
+/// Builds the program's name tables, then fills every call's unwritten
+/// arguments from the callee's signature ([`crate::defaults`]).
+///
+/// The expansion is *inside* this function, and takes `program` mutably for it,
+/// so that no entry point can build tables and skip the rewrite — the guarantee
+/// `parse_module` gives `record_update` and `try_op`. A caller that only wants
+/// the tables still gets the rewrite, which is the point: everything downstream
+/// is entitled to assume a call is positional and fully applied.
+pub fn resolve(program: &mut Program) -> Result<Resolved, Vec<Diagnostic>> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut index: IndexMap<Symbol, usize> = IndexMap::new();
     for (i, module) in program.modules.iter().enumerate() {
@@ -404,14 +437,22 @@ pub fn resolve(program: &Program) -> Result<Resolved, Vec<Diagnostic>> {
         diags.push(cycle_diagnostic(program, cycle));
     }
 
+    // Only with a consistent set of tables: expansion resolves names through
+    // them, and a program with a duplicate module or an import cycle has none
+    // it could trust.
+    if !diags.is_empty() {
+        return Err(diags);
+    }
+    let mut resolved = Resolved {
+        scopes,
+        declarations,
+        declared,
+        index,
+        order,
+    };
+    crate::defaults::expand(program, &mut resolved, &mut diags);
     if diags.is_empty() {
-        Ok(Resolved {
-            scopes,
-            declarations,
-            declared,
-            index,
-            order,
-        })
+        Ok(resolved)
     } else {
         Err(diags)
     }
@@ -863,7 +904,7 @@ mod tests {
     }
 
     fn errors(files: &[(&str, &str)]) -> Vec<Diagnostic> {
-        match resolve(&program(files)) {
+        match resolve(&mut program(files)) {
             Ok(_) => panic!("expected resolution to fail"),
             Err(diags) => diags,
         }
@@ -887,7 +928,7 @@ mod tests {
 
     #[test]
     fn a_name_resolves_across_three_modules() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("base", "pub fn one() -> Int = 1"),
             (
                 "middle",
@@ -923,7 +964,7 @@ mod tests {
 
     #[test]
     fn a_diamond_import_visits_the_shared_module_once() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("base", "pub fn one() -> Int = 1"),
             ("left", "import base (one)\npub fn l() -> Int = one()"),
             ("right", "import base (one)\npub fn r() -> Int = one()"),
@@ -955,7 +996,7 @@ mod tests {
 
     #[test]
     fn a_private_name_cannot_be_reached_from_another_module() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             (
                 "store",
                 "fn secret() -> Int = 1\npub fn public() -> Int = secret()",
@@ -1054,7 +1095,7 @@ mod tests {
 
     #[test]
     fn qualifying_the_reference_fixes_an_ambiguous_import() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("store", "pub fn place() -> Int = 1"),
             (
                 "app",
@@ -1121,7 +1162,7 @@ mod tests {
 
     #[test]
     fn a_module_binder_lives_in_its_own_namespace() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("orders", "pub fn place() -> Int = 1"),
             (
                 "app",
@@ -1143,7 +1184,7 @@ mod tests {
 
     #[test]
     fn an_alias_rebinds_the_module_and_the_default_binder_goes_away() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("store.orders", "pub fn place() -> Int = 1"),
             (
                 "app",
@@ -1165,7 +1206,7 @@ mod tests {
 
     #[test]
     fn a_selective_import_binds_no_module_binder() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("orders", "pub fn place() -> Int = 1"),
             ("app", "import orders (place)\nfn f() -> Int = place()"),
         ]))
@@ -1191,7 +1232,7 @@ mod tests {
 
     #[test]
     fn a_public_type_exports_its_constructors_and_a_private_one_does_not() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             (
                 "shapes",
                 "pub type Shape = Circle(Int) | Square(Int)\ntype Hidden = Only(Int)",
@@ -1225,7 +1266,7 @@ mod tests {
 
     #[test]
     fn effects_and_modules_of_the_same_name_coexist() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("clock", "pub nondet effect clock { read now() -> Int }"),
             ("app", "import clock\nfn f() -> Int = 1"),
         ]))
@@ -1247,7 +1288,7 @@ mod tests {
 
     #[test]
     fn a_name_missing_everywhere_points_at_the_module_that_exports_it() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("store", "pub fn place() -> Int = 1"),
             ("app", "fn f() -> Int = 1"),
         ]))
@@ -1265,7 +1306,7 @@ mod tests {
     fn the_anonymous_module_keeps_its_names_bare() {
         let module = parse_module(SourceId(0), ModuleName::anonymous(), "fn f() -> Int = 1")
             .expect("parses");
-        let r = resolve(&Program::single(module)).expect("resolves");
+        let r = resolve(&mut Program::single(module)).expect("resolves");
         assert_eq!(
             r.scopes[0].values[&Symbol::new("f")].qualified.as_str(),
             "f"
@@ -1275,8 +1316,11 @@ mod tests {
 
     #[test]
     fn two_items_of_one_name_leave_the_first_binding_for_inference_to_report() {
-        let r = resolve(&program(&[("app", "fn f() -> Int = 1\nfn f() -> Int = 2")]))
-            .expect("a duplicate definition is inference's diagnostic, not resolution's");
+        let r = resolve(&mut program(&[(
+            "app",
+            "fn f() -> Int = 1\nfn f() -> Int = 2",
+        )]))
+        .expect("a duplicate definition is inference's diagnostic, not resolution's");
         let first = &r.scopes[at(&r, "app")].values[&Symbol::new("f")];
         assert_eq!(first.qualified.as_str(), "app.f");
     }
@@ -1306,7 +1350,7 @@ mod tests {
             })
             .collect();
 
-        let r = resolve(&Program { modules }).expect("a chain is acyclic");
+        let r = resolve(&mut Program { modules }).expect("a chain is acyclic");
         assert_eq!(r.order.len(), depth);
         assert_eq!(r.order[0], depth - 1, "the deepest import is checked first");
         assert_eq!(r.order[depth - 1], 0);
@@ -1329,7 +1373,7 @@ mod tests {
 
     #[test]
     fn importing_one_module_twice_is_not_a_cycle() {
-        let r = resolve(&program(&[
+        let r = resolve(&mut program(&[
             ("store", "pub fn place() -> Int = 1"),
             (
                 "app",

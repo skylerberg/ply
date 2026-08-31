@@ -21,8 +21,8 @@ fn program_of(files: &[(&str, &str)]) -> Program {
 }
 
 fn hashes(source: &str) -> HashOutput {
-    let program = program_of(&[("m", source)]);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = program_of(&[("m", source)]);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(r) => r,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };

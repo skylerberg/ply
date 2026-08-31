@@ -29,11 +29,11 @@ use ply_syntax::resolve::{Resolved, resolve};
 fn load(src: &str) -> (Program, Resolved) {
     let mut map = SourceMap::new();
     let id: SourceId = map.add("meaning.ply", src.to_string());
-    let program = match parse_program([(id, ModuleName::from_dotted("meaning"), src)]) {
+    let mut program = match parse_program([(id, ModuleName::from_dotted("meaning"), src)]) {
         Ok(p) => p,
         Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
     };
-    let resolved = resolve(&program).expect("the probe must resolve");
+    let resolved = resolve(&mut program).expect("the probe must resolve");
     (program, resolved)
 }
 

@@ -31,10 +31,10 @@ struct Compiled {
 }
 
 fn compile(source: &str) -> Compiled {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("the fixture parses");
-    let resolved = resolve(&program).expect("the fixture resolves");
+    let resolved = resolve(&mut program).expect("the fixture resolves");
     let check = check_program(&program, &resolved)
         .unwrap_or_else(|d| panic!("the fixture typechecks: {d:#?}"));
     Compiled {
@@ -552,10 +552,10 @@ fn relay(n: Int) -> Int / {net.write[socket]}
 = net.send[socket](n)
 "#,
     ] {
-        let program =
+        let mut program =
             ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
                 .expect("parses");
-        let resolved = resolve(&program).expect("resolves");
+        let resolved = resolve(&mut program).expect("resolves");
         let diagnostics =
             check_program(&program, &resolved).expect_err("a spec may not perform an effect");
         assert!(

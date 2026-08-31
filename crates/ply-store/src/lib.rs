@@ -93,7 +93,17 @@ pub use schema::fingerprint as schema_fingerprint;
 /// name, which is nothing but the name — and means `E0101 UNKNOWN_NAME` before
 /// and a value after. A cached `Pass` under that hash is a claim about the
 /// program in which the name meant nothing.
-pub const RUNTIME_VERSION: &str = "0.13.0";
+/// 0.14.0 gives `assert` its second parameter, `message: Option<String> =
+/// None`, and takes `range`'s optional lower bound away. Both arms existed in
+/// this evaluator from the first commit and neither was reachable: the
+/// checker's signatures were one argument and two. Two things move under this.
+/// A failing `assert` can now carry a note it could not carry before, so a
+/// cached `Fail` is a claim about a diagnostic with different text. And every
+/// `assert(c)` in the tree is spliced to `assert(c, None)` before it is hashed,
+/// so its call sites' `DefHash`es move once — the splice is what makes
+/// `assert(c)` and `assert(c, None)` one definition, and the price of that is
+/// paid here, once.
+pub const RUNTIME_VERSION: &str = "0.14.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
 ///
@@ -141,7 +151,11 @@ pub const RUNTIME_VERSION: &str = "0.13.0";
 /// `ply_hash::tests::builtins_and_unknown_names_are_not_dependencies` pins — so
 /// the cached interface under it is a stale entry rather than an unreachable
 /// one, and only this bump discards it.
-pub const FRONTEND_VERSION: &str = "0.17.0";
+/// 0.18.0 widens `assert`'s scheme to `(Bool, Option<String>) -> Unit`. A
+/// prelude signature change, which is this constant's own listed reason: a
+/// definition whose stored interface was computed against the one-argument
+/// `assert` was computed against a prelude this front end no longer has.
+pub const FRONTEND_VERSION: &str = "0.18.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 ///

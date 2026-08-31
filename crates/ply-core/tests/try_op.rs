@@ -22,8 +22,8 @@ use ply_syntax::resolve::resolve;
 
 fn compile(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
     let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let program = ply_syntax::parse_program(inputs)?;
-    let resolved = resolve(&program)?;
+    let mut program = ply_syntax::parse_program(inputs)?;
+    let resolved = resolve(&mut program)?;
     check_program(&program, &resolved)
 }
 

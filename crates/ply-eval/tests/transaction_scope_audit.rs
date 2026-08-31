@@ -38,10 +38,10 @@ struct Compiled {
 }
 
 fn compile(source: &str) -> Compiled {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("the fixture parses");
-    let resolved = resolve(&program).expect("the fixture resolves");
+    let resolved = resolve(&mut program).expect("the fixture resolves");
     let check = check_program(&program, &resolved)
         .unwrap_or_else(|d| panic!("the fixture typechecks: {d:#?}"));
     Compiled {

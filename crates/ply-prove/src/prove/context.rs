@@ -455,7 +455,7 @@ fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut
             }
             ExprKind::Unary { operand, .. } => stack.push(operand),
             ExprKind::Lambda { body, .. } => stack.push(body),
-            ExprKind::App { func, args } => {
+            ExprKind::App { func, args, .. } => {
                 stack.push(func);
                 stack.extend(args);
             }

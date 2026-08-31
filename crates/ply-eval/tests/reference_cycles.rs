@@ -24,8 +24,9 @@ use ply_syntax::resolve::resolve;
 
 fn rejected(src: &str) -> Vec<Diagnostic> {
     let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-    let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-    let resolved = resolve(&program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
+    let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+    let resolved =
+        resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
     match check_program(&program, &resolved) {
         Ok(_) => Vec::new(),
         Err(diags) => diags,

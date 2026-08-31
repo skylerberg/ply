@@ -38,8 +38,8 @@ fn program_of(files: &[(&str, &str)]) -> Program {
 const JSON_STUB: &str = "// std.json, as much of it as a hash needs\n";
 
 fn hashes(source: &str) -> HashOutput {
-    let program = program_of(&[("std.json", JSON_STUB), ("m", source)]);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = program_of(&[("std.json", JSON_STUB), ("m", source)]);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(r) => r,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };
@@ -160,16 +160,16 @@ fn a_change_to_a_composed_types_codec_moves_the_composing_one() {
 fn moving_a_derivation_to_another_module_moves_no_hash() {
     let here = {
         let source = "type Order = {id: Int}\nderive eq for Order";
-        let program = program_of(&[("m", source)]);
-        let resolved = ply_syntax::resolve(&program).expect("resolves");
+        let mut program = program_of(&[("m", source)]);
+        let resolved = ply_syntax::resolve(&mut program).expect("resolves");
         hash_program_ast(&program, &resolved).expect("hashes").defs[&Symbol::new("m.order_eq")]
     };
     let there = {
-        let program = program_of(&[
+        let mut program = program_of(&[
             ("m", "fn unrelated() -> Int = 1"),
             ("other", "type Order = {id: Int}\nderive eq for Order"),
         ]);
-        let resolved = ply_syntax::resolve(&program).expect("resolves");
+        let resolved = ply_syntax::resolve(&mut program).expect("resolves");
         hash_program_ast(&program, &resolved).expect("hashes").defs[&Symbol::new("other.order_eq")]
     };
     assert_eq!(

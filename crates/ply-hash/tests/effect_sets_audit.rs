@@ -263,11 +263,11 @@ fn program(files: &[(&str, &str)]) -> HashOutput {
         .iter()
         .enumerate()
         .map(|(i, (name, source))| (SourceId(i as u32), ModuleName::from_dotted(name), *source));
-    let program = match ply_syntax::parse_program(inputs) {
+    let mut program = match ply_syntax::parse_program(inputs) {
         Ok(p) => p,
         Err(diags) => panic!("program did not parse: {diags:#?}"),
     };
-    let resolved = match ply_syntax::resolve(&program) {
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(r) => r,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };

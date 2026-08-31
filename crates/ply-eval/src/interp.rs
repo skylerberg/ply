@@ -397,7 +397,7 @@ impl<'a> Interp<'a> {
             ExprKind::Unary { op, operand } => self.eval_unary(*op, operand, env, e.span),
             ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs, env, e.span),
             ExprKind::Lambda { params, body } => Ok(eval_lambda(params, body, env, self.module)),
-            ExprKind::App { func, args } => self.eval_app(func, args, env, e.span),
+            ExprKind::App { func, args, .. } => self.eval_app(func, args, env, e.span),
             ExprKind::If {
                 cond,
                 then_branch,
