@@ -606,6 +606,8 @@ fn sweep(spec: BackendSpec) -> Sweep {
         out.offers.offered += seen.offered;
         out.offers.offered_target += seen.offered_target;
         out.offers.fired += seen.fired;
+        out.offers.bytes_in += seen.bytes_in;
+        out.offers.bytes_out += seen.bytes_out;
     }
     out
 }
@@ -674,9 +676,37 @@ fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
         sweep.offers.offered,
         sweep.compared
     );
+    // The `Bytes` widening of `compiled::crossable` (2026-08-30), asserted
+    // rather than assumed. A widening nothing on disk exercises leaves every
+    // test in this file green over a seam it did not reach, which is the
+    // vacuous pass `CONTRIBUTING.md` §"The one rule" names — and it is exactly
+    // the shape this widening could take, since `Bytes` is a kind a corpus
+    // might never pass to a named function at all.
+    //
+    // Both directions, because they are two mechanisms: `admit`'s `crossable`
+    // test on the arguments, and `Machine::compiled_answer`'s on the answer.
+    // Before the widening both of these were 0 by construction.
+    assert!(
+        sweep.offers.bytes_in > 0,
+        "no call carrying a `Bytes` argument was offered over {} tests, so the widening of \
+         `compiled::crossable` is inert on every corpus on disk and this file's greens say \
+         nothing about it",
+        sweep.compared
+    );
+    assert!(
+        sweep.offers.bytes_out > 0,
+        "{} calls carried a `Bytes` in and not one answered a `Bytes`, so the widening bought \
+         arguments and no returns",
+        sweep.offers.bytes_in
+    );
     println!(
-        "honest backend: {} entered of {} offered, over {} tests",
-        sweep.entered, sweep.offers.offered, sweep.compared
+        "honest backend: {} entered of {} offered, over {} tests · {} offers carried a `Bytes` \
+         argument · {} answered a `Bytes`",
+        sweep.entered,
+        sweep.offers.offered,
+        sweep.compared,
+        sweep.offers.bytes_in,
+        sweep.offers.bytes_out
     );
 }
 
@@ -713,6 +743,16 @@ fn a_wrong_kinded_compiled_answer_is_caught_over_the_corpus() {
 /// `compiled::admit` gates on the shape of the **arguments** and never on the
 /// return type, so every `Int -> List<..>`, `Int -> String` and `Int -> Record`
 /// in `examples/` is offered and must be declined.
+///
+/// > **Narrowed, not closed, by the `Bytes` widening (2026-08-30).** The gap
+/// > used to hold every `Int -> Bytes` too, and `std.router.hex_char` alone was
+/// > 65,560 calls of it; those are now inside the fragment and answered. What
+/// > is left is `String`, `Float`, `Decimal`, `List`, `Map`, `Record`, `Ctor`
+/// > and every polymorphic return, which is still most of `examples/`. This
+/// > test is what fails the day the fragment grows to cover the whole of what
+/// > the seam offers — at which point `Unoffered` has nothing to invent an
+/// > answer for and stops being a corruption, and something else has to police
+/// > the registry.
 #[test]
 fn an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus() {
     fires_and_is_caught("unoffered", Mutation::Unoffered, None);
