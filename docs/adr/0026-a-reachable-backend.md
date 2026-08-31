@@ -24,6 +24,23 @@ it owes. Supersedes nothing.
 > Over `examples/` and `tests/fixtures/` it is offered 120,340 calls and enters
 > **18,773** of them — §1.2's number, re-derived by a different route.
 >
+> > **`and it is slower than the machine` is withdrawn, 2026-08-30
+> > ([ADR 0030](0030-compiled-code-on-the-front-end.md) §5).** It is slower on the
+> > case this note's finding 3 measures — a **declined** body, re-run to
+> > exhaustion once per offer — and faster on the case that decides whether entry
+> > is worth anything. On the Ply front end it enters 190,618 times and does the
+> > work in **0.0800 s against the machine's 0.2900 s**, taking the whole run from
+> > 2.70 s to 2.48 s, **1.089×**. The rest of the sentence stands: it is not a
+> > code generator, and §4.5's precondition is unchanged.
+> >
+> > §3's projection that a real front end cannot enter is withdrawn with it.
+> > *"`fn read_line(buf: Bytes, ..) -> Line` **cannot cross**"* is still true of
+> > `read_line` — it is refused on its **return** type, which is the finding ADR
+> > 0030 §1 turns on. What does not follow, and what §3 drew from it, is that a
+> > real front end's arguments are outside the fragment: a lexer's hot arguments
+> > are offsets and bytes, and a byte in Ply is an `Int`, so even at the
+> > pre-widening `Int | Bool` rung the front end admits 89,912 calls.
+>
 > Three findings from building it, each recorded where it bites:
 >
 > 1. **The third pair had a hole, and it was `(Err, Err)` wearing a third
@@ -746,6 +763,37 @@ the record has been assuming.
 > the note on §4.7 has the reason and the measurement, and "seven" is written
 > here rather than "the eight" because the difference is the whole of what this
 > clause is for.
+>
+> > **Read one word narrower, 2026-08-30: "seven of the eight" is a property of
+> > `Reference`, not of the seam, and this clause is a condition on *any*
+> > backend.** Traced through the types rather than argued. `ply test`'s only
+> > install route is `InterpExecutor::with_backend`
+> > (`crates/ply-test/src/lib.rs:895`), whose signature is
+> > `(&'static ply_eval::Fragment, BackendSpec)` — a `Fragment`, not a
+> > `dyn Compiled`. It reaches a backend only through `Fragment::attach`
+> > (`crates/ply-eval/src/backend.rs:257`), which returns `Reference`, or
+> > `Mutant` wrapping `Rc<Reference>` concretely. So **the eight corruptions
+> > police one implementation of `Compiled` and there is no route by which a
+> > second one is offered to them.**
+> >
+> > That is not a naming quibble: two of the eight need operations the
+> > `Compiled` trait does not have. `Unoffered` asks the registry
+> > (`Fragment::holds`) whether a body exists, which is the distinction between
+> > "declined" and "never had one"; `ExceedsBudget` re-runs the body with fuel
+> > that is *not* the machine's budget (`Reference::run`). `Compiled` is
+> > `describes` and `enter` and nothing else (`compiled.rs:379`), so a cranelift
+> > backend arriving tomorrow is policed by **none** of the eight until the
+> > mutations are lifted off `Reference` onto a trait that carries those two
+> > operations, and `with_backend` stops naming a concrete type.
+> >
+> > `crates/ply-cli/tests/backend.rs`'s 14 green tests are therefore evidence
+> > about `Reference` and are read, in the sentence above and in
+> > `CONTRIBUTING.md` item 13, as evidence about the shipping path's ability to
+> > catch a wrong backend. **The gap is exactly the shape §"The one rule" names**
+> > — a green result over space nothing exercises — and it is recorded here
+> > rather than fixed because lifting the mutations is a change to production
+> > source with its own review, and because the clause it qualifies is the
+> > gate M9 has to pass rather than one this ADR passed.
 
 **No backend may ship until `ply test --engine both` can attach one and catch the
 eight.** Not because policing is more valuable than speed, but because it is
@@ -1035,6 +1083,42 @@ measurement either.
   no toolchain and CI runs `fmt`/`clippy`/`test` on 1.93.1 with the `spike` job
   alone on 1.94.0. Because §4.7 promotes nothing, no workspace toolchain decision
   is forced by this ADR. One is forced by M9.
+
+  > **The last sentence is withdrawn, 2026-08-30, on a measurement.** It read:
+  > *"One is forced by M9."* **The 1.94.0 floor is a property of the version
+  > `crates/ply-codegen-spike/Cargo.toml` pins, not of cranelift.** Read off the
+  > crates.io index, `rust-version` per release: `0.132.0`–`0.132.3` declare
+  > **1.93.0**, and 1.94.0 first appears at `0.133.0`. All five crates the spike
+  > uses — `cranelift-jit`, `-codegen`, `-frontend`, `-module`, `-native` — agree
+  > on that boundary.
+  >
+  > Run rather than read, on this machine's default `stable` (**rustc 1.93.1**,
+  > the version CI pins in six jobs), with `cranelift-jit = "=0.132.3"`: a probe
+  > compiles the body of `lexer.is_digit` — the hottest definition the widened
+  > seam admits on the Ply front end — through `JITBuilder`, `FunctionBuilder`,
+  > `define_function` and `get_finalized_function`, and **calls the native code**.
+  > `is_digit(47,48,53,57,58,97) = [0,1,1,1,0,0]`. The check was seen to fail
+  > before it was believed: flipping one expected answer reports `left: [0, 1, 1,
+  > 1, 0, 0] / right: [0, 1, 1, 1, 1, 0]`, so it reads the JIT's output rather
+  > than its own constant. Whole cranelift stack built clean on 1.93.1 in 23.86s
+  > on aarch64-apple-darwin.
+  >
+  > So M9 forces a version *choice*, not a toolchain *move*: `0.132.x` keeps the
+  > 1.93.1 pin and `0.133+` moves it. What M9 still forces is the other half of
+  > this ADR's cost, and that half is unchanged and was re-measured the same day
+  > — an optional, default-off cranelift dependency puts **31 packages** into the
+  > shipping `Cargo.lock` and takes `grep -c cranelift Cargo.lock` from **0 to
+  > 44**, with the feature **off** and the crate excluded from
+  > `workspace.members`. A lockfile entry is not conditional on a feature.
+  >
+  > Two boundaries on this. The spike's own source does **not** compile against
+  > `0.132.3`: `cargo check` reports **11 errors, all in `src/jit.rs`** —
+  > `ir::MemFlagsData` (renamed `MemFlags`), eight `iadd_imm_s`/`icmp_imm_s`
+  > call sites (the `_s` suffix is a 0.133 addition), and two signature changes
+  > around `stack_load`/`stack_addr`. They are naming and arity drift rather than
+  > a missing capability, but **they were not ported**, so nothing here says a
+  > twelfth error is not behind the eleventh. And this bullet moves the
+  > *toolchain* line only; §4.7's refusal to promote the spike is untouched.
 - **Whether 6.199× holds anywhere else.** One kernel, one program, one box, one
   pre-registered run whose pre-registration forbade re-running it, through a seam
   that passes only `Int` and `Bool`. ADR 0018 §0.5 lists this among what a reader

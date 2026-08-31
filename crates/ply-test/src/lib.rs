@@ -892,6 +892,16 @@ impl<'a> InterpExecutor<'a> {
     /// refuses to read or write the store, and `backend_escapes` fails the run if
     /// a `Pass` was written by a test that entered native code anyway. See
     /// ADR 0026 §4.6.
+    ///
+    /// **The parameter is a `Fragment` and not a `dyn Compiled`, and that is the
+    /// limit of what a shipping command can install.** Every backend this can
+    /// build comes from `Fragment::attach`, which is `ply_eval::backend::Reference`
+    /// or one of the eight corruptions wrapping it. A second implementation of
+    /// `Compiled` — a code generator — does not fit through here, and the eight
+    /// would not be wrapping it if it did, because two of them need a registry
+    /// query and a run on fuel that is not the machine's budget, neither of
+    /// which is on the trait. See `ply_eval::backend::Mutant`'s header and
+    /// ADR 0026 §4.5, annotated 2026-08-30.
     pub fn with_backend(
         mut self,
         fragment: &'static ply_eval::Fragment,

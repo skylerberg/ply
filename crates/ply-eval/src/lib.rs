@@ -17,6 +17,7 @@ pub mod arena;
 mod argv;
 pub mod backend;
 pub mod builtins;
+pub mod census;
 pub mod code;
 mod compiled;
 pub mod cont;
