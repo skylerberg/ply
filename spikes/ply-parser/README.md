@@ -70,6 +70,16 @@ module in the directory and four agents wrote into this one at once.
 | `fixtures/reference-tests.corpus` (mined) | 716 | 19,491 | 8,918 | 2,034 | 793 |
 | **total** | **763** | **780,456** | **252,881** | **126,565** | **833** |
 
+> **WITHDRAWN 2026-08-30.** *"Disagreements: 0."* — **the differential is red on
+> 28 of the 763 inputs, which is 70.2% of the corpus by bytes**, and it was red
+> before the three language features were converted into the port. `?` and
+> `{..b, f: e}` became *syntax* after this spike was taken (ADR 0028, ADR 0023)
+> and the Ply parser can neither lex nor parse them. The disagreeing set is
+> **identical before and after the port** (checked by running the differential
+> against both trees). 735 inputs still agree tree-and-diagnostics byte for byte,
+> and the table above is the tally as it stood on 2026-08-28. **`GAPS.md` §11R has
+> the numbers, the cause and what restoring it would cost.**
+
 **Disagreements: 0.** Node-tag coverage **92 of 92**. `examples/clock.ply` agreed
 byte for byte on the first attempt and so did every file up to `db.ply` (135,285
 bytes, 63,215 records); **not one line of any area's `.ply` file was edited to
@@ -84,6 +94,14 @@ has a `_` arm**, so a variant added to `ast.rs` stops the harness compiling rath
 than being silently skipped.
 
 ### The comparison is armed
+
+> **This figure can no longer be re-taken as written.** `arm-harness.sh` requires
+> a green baseline (lines 83–89) and refuses to run against the red differential
+> above, so the count below is the one taken on 2026-08-28. A successor sweep that
+> does not need green — it compares disagreement *sets* — is in `GAPS.md` §2, and
+> it found **13 of the 26 remaining error-propagation sites unwatched**, 8 of them
+> demonstrably so. The sixteen below all corrupt the tree the parser builds when
+> it *succeeds*; not one corrupts what it does when a sub-parse fails.
 
 `./arm-harness.sh`: **16 mutations, 16 armed, 0 survived, 0 invalid.** The three
 classes ADR 0020 asks for, plus one per structural property claimed — dropped
@@ -296,6 +314,31 @@ Taken 2026-08-28, in `~/.worktrees/ply/spike-ply-parser`, on the machine in
 - The differential: **763 inputs, 780,456 bytes, 0 disagreements**, tag coverage
   92/92.
 - Arming: **16 armed, 0 survived, 0 invalid.**
+
+**Re-checked 2026-08-30, after `list_at`, `?` and `let` destructuring were
+converted into the port. Three of those five lines no longer hold, and the two
+that do were re-run rather than quoted:**
+
+- `run.sh` exits **101**, at the differential and only there. Everything before it
+  passes: instrument current, **110** in-language tests (112 → 110; two suites
+  became unwritable when `bail` did, `GAPS.md` §2), harness `--lib` 10 + `--test
+  fields` 1, `cargo fmt --check` and `clippy -D warnings` clean.
+- The differential: **735 of 763 inputs agree, 28 disagree — 70.2% of the corpus
+  by bytes.** Not caused by the port: the disagreeing set is identical when the
+  same differential is run against the pre-port tree. Cause and cost in `GAPS.md`
+  §11R.
+- Arming, re-taken by substitution: `arm-harness.sh` refuses a red baseline by
+  design, so each of the 16 was applied to the ported source and scored on whether
+  the disagreeing **set** changed. **All 16 still apply and all 16 still go red**,
+  changing between 29 and 152 inputs — the port disarmed none of them.
+- But the 16 watch one half of the parser. A successor sweep over the sites `?`
+  could not convert — 26 hand-written `Stop(Err(q))` propagations — found **13 of
+  26 change nothing across all 763 inputs**, 8 of them demonstrably not equivalent
+  mutants. `GAPS.md` §2, "The residue is half unwatched".
+- Re-taken and reproduced: the §13R multiplier. An independent interleaved series
+  got **2.632 before / 2.471 after** against §13R's 2.585 / 2.443, with the
+  byte-identical-`lexer.ply` control at **1.017** against its 1.004 — same
+  direction, same size, on a different sitting.
 - **No source file outside `spikes/ply-parser/` was modified.** Taking §4's
   measurements created three gitignored artifacts and nothing else:
   `examples/.ply-cache` and `spikes/ply-parser/.ply-cache` (written by `ply
