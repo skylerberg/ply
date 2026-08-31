@@ -14,10 +14,11 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 
 fn compile(source: &str) -> (Program, Resolved) {
-    let program = ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
-        .unwrap_or_else(|d| panic!("did not parse: {d:#?}"));
+    let mut program =
+        ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
+            .unwrap_or_else(|d| panic!("did not parse: {d:#?}"));
     let resolved =
-        ply_syntax::resolve(&program).unwrap_or_else(|d| panic!("did not resolve: {d:#?}"));
+        ply_syntax::resolve(&mut program).unwrap_or_else(|d| panic!("did not resolve: {d:#?}"));
     (program, resolved)
 }
 
@@ -97,8 +98,8 @@ fn renaming_a_definition_holding_a_numeric_literal_changes_no_hash() {
 
 fn round_trip(source: &str) {
     let bodies = bodies_of(source);
-    let rebuilt = reconstruct(&bodies).expect("bodies reconstruct");
-    let resolved = ply_syntax::resolve(&rebuilt.program)
+    let mut rebuilt = reconstruct(&bodies).expect("bodies reconstruct");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program)
         .unwrap_or_else(|d| panic!("reconstruction did not resolve: {d:#?}"));
     let (again, _) =
         hash_program_with_bodies(&rebuilt.program, &resolved).expect("rebuilt program hashes");

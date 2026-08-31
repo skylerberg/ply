@@ -47,8 +47,8 @@ impl Compiled {
             .enumerate()
             .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
             .collect();
-        let program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved = ply_syntax::resolve(&program)
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
+        let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = ply_core::check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));

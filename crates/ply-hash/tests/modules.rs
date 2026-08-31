@@ -25,8 +25,8 @@ fn program_of(files: &[(&str, &str)]) -> Program {
 }
 
 fn hashes(files: &[(&str, &str)]) -> HashOutput {
-    let program = program_of(files);
-    let resolved = match ply_syntax::resolve(&program) {
+    let mut program = program_of(files);
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };
@@ -555,26 +555,26 @@ fn a_one_module_program_hashes_like_a_bare_module() {
     let module = ply_syntax::parse(SourceId(0), source).expect("parses");
     let bare = hash_ast(&module).expect("hashes");
 
-    let program = Program::single(module);
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let mut program = Program::single(module);
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     assert_eq!(bare, hash_program_ast(&program, &resolved).expect("hashes"));
 }
 
 #[test]
 fn an_empty_program_hashes_to_nothing() {
-    let program = Program::default();
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let mut program = Program::default();
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     let out = hash_program_ast(&program, &resolved).expect("hashes");
     assert_eq!(out, HashOutput::default());
 }
 
 #[test]
 fn a_duplicate_definition_is_still_reported_per_module() {
-    let program = program_of(&[
+    let mut program = program_of(&[
         ("a", "fn f() -> Int = 1\nfn f() -> Int = 2\n"),
         ("b", "fn f() -> Int = 3\n"),
     ]);
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     let diags = hash_program_ast(&program, &resolved)
         .expect_err("a duplicate within one module is an error");
     assert_eq!(diags.len(), 1);
@@ -586,8 +586,8 @@ fn a_duplicate_definition_is_still_reported_per_module() {
 /// resolved source structure alone.
 #[test]
 fn the_checked_entry_point_agrees_with_the_unchecked_one() {
-    let program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
-    let resolved = ply_syntax::resolve(&program).expect("resolves");
+    let mut program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
+    let resolved = ply_syntax::resolve(&mut program).expect("resolves");
     let check = match ply_core::check_program(&program, &resolved) {
         Ok(check) => check,
         Err(diags) => panic!("program did not typecheck: {diags:#?}"),
@@ -614,8 +614,8 @@ fn hashing_a_multi_module_program_is_stable_across_runs() {
 #[test]
 fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
     let paired = |files: &[(&str, &str)]| -> Vec<(String, DefHash)> {
-        let program = program_of(files);
-        let resolved = ply_syntax::resolve(&program).expect("resolves");
+        let mut program = program_of(files);
+        let resolved = ply_syntax::resolve(&mut program).expect("resolves");
         let check = match ply_core::check_program(&program, &resolved) {
             Ok(check) => check,
             Err(diags) => panic!("program did not typecheck: {diags:#?}"),

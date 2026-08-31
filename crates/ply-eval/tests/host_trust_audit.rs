@@ -48,10 +48,10 @@ struct Compiled {
 }
 
 fn compile(source: &str) -> Compiled {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("the fixture parses");
-    let resolved = resolve(&program).expect("the fixture resolves");
+    let resolved = resolve(&mut program).expect("the fixture resolves");
     let check = check_program(&program, &resolved).expect("the fixture typechecks");
     Compiled {
         program,
@@ -61,10 +61,10 @@ fn compile(source: &str) -> Compiled {
 }
 
 fn compile_error(source: &str) -> Vec<Diagnostic> {
-    let program =
+    let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
             .expect("the fixture parses");
-    let resolved = resolve(&program).expect("the fixture resolves");
+    let resolved = resolve(&mut program).expect("the fixture resolves");
     check_program(&program, &resolved).expect_err("the fixture was expected not to typecheck")
 }
 

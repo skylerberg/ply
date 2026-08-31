@@ -65,7 +65,7 @@ fn compile(modules: &[(&str, &str)]) -> Result<CheckOutput, Vec<Diagnostic>> {
     if !diags.is_empty() {
         return Err(diags);
     }
-    let resolved = resolve(&program)?;
+    let resolved = resolve(&mut program)?;
     check_program(&program, &resolved)
 }
 

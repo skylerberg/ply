@@ -255,10 +255,13 @@ impl Hybrid for BodyHybrid<'_> {
         }
         bodies.push_test(self.test.clone());
 
-        let Ok(rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
+        let Ok(mut rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
             return Trial::unresolved(Unresolved::MissingBody);
         };
-        let Ok(resolved) = ply_syntax::resolve(&rebuilt.program) else {
+        // `resolve` also fills defaults, which it needs the program mutably
+        // for. Here that is a no-op: a reconstructed program's calls were
+        // positional and fully applied before they were ever encoded.
+        let Ok(resolved) = ply_syntax::resolve(&mut rebuilt.program) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
         let Ok(rehashed) = ply_hash::hash_program_ast(&rebuilt.program, &resolved) else {

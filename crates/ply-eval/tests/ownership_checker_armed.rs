@@ -38,7 +38,7 @@ fn inline(src: &str) -> Program1 {
         parse_program(vec![(source, name, src)]).expect("the armed program must parse");
     let expanded = ply_derive::expand_program(&mut program);
     assert!(expanded.is_empty(), "derive refused: {expanded:?}");
-    let resolved = resolve(&program).expect("the armed program must resolve");
+    let resolved = resolve(&mut program).expect("the armed program must resolve");
     Program1 {
         program,
         resolved,

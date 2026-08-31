@@ -139,11 +139,11 @@ pub fn front(root: &Path) -> Result<Front> {
         .zip(&names)
         .map(|(&id, name)| (id, name.clone(), sources.get(id).map_or("", |f| &*f.text)))
         .collect();
-    let program = ply_syntax::parse_program(inputs).map_err(|d| report(&d))?;
+    let mut program = ply_syntax::parse_program(inputs).map_err(|d| report(&d))?;
     timings.record(Phase::Parse, started.elapsed());
 
     let started = Instant::now();
-    let resolved = resolve(&program).map_err(|d| report(&d))?;
+    let resolved = resolve(&mut program).map_err(|d| report(&d))?;
     timings.record(Phase::Resolve, started.elapsed());
 
     let started = Instant::now();

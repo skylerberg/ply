@@ -126,10 +126,13 @@ fn expr(e: &mut Expr, span: Span) {
             }
             expr(body, span);
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, named } => {
             expr(func, span);
             for a in args {
                 expr(a, span);
+            }
+            for n in named {
+                expr(&mut n.value, span);
             }
         }
         ExprKind::If {

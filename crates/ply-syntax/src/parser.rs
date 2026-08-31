@@ -4,7 +4,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Kw, Token, TokenKind, lex};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_span::{Diagnostic, SourceId, Span, codes};
 
 /// Signals that the enclosing construct was abandoned. The diagnostic explaining
 /// why has already been recorded.
@@ -14,6 +14,12 @@ pub struct Bail;
 enum RowMember {
     Atom(AtomExpr),
     Set(QName),
+}
+
+/// What one comma-separated member of an argument list turned out to be.
+enum Arg {
+    Positional(Expr),
+    Named(NamedArg),
 }
 
 type PResult<T> = Result<T, Bail>;
@@ -169,6 +175,13 @@ impl Parser {
 
     fn at_eof(&self) -> bool {
         matches!(self.kind(), TokenKind::Eof)
+    }
+
+    /// The token `n` ahead, clamped at the end. Only a named argument needs
+    /// this: `f(x)` and `f(x: 1)` share a first token.
+    fn peek_is(&self, n: usize, k: &TokenKind) -> bool {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[i].kind == k
     }
 
     fn at_ident_text(&self, text: &str) -> bool {
@@ -728,7 +741,7 @@ impl Parser {
         };
 
         let open = self.expect(&TokenKind::LParen, "`(` to start the parameter list")?;
-        let params = self.comma_list(&TokenKind::RParen, Self::param)?;
+        let params = self.comma_list(&TokenKind::RParen, Self::fn_param)?;
         self.expect_close(&TokenKind::RParen, open, "`)` to close the parameter list")?;
 
         let ret = if self.eat(&TokenKind::Arrow) {
@@ -859,15 +872,61 @@ impl Parser {
         Ok(Binder { name, ty, span })
     }
 
+    /// A `fn` parameter, which may carry `= <expr>`.
+    fn fn_param(&mut self) -> PResult<Param> {
+        self.param_inner(true)
+    }
+
+    /// A lambda parameter, which may not. A default exists so that a *call* can
+    /// leave the argument out, and a lambda is reached through a value rather
+    /// than through a name a call site could match against a signature.
     fn param(&mut self) -> PResult<Param> {
+        self.param_inner(false)
+    }
+
+    fn param_inner(&mut self, allow_default: bool) -> PResult<Param> {
         let name = self.expect_ident("a parameter name")?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.ty()?)
         } else {
             None
         };
-        let span = name.span.to(ty.as_ref().map_or(name.span, |t| t.span()));
-        Ok(Param { name, ty, span })
+        // Parsed either way, so that a default written on a lambda is refused
+        // with the reason rather than with `expected `,` or `|``.
+        let default = if self.at(&TokenKind::Eq) {
+            let eq = self.advance();
+            let e = self.expr()?;
+            if allow_default {
+                Some(e)
+            } else {
+                self.push(
+                    Diagnostic::error(
+                        codes::DEFAULT_NOT_ALLOWED,
+                        "a lambda parameter cannot have a default",
+                    )
+                    .primary(eq.to(e.span), "no call can omit this argument")
+                    .note(
+                        "a default is filled in by matching a call against a signature, and a \
+                         lambda is called through a value rather than by name",
+                    ),
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let end = default
+            .as_ref()
+            .map(|d| d.span)
+            .or_else(|| ty.as_ref().map(|t| t.span()))
+            .unwrap_or(name.span);
+        let span = name.span.to(end);
+        Ok(Param {
+            name,
+            ty,
+            default,
+            span,
+        })
     }
 
     fn generics(&mut self) -> PResult<Generics> {
@@ -1311,12 +1370,13 @@ impl Parser {
         loop {
             match self.kind() {
                 TokenKind::LParen => {
-                    let (args, close) = self.call_args()?;
+                    let (args, named, close) = self.call_args()?;
                     let span = e.span.to(close);
                     e = Expr {
                         kind: ExprKind::App {
                             func: Box::new(e),
                             args,
+                            named,
                         },
                         span,
                     };
@@ -1352,7 +1412,20 @@ impl Parser {
                     };
                     let op = self.expect_ident("an operation name")?;
                     let resource = self.opt_resource()?;
-                    let (args, close) = self.call_args()?;
+                    let (args, named, close) = self.call_args()?;
+                    // An operation has no defaults to fill and a handler clause
+                    // must bind exactly what it declares, so there is nothing
+                    // for a name to select.
+                    for n in &named {
+                        self.push(
+                            Diagnostic::error(
+                                codes::UNKNOWN_ARGUMENT_NAME,
+                                format!("`{}.{}` takes no named arguments", effect, op.name),
+                            )
+                            .primary(n.span, "named")
+                            .note("an effect operation's arguments are positional"),
+                        );
+                    }
                     let span = e.span.to(close);
                     e = Expr {
                         kind: ExprKind::Perform {
@@ -1394,17 +1467,62 @@ impl Parser {
         Ok(Some(r))
     }
 
-    fn call_args(&mut self) -> PResult<(Vec<Expr>, Span)> {
+    fn call_args(&mut self) -> PResult<(Vec<Expr>, Vec<NamedArg>, Span)> {
         let saved = std::mem::replace(&mut self.no_brace, false);
         let open = self.expect(&TokenKind::LParen, "`(` to start the argument list")?;
-        let args = self.comma_list(&TokenKind::RParen, Self::expr);
-        let r = args.and_then(|args| {
+        let parsed = self.comma_list(&TokenKind::RParen, Self::call_arg);
+        let r = parsed.and_then(|parsed| {
             let close =
                 self.expect_close(&TokenKind::RParen, open, "`)` to close the arguments")?;
-            Ok((args, close))
+            let mut args = Vec::new();
+            let mut named: Vec<NamedArg> = Vec::new();
+            for arg in parsed {
+                match arg {
+                    Arg::Positional(e) => {
+                        // Ordering is the parser's to enforce because it is a
+                        // property of the text; which *names* are legal needs
+                        // the callee's signature and is `defaults::expand`'s.
+                        if let Some(first) = named.first() {
+                            self.push(
+                                Diagnostic::error(
+                                    codes::ARGUMENT_ORDER,
+                                    "a positional argument cannot follow a named one",
+                                )
+                                .primary(e.span, "positional")
+                                .secondary(first.span, "the first named argument is here")
+                                .note(
+                                    "positional arguments fill parameters left to right, which \
+                                     a name in front of them would make ambiguous",
+                                ),
+                            );
+                        }
+                        args.push(e);
+                    }
+                    Arg::Named(n) => named.push(n),
+                }
+            }
+            Ok((args, named, close))
         });
         self.no_brace = saved;
         r
+    }
+
+    /// `name: value` is a named argument; anything else is positional.
+    ///
+    /// The lookahead is two tokens and cannot be one: `f(x)` and `f(x: 1)` share
+    /// a first token, and `x` alone is an ordinary variable reference.
+    fn call_arg(&mut self) -> PResult<Arg> {
+        if let TokenKind::Ident(name) = self.kind()
+            && self.peek_is(1, &TokenKind::Colon)
+        {
+            let name = Ident::new(name.clone(), self.span());
+            self.advance();
+            self.advance();
+            let value = self.expr()?;
+            let span = name.span.to(value.span);
+            return Ok(Arg::Named(NamedArg { name, value, span }));
+        }
+        Ok(Arg::Positional(self.expr()?))
     }
 
     fn primary_expr(&mut self) -> PResult<Expr> {
@@ -2206,9 +2324,9 @@ impl Parser {
     }
 }
 
-fn starts_upper(name: &Symbol) -> bool {
-    name.as_str().chars().next().is_some_and(char::is_uppercase)
-}
+/// One implementation, in `ast`, because [`ast::is_default_expr`] asks the same
+/// question of a default's callee that the grammar asks of a pattern.
+use crate::ast::is_ctor_name as starts_upper;
 
 /// Expressions that end in `}` may stand as a statement without a `;`.
 fn is_block_like(kind: &ExprKind) -> bool {

@@ -544,8 +544,8 @@ pub fn choice() -> Int =
             ply_syntax::ast::ModuleName::from_dotted("m"),
             NESTED,
         )];
-        let program = ply_syntax::parse_program(inputs).expect("the fixture parses");
-        let resolved = ply_syntax::resolve::resolve(&program).expect("the fixture resolves");
+        let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
+        let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
         let regions = crate::region_kind::infer(&program, &resolved);
         assert!(regions.len() >= 5, "{} regions found", regions.len());
 

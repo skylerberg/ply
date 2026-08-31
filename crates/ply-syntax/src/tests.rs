@@ -1286,7 +1286,7 @@ fn dump_expr(e: &Expr) -> String {
         ExprKind::Lambda { params, body } => {
             format!("(lam ({}) {})", dump_params(params), dump_expr(body))
         }
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             let mut s = format!("(call {}", dump_expr(func));
             for a in args {
                 s.push_str(&format!(" {}", dump_expr(a)));
@@ -2433,7 +2433,7 @@ fn has_try(m: &Module) -> bool {
             ExprKind::Binary { lhs, rhs, .. } => e(lhs) || e(rhs),
             ExprKind::Unary { operand, .. } => e(operand),
             ExprKind::Lambda { body, .. } => e(body),
-            ExprKind::App { func, args } => e(func) || args.iter().any(e),
+            ExprKind::App { func, args, .. } => e(func) || args.iter().any(e),
             ExprKind::If {
                 cond,
                 then_branch,
@@ -3095,7 +3095,7 @@ fn has_record_update(m: &Module) -> bool {
             ExprKind::Binary { lhs, rhs, .. } => e(lhs) || e(rhs),
             ExprKind::Unary { operand, .. } => e(operand),
             ExprKind::Lambda { body, .. } => e(body),
-            ExprKind::App { func, args } => e(func) || args.iter().any(e),
+            ExprKind::App { func, args, .. } => e(func) || args.iter().any(e),
             ExprKind::If {
                 cond,
                 then_branch,

@@ -117,7 +117,7 @@ pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
     if !diags.is_empty() {
         return Err(diags);
     }
-    let resolved = resolve(&program)?;
+    let resolved = resolve(&mut program)?;
     check_program_with(&program, &resolved, &Known::default())
 }
 
@@ -3155,7 +3155,10 @@ impl<'a> Checker<'a> {
                 )
             }
 
-            ExprKind::App { func, args } => self.infer_app(e, func, args),
+            // `named` is empty: `defaults::expand` cleared it in `resolve`,
+            // and `no_named_argument_survives_resolve_anywhere_in_the_tree`
+            // is what makes that an invariant rather than a hope.
+            ExprKind::App { func, args, .. } => self.infer_app(e, func, args),
 
             ExprKind::If {
                 cond,
@@ -5987,7 +5990,7 @@ fn collect_refs_inner<'a>(e: &'a Expr, out: &mut Refs<'a>) {
         }
         ExprKind::Unary { operand, .. } => collect_refs(operand, out),
         ExprKind::Lambda { body, .. } => collect_refs(body, out),
-        ExprKind::App { func, args } => {
+        ExprKind::App { func, args, .. } => {
             collect_refs(func, out);
             args.iter().for_each(|a| collect_refs(a, out));
         }

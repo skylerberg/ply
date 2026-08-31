@@ -285,6 +285,49 @@ pub mod codes {
     /// expansion has no `let` left to carry `T` on, and a written annotation
     /// must not evaporate.
     pub const TRY_POSITION: &str = "E0119";
+    /// A parameter default written where no call could ever fill it in: on a
+    /// lambda, on an effect operation, or on a handler clause.
+    ///
+    /// A default is spliced into a call site by matching that call against a
+    /// *signature*, which needs a name to match against. A lambda is reached
+    /// through a value; an operation's arguments come from a `perform` and its
+    /// clause must bind exactly what the operation declares.
+    pub const DEFAULT_NOT_ALLOWED: &str = "E0120";
+    /// A parameter default that is not a pure, closed expression.
+    ///
+    /// The expression is copied into every call site that omits the argument
+    /// (`docs/adr/0029`), so it must mean the same thing at each. A call or a
+    /// `perform` would run there rather than here; a mention of another
+    /// parameter or of a local would resolve against the caller's binders. The
+    /// predicate is [`ply_syntax::is_default_expr`], which is
+    /// [`ply_syntax::is_pure`] widened to admit constructor applications —
+    /// `Some(0)` is a default a program will actually want.
+    ///
+    /// [`ply_syntax::is_pure`]: https://docs.rs/ply-syntax
+    /// [`ply_syntax::is_default_expr`]: https://docs.rs/ply-syntax
+    pub const DEFAULT_NOT_PURE: &str = "E0121";
+    /// A default on a `pub fn` that mentions a name the callee's module does
+    /// not export.
+    ///
+    /// Expansion qualifies the default's free names against the module that
+    /// wrote them and splices the result into the caller, so a private name
+    /// would become a reference no other module is allowed to make. Checked at
+    /// the definition rather than at each call site: the answer does not vary
+    /// by caller, and a diagnostic on the signature is one a reader can act on.
+    pub const DEFAULT_PRIVATE_NAME: &str = "E0122";
+    /// A named argument that names no parameter of the callee, or names one
+    /// twice, or names one a positional argument already filled.
+    pub const UNKNOWN_ARGUMENT_NAME: &str = "E0123";
+    /// A positional argument after a named one. Positional arguments fill
+    /// parameters left to right, which a name in front of them makes ambiguous.
+    pub const ARGUMENT_ORDER: &str = "E0124";
+    /// A parameter filled neither positionally nor by name, carrying no
+    /// default.
+    ///
+    /// Distinct from [`ARITY_MISMATCH`], which is what a call through a *value*
+    /// gets: this one can name the parameter, because the callee was reached by
+    /// a name and its signature is in hand.
+    pub const MISSING_ARGUMENT: &str = "E0125";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -774,6 +817,16 @@ mod tests {
             ("RECORD_UPDATE_FIELD", codes::RECORD_UPDATE_FIELD, "E0117"),
             ("TRY_SCOPE", codes::TRY_SCOPE, "E0118"),
             ("TRY_POSITION", codes::TRY_POSITION, "E0119"),
+            ("DEFAULT_NOT_ALLOWED", codes::DEFAULT_NOT_ALLOWED, "E0120"),
+            ("DEFAULT_NOT_PURE", codes::DEFAULT_NOT_PURE, "E0121"),
+            ("DEFAULT_PRIVATE_NAME", codes::DEFAULT_PRIVATE_NAME, "E0122"),
+            (
+                "UNKNOWN_ARGUMENT_NAME",
+                codes::UNKNOWN_ARGUMENT_NAME,
+                "E0123",
+            ),
+            ("ARGUMENT_ORDER", codes::ARGUMENT_ORDER, "E0124"),
+            ("MISSING_ARGUMENT", codes::MISSING_ARGUMENT, "E0125"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

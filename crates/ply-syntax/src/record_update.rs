@@ -412,9 +412,10 @@ impl Cx<'_> {
                     self.expr(body);
                     self.scope.truncate(mark);
                 }
-                ExprKind::App { func, args } => {
+                ExprKind::App { func, args, named } => {
                     self.expr(func);
                     args.iter_mut().for_each(|a| self.expr(a));
+                    named.iter_mut().for_each(|n| self.expr(&mut n.value));
                 }
                 ExprKind::If {
                     cond,

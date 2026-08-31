@@ -39,7 +39,7 @@ fn parse(files: &[(&str, &str)]) -> (Program, Resolved) {
     if !diags.is_empty() {
         panic!("program did not expand: {diags:#?}");
     }
-    let resolved = match ply_syntax::resolve(&program) {
+    let resolved = match ply_syntax::resolve(&mut program) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("program did not resolve: {diags:#?}"),
     };
@@ -65,8 +65,8 @@ fn compile(files: &[(&str, &str)]) -> Checked {
 /// hash to the key its body was filed under — the round trip, stated as the only
 /// thing that actually matters.
 fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
-    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = match ply_syntax::resolve(&rebuilt.program) {
+    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    let resolved = match ply_syntax::resolve(&mut rebuilt.program) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("reconstructed program did not resolve: {diags:#?}"),
     };
@@ -647,8 +647,8 @@ fn reconstructed_tests_evaluate() {
         "#,
     )]);
 
-    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should check");
     let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
 
@@ -797,7 +797,7 @@ fn namespace(checked: &Checked) -> BTreeMap<DefHash, Symbol> {
 fn a_namespace_restores_the_names_and_the_modules() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
     let names = namespace(&original);
-    let rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &names)
+    let mut rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &names)
         .expect("bodies should reconstruct");
 
     for (hash, given) in &rebuilt.names {
@@ -821,7 +821,7 @@ fn a_namespace_restores_the_names_and_the_modules() {
 
     // And it is a program, not just a naming: it resolves, it typechecks, and
     // every definition hashes back to the key its body was filed under.
-    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
     assert!(check.defs.contains_key(&Symbol::new("app.main")));
     assert!(
@@ -872,7 +872,7 @@ fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
         // A name with no module to put it in.
         full.keys().map(|h| (*h, Symbol::new("bare"))).collect(),
     ] {
-        let rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &broken)
+        let mut rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &broken)
             .expect("a namespace that cannot be used is not a broken artifact");
         assert!(
             rebuilt
@@ -882,7 +882,7 @@ fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
             "a mixture was produced: {:?}",
             rebuilt.names.values().take(4).collect::<Vec<_>>()
         );
-        ply_syntax::resolve(&rebuilt.program).expect("the fallback still resolves");
+        ply_syntax::resolve(&mut rebuilt.program).expect("the fallback still resolves");
     }
 }
 
@@ -949,8 +949,8 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
         "#,
     )]);
 
-    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&rebuilt.program).expect("it should resolve");
+    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
     let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
     assert_eq!(interp.test_count(), 2);
