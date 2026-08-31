@@ -9,7 +9,12 @@
 //!   refdump --tags <file>      the distinct node tags, one per line
 //!   refdump --bundle <file>    every fixture in a bundle, dumps joined by `~`
 //!   refdump --bundle-tags <f>  the distinct tags over a whole bundle
-//!   refdump --unexpanded <f>   the dump with `effect_set::expand` projected out
+//!
+//! > **Withdrawn 2026-08-30.** A sixth mode stood here: *"`refdump
+//! > --unexpanded <f>`   the dump with `effect_set::expand` projected out"*.
+//! > Every dump this binary prints is now unexpanded — `reference_dump` enters
+//! > at `ply_syntax::parse_unexpanded` — so the flag would name the only
+//! > behaviour there is. `../GAPS.md` §11R.D.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,13 +44,8 @@ fn main() {
         }
         return;
     }
-    let dump = if mode == "unexpanded" {
-        ply_parser_spike_harness::reference_dump_unexpanded(&text)
-    } else {
-        ply_parser_spike_harness::reference_dump(&text)
-    };
+    let dump = ply_parser_spike_harness::reference_dump(&text);
     match mode {
-        "unexpanded" => println!("{dump}"),
         "dump" => println!("{dump}"),
         "nodes" => println!("{}", ply_parser_spike_harness::node_count(&dump)),
         "tags" => {

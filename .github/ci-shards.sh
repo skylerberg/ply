@@ -10,9 +10,11 @@
 # fails if a member is in no shard, in two shards, or named here and absent from
 # the tree.
 #
-#   ci-shards.sh verify        every member is in exactly one shard, and every
+#   ci-shards.sh verify        every member is in exactly one shard, every
 #                              deferred test and every tree check exists where
-#                              this table says
+#                              this table says, and every directory under
+#                              `spikes/` is either run by a named CI job or
+#                              listed as deliberately outside with a reason
 #   ci-shards.sh matrix        the JSON matrix for the parallel test job
 #   ci-shards.sh packages ID   `-p` arguments for one shard
 #   ci-shards.sh skips         `--skip` arguments the parallel shards need
@@ -203,6 +205,38 @@ TREE_CHECKS=(
   "ply-span:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span:armed:ambiguous_enum_names_are_declared"
   "ply-span:armed:no_two_adrs_share_a_number"
+)
+
+# Directories under `spikes/`, and the CI job that runs each.
+#
+# `KNOWN_OUTSIDE` above exists because a crate in no shard is a crate nothing
+# builds. A spike is the same failure with a worse blast radius, and it has
+# already happened twice here: `spikes/ply-parser` sat outside the cargo
+# workspace with its own `[workspace]`, in **no CI job at all**, while its
+# `README.md` predicted in writing that it would bit-rot -- and it did. Four
+# language features landed, its differential went red on 28 of 763 inputs
+# (70.2% of the corpus by bytes) and nothing said so for two days.
+#
+# So this is the same check one directory up. Each entry is `dir:job`, and
+# `verify` fails unless the job exists in `.github/workflows/ci.yml` **and** is
+# named in the `ci` aggregate job's `needs:` list -- because a job that nothing
+# needs is not required, and the `ci` job's own comment is what says a skipped
+# job is not a green tick.
+declare -a SPIKE_JOBS=(
+  "ply-parser:parser-spike"
+)
+
+# Spikes deliberately in no CI job, with the reason, in `KNOWN_OUTSIDE`'s shape.
+#
+# **This list is a finding, not a decision that closes anything.** Three of the
+# four are `.ply` files and a `bench.sh` with no harness and no differential:
+# there is nothing for a job to assert, and a benchmark whose output is a number
+# is not a check. `spikes/ply-lexer` is different and its entry says so.
+declare -a SPIKES_OUTSIDE_CI=(
+  "ply-lexer:it HAS a differential and a run.sh and it is BROKEN -- as of 2026-08-30 \`spikes/ply-lexer/run.sh\` does not reach a single test because its harness does not compile: \`non-exhaustive patterns: &ply_syntax::lexer::TokenKind::Question not covered\` at src/lib.rs:66, the identical bit-rot the parser spike one directory over was just repaired for. It is cited by ADR 0020 6.1, ADR 0021 and ADR 0022 for throughput figures that cannot currently be re-taken. Adding a job here would only report a red that is already known; the entry exists so that the red is written down where CI is configured rather than only in a session transcript. Fix the spike, then move it to SPIKE_JOBS"
+  "ply-lexer-nesting:three files -- main.ply, nesting.ply, bench.sh -- and no harness, no fixtures and no differential. It measures how deep a fold nests; its output is a number for ADR 0022, not a pass or a fail"
+  "ply-lexer-rc:same shape -- main.ply, fieldorder.ply, bench.sh. It measures what building a container anywhere but last in a record literal costs, which is spikes/ply-lexer/GAPS.md 1's measurement. A number, not a check"
+  "ply-lexer-throughput:same shape -- main.ply, lexer.ply, bench.sh. It measures tokens per second for ADR 0020 6.1. A number, not a check"
 )
 
 shard_packages() {
@@ -413,11 +447,106 @@ cmd_verify() {
     fi
   done < <(cmd_tree_checks)
 
+  # --- spikes ---------------------------------------------------------------
+  #
+  # Same three questions as the crate half: is every directory accounted for,
+  # does every job this table names exist, and is it actually required.
+  local workflow="$root/.github/workflows/ci.yml"
+  local -a spike_listed=()
+  local spike job needs block
+  if [[ ! -f $workflow ]]; then
+    echo "FAIL: no workflow at $workflow, so no spike job can be checked" >&2
+    failures=$((failures + 1))
+  fi
+  # The `needs:` list of the `ci` aggregate job. Every SPIKE_JOBS entry has to
+  # appear in it or the job is not required and gates nothing.
+  #
+  # Read by joining the whole `ci:` block onto one line first, because the list
+  # is wrapped across two lines whenever `cargo fmt`-style line length would be
+  # exceeded -- a `sed -n 's/^ *needs: *//p'` read the first line of it and the
+  # check below then failed on a job that was in fact listed. The `exit` on the
+  # next job-level key is what keeps this reading `ci`'s list and not a later
+  # job's, if `ci` ever stops being last.
+  needs=$(awk '/^  ci:/{f=1;next} f && /^  [a-z]/{exit} f' "$workflow" 2>/dev/null |
+    tr '\n' ' ' | sed -n 's/.*needs: *\(\[[^]]*\]\).*/\1/p')
+  if [[ -z $needs ]]; then
+    echo "FAIL: could not read the \`ci\` job's \`needs:\` list out of $workflow -- every check below would pass vacuously" >&2
+    failures=$((failures + 1))
+  fi
+  for entry in ${SPIKE_JOBS[@]+"${SPIKE_JOBS[@]}"}; do
+    spike=${entry%%:*}
+    job=${entry#*:}
+    spike_listed+=("$spike")
+    if [[ ! -d "$root/spikes/$spike" ]]; then
+      echo "FAIL: SPIKE_JOBS names spikes/$spike, which is not in the tree -- delete the entry" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    if [[ ! -x "$root/spikes/$spike/run.sh" ]]; then
+      echo "FAIL: spikes/$spike has no executable run.sh, so job '$job' has nothing to run" >&2
+      failures=$((failures + 1))
+    fi
+    if ! grep -q "^  $job:\$" "$workflow"; then
+      echo "FAIL: SPIKE_JOBS says job '$job' runs spikes/$spike, and $workflow defines no such job" >&2
+      failures=$((failures + 1))
+    # A job that exists and is required still proves nothing unless it runs
+    # *this* spike. Without this arm, `ply-parser:spike` -- the codegen spike's
+    # job, which exists and is in `needs:` -- passed every check above while
+    # `spikes/ply-parser/run.sh` was executed by nothing. Watched to fail
+    # 2026-08-30 by making exactly that substitution.
+    #
+    # The job's block is read into a variable and matched with `[[ == * ]]`
+    # rather than piped into `grep -q`: this file runs under `pipefail`, and a
+    # `grep -q` that exits at its first match closes the pipe, so the producer's
+    # SIGPIPE becomes the pipeline's status and the test reads backwards --
+    # more matching output making failure more likely. That is not
+    # hypothetical here: `spikes/ply-parser/arm-harness.sh`'s header records the
+    # same construction scoring its three loudest results wrong.
+    else
+      block=$(awk -v j="  $job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
+      if [[ $block != *"spikes/$spike/run.sh"* ]]; then
+        echo "FAIL: job '$job' exists but its steps never run spikes/$spike/run.sh, so the spike is required in name only" >&2
+        failures=$((failures + 1))
+      fi
+    fi
+    # Whole word: a substring test passes `spike` against a `needs:` holding
+    # only `parser-spike`, which is the same false green one directory down.
+    if [[ " ${needs//[][,]/ } " != *" $job "* ]]; then
+      echo "FAIL: job '$job' is not in the \`ci\` job's needs list, so it is not required and a green tick can be reported over it never having run" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  for entry in ${SPIKES_OUTSIDE_CI[@]+"${SPIKES_OUTSIDE_CI[@]}"}; do
+    spike=${entry%%:*}
+    note=${entry#*:}
+    spike_listed+=("$spike")
+    if [[ ! -d "$root/spikes/$spike" ]]; then
+      echo "FAIL: SPIKES_OUTSIDE_CI names spikes/$spike, which is not in the tree -- delete the entry ($note)" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ -d "$root/spikes" ]]; then
+    for dir in "$root"/spikes/*/; do
+      spike=$(basename "$dir")
+      seen=0
+      for candidate in ${spike_listed[@]+"${spike_listed[@]}"}; do
+        [[ $candidate == "$spike" ]] && seen=$((seen + 1))
+      done
+      if [[ $seen -eq 0 ]]; then
+        echo "FAIL: spikes/$spike is in no CI job and in no SPIKES_OUTSIDE_CI entry, so nothing in CI runs it and nothing says why -- which is exactly how spikes/ply-parser rotted" >&2
+        failures=$((failures + 1))
+      elif [[ $seen -gt 1 ]]; then
+        echo "FAIL: spikes/$spike is listed $seen times" >&2
+        failures=$((failures + 1))
+      fi
+    done
+  fi
+
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the shard table" >&2
     return 1
   fi
-  echo "${#all_members[@]} workspace members, each in exactly one shard; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#DEFERRED[@]} deferred tests and ${#TREE_CHECKS[@]} tree checks, each present in the tree"
+  echo "${#all_members[@]} workspace members, each in exactly one shard; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#DEFERRED[@]} deferred tests and ${#TREE_CHECKS[@]} tree checks, each present in the tree; ${#SPIKE_JOBS[@]} spike(s) run by a required CI job and ${#SPIKES_OUTSIDE_CI[@]} deliberately outside"
 }
 
 case "${1:-}" in
