@@ -216,6 +216,26 @@ slot indices does not *construct* anything, so "carrying less" is a fact settled
 at lowering rather than a chain built per call. There is no cheaper approximation
 left to try — these were the two.
 
+**Narrowing only where it can pay is 15× cheaper and still not free.** §11 S4's probe narrowed at
+every carry site, which is why it cost what it did. Narrowing only where the sub-expression being
+started actually appends, on `/health` against a 742 baseline:
+
+| what decides whether the frame narrows | allocations | G1 pairs met |
+| --- | ---: | ---: |
+| every carry site | 1,451 (+88%) | 3 of 5 |
+| **only where the sub-expression appends** | **785 (+5.8%)** | **3 of 5** |
+| only where the appended list is a bare name absent from the live set | 785 (+5.4%) | 2 of 5 |
+| a precise per-argument live set instead of `Live`'s | 802 (+7.5%) | 2 of 5 |
+
+Same benefit for a fifteenth of the cost, and the two attempts to sharpen it further both bought
+less. The third fails because `push(s.out, i)` — the shape the compounding case is written in — has
+no bare name to test; the fourth because a syntactic free-variable set ignores binders and so keeps
+more than `Live` does, not less.
+
+**It still fails G2**, and that is the point worth carrying forward: even narrowing *only* where it
+can possibly pay, building a window per site costs 5.8% of the request path. The window has to be
+free rather than cheap, which is the next block.
+
 **And the frame's narrowed view has to be inline, which is what forces the rest of
 the rewrite.** Modelled over a scope of depth *d*, allocations per carry:
 

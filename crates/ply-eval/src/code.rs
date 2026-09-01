@@ -371,7 +371,7 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             let mut keep: Vec<crate::rc::Dead> = Vec::new();
             for (name, value) in fields.iter().rev() {
                 if armed {
-                    keep.push(Rc::from(live.snapshot()));
+                    keep.push(narrowing_for(value, live));
                 }
                 lowered.push((name.name.clone(), lower_in(value, live)));
             }
@@ -515,13 +515,114 @@ fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::
     // missing here is `cannot find` at the read, not a slower program.
     let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
     let mut keep: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
+    // The frame started at `i` evaluates arguments `i+1..` and nothing else, so what it needs is
+    // exactly the names those read. Taking it from `Live` instead would include what is read after
+    // the call, which the frame does not need and which is most of the window's cost.
     for e in exprs.iter().rev() {
-        keep.push(Rc::from(live.snapshot()));
+        keep.push(narrowing_for(e, live));
         out.push(lower_in(e, live));
     }
     out.reverse();
     keep.reverse();
     (Rc::new(out), Rc::new(keep))
+}
+
+/// What the frame should hold while `e` runs, or empty for "hold what it holds today".
+///
+/// Narrowing costs one link per name kept and buys nothing unless something in `e` can be reused,
+/// so it is only asked for where `e` appends. Measured uniformly at every carry site it was +88%
+/// allocations on the request path; the append sites are a small fraction of them.
+fn narrowing_for(e: &Expr, live: &mut Live) -> crate::rc::Dead {
+    if appends(e) {
+        Rc::from(live.snapshot())
+    } else {
+        crate::rc::no_dead()
+    }
+}
+
+/// Whether `e` writes a `push` anywhere inside it.
+///
+/// Syntactic and local on purpose: an append reached through a call is the non-local case no
+/// analysis of this body sees, and narrowing here would not help it. It deliberately does *not*
+/// require the list to be a plain name — `push(s.out, i)` is the shape the compounding case is
+/// written in, and testing for a bare name loses it.
+fn appends(e: &Expr) -> bool {
+    if let ExprKind::App { func, .. } = &e.kind
+        && let ExprKind::Var(q) = &func.kind
+        && q.is_bare()
+        && q.symbol().as_str() == "push"
+    {
+        return true;
+    }
+    crate::limit::grow(|| children(e).into_iter().any(appends))
+}
+
+/// Every sub-expression of `e`, for the walks above.
+fn children(e: &Expr) -> Vec<&Expr> {
+    let mut out: Vec<&Expr> = Vec::new();
+    match &e.kind {
+        ExprKind::Lit(_) | ExprKind::Var(_) => {}
+        ExprKind::Lambda { body, .. }
+        | ExprKind::Field { base: body, .. }
+        | ExprKind::Try { operand: body }
+        | ExprKind::Unary { operand: body, .. }
+        | ExprKind::WithRegion { body, .. }
+        | ExprKind::Simulate { body, .. } => out.push(body),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        ExprKind::App { func, args, .. } => {
+            out.push(func);
+            out.extend(args.iter());
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            out.push(cond);
+            out.push(then_branch);
+            out.push(else_branch);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            out.push(scrutinee);
+            for a in arms {
+                out.push(&a.body);
+                out.extend(a.guard.iter());
+            }
+        }
+        ExprKind::Block { stmts, tail } => {
+            for st in stmts {
+                match st {
+                    AstStmt::Let { value, .. } => out.push(value),
+                    AstStmt::Expr(x) => out.push(x),
+                }
+            }
+            out.extend(tail.iter().map(|t| &**t));
+        }
+        ExprKind::Record { fields } => out.extend(fields.iter().map(|(_, v)| v)),
+        ExprKind::RecordUpdate { base, fields } => {
+            out.push(base);
+            out.extend(fields.iter().map(|(_, v)| v));
+        }
+        ExprKind::List { items } => out.extend(items.iter()),
+        ExprKind::Perform { args, .. } => out.extend(args.iter()),
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
+            out.push(body);
+            out.extend(clauses.iter().map(|c| &c.body));
+            out.extend(return_clause.iter().map(|r| &r.body));
+        }
+        ExprKind::WithCell { init, body, .. } => {
+            out.push(init);
+            out.push(body);
+        }
+    }
+    out
 }
 
 fn lower_all(exprs: &[Expr], live: &mut Live) -> Rc<Vec<Code>> {

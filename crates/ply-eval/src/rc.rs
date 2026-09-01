@@ -40,7 +40,9 @@ pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env
     if !remaining {
         return Env::empty();
     }
-    if !probe_carries() {
+    // Empty means "hold what you hold today": lowering only asks for a narrowing where the
+    // sub-expression appends, because the window costs a link per name kept.
+    if !probe_carries() || live.is_empty() {
         return env.clone();
     }
     env.keep_only(live)
