@@ -82,7 +82,7 @@ impl Region {
             body: None,
             size: 0,
             captures: crate::code::no_captures(),
-            captured: Rc::from(Vec::new()),
+            captured: crate::code::no_captured(),
             module: 0,
             span,
             floor: 0,

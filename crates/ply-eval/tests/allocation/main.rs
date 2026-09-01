@@ -22,5 +22,6 @@ mod fixture_open_cost;
 mod link_reuse;
 mod literal_sharing;
 mod lowering_sharing;
+mod record_update_reuse;
 mod region_arena_cost;
 mod region_reclamation_audit;

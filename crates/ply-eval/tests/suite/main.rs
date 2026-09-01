@@ -22,6 +22,7 @@ mod map_order;
 mod ownership_checker_armed;
 mod ownership_checker_oracle;
 mod position_invariance_g1;
+mod record_update_reuse;
 mod reference_counting_audit;
 mod reference_counting_cost;
 mod reference_cycles;

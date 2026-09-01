@@ -1,11 +1,15 @@
 # ADR 0034 — The append cliff is a calculus mismatch: Perceus over slots
 
-**Decision 1 is landed and its gate is green.** The machine runs on slot
-frames, a last use moves the value out of its slot, and
+**Decisions 1 and 3 are landed and their gates are green.** The machine runs
+on slot frames, a last use moves the value out of its slot, and
 `position_invariance_g1` passes on all five pairs — the fifth included, through
-a field-granular move the flat record representation enabled. The request
-path's allocation count did not move (`w6_report_allocations` holds the band).
-Decisions 2–4 — the chunked representation, reuse, and the checked promise —
+a field-granular move the flat record representation enabled. A record update
+whose base dies at the update writes into the base's record instead of building
+one, and the request path's allocation count moved for the first time since
+ADR 0024 — through that reuse and through the argument-vector and literal
+levers the allocation census attributed, not through the slot frames themselves
+(`README.md` carries the figures, and `w6_report_allocations` holds them to the
+tree). Decisions 2 and 4 — the chunked representation and the checked promise —
 remain sequenced behind their own gates; decision 5 was already done.
 
 Continues ADR 0024, whose findings it accepts entire and whose sequencing it
@@ -359,6 +363,29 @@ recycling a tree is neither easy nor worth much. Record types are structural and
 already printed sorted, so the layout is statically known wherever the type is,
 **and this is independently a win.** The fifth gate pair lands here too:
 field-granular liveness needs a field to be addressable.
+
+**Landed for records, in the form the machine could reach without a shape
+analysis.** The lowering of a record update names its base — the binding a
+`..s` copies from, or, for a literal that rewrites every field, the binding a
+written field projects from — and reads it *after* the written fields, as a read
+of the record's cells alone: a whole use before it clones, a projection of a
+written field is still that field's last use. When the base is the binding's
+last use and nothing else holds the record, the machine sets the written fields
+into it in place; otherwise it copies once. That reuse is keyed on a runtime
+uniqueness probe, not on the promise a caller might make, so multi-shot
+resumption degrades it to a copy rather than breaking it, and the exact-shape
+check makes any candidate base safe — a record of another shape is built as
+written. `record_update_reuse` holds both halves, and
+`a_threaded_record_update_allocates_nothing_per_round` pins the loop shape a
+state record takes.
+
+**Not landed: constructor reuse.** An applied constructor keeps its argument
+vector as the value's payload, so it is the one call whose vector the free list
+never gets back, and reusing a dying constructor's cells for a new application
+of the same constructor is the Perceus reuse this decision names and the tree
+does not yet perform. It waits on the same instrument as Decision 2: the census
+has to show a constructor application as the residue before the change has
+something to measure.
 
 ## Decision 4 — a checked promise, callee-side
 

@@ -345,6 +345,46 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     ctx.push(Value::Record(Arc::new(map.into_iter().collect())))
 }
 
+/// A record update, built as written: the base's copied fields and the written ones. In-place
+/// reuse is the machine's, keyed on a uniqueness the fragment's handles never have.
+pub unsafe extern "C" fn rt_record_update(
+    ctx: *mut Ctx,
+    shape: i64,
+    base: i64,
+    args: *const i64,
+    n: i64,
+) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let names = ctx.tables.shapes[shape as usize].clone();
+    let written = args_of(ctx, args, n);
+    let fields = match ctx.read(base) {
+        Value::Record(fields) => fields.clone(),
+        other => {
+            let d = error(format!(
+                "a record update needs a record, and this is {}",
+                other.type_name()
+            ));
+            return ctx.fail(d);
+        }
+    };
+    let mut map = BTreeMap::new();
+    for name in &names[n as usize..] {
+        match fields.get(name) {
+            Some(v) => {
+                map.insert(name.clone(), v.clone());
+            }
+            None => {
+                let d = error(format!("this record has no field `{name}`"));
+                return ctx.fail(d);
+            }
+        }
+    }
+    for (name, value) in names.iter().zip(written) {
+        map.insert(name.clone(), value);
+    }
+    ctx.push(Value::Record(Arc::new(map.into_iter().collect())))
+}
+
 /// One field of a record, with the two failures the interpreter has here kept as failures rather
 /// than answered.
 pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64) -> i64 {
@@ -476,6 +516,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_builtin", rt_builtin as *const u8),
         ("rt_ctor", rt_ctor as *const u8),
         ("rt_record", rt_record as *const u8),
+        ("rt_record_update", rt_record_update as *const u8),
         ("rt_field", rt_field as *const u8),
         ("rt_list", rt_list as *const u8),
         ("rt_list_fits", rt_list_fits as *const u8),

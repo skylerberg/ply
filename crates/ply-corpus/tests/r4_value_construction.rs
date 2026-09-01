@@ -754,32 +754,46 @@ fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
         }
     }
 
-    // The control, and the correction.
-    let control = added(&base, &micro(&loaded, "r4_str"));
+    // A builtin call takes from the list too, since `builtins::call` gives its vector back —
+    // the change this test used to name as "worth reporting", reported.
+    let builtin = added(&base, &micro(&loaded, "r4_str"));
     println!("\nr4_str: adding one 1-argument builtin call to the loop body adds");
-    for (size, site, per) in &control {
+    for (size, site, per) in &builtin {
         println!("   {per:>+6.2} per iteration  {size:>5}B  {site}");
     }
     let want = size_of::<Value>();
+    if let Some((size, site, per)) = builtin
+        .iter()
+        .find(|(size, site, _)| *size == want && is_argument_vector(site))
+    {
+        panic!(
+            "a 1-argument builtin call added {per:.2} allocations of {size} bytes per iteration \
+             under `{site}`: `builtins::call` has stopped giving its vector back to the free list"
+        );
+    }
+
+    // The control: a constructor application keeps its vector as the value's payload, so that
+    // one class is never given back and the instrument sees exactly one buffer per iteration.
+    // Without this the zeros above could mean the instrument sees no argument vector at all.
+    let control = added(&base, &micro(&loaded, "r4_applied"));
+    println!("\nr4_applied: adding one 1-argument constructor application to the loop body adds");
+    for (size, site, per) in &control {
+        println!("   {per:>+6.2} per iteration  {size:>5}B  {site}");
+    }
     let hit = control
         .iter()
         .find(|(size, site, _)| *size == want && is_argument_vector(site));
     let (_, _, per) = hit.unwrap_or_else(|| {
         panic!(
             "the control loop added no {want}-byte allocation under `ply_eval::argv::take`, so \
-             the two zeros above mean nothing: either `builtins::call` now returns the buffer it \
-             was handed — which would be the change the argument-vector pool's arithmetic assumes had already \
-             happened, and is worth reporting — or this instrument has stopped seeing an argument \
-             vector at all"
+             the zeros above mean nothing: either a constructor no longer keeps the vector it is \
+             applied to, or this instrument has stopped seeing an argument vector at all"
         )
     });
     assert!(
         (per - 1.0).abs() < 0.05,
-        "a 1-argument builtin call added {per:.2} argument vectors per iteration, not 1: the \
-         residue the free list cannot reach is no longer one buffer per builtin application and \
-         the split printed by \
-         `the_argument_vectors_the_free_list_does_not_take_are_the_ones_no_callee_gives_back` is \
-         about a different population"
+        "a 1-argument constructor application added {per:.2} argument vectors per iteration, \
+         not 1"
     );
 }
 

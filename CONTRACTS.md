@@ -1674,7 +1674,7 @@ teardown falls back to the allocator instead of aborting a worker.
 ### `ply-eval::cont` — landed
 
 ```rust
-pub enum Frame { .. }                // 28 kinds as shipped; the ADR's table
+pub enum Frame { .. }                // 30 kinds as shipped; the ADR's table
                                      // describes the 20 M6 landed. Added since:
                                      // `CloseRegion` (ADR 0017), the
                                      // `MapFoldStep` / `BytesPositionStep` /
