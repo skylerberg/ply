@@ -80,17 +80,6 @@ fn check_types_prints_signatures_and_footprints() {
 }
 
 /// `--costs` — ADR 0025 §Decision 2a, built at ADR 0033 §11 S2.
-///
-/// The two definitions differ by **argument order alone** and compute the same
-/// list, which is the whole point of the flag: nothing else in the output of
-/// `ply check` distinguishes them, and the difference is asymptotic. Pinned
-/// here rather than in `ply-eval` because the columns are what a reader diffs,
-/// and because until this test existed `ply_eval::costs` had no caller outside
-/// its own tests.
-///
-/// It cannot pass by the checker answering one thing everywhere: `grows_last`
-/// must read `reuses` and `grows_first` must read `COPIES`, so a constant
-/// verdict in either direction reddens one of the two assertions.
 #[test]
 fn check_costs_separates_two_spellings_of_one_computation() {
     let dir = project(

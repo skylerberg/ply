@@ -754,16 +754,6 @@ mod generated {
 }
 
 /// [`record_sites`] clears on the way in as well as on the way out.
-///
-/// Clearing only on the way out would leave the map dirty for the next caller
-/// whenever one panicked between its own arm and disarm — and that next caller's
-/// isolation would then hold because nothing had failed yet, which is not a
-/// property. Arming clears, so a measurement starts empty whatever happened
-/// before it on this thread. `tests/suite/position_invariance_g1.rs` is the
-/// caller that depends on it: it measures ten programs in a row on one thread
-/// and panics inside the armed window on any member whose test fails to run.
-/// The crate's integration tests are one binary, so the thread that runs it has
-/// very likely run something else first.
 #[test]
 fn arming_site_recording_clears_what_the_last_caller_left() {
     let span = Span::new(ply_span::SourceId(0), 0, 1);

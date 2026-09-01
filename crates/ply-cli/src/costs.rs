@@ -1,28 +1,4 @@
 //! `ply check --costs`: where an append copies, before the program runs.
-//!
-//! The checker is [`ply_eval::costs`] and this module only renders it. ADR 0025
-//! §Decision 2a asked for the flag and ADR 0033 §11 S2 is where it was built —
-//! between those two the checker shipped with **no caller outside its own
-//! tests**, which is why the output shape below is the ADR's rather than one
-//! grown from use.
-//!
-//! # Why this prints a cost and not a guarantee
-//!
-//! [`ply_eval::costs`] reads the lowered `Code` and changes no evaluation:
-//! `push` keeps its dynamic `Arc::get_mut` guard, so a verdict here is a claim
-//! *about* a run and never a permission granted to one. A wrong verdict costs a
-//! reader a wrong expectation; it cannot cost a program its meaning. That is
-//! also why [`Verdict::Unknown`] is printed rather than rounded to one of the
-//! other two — `costs`'s module header lists the four shapes no analysis of one
-//! body can decide, and rounding them would be the one thing that makes a
-//! checker worse than none.
-//!
-//! # The width is pinned, for the reason `--types`' is
-//! [`crate::signature`] renders at a fixed width because its output is diffed in
-//! review. This block is diffed for the same reason — the interesting question
-//! about it is *what changed since the last run* — so the columns are laid out
-//! once, here, and `costs_reports_the_shipped_quadratic` in
-//! `crates/ply-cli/tests/check.rs` pins them.
 
 use ply_eval::costs::{Costs, DefKind, Definition, Report, Verdict};
 use ply_span::{SourceMap, Span};
@@ -111,10 +87,6 @@ fn tally(def: &Definition) -> String {
 }
 
 /// The whole-program line.
-///
-/// `rounds` is printed rather than hidden because [`Report::rounds`] at its
-/// ceiling means the fixpoint did not converge and the verdicts above are not
-/// an answer — `costs`'s own harness prints it for the same reason.
 fn summary(report: &Report) -> String {
     let (mut reuses, mut copies, mut unknown) = (0, 0, 0);
     for def in report.all() {

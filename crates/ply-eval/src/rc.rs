@@ -27,10 +27,6 @@ pub fn probe_armed() -> bool {
 }
 
 /// [`carry`], minus the bindings the sub-expression just started is the last reader of.
-///
-/// Sound for the reason [`Own::Owned`] is: a wrong `dead` costs the continuation it was computed
-/// for an `INTERNAL_ERROR`, never a wrong value, because [`Env::release`] never writes through a
-/// shared link.
 pub(crate) fn carry_released(env: &Env, remaining: bool, dead: &[Symbol]) -> Env {
     if !remaining {
         return Env::empty();
@@ -269,13 +265,6 @@ pub struct Live {
     ownable: Vec<Vec<Symbol>>,
     /// How many leading names of each `ownable` frame are that barrier's own
     /// **parameters**, which [`Live::barrier_params`] hands back.
-    ///
-    /// A parameter is the one kind of ownable name in scope for the whole of a
-    /// barrier's body, so it is the only one a block can safely consider dead
-    /// at one of its statements without knowing where the name was bound.
-    /// `ownable` holds every name bound *anywhere* inside the barrier, nested
-    /// blocks and match arms included, and a name from a sibling scope is not
-    /// in scope at this block at all.
     params: Vec<usize>,
 }
 

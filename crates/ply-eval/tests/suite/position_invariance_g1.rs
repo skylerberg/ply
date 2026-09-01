@@ -1,106 +1,4 @@
 //! **ADR 0033 §10 G1 — position invariance, registered before the measurement.**
-//!
-//! ADR 0033's central claim is that the positional rule
-//! (`spikes/ply-lexer/GAPS.md` §1) is an artifact of tracking ownership at
-//! *scope* granularity over a shared `Rc` chain, and that slot-granular frames
-//! (§4, sequenced as S4) remove it. That claim is **argued from the mechanism
-//! and not measured**, which is what this file is for: the criterion is written
-//! down here, in code, before the fix exists, per `CONTRIBUTING.md`
-//! §"Measure an ADR's motivating claim before accepting the ADR".
-//!
-//! The corpus is **paired**. Each pair computes the same value two ways:
-//!
-//! - *canonical* — the growing sub-expression is last at every enclosing node;
-//! - *pessimal* — it is first, or otherwise non-final, at one or more of them.
-//!
-//! A pair is the whole instrument. A single program measures nothing here: an
-//! evaluator that reused at every append and one that reused at none would both
-//! be consistent with any one-sided reading, and it is the *difference between
-//! two spellings of one computation* that G1 is about. This is
-//! `ownership_checker_armed.rs`'s construction — the same append written two
-//! ways so no constant answer passes — applied to a rate rather than to a
-//! verdict.
-//!
-//! Counted with [`rc::sites`], not with a clock. Append counts are
-//! deterministic: two runs of one program agree to the digit whatever the
-//! machine is doing, so nothing here belongs in the deferred timing shard.
-//!
-//! ## The three tests, and why one of them is ignored
-//!
-//! - [`the_same_computation_costs_the_same_in_either_order`] is G1 itself. **It
-//!   is red on this tree, and it was run and seen red on 2026-08-31 rather than
-//!   assumed to be**, per
-//!   `CONTRIBUTING.md` §"Do not state a guarantee you have not armed". It is
-//!   `#[ignore]`d so that it does not redden CI before S4 lands; the ignore
-//!   reason says how to run it.
-//! - [`every_pair_is_pinned_to_what_it_costs_today`] is **not** ignored. It pins
-//!   today's per-pair counts exactly, so movement in either direction — S4
-//!   fixing it, or anything else quietly changing it — fails rather than going
-//!   unnoticed. `region_kind_inference::the_split_over_the_repositorys_own_examples`
-//!   is the model: a number a later change is expected to move, printed and
-//!   held, with the document to correct named beside it.
-//! - [`the_corpus_is_the_five_shapes_it_says_it_is`] holds the corpus itself,
-//!   and it is here because **neither of the other two can see what they are
-//!   measuring**. Every count in the table below is 200 / 200 or 0 / 200, so
-//!   one pair's programs can be replaced by another pair's with G1 red in the
-//!   same words and the pin green to the digit. That is not a hypothesis about
-//!   this file; it is the state it was found in, and the next section has it.
-//!
-//! ## That none of them is vacuous, checked rather than argued
-//!
-//! An ignored test is unobserved by definition, and a pin is green on the day
-//! it is written whatever it pins. So each was mutated and watched, 2026-08-31,
-//! and each mutation was reverted:
-//!
-//! - **Measure the canonical member twice** — `pessimal: canonical` in
-//!   [`measure_corpus`], so every pair reports identical rates. G1 went
-//!   **green**, wrongly, at 200 / 200 against 200 / 200 and a gap of 0.000 on
-//!   all five pairs; the pin went **red**, naming every pessimal member that
-//!   had stopped being measured. That is the division of labour the two tests
-//!   are for: G1 alone cannot tell "the gap closed" from "the instrument
-//!   stopped looking", and the pin can.
-//! - **Measure the pessimal member twice** — the same edit the other way, so
-//!   every pair reports 0 / 200 against 0 / 200 and the gap is again 0.000. G1
-//!   stayed **red** on all five pairs, on [`Criteria::min_canonical_rate`]
-//!   alone, and the pin went **red**. Taken with the bullet above, **no
-//!   constant measurement passes**: a gap of zero is reachable from either
-//!   side and neither side gets through both bars.
-//! - **Point one pair's canonical member at its pessimal source** — the gap
-//!   goes to 0.000 and the canonical rate to 0.000. G1 stayed **red**, and for
-//!   that pair it failed on [`Criteria::min_canonical_rate`] alone rather than
-//!   on the gap. The second bullet of §10 G1 is therefore armed independently
-//!   of the first, which matters because the first is satisfiable by making the
-//!   canonical form as slow as the pessimal one.
-//! - **Replace one pair's pessimal member with another pair's** —
-//!   [`COMPOUNDING_PESSIMAL`] swapped for [`RECORD_FIELD_PESSIMAL`], which
-//!   deletes ADR 0025 §Context row five from the corpus and leaves a duplicate
-//!   of the pair above it. **This is the state this file was found in on
-//!   2026-08-31**, with ADR 0033 §10's third row and §14's "five shapes"
-//!   reporting a measurement nothing was taking, and with `COMPOUNDING_PESSIMAL`
-//!   unreferenced — `cargo clippy -p ply-eval --tests` said so, and CI runs
-//!   clippy with `-D warnings`. Re-run deliberately after the repair: the pin
-//!   stays **green** to the digit and G1 stays **red in the same words**, and
-//!   [`the_corpus_is_the_five_shapes_it_says_it_is`] is what fails.
-//! - **Empty the corpus** — `corpus()` returns `Vec::new()`. G1 asserts that a
-//!   list of failures is empty and an empty corpus produces one, so it reported
-//!   **`ok`** over nothing at all; [`EXPECTED_PAIRS`], checked in
-//!   [`measure_corpus`], now fails it and both other tests on the count.
-//! - **Grow a member a second append site** — [`CALL_ARG_CANONICAL`]'s
-//!   recursive call split over two branches that append 100 times each. Its
-//!   append counts do not move: the pin read `(200, 200, 2)` against the pinned
-//!   `(200, 200, 1)` and failed **on the site column alone**. That is the whole
-//!   of what [`rc::sites`] buys over `rc::stats` here, and it buys it only
-//!   because [`Cost::sites`] is pinned — summing the split back into a total,
-//!   which is what this file did before, leaves exactly the number `rc::stats`
-//!   would have given and nothing would have failed. (The identity test fails
-//!   too, on the digest, because the source changed. It is the count pin that
-//!   would catch the same shape arriving from a change in the evaluator.)
-//!
-//! The first two are guarded by nothing but this note: an instrument that
-//! measures one member of a pair twice leaves the corpus untouched, and no test
-//! here reads the wiring in [`measure_corpus`]. **The other four redden a
-//! test**, which is the difference between a mutation that was run once and a
-//! property that is held.
 
 use ply_eval::rc;
 use ply_eval::{Machine, TaskRegions};
@@ -109,14 +7,7 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
 
-// ------------------------------------------------------------ the criteria
-
 /// The thresholds, pinned before the numbers exist.
-///
-/// Modelled on `ply_corpus::w6::Criteria::default()` and for its reason: there
-/// is deliberately no path from a measurement to these values. Nothing below
-/// constructs a `Criteria` from a file, an environment variable or a measured
-/// rate, so a run cannot supply the bar it is about to clear.
 #[derive(Clone, Copy, Debug)]
 struct Criteria {
     /// ADR 0033 §10 G1, first bullet: `|in_place_rate(canonical) −
@@ -144,8 +35,6 @@ impl Default for Criteria {
         }
     }
 }
-
-// -------------------------------------------------------------- the corpus
 
 /// One shape, written the two ways.
 struct Pair {
@@ -231,24 +120,7 @@ test "the growing field is last and its record is first in the call" {
 /// reproduced verbatim in both members — with the binding that produces `xs`
 /// added ahead of them, since ADR 0025's fragment does not say where `xs` comes
 /// from and that is the whole of what this pair varies: a statement binder here,
-/// a parameter there. `code.rs`'s `cumulative` is seeded from statement binders
-/// alone, so a parameter can never enter a `Dead` set.
-///
-/// The driver exists to run the body 200 times rather than once: a rate over one
-/// update is not a rate.
-///
-/// **This pair is not strictly positional and is in the corpus anyway.** The
-/// two members differ in where the accumulator *arrives from*, not in where the
-/// `push` sits, so a reading of G1 as "argument order" excludes it — and they
-/// differ in one more thing, said here because a reader of ADR 0033 §10's table
-/// alone would not know it: the pessimal member introduces `inner`, so it runs
-/// 200 call frames the canonical member does not. Both answer 2200 and both run
-/// exactly 200 appends, which is what the rate is taken over. ADR 0033 §4
-/// does not read it that way — *"a parameter is a slot like any other; if the
-/// caller passed its last use, the value arrives at count 1"* — and it is the
-/// same claim under test: one computation, two spellings, and a cost that
-/// should not be able to tell them apart. It is also the shape S3 is scheduled
-/// to move on its own, so this pair is the one that can go green before S4.
+/// a parameter there.
 const PARAM_VS_LET_CANONICAL: &str = r#"
 fn probe(n: Int) -> Int = {
   let xs = range(0, n);
@@ -284,14 +156,6 @@ test "the accumulator arrives as a parameter" {
 
 /// ADR 0025 §Context row 6 — the `fold` accumulator, which is the shape the
 /// standard library is written in, at 200 / 200.
-///
-/// **Both members call a two-argument helper that answers its list argument,
-/// and that is deliberate.** In `|acc, x| push(acc, x)` the append *is* the
-/// whole closure body, so there is no non-final position for it to occupy; a
-/// pessimal member has to introduce an enclosing node. Introducing one on only
-/// one side would leave the pair differing in two things, so both sides get the
-/// same helper with its parameters in opposite orders and the position of the
-/// `push` is again the only difference.
 const FOLD_CLOSURE_CANONICAL: &str = r#"
 fn keep_last(i: Int, a: List<Int>) -> List<Int> = a
 
@@ -314,13 +178,6 @@ test "a fold accumulator appended in first position" {
 
 /// How many pairs the corpus has, and therefore how many shapes G1 is taken
 /// over.
-///
-/// Written down because [`the_same_computation_costs_the_same_in_either_order`]
-/// asserts that a list of failures is empty, and an empty corpus produces an
-/// empty list: with `corpus()` returning `Vec::new()`, G1 reported `ok` — run
-/// and watched, 2026-08-31, before [`measure_corpus`] checked this. ADR 0033
-/// §10's table has five rows and §14 says "a paired corpus of five shapes", so
-/// the number is a claim in two documents and this is the one place it lives.
 const EXPECTED_PAIRS: usize = 5;
 
 fn corpus() -> Vec<Pair> {
@@ -363,8 +220,6 @@ fn corpus() -> Vec<Pair> {
     ]
 }
 
-// --------------------------------------------------------- the measurement
-
 struct Program1 {
     program: Program,
     resolved: Resolved,
@@ -392,12 +247,6 @@ fn inline(src: &str) -> Program1 {
 }
 
 /// A member's identity, as twelve hex characters of BLAKE3 over its source.
-///
-/// `map_order::the_iteration_order_is_pinned` is the idiom. It is here because
-/// **no count in this corpus identifies the program that produced it**: every
-/// canonical member reads 200 of 200 and every pessimal one 0 of 200, so any
-/// member may be replaced by any other of its kind with both bars staying
-/// green. `the_corpus_is_the_five_shapes_it_says_it_is` holds these.
 fn digest(src: &str) -> String {
     format!("b3:{}", &blake3::hash(src.as_bytes()).to_hex()[..12])
 }
@@ -416,12 +265,6 @@ struct Cost {
 
 /// Every append this member ran, summed over its sites, and how many sites
 /// that was.
-///
-/// What isolates one member from the next is [`rc::record_sites`] clearing the
-/// site map, on the arming call as well as the disarming one. Do not add a
-/// filter by [`SourceId`] instead: [`inline`] builds a fresh [`SourceMap`] per
-/// member and `SourceMap::add` numbers from zero, so every member of this corpus
-/// is `SourceId(0)` and such a filter excludes nothing it is meant to.
 fn measure(src: &str) -> Cost {
     let p = inline(src);
     let mut machine = Machine::for_program(&p.program, &p.resolved);
@@ -525,15 +368,7 @@ fn print_table(rows: &[(Pair, Measured)]) {
     }
 }
 
-// ------------------------------------------------------------------- G1
-
 /// **ADR 0033 §10 G1.** Two spellings of one computation cost the same.
-///
-/// Red on this tree, and it is supposed to be: §10 says so in advance —
-/// *"Today's figures are 200 / 200 against 0 / 200, so it will be"* — and the
-/// numbers [`every_pair_is_pinned_to_what_it_costs_today`] holds are what red
-/// looks like. If §4 lands (S4) and this stays red, ADR 0033 §12 item 1 is what
-/// follows: the diagnosis in §1 is wrong and §5 is the whole of what survives.
 #[test]
 #[ignore = "ADR 0033 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
             shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
@@ -584,25 +419,8 @@ fn the_same_computation_costs_the_same_in_either_order() {
     );
 }
 
-// ---------------------------------------------------------------- the corpus
-
 /// The corpus is five shapes, each pair is two different programs, and each is
 /// the program it was pinned as.
-///
-/// **Neither bar can see any of that, and that is why this exists.** Every
-/// pinned count is `(200, 200)` against `(0, 200)`, so one pair's members can
-/// be replaced by another pair's and both bars stay green on a corpus that has
-/// silently lost a shape. That is not hypothetical: on 2026-08-31 this file's
-/// compounding pair was found pointing at [`RECORD_FIELD_PESSIMAL`] — a
-/// byte-identical duplicate of the pair above it — while ADR 0033 §10's third
-/// row and §14's "five shapes" reported a measurement nothing was taking. The
-/// pin was green to the digit and G1 was red in exactly the words it is red in
-/// now, so neither said anything. Reproduced deliberately after the repair, and
-/// this test is what fails.
-///
-/// The digests are BLAKE3 over the source text, so **editing a member reddens
-/// this**. That is intended: re-pin the digest in the same change, and if you
-/// did not edit anything, a corpus member moved under you.
 #[test]
 fn the_corpus_is_the_five_shapes_it_says_it_is() {
     let pairs = corpus();
@@ -676,8 +494,6 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
     );
 }
 
-// ------------------------------------------------------------------ the pin
-
 /// One pinned member: `(in place, total, sites)`.
 type Member = (u64, u64, usize);
 /// One pinned row: the pair's name, then its canonical member and its pessimal
@@ -685,25 +501,6 @@ type Member = (u64, u64, usize);
 type Row = (&'static str, Member, Member);
 
 /// What each pair costs on this tree, held to the digit.
-///
-/// `region_kind_inference::the_split_over_the_repositorys_own_examples` is the
-/// model — a number a later change is expected to move, printed so a reader can
-/// see it and held so a reader cannot miss it moving. The difference is that
-/// that census asserts only that it measured something, because a threshold on
-/// it would be a threshold on `examples/`; here the corpus is this file's own
-/// and every count in it is a property of the evaluator, so the pin is exact.
-///
-/// **When this fails, that is the event it exists for.** Read the direction:
-/// pessimal counts rising towards their canonical partners is ADR 0033 §11 S4
-/// working, and the response is to re-pin here, run
-/// [`the_same_computation_costs_the_same_in_either_order`] with `--ignored`,
-/// and — if it is green — delete `docs/GUIDE.md` §6.7 and its §19 gotcha per
-/// §11. Anything else moving is a regression until shown otherwise.
-///
-/// **What it does not hold is which program produced a number**, because the
-/// numbers do not distinguish the members: that is
-/// [`the_corpus_is_the_five_shapes_it_says_it_is`]'s job, and neither test
-/// covers the other.
 #[test]
 fn every_pair_is_pinned_to_what_it_costs_today() {
     let rows = measure_corpus(&Criteria::default());
