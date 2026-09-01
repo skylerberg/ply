@@ -1,7 +1,7 @@
 # ADR 0034 — The append cliff is a calculus mismatch: Perceus over slots
 
-**Decisions 1 and 3 are landed and their gates are green.** The machine runs
-on slot frames, a last use moves the value out of its slot, and
+**Decisions 1, 2 and 3 are landed and their gates are green.** The machine
+runs on slot frames, a last use moves the value out of its slot, and
 `position_invariance_g1` passes on all five pairs — the fifth included, through
 a field-granular move the flat record representation enabled. A record update
 whose base dies at the update writes into the base's record instead of building
@@ -9,8 +9,11 @@ one, and the request path's allocation count moved for the first time since
 ADR 0024 — through that reuse and through the argument-vector and literal
 levers the allocation census attributed, not through the slot frames themselves
 (`README.md` carries the figures, and `w6_report_allocations` holds them to the
-tree). Decisions 2 and 4 — the chunked representation and the checked promise —
-remain sequenced behind their own gates; decision 5 was already done.
+tree). The list is a radix trie whose newest leaf is held apart, so a copying
+append and a `[x, ..rest]` pattern are both bounded whatever the length, and
+the accumulator that used to quadruple per doubling now doubles. Decision 4 —
+the checked promise — remains sequenced behind its own gate; decision 5 was
+already done.
 
 Continues ADR 0024, whose findings it accepts entire and whose sequencing it
 re-orders.
@@ -309,6 +312,32 @@ case bounded, and no amount of the first removes the need for the second under
 multi-shot.** Re-posed as a property of the language: **no core operation may
 have a cost ratio that grows with *n* on a property the source does not show.**
 
+**Landed, as the tree's own type rather than a dependency**
+(`crates/ply-eval/src/list.rs`). A `List` is a radix trie of 32-wide nodes with
+its newest leaf held apart as a tail, the shape Clojure's vector takes. A list
+no longer than a leaf is only a tail — one array, the flat vector the request
+path is measured on, so the corpus gate is met by construction rather than by
+measurement. Past that, a push down a uniquely held path writes in place, a
+push onto a shared list copies one leaf and one branch per level, and a
+`[x, ..rest]` pattern moves an offset instead of building the tail — which was
+the larger cliff for the workloads this language is meant for: recursion over
+a list by pattern was quadratic, and every parser written in Ply took that
+shape. The header fits the 32-byte `Value` the refusal to narrow it pins, so no
+slot or binding grew.
+
+**What owning the type changed about the instrument.** The section below
+priced the instrument restatement as the larger half of this change because
+the candidate crate exposed no uniqueness. The tree's own type knows whether
+every array on a push's path was uniquely held and how many slots it copied
+when one was not, so `updates_in_place` and `elements_copied` keep their
+meaning and the ownership checker's oracle needed no restatement. One
+distinction had to be made explicit, and it is worth recording because it is
+easy to conflate: a push onto a shared *empty* list copies zero slots and is
+still a copy, not an in-place write — the oracle's agreement rate fell below
+its floor while the two were conflated. The assertion that did have to move
+was the one that named the old shape: the accumulator-shape test asserted a
+second owner *quadruples* bytes per doubling, and now asserts it doubles.
+
 ### The instrument is the larger half of this change
 
 The in-place counter answers *did this append copy the whole list*, **which is
@@ -549,9 +578,13 @@ which nothing implemented until then. They establish sole ownership at runtime
 the function — so the largest residue the checker reports is one an author can
 remove with a one-line edit.
 
-Next: **the other forty-four references to the copy counters, which is the
-larger half** of the representation change. Then the chunked vector, then
-reuse, then the checked promise.
+Also done since: the record-update reuse of Decision 3, and the bounded list
+of Decision 2 — in that order, because the reuse's `..rest`-free shape did not
+need the representation and the representation's landing note above records
+what the copy counters turned out to need, which was one assertion rather than
+forty-four.
+
+Next: the checked promise, Decision 4.
 
 **The guide's statement of the positional rule is deleted** — §6.7 now states
 the ownership rule and the residue `--costs` reports: a copy means a genuine

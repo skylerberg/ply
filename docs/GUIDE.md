@@ -1018,12 +1018,12 @@ Python, that is the one thing to unlearn here. The last element is
 `list_at(xs, len(xs) - 1)`, and the first is `list_at(xs, 0)`; there is no
 `head` and no `last`, because those are the two lines you just read.
 
-An index costs the same whatever the position, on today's representation — a
-`List` is a contiguous array, so `list_at(xs, 0)` and `list_at(xs, 99999)` cost
-the same. That is a fact about the representation and not a promise: ADR 0024
-records the conditions under which a `List` becomes a chunked structurally
-shared vector, and an index over one of those is logarithmic rather than
-constant.
+An index costs the same whatever the position for a list no longer than a
+leaf, and a few pointer hops past that: a `List` is a radix trie of 32-wide
+nodes with its newest leaf held apart (ADR 0034), so `list_at(xs, 99999)` walks
+four nodes where `list_at(xs, 0)` on a short list walks none. What the
+representation buys is the bound on the *other* operations — see the end of
+this section.
 
 **It is not, however, much faster than the `Map<Int, v>` you might reach for
 instead**, and the GUIDE says so because the number surprised the people who
@@ -1042,6 +1042,15 @@ you read again after the append, a value a closure captured, a cell's contents
 or a map's entry read out through `cell_get` / `map_get` (`cell_update` and
 `map_update` are the fix, §13.8 and §13.3), a caller that keeps reading what
 it passed.
+
+**And a copy is bounded.** A `List` is a radix trie of 32-wide nodes with its
+newest leaf held apart (ADR 0034): a push onto a shared list copies one leaf
+and one node per level, never the whole list, so an accumulator with a second
+owner is still linear — slower than one without, by a constant, and not
+quadratic. A `[x, ..rest]` pattern (§6.3) shares the list too: `rest` is an
+offset into the same nodes, so walking a list by pattern costs what walking
+it with `fold` does. Neither is a rule you have to remember; both are what
+lets you not remember one.
 
 **Run `ply check --costs`** to see it per `push` site: every copy is reported
 with its cause and, where a source edit removes it, the edit.
@@ -2213,8 +2222,8 @@ plus whatever `f` performs.
 `cell_update(c, f)` replaces the contents with `f` applied to them, and it is
 the only way an append onto a cell's contents grows in place: the contents
 leave the region for the length of the call, so `push` inside `f` finds one
-owner, where `cell_set(c, push(cell_get(c), x))` copies the whole list every
-time because the cell still holds it. While the update runs the cell is
+owner, where `cell_set(c, push(cell_get(c), x))` copies every time because the
+cell still holds it. While the update runs the cell is
 unreadable — a `cell_get` reached through an effect `f` performs, or a nested
 update of the same cell, is refused rather than answered with a placeholder.
 

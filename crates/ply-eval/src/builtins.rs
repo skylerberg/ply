@@ -4,7 +4,7 @@ use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
 use crate::map;
 use crate::semantics::arity_error;
-use crate::value::{Decimal, Value, Vector, first_difference, type_error, values_equal};
+use crate::value::{Decimal, List, Value, first_difference, type_error, values_equal};
 use ply_span::{Diagnostic, Span, codes};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -469,25 +469,12 @@ impl fmt::Debug for Step {
 fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
-    let (out, copied) = match &mut xs {
-        Value::List(list) => match std::sync::Arc::get_mut(list) {
-            Some(items) => {
-                items.push(x);
-                crate::rc::note_update(true, span);
-                return Ok(Step::Done(xs));
-            }
-            None => {
-                let copied = list.len();
-                let mut out = Vec::with_capacity(copied + 1);
-                out.extend(list.iter().cloned());
-                out.push(x);
-                (out, copied)
-            }
-        },
-        other => return Err(type_error(span, "`push`", "List", other)),
+    let Value::List(list) = &mut xs else {
+        return Err(type_error(span, "`push`", "List", &xs));
     };
-    crate::rc::note_update_of(false, copied, span);
-    Ok(Step::Done(Value::list(out)))
+    let copied = list.push(x);
+    crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
+    Ok(Step::Done(xs))
 }
 
 /// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
@@ -1071,7 +1058,7 @@ fn call_with(
 }
 
 /// Where a list index becomes a position.
-fn at(xs: &[Value], i: i64) -> Option<&Value> {
+fn at(xs: &List, i: i64) -> Option<&Value> {
     usize::try_from(i).ok().and_then(|i| xs.get(i))
 }
 
@@ -1232,7 +1219,7 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
     })
 }
 
-fn next_map(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, span: Span) -> Step {
+fn next_map(f: Value, items: List, next: usize, done: Vec<Value>, span: Span) -> Step {
     let Some(x) = items.get(next).cloned() else {
         return Step::Done(Value::list(done));
     };
@@ -1249,7 +1236,7 @@ fn next_map(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, span:
     }
 }
 
-fn next_filter(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, span: Span) -> Step {
+fn next_filter(f: Value, items: List, next: usize, done: Vec<Value>, span: Span) -> Step {
     let Some(x) = items.get(next).cloned() else {
         return Step::Done(Value::list(done));
     };
@@ -1266,7 +1253,7 @@ fn next_filter(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, sp
     }
 }
 
-fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span) -> Step {
+fn next_fold(f: Value, items: List, next: usize, acc: Value, span: Span) -> Step {
     let Some(x) = items.get(next).cloned() else {
         return Step::Done(acc);
     };
