@@ -408,8 +408,14 @@ whether it rewrote or how much it moved. Under S5 the seven assertions reading t
 not made *vacuous*, they are made **unmeasurable**, and the difference matters — a vacuous assertion
 can be re-pointed at the same quantity, an unmeasurable one has to be re-pointed at a different one.
 
-What survives the swap is allocation count, which the global allocator can observe and
-`w6-alloc` already does. So S5's remaining prerequisite is those assertions moving from "did this
+What survives the swap is what the allocator saw — and in **bytes**, not in allocation count. A
+whole-list copy is one `Vec::with_capacity`, so a quadratic accumulator makes the same O(n)
+allocations a linear one does while moving O(n²) bytes doing it: counting allocations separates the
+two by 2.29× against 1.46×, which is not a shape. Counting bytes separates them by **3.99× against
+1.37×** per doubling — the 4×-against-2× signature — and at n = 2,000 by 64 MB against 412 KB.
+`accumulator_shape::a_quadratic_accumulator_grows_faster_than_a_linear_one` is that test, and it
+asks a question `imbl` can answer: a chunked append that copies a path instead of an array moves the
+quadratic ratio toward the linear one, which is visible where a boolean is not. So S5's remaining prerequisite is those assertions moving from "did this
 append copy" to "what did this append allocate", and that is a change to what the record
 *guarantees* about reuse rather than to how it measures it. It is the last thing standing between
 the pricing in §10.1 and the swap.
@@ -654,7 +660,7 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4c** | clause and `return` bodies copy in their free variables rather than extending the prompt scope | done, behind the probe — removes §4.1's addressing obstacle |
 | **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
 | **S5a** | the append counter measures volume, not a boolean | done — necessary, and not sufficient: see §5 |
-| **S5b** | the reuse assertions move from "did it copy" to "what did it allocate" | **next** — `imbl` can report neither of the counters they read |
+| **S5b** | the shape assertion moves from "did it copy" to "what did it move" | done — **bytes**, not allocation count; see §5 |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
