@@ -24,7 +24,7 @@ pub enum Own {
 pub fn probe_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED
-        .get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1" || v == "params"))
+        .get_or_init(|| std::env::var("PLY_ADR0034_PROBE").is_ok_and(|v| v == "1" || v == "params"))
 }
 
 /// Whether the probe's *carry-site* half is armed — the `App` and `Record` per-argument releases,
@@ -32,7 +32,7 @@ pub fn probe_armed() -> bool {
 pub fn probe_carries() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED
-        .get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1" || v == "carry"))
+        .get_or_init(|| std::env::var("PLY_ADR0034_PROBE").is_ok_and(|v| v == "1" || v == "carry"))
 }
 
 /// [`carry`], minus the bindings the sub-expression just started is the last reader of.

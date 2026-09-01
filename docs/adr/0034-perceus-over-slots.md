@@ -171,7 +171,7 @@ calls with no annotation, which is why Koka needs no ownership in its surface
 types.
 
 **Measured, by §11's S4 probe rather than argued.** The probe is ADR 0025's P1 at
-the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0033_PROBE`, which
+the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0034_PROBE`, which
 takes `params` for S3's half, `carry` for this one and `1` for both: the frame carries the scope *minus* what the
 sub-expression just started is the last reader of. Armed, **four of §10 G1's five
 pairs go to a gap of 0.000**, including ADR 0025 §Context row five — the case
@@ -458,7 +458,7 @@ releases, and a *parameter* is the deepest binding in its barrier's chain, so re
 the whole scope. The benefit is real and the corpus rates reproduce — but they are the standard
 library's test suites, and `/health` pays the release without pushing the lists that would repay it.
 
-So S3 sits behind `PLY_ADR0033_PROBE=1` with S4's probe, and the flag now arms both. The case
+So S3 sits behind `PLY_ADR0034_PROBE=1` with S4's probe, and the flag now arms both. The case
 analysis (§8.1), the adversarial cases and the G1 pair all stand; what does not stand is landing it
 by default. `Env::keep_only(live)` built up from empty is ADR 0025's suggested alternative primitive
 and is the thing to try before P2 is proposed again — or `Env::release` writing through a link it
