@@ -1,35 +1,13 @@
 //! What a frame push and a scope binding cost the allocator once the machine is warm, and that
 //! reusing a link cannot make two owners disagree.
 
+use crate::counting::charge;
 use ply_eval::{Env, Frame, Next, ScopeSlot, Stack, Value};
 use ply_span::{Span, Symbol};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
-thread_local! {
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
 
 fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    ALLOCS.with(|c| c.set(0));
-    let out = f();
-    (out, ALLOCS.with(Cell::get))
+    let (out, allocs, _) = charge(f);
+    (out, allocs)
 }
 
 /// A frame that carries a value the test can read back, so a recycled link is checked for what it

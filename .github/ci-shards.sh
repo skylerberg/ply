@@ -205,8 +205,8 @@ declare -a KNOWN_OUTSIDE=(
 # Treat 13 as the current count and not as the answer. When a shard goes red on
 # a ratio or a budget, the fix is usually another row here.
 DEFERRED=(
-  "ply-eval:region_arena_cost:snapshot_cost_as_a_function_of_region_size"
-  "ply-eval:fixture_open_cost:a_seeded_fixture_opens_per_test_in_microseconds"
+  "ply-eval:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
+  "ply-eval:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
   "ply-eval:suite:simulation::a_long_sleep_is_a_jump"
   "ply-test:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
   "ply-test:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"

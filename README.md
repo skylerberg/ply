@@ -432,7 +432,7 @@ from three minutes to twenty-nine, and the high ones describe a loaded machine
 rather than the tree.
 
 And `ignored` is not the whole of the timing-sensitive suite —
-`ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+`ply-eval/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock growth ratio and runs by default, and it failed for us on
 a machine that was busy compiling something else. On a quiet machine it passes.
 

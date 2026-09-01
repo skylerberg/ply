@@ -518,7 +518,7 @@ microbenchmark is how a lever that moves nothing gets adopted.**
 | lever | what it is, concretely | why it might be big |
 | --- | --- | --- |
 | **more native builtins** | fold `read_line`, `is_token`, `trim_ows` and `trim_end` into one native head scan; `string_lower`; `add_field` | this is W2's lever reapplied to the layer W3 added |
-| **the frame push** | ADR 0005's heap allocations per frame push; measured by the §1.5 engine substitution and by `crates/ply-corpus/tests/frame_cost.rs` | it is paid per node the machine suspends inside, which is most of them |
+| **the frame push** | ADR 0005's heap allocations per frame push; measured by the §1.5 engine substitution and by `crates/ply-corpus/tests/allocation/frame_cost.rs` | it is paid per node the machine suspends inside, which is most of them |
 | **`Env::lookup`** | a linear walk down an `Rc` chain, so a variable reference costs O(scope depth); priced by a depth sweep and by an indexed alternative | this is an *algorithm* on the hottest path in the interpreter, which is exactly W2's class of finding |
 | **boxing on hot paths** | where a `Value::Int` per element survives; counted per request rather than guessed at | `Value::Int` per byte was W1's whole disease |
 | **caching derived work** | `table()` rebuilds the route table from its pattern strings on **every request**; a derived codec dictionary is a record built per call | a per-request rebuild of a constant is free to remove |
