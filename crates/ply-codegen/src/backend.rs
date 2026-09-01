@@ -376,6 +376,9 @@ impl Policed for Bodies {
 }
 
 /// Which of the compiled bodies are registered for the machine to enter.
+///
+/// Read once per process, so a test cannot set it and expect it to take now that the crate's tests
+/// share one binary; measure this arm through the command.
 fn registers(source: &Source, name: &str) -> bool {
     static ALL: OnceLock<bool> = OnceLock::new();
     let all =
