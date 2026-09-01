@@ -181,7 +181,7 @@ is what actually holds. Asserting the test count does not substitute — a gated
 test returns early and passes, so the count is right with nothing behind it.
 ### Some tests assert on a wall clock and run by default
 
-`ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+`ply-eval/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a timing growth ratio and is **not** in the `ignored` set. It passes
 on a quiet machine and has been seen to fail on one busy compiling something
 else. **If it is your only failure, re-run before you believe it.**
@@ -622,11 +622,11 @@ that stops running reports nothing, and reporting nothing is indistinguishable
 from passing — which is the failure this whole section is organised around.
 ### Exactly one test reads a prose document
 
-`crates/ply-corpus/tests/w6_report_allocations.rs`'s
+`crates/ply-corpus/tests/allocation/w6_report_allocations.rs`'s
 `the_readme_still_describes_this_request_path` reads `README.md`'s *"One
 `/health` request makes N allocations and M bytes"* and compares both numbers
 against a freshly counted window, within 1%. Run it with
-`cargo test -p ply-corpus --test w6_report_allocations -- --nocapture` and it
+`cargo test -p ply-corpus --test allocation -- w6_report_allocations --nocapture` and it
 prints both sides. The count does not vary with the build profile.
 
 Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
