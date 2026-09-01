@@ -38,6 +38,8 @@
 #   ci-shards.sh packages ID   `-p` arguments for one shard
 #   ci-shards.sh skips         `--skip` arguments the parallel shards need
 #   ci-shards.sh deferred      one `package target test` line per deferred test
+#   ci-shards.sh deferred-packages
+#                              the `-p` arguments for one build covering them all
 #   ci-shards.sh tree-checks   one `package target test` line per tree check
 
 set -euo pipefail
@@ -349,6 +351,19 @@ cmd_deferred() {
   done
 }
 
+# The `-p` arguments for one build that covers every deferred test. The
+# timing job used to run `cargo test -p <package>` once per entry; cargo
+# resolves features over *the selected packages*, so each entry got its own
+# resolution and the tree recompiled between them. One selection is one
+# resolution, so this is what keeps the build to one.
+cmd_deferred_packages() {
+  local package
+  while read -r package _ _; do
+    printf '%s\n' "$package"
+  done < <(cmd_deferred) | sort -u | tr '\n' ' ' | sed 's/ $//'
+  echo
+}
+
 # Same three-field split as `cmd_deferred`, for the same reason.
 cmd_tree_checks() {
   local entry rest
@@ -624,9 +639,10 @@ case "${1:-}" in
   packages) cmd_packages "${2:?a shard id}" ;;
   skips) cmd_skips ;;
   deferred) cmd_deferred ;;
+  deferred-packages) cmd_deferred_packages ;;
   tree-checks) cmd_tree_checks ;;
   *)
-    echo "usage: ci-shards.sh {verify|matrix|packages ID|skips|deferred|tree-checks}" >&2
+    echo "usage: ci-shards.sh {verify|matrix|packages ID|skips|deferred|deferred-packages|tree-checks}" >&2
     exit 2
     ;;
 esac
