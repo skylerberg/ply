@@ -292,7 +292,7 @@ impl<'a> Dumper<'a> {
     }
 
     /// The fallback expression is dumped like any other `Option`, and that is a change: it arrived
-    /// with ADR 0029 and nothing emitted it until `../GAPS.md` §11R.D moved this comparison to the
+    /// with default arguments and nothing emitted it until `../GAPS.md` §11R.D moved this comparison to the
     /// pre-rewrite tree.
     fn param(&mut self, p: &Param) {
         self.rec(p.span, "prm");
@@ -774,6 +774,12 @@ fn bin_op_name(op: BinOp) -> &'static str {
         BinOp::And => "and",
         BinOp::Or => "or",
         BinOp::Concat => "concat",
+        BinOp::BitAnd => "bitand",
+        BinOp::BitOr => "bitor",
+        BinOp::BitXor => "bitxor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
+        BinOp::Ushr => "ushr",
     }
 }
 
@@ -781,6 +787,7 @@ fn un_op_name(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "neg",
         UnOp::Not => "not",
+        UnOp::BitNot => "bitnot",
     }
 }
 

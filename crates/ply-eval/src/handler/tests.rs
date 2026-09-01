@@ -58,6 +58,7 @@ fn call(func: Code, args: Vec<Code>) -> Code {
     node(NodeKind::App {
         func,
         args: Rc::new(args),
+        dead: Rc::new(Vec::new()),
     })
 }
 
@@ -69,6 +70,7 @@ fn lam(params: &[&str], body: Code) -> Code {
     node(NodeKind::Lambda {
         params: Rc::new(params.iter().map(|p| Symbol::new(*p)).collect()),
         body,
+        free: None,
     })
 }
 
@@ -129,6 +131,7 @@ fn clause_(
         resume: resume.map(Symbol::new),
         body,
         span: sp(),
+        free: None,
     }
 }
 
@@ -141,6 +144,7 @@ fn handle_(body: Code, clauses: Vec<Clause>, ret: Option<(&str, Code)>) -> Code 
                 binder: Symbol::new(binder),
                 body,
                 span: sp(),
+                free: None,
             })
         }),
     })

@@ -1,39 +1,11 @@
 //! What a **stale** entry in either of R3's two caches can do to a program.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::region_kind::Cause;
-use ply_eval::{Machine, RegionKind, Value};
-use ply_span::{SourceId, Span};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
+use ply_eval::{RegionKind, Value};
+use ply_span::Span;
 
 impl Compiled {
-    #[track_caller]
-    fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs)
-            .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}\n{src}"));
-        let resolved = resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}\n{src}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}\n{src}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
     #[track_caller]
     fn call(&self, name: &str) -> Value {
         let mut machine = self.machine();
@@ -125,8 +97,12 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
 }
 
 /// The same question on a tail-resumptive region, which takes no pin.
+///
+/// The staleness arm is vacuous since the tail-resumptive refinement — `unique` is now the honest inference for this
+/// shape, so injecting it injects the honest answer — and is kept as a regression guard: it reddens
+/// at the `Unique` assertion if the clause form goes back to forcing `shared`.
 #[test]
-fn a_stale_unique_over_a_tail_resumptive_region_does_not_move_the_answer() {
+fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     let pure = Compiled::new(&tail_fixture(TAIL_PURE));
     let tail = Compiled::new(&tail_fixture(TAIL_CAPTURING));
 
@@ -137,7 +113,11 @@ fn a_stale_unique_over_a_tail_resumptive_region_does_not_move_the_answer() {
         Some(RegionKind::Unique),
         "the two fixtures no longer place their region at one span"
     );
-    assert_eq!(tail.machine().region_kind(span), Some(RegionKind::Shared));
+    assert_eq!(
+        tail.machine().region_kind(span),
+        Some(RegionKind::Unique),
+        "the tail-resumptive refinement: a tail-resumptive clause is not a capture that outlives its region"
+    );
 
     let honest = int(tail.call("m.go"));
     assert_eq!(honest, 12003, "the honest answer moved");

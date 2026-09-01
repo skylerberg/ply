@@ -52,6 +52,21 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
         }
     };
+    // Resolved here for the credentials' reason: this command's whole answer to "what can
+    // this program touch" is the label-to-directory mapping, so a root that will not resolve
+    // is `E0454` before a listing overstates what the run reaches.
+    let roots = match ply_host::fs::Roots::load(&args.fs.fs, ply_span::Span::DUMMY) {
+        Ok(roots) => roots,
+        Err(diagnostic) => {
+            return report_bind_error(
+                "hosts",
+                std::slice::from_ref(&diagnostic),
+                &loaded.sources,
+                args.json,
+                style,
+            );
+        }
+    };
     // Resolved here for the same reason the credentials are: `ply hosts` is the command that
     // answers "what does this run trust", and a connection string that will not parse is a run that
     // will not start.
@@ -91,6 +106,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
     let disclosures = hosts::Disclosures::of(
         &listing,
         Some(&credentials),
+        Some(&roots),
         db,
         schema,
         Some(configuration),
@@ -121,6 +137,9 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         });
         if let Some(transport) = &disclosures.transport {
             report["transport"] = transport.json();
+        }
+        if let Some(filesystem) = &disclosures.filesystem {
+            report["filesystem"] = filesystem.json();
         }
         if let Some(database) = &disclosures.database {
             report["database"] = database.json();

@@ -1,0 +1,336 @@
+// The filesystem effect, rooted: a resource label names a directory the run binds with `--fs`.
+pub nondet effect fs {
+  read  read_file[r](path: String) -> Option<Bytes>
+  read  list_dir[r](path: String) -> Option<List<String>>
+  read  exists[r](path: String) -> Bool
+  read  file_size[r](path: String) -> Option<Int>
+  read  modified_ms[r](path: String) -> Option<Int>
+  write write_file[r](path: String, body: Bytes) -> Bool
+  write create_dir[r](path: String) -> Bool
+  write remove[r](path: String) -> Bool
+  write rename[r](from: String, to: String) -> Bool
+}
+
+
+// One directory tree, as a value.
+pub type MemFs = {
+  files: Map<String, Bytes>,
+  dirs: Map<String, Int>,
+  modified: Map<String, Int>,
+  clock: Int,
+}
+
+// A write's two answers: the tree it produced and whether it happened.
+pub type Written = { fs: MemFs, ok: Bool }
+
+// A root with nothing in it.
+pub fn mem_empty() -> MemFs =
+  { files: map_new(), dirs: map_new(), modified: map_new(), clock: 1 }
+
+// A tree seeded with files, every parent directory created along the way.
+pub fn mem_of(files: List<{path: String, body: Bytes}>) -> MemFs =
+  fold(files, mem_empty(), |f: MemFs, entry: {path: String, body: Bytes}|
+    mem_write(mem_create_dir(f, parent_of(entry.path)).fs, entry.path, entry.body).fs)
+
+// The lexical half of the host's confinement check, so a test can assert the rule rather than
+// describe it.
+pub fn mem_confined(path: String) -> Bool =
+  !string_starts_with(path, "/") &&
+  len(filter(string_split(path, "/"), |s: String| s == "..")) == 0
+
+pub fn mem_read(f: MemFs, path: String) -> Option<Bytes> =
+  if !mem_confined(path) { None } else { map_get(f.files, normal(path)) }
+
+pub fn mem_exists(f: MemFs, path: String) -> Bool =
+  mem_confined(path) &&
+  (map_contains(f.files, normal(path)) || mem_is_dir(f, path))
+
+pub fn mem_size(f: MemFs, path: String) -> Option<Int> = {
+  let body = mem_read(f, path)?;
+  Some(bytes_len(body))
+}
+
+// A directory carries the stamp it was created at, a file the stamp it was last written at, so
+// `modified_ms` answers for both.
+pub fn mem_modified(f: MemFs, path: String) -> Option<Int> =
+  if !mem_confined(path) { None } else {
+    match map_get(f.modified, normal(path)) {
+      Some(at) -> Some(at),
+      None -> map_get(f.dirs, normal(path)),
+    }
+  }
+
+// One directory, never its subtree, ascending so the order is a fact about the contents.
+pub fn mem_list(f: MemFs, path: String) -> Option<List<String>> =
+  if !mem_is_dir(f, path) { None } else {
+    let here = normal(path);
+    let names = fold(all_keys(f), map_new(), |acc: Map<String, Bool>, k: String|
+      if parent_of(k) == here { map_insert(acc, base_of(k), true) } else { acc });
+    Some(map_keys(names))
+  }
+
+// `false` when the parent directory is not there, when a directory already occupies the path, or
+// when the path is not confined — which is what the host answers for the first two and refuses for
+// the third.
+pub fn mem_write(f: MemFs, path: String, body: Bytes) -> Written = {
+  let key = normal(path);
+  if !mem_confined(path) || key == "" || mem_is_dir(f, path) ||
+     !mem_is_dir(f, parent_of(key)) {
+    { fs: f, ok: false }
+  } else {
+    {
+      fs: {
+        ..f,
+        files: map_insert(f.files, key, body),
+        modified: map_insert(f.modified, key, f.clock),
+        clock: f.clock + 1,
+      },
+      ok: true,
+    }
+  }
+}
+
+// The directory and every missing ancestor, which is what the host's `create_dir` does.
+pub fn mem_create_dir(f: MemFs, path: String) -> Written =
+  if !mem_confined(path) { { fs: f, ok: false } }
+  else if occupied_by_file(f, path) { { fs: f, ok: false } }
+  else {
+    fold(ancestors(normal(path)), { fs: f, ok: true },
+      |w: Written, dir: String|
+        if map_contains(w.fs.dirs, dir) { w }
+        else {
+          {
+            fs: {
+              ..w.fs,
+              dirs: map_insert(w.fs.dirs, dir, w.fs.clock),
+              clock: w.fs.clock + 1,
+            },
+            ok: w.ok,
+          }
+        })
+  }
+
+// One file, or one empty directory.
+pub fn mem_remove(f: MemFs, path: String) -> Written = {
+  let key = normal(path);
+  if !mem_confined(path) || key == "" { { fs: f, ok: false } }
+  else if map_contains(f.files, key) {
+    { fs: { ..f, files: map_remove(f.files, key),
+                 modified: map_remove(f.modified, key) },
+      ok: true }
+  } else if map_contains(f.dirs, key) {
+    if len(children_of(f, key)) > 0 { { fs: f, ok: false } }
+    else { { fs: { ..f, dirs: map_remove(f.dirs, key) }, ok: true } }
+  } else {
+    { fs: f, ok: false }
+  }
+}
+
+// A file moved within one root, which is what makes a cache write atomic.
+pub fn mem_rename(f: MemFs, from: String, to: String) -> Written = {
+  let src = normal(from);
+  let dst = normal(to);
+  match map_get(f.files, src) {
+    None -> { fs: f, ok: false },
+    Some(body) ->
+      if !mem_confined(from) || !mem_confined(to) || dst == "" ||
+         mem_is_dir(f, dst) || !mem_is_dir(f, parent_of(dst)) {
+        { fs: f, ok: false }
+      } else {
+        {
+          fs: {
+            ..f,
+            files: map_insert(map_remove(f.files, src), dst, body),
+            modified: map_insert(map_remove(f.modified, src), dst, f.clock),
+            clock: f.clock + 1,
+          },
+          ok: true,
+        }
+      },
+  }
+}
+
+
+// The canonical spelling of a path: no empty segments, no `.`, no trailing slash.
+fn normal(p: String) -> String = joined(segments(p))
+
+fn segments(p: String) -> List<String> =
+  filter(string_split(p, "/"), |s: String| s != "" && s != ".")
+
+fn joined(segs: List<String>) -> String =
+  fold(segs, "", |acc: String, s: String| if acc == "" { s } else { acc ++ "/" ++ s })
+
+// Every prefix of a path, shallowest first, which is what `mem_create_dir` walks.
+fn ancestors(p: String) -> List<String> =
+  fold(segments(p), { at: "", out: [] },
+    |acc: { at: String, out: List<String> }, s: String| {
+      let next = if acc.at == "" { s } else { acc.at ++ "/" ++ s };
+      { at: next, out: push(acc.out, next) }
+    }).out
+
+// The directory a path sits in, and `""` — the root — for a path with one segment.
+fn parent_of(p: String) -> String = {
+  let segs = segments(p);
+  joined(fold(segs, { kept: [], at: 0 },
+    |acc: { kept: List<String>, at: Int }, s: String|
+      if acc.at < len(segs) - 1 { { kept: push(acc.kept, s), at: acc.at + 1 } }
+      else { { ..acc, at: acc.at + 1 } }).kept)
+}
+
+fn base_of(p: String) -> String =
+  match list_at(segments(p), len(segments(p)) - 1) {
+    Some(name) -> name,
+    None -> "",
+  }
+
+fn mem_is_dir(f: MemFs, path: String) -> Bool =
+  mem_confined(path) && (normal(path) == "" || map_contains(f.dirs, normal(path)))
+
+fn occupied_by_file(f: MemFs, path: String) -> Bool =
+  len(filter(ancestors(normal(path)), |a: String| map_contains(f.files, a))) > 0
+
+fn all_keys(f: MemFs) -> List<String> =
+  fold(map_keys(f.dirs), map_keys(f.files), |acc: List<String>, k: String| push(acc, k))
+
+fn children_of(f: MemFs, dir: String) -> List<String> =
+  filter(all_keys(f), |k: String| parent_of(k) == dir)
+
+
+// A shipped module's tests are the compiler's, and `ply test --std` is what selects them.
+
+test "a handled fs read is det, hermetic and answers the twin" {
+  let fixture = mem_of([{path: "lexer.ply", body: b"fn f() -> Int = 1"}]);
+  handle {
+    assert_eq(fs.read_file[src]("lexer.ply"), Some(b"fn f() -> Int = 1"));
+    assert_eq(fs.read_file[src]("absent.ply"), None);
+    assert(fs.exists[src]("lexer.ply"));
+    assert(!fs.exists[src]("absent.ply"));
+    assert_eq(fs.file_size[src]("lexer.ply"), Some(17))
+  } with {
+    fs.read_file[src](p) -> mem_read(fixture, p),
+    fs.exists[src](p)    -> mem_exists(fixture, p),
+    fs.file_size[src](p) -> mem_size(fixture, p),
+  }
+}
+
+// The write half, threaded through a cell exactly as a program threads `std.db`'s twin.
+test "a handled fs write is det and the next read sees it" {
+  with_cell[tree](mem_empty()) { t ->
+    handle {
+      assert(fs.create_dir[out]("build/cache"));
+      assert(fs.write_file[out]("build/cache/a.plyx", b"artifact"));
+      assert_eq(fs.read_file[out]("build/cache/a.plyx"), Some(b"artifact"));
+      assert_eq(fs.list_dir[out]("build/cache"), Some(["a.plyx"]));
+      assert(fs.rename[out]("build/cache/a.plyx", "build/cache/b.plyx"));
+      assert_eq(fs.read_file[out]("build/cache/a.plyx"), None);
+      assert_eq(fs.read_file[out]("build/cache/b.plyx"), Some(b"artifact"))
+    } with {
+      fs.create_dir[out](p) -> {
+        let w = mem_create_dir(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.write_file[out](p, body) -> {
+        let w = mem_write(cell_get(t), p, body);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.rename[out](from, to) -> {
+        let w = mem_rename(cell_get(t), from, to);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.read_file[out](p) -> mem_read(cell_get(t), p),
+      fs.list_dir[out](p) -> mem_list(cell_get(t), p),
+    }
+  }
+}
+
+// The lexical half of what the host refuses with E0452, asserted on the twin so a fixture cannot be
+// the thing that makes an escaping path look ordinary.
+test "the twin treats a path that leaves its root as naming nothing" {
+  let fixture = mem_of([{path: "src/a.ply", body: b"a"}]);
+  assert(mem_confined("src/a.ply"));
+  assert(mem_confined("./src/a.ply"));
+  assert(!mem_confined("/etc/passwd"));
+  assert(!mem_confined("../secrets"));
+  assert(!mem_confined("src/../../secrets"));
+  assert_eq(mem_read(fixture, "../src/a.ply"), None);
+  assert_eq(mem_read(fixture, "/src/a.ply"), None);
+  assert(!mem_exists(fixture, "../src/a.ply"));
+  assert(!mem_write(fixture, "../out.txt", b"x").ok)
+}
+
+test "one directory, never its subtree" {
+  let fixture = mem_of([
+    {path: "src/a.ply", body: b"a"},
+    {path: "src/deep/b.ply", body: b"b"},
+    {path: "top.ply", body: b"t"},
+  ]);
+  assert_eq(mem_list(fixture, ""), Some(["src", "top.ply"]));
+  assert_eq(mem_list(fixture, "src"), Some(["a.ply", "deep"]));
+  assert_eq(mem_list(fixture, "src/deep"), Some(["b.ply"]));
+  assert_eq(mem_list(fixture, "src/a.ply"), None);
+  assert_eq(mem_list(fixture, "nowhere"), None)
+}
+
+test "a write stamps, a read does not, and a later write stamps later" {
+  let one = mem_write(mem_empty(), "a.txt", b"1").fs;
+  let two = mem_write(one, "b.txt", b"2").fs;
+  match mem_modified(two, "a.txt") {
+    None -> panic("the file was written"),
+    Some(first) -> match mem_modified(two, "b.txt") {
+      None -> panic("the file was written"),
+      Some(second) -> {
+        assert(second > first);
+        assert_eq(mem_read(two, "a.txt"), Some(b"1"));
+        assert_eq(mem_modified(two, "a.txt"), Some(first))
+      },
+    },
+  }
+}
+
+test "a write needs its directory, and create_dir makes every missing one" {
+  assert(!mem_write(mem_empty(), "build/cache/a.plyx", b"x").ok);
+  let made = mem_create_dir(mem_empty(), "build/cache");
+  assert(made.ok);
+  assert(mem_exists(made.fs, "build"));
+  assert(mem_exists(made.fs, "build/cache"));
+  assert(mem_write(made.fs, "build/cache/a.plyx", b"x").ok);
+  // Idempotent: `true` means the directory is there.
+  assert(mem_create_dir(made.fs, "build/cache").ok)
+}
+
+test "remove takes one file or one empty directory and never a tree" {
+  let fixture = mem_of([{path: "src/a.ply", body: b"a"}]);
+  assert(!mem_remove(fixture, "src").ok);
+  let gone = mem_remove(fixture, "src/a.ply");
+  assert(gone.ok);
+  assert_eq(mem_read(gone.fs, "src/a.ply"), None);
+  assert_eq(mem_modified(gone.fs, "src/a.ply"), None);
+  assert(mem_remove(gone.fs, "src").ok);
+  assert(!mem_exists(mem_remove(gone.fs, "src").fs, "src"));
+  assert(!mem_remove(fixture, "absent").ok)
+}
+
+test "rename is a move, and it refuses what it cannot place" {
+  let fixture = mem_of([{path: "out/a.tmp", body: b"artifact"}]);
+  let moved = mem_rename(fixture, "out/a.tmp", "out/a.plyx");
+  assert(moved.ok);
+  assert_eq(mem_read(moved.fs, "out/a.tmp"), None);
+  assert_eq(mem_read(moved.fs, "out/a.plyx"), Some(b"artifact"));
+  // No such directory, so nothing moves and the source is still there.
+  let refused = mem_rename(fixture, "out/a.tmp", "elsewhere/a.plyx");
+  assert(!refused.ok);
+  assert_eq(mem_read(refused.fs, "out/a.tmp"), Some(b"artifact"));
+  // Out of the root is not expressible in one atom, so it is not a rename.
+  assert(!mem_rename(fixture, "out/a.tmp", "../a.plyx").ok);
+  assert(!mem_rename(fixture, "absent", "out/b.plyx").ok)
+}
+
+test "a path spelled two ways is one file" {
+  let fixture = mem_of([{path: "src/a.ply", body: b"a"}]);
+  assert_eq(mem_read(fixture, "./src/a.ply"), Some(b"a"));
+  assert_eq(mem_read(fixture, "src//a.ply"), Some(b"a"));
+  assert_eq(mem_read(fixture, "src/a.ply/"), Some(b"a"))
+}

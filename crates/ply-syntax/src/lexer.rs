@@ -113,9 +113,18 @@ pub enum TokenKind {
     Slash,
     Percent,
 
+    /// `&`, `^` and `~` are the bit operators of
+    /// `&` was a character the lexer
+    /// reached only to reject; `^` and `~` were in the token set nowhere, so
+    /// neither can collide. `&&` and `||` still munch first, so `|| body` is
+    /// still a nullary lambda and `TokenKind::Pipe` still separates a sum
+    /// type's variants.
+    Amp,
     AmpAmp,
+    Caret,
     Pipe,
     PipePipe,
+    Tilde,
 
     /// `e?` — the postfix try operator (GUIDE §6.10).
     Question,
@@ -170,9 +179,12 @@ impl TokenKind {
             TokenKind::Star => "*",
             TokenKind::Slash => "/",
             TokenKind::Percent => "%",
+            TokenKind::Amp => "&",
             TokenKind::AmpAmp => "&&",
+            TokenKind::Caret => "^",
             TokenKind::Pipe => "|",
             TokenKind::PipePipe => "||",
+            TokenKind::Tilde => "~",
             TokenKind::Question => "?",
             TokenKind::Ident(_)
             | TokenKind::Int(_)
@@ -358,9 +370,59 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// `0xFF`, `0xdead_beef`: the same `Lit::Int` as the decimal spelling, bounded as a
+    /// `u64` bit pattern so `0xFFFF_FFFF_FFFF_FFFF` is `-1`.
+    fn hex(&mut self, start: usize) -> TokenKind {
+        self.bump();
+        self.bump();
+        let mut digits = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_hexdigit() {
+                digits.push(c);
+                self.bump();
+            } else if c == '_' {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            self.error(
+                codes::UNEXPECTED_TOKEN,
+                "hex literal with no digits",
+                self.span_from(start),
+                "write at least one digit after `0x`, as in `0xFF`",
+            );
+            return TokenKind::Int(0);
+        }
+        if self.peek().is_some_and(is_ident_start) {
+            self.error(
+                codes::UNEXPECTED_TOKEN,
+                "invalid suffix on a hex literal",
+                self.span_from(start),
+                "a hex literal is an `Int` and takes no suffix; separate a name with a space",
+            );
+        }
+        match u64::from_str_radix(&digits, 16) {
+            Ok(v) => TokenKind::Int(v as i64),
+            Err(_) => {
+                self.error(
+                    codes::UNEXPECTED_TOKEN,
+                    format!("hex literal `0x{digits}` does not fit in `Int`"),
+                    self.span_from(start),
+                    "`Int` is 64 bits, so a hex literal has at most 16 digits",
+                );
+                TokenKind::Int(0)
+            }
+        }
+    }
+
     /// `1`, `1.5`, `1e9`, `1.50m`.
     fn number(&mut self) -> TokenKind {
         let start = self.pos;
+        if self.peek() == Some('0') && matches!(self.peek2(), Some('x') | Some('X')) {
+            return self.hex(start);
+        }
         let mut whole = String::new();
         self.digits(&mut whole);
 
@@ -755,17 +817,13 @@ impl<'a> Lexer<'a> {
             '/' => TokenKind::Slash,
             '%' => TokenKind::Percent,
             '?' => TokenKind::Question,
+            '^' => TokenKind::Caret,
+            '~' => TokenKind::Tilde,
             '&' => {
                 if self.eat('&') {
                     TokenKind::AmpAmp
                 } else {
-                    self.error(
-                        codes::UNEXPECTED_TOKEN,
-                        "unexpected character `&`",
-                        self.span_from(start),
-                        "Ply has no bitwise `&`; write `&&` for logical and",
-                    );
-                    return None;
+                    TokenKind::Amp
                 }
             }
             '|' => {
@@ -986,7 +1044,7 @@ mod tests {
     #[test]
     fn operators_use_maximal_munch() {
         assert_eq!(
-            kinds("-> - ++ + == = != ! <= < >= > && || | .. ."),
+            kinds("-> - ++ + == = != ! <= < >= > && & || | ^ ~ .. ."),
             vec![
                 TokenKind::Arrow,
                 TokenKind::Minus,
@@ -1001,8 +1059,11 @@ mod tests {
                 TokenKind::Ge,
                 TokenKind::Gt,
                 TokenKind::AmpAmp,
+                TokenKind::Amp,
                 TokenKind::PipePipe,
                 TokenKind::Pipe,
+                TokenKind::Caret,
+                TokenKind::Tilde,
                 TokenKind::DotDot,
                 TokenKind::Dot,
                 TokenKind::Eof,
@@ -1010,12 +1071,47 @@ mod tests {
         );
     }
 
+    /// The one munch the lexer deliberately does *not* do. `Map<Int, List<Int>>`
+    /// closes with two `>` that must stay two tokens, so a shift is assembled by
+    /// the expression parser out of adjacent ones (the operator decision) and never here.
     #[test]
-    fn a_lone_ampersand_is_reported_and_skipped() {
-        let (toks, diags) = lex(SourceId(0), "a & b");
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].notes.is_empty());
-        assert_eq!(toks.len(), 3);
+    fn angle_brackets_never_munch_into_a_shift() {
+        assert_eq!(
+            kinds(">> >>>"),
+            vec![
+                TokenKind::Gt,
+                TokenKind::Gt,
+                TokenKind::Gt,
+                TokenKind::Gt,
+                TokenKind::Gt,
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("<<"),
+            vec![TokenKind::Lt, TokenKind::Lt, TokenKind::Eof]
+        );
+        // `>>=` is `>` then `>=`, not two `>`, so it cannot become a shift.
+        assert_eq!(
+            kinds(">>="),
+            vec![TokenKind::Gt, TokenKind::Ge, TokenKind::Eof]
+        );
+    }
+
+    /// Was `a_lone_ampersand_is_reported_and_skipped`. the operator decision makes the
+    /// character real, so the diagnostic that said Ply has no bitwise `&` is
+    /// gone and this is the assertion that it is gone.
+    #[test]
+    fn a_lone_ampersand_is_a_token_of_its_own() {
+        assert_eq!(
+            kinds("a & b"),
+            vec![
+                TokenKind::Ident(Symbol::new("a")),
+                TokenKind::Amp,
+                TokenKind::Ident(Symbol::new("b")),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

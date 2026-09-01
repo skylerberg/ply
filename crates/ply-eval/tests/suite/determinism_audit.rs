@@ -1,31 +1,9 @@
 //! A simulated run is a pure function of its definition set and its seed.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::explore::{Interleaving, Step};
 use ply_eval::{Dependence, Machine, Plan, Seed, SimMode, explore, explore_under};
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
 use std::collections::BTreeSet;
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("parses");
-    let resolved = resolve(&mut program).expect("resolves");
-    let check = check_program(&program, &resolved).expect("checks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
 
 /// Everything one interleaving is allowed to be a function of, rendered.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -84,7 +62,7 @@ impl Compiled {
     /// The choice sequence a run realized, which is not its seed's path: beyond the path the
     /// `sched` stream chose.
     fn choices_of(&self, index: usize, seed: &Seed) -> Vec<u16> {
-        self.at(index, seed)
+        self.interleaving_at(index, seed)
             .steps
             .iter()
             .map(|s| s.choice)
@@ -93,8 +71,8 @@ impl Compiled {
 
     /// The interleaving as [`explore`] consumes it, for the tests that drive a whole search rather
     /// than one run.
-    fn at(&self, index: usize, seed: &Seed) -> Interleaving {
-        self.run(index, seed).0
+    fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
+        self.run_at(index, seed).0
     }
 
     /// One call of a named function, with both of the things a search wants from it: what it
@@ -120,7 +98,7 @@ impl Compiled {
 
     /// One run, with both of the things a search wants from it: what it interleaved, and the world
     /// it left behind.
-    fn run(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
+    fn run_at(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
@@ -281,7 +259,7 @@ const SHAPE_NAMES: [&str; 4] = [
 /// in one process, compared over the whole recording.
 #[test]
 fn one_seed_is_one_interleaving_across_hundreds_of_runs_in_one_process() {
-    let compiled = compile(LOST_UPDATE);
+    let compiled = Compiled::named("t", LOST_UPDATE);
     // A bare root, and the same root with its own realized path pinned — the two halves of what a
     // seed is.
     let pinned = Seed::at(3, compiled.choices_of(0, &Seed::root(3)));
@@ -305,7 +283,7 @@ fn one_seed_is_one_interleaving_across_hundreds_of_runs_in_one_process() {
 /// seed does not name has many chances to show.
 #[test]
 fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
-    let compiled = compile(SHAPES);
+    let compiled = Compiled::named("t", SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
         for root in 0..48u64 {
             let seed = Seed::root(root);
@@ -320,7 +298,7 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
 /// theatre.
 #[test]
 fn different_seeds_really_do_explore_different_interleavings() {
-    let compiled = compile(SHAPES);
+    let compiled = Compiled::named("t", SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
         let seen: BTreeSet<Vec<String>> = (0..48u64)
             .map(|root| compiled.transcript_of(index, &Seed::root(root)).steps)
@@ -338,7 +316,7 @@ fn different_seeds_really_do_explore_different_interleavings() {
 /// run.
 #[test]
 fn a_path_pins_what_it_names_and_a_whole_path_replays_its_run() {
-    let compiled = compile(LOST_UPDATE);
+    let compiled = Compiled::named("t", LOST_UPDATE);
     for root in 0..24u64 {
         let free = compiled.transcript(&Seed::root(root));
         let choices = compiled.choices_of(0, &Seed::root(root));
@@ -370,8 +348,9 @@ fn a_path_pins_what_it_names_and_a_whole_path_replays_its_run() {
 /// A run must be a function of the *definition set*, not of the source text.
 #[test]
 fn an_edit_that_changes_no_hash_changes_no_interleaving() {
-    let plain = compile(LOST_UPDATE);
-    let edited = compile(
+    let plain = Compiled::named("t", LOST_UPDATE);
+    let edited = Compiled::named(
+        "t",
         &LOST_UPDATE
             .replace("let seen =", "// a comment nobody reads\n  let observed =")
             .replace("seen + 1", "observed + 1")
@@ -394,11 +373,15 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
 /// function of the seed as which task comes next.
 #[test]
 fn the_whole_search_is_a_function_of_its_plan() {
-    let compiled = compile(SHAPES);
+    let compiled = Compiled::named("t", SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
-        let first = explore(&dpor(128), &mut |seed: &Seed| compiled.at(index, seed));
+        let first = explore(&dpor(128), &mut |seed: &Seed| {
+            compiled.interleaving_at(index, seed)
+        });
         for _ in 0..8 {
-            let again = explore(&dpor(128), &mut |seed: &Seed| compiled.at(index, seed));
+            let again = explore(&dpor(128), &mut |seed: &Seed| {
+                compiled.interleaving_at(index, seed)
+            });
             assert_eq!(again.seeds, first.seeds, "`{name}`: the search wandered");
             assert_eq!(
                 again.exploration, first.exploration,
@@ -412,7 +395,7 @@ fn the_whole_search_is_a_function_of_its_plan() {
 /// are those of the interleaving its seed names, whatever else the search went on to explore.
 #[test]
 fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
-    let compiled = compile(SHAPES);
+    let compiled = Compiled::named("t", SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
         let named = compiled.transcript_of(index, &Seed::root(0));
         for plan in [
@@ -430,7 +413,7 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
                 if seed == &Seed::root(0) && seen.is_none() {
                     seen = Some(compiled.transcript_of(index, seed));
                 }
-                compiled.at(index, seed)
+                compiled.interleaving_at(index, seed)
             });
             assert!(explored.exploration.explored >= 1);
             assert_eq!(
@@ -566,7 +549,7 @@ const PRUNING_NAMES: [&str; 5] = [
 /// The audit that fails rather than flatters.
 #[test]
 fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
-    let compiled = compile(PRUNING);
+    let compiled = Compiled::named("t", PRUNING);
     for name in PRUNING_NAMES.iter() {
         let plan = dpor(4096);
 
@@ -705,11 +688,15 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
             "one region reached twice through a call",
         ),
     ] {
-        let compiled = compile(source);
-        let searched = explore(&dpor(1024), &mut |seed: &Seed| compiled.at(0, seed));
+        let compiled = Compiled::named("t", source);
+        let searched = explore(&dpor(1024), &mut |seed: &Seed| {
+            compiled.interleaving_at(0, seed)
+        });
 
         // The race is real: a sample finds it.
-        let sampled = explore(&Plan::random(64), &mut |seed: &Seed| compiled.at(0, seed));
+        let sampled = explore(&Plan::random(64), &mut |seed: &Seed| {
+            compiled.interleaving_at(0, seed)
+        });
         assert!(
             sampled.exploration.failure.is_some(),
             "`{name}`: the fixture must contain a reachable lost update, or it proves nothing"
@@ -733,7 +720,8 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
 /// **BLOCKER.**
 #[test]
 fn a_legal_program_is_never_reported_as_a_simulation_divergence() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect counter {
   read  get[r]() -> Int
@@ -787,7 +775,9 @@ test "the second region's shape depends on what the first raced to" {
 }
 "#,
     );
-    let explored = explore(&dpor(256), &mut |seed: &Seed| compiled.at(0, seed));
+    let explored = explore(&dpor(256), &mut |seed: &Seed| {
+        compiled.interleaving_at(0, seed)
+    });
     if let Some(diagnostic) = &explored.diagnostic {
         assert_ne!(
             diagnostic.code,

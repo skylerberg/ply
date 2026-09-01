@@ -377,7 +377,7 @@ fn non_scalar_arguments() -> Vec<(&'static str, Value)> {
         ("Map", Value::Map(ply_eval::Map::new())),
         (
             "Record",
-            Value::Record(std::sync::Arc::new(std::collections::BTreeMap::new())),
+            Value::Record(std::sync::Arc::new(ply_eval::Fields::default())),
         ),
         ("Decimal", Value::Decimal(ply_eval::Decimal::new(7, 0))),
         (

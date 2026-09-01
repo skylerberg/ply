@@ -75,12 +75,17 @@ fn the_census_over_the_parser_spike() {
     for (construct, count) in &ranked {
         println!("  {count:5}  {construct}");
     }
-    println!("the enterable set: {:?}", unit.compiled());
+    // `compiled()` is the fixpoint's survivors; `len()` is how many of those are registered.
+    println!(
+        "survived the fixpoint ({}): {:?}",
+        unit.compiled().len(),
+        unit.compiled()
+    );
 
     // The floor is the measurement, not a guess.
     assert!(
         unit.len() >= 20,
-        "the enterable fragment over the parser fell to {} (22 when measured)",
+        "the enterable fragment over the parser fell to {}",
         unit.len()
     );
 }

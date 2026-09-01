@@ -96,6 +96,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &loaded.check,
         args.host,
         &args.tls.tls,
+        &args.fs.fs,
         db,
         configuration,
         &args.trace,

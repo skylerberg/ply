@@ -4,58 +4,23 @@
 // allow `secrets.rs` carries, for the same reason.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::{
-    ARGUMENT_VECTOR_CLASSES, Decimal, Machine, SECRET_REDACTED, Value, first_difference,
-    values_equal,
+    ARGUMENT_VECTOR_CLASSES, Decimal, SECRET_REDACTED, Value, first_difference, values_equal,
 };
-use ply_span::{Diagnostic, SourceId, Span};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Span};
 use std::sync::Arc;
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = [(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-    let resolved =
-        resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    let check = check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
 impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn index_of(&self, name: &str) -> usize {
-        self.check
-            .tests
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap_or_else(|| panic!("no test named {name:?}"))
-    }
-
     #[track_caller]
-    fn run(&self, name: &str) {
+    fn must_pass(&self, name: &str) {
         if let Err(d) = self.machine().eval_test(self.index_of(name)) {
             panic!("{name:?} was expected to pass:\n{d:#?}");
         }
     }
 
     #[track_caller]
-    fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
+    fn answer_of(&self, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
         self.machine().call(name, args, Span::DUMMY)
     }
 }
@@ -145,7 +110,7 @@ test "a string argument survives two resumptions" {
 
 #[test]
 fn an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_arguments() {
-    let compiled = compile(RESUMED_ARGUMENTS);
+    let compiled = Compiled::new(RESUMED_ARGUMENTS);
     for name in [
         "arity 1",
         "arity 2",
@@ -155,7 +120,7 @@ fn an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_argu
         "nested calls of one class",
         "a string argument survives two resumptions",
     ] {
-        compiled.run(name);
+        compiled.must_pass(name);
     }
 }
 
@@ -189,12 +154,12 @@ pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 
 /// The secret containment claim as a bound on the free list, measured through the machine.
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
-    let compiled = compile(SECRET_ARGUMENTS);
+    let compiled = Compiled::new(SECRET_ARGUMENTS);
     for arity in 1..=ARGUMENT_VECTOR_CLASSES + 1 {
         let payload = Arc::new(Value::str("hunter2"));
         let secret = Value::Secret(Arc::clone(&payload));
         let answered = compiled
-            .call(&format!("m.carry{arity}"), vec![secret])
+            .answer_of(&format!("m.carry{arity}"), vec![secret])
             .unwrap_or_else(|d| panic!("`carry{arity}` raised: {d:#?}"));
         assert_eq!(answered, Value::Bool(false), "arity {arity}");
         assert_eq!(
@@ -209,11 +174,11 @@ fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
 /// The same, past the free list's bound and back.
 #[test]
 fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
-    let compiled = compile(SECRET_ARGUMENTS);
+    let compiled = Compiled::new(SECRET_ARGUMENTS);
     let payload = Arc::new(Value::str("hunter2"));
     let secret = Value::Secret(Arc::clone(&payload));
     let answered = compiled
-        .call("m.deep", vec![secret])
+        .answer_of("m.deep", vec![secret])
         .unwrap_or_else(|d| panic!("`deep` raised: {d:#?}"));
     assert_eq!(answered, Value::Int(2000));
     assert_eq!(
@@ -226,14 +191,14 @@ fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
 /// A buffer that carried a credential is handed to the next call of that arity.
 #[test]
 fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments() {
-    let compiled = compile(SECRET_ARGUMENTS);
+    let compiled = Compiled::new(SECRET_ARGUMENTS);
     for _ in 0..64 {
         let secret = Value::secret(Value::str("hunter2"));
         let _ = compiled
-            .call("m.carry4", vec![secret])
+            .answer_of("m.carry4", vec![secret])
             .expect("`carry4` runs");
         let answered = compiled
-            .call(
+            .answer_of(
                 "m.after4",
                 vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
             )
@@ -441,7 +406,7 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
 /// replaces the value, and the key a program reads back is the canonical spelling either way.
 #[test]
 fn map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling() {
-    let compiled = compile(
+    let compiled = Compiled::new(
         r#"
 pub fn last_wins(ignored: Int) -> String =
   string_of_keys(map_insert(map_insert(map_new(), 1.50m, 1), 1.5m, 2))
@@ -459,14 +424,16 @@ test "the two maps are equal" {
 }
 "#,
     );
-    compiled.run("the two maps are equal");
+    compiled.must_pass("the two maps are equal");
     assert_eq!(
-        compiled.call("m.last_wins", vec![Value::Int(0)]).unwrap(),
+        compiled
+            .answer_of("m.last_wins", vec![Value::Int(0)])
+            .unwrap(),
         Value::str("1.5")
     );
     assert_eq!(
         compiled
-            .call("m.first_spelling", vec![Value::Int(0)])
+            .answer_of("m.first_spelling", vec![Value::Int(0)])
             .unwrap(),
         Value::str("1.5"),
         "two maps that `assert_eq` as one value answer `map_keys` with two different lists"
@@ -509,7 +476,7 @@ test "two tasks build constants" {
 fn a_seeded_schedule_is_the_same_cold_and_warm_over_the_constant_memos() {
     use ply_eval::{Plan, Seed, explore};
 
-    let compiled = compile(SIMULATED_CONSTANTS);
+    let compiled = Compiled::new(SIMULATED_CONSTANTS);
     let observe = |seed: &Seed| -> (ply_eval::Interleaving, String) {
         let mut machine = compiled.machine();
         machine.cells_mut().journal();
@@ -577,13 +544,13 @@ fn a_seeded_schedule_is_the_same_cold_and_warm_over_the_constant_memos() {
 /// and nothing clears it between programs.
 #[test]
 fn two_programs_on_one_thread_do_not_read_each_others_constructor_of_the_same_name() {
-    let nullary = compile(
+    let nullary = Compiled::new(
         r#"
 type Tag = Marker | Other
 pub fn mention(ignored: Int) -> Tag = Marker
 "#,
     );
-    let unary = compile(
+    let unary = Compiled::new(
         r#"
 type Tag = Marker(Int) | Other
 pub fn mention(ignored: Int) -> Tag = Marker(7)
@@ -593,8 +560,12 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
 
     // Both orders, because a cache defect is usually asymmetric.
     for (first, second) in [(&nullary, &unary), (&unary, &nullary)] {
-        let a = first.call("m.mention", vec![Value::Int(0)]).expect("runs");
-        let b = second.call("m.mention", vec![Value::Int(0)]).expect("runs");
+        let a = first
+            .answer_of("m.mention", vec![Value::Int(0)])
+            .expect("runs");
+        let b = second
+            .answer_of("m.mention", vec![Value::Int(0)])
+            .expect("runs");
         let (nullary_answer, unary_answer) = if std::ptr::eq(first, &nullary) {
             (a, b)
         } else {
@@ -619,9 +590,11 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
     // And the closure half: a mention of the arity-1 `Marker` is a function whose arity is 1,
     // whatever the nullary program left in the cache.
     let _ = nullary
-        .call("m.mention", vec![Value::Int(0)])
+        .answer_of("m.mention", vec![Value::Int(0)])
         .expect("runs");
-    let f = unary.call("m.func", vec![Value::Int(0)]).expect("runs");
+    let f = unary
+        .answer_of("m.func", vec![Value::Int(0)])
+        .expect("runs");
     match &f {
         Value::Closure(c) => assert_eq!(
             c.arity(),
@@ -657,7 +630,7 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
 /// `Map<Decimal, _>`.
 #[test]
 fn a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too() {
-    let compiled = compile(
+    let compiled = Compiled::new(
         r#"
 type Line = {sku: String, price: Decimal}
 
@@ -681,15 +654,17 @@ test "one line, either way" {
 }
 "#,
     );
-    compiled.run("one line, either way");
+    compiled.must_pass("one line, either way");
     assert_eq!(
         compiled
-            .call("m.wrote_rounded", vec![Value::Int(0)])
+            .answer_of("m.wrote_rounded", vec![Value::Int(0)])
             .unwrap(),
         Value::str("1.5")
     );
     assert_eq!(
-        compiled.call("m.wrote_exact", vec![Value::Int(0)]).unwrap(),
+        compiled
+            .answer_of("m.wrote_exact", vec![Value::Int(0)])
+            .unwrap(),
         Value::str("1.5"),
         "a record key holding a `Decimal` reads back a price the program did not write last"
     );

@@ -38,10 +38,20 @@ pub enum NodeKind {
     Lambda {
         params: Rc<Vec<Symbol>>,
         body: Code,
+        /// The body's free variables, which is all a closure over it has to keep — the slot rewrite.
+        /// `None` means "capture the whole scope", as [`Clause::free`] does, so that an omitted set
+        /// is the slow answer rather than a closure that captured nothing.
+        /// Capturing the whole scope instead pins every other binding in it for the closure's life,
+        /// which `costs.rs` records as its third blindness.
+        free: Option<Rc<Vec<Symbol>>>,
     },
     App {
         func: Code,
         args: Rc<Vec<Code>>,
+        /// Per argument, what the arguments to its right still read — the sequence S4's probe.
+        /// Empty unless the probe is armed, and then a shared empty `Rc`, so the shipped lowering
+        /// allocates nothing for it and `carry` takes the branch it takes today.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     If {
         cond: Code,
@@ -58,6 +68,10 @@ pub enum NodeKind {
     },
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
+        /// Per field, what the fields to its right still read — the same
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site the slot rewrite
+        /// the slot probe covers. Empty unless the probe is armed.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     Field {
         base: Code,
@@ -135,12 +149,23 @@ pub struct Clause {
     /// The continuation binder of a general clause.
     pub resume: Option<Symbol>,
     pub body: Code,
+    /// The body's free variables — what a clause needs from the scope its handler was installed in,
+    /// and nothing else. what the machine has to become: extending the whole prompt environment pins every binding in
+    /// it for the clause's life, and makes a flat slot index name the wrong thing.
+    ///
+    /// `None` means "do not narrow", which is what a hand-built `Clause` gets. An *empty* set means
+    /// the body reads nothing from the handler's scope, and narrowing to nothing is right. The
+    /// distinction matters because the two failure directions are not symmetric: keeping too much
+    /// costs a pinned binding, keeping too little is `cannot find` at the read.
+    pub free: Option<Rc<Vec<Symbol>>>,
     pub span: Span,
 }
 
 pub struct ReturnArm {
     pub binder: Symbol,
     pub body: Code,
+    /// As [`Clause::free`].
+    pub free: Option<Rc<Vec<Symbol>>>,
     pub span: Span,
 }
 
@@ -157,6 +182,7 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(e, &mut ownable);
     let mut live = Live::new(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     lower_in(e, &mut live)
 }
@@ -167,30 +193,6 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
 pub type Params = Rc<Vec<Symbol>>;
 
 /// Lowered bodies, shared by every machine built from one program.
-///
-/// A machine is built per pool thread per concurrency group, per interleaving of
-/// a search and per sampled case of a spec, so the same traversal would other-
-/// wise run hundreds of times over one program.
-///
-/// The key is the body's address, and what makes an address an identity is the
-/// lifetime rather than the map: everything keyed here is borrowed for `'a` and
-/// this cache cannot outlive `'a`, so nothing it has keyed can be freed and
-/// something else allocated in its place while it is still readable.
-///
-/// **That holds only because `invariant` below makes `Lowering<'a>` invariant in
-/// `'a`, and it is false without it.** Covariant, `&Lowering<'long>` coerces to
-/// `&Lowering<'short>` and [`Lowering::of`] takes `&self`, so a long-lived cache
-/// accepts a body borrowed for any shorter lifetime; keying a `Box<Expr>`
-/// through that coercion and dropping it leaves an entry under a dangling
-/// address. A variance property is a compile-time property and a `#[test]`
-/// cannot observe it, so the guard is this doc-test:
-///
-/// ```compile_fail
-/// use ply_eval::Lowering;
-/// fn shrink<'long: 'short, 'short>(c: &'short Lowering<'long>) -> &'short Lowering<'short> {
-///     c
-/// }
-/// ```
 pub struct Lowering<'a> {
     program: &'a Program,
     bodies: RefCell<FxHashMap<usize, (Params, Code)>>,
@@ -314,16 +316,17 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
         }
         ExprKind::Lambda { params, body } => {
             let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
-            let body = lower_barrier(&params, body, live);
+            let (body, free) = lower_barrier_free(&params, body, live);
             NodeKind::Lambda {
+                free: Some(Rc::new(free)),
                 params: Rc::new(params),
                 body,
             }
         }
         ExprKind::App { func, args, .. } => {
-            let args = lower_all(args, live);
+            let (args, dead) = lower_args(args, live);
             let func = lower_in(func, live);
-            NodeKind::App { func, args }
+            NodeKind::App { func, args, dead }
         }
         ExprKind::If {
             cond,
@@ -376,13 +379,24 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::Record { fields } => {
+            let armed = crate::rc::probe_carries();
             let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
+            let mut keep: Vec<crate::rc::Dead> = Vec::new();
             for (name, value) in fields.iter().rev() {
+                if armed {
+                    keep.push(narrowing_for(value, live));
+                }
                 lowered.push((name.name.clone(), lower_in(value, live)));
             }
             lowered.reverse();
+            keep.reverse();
             NodeKind::Record {
                 fields: Rc::new(lowered),
+                dead: if keep.is_empty() {
+                    no_arg_dead()
+                } else {
+                    Rc::new(keep)
+                },
             }
         }
         // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
@@ -471,17 +485,157 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
 
 /// A construct whose body may run more than once, or later, or beside another task: a lambda, a
 /// handler clause, a `return` clause, a `simulate` region.
-fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
+/// [`lower_barrier`], also answering the barrier's free variables.
+fn lower_barrier_free(params: &[Symbol], body: &Expr, live: &mut Live) -> (Code, Vec<Symbol>) {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(body, &mut ownable);
     let outer = live.open(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     let code = lower_in(body, live);
     for p in params {
         live.kill(p);
     }
-    live.close(outer);
-    code
+    let free = live.close(outer);
+    (code, free)
+}
+
+fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
+    lower_barrier_free(params, body, live).0
+}
+
+/// [`lower_all`], also answering which bindings each argument is the last reader
+/// of — the sequence S4.
+/// The empty per-argument dead set, shared rather than allocated per node.
+///
+/// `App` and `Record` carry one of these on every lowering and it is empty unless the the sequence
+/// S4 probe is armed, so allocating a fresh `Rc` per node put ~10 allocations on each `/health`
+/// request for a vector nothing reads.
+fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
+    thread_local! {
+        static EMPTY: Rc<Vec<crate::rc::Dead>> = Rc::new(Vec::new());
+    }
+    EMPTY.with(Rc::clone)
+}
+
+fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
+    if !crate::rc::probe_carries() {
+        return (lower_all(exprs, live), no_arg_dead());
+    }
+    // Walked in reverse, so before argument `i` is lowered the live set holds everything the
+    // arguments to its right read — along with what is read after the call, which the frame does
+    // not need. Keeping those too over-approximates, and that is the only safe direction: a name
+    // missing here is `cannot find` at the read, not a slower program.
+    let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
+    let mut keep: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
+    // The frame started at `i` evaluates arguments `i+1..` and nothing else, so what it needs is
+    // exactly the names those read. Taking it from `Live` instead would include what is read after
+    // the call, which the frame does not need and which is most of the window's cost.
+    for e in exprs.iter().rev() {
+        keep.push(narrowing_for(e, live));
+        out.push(lower_in(e, live));
+    }
+    out.reverse();
+    keep.reverse();
+    (Rc::new(out), Rc::new(keep))
+}
+
+/// What the frame should hold while `e` runs, or empty for "hold what it holds today".
+///
+/// Narrowing costs one link per name kept and buys nothing unless something in `e` can be reused,
+/// so it is only asked for where `e` appends. Measured uniformly at every carry site it was +88%
+/// allocations on the request path; the append sites are a small fraction of them.
+fn narrowing_for(e: &Expr, live: &mut Live) -> crate::rc::Dead {
+    if appends(e) {
+        Rc::from(live.snapshot())
+    } else {
+        crate::rc::no_dead()
+    }
+}
+
+/// Whether `e` writes a `push` anywhere inside it.
+///
+/// Syntactic and local on purpose: an append reached through a call is the non-local case no
+/// analysis of this body sees, and narrowing here would not help it. It deliberately does *not*
+/// require the list to be a plain name — `push(s.out, i)` is the shape the compounding case is
+/// written in, and testing for a bare name loses it.
+fn appends(e: &Expr) -> bool {
+    if let ExprKind::App { func, .. } = &e.kind
+        && let ExprKind::Var(q) = &func.kind
+        && q.is_bare()
+        && q.symbol().as_str() == "push"
+    {
+        return true;
+    }
+    crate::limit::grow(|| children(e).into_iter().any(appends))
+}
+
+/// Every sub-expression of `e`, for the walks above.
+fn children(e: &Expr) -> Vec<&Expr> {
+    let mut out: Vec<&Expr> = Vec::new();
+    match &e.kind {
+        ExprKind::Lit(_) | ExprKind::Var(_) => {}
+        ExprKind::Lambda { body, .. }
+        | ExprKind::Field { base: body, .. }
+        | ExprKind::Try { operand: body }
+        | ExprKind::Unary { operand: body, .. }
+        | ExprKind::WithRegion { body, .. }
+        | ExprKind::Simulate { body, .. } => out.push(body),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        ExprKind::App { func, args, .. } => {
+            out.push(func);
+            out.extend(args.iter());
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            out.push(cond);
+            out.push(then_branch);
+            out.push(else_branch);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            out.push(scrutinee);
+            for a in arms {
+                out.push(&a.body);
+                out.extend(a.guard.iter());
+            }
+        }
+        ExprKind::Block { stmts, tail } => {
+            for st in stmts {
+                match st {
+                    AstStmt::Let { value, .. } => out.push(value),
+                    AstStmt::Expr(x) => out.push(x),
+                }
+            }
+            out.extend(tail.iter().map(|t| &**t));
+        }
+        ExprKind::Record { fields } => out.extend(fields.iter().map(|(_, v)| v)),
+        ExprKind::RecordUpdate { base, fields } => {
+            out.push(base);
+            out.extend(fields.iter().map(|(_, v)| v));
+        }
+        ExprKind::List { items } => out.extend(items.iter()),
+        ExprKind::Perform { args, .. } => out.extend(args.iter()),
+        ExprKind::Handle {
+            body,
+            clauses,
+            return_clause,
+        } => {
+            out.push(body);
+            out.extend(clauses.iter().map(|c| &c.body));
+            out.extend(return_clause.iter().map(|r| &r.body));
+        }
+        ExprKind::WithCell { init, body, .. } => {
+            out.push(init);
+            out.push(body);
+        }
+    }
+    out
 }
 
 fn lower_all(exprs: &[Expr], live: &mut Live) -> Rc<Vec<Code>> {
@@ -562,7 +716,15 @@ fn lower_block(
     }
     let entry = live.snapshot();
 
-    let mut cumulative: Vec<Symbol> = Vec::new();
+    // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
+    // why releasing a parameter releases nothing still read, which carries the case analysis for why this releases nothing still read.
+    // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
+    // which are not in scope here.
+    let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {
+        live.barrier_params().to_vec()
+    } else {
+        Vec::new()
+    };
     let mut out: Vec<Stmt> = Vec::with_capacity(n);
     for i in 0..n {
         for name in &bound[i] {
@@ -608,7 +770,7 @@ fn lower_clause(c: &HandleClause, live: &mut Live) -> Clause {
     let resume = c.resume.as_ref().map(|r| r.name.clone());
     let mut bound = params.clone();
     bound.extend(resume.clone());
-    let body = lower_barrier(&bound, &c.body, live);
+    let (body, free) = lower_barrier_free(&bound, &c.body, live);
     Clause {
         effect: c.effect.clone(),
         op: c.op.name.clone(),
@@ -616,16 +778,18 @@ fn lower_clause(c: &HandleClause, live: &mut Live) -> Clause {
         params: Rc::new(params),
         resume,
         body,
+        free: Some(Rc::new(free)),
         span: c.span,
     }
 }
 
 fn lower_return(rc: &ReturnClause, live: &mut Live) -> Rc<ReturnArm> {
     let binder = rc.binder.name.clone();
-    let body = lower_barrier(std::slice::from_ref(&binder), &rc.body, live);
+    let (body, free) = lower_barrier_free(std::slice::from_ref(&binder), &rc.body, live);
     Rc::new(ReturnArm {
         binder,
         body,
+        free: Some(Rc::new(free)),
         span: rc.span,
     })
 }
@@ -786,7 +950,7 @@ mod tests {
     #[test]
     fn a_record_keeps_its_fields_in_source_order() {
         let e = record(vec![("b", int(2)), ("a", int(1))]);
-        let NodeKind::Record { fields } = &lower(&e).kind else {
+        let NodeKind::Record { fields, .. } = &lower(&e).kind else {
             panic!("expected a record");
         };
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();

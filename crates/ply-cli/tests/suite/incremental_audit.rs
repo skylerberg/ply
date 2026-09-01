@@ -894,6 +894,43 @@ fn chain_lib(base: &str) -> String {
     )
 }
 
+/// A failed wave gives up what the blamed file calls, so a diagnostic it reports is one a
+/// from-scratch check reports too.
+///
+/// The fixture is the only shape that can tell the two apart. `base`'s row moves, so `mid`'s
+/// footprint moves while `mid`'s own text does not -- which is exactly a definition gate 2 restores
+/// with an interface that is no longer true. `top` is edited as well, so it is checked in the same
+/// wave, against that stale footprint, and its declared row makes the difference visible: it
+/// permits where `mid` now performs, so a stale `mid` puts it in breach and a fresh one does not.
+/// Give up nothing on the failure and the run reports `E0302` for a program that checks.
+#[test]
+fn a_failing_wave_reports_what_a_from_scratch_check_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "lib.ply", &chain_lib(r#"log.note[a]("n") + n"#));
+    write(
+        dir.path(),
+        "top.ply",
+        "import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
+    );
+    agree(dir.path(), "cold");
+
+    write(dir.path(), "lib.ply", &chain_lib(r#"log.note[b]("n") + n"#));
+    write(
+        dir.path(),
+        "top.ply",
+        "import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
+    );
+    let after = agree(
+        dir.path(),
+        "the row moved under a caller checked in the same wave",
+    );
+    assert!(
+        rechecked(&after).contains("lib.mid"),
+        "`mid` is what `top` was checked against, so the failure has to give it up: {:?}",
+        rechecked(&after)
+    );
+}
+
 /// The cutoff: a callee's body is not part of what a caller is checked against, so re-implementing
 /// one re-infers nothing above it.
 #[test]

@@ -695,12 +695,12 @@ impl Walk<'_, '_> {
                 Owner::Fresh
             }
 
-            NodeKind::Lambda { params, body } => {
+            NodeKind::Lambda { params, body, .. } => {
                 self.barrier(params, body, st, &[]);
                 Owner::Fresh
             }
 
-            NodeKind::App { func, args } => {
+            NodeKind::App { func, args, .. } => {
                 let builtin = self.builtin_of(func, st);
                 let callee = self.callee_of(func, st);
                 // `Value::Closure` holds the whole chain, so a lambda written here keeps every
@@ -849,7 +849,7 @@ impl Walk<'_, '_> {
                 answer
             }
 
-            NodeKind::Record { fields } => {
+            NodeKind::Record { fields, .. } => {
                 let outer = st.frontier;
                 for (i, (_, value)) in fields.iter().enumerate() {
                     st.frontier = if i + 1 == fields.len() {
@@ -1141,7 +1141,7 @@ impl Walk<'_, '_> {
     /// A callback written at the call site, entered with the owners the builtin is known to hand it
     /// rather than with the `Unknown` a closure of unknown provenance gets.
     fn walk_callback(&mut self, owners: &[Owner], arg: &Code, st: &mut State) -> Owner {
-        let NodeKind::Lambda { params, body } = &arg.kind else {
+        let NodeKind::Lambda { params, body, .. } = &arg.kind else {
             // Named elsewhere: its body is checked where it is defined.
             let here = st.frontier;
             return self.walk(arg, st, here);

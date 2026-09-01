@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # M1 and M2 of /tmp/ply-parser-spike/PREREGISTRATION-INTEGRATION.md: the
-# lexer-to-parser cost multiplier that ADR 0020 §6.2 assumes at 5-10x and ADR
-# 0021 §3 says only writing the parser could settle.
+# lexer-to-parser cost multiplier that the self-hosting spike assumes at 5-10x and that
+# only writing the parser could settle.
 #
 #   ./spikes/ply-parser/measure-multiplier.sh            # the five registered files
 #   ./spikes/ply-parser/measure-multiplier.sh <file>...  # others

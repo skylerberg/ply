@@ -752,3 +752,21 @@ mod generated {
         );
     }
 }
+
+/// [`record_sites`] clears on the way in as well as on the way out.
+#[test]
+fn arming_site_recording_clears_what_the_last_caller_left() {
+    let span = Span::new(ply_span::SourceId(0), 0, 1);
+    record_sites(true);
+    note_update(true, span);
+    assert_eq!(sites().len(), 1, "the update was attributed to its span");
+
+    // The caller panicked here: no disarm ran.
+    record_sites(true);
+    assert!(
+        sites().is_empty(),
+        "arming inherited the last caller's residue: {:?}",
+        sites()
+    );
+    record_sites(false);
+}

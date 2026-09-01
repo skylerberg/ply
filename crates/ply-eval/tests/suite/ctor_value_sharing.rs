@@ -1,31 +1,9 @@
 //! One `Value` per constructor per thread, and what that may not change.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::{Arena, Machine, RegionKind, Value, values_equal};
-use ply_span::{SourceId, Span};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::Span;
 use std::sync::Arc;
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = [(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-    let resolved =
-        resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    let check = check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
 
 /// `twice` mentions one nullary constructor twice and `boxes` mentions one constructor of arity 1
 /// twice, each in a fresh position, so a list of two holds what two separate mentions evaluated to.
@@ -62,7 +40,7 @@ fn pair(value: &Value) -> (&Value, &Value) {
 
 #[test]
 fn two_mentions_of_a_nullary_constructor_are_one_value() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let answered = answered(&c, "m.twice");
     {
         let (first, second) = pair(&answered);
@@ -79,7 +57,7 @@ fn two_mentions_of_a_nullary_constructor_are_one_value() {
 
 #[test]
 fn two_mentions_of_a_constructor_of_arity_one_are_one_closure() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let answered = answered(&c, "m.boxes");
     {
         let (first, second) = pair(&answered);
@@ -97,7 +75,7 @@ fn two_mentions_of_a_constructor_of_arity_one_are_one_closure() {
 /// equal to one built here.
 #[test]
 fn a_shared_constructor_still_matches_and_still_compares_equal() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     assert_eq!(
         answered(&c, "m.ranked"),
         Value::Int(3),
@@ -119,7 +97,7 @@ fn a_shared_constructor_still_matches_and_still_compares_equal() {
 /// something a region reclaims.
 #[test]
 fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let shared = answered(&c, "m.twice");
     let (held, _) = pair(&shared);
     let held = held.clone();
@@ -147,7 +125,7 @@ fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
 /// Sharing the *function* a constructor of arity >= 1 evaluates to may not share what it builds.
 #[test]
 fn applying_one_shared_constructor_twice_builds_two_values() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let answered = answered(&c, "m.built");
     {
         let (first, second) = pair(&answered);
@@ -173,7 +151,7 @@ fn applying_one_shared_constructor_twice_builds_two_values() {
 /// where that is load-bearing.
 #[test]
 fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let fresh = Value::ctor("m.Red", Vec::new());
     let answered = answered(&c, "m.twice");
     {

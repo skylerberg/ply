@@ -13,6 +13,15 @@ pub const MUL: &str = "(*)";
 pub const DIV: &str = "(/)";
 pub const REM: &str = "(%)";
 pub const CONCAT: &str = "(++)";
+/// The bit operators, uninterpreted: seven symbols, because `-1 >> 1` and `-1 >>> 1` differ and one
+/// symbol would prove them equal by congruence.
+pub const BIT_AND: &str = "(&)";
+pub const BIT_OR: &str = "(|)";
+pub const BIT_XOR: &str = "(^)";
+pub const BIT_NOT: &str = "(~)";
+pub const SHL: &str = "(<<)";
+pub const SHR: &str = "(>>)";
+pub const USHR: &str = "(>>>)";
 /// The ordered comparisons, uninterpreted.
 pub const LT: &str = "(<)";
 pub const LE: &str = "(<=)";

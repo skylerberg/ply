@@ -342,7 +342,10 @@ mod tests {
         };
         let mut fields = BTreeMap::new();
         fields.insert(Symbol::new("saved"), inner);
-        let value = Value::list(vec![Value::Int(0), Value::Record(Arc::new(fields))]);
+        let value = Value::list(vec![
+            Value::Int(0),
+            Value::Record(Arc::new(fields.into_iter().collect())),
+        ]);
 
         let found = carries(&value).expect("the record carries it");
         assert_eq!(

@@ -14,7 +14,7 @@
 # `crates/ply-std/src/lib.rs` `include_str!`s all eight stdlib modules into the
 # binary, so editing one changes what `import std.http` means and moves no
 # `.rs` at all. A round-1 workstream published a headline count taken through
-# that hole, and ADR 0020 §0 opens with an ADR nearly lost to the same class.
+# that hole, and the self-hosting spike opens with a measurement nearly lost to the same class.
 #
 # Three instruments, cheapest first.
 #

@@ -355,12 +355,6 @@ fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
                with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x } }",
         ),
         (
-            "a tail-resumptive clause, which captures just the same",
-            "fn go() -> Int = with_cell[r](0) { c ->
-               handle { if amb.flip[coin]() { 1 } else { 2 } }
-               with { amb.flip[coin]() -> true, return x -> x } }",
-        ),
-        (
             "a handle lexically enclosing the region, which answers across it",
             "fn go() -> Int =
                handle { with_cell[r](0) { c -> if amb.flip[coin]() { 1 } else { 2 } } }

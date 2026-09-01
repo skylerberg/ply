@@ -81,8 +81,11 @@ moved; each later one compares a rechecked interface against the stored one and
 admits the callers of only those that differ. It terminates because the recheck
 set only grows. Only the final wave's output escapes — an intermediate wave can
 hand a caller a stale interface and report a diagnostic a from-scratch check
-would not, so a wave that restored any interface and then failed is thrown away
-and re-run restoring none. A type error therefore costs two checks.
+would not, so a wave that restored any interface and then failed **gives up the
+interfaces the files it blamed were checked against.** A type error therefore
+costs a second check of what the erroring file calls. Giving up the whole cache
+is also correct and is what this did first; narrowing it to the blamed files'
+callees is what keeps a mistyped expression from re-inferring the program.
 
 **The invariant that decides every ambiguous case: a missing entry, an absent
 fingerprint or a wave that cannot tell means recheck.**

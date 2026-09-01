@@ -18,8 +18,70 @@ pub enum Own {
     Owned,
 }
 
+/// Whether the sequence S4's probe is armed, read once per process. Off by default: it is a probe
+/// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
+/// do not arm it in anything being timed.
+pub fn probe_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "params")
+    })
+}
+
+/// Whether the probe's *carry-site* half is armed — the `App` and `Record` per-argument releases,
+/// as against the statement-level parameter releases [`probe_armed`] gates.
+pub fn probe_carries() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "carry")
+    })
+}
+
+/// [`carry`], minus the bindings the sub-expression just started is the last reader of.
+pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env {
+    if !remaining {
+        return Env::empty();
+    }
+    // Empty means "hold what you hold today": lowering only asks for a narrowing where the
+    // sub-expression appends, because the window costs a link per name kept.
+    if !probe_carries() || live.is_empty() {
+        return env.clone();
+    }
+    env.keep_only(live)
+}
+
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
+/// Counters for the slot rewrite's capture-against-carry census. Diagnostics only.
+pub mod census4 {
+    use std::cell::Cell;
+    thread_local! {
+        pub static CARRIES: Cell<u64> = const { Cell::new(0) };
+        pub static CAPTURES: Cell<u64> = const { Cell::new(0) };
+        pub static CAPTURED_FRAMES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn carry() {
+        let _ = CARRIES.try_with(|c| c.set(c.get() + 1));
+    }
+    pub fn capture(frames: u64) {
+        let _ = CAPTURES.try_with(|c| c.set(c.get() + 1));
+        let _ = CAPTURED_FRAMES.try_with(|c| c.set(c.get() + frames));
+    }
+    pub fn read() -> (u64, u64, u64) {
+        (
+            CARRIES.try_with(|c| c.get()).unwrap_or(0),
+            CAPTURES.try_with(|c| c.get()).unwrap_or(0),
+            CAPTURED_FRAMES.try_with(|c| c.get()).unwrap_or(0),
+        )
+    }
+    pub fn reset() {
+        let _ = CARRIES.try_with(|c| c.set(0));
+        let _ = CAPTURES.try_with(|c| c.set(0));
+        let _ = CAPTURED_FRAMES.try_with(|c| c.set(0));
+    }
+}
+
 pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
+    census4::carry();
     if remaining { env.clone() } else { Env::empty() }
 }
 
@@ -51,6 +113,15 @@ pub struct Stats {
     pub updates: u64,
     /// Updates that rewrote the value rather than copying it.
     pub updates_in_place: u64,
+    /// Elements copied by the updates that did not rewrite in place.
+    ///
+    /// The boolean above answers "did this append copy the whole list", which is the right question
+    /// only while a copy is all-or-nothing. Under a chunked representation an append that cannot
+    /// rewrite copies a path rather than an array, so the boolean would read `false` for something
+    /// costing O(log n) and the rate would be uniformly bad while the program got faster. This
+    /// counts what was actually copied, which is the question that survives the representation —
+    /// the bounded worst case.
+    pub elements_copied: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
 }
@@ -85,6 +156,7 @@ thread_local! {
         takes_moved: 0,
         updates: 0,
         updates_in_place: 0,
+        elements_copied: 0,
         cycles: 0,
     }) };
     static CYCLES: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
@@ -117,12 +189,11 @@ impl SiteCount {
     }
 }
 
-/// Arms or disarms per-site attribution of [`Stats::updates`].
+/// Arms or disarms per-site attribution of [`Stats::updates`], clearing the map
+/// in both directions so a measurement starts empty whatever ran before it.
 pub fn record_sites(on: bool) {
     let _ = RECORDING.try_with(|c| c.set(on));
-    if !on {
-        let _ = SITES.try_with(|c| c.borrow_mut().clear());
-    }
+    let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
 /// What each `push` site has done since [`record_sites`] armed it.
@@ -157,9 +228,15 @@ pub(crate) fn note_take(moved: bool) {
 }
 
 pub(crate) fn note_update(in_place: bool, span: Span) {
+    note_update_of(in_place, 0, span);
+}
+
+/// [`note_update`], with the number of elements the update had to copy.
+pub(crate) fn note_update_of(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
         s.updates += 1;
         s.updates_in_place += u64::from(in_place);
+        s.elements_copied += copied as u64;
     });
     if RECORDING.try_with(Cell::get).unwrap_or(false) {
         let _ = SITES.try_with(|c| {
@@ -245,6 +322,9 @@ pub struct Live {
     /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
     /// holding every name bound anywhere inside it.
     ownable: Vec<Vec<Symbol>>,
+    /// How many leading names of each `ownable` frame are that barrier's own
+    /// **parameters**, which [`Live::barrier_params`] hands back.
+    params: Vec<usize>,
 }
 
 impl Live {
@@ -252,6 +332,23 @@ impl Live {
         Live {
             later: Vec::new(),
             ownable: vec![ownable],
+            params: vec![0],
+        }
+    }
+
+    /// The current barrier's parameters — the sequence S3 / the ownership design P2.
+    pub fn barrier_params(&self) -> &[Symbol] {
+        match (self.ownable.last(), self.params.last()) {
+            (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
+            _ => &[],
+        }
+    }
+
+    /// Declares that the first `count` names of the current barrier's frame are
+    /// its parameters. Called once, immediately after the frame is opened.
+    pub fn params_are(&mut self, count: usize) {
+        if let Some(last) = self.params.last_mut() {
+            *last = count;
         }
     }
 
@@ -281,6 +378,13 @@ impl Live {
         self.ownable
             .last()
             .is_some_and(|scope| scope.iter().any(|n| n == name))
+    }
+
+    /// Whether this name is a binding of the current barrier — [`Live::tracked`]
+    /// in public form, for the the sequence S4 probe, which may only release a
+    /// name whose last use this body can bound.
+    pub fn is_ownable(&self, name: &Symbol) -> bool {
+        self.tracked(name)
     }
 
     pub fn is_live(&self, name: &Symbol) -> bool {
@@ -325,18 +429,23 @@ impl Live {
     /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
     pub fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
         self.ownable.push(bound);
+        self.params.push(0);
         std::mem::take(&mut self.later)
     }
 
     /// Closes a barrier.
-    pub fn close(&mut self, outer: Vec<Symbol>) {
+    /// Closes a barrier, answering its **free variables** — the names still live inside it, which
+    /// are exactly what a closure over it has to keep.
+    pub fn close(&mut self, outer: Vec<Symbol>) -> Vec<Symbol> {
         let free = std::mem::replace(&mut self.later, outer);
         self.ownable.pop();
-        for name in free {
-            if !self.is_live(&name) {
-                self.later.push(name);
+        self.params.pop();
+        for name in &free {
+            if !self.is_live(name) {
+                self.later.push(name.clone());
             }
         }
+        free
     }
 
     /// Counts the bindings a scope introduces, for the naive `drop` denominator.

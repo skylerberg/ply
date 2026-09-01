@@ -8,9 +8,9 @@
 #
 # `measure-multiplier.sh` took (P-Z)/(L-Z) and nothing else. This adds the two
 # things that file's own §H5 caveat says are missing: the *dump* term, so that
-# ADR 0020 §6.1's ~17,000 tokens/s can be re-taken in the probe shape it was
+# the self-hosting spike's ~17,000 tokens/s can be re-taken in the probe shape it was
 # originally taken in rather than a different one, and the Rust front end, so
-# that ADR 0020 §8's "not a clean single-sitting figure" stops being true.
+# that the self-hosting spike's "not a clean single-sitting figure" stops being true.
 #
 # Five probes per file, five project directories each holding the same six
 # modules so module typechecking is identical and cancels in every difference:
@@ -18,7 +18,7 @@
 #   Z   bytes_len(source())                     start, typecheck, the literal
 #   L   len(lexer::lex(source()).toks)          and the lexer
 #   P   len(items::parse(source()).node.items)  and the parser
-#   LD  string_len(lexer::dump(source()))       lexer + its dump  (ADR 0020 §6.1's shape)
+#   LD  string_len(lexer::dump(source()))       lexer + its dump  (the self-hosting spike's shape)
 #   PD  string_len(items::dump(source()))       parser + the tree dump
 #
 # Minimum user CPU over N runs, N=5 where one run is under 2 s and N=3

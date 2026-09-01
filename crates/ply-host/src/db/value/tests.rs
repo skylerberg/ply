@@ -65,13 +65,16 @@ fn a_param_the_declaration_does_not_have_is_ply_s_fault() {
 fn a_statement_is_its_sql_field_and_nothing_else() {
     let mut fields = BTreeMap::new();
     fields.insert(Symbol::new("sql"), Value::str("select 1"));
-    let stmt = Value::Record(Arc::new(fields));
+    let stmt = Value::Record(Arc::new(fields.into_iter().collect()));
     assert_eq!(statement(&stmt, Span::DUMMY).expect("decodes"), "select 1");
 
     assert_eq!(
-        statement(&Value::Record(Arc::new(BTreeMap::new())), Span::DUMMY)
-            .expect_err("no `sql`")
-            .code,
+        statement(
+            &Value::Record(Arc::new(ply_eval::Fields::default())),
+            Span::DUMMY
+        )
+        .expect_err("no `sql`")
+        .code,
         codes::INTERNAL_ERROR
     );
     assert_eq!(

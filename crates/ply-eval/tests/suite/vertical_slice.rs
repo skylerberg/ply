@@ -1,10 +1,6 @@
 //! Exercises the contract entry point on real source: parse, resolve, check, evaluate.
 
-use ply_core::{CheckOutput, check_program};
-use ply_eval::Machine;
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use crate::fixture::Compiled;
 
 const SOURCE: &str = r#"
 effect db {
@@ -31,36 +27,8 @@ test "a failing assertion is reported, not swallowed" {
 }
 "#;
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-impl Compiled {
-    fn new(files: &[(&str, &str)]) -> Compiled {
-        let inputs: Vec<_> = files
-            .iter()
-            .enumerate()
-            .map(|(i, (name, text))| (SourceId(i as u32), ModuleName::from_dotted(name), *text))
-            .collect();
-        let mut program = ply_syntax::parse_program(inputs).expect("the sample should parse");
-        let resolved = resolve(&mut program).expect("the sample should resolve");
-        let check = check_program(&program, &resolved).expect("the sample should typecheck");
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-}
-
 fn single() -> Compiled {
-    Compiled::new(&[("m", SOURCE)])
+    Compiled::modules(&[("m", SOURCE)])
 }
 
 #[test]
@@ -90,7 +58,7 @@ fn a_failing_test_yields_an_assertion_diagnostic() {
 /// module and spell the effect differently.
 #[test]
 fn a_handler_discharges_an_effect_declared_in_another_module() {
-    let compiled = Compiled::new(&[
+    let compiled = Compiled::modules(&[
         (
             "store",
             "pub effect db {\n  read get[r](key: Int) -> Int\n}\n\
@@ -125,7 +93,7 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
 /// still mean what they meant where the `handle` was written.
 #[test]
 fn a_handler_clause_body_resolves_where_the_handler_was_written() {
-    let compiled = Compiled::new(&[
+    let compiled = Compiled::modules(&[
         (
             "store",
             "pub effect db {\n  read all[t]() -> Int\n}\n\
@@ -156,7 +124,7 @@ fn a_handler_clause_body_resolves_where_the_handler_was_written() {
 /// wrong, so each definition has to reach its own.
 #[test]
 fn same_named_definitions_in_two_modules_do_not_collide() {
-    let compiled = Compiled::new(&[
+    let compiled = Compiled::modules(&[
         (
             "alpha",
             "pub fn answer() -> Int = 1\npub fn wrapped() -> Int = answer()\n",
@@ -188,7 +156,7 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
 /// a value built by one must not match the other's pattern.
 #[test]
 fn constructors_from_two_modules_are_distinct_values() {
-    let compiled = Compiled::new(&[
+    let compiled = Compiled::modules(&[
         (
             "alpha",
             "pub type A = Wrapped(Int)\npub fn make() -> A = Wrapped(1)\n",

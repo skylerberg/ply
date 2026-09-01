@@ -1,7 +1,7 @@
 //! The real one: `net` over loopback TCP, plaintext or TLS.
 
-use super::pool::{Done, Pool};
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
+use crate::pool::{Done, NET_FIRST_TOKEN, Pool};
 use crate::tls::{self, Credentials, Handshakes};
 use ply_core::ty::Resource;
 use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
@@ -112,7 +112,7 @@ impl TcpHost {
                 open: Mutex::new(BTreeMap::new()),
                 handles: Handles::new(),
             }),
-            pool: Pool::new(),
+            pool: Pool::new(NET_FIRST_TOKEN),
             credentials,
             handshakes: Arc::new(Handshakes::default()),
             stopping: Arc::new(AtomicBool::new(false)),

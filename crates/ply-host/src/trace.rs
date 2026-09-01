@@ -403,7 +403,7 @@ fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
     let mut fields = BTreeMap::new();
     fields.insert(ID.clone(), ply_eval::Value::Int(id));
     fields.insert(CHANNEL.clone(), ply_eval::Value::str(spans::label(channel)));
-    ply_eval::Value::Record(Arc::new(fields))
+    ply_eval::Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
 /// A poisoned lock here holds a span table whose invariant is "innermost last", which a thread that
