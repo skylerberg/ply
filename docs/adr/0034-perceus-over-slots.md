@@ -415,7 +415,20 @@ two by 2.29× against 1.46×, which is not a shape. Counting bytes separates the
 1.37×** per doubling — the 4×-against-2× signature — and at n = 2,000 by 64 MB against 412 KB.
 `accumulator_shape::a_quadratic_accumulator_grows_faster_than_a_linear_one` is that test, and it
 asks a question `imbl` can answer: a chunked append that copies a path instead of an array moves the
-quadratic ratio toward the linear one, which is visible where a boolean is not. So S5's remaining prerequisite is those assertions moving from "did this
+quadratic ratio toward the linear one, which is visible where a boolean is not.
+
+**That is one site of forty-five, and counting them changes what S5 is.** The copy counters are read
+**45 times across 8 files** — 16 of them in `ownership_checker_oracle`, 9 in
+`stdlib_accumulator_cost`, 7 in `ownership_checker_armed`. The whole ownership-checking edifice is
+built on "did this append copy the whole list", including `costs.rs`'s own oracle, which judges the
+checker's verdicts against exactly that counter.
+
+So S5 is not a representation change with an instrument problem attached. **It is an instrument
+change with a representation change attached**, and the instrument half is the larger one: the
+checker's notion of a correct verdict has to be restated in a quantity that survives, before the
+representation it describes can move. This ADR has called S5 "ready" or "mechanical" more than once
+and it has not been either time; the number above is why, and it is recorded so the next reader does
+not have to find it the same way. So S5's remaining prerequisite is those assertions moving from "did this
 append copy" to "what did this append allocate", and that is a change to what the record
 *guarantees* about reuse rather than to how it measures it. It is the last thing standing between
 the pricing in §10.1 and the swap.
@@ -660,7 +673,8 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4c** | clause and `return` bodies copy in their free variables rather than extending the prompt scope | done, behind the probe — removes §4.1's addressing obstacle |
 | **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
 | **S5a** | the append counter measures volume, not a boolean | done — necessary, and not sufficient: see §5 |
-| **S5b** | the shape assertion moves from "did it copy" to "what did it move" | done — **bytes**, not allocation count; see §5 |
+| **S5b** | the shape assertion moves from "did it copy" to "what did it move" | done — **bytes**, not allocation count; see §5. One of the sites, not all of them |
+| **S5c** | the other 44 references to the copy counters | **not started**, and it is the larger half of S5 |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
