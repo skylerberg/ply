@@ -3,7 +3,7 @@
 
 use super::*;
 use ply_eval::sched::{Policy, ROOT, Resumption, Turn};
-use ply_eval::{Continuation, Env, HostRegistry, Pending, Prompt, Stack, TaskId, Value};
+use ply_eval::{Continuation, HostRegistry, Pending, Prompt, Stack, TaskId, Value};
 use ply_span::SourceId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -16,11 +16,12 @@ fn suspended() -> Continuation {
         clauses: std::rc::Rc::new(Vec::new()),
         effects: std::rc::Rc::new(Vec::new()),
         ret: None,
-        env: Env::empty(),
+        clause_captures: Vec::new(),
+        ret_captures: std::rc::Rc::from(Vec::new()),
         module: 0,
         span: Span::DUMMY,
     });
-    Stack::new().push_prompt(prompt).capture(1, 0).0
+    Stack::new().push_prompt(prompt, 0).capture(1, 0).0
 }
 
 #[derive(Default)]

@@ -406,7 +406,6 @@ mod tests {
     use crate::argv;
     use crate::build::*;
     use crate::differential::compare_answers;
-    use crate::env::Env;
     use crate::limit::DEFAULT_MAX_CALLS;
     use crate::machine::Machine;
     use crate::value::Fields;
@@ -819,7 +818,7 @@ mod tests {
             kind: ClosureKind::Fn {
                 params: vec![Symbol::new("x")],
                 body: Arc::new(body),
-                env: Env::empty(),
+                bindings: Vec::new(),
                 module: 0,
             },
         }));
@@ -872,12 +871,16 @@ mod tests {
     /// A `Code` closure built by hand, so [`admit`] can be asked about a body the machine would not
     /// otherwise hand it: an anonymous one, or one under a name no definition publishes.
     fn code_closure(name: Option<&str>, params: &[&str], body: Expr) -> Closure {
+        let params: Vec<Symbol> = params.iter().copied().map(Symbol::new).collect();
+        let lowered = crate::code::lower_fn(&params, &body);
         Closure {
             name: name.map(Symbol::new),
             kind: ClosureKind::Code {
-                params: Rc::new(params.iter().copied().map(Symbol::new).collect()),
-                body: crate::code::lower(&body),
-                env: Env::empty(),
+                params: Rc::new(params),
+                size: lowered.size,
+                body: lowered.code,
+                captures: crate::code::no_captures(),
+                captured: Rc::from(Vec::new()),
                 module: 0,
             },
         }
@@ -917,7 +920,7 @@ mod tests {
             kind: ClosureKind::Fn {
                 params: vec![Symbol::new("x")],
                 body: Arc::new(bin(BinOp::Mul, var("x"), int(2))),
-                env: Env::empty(),
+                bindings: Vec::new(),
                 module: 0,
             },
         };

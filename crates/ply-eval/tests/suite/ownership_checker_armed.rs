@@ -108,25 +108,28 @@ fn only_site(p: &Program1) -> (Verdict, String, rc::SiteCount) {
     (said[0].1, said[0].2.clone(), ran[0].1)
 }
 
-/// `push` at argument 0 of 3: the enclosing call's frame carries the scope for the whole of the
-/// append, so the accumulator is at two owners and the whole array is copied on every iteration.
-const QUADRATIC: &str = r#"
-fn grow(acc: List<Int>, i: Int, n: Int) -> List<Int> =
-  if i >= n { acc } else { grow(push(acc, i), i + 1, n) }
+/// The binding is read again after the append — a genuine second owner, which is what is left of
+/// "copies" now that position decides nothing: the clone that later read forces is the owner.
+const COPIES_BY_SECOND_READ: &str = r#"
+fn grow(acc: List<Int>, i: Int, n: Int) -> List<Int> = {
+  let next = push(acc, i);
+  if len(acc) > n { acc } else if i >= n { next } else { grow(next, i + 1, n) }
+}
 
-test "a growing accumulator in a non-last argument position" {
-  assert_eq(len(grow([], 0, 60)), 60)
+test "a growing accumulator read again after the append" {
+  assert_eq(len(grow([], 0, 60)), 61)
 }
 "#;
 
-/// The identical loop with the append moved into last position, which the ownership design measures at
-/// 200 of 200 in place.
-const LINEAR_BY_POSITION: &str = r#"
-fn grow(i: Int, n: Int, acc: List<Int>) -> List<Int> =
-  if i >= n { acc } else { grow(i + 1, n, push(acc, i)) }
+/// The spelling that was this file's *pessimal* control on the chain machine: the append in a
+/// non-last argument position. Under ADR 0034's slot frames a last use moves the value out of its
+/// slot wherever it sits, so this is now the linear control — which is the whole of what changed.
+const LINEAR_BY_LAST_USE: &str = r#"
+fn grow(acc: List<Int>, i: Int, n: Int) -> List<Int> =
+  if i >= n { acc } else { grow(push(acc, i), i + 1, n) }
 
-test "a growing accumulator in last argument position" {
-  assert_eq(len(grow(0, 60, [])), 60)
+test "a growing accumulator at its last use" {
+  assert_eq(len(grow([], 0, 60)), 60)
 }
 "#;
 
@@ -217,13 +220,13 @@ fn the_same_loop_over_a_list_it_built_itself_is_not_flagged() {
 }
 
 #[test]
-fn a_quadratic_append_is_flagged_and_the_counters_confirm_it() {
-    let p = inline(QUADRATIC);
+fn an_append_whose_binding_is_read_again_is_flagged_and_the_counters_confirm_it() {
+    let p = inline(COPIES_BY_SECOND_READ);
     let (verdict, reason, count) = only_site(&p);
-    println!("quadratic: {verdict:?} — {reason}\n  {count:?}");
+    println!("read again: {verdict:?} — {reason}\n  {count:?}");
     assert_eq!(
         count.in_place, 0,
-        "the control is not quadratic after all: {count:?}, so this test arms nothing"
+        "the control is not copying after all: {count:?}, so this test arms nothing"
     );
     assert!(
         count.copies >= 50,
@@ -236,13 +239,17 @@ fn a_quadratic_append_is_flagged_and_the_counters_confirm_it() {
          {} iterations — reason given: {reason}",
         count.copies
     );
+    assert!(
+        reason.contains("read again"),
+        "the verdict is `Copies`, but not for the later read's reason: {reason}"
+    );
 }
 
 #[test]
-fn the_same_loop_in_last_position_is_not_flagged_and_the_counters_confirm_it() {
-    let p = inline(LINEAR_BY_POSITION);
+fn the_same_loop_at_its_last_use_is_not_flagged_and_the_counters_confirm_it() {
+    let p = inline(LINEAR_BY_LAST_USE);
     let (verdict, reason, count) = only_site(&p);
-    println!("linear by position: {verdict:?} — {reason}\n  {count:?}");
+    println!("linear by last use: {verdict:?} — {reason}\n  {count:?}");
     assert_eq!(
         count.copies, 0,
         "the control is not linear after all: {count:?}, so this test arms nothing"
@@ -279,12 +286,12 @@ fn a_fold_accumulator_is_not_flagged_and_the_counters_confirm_it() {
     );
 }
 
-/// The pair, stated as one assertion: two programs that compute the same answer and differ only in
-/// argument order must get **different** verdicts.
+/// The pair, stated as one assertion: two loops that differ only in whether the binding is read
+/// again after the append must get **different** verdicts.
 #[test]
 fn the_two_shapes_get_different_verdicts_which_is_what_a_constant_answer_cannot_do() {
-    let (slow, _, slow_count) = only_site(&inline(QUADRATIC));
-    let (fast, _, fast_count) = only_site(&inline(LINEAR_BY_POSITION));
+    let (slow, _, slow_count) = only_site(&inline(COPIES_BY_SECOND_READ));
+    let (fast, _, fast_count) = only_site(&inline(LINEAR_BY_LAST_USE));
     assert_ne!(
         slow_count.rate(),
         fast_count.rate(),
@@ -292,7 +299,7 @@ fn the_two_shapes_get_different_verdicts_which_is_what_a_constant_answer_cannot_
     );
     assert_ne!(
         slow, fast,
-        "the checker gave one answer to a quadratic loop and to the same loop \
-         written linearly; it is a constant and agreement with any corpus is vacuous"
+        "the checker gave one answer to a copying loop and to the same loop whose \
+         append is the last use; it is a constant and agreement with any corpus is vacuous"
     );
 }

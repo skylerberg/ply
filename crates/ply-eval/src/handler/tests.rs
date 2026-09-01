@@ -2,117 +2,22 @@
 
 use super::*;
 use crate::build;
-use crate::code::{Node, NodeKind, Stmt};
-use crate::machine::{Machine, Progress};
+use crate::build::{
+    bin, block, boolean, call, callv, discard, if_, int, lam, letv, list, unit, var,
+};
+use crate::machine::Machine;
 use ply_span::{SourceId, Symbol};
-use ply_syntax::ast::{BinOp, Ident, Item, Lit, Mode, Pattern, PatternKind, QName};
+use ply_syntax::ast::{BinOp, Expr, HandleClause, Item, Mode};
 
-// Building lowered code directly.
+// The programs are built as AST and lowered by the real lowering, so every variable occurrence
+// gets the slot the machine will read.
 
 fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
 }
 
-fn node(kind: NodeKind) -> Code {
-    Rc::new(Node {
-        kind,
-        span: sp(),
-        own: crate::rc::Own::Borrowed,
-    })
-}
-
-fn lit(l: Lit) -> Code {
-    let value = crate::semantics::literal(&l);
-    node(NodeKind::Lit(l, value))
-}
-
-fn int(i: i64) -> Code {
-    lit(Lit::Int(i))
-}
-
-fn boolean(b: bool) -> Code {
-    lit(Lit::Bool(b))
-}
-
-fn unit() -> Code {
-    lit(Lit::Unit)
-}
-
-fn var(name: &str) -> Code {
-    node(NodeKind::Var(QName::bare(Ident::new(name, sp()))))
-}
-
-fn bin(op: BinOp, lhs: Code, rhs: Code) -> Code {
-    node(NodeKind::Binary { op, lhs, rhs })
-}
-
-fn if_(cond: Code, then_branch: Code, else_branch: Code) -> Code {
-    node(NodeKind::If {
-        cond,
-        then_branch,
-        else_branch,
-    })
-}
-
-fn call(func: Code, args: Vec<Code>) -> Code {
-    node(NodeKind::App {
-        func,
-        args: Rc::new(args),
-        dead: Rc::new(Vec::new()),
-    })
-}
-
-fn callv(name: &str, args: Vec<Code>) -> Code {
-    call(var(name), args)
-}
-
-fn lam(params: &[&str], body: Code) -> Code {
-    node(NodeKind::Lambda {
-        params: Rc::new(params.iter().map(|p| Symbol::new(*p)).collect()),
-        body,
-        free: None,
-    })
-}
-
-fn list(items: Vec<Code>) -> Code {
-    node(NodeKind::List {
-        items: Rc::new(items),
-    })
-}
-
-fn block(stmts: Vec<Stmt>, tail: Option<Code>) -> Code {
-    node(NodeKind::Block {
-        stmts: Rc::new(stmts),
-        tail,
-    })
-}
-
-fn letv(name: &str, value: Code) -> Stmt {
-    Stmt::Let {
-        pat: Pattern {
-            kind: PatternKind::Var(Ident::new(name, sp())),
-            span: sp(),
-        },
-        value,
-        span: sp(),
-        dead: crate::rc::no_dead(),
-    }
-}
-
-fn discard(value: Code) -> Stmt {
-    Stmt::Expr {
-        code: value,
-        dead: crate::rc::no_dead(),
-    }
-}
-
-fn perform_(effect: &str, op: &str, resource: Option<&str>, args: Vec<Code>) -> Code {
-    node(NodeKind::Perform {
-        effect: QName::bare(Ident::new(effect, sp())),
-        op: Symbol::new(op),
-        resource: resource.map(Symbol::new),
-        args: Rc::new(args),
-    })
+fn perform_(effect: &str, op: &str, resource: Option<&str>, args: Vec<Expr>) -> Expr {
+    build::perform(effect, op, resource, args)
 }
 
 fn clause_(
@@ -121,49 +26,30 @@ fn clause_(
     resource: Option<&str>,
     params: &[&str],
     resume: Option<&str>,
-    body: Code,
-) -> Clause {
-    Clause {
-        effect: QName::bare(Ident::new(effect, sp())),
-        op: Symbol::new(op),
-        resource: resource.map(Symbol::new),
-        params: Rc::new(params.iter().map(|p| Symbol::new(*p)).collect()),
-        resume: resume.map(Symbol::new),
-        body,
-        span: sp(),
-        free: None,
+    body: Expr,
+) -> HandleClause {
+    match resume {
+        Some(k) => build::general_clause(effect, op, resource, params, k, body),
+        None => build::clause(effect, op, resource, params, body),
     }
 }
 
-fn handle_(body: Code, clauses: Vec<Clause>, ret: Option<(&str, Code)>) -> Code {
-    node(NodeKind::Handle {
-        body,
-        clauses: Rc::new(clauses),
-        ret: ret.map(|(binder, body)| {
-            Rc::new(ReturnArm {
-                binder: Symbol::new(binder),
-                body,
-                span: sp(),
-                free: None,
-            })
-        }),
-    })
+fn handle_(body: Expr, clauses: Vec<HandleClause>, ret: Option<(&str, Expr)>) -> Expr {
+    match ret {
+        Some((binder, ret)) => build::handle_ret(body, clauses, binder, ret),
+        None => build::handle(body, clauses),
+    }
 }
 
-fn with_cell_(resource: &str, init: Code, binder: &str, body: Code) -> Code {
-    node(NodeKind::WithCell {
-        resource: Symbol::new(resource),
-        init,
-        binder: Symbol::new(binder),
-        body,
-    })
+fn with_cell_(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
+    build::with_cell(resource, init, binder, body)
 }
 
-fn cell_get(cell: Code) -> Code {
+fn cell_get(cell: Expr) -> Expr {
     callv("cell_get", vec![cell])
 }
 
-fn cell_set(cell: Code, value: Code) -> Code {
+fn cell_set(cell: Expr, value: Expr) -> Expr {
     callv("cell_set", vec![cell, value])
 }
 
@@ -175,21 +61,14 @@ struct Outcome {
     cells: Vec<Value>,
 }
 
-fn run(code: &Code) -> Outcome {
-    run_in(Vec::new(), code)
+fn run(e: &Expr) -> Outcome {
+    run_in(Vec::new(), e)
 }
 
-fn run_in(items: Vec<Item>, code: &Code) -> Outcome {
+fn run_in(items: Vec<Item>, e: &Expr) -> Outcome {
     let (program, resolved) = build::standalone(items);
     let mut machine = Machine::for_program(&program, &resolved);
-    machine.go_eval(code.clone(), Env::empty(), 0);
-    let result = loop {
-        match machine.step() {
-            Ok(Progress::Running) => {}
-            Ok(Progress::Halted(v)) => break Ok(v),
-            Err(d) => break Err(d),
-        }
-    };
+    let result = machine.eval_expr_for_test(e);
     Outcome {
         result,
         cells: machine.cells().slots().map(|(_, v)| v.clone()).collect(),

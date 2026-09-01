@@ -79,17 +79,21 @@ fn a_binding_whose_last_use_follows_the_capture_survives_a_second_resumption() {
     let before = rc::stats();
     passes(MOVE_OUT, "a binding whose last use follows the capture");
     let moved = rc::stats().takes_moved - before.takes_moved;
+    // Eight, accounted for under ADR 0034's slot frames — the tripwire fired when the frames
+    // landed and this is the answer to its "find out which" instruction. Per resumption (×2):
+    // `b` at the `if`, `big` at the taken branch's `len`, and the `return` clause's `x` — all
+    // three read from the resumption's *own restored copy* of the captured window, which is what
+    // makes a move inside a captured extent sound: the capture snapshots the slots, every
+    // resumption restores a fresh clone, and the machine's emptied slot is never re-read. Plus
+    // `k`'s second application in the clause, and `out` at the assertion. On the chain machine
+    // the count was 2 (`b` and `out`) because a pending frame's clone of the scope made every
+    // link shared and `take_unique` refused.
     assert_eq!(
-        moved, 2,
-        "this probe moved {moved} bindings out of their scope rather than the 2 it moves today. \
-         The two are not `big`: `big` is read inside a captured extent, and `take_unique` refuses \
-         there because the continuation shares the link.\n\n\
-         This pin exists because the program's own `assert_eq` cannot arm itself on the chain — a \
-         continuation holds an immutable copy and nothing can empty it, so the assertion passes \
-         whatever the implementation does. The count is the mechanism, and it is a tripwire rather \
-         than a proof: if it moves under ADR 0034's slot frames, find out *which* binding started moving \
-         before deciding the change is right, because a last use inside a captured extent is not a \
-         last use"
+        moved, 8,
+        "this probe moved {moved} bindings out of their slots rather than the 8 it moves under \
+         slot frames. The breakdown above is the pin; if it moves, find out *which* binding \
+         changed before deciding the change is right — a last use inside a captured extent is \
+         only sound against a restored copy"
     );
 }
 

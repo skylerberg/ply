@@ -369,11 +369,10 @@ fn print_table(rows: &[(Pair, Measured)]) {
 }
 
 /// **the gate G1.** Two spellings of one computation cost the same.
+///
+/// Red on the chain machine and armed by having been seen red there; green since ADR 0034's slot
+/// frames, which is the claim the rewrite was gated on. The pin below holds the per-pair counts.
 #[test]
-#[ignore = "the gate G1: red until slot frames land, and armed by having been \
-            shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
-            Run it with `cargo test -p ply-eval --test suite position_invariance -- --ignored \
-            --nocapture`."]
 fn the_same_computation_costs_the_same_in_either_order() {
     let c = Criteria::default();
     let rows = measure_corpus(&c);
@@ -507,22 +506,21 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
     print_table(&rows);
 
     // `(in place, total, sites)` for the canonical member and then the pessimal
-    // one, measured on this tree 2026-08-31. Every pair reads 200 of 200
-    // against 0 of 200 over one append site: the gap is 1.000 and G1's bar is
-    // 0.02.
+    // one, under ADR 0034's slot frames. Every pair reads 200 of 200 on both
+    // sides: a last use moves the value out of its slot wherever it sits, so
+    // position decides nothing — including the record-field pair, whose
+    // pessimal member needs the field-granular move. On the chain machine every
+    // pessimal member read 0 of 200, which is the cliff this rewrite deletes.
     let expected: [Row; EXPECTED_PAIRS] = [
-        ("call argument", (200, 200, 1), (0, 200, 1)),
-        ("record field", (200, 200, 1), (0, 200, 1)),
+        ("call argument", (200, 200, 1), (200, 200, 1)),
+        ("record field", (200, 200, 1), (200, 200, 1)),
         (
             "compounding: field last, record first",
             (200, 200, 1),
-            (0, 200, 1),
+            (200, 200, 1),
         ),
-        // `(200, 200, 1)` under `PLY_the slot rewrite_PROBE=1`, which is the ownership design's P2: a parameter may
-        // then appear in a `Dead` set. Off by default, because P2 costs more allocations on the
-        // request path than it saves there — the sequence S3 — so this pin is the default tree's.
-        ("let binding against parameter", (200, 200, 1), (0, 200, 1)),
-        ("fold closure accumulator", (200, 200, 1), (0, 200, 1)),
+        ("let binding against parameter", (200, 200, 1), (200, 200, 1)),
+        ("fold closure accumulator", (200, 200, 1), (200, 200, 1)),
     ];
 
     let got: Vec<Row> = rows

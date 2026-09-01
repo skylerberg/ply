@@ -269,18 +269,31 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             Some(handle)
         }),
 
-        Value::Closure(closure) => grow(|| match &closure.kind {
-            ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
-            ClosureKind::Fn { env, .. } | ClosureKind::Code { env, .. } => {
-                env.bindings().find_map(|(bound, v)| {
+        Value::Closure(closure) => grow(|| {
+            let named = |bound: &ply_span::Symbol, route: &mut Vec<String>, handle| {
+                let what = match &closure.name {
+                    Some(n) => format!("`{bound}`, captured by `{n}`"),
+                    None => format!("`{bound}`, captured by a closure"),
+                };
+                route.push(what);
+                Some(handle)
+            };
+            match &closure.kind {
+                ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
+                ClosureKind::Fn { bindings, .. } => bindings.iter().find_map(|(bound, v)| {
                     let handle = find(v, route)?;
-                    let what = match &closure.name {
-                        Some(n) => format!("`{bound}`, captured by `{n}`"),
-                        None => format!("`{bound}`, captured by a closure"),
-                    };
-                    route.push(what);
-                    Some(handle)
-                })
+                    named(bound, route, handle)
+                }),
+                ClosureKind::Code {
+                    captures, captured, ..
+                } => captures
+                    .names
+                    .iter()
+                    .zip(captured.iter())
+                    .find_map(|(bound, v)| {
+                        let handle = find(v, route)?;
+                        named(bound, route, handle)
+                    }),
             }
         }),
     }
@@ -397,13 +410,13 @@ mod tests {
     /// assembled directly.
     #[test]
     fn a_closure_whose_scope_reaches_a_handle_is_found_and_the_binding_named() {
-        use crate::env::Env;
         use crate::value::Closure;
         use ply_syntax::ast::{Expr, ExprKind, Lit};
 
-        let env = Env::empty()
-            .bind(Symbol::new("c"), cell())
-            .bind(Symbol::new("n"), Value::Int(1));
+        let bindings = vec![
+            (Symbol::new("n"), Value::Int(1)),
+            (Symbol::new("c"), cell()),
+        ];
         let closure = Value::Closure(Arc::new(Closure {
             name: Some(Symbol::new("m.later")),
             kind: ClosureKind::Fn {
@@ -412,7 +425,7 @@ mod tests {
                     kind: ExprKind::Lit(Lit::Int(0)),
                     span: Span::DUMMY,
                 }),
-                env,
+                bindings,
                 module: 0,
             },
         }));
