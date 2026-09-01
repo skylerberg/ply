@@ -867,9 +867,9 @@ mod tests {
     use crate::builtins::Builtin;
 
     /// [`Analysis::walk_callback`] reads the callback out of the **last** argument, which is true
-    /// of all six and is not a rule the type system enforces.
+    /// of all eight and is not a rule the type system enforces.
     #[test]
-    fn the_callback_builtins_are_the_six_this_module_knows() {
+    fn the_callback_builtins_are_the_eight_this_module_knows() {
         let mut names: Vec<&str> = Builtin::all()
             .iter()
             .filter(|b| b.higher_order())
@@ -880,11 +880,13 @@ mod tests {
             names,
             [
                 "bytes_position",
+                "cell_update",
                 "filter",
                 "fold",
                 "iterate",
                 "map",
-                "map_fold"
+                "map_fold",
+                "map_update"
             ],
             "a callback builtin was added or removed; `walk_callback` reads the function out of \
              the last argument and has to be checked against the new one"

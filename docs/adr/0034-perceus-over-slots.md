@@ -515,6 +515,13 @@ offset from the top, never an absolute index — which is what lets a multi-shot
 resumption splice `Rc`-shared segments onto any stack at any height with no
 frame rewritten.
 
+Also done since: the fused `cell_update` and `map_update` builtins ADR 0024
+specified, which the cost report's `cell` and `map` causes name as the fix and
+which nothing implemented until then. They establish sole ownership at runtime
+— the contents leave the arena, or the entry leaves the map, for the length of
+the function — so the largest residue the checker reports is one an author can
+remove with a one-line edit.
+
 Next: **the other forty-four references to the copy counters, which is the
 larger half** of the representation change. Then the chunked vector, then
 reuse, then the checked promise.

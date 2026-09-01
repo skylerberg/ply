@@ -443,7 +443,8 @@ Requirements:
   `(row(body) \ handled) ∪ ⋃ row(clause_i)`.
 - `with_cell[r](init) { c -> body }` binds `c : Cell<T>` and discharges
   `cell.read[r]` / `cell.write[r]` from the body's row. `cell_get` / `cell_set`
-  are prelude builtins that perform those atoms.
+  are prelude builtins that perform those atoms, and `cell_update` performs both
+  (plus its function's row).
 - `with_region[r] { body }` (ADR 0017) opens a lexical allocation scope
   branded `r` and discharges the same two atoms at *its* boundary. A
   `with_cell[r]` written under a region of that name allocates **into** it: the
@@ -1018,15 +1019,15 @@ impl<'a> Interp<'a> {
 - An unhandled `Perform` at runtime is `UNHANDLED_EFFECT`. Inference should have
   ruled this out; it is a bug-catcher, not a user-facing path.
 - Recursion depth must be bounded and produce a diagnostic, not a stack overflow.
-- **A loop is not a recursion.** `map`, `filter`, `fold`, `iterate`, `map_fold`
-  and `bytes_position` are driven by a step protocol — `Step::Apply` answered by
+- **A loop is not a recursion.** `map`, `filter`, `fold`, `iterate`, `map_fold`,
+  `bytes_position`, `cell_update` and `map_update` are driven by a step protocol — `Step::Apply` answered by
   a `Frame` the machine pushes and pops — so each costs **depth 1** however many
   rounds it runs. A driver that nested would make the bound a function of how a
   loop is spelled, which is the defect ADR 0005 removed tail-call elision to
   prevent. ADR 0022.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `list_at`, `map`,
   `filter`, `fold`, `iterate`, `range`, `int_to_string`, `string_concat`,
-  `cell_get`, `cell_set`, `panic`, `wrap_add`, `wrap_sub`, `wrap_mul`,
+  `cell_get`, `cell_set`, `cell_update`, `panic`, `wrap_add`, `wrap_sub`, `wrap_mul`,
   `byte_of_int`, plus the `Bytes` and text builtins in the host-boundary section
   below.
   The three `wrap_*` are the only arithmetic in the language that cannot raise;
@@ -1673,10 +1674,11 @@ teardown falls back to the allocator instead of aborting a worker.
 ### `ply-eval::cont` — landed
 
 ```rust
-pub enum Frame { .. }                // 26 kinds as shipped; the ADR's table
+pub enum Frame { .. }                // 28 kinds as shipped; the ADR's table
                                      // describes the 20 M6 landed. Added since:
                                      // `CloseRegion` (ADR 0017), the
-                                     // `MapFoldStep` / `BytesPositionStep`
+                                     // `MapFoldStep` / `BytesPositionStep` /
+                                     // `CellUpdateStep` / `MapUpdateStep`
                                      // builtin steps, and ADR 0034's window
                                      // bookkeeping, `Exit` and `Restore`.
 pub struct Prompt {
@@ -4664,6 +4666,7 @@ All pure except `map_fold`; every `k` carries `derivable(ord, k)`.
 | --- | --- |
 | `map_new` | `() -> Map<k, v>` |
 | `map_insert` | `(Map<k, v>, k, v) -> Map<k, v>` |
+| `map_update` | `(Map<k, v>, k, (v) -> v / e) -> Map<k, v> / e` |
 | `map_get` | `(Map<k, v>, k) -> Option<v>` |
 | `map_contains` | `(Map<k, v>, k) -> Bool` |
 | `map_remove` | `(Map<k, v>, k) -> Map<k, v>` |

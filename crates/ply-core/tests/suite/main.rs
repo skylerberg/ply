@@ -13,6 +13,7 @@ mod byte_builtins;
 mod derivation;
 mod effect_sets;
 mod effect_sets_audit;
+mod fused_update_builtins;
 mod iterate_builtin;
 mod list_builtins;
 mod map_keys;
