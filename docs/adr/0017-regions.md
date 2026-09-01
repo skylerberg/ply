@@ -262,7 +262,7 @@ type is declared, so no type after the constructor mentions `log`. Refusing it
 would need the brand to survive a nominal declaration, which is the rank-2
 machinery ADR 0005 §"Alternatives" rejected. It is recorded here as the one
 route that is open, and it is what
-`crates/ply-eval/tests/region_isolation_audit.rs` now attacks the region stack
+`crates/ply-eval/tests/suite/region_isolation_audit.rs` now attacks the region stack
 with — layer 2 of that file, "a cell smuggled out of its region through every
 carrier the language has, and a continuation resumed after the region that made
 it returned".
@@ -295,8 +295,8 @@ where a wrong answer would be discovered late and expensively.
 > for that cell. Since this ADR's governing property is that program meaning does
 > not change, ADR 0005 wins and this section is rewritten to say so. The
 > discriminating programs are landed in
-> `crates/ply-eval/tests/region_meaning_audit.rs` and
-> `crates/ply-eval/tests/resumption_semantics_audit.rs`.
+> `crates/ply-eval/tests/suite/region_meaning_audit.rs` and
+> `crates/ply-eval/tests/suite/resumption_semantics_audit.rs`.
 
 **State is threaded, exactly as ADR 0005 §3 says.** There is one current state at
 every point of an execution and it moves forward; capture does not save it and
@@ -666,8 +666,8 @@ and mutated in place, or by W4's transaction-and-rollback pattern.
    green whatever it did to meaning.
 
    The oracle for "meaning did not move" is therefore not `--engine both`. It is
-   `crates/ply-eval/tests/region_meaning_audit.rs` and
-   `crates/ply-eval/tests/resumption_semantics_audit.rs`: programs whose answer
+   `crates/ply-eval/tests/suite/region_meaning_audit.rs` and
+   `crates/ply-eval/tests/suite/resumption_semantics_audit.rs`: programs whose answer
    *differs* between the two candidate readings, with the expected integer
    written down. `--engine both` remains worth running and remains weak
    evidence here.
@@ -732,7 +732,7 @@ Where this could go wrong, in order of how hard it would be to see:
   > accept a hand-written `unique` this section requires it to refuse. Closed by
   > `region_kind::Analysis::locals`; the answer is pinned for a parameter, a
   > `let`, a `match` binder, a lambda parameter and a callback argument by
-  > `crates/ply-eval/tests/hoist_staleness_audit.rs`'s
+  > `crates/ply-eval/tests/suite/hoist_staleness_audit.rs`'s
   > `a_local_shadowing_a_definitions_name_is_still_a_local` and
   > `a_declared_unique_over_a_local_shadowing_a_definition_is_refused`. The
   > census the module comment publishes did not move —

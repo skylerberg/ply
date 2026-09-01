@@ -293,7 +293,7 @@ whole-list copy per record however either is written.
 > lesson "avoid `push`" is not available — `push` is the language's sole list
 > primitive and `trace.ply`'s own `cons` is written out of it. Last position is
 > **necessary and not sufficient**, and on the tree-walker it buys nothing.
-> `crates/ply-eval/tests/stdlib_accumulator_cost.rs` asserts both halves.
+> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts both halves.
 **`bytes_slice` and `bytes_split` copy.** `Value::Bytes` is `Arc<[u8]>` with no
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.
@@ -308,7 +308,7 @@ speed: the tree-walker is 2.82x faster on the request path.
 > counting, so every `push` copies its list whatever position it is written in,
 > where the machine rewrites in place. Encoding a string of k escapes through
 > `std.json`, the machine grows linearly and the tree-walker quadratically.
-> `crates/ply-eval/tests/stdlib_accumulator_cost.rs` asserts both halves.
+> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts both halves.
 
 **`--backend` makes it three runs.** `ply test --backend <spec>` attaches a
 compiled backend, and under `--engine both` that backend is a third engine,
@@ -435,7 +435,7 @@ drifted — the ones that say something about what the language does rather than
 about how many tests exist.
 
 A few tests are marked `ignored`. They are timing benchmarks you run on purpose
-rather than gates — the ones in `ply-corpus --test http_cost` and
+rather than gates — the ones in `ply-corpus`'s `http_cost` tests and
 `interp::tests::a_cached_mention_against_the_allocation_it_replaces` in
 `ply-eval`'s lib tests — plus one doc-test, which is not a benchmark. Each
 benchmark prints the command that runs it. `docs/ONBOARDING.md` §2 has the wall

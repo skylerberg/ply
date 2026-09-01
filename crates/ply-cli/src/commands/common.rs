@@ -292,7 +292,7 @@ pub struct Counted<T> {
 /// about the program. `interp.rs` calls nothing in `ply_eval::rc` — no `carry`,
 /// no `Env::take_unique` — so it never moves a value out of a scope, and every
 /// `push` whose list is read from a binding copies. The linear and the
-/// quadratic program of `tests/refcount_counters.rs` read 0.995 and 0.0 on the
+/// quadratic program of `tests/suite/refcount_counters.rs` read 0.995 and 0.0 on the
 /// machine and **both read 0.0** on the tree-walker, so a reader comparing them
 /// there learns nothing and a reader who did not notice the engine learns
 /// something false. `updates` and `updates_in_place` stay: those are counts of

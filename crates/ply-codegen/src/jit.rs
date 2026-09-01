@@ -25,7 +25,7 @@
 //! because `ply_eval::Machine` enters this code and believes what it returns.
 //! What stops it is the same mechanism — [`Denotes::Uncompiled`] refuses the
 //! caller at compile time, so the compiled set is closed under calls — and
-//! `crates/ply-codegen/tests/fragment.rs`'s
+//! `crates/ply-codegen/tests/suite/fragment.rs`'s
 //! `the_compiled_set_is_closed_under_calls` is what checks it by compiling the
 //! fixpoint's answer a second time and asserting it refuses nothing.
 

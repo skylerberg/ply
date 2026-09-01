@@ -486,7 +486,7 @@ W1's footprint check, the paragraph above still stands on its own.
 A reader cannot tell an asserted invariant from an observation. Say which:
 
 > Selecting zero deterministic tests after a rename is an invariant the suite
-> asserts — `crates/ply-cli/tests/cli.rs:145
+> asserts — `crates/ply-cli/tests/suite/cli.rs:145
 > renaming_a_definition_re_runs_nothing` — not a heuristic.
 
 That sentence is checkable in one grep. "The rename path is safe" is not.
@@ -661,7 +661,7 @@ original ones and the gaps are where closures used to be.
     registered, raised nowhere. Consequence is small and worth knowing — a
     consumer reading `Assertion::kind` to tell a runaway recursion from a failed
     `assert_eq` cannot, and the four tests that do tell them apart
-    (`ply-cli/tests/failure_classification_audit.rs`, `ply-test/tests/hybrid.rs`,
+    (`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test/tests/suite/hybrid.rs`,
     `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) all match the rendered
     string instead. `limit.rs`'s doc is corrected in place; the code gap is
     **not** fixed, because deciding whether the fix is to construct the variant
@@ -684,7 +684,7 @@ original ones and the gaps are where closures used to be.
     slice is the fifth "declared, registered, raised nowhere" this file records;
     §"The shape it keeps taking" counts them.
     `ply_test::SliceBuilder` is constructed in exactly one place in the
-    workspace — `crates/ply-test/tests/bisect_audit.rs`, four times, all tests —
+    workspace — `crates/ply-test/tests/suite/bisect_audit.rs`, four times, all tests —
     and `grep -rn 'Event::Perform' --include=*.rs` matches only `slice.rs`'s own
     `match` arm and its own unit test. `Attribution::slice` starts `None`
     (`ply-test/src/lib.rs:305`) and its only writer is

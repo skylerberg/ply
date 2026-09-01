@@ -9,7 +9,7 @@
 > | --- | --- | --- | --- |
 > | `cluster::available()` | `crates/ply-host/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
 > | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
-> | `#![cfg(unix)]` | `crates/ply-cli/tests/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
+> | `#![cfg(unix)]` | `crates/ply-cli/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
 > | its own `[workspace]` | `crates/ply-codegen-spike/Cargo.toml` | always, under `cargo test --workspace` | no |
 > | `PLY_TEST_DB` | `crates/ply-host/src/db/pool/tests.rs:25` | the variable is unset | **no — nothing is printed at all, on either stream** |
 >
@@ -387,7 +387,7 @@ ambient is what the previous eight milestones exist to remove.
   read; a `--config-schema` verified at start-up so a missing credential is a
   refusal rather than a 3am 500 — a `required` key nothing supplies is `E0441`
   before anything is bound (`crates/ply-cli/src/config.rs`, asserted by
-  `crates/ply-cli/tests/config_cli.rs:265`). *This line used to read "verified
+  `crates/ply-cli/tests/suite/config_cli.rs:265`). *This line used to read "verified
   at start-up, exactly as W4 verifies a database schema". The comparison was
   wrong in the direction that flatters: `--config-schema` really is verified,
   and `--db-schema` is not — it evaluates the program's `Schema` function and
@@ -596,9 +596,9 @@ own terms:
 `with_cell` allocated through the arena, and no region ever closed. The gap was
 found by a benchmark rather than by a report, which is stated in the tests that
 now exist to prevent its recurrence —
-`crates/ply-eval/tests/cell_arena_wiring.rs:5` ("R1 built the allocator and
+`crates/ply-eval/tests/suite/cell_arena_wiring.rs:5` ("R1 built the allocator and
 connected nothing, and a benchmark rather than a report is what found that out")
-and `crates/ply-eval/tests/region_wiring_audit.rs:6`. R1's own tests were green
+and `crates/ply-eval/tests/suite/region_wiring_audit.rs:6`. R1's own tests were green
 throughout, because every one of them attacked the allocator or the analysis
 directly and none asked whether an engine had ever called either.
 
@@ -612,7 +612,7 @@ test, and snapshot-at-capture answers `1` for that cell. Since ADR 0017's
 governing property is that program meaning does not change, ADR 0005 won and §3
 was rewritten to say so. The retraction is in the ADR rather than hidden by a
 deletion, and the discriminating programs are landed in
-`crates/ply-eval/tests/region_meaning_audit.rs` and
+`crates/ply-eval/tests/suite/region_meaning_audit.rs` and
 `resumption_semantics_audit.rs`.
 
 ## R2 — the wiring, and the first real free
@@ -630,7 +630,7 @@ R2 put R1's machinery on the evaluation path and deleted what it replaced:
   is a node in `ply_syntax::ast`, in `ply_eval::code`, and in both engines
   (`machine.rs:992`, `interp.rs:422`)
 - **The close is a real free**, deferred by an `Arena::pin` when a capture can
-  still reach the slots — which is why `crates/ply-eval/tests/use_after_free_audit.rs`
+  still reach the slots — which is why `crates/ply-eval/tests/suite/use_after_free_audit.rs`
   exists: before R2 a region's memory was never handed back, so an escape the
   checks missed was harmless. R2 makes the same escape this language's first
   possible use-after-free, and every program in that file is written to produce
@@ -712,8 +712,8 @@ hoisted both — the region-kind analysis and the lowered bodies are now scoped 
 the *program*, so an engine built next over the same program is handed the answer
 instead of recomputing it (`Machine::share_region_kinds`,
 `Machine::share_lowering`; the new tests are
-`ply-eval/tests/region_kind_sharing.rs`, `ply-eval/tests/lowering_sharing.rs` and
-`ply-corpus/tests/region_kind_hoisted.rs`).
+`ply-eval/tests/suite/region_kind_sharing.rs`, `ply-eval/tests/lowering_sharing.rs` and
+`ply-corpus/tests/suite/region_kind_hoisted.rs`).
 
 R3 did **not** do unboxing, evidence passing or codegen. Those were the planned
 next milestone, and the premise under them is the one that had just failed.
@@ -727,7 +727,7 @@ lowering was on the request path, and it is not re-takeable now whether it ever
 was. The region-kind half of that run is different: its cost was one whole-program
 traversal per `Machine`, both harnesses build a `Machine` per call, and the
 before-and-after pair is written down in
-`crates/ply-corpus/tests/region_kind_hoisted.rs`'s header — which says in the
+`crates/ply-corpus/tests/suite/region_kind_hoisted.rs`'s header — which says in the
 same breath that only the *after* half of it is re-takeable from this tree. What
 R3 can show is where both families are now, and it is zero per request for both.
 
@@ -881,16 +881,16 @@ Re-run rather than assumed. Every row is a command whose output was read.
 | postgres transactions commit and roll back | `examples/same-tests.sh`: **29 requests byte for byte identical**, committed 201 with orders 3→4, rolled back 409 with the sequence still consumed |
 | `Store::open` under 5 ms at 10,000 definitions | **1.79 ms** over 4,841 results, 9,821 definitions seen |
 | simulation seed rate | **5,331–7,107 seeds/s** over 5 trials on a `--concurrent-tests` corpus; every exploration exhaustive, 54 interleavings after reduction from ≥4,096 (`ply-corpus sim`). That a seeded replay is *exact* is asserted by the suite, not by this row |
-| the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval/tests/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
+| the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval/tests/suite/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
 
 The remaining invariants are asserted by the suite rather than re-run by hand,
 and each has a name to grep for rather than a claim to take:
-`ply-hash/tests/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
-`ply-cli/tests/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
-`ply-test/tests/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
-`ply-eval/tests/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
+`ply-hash/tests/suite/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
+`ply-cli/tests/suite/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
+`ply-test/tests/suite/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
+`ply-eval/tests/suite/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
 effect in a `det` test —
-`ply-cli/tests/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
+`ply-cli/tests/suite/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
 runs `ply test --json` on a two-line project and asserts exit code 2 with
 `diagnostics[0].code == "E0412"`. The suite is green above, which is what makes
 those citations rather than promises.
@@ -941,7 +941,7 @@ What that does **not** license is ripping regions out. Two things the region
 track bought are measured and are not in dispute. The **escape discipline** is a
 safety property, not an allocation claim: the arena is what made a use-after-free
 constructible in this language at all, and the brand is what refuses it at
-compile time (`crates/ply-eval/tests/use_after_free_audit.rs`). And the **arena
+compile time (`crates/ply-eval/tests/suite/use_after_free_audit.rs`). And the **arena
 beats the persistent map it replaced**, re-taken here with
 `cargo test -p ply-eval --release --test region_arena_cost -- --nocapture`, which
 prints for 10,000 cells:
@@ -1276,7 +1276,7 @@ the deletability of the spike, the falsification table's reproducibility, and th
 > ```
 >
 > Crossover measured at depth 9,990: k = 90 passes, k = 100 raises.
-> `crates/ply-eval/tests/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
+> `crates/ply-eval/tests/suite/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
 > therefore holds only below that ratio — both its programs pend two frames a
 > level — and its name and doc claimed the general statement.
 >

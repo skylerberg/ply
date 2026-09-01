@@ -643,7 +643,7 @@ impl<'a> Machine<'a> {
     /// > The second bullet stands unchanged and is now checked rather than
     /// > stated: `--engine both --backend wrong:off-by-one` is caught by two
     /// > tests on the value axis, and six of the other seven configurations are
-    /// > caught too. `crates/ply-cli/tests/backend.rs` names the eighth.
+    /// > caught too. `crates/ply-cli/tests/suite/backend.rs` names the eighth.
     ///
     /// [`Compiled`]: crate::Compiled
     pub fn set_compiled(&mut self, compiled: Rc<dyn crate::Compiled>) {

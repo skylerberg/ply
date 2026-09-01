@@ -131,7 +131,7 @@ is randomized execution and never reaches `lower` at all. The cost is to
 > ```
 >
 > **This argument is now gated rather than only argued.**
-> `crates/ply-cli/tests/tiers.rs::a_total_index_reaches_property_where_a_raising_one_is_a_gap`
+> `crates/ply-cli/tests/suite/tiers.rs::a_total_index_reaches_property_where_a_raising_one_is_a_gap`
 > runs the two laws above as one module and asserts both halves — `property` for
 > the `list_at` arm, `Unattempted(Gap::Raised)` for the `bytes_at` control — so
 > a `list_at` that quietly began raising is a red test rather than a paragraph
@@ -321,7 +321,7 @@ overstated it (corrected 2026-08-30 on review, which ran the other
 corruption).** `builtins::call` reads `b.arity()` on every call
 (`builtins.rs:558`; `region_kind.rs:1086` and `value.rs:169` read it too), so an
 arity *narrower* than the truth is caught loudly: giving `ListAt` `(1, 1)`
-reddens five of the six tests in `crates/ply-eval/tests/list_builtins.rs`, at
+reddens five of the six tests in `crates/ply-eval/tests/suite/list_builtins.rs`, at
 run time, under the tree-walker. What nothing gates is an arity that is too
 *wide*, because no well-typed call can reach the extra slot to meet it. That is
 exactly the drift the paragraph goes on to describe — `assert` and `range` are

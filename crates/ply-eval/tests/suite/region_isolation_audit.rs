@@ -294,7 +294,7 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
 /// A closure was the last one the region check did not inspect: it looked at the
 /// body's *type*, and a function type hid the cell in its effect row. ADR 0017
 /// §2 closed it, along with the record-of-closures, operation and store routes —
-/// `ply-core/tests/region_escape_audit.rs` is where each is pinned as an error.
+/// `ply-core/tests/suite/region_escape_audit.rs` is where each is pinned as an error.
 /// What is left is a *continuation* parked in an enclosing region's cell: its
 /// row is erased where the variant field's function type is declared, so no type
 /// downstream of the constructor mentions the region. That is ADR 0005 required
