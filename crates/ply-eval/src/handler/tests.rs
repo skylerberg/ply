@@ -70,6 +70,7 @@ fn lam(params: &[&str], body: Code) -> Code {
     node(NodeKind::Lambda {
         params: Rc::new(params.iter().map(|p| Symbol::new(*p)).collect()),
         body,
+        free: Rc::new(Vec::new()),
     })
 }
 

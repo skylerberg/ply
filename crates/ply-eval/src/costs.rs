@@ -695,7 +695,7 @@ impl Walk<'_, '_> {
                 Owner::Fresh
             }
 
-            NodeKind::Lambda { params, body } => {
+            NodeKind::Lambda { params, body, .. } => {
                 self.barrier(params, body, st, &[]);
                 Owner::Fresh
             }
@@ -1141,7 +1141,7 @@ impl Walk<'_, '_> {
     /// A callback written at the call site, entered with the owners the builtin is known to hand it
     /// rather than with the `Unknown` a closure of unknown provenance gets.
     fn walk_callback(&mut self, owners: &[Owner], arg: &Code, st: &mut State) -> Owner {
-        let NodeKind::Lambda { params, body } = &arg.kind else {
+        let NodeKind::Lambda { params, body, .. } = &arg.kind else {
             // Named elsewhere: its body is checked where it is defined.
             let here = st.frontier;
             return self.walk(arg, st, here);
