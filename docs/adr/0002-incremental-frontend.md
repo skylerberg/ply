@@ -123,11 +123,14 @@ missing entry, an absent fingerprint or a wave that cannot tell means recheck.
 Two costs are accepted rather than hidden. An own hash is written in names, so
 renaming a callee moves its callers' own hashes and buys a recheck nothing
 needed — the same trade gate 1 makes when it re-parses a file that was only
-reformatted. And a wave that restored any interface and then failed is thrown
-away and re-run restoring none, because a diagnostic raised against a restored
-interface can be one a from-scratch check would not raise; a type error
-therefore costs two checks, which is the "refusing only ever costs time" side of
-the invariant landing on the edit-and-fix loop.
+reformatted. And a wave that restored any interface and then failed gives up
+the interfaces the files it blamed were checked against, because a diagnostic
+raised against a restored one can be one a from-scratch check would not raise.
+A type error therefore costs a second check of what the erroring file calls,
+which is the "refusing only ever costs time" side of the invariant landing on
+the edit-and-fix loop. Giving up the whole cache instead is correct and was what
+this first did; narrowing it to the blamed files' callees is what keeps a
+mistyped expression from re-inferring the program.
 
 ### The ordering constraint
 
