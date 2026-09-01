@@ -142,10 +142,10 @@ fn search() -> Int =
     assert!(site.through.is_empty(), "the site is written in the region");
 }
 
-/// A tail-resumptive clause captures too — ADR 0005 §1.3 runs `K.capture(n)` for both forms — and
-/// the difference is observable, because the clause writes the region before it resumes.
+/// A tail-resumptive clause captures, and its continuation still cannot outlive the region — ADR
+/// 0033 §8.
 #[test]
-fn a_tail_resumptive_clause_inside_the_region_makes_it_shared() {
+fn a_tail_resumptive_clause_inside_the_region_leaves_it_unique() {
     let src = &format!(
         r#"{AMB}
 fn once() -> Int =
@@ -158,13 +158,10 @@ fn once() -> Int =
     );
     let regions = regions_of(src);
     let r = region(&regions, "trace");
-    assert_eq!(r.kind, RegionKind::Shared);
+    assert_eq!(r.kind, RegionKind::Unique);
     assert!(
-        matches!(
-            &r.capture.as_ref().expect("a site").cause,
-            Cause::TailClause { .. }
-        ),
-        "{:?}",
+        r.capture.is_none(),
+        "a tail-resumptive clause is not a capture that outlives the region: {:?}",
         r.capture
     );
 }

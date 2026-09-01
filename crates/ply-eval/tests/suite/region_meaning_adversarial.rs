@@ -718,3 +718,36 @@ test "the trace cell ends at two, every time" {
             .unwrap_or_else(|d| panic!("run {run} must answer as run 0 did: {d:#?}"));
     }
 }
+
+/// A tail-resumptive clause writing the cell of the region that encloses its own
+/// handler — the shape ADR 0032 §8 moved from `shared` to `unique`.
+///
+/// This is shape 1 of the three above, aimed at the change that made it
+/// reachable. The clause writes `c` before each of its two resumptions and the
+/// body reads it back afterwards, so the continuation reads region-allocated
+/// state that a truncating close would have handed away. `2` is what the
+/// threaded world answers, and ADR 0005 §3 is why a kind may not move it.
+#[test]
+fn a_tail_resumptive_clause_writing_its_own_region_still_threads() {
+    holds(
+        r#"
+effect amb { read flip[coin]() -> Bool }
+
+fn twice() -> Int =
+  with_cell[trace](0) { c ->
+    handle { { let a = amb.flip[coin](); let b = amb.flip[coin](); cell_get(c) } } with {
+      amb.flip[coin]() -> { cell_set(c, cell_get(c) + 1); true },
+      return x -> x } }
+
+fn nested() -> Int =
+  with_cell[outer](0) { o ->
+    with_cell[inner](0) { i ->
+      handle { { let a = amb.flip[coin](); cell_get(o) * 10 + cell_get(i) } } with {
+        amb.flip[coin]() -> { cell_set(o, 7); cell_set(i, 3); true },
+        return x -> x } } }
+
+test "the write is threaded through both resumptions" { assert(twice() == 2, None) }
+test "a nested region under the same clause is threaded too" { assert(nested() == 73, None) }
+"#,
+    );
+}

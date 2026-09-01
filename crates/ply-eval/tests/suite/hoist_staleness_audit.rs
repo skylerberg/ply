@@ -126,7 +126,7 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
 
 /// The same question on a tail-resumptive region, which takes no pin.
 #[test]
-fn a_stale_unique_over_a_tail_resumptive_region_does_not_move_the_answer() {
+fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     let pure = Compiled::new(&tail_fixture(TAIL_PURE));
     let tail = Compiled::new(&tail_fixture(TAIL_CAPTURING));
 
@@ -137,7 +137,11 @@ fn a_stale_unique_over_a_tail_resumptive_region_does_not_move_the_answer() {
         Some(RegionKind::Unique),
         "the two fixtures no longer place their region at one span"
     );
-    assert_eq!(tail.machine().region_kind(span), Some(RegionKind::Shared));
+    assert_eq!(
+        tail.machine().region_kind(span),
+        Some(RegionKind::Unique),
+        "ADR 0032 §8: a tail-resumptive clause is not a capture that outlives its region"
+    );
 
     let honest = int(tail.call("m.go"));
     assert_eq!(honest, 12003, "the honest answer moved");
