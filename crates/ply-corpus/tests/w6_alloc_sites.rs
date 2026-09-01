@@ -37,6 +37,9 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<HashMap<String, (usize, usize)>> = RefCell::new(HashMap::new());
+    /// Code address -> the `ply_*` names at it. Written inside the allocator
+    /// under `INSIDE`, so what it allocates is not counted as the program's.
+    static NAMES: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
     static TOTAL: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -70,26 +73,45 @@ static ALLOCATOR: Tracing = Tracing;
 
 /// The nearest few `ply_*` frames, which is the attribution that matters: a
 /// `RawVec::grow` frame names the allocator, not the code that wanted the room.
+///
+/// The resolve is memoised per code address. `tests/r4_value_construction.rs`
+/// carries the reasoning at its own `frames`; the short version is that
+/// `Backtrace::force_capture()` plus `format!("{bt}")` symbolicates the whole
+/// stack, this runs on every allocation, and the set of addresses that
+/// allocate is small and fixed.
 fn site() -> String {
-    let bt = std::backtrace::Backtrace::force_capture();
-    let text = format!("{bt}");
     let mut frames: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let Some(at) = line.find(": ") else { continue };
-        let name = line[at + 2..].trim();
-        if name.starts_with("ply_") && !name.contains("w6_alloc_sites") {
-            let cut = name.rfind("::h").map(|i| &name[..i]).unwrap_or(name);
-            frames.push(cut.to_string());
-            if frames.len() == 3 {
-                break;
-            }
-        }
-    }
+    backtrace::trace(|frame| {
+        frames.extend(named(frame));
+        frames.len() < 3
+    });
+    frames.truncate(3);
     if frames.is_empty() {
         "<no ply frame>".to_string()
     } else {
         frames.join(" < ")
     }
+}
+
+/// The `ply_*` names at one frame, or empty for a frame this file drops. A
+/// `Vec` because one address can carry several inlined frames.
+fn named(frame: &backtrace::Frame) -> Vec<String> {
+    let ip = frame.ip() as usize;
+    if let Some(hit) = NAMES.with(|c| c.borrow().get(&ip).cloned()) {
+        return hit;
+    }
+    let mut found: Vec<String> = Vec::new();
+    backtrace::resolve_frame(frame, |symbol| {
+        let Some(name) = symbol.name() else { return };
+        let name = name.to_string();
+        if !name.starts_with("ply_") || name.contains("w6_alloc_sites") {
+            return;
+        }
+        let cut = name.rfind("::h").map(|i| &name[..i]).unwrap_or(&name);
+        found.push(cut.to_string());
+    });
+    NAMES.with(|c| c.borrow_mut().insert(ip, found.clone()));
+    found
 }
 
 fn repo() -> PathBuf {

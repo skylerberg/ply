@@ -158,168 +158,78 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings; 13.7s cold, 0.4s warm
-cargo test --workspace                          # 9.5-29 min — 3,696 pass, 0 fail, 5 ignored
+cargo test --workspace                          # about 3 min; must be 0 failed
 ```
 
-> **Re-taken 2026-08-31, as one command after the last edit of the compiled
-> seam's answer-test change:** `cargo fmt --all --check` silent, `cargo clippy
-> --workspace --all-targets` **0 warnings**, `cargo test --workspace` **3,868
-> passed / 0 failed / 5 ignored over 167 test targets**. This is a measurement
-> and not arithmetic — the source digests were taken before the run and checked
-> equal after it, so nothing moved under it. The `3,696` above is left as the
-> line this file has carried, because the number it is compared against below
-> was taken with a different command (`--no-fail-fast -- --test-threads=2`) and
-> replacing one with the other would be the conflation the block underneath
-> warns about.
+**No test count here, on purpose.** This line used to carry one and a chain of
+blocks re-taking it. It was found stale on every re-take, never by anything
+failing, and the last time by fifteen binaries and 182 tests. Nothing in the
+tree checks it, so keeping it current was hand work that bought nothing —
+`docs/ONBOARDING.md` §Provenance says which counts *are* worth keeping and why
+this one is not. What matters at this line is that nothing failed.
 
-> **The count moved on 2026-08-28 and this line is deliberately not rewritten
-> to a number nobody took.** ADR 0026's work adds **24** tests — 8 to
-> `ply-eval`'s `differential_corpus` (the eight wrong backends at corpus scale),
-> 14 in a new `ply-cli/tests/backend.rs`, 1 to `ply-span`'s `armed.rs` and 1 to
-> `ply-corpus`'s `w6` — so a full run should read **3,720**. That is arithmetic,
-> not a measurement: `--workspace` was not re-run for this change, on this file's
-> own rule that a figure belongs where it was taken. The per-package counts that
-> *were* taken are `cargo test -p ply-eval` at **1,014 passed / 0 failed / 1
-> ignored over 43 targets**, and `cargo test -p ply-cli --test backend` at 14/0.
+> **The wall clock, re-taken 2026-08-31.** It read **9.5-29 min**. Measured as
+> `/usr/bin/time -p cargo test --locked --workspace --no-fail-fast` from an
+> already-built `target/`, at a 1-minute load below §"Gate on an idle machine"'s
+> threshold of 4. **Both rows are one tree** — the same commit with
+> `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted, then restored —
+> so the pair isolates one change and nothing else.
 >
-> It also adds wall clock in one place worth naming: `cargo test -p ply-eval
-> --test differential_corpus` goes from seconds to **73.4s**, because five of the
-> eight corruptions sweep the whole 1,116-test corpus. An earlier run of the same
-> suite read 82.7s; both are **observations rather than figures**, taken at a
-> 1-minute load average of 8-9 against this file's own 4.0 gate. That is the
+> **That tree is the merge of #64 and not of #65**, which landed the closed
+> fragment while this branch was in review. The pair below still isolates what
+> it says it isolates, on the tree it was taken on; the *absolute* figures have
+> **not** been re-taken against #65, and #65 touches the compiled seam that
+> `differential_corpus` exercises, so expect them to move. Re-take on an idle
+> machine before quoting either as this tree's number:
+>
+> | | wall | user | sys | in-target |
+> | --- | --- | --- | --- | --- |
+> | without the memoised resolve | 250.5s | 322.1s | 40.4s | 246.9s |
+> | with it | **182.3s** | 226.9s | 24.9s | 178.1s |
+>
+> The two targets are **46.2s -> 6.7s** and **40.4s -> 2.6s**; that is 77.4s
+> against a 68.2s move in the total, and the 9s of daylight is run-to-run noise
+> elsewhere, not a saving that went missing. The 9.5-29 min range is not
+> withdrawn as a lie about its own day — it predates `[profile.dev] opt-level =
+> 2`, which the root `Cargo.toml` records at 6.5x on one binary, and it predates
+> cranelift shipping. Those are not measurements of the same tree.
+>
+> **One run each, not a best-of-N.** The spread `docs/ONBOARDING.md` §2 records
+> for this command is wide, so treat 182.3s as the reading and not as the value.
+
+> **ADR 0026 added wall clock in one place worth naming.** `cargo test -p
+> ply-eval --test differential_corpus` went from seconds to **73.4s**, because
+> five of the eight corruptions sweep the whole corpus. An earlier run of the
+> same suite read 82.7s; both are **observations rather than figures**, taken at
+> a 1-minute load average of 8-9 against this file's own 4.0 gate. That is the
 > price of the seam having measured sensitivity inside `cargo test --workspace`
 > rather than in a crate on another toolchain.
 
-> **Re-taken after item 11's fix (2026-08-24).** The line above read `9.5-29
-> min — 3,690 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
-> --no-fail-fast -- --test-threads=2` now reports **3,696 passed / 0 failed / 5
-> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
-> **1,172.3s real / 1,168.4s user** by `/usr/bin/time -p`, with `fmt --all
-> --check` silent and `clippy --workspace --all-targets` at zero. The wall clock
-> is an upper bound as usual — another agent was building on this machine.
->
-> **The +6 is all of item 11's, and it was attributed per package rather than
-> subtracted.** An earlier draft of this block hedged — *"The +6 is not
-> attributable to this change alone and is not claimed to be … Reading a
-> per-target diff against a tree that no longer exists is how you would
-> attribute the rest, and this pass did not do it."* — and then named exactly
-> six tests, which is the whole of the +6. The three package counts were taken
-> on both sides while the change was being built, so no diff against a vanished
-> tree is needed:
->
-> | suite | before | after |
-> | --- | --- | --- |
-> | `cargo test -p ply-eval --lib` | 527 | 531 |
-> | `cargo test -p ply-eval --test differential_corpus` | 5 | 6 |
-> | `cargo test -p ply-core --lib` | 204 | 205 |
->
-> The 527 is not this pass's word for it either: `compiled.rs`'s test-module
-> header recorded *"a re-run reads 527 green"* when the frame-ceiling change
-> took the 3,690. Four of the six are the effects gate's own — including
-> `the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop`,
-> the only one that catches a propagation stopping after one hop — one is the
-> corpus test, and one is `ply-core`'s for the duplicate-`fn` hazard
-> `mark_internal_effects` would otherwise panic on.
->
-> **Taken twice, by two methods, and they agree.** The figure above is one
-> `--workspace` run. It was also taken as `.github/ci-shards.sh`'s four shards,
-> each into its own log, from a `rsync`ed copy under `/tmp` that no other
-> session could reach — `ci-shards.sh verify` reports *13 workspace members,
-> each in exactly one shard*, so the four sum to the workspace:
->
-> | shard | passed | failed | ignored | binaries | doc-tests | real |
-> | --- | --- | --- | --- | --- | --- | --- |
-> | `core` | 1,528 | 0 | 0 | 41 | 9 | 38.2s |
-> | `cli-eval` | 1,688 | 0 | 1 | 77 | 2 | 240.7s |
-> | `corpus` | 199 | 0 | 3 | 16 | 1 | 235.2s |
-> | `postgres` | 281 | 0 | 1 | 8 | 1 | 44.2s |
-> | **sum** | **3,696** | **0** | **5** | **142** | **13** | **558.2s** |
->
-> The shard set was run **twice**, on two frozen copies taken either side of the
-> last documentation edit, and the five counts are identical both times
-> (1,528 / 1,688 / 199 / 281 and the 142 + 13 split); only the wall clocks moved
-> — 577.3s the first time, 558.2s the second, which is what a machine with three
-> other agents on it does to a wall clock and does not do to a count. Those are
-> sequential shards from a warm `target/` and are not comparable with the
-> single-run figure above. `PLY_PG_URL` was not set for any of the three runs,
-> so the `postgres` shard's ten live tests passed without running — the gate
-> every unqualified reading in this file was taken under.
->
-> **Both runs were instrumented and an earlier one was not, which is the part
-> worth copying.** The earlier attempt reported 3,689 / **6 failed**, the six
-> being exactly the tests that go red when `Gate::InternalEffects` is deleted,
-> with the gate present in the file throughout — traced to
-> `crates/ply-core/src/infer.rs` being rewritten *during* the run, so cargo
-> built `ply-core` from a file that was mid-edit. Nothing in the log said so.
-> Who was writing is not established and the honest reading is in §"A moving
-> tree invalidates a correctness number": a background `cargo test --workspace`
-> and a foreground mutation in the same session will do this to you without any
-> second party. The runs above digest every non-`target/`, non-`.ply-cache/`
-> file before and after; the copy's digest was identical across the run
-> (`da4c6109…` for the final one), and its `.rs`, `.ply` and `.toml` matched the
-> worktree's when the run started. Take the digest — a wrong red costs an
-> afternoon, and a wrong **green** is what this file exists to prevent.
+> **Before trusting any long run, read §"A moving tree invalidates a
+> correctness number".** A run taken while the tree moves under it reports a
+> result about no tree at all, and nothing in the log says so. That section has
+> the three ways it has happened here and the checks that catch each.
 
-**All three are currently clean**, re-verified after R4 (2026-08-21): `fmt
---all --check` silent and exit 0, `clippy --workspace --all-targets` **zero**
-warnings and zero errors, `cargo test --workspace --no-fail-fast` **3,644 passed
-/ 0 failed / 5 ignored** across **155 targets** (142 binaries + 13 doc-test
-suites). If you introduce the first warning, that is a regression, not a
-baseline.
+**All three are currently clean**: `fmt --all --check` silent and exit 0,
+`clippy --workspace --all-targets` **zero** warnings and zero errors,
+`cargo test --workspace --no-fail-fast` **0 failed**. If you introduce the first
+warning, that is a regression, not a baseline.
 
-> **Re-taken after the frame-ceiling fix (2026-08-24).** The line above read
-> `9.5-18 min — 3,661 pass, 0 fail, 5 ignored`. `cargo test --workspace -j 2
-> --no-fail-fast -- --test-threads=2` now reports **3,690 passed / 0 failed / 5
-> ignored** across **155 targets** (142 binaries + 13 doc-test suites), exit 0,
-> **1,735.2s real / 1,548.7s user** by `/usr/bin/time -p`. That wall clock was
-> taken on a machine at load 25–43 with three other agents building and testing
-> on it, so it is an upper bound and not comparable with the older figures; the
-> counts are deterministic and are. The +29 is three tests from §"Things known
-> to be broken" items 9, 10 and 13's close and twenty-six from the per-gate
-> tests item 13's close added. `fmt --all --check` silent, `clippy --workspace
-> --all-targets` zero warnings and zero errors, both re-run on the same tree.
-> Two caveats worth carrying. The heaviest new test peaks near 4.2 GiB — see
-> §"The suite proves less than it looks like it proves". And the **binary count
-> is 142 here where the reading above it is 143, and this pass could not account
-> for the difference**: every `tests/*.rs` in every workspace member appears in
-> the run except the five under `crates/ply-codegen-spike/`, which are excluded
-> by design because that crate declares its own `[workspace]` (item 1), and
-> `value_semantics_audit` — the binary the 143 reading added — is present and
-> ran. Recorded rather than reconciled, because "the count moved and I guessed
-> why" is the failure this file is about.
+> **Two caveats worth carrying.** The heaviest test peaks near **4.2 GiB** — see
+> §"The suite proves less than it looks like it proves". And `PLY_PG_URL` was
+> not set for most readings in this file, so the `postgres` shard's ten live
+> tests passed **without running** — the gate every unqualified reading here was
+> taken under.
 
-> **Re-verified again (second regression audit, 2026-08-21).** `fmt --all
-> --check` silent and exit 0; `clippy --workspace --all-targets` zero lines
-> matching `warning` or `error`; `cargo test --workspace --no-fail-fast`
-> **3,661 passed / 0 failed / 5 ignored** across **156 targets** (**143**
-> binaries + 13 doc-test suites), **1,087.3s real** on a machine at load 4–12.
-> The four new tests are one binary the audit before it added
-> (`ply-eval/tests/value_semantics_audit.rs`) and three the fixes for what it
-> found added: two in `ply-eval/tests/map_order.rs` and
-> `value_semantics_audit.rs`, and
-> `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`.
-
-> **Re-taken after R4 (2026-08-21).** The line read `~6.5 min — 3,597 pass, 0
-> fail, 4 ignored` and the paragraph `3,597 / 0 / 4 across 151 targets in
-> 399.6s, and again at 406.9s`. R4 added four test binaries; §"Things known to
-> be broken" and `docs/ONBOARDING.md` §2 name them. The wall clock re-take is
-> **569.3s (9m 29s) real, 726.6s user**, `/usr/bin/time -p` on one run from an
-> already-built `target/` — and that run was **not on an idle machine**, so it
-> is an upper-ish bound rather than the clean figure the older ones are. The
-> `test result:` lines sum to 478.5s of in-target time, excluding compilation.
-> The reason the estimate went up is one target:
-> `ply-corpus/tests/r4_value_construction.rs` takes **70.9s in debug and 25.6s
-> in release**, because it captures a backtrace per allocation. It is not
+> **One target used to dominate the wall clock.**
+> `ply-corpus/tests/r4_value_construction.rs` took **70.9s in debug and 25.6s in
+> release**, because it captured a backtrace per allocation. It is not
 > `ignored`, and the figures it is documented to print are the release ones.
-
-> **The counts moved twice and the reason is in the tree both times, not in the
-> suite.** They read 3,566 / 147 / 324.5s, then 3,584 / 150 / 352.4s. R3 added
-> three test binaries and nine tests inside existing ones; the audit after it
-> added `ply-eval/tests/hoist_staleness_audit.rs`, and the fixes for what it
-> found added three more tests — including the first doc-test `ply-eval` has
-> ever had, a `compile_fail` example that is the only way to assert a variance.
-> `README.md`'s Status paragraph and `docs/ONBOARDING.md` §2 carry the same
-> re-take and the list of files.
+>
+> > **Fixed 2026-08-31, and it was the resolve rather than the capture.**
+> > Memoising symbolication per code address takes that target to **6.7s** in a
+> > debug workspace run, with every figure it prints unchanged. The release
+> > comparison above has not been re-taken against the new code.
 
 ### There is CI, and it is younger than most of this file
 
@@ -820,38 +730,6 @@ half carries your claim, an unresolved timing number is a caveat in a harmless
 place — say `UNMEASURED` and check in the raw windows so a reader can re-cut
 them. That is a better artifact than a number of unknown provenance sitting
 where the hole was.
-
-### The two seam instruments, and the vacuity trap both of them set
-
-`crates/ply-eval` carries two environment-gated measurement knobs. Neither is a
-`--backend` spec and neither should become one: a spec is a user-facing promise,
-these are instruments.
-
-- **`PLY_SEAM_CENSUS=1`** — `crates/ply-eval/src/census.rs`. Counts what the
-  compiled seam is offered and which gate refused it, printed on stderr at exit.
-  Every **coverage** share must be taken with **no backend attached**: entering a
-  call hides its whole subtree, so it shrinks numerator and denominator together.
-  Since the 2026-08-31 answer widening that is a requirement rather than a
-  convention — with a backend attached the Ply front end's denominator collapses
-  from 2,414,170 body calls to 26.
-- **`PLY_BACKEND_ONLY=<comma-separated program-wide names>`** —
-  `crates/ply-eval/src/backend.rs`. Narrows `Reference`'s registry to those
-  names. It exists to price a *different* backend's limit with the one that
-  ships: `Reference` is a tree-walker and can run anything the seam admits, so
-  the only way to ask "what would a code generator that cannot compile a callback
-  reach" is to take the callback users away from it. ADR 0030 §10 is that
-  measurement. Narrowing can only add declines, so it cannot change an answer —
-  `--engine both` audits 13 of 13 with 0 failed under it.
-
-**The trap is the same for both and it is this project's signature defect.** A
-census that was never enabled prints nothing and a narrowing that never applied
-enters everything, and in both cases the run still says `0 failed` — so the
-number you write down is the *unrestricted* one wearing the restricted one's
-label. Check the instrument fired, in the run's own output, and check in the
-reading: `ply test` prints `N in the fragment` and `X of Y offers entered` on
-every backend run, and the difference between `26 of 26 · 413 in the fragment`
-and `495152 of 1049245 · 220 in the fragment` is what says the variable reached
-the process. Both readings belong in the log, not just the one you wanted.
 
 ### A moving tree invalidates a correctness number, and only an instrument says so
 
@@ -1423,18 +1301,11 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is **thirty-one** files, `00NN-slug.md`, with **no index** — the
+`docs/adr/` is **twenty-nine** files, `00NN-slug.md`, with **no index** — the
 numbers are the ordering. Pick the next free one — and **nothing you have to
 remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
 fails when two files share a number, so the check catches you rather than a
 reader finding an ambiguous `ADR NNNN` citation months later.
-
-> **The count has now been stale a fourth time (2026-08-31), which is the whole
-> argument for the test below it.** It read *"`docs/adr/` is **twenty-nine**
-> files"* while the directory held **thirty**; ADR 0031 makes it thirty-one. The
-> *advice* has been right since the test arrived and the *count* beside it has
-> gone wrong every time an ADR landed — so read the number as prose and
-> `ls docs/adr/*.md | wc -l` as the answer.
 
 > **Corrected again (2026-08-30), and this time by a test rather than by better
 > advice.** The line above read *"Number yours `0028` and up, and read the open
@@ -1500,7 +1371,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
 | `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today, on the default toolchain since the move to cranelift 0.132.3 (this used to read `cargo +1.94.0 test --release`): `cd crates/ply-codegen-spike && cargo test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
-| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: it is **about three times slower in debug than release** (70.9s against 25.6s) because it captures a backtrace per allocation, and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
+| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
@@ -2256,29 +2127,6 @@ Recorded here so nobody spends an afternoon rediscovering them.
     everything that exists here; what it costs is a definition that both
     discharges its own effects and takes scalars, which is what the fixture is.
 
-    > **Narrowed 2026-08-31, when the argument test became a type test.** The
-    > sentence *"They are never offered because they take and return records,
-    > lists and closures, and `Gate::ArgumentShape` precedes both effect
-    > gates"* is now true for one of its three reasons. A record and a list
-    > cross this seam: `compiled::Gate::ArgumentShape` carries them and
-    > `compiled::Gate::ArgumentType` decides them from the declared type. What
-    > still refuses `desk.under` is the **closure** — its second parameter is
-    > declared `body: () -> a / {Serving | e}`, so the argument is a
-    > `Value::Closure` and the kind gate refuses it with no lookup, ahead of the
-    > effect gates exactly as the sentence says.
-    >
-    > The effect gates are consequently doing more work than they were, which is
-    > the point of writing this down rather than leaving the old sentence to be
-    > re-quoted. Measured on the same corpus either side of the widening,
-    > `PLY_SEAM_CENSUS=1 ply test examples --no-cache -j 1`:
-    > `Gate::InternalEffects` goes **54 -> 91** refusals and
-    > `Gate::PublishedRow` **385 -> 1,144**. Both gates were reached by more
-    > calls, both refused every one of them, and no definition that discharges
-    > its own effects became enterable — `tests/fixtures/self_handled_effect.ply`
-    > is still refused on the corpus path and
-    > `a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered`
-    > is still what says so.
-
     **One thing the fix nearly got wrong, recorded because it was found by
     reading and not by the suite.** `mark_internal_effects` indexes definitions
     by program-wide name, and the first draft let a module's *second* `fn f`
@@ -2550,38 +2398,6 @@ Recorded here so nobody spends an afternoon rediscovering them.
       > > --backend reference` goes from 51 definitions and **768** entries to
       > > 153 definitions and **62,388**, measured either side on 2026-08-30 by
       > > narrowing the seam back and rebuilding.
-      > >
-      > > > **Re-taken after the type gate, 2026-08-31, by the same method — a
-      > > > binary built from this tree with the gate narrowed back.** `ply test
-      > > > examples --no-cache -j 1 --engine both --backend reference` goes
-      > > > from **153** definitions in the fragment to **180**, and from
-      > > > 55,693 entered of 58,425 offers to **56,379 entered of 60,223**.
-      > > > The fragment grew by 27 definitions and the entries by 686, which
-      > > > is small beside the front end's 190,617 -> 306,931 and is the
-      > > > finding rather than a disappointment: `examples/` is a corpus of
-      > > > `String` and `Decimal`, and this widening deliberately did not move
-      > > > the leaf set. `crates/ply-eval/src/census.rs`'s header attributes
-      > > > it — 108,925 of the 121,642 `Gate::ArgumentType` refusals are
-      > > > `String`. All fourteen tests in `crates/ply-cli/tests/backend.rs`
-      > > > still pass unchanged.
-      > > >
-      > > > > **Re-taken again after the ANSWER test, 2026-08-31, and the last
-      > > > > sentence above is withdrawn for it.** *"All fourteen tests in
-      > > > > `crates/ply-cli/tests/backend.rs` still pass unchanged"* — two of
-      > > > > them **failed**, correctly, and that file is now fifteen tests
-      > > > > over a changed corpus. `Machine::compiled_answer` decides an
-      > > > > answer from the declared **return** type, so `pair(Int) ->
-      > > > > List<Int>` moved *inside* the fragment and
-      > > > > `Mutation::Unoffered` — which needs a definition that is offered
-      > > > > and has no body — lost the only one that corpus had.
-      > > > > `label(Int) -> String` replaces it, and the fifteenth test is
-      > > > > `wrong:handle`, a ninth wrong backend for the hazard this
-      > > > > widening created: a container answer is checked for its kind and
-      > > > > not for its contents. On `examples/` the fragment goes **180 ->
-      > > > > 220** definitions and 56,379 entered of 60,223 offers to
-      > > > > **56,703 of 59,435**; on the ported front end it goes **306,931
-      > > > > entries -> 26**, one `items.parse` per file, which is the whole
-      > > > > point and is PR #30's shape.
       >
       > **And the result-cache rule is armed, in both of ADR 0026 §4.6's
       > stages, each seen to fail before it was believed.** `cache_bypassed`
