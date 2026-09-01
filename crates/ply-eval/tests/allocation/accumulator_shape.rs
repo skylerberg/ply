@@ -32,15 +32,15 @@ fn load(src: &str) -> (Program, Resolved) {
 
 /// Bytes charged to running every test in `src`.
 ///
-/// The machine is built *inside* the measured region on purpose: lowering allocates, and a
-/// comparison between two `n` wants both sides paying the same fixed costs so that what is left is
-/// the accumulator.
+/// The machine is built *outside* the measured region: lowering allocates, and a fixed cost on both
+/// sides of a ratio does not cancel, it flattens the ratio toward one.
 fn bytes(src: &str) -> usize {
     let (program, resolved) = load(src);
+    let mut machine = Machine::for_program(&program, &resolved);
+    let count = machine.test_count();
+    assert!(count > 0, "the probe declares no test");
     let (out, _, bytes) = charge(|| {
-        let mut machine = Machine::for_program(&program, &resolved);
-        let count = machine.test_count();
-        let mut ok = count > 0;
+        let mut ok = true;
         for i in 0..count {
             ok &= machine.eval_test(i).is_ok();
         }
@@ -99,3 +99,11 @@ fn a_quadratic_accumulator_grows_faster_than_a_linear_one() {
          {lin_2k}, which is too close together to be measuring the difference"
     );
 }
+
+// The stdlib accumulators are deliberately not measured here, and ADR 0034 §5 records why: a probe
+// that imports `std.json` charges roughly 11 MB of module-level and memoised work that does not
+// scale with the probe, and two runs of it are not independent — the second is measured against a
+// warm memo and a warm interner. Doubling the subject read 0.98x, and *fell* between k = 500 and
+// k = 1000, which is not a quantity a ratio can be taken of. The synthetic pair above works because
+// both sides pay the same near-zero fixed cost; the stdlib probes need their fixed part subtracted
+// or their accumulator driven directly, and neither is written.
