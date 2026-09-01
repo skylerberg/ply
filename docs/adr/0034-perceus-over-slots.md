@@ -339,10 +339,16 @@ prompt environment underneath. **A flat per-barrier index is therefore not a run
 though `slots.rs` verifies it is internally consistent — the two passes agree with each other and
 disagree with the machine.
 
-Two ways out, and the second is likelier: give every occurrence a `(depth, index)` rather than an
-index, or make a clause body a real frame that copies in the free variables it needs, exactly as a
-closure now does (§11 S4a). The second keeps addressing flat and reuses machinery that already
-exists; the first keeps clause entry cheap. Neither is written.
+Two ways out: give every occurrence a `(depth, index)`, or make a clause body a real frame that
+copies in the free variables it needs, exactly as a closure does. **The second is built** — §11 S4c,
+behind the probe — and it keeps addressing flat. Armed it costs `/health` about 2 allocations a
+request and takes reuse over `examples/` from 67.3% to 68.6%; the soundness suites pass with it on,
+which is the part that mattered, because a clause body that loses a name it reads is `cannot find`
+at the read rather than a slow program.
+
+It is behind the probe rather than on because G2 is a gate and +0.7% is an increase. What it removes
+is the structural obstacle: with it armed a clause body's scope is its own free variables plus its
+parameters, which a flat slot index can address.
 
 **What makes step 3 work is step 1**, and only step 1: a value can be moved out of a slot exactly
 when the slot array has one owner, and the array has one owner exactly when it is the machine's
@@ -621,6 +627,7 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
 | **S4a** | §4's flat closure conversion — a lambda captures its free variables, not the scope | done; +0.6 points of reuse, +2.6 allocations, both marginal |
 | **S4b** | slot resolution at lowering, verified against the names | done — no runtime change; the assignment the rewrite switches to is wrong-checked first |
+| **S4c** | clause and `return` bodies copy in their free variables rather than extending the prompt scope | done, behind the probe — removes §4.1's addressing obstacle |
 | **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |

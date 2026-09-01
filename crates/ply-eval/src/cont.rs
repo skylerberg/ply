@@ -969,6 +969,7 @@ mod tests {
             resume: None,
             body: crate::code::lower(&crate::build::int(0)),
             span: Span::DUMMY,
+            free: None,
         };
         let with = |c: Clause| {
             Rc::new(Prompt {
@@ -1034,6 +1035,7 @@ mod tests {
             resume: None,
             body: crate::code::lower(&crate::build::int(0)),
             span: Span::DUMMY,
+            free: None,
         };
         let inner = s.push_prompt(Rc::new(Prompt {
             clauses: Rc::new(vec![clause]),

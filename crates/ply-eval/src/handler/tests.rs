@@ -70,7 +70,7 @@ fn lam(params: &[&str], body: Code) -> Code {
     node(NodeKind::Lambda {
         params: Rc::new(params.iter().map(|p| Symbol::new(*p)).collect()),
         body,
-        free: Rc::new(Vec::new()),
+        free: None,
     })
 }
 
@@ -131,6 +131,7 @@ fn clause_(
         resume: resume.map(Symbol::new),
         body,
         span: sp(),
+        free: None,
     }
 }
 
@@ -143,6 +144,7 @@ fn handle_(body: Code, clauses: Vec<Clause>, ret: Option<(&str, Code)>) -> Code 
                 binder: Symbol::new(binder),
                 body,
                 span: sp(),
+                free: None,
             })
         }),
     })
