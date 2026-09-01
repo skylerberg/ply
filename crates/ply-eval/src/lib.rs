@@ -32,6 +32,7 @@ pub mod region_kind;
 pub mod sched;
 mod semantics;
 pub mod sim;
+pub mod slots;
 pub mod task_regions;
 pub mod trace;
 mod value;
