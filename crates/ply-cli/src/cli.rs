@@ -275,6 +275,11 @@ pub struct CheckArgs {
     #[arg(long)]
     pub types: bool,
 
+    /// Print, for every `push`, whether it grows its list in place or copies
+    /// it, and what would remove the copy.
+    #[arg(long)]
+    pub costs: bool,
+
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,

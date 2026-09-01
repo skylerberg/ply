@@ -53,14 +53,21 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     if args.explain {
         print_explain(&loaded, style);
     }
-    if args.types {
+    if args.types || args.costs {
         // Only now, so that `print_explain` above still reports the gates as they actually fired.
-        if args.explain
+        // `--costs` needs every AST either way: a module gate 1 skipped has no lowered `Code`, so a
+        // partial parse would report an append-free program rather than an unanswered one.
+        if (args.explain || args.costs)
             && let Err(err) = complete_parse(args, &mut loaded, store.as_mut())
         {
             return report_load_error("check", &err, args.json, style);
         }
-        print_types(&loaded, args.explain, style);
+        if args.types {
+            print_types(&loaded, args.explain, style);
+        }
+        if args.costs {
+            print_costs(&loaded, style);
+        }
     }
     EXIT_OK
 }
