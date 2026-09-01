@@ -1,37 +1,15 @@
 //! A transaction is a handler, so its two hazards are the machine's rather than a driver's, and
 //! both are audited here.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId, Pending,
 };
 use ply_eval::{Machine, TaskId, Value};
-use ply_span::{Diagnostic, SourceId, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let check = check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture typechecks: {d:#?}"));
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
 
 /// The `db` effect and the `transaction` scope, in the shape `std.db` ships them.
 const DB: &str = r#"
@@ -221,7 +199,7 @@ fn run(body: &str) -> Run {
 
 fn run_with(body: &str, tasks: bool) -> Run {
     let source = format!("{DB}{body}");
-    let compiled = compile(&source);
+    let compiled = Compiled::named("t", &source);
     let journal = Arc::new(Journal::default());
     let binding = registry(journal.clone() as Arc<dyn HostHandler>, tasks)
         .bind(&compiled.check)
@@ -373,7 +351,7 @@ test/nondet "alone" {
 }
 "#
     );
-    let compiled = compile(&source);
+    let compiled = Compiled::named("t", &source);
     let performers = Arc::new(Performers::default());
     let binding = registry(performers.clone() as Arc<dyn HostHandler>, false)
         .bind(&compiled.check)
@@ -404,7 +382,7 @@ test/nondet "spawned" {
 }
 "#
     );
-    let compiled = compile(&source);
+    let compiled = Compiled::named("t", &source);
     let performers = Arc::new(Performers::default());
     let binding = registry(performers.clone() as Arc<dyn HostHandler>, true)
         .bind(&compiled.check)
@@ -426,7 +404,7 @@ test/nondet "spawned" {
 
 fn ends_after(body: &str, budget: Option<usize>) -> (Arc<Bookkeeper>, Result<(), Diagnostic>) {
     let source = format!("{DB}{body}");
-    let compiled = compile(&source);
+    let compiled = Compiled::named("t", &source);
     let journal = Arc::new(Journal::default());
     let binding = registry(journal as Arc<dyn HostHandler>, false)
         .bind(&compiled.check)
@@ -570,7 +548,7 @@ test/nondet "value" {
 }
 "#
     );
-    let compiled = compile(&source);
+    let compiled = Compiled::named("t", &source);
     let journal = Arc::new(Journal::default());
     let binding = registry(journal as Arc<dyn HostHandler>, false)
         .bind(&compiled.check)

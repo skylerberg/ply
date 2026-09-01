@@ -1,39 +1,11 @@
 //! What a **stale** entry in either of R3's two caches can do to a program.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::region_kind::Cause;
-use ply_eval::{Machine, RegionKind, Value};
-use ply_span::{SourceId, Span};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
+use ply_eval::{RegionKind, Value};
+use ply_span::Span;
 
 impl Compiled {
-    #[track_caller]
-    fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs)
-            .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}\n{src}"));
-        let resolved = resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}\n{src}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}\n{src}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
     #[track_caller]
     fn call(&self, name: &str) -> Value {
         let mut machine = self.machine();

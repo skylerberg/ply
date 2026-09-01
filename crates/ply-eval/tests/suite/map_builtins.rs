@@ -1,51 +1,8 @@
 //! The `Map` builtins on real source, through parse, resolve, check and the evaluator.
 
-use ply_core::{CheckOutput, check_program};
-use ply_eval::Machine;
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = match ply_syntax::parse_program(inputs) {
-        Ok(p) => p,
-        Err(d) => panic!("did not parse: {d:#?}"),
-    };
-    let resolved = match resolve(&mut program) {
-        Ok(r) => r,
-        Err(d) => panic!("did not resolve: {d:#?}"),
-    };
-    let check = match check_program(&program, &resolved) {
-        Ok(c) => c,
-        Err(d) => panic!("did not typecheck: {d:#?}"),
-    };
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
+use crate::fixture::Compiled;
 
 /// Every `test` in the source, all of which must pass.
-fn run_tests(source: &str) -> Compiled {
-    let c = compile(source);
-    assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = machine.eval_test(i) {
-            panic!("`{}` failed under the machine: {d:#?}", t.name);
-        }
-    }
-    c
-}
-
 #[test]
 fn the_builtins_behave_as_the_contract_states() {
     let source = r#"
@@ -116,7 +73,7 @@ test "a map nests, as a key and as a value" {
   assert_eq(map_get(outer, map_insert(map_new(), 1, 1)), Some("in"))
 }
 "#;
-    run_tests(source);
+    Compiled::ran(source);
 }
 
 /// Pattern matching.
@@ -153,7 +110,7 @@ test "a map binds to a variable pattern" {
   assert_eq(size(base()), 2)
 }
 "#;
-    run_tests(source);
+    Compiled::ran(source);
 }
 
 /// `map_fold` calls user code, so its loop is a frame rather than host recursion.
@@ -168,7 +125,7 @@ test "a ten-thousand entry fold is exact" {
   assert_eq(map_len(build(10000)), 10000)
 }
 "#;
-    run_tests(source);
+    Compiled::ran(source);
 }
 
 /// A `map_fold` whose function performs an effect threads its row, which is the one thing about
@@ -191,7 +148,7 @@ test "the atom the folded function performs is in the row" {
   }
 }
 "#;
-    let c = run_tests(source);
+    let c = Compiled::ran(source);
     assert_eq!(
         c.check.defs[&ply_span::Symbol::new("m.shout")]
             .footprint

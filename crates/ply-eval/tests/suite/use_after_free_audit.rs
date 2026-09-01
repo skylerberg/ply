@@ -1,65 +1,29 @@
 //! Reading a slot after its region reclaimed it.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
+use ply_eval::Value;
 use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
-use ply_eval::{Machine, Value};
-use ply_span::{Diagnostic, SourceId, Span, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Span, codes};
 
 // ------------------------------------------------------------------ harness
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
+/// The diagnostics that refused `src`, insisting there are some: every caller here is asserting
+/// that a use-after-free was caught, so an accepted fixture is the interesting failure.
+#[track_caller]
+fn refused(src: &str) -> Vec<Diagnostic> {
+    match Compiled::rejected(src) {
+        d if d.is_empty() => panic!("this reaches a region's slots and was accepted:\n{src}"),
+        d => d,
+    }
 }
 
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        Compiled::modules(&[("m", src)])
-    }
-
-    fn modules(sources: &[(&str, &str)]) -> Compiled {
-        let inputs: Vec<_> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-            .collect();
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    #[track_caller]
-    fn refused(src: &str) -> Vec<Diagnostic> {
-        let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        match check_program(&program, &resolved) {
-            Ok(_) => panic!("this reaches a region's slots and was accepted:\n{src}"),
-            Err(d) => d,
-        }
-    }
-
     /// The machine's answer and the arena it left behind.
     #[track_caller]
-    fn run(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
+    fn run_call(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
         let mut machine = self.machine();
         let answer = machine.call(name, Vec::new(), Span::DUMMY);
         (answer, machine.cells().stats())
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
     }
 
     fn kinds(&self) -> ply_eval::region_kind::Regions {
@@ -69,7 +33,7 @@ impl Compiled {
 
 #[track_caller]
 fn answers(compiled: &Compiled, name: &str, want: i64) -> Stats {
-    let (answer, stats) = compiled.run(name);
+    let (answer, stats) = compiled.run_call(name);
     match answer {
         Ok(Value::Int(got)) => assert_eq!(
             got, want,
@@ -117,7 +81,7 @@ fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
         ),
     ];
     for (what, src) in carriers {
-        let diags = Compiled::refused(src);
+        let diags = refused(src);
         assert!(
             diags
                 .iter()
@@ -139,7 +103,7 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
     ));
     answers(&inside, "m.read_it", 42);
 
-    let out = Compiled::refused(&format!(
+    let out = refused(&format!(
         "{ALIAS}pub fn leak() -> Held = with_cell[k](42) {{ c -> keep(c) }}"
     ));
     assert!(
@@ -148,7 +112,7 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
         "the alias erased the brand on the way out: {out:#?}"
     );
 
-    let deref = Compiled::refused(&format!("{ALIAS}fn peek(c: Held) -> Int = cell_get(c)"));
+    let deref = refused(&format!("{ALIAS}fn peek(c: Held) -> Int = cell_get(c)"));
     assert!(
         deref
             .iter()
@@ -162,7 +126,7 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
 /// it.
 #[test]
 fn a_region_in_a_law_body_reports_its_escape() {
-    let diags = Compiled::refused(
+    let diags = refused(
         r#"law "leak" forall (n: Int) { with_region[r] { with_cell[r](n) { c -> c } } == 0 }"#,
     );
     assert!(
@@ -261,7 +225,7 @@ pub fn attack() -> Int = simulate {
 /// identical escape is a compile error that names the task.
 #[test]
 fn the_same_escape_out_of_a_with_region_is_refused_statically() {
-    let diags = Compiled::refused(
+    let diags = refused(
         r#"
 pub fn attack() -> Int = simulate {
   { let t = with_region[s] { with_cell[s](11) { c -> task.spawn(|| cell_get(c)) } };

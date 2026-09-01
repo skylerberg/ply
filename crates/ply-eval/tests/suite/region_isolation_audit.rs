@@ -1,58 +1,14 @@
 //! Adversarial audit of the one property the milestone cannot be wrong about: **no two region
 //! stacks opened from one fixture observe each other's writes.**
 
-use ply_core::{CheckOutput, Footprint, check_program};
+use crate::fixture::Compiled;
+use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Machine, TaskRegions, Value};
-use ply_span::{Diagnostic, SourceId};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::Diagnostic;
 use std::marker::PhantomData;
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn rejected(src: &str) -> Vec<Diagnostic> {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        match check_program(&program, &resolved) {
-            Ok(_) => Vec::new(),
-            Err(diags) => diags,
-        }
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn index_of(&self, name: &str) -> usize {
-        self.check
-            .tests
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap_or_else(|| panic!("no test named {name:?}"))
-    }
-
     fn footprint(&self, name: &str) -> &Footprint {
         &self.check.tests[self.index_of(name)].footprint
     }
@@ -766,5 +722,4 @@ macro_rules! is_send {
         (&Probe::<$t>(PhantomData)).probe()
     };
 }
-
 use is_send;

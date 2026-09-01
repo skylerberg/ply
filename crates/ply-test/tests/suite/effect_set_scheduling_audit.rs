@@ -1,34 +1,11 @@
 //! What an over-broad `effect set` costs the scheduler — ADR 0013 §11's required test 8, and the
 //! other half of "an alias is annotation-only".
 
-use ply_core::{CheckOutput, Footprint};
-use ply_span::SourceId;
-use ply_syntax::resolve::Resolved;
+use crate::fixture::Compiled;
+use ply_core::Footprint;
 use ply_test::{group_by_conflict, shared_footprint};
 
-struct Compiled {
-    check: CheckOutput,
-}
-
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let resolved: Resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        Compiled { check }
-    }
-
-    fn footprints(&self) -> Vec<Footprint> {
-        self.check
-            .tests
-            .iter()
-            .map(|t| t.footprint.clone())
-            .collect()
-    }
-
     fn groups(&self) -> Vec<Vec<usize>> {
         let scheduled: Vec<(usize, Footprint)> =
             self.footprints().into_iter().enumerate().collect();
@@ -69,7 +46,7 @@ test \"orders\" { assert_eq(place_order(), 2) }
 
 #[test]
 fn precise_rows_let_two_disjoint_endpoints_run_side_by_side() {
-    let compiled = Compiled::new(&format!("{STORE}{PRECISE}"));
+    let compiled = Compiled::anonymous(&format!("{STORE}{PRECISE}"));
     let footprints = compiled.footprints();
     assert!(
         !footprints[0].conflicts_with(&footprints[1]),
@@ -85,7 +62,7 @@ fn precise_rows_let_two_disjoint_endpoints_run_side_by_side() {
 /// The headline: one set, two endpoints, and now they cannot share a round.
 #[test]
 fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
-    let compiled = Compiled::new(&format!("{STORE}{ALIASED}"));
+    let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
     let footprints = compiled.footprints();
     assert!(
         footprints[0].conflicts_with(&footprints[1]),
@@ -103,7 +80,7 @@ fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
 /// mystery.
 #[test]
 fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
-    let compiled = Compiled::new(&format!("{STORE}{ALIASED}"));
+    let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
     let footprints = compiled.footprints();
     let atoms: Vec<String> = shared_footprint(&footprints[0])
         .atoms()
@@ -118,7 +95,7 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
         "an alias name reaches no footprint: {atoms:?}"
     );
 
-    let precise = Compiled::new(&format!("{STORE}{PRECISE}"));
+    let precise = Compiled::anonymous(&format!("{STORE}{PRECISE}"));
     let precise_atoms: Vec<String> = shared_footprint(&precise.footprints()[0])
         .atoms()
         .map(|a| a.to_string())
@@ -135,8 +112,8 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
 /// widening is upward.
 #[test]
 fn an_alias_only_ever_widens_a_tests_footprint() {
-    let precise = Compiled::new(&format!("{STORE}{PRECISE}")).footprints();
-    let aliased = Compiled::new(&format!("{STORE}{ALIASED}")).footprints();
+    let precise = Compiled::anonymous(&format!("{STORE}{PRECISE}")).footprints();
+    let aliased = Compiled::anonymous(&format!("{STORE}{ALIASED}")).footprints();
     for (before, after) in precise.iter().zip(aliased.iter()) {
         for atom in before.atoms() {
             assert!(

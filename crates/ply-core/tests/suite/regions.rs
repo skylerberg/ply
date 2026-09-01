@@ -2,31 +2,19 @@
 //! types of the values allocated in it, and every route a branded value could take out of the
 //! region.
 
-use ply_core::{CheckOutput, check_program};
-use ply_span::{Diagnostic, SourceId, codes};
-use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-fn compile(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs)?;
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        return Err(diags);
-    }
-    let resolved = resolve(&mut program)?;
-    check_program(&program, &resolved)
-}
+use crate::fixture::expanded;
+use ply_core::CheckOutput;
+use ply_span::{Diagnostic, codes};
 
 fn ok(source: &str) -> CheckOutput {
-    match compile(source) {
+    match expanded(source) {
         Ok(out) => out,
         Err(d) => panic!("expected this to check:\n{source}\ngot {d:#?}"),
     }
 }
 
 fn errors(source: &str) -> Vec<Diagnostic> {
-    match compile(source) {
+    match expanded(source) {
         Ok(_) => panic!("expected a diagnostic from:\n{source}"),
         Err(d) => d,
     }

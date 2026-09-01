@@ -1,16 +1,9 @@
 //! Adversarial audit of "an `effect set` is annotation-only".
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::compile;
+use ply_core::CheckOutput;
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-fn compile(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs)?;
-    let resolved = resolve(&mut program)?;
-    check_program(&program, &resolved)
-}
 
 #[track_caller]
 fn ok(source: &str) -> CheckOutput {

@@ -1,43 +1,15 @@
 //! Adversarial audit of ADR 0008 §7 / ADR 0011 §3 — a host handler's continuation may be resumed at
 //! most once.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
+use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Pending,
 };
-use ply_eval::{Machine, Value};
-use ply_span::{Diagnostic, SourceId, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let check = check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture typechecks: {d:#?}"));
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-}
 
 /// Answers the ordinal of its own call, so a replay is visible in the value as well as in the
 /// count.
@@ -141,7 +113,7 @@ fn run(source: &str, linearity: Linearity, tasks: bool) -> Run {
 }
 
 fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> Run {
-    let compiled = compile(source);
+    let compiled = Compiled::named("t", source);
     let counter = Arc::new(Counter::default());
     let mut registry = registry_of(vec![(
         op("net", "send", linearity),
@@ -440,7 +412,8 @@ test/nondet "the send is not inside the continuation" {
 /// unreachable and a three-shot handler still runs three times.
 #[test]
 fn a_present_but_unbound_registry_leaves_multi_shot_alone() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -495,12 +468,7 @@ fn relay(n: Int) -> Int / {net.write[socket]}
 = net.send[socket](n)
 "#,
     ] {
-        let mut program =
-            ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-                .expect("parses");
-        let resolved = resolve(&mut program).expect("resolves");
-        let diagnostics =
-            check_program(&program, &resolved).expect_err("a spec may not perform an effect");
+        let diagnostics = Compiled::rejected_in("t", source);
         assert!(
             diagnostics.iter().any(|d| d.code == codes::EFFECT_IN_SPEC),
             "{:?}",
