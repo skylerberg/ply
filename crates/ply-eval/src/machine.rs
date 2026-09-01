@@ -3,9 +3,10 @@
 use crate::arena::Arena;
 use crate::arena::RegionKind;
 use crate::builtins::{self, Builtin, Step};
-use crate::code::{self, ClosureCode, Code, Lowering, NodeKind, Stmt as CodeStmt, lower};
-use crate::cont::{Continuation, Delimiter, Frame, Next, SimId, Stack};
-use crate::env::{Env, Slot};
+use crate::code::{
+    self, Captures, ClosureCode, Code, Lowered, Lowering, NodeKind, Pat, Stmt as CodeStmt, lower,
+};
+use crate::cont::{Continuation, Delimiter, Extent, Frame, Next, Prompt, SimId, Stack};
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::host::{
     HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, MachineId, Pending, attribute,
@@ -24,12 +25,11 @@ use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
 use crate::value::{Closure, ClosureKind, Fields, Value};
+use crate::window::{SlotVal, Windows};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{
-    BinOp, Expr, FnDef, Item, Mode, Pattern, PatternKind, Program, QName, TypeDefBody, UnOp,
-};
+use ply_syntax::ast::{BinOp, Expr, FnDef, Item, Mode, Program, QName, TypeDefBody, UnOp};
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, OnceCell};
@@ -47,7 +47,7 @@ pub enum Progress {
 
 /// `S` of `⟨S, K, W⟩`.
 enum State {
-    Eval { code: Code, env: Env, module: usize },
+    Eval { code: Code, module: usize },
     Return(Value),
     Perform(Request),
     Halt(Value),
@@ -56,7 +56,7 @@ enum State {
 impl From<handler::State> for State {
     fn from(s: handler::State) -> State {
         match s {
-            handler::State::Eval { code, env, module } => State::Eval { code, env, module },
+            handler::State::Eval { code, module } => State::Eval { code, module },
             handler::State::Return(value) => State::Return(value),
             handler::State::Perform(request) => State::Perform(request),
         }
@@ -112,6 +112,8 @@ pub struct Machine<'a> {
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
     stack: Stack,
+    /// The machine-owned slot stack, and the current activation's base.
+    windows: Windows,
     state: State,
     current: Span,
     /// An opt-in ceiling on this engine's own heap.
@@ -246,6 +248,7 @@ impl<'a> Machine<'a> {
             region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
             stack: Stack::new(),
+            windows: Windows::new(),
             state: State::Halt(Value::Unit),
             current: Span::DUMMY,
             max_frames: None,
@@ -444,7 +447,7 @@ impl<'a> Machine<'a> {
         };
         let (module, source) = (slot.module, slot.body);
         let body = self.lowering.body(source);
-        self.drive(body, Env::empty(), module).map(|_| ())
+        self.drive(body, module).map(|_| ())
     }
 
     /// A position in this program is not a position in a [`CheckOutput`]: the incremental front end
@@ -467,27 +470,27 @@ impl<'a> Machine<'a> {
             .note("run `ply cache clear`, or pass `--no-incremental`"));
         };
         let body = self.lowering.body(source);
-        self.drive(body, Env::empty(), owner).map(|_| ())
+        self.drive(body, owner).map(|_| ())
     }
 
     /// An expression of unknown provenance, lowered afresh.
     pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
-        self.drive(lower(e), Env::empty(), 0)
+        self.drive(lower(e), 0)
     }
 
-    /// An expression from `module`, with `bindings` already in scope.
+    /// An expression from `module`, with `bindings` already in scope: the names are lowered as
+    /// leading parameters of the body's window, so their occurrences resolve to slots exactly as
+    /// a function's parameters do.
     pub fn eval_expr_in(
         &mut self,
         e: &'a Expr,
         module: usize,
         bindings: &[(Symbol, Value)],
     ) -> Result<Value, Diagnostic> {
-        let mut env = Env::empty();
-        for (name, value) in bindings {
-            env = env.bind(name.clone(), value.clone());
-        }
-        let body = self.lowering.body(e);
-        self.drive(body, env, module)
+        let params: code::Params = Rc::new(bindings.iter().map(|(n, _)| n.clone()).collect());
+        let lowered = self.lowering.of(&params, e);
+        let values: Vec<Value> = bindings.iter().map(|(_, v)| v.clone()).collect();
+        self.drive_with(lowered, module, &values)
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
@@ -561,8 +564,8 @@ impl<'a> Machine<'a> {
     /// One transition.
     pub fn step(&mut self) -> Result<Progress, Diagnostic> {
         match std::mem::replace(&mut self.state, State::Return(Value::Unit)) {
-            State::Eval { code, env, module } => {
-                self.eval(&code, env, module)?;
+            State::Eval { code, module } => {
+                self.eval(&code, module)?;
                 Ok(Progress::Running)
             }
             State::Return(value) => {
@@ -597,6 +600,7 @@ impl<'a> Machine<'a> {
                 let answered = {
                     let Machine {
                         stack,
+                        windows,
                         regions,
                         host_ops,
                         ..
@@ -604,7 +608,7 @@ impl<'a> Machine<'a> {
                     // A closure rather than a value: a pin is an `Rc` allocation, and `perform`
                     // only calls this for a capture that can outlive the region it was taken in.
                     let mut pin = || regions.pin();
-                    handler::perform(stack, request, decl, *host_ops, &mut pin)?
+                    handler::perform(stack, windows, request, decl, *host_ops, &mut pin)?
                 };
                 match answered {
                     Answered::Handler(transition) => self.take(transition)?,
@@ -628,6 +632,7 @@ impl<'a> Machine<'a> {
     /// world rather than unwinding anything.
     fn reset(&mut self) {
         self.stack = Stack::new();
+        self.windows.clear();
         self.regions.reset();
         self.trace.clear();
         self.state = State::Halt(Value::Unit);
@@ -640,9 +645,34 @@ impl<'a> Machine<'a> {
         self.last_linear = None;
     }
 
-    fn drive(&mut self, code: Code, env: Env, module: usize) -> Result<Value, Diagnostic> {
+    fn drive(&mut self, body: Lowered, module: usize) -> Result<Value, Diagnostic> {
+        self.drive_with(body, module, &[])
+    }
+
+    /// [`Machine::drive`], with `bindings` written into the body's leading slots.
+    fn drive_with(
+        &mut self,
+        body: Lowered,
+        module: usize,
+        bindings: &[Value],
+    ) -> Result<Value, Diagnostic> {
         self.reset();
-        self.state = State::Eval { code, env, module };
+        // The root window still needs an accounting frame: an entry point's stack can become a
+        // task (`into_task` converts the base segment), and a capture's height walk then crosses
+        // this window.
+        self.stack = self.stack.push(Frame::Exit {
+            callee_window: body.size,
+            caller_window: 0,
+        });
+        let base = self.windows.enter(body.size);
+        self.windows.base = base;
+        for (i, v) in bindings.iter().enumerate() {
+            self.windows.write(i as u32, v.clone());
+        }
+        self.state = State::Eval {
+            code: body.code,
+            module,
+        };
         let outcome = self.run();
         let outcome = self.close_regions(outcome);
         self.close_open_regions();
@@ -704,8 +734,112 @@ impl<'a> Machine<'a> {
         }
     }
 
-    pub(crate) fn go_eval(&mut self, code: Code, env: Env, module: usize) {
-        self.state = State::Eval { code, env, module };
+    pub(crate) fn go_eval(&mut self, code: Code, module: usize) {
+        self.state = State::Eval { code, module };
+    }
+
+    pub(crate) fn windows_mut(&mut self) -> &mut Windows {
+        &mut self.windows
+    }
+
+    pub(crate) fn regions_and_windows(&mut self) -> (&mut TaskRegions, &mut Windows) {
+        (&mut self.regions, &mut self.windows)
+    }
+
+    /// Undoes one activation window: drops the callee's slots and re-derives the caller's base
+    /// from its window size — both relative, which is what lets a spliced extent's frames run at
+    /// any height.
+    pub(crate) fn exit_window(&mut self, callee_window: u32, caller_window: u32) {
+        let to = self.windows.len() - callee_window as usize;
+        self.windows.truncate(to);
+        self.windows.base = to - caller_window as usize;
+    }
+
+    /// Splices a captured continuation onto the current control, restoring its slot snapshot if
+    /// it carries one.
+    pub(crate) fn splice(&mut self, k: &Continuation, value: Value) -> Result<(), Diagnostic> {
+        k.admit(self.host_ops)
+            .map_err(|resumes| self.err_replayed(handler::Replayed { resumes }))?;
+        match k.extent() {
+            Extent::InPlace => {
+                self.stack = self.stack.resume(k);
+            }
+            Extent::Saved { slots } => {
+                let base_offset = self.windows.window();
+                self.stack = self
+                    .stack
+                    .push(Frame::Restore {
+                        spill: k.cut_window() as u32,
+                        base_offset,
+                    })
+                    .resume(k);
+                self.windows.restore(slots);
+            }
+        }
+        self.windows.base = self.windows.len() - k.base_offset();
+        self.go_return(value);
+        Ok(())
+    }
+
+    /// Undoes a seal whose continuation turned out not to be consumed — a scheduled-looking
+    /// operation the region's policy does not answer, handed to the host with the machine's stack
+    /// intact. The seal cloned the shared portion and drained the extent above it, so putting the
+    /// drained portion back restores the exact heights.
+    fn unseal(&mut self, k: &Continuation) {
+        if let Extent::Saved { slots } = k.extent() {
+            self.windows.restore(&slots[k.cut_window()..]);
+            self.windows.base = self.windows.len() - k.base_offset();
+        }
+    }
+
+    /// Copies a barrier's free-variable values out of the current window, by each capture's own
+    /// ownership: a capture that is the binding's last use moves it, anything else clones. A
+    /// vacant source slot is a name no binder ran for — a nullary constructor pattern — and falls
+    /// back to global resolution exactly as a read would.
+    fn capture_values(
+        &mut self,
+        captures: &Rc<Captures>,
+        module: usize,
+    ) -> Result<Rc<[Value]>, Diagnostic> {
+        if captures.is_empty() {
+            return Ok(Rc::from(Vec::new()));
+        }
+        let mut out: Vec<Value> = Vec::with_capacity(captures.len());
+        for j in 0..captures.len() {
+            let src = captures.src[j];
+            enum Peek {
+                Val(Value),
+                Moved,
+                Vacant,
+            }
+            let peek = match captures.owns[j] {
+                Own::Owned => match self.windows.take(src) {
+                    SlotVal::Full(v) => {
+                        crate::rc::note_take(true);
+                        Peek::Val(v)
+                    }
+                    SlotVal::Moved => Peek::Moved,
+                    SlotVal::Vacant => Peek::Vacant,
+                },
+                _ => match self.windows.read(src) {
+                    SlotVal::Full(v) => Peek::Val(v.clone()),
+                    SlotVal::Moved => Peek::Moved,
+                    SlotVal::Vacant => Peek::Vacant,
+                },
+            };
+            out.push(match peek {
+                Peek::Val(v) => v,
+                Peek::Moved => return Err(err_released(&captures.names[j], self.current)),
+                Peek::Vacant => self.lookup_name(&captures.names[j], module)?,
+            });
+        }
+        Ok(Rc::from(out))
+    }
+
+    /// Global resolution of a bare name, for a read that fell through a vacant slot.
+    fn lookup_name(&mut self, name: &Symbol, module: usize) -> Result<Value, Diagnostic> {
+        let q = QName::bare(ply_syntax::ast::Ident::new(name.as_str(), self.current));
+        self.lookup(&q, module)
     }
 
     pub(crate) fn go_return(&mut self, value: Value) {
@@ -727,7 +861,7 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    fn eval(&mut self, code: &Code, env: Env, module: usize) -> Result<(), Diagnostic> {
+    fn eval(&mut self, code: &Code, module: usize) -> Result<(), Diagnostic> {
         let span = code.span;
         self.current = span;
         match &code.kind {
@@ -735,16 +869,37 @@ impl<'a> Machine<'a> {
             // inline variant for everything else.
             NodeKind::Lit(_, value) => self.go_return(value.clone()),
 
-            // The reference-counting pass says whether this is the last read of a binding of this
-            // scope.
-            NodeKind::Var(q) => {
-                let mut env = env;
-                let value = match (code.own, q.is_bare()) {
-                    (Own::Owned, true) => match env.take_unique(q.symbol()) {
-                        Some(value) => value,
-                        None => self.lookup(q, &env, module)?,
+            // The forward pass gave this occurrence a slot; the backward pass says whether it is
+            // the binding's last use, which moves the value out of the slot instead of cloning.
+            NodeKind::Var { name, slot } => {
+                enum Peek {
+                    Val(Value),
+                    Moved,
+                    Vacant,
+                }
+                let peek = match slot {
+                    Some(s) => match code.own {
+                        Own::Owned => match self.windows.take(*s) {
+                            SlotVal::Full(v) => {
+                                crate::rc::note_take(true);
+                                Peek::Val(v)
+                            }
+                            SlotVal::Moved => Peek::Moved,
+                            SlotVal::Vacant => Peek::Vacant,
+                        },
+                        _ => match self.windows.read(*s) {
+                            SlotVal::Full(v) => Peek::Val(v.clone()),
+                            SlotVal::Moved => Peek::Moved,
+                            SlotVal::Vacant => Peek::Vacant,
+                        },
                     },
-                    _ => self.lookup(q, &env, module)?,
+                    None => Peek::Vacant,
+                };
+                let value = match peek {
+                    Peek::Val(v) => v,
+                    // The liveness analysis called this binding dead and it was read anyway.
+                    Peek::Moved => return Err(err_released(name, span)),
+                    Peek::Vacant => self.lookup(name, module)?,
                 };
                 self.go_return(value);
             }
@@ -758,7 +913,7 @@ impl<'a> Machine<'a> {
                     },
                     span,
                 )?;
-                self.go_eval(operand.clone(), env, module);
+                self.go_eval(operand.clone(), module);
             }
 
             NodeKind::Binary { op, lhs, rhs } => {
@@ -766,45 +921,46 @@ impl<'a> Machine<'a> {
                     Frame::BinaryRhs {
                         op: *op,
                         rhs: rhs.clone(),
-                        env: env.clone(),
                         module,
                         lhs_span: lhs.span,
                         span,
                     },
                     span,
                 )?;
-                self.go_eval(lhs.clone(), env, module);
+                self.go_eval(lhs.clone(), module);
             }
 
-            NodeKind::Lambda { params, body, free } => {
-                let captured = match free {
-                    Some(free) => env.keep_only(free),
-                    None => env.clone(),
-                };
+            NodeKind::Lambda {
+                params,
+                body,
+                size,
+                captures,
+            } => {
+                let captured = self.capture_values(captures, module)?;
                 self.go_return(Value::Closure(Arc::new(Closure {
                     name: None,
                     kind: ClosureKind::Code {
                         params: params.clone(),
                         body: body.clone(),
-                        env: captured,
+                        size: *size,
+                        captures: captures.clone(),
+                        captured,
                         module,
                     },
                 })));
             }
 
-            NodeKind::App { func, args, dead } => {
-                let carried = crate::rc::carry(&env, !args.is_empty());
+            NodeKind::App { func, args } => {
+                crate::rc::note_carry();
                 self.push(
                     Frame::AppCallee {
                         args: args.clone(),
-                        dead: dead.clone(),
-                        env: carried,
                         module,
                         span,
                     },
                     span,
                 )?;
-                self.go_eval(func.clone(), env, module);
+                self.go_eval(func.clone(), module);
             }
 
             NodeKind::If {
@@ -816,13 +972,12 @@ impl<'a> Machine<'a> {
                     Frame::If {
                         then_branch: then_branch.clone(),
                         else_branch: else_branch.clone(),
-                        env: env.clone(),
                         module,
                         cond_span: cond.span,
                     },
                     span,
                 )?;
-                self.go_eval(cond.clone(), env, module);
+                self.go_eval(cond.clone(), module);
             }
 
             NodeKind::Match { scrutinee, arms } => {
@@ -833,44 +988,86 @@ impl<'a> Machine<'a> {
                         scrutinee: Value::Unit,
                         arms: arms.clone(),
                         next: 0,
-                        env: env.clone(),
                         module,
                         scrutinee_span: scrutinee.span,
                     },
                     span,
                 )?;
-                self.go_eval(scrutinee.clone(), env, module);
+                self.go_eval(scrutinee.clone(), module);
             }
 
             NodeKind::Block { stmts, tail } => {
-                self.enter_block(stmts.clone(), 0, tail.clone(), env, module)?;
+                self.enter_block(stmts.clone(), 0, tail.clone(), module)?;
             }
 
-            NodeKind::Record { fields, dead } => {
+            NodeKind::Record { fields } => {
                 if fields.is_empty() {
                     self.go_return(Value::Record(Arc::new(Fields::default())));
                 } else {
-                    let carried = crate::rc::carry_released(
-                        &env,
-                        fields.len() > 1,
-                        dead.first().map(|d| &**d).unwrap_or(&[]),
-                    );
+                    crate::rc::note_carry();
                     self.push(
                         Frame::RecordField {
                             done: Vec::with_capacity(fields.len()),
                             fields: fields.clone(),
-                            dead: dead.clone(),
                             next: 1,
-                            env: carried,
                             module,
                         },
                         span,
                     )?;
-                    self.go_eval(fields[0].1.clone(), env, module);
+                    self.go_eval(fields[0].1.clone(), module);
                 }
             }
 
             NodeKind::Field { base, field } => {
+                // Field-granular liveness: the last use of *this field* of a slot binding takes
+                // it out of the record in place — when the record is unshared — while the record
+                // stays put for the other fields still read later. The runtime uniqueness probe
+                // keeps this sound under multi-shot resumption: a captured window's snapshot
+                // holds a second reference, so the take degrades to a clone.
+                if code.own == Own::OwnedField
+                    && let NodeKind::Var {
+                        name,
+                        slot: Some(s),
+                    } = &base.kind
+                {
+                    enum Got {
+                        Val(Value),
+                        Fall,
+                        NotRecord(&'static str, String),
+                        Moved,
+                    }
+                    let got = match self.windows.read_mut(*s) {
+                        SlotVal::Full(Value::Record(fields)) => match Arc::get_mut(fields) {
+                            Some(map) => match map.set(&field.name, Value::Unit) {
+                                Some(v) => Got::Val(v),
+                                None => Got::Fall,
+                            },
+                            None => match fields.get(&field.name) {
+                                Some(v) => Got::Val(v.clone()),
+                                None => Got::Fall,
+                            },
+                        },
+                        SlotVal::Full(other) => Got::NotRecord(other.type_name(), other.render()),
+                        SlotVal::Moved => Got::Moved,
+                        SlotVal::Vacant => Got::Fall,
+                    };
+                    match got {
+                        Got::Val(v) => {
+                            self.go_return(v);
+                            return Ok(());
+                        }
+                        Got::Moved => return Err(err_released(name, span)),
+                        Got::NotRecord(ty, rendered) => {
+                            return Err(Diagnostic::error(
+                                codes::RUNTIME_ERROR,
+                                format!("field access expects a record, but got {ty}"),
+                            )
+                            .primary(base.span, format!("this is {rendered}")));
+                        }
+                        // A missing field or a vacant slot reports through the ordinary path.
+                        Got::Fall => {}
+                    }
+                }
                 self.push(
                     Frame::FieldAccess {
                         field: field.clone(),
@@ -878,25 +1075,24 @@ impl<'a> Machine<'a> {
                     },
                     span,
                 )?;
-                self.go_eval(base.clone(), env, module);
+                self.go_eval(base.clone(), module);
             }
 
             NodeKind::List { items } => {
                 if items.is_empty() {
                     self.go_return(Value::list(Vec::new()));
                 } else {
-                    let carried = crate::rc::carry(&env, items.len() > 1);
+                    crate::rc::note_carry();
                     self.push(
                         Frame::ListItem {
                             done: Vec::with_capacity(items.len()),
                             items: items.clone(),
                             next: 1,
-                            env: carried,
                             module,
                         },
                         span,
                     )?;
-                    self.go_eval(items[0].clone(), env, module);
+                    self.go_eval(items[0].clone(), module);
                 }
             }
 
@@ -915,7 +1111,6 @@ impl<'a> Machine<'a> {
                     Vec::with_capacity(args.len()),
                     args,
                     0,
-                    &env,
                     module,
                     span,
                 );
@@ -929,16 +1124,28 @@ impl<'a> Machine<'a> {
                         .map(|c| self.effect_name(module, &c.effect))
                         .collect(),
                 );
-                let transition = handler::enter_handle(
-                    &self.stack,
-                    body,
-                    clauses,
+                // The clause bodies' free variables are copied out of the current window now, at
+                // handle entry: a clause runs below its own prompt and cannot reach this
+                // activation's slots when a perform arrives.
+                let mut clause_captures = Vec::with_capacity(clauses.len());
+                for clause in clauses.iter() {
+                    clause_captures.push(self.capture_values(&clause.captures, module)?);
+                }
+                let ret_captures = match ret {
+                    Some(arm) => self.capture_values(&arm.captures, module)?,
+                    None => Rc::from(Vec::new()),
+                };
+                let prompt = Rc::new(Prompt {
+                    clauses: clauses.clone(),
                     effects,
-                    ret.as_ref(),
-                    &env,
+                    ret: ret.clone(),
+                    clause_captures,
+                    ret_captures,
                     module,
                     span,
-                );
+                });
+                let transition =
+                    handler::enter_handle(&self.stack, body, prompt, module, self.windows.window());
                 self.take(transition)?;
             }
 
@@ -946,15 +1153,16 @@ impl<'a> Machine<'a> {
                 resource,
                 init,
                 binder,
+                slot,
                 body,
             } => {
                 let transition = handler::enter_with_cell(
                     &self.stack,
                     resource,
                     binder,
+                    *slot,
                     init,
                     body,
-                    &env,
                     module,
                     span,
                 );
@@ -964,20 +1172,17 @@ impl<'a> Machine<'a> {
             NodeKind::WithRegion { body } => {
                 let kind = self.region_kind(span);
                 let stack = self.stack.clone();
-                let transition = handler::enter_with_region(
-                    &mut self.regions,
-                    &stack,
-                    body,
-                    &env,
-                    module,
-                    kind,
-                    span,
-                );
+                let transition =
+                    handler::enter_with_region(&mut self.regions, &stack, body, module, kind, span);
                 self.take(transition)?;
             }
 
-            NodeKind::Simulate { body } => {
-                self.enter_simulate(body.clone(), env, module, span)?;
+            NodeKind::Simulate {
+                body,
+                size,
+                captures,
+            } => {
+                self.enter_simulate(body.clone(), *size, captures.clone(), module, span)?;
             }
         }
         Ok(())
@@ -1136,8 +1341,10 @@ impl<'a> Machine<'a> {
                 return Err(err_task_lost_its_region(span, &operation));
             };
             let (k, _) = self.stack.capture(segments, self.host_ops);
-            // Parked until the host answers, which may be after every region open here has closed.
-            let k = k.pinned(self.regions.pin());
+            // Parked until the host answers, which may be after every region open here has
+            // closed — with its windows sealed on, because the machine's slots keep moving while
+            // it waits.
+            let k = handler::seal(k, &mut self.windows).pinned(self.regions.pin());
             let live = region_mut(&mut self.sims, region).expect("the region was just found");
             live.sched.park_on_host(k, pending, span)?;
             return self.schedule();
@@ -1194,7 +1401,16 @@ impl<'a> Machine<'a> {
         };
         let id = SimId(self.entered_sims);
         self.entered_sims += 1;
-        let k = std::mem::take(&mut self.stack).into_task(id, self.host_ops);
+        let base_offset = self.windows.window();
+        let saved = self.windows.drain_all();
+        let k = std::mem::take(&mut self.stack)
+            .into_task(id, self.host_ops)
+            .with_extent(
+                Extent::Saved {
+                    slots: Rc::new(saved),
+                },
+                base_offset,
+            );
         let sched = Scheduler::production(id, span, permit).rooted_running()?;
         self.sims.push(Region::production(id, sched, span));
         self.run_scheduled(Scheduled {
@@ -1226,7 +1442,8 @@ impl<'a> Machine<'a> {
     fn enter_simulate(
         &mut self,
         body: Code,
-        env: Env,
+        size: u32,
+        captures: Rc<Captures>,
         module: usize,
         span: Span,
     ) -> Result<(), Diagnostic> {
@@ -1239,6 +1456,9 @@ impl<'a> Machine<'a> {
                     .secondary(span, "reached from here")
             });
         }
+        // The body is a barrier: what it reads from this scope it takes as a copy now, because
+        // its tasks run over their own windows above the region's floor.
+        let captured = self.capture_values(&captures, module)?;
         let id = SimId(self.entered_sims);
         self.entered_sims += 1;
         self.trail.enter(span);
@@ -1249,9 +1469,13 @@ impl<'a> Machine<'a> {
             self.sim_steps,
             self.stack.clone(),
             body,
-            env,
+            size,
+            captures,
+            captured,
             module,
             span,
+            self.windows.len(),
+            self.windows.base,
         ));
         self.schedule()
     }
@@ -1274,6 +1498,9 @@ impl<'a> Machine<'a> {
         // inside it must go to the host binding rather than be given virtual time that starts at
         // zero and only moves when every task is asleep.
         if !live.sched.answers(effect.as_str(), op.as_str()) {
+            // The capture is not consumed: the control was never cut from the machine's stack,
+            // so the windows the seal drained go back exactly where they were.
+            self.unseal(&k);
             return self.perform_host(Request {
                 effect,
                 op,
@@ -1432,20 +1659,43 @@ impl<'a> Machine<'a> {
                         region.handlers.rand().drawn(),
                     );
                 }
+                self.windows.truncate(region.floor);
+                self.windows.base = region.rbase;
                 self.stack = region.below;
                 self.go_return(value);
                 Ok(())
             }
             Turn::Run { resumption, .. } => {
                 let (below, id) = (region.below.clone(), region.id);
+                let (floor, rbase) = (region.floor, region.rbase);
+                // Every turn starts from the region's entry height: the previous task's windows
+                // died with its turn, captured onto its continuation or finished with it.
+                self.windows.truncate(floor);
+                self.windows.base = rbase;
                 match resumption {
                     Resumption::Enter => {
                         let Some(body) = region.body.clone() else {
                             return Err(err_lazy_region_entered(region.span));
                         };
-                        let (env, module) = (region.env.clone(), region.module);
-                        self.stack = below.push_sim(id);
-                        self.go_eval(body, env, module);
+                        let (size, captures, captured, module) = (
+                            region.size,
+                            region.captures.clone(),
+                            region.captured.clone(),
+                            region.module,
+                        );
+                        // The body's window needs a frame to account for it, both so a capture's
+                        // height walk sees it and so the region's own value pops it on the way
+                        // out.
+                        self.stack = below.push_sim(id).pushed(Frame::Exit {
+                            callee_window: size,
+                            caller_window: 0,
+                        });
+                        let base = self.windows.enter(size);
+                        self.windows.base = base;
+                        for (j, dst) in captures.dst.iter().enumerate() {
+                            self.windows.write(*dst, captured[j].clone());
+                        }
+                        self.go_eval(body, module);
                         Ok(())
                     }
                     Resumption::Start { body, over, span } => {
@@ -1453,9 +1703,8 @@ impl<'a> Machine<'a> {
                         self.apply(body, Vec::new(), span)
                     }
                     Resumption::Resume { k, value } => {
-                        let transition = handler::resume(&below, &k, value, self.host_ops)
-                            .map_err(|refused| self.err_replayed(refused))?;
-                        self.take(transition)
+                        self.stack = below;
+                        self.splice(&k, value)
                     }
                 }
             }
@@ -1470,15 +1719,52 @@ impl<'a> Machine<'a> {
         value: Value,
     ) -> Result<(), Diagnostic> {
         if let Some(id) = k.sim() {
-            let anchor = k.under_sim(&self.stack);
-            match (region_mut(&mut self.sims, id), anchor) {
-                (Some(region), Some(anchor)) => region.below = anchor,
-                _ => return Err(err_region_ended(self.current)),
+            if region_mut(&mut self.sims, id).is_none() || k.under_sim(&self.stack).is_none() {
+                return Err(err_region_ended(self.current));
             }
+            k.admit(self.host_ops)
+                .map_err(|resumes| self.err_replayed(handler::Replayed { resumes }))?;
+            // The `Restore` bookkeeping goes onto the stack *before* the anchor is cut, because
+            // the region's completion replaces the stack with the anchor and returns through it —
+            // a restore frame outside the anchor would be bypassed, leaving the restored windows
+            // on the stack and the resumer's base wrong.
+            if let Extent::Saved { .. } = k.extent() {
+                self.stack = self.stack.push(Frame::Restore {
+                    spill: k.cut_window() as u32,
+                    base_offset: self.windows.window(),
+                });
+            }
+            let anchor = k.under_sim(&self.stack).expect("checked above");
+            let region = region_mut(&mut self.sims, id).expect("checked above");
+            region.below = anchor;
+            // The region continues wherever it is being resumed, so its floor — the height every
+            // scheduling turn resets to — moves with it: the point where the `Sim` delimiter
+            // lands once the extent is restored. A tail-resumptive capture left the extent in
+            // place, so its floor has not moved.
+            if let Extent::Saved { slots } = k.extent() {
+                let above = k
+                    .deltas_through_sim()
+                    .expect("the continuation carries the delimiter it was anchored by");
+                // The entering activation's window size survives every re-anchoring, and is what
+                // re-derives its base under the delimiter's new position.
+                let entering = region.floor - region.rbase;
+                region.floor = self.windows.len() + slots.len() - above;
+                region.rbase = region.floor - entering;
+            }
+            match k.extent() {
+                Extent::InPlace => {
+                    self.stack = self.stack.resume(k);
+                }
+                Extent::Saved { slots } => {
+                    self.stack = self.stack.resume(k);
+                    self.windows.restore(slots);
+                }
+            }
+            self.windows.base = self.windows.len() - k.base_offset();
+            self.go_return(value);
+            return Ok(());
         }
-        let transition = handler::resume(&self.stack, k, value, self.host_ops)
-            .map_err(|refused| self.err_replayed(refused))?;
-        self.take(transition)
+        self.splice(k, value)
     }
 
     /// The stack is moved out rather than borrowed: a pop that owns its stack takes the frame out
@@ -1490,8 +1776,30 @@ impl<'a> Machine<'a> {
                 self.dispatch(frame, value)
             }
             Next::Leave(Delimiter::Ply(prompt), rest) => {
-                let transition = handler::leave_handle(&prompt, value, rest);
-                self.take(transition)
+                match &prompt.ret {
+                    Some(arm) => {
+                        // The `return` arm is a barrier of its own: open its window above the
+                        // leaving activation, fill in its captures, and bind the value to its one
+                        // parameter.
+                        let caller_window = self.windows.window();
+                        self.stack = rest.pushed(Frame::Exit {
+                            callee_window: arm.size,
+                            caller_window,
+                        });
+                        let base = self.windows.enter(arm.size);
+                        self.windows.base = base;
+                        for (j, dst) in arm.captures.dst.iter().enumerate() {
+                            self.windows.write(*dst, prompt.ret_captures[j].clone());
+                        }
+                        self.windows.write(0, value);
+                        self.go_eval(arm.body.clone(), prompt.module);
+                    }
+                    None => {
+                        self.stack = rest;
+                        self.go_return(value);
+                    }
+                }
+                Ok(())
             }
             // A task's body returned.
             Next::Leave(Delimiter::Sim(region), _) => self.finish_task(region, value),
@@ -1528,23 +1836,50 @@ impl<'a> Machine<'a> {
             ClosureKind::Code {
                 params,
                 body,
-                env,
+                size,
+                captures,
+                captured,
                 module,
             } => {
-                let (body, env, module) = (body.clone(), env.clone(), *module);
-                self.enter_code(closure, params, body, env, module, args, span)
+                let lowered = Lowered {
+                    code: body.clone(),
+                    size: *size,
+                };
+                let (captures, captured, module) = (captures.clone(), captured.clone(), *module);
+                self.enter_code(
+                    closure,
+                    params.len(),
+                    lowered,
+                    Some((captures, captured)),
+                    &[],
+                    module,
+                    args,
+                    span,
+                )
             }
-            // A closure this machine did not lower, handed in through `call`.
+            // A closure this machine did not lower, handed in through `call`. Its external
+            // bindings are lowered as leading parameters, so the body's reads of them resolve to
+            // slots like anything else.
             ClosureKind::Fn {
                 params,
                 body,
-                env,
+                bindings,
                 module,
             } => {
-                let params: Vec<Symbol> = params.clone();
-                let body = self.closure_code.of(&params, body);
-                let (env, module) = (env.clone(), *module);
-                self.enter_code(closure, &params, body, env, module, args, span)
+                let pre: Vec<Symbol> = bindings.iter().map(|(n, _)| n.clone()).collect();
+                let lowered = self.closure_code.of(&pre, params, body);
+                let pre_values: Vec<Value> = bindings.iter().map(|(_, v)| v.clone()).collect();
+                let (arity, module) = (params.len(), *module);
+                self.enter_code(
+                    closure,
+                    arity,
+                    lowered,
+                    None,
+                    &pre_values,
+                    module,
+                    args,
+                    span,
+                )
             }
             ClosureKind::Ctor { name, arity } => {
                 if crate::census::enabled() {
@@ -1577,22 +1912,18 @@ impl<'a> Machine<'a> {
     fn enter_code(
         &mut self,
         closure: &Closure,
-        params: &[Symbol],
-        body: Code,
-        env: Env,
+        arity: usize,
+        body: Lowered,
+        captures: Option<(Rc<Captures>, Rc<[Value]>)>,
+        pre: &[Value],
         module: usize,
         mut args: Vec<Value>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        if params.len() != args.len() {
-            return Err(arity_error(
-                span,
-                &closure.describe(),
-                params.len(),
-                args.len(),
-            ));
+        if arity != args.len() {
+            return Err(arity_error(span, &closure.describe(), arity, args.len()));
         }
-        let memo = match (params.is_empty(), &closure.name) {
+        let memo = match (arity == 0 && pre.is_empty(), &closure.name) {
             (true, Some(name)) => match self.constant(name) {
                 Lookup::Known(value) => {
                     self.go_return(value);
@@ -1607,29 +1938,26 @@ impl<'a> Machine<'a> {
             self.census_call(closure, &args);
         }
         if let Some(value) = self.compiled_answer(closure, &args) {
-            // The interpreted path moves these into the callee's `Env`; a scalar carries no
+            // The interpreted path moves these into the callee's window; a scalar carries no
             // refcount and no `Drop`, so dropping them here is the same observation.
             args.clear();
             crate::argv::give(args);
             // The bound was charged in `compiled_answer` — a zero budget declines — so what is left
             // is the frame bound `push` checks, in the order the interpreted path below checks
-            // them.
+            // them. No window was opened for a native body, so there is nothing to undo on return.
             self.push(
                 Frame::Call {
                     name: closure.name.clone(),
                     call_site: span,
                     memo,
+                    callee_window: 0,
+                    caller_window: self.windows.window(),
                 },
                 span,
             )?;
             self.go_return(value);
             return Ok(());
         }
-        let mut scope = env;
-        for (p, v) in params.iter().zip(args.drain(..)) {
-            scope = scope.bind(p.clone(), v);
-        }
-        crate::argv::give(args);
         if self.stack.calls() >= self.max_calls {
             return Err(self.err_call_limit(span, &self.stack));
         }
@@ -1638,10 +1966,29 @@ impl<'a> Machine<'a> {
                 name: closure.name.clone(),
                 call_site: span,
                 memo,
+                callee_window: body.size,
+                caller_window: self.windows.window(),
             },
             span,
         )?;
-        self.go_eval(body, scope, module);
+        let base = self.windows.enter(body.size);
+        self.windows.base = base;
+        let mut at = 0u32;
+        for v in pre.iter().cloned() {
+            self.windows.write(at, v);
+            at += 1;
+        }
+        for v in args.drain(..) {
+            self.windows.write(at, v);
+            at += 1;
+        }
+        if let Some((spec, values)) = &captures {
+            for (j, dst) in spec.dst.iter().enumerate() {
+                self.windows.write(*dst, values[j].clone());
+            }
+        }
+        crate::argv::give(args);
+        self.go_eval(body.code, module);
         Ok(())
     }
 
@@ -1943,29 +2290,25 @@ impl<'a> Machine<'a> {
         stmts: Rc<Vec<CodeStmt>>,
         next: usize,
         tail: Option<Code>,
-        scope: Env,
         module: usize,
     ) -> Result<(), Diagnostic> {
         if let Some(stmt) = stmts.get(next) {
             let code = stmt.code().clone();
-            // The continuation carries only what it still reads.
-            let rest = scope.release(stmt.dead());
             let span = code.span;
             self.push(
                 Frame::BlockStep {
                     stmts,
                     next: next + 1,
                     tail,
-                    scope: rest,
                     module,
                 },
                 span,
             )?;
-            self.go_eval(code, scope, module);
+            self.go_eval(code, module);
             return Ok(());
         }
         match tail {
-            Some(t) => self.go_eval(t, scope, module),
+            Some(t) => self.go_eval(t, module),
             None => self.go_return(Value::Unit),
         }
         Ok(())
@@ -1976,71 +2319,76 @@ impl<'a> Machine<'a> {
         scrutinee: Value,
         arms: Rc<Vec<code::Arm>>,
         from: usize,
-        env: Env,
         module: usize,
         scrutinee_span: Span,
     ) -> Result<(), Diagnostic> {
+        // A matching arm writes its bindings straight into its own slots; a rejected arm's
+        // partial writes land in slots only that arm reads, so there is nothing to undo.
         let mut hit = None;
-        for (i, arm) in arms.iter().enumerate().skip(from) {
-            let mut arm_env = env.clone();
-            if self.match_pattern(&arm.pat, &scrutinee, &mut arm_env, module)? {
-                hit = Some((i, arm_env, arm.guard.clone(), arm.body.clone()));
+        for at in from..arms.len() {
+            if self.match_pattern(&arms[at].pat, &scrutinee, module)? {
+                hit = Some(at);
                 break;
             }
         }
         match hit {
             None => Err(err_non_exhaustive(scrutinee_span, &scrutinee)),
-            Some((_, arm_env, None, body)) => {
-                self.go_eval(body, arm_env, module);
-                Ok(())
-            }
-            Some((at, arm_env, Some(guard), _)) => {
-                let guard_span = guard.span;
-                self.push(
-                    Frame::MatchGuard {
-                        scrutinee,
-                        arms,
-                        at,
-                        arm_env: arm_env.clone(),
-                        env,
-                        module,
-                        scrutinee_span,
-                    },
-                    guard_span,
-                )?;
-                self.go_eval(guard, arm_env, module);
-                Ok(())
-            }
+            Some(at) => match &arms[at].guard {
+                None => {
+                    let body = arms[at].body.clone();
+                    self.go_eval(body, module);
+                    Ok(())
+                }
+                Some(guard) => {
+                    let guard = guard.clone();
+                    let guard_span = guard.span;
+                    self.push(
+                        Frame::MatchGuard {
+                            scrutinee,
+                            arms: arms.clone(),
+                            at,
+                            module,
+                            scrutinee_span,
+                        },
+                        guard_span,
+                    )?;
+                    self.go_eval(guard, module);
+                    Ok(())
+                }
+            },
         }
     }
 
     pub(crate) fn match_pattern(
-        &self,
-        pat: &Pattern,
+        &mut self,
+        pat: &Pat,
         value: &Value,
-        env: &mut Env,
         module: usize,
     ) -> Result<bool, Diagnostic> {
-        Ok(match &pat.kind {
-            PatternKind::Wildcard => true,
-            PatternKind::Var(id) => {
-                // A nullary constructor written bare is indistinguishable from a binder in the AST,
-                // so the constructor table decides.
-                let declared = self.ctor_name(module, &QName::bare(id.clone()));
-                match declared.as_ref().and_then(|name| self.ctors.get(name)) {
+        Ok(match pat {
+            Pat::Wildcard => true,
+            Pat::Var { name, slot } => {
+                // A nullary constructor written bare is indistinguishable from a binder in the
+                // AST, so the constructor table decides — and a constructor binds nothing, which
+                // is why its slot stays vacant and a read of the name falls back to global
+                // resolution.
+                let declared = self.ctor_name(module, &QName::bare(name.clone()));
+                match declared.as_ref().and_then(|n| self.ctors.get(n)) {
                     Some(0) => {
                         let ctor = declared.expect("a hit came from a resolved name");
                         matches!(value, Value::Ctor { name, args }
                             if *name == ctor && args.is_empty())
                     }
                     _ => {
-                        *env = env.bind(id.name.clone(), value.clone());
+                        if let Some(s) = slot {
+                            self.windows.write(*s, value.clone());
+                        }
                         true
                     }
                 }
             }
-            PatternKind::Lit(lit) => crate::semantics::lit_matches(lit, value),
-            PatternKind::Ctor { name, args } => match value {
+            Pat::Lit(lit) => crate::semantics::lit_matches(lit, value),
+            Pat::Ctor { name, args } => match value {
                 Value::Ctor {
                     name: vname,
                     args: vargs,
@@ -2050,7 +2398,7 @@ impl<'a> Machine<'a> {
                         return Ok(false);
                     }
                     for (p, v) in args.iter().zip(vargs.iter()) {
-                        if !self.match_pattern(p, v, env, module)? {
+                        if !self.match_pattern(p, v, module)? {
                             return Ok(false);
                         }
                     }
@@ -2058,7 +2406,7 @@ impl<'a> Machine<'a> {
                 }
                 _ => false,
             },
-            PatternKind::Record { fields, rest } => match value {
+            Pat::Record { fields, rest } => match value {
                 Value::Record(map) => {
                     if !*rest && map.len() != fields.len() {
                         return Ok(false);
@@ -2067,7 +2415,7 @@ impl<'a> Machine<'a> {
                         let Some(v) = map.get(&name.name).cloned() else {
                             return Ok(false);
                         };
-                        if !self.match_pattern(p, &v, env, module)? {
+                        if !self.match_pattern(p, &v, module)? {
                             return Ok(false);
                         }
                     }
@@ -2075,7 +2423,7 @@ impl<'a> Machine<'a> {
                 }
                 _ => false,
             },
-            PatternKind::List { items, rest } => match value {
+            Pat::List { items, rest } => match value {
                 Value::List(xs) => {
                     let fits = match rest {
                         Some(_) => xs.len() >= items.len(),
@@ -2085,14 +2433,14 @@ impl<'a> Machine<'a> {
                         return Ok(false);
                     }
                     for (p, v) in items.iter().zip(xs.iter()) {
-                        if !self.match_pattern(p, v, env, module)? {
+                        if !self.match_pattern(p, v, module)? {
                             return Ok(false);
                         }
                     }
                     match rest {
                         Some(rest) => {
                             let tail = Value::list(xs[items.len()..].to_vec());
-                            self.match_pattern(rest, &tail, env, module)?
+                            self.match_pattern(rest, &tail, module)?
                         }
                         None => true,
                     }
@@ -2102,17 +2450,10 @@ impl<'a> Machine<'a> {
         })
     }
 
-    /// Locals, then the module's own items and its selective imports, then the prelude — the
-    /// resolution order the whole language is specified in.
-    fn lookup(&mut self, q: &QName, env: &Env, module: usize) -> Result<Value, Diagnostic> {
-        if q.is_bare() {
-            match env.lookup(q.symbol()) {
-                Some(Slot::Live(v)) => return Ok(v.clone()),
-                // The reference-counting pass called this binding dead and it was read anyway.
-                Some(Slot::Released) => return Err(err_released(q, self.current)),
-                None => {}
-            }
-        }
+    /// The module's own items and its selective imports, then the prelude — the resolution order
+    /// the whole language is specified in. Locals never reach here: their occurrences resolve to
+    /// slots at lowering.
+    fn lookup(&mut self, q: &QName, module: usize) -> Result<Value, Diagnostic> {
         let key = (
             module,
             q.module.as_ref().map(|m| m.name.clone()),
@@ -2158,9 +2499,11 @@ impl<'a> Machine<'a> {
         let closure = Closure {
             name: Some(name.clone()),
             kind: ClosureKind::Code {
-                body,
                 params,
-                env: Env::empty(),
+                size: body.size,
+                body: body.code,
+                captures: code::no_captures(),
+                captured: Rc::from(Vec::new()),
                 module,
             },
         };
@@ -2234,7 +2577,7 @@ fn region_mut(sims: &mut [Region], id: SimId) -> Option<&mut Region> {
 /// Puts a spawned task under the delimiters its `spawn` site sat under.
 fn install(below: Stack, over: &[Delimiter]) -> Stack {
     over.iter().rev().fold(below, |stack, delimiter| {
-        stack.push_delimiter(delimiter.clone())
+        stack.push_delimiter(delimiter.clone(), 0)
     })
 }
 
@@ -2355,13 +2698,13 @@ impl HostRuntime for Unbound {
     }
 }
 
-/// A binding the reference-counting pass dropped, read afterwards.
+/// A binding the liveness analysis moved out of its slot, read afterwards.
 #[cold]
 #[inline(never)]
-fn err_released(q: &QName, span: Span) -> Diagnostic {
+fn err_released(name: &dyn std::fmt::Display, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("`{q}` was read after reference counting dropped it"),
+        format!("`{name}` was read after reference counting dropped it"),
     )
     .primary(span, "this binding was released before this read")
     .note("the last-use analysis in `ply_eval::rc` called this binding dead and something read it anyway")

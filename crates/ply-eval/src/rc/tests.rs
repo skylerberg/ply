@@ -149,10 +149,10 @@ fn a_straight_line_body_elides_every_reference_counting_operation() {
     assert_eq!(int_of(&value), 2);
     // `a` and `b` are read once each, and each read is the last one.
     assert_eq!((stats.dup_sites, stats.dup_emitted), (2, 0));
-    // Two bindings; `a` dies at the second statement and is dropped there, while `b` is still live
-    // at the tail and its scope's end frees it for nothing.
-    assert_eq!((stats.drop_sites, stats.drop_emitted), (2, 1));
-    assert_eq!(stats.elided(), Some(0.75));
+    // Two bindings, and neither pays a drop of its own: a last use moves the value out of its
+    // slot, and the scope's end is one window truncation.
+    assert_eq!((stats.drop_sites, stats.drop_emitted), (2, 0));
+    assert_eq!(stats.elided(), Some(1.0));
 }
 
 /// A binding read twice keeps its `dup`, which is the half of the accounting that would make the
@@ -176,10 +176,11 @@ fn a_binding_read_twice_keeps_the_duplication_at_its_earlier_read() {
     );
 }
 
-/// A free variable of a closure is never a last use: the closure holds the scope for as long as it
-/// lives, and nothing in this body bounds that.
+/// A read to the left of a capture of the same binding is not a last use: the capture copies the
+/// value later in evaluation order, so the earlier read must clone. The capture itself may be the
+/// move — the closure then owns the value outright, which is exactly right.
 #[test]
-fn a_variable_captured_by_a_closure_is_never_owned() {
+fn a_read_before_a_capture_is_cloned_and_the_program_still_answers() {
     let e = block(
         vec![letv("xs", ints(&[1, 2, 3]))],
         Some(callv(
@@ -192,9 +193,9 @@ fn a_variable_captured_by_a_closure_is_never_owned() {
     );
     let (value, stats) = run_expr(e);
     assert_eq!(int_of(&value), 3);
-    assert_eq!(
-        stats.takes_moved, 0,
-        "nothing may be moved out of a scope a closure captured"
+    assert!(
+        stats.dup_emitted >= 1,
+        "the argument read of `xs` runs before the lambda captures it, so it clones: {stats:?}"
     );
 }
 
@@ -302,73 +303,10 @@ fn an_ordinary_cell_write_reports_nothing() {
     assert!(take_cycles().is_empty());
 }
 
-/// Releasing a binding builds a new scope rather than writing through a shared link, which is what
-/// keeps a closure that captured the scope reading what it captured.
-#[test]
-fn releasing_a_binding_leaves_a_scope_that_captured_it_intact() {
-    use crate::Env;
-    use ply_span::Symbol;
-
-    let name = Symbol::new("xs");
-    let scope = Env::empty().bind(name.clone(), Value::Int(7));
-    let captured = scope.clone();
-    let released = scope.release(std::slice::from_ref(&name));
-
-    assert!(
-        matches!(captured.lookup(&name), Some(crate::ScopeSlot::Live(_))),
-        "the captured scope lost a binding it was holding"
-    );
-    assert!(matches!(
-        released.lookup(&name),
-        Some(crate::ScopeSlot::Released)
-    ));
-    assert!(matches!(
-        scope.lookup(&name),
-        Some(crate::ScopeSlot::Live(_))
-    ));
-}
-
-/// Taking refuses whenever anything else can reach the binding, which is the whole safety argument
-/// stated as a unit test.
-#[test]
-fn taking_refuses_a_scope_anybody_else_holds() {
-    use crate::Env;
-    use ply_span::Symbol;
-
-    let name = Symbol::new("xs");
-    let mut scope = Env::empty().bind(name.clone(), Value::Int(7));
-    let held = scope.clone();
-    assert!(
-        scope.take_unique(&name).is_none(),
-        "a scope two owners hold may not be emptied"
-    );
-    drop(held);
-    assert!(
-        matches!(scope.take_unique(&name), Some(Value::Int(7))),
-        "a scope nothing else holds hands its binding over"
-    );
-    assert!(matches!(
-        scope.lookup(&name),
-        Some(crate::ScopeSlot::Released)
-    ));
-}
-
-/// A binding released and then read is Ply's fault and stops the run, rather than walking past the
-/// released slot to an outer binding of the same name and answering with a value nobody wrote.
-#[test]
-fn reading_a_released_binding_is_an_internal_error_and_not_an_outer_binding() {
-    use crate::Env;
-    use ply_span::Symbol;
-
-    let name = Symbol::new("xs");
-    let outer = Env::empty().bind(name.clone(), Value::Int(1));
-    let inner = outer.bind(name.clone(), Value::Int(2));
-    let released = inner.release(std::slice::from_ref(&name));
-    assert!(
-        matches!(released.lookup(&name), Some(crate::ScopeSlot::Released)),
-        "the release must be visible rather than uncovering the shadowed binding"
-    );
-}
+// The chain-level release and take-unique unit tests that stood here died with the chain: a moved
+// slot is [`crate::window::SlotVal::Moved`], its read is an internal error rather than an outer
+// binding of the same name, and both are pinned in `crate::window`'s own tests — a shadowed name
+// cannot be uncovered because the two bindings are two different slots.
 
 /// A binding read again after an inner scope reused its name.
 #[test]

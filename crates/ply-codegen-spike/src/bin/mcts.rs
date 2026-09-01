@@ -206,7 +206,7 @@ fn census(loaded: &'static Loaded, module: &str) -> Result<(Vec<CensusRow>, Vec<
     let mut rows = Vec::new();
     for name in &all {
         let (def, _) = loaded.definition(name).expect("it was just listed");
-        let nodes = node_count(&lower(&def.body));
+        let nodes = node_count(&lower(&def.body).code);
         // A function can be refused twice — once on its own construct, once again after a callee is
         // dropped.
         let why = refusals

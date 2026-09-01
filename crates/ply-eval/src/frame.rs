@@ -26,7 +26,6 @@ impl Machine<'_> {
             Frame::BinaryRhs {
                 op,
                 rhs,
-                env,
                 module,
                 lhs_span,
                 span,
@@ -42,7 +41,6 @@ impl Machine<'_> {
                         Frame::ShortCircuit {
                             op,
                             rhs: rhs.clone(),
-                            env: env.clone(),
                             module,
                             rhs_span,
                         },
@@ -60,7 +58,7 @@ impl Machine<'_> {
                         span,
                     )?;
                 }
-                self.go_eval(rhs, env, module);
+                self.go_eval(rhs, module);
             }
 
             Frame::BinaryApply {
@@ -79,102 +77,91 @@ impl Machine<'_> {
                 self.go_return(Value::Bool(rhs));
             }
 
-            Frame::AppCallee {
-                args,
-                dead,
-                env,
-                module,
-                span,
-            } => {
+            Frame::AppCallee { args, module, span } => {
                 if args.is_empty() {
-                    // Perceus' rule that decides whether anything is ever reused: the scope the
-                    // arguments were evaluated in is dead here, and dropping it *before* the call
-                    // is what leaves the callee holding the only reference to what it was handed.
-                    drop(env);
                     return self.apply(value, Vec::new(), span);
                 }
                 let first = args[0].clone();
-                // the sequence S4: the frame carries the scope minus what
-                // argument 0 is the last reader of, rather than all of it.
-                // `dead` is empty unless the probe is armed, and then this is
-                // `carry` exactly.
-                let carried = crate::rc::carry_released(
-                    &env,
-                    args.len() > 1,
-                    dead.first().map(|d| &**d).unwrap_or(&[]),
-                );
+                crate::rc::note_carry();
                 self.push(
                     Frame::AppArgs {
                         callee: value,
                         done: crate::argv::take(args.len()),
                         args,
-                        dead,
                         next: 1,
-                        env: carried,
                         module,
                         span,
                     },
                     span,
                 )?;
-                self.go_eval(first, env, module);
+                self.go_eval(first, module);
             }
 
             Frame::AppArgs {
                 callee,
                 mut done,
                 args,
-                dead,
                 next,
-                env,
                 module,
                 span,
             } => {
                 done.push(value);
                 match args.get(next) {
-                    None => {
-                        // See `AppCallee` above: the argument scope is dropped before the call, not
-                        // after it.
-                        drop(env);
-                        return self.apply(callee, done, span);
-                    }
+                    None => return self.apply(callee, done, span),
                     Some(arg) => {
                         let arg = arg.clone();
-                        let carried = crate::rc::carry_released(
-                            &env,
-                            next + 1 < args.len(),
-                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
-                        );
+                        crate::rc::note_carry();
                         self.push(
                             Frame::AppArgs {
                                 callee,
                                 done,
                                 args,
-                                dead,
                                 next: next + 1,
-                                env: carried,
                                 module,
                                 span,
                             },
                             span,
                         )?;
-                        self.go_eval(arg, env, module);
+                        self.go_eval(arg, module);
                     }
                 }
             }
 
-            Frame::Call { name, memo, .. } => {
+            Frame::Call {
+                name,
+                memo,
+                callee_window,
+                caller_window,
+                ..
+            } => {
+                self.exit_window(callee_window, caller_window);
                 if memo && let Some(name) = &name {
                     self.remember_constant(name, &value);
                 }
                 self.go_return(value);
             }
 
+            Frame::Exit {
+                callee_window,
+                caller_window,
+            } => {
+                self.exit_window(callee_window, caller_window);
+                self.go_return(value);
+            }
+
             Frame::Resume { k } => return self.resume_continuation(&k, value),
+
+            Frame::Restore { spill, base_offset } => {
+                let windows = self.windows_mut();
+                let to = windows.len() - spill as usize;
+                windows.truncate(to);
+                windows.base = to - base_offset as usize;
+                self.go_return(value);
+            }
 
             Frame::If {
                 then_branch,
                 else_branch,
-                env,
                 module,
                 cond_span,
             } => {
@@ -183,27 +170,24 @@ impl Machine<'_> {
                 } else {
                     else_branch
                 };
-                self.go_eval(taken, env, module);
+                self.go_eval(taken, module);
             }
 
             Frame::MatchArms {
                 scrutinee,
                 arms,
                 next,
-                env,
                 module,
                 scrutinee_span,
             } => {
                 let scrutinee = if next == 0 { value } else { scrutinee };
-                return self.try_arms(scrutinee, arms, next, env, module, scrutinee_span);
+                return self.try_arms(scrutinee, arms, next, module, scrutinee_span);
             }
 
             Frame::MatchGuard {
                 scrutinee,
                 arms,
                 at,
-                arm_env,
-                env,
                 module,
                 scrutinee_span,
             } => {
@@ -213,7 +197,7 @@ impl Machine<'_> {
                     .map_or(scrutinee_span, |guard| guard.span);
                 if value.as_bool(guard_span, "a match guard")? {
                     let body = arms[at].body.clone();
-                    self.go_eval(body, arm_env, module);
+                    self.go_eval(body, module);
                     return Ok(());
                 }
                 // A rejected arm falls through to the next one with the scrutinee it was already
@@ -223,7 +207,6 @@ impl Machine<'_> {
                         scrutinee,
                         arms,
                         next: at + 1,
-                        env,
                         module,
                         scrutinee_span,
                     },
@@ -236,26 +219,20 @@ impl Machine<'_> {
                 stmts,
                 next,
                 tail,
-                scope,
                 module,
             } => {
-                let mut scope = scope;
-                if let CodeStmt::Let { pat, span, .. } = &stmts[next - 1] {
-                    let mut bound = scope.clone();
-                    if !self.match_pattern(pat, &value, &mut bound, module)? {
-                        return Err(err_let_mismatch(*span, &value));
-                    }
-                    scope = bound;
+                if let CodeStmt::Let { pat, span, .. } = &stmts[next - 1]
+                    && !self.match_pattern(pat, &value, module)?
+                {
+                    return Err(err_let_mismatch(*span, &value));
                 }
-                return self.enter_block(stmts, next, tail, scope, module);
+                return self.enter_block(stmts, next, tail, module);
             }
 
             Frame::RecordField {
                 mut done,
                 fields,
-                dead,
                 next,
-                env,
                 module,
             } => {
                 done.push((fields[next - 1].0.clone(), value));
@@ -266,42 +243,52 @@ impl Machine<'_> {
                     }
                     Some((_, code)) => {
                         let code = code.clone();
-                        let carried = crate::rc::carry_released(
-                            &env,
-                            next + 1 < fields.len(),
-                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
-                        );
+                        crate::rc::note_carry();
                         self.push(
                             Frame::RecordField {
                                 done,
                                 fields,
-                                dead,
                                 next: next + 1,
-                                env: carried,
                                 module,
                             },
                             code.span,
                         )?;
-                        self.go_eval(code, env, module);
+                        self.go_eval(code, module);
                     }
                 }
             }
 
-            Frame::FieldAccess { field, base_span } => match &value {
-                Value::Record(fields) => match fields.get(&field.name) {
-                    Some(v) => self.go_return(v.clone()),
-                    None => return Err(err_no_such_field(&field, fields)),
-                },
-                other => {
-                    return Err(type_error(base_span, "field access", "a record", other));
+            Frame::FieldAccess { field, base_span } => {
+                let mut value = value;
+                match &mut value {
+                    // A record whose only owner just handed it over is dying: the projection
+                    // moves the field out instead of cloning it, which is what makes `f(s.out)`
+                    // with `s` at its last use hand `f` a uniquely-owned value.
+                    Value::Record(fields) => {
+                        let taken = match Arc::get_mut(fields) {
+                            Some(map) => map.set(&field.name, Value::Unit),
+                            None => fields.get(&field.name).cloned(),
+                        };
+                        match taken {
+                            Some(v) => self.go_return(v),
+                            None => {
+                                let Value::Record(fields) = &value else {
+                                    unreachable!("just matched a record");
+                                };
+                                return Err(err_no_such_field(&field, fields));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(type_error(base_span, "field access", "a record", other));
+                    }
                 }
-            },
+            }
 
             Frame::ListItem {
                 mut done,
                 items,
                 next,
-                env,
                 module,
             } => {
                 done.push(value);
@@ -309,18 +296,17 @@ impl Machine<'_> {
                     None => self.go_return(Value::list(done)),
                     Some(item) => {
                         let item = item.clone();
-                        let carried = crate::rc::carry(&env, next + 1 < items.len());
+                        crate::rc::note_carry();
                         self.push(
                             Frame::ListItem {
                                 done,
                                 items,
                                 next: next + 1,
-                                env: carried,
                                 module,
                             },
                             item.span,
                         )?;
-                        self.go_eval(item, env, module);
+                        self.go_eval(item, module);
                     }
                 }
             }
@@ -332,7 +318,6 @@ impl Machine<'_> {
                 mut done,
                 args,
                 next,
-                env,
                 module,
                 span,
             } => {
@@ -345,7 +330,6 @@ impl Machine<'_> {
                     done,
                     &args,
                     next,
-                    &env,
                     module,
                     span,
                 );
@@ -353,26 +337,20 @@ impl Machine<'_> {
             }
 
             Frame::WithCellBody {
-                binder,
+                slot,
                 body,
-                env,
                 module,
                 region,
                 ..
             } => {
                 let stack = self.stack().clone();
                 let kind = self.region_kind(region);
-                let transition = handler::open_cell(
-                    self.regions_mut(),
-                    &binder,
-                    &body,
-                    &env,
-                    module,
-                    value,
-                    stack,
-                    kind,
-                    region,
-                )?;
+                let transition = {
+                    let (regions, windows) = self.regions_and_windows();
+                    handler::open_cell(
+                        regions, windows, slot, &body, module, value, stack, kind, region,
+                    )?
+                };
                 self.record_alloc_access();
                 return self.take(transition);
             }

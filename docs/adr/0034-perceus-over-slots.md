@@ -1,8 +1,12 @@
 # ADR 0034 — The append cliff is a calculus mismatch: Perceus over slots
 
-**Proposed.** The diagnosis is confirmed on four of the five shapes its gate
-holds and narrowed by the fifth; the representation change is unmeasured; reuse
-and the checked promise are untouched.
+**Decision 1 is landed and its gate is green.** The machine runs on slot
+frames, a last use moves the value out of its slot, and
+`position_invariance_g1` passes on all five pairs — the fifth included, through
+a field-granular move the flat record representation enabled. The request
+path's allocation count did not move (`w6_report_allocations` holds the band).
+Decisions 2–4 — the chunked representation, reuse, and the checked promise —
+remain sequenced behind their own gates; decision 5 was already done.
 
 Continues ADR 0024, whose findings it accepts entire and whose sequencing it
 re-orders.
@@ -214,8 +218,11 @@ get wrong. Its four probes are the four ways a slot machine takes it away:
 One caveat that file states about itself: the first probe's own `assert_eq` cannot fail on the
 chain, because a continuation holds an immutable copy nothing can empty. What arms it there is a pin
 on `takes_moved` — the mechanism rather than the answer — and it is a tripwire: if it moves, find
-out which binding started moving before concluding the change is right. **Sibling isolation — one
-resumption seeing another's slot writes — is not covered and wants a probe before the change.**
+out which binding started moving before concluding the change is right. (It moved when the frames
+landed — to eight — and the audit now carries the per-binding accounting beside the new pin.)
+**Sibling isolation — one resumption seeing another's slot writes — is probed by
+`sibling_resumptions_do_not_share_slot_writes`, which arms itself: a shared window hands the
+second resumption a moved-out slot, which is a loud internal error.**
 
 Nine measurements narrow this to one design, and **it is not the "frame carries a
 narrowed scope" that every attempt kept reaching for. That framing is what made
@@ -248,10 +255,10 @@ own binders are ownable inside it — but at runtime the clause's scope is the
 prompt's environment *extended* with the clause's parameters. **So the two passes
 agree with each other and disagree with the machine.** Two ways out: give every
 occurrence a depth and an index, or **make a clause body a real frame that copies
-in the free variables it needs, exactly as a closure does.** The second is built,
-behind the probe, and keeps addressing flat; **it is behind the probe rather than
-on because the allocation gate is a gate and it is an increase.** What it removes
-is the structural obstacle.
+in the free variables it needs, exactly as a closure does.** The second is what
+shipped, and keeps addressing flat: since the slot frames landed a clause's
+captures are copied into the prompt at handle entry unconditionally, and the
+allocation gate that once kept it behind a probe held anyway.
 
 **What makes the move work is the machine owning the stack, and only that**: a
 value can be moved out of a slot exactly when the array has one owner, and the
@@ -492,15 +499,30 @@ releasing one rebuilds the whole scope.** Whether that trade is worth taking is
 not something the gate alone answers, **and it is recorded with both numbers
 rather than only the one that fails.**
 
-Next: the flat record representation, **ahead of the slot rewrite rather than
-behind it**, because the fifth gate pair needs it. Then slot frames, gated on
-both gates. Then **the other forty-four references to the copy counters, which is
-the larger half** of the representation change. Then the chunked vector, then
+Done since: the flat record representation, and **slot frames themselves — the
+gate is green on all five pairs and the request path's allocation count did not
+move.** Three facts from the landing worth more than the plan that predicted
+them. The fifth pair fell to a **field-granular move** — a projection that is
+the last use of its *field* takes it out of the record in place, behind the
+same runtime uniqueness probe — not to the path-granular analysis ADR 0024
+declined; the probe is what keeps it a slow-never-wrong answer. A
+**tail-resumptive capture costs no slot traffic at all**: the extent's windows
+stay where they are and the splice is the pointer work it always was, so the
+hot perform path never pays for the rewrite — only a general clause's capture
+copies its windows, once, which is the honest cost two futures require. And
+**every quantity a frame or a segment records is relative** — a window size, an
+offset from the top, never an absolute index — which is what lets a multi-shot
+resumption splice `Rc`-shared segments onto any stack at any height with no
+frame rewritten.
+
+Next: **the other forty-four references to the copy counters, which is the
+larger half** of the representation change. Then the chunked vector, then
 reuse, then the checked promise.
 
-**The guide's statement of the positional rule is deleted, not corrected, when
-the gate is green. That is the test of whether the rule is gone: a rule that
-still needs stating is still there.**
+**The guide's statement of the positional rule is deleted** — §6.7 now states
+the ownership rule and the residue `--costs` reports: a copy means a genuine
+second owner. A rule that still needs stating is still there; this one no
+longer needs stating.
 
 ## What would make this wrong
 

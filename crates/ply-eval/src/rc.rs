@@ -1,12 +1,15 @@
 //! Reference counting for the values that outlive their region.
+//!
+//! Perceus' operations, on the machine's slot calculus (ADR 0034): `dup` is a clone at a read
+//! that is not the binding's last, `drop` is the window truncation at an activation's end, and a
+//! *move* is a last use taking the value out of its slot. There is no fourth row: a pending frame
+//! records a base index rather than holding a scope, so nothing owns "the scope" any more.
 
 use crate::arena::Slot;
-use crate::env::Env;
 use crate::value::Value;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
 /// How a variable occurrence takes its value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -14,44 +17,17 @@ pub enum Own {
     /// The binding is read again later, so the read clones — Perceus' `dup`.
     #[default]
     Borrowed,
-    /// The last use of a binding introduced inside the enclosing barrier.
+    /// The last use of a binding of the enclosing barrier: the read moves the value out of its
+    /// slot, leaving the slot empty.
     Owned,
+    /// On a `Field` node whose base is a slot-resolved variable: the projection is the last use
+    /// of this *field*, while other fields of the binding are still read later. The machine takes
+    /// the field out of the record in place when the record is unshared — the fifth gate pair,
+    /// which no release keyed by a name can reach.
+    OwnedField,
 }
 
-/// Whether the sequence S4's probe is armed, read once per process. Off by default: it is a probe
-/// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
-/// do not arm it in anything being timed.
-pub fn probe_armed() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "params")
-    })
-}
-
-/// Whether the probe's *carry-site* half is armed — the `App` and `Record` per-argument releases,
-/// as against the statement-level parameter releases [`probe_armed`] gates.
-pub fn probe_carries() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "carry")
-    })
-}
-
-/// [`carry`], minus the bindings the sub-expression just started is the last reader of.
-pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env {
-    if !remaining {
-        return Env::empty();
-    }
-    // Empty means "hold what you hold today": lowering only asks for a narrowing where the
-    // sub-expression appends, because the window costs a link per name kept.
-    if !probe_carries() || live.is_empty() {
-        return env.clone();
-    }
-    env.keep_only(live)
-}
-
-/// The scope a pending frame carries while the subexpression it is waiting for runs.
-/// Counters for the slot rewrite's capture-against-carry census. Diagnostics only.
+/// Counters for the slot machine's capture-against-carry census. Diagnostics only.
 pub mod census4 {
     use std::cell::Cell;
     thread_local! {
@@ -80,17 +56,12 @@ pub mod census4 {
     }
 }
 
-pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
+/// A pending frame started waiting while a sub-expression runs — what the census counts against
+/// captures. Under the slot machine a carry is a base index in the frame and costs nothing;
+/// the census stays because the trade it guards is still the trade: a capture *copies* the
+/// windows it cuts, and that is affordable only while carries outnumber captures.
+pub(crate) fn note_carry() {
     census4::carry();
-    if remaining { env.clone() } else { Env::empty() }
-}
-
-/// The bindings a statement's end kills, which the machine drops out of the scope its continuation
-/// carries.
-pub type Dead = Rc<[Symbol]>;
-
-pub fn no_dead() -> Dead {
-    Rc::from(Vec::new())
 }
 
 /// What the pass and the runtime counted.
@@ -102,11 +73,12 @@ pub struct Stats {
     pub dup_emitted: u64,
     /// Bindings introduced — the naive `drop` count, one per binding.
     pub drop_sites: u64,
-    /// Bindings named in a `dead` set, which is a `release` the machine runs.
+    /// Per-binding drop operations the machine still runs. Zero since the slot rewrite: a scope's
+    /// end is one window truncation, so no binding pays a drop of its own.
     pub drop_emitted: u64,
-    /// `take_unique` calls the machine attempted, at an `Owned` occurrence.
+    /// Moves the machine attempted, at an `Owned` occurrence.
     pub takes_attempted: u64,
-    /// Those that found the scope unshared and moved the value.
+    /// Those that found a live value in the slot and moved it.
     pub takes_moved: u64,
     /// Updates of a compound value — an operation that answers the argument it was given with one
     /// element changed.
@@ -120,7 +92,7 @@ pub struct Stats {
     /// rewrite copies a path rather than an array, so the boolean would read `false` for something
     /// costing O(log n) and the rate would be uniformly bad while the program got faster. This
     /// counts what was actually copied, which is the question that survives the representation —
-    /// the bounded worst case.
+    /// ADR 0034's S5b.
     pub elements_copied: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
@@ -316,15 +288,30 @@ fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     }
 }
 
+/// One use the backward pass is still expecting to see, to the right of the point the walk has
+/// reached: a whole read of a binding, or a read of one field of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Use {
+    pub name: Symbol,
+    /// `None` is a whole-value use; `Some(f)` a read of one field.
+    pub field: Option<Symbol>,
+}
+
+impl Use {
+    fn whole(name: &Symbol) -> Use {
+        Use {
+            name: name.clone(),
+            field: None,
+        }
+    }
+}
+
 /// The backward pass: what is still live to the right of the point the walk has reached.
 pub struct Live {
-    later: Vec<Symbol>,
+    later: Vec<Use>,
     /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
-    /// holding every name bound anywhere inside it.
+    /// holding every slot name of that barrier: captures, parameters and binders alike.
     ownable: Vec<Vec<Symbol>>,
-    /// How many leading names of each `ownable` frame are that barrier's own
-    /// **parameters**, which [`Live::barrier_params`] hands back.
-    params: Vec<usize>,
 }
 
 impl Live {
@@ -332,33 +319,24 @@ impl Live {
         Live {
             later: Vec::new(),
             ownable: vec![ownable],
-            params: vec![0],
         }
     }
 
-    /// The current barrier's parameters — the sequence S3 / the ownership design P2.
-    pub fn barrier_params(&self) -> &[Symbol] {
-        match (self.ownable.last(), self.params.last()) {
-            (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
-            _ => &[],
+    fn any_later(&self, name: &Symbol) -> bool {
+        self.later.iter().any(|u| &u.name == name)
+    }
+
+    fn push(&mut self, u: Use) {
+        if !self.later.contains(&u) {
+            self.later.push(u);
         }
     }
 
-    /// Declares that the first `count` names of the current barrier's frame are
-    /// its parameters. Called once, immediately after the frame is opened.
-    pub fn params_are(&mut self, count: usize) {
-        if let Some(last) = self.params.last_mut() {
-            *last = count;
-        }
-    }
-
-    /// Records a read and answers whether the value may be moved rather than cloned.
+    /// Records a whole-value read and answers whether the value may be moved rather than cloned.
     pub fn use_of(&mut self, name: &Symbol) -> Own {
         let tracked = self.tracked(name);
-        let last = !self.later.iter().any(|n| n == name);
-        if last {
-            self.later.push(name.clone());
-        }
+        let last = !self.any_later(name);
+        self.push(Use::whole(name));
         if tracked {
             bump(|s| {
                 s.dup_sites += 1;
@@ -372,6 +350,42 @@ impl Live {
         }
     }
 
+    /// Records a read of one field, and answers what the projection may take: the whole value when
+    /// nothing later reads the binding at all, the field alone when only *other* fields are read
+    /// later, and a clone otherwise.
+    pub fn use_field(&mut self, name: &Symbol, field: &Symbol) -> Own {
+        let tracked = self.tracked(name);
+        let whole_later = self
+            .later
+            .iter()
+            .any(|u| &u.name == name && u.field.is_none());
+        let field_later = self
+            .later
+            .iter()
+            .any(|u| &u.name == name && u.field.as_ref() == Some(field));
+        let any_later = self.any_later(name);
+        let own = if !tracked {
+            Own::Borrowed
+        } else if !any_later {
+            Own::Owned
+        } else if !whole_later && !field_later {
+            Own::OwnedField
+        } else {
+            Own::Borrowed
+        };
+        self.push(Use {
+            name: name.clone(),
+            field: Some(field.clone()),
+        });
+        if tracked {
+            bump(|s| {
+                s.dup_sites += 1;
+                s.dup_emitted += u64::from(own == Own::Borrowed);
+            });
+        }
+        own
+    }
+
     /// Whether this name is a binding of the current barrier, which is the only thing the counts
     /// and the ownership answer are about.
     fn tracked(&self, name: &Symbol) -> bool {
@@ -380,83 +394,84 @@ impl Live {
             .is_some_and(|scope| scope.iter().any(|n| n == name))
     }
 
-    /// Whether this name is a binding of the current barrier — [`Live::tracked`]
-    /// in public form, for the the sequence S4 probe, which may only release a
-    /// name whose last use this body can bound.
-    pub fn is_ownable(&self, name: &Symbol) -> bool {
-        self.tracked(name)
-    }
-
     pub fn is_live(&self, name: &Symbol) -> bool {
-        self.later.iter().any(|n| n == name)
+        self.any_later(name)
     }
 
     /// Crossing a binder, backwards: reads further left mean an outer binding of the same name.
     pub fn kill(&mut self, name: &Symbol) {
-        self.later.retain(|n| n != name);
+        self.later.retain(|u| &u.name != name);
     }
 
-    /// Enters a scope in which `binders` denote new bindings, answering the ones the rest of the
-    /// activation still reads.
-    pub fn shadow(&mut self, binders: &[Symbol]) -> Vec<Symbol> {
+    /// Enters a scope in which `binders` denote new bindings, answering the uses of an outer
+    /// binding of one of those names that the rest of the activation still makes.
+    pub(crate) fn shadow(&mut self, binders: &[Symbol]) -> Vec<Use> {
         let mut held = Vec::new();
-        for name in binders {
-            if self.is_live(name) && !held.iter().any(|n| n == name) {
-                held.push(name.clone());
+        for u in &self.later {
+            if binders.iter().any(|b| b == &u.name) && !held.contains(u) {
+                held.push(u.clone());
             }
         }
-        self.later.retain(|n| !binders.iter().any(|b| b == n));
+        self.later.retain(|u| !binders.iter().any(|b| b == &u.name));
         held
     }
 
-    pub fn snapshot(&self) -> Vec<Symbol> {
+    pub(crate) fn snapshot(&self) -> Vec<Use> {
         self.later.clone()
     }
 
-    pub fn restore(&mut self, names: Vec<Symbol>) {
-        self.later = names;
+    pub(crate) fn restore(&mut self, uses: Vec<Use>) {
+        self.later = uses;
     }
 
     /// Unions a branch's live set into the current one.
-    pub fn union(&mut self, other: Vec<Symbol>) {
-        for name in other {
-            if !self.is_live(&name) {
-                self.later.push(name);
-            }
+    pub(crate) fn union(&mut self, other: Vec<Use>) {
+        for u in other {
+            self.push(u);
         }
     }
 
     /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
-    pub fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
+    pub(crate) fn open(&mut self, bound: Vec<Symbol>) -> Vec<Use> {
         self.ownable.push(bound);
-        self.params.push(0);
         std::mem::take(&mut self.later)
     }
 
-    /// Closes a barrier.
-    /// Closes a barrier, answering its **free variables** — the names still live inside it, which
-    /// are exactly what a closure over it has to keep.
-    pub fn close(&mut self, outer: Vec<Symbol>) -> Vec<Symbol> {
-        let free = std::mem::replace(&mut self.later, outer);
+    /// Closes a barrier, replaying its free variables as reads at the construct that captured
+    /// them, and answering how the capture may take each: a clone while the enclosing activation
+    /// still reads the name, a move when the capture is its last use.
+    ///
+    /// `movable` is false for a barrier whose capture runs *before* code lowered to its left in
+    /// the walk — a handler clause or a `simulate` body, both captured at the construct's entry
+    /// while the body between entry and any later read has yet to run. Those captures always
+    /// clone.
+    pub(crate) fn close_with_owns(
+        &mut self,
+        outer: Vec<Use>,
+        frees: &[Symbol],
+        movable: bool,
+    ) -> Vec<Own> {
+        self.later = outer;
         self.ownable.pop();
-        self.params.pop();
-        for name in &free {
-            if !self.is_live(name) {
-                self.later.push(name.clone());
+        let mut owns = Vec::with_capacity(frees.len());
+        for name in frees {
+            let tracked = self.tracked(name);
+            let moved = movable && tracked && !self.any_later(name);
+            owns.push(if moved { Own::Owned } else { Own::Borrowed });
+            if tracked {
+                bump(|s| {
+                    s.dup_sites += 1;
+                    s.dup_emitted += u64::from(!moved);
+                });
             }
+            self.push(Use::whole(name));
         }
-        free
+        owns
     }
 
     /// Counts the bindings a scope introduces, for the naive `drop` denominator.
     pub fn declare(&mut self, count: usize) {
         bump(|s| s.drop_sites += count as u64);
-    }
-
-    /// The names a statement's end kills, counted as the `drop`s the pass did emit.
-    pub fn released(&mut self, dead: Vec<Symbol>) -> Dead {
-        bump(|s| s.drop_emitted += dead.len() as u64);
-        Rc::from(dead)
     }
 }
 

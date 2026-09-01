@@ -1,8 +1,8 @@
 //! What a step costs the allocator, exactly.
 
 use crate::counting::charge;
+use ply_eval::Stack;
 use ply_eval::cont::{Frame, Prompt, Segment};
-use ply_eval::{Env, Stack};
 use ply_span::Span;
 use std::hint::black_box;
 use std::rc::Rc;
@@ -17,6 +17,8 @@ fn call_frame() -> Frame {
         name: None,
         call_site: Span::DUMMY,
         memo: false,
+        callee_window: 0,
+        caller_window: 0,
     }
 }
 
@@ -81,7 +83,8 @@ fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
         clauses: Rc::new(Vec::new()),
         effects: Rc::new(Vec::new()),
         ret: None,
-        env: Env::empty(),
+        clause_captures: Vec::new(),
+        ret_captures: Rc::from(Vec::new()),
         module: 0,
         span: Span::DUMMY,
     });
@@ -95,7 +98,7 @@ fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
     let (_, prompts) = allocations_of(|| {
         let mut s = stack.clone();
         for _ in 0..N {
-            s = s.push_prompt(prompt.clone());
+            s = s.push_prompt(prompt.clone(), 0);
         }
         s
     });
