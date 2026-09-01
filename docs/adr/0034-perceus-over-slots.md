@@ -245,10 +245,9 @@ ADR 0025 priced this against `rpds::Vector` and it failed two of four
 pre-registered criteria. **Two corrections to how that result should be read,
 neither of which moves the bar it failed:**
 
-1. `rpds::Vector` does **not** do the unique-path in-place mutation; the `im` /
-   `imbl` family does. So its unique-path overhead is an upper bound on a cost a
-   tail chunk mostly removes, and the measurement should be re-taken against a
-   vector that has the fast path before the gate is applied.
+1. The measurement was re-taken against both families, in §10.1. `imbl` is the
+   candidate: `rpds` allocates once per append, which G2 refuses. Its time ratio
+   is the better of the two and that is not the binding criterion.
 2. **The gate's shape is wrong**, and this is a disagreement rather than a
    re-measurement. It reads "take the representation change if the analysis
    fails". They are not alternatives: the analysis makes the common case free and
@@ -432,6 +431,53 @@ two doublings, and bounded; and `list_at` stays within 2× of today's **measured
 through the backend**, per ADR 0027 §7's warning that dispatch will otherwise hide
 the term. This supersedes ADR 0025's `Vector<T>` gate, for §5's reason.
 
+### §10.1 G3 answered, and G2 is what decides it
+
+Both candidate representations were priced before §5 was built, against
+`Arc<Vec<Value>>`. Times are the minimum of three; allocations are counted with a
+global allocator over one 8,000-element list built by repeated unique append.
+
+| shared/unique time ratio | n = 4,000 | 8,000 | 16,000 | 32,000 |
+| --- | ---: | ---: | ---: | ---: |
+| `Arc<Vec>` — today | 105 | 215 | 644 | 1,406 |
+| `imbl::Vector` | 12.4 | 11.3 | 11.9 | 11.6 |
+| `rpds::Vector` | 6.7 | 7.0 | 6.8 | 7.0 |
+
+**G3's property holds for both and fails for what ships.** Today's ratio grows
+without bound; both candidates are flat — `imbl` 1.10 across the range, `rpds`
+1.05, against a bar of 1.5. The index term is negligible where ADR 0027 §7 says
+to measure it: per index, 0.47 ns today against 6.96 ns (`imbl`) and 2.95 ns
+(`rpds`), against roughly 1.7 µs of dispatch around it.
+
+**G3 as registered selects `rpds`, and `rpds` is disqualified — by G2.**
+
+| allocations, one 8,000-element list | allocations | bytes | per append |
+| --- | ---: | ---: | ---: |
+| `Arc<Vec>` | 13 | 131 KB | 0.002 |
+| `imbl::Vector` | 135 | 75 KB | 0.017 |
+| `rpds::Vector` | **9,293** | 328 KB | **1.162** |
+
+`rpds` allocates **once per append**, which is the spine-node cost ADR 0025's
+fallback section predicted and set against itself. Allocations per request is
+what G2 bounds and what this record judges a milestone on, so `rpds` cannot land
+whatever its time ratio is. `imbl` costs ten times `Vec`'s allocation count in
+the relative reading and 122 allocations in the absolute one, while using **43%
+fewer bytes**, because `Vec`'s doubling over-allocates where a chunked spine does
+not.
+
+**The gate is not being moved to fit this.** G3 asked for a *ratio* and got a
+true answer to that question; what it never bounded is the absolute cost of the
+good case, and that is not a new bar — it is G2, already registered, already the
+thing that caught S3. Read together they admit `imbl` and refuse `rpds`, and the
+lesson for the next gate written here is that a ratio criterion needs a level
+criterion beside it or it will select whatever makes the common case uniformly
+bad.
+
+**Still unmeasured, and it is what §5 turns on:** whether `imbl`'s 122 extra
+allocations per large list show up on the request path at all. `/health` builds
+small lists, and G2 is measured there. That number needs the change to exist, so
+§5 stays gated on it rather than on this table.
+
 ---
 
 ## §11 Sequence
@@ -446,7 +492,7 @@ the term. This supersedes ADR 0025's `Vector<T>` gate, for §5's reason.
 | **S4″** | both of ADR 0025's fallback primitives for P1, priced | done — both roughly double request-path allocations; §4 has the table |
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
 | **S4** | §4, slot frames and flat closure conversion | gated on **G1**, then **G2** |
-| **S5** | §5, the chunked vector | gated on **G3** |
+| **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
 
