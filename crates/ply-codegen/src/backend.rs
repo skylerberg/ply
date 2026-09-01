@@ -47,6 +47,7 @@ use ply_syntax::ast::{Program, TypeExpr};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The widest arity this boundary carries without allocating an argument array.
@@ -205,7 +206,7 @@ impl Cranelift {
         let (compiled, refusals) = closure(source, &candidates)?;
         let members: BTreeSet<Symbol> = compiled
             .iter()
-            .filter(|name| scalar_signature(source, name))
+            .filter(|name| registers(source, name))
             .map(Symbol::new)
             .collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -531,6 +532,34 @@ impl Policed for Bodies {
     }
 }
 
+/// Which of the compiled bodies are registered for the machine to enter.
+///
+/// Measurement scaffolding, off unless `PLY_CODEGEN_REGISTER=all` is set in the
+/// environment, and **read once per process** -- `ply_eval::backend`'s
+/// `PLY_BACKEND_ONLY` is the precedent and this follows its shape deliberately.
+///
+/// It exists to settle a *cost* claim rather than a correctness one.
+/// [`scalar_signature`] drops 467 of the 489 bodies the fixpoint compiles over
+/// `spikes/ply-parser`, and its stated reason is that declining before the fact
+/// is cheaper than declining at runtime. That is a claim about time, and the
+/// only way to know is to register them and take the clock.
+///
+/// Widening is **not** a correctness risk, which is why this knob is safe to
+/// hand a corpus: the runtime unboxes dynamically, so `rt_unbox_int` on a
+/// `Bytes` calls `ctx.fail` and the entry declines with `Declines::failed`
+/// counting it. `scalar_signature`'s own doc says the machine's boundary is the
+/// authority on both sides. What widening can change is how much is *paid* per
+/// declined call, not what any call answers.
+///
+/// Deliberately not a `--backend` spec, for `PLY_BACKEND_ONLY`'s reason: a spec
+/// is a user-facing promise and this is an instrument.
+fn registers(source: &Source, name: &str) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    let all =
+        *ALL.get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "all"));
+    all || scalar_signature(source, name)
+}
+
 /// Whether every parameter and the return type are written `Int` or `Bool`.
 ///
 /// Necessary and not sufficient, and the machine's boundary is the authority on
@@ -547,6 +576,16 @@ impl Policed for Bodies {
 /// here would be a body that unboxes an `Int` from an `Arc<[u8]>` and fails
 /// every time. The two registries have parted company and the wider one is the
 /// tree-walker's.
+///
+/// > **Measured, 2026-08-31 -- ADR 0032.** The cost claim above is true and the
+/// > margin is larger than it reads. This filter drops **467 of the 489** bodies
+/// > the fixpoint compiles over `spikes/ply-parser`; registering them all
+/// > (`PLY_CODEGEN_REGISTER=all`) takes the front end from 3.04 s to 4.72 s
+/// > against a 2.85 s interpreter, because it buys 495,152 shallow entries
+/// > rather than a higher one. On `benches/kernel` the same widening is worth
+/// > 1.5x, because there the root *is* compilable and 2,974 entries collapse to
+/// > 63. Keep the narrow default; the way past it is compiling `++` and nested
+/// > record patterns, not registering more leaves.
 fn scalar_signature(source: &Source, name: &str) -> bool {
     let Some((def, _)) = source.definition(name) else {
         return false;
