@@ -42,10 +42,9 @@ pub enum NodeKind {
     App {
         func: Code,
         args: Rc<Vec<Code>>,
-        /// Per argument, the bindings that argument is the **last reader** of —
-        /// ADR 0034 §11 S4's probe. Empty everywhere unless the probe is armed,
-        /// so the shipped lowering allocates one empty `Rc` per `App` and the
-        /// machine's `carry` takes exactly the branch it takes today.
+        /// Per argument, what the arguments to its right still read — ADR 0034 §11 S4's probe.
+        /// Empty unless the probe is armed, and then a shared empty `Rc`, so the shipped lowering
+        /// allocates nothing for it and `carry` takes the branch it takes today.
         dead: Rc<Vec<crate::rc::Dead>>,
     },
     If {
@@ -63,7 +62,7 @@ pub enum NodeKind {
     },
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
-        /// Per field, what that field's value is the last reader of — the same
+        /// Per field, what the fields to its right still read — the same
         /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0034
         /// §11 S4's probe covers. Empty unless the probe is armed.
         dead: Rc<Vec<crate::rc::Dead>>,
