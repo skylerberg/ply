@@ -293,7 +293,9 @@ caller threads the sink.
 > `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts the standard
 > library's accumulators stay linear, and
 > `crates/ply-eval/tests/allocation/accumulator_shape.rs` that an accumulator
-> with a second owner does too.
+> with a second owner does too. A `reuse fn` makes the same claim about one
+> function an obligation `ply check` enforces (`E0127`), and the standard
+> library's lexer, parser and encoder loops are marked.
 **`bytes_slice` and `bytes_split` copy.** `Value::Bytes` is `Arc<[u8]>` with no
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.

@@ -797,6 +797,7 @@ impl Decoder<'_> {
             derived: None,
             // A spec is erased by normalization, so a body decoded from its hash carries none.
             spec: Vec::new(),
+            reuse: None,
             body,
             span: Span::DUMMY,
         })

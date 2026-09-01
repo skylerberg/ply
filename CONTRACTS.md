@@ -648,6 +648,8 @@ pub struct DefEntry {
     pub span: FileSpan,
     pub kind: DefKind,                   // Fn | Type | Effect
     pub members: Vec<Member>,            // variants of a type, operations of an effect
+    pub reuse: bool,                     // a `reuse fn`: gate 1 knows without a parse,
+                                         // because the promise is checked whole-program
 }
 pub struct Member    { pub name: Symbol, pub span: FileSpan }
 pub struct NameRef   { pub name: Symbol, pub hash: DefHash }
@@ -2977,8 +2979,13 @@ pub struct LawDef {
     pub span: Span,
 }
 
-pub struct FnDef { /* … */ pub spec: Vec<SpecClause>, /* … */ }
+pub struct FnDef { /* … */ pub spec: Vec<SpecClause>, pub reuse: Option<Span>, /* … */ }
 ```
+
+`reuse` is contextual the same way: it opens an item only when `fn` follows
+(after `pub`, if any), its span is kept on the definition for `E0127`'s
+secondary label, and normalization erases it as it erases a spec — a promise is
+an obligation on the body, not part of what the body denotes.
 
 `requires`, `ensures`, `law`, `forall`, `where` and `result` are all **contextual**
 — `lexer::is_ident` stays true for every one, no `Kw` variant is added, and a
@@ -7507,7 +7514,7 @@ Read `ply_store`'s own doc comments, which do:
 | `FRONTEND_VERSION` | `0.15.0` | `0.14.0`: a handler clause for a polymorphic operation is universally quantified, so a clause answering a concrete type for an operation declared `-> a` is `E0201` where it was accepted. `0.15.0`: ADR 0017's region surface — `with_region[r]`, the escape check on resolved types, and a variant field declared as a concrete `Cell` becoming `E0446` |
 | `PROVER_VERSION` | `0.5.0` | unchanged since W4 |
 | `BODY_ENCODING` | `7` | unchanged since W4 |
-| `FRONTEND_FORMAT` | `4` | — |
+| `FRONTEND_FORMAT` | `5` | — |
 
 Each of those last two `FRONTEND_VERSION` bumps is a front end that *refuses* a
 program the previous one accepted, which is the case the constant's own comment

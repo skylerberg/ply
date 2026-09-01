@@ -3,6 +3,7 @@
 use ply_cli::driver;
 use ply_cli::load::Loaded;
 use ply_store::Store;
+use ply_syntax::ast::ModuleName;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -843,4 +844,37 @@ pub fn different() -> String = greet("ada", "hi")
         of("different"),
         "a call that really does pass another value must not collide with one that does not"
     );
+}
+
+/// A `reuse fn` is checked whole-program, so gate 1 has to know a skipped module holds one: the
+/// second run parses nothing and still reports the promise, and completing the parse for it finds
+/// the copy the promise forbids.
+#[test]
+fn a_promise_in_a_module_gate_one_skips_is_still_known_and_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    write(
+        dir,
+        "grow.ply",
+        "reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {\n\
+         \x20 let ys = push(xs, n);\n\
+         \x20 if len(xs) < 0 { xs } else { ys }\n\
+         }\n",
+    );
+    let first = agree(dir, "first run");
+    assert!(first.promised);
+
+    let second = agree(dir, "second run");
+    assert!(
+        !second.complete,
+        "gate 1 parsed the unchanged file, so this proves nothing"
+    );
+    assert!(second.promised, "the promise was lost with the parse");
+
+    let mut store = Store::open(dir).unwrap();
+    let full =
+        driver::load_to_evaluate(dir, &mut store, &[ModuleName::from_dotted("grow")]).unwrap();
+    let broken = ply_cli::costs::promises(&full.program, &full.resolved);
+    assert_eq!(broken.len(), 1, "{broken:#?}");
+    assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
 }

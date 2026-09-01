@@ -24,6 +24,24 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 
     let warnings = once_each(warnings);
 
+    if loaded.promised {
+        // The promise is whole-program, so it needs every body; the gates' report is kept as they
+        // fired, so `--explain` still says what the run decided rather than what the check needed.
+        let frontend = loaded.frontend.clone();
+        if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
+            return report_load_error("check", &err, args.json, style);
+        }
+        loaded.frontend = frontend;
+        let broken = crate::costs::promises(&loaded.program, &loaded.resolved);
+        if !broken.is_empty() {
+            let err = crate::load::LoadError {
+                sources: loaded.sources.clone(),
+                diagnostics: broken,
+            };
+            return report_load_error("check", &err, args.json, style);
+        }
+    }
+
     if args.json {
         let mut report = report_json(&loaded, &warnings);
         // After `front_end` is recorded, so that completing the parse cannot rewrite the report of
@@ -535,6 +553,50 @@ mod tests {
             .map(|d| d["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["a.total", "b.total"]);
+    }
+
+    /// The promise, its exemption and its refusal — the checked obligation ADR 0034's decision 4
+    /// puts on the callee.
+    #[test]
+    fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
+        // Kept: the append is the last use of a parameter, whatever the caller does with it.
+        let (_dir, loaded) = fixture(
+            "reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = push(xs, n)\n\
+             fn keep(xs: List<Int>) -> Int = len(grow(xs, 1)) + len(xs)\n",
+        );
+        assert!(loaded.promised);
+        assert!(crate::costs::promises(&loaded.program, &loaded.resolved).is_empty());
+
+        // Broken: the binding is read again after the append, inside the promised body.
+        let (_dir, loaded) = fixture(
+            "reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {\n\
+             \x20 let ys = push(xs, n);\n\
+             \x20 if len(xs) < 0 { xs } else { ys }\n\
+             }\n",
+        );
+        let broken = crate::costs::promises(&loaded.program, &loaded.resolved);
+        assert_eq!(broken.len(), 1, "{broken:#?}");
+        assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
+        assert!(broken[0].message.contains("`grow` is a `reuse fn`"));
+        assert!(broken[0].notes.iter().any(|n| n.contains("last use")));
+        let err = crate::load::LoadError {
+            sources: loaded.sources.clone(),
+            diagnostics: broken,
+        };
+        assert_eq!(
+            report_load_error("check", &err, true, Style::plain()),
+            EXIT_COMPILE_ERROR
+        );
+
+        // The same body without the marker is what `--costs` reports, not an error.
+        let (_dir, loaded) = fixture(
+            "fn grow(xs: List<Int>, n: Int) -> List<Int> = {\n\
+             \x20 let ys = push(xs, n);\n\
+             \x20 if len(xs) < 0 { xs } else { ys }\n\
+             }\n",
+        );
+        assert!(!loaded.promised);
+        assert!(crate::costs::promises(&loaded.program, &loaded.resolved).is_empty());
     }
 
     #[test]
