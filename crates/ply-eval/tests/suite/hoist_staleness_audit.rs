@@ -126,7 +126,7 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
 
 /// The same question on a tail-resumptive region, which takes no pin.
 ///
-/// The staleness arm is vacuous since ADR 0033 §8 — `unique` is now the honest inference for this
+/// The staleness arm is vacuous since ADR 0034 §8 — `unique` is now the honest inference for this
 /// shape, so injecting it injects the honest answer — and is kept as a regression guard: it reddens
 /// at the `Unique` assertion if the clause form goes back to forcing `shared`.
 #[test]
@@ -144,7 +144,7 @@ fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     assert_eq!(
         tail.machine().region_kind(span),
         Some(RegionKind::Unique),
-        "ADR 0033 §8: a tail-resumptive clause is not a capture that outlives its region"
+        "ADR 0034 §8: a tail-resumptive clause is not a capture that outlives its region"
     );
 
     let honest = int(tail.call("m.go"));

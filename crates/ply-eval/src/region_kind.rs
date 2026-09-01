@@ -13,7 +13,7 @@ pub enum Cause {
     /// A handler clause with a `resume` binder, which may resume any number of times.
     Clause { effect: Symbol, op: Symbol },
     /// A tail-resumptive clause, whose continuation reaches no binder and is spliced above the
-    /// region's close, so it is not on its own a reason to be `shared` — ADR 0033 §8.
+    /// region's close, so it is not on its own a reason to be `shared` — ADR 0034 §8.
     TailClause { effect: Symbol, op: Symbol },
     /// A `perform` no `handle` inside the region answers.
     Escapes { effect: Symbol, op: Symbol },

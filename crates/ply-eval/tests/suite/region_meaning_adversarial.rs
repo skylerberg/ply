@@ -720,7 +720,7 @@ test "the trace cell ends at two, every time" {
 }
 
 /// A tail-resumptive clause writing the cell of the region that encloses its own
-/// handler — the shape ADR 0033 §8 moved from `shared` to `unique`.
+/// handler — the shape ADR 0034 §8 moved from `shared` to `unique`.
 #[test]
 fn a_tail_resumptive_clause_writing_its_own_region_still_threads() {
     holds(
