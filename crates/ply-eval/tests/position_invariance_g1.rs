@@ -1,6 +1,6 @@
-//! **ADR 0032 §10 G1 — position invariance, registered before the measurement.**
+//! **ADR 0033 §10 G1 — position invariance, registered before the measurement.**
 //!
-//! ADR 0032's central claim is that the positional rule
+//! ADR 0033's central claim is that the positional rule
 //! (`spikes/ply-lexer/GAPS.md` §1) is an artifact of tracking ownership at
 //! *scope* granularity over a shared `Rc` chain, and that slot-granular frames
 //! (§4, sequenced as S4) remove it. That claim is **argued from the mechanism
@@ -75,7 +75,7 @@
 //!   [`COMPOUNDING_PESSIMAL`] swapped for [`RECORD_FIELD_PESSIMAL`], which
 //!   deletes ADR 0025 §Context row five from the corpus and leaves a duplicate
 //!   of the pair above it. **This is the state this file was found in on
-//!   2026-08-31**, with ADR 0032 §10's third row and §14's "five shapes"
+//!   2026-08-31**, with ADR 0033 §10's third row and §14's "five shapes"
 //!   reporting a measurement nothing was taking, and with `COMPOUNDING_PESSIMAL`
 //!   unreferenced — `cargo clippy -p ply-eval --tests` said so, and CI runs
 //!   clippy with `-D warnings`. Re-run deliberately after the repair: the pin
@@ -119,12 +119,12 @@ use ply_syntax::resolve::{Resolved, resolve};
 /// rate, so a run cannot supply the bar it is about to clear.
 #[derive(Clone, Copy, Debug)]
 struct Criteria {
-    /// ADR 0032 §10 G1, first bullet: `|in_place_rate(canonical) −
+    /// ADR 0033 §10 G1, first bullet: `|in_place_rate(canonical) −
     /// in_place_rate(pessimal)| ≤ 0.02` for **every** pair. Two spellings of one
     /// computation may not differ in cost by more than measurement noise, and
     /// there is no noise in an append count, so this is nearly an equality.
     max_position_gap: f64,
-    /// ADR 0032 §10 G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
+    /// ADR 0033 §10 G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
     /// every pair whose canonical form is linear today. Without it the first
     /// bullet is satisfiable by making the canonical form as slow as the
     /// pessimal one, which is the wrong direction to converge in.
@@ -240,10 +240,10 @@ test "the growing field is last and its record is first in the call" {
 /// **This pair is not strictly positional and is in the corpus anyway.** The
 /// two members differ in where the accumulator *arrives from*, not in where the
 /// `push` sits, so a reading of G1 as "argument order" excludes it — and they
-/// differ in one more thing, said here because a reader of ADR 0032 §10's table
+/// differ in one more thing, said here because a reader of ADR 0033 §10's table
 /// alone would not know it: the pessimal member introduces `inner`, so it runs
 /// 200 call frames the canonical member does not. Both answer 2200 and both run
-/// exactly 200 appends, which is what the rate is taken over. ADR 0032 §4
+/// exactly 200 appends, which is what the rate is taken over. ADR 0033 §4
 /// does not read it that way — *"a parameter is a slot like any other; if the
 /// caller passed its last use, the value arrives at count 1"* — and it is the
 /// same claim under test: one computation, two spellings, and a cost that
@@ -318,7 +318,7 @@ test "a fold accumulator appended in first position" {
 /// Written down because [`the_same_computation_costs_the_same_in_either_order`]
 /// asserts that a list of failures is empty, and an empty corpus produces an
 /// empty list: with `corpus()` returning `Vec::new()`, G1 reported `ok` — run
-/// and watched, 2026-08-31, before [`measure_corpus`] checked this. ADR 0032
+/// and watched, 2026-08-31, before [`measure_corpus`] checked this. ADR 0033
 /// §10's table has five rows and §14 says "a paired corpus of five shapes", so
 /// the number is a claim in two documents and this is the one place it lives.
 const EXPECTED_PAIRS: usize = 5;
@@ -417,18 +417,11 @@ struct Cost {
 /// Every append this member ran, summed over its sites, and how many sites
 /// that was.
 ///
-/// > **Corrected: the isolation this comment used to name could not fire.**
-/// > The withdrawn clause, verbatim: *"and filtered by source so a neighbouring
-/// > test on this thread cannot contribute"*. [`inline`] builds a fresh
-/// > [`SourceMap`] per member and `SourceMap::add` returns
-/// > `SourceId(self.files.len())` (`crates/ply-span/src/lib.rs:162`), so every
-/// > member of this corpus is `SourceId(0)`; instrumented and run 2026-08-31,
-/// > all ten printed one site at `SourceId(0)` with nothing skipped. The filter
-/// > excluded nothing and could not have excluded a neighbouring inline
-/// > program, which would be `SourceId(0)` too. It is gone. What isolates a
-/// > member is [`rc::record_sites`] clearing the map — now on the arming call
-/// > as well as the disarming one, so the isolation no longer depends on the
-/// > previous member having finished without panicking.
+/// What isolates one member from the next is [`rc::record_sites`] clearing the
+/// site map, on the arming call as well as the disarming one. Do not add a
+/// filter by [`SourceId`] instead: [`inline`] builds a fresh [`SourceMap`] per
+/// member and `SourceMap::add` numbers from zero, so every member of this corpus
+/// is `SourceId(0)` and such a filter excludes nothing it is meant to.
 fn measure(src: &str) -> Cost {
     let p = inline(src);
     let mut machine = Machine::for_program(&p.program, &p.resolved);
@@ -484,7 +477,7 @@ fn measure_corpus(c: &Criteria) -> Vec<(Pair, Measured)> {
     assert_eq!(
         pairs.len(),
         EXPECTED_PAIRS,
-        "the corpus is {} pairs where {EXPECTED_PAIRS} is what ADR 0032 §10's table and §14 \
+        "the corpus is {} pairs where {EXPECTED_PAIRS} is what ADR 0033 §10's table and §14 \
          report; a bar over fewer shapes than it claims is not the bar that was registered",
         pairs.len(),
     );
@@ -534,15 +527,15 @@ fn print_table(rows: &[(Pair, Measured)]) {
 
 // ------------------------------------------------------------------- G1
 
-/// **ADR 0032 §10 G1.** Two spellings of one computation cost the same.
+/// **ADR 0033 §10 G1.** Two spellings of one computation cost the same.
 ///
 /// Red on this tree, and it is supposed to be: §10 says so in advance —
 /// *"Today's figures are 200 / 200 against 0 / 200, so it will be"* — and the
 /// numbers [`every_pair_is_pinned_to_what_it_costs_today`] holds are what red
-/// looks like. If §4 lands (S4) and this stays red, ADR 0032 §12 item 1 is what
+/// looks like. If §4 lands (S4) and this stays red, ADR 0033 §12 item 1 is what
 /// follows: the diagnosis in §1 is wrong and §5 is the whole of what survives.
 #[test]
-#[ignore = "ADR 0032 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
+#[ignore = "ADR 0033 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
             shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
             Run it with `cargo test -p ply-eval --test position_invariance_g1 -- --ignored \
             --nocapture`."]
@@ -584,7 +577,7 @@ fn the_same_computation_costs_the_same_in_either_order() {
     }
     assert!(
         failures.is_empty(),
-        "ADR 0032 §10 G1 is not met on {} of {} pairs:\n  - {}",
+        "ADR 0033 §10 G1 is not met on {} of {} pairs:\n  - {}",
         failures.len(),
         rows.len(),
         failures.join("\n  - "),
@@ -601,7 +594,7 @@ fn the_same_computation_costs_the_same_in_either_order() {
 /// be replaced by another pair's and both bars stay green on a corpus that has
 /// silently lost a shape. That is not hypothetical: on 2026-08-31 this file's
 /// compounding pair was found pointing at [`RECORD_FIELD_PESSIMAL`] — a
-/// byte-identical duplicate of the pair above it — while ADR 0032 §10's third
+/// byte-identical duplicate of the pair above it — while ADR 0033 §10's third
 /// row and §14's "five shapes" reported a measurement nothing was taking. The
 /// pin was green to the digit and G1 was red in exactly the words it is red in
 /// now, so neither said anything. Reproduced deliberately after the repair, and
@@ -632,7 +625,7 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
             assert_ne!(
                 digest(a.pessimal),
                 digest(b.pessimal),
-                "`{}` and `{}` are the same pessimal program, so one of the two shapes ADR 0032 \
+                "`{}` and `{}` are the same pessimal program, so one of the two shapes ADR 0033 \
                  §10 reports a row for is not being measured",
                 a.name,
                 b.name,
@@ -701,7 +694,7 @@ type Row = (&'static str, Member, Member);
 /// and every count in it is a property of the evaluator, so the pin is exact.
 ///
 /// **When this fails, that is the event it exists for.** Read the direction:
-/// pessimal counts rising towards their canonical partners is ADR 0032 §11 S4
+/// pessimal counts rising towards their canonical partners is ADR 0033 §11 S4
 /// working, and the response is to re-pin here, run
 /// [`the_same_computation_costs_the_same_in_either_order`] with `--ignored`,
 /// and — if it is green — delete `docs/GUIDE.md` §6.7 and its §19 gotcha per
@@ -728,7 +721,7 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
             (200, 200, 1),
             (0, 200, 1),
         ),
-        // Moved by ADR 0032 §11 S3 (ADR 0025 P2) from `(0, 200, 1)`: a parameter
+        // Moved by ADR 0033 §11 S3 (ADR 0025 P2) from `(0, 200, 1)`: a parameter
         // may now appear in a `Dead` set, so the accumulator threaded as a
         // parameter is reused exactly as the one threaded as a `let` is. This is
         // the **first** pair to meet G1, and it met it without a slot frame,

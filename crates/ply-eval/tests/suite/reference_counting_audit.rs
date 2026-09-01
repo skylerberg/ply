@@ -185,7 +185,7 @@ test "a cell holding a closure over itself" {
     );
 }
 
-/// A parameter released at the statement that last reads it — ADR 0032 §11 S3,
+/// A parameter released at the statement that last reads it — ADR 0033 §11 S3,
 /// which is ADR 0025 §Decision 3 P2, whose landing condition was that the case
 /// analysis be written rather than assumed. It is written at the seeding site in
 /// `code.rs`; these are its six cases, run.
@@ -258,11 +258,11 @@ test "shadowed" { assert_eq(go([1, 2, 3]), 5) }
 ///
 /// The append is in last position, because that is a *different* precondition
 /// and this test is not about it: written as `grow(push(xs, n), m)` the same
-/// program copies all 50, which is the positional rule ADR 0032 §4 is aimed at
+/// program copies all 50, which is the positional rule ADR 0033 §4 is aimed at
 /// and which S3 does not touch.
 ///
 /// `a_fold_accumulator_nothing_else_holds_is_rewritten_in_place` above is the
-/// `let`-threaded twin this was measured against — before ADR 0032 §11 S3 the
+/// `let`-threaded twin this was measured against — before ADR 0033 §11 S3 the
 /// two disagreed, and `position_invariance_g1`'s "let binding against parameter"
 /// pair is the same finding pinned at 200 appends.
 #[test]

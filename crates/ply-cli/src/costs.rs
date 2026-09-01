@@ -1,7 +1,7 @@
 //! `ply check --costs`: where an append copies, before the program runs.
 //!
 //! The checker is [`ply_eval::costs`] and this module only renders it. ADR 0025
-//! §Decision 2a asked for the flag and ADR 0032 §11 S2 is where it was built —
+//! §Decision 2a asked for the flag and ADR 0033 §11 S2 is where it was built —
 //! between those two the checker shipped with **no caller outside its own
 //! tests**, which is why the output shape below is the ADR's rather than one
 //! grown from use.

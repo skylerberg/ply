@@ -79,7 +79,7 @@ fn check_types_prints_signatures_and_footprints() {
     assert!(text.contains("effect db"));
 }
 
-/// `--costs` — ADR 0025 §Decision 2a, built at ADR 0032 §11 S2.
+/// `--costs` — ADR 0025 §Decision 2a, built at ADR 0033 §11 S2.
 ///
 /// The two definitions differ by **argument order alone** and compute the same
 /// list, which is the whole point of the flag: nothing else in the output of
