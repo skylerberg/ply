@@ -79,6 +79,69 @@ fn check_types_prints_signatures_and_footprints() {
     assert!(text.contains("effect db"));
 }
 
+/// `--costs` — ADR 0025 §Decision 2a, built at ADR 0032 §11 S2.
+///
+/// The two definitions differ by **argument order alone** and compute the same
+/// list, which is the whole point of the flag: nothing else in the output of
+/// `ply check` distinguishes them, and the difference is asymptotic. Pinned
+/// here rather than in `ply-eval` because the columns are what a reader diffs,
+/// and because until this test existed `ply_eval::costs` had no caller outside
+/// its own tests.
+///
+/// It cannot pass by the checker answering one thing everywhere: `grows_last`
+/// must read `reuses` and `grows_first` must read `COPIES`, so a constant
+/// verdict in either direction reddens one of the two assertions.
+#[test]
+fn check_costs_separates_two_spellings_of_one_computation() {
+    let dir = project(
+        "fn grows_last(n: Int, xs: List<Int>) -> List<Int> =\n\
+         \x20 if n == 0 { xs } else { grows_last(n - 1, push(xs, n)) }\n\
+         fn grows_first(xs: List<Int>, n: Int) -> List<Int> =\n\
+         \x20 if n == 0 { xs } else { grows_first(push(xs, n), n - 1) }\n",
+    );
+    let out = ply(dir.path()).args(["check", "--costs"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout_of(&out);
+
+    assert!(
+        text.contains("m.grows_last  1 reuses"),
+        "the last-position spelling must read `reuses`:\n{text}"
+    );
+    assert!(
+        text.contains("m.grows_first  1 COPIES"),
+        "the non-final spelling must read `COPIES`:\n{text}"
+    );
+    // The fix is named, and `copy` is not what is offered — ADR 0025
+    // §Decision 4 puts the reordering first and never recommends the
+    // pessimization.
+    assert!(
+        text.contains("fix: move the append into last position"),
+        "a copy must name its edit:\n{text}"
+    );
+    assert!(
+        !text.contains("copy("),
+        "`copy` is never the recommended fix:\n{text}"
+    );
+    assert!(
+        text.contains("2 appends: 1 reuse, 1 copy, 0 undecided"),
+        "the whole-program tally:\n{text}"
+    );
+}
+
+/// A program with no append says so, rather than printing nothing and leaving a
+/// reader unable to tell a clean program from a flag that did not run.
+#[test]
+fn check_costs_says_so_when_there_is_nothing_to_cost() {
+    let dir = project(GREEN);
+    let out = ply(dir.path()).args(["check", "--costs"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout_of(&out).contains("no appends: nothing to cost"),
+        "got:\n{}",
+        stdout_of(&out)
+    );
+}
+
 #[test]
 fn check_exits_two_on_a_type_error_and_says_nothing_on_stdout() {
     let dir = project(BROKEN);
