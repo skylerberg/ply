@@ -33,7 +33,7 @@ fn answered(c: &Compiled, name: &str) -> Value {
 #[track_caller]
 fn pair(value: &Value) -> (&Value, &Value) {
     match value {
-        Value::List(items) if items.len() == 2 => (&items[0], &items[1]),
+        Value::List(items) if items.len() == 2 => (items.get(0).unwrap(), items.get(1).unwrap()),
         other => panic!("expected a list of two mentions, found {other}"),
     }
 }

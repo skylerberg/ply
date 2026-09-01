@@ -2469,7 +2469,7 @@ impl<'a> Machine<'a> {
                     }
                     match rest {
                         Some(rest) => {
-                            let tail = Value::list(xs[items.len()..].to_vec());
+                            let tail = Value::List(xs.skip(items.len()));
                             self.match_pattern(rest, &tail, module)?
                         }
                         None => true,

@@ -491,9 +491,8 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     let ctx = unsafe { &mut *ctx };
     match ctx.read(value) {
         Value::List(xs) => {
-            let from = (from as usize).min(xs.len());
-            let tail = xs[from..].to_vec();
-            ctx.push(Value::list(tail))
+            let tail = xs.skip(from as usize);
+            ctx.push(Value::List(tail))
         }
         _ => {
             let d = error("a list pattern bound a value that is not a list");
