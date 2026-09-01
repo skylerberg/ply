@@ -1,4 +1,4 @@
-//! **ADR 0033 §10 G1 — position invariance, registered before the measurement.**
+//! **ADR 0034 §10 G1 — position invariance, registered before the measurement.**
 
 use ply_eval::rc;
 use ply_eval::{Machine, TaskRegions};
@@ -10,12 +10,12 @@ use ply_syntax::resolve::{Resolved, resolve};
 /// The thresholds, pinned before the numbers exist.
 #[derive(Clone, Copy, Debug)]
 struct Criteria {
-    /// ADR 0033 §10 G1, first bullet: `|in_place_rate(canonical) −
+    /// ADR 0034 §10 G1, first bullet: `|in_place_rate(canonical) −
     /// in_place_rate(pessimal)| ≤ 0.02` for **every** pair. Two spellings of one
     /// computation may not differ in cost by more than measurement noise, and
     /// there is no noise in an append count, so this is nearly an equality.
     max_position_gap: f64,
-    /// ADR 0033 §10 G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
+    /// ADR 0034 §10 G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
     /// every pair whose canonical form is linear today. Without it the first
     /// bullet is satisfiable by making the canonical form as slow as the
     /// pessimal one, which is the wrong direction to converge in.
@@ -320,7 +320,7 @@ fn measure_corpus(c: &Criteria) -> Vec<(Pair, Measured)> {
     assert_eq!(
         pairs.len(),
         EXPECTED_PAIRS,
-        "the corpus is {} pairs where {EXPECTED_PAIRS} is what ADR 0033 §10's table and §14 \
+        "the corpus is {} pairs where {EXPECTED_PAIRS} is what ADR 0034 §10's table and §14 \
          report; a bar over fewer shapes than it claims is not the bar that was registered",
         pairs.len(),
     );
@@ -368,9 +368,9 @@ fn print_table(rows: &[(Pair, Measured)]) {
     }
 }
 
-/// **ADR 0033 §10 G1.** Two spellings of one computation cost the same.
+/// **ADR 0034 §10 G1.** Two spellings of one computation cost the same.
 #[test]
-#[ignore = "ADR 0033 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
+#[ignore = "ADR 0034 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
             shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
             Run it with `cargo test -p ply-eval --test suite position_invariance -- --ignored \
             --nocapture`."]
@@ -412,7 +412,7 @@ fn the_same_computation_costs_the_same_in_either_order() {
     }
     assert!(
         failures.is_empty(),
-        "ADR 0033 §10 G1 is not met on {} of {} pairs:\n  - {}",
+        "ADR 0034 §10 G1 is not met on {} of {} pairs:\n  - {}",
         failures.len(),
         rows.len(),
         failures.join("\n  - "),
@@ -443,7 +443,7 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
             assert_ne!(
                 digest(a.pessimal),
                 digest(b.pessimal),
-                "`{}` and `{}` are the same pessimal program, so one of the two shapes ADR 0033 \
+                "`{}` and `{}` are the same pessimal program, so one of the two shapes ADR 0034 \
                  §10 reports a row for is not being measured",
                 a.name,
                 b.name,
@@ -520,7 +520,7 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
         ),
         // `(200, 200, 1)` under `PLY_ADR0033_PROBE=1`, which is ADR 0025's P2: a parameter may
         // then appear in a `Dead` set. Off by default, because P2 costs more allocations on the
-        // request path than it saves there — ADR 0033 §11 S3 — so this pin is the default tree's.
+        // request path than it saves there — ADR 0034 §11 S3 — so this pin is the default tree's.
         ("let binding against parameter", (200, 200, 1), (0, 200, 1)),
         ("fold closure accumulator", (200, 200, 1), (0, 200, 1)),
     ];
