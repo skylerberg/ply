@@ -384,15 +384,18 @@ impl Live {
     }
 
     /// Closes a barrier.
-    pub fn close(&mut self, outer: Vec<Symbol>) {
+    /// Closes a barrier, answering its **free variables** — the names still live inside it, which
+    /// are exactly what a closure over it has to keep.
+    pub fn close(&mut self, outer: Vec<Symbol>) -> Vec<Symbol> {
         let free = std::mem::replace(&mut self.later, outer);
         self.ownable.pop();
         self.params.pop();
-        for name in free {
-            if !self.is_live(&name) {
-                self.later.push(name);
+        for name in &free {
+            if !self.is_live(name) {
+                self.later.push(name.clone());
             }
         }
+        free
     }
 
     /// Counts the bindings a scope introduces, for the naive `drop` denominator.

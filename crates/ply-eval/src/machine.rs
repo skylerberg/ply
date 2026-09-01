@@ -776,13 +776,14 @@ impl<'a> Machine<'a> {
                 self.go_eval(lhs.clone(), env, module);
             }
 
-            NodeKind::Lambda { params, body } => {
+            NodeKind::Lambda { params, body, free } => {
+                let captured = env.keep_only(free);
                 self.go_return(Value::Closure(Arc::new(Closure {
                     name: None,
                     kind: ClosureKind::Code {
                         params: params.clone(),
                         body: body.clone(),
-                        env,
+                        env: captured,
                         module,
                     },
                 })));
