@@ -322,6 +322,19 @@ fn a_backend_that_runs_past_its_budget_is_caught() {
 /// What tells this test binary that it is the child and must run the crash rather than guard it.
 const CRASH_CHILD: &str = "PLY_SPIKE_CRASH_CHILD";
 
+/// This binary's own name for the test `leaf`, derived rather than written down.
+///
+/// libtest names a test by its module path *inside the binary*, so moving this file into
+/// `tests/suite/` renamed the test below and a spelled-out filter stopped matching it. That fails
+/// in the worst direction: a filter matching nothing runs no test and exits **0**, so the child
+/// comes back looking like a clean run rather than like a mismatch.
+fn own_test_name(leaf: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_binary, module)) => format!("{module}::{leaf}"),
+        None => leaf.to_string(),
+    }
+}
+
 /// 7b.
 #[test]
 fn a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it() {
@@ -333,13 +346,12 @@ fn a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outs
     }
 
     let exe = std::env::current_exe().expect("a test binary knows where it is");
+    let name = own_test_name(
+        "a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it",
+    );
     let mut command = Command::new(exe);
     command
-        .args([
-            "--exact",
-            "a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outside_it",
-            "--nocapture",
-        ])
+        .args(["--exact", name.as_str(), "--nocapture"])
         .env(CRASH_CHILD, "1");
     let (ended, output) = run_guarded(&mut command).expect("the child runs");
 
@@ -347,8 +359,9 @@ fn a_backend_that_ignores_its_budget_kills_the_process_and_is_reported_from_outs
         Ended::Killed(how) => how.clone(),
         Ended::Exited(status) => panic!(
             "a backend running a five-million-deep native recursion with unlimited fuel came \
-             back with {status:?}, so the hazard this test is about is gone and the report \
-             below is describing nothing:\n{output}"
+             back with {status:?}. Either the hazard this test is about is gone, or the child \
+             never ran the test: it was filtered with `--exact {name}`, and a filter that \
+             matches nothing exits 0 saying `running 0 tests`. The output says which:\n{output}"
         ),
     };
     assert!(
