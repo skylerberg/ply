@@ -752,3 +752,29 @@ mod generated {
         );
     }
 }
+
+/// [`record_sites`] clears on the way in as well as on the way out.
+///
+/// The disarm used to do all of the clearing, so a caller that panicked between
+/// its own arm and disarm left the map dirty for the next one — and the next
+/// one's isolation then held because nothing had failed yet, which is not a
+/// property. Arming clears, so a measurement starts empty whatever happened
+/// before it on this thread. `tests/position_invariance_g1.rs` is the caller
+/// that depends on it: it measures ten programs in a row on one thread and
+/// panics inside the armed window on any member whose test fails to run.
+#[test]
+fn arming_site_recording_clears_what_the_last_caller_left() {
+    let span = Span::new(ply_span::SourceId(0), 0, 1);
+    record_sites(true);
+    note_update(true, span);
+    assert_eq!(sites().len(), 1, "the update was attributed to its span");
+
+    // The caller panicked here: no disarm ran.
+    record_sites(true);
+    assert!(
+        sites().is_empty(),
+        "arming inherited the last caller's residue: {:?}",
+        sites()
+    );
+    record_sites(false);
+}

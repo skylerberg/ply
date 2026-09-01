@@ -117,12 +117,11 @@ impl SiteCount {
     }
 }
 
-/// Arms or disarms per-site attribution of [`Stats::updates`].
+/// Arms or disarms per-site attribution of [`Stats::updates`], clearing the map
+/// in both directions so a measurement starts empty whatever ran before it.
 pub fn record_sites(on: bool) {
     let _ = RECORDING.try_with(|c| c.set(on));
-    if !on {
-        let _ = SITES.try_with(|c| c.borrow_mut().clear());
-    }
+    let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
 /// What each `push` site has done since [`record_sites`] armed it.
