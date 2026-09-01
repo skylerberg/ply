@@ -13,10 +13,10 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
-use ply_eval::code::{Arm, Stmt};
+use ply_eval::code::{Arm, Pat, Stmt};
 use ply_eval::{Builtin, Code, NodeKind, Value, lower};
 use ply_span::Symbol;
-use ply_syntax::ast::{BinOp, Lit, PatternKind, QName, UnOp};
+use ply_syntax::ast::{BinOp, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -316,7 +316,12 @@ impl Jit {
             jit.funcs
                 .insert((*name).to_string(), (id, def.params.len(), module_index));
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-            bodies.push(((*name).to_string(), params, lower(&def.body), module_index));
+            bodies.push((
+                (*name).to_string(),
+                params,
+                lower(&def.body).code,
+                module_index,
+            ));
         }
         Ok((jit, bodies, started))
     }
@@ -421,7 +426,7 @@ pub fn node_count(code: &Code) -> usize {
 fn count_nodes(code: &Code) -> usize {
     let mut n = 1;
     match &code.kind {
-        NodeKind::Lit(..) | NodeKind::Var(_) => {}
+        NodeKind::Lit(..) | NodeKind::Var { .. } => {}
         NodeKind::Unary { operand, .. } => n += count_nodes(operand),
         NodeKind::Binary { lhs, rhs, .. } => n += count_nodes(lhs) + count_nodes(rhs),
         NodeKind::Lambda { body, .. } => n += count_nodes(body),
@@ -462,7 +467,7 @@ fn count_nodes(code: &Code) -> usize {
         NodeKind::Perform { args, .. } => n += args.iter().map(count_nodes).sum::<usize>(),
         NodeKind::Handle { body, .. } => n += count_nodes(body),
         NodeKind::WithCell { init, body, .. } => n += count_nodes(init) + count_nodes(body),
-        NodeKind::Simulate { body } => n += count_nodes(body),
+        NodeKind::Simulate { body, .. } => n += count_nodes(body),
         NodeKind::WithRegion { body } => n += count_nodes(body),
     }
     n
@@ -707,7 +712,7 @@ impl Fx<'_, '_> {
             NodeKind::Lit(Lit::Int(_), _) => Kind::Int,
             NodeKind::Lit(Lit::Bool(_), _) => Kind::Bool,
             NodeKind::Lit(..) => Kind::Boxed,
-            NodeKind::Var(q) => match self.denotation(q, scope)? {
+            NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                 Denotes::Local(v) => v.kind,
                 _ => Kind::Boxed,
             },
@@ -752,7 +757,7 @@ impl Fx<'_, '_> {
                     let mut inner = scope.clone();
                     for s in stmts.iter() {
                         if let Stmt::Let { pat, value, .. } = s
-                            && let PatternKind::Var(name) = &pat.kind
+                            && let Pat::Var { name, .. } = pat
                         {
                             let kind = self.kind_of(value, &inner)?;
                             inner.push((
@@ -783,7 +788,7 @@ impl Fx<'_, '_> {
         match &code.kind {
             NodeKind::Lit(lit, _) => self.literal(lit),
 
-            NodeKind::Var(q) => match self.denotation(q, scope)? {
+            NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                 Denotes::Local(v) => Ok(v),
                 Denotes::Constant(handle) => Ok(self.constant(handle)),
                 _ => self.refuse(format!(
@@ -877,9 +882,9 @@ impl Fx<'_, '_> {
                     match s {
                         Stmt::Let { pat, value, .. } => {
                             let v = self.expr(value, &mut inner)?;
-                            match &pat.kind {
-                                PatternKind::Var(name) => inner.push((name.name.clone(), v)),
-                                PatternKind::Wildcard => {}
+                            match pat {
+                                Pat::Var { name, .. } => inner.push((name.name.clone(), v)),
+                                Pat::Wildcard => {}
                                 other => {
                                     return self.refuse(format!(
                                         "a `let` binding a {} pattern",
@@ -1158,7 +1163,7 @@ impl Fx<'_, '_> {
     }
 
     fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
-        let NodeKind::Var(q) = &func.kind else {
+        let NodeKind::Var { name: q, .. } = &func.kind else {
             return self.refuse("a call whose callee is an expression");
         };
         let denotes = self.denotation(q, scope)?;
@@ -1250,10 +1255,10 @@ impl Fx<'_, '_> {
     }
 
     /// Whether a sub-pattern binds without being able to fail.
-    fn irrefutable(&self, pat: &ply_syntax::ast::Pattern) -> bool {
-        match &pat.kind {
-            PatternKind::Wildcard => true,
-            PatternKind::Var(id) => self
+    fn irrefutable(&self, pat: &Pat) -> bool {
+        match pat {
+            Pat::Wildcard => true,
+            Pat::Var { name: id, .. } => self
                 .ctor_of(&QName::bare(id.clone()))
                 .is_none_or(|(_, arity)| arity != 0),
             _ => false,
@@ -1262,8 +1267,8 @@ impl Fx<'_, '_> {
 
     /// The name a sub-pattern binds, and `None` for one that binds nothing — a wildcard, or a bare
     /// nullary constructor, which is a test rather than a binder ([`Fx::test_pattern`]).
-    fn binder(&self, pat: &ply_syntax::ast::Pattern) -> Option<Symbol> {
-        let PatternKind::Var(id) = &pat.kind else {
+    fn binder(&self, pat: &Pat) -> Option<Symbol> {
+        let Pat::Var { name: id, .. } = pat else {
             return None;
         };
         match self.ctor_of(&QName::bare(id.clone())) {
@@ -1274,24 +1279,18 @@ impl Fx<'_, '_> {
 
     /// The refutable half of a pattern: leave the current block for `hit` when it matches and
     /// `miss` when it does not.
-    fn test_pattern(
-        &mut self,
-        pat: &ply_syntax::ast::Pattern,
-        value: Val,
-        hit: Block,
-        miss: Block,
-    ) -> Result<()> {
-        match &pat.kind {
-            PatternKind::Wildcard => {
+    fn test_pattern(&mut self, pat: &Pat, value: Val, hit: Block, miss: Block) -> Result<()> {
+        match pat {
+            Pat::Wildcard => {
                 self.builder.ins().jump(hit, &[]);
             }
-            PatternKind::Var(id) => match self.ctor_of(&QName::bare(id.clone())) {
+            Pat::Var { name: id, .. } => match self.ctor_of(&QName::bare(id.clone())) {
                 Some((index, 0)) => self.test_ctor(value, index, hit, miss),
                 _ => {
                     self.builder.ins().jump(hit, &[]);
                 }
             },
-            PatternKind::Lit(lit) => {
+            Pat::Lit(lit) => {
                 let literal = self.literal(lit)?;
                 let native = (literal.kind == Kind::Int && value.kind == Kind::Int)
                     || (literal.kind == Kind::Bool && value.kind == Kind::Bool);
@@ -1316,7 +1315,7 @@ impl Fx<'_, '_> {
                 };
                 self.builder.ins().brif(eq, hit, &[], miss, &[]);
             }
-            PatternKind::List { items, rest } => {
+            Pat::List { items, rest } => {
                 if let Some(bad) = items
                     .iter()
                     .chain(rest.iter().map(|r| r.as_ref()))
@@ -1324,7 +1323,7 @@ impl Fx<'_, '_> {
                 {
                     return self.refuse(format!(
                         "a {} pattern nested inside a list pattern",
-                        pattern_name(&bad.kind)
+                        pattern_name(bad)
                     ));
                 }
                 let v = self.boxed(value);
@@ -1337,7 +1336,7 @@ impl Fx<'_, '_> {
                 let fits = self.builder.ins().icmp_imm(IntCC::NotEqual, fits, 0);
                 self.builder.ins().brif(fits, hit, &[], miss, &[]);
             }
-            PatternKind::Ctor { name, args } => {
+            Pat::Ctor { name, args } => {
                 let Some((index, arity)) = self.ctor_of(name) else {
                     return self.refuse(format!(
                         "the constructor pattern `{}`, which names nothing this unit knows",
@@ -1354,7 +1353,7 @@ impl Fx<'_, '_> {
                 if let Some(bad) = args.iter().find(|a| !self.irrefutable(a)) {
                     return self.refuse(format!(
                         "a {} pattern nested inside the constructor pattern `{}`",
-                        pattern_name(&bad.kind),
+                        pattern_name(bad),
                         name.symbol()
                     ));
                 }
@@ -1376,21 +1375,16 @@ impl Fx<'_, '_> {
     }
 
     /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
-    fn bind_pattern(
-        &mut self,
-        pat: &ply_syntax::ast::Pattern,
-        value: Val,
-        scope: &mut Scope,
-    ) -> Result<()> {
-        match &pat.kind {
-            PatternKind::Wildcard => {}
-            PatternKind::Var(id) => {
+    fn bind_pattern(&mut self, pat: &Pat, value: Val, scope: &mut Scope) -> Result<()> {
+        match pat {
+            Pat::Wildcard => {}
+            Pat::Var { name: id, .. } => {
                 if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))) {
                     scope.push((id.name.clone(), value));
                 }
             }
-            PatternKind::Lit(_) => {}
-            PatternKind::List { items, rest } => {
+            Pat::Lit(_) => {}
+            Pat::List { items, rest } => {
                 let base = self.boxed(value);
                 for (i, item) in items.iter().enumerate() {
                     if let Some(name) = self.binder(item) {
@@ -1421,7 +1415,7 @@ impl Fx<'_, '_> {
                     ));
                 }
             }
-            PatternKind::Ctor { args, .. } => {
+            Pat::Ctor { args, .. } => {
                 let base = self.boxed(value);
                 for (i, arg) in args.iter().enumerate() {
                     let Some(name) = self.binder(arg) else {
@@ -1485,13 +1479,13 @@ impl Fx<'_, '_> {
     }
 }
 
-fn pattern_name(p: &PatternKind) -> &'static str {
+fn pattern_name(p: &Pat) -> &'static str {
     match p {
-        PatternKind::Wildcard => "wildcard",
-        PatternKind::Var(_) => "binding",
-        PatternKind::Lit(_) => "literal",
-        PatternKind::Ctor { .. } => "constructor",
-        PatternKind::Record { .. } => "record",
-        PatternKind::List { .. } => "list",
+        Pat::Wildcard => "wildcard",
+        Pat::Var { .. } => "binding",
+        Pat::Lit(_) => "literal",
+        Pat::Ctor { .. } => "constructor",
+        Pat::Record { .. } => "record",
+        Pat::List { .. } => "list",
     }
 }
