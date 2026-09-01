@@ -157,6 +157,7 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(e, &mut ownable);
     let mut live = Live::new(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     lower_in(e, &mut live)
 }
@@ -475,6 +476,7 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(body, &mut ownable);
     let outer = live.open(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     let code = lower_in(body, live);
     for p in params {
@@ -562,7 +564,40 @@ fn lower_block(
     }
     let entry = live.snapshot();
 
-    let mut cumulative: Vec<Symbol> = Vec::new();
+    // Seeded with the enclosing barrier's parameters — ADR 0032 §11 S3, which
+    // is ADR 0025 §Decision 3 P2. Without them a parameter can never appear in
+    // a `Dead` set, so the block's continuation carries a scope that still
+    // reaches it: an accumulator threaded as a `let` is reused and the
+    // identical accumulator threaded as a parameter is not.
+    //
+    // **Why this cannot release a name something still reads.** The filters
+    // below are unchanged, and a parameter has to clear all three: it must not
+    // be in `after[i]` — what is still read once statement `i` has finished —
+    // and it must be in `before`, what is read entering it. `Live` is a
+    // backward pass, so those are exact for direct reads. The cases that are
+    // not direct reads, each of which keeps the name in `after[i]`:
+    //
+    // - **captured by a closure, a handler clause or a `simulate` body.**
+    //   `Live::close` replays a barrier's still-live names into the enclosing
+    //   `later` as reads *at the construct that captured them*, "never last
+    //   ones" — so the capture is a read positioned at the statement holding
+    //   the lambda, and every statement left of it sees the name in `after`.
+    // - **stored in a cell.** `cell_set(c, xs)` is an ordinary read of `xs` at
+    //   that statement; the value is then the arena's and no longer this
+    //   binding's to release.
+    // - **read in a later `match` arm.** `lower_arm` walks the arm inside the
+    //   enclosing walk, so the read lands in `later` before the walk reaches
+    //   any statement to its left.
+    // - **read in the tail.** The tail is lowered *first* (above), which is what
+    //   puts its reads in `later` before any statement is visited.
+    // - **shadowed by an inner binder of the same name.** `shadow`/`union`
+    //   already keep the two apart, and the `bound[i].contains(name)` arm of the
+    //   filter is what names the shadowing binder rather than the parameter.
+    //
+    // Only parameters are seeded, not every name in `ownable`: that frame holds
+    // every name bound *anywhere* in the barrier, and one from a sibling block
+    // is not in scope here at all. See `Live::barrier_params`.
+    let mut cumulative: Vec<Symbol> = live.barrier_params().to_vec();
     let mut out: Vec<Stmt> = Vec::with_capacity(n);
     for i in 0..n {
         for name in &bound[i] {

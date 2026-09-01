@@ -728,7 +728,17 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
             (200, 200, 1),
             (0, 200, 1),
         ),
-        ("let binding against parameter", (200, 200, 1), (0, 200, 1)),
+        // Moved by ADR 0032 §11 S3 (ADR 0025 P2) from `(0, 200, 1)`: a parameter
+        // may now appear in a `Dead` set, so the accumulator threaded as a
+        // parameter is reused exactly as the one threaded as a `let` is. This is
+        // the **first** pair to meet G1, and it met it without a slot frame,
+        // which is why S3 was kept in the sequence after S4 was known to subsume
+        // it. The other four are positional and are S4's to move.
+        (
+            "let binding against parameter",
+            (200, 200, 1),
+            (200, 200, 1),
+        ),
         ("fold closure accumulator", (200, 200, 1), (0, 200, 1)),
     ];
 

@@ -184,3 +184,99 @@ test "a cell holding a closure over itself" {
         "no `Arc` cycle exists to report: {stats:?}"
     );
 }
+
+/// A parameter released at the statement that last reads it — ADR 0032 §11 S3,
+/// which is ADR 0025 §Decision 3 P2, whose landing condition was that the case
+/// analysis be written rather than assumed. It is written at the seeding site in
+/// `code.rs`; these are its six cases, run.
+///
+/// The failure mode is not a wrong answer. It is `Slot::Released` reaching
+/// `machine.rs`'s `err_released` as `INTERNAL_ERROR` on a legal program — loud
+/// rather than silent, but a new way to reach a diagnostic whose whole point is
+/// being unreachable. Each probe below reads its parameter *after* the statement
+/// that would have been its last direct read, by a route that is not a direct
+/// read, and `passes` fails on either a raised diagnostic or a wrong integer.
+#[test]
+fn a_parameter_a_later_construct_still_reaches_is_not_released() {
+    // 1. Captured by a closure written after the last direct read.
+    passes(
+        r#"
+fn go(xs: List<Int>) -> Int = { let n = len(xs); let f = || len(xs); n + f() }
+test "closure" { assert_eq(go([1, 2, 3]), 6) }
+"#,
+    );
+    // 2. Captured by a handler clause.
+    passes(
+        r#"
+effect ask { read one[k]() -> Int }
+fn go(xs: List<Int>) -> Int = {
+  let n = len(xs);
+  n + handle { ask.one[k]() } with { ask.one[k]() -> len(xs), return x -> x } }
+test "handler clause" { assert_eq(go([1, 2, 3]), 6) }
+"#,
+    );
+    // 3. Stored in a cell, then read back out of it.
+    passes(
+        r#"
+fn go(xs: List<Int>) -> Int =
+  with_cell[r]([]) { c -> { let n = len(xs); cell_set(c, xs); n + len(cell_get(c)) } }
+test "cell" { assert_eq(go([1, 2, 3]), 6) }
+"#,
+    );
+    // 4. Read in a later `match` arm.
+    passes(
+        r#"
+fn go(xs: List<Int>, b: Bool) -> Int = {
+  let n = len(xs);
+  n + match b { true -> len(xs), false -> 0 } }
+test "match arm" { assert_eq(go([1, 2, 3], true), 6) }
+"#,
+    );
+    // 5. Read in the tail, after the statements.
+    passes(
+        r#"
+fn go(xs: List<Int>) -> Int = { let n = len(xs); let m = n * 2; m + len(xs) }
+test "tail" { assert_eq(go([1, 2, 3]), 9) }
+"#,
+    );
+    // 6. Shadowed by an inner binder of the same name, which must release the
+    //    *binder* and leave the parameter to the reads left of it.
+    passes(
+        r#"
+fn go(xs: List<Int>) -> Int = {
+  let n = len(xs);
+  let xs = [9, 9];
+  let m = len(xs);
+  n + m }
+test "shadowed" { assert_eq(go([1, 2, 3]), 5) }
+"#,
+    );
+}
+
+/// The half of P2 that is the point of it: threaded as a parameter, an
+/// accumulator is now reused, and the count says so rather than the clock.
+///
+/// The append is in last position, because that is a *different* precondition
+/// and this test is not about it: written as `grow(push(xs, n), m)` the same
+/// program copies all 50, which is the positional rule ADR 0032 §4 is aimed at
+/// and which S3 does not touch.
+///
+/// `a_fold_accumulator_nothing_else_holds_is_rewritten_in_place` above is the
+/// `let`-threaded twin this was measured against — before ADR 0032 §11 S3 the
+/// two disagreed, and `position_invariance_g1`'s "let binding against parameter"
+/// pair is the same finding pinned at 200 appends.
+#[test]
+fn an_accumulator_threaded_as_a_parameter_is_rewritten_in_place() {
+    let stats = passes(
+        r#"
+fn grow(n: Int, xs: List<Int>) -> List<Int> =
+  if n == 0 { xs } else { { let m = n - 1; grow(m, push(xs, n)) } }
+test "grown" { assert_eq(len(grow(50, [])), 50) }
+"#,
+    );
+    assert_eq!(
+        (stats.updates, stats.updates_in_place),
+        (50, 50),
+        "a parameter accumulator must be reused as a `let` one is"
+    );
+}
