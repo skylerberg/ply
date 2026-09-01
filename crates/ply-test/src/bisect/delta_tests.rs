@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 struct Compiled {
     program: Program,
     resolved: Resolved,
-    #[allow(dead_code)]
     check: CheckOutput,
     hashes: HashOutput,
 }
