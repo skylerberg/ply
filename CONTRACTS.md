@@ -704,15 +704,30 @@ is unchanged *and* every entry of its `deps` still resolves to the same
 cheap conservative pre-check. Its definitions' types and footprints then come
 from `cached_def` / `cached_decl`, and its tests from the fingerprint.
 
-**Gate 2 — definition level.** Inside a file that did change, recheck only those
-definitions whose `DefHash` is absent from the store. A reference contributes
-the referent's hash, so this one condition covers both "its own normalized form
-changed" and "a dependency's hash changed".
+**Gate 2 — definition level.** Inside a file that did change, recheck a
+definition whose **own hash** moved — its normalized form with references by
+name — and any definition a rechecked one's **interface hash** turns out to have
+moved under. The interface is the published scheme, footprint and constraints,
+which are everything a caller can observe; the footprint is in it because effect
+rows are inferred, so a body edit that adds a `perform` still reaches callers.
 
-The keys differ for a reason that must not be optimized away: **a `DefHash`
-cannot be computed without parsing**, so gate 1 has to key on raw file content,
-while gate 2 keys on `DefHash`. Gate 1 is conservative about formatting; gate 2
-is exact.
+That runs as waves: check what moved, compare each rechecked definition's fresh
+interface against the stored one, admit the callers of only those that differ,
+repeat to a fixpoint. Only the final wave's `CheckOutput` and diagnostics may
+escape — an intermediate wave can hand a caller a stale interface.
+
+`DefHash` remains the key for the **test cache** and for selection, and is
+unchanged. It is transitive by construction, which is the right question for
+"must this test re-run" and too strong a question for "must this definition be
+rechecked": written signatures mean a caller's type cannot depend on a callee's
+body. `docs/adr/0002-incremental-frontend.md` §"Early cutoff" carries the
+reasoning and the two wrong readings that look sound.
+
+Gate 1's key differs for a reason that must not be optimized away: **a `DefHash`
+cannot be computed without parsing**, so gate 1 has to key on raw file content.
+Gate 1 is conservative about formatting; gate 2 is conservative about a name — a
+renamed callee moves its callers' own hashes and costs a recheck, never a wrong
+answer.
 
 ### Requirements
 

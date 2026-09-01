@@ -3,6 +3,7 @@
 
 pub mod body;
 pub mod graph;
+pub mod interface;
 pub mod normalize;
 
 #[cfg(test)]
@@ -21,6 +22,8 @@ use std::fmt;
 use body::{BodySet, StoredBody};
 use graph::{Entry, NodeBody, NodeId, ProgramIndex};
 use normalize::{ComponentIndices, EffectIndex, HashTable, Normalizer};
+
+pub use interface::interface_hash;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DefHash(pub [u8; 32]);
@@ -85,6 +88,13 @@ impl<'de> Deserialize<'de> for DefHash {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashOutput {
     pub defs: IndexMap<Symbol, DefHash>,
+    /// `defs`, with each reference written as the referent's name rather than
+    /// its hash, so this moves with a definition's own text and not with a
+    /// callee's.
+    ///
+    /// Never an identity: two definitions calling different functions of the
+    /// same shape share one.
+    pub own: IndexMap<Symbol, DefHash>,
     /// `type` and `effect` declarations, which `defs` deliberately omits — only a `fn` is a
     /// definition a test can be selected on.
     pub decls: IndexMap<Symbol, DefHash>,
@@ -113,6 +123,12 @@ const SPEC_DOMAIN: &[u8] = b"ply.spec.1";
 /// baseline can never be mistaken for an obligation key.
 const SPEC_TEXT_DOMAIN: &[u8] = b"ply.spec.text.1";
 
+/// Domain tag for [`HashOutput::own`]. A definition's own-form key is one hash
+/// of one definition's bytes and so is its `DefHash`; tagging is what stops the
+/// two being interchangeable at a call site that takes `DefHash` and means
+/// identity.
+const OWN_DOMAIN: &[u8] = b"ply.own.1";
+
 /// The identity of a claim as written, for [`HashOutput::spec_texts`] and
 /// [`HashOutput::law_texts`].
 fn spec_text_hash(kind: Option<SpecKind>, index: u32, normalized: &[u8]) -> DefHash {
@@ -120,6 +136,14 @@ fn spec_text_hash(kind: Option<SpecKind>, index: u32, normalized: &[u8]) -> DefH
     hasher.update(SPEC_TEXT_DOMAIN);
     hasher.update(&[kind.map_or(0, |k| k.tag())]);
     hasher.update(&index.to_le_bytes());
+    hasher.update(normalized);
+    DefHash(*hasher.finalize().as_bytes())
+}
+
+/// The key for [`HashOutput::own`], over a definition's by-name encoding.
+fn own_hash(normalized: &[u8]) -> DefHash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OWN_DOMAIN);
     hasher.update(normalized);
     DefHash(*hasher.finalize().as_bytes())
 }
@@ -296,6 +320,7 @@ fn hash_index(
         law_texts.push(spec_text_hash(None, 0, &text));
     }
 
+    let mut own: IndexMap<Symbol, DefHash> = IndexMap::new();
     let mut specs: IndexMap<Symbol, Vec<DefHash>> = IndexMap::new();
     let mut spec_texts: IndexMap<Symbol, Vec<DefHash>> = IndexMap::new();
     for entry in &index.order {
@@ -305,13 +330,17 @@ fn hash_index(
         let NodeBody::Fn(def) = index.nodes[v].body else {
             continue;
         };
+        let module = index.nodes[v].module;
+        let (form, _) = encode_item_with(&index, module, &scc, &hashes, true, |nz| {
+            nz.node(NodeBody::Fn(def))
+        });
+        own.insert(index.nodes[v].name.clone(), own_hash(&form));
         if def.spec.is_empty() {
             continue;
         }
         let Some(&owner) = hashes.get(&v) else {
             continue;
         };
-        let module = index.nodes[v].module;
         let clauses = def
             .spec
             .iter()
@@ -349,6 +378,7 @@ fn hash_index(
             laws: law_hashes,
             law_refs,
             law_texts,
+            own,
             specs,
             spec_texts,
         },
@@ -415,6 +445,7 @@ struct Hashed {
     laws: Vec<DefHash>,
     law_refs: Vec<Vec<NodeId>>,
     law_texts: Vec<DefHash>,
+    own: IndexMap<Symbol, DefHash>,
     specs: IndexMap<Symbol, Vec<DefHash>>,
     spec_texts: IndexMap<Symbol, Vec<DefHash>>,
 }
@@ -591,6 +622,7 @@ fn assemble(
         laws,
         law_refs,
         law_texts,
+        own,
         specs,
         spec_texts,
     } = hashed;
@@ -598,6 +630,7 @@ fn assemble(
         tests,
         laws,
         law_texts,
+        own,
         specs,
         spec_texts,
         ..HashOutput::default()

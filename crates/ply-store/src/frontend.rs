@@ -95,6 +95,20 @@ pub struct Member {
 pub struct DefEntry {
     pub name: Symbol,
     pub hash: DefHash,
+    /// This definition's own form, with its references left as the names they
+    /// were written as instead of normalized to what they denote. Editing a
+    /// callee moves `hash` for every transitive caller and moves `own` for
+    /// nobody but the callee, which is what lets a gate cut a recheck off.
+    ///
+    /// **Not an identity.** Two definitions calling differently-named functions
+    /// of the same shape share an `own`, so nothing may key a cache on it.
+    pub own: DefHash,
+    /// Everything a caller can observe of this definition: its published
+    /// scheme, its footprint, its published constraints. Signatures are
+    /// written rather than inferred, so a callee's body edit that leaves this
+    /// standing cannot change how a caller checks — but effect rows are still
+    /// inferred, so a body that gains a `perform` moves it and does propagate.
+    pub iface: DefHash,
     pub span: FileSpan,
     pub kind: DefKind,
     /// Empty for a `fn`.
