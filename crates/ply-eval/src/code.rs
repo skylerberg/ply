@@ -150,7 +150,7 @@ pub struct Clause {
     pub resume: Option<Symbol>,
     pub body: Code,
     /// The body's free variables — what a clause needs from the scope its handler was installed in,
-    /// and nothing else. what the machine has to become: extending the whole prompt environment pins every binding in
+    /// and nothing else. ADR 0034: extending the whole prompt environment pins every binding in
     /// it for the clause's life, and makes a flat slot index name the wrong thing.
     ///
     /// `None` means "do not narrow", which is what a hand-built `Clause` gets. An *empty* set means
@@ -717,7 +717,7 @@ fn lower_block(
     let entry = live.snapshot();
 
     // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
-    // why releasing a parameter releases nothing still read, which carries the case analysis for why this releases nothing still read.
+    // ADR 0034 carries the case analysis for why this releases nothing still read.
     // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
     // which are not in scope here.
     let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {
