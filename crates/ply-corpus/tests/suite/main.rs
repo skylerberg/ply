@@ -7,7 +7,6 @@
 //! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
 mod constant_memo_service;
-mod differential_sweep;
 mod http_cost;
 mod region_isolation_cost;
 mod region_kind_hoisted;

@@ -3,7 +3,7 @@
 //! region *label* two tests both write is one piece of state and colours them apart.
 
 use ply_core::{CheckOutput, Footprint};
-use ply_eval::{EngineChoice, Plan, TaskRegions, Value};
+use ply_eval::{Plan, TaskRegions, Value};
 use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
@@ -364,7 +364,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
             &compiled.check,
             &compiled.hashes,
             &mut store,
-            EngineChoice::Both,
+            true,
             ply_test::Search::of(&selection),
             ply_test::Hosting::hermetic(),
         );
@@ -702,7 +702,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
                 &compiled.check,
                 &compiled.hashes,
                 &mut store,
-                EngineChoice::Both,
+                true,
                 ply_test::Search::of(&selection),
                 ply_test::Hosting::hermetic(),
             )

@@ -721,14 +721,13 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 }
 
 /// Codes a host handler may not raise.
-pub const RESERVED_CODES: [&str; 22] = [
+pub const RESERVED_CODES: [&str; 21] = [
     codes::INTERNAL_ERROR,
     codes::ENGINE_DIVERGENCE,
     codes::SIMULATION_DIVERGENCE,
     codes::DEADLOCK,
     codes::NESTED_SIMULATION,
     codes::TASK_ESCAPES_SCOPE,
-    codes::MACHINE_ONLY_CLAUSE,
     codes::HOST_OPERATION_UNKNOWN,
     codes::HOST_HANDLER_CONFLICT,
     codes::HOST_DETERMINISM_MISMATCH,
@@ -855,21 +854,6 @@ pub fn err_withheld(
     .note(format!(
         "handle `{operation}` over `{module}`'s twin, which is what makes a test that reads it `det`, cached and hermetic"
     ))
-}
-
-/// The tree-walker's refusal of a bound host operation.
-#[cold]
-#[inline(never)]
-pub fn err_machine_only_host(span: Span, operation: &str, path: &'static str) -> Diagnostic {
-    Diagnostic::error(
-        codes::MACHINE_ONLY_CLAUSE,
-        format!("`{operation}` resolves to a host handler, which the tree-walker cannot drive"),
-    )
-    .primary(span, "this operation needs the machine's control stack")
-    .note(format!(
-        "`{path}` is bound here, and a host answer may be pending on a reactor the tree-walker has no way to poll"
-    ))
-    .note("run this with `--engine machine`, which is the default")
 }
 
 #[cold]

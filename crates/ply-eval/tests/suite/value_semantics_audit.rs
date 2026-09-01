@@ -6,7 +6,7 @@
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{
-    ARGUMENT_VECTOR_CLASSES, Decimal, Interp, Machine, SECRET_REDACTED, Value, first_difference,
+    ARGUMENT_VECTOR_CLASSES, Decimal, Machine, SECRET_REDACTED, Value, first_difference,
     values_equal,
 };
 use ply_span::{Diagnostic, SourceId, Span};
@@ -156,23 +156,6 @@ fn an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_argu
         "a string argument survives two resumptions",
     ] {
         compiled.run(name);
-    }
-}
-
-/// The engine that cannot run any of the above, stated rather than assumed.
-#[test]
-fn the_tree_walker_refuses_every_resumption_case_so_engine_both_compares_none_of_them() {
-    let compiled = compile(RESUMED_ARGUMENTS);
-    for name in ["arity 1", "arity 4", "nested calls of one class"] {
-        let index = compiled.index_of(name);
-        let refused = Interp::new(&compiled.program, &compiled.resolved, &compiled.check)
-            .eval_test(index)
-            .expect_err("the tree-walker cannot bind a continuation");
-        assert_eq!(
-            refused.code,
-            ply_span::codes::MACHINE_ONLY_CLAUSE,
-            "{name}: the tree-walker refused for an unexpected reason: {refused:#?}"
-        );
     }
 }
 
@@ -328,64 +311,6 @@ fn the_assertion_differ_never_descends_into_a_credential() {
             actual.render().contains(SECRET_REDACTED),
             "{label}: the redaction marker is missing, so something else rendered instead"
         );
-    }
-}
-
-// --- 4. both engines read one constructor memo ------------------------------
-
-const MENTIONS: &str = r#"
-type Colour = Red | Green
-type Boxed = Box(Int)
-
-pub fn nullary(ignored: Int) -> Colour = Red
-pub fn closure(ignored: Int) -> (Int) -> Boxed = Box
-pub fn literal(ignored: Int) -> String = "abcd"
-"#;
-
-/// **An audit gap, asserted rather than described.**
-#[test]
-fn both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two() {
-    let c = compile(MENTIONS);
-    let on_both = |name: &str| -> (Value, Value) {
-        let walked = Interp::new(&c.program, &c.resolved, &c.check)
-            .call(name, vec![Value::Int(0)], Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised on the tree-walker: {d:#?}"));
-        let stepped = Machine::new(&c.program, &c.resolved, &c.check)
-            .call(name, vec![Value::Int(0)], Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised on the machine: {d:#?}"));
-        (walked, stepped)
-    };
-
-    match &on_both("m.nullary") {
-        (Value::Ctor { args: a, .. }, Value::Ctor { args: b, .. }) => assert!(
-            Arc::ptr_eq(a, b),
-            "the two engines built a nullary constructor separately; if that is now true, \
-             `--engine both` has become independent evidence for `ctor_value` and this test \
-             should be replaced by one that says so"
-        ),
-        other => panic!("a mention of `Red` is not a `Ctor`: {other:?}"),
-    }
-    match &on_both("m.closure") {
-        (Value::Closure(a), Value::Closure(b)) => assert!(
-            Arc::ptr_eq(a, b),
-            "the two engines built a constructor closure separately"
-        ),
-        other => panic!("a mention of `Box` is not a closure: {other:?}"),
-    }
-
-    // The control, and the reason the sentence in ADR 0019 §2 is half right: a literal really is
-    // built twice, so a divergence in the literal half would be visible to the differential
-    // harness.
-    match &on_both("m.literal") {
-        (Value::Str(a), Value::Str(b)) => {
-            assert!(
-                !Arc::ptr_eq(a, b),
-                "the tree-walker stopped building a literal per evaluation, so the literal half \
-                 of ADR 0019 §2 is no longer audited by `--engine both` either"
-            );
-            assert_eq!(a, b, "the two engines disagree about a literal's value");
-        }
-        other => panic!("a literal is not a `Str`: {other:?}"),
     }
 }
 

@@ -490,22 +490,8 @@ test "join answers the body" {
     assert!(machine.simulated().is_some());
 }
 
-/// A `simulate` region is machine-only, so the tree-walker refuses it by name rather than running
-/// one unnamed interleaving that the cache would then keep.
-#[test]
-fn the_tree_walker_refuses_a_region() {
-    let compiled = compile(OUTLIVES);
-    let refusals = ply_eval::machine_only_clauses(&compiled.program);
-    assert_eq!(refusals.len(), 1);
-    assert_eq!(refusals[0].code, ply_span::codes::MACHINE_ONLY_CLAUSE);
-
-    let mut interp = ply_eval::Interp::new(&compiled.program, &compiled.resolved, &compiled.check);
-    let refused = interp.eval_test(0).expect_err("the tree-walker declines");
-    assert!(ply_eval::is_machine_only(&refused));
-}
-
-/// Values that cross the boundary are ordinary values: the world a region wrote through is the
-/// machine's, threaded, and it survives the region.
+/// Values that cross the boundary are ordinary values: the world a region wrote
+/// through is the machine's, threaded, and it survives the region.
 #[test]
 fn the_world_a_region_wrote_survives_it() {
     let compiled = compile(OUTLIVES);

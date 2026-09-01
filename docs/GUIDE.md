@@ -1367,11 +1367,6 @@ is the zero-shot case: a rollback declines to resume its body.
 `resume` is contextual — a keyword only between a clause's `)` and its `->` — so
 it remains an ordinary identifier everywhere else.
 
-One restriction, and it is the *engine* rather than the language: a clause that
-binds a continuation is `E0504` under `--engine treewalk`. Such a program runs on
-the control-stack machine, which is the default; a program that wants the
-two-engine agreement check of `--engine both` must stay tail-resumptive.
-
 ### 7.8 Unhandled effects
 
 Three different things can go wrong and they have three different codes, because
@@ -1603,12 +1598,12 @@ diagnostic with spans and snippets, the expected/actual pair, the footprint at
 the point of failure, the suspect set, the culprit with its search statistics,
 and the replay command.
 
-### 9.7 Two engines
+### 9.7 Auditing a compiled backend
 
-Ply ships two evaluators: a tree-walker and a control-stack machine.
-`--engine machine` is the default, `--engine treewalk` runs the other, and
-`--engine both` runs each test on both and fails the run on any disagreement
-(`E0503`). Anything but the default neither reads nor writes the result cache.
+`--backend` attaches a compiled backend (§17). `--audit-backend` runs each test
+twice — once with it and once without — and fails the run on any disagreement
+(`E0503`). It is off by default because it doubles what a run costs, and a run
+with a backend attached neither reads nor writes the result cache either way.
 
 ---
 
@@ -2617,7 +2612,6 @@ and then emits exactly one JSON object on stdout and nothing else.
 | `--types` | print the inferred signature and footprint of every definition |
 | `--explain` | which files were parsed and which definitions rechecked, with the reason a skip was refused |
 | `--no-incremental` | neither read nor write the front-end cache |
-| `--engine treewalk\|machine\|both` | which evaluator the program must be runnable by |
 | `--json` | |
 
 ### `ply test [path]`
@@ -2632,8 +2626,8 @@ and then emits exactly one JSON object on stdout and nothing else.
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--engine treewalk\|machine\|both` | |
 | `--backend BACKEND` | attach a compiled backend to the machine |
+| `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
 | `--seed`, `--sim`, `--seeds`, `--sim-budget`, `--sim-steps`, `--measure-reduction` | §10.4 |
@@ -2642,7 +2636,7 @@ and then emits exactly one JSON object on stdout and nothing else.
 
 ### `ply run [path]`
 
-`--host`, `--seed`, `--engine`, the TLS/db/config flags, `--trace`,
+`--host`, `--seed`, the TLS/db/config flags, `--trace`,
 `--drain-ms`, `--drain-lead-ms`, `--json`. A `.plyx` path is run out of its own
 verified definitions rather than out of a source tree it may not be next to.
 
@@ -2821,8 +2815,7 @@ program.
 | --- | --- |
 | `E0501` | assertion failed |
 | `E0502` | runtime error — `panic`, division by zero, integer overflow, an out-of-range index, a spent `iterate` budget, the recursion limit |
-| `E0503` | the two engines disagree (never a warning: the cache would record whichever ran first) |
-| `E0504` | a handler clause the tree-walker cannot express |
+| `E0503` | a compiled backend and the machine disagree (never a warning: the cache would record whichever ran first) |
 | `E0505` | Ply broke one of its own invariants |
 
 ### Warnings

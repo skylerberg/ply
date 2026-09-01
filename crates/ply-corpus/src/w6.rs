@@ -373,33 +373,6 @@ impl Ladder {
     }
 }
 
-/// The same request under one execution strategy and then another.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EnginePoint {
-    /// `treewalk` or `machine`.
-    pub engine: String,
-    pub per_request_micros: f64,
-    pub requests: u32,
-}
-
-/// The ratio between the fastest and slowest engine measured, and which won.
-pub fn engine_spread(points: &[EnginePoint]) -> Option<(f64, String, String)> {
-    let fastest = points
-        .iter()
-        .min_by(|a, b| a.per_request_micros.total_cmp(&b.per_request_micros))?;
-    let slowest = points
-        .iter()
-        .max_by(|a, b| a.per_request_micros.total_cmp(&b.per_request_micros))?;
-    if !usable(fastest.per_request_micros) {
-        return None;
-    }
-    Some((
-        slowest.per_request_micros / fastest.per_request_micros,
-        fastest.engine.clone(),
-        slowest.engine.clone(),
-    ))
-}
-
 /// One input the spike and the interpreter both answered.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpikeInput {
@@ -1075,8 +1048,6 @@ pub struct Report {
     pub denominators: Denominators,
     pub points: Vec<Point>,
     #[serde(default)]
-    pub engines: Vec<EnginePoint>,
-    #[serde(default)]
     pub spike: Option<Spike>,
     #[serde(default)]
     pub alternatives: Vec<Alternative>,
@@ -1185,14 +1156,6 @@ impl Report {
                 }
             }
             Err(e) => findings.push(format!("the ladder does not assemble: {e}")),
-        }
-        if self.engines.len() < 2 {
-            findings.push(
-                "the engine substitution is missing: one interpreter against another is the \
-                 cheapest bound on how much of a request is dispatch, and both engines already \
-                 exist"
-                    .to_string(),
-            );
         }
         if self.spike.is_none() {
             findings.push(
@@ -1342,26 +1305,6 @@ pub fn render(report: &Report) -> String {
         ));
     }
     s.push('\n');
-
-    if !report.engines.is_empty() {
-        s.push_str("one interpreter against another — the cheapest bound on dispatch cost\n");
-        s.push_str(&format!(
-            "  {:<12} {:>10} {:>10}\n",
-            "engine", "µs/req", "reqs"
-        ));
-        for point in &report.engines {
-            s.push_str(&format!(
-                "  {:<12} {:>10.2} {:>10}\n",
-                point.engine, point.per_request_micros, point.requests
-            ));
-        }
-        if let Some((ratio, fast, slow)) = engine_spread(&report.engines) {
-            s.push_str(&format!(
-                "  swapping the whole evaluator moves a request {ratio:.2}x ({slow} over {fast})\n"
-            ));
-        }
-        s.push('\n');
-    }
 
     if let Some(spike) = &report.spike {
         let judged = spike.judge();
@@ -2112,18 +2055,6 @@ mod tests {
                 total_worst_micros: Some(120.0),
             },
             points,
-            engines: vec![
-                EnginePoint {
-                    engine: "treewalk".to_string(),
-                    per_request_micros: 110.0,
-                    requests: 1000,
-                },
-                EnginePoint {
-                    engine: "machine".to_string(),
-                    per_request_micros: 120.0,
-                    requests: 1000,
-                },
-            ],
             spike: Some(spike(3.0)),
             alternatives: roster(1.1),
             offerings: vec![Offering {
@@ -2153,7 +2084,6 @@ mod tests {
 
         let mut thin = report(full_points());
         thin.spike = None;
-        thin.engines.clear();
         thin.offerings.clear();
         thin.limits.clear();
         thin.provenance.not_measured.clear();
@@ -2161,7 +2091,6 @@ mod tests {
         let findings = thin.audit();
         for expected in [
             "no codegen spike",
-            "engine substitution",
             "no offering",
             "no limits",
             "not_measured",
@@ -2191,7 +2120,6 @@ mod tests {
         for expected in [
             "the accumulated stack",
             "residue",
-            "one interpreter against another",
             "the codegen spike",
             "the cheaper levers",
             "what this language serves today",

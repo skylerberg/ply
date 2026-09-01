@@ -1,7 +1,7 @@
-//! A nullary pure definition is a constant, and both engines remember it.
+//! A nullary pure definition is a constant, and the evaluator remembers it.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine, Value};
+use ply_eval::{Machine, Value};
 use ply_span::{SourceId, Span, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -67,43 +67,35 @@ pub fn probe_over_declared(n: Int) -> Int / {store.read} =
   over_declared() + nest_over_declared(n)
 "#;
 
-/// Both engines, one budget, one entry point.
-fn probe(c: &Compiled, name: &str) -> [Result<Value, ply_span::Diagnostic>; 2] {
-    let args = || vec![Value::Int(400)];
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check).with_max_calls(BUDGET);
-    let walked = interp.call(name, args(), Span::DUMMY);
+/// One budget, one entry point.
+fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check).with_max_calls(BUDGET);
-    let stepped = machine.call(name, args(), Span::DUMMY);
-    [walked, stepped]
+    machine.call(name, vec![Value::Int(400)], Span::DUMMY)
 }
 
 #[test]
-fn a_nullary_pure_definition_is_evaluated_once_and_both_engines_agree() {
+fn a_nullary_pure_definition_is_evaluated_once() {
     let c = compile(SOURCE);
-    for answered in probe(&c, "m.probe_constant") {
-        match answered {
-            Ok(value) => assert_eq!(value, Value::Int(1400)),
-            Err(d) => panic!("the remembered constant did not survive the depth: {d:#?}"),
-        }
+    match probe(&c, "m.probe_constant") {
+        Ok(value) => assert_eq!(value, Value::Int(1400)),
+        Err(d) => panic!("the remembered constant did not survive the depth: {d:#?}"),
     }
 }
 
 #[test]
 fn a_definition_with_a_parameter_is_not_a_constant_however_dead_the_parameter_is() {
     let c = compile(SOURCE);
-    for answered in probe(&c, "m.probe_parameterized") {
-        let d = answered.expect_err("a parameterized definition must be re-evaluated");
-        assert_eq!(d.code, codes::RUNTIME_ERROR);
-    }
+    let d = probe(&c, "m.probe_parameterized")
+        .expect_err("a parameterized definition must be re-evaluated");
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
 }
 
 #[test]
 fn a_declared_row_the_body_never_performs_still_refuses_the_memo() {
     let c = compile(SOURCE);
-    for answered in probe(&c, "m.probe_over_declared") {
-        let d = answered.expect_err("the published row is what decides, not the body's");
-        assert_eq!(d.code, codes::RUNTIME_ERROR);
-    }
+    let d = probe(&c, "m.probe_over_declared")
+        .expect_err("the published row is what decides, not the body's");
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
 }
 
 /// The rule has to keep the atoms: a nullary definition that performs is re-evaluated, and its
@@ -133,10 +125,6 @@ test "a nullary effectful definition performs once per call" {
 "#,
     );
     assert_eq!(c.check.tests.len(), 1);
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    if let Err(d) = interp.eval_test(0) {
-        panic!("the tree-walker dropped a perform: {d:#?}");
-    }
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     if let Err(d) = machine.eval_test(0) {
         panic!("the machine dropped a perform: {d:#?}");
@@ -165,10 +153,6 @@ test "the table is the same list however many times it is asked for" {
 }
 "#,
     );
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    if let Err(d) = interp.eval_test(0) {
-        panic!("the tree-walker disagreed: {d:#?}");
-    }
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     if let Err(d) = machine.eval_test(0) {
         panic!("the machine disagreed: {d:#?}");

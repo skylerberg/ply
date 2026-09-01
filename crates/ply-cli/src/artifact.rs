@@ -916,14 +916,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer = evaluate(
-        &opened,
-        args.engine.into(),
-        span,
-        &plan,
-        &hosts,
-        declared.as_ref(),
-    );
+    let answer = evaluate(&opened, span, &plan, &hosts, declared.as_ref());
 
     // ADR 0015 §4.4's pinned order, on the machine's own thread and never from a signal handler:
     // roll every open transaction back, close every open span, flush the sink, close the pool.
@@ -996,24 +989,18 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
-/// The same two engines and the same disagreement check `ply run` applies to source.
+/// The same evaluation `ply run` gives source, over a decoded artifact.
 fn evaluate(
     opened: &Opened,
-    engine: ply_eval::EngineChoice,
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_core::ty::Footprint>,
 ) -> Result<ply_eval::Value, Diagnostic> {
-    use ply_eval::{Engine, EngineChoice, Interp, Machine, compare_answers};
+    use ply_eval::Machine;
 
     let name = opened.entry.as_str();
-    let mut interp = Interp::new(&opened.program, &opened.resolved, &opened.check);
-    interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
-    // See `commands::run::evaluate`: the region kinds belong to the program, so the two engines
-    // share one analysis instead of running it twice.
-    machine.share_region_kinds(interp.shared_region_kinds());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);
@@ -1022,22 +1009,7 @@ fn evaluate(
         machine.set_declared_footprint(declared.clone());
     }
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-
-    match engine {
-        EngineChoice::Treewalk => interp.call(name, Vec::new(), span),
-        EngineChoice::Machine => machine.call(name, Vec::new(), span),
-        EngineChoice::Both => {
-            let left = interp.call(name, Vec::new(), span);
-            let right = machine.call(name, Vec::new(), span);
-            if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
-                return right;
-            }
-            match compare_answers(&interp, &machine, name, &left, &right) {
-                Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
-                None => left,
-            }
-        }
-    }
+    machine.call(name, Vec::new(), span)
 }
 
 // --- diagnostics -------------------------------------------------------------

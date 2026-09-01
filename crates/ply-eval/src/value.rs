@@ -86,7 +86,7 @@ pub enum ClosureKind {
         /// travels with the closure rather than the caller.
         module: usize,
     },
-    /// The tree-walker deep-clones an `Expr` per closure; the machine lowers once and every closure
+    /// A generator deep-clones an `Expr` per closure; the machine lowers once and every closure
     /// after that is a pointer.
     Code {
         params: Rc<Vec<Symbol>>,

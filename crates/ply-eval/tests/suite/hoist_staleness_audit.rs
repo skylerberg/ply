@@ -2,7 +2,7 @@
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::region_kind::Cause;
-use ply_eval::{Interp, Machine, RegionKind, Value};
+use ply_eval::{Machine, RegionKind, Value};
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -32,10 +32,6 @@ impl Compiled {
 
     fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
     }
 
     #[track_caller]
@@ -72,7 +68,7 @@ fn fixture(body: &str) -> String {
     format!("{PRELUDE}{body}{pad} }}\n")
 }
 
-/// The same pair for a tail-resumptive clause, which both engines run.
+/// The same pair for a tail-resumptive clause.
 const TAIL_PRELUDE: &str = "effect log { write note[tape](n: Int) -> Int }\n\nfn go() -> Int =\n  with_cell[tape](0) { c -> ";
 
 const TAIL_CAPTURING: &str = "{ let total = handle { log.note[tape](1) + log.note[tape](2) } with { log.note[tape](n) -> { cell_set(c, cell_get(c) * 10 + n); n } }; total + cell_get(c) * 1000 }";
@@ -126,24 +122,11 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
         "a region the analysis called `unique` was reclaimed at its close while a continuation \
          could still reach it"
     );
-
-    let mut treewalk = capturing.interp();
-    treewalk.share_region_kinds(filler.shared_region_kinds());
-    let refused = treewalk
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .expect_err("the tree-walker binds no continuation");
-    assert_eq!(
-        refused.code,
-        ply_span::codes::MACHINE_ONLY_CLAUSE,
-        "the tree-walker now runs a `resume` binder, so `--engine both` can audit this shape and \
-         the second engine belongs in this test: {}",
-        refused.message
-    );
 }
 
-/// The same question on the shape `--engine both` *does* audit.
+/// The same question on a tail-resumptive region, which takes no pin.
 #[test]
-fn a_stale_unique_over_a_tail_resumptive_region_moves_neither_engine() {
+fn a_stale_unique_over_a_tail_resumptive_region_does_not_move_the_answer() {
     let pure = Compiled::new(&tail_fixture(TAIL_PURE));
     let tail = Compiled::new(&tail_fixture(TAIL_CAPTURING));
 
@@ -171,26 +154,10 @@ fn a_stale_unique_over_a_tail_resumptive_region_moves_neither_engine() {
             )
         });
 
-    let mut treewalk = tail.interp();
-    treewalk.share_region_kinds(filler.shared_region_kinds());
-    let on_treewalk = treewalk
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| {
-            panic!(
-                "a stale `unique` broke the tree-walker: [{}] {}",
-                d.code, d.message
-            )
-        });
-
     assert_eq!(
         int(on_machine),
         honest,
-        "a tail-resumptive region the analysis called `unique` answered differently on the machine"
-    );
-    assert_eq!(
-        int(on_treewalk),
-        honest,
-        "the two engines disagree under a stale region kind, which is an `E0503` divergence"
+        "a tail-resumptive region the analysis called `unique` answered differently"
     );
 }
 

@@ -1,28 +1,14 @@
-//! Evaluating `Float` and `Decimal`, on both engines.
+//! Evaluating `Float` and `Decimal`.
 
 use crate::build::*;
-use crate::differential::compare_answers;
 use crate::value::{Decimal, values_equal};
-use crate::{Interp, Machine, Value};
+use crate::{Machine, Value};
 use ply_span::{Diagnostic, Span, codes};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, Lit, QName, UnOp};
 
 fn eval(e: Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(Vec::new());
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let mut machine = Machine::for_program(&program, &resolved);
-    let left = treewalk.eval_expr_for_test(&e);
-    let right = machine.eval_expr_for_test(&e);
-    if let Some(d) = compare_answers(
-        &treewalk,
-        &machine,
-        "the expression under test",
-        &left,
-        &right,
-    ) {
-        panic!("treewalk and machine disagree — {d}");
-    }
-    left
+    Machine::for_program(&program, &resolved).eval_expr_for_test(&e)
 }
 
 #[track_caller]

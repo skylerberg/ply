@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
-use ply_eval::{Engine, Env, Evaluator, Fixture, Interp, Machine, Value};
+use ply_eval::{Env, Evaluator, Fixture, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -33,8 +33,7 @@ fn nanos(d: Duration) -> f64 {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct EnginePass {
-    pub engine: String,
+pub struct Pass {
     /// Constructing one worker: what `ply-test` pays per rayon thread per concurrency group.
     pub worker_setup_millis: f64,
     /// Every test once on a freshly built worker — setup, plus whatever the engine defers to first
@@ -52,47 +51,19 @@ pub struct Throughput {
     pub root: String,
     pub definitions: usize,
     pub tests: usize,
-    pub engines: Vec<EnginePass>,
+    pub pass: Pass,
     /// `lower` over every test body once.
     pub lower_test_bodies_millis: f64,
-    /// Machine over tree-walker on the steady pass: the interpreter ratio with per-worker setup
-    /// excluded.
-    pub steady_ratio: Option<f64>,
-    /// Machine over tree-walker on a fresh worker, which is what a real run charges.
-    pub first_pass_ratio: Option<f64>,
 }
 
-pub fn throughput(root: &Path, engines: &[Engine], repeats: usize) -> Result<Throughput> {
+pub fn throughput(root: &Path, repeats: usize) -> Result<Throughput> {
     let front = front(root)?;
-    let mut passes = Vec::new();
-    for &engine in engines {
-        passes.push(one_engine(&front, engine, repeats)?);
-    }
-
-    let by = |e: Engine| passes.iter().find(|p| p.engine == e.as_str());
-    let (tree, machine) = (by(Engine::Treewalk), by(Engine::Machine));
-    if let (Some(tree), Some(machine)) = (tree, machine)
-        && tree.performs != machine.performs
-    {
-        bail!(
-            "the engines performed {} and {} atoms, so they did not run the same program",
-            tree.performs,
-            machine.performs
-        );
-    }
-    let ratio = |f: fn(&EnginePass) -> f64| match (tree, machine) {
-        (Some(t), Some(m)) if f(t) > 0.0 => Some(f(m) / f(t)),
-        _ => None,
-    };
-
     Ok(Throughput {
         root: root.display().to_string(),
         definitions: front.check.defs.len(),
         tests: front.check.tests.len(),
         lower_test_bodies_millis: millis(lower_every_test_body(&front, repeats)),
-        steady_ratio: ratio(|p| p.steady_pass_millis),
-        first_pass_ratio: ratio(|p| p.first_pass_millis),
-        engines: passes,
+        pass: one_pass(&front, repeats)?,
     })
 }
 
@@ -118,25 +89,16 @@ fn lower_every_test_body(front: &Front, repeats: usize) -> Duration {
     })
 }
 
-fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePass> {
-    fn build<'a>(front: &'a Front, engine: Engine) -> Box<dyn Evaluator + 'a> {
-        match engine {
-            Engine::Treewalk => {
-                let mut interp = Interp::new(&front.program, &front.resolved, &front.check);
-                interp.share_region_kinds(front.shared_region_kinds());
-                Box::new(interp)
-            }
-            Engine::Machine => {
-                let mut machine = Machine::new(&front.program, &front.resolved, &front.check);
-                machine.share_region_kinds(front.shared_region_kinds());
-                Box::new(machine)
-            }
-        }
+fn one_pass(front: &Front, repeats: usize) -> Result<Pass> {
+    fn build<'a>(front: &'a Front) -> Box<dyn Evaluator + 'a> {
+        let mut machine = Machine::new(&front.program, &front.resolved, &front.check);
+        machine.share_region_kinds(front.shared_region_kinds());
+        Box::new(machine)
     }
 
     let setup = best_of(repeats, || {
         let started = Instant::now();
-        black_box(build(front, engine));
+        black_box(build(front));
         started.elapsed()
     });
 
@@ -144,7 +106,7 @@ fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePas
     let mut performs = 0u64;
     let mut best: Option<(Duration, Duration)> = None;
     for _ in 0..repeats.max(1) {
-        let mut worker = build(front, engine);
+        let mut worker = build(front);
         let started = Instant::now();
         performs = run_every_test(worker.as_mut())?;
         let first = started.elapsed();
@@ -159,8 +121,7 @@ fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePas
     }
     let (first, steady) = best.expect("at least one attempt always runs");
 
-    Ok(EnginePass {
-        engine: engine.as_str().to_string(),
+    Ok(Pass {
         worker_setup_millis: millis(setup),
         first_pass_millis: millis(first),
         steady_pass_millis: millis(steady),
@@ -544,28 +505,20 @@ pub fn render(m: &Measurements) -> String {
             t.definitions, t.tests
         ));
         s.push_str(&format!(
-            "  {:<10} {:>12} {:>12} {:>12} {:>12}\n",
-            "engine", "setup ms", "1st pass", "steady", "performs"
+            "  {:>12} {:>12} {:>12} {:>12}\n",
+            "setup ms", "1st pass", "steady", "performs"
         ));
-        for e in &t.engines {
-            s.push_str(&format!(
-                "  {:<10} {:>12.2} {:>12.2} {:>12.2} {:>12}\n",
-                e.engine,
-                e.worker_setup_millis,
-                e.first_pass_millis,
-                e.steady_pass_millis,
-                e.performs
-            ));
-        }
+        s.push_str(&format!(
+            "  {:>12.2} {:>12.2} {:>12.2} {:>12}\n",
+            t.pass.worker_setup_millis,
+            t.pass.first_pass_millis,
+            t.pass.steady_pass_millis,
+            t.pass.performs
+        ));
         s.push_str(&format!(
             "  lowering every test body once: {:.2} ms\n",
             t.lower_test_bodies_millis
         ));
-        if let (Some(steady), Some(first)) = (t.steady_ratio, t.first_pass_ratio) {
-            s.push_str(&format!(
-                "  machine / treewalk: {steady:.2}x steady, {first:.2}x on a fresh worker\n"
-            ));
-        }
         s.push('\n');
     }
 
@@ -659,53 +612,31 @@ mod tests {
     }
 
     #[test]
-    fn both_engines_run_the_same_program_and_are_reported_separately() {
+    fn a_pass_reports_what_it_ran() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let t = throughput(&root, &[Engine::Treewalk, Engine::Machine], 1).unwrap();
-        assert_eq!(t.engines.len(), 2);
-        // `throughput` refuses a mismatch, so reaching here already proves the two agreed;
-        // asserting it keeps the reason visible.
-        assert_eq!(t.engines[0].performs, t.engines[1].performs);
-        assert!(t.engines.iter().all(|e| e.steady_pass_millis > 0.0));
-        assert!(t.steady_ratio.is_some_and(|r| r > 0.0));
+        let t = throughput(&root, 1).unwrap();
+        assert!(t.pass.steady_pass_millis > 0.0);
+        assert!(t.pass.performs > 0, "the corpus performed no atom");
         assert!(t.lower_test_bodies_millis > 0.0);
     }
 
-    /// A ratio between two engines is meaningless when only one ran, and a silent `1.0` would read
-    /// as parity.
-    #[test]
-    fn one_engine_reports_no_ratio() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("corpus");
-        corpus_at(&root);
-
-        let t = throughput(&root, &[Engine::Machine], 1).unwrap();
-        assert_eq!(t.engines.len(), 1);
-        assert!(t.steady_ratio.is_none());
-        assert!(t.first_pass_ratio.is_none());
-    }
-
-    /// The tree-walker deep-clones every body per worker and the machine lowers on first call, so
-    /// setup must not be read as interpreter speed.
+    /// The machine lowers on first call, so setup must not be read as interpreter speed.
     #[test]
     fn setup_is_reported_apart_from_evaluation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let t = throughput(&root, &[Engine::Treewalk, Engine::Machine], 9).unwrap();
-        for e in &t.engines {
-            assert!(
-                e.first_pass_millis >= e.steady_pass_millis * 0.5,
-                "{} reported a first pass of {} ms against a steady {} ms",
-                e.engine,
-                e.first_pass_millis,
-                e.steady_pass_millis
-            );
-        }
+        let t = throughput(&root, 9).unwrap();
+        assert!(
+            t.pass.first_pass_millis >= t.pass.steady_pass_millis * 0.5,
+            "a first pass of {} ms against a steady {} ms",
+            t.pass.first_pass_millis,
+            t.pass.steady_pass_millis
+        );
     }
 
     /// The forkable world's version of this asserted that a fork of a 10,000-cell fixture cost what

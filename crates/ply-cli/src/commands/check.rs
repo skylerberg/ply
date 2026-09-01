@@ -1,21 +1,15 @@
-use super::common::{
-    IND, diagnostic_json, emit_json, once_each, plural, print_diagnostics, print_warnings,
-    report_load_error,
-};
+use super::common::{IND, emit_json, once_each, plural, print_warnings, report_load_error};
+use crate::EXIT_OK;
 use crate::cli::CheckArgs;
 use crate::driver;
 use crate::load::{Loaded, load, project_root};
 use crate::signature;
 use crate::style::Style;
-use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_core::print_scheme;
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
 use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
-
-/// The contextual keyword a general clause is written with.
-const RESUME: &str = "resume";
 
 /// What every line of the `--types` block is printed at: `IND` plus the two spaces that put a
 /// definition under its module heading.
@@ -28,25 +22,10 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         Err(err) => return report_load_error("check", &err, args.json, style),
     };
 
-    let refused = match refuse_machine_only(args, &mut loaded, store.as_mut(), &mut warnings) {
-        Ok(refused) => refused,
-        Err(err) => return report_load_error("check", &err, args.json, style),
-    };
     let warnings = once_each(warnings);
 
     if args.json {
         let mut report = report_json(&loaded, &warnings);
-        if !refused.is_empty() {
-            let rendered: Vec<Value> = refused
-                .iter()
-                .map(|d| diagnostic_json(d, &loaded.sources))
-                .collect();
-            report["ok"] = json!(false);
-            report["exit_code"] = json!(EXIT_COMPILE_ERROR);
-            report["diagnostics"] = Value::Array(rendered);
-            emit_json(&report);
-            return EXIT_COMPILE_ERROR;
-        }
         // After `front_end` is recorded, so that completing the parse cannot rewrite the report of
         // what the gates decided.
         if args.explain {
@@ -57,11 +36,6 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         }
         emit_json(&report);
         return EXIT_OK;
-    }
-
-    if !refused.is_empty() {
-        print_diagnostics(&refused, &loaded.sources, style);
-        return EXIT_COMPILE_ERROR;
     }
 
     let modules = loaded.module_count();
@@ -115,42 +89,6 @@ fn complete_parse(
         None => load(&args.path)?,
     };
     Ok(())
-}
-
-/// A program the chosen engine cannot express is not a program that checks, whatever inference said
-/// about it.
-fn refuse_machine_only(
-    args: &CheckArgs,
-    loaded: &mut Loaded,
-    store: Option<&mut Store>,
-    warnings: &mut Vec<Diagnostic>,
-) -> Result<Vec<Diagnostic>, crate::load::LoadError> {
-    if ply_eval::EngineChoice::from(args.engine) != ply_eval::EngineChoice::Treewalk {
-        return Ok(Vec::new());
-    }
-    let unscanned: Vec<ModuleName> = loaded
-        .modules()
-        .iter()
-        .filter(|m| !loaded.has_ast(m.name))
-        .filter(|m| {
-            loaded
-                .sources
-                .get(m.info.source)
-                .is_some_and(|f| f.text.contains(RESUME))
-        })
-        .map(|m| m.name.clone())
-        .collect();
-    if !unscanned.is_empty() {
-        *loaded = match store {
-            Some(store) => {
-                let full = driver::load_to_evaluate(&args.path, store, &unscanned);
-                warnings.extend(store.take_warnings());
-                full?
-            }
-            None => load(&args.path)?,
-        };
-    }
-    Ok(ply_eval::machine_only_clauses(&loaded.program))
 }
 
 /// A cache that cannot be opened is never a reason to refuse to typecheck: the front end degrades

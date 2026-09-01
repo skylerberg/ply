@@ -81,36 +81,6 @@ impl When {
     }
 }
 
-/// Which evaluator runs. `both` runs each program on both and fails the run on
-/// any disagreement, which is the only check that catches an engine drifting.
-///
-/// Mirrors `ply_eval::EngineChoice` rather than deriving `ValueEnum` on it,
-/// because `ply-eval` does not depend on `clap` and should not start.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum EngineArg {
-    Treewalk,
-    #[default]
-    Machine,
-    Both,
-}
-
-impl EngineArg {
-    pub fn as_str(self) -> &'static str {
-        ply_eval::EngineChoice::from(self).as_str()
-    }
-}
-
-impl From<EngineArg> for ply_eval::EngineChoice {
-    fn from(a: EngineArg) -> ply_eval::EngineChoice {
-        match a {
-            EngineArg::Treewalk => ply_eval::EngineChoice::Treewalk,
-            EngineArg::Machine => ply_eval::EngineChoice::Machine,
-            EngineArg::Both => ply_eval::EngineChoice::Both,
-        }
-    }
-}
-
 /// Which search a `simulate` region runs.
 ///
 /// Mirrors `ply_eval::SimMode` rather than deriving `ValueEnum` on it, because
@@ -318,11 +288,6 @@ pub struct CheckArgs {
     /// recheck every definition.
     #[arg(long)]
     pub no_incremental: bool,
-
-    /// Which evaluator the program has to be runnable by. A handler clause
-    /// that binds a continuation is refused by `treewalk`.
-    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
-    pub engine: EngineArg,
 }
 
 #[derive(Args, Debug)]
@@ -376,29 +341,32 @@ pub struct TestArgs {
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
 
-    /// Which evaluator runs. `both` runs each test on both and fails on any
-    /// disagreement. Anything but the default neither reads nor writes the
-    /// result cache.
-    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
-    pub engine: EngineArg,
-
     /// Attach a compiled backend to the machine, so a call it accepts is
     /// entered natively instead of evaluated.
     ///
     /// `cranelift` is a code generator: it compiles the carried fragment
     /// to machine code at startup and the machine drops into it at the leaves.
-    /// `reference` answers correctly by tree-walking a second time, and is what
-    /// runs where there is no code generator.
+    /// `reference` answers correctly by evaluating the body on a machine of its
+    /// own, and is what runs where there is no code generator.
     ///
     /// `[<backend>:]wrong:<mutation>` is a backend that is wrong on purpose, so
     /// that a green run can be read as evidence — one of `off-by-one`,
     /// `inverted`, `stale`, `wrong-type`, `unoffered`, `handle`,
     /// `exceeds-budget[={k}]` or
     /// `answers={int}`, each optionally `@<definition>`. A bare `wrong:` wraps
-    /// `reference`. Under `--engine both` the backend is a third engine and a
-    /// disagreement fails the run. Never reads or writes the result cache.
+    /// `reference`. Never reads or writes the result cache.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
+
+    /// Run each test twice — once with the backend attached and once without —
+    /// and fail the run on any disagreement.
+    ///
+    /// Off by default because it doubles what a run costs, which is what a
+    /// backend attached for *measurement* must not pay. A searched test and a
+    /// test that reaches a host handler are run once whatever this says, and
+    /// the run reports how many it could not pair.
+    #[arg(long, requires = "backend")]
+    pub audit_backend: bool,
 
     /// Bind the real host handlers. Off by default, and the default is the
     /// point: a suite that silently acquires a live dependency is the failure
@@ -574,12 +542,6 @@ pub struct RunArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
-
-    /// Which evaluator runs. `both` runs each test on both and fails on any
-    /// disagreement. Anything but the default neither reads nor writes the
-    /// result cache.
-    #[arg(long, value_enum, default_value_t = EngineArg::default(), value_name = "ENGINE")]
-    pub engine: EngineArg,
 
     /// The interleaving a `simulate` region takes: `7`, or `7:3.0.2`.
     ///

@@ -1,7 +1,7 @@
-//! The byte builtins on real source, through parse, resolve, check and both engines.
+//! The byte builtins on real source, through parse, resolve, check and the evaluator.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine};
+use ply_eval::Machine;
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -33,15 +33,9 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-fn run_both(source: &str) -> Compiled {
+fn run_tests(source: &str) -> Compiled {
     let c = compile(source);
     assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = interp.eval_test(i) {
-            panic!("`{}` failed under the tree-walker: {d:#?}", t.name);
-        }
-    }
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     for (i, t) in c.check.tests.iter().enumerate() {
         if let Err(d) = machine.eval_test(i) {
@@ -53,7 +47,7 @@ fn run_both(source: &str) -> Compiled {
 
 #[test]
 fn every_byte_builtin_behaves_as_the_contract_states() {
-    run_both(
+    run_tests(
         r#"
 fn head() -> Bytes = b"GET /orders?id=7 HTTP/1.1\r\nHost: x\r\n\r\nbody"
 
@@ -137,7 +131,7 @@ test "a position predicate may perform, and the search still exits early" {
 /// W1's folds answered.
 #[test]
 fn the_builtins_agree_with_the_folds_they_replaced() {
-    run_both(
+    run_tests(
         r#"
 fn fold_index_of(hay: Bytes, byte: Int, from: Int) -> Int =
   fold(range(from, bytes_len(hay)), -1, |found, i|
@@ -228,19 +222,10 @@ test "the source checks" { assert(true) }
         "m.not_a_byte",
         "m.empty_separator",
     ] {
-        let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-        let walked = interp
-            .call(name, Vec::new(), ply_span::Span::DUMMY)
-            .expect_err(name);
         let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
-        let stepped = machine
+        let d = machine
             .call(name, Vec::new(), ply_span::Span::DUMMY)
             .expect_err(name);
-        assert_eq!(walked.code, ply_span::codes::RUNTIME_ERROR, "{name}");
-        assert_eq!(
-            walked.message, stepped.message,
-            "the two engines phrase `{name}` differently, which `--engine both` reports as a \
-             divergence on correct code"
-        );
+        assert_eq!(d.code, ply_span::codes::RUNTIME_ERROR, "{name}");
     }
 }

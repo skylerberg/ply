@@ -84,14 +84,9 @@ fn stdout_of(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn a_program_over_bytes_and_text_passes_on_both_engines() {
+fn a_program_over_bytes_and_text_passes() {
     let dir = project(SERVER);
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--engine")
-        .arg("both")
-        .output()
-        .unwrap();
+    let out = ply(dir.path()).arg("test").output().unwrap();
     let text = stdout_of(&out);
     assert!(
         out.status.success(),

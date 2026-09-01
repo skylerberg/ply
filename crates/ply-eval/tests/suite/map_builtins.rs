@@ -1,7 +1,7 @@
-//! The `Map` builtins on real source, through parse, resolve, check and both engines.
+//! The `Map` builtins on real source, through parse, resolve, check and the evaluator.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine};
+use ply_eval::Machine;
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -33,16 +33,10 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// Every `test` in the source, under both engines, which must agree.
-fn run_both(source: &str) -> Compiled {
+/// Every `test` in the source, all of which must pass.
+fn run_tests(source: &str) -> Compiled {
     let c = compile(source);
     assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = interp.eval_test(i) {
-            panic!("`{}` failed under the tree-walker: {d:#?}", t.name);
-        }
-    }
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     for (i, t) in c.check.tests.iter().enumerate() {
         if let Err(d) = machine.eval_test(i) {
@@ -122,7 +116,7 @@ test "a map nests, as a key and as a value" {
   assert_eq(map_get(outer, map_insert(map_new(), 1, 1)), Some("in"))
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// Pattern matching.
@@ -159,7 +153,7 @@ test "a map binds to a variable pattern" {
   assert_eq(size(base()), 2)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// `map_fold` calls user code, so its loop is a frame rather than host recursion.
@@ -174,7 +168,7 @@ test "a ten-thousand entry fold is exact" {
   assert_eq(map_len(build(10000)), 10000)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// A `map_fold` whose function performs an effect threads its row, which is the one thing about
@@ -197,7 +191,7 @@ test "the atom the folded function performs is in the row" {
   }
 }
 "#;
-    let c = run_both(source);
+    let c = run_tests(source);
     assert_eq!(
         c.check.defs[&ply_span::Symbol::new("m.shout")]
             .footprint

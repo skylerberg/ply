@@ -139,12 +139,7 @@ binds a continuation: `db.rollback(reason) resume k -> ...` in
 > k(false)` is the multi-shot case, and it parses and runs today
 > (`crates/ply-syntax/src/ast.rs:1019`, `crates/ply-eval/src/handler.rs`).
 > `resume` is contextual, a keyword only between a clause's `)` and its `->`, so
-> it stays an ordinary identifier everywhere else. The one live restriction is
-> the *engine*, not the language: a clause binding a continuation is `E0504`
-> under `--engine treewalk` ("this clause needs an explicit control stack"), so
-> such a program runs on the control-stack machine — the default — and a program
-> that wants the two-engine agreement check of `--engine both` must stay
-> tail-resumptive.
+> it stays an ordinary identifier everywhere else.
 
 **State in handlers** uses region-scoped cells, a builtin rather than a
 user-level effect so that its atoms are discharged at the region boundary and
@@ -518,13 +513,7 @@ clauses beside it, not a contract checked at every call site.
 
 ## What of this is built
 
-This section used to read: "Native codegen (the v0 evaluator is a tree-walking
-interpreter), multi-shot continuations, VM-level snapshot/fork, deterministic
-scheduling simulation, and specs are all deliberately deferred … §6 is M7 and §7
-is M8; both describe what those milestones land, not what the vertical slice
-ships." Four of those five have since landed and one of the four has since been
-*removed again*, so the sentence inverted without being rewritten. What is
-actually true of the shipped language:
+What is true of the shipped language:
 
 | §  | mechanism | state |
 | --- | --- | --- |
@@ -538,8 +527,7 @@ actually true of the shipped language:
 | —  | VM-level snapshot/fork (the persistent `World`) | built in M6, then **removed** by ADR 0017 |
 | —  | native codegen | **the one thing still deferred** (M9) |
 
-The evaluator is still an interpreter, and there are two of them: a tree-walker
-and a control-stack machine, with `--engine both` asserting they agree. Native
+The evaluator is still an interpreter: a control-stack machine. Native
 codegen is deferred on a *measurement* rather than on effort — the interpreter is
 about 35% of a served request, which caps any execution-strategy change at 1.55x,
 and a Cranelift spike projects 1.48x against a 1.50x bar. `docs/adr/0016-w6-performance.md`

@@ -518,7 +518,7 @@ the order below.
 | `ply-derive` | 1.8k | derived codecs (JSON etc.) |
 | `ply-core` | 12.2k | types, **effect rows and atoms**, inference |
 | `ply-hash` | 6.7k | **content addressing**: normalization, the def graph, `DefHash` |
-| `ply-eval` | 31.1k | two engines (tree-walker + control-stack machine), regions, simulation |
+| `ply-eval` | 31.1k | the control-stack machine, regions, simulation |
 | `ply-store` | 8.8k | on-disk cache, obligations |
 | `ply-test` | 12.2k | selection, **conflict grouping**, bisection, spec obligations |
 | `ply-prove` | 12.3k | obligation discharge, tiers, evidence |

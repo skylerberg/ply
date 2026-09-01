@@ -1,7 +1,7 @@
 //! What fraction of a real program's calls can cross the compiled seam.
 
 use ply_eval::differential::compare_tests;
-use ply_eval::{Fixture, Interp, Machine};
+use ply_eval::{Fixture, Machine};
 use ply_span::{SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -157,10 +157,10 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
             continue;
         };
         let backend = std::rc::Rc::new(Declining::over(&program));
-        let mut treewalk = Interp::new(&program, &resolved, &check);
+        let mut plain = Machine::new(&program, &resolved, &check);
         let mut machine = Machine::new(&program, &resolved, &check);
         machine.set_compiled(backend.clone());
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
         compared += report.compared;
         offered += backend.offered.get();
         let (b, a, sc, _) = ply_eval::census::snapshot();

@@ -307,7 +307,7 @@ impl CarriedTypes {
 /// Which gate refused a call, named rather than collapsed into `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Gate {
-    /// Not a body this machine lowered: a tree-walker closure, a constructor or a builtin.
+    /// Not a body this machine lowered: an unlowered closure, a constructor or a builtin.
     NotLoweredCode,
     /// An argument whose *kind* this boundary does not carry — see [`crossable_argument_kind`].
     ArgumentShape,
@@ -403,13 +403,13 @@ pub(crate) fn admit_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::argv;
     use crate::build::*;
     use crate::differential::compare_answers;
     use crate::env::Env;
     use crate::limit::DEFAULT_MAX_CALLS;
     use crate::machine::Machine;
     use crate::value::{Closure, ClosureKind};
-    use crate::{Interp, argv};
     use ply_core::{CheckOutput, check_program};
     use ply_span::Diagnostic;
     use ply_syntax::ast::{BinOp, Expr, ExprKind, Item, Program};
@@ -766,19 +766,19 @@ mod tests {
             "the boundary reported a violation it cannot actually see"
         );
 
-        let mut treewalk = Interp::new(&c.program, &c.resolved, &c.check);
-        let from_treewalk = treewalk.eval_expr_for_test(&subject);
-        assert_eq!(from_treewalk.as_ref().ok(), Some(&Value::Int(42)));
+        let mut plain = Machine::new(&c.program, &c.resolved, &c.check);
+        let from_plain = plain.eval_expr_for_test(&subject);
+        assert_eq!(from_plain.as_ref().ok(), Some(&Value::Int(42)));
         assert!(
             compare_answers(
-                &treewalk,
+                &plain,
                 &machine,
                 "the expression under test",
-                &from_treewalk,
+                &from_plain,
                 &from_machine,
             )
             .is_some(),
-            "`--engine both` did not report a backend that answered 99 for 42"
+            "the backend audit did not report a backend that answered 99 for 42"
         );
     }
 
@@ -808,12 +808,12 @@ mod tests {
     /// `interp.rs` mints a closure per top-level `fn` carrying the program-wide name, and one
     /// handed into a machine reaches `enter_code` through the `ClosureKind::Fn` arm.
     #[test]
-    fn a_tree_walker_closure_with_a_program_wide_name_is_never_offered() {
+    fn an_unlowered_closure_with_a_program_wide_name_is_never_offered() {
         let body = bin(BinOp::Mul, var("x"), int(2));
         let call_it = callv("f", vec![int(21)]);
         let c = checked(vec![double_def()]);
 
-        let treewalk_closure = Value::Closure(Arc::new(Closure {
+        let unlowered = Value::Closure(Arc::new(Closure {
             name: Some(Symbol::new("double")),
             kind: ClosureKind::Fn {
                 params: vec![Symbol::new("x")],
@@ -826,11 +826,11 @@ mod tests {
         let backend = Double::declining(&c.program);
         let mut machine = c.machine();
         machine.set_compiled(backend.clone());
-        let got = machine.eval_expr_in(&call_it, 0, &[(Symbol::new("f"), treewalk_closure)]);
+        let got = machine.eval_expr_in(&call_it, 0, &[(Symbol::new("f"), unlowered)]);
         assert_eq!(ok(got), Value::Int(42));
         assert!(
             backend.offers().is_empty(),
-            "a tree-walker closure was routed into a backend: {:?}",
+            "an unlowered closure was routed into a backend: {:?}",
             backend.offers()
         );
         assert_eq!(machine.compiled_counts(), (0, 0));
@@ -906,13 +906,12 @@ mod tests {
         Ok(("double".to_string(), DEFAULT_MAX_CALLS))
     }
 
-    /// A tree-walker closure carries a program-wide name over a body that is a deep clone rather
-    /// than a node of the program, and `Interp` is the oracle `--engine both` audits the machine
-    /// against.
+    /// An unlowered closure carries a program-wide name over a body that is a deep clone rather
+    /// than a node of the program.
     #[test]
     fn a_body_this_machine_did_not_lower_is_refused_by_the_kind_gate() {
         let c = checked(vec![double_def()]);
-        let treewalk = Closure {
+        let unlowered = Closure {
             name: Some(Symbol::new("double")),
             kind: ClosureKind::Fn {
                 params: vec![Symbol::new("x")],
@@ -922,7 +921,7 @@ mod tests {
             },
         };
         assert_eq!(
-            gate(&c, &treewalk, &[Value::Int(21)]),
+            gate(&c, &unlowered, &[Value::Int(21)]),
             Err(Gate::NotLoweredCode)
         );
         assert_eq!(
@@ -1105,7 +1104,7 @@ mod tests {
     }
 
     /// `budget` is the machine's remaining nested calls, so the last one belongs to the machine:
-    /// the interpreted path raises the bound both engines raise, at the machine's own span.
+    /// the interpreted path raises the bound at the machine's own span.
     #[test]
     fn the_last_nested_call_is_refused_by_the_budget_gate() {
         let c = checked(vec![double_def()]);
@@ -1410,7 +1409,7 @@ mod tests {
         assert_eq!(machine.compiled_counts(), (1, 0));
     }
 
-    /// `limit.rs` exists so a runaway recursion is a diagnostic in both engines.
+    /// `limit.rs` exists so a runaway recursion is a diagnostic.
     #[test]
     fn the_budget_is_the_machines_remaining_depth_and_never_reaches_zero() {
         let c = checked(vec![fn_def_sig(
@@ -1564,7 +1563,7 @@ mod tests {
         assert_eq!(machine.compiled_refusals(), 1);
     }
 
-    /// The `--engine both` comparison, taken between a machine with a backend and one without: the
+    /// The `--audit-backend` comparison, taken between a machine with a backend and one without: the
     /// rendered value, the outcome field by field, the footprint, and the cell arena slot by slot.
     #[track_caller]
     fn agree_on(c: &Checked, backend: Rc<Double>, e: &Expr) {

@@ -1,7 +1,7 @@
 //! The before column of W2's headline number has to be a twin, not a guess.
 
 use ply_corpus::serve::{Endpoint, Parser};
-use ply_eval::{EngineChoice, Plan};
+use ply_eval::Plan;
 use std::path::PathBuf;
 
 fn repo() -> PathBuf {
@@ -47,7 +47,7 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
         &loaded.check,
         &loaded.hashes,
         &mut store,
-        EngineChoice::Both,
+        false,
         ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
     );

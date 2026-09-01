@@ -181,7 +181,7 @@ fn a_non_error_severity_is_still_a_failure() {
     assert!(!report.failures[0].defect);
 }
 
-/// **A divergence between the two engines is a defect in Ply.**
+/// **A divergence between a backend and the machine is a defect in Ply.**
 #[test]
 fn an_engine_divergence_is_a_defect_in_ply() {
     let (defect, status, verdict) = classified(codes::ENGINE_DIVERGENCE);
@@ -190,18 +190,7 @@ fn an_engine_divergence_is_a_defect_in_ply() {
     assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 }
 
-/// **A refusal to run is classified as the program's fault.**
-#[test]
-fn documents_a_machine_only_clause_is_classified_as_the_programs_fault() {
-    let (defect, status, verdict) = classified(codes::MACHINE_ONLY_CLAUSE);
-    assert!(
-        !defect,
-        "a refusal to run is now classified apart from a red test — good; assert \
-         the new shape instead of deleting this test"
-    );
-    assert_eq!(status, Status::Failed);
-    assert_ne!(verdict, Verdict::NotAttempted(Skipped::Panicked));
-}
+// ---------------------------------------------- one variant, one description
 
 fn hash(seed: &str) -> ply_hash::DefHash {
     ply_hash::DefHash::from_hex(&seed.repeat(32)).expect("a well-formed hash")

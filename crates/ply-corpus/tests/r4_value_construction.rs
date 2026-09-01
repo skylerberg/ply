@@ -625,7 +625,7 @@ fn a_requests_allocations_are_attributed_to_the_values_they_build() {
             "{name} attributes {:.1} allocations per request to a literal: `NodeKind::Lit` \
              carries the value it denotes and `Machine::eval` clones it, so nothing on this \
              path should reach `interp::literal` at all — either the hoist regressed or the \
-             tree-walker is running this route",
+             constructor memo is not on this route",
             literal.0
         );
     }

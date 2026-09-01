@@ -252,7 +252,7 @@ impl<'a> Lowering<'a> {
     }
 }
 
-/// The lowered body of the last closure the tree-walker made that the machine applied.
+/// The lowered body of the last unlowered closure the machine applied.
 #[derive(Default)]
 pub struct ClosureCode {
     last: Option<(Arc<Expr>, Vec<Symbol>, Code)>,
@@ -290,7 +290,7 @@ fn node(kind: NodeKind, span: Span) -> Code {
 /// rest of the activation still reads by the time an occurrence is reached.
 fn lower_node(e: &Expr, live: &mut Live) -> Code {
     let kind = match &e.kind {
-        ExprKind::Lit(lit) => NodeKind::Lit(lit.clone(), crate::interp::literal(lit)),
+        ExprKind::Lit(lit) => NodeKind::Lit(lit.clone(), crate::semantics::literal(lit)),
         ExprKind::Var(q) => {
             let own = if q.is_bare() {
                 live.use_of(q.symbol())

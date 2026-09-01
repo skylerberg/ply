@@ -1,7 +1,7 @@
-//! The list index on real source, through parse, resolve, check and both engines.
+//! The list index on real source, through parse, resolve, check and the evaluator.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine};
+use ply_eval::Machine;
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -33,16 +33,10 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// Every `test` in the source, under both engines, which must agree.
-fn run_both(source: &str) -> Compiled {
+/// Every `test` in the source, all of which must pass.
+fn run_tests(source: &str) -> Compiled {
     let c = compile(source);
     assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = interp.eval_test(i) {
-            panic!("`{}` failed under the tree-walker: {d:#?}", t.name);
-        }
-    }
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     for (i, t) in c.check.tests.iter().enumerate() {
         if let Err(d) = machine.eval_test(i) {
@@ -75,7 +69,7 @@ test "head and last are the index, not builtins of their own" {
   assert_eq(last([]), None)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// Absent, not clamped, and not counted from the end.
@@ -105,7 +99,7 @@ test "the empty list has no element anywhere" {
   assert_eq(list_at([], -1), None)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// The element type is a parameter, so a record, an ADT value and a nested list all have to come
@@ -141,7 +135,7 @@ test "a list element, which is also what makes list_at nest" {
   )
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// The builtin is pure and takes no callback, so a call publishes exactly the row of the
@@ -167,7 +161,7 @@ test "a pure peek and an effectful index expression" {
   }
 }
 "#;
-    let c = run_both(source);
+    let c = run_tests(source);
     assert_eq!(
         c.check.defs[&ply_span::Symbol::new("m.quiet")]
             .footprint
@@ -195,7 +189,7 @@ test "the module's own definition wins" {
   assert_eq(list_at([1, 2, 3], 0), -1)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }
 
 /// The index is not a callback builtin, so it cannot suspend, so a peek inside a loop costs the
@@ -213,5 +207,5 @@ test "a peek per element over ten thousand elements" {
   assert_eq(sum_by_index(range(0, 10000)), 49995000)
 }
 "#;
-    run_both(source);
+    run_tests(source);
 }

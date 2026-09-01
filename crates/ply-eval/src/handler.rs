@@ -4,7 +4,7 @@ use crate::arena::{Pin, RegionKind};
 use crate::code::{Clause, Code, ReturnArm};
 use crate::cont::{Continuation, Frame, Prompt, SimId, Stack, Target};
 use crate::env::Env;
-use crate::interp::arity_error;
+use crate::semantics::arity_error;
 use crate::task_regions::TaskRegions;
 use crate::value::Value;
 use ply_core::ty::{EffectAtom, Resource};

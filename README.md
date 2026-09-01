@@ -277,11 +277,10 @@ writes its whole state back through a persistent map. Tests that use the double
 for speed will be disappointed; they use it for isolation and determinism, which
 it does deliver.
 
-**The tracing sink is quadratic in a test — on the tree-walker.** `std.trace`'s
-`Sink` appends with `push`; on `--engine machine`, the default, a collecting twin
-holding N records costs N pushes and **zero** whole-list copies *if the caller
-threads the sink in last position too*, and on `--engine treewalk` it costs one
-whole-list copy per record however either is written.
+**The tracing sink's cost turns on how the caller writes it.** `std.trace`'s
+`Sink` appends with `push`; a collecting twin holding N records costs N pushes
+and **zero** whole-list copies *if the caller threads the sink in last position
+too*, and one whole-list copy per record if it does not.
 
 > **The mechanism, because "appends with `push`" alone teaches the wrong
 > lesson.** `push` grows a `List` **in place** when the caller is its last owner
@@ -292,33 +291,22 @@ whole-list copy per record however either is written.
 > remains, and never asks what those remaining sub-expressions read. So the
 > lesson "avoid `push`" is not available — `push` is the language's sole list
 > primitive and `trace.ply`'s own `cons` is written out of it. Last position is
-> **necessary and not sufficient**, and on the tree-walker it buys nothing.
-> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts both halves.
+> **necessary and not sufficient**.
+> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts it.
 **`bytes_slice` and `bytes_split` copy.** `Value::Bytes` is `Arc<[u8]>` with no
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.
 
-**`--engine both` is not free.** The guarantee that the tree-walking evaluator
-and the control-stack machine agree costs two runs, and the two are not the same
-speed: the tree-walker is 2.82x faster on the request path.
+**`--audit-backend` is not free.** `ply test --backend <spec>` attaches a
+compiled backend; `--audit-backend` runs each test without it as well, so that a
+divergence reported is the backend's and nothing else's. That costs two runs, so
+it is off by default. A run with a backend attached neither reads nor writes the
+result cache either way.
 
-> **The sign is not constant, which "2.82x faster" invites a reader to assume.**
-> The request path builds no large accumulator. On code that does, the
-> tree-walker is *slower and asymptotically worse*: it runs no reference
-> counting, so every `push` copies its list whatever position it is written in,
-> where the machine rewrites in place. Encoding a string of k escapes through
-> `std.json`, the machine grows linearly and the tree-walker quadratically.
-> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts both halves.
-
-**`--backend` makes it three runs.** `ply test --backend <spec>` attaches a
-compiled backend, and under `--engine both` that backend is a third engine,
-compared against the plain machine so that a divergence reported is the
-backend's and nothing else's. A run with a backend attached neither reads nor
-writes the result cache.
-
-Two backends ship. `reference` is a second tree-walker over the scalar-signature
-fragment — not a code generator, and slower than the machine — and it exists so
-that a *wrong* backend can be caught before a fast one is argued about:
+Two backends ship. `reference` evaluates the body on a machine of its own over
+the scalar-signature fragment — not a code generator, and slower than entering
+none — and it exists so that a *wrong* backend can be caught before a fast one
+is argued about:
 `--backend wrong:<mutation>` installs one of eight deliberately wrong backends.
 `cranelift` is a real JIT, compiled into the binary with no feature flag.
 

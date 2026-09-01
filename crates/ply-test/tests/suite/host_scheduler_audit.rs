@@ -5,7 +5,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{EngineChoice, Plan, Value};
+use ply_eval::{Plan, Value};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_store::Store;
@@ -149,9 +149,7 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        // The tree-walker refuses a host operation as machine-only, so a bound run is a machine
-        // run.
-        EngineChoice::Machine,
+        false,
         search,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -354,7 +352,7 @@ test/nondet "spawn, join, then simulate" {
     ran.refused(codes::NESTED_SIMULATION);
 }
 
-/// `--engine both` over a bound host.
+/// A bound host operation is performed once.
 #[test]
 fn engine_both_over_a_bound_host_sends_once_and_does_not_diverge() {
     let compiled = compile(
@@ -363,7 +361,7 @@ nondet effect net {
   write send[s](payload: Int) -> Int
 }
 
-test/nondet "both engines, one socket" {
+test/nondet "one socket, one send" {
   assert_eq(net.send[socket](1), 1)
 }
 "#,
@@ -383,7 +381,7 @@ test/nondet "both engines, one socket" {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Both,
+        true,
         search,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -469,7 +467,7 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Machine,
+        false,
         Search::of(&selection),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -510,7 +508,7 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Machine,
+        false,
         Search::of(&selection),
         // The shape `ply test` uses: the registry is carried, nothing is bound.
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
@@ -550,7 +548,7 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Machine,
+        false,
         Search::of(&selection).measuring(true),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -598,7 +596,7 @@ test "a det test over a deterministic host handler" {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Machine,
+        false,
         search,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -667,7 +665,7 @@ test/nondet "spawns without a binding" {
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        EngineChoice::Machine,
+        false,
         search,
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
             counter.clone(),
