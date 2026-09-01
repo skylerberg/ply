@@ -1,7 +1,6 @@
 //! What fraction of a real program's calls can cross the compiled seam.
 
-use ply_eval::differential::compare_tests;
-use ply_eval::{Fixture, Interp, Machine};
+use ply_eval::{Evaluator, Fixture, Machine};
 use ply_span::{SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -157,11 +156,19 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
             continue;
         };
         let backend = std::rc::Rc::new(Declining::over(&program));
-        let mut treewalk = Interp::new(&program, &resolved, &check);
+        // One machine, deliberately. `admitted` is a process-wide counter this
+        // crate's `admit` bumps, so a second machine over the same corpus counts
+        // every call twice while only the backed one's backend counts an offer,
+        // and the cross-check below reads exactly 2x.
         let mut machine = Machine::new(&program, &resolved, &check);
         machine.set_compiled(backend.clone());
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
-        compared += report.compared;
+        Evaluator::set_fixture(&mut machine, &Fixture::empty());
+        let mut ran = 0usize;
+        for index in 0..Evaluator::test_count(&machine) {
+            let _ = Evaluator::eval_test(&mut machine, index);
+            ran += 1;
+        }
+        compared += ran;
         offered += backend.offered.get();
         let (b, a, sc, _) = ply_eval::census::snapshot();
         println!(
@@ -170,7 +177,7 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
             b - prev.0,
             a - prev.1,
             sc - prev.2,
-            report.compared
+            ran
         );
         prev = (b, a, sc);
     }

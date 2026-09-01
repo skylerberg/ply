@@ -2069,7 +2069,7 @@ fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
     );
 }
 
-// --- engines ----------------------------------------------------------------
+// --- multi-shot resumption --------------------------------------------------
 
 /// A clause that binds a continuation.
 const MULTI_SHOT: &str = "\
@@ -2113,142 +2113,10 @@ fn a_multi_shot_program_runs_and_caches_with_no_flags_at_all() {
     );
 }
 
+/// Gate 1 skips a file whose bytes did not change, and a second `ply check` over
+/// untouched source must not start parsing everything again.
 #[test]
-fn the_machine_runs_a_clause_that_binds_a_continuation() {
-    let dir = project(MULTI_SHOT);
-    let out = ply(dir.path())
-        .args(["test", "--engine", "machine"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
-    assert!(stdout_of(&out).contains("1 passed"), "{}", stdout_of(&out));
-}
-
-/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine.
-#[test]
-fn engine_both_does_not_call_a_refusal_a_divergence() {
-    let dir = project(MULTI_SHOT);
-    let out = ply(dir.path())
-        .args(["test", "--engine", "both"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
-    assert!(!stdout_of(&out).contains("E0503"), "{}", stdout_of(&out));
-}
-
-/// …and says so, rather than letting a green run under two engines be read as two engines having
-/// agreed about it.
-#[test]
-fn engine_both_reports_the_tests_it_could_not_audit() {
-    let dir = project(MULTI_SHOT);
-    let out = ply(dir.path())
-        .args(["test", "--engine", "both", "--json", "--no-cache"])
-        .output()
-        .unwrap();
-    let v = json_of(&out);
-    assert_eq!(v["audit"]["compared"], 0, "{v}");
-    assert_eq!(v["audit"]["unaudited"], 1, "{v}");
-    assert_eq!(v["results"][0]["audited"], false, "{v}");
-
-    let text = stdout_of(
-        &ply(dir.path())
-            .args(["test", "--engine", "both", "--no-cache"])
-            .output()
-            .unwrap(),
-    );
-    assert!(text.contains("audited 0 of 1"), "{text}");
-    assert!(text.contains("ran on one engine only"), "{text}");
-}
-
-/// A test both engines ran is counted as audited, or the count would be a constant rather than a
-/// coverage.
-#[test]
-fn engine_both_counts_a_test_two_engines_ran() {
-    let dir = project("test \"plain\" { assert_eq(1 + 1, 2) }\n");
-    let v = json_of(
-        &ply(dir.path())
-            .args(["test", "--engine", "both", "--json", "--no-cache"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(v["audit"]["compared"], 1, "{v}");
-    assert_eq!(v["audit"]["unaudited"], 0, "{v}");
-    assert_eq!(v["results"][0]["audited"], true, "{v}");
-}
-
-/// A run with one engine reports no coverage at all.
-#[test]
-fn a_single_engine_run_reports_no_audit_coverage() {
-    let dir = project(MULTI_SHOT);
-    for engine in ["machine", "treewalk"] {
-        let v = json_of(
-            &ply(dir.path())
-                .args(["test", "--engine", engine, "--json", "--no-cache"])
-                .output()
-                .unwrap(),
-        );
-        assert!(v["audit"].is_null(), "engine {engine}: {v}");
-        assert!(v["results"][0]["audited"].is_null(), "engine {engine}: {v}");
-        let text = stdout_of(
-            &ply(dir.path())
-                .args(["test", "--engine", engine, "--no-cache"])
-                .output()
-                .unwrap(),
-        );
-        assert!(!text.contains("audited"), "engine {engine}: {text}");
-    }
-}
-
-#[test]
-fn the_tree_walker_refuses_it_and_names_the_engine_that_runs_it() {
-    let dir = project(MULTI_SHOT);
-    let out = ply(dir.path())
-        .args(["test", "--engine", "treewalk"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("E0504") || text.contains("binds a continuation"),
-        "{text}"
-    );
-    assert!(text.contains("--engine machine"), "{text}");
-}
-
-/// The refusal is derived from the AST, and gate 1 skips a file whose bytes did not change.
-#[test]
-fn check_refuses_the_same_program_cold_and_warm() {
-    let dir = project(MULTI_SHOT);
-    let refuse = |dir: &std::path::Path| {
-        ply(dir)
-            .args(["check", "--engine", "treewalk"])
-            .output()
-            .unwrap()
-    };
-    let cold = refuse(dir.path());
-    let warm = refuse(dir.path());
-    assert_eq!(cold.status.code(), Some(2));
-    assert_eq!(warm.status.code(), Some(2));
-    assert_eq!(
-        String::from_utf8(cold.stderr).unwrap(),
-        String::from_utf8(warm.stderr).unwrap()
-    );
-
-    for engine in ["machine", "both"] {
-        let out = ply(dir.path())
-            .args(["check", "--engine", engine])
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(0), "--engine {engine}");
-    }
-    let default = ply(dir.path()).arg("check").output().unwrap();
-    assert_eq!(default.status.code(), Some(0), "{}", stdout_of(&default));
-}
-
-/// The pre-filter that decides which skipped files to re-parse keys on the text `resume`, so a
-/// project without one must not start parsing everything again.
-#[test]
-fn a_project_with_no_general_clause_still_skips_every_unchanged_file() {
+fn an_unchanged_file_is_skipped_on_the_second_check() {
     let dir = project(GREEN);
     ply(dir.path()).arg("check").assert().success();
     let out = ply(dir.path())

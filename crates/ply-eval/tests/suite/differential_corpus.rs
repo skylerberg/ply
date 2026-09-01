@@ -1,7 +1,7 @@
 //! Both engines over the corpora that exist on disk.
 
 use ply_eval::differential::compare_tests;
-use ply_eval::{Fixture, Interp, Machine};
+use ply_eval::{Fixture, Machine};
 use ply_span::SourceMap;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -126,81 +126,8 @@ fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
     out
 }
 
-#[test]
-fn the_two_engines_agree_on_every_corpus_on_disk() {
-    let root = workspace_root();
-    let mut programs = 0;
-    let mut skipped = 0;
-    let mut tests = 0;
-    let mut atoms = 0;
-
-    for (label, dir, files) in corpora(&root) {
-        let Some((program, resolved)) = load(&dir, &files) else {
-            skipped += 1;
-            continue;
-        };
-        programs += 1;
-
-        let mut treewalk = Interp::for_program(&program, &resolved);
-        let mut machine = Machine::for_program(&program, &resolved);
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
-        tests += report.compared;
-        atoms += machine.trace().performs();
-
-        assert!(report.is_clean(), "{label}\n{report}");
-        // A green run whose footprint axis never ran is what let two engines performing different
-        // atoms pass this audit.
-        assert_eq!(
-            report.footprints_compared, report.compared,
-            "{label}: an engine stopped reporting what it performed\n{report}"
-        );
-    }
-
-    assert!(programs > 0, "no corpus loaded; {skipped} were skipped");
-    assert!(
-        tests > 0,
-        "{programs} programs loaded but not one of them declares a test"
-    );
-    assert!(
-        atoms > 0,
-        "no corpus performed an effect, so agreeing on footprints proved nothing"
-    );
-}
-
-/// A refusal is not agreement, so the harness must count it apart.
-#[test]
-fn a_machine_only_fixture_is_counted_apart_from_what_was_compared() {
-    let root = workspace_root();
-    let dir = root.join("tests/fixtures");
-    let file = dir.join("machine_only_clause.ply");
-    assert!(
-        file.exists(),
-        "{} is part of the repository",
-        file.display()
-    );
-
-    let (program, resolved) = load(&dir, std::slice::from_ref(&file)).expect("the fixture loads");
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let mut machine = Machine::for_program(&program, &resolved);
-
-    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
-    assert!(report.is_clean(), "{report}");
-    assert_eq!(report.compared, 0, "{report}");
-    assert_eq!(report.machine_only, 1, "{report}");
-
-    assert!(
-        Machine::for_program(&program, &resolved)
-            .eval_test(0)
-            .is_ok()
-    );
-    let refused = Interp::for_program(&program, &resolved)
-        .eval_test(0)
-        .expect_err("the tree-walker refuses the clause");
-    assert_eq!(refused.code, ply_span::codes::MACHINE_ONLY_CLAUSE);
-}
-
-/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11, pinned on its fixture
-/// rather than left to the sweep above.
+/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11,
+/// pinned on its fixture rather than left to the sweep above.
 #[test]
 fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered() {
     let root = workspace_root();
@@ -246,12 +173,12 @@ fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_en
         "`measured` stopped publishing a row, so this corpus no longer reaches the row gate"
     );
 
-    let backend = std::rc::Rc::new(backends::TreeWalker::over(&program));
-    let mut treewalk = Interp::new(&program, &resolved, &check);
+    let backend = std::rc::Rc::new(backends::Nested::over(&program));
+    let mut plain = Machine::new(&program, &resolved, &check);
     let mut machine = Machine::new(&program, &resolved, &check);
     machine.set_compiled(backend);
 
-    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+    let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
     assert!(report.is_clean(), "{report}");
     assert_eq!(report.compared, 1, "{report}");
     assert_eq!(report.footprints_compared, 1, "{report}");
@@ -270,27 +197,9 @@ fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_en
     );
 }
 
-/// `examples/` is the corpus the milestone's exit criterion names, so it gets its own assertion
-/// rather than being one entry in a loop that would still pass if it silently stopped loading.
-#[test]
-fn the_two_engines_agree_on_examples() {
-    let root = workspace_root();
-    let dir = root.join("examples");
-    let files = ply_files(&dir);
-    assert!(!files.is_empty(), "examples/ holds no .ply files");
-
-    let (program, resolved) = load(&dir, &files).expect("examples/ parses and resolves");
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let mut machine = Machine::for_program(&program, &resolved);
-
-    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
-    assert!(report.compared >= files.len(), "{report}");
-    assert!(report.is_clean(), "{report}");
-}
-
 /// The same corpora, with a backend attached.
 mod backends {
-    use ply_eval::{Compiled, Interp, Value};
+    use ply_eval::{Compiled, Machine, Value};
     use ply_span::{Span, Symbol};
     use ply_syntax::ast::Program;
     use ply_syntax::resolve::{Resolved, resolve};
@@ -326,28 +235,28 @@ mod backends {
         }
     }
 
-    /// A backend whose "compiled code" is the tree-walker, over its own copy of the program with
+    /// A backend whose "compiled code" is a nested machine, over its own copy of the program with
     /// its own world.
-    pub struct TreeWalker {
+    pub struct Nested {
         program: *const Program,
-        inner: RefCell<Interp<'static>>,
+        inner: RefCell<Machine<'static>>,
     }
 
-    impl TreeWalker {
-        pub fn over(program: &Program) -> TreeWalker {
+    impl Nested {
+        pub fn over(program: &Program) -> Nested {
             let copy: &'static mut Program = Box::leak(Box::new(program.clone()));
             let resolved: &'static Resolved = Box::leak(Box::new(
                 resolve(copy).expect("the corpus resolved once already"),
             ));
             let copy: &'static Program = copy;
-            TreeWalker {
+            Nested {
                 program: std::ptr::from_ref(program),
-                inner: RefCell::new(Interp::for_program(copy, resolved)),
+                inner: RefCell::new(Machine::for_program(copy, resolved)),
             }
         }
     }
 
-    impl Compiled for TreeWalker {
+    impl Compiled for Nested {
         fn describes(&self, program: &Program) -> bool {
             std::ptr::eq(self.program, std::ptr::from_ref(program))
         }
@@ -379,11 +288,11 @@ fn a_backend_that_declines_everything_changes_nothing_over_every_corpus_on_disk(
             continue;
         };
         let backend = std::rc::Rc::new(backends::Declining::over(&program));
-        let mut treewalk = Interp::new(&program, &resolved, &check);
+        let mut plain = Machine::new(&program, &resolved, &check);
         let mut machine = Machine::new(&program, &resolved, &check);
         machine.set_compiled(backend.clone());
 
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
         assert!(report.is_clean(), "{label}\n{report}");
         assert_eq!(
             report.footprints_compared, report.compared,
@@ -421,11 +330,11 @@ fn a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk() {
         let Ok(check) = ply_core::check_program(&program, &resolved) else {
             continue;
         };
-        let mut treewalk = Interp::new(&program, &resolved, &check);
+        let mut plain = Machine::new(&program, &resolved, &check);
         let mut machine = Machine::new(&program, &resolved, &check);
-        machine.set_compiled(std::rc::Rc::new(backends::TreeWalker::over(&program)));
+        machine.set_compiled(std::rc::Rc::new(backends::Nested::over(&program)));
 
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
         assert!(report.is_clean(), "{label}\n{report}");
         assert_eq!(
             report.footprints_compared, report.compared,

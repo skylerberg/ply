@@ -467,7 +467,7 @@ impl Stack {
     }
 
     /// Pending calls — the [`Frame::Call`]s among [`Stack::frames`], counted the same way the
-    /// tree-walker counts its own nesting.
+    /// a recursive evaluator counts its own nesting.
     pub fn calls(&self) -> usize {
         self.calls
     }

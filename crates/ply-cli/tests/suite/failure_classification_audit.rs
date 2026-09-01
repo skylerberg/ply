@@ -199,34 +199,22 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
 
 /// Both engines and the audit that runs them together classify a resource limit the same way.
 #[test]
-fn the_recursion_limit_is_one_program_error_on_every_engine() {
+fn the_recursion_limit_is_a_program_error() {
     const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
                            test \"spins\" { assert_eq(spin(0), 0) }\n";
-    for engine in ["treewalk", "machine", "both"] {
-        let dir = project(RUNAWAY);
-        let out = ply(dir.path())
-            .args(["test", "--json", "--engine", engine])
-            .output()
-            .unwrap();
-        let v = json_of(&out);
-        let failure = &v["failures"][0];
-        assert_eq!(failure["defect"], false, "engine {engine}: {failure}");
-        assert_eq!(
-            failure["diagnostic"]["code"], "E0502",
-            "engine {engine}: {failure}"
-        );
-        assert_ne!(
-            failure["diagnostic"]["code"], "E0503",
-            "engine {engine} disagreed with the other one: {failure}"
-        );
-        assert!(
-            failure["diagnostic"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("recursion limit of 10000 nested calls exceeded"),
-            "engine {engine}: {failure}"
-        );
-    }
+    let dir = project(RUNAWAY);
+    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    let v = json_of(&out);
+    let failure = &v["failures"][0];
+    assert_eq!(failure["defect"], false, "{failure}");
+    assert_eq!(failure["diagnostic"]["code"], "E0502", "{failure}");
+    assert!(
+        failure["diagnostic"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("recursion limit of 10000 nested calls exceeded"),
+        "{failure}"
+    );
 }
 
 // --- the consequence: these failures are actually bisected ------------------
@@ -517,27 +505,21 @@ fn stack(n: Int) -> Chain = fold(range(0, n), Nil, |acc, x| Link(acc))
 
 test \"deep values compare\" { assert_eq(stack(20000), stack(20000)) }
 ";
-    for engine in ["treewalk", "machine", "both"] {
+    {
         let dir = project(DEEP);
-        let out = ply(dir.path())
-            .args(["test", "--json", "--engine", engine])
-            .output()
-            .unwrap();
+        let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
         let v = json_of(&out);
-        assert_eq!(out.status.code(), Some(1), "engine {engine}: {v}");
+        assert_eq!(out.status.code(), Some(1), "{v}");
         let mut failure = v["failures"][0].clone();
         failure["__status"] = v["results"][0]["status"].clone();
         assert_program_error(&failure, "a value deeper than the bound");
-        assert_eq!(
-            failure["diagnostic"]["code"], "E0502",
-            "engine {engine}: {failure}"
-        );
+        assert_eq!(failure["diagnostic"]["code"], "E0502", "{failure}");
         assert!(
             failure["diagnostic"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("recursion limit of 10000 nested values exceeded"),
-            "engine {engine}: {failure}"
+            "{failure}"
         );
     }
 }
@@ -561,13 +543,11 @@ fn a_deeply_nested_expression_runs_rather_than_aborting_the_run() {
         stdout_of(&checked)
     );
 
-    for engine in ["treewalk", "machine", "both"] {
-        let out = ply(dir.path())
-            .args(["test", "--json", "--no-cache", "--engine", engine])
-            .output()
-            .unwrap();
-        let v = json_of(&out);
-        assert_eq!(out.status.code(), Some(0), "engine {engine}: {v}");
-        assert_eq!(v["summary"]["passed"], 1, "engine {engine}: {v}");
-    }
+    let out = ply(dir.path())
+        .args(["test", "--json", "--no-cache"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(v["summary"]["passed"], 1, "{v}");
 }

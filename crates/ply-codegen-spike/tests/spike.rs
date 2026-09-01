@@ -1,9 +1,7 @@
 //! What has to hold before the spike's number means anything.
 
 use ply_codegen_spike::jit::{Jit, Opts};
-use ply_codegen_spike::measure::{
-    GROUP, Harness, Input, InputResult, agrees_with_treewalk, compare, speedup,
-};
+use ply_codegen_spike::measure::{GROUP, Harness, Input, InputResult, compare, speedup};
 use ply_codegen_spike::program::Loaded;
 use ply_eval::{Value, values_equal};
 use ply_span::Span;
@@ -85,24 +83,6 @@ fn the_compiled_function_answers_what_the_machine_answers() {
         assert!(
             agree_on(&mut harness, input),
             "disagreed on `{}`",
-            input.name
-        );
-    }
-}
-
-#[test]
-fn and_what_the_tree_walker_answers() {
-    let mut harness = Harness::new(GROUP).expect("the group compiles");
-    for input in inputs() {
-        let expected = harness
-            .machine
-            .call(READ_LINE, input.args.clone(), Span::DUMMY);
-        if expected.is_err() {
-            continue;
-        }
-        assert!(
-            agrees_with_treewalk(&mut harness, READ_LINE, &input).expect("the tree-walker ran"),
-            "the tree-walker and the spike differ on `{}`",
             input.name
         );
     }

@@ -7,7 +7,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{EngineChoice, Plan, Value};
+use ply_eval::{Plan, Value};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::Store;
@@ -123,7 +123,7 @@ fn run_with(
     compiled: &Compiled,
     store: &mut Store,
     binding: Option<&Arc<HostBinding>>,
-    engine: EngineChoice,
+    audit_backend: bool,
 ) -> RunReport {
     let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
@@ -137,14 +137,14 @@ fn run_with(
         &compiled.check,
         &compiled.hashes,
         store,
-        engine,
+        audit_backend,
         Search::default(),
         hosting,
     )
 }
 
 fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    run_with(compiled, store, binding, EngineChoice::Machine)
+    run_with(compiled, store, binding, false)
 }
 
 /// Two tests, one resource, both declared `read`, and a handler that writes.
@@ -360,10 +360,10 @@ fn the_same_det_test_is_refused_hermetically() {
     );
 }
 
-/// `--engine both` runs the tree-walker beside the machine, and the tree-walker cannot drive a host
+/// `--audit-backend` runs a second machine beside the first, and a host handler is not a
 /// handler.
 #[test]
-fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_once() {
+fn auditing_a_backend_over_a_host_handler_calls_the_handler_once() {
     let compiled = Compiled::new(DET_REACHES_HOST);
     let root = TempRoot::new();
     let mut store = root.store();
@@ -380,7 +380,7 @@ fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_o
         )],
     );
 
-    let report = run_with(&compiled, &mut store, Some(&binding), EngineChoice::Both);
+    let report = run_with(&compiled, &mut store, Some(&binding), true);
     assert_eq!(
         report.failed,
         0,
@@ -394,7 +394,7 @@ fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_o
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "running both engines must not perform the operation twice"
+        "auditing a backend must not perform the operation twice"
     );
     assert_eq!(report.results[0].recorded, Some(Record::Host));
 }

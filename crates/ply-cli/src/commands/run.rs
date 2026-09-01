@@ -1,6 +1,6 @@
 use super::common::{
-    IND, counted_engine, counters_json, describe_schema, diagnostic_json, emit_json, location,
-    plural, print_diagnostics, report_bind_error, report_load_error,
+    IND, counters_json, describe_schema, diagnostic_json, emit_json, location, plural,
+    print_diagnostics, report_bind_error, report_load_error,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -9,7 +9,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_DRAIN_INCOMPLETE, EXIT_FAILED, EXIT_OK};
 use ply_core::DefInfo;
 use ply_core::ty::Footprint;
-use ply_eval::{Engine, EngineChoice, Interp, Machine, Plan, Value as PlyValue, compare_answers};
+use ply_eval::{Machine, Plan, Value as PlyValue};
 use ply_host::signal::{self, Shutdown};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use serde_json::{Value, json};
@@ -147,14 +147,12 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let name = entry.name.clone();
     let module = entry.module.to_string();
     let span = entry.span;
-    let engine: EngineChoice = args.engine.into();
     let plan = crate::simulation::run_plan(args.seed.as_ref());
     // The counters are process-wide and cumulative, so they mean nothing unless this run is the
     // only thing they have seen.
     ply_eval::rc::reset();
     let answer = evaluate(
         &loaded,
-        engine,
         name.as_str(),
         span,
         &plan,
@@ -162,10 +160,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         declared.as_ref(),
     );
 
-    let counters_value = match engine {
-        EngineChoice::Both => Value::Null,
-        _ => counters_json(&ply_eval::rc::stats(), counted_engine(engine)),
-    };
+    let counters_value = counters_json(&ply_eval::rc::stats());
 
     // A cycle among escaped values is never collected (ADR 0017 §4), so the run that built one is
     // the only place a reader can be told it is there.
@@ -410,20 +405,13 @@ fn print_handshakes(hosts: &Hosts, style: Style) {
 /// were the program's.
 fn evaluate(
     loaded: &Loaded,
-    engine: EngineChoice,
     name: &str,
     span: Span,
     plan: &Plan,
     hosts: &Hosts,
     declared: Option<&Footprint>,
 ) -> Result<PlyValue, Diagnostic> {
-    let mut interp = Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
-    interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
-    // One analysis for the program rather than one per engine: under `both` the two would otherwise
-    // each run the whole-program region-kind pass, and the answer is a property of the program
-    // neither of them owns.
-    machine.share_region_kinds(interp.shared_region_kinds());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);
@@ -434,24 +422,7 @@ fn evaluate(
     // `ply run` takes exactly one interleaving, the one its seed names: exploration is a test-time
     // activity, so there is nothing to search here.
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-
-    match engine {
-        EngineChoice::Treewalk => interp.call(name, Vec::new(), span),
-        EngineChoice::Machine => machine.call(name, Vec::new(), span),
-        EngineChoice::Both => {
-            let left = interp.call(name, Vec::new(), span);
-            let right = machine.call(name, Vec::new(), span);
-            // A refusal is not a disagreement: the tree-walker declined to start, so the machine's
-            // answer is the only one there is.
-            if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
-                return right;
-            }
-            match compare_answers(&interp, &machine, name, &left, &right) {
-                Some(d) => Err(d.to_diagnostic(Engine::Treewalk, Engine::Machine, span)),
-                None => left,
-            }
-        }
-    }
+    machine.call(name, Vec::new(), span)
 }
 
 /// A file argument names one module, so its `main` is the only candidate.
@@ -551,7 +522,7 @@ mod tests {
     fn eval(l: &Loaded) -> Result<String, Diagnostic> {
         let entry = entry_point(l)?;
         let (name, span) = (entry.name.clone(), entry.span);
-        Interp::new(&l.program, &l.resolved, &l.check)
+        Machine::new(&l.program, &l.resolved, &l.check)
             .call(name.as_str(), Vec::new(), span)
             .map(|v| v.to_string())
     }

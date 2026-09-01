@@ -1,7 +1,7 @@
 //! A backend a shipping command can attach, and eight ways of being wrong.
 
 use crate::compiled::Compiled;
-use crate::interp::Interp;
+use crate::machine::Machine;
 use crate::value::Value;
 use ply_core::CheckOutput;
 use ply_span::{Span, Symbol};
@@ -296,17 +296,17 @@ pub(crate) fn carried_signature(types: &crate::compiled::CarriedTypes, name: &Sy
     types.signature_carried(name)
 }
 
-/// A backend whose compiled code is a second tree-walker.
+/// A backend whose compiled code is a nested [`Machine`], not an independent oracle.
 pub struct Reference {
     fragment: &'static Fragment,
-    inner: RefCell<Interp<'static>>,
+    inner: RefCell<Machine<'static>>,
 }
 
 impl Reference {
     fn new(fragment: &'static Fragment) -> Reference {
         Reference {
             fragment,
-            inner: RefCell::new(Interp::new(
+            inner: RefCell::new(Machine::new(
                 fragment.program,
                 fragment.resolved,
                 fragment.check,
@@ -444,7 +444,7 @@ impl Mutation {
 /// Which of the backends a command can install.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
-    /// [`Reference`]: a second tree-walker over the carried-signature fragment.
+    /// [`Reference`]: a nested machine over the carried-signature fragment.
     #[default]
     Reference,
     /// `ply_codegen::Cranelift`: native code, compiled at install time.

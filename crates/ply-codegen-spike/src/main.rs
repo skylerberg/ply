@@ -2,9 +2,7 @@
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::jit::{Jit, Opts};
-use ply_codegen_spike::measure::{
-    ENTRY_FN, GROUP, Harness, Input, InputResult, agrees_with_treewalk, compare, speedup,
-};
+use ply_codegen_spike::measure::{ENTRY_FN, GROUP, Harness, Input, InputResult, compare, speedup};
 use ply_codegen_spike::program::Loaded;
 use ply_codegen_spike::served;
 use ply_eval::Value;
@@ -246,7 +244,7 @@ fn parse_args() -> Result<Args> {
 }
 
 /// Agreement, on every input the spike will be timed on and on every refusal path a peer can
-/// choose, against the machine **and** the tree-walker.
+/// choose, against the machine.
 fn verify(harness: &mut Harness, large: &[u8]) -> Result<usize> {
     let mut inputs: Vec<Input> = Vec::new();
     for (label, head) in [
@@ -307,9 +305,6 @@ fn verify(harness: &mut Harness, large: &[u8]) -> Result<usize> {
         };
         if !same {
             disagreements.push(format!("{}: the machine and the spike differ", input.name));
-        }
-        if expected.is_ok() && !agrees_with_treewalk(harness, READ_LINE, input)? {
-            disagreements.push(format!("{}: the tree-walker disagreed", input.name));
         }
     }
     if !disagreements.is_empty() {
@@ -439,9 +434,7 @@ fn main() -> Result<()> {
 
     let mut harness = Harness::new(GROUP)?;
     let checked = verify(&mut harness, &large)?;
-    println!(
-        "agreement: {checked} inputs, against the machine and the tree-walker, before anything was timed"
-    );
+    println!("agreement: {checked} inputs, against the machine, before anything was timed");
     drop(harness);
 
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library()?));
@@ -714,7 +707,7 @@ fn main() -> Result<()> {
             "polymorphism and derived code: a `derive json` encoder is a record of closures, \
              which the fragment refuses"
                 .into(),
-            "a second engine's cost: `--engine both` would have to police a third evaluator, and \
+            "a second engine's cost: the backend audit would have to police a third evaluator, and \
              nothing here measures that"
                 .into(),
         ],

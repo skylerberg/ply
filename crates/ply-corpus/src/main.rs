@@ -6,7 +6,6 @@ use ply_corpus::measure;
 use ply_corpus::regions;
 use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write;
-use ply_eval::{Engine, EngineChoice};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -28,7 +27,7 @@ enum Command {
     /// Generate and benchmark at several sizes, for one comparison table.
     Sweep(SweepArgs),
     /// Price the control-stack machine's own claims: interpreter throughput
-    /// against the tree-walker, fixture open against rebuild, resumption cost, and
+    /// fixture open against rebuild, resumption cost, and
     /// what isolation did to the schedule.
     Measure(MeasureArgs),
     /// Price the search: interleavings pruned against unpruned, seeds to the
@@ -60,8 +59,8 @@ enum Command {
     /// so a measurement cannot supply the bar it is about to clear.
     W6(W6Args),
     /// Take the W6 ladder: nine rungs, each a pair of absolutes differing in
-    /// one substitution, plus the floor, the served total, the offering rows
-    /// and the engine substitution. Writes the measurement half of a
+    /// one substitution, plus the floor, the served total and the offering rows.
+    /// Writes the measurement half of a
     /// `ply_corpus::w6::Report`, which `w6` then judges.
     W6Ladder(W6LadderArgs),
     /// Price ADR 0017 §6 before it is built: colour the same test set with and
@@ -194,15 +193,8 @@ struct BenchArgs {
     /// Repeats per scenario; the fastest run is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// The evaluator whose wall clock the `execute` phase is measuring.
-    #[arg(long, default_value = "machine", value_parser = parse_engine)]
-    engine: EngineChoice,
     #[arg(long)]
     json: bool,
-}
-
-fn parse_engine(s: &str) -> Result<EngineChoice, String> {
-    EngineChoice::parse(s).ok_or_else(|| format!("expected treewalk, machine or both, got `{s}`"))
 }
 
 #[derive(Args, Debug)]
@@ -229,10 +221,6 @@ struct MeasureArgs {
     /// Repeats per measurement; the fastest is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Which engines the throughput table covers. One engine reports no ratio,
-    /// and is what a profiler should be pointed at.
-    #[arg(long, default_value = "both", value_parser = parse_engine)]
-    engine: EngineChoice,
     /// Fixture sizes for the open-against-rebuild comparison.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 100, 1_000, 10_000, 100_000])]
     cells: Vec<usize>,
@@ -926,13 +914,11 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
         return Ok(());
     }
     let stack = w6_run::in_process(&args.repo, args.requests, args.iterations, args.repeats)?;
-    let engines = w6_run::engines(&args.repo, args.requests, args.repeats)?;
     if args.no_served {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "in_process": stack,
-                "engines": engines,
             }))?
         );
         return Ok(());
@@ -1004,7 +990,6 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
         &stack,
         &served,
         &other_rows,
-        engines,
         &levers,
     )?;
     let text = serde_json::to_string_pretty(&report)?;
@@ -1209,12 +1194,6 @@ fn prove(args: ProveArgs) -> Result<()> {
 }
 
 fn measure(args: MeasureArgs) -> Result<()> {
-    let engines: Vec<Engine> = match args.engine {
-        EngineChoice::Treewalk => vec![Engine::Treewalk],
-        EngineChoice::Machine => vec![Engine::Machine],
-        EngineChoice::Both => vec![Engine::Treewalk, Engine::Machine],
-    };
-
     let mut out = measure::Measurements {
         throughput: None,
         scheduling: None,
@@ -1228,7 +1207,7 @@ fn measure(args: MeasureArgs) -> Result<()> {
     }
 
     if let Some(root) = &args.corpus {
-        out.throughput = Some(measure::throughput(root, &engines, args.repeats)?);
+        out.throughput = Some(measure::throughput(root, args.repeats)?);
         if !args.only_throughput {
             // Scheduling clears the cache, so the store is timed before it rather than over the
             // empty one it leaves behind.
@@ -1260,7 +1239,6 @@ fn run() -> Result<()> {
                 &args.corpus,
                 &bench::Options {
                     repeats: args.repeats,
-                    engine: args.engine,
                 },
             )?;
             emit_report(&report, args.json)
@@ -1412,7 +1390,6 @@ fn sweep(args: SweepArgs) -> Result<()> {
             &root,
             &bench::Options {
                 repeats: args.repeats,
-                engine: EngineChoice::default(),
             },
         )?);
     }

@@ -2,13 +2,12 @@
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
-use ply_eval::{Interp, Machine, Value};
+use ply_eval::{Machine, Value};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 
-/// The tree-walker's refusal of a construct only the machine has.
-const MACHINE_ONLY: &str = "E0504";
+// ------------------------------------------------------------------ harness
 
 struct Compiled {
     program: Program,
@@ -56,28 +55,11 @@ impl Compiled {
     fn run(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
         let mut machine = self.machine();
         let answer = machine.call(name, Vec::new(), Span::DUMMY);
-        let treewalk = self.interp().call(name, Vec::new(), Span::DUMMY);
-        match (&answer, &treewalk) {
-            (Ok(a), Ok(b)) => assert_eq!(a, b, "the engines disagree about `{name}`"),
-            (_, Err(b)) if b.code == MACHINE_ONLY || b.code == codes::INTERNAL_ERROR => {}
-            (Err(a), Err(b)) => assert_eq!(
-                a.code, b.code,
-                "the engines disagree about why `{name}` failed"
-            ),
-            (Ok(v), Err(b)) => {
-                panic!("only the tree-walker failed `{name}`: {v:?} then {b:#?}")
-            }
-            (Err(a), Ok(v)) => panic!("only the machine failed `{name}`: {a:#?} then {v:?}"),
-        }
         (answer, machine.cells().stats())
     }
 
     fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
     }
 
     fn kinds(&self) -> ply_eval::region_kind::Regions {

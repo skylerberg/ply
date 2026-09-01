@@ -1,19 +1,16 @@
-//! Running one program on both engines and comparing what they did.
+//! Running one program with a compiled backend attached and without, and comparing what they did.
 
-use crate::Engine;
 use crate::arena::Arena;
-use crate::interp::Interp;
 use crate::machine::Machine;
 use crate::task_regions::Fixture;
 use crate::value::Value;
 use ply_core::ty::Footprint;
 use ply_span::{Diagnostic, Label, Severity, Span, Symbol, codes};
-use ply_syntax::ast::{Expr, ExprKind, Item, Program, Stmt};
+use ply_syntax::ast::Expr;
 use std::fmt;
 
 /// What the harness needs of an engine.
 pub trait Evaluator {
-    fn engine(&self) -> Engine;
     fn test_count(&self) -> usize;
     fn test_name(&self, index: usize) -> Option<&str>;
     fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic>;
@@ -21,7 +18,7 @@ pub trait Evaluator {
     /// incremental front end reports tests from modules it never parsed.
     fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic>;
     fn eval_expr(&mut self, e: &Expr) -> Result<Value, Diagnostic>;
-    /// The run's cells, ascending by slot: the state the two engines must agree on once a test has
+    /// The run's cells, ascending by slot: the state the two sides must agree on once a test has
     /// run.
     fn cells(&self) -> &Arena;
     /// The same arena, so the harness can ask it to journal what it reclaims.
@@ -39,58 +36,7 @@ pub trait Evaluator {
     }
 }
 
-impl Evaluator for Interp<'_> {
-    fn engine(&self) -> Engine {
-        Engine::Treewalk
-    }
-
-    fn test_count(&self) -> usize {
-        Interp::test_count(self)
-    }
-
-    fn test_name(&self, index: usize) -> Option<&str> {
-        Interp::test_name(self, index)
-    }
-
-    fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
-        Interp::eval_test(self, index)
-    }
-
-    fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic> {
-        Interp::eval_test_in(self, module, ordinal)
-    }
-
-    fn eval_expr(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
-        self.eval_expr_for_test(e)
-    }
-
-    fn cells(&self) -> &Arena {
-        Interp::cells(self)
-    }
-
-    fn cells_mut(&mut self) -> &mut Arena {
-        Interp::cells_mut(self)
-    }
-
-    fn set_fixture(&mut self, fixture: &Fixture) {
-        let (regions, _) = fixture.open();
-        Interp::set_regions(self, regions);
-    }
-
-    fn observed_footprint(&self) -> Option<Footprint> {
-        Some(self.trace().footprint().clone())
-    }
-
-    fn observed_performs(&self) -> Option<u64> {
-        Some(self.trace().performs())
-    }
-}
-
 impl Evaluator for Machine<'_> {
-    fn engine(&self) -> Engine {
-        Engine::Machine
-    }
-
     fn test_count(&self) -> usize {
         Machine::test_count(self)
     }
@@ -181,24 +127,8 @@ pub struct Divergence {
 
 impl Divergence {
     /// Fails the run.
-    pub fn to_diagnostic(&self, left: Engine, right: Engine, span: Span) -> Diagnostic {
-        Diagnostic::error(
-            codes::ENGINE_DIVERGENCE,
-            format!(
-                "`{}` and `{}` disagree on `{}`",
-                left.as_str(),
-                right.as_str(),
-                self.subject
-            ),
-        )
-        .primary(span, format!("the two engines' {} differ", self.detail.what()))
-        .note(format!("{}: {}", left.as_str(), self.left))
-        .note(format!("{}: {}", right.as_str(), self.right))
-        .note("a divergence is never a warning: the result cache would record whichever engine ran first")
-    }
-
-    /// The same divergence, when the right-hand side is a machine with a compiled backend attached
-    /// and the left-hand side is the same machine without one.
+    /// Fails the run. The blame is the backend's, always: the machine hands it no
+    /// route back in, so a wrong answer is the only thing it can contribute.
     pub fn to_backend_diagnostic(&self, span: Span) -> Diagnostic {
         Diagnostic::error(
             codes::ENGINE_DIVERGENCE,
@@ -211,7 +141,7 @@ impl Divergence {
         .note(format!("machine, no backend: {}", self.left))
         .note(format!("machine with the backend: {}", self.right))
         .note("the boundary checks a backend's answer for kind and nothing else, so a wrong value crosses it")
-        .note("re-run without `--backend` to confirm the two engines still agree without one")
+        .note("re-run without `--backend` to confirm the program passes without one")
     }
 }
 
@@ -228,29 +158,18 @@ impl fmt::Display for Divergence {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Report {
-    pub left: Engine,
-    pub right: Engine,
-    /// Subjects both engines ran and the harness compared.
+    /// Subjects both sides ran and the harness compared.
     pub compared: usize,
-    /// Of those, how many carried a footprint from both engines.
+    /// Of those, how many carried a footprint from both sides.
     pub footprints_compared: usize,
-    /// Subjects one engine refused, so there was nothing to compare.
-    pub machine_only: usize,
     pub divergences: Vec<Divergence>,
 }
 
 impl Report {
-    pub fn new(left: Engine, right: Engine) -> Report {
-        Report {
-            left,
-            right,
-            compared: 0,
-            footprints_compared: 0,
-            machine_only: 0,
-            divergences: Vec::new(),
-        }
+    pub fn new() -> Report {
+        Report::default()
     }
 
     pub fn is_clean(&self) -> bool {
@@ -261,7 +180,7 @@ impl Report {
     /// summarize the rest.
     pub fn into_result(self) -> Result<Report, Diagnostic> {
         match self.divergences.first() {
-            Some(d) => Err(d.to_diagnostic(self.left, self.right, Span::DUMMY)),
+            Some(d) => Err(d.to_backend_diagnostic(Span::DUMMY)),
             None => Ok(self),
         }
     }
@@ -271,12 +190,9 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "{} vs {}: {} compared, {} footprints, {} machine-only, {} divergences",
-            self.left.as_str(),
-            self.right.as_str(),
+            "{} compared, {} footprints, {} divergences",
             self.compared,
             self.footprints_compared,
-            self.machine_only,
             self.divergences.len()
         )?;
         for d in &self.divergences {
@@ -299,9 +215,6 @@ pub fn compare_test(left: &mut dyn Evaluator, right: &mut dyn Evaluator, index: 
     audit_state(left, right);
     let l = left.eval_test(index);
     let r = right.eval_test(index);
-    if refused(&l) || refused(&r) {
-        return Compared::Refused;
-    }
     match compare_outcomes(left, right, &subject, Some(index), &l, &r) {
         Some(d) => Compared::Diverged(d),
         None => Compared::Agreed,
@@ -318,14 +231,9 @@ pub fn audit_state(left: &mut dyn Evaluator, right: &mut dyn Evaluator) {
 pub enum Compared {
     Agreed,
     Diverged(Divergence),
-    Refused,
 }
 
-fn refused(outcome: &Result<(), Diagnostic>) -> bool {
-    matches!(outcome, Err(d) if is_machine_only(d))
-}
-
-/// Compares two engines that have each already answered the same question.
+/// Compares two evaluators that have each already answered the same question.
 pub fn compare_outcomes(
     left: &dyn Evaluator,
     right: &dyn Evaluator,
@@ -395,7 +303,7 @@ pub fn compare_tests(
     right: &mut dyn Evaluator,
     base: &Fixture,
 ) -> Report {
-    let mut report = Report::new(left.engine(), right.engine());
+    let mut report = Report::new();
 
     left.set_fixture(base);
     right.set_fixture(base);
@@ -414,10 +322,6 @@ pub fn compare_tests(
 
     for index in 0..count {
         match compare_test(left, right, index) {
-            Compared::Refused => {
-                report.machine_only += 1;
-                continue;
-            }
             Compared::Agreed => report.compared += 1,
             Compared::Diverged(d) => {
                 report.compared += 1;
@@ -575,8 +479,8 @@ fn reclaimed_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, 
     let (a, b) = (left.journalled(), right.journalled());
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
         // By index and value, never by generation: a generation counts how many entry points a
-        // *position* has been through, and the tree-walker refuses a machine-only test before it
-        // resets, so the two engines reach the same state having reclaimed a different number of
+        // *position* has been through, which is a run's history and not the program's: two runs
+        // can reach the same state having reclaimed a different number of
         // times.
         if x.0.index() != y.0.index() || x.1.render() != y.1.render() {
             return Some((
@@ -595,140 +499,6 @@ fn reclaimed_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, 
         return Some((Detail::Reclaimed { at: at.to_string() }, show(a), show(b)));
     }
     None
-}
-
-/// The tree-walker's refusal of a `simulate` region.
-pub fn machine_only_region(span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::MACHINE_ONLY_CLAUSE,
-        "a `simulate` region installs a scheduler over captured continuations",
-    )
-    .primary(span, "this region needs an explicit control stack")
-    .note(format!(
-        "run this with `--engine {}`",
-        Engine::Machine.as_str()
-    ))
-}
-
-/// The tree-walker's refusal of a clause it cannot run.
-pub fn machine_only_clause(span: Span, effect: &str, op: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::MACHINE_ONLY_CLAUSE,
-        format!("the handler clause for `{effect}.{op}` binds a continuation"),
-    )
-    .primary(span, "this clause needs an explicit control stack")
-    .note(format!(
-        "run this with `--engine {}`",
-        Engine::Machine.as_str()
-    ))
-}
-
-/// A refusal means this engine declined to start, so the other engine's answer is the only one
-/// there is and comparing them would report a divergence where there is no disagreement — only one
-/// participant.
-pub fn is_machine_only(d: &Diagnostic) -> bool {
-    d.code == codes::MACHINE_ONLY_CLAUSE
-}
-
-/// Every clause in a program the tree-walker would refuse.
-pub fn machine_only_clauses(program: &Program) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    for module in &program.modules {
-        for item in &module.items {
-            match item {
-                Item::Fn(d) => {
-                    walk_expr(&d.body, &mut out);
-                    for clause in &d.spec {
-                        walk_expr(&clause.expr, &mut out);
-                    }
-                }
-                Item::Test(t) => walk_expr(&t.body, &mut out),
-                // A concurrency law's body *is* a `simulate` region, which is machine-only, so a
-                // law is exactly where this walk pays.
-                Item::Law(l) => {
-                    if let Some(guard) = &l.guard {
-                        walk_expr(guard, &mut out);
-                    }
-                    walk_expr(&l.body, &mut out);
-                }
-                // A `derive` has no body of its own; its generated definitions are `Item::Fn`s and
-                // are walked above.
-                Item::Type(_) | Item::Effect(_) | Item::Derive(_) | Item::EffectSet(_) => {}
-            }
-        }
-    }
-    out
-}
-
-fn walk_expr(e: &Expr, out: &mut Vec<Diagnostic>) {
-    let mut children: Vec<&Expr> = Vec::new();
-    match &e.kind {
-        ExprKind::Lit(_) | ExprKind::Var(_) => {}
-        ExprKind::Unary { operand, .. } => children.push(operand),
-        ExprKind::Binary { lhs, rhs, .. } => children.extend([lhs.as_ref(), rhs.as_ref()]),
-        ExprKind::Lambda { body, .. } => children.push(body),
-        ExprKind::App { func, args, .. } => {
-            children.push(func);
-            children.extend(args);
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => children.extend([cond.as_ref(), then_branch.as_ref(), else_branch.as_ref()]),
-        ExprKind::Match { scrutinee, arms } => {
-            children.push(scrutinee);
-            for arm in arms {
-                children.extend(arm.guard.iter());
-                children.push(&arm.body);
-            }
-        }
-        ExprKind::Block { stmts, tail } => {
-            for s in stmts {
-                match s {
-                    Stmt::Expr(x) => children.push(x),
-                    Stmt::Let { value, .. } => children.push(value),
-                }
-            }
-            children.extend(tail.as_deref());
-        }
-        ExprKind::Record { fields } => children.extend(fields.iter().map(|(_, v)| v)),
-        ExprKind::RecordUpdate { base, fields } => {
-            children.push(base);
-            children.extend(fields.iter().map(|(_, v)| v));
-        }
-        ExprKind::Field { base, .. } => children.push(base),
-        ExprKind::Try { operand } => children.push(operand),
-        ExprKind::List { items } => children.extend(items),
-        ExprKind::Perform { args, .. } => children.extend(args),
-        ExprKind::Handle {
-            body,
-            clauses,
-            return_clause,
-        } => {
-            children.push(body);
-            for c in clauses {
-                if c.resume.is_some() {
-                    out.push(machine_only_clause(
-                        c.span,
-                        &c.effect.to_string(),
-                        c.op.name.as_str(),
-                    ));
-                }
-                children.push(&c.body);
-            }
-            children.extend(return_clause.as_deref().map(|r| &r.body));
-        }
-        ExprKind::WithCell { init, body, .. } => children.extend([init.as_ref(), body.as_ref()]),
-        ExprKind::WithRegion { body, .. } => children.push(body),
-        ExprKind::Simulate { body } => {
-            out.push(machine_only_region(e.span));
-            children.push(body);
-        }
-    }
-    for child in children {
-        walk_expr(child, out);
-    }
 }
 
 fn label_eq(a: &Label, b: &Label) -> bool {
@@ -762,9 +532,9 @@ mod tests {
     use ply_syntax::ast::{BinOp, Item, Mode, Program};
     use ply_syntax::resolve::Resolved;
 
-    /// An engine that is the tree-walker except where a test asks it not to be.
+    /// A machine except where a test asks it not to be.
     struct Perturbed<'a> {
-        inner: Interp<'a>,
+        inner: Machine<'a>,
         /// Answers `eval_test` with this instead of running it.
         outcome: Option<Result<(), Diagnostic>>,
         /// Allocated into the arena after every test.
@@ -775,7 +545,7 @@ mod tests {
     impl<'a> Perturbed<'a> {
         fn new(program: &'a Program, resolved: &'a Resolved) -> Perturbed<'a> {
             Perturbed {
-                inner: Interp::for_program(program, resolved),
+                inner: Machine::for_program(program, resolved),
                 outcome: None,
                 extra_cell: None,
                 footprint: None,
@@ -784,10 +554,6 @@ mod tests {
     }
 
     impl Evaluator for Perturbed<'_> {
-        fn engine(&self) -> Engine {
-            Engine::Machine
-        }
-
         fn test_count(&self) -> usize {
             self.inner.test_count()
         }
@@ -859,9 +625,9 @@ mod tests {
     }
 
     #[test]
-    fn two_honest_engines_over_one_corpus_report_nothing() {
+    fn two_honest_evaluators_over_one_corpus_report_nothing() {
         let (program, resolved) = standalone(corpus());
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
         let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         assert_eq!(report.compared, 2);
@@ -869,12 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_that_passes_what_the_other_failed_is_caught() {
+    fn a_side_that_passes_what_the_other_failed_is_caught() {
         let (program, resolved) = standalone(vec![test_def(
             "fails on both, honestly",
             callv("assert_eq", vec![int(1), int(2)]),
         )]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
         right.outcome = Some(Ok(()));
 
@@ -893,10 +659,10 @@ mod tests {
             "assertion",
             callv("assert_eq", vec![int(1), int(2)]),
         )]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
-        let mut drifted = Interp::for_program(&program, &resolved)
+        let mut drifted = Machine::for_program(&program, &resolved)
             .eval_test(0)
             .unwrap_err();
         drifted.notes[1] = "actual: 1".to_string();
@@ -920,10 +686,10 @@ mod tests {
             "assertion",
             spanned(callv("assert_eq", vec![int(1), int(2)]), at(88, 100)),
         )]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
-        let mut drifted = Interp::for_program(&program, &resolved)
+        let mut drifted = Machine::for_program(&program, &resolved)
             .eval_test(0)
             .unwrap_err();
         drifted.labels[0].span = at(1, 2);
@@ -939,12 +705,12 @@ mod tests {
         assert!(report.divergences[0].left.contains("88..100"));
     }
 
-    /// The case a verdict comparison alone would miss entirely: both engines pass, and one of them
+    /// The case a verdict comparison alone would miss entirely: both sides pass, and one of them
     /// left its cells somewhere else.
     #[test]
     fn an_arena_that_differs_after_a_passing_test_is_caught_at_the_cell() {
         let (program, resolved) = standalone(corpus());
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
         right.extra_cell = Some(Value::Int(99));
 
@@ -965,7 +731,7 @@ mod tests {
     #[test]
     fn an_arena_whose_contents_differ_names_the_cell_and_both_values() {
         let (program, resolved) = standalone(corpus());
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
         let seeded = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(0))));
@@ -979,9 +745,9 @@ mod tests {
     }
 
     #[test]
-    fn footprints_are_compared_only_when_both_engines_traced_one() {
+    fn footprints_are_compared_only_when_both_sides_traced_one() {
         let (program, resolved) = standalone(corpus());
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
         let report = compare_tests(&mut left, &mut right, &Fixture::empty());
@@ -990,10 +756,10 @@ mod tests {
     }
 
     #[test]
-    fn a_corpus_the_two_engines_disagree_on_the_size_of_stops_immediately() {
+    fn a_corpus_the_two_sides_disagree_on_the_size_of_stops_immediately() {
         let (program, resolved) = standalone(corpus());
         let (smaller, smaller_resolved) = standalone(vec![test_def("only one", int(1))]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&smaller, &smaller_resolved);
 
         let report = compare_tests(&mut left, &mut right, &Fixture::empty());
@@ -1005,7 +771,7 @@ mod tests {
     #[test]
     fn an_expression_comparison_reports_the_two_values() {
         let (program, resolved) = standalone(Vec::new());
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
         let agree = bin(BinOp::Add, int(1), int(2));
@@ -1013,21 +779,21 @@ mod tests {
     }
 
     #[test]
-    fn a_divergence_becomes_a_failing_diagnostic_naming_both_engines() {
+    fn a_divergence_becomes_a_failing_diagnostic_naming_both_sides() {
         let (program, resolved) = standalone(vec![test_def("t", int(1))]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
         right.outcome = Some(Err(Diagnostic::error(codes::RUNTIME_ERROR, "boom")));
 
         let report = compare_tests(&mut left, &mut right, &Fixture::empty());
         let d = report.into_result().unwrap_err();
         assert_eq!(d.code, codes::ENGINE_DIVERGENCE);
-        assert!(d.message.contains("treewalk"), "{}", d.message);
+        assert!(d.message.contains("backend"), "{}", d.message);
         assert!(d.message.contains("machine"), "{}", d.message);
         assert!(d.notes.iter().any(|n| n.contains("boom")), "{:?}", d.notes);
     }
 
-    /// Exercises the shapes the two engines are most likely to disagree about: a handler answering
+    /// Exercises the shapes a backend is most likely to get wrong: a handler answering
     /// a perform, a cell written from a clause, all three higher-order builtins driving a closure
     /// that itself performs, and four distinct failures whose diagnostics must match label for
     /// label.
@@ -1152,12 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn the_two_real_engines_agree_over_a_mixed_corpus() {
+    fn two_real_machines_agree_over_a_mixed_corpus() {
         let (program, resolved) = standalone(mixed_corpus());
-        let mut treewalk = Interp::for_program(&program, &resolved);
+        let mut plain = Machine::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
 
-        let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
+        let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
         assert_eq!(report.compared, 8);
         assert!(report.is_clean(), "{report}");
     }
@@ -1167,9 +933,9 @@ mod tests {
     #[test]
     fn the_mixed_corpus_really_does_fail_four_of_its_tests() {
         let (program, resolved) = standalone(mixed_corpus());
-        let mut treewalk = Interp::for_program(&program, &resolved);
-        let codes: Vec<&str> = (0..treewalk.test_count())
-            .filter_map(|i| Evaluator::eval_test(&mut treewalk, i).err().map(|d| d.code))
+        let mut plain = Machine::for_program(&program, &resolved);
+        let codes: Vec<&str> = (0..plain.test_count())
+            .filter_map(|i| Evaluator::eval_test(&mut plain, i).err().map(|d| d.code))
             .collect();
         assert_eq!(
             codes,
@@ -1182,23 +948,23 @@ mod tests {
         );
     }
 
-    /// The harness must still bite when the honest engine is the machine.
+    /// The harness must still bite when both sides are honest machines.
     #[test]
     fn a_machine_that_answered_differently_would_be_caught() {
         let (program, resolved) = standalone(vec![test_def(
             "a failing assertion",
             callv("assert_eq", vec![int(1), int(2)]),
         )]);
-        let mut treewalk = Interp::for_program(&program, &resolved);
+        let mut plain = Machine::for_program(&program, &resolved);
         let mut machine = Machine::for_program(&program, &resolved);
-        assert!(compare_tests(&mut treewalk, &mut machine, &Fixture::empty()).is_clean());
+        assert!(compare_tests(&mut plain, &mut machine, &Fixture::empty()).is_clean());
 
         let mut perturbed = Perturbed::new(&program, &resolved);
         perturbed.outcome = Some(Err(Diagnostic::error(
             super::codes::ASSERTION_FAILED,
             "assertion failed: expected 2, found 1",
         )));
-        let report = compare_tests(&mut treewalk, &mut perturbed, &Fixture::empty());
+        let report = compare_tests(&mut plain, &mut perturbed, &Fixture::empty());
         assert_eq!(
             report.divergences[0].detail,
             Detail::Diagnostic {
@@ -1208,21 +974,9 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_clause_names_itself_and_the_engine_that_runs_it() {
-        let d = machine_only_clause(at(4, 9), "amb", "flip");
-        assert!(d.message.contains("`amb.flip`"), "{}", d.message);
-        assert!(
-            d.notes.iter().any(|n| n.contains("--engine machine")),
-            "{:?}",
-            d.notes
-        );
-        assert_eq!(d.primary_span().unwrap(), at(4, 9));
-    }
-
-    #[test]
-    fn a_seeded_fixture_reaches_both_engines() {
+    fn a_seeded_fixture_reaches_both_sides() {
         let (program, resolved) = standalone(vec![test_def("t", int(1))]);
-        let mut left = Interp::for_program(&program, &resolved);
+        let mut left = Machine::for_program(&program, &resolved);
         let mut right = Perturbed::new(&program, &resolved);
 
         let seeded = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::str("fixture"))));

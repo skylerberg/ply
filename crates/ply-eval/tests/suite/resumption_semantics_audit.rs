@@ -1,7 +1,7 @@
 //! What a resumption observes, pinned as numbers.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine, Plan, Seed, Value, explore};
+use ply_eval::{Machine, Plan, Seed, Value, explore};
 use ply_span::{Diagnostic, SourceId, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -39,24 +39,12 @@ impl Compiled {
             .unwrap_or_else(|| panic!("no test named {name:?}"))
     }
 
-    /// Runs one test on both engines and requires them to agree, or the tree-walker to refuse the
-    /// program by name.
-    fn both(&self, name: &str) {
+    /// Runs one test and requires it to pass; the oracle is the integer each
+    /// probe writes down, which [`Compiled::ints_after`] reads.
+    fn passes(&self, name: &str) {
         let index = self.index_of(name);
-        let machine = self.machine().eval_test(index);
-        let treewalk = Interp::new(&self.program, &self.resolved, &self.check).eval_test(index);
-        match (machine, treewalk) {
-            (Ok(()), Ok(())) => {}
-            (Ok(()), Err(t)) => assert!(
-                ply_eval::is_machine_only(&t),
-                "the tree-walker failed {name:?} for a reason other than the missing \
-                 control stack: {t:#?}"
-            ),
-            (Err(m), Err(t)) => assert!(
-                ply_eval::is_machine_only(&t),
-                "the engines disagree about why {name:?} failed: {m:#?} vs {t:#?}"
-            ),
-            (Err(m), Ok(())) => panic!("only the machine failed {name:?}: {m:#?}"),
+        if let Err(d) = self.machine().eval_test(index) {
+            panic!("{name:?} must pass: {d:#?}");
         }
     }
 
@@ -170,7 +158,7 @@ test "three resumptions" {
 #[test]
 fn zero_resumptions_keeps_the_clauses_writes_and_none_of_the_abandoned_ones() {
     let compiled = Compiled::new(WORKED);
-    compiled.both("zero resumptions");
+    compiled.passes("zero resumptions");
     assert_eq!(
         compiled.ints_after("zero resumptions"),
         vec![1],
@@ -183,7 +171,7 @@ fn zero_resumptions_keeps_the_clauses_writes_and_none_of_the_abandoned_ones() {
 #[test]
 fn one_resumption_observes_the_write_the_clause_made_before_resuming() {
     let compiled = Compiled::new(WORKED);
-    compiled.both("one resumption");
+    compiled.passes("one resumption");
     assert_eq!(
         compiled.ints_after("one resumption"),
         vec![5],
@@ -195,7 +183,7 @@ fn one_resumption_observes_the_write_the_clause_made_before_resuming() {
 #[test]
 fn two_resumptions_thread_one_world_rather_than_snapshotting_per_branch() {
     let compiled = Compiled::new(WORKED);
-    compiled.both("two resumptions");
+    compiled.passes("two resumptions");
     assert_eq!(
         compiled.ints_after("two resumptions"),
         vec![2],
@@ -208,7 +196,7 @@ fn two_resumptions_thread_one_world_rather_than_snapshotting_per_branch() {
 #[test]
 fn three_resumptions_each_see_the_previous_ones_write() {
     let compiled = Compiled::new(WORKED);
-    compiled.both("three resumptions");
+    compiled.passes("three resumptions");
     assert_eq!(
         compiled.ints_after("three resumptions"),
         vec![3],
@@ -295,7 +283,7 @@ test "a continuation resumed twice across a region boundary" {
 #[test]
 fn a_capture_inside_a_nested_region_accumulates_in_the_outer_one() {
     let compiled = Compiled::new(NESTED);
-    compiled.both("nested region capture");
+    compiled.passes("nested region capture");
     let ints = compiled.ints_after("nested region capture");
     assert_eq!(
         ints[0], 2,
@@ -307,7 +295,7 @@ fn a_capture_inside_a_nested_region_accumulates_in_the_outer_one() {
 #[test]
 fn an_inner_region_already_gives_each_resumption_its_own_allocation() {
     let compiled = Compiled::new(NESTED);
-    compiled.both("an inner region is re-entered per resumption");
+    compiled.passes("an inner region is re-entered per resumption");
     let ints = compiled.ints_after("an inner region is re-entered per resumption");
     assert_eq!(
         ints[0], 2,
@@ -324,7 +312,7 @@ fn an_inner_region_already_gives_each_resumption_its_own_allocation() {
 #[test]
 fn two_resumptions_across_a_region_boundary_still_thread_one_world() {
     let compiled = Compiled::new(NESTED);
-    compiled.both("a continuation resumed twice across a region boundary");
+    compiled.passes("a continuation resumed twice across a region boundary");
     assert_eq!(
         compiled.renders_after("a continuation resumed twice across a region boundary"),
         vec![
@@ -379,7 +367,7 @@ test "per-branch state, built by the handler" {
 }
 "#,
     );
-    compiled.both("per-branch state, built by the handler");
+    compiled.passes("per-branch state, built by the handler");
     assert_eq!(
         compiled.ints_after("per-branch state, built by the handler"),
         vec![1],

@@ -12,7 +12,6 @@ mod constant_memo;
 mod ctor_value_sharing;
 mod determinism_audit;
 mod differential_corpus;
-mod equivalence_audit;
 mod exploration_soundness;
 mod hoist_staleness_audit;
 mod host_boundary;

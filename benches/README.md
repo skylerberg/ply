@@ -56,9 +56,8 @@ makes on their own:
 | scheduling | world-isolated against shared tests, and the groups the shared ones alone need |
 | `Store::open` | against the cache the corpus has already filled |
 
-`--engine <treewalk\|machine>` restricts the throughput table to one engine and
-`--only-throughput` drops the rest, which together is what to point a profiler
-at. `crates/ply-corpus/tests/frame_cost.rs` counts the allocations a frame push
+`--only-throughput` drops everything but the throughput table, which is what to
+point a profiler at. `crates/ply-corpus/tests/frame_cost.rs` counts the allocations a frame push
 and pop cost, which is the machine-independent half of the same question.
 
 ## What `sim` adds
@@ -299,9 +298,7 @@ one test holding tens of records, which is the size it is priced at.
 > live clone of the scope whenever a sub-expression remains, without asking what
 > it reads. `append` writes `records:` first of three fields, so the copy is
 > taken once per record. `README.md` §"Where this is not competitive" carries the
-> full argument, including that the one-line field-order fix on PR #38 removes it
-> **on the machine engine only**: the tree-walker runs no reference counting, so
-> `--engine treewalk` is quadratic whatever order is written.
+> full argument, including the one-line field-order fix on PR #38 that removes it.
 
 **A collecting sink never writes into a pipe.** A pipe nobody drains fills at
 64KiB and blocks the writer, so a server writing one JSON line per request into a
@@ -645,8 +642,8 @@ cd crates/ply-codegen-spike && cargo build --release   # 1.93.1; was +1.94.0 bef
 `benches/kernel/` is the kernel itself, in Ply, and it is a program rather than a
 microbenchmark: three-heap Nim under normal play, positions bit-packed into one
 `Int`, UCB1 in integer fixed point, bounded playouts, a tree of `Map<Int, Node>`
-with children held as lists of ids. It passes `ply test benches/kernel/
---engine both` — eight tests, one of which checks the search against Nim's
+with children held as lists of ids. It passes `ply test benches/kernel/` —
+eight tests, one of which checks the search against Nim's
 closed-form optimal strategy rather than against itself. `benches/kernel/work.ply`
 is instrumentation kept in its own module so that a census of the kernel is a
 census of the kernel; it re-runs the same iteration sequence and totals the work

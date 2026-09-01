@@ -47,7 +47,7 @@ pub struct Criteria {
     pub max_time_regression: f64,
     /// Below this the ladder did not separate and nothing is decided from it.
     pub min_separation: f64,
-    /// Divergences `--engine both` may report over the corpora on disk.
+    /// Divergences the backend audit may report over the corpora on disk.
     pub max_divergences: usize,
 }
 

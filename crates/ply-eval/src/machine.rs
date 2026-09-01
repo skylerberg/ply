@@ -11,15 +11,15 @@ use crate::host::{
     HostAnswer, HostBinding, HostRequest, HostRuntime, HostUse, MachineId, Pending, attribute,
     err_blocking_answered_inline, err_hermetic, err_host_in_search, err_withheld, operation_label,
 };
-use crate::interp::{
-    OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
-    err_unknown_name, op_decl,
-};
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS};
 use crate::memo::{Lookup, Memo};
 use crate::rc::Own;
 use crate::region::{self, Region, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
+use crate::semantics::{
+    OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
+    err_unknown_name, op_decl,
+};
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
@@ -92,7 +92,7 @@ pub struct Machine<'a> {
     /// Where the lowering itself is kept, and the reason `lowered` above is only a map from a name
     /// to a closure this machine has already built.
     lowering: Rc<Lowering<'a>>,
-    /// The lowered body of the last tree-walker closure this machine applied.
+    /// The lowered body of the last unlowered closure this machine applied.
     closure_code: ClosureCode,
     /// What a nullary pure definition evaluated to, so a service does not rebuild its route table
     /// once per request.
@@ -277,6 +277,14 @@ impl<'a> Machine<'a> {
     pub fn with_max_calls(mut self, max: usize) -> Machine<'a> {
         self.max_calls = max.max(1);
         self
+    }
+
+    /// The same bound, set on a machine that already exists.
+    ///
+    /// [`crate::backend::Reference`] needs it: its inner machine is built once
+    /// per run and re-bound per call to whatever the outer machine has left.
+    pub fn set_max_calls(&mut self, max: usize) {
+        self.max_calls = max.max(1);
     }
 
     /// The atoms this engine performed at the last entry point.
@@ -492,6 +500,47 @@ impl<'a> Machine<'a> {
         for arg in &args {
             crate::escape::check(&boundary, arg, span)?;
         }
+        self.enter(f, args, span)
+    }
+
+    /// The same call **without** the entry-point boundary check, for a caller
+    /// that is not an entry point.
+    ///
+    /// The one such caller is [`crate::backend::Reference`], which is handed a
+    /// call the outer machine is in the middle of and answers it on a machine of
+    /// its own. `escape::check` asks "does this argument carry a [`Value::Cell`],
+    /// [`Value::Task`] or [`Value::Continuation`]", and `compiled::admit` has
+    /// already answered it: every argument that reaches a backend is either
+    /// childless — an `i64`, a `bool`, an `Arc<[u8]>` — or of a declared type
+    /// `compiled::CarriedTypes` cleared of reaching any of those three at any
+    /// depth. Asking again is not a second opinion; it is the same question
+    /// asked of the value instead of the type, which is precisely the
+    /// **O(value) walk per call** ADR 0030 and [`crate::census`] measured as
+    /// unaffordable on a real front end and which the type gate exists to avoid.
+    ///
+    /// It is **not** a check being dropped for speed. The boundary this refuses
+    /// at is `Boundary::EntryPoint`, and a compiled entry is not one: the
+    /// machine's own inner calls — `apply` on a closure inside a body — do not
+    /// run it either. What keeps a handle out of a backend is `compiled::admit`,
+    /// and `a_cell_touching_caller_agrees_slot_for_slot_with_an_entered_callee`
+    /// is where that is asserted end to end.
+    pub(crate) fn call_within(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let sym = Symbol::new(name);
+        let f = self.definition(&sym).ok_or_else(|| {
+            Diagnostic::error(codes::UNKNOWN_NAME, format!("no definition named `{name}`"))
+                .primary(span, "not defined in this program")
+                .note("this name is program-wide: `store.orders.place`, not `place`")
+        })?;
+        self.enter(f, args, span)
+    }
+
+    /// Reset the world, run the body, and hand back whatever the run is holding.
+    fn enter(&mut self, f: Value, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
         self.reset();
         // The same three lines [`Machine::drive`] ends with, and for the same reason: this is an
         // entry point — it resets the world before it starts — so whatever a host handler is
@@ -519,7 +568,7 @@ impl<'a> Machine<'a> {
             State::Perform(request) => {
                 let decl = op_decl(&self.ops, &request.effect, &request.op);
                 // Charged after the declaration check and before the handler search, which is where
-                // the tree-walker charges it: an unhandled `perform` was still performed, and two
+                // an unhandled `perform` was still performed, and two
                 // engines that record it at different moments disagree on a failing program.
                 handler::check_operation(
                     decl,
@@ -1471,7 +1520,7 @@ impl<'a> Machine<'a> {
                 let (body, env, module) = (body.clone(), env.clone(), *module);
                 self.enter_code(closure, params, body, env, module, args, span)
             }
-            // A closure the tree-walker made, handed in through `call`.
+            // A closure this machine did not lower, handed in through `call`.
             ClosureKind::Fn {
                 params,
                 body,
@@ -1976,7 +2025,7 @@ impl<'a> Machine<'a> {
                     }
                 }
             }
-            PatternKind::Lit(lit) => crate::interp::lit_matches(lit, value),
+            PatternKind::Lit(lit) => crate::semantics::lit_matches(lit, value),
             PatternKind::Ctor { name, args } => match value {
                 Value::Ctor {
                     name: vname,
@@ -2137,13 +2186,13 @@ impl<'a> Machine<'a> {
         &mut self.regions
     }
 
-    /// The bound both engines share.
+    /// The semantic bound.
     fn err_call_limit(&self, span: Span, stack: &Stack) -> Diagnostic {
         limit::err_recursion_limit(span, NESTED_CALLS, self.max_calls, &innermost_calls(stack))
     }
 
     /// Only reachable through [`Machine::with_max_frames`], and phrased so a reader can tell it
-    /// apart from the bound both engines share: this one says which engine ran out of what, and
+    /// apart from the semantic bound: this one says what ran out of what, and
     /// never the words "recursion limit".
     fn err_frame_ceiling(&self, span: Span, max: usize, stack: &Stack) -> Diagnostic {
         limit::err_frame_ceiling(span, max, self.max_calls, &innermost_calls(stack))
@@ -2456,8 +2505,7 @@ fn err_task_escapes(span: Span, effect: &str, op: &str) -> Diagnostic {
     .note("join the task inside the `simulate` region that spawned it")
 }
 
-/// The innermost pending calls, innermost first — the same list the tree-walker reads off its own
-/// nesting, so the two engines' notes are one string.
+/// The innermost pending calls, innermost first.
 fn innermost_calls(stack: &Stack) -> Vec<Option<Symbol>> {
     let mut out = Vec::new();
     let mut stack = stack.clone();

@@ -133,7 +133,7 @@ pub fn materialise_schema(
         .defs
         .values()
         .find(|d| d.name.as_str() == name)?;
-    ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check)
+    ply_eval::Machine::new(&loaded.program, &loaded.resolved, &loaded.check)
         .call(name, Vec::new(), def.span)
         .ok()
         .as_ref()
@@ -227,24 +227,12 @@ pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
 
-/// One engine's counters, and the cycle diagnostics that had to be rescued from the reset that took
-/// them.
-pub struct Counted<T> {
-    pub answer: T,
-    pub counters: ply_eval::rc::Stats,
-    /// Which evaluator [`Counted::counters`] came from.
-    pub engine: ply_eval::Engine,
-    /// Cycles reported *before* this engine ran, drained so that the reset could not discard them.
-    pub carried_cycles: Vec<Diagnostic>,
-}
-
 /// What the reference-counting pass and the evaluator counted over one run.
-pub fn counters_json(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> Value {
+pub fn counters_json(stats: &ply_eval::rc::Stats) -> Value {
     json!({
-        "engine": engine.as_str(),
         "updates": stats.updates,
         "updates_in_place": stats.updates_in_place,
-        "in_place": engine_in_place(stats, engine),
+        "in_place": stats.in_place(),
         "takes_attempted": stats.takes_attempted,
         "takes_moved": stats.takes_moved,
         "dup_sites": stats.dup_sites,
@@ -256,21 +244,21 @@ pub fn counters_json(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> V
     })
 }
 
-/// [`ply_eval::rc::Stats::in_place`] where it says something about the program, and `None` where it
-/// says something about the evaluator.
-fn engine_in_place(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> Option<f64> {
-    match engine {
-        ply_eval::Engine::Treewalk => None,
-        ply_eval::Engine::Machine => stats.in_place(),
-    }
-}
-
-/// Which evaluator's counters a single-engine run produced.
-pub fn counted_engine(choice: ply_eval::EngineChoice) -> ply_eval::Engine {
-    match choice {
-        ply_eval::EngineChoice::Treewalk => ply_eval::Engine::Treewalk,
-        _ => ply_eval::Engine::Machine,
-    }
+/// The one-line human projection of [`counters_json`].
+pub fn counters_line(stats: &ply_eval::rc::Stats) -> String {
+    let pct = |v: Option<f64>| match v {
+        Some(v) => format!("{:.1}%", v * 100.0),
+        None => "n/a".to_string(),
+    };
+    format!(
+        "counters    in place {} of {} ({}) · moved {} of {} · elided {}",
+        stats.updates_in_place,
+        stats.updates,
+        pct(stats.in_place()),
+        stats.takes_moved,
+        stats.takes_attempted,
+        pct(stats.elided()),
+    )
 }
 
 #[cfg(test)]

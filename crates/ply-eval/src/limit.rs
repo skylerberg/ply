@@ -1,4 +1,4 @@
-//! The bound on runaway recursion, shared by both engines.
+//! The bound on runaway recursion.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
