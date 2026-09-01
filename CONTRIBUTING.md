@@ -141,6 +141,13 @@ Watch a run with `gh pr checks <n> --watch --fail-fast`, which exits at the
 first failed check, so a formatting slip surfaces when `fmt` finishes rather
 than when the last shard does.
 
+**Workspace crates are cached by content, not by file time.** Every job that
+compiles runs rustc through `sccache`, with the Actions cache as its store, so
+a workspace crate that `main` already built is a download rather than a
+compile and a prose-only change compiles almost nothing. The stats step at the
+end of each job says whether the cache did anything; a store error is a slower
+run, never a red one.
+
 **The test job is sharded**, because one runner running everything is too slow.
 `.github/ci-shards.sh` holds the partition and `verify` fails if a workspace
 member is in no shard, in two shards, or named and absent from the tree — a
