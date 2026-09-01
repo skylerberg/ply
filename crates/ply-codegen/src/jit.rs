@@ -1428,12 +1428,15 @@ impl Fx<'_, '_> {
                     let has = self.builder.ins().icmp_imm(IntCC::NotEqual, has, 0);
                     let present = self.builder.create_block();
                     self.builder.ins().brif(has, present, &[], miss, &[]);
-                    self.builder.switch_to_block(present);
-                    self.builder.seal_block(present);
+                    // Sealed by whoever ends up owning it: the next iteration's `cur`, or the
+                    // tail. Sealing here as well is a double seal, which cranelift only rejects
+                    // under `debug_assertions`.
                     if self.irrefutable(sub) {
                         cur = present;
                         continue;
                     }
+                    self.builder.switch_to_block(present);
+                    self.builder.seal_block(present);
                     let field = self.helper(self.jit.helpers.field, &[base, index]);
                     self.check();
                     let next = self.builder.create_block();
