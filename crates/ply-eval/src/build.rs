@@ -376,6 +376,7 @@ pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
         constraints: Vec::new(),
         derived: None,
         spec: Vec::new(),
+        reuse: None,
         body,
         span: sp(),
     }))
@@ -395,6 +396,7 @@ pub fn fn_def_sig(name: &str, params: &[(&str, TypeExpr)], ret: TypeExpr, body: 
         constraints: Vec::new(),
         derived: None,
         spec: Vec::new(),
+        reuse: None,
         body,
         span: sp(),
     }))

@@ -553,6 +553,7 @@ pub(crate) fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
             w.tag(tag::END);
         }
         put_symbols(&mut w, &def.deps);
+        w.bool(def.reuse);
         w.tag(tag::END);
     }
 
@@ -611,6 +612,7 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
             members.push(Member { name, span });
         }
         let deps = get_symbols(&mut r, WHAT)?;
+        let reuse = r.bool(WHAT)?;
         r.tag(tag::END, WHAT)?;
         defs.push(DefEntry {
             name,
@@ -621,6 +623,7 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
             kind,
             members,
             deps,
+            reuse,
         });
     }
 
