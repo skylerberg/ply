@@ -235,6 +235,19 @@ pub enum Frame {
         left: i64,
         span: Span,
     },
+
+    /// `cell_update` is waiting for its function's answer, which goes back into the cell.
+    CellUpdateStep {
+        slot: crate::arena::Slot,
+        span: Span,
+    },
+
+    /// `map_update` is waiting for its function's answer, which goes back under the key.
+    MapUpdateStep {
+        map: Value,
+        key: Value,
+        span: Span,
+    },
 }
 
 /// How many slots sit between the state just below this pending frame and the state just above

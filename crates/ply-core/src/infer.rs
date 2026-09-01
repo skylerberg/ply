@@ -510,10 +510,10 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `cell_get` / `cell_set` are call forms rather than schemes, so the application rule has to
-    /// recognise them before inferring the callee — and silently, since a local or a module item of
-    /// that name is not one.
-    fn cell_form(&self, q: &QName) -> Option<Mode> {
+    /// `cell_get` / `cell_set` / `cell_update` are call forms rather than schemes, so the
+    /// application rule has to recognise them before inferring the callee — and silently, since a
+    /// local or a module item of that name is not one.
+    fn cell_form(&self, q: &QName) -> Option<CellForm> {
         if !q.is_bare() || self.env.depth_of(q.symbol()) != Some(0) {
             return None;
         }
@@ -521,8 +521,9 @@ impl<'a> Checker<'a> {
             return None;
         }
         match q.symbol().as_str() {
-            "cell_get" => Some(Mode::Read),
-            "cell_set" => Some(Mode::Write),
+            "cell_get" => Some(CellForm::Get),
+            "cell_set" => Some(CellForm::Set),
+            "cell_update" => Some(CellForm::Update),
             _ => None,
         }
     }
@@ -941,6 +942,24 @@ impl<'a> Checker<'a> {
                 ),
             ),
             (
+                "map_update",
+                poly(
+                    vec![a, b],
+                    vec![e],
+                    vec![
+                        map_ty.clone(),
+                        ta.clone(),
+                        Type::Fn {
+                            params: vec![tb.clone()],
+                            ret: Box::new(tb.clone()),
+                            effects: re.clone(),
+                        },
+                    ],
+                    map_ty.clone(),
+                    re.clone(),
+                ),
+            ),
+            (
                 "map_get",
                 poly(
                     vec![a, b],
@@ -1165,7 +1184,24 @@ impl<'a> Checker<'a> {
             poly(
                 vec![a, b],
                 vec![],
-                vec![cell_ty, ta],
+                vec![cell_ty.clone(), ta.clone()],
+                Type::unit(),
+                Row::empty(),
+            ),
+        );
+        self.env.bind_global(
+            Symbol::new("cell_update"),
+            poly(
+                vec![a, b],
+                vec![e],
+                vec![
+                    cell_ty,
+                    Type::Fn {
+                        params: vec![ta.clone()],
+                        ret: Box::new(ta),
+                        effects: re,
+                    },
+                ],
                 Type::unit(),
                 Row::empty(),
             ),
@@ -3776,9 +3812,9 @@ impl<'a> Checker<'a> {
 
     fn infer_app(&mut self, e: &Expr, func: &Expr, args: &[Expr]) -> (Type, Row) {
         if let ExprKind::Var(q) = &func.kind
-            && let Some(mode) = self.cell_form(q)
+            && let Some(form) = self.cell_form(q)
         {
-            return self.infer_cell_op(e, args, mode);
+            return self.infer_cell_op(e, args, form);
         }
 
         let (ft, mut row) = self.infer(func);
@@ -3850,12 +3886,11 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_cell_op(&mut self, e: &Expr, args: &[Expr], mode: Mode) -> (Type, Row) {
-        let expected = if mode == Mode::Read { 1 } else { 2 };
-        let name = if mode == Mode::Read {
-            "cell_get"
-        } else {
-            "cell_set"
+    fn infer_cell_op(&mut self, e: &Expr, args: &[Expr], form: CellForm) -> (Type, Row) {
+        let (name, expected) = match form {
+            CellForm::Get => ("cell_get", 1),
+            CellForm::Set => ("cell_set", 2),
+            CellForm::Update => ("cell_update", 2),
         };
         let mut row = Row::empty();
         let mut tys = Vec::new();
@@ -3879,9 +3914,32 @@ impl<'a> Checker<'a> {
         let elem = self.fresh.ty();
         let cell = Type::Con(Symbol::new("Cell"), vec![region.clone(), elem.clone()]);
         self.expect(args[0].span, &cell, &tys[0], "cell argument");
-        if mode == Mode::Write {
-            self.expect(args[1].span, &elem, &tys[1], "value stored into the cell");
+        match form {
+            CellForm::Get => {}
+            CellForm::Set => {
+                self.expect(args[1].span, &elem, &tys[1], "value stored into the cell");
+            }
+            // The function's own row joins the call's: what it performs, the update performs.
+            CellForm::Update => {
+                let effects = self.fresh.row();
+                let f = Type::Fn {
+                    params: vec![elem.clone()],
+                    ret: Box::new(elem.clone()),
+                    effects: effects.clone(),
+                };
+                self.expect(
+                    args[1].span,
+                    &f,
+                    &tys[1],
+                    "function applied to the cell's contents",
+                );
+                row = self.join(e.span, row, effects);
+            }
         }
+        let ret = match form {
+            CellForm::Get => elem,
+            CellForm::Set | CellForm::Update => Type::unit(),
+        };
 
         let region = self.subst.resolve_ty(&region);
         let Some(resource) = region_of(&region).map(Symbol::new) else {
@@ -3896,22 +3954,20 @@ impl<'a> Checker<'a> {
                      `cell.read[r]` / `cell.write[r]` atoms can be discharged at the region boundary",
                 ),
             );
-            let ret = if mode == Mode::Read {
-                elem
-            } else {
-                Type::unit()
-            };
             return (ret, row);
         };
 
-        let atom = EffectAtom::new(CELL, Resource::Named(resource), mode);
-        self.record(atom.clone(), e.span, true);
-        let row = self.join(e.span, row, Row::singleton(atom));
-        let ret = if mode == Mode::Read {
-            elem
-        } else {
-            Type::unit()
+        // An update reads and writes, so it performs both atoms.
+        let modes: &[Mode] = match form {
+            CellForm::Get => &[Mode::Read],
+            CellForm::Set => &[Mode::Write],
+            CellForm::Update => &[Mode::Read, Mode::Write],
         };
+        for mode in modes {
+            let atom = EffectAtom::new(CELL, Resource::Named(resource.clone()), *mode);
+            self.record(atom.clone(), e.span, true);
+            row = self.join(e.span, row, Row::singleton(atom));
+        }
         (ret, row)
     }
 
@@ -5352,7 +5408,15 @@ fn written_row_reason(te: &TypeExpr) -> Option<String> {
 }
 
 fn is_cell_builtin(name: &Symbol) -> bool {
-    matches!(name.as_str(), "cell_get" | "cell_set")
+    matches!(name.as_str(), "cell_get" | "cell_set" | "cell_update")
+}
+
+/// The three region-scoped cell call forms.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CellForm {
+    Get,
+    Set,
+    Update,
 }
 
 /// The builtin a generated `OrdDict` is built out of, reserved so that no module can supply it.

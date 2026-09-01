@@ -80,6 +80,27 @@ pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagn
     Ok(m)
 }
 
+/// Takes the entry's value out of the map for a `map_update`: the map no longer holds it, so
+/// the function it is handed to sees the value at one owner when nothing else does.
+pub(crate) fn take(
+    mut m: Value,
+    k: &Value,
+    span: Span,
+) -> Result<(Value, Option<Value>), Diagnostic> {
+    key(k, "map_update", span)?;
+    let taken = match &mut m {
+        Value::Map(out) => match out.get(k).cloned() {
+            Some(v) => {
+                out.remove_mut(k);
+                Some(v)
+            }
+            None => None,
+        },
+        other => return Err(crate::value::type_error(span, "`map_update`", "Map", other)),
+    };
+    Ok((m, taken))
+}
+
 pub(crate) fn len(m: &Value, span: Span) -> Result<Value, Diagnostic> {
     Ok(Value::Int(m.as_map(span, "`map_len`")?.size() as i64))
 }

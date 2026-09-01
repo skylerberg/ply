@@ -1031,8 +1031,10 @@ otherwise. The machine moves a binding's value out of its slot at its last use
 (ADR 0034), so *where* the append sits — in a call, in a record literal, first
 or last — decides nothing: an accumulator threaded through a loop is linear
 however you spell it. What still copies is a genuine second owner — a binding
-you read again after the append, a value a closure captured, a cell's contents,
-a map's entry, a caller that keeps reading what it passed.
+you read again after the append, a value a closure captured, a cell's contents
+or a map's entry read out through `cell_get` / `map_get` (`cell_update` and
+`map_update` are the fix, §13.8 and §13.3), a caller that keeps reading what
+it passed.
 
 **Run `ply check --costs`** to see it per `push` site: every copy is reported
 with its cause and, where a source edit removes it, the edit.
@@ -1427,7 +1429,8 @@ with_cell[users](initial) { cell ->
 `c` for the duration of `body`, and closes the region when `body` ends. The
 label in brackets brands the region.
 
-`cell_get(c)` reads and `cell_set(c, v)` writes. Both are builtins rather than
+`cell_get(c)` reads, `cell_set(c, v)` writes, and `cell_update(c, f)` replaces
+the contents with `f` applied to them (§13.8). All three are builtins rather than
 effect operations, so the atoms they perform name the region of their argument
 and never appear in a row that outlives it.
 
@@ -2100,10 +2103,17 @@ map_entries<k, v>(m: Map<k, v>) -> List<{key: k, value: v}>
 map_of_entries<k, v>(es: List<{key: k, value: v}>) -> Map<k, v>
 map_merge<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>   // b wins on a shared key
 map_fold<k, v, c | e>(m: Map<k, v>, init: c, f: (c, k, v) -> c / e) -> c / e
+map_update<k, v | e>(m: Map<k, v>, key: k, f: (v) -> v / e) -> Map<k, v> / e
 ```
 
 `map_fold` visits entries in ascending key order, so a fold over a map is a
 function of its contents rather than of how it was built.
+
+`map_update(m, k, f)` replaces the entry under `k` with `f` applied to it, and
+leaves a map with no such key as it was. The entry leaves the map before `f`
+sees it, so a `push` inside `f` finds its list at one owner when nothing else
+holds the map — which `push(map_get(m, k), x)` never does, because `map_get`
+answers a clone the map still holds.
 
 ### 13.4 Ordering
 
@@ -2186,10 +2196,20 @@ The scale and the rounding mode are arguments because `/` on `Decimal` is
 ```ply
 cell_get<a>(c: Cell<a>) -> a
 cell_set<a>(c: Cell<a>, v: a) -> Unit
+cell_update<a | e>(c: Cell<a>, f: (a) -> a / e) -> Unit / e
 ```
 
 Builtins rather than effect operations, so their atoms are discharged at the
-region boundary (§8).
+region boundary (§8). `cell_update` performs both the read and the write atom,
+plus whatever `f` performs.
+
+`cell_update(c, f)` replaces the contents with `f` applied to them, and it is
+the only way an append onto a cell's contents grows in place: the contents
+leave the region for the length of the call, so `push` inside `f` finds one
+owner, where `cell_set(c, push(cell_get(c), x))` copies the whole list every
+time because the cell still holds it. While the update runs the cell is
+unreadable — a `cell_get` reached through an effect `f` performs, or a nested
+update of the same cell, is refused rather than answered with a placeholder.
 
 ### 13.9 Secrets
 

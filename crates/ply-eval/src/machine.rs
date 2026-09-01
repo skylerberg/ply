@@ -1586,7 +1586,7 @@ impl<'a> Machine<'a> {
     fn record_cell_access(&mut self, b: Builtin, args: &[Value]) {
         let mode = match b {
             Builtin::CellGet => Mode::Read,
-            Builtin::CellSet => Mode::Write,
+            Builtin::CellSet | Builtin::CellUpdate => Mode::Write,
             _ => return,
         };
         let Some(Value::Cell(slot)) = args.first() else {
