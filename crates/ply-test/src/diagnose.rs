@@ -1,4 +1,4 @@
-//! Turning one failure into the artifact of ADR 0004.
+//! Turning one failure into the artifact of the failure artifact.
 
 use crate::bisect::{
     Baseline, Bisection, Budget, Classify, Delta, DepEdges, Diff, Gate, Hybrid, Mode, NoHybrid,

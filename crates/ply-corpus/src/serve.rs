@@ -348,7 +348,7 @@ pub struct HeadPoint {
     pub per_second: f64,
 }
 
-/// The exit criterion ADR 0012 §5 states: whether a request's cost is a function of how many bytes
+/// The exit criterion the byte builtins states: whether a request's cost is a function of how many bytes
 /// the head is or of how many fields were parsed.
 pub fn head_sweep(
     repo: &Path,

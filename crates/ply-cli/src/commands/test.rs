@@ -1298,7 +1298,7 @@ fn print_explain(
     } else {
         format!(" · {} host-backed and never free", counts.host)
     };
-    // ADR 0008 §6 again, for the population ADR 0017 §6 moves: a contention a rename would remove
+    // host effects having no region isolation again, for the population region isolation moves: a contention a rename would remove
     // reads differently from one that needs a database, and a report that did not separate them
     // would leave the cost of losing the fork looking like ordinary shared state.
     let regioned = if parallelism.region_contended == 0 {
@@ -2836,7 +2836,7 @@ test \"stuck\" {
     }
 
     /// Two structurally identical tests in different modules have the same hash, so proving one
-    /// proves the other — the corollary the ADR calls out as looking like a bug.
+    /// proves the other — the corollary the module rules call out as looking like a bug.
     #[test]
     fn identical_tests_in_two_modules_share_one_cache_entry() {
         let (dir, loaded, hashes) = project(&[

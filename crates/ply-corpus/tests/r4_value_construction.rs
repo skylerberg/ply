@@ -310,7 +310,7 @@ const RULES: &[Rule] = &[
         size: any,
     },
     // `Frame::AppCallee`'s call to `argv::take` (frame.rs:111), `32 * arity` bytes — one per
-    // application that the free list could not serve, which since ADR 0019 §1 is not every
+    // application that the free list could not serve, which since the argument-vector pool is not every
     // application.
     Rule {
         bucket: "Vec<Value> — call arguments",
@@ -749,7 +749,7 @@ fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
             panic!(
                 "one {arity}-argument call added {per:.2} allocations of {size} bytes per \
                  iteration under `{site}`: the free list is not serving arity {arity}, and the \
-                 178.0 allocations per request ADR 0019 §1 took off the /health path are back"
+                 178.0 allocations per request the argument-vector pool took off the /health path are back"
             );
         }
     }
@@ -768,7 +768,7 @@ fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
         panic!(
             "the control loop added no {want}-byte allocation under `ply_eval::argv::take`, so \
              the two zeros above mean nothing: either `builtins::call` now returns the buffer it \
-             was handed — which would be the change ADR 0019 §1's arithmetic assumes had already \
+             was handed — which would be the change the argument-vector pool's arithmetic assumes had already \
              happened, and is worth reporting — or this instrument has stopped seeing an argument \
              vector at all"
         )
@@ -807,7 +807,7 @@ fn a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation() {
             panic!(
                 "`{name}` added {per:.2} allocations of {size} bytes per iteration under \
                  `{site}`: a literal is being rebuilt per evaluation again, and the 65.0 \
-                 allocations per request ADR 0019 §2 took off the /health path are back"
+                 allocations per request the constant-value memo took off the /health path are back"
             );
         }
     }
@@ -905,7 +905,7 @@ fn a_nullary_constructor_is_built_once_rather_than_on_every_mention() {
         panic!(
             "one mention of a nullary constructor added {per:.2} allocations of {size} bytes \
              per iteration under `{site}`: `interp::ctor_value` is building a fresh value per \
-             mention again, and the 21.0 allocations per request ADR 0019 §2 took off the \
+             mention again, and the 21.0 allocations per request the constant-value memo took off the \
              /health path are back"
         );
     }
@@ -950,7 +950,7 @@ fn a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention() {
         panic!(
             "one mention of `R4Box` added {per:.2} allocations of {size} bytes per iteration \
              under `{site}`: the constructor closure is being rebuilt per mention again, which \
-             is the 24.0 allocations per request ADR 0019 §2 removed"
+             is the 24.0 allocations per request the constant-value memo removed"
         );
     }
     let control = rows
@@ -1239,7 +1239,7 @@ fn the_argument_vectors_the_free_list_does_not_take_are_the_ones_no_callee_gives
          floor, reached only by boxing Ctor's name and args together) would save {:.0} bytes per \
          request of that and zero allocations.\n   This understates it: a recycled buffer is \
          allocated once and filled many times, so the slots a request touches are unchanged and \
-         only the slots it allocates are counted here. ADR 0019 §4's figure was taken before the \
+         only the slots it allocates are counted here. the refusal to narrow `Value`'s figure was taken before the \
          free list existed and is the count of slots touched.",
         slots * size_of::<Value>() as f64,
         size_of::<Value>(),

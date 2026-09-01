@@ -49,8 +49,8 @@ pub enum Frame {
 
     AppCallee {
         args: Rc<Vec<Code>>,
-        /// Per argument, what it is the last reader of. Empty unless ADR 0034
-        /// §11 S4's probe is armed — see [`crate::code::NodeKind::App`].
+        /// Per argument, what it is the last reader of. Empty unless the slot rewrite
+        /// the slot probe is armed — see [`crate::code::NodeKind::App`].
         dead: Rc<Vec<crate::rc::Dead>>,
         env: Env,
         module: usize,
@@ -686,7 +686,8 @@ pub struct Continuation {
     resumes: Rc<Cell<u32>>,
     /// This continuation's claim on the regions that were open when it was captured, so their
     /// lexical close retains their slots instead of handing them back to a bump pointer this
-    /// continuation can still read through — ADR 0005 required test 6.
+    /// continuation can still read through: the escape case, where a continuation is
+    /// resumed after the region that made its cell returned.
     pin: Option<Pin>,
 }
 

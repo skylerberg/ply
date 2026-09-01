@@ -203,7 +203,7 @@ fn unary_binds_tighter_than_arithmetic_and_nests() {
     assert_eq!(expr("!f(x)"), "(not (call f x))");
 }
 
-/// ADR 0033 §2.1 opened four levels between the comparisons and `++`. The
+/// operator precedence opened four levels between the comparisons and `++`. The
 /// numbers in `bin_op` all moved; what these assert is the thing that made that
 /// safe, which is the *order* — and the order of the bit operators is Rust's.
 #[test]

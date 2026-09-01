@@ -1,4 +1,4 @@
-//! ADR 0016 §3's spike, run.
+//! The codegen spike's spike, run.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::jit::{Jit, Opts};
@@ -14,7 +14,7 @@ const READ_LINE: &str = "std.http.read_line";
 const CHOSEN: &str = "the innermost loop of the framing layer — one call for the request line, one \
                       per field line, one for the terminator — and the function with the highest \
                       per-request cost whose whole body, with the whole call graph under it \
-                      (`line_at`, `line_stops`), is inside ADR 0016 §3.2's fragment";
+                      (`line_at`, `line_stops`), is inside the spike's fragment's fragment";
 const PARSE_HEAD: &str = "std.http.parse_head";
 const MAX_REQUEST_LINE: i64 = 8192;
 const MAX_HEADER_BYTES: i64 = 65536;

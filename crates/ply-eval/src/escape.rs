@@ -121,7 +121,7 @@ impl Boundary<'_> {
         match self {
             Boundary::HostArgument { path, .. } => Cow::Owned(format!(
                 "`{path}` is a host handler, and a host handler outlives every region the program \
-                 opens (ADR 0008)"
+                 opens"
             )),
             Boundary::HostAnswer { path, .. } => Cow::Owned(format!(
                 "`{path}` is outside the program, so a handle it produced names no region this \
@@ -203,7 +203,7 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
     .note(escapee.handle.why())
     .note(boundary.outlives())
     .note(
-        "ADR 0017 §2 makes this a type error wherever a type still mentions the brand; this is \
+        "the escape brand makes this a type error wherever a type still mentions the brand; this is \
          the boundary where none does, so it is refused here instead of read later",
     )
     .note(boundary.remedy())
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(carries(&value), None);
     }
 
-    /// The erasure route ADR 0017 §2 leaves open, seen from the boundary: the constructor's field
+    /// The erasure route the escape brand leaves open, seen from the boundary: the constructor's field
     /// type mentions no brand, so only the value says so.
     #[test]
     fn a_handle_inside_a_constructor_is_found_and_the_route_names_it() {

@@ -1,4 +1,4 @@
-//! An attack on the scheduler's claim under ADR 0017 §6: that a test's allocations live in a region
+//! An attack on the scheduler's claim under region isolation: that a test's allocations live in a region
 //! closed when the test ends, so tests still cannot observe each other's allocations — while a
 //! region *label* two tests both write is one piece of state and colours them apart.
 
@@ -167,7 +167,7 @@ test "two" { cells.put[rows](2) }
     );
 }
 
-/// ADR 0017 §6's lost case, reached by inference rather than by injection: six tests whose only
+/// Region isolation's lost case, reached by inference rather than by injection: six tests whose only
 /// atoms name one label are six colours wide, and every one of them is `shared` on the line
 /// `--explain` prints.
 #[test]
@@ -480,7 +480,7 @@ fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     );
 }
 
-/// ADR 0017 §6's fixture, at the runner: built once for the group, mutated in place by every test
+/// Region isolation's fixture, at the runner: built once for the group, mutated in place by every test
 /// in it, and the test's own allocations closed on top.
 #[test]
 fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {

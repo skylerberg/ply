@@ -184,7 +184,7 @@ impl CarriedTypes {
             Type::Con(name, args) => match name.as_str() {
                 "Int" | "Bool" | "Bytes" => args.is_empty(),
                 "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
-                // ADR 0019 §5 item 4's three, and the leaf set is deliberately `crossable`'s
+                // the fragment's gaps item 4's three, and the leaf set is deliberately `crossable`'s
                 // exactly rather than one kind wider — `Unit` included, which holds nothing and is
                 // refused anyway so that the leaf set is the same list in both directions.
                 "Float" | "Decimal" | "String" | "Unit" => false,
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(backend.offers()[0].args, vec![Value::Bool(true)]);
         drop(machine);
 
-        // ADR 0019 §5 item 4: the spike's fragment accepts `Float` arithmetic and fails on it at
+        // the fragment's gaps item 4: the spike's fragment accepts `Float` arithmetic and fails on it at
         // run time.
         let backend = Double::declining(&c.program);
         let mut machine = c.machine();
@@ -1141,7 +1141,7 @@ mod tests {
             gate(&c, &anonymous, &[Value::str("21")]),
             Err(Gate::ArgumentShape)
         );
-        // Re-taken for the type gate (ADR 0030 §9.2 registered this debt): a `Record` argument is
+        // Re-taken for the type gate (the fragment census registered this debt): a `Record` argument is
         // NOT in the lookup-free half any more.
         let record = Value::Record(Arc::new(Fields::default()));
         assert_eq!(
@@ -1444,7 +1444,7 @@ mod tests {
         );
     }
 
-    /// `argv.rs` is 40.9% of ADR 0019 §1.
+    /// The free list serves an entered call's argument vector too.
     #[test]
     fn an_entered_call_returns_its_argument_vector_to_the_free_list() {
         let c = checked(vec![double_def()]);

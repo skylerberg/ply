@@ -1,4 +1,4 @@
-//! ADR 0017 §4 asked of whole programs rather than of synthetic expressions.
+//! The reference-counting pass asked of whole programs rather than of synthetic expressions.
 
 use ply_eval::{Machine, rc};
 use ply_span::{SourceId, SourceMap};
@@ -72,7 +72,7 @@ test "a captured list keeps its length" {
     );
 }
 
-/// ADR 0017 §5 gives every task its own region stack, and a value two tasks reach is a value
+/// Per-task region stacks gives every task its own region stack, and a value two tasks reach is a value
 /// neither may rewrite.
 #[test]
 fn a_list_two_tasks_reach_is_copied_rather_than_rewritten() {
@@ -143,7 +143,7 @@ test "a parked continuation reads a binding the block released" {
     );
 }
 
-/// A fold whose accumulator nothing else holds is the case §4 exists for, and the one the whole
+/// A fold whose accumulator nothing else holds is the case the reference-counting pass exists for, and the one the whole
 /// scheme is paid for by.
 #[test]
 fn a_fold_accumulator_nothing_else_holds_is_rewritten_in_place() {
@@ -185,8 +185,8 @@ test "a cell holding a closure over itself" {
     );
 }
 
-/// A parameter released at the statement that last reads it — ADR 0034 §11 S3,
-/// which is ADR 0025 §Decision 3 P2, whose landing condition was that the case
+/// A parameter released at the statement that last reads it — the sequence S3,
+/// which is the ownership design P2, whose landing condition was that the case
 /// analysis be written rather than assumed. It is written at the seeding site in
 /// `code.rs`; these are its six cases, run.
 #[test]
@@ -249,7 +249,7 @@ test "shadowed" { assert_eq(go([1, 2, 3]), 5) }
 /// The half of P2 that is the point of it: threaded as a parameter, an
 /// A parameter accumulator whose `push` is in last-argument position is reused.
 ///
-/// This does **not** discriminate ADR 0025's P2: it passes with and without it, because the
+/// This does **not** discriminate the ownership design's P2: it passes with and without it, because the
 /// caller's `drop(env)` before the call already delivers the value at one owner. The shape that
 /// does is `position_invariance_g1`'s "let binding against parameter" pair, where the append is a
 /// statement rather than a last argument.

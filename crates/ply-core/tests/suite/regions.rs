@@ -1,4 +1,4 @@
-//! ADR 0017 §1 and §2 at the type level: `with_region[r] { .. }`, the brand `r` carries in the
+//! The region model and its brand at the type level: `with_region[r] { .. }`, the brand `r` carries in the
 //! types of the values allocated in it, and every route a branded value could take out of the
 //! region.
 
@@ -68,7 +68,7 @@ fn a_region_with_no_cell_in_it_is_just_its_body() {
     ok("fn plain() -> Int = with_region[r] { 1 + 2 }");
 }
 
-/// ADR 0017 §1: "an inner region may reference an outer region's values".
+/// The region model: "an inner region may reference an outer region's values".
 #[test]
 fn an_inner_region_may_read_an_outer_regions_cell() {
     ok("fn nested() -> Int = with_region[outer] {
@@ -332,7 +332,7 @@ fn an_outer_regions_value_escaping_names_the_outer_region() {
 
 // --- what must not move -----------------------------------------------------
 
-/// ADR 0017 §1: "the surface syntax is unchanged, so existing programs do not move."
+/// The region model: "the surface syntax is unchanged, so existing programs do not move."
 #[test]
 fn a_with_cell_written_before_this_change_still_checks_unmodified() {
     let out = ok("fn counter() -> Int = with_cell[r](0) { c -> { cell_set(c, 3); cell_get(c) } }");

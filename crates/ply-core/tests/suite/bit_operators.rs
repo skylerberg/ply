@@ -46,7 +46,7 @@ fn not(a: Int) -> Int = ~a
     assert_eq!(sig(&out, "not"), "(Int) -> Int");
 }
 
-/// A signature is written (§5.9) but a *body* is inferred, and the operators are what pins it
+/// A signature is written but a *body* is inferred, and the operators are what pins it
 #[test]
 fn an_operator_pins_an_inferred_binder_to_int() {
     let out = ok("fn mix(xs: List<Int>, seed: Int) -> Int = fold(xs, seed, |acc, x| acc ^ x)\n");
@@ -212,7 +212,7 @@ fn loud(a: Int) -> Int = a & { tell.say[out]("x"); 1 }
     assert_eq!(footprint(&out, "loud"), "{m.tell.write[out]}");
 }
 
-/// None of the four names is reserved, which is the ADR 0027 hazard restated:
+/// None of the four names is reserved, which is the the list index decision hazard restated:
 #[test]
 fn a_module_may_declare_its_own_wrapping_function() {
     let out = ok(

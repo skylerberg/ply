@@ -161,7 +161,7 @@ boundaries hand a value somewhere no type is left to look at — a host operatio
 argument, the value a host handler or runtime answers with, and an argument
 handed to an entry point from outside the program — and a handle into a region
 reaching one of those is `E0449`, which names the handle, the route to it and the
-boundary. ADR 0017 §2's one deliberately open route, a continuation parked in an
+boundary. ADR 0017's one deliberately open route, a continuation parked in an
 enclosing region's cell where a constructor's field type erases the brand, stays
 open; what `E0449` bounds is where the value it produces can then go.
 
@@ -336,8 +336,7 @@ two tasks that allocate are ordered even when nothing in their rows conflicts.
 **Over every interleaving the scheduler could have chosen.** Tasks interleave at
 the operations the scheduler answers — `task`, `clock` and `random` — so a task
 that reads shared state and writes it back with none of those in between runs the
-two as one step, and no schedule separates them. That is a real limit and ADR 0006
-§3.3 states it: put a `task.yield()` in the window, or a `clock.now()` stamp the
+two as one step, and no schedule separates them. That is a real limit and ADR 0006 states it: put a `task.yield()` in the window, or a `clock.now()` stamp the
 code was going to write anyway, or push the check into the resource so there is
 nothing to separate.
 
@@ -530,7 +529,7 @@ What is true of the shipped language:
 The evaluator is still an interpreter: a control-stack machine. Native
 codegen is deferred on a *measurement* rather than on effort — the interpreter is
 about 35% of a served request, which caps any execution-strategy change at 1.55x,
-and a Cranelift spike projects 1.48x against a 1.50x bar. `docs/adr/0016-w6-performance.md`
+and a Cranelift spike projects 1.48x against a 1.50x bar. `docs/adr/0011-the-web-track.md`
 holds the numbers and states what would reopen it. See ROADMAP.md for the
 milestone-by-milestone record.
 

@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(f.cmp(&g), std::cmp::Ordering::Equal);
     }
 
-    /// ADR 0019 §0.1 at this seam. A cached value has the program's lifetime, so
+    /// The secret invariant at this seam. A cached value has the program's lifetime, so
     /// what it may hold is the whole question: a nullary constructor's `args`
     /// are empty, so it can hold no [`Value::Cell`] past the region that would
     /// reclaim one and no [`Value::Secret`] past the call that made it — and
@@ -558,14 +558,14 @@ mod tests {
     }
 
     /// What the cache trades: a `malloc`/`free` pair for a hash of the name and
-    /// a refcount bump. Unmeasured until this ran, and ADR 0019's
+    /// a refcount bump. Unmeasured until this ran, and the value-representation work's
     /// `max_time_regression` is what it feeds.
     ///
     /// Both arms are timed in one window inside one process, alternating, and
     /// the fastest of each is reported — `benches/README.md` §"Every ratio is
     /// taken inside one window" is the reason, and on a machine whose load
     /// moves between 3 and 47 it is the only way this resolves at all. The
-    /// second arm is `ctor_value`'s body from before ADR 0019 §2, spelled out
+    /// second arm is `ctor_value`'s body from before the constant-value memo, spelled out
     /// rather than called, because that function no longer exists.
     ///
     /// **What it measures is a mention in a hot loop, where the allocator's
@@ -637,7 +637,7 @@ mod tests {
             assert!(
                 ratio < 1.5,
                 "a cached mention of {what} cost {:.1}ns against {:.1}ns to rebuild it: the \
-                 lookup is dearer than the allocation it replaced, and ADR 0019 §\"What is \
+                 lookup is dearer than the allocation it replaced, and the value-representation work's \"what is \
                  assumed\" item 1 is failing at this seam",
                 per(best[cached]),
                 per(best[rebuilt])

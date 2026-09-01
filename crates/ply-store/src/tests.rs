@@ -1484,7 +1484,7 @@ fn re_recording_the_same_baseline_writes_nothing() {
     );
 }
 
-/// ADR 0004's silent-wrongness path: prune deletes the baselines, and every later failure degrades
+/// The failure artifact's silent-wrongness path: prune deletes the baselines, and every later failure degrades
 /// to `no_bodies` with no error to explain it.
 #[test]
 fn pruning_keeps_the_bodies_a_baseline_names_even_when_no_file_declares_them() {
@@ -2546,7 +2546,7 @@ fn opening_a_ten_thousand_definition_cache_is_under_the_budget() {
         reopened.stats().data_bytes
     );
     // An unoptimized BLAKE3 over half a megabyte of index dominates a debug build; the budget the
-    // ADR sets is a release number.
+    // a record sets is a release number.
     let budget = if cfg!(debug_assertions) {
         std::time::Duration::from_millis(250)
     } else {

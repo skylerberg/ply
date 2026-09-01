@@ -919,7 +919,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     let plan = crate::simulation::run_plan(args.seed.as_ref());
     let answer = evaluate(&opened, span, &plan, &hosts, declared.as_ref());
 
-    // ADR 0015 §4.4's pinned order, on the machine's own thread and never from a signal handler:
+    // the teardown order's pinned order, on the machine's own thread and never from a signal handler:
     // roll every open transaction back, close every open span, flush the sink, close the pool.
     let teardown =
         crate::commands::run::teardown(&hosts, shutdown.as_ref(), args.shutdown.drain_ms);

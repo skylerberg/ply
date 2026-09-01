@@ -195,7 +195,7 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
 
 // --- Does importing `std` disturb anything that does not? -------------------
 
-/// ADR 0012 corollary 1: nothing outside a definition's own reachable graph may enter its hash.
+/// Nothing outside a definition's own reachable graph may enter its hash.
 #[test]
 fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
     let dir = tempfile::tempdir().unwrap();
@@ -419,7 +419,7 @@ fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
 
 // --- Renaming a `std` definition is free ------------------------------------
 
-/// ADR 0001's headline invariant, asked of the stdlib: renaming a definition changes no hash
+/// The module rules's headline invariant, asked of the stdlib: renaming a definition changes no hash
 /// anywhere.
 #[test]
 fn renaming_a_shipped_definition_moves_no_hash() {

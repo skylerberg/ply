@@ -149,7 +149,7 @@ fn a_statement_reaches_the_implementation_with_every_table_it_touches() {
     assert!(atoms.iter().any(|a| a.contains("orders")), "{atoms:?}");
 }
 
-/// ADR 0014 §2.3's preventer, end to end through the handler: a join reaches a table the entry
+/// The driver's reported footprint's preventer, end to end through the handler: a join reaches a table the entry
 /// point's row never declared, and the refusal happens at prepare — before a connection is acquired
 /// and before a row is read.
 #[test]
@@ -299,7 +299,7 @@ fn a_perform_of_the_wrong_arity_is_plys_fault() {
     assert_eq!(driver.statements.load(Ordering::Relaxed), 0);
 }
 
-/// The listing is the artifact ADR 0008 §2 exists to produce, and the implementation gets a say in
+/// The listing is the artifact the trusted registration exists to produce, and the implementation gets a say in
 /// exactly one column of it.
 #[test]
 fn every_operation_a_driver_serves_appears_with_the_implementations_own_path() {

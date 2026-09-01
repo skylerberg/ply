@@ -207,7 +207,7 @@ mod tests {
         assert!(shared_footprint(&f).is_empty());
     }
 
-    /// The case ADR 0017 §6 costs, at its smallest: a seed keeps its exemption and the region label
+    /// The case region isolation costs, at its smallest: a seed keeps its exemption and the region label
     /// does not, so the test is shared *and* the seed is not what made it shared.
     #[test]
     fn a_region_label_contends_and_the_seed_beside_it_still_does_not() {
@@ -247,7 +247,7 @@ mod tests {
         assert!(!is_seeded(&Footprint::empty()));
     }
 
-    /// ADR 0005 §5's property, preserved with its population changed: what is free to add is a test
+    /// The isolation rule's property, preserved with its population changed: what is free to add is a test
     /// that names nothing, not a test whose state used to be forked.
     #[test]
     fn adding_isolated_simulated_tests_changes_no_group_count() {

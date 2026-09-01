@@ -1,4 +1,4 @@
-//! Adversarial audit of the property ADR 0013 §1.5 calls the headline test: an `effect set` name
+//! Adversarial audit of the property the alias properties calls the headline test: an `effect set` name
 //! never enters a hash.
 
 use ply_hash::{DefHash, HashOutput, hash_ast, hash_program_ast};

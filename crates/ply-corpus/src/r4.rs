@@ -1,4 +1,4 @@
-//! The bar each of ADR 0019's levers has to clear, written before the lever is.
+//! The bar each of the value-representation work's levers has to clear, written before the lever is.
 
 /// The window pair every figure a verdict reads must be fitted from.
 pub const WINDOW: (usize, usize) = (20, 200);
@@ -6,7 +6,7 @@ pub const WINDOW: (usize, usize) = (20, 200);
 /// Allocations per `/health` over SimNet at [`WINDOW`], before any lever.
 pub const BASELINE: f64 = 911.5;
 
-/// One of ADR 0019's changes.
+/// One of the value-representation work's changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lever {
     ArgumentVectors,

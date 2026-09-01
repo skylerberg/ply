@@ -160,7 +160,7 @@ const ESCAPE: &str = "\\\"";
 /// The sizes the `json` claim is read at.
 const SIZES: [usize; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
 
-/// The sizes the `router` and `trace` claims are read at — the ones ADR 0020 §7 item 3 reports the
+/// The sizes the `router` and `trace` claims are read at — the ones the accumulator fixes item 3 reports the
 /// survey's before-counts at.
 const TABLE_SIZES: [usize; 3] = [200, 400, 800];
 

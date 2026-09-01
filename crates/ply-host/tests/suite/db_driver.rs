@@ -212,7 +212,7 @@ fn every_mapped_type_round_trips(reactor: &Reactor) {
                 Param::Text("varchar".into()),
                 Param::Bytes(vec![0, 1, 127, 128, 255]),
                 Param::Float(1.5),
-                // `float4` is a *result* type in §4.2's mapping and not a parameter type, so the
+                // `float4` is a *result* type in the type mapping and not a parameter type, so the
                 // narrowing is written where a reader sees it rather than performed silently by the
                 // driver.
                 Param::Float(0.5),
@@ -757,7 +757,7 @@ fn a_nested_level_that_disagrees_is_a_value(db: &Postgres) {
     assert_eq!(ctor_of(&answer), "std.db.Failed");
     assert!(
         format!("{answer:?}").contains("25001"),
-        "the SQLSTATE is not the one the ADR names: {answer:?}"
+        "the SQLSTATE is not the one the design names: {answer:?}"
     );
     assert_eq!(db.depth(ALONE), 1, "the refused nesting opened a scope");
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("the outer rolls back");

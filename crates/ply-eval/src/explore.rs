@@ -580,7 +580,7 @@ mod tests {
     use ply_core::{EffectAtom, Resource};
     use ply_syntax::ast::Mode;
 
-    /// A model scheduler: enough of ADR 0006 §3 to exercise the search, and none of the machine.
+    /// A model scheduler: enough of the scheduler on the control stack to exercise the search, and none of the machine.
     #[derive(Clone, Debug)]
     enum Op {
         /// Read a cell into this task's register.
@@ -1216,7 +1216,7 @@ mod tests {
         assert!(explored.exploration.exhaustive);
     }
 
-    /// The soundness case ADR 0006 §6.2's pseudocode drops.
+    /// The soundness case the backtrack-set search's pseudocode drops.
     #[test]
     fn a_race_with_a_task_that_was_blocked_at_the_backtrack_point_is_still_found() {
         for root in 0..8u64 {

@@ -154,7 +154,7 @@ fn print_explain(loaded: &Loaded, style: Style) {
     super::common::print_phases(&loaded.frontend.phases, style);
 }
 
-/// ADR 0025 §Decision 2a: for every `push`, whether it grows its list in place or copies it.
+/// the ownership design: for every `push`, whether it grows its list in place or copies it.
 fn print_costs(loaded: &Loaded, style: Style) {
     println!();
     match crate::costs::lines(&loaded.program, &loaded.resolved, &loaded.sources, style) {

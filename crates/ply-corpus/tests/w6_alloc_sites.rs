@@ -197,7 +197,7 @@ fn report(name: &str, window: &Window) {
 /// The window this file's ranking has always been taken over.
 const SMALL: usize = 20;
 
-/// The window `w6-alloc` is published at, and the one ADR 0017's readings are taken over.
+/// The window `w6-alloc` is published at, and the one the region model's readings are taken over.
 const LARGE: usize = 200;
 
 /// How far the two harnesses may disagree at the same window before the disagreement is a defect in

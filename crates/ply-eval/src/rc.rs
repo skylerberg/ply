@@ -1,4 +1,4 @@
-//! Reference counting for the values that outlive their region — ADR 0017 §4.
+//! Reference counting for the values that outlive their region.
 
 use crate::arena::Slot;
 use crate::env::Env;
@@ -18,21 +18,23 @@ pub enum Own {
     Owned,
 }
 
-/// Whether ADR 0034 §11 S4's probe is armed, read once per process. Off by default: it is a probe
+/// Whether the sequence S4's probe is armed, read once per process. Off by default: it is a probe
 /// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
 /// do not arm it in anything being timed.
 pub fn probe_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED
-        .get_or_init(|| std::env::var("PLY_ADR0034_PROBE").is_ok_and(|v| v == "1" || v == "params"))
+    *ARMED.get_or_init(|| {
+        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "params")
+    })
 }
 
 /// Whether the probe's *carry-site* half is armed — the `App` and `Record` per-argument releases,
 /// as against the statement-level parameter releases [`probe_armed`] gates.
 pub fn probe_carries() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED
-        .get_or_init(|| std::env::var("PLY_ADR0034_PROBE").is_ok_and(|v| v == "1" || v == "carry"))
+    *ARMED.get_or_init(|| {
+        std::env::var("PLY_the slot rewrite_PROBE").is_ok_and(|v| v == "1" || v == "carry")
+    })
 }
 
 /// [`carry`], minus the bindings the sub-expression just started is the last reader of.
@@ -49,7 +51,7 @@ pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env
 }
 
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
-/// Counters for ADR 0034 §4's capture-against-carry census. Diagnostics only.
+/// Counters for the slot rewrite's capture-against-carry census. Diagnostics only.
 pub mod census4 {
     use std::cell::Cell;
     thread_local! {
@@ -118,7 +120,7 @@ pub struct Stats {
     /// rewrite copies a path rather than an array, so the boolean would read `false` for something
     /// costing O(log n) and the rate would be uniformly bad while the program got faster. This
     /// counts what was actually copied, which is the question that survives the representation —
-    /// ADR 0034 §5.
+    /// the bounded worst case.
     pub elements_copied: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
@@ -334,7 +336,7 @@ impl Live {
         }
     }
 
-    /// The current barrier's parameters — ADR 0034 §11 S3 / ADR 0025 P2.
+    /// The current barrier's parameters — the sequence S3 / the ownership design P2.
     pub fn barrier_params(&self) -> &[Symbol] {
         match (self.ownable.last(), self.params.last()) {
             (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
@@ -379,7 +381,7 @@ impl Live {
     }
 
     /// Whether this name is a binding of the current barrier — [`Live::tracked`]
-    /// in public form, for the ADR 0034 §11 S4 probe, which may only release a
+    /// in public form, for the the sequence S4 probe, which may only release a
     /// name whose last use this body can bound.
     pub fn is_ownable(&self, name: &Symbol) -> bool {
         self.tracked(name)

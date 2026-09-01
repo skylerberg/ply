@@ -54,7 +54,7 @@ effect state {
   write put[s](v: Int) -> Unit
 }
 
-// §3, "Zero resumptions". The clause never resumes; the region closes and
+// Zero resumptions. The clause never resumes; the region closes and
 // whatever the abandoned computation would have written never happens.
 test "zero resumptions" {
   with_cell[log](0) { c -> {
@@ -72,7 +72,7 @@ test "zero resumptions" {
   } }
 }
 
-// §3, "One resumption". The clause writes the cell and *then* resumes.
+// One resumption. The clause writes the cell and *then* resumes.
 test "one resumption" {
   with_cell[s](0) { c -> {
     let out = handle {
@@ -88,7 +88,7 @@ test "one resumption" {
   } }
 }
 
-// §3, "Two resumptions" — the case ADR 0017 says decides the design.
+// Two resumptions — the case that decides the design.
 test "two resumptions" {
   with_cell[trace](0) { c -> {
     let total = handle {
@@ -120,7 +120,7 @@ test "three resumptions" {
 }
 "#;
 
-/// §3's zero-resumption example.
+/// The zero-resumption example.
 #[test]
 fn zero_resumptions_keeps_the_clauses_writes_and_none_of_the_abandoned_ones() {
     let compiled = Compiled::new(WORKED);
@@ -132,7 +132,7 @@ fn zero_resumptions_keeps_the_clauses_writes_and_none_of_the_abandoned_ones() {
     );
 }
 
-/// §3's one-resumption example, written as the canonical cell-backed state handler rather than as
+/// The one-resumption example, written as the canonical cell-backed state handler rather than as
 /// `ask.get() resume k -> k(7)`.
 #[test]
 fn one_resumption_observes_the_write_the_clause_made_before_resuming() {
@@ -145,7 +145,7 @@ fn one_resumption_observes_the_write_the_clause_made_before_resuming() {
     );
 }
 
-/// §3's two-resumption example, run as written.
+/// The two-resumption example, run as written.
 #[test]
 fn two_resumptions_thread_one_world_rather_than_snapshotting_per_branch() {
     let compiled = Compiled::new(WORKED);
@@ -289,7 +289,7 @@ fn two_resumptions_across_a_region_boundary_still_thread_one_world() {
     );
 }
 
-/// The test that decides whether ADR 0017 §3 can be implemented at all.
+/// The test that decides whether the region-kind rule can be implemented at all.
 #[test]
 fn snapshot_at_capture_would_make_the_canonical_state_handler_unwritable() {
     let compiled = Compiled::new(WORKED);
@@ -301,7 +301,7 @@ fn snapshot_at_capture_would_make_the_canonical_state_handler_unwritable() {
     assert_eq!(compiled.ints_after("one resumption"), vec![5]);
 }
 
-/// ADR 0005 §3.3: a handler that *wants* per-branch state saves and restores around each
+/// per-resumption state, built by the handler: a handler that *wants* per-branch state saves and restores around each
 /// resumption, in four lines and in the handler where a reader can see it.
 #[test]
 fn a_handler_can_build_per_branch_state_on_top_of_threading() {
@@ -418,8 +418,8 @@ fn the_search_re_runs_each_interleaving_from_the_seed_rather_than_from_the_last_
     );
 }
 
-/// A second resumption *across* a `simulate` delimiter is refused, and this is where ADR 0017's two
-/// readings would have visibly parted company even under ADR 0005.
+/// A second resumption *across* a `simulate` delimiter is refused, and this is where the region model's two
+/// readings would have visibly parted company even under the control-stack design.
 #[test]
 fn a_second_resumption_across_a_simulate_delimiter_is_a_diagnostic() {
     let compiled = Compiled::new(

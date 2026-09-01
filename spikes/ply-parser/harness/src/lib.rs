@@ -292,7 +292,7 @@ impl<'a> Dumper<'a> {
     }
 
     /// The fallback expression is dumped like any other `Option`, and that is a change: it arrived
-    /// with ADR 0029 and nothing emitted it until `../GAPS.md` §11R.D moved this comparison to the
+    /// with default arguments and nothing emitted it until `../GAPS.md` §11R.D moved this comparison to the
     /// pre-rewrite tree.
     fn param(&mut self, p: &Param) {
         self.rec(p.span, "prm");

@@ -166,7 +166,7 @@ fn report_accept(
     code
 }
 
-/// What a reviewer should do with this definition, from the four rows of ADR 0007 §9.2's table that
+/// What a reviewer should do with this definition, from the four rows of the review table's table that
 /// are worth printing.
 fn advice(entry: &Reviewed) -> &'static str {
     if !entry.specified() {

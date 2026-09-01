@@ -1,4 +1,4 @@
-//! Adversarial audit of ADR 0008 §7 / ADR 0011 §3 — a host handler's continuation may be resumed at
+//! Adversarial audit of host linearity / the linearity counter — a host handler's continuation may be resumed at
 //! most once.
 
 use crate::fixture::Compiled;
@@ -231,7 +231,7 @@ test/nondet "twice over" {
     assert_eq!(run.sends, 2);
 }
 
-/// The hazard ADR 0011 §3 names, with the second resumption moved out of the clause entirely: the
+/// The hazard the linearity counter names, with the second resumption moved out of the clause entirely: the
 /// clause stores `k` in a cell, returns, and the *body* resumes it a second time long after the
 /// handler is gone.
 #[test]
@@ -370,7 +370,7 @@ test/nondet "replay over a token" {
     run.refused(codes::HOST_CONTINUATION_RESUMED);
 }
 
-/// The false positive ADR 0011 §3 accepts on purpose, pinned so it stays a decision rather than
+/// The false positive the linearity counter accepts on purpose, pinned so it stays a decision rather than
 /// becoming a discovery.
 #[test]
 fn a_send_in_the_clause_refuses_a_replay_that_would_repeat_nothing() {

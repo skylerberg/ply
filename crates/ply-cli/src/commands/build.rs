@@ -106,7 +106,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
         human(bytes.len() as u64),
         out.display(),
     );
-    // The ratio §5.1 decided against incremental transfer on.
+    // The ratio incremental transfer was decided against on.
     match binary_bytes() {
         Some(n) => println!(
             "{IND}{} ply {} · {}",

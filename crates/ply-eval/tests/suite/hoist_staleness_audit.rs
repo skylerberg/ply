@@ -28,7 +28,7 @@ fn int(value: Value) -> i64 {
 const PRELUDE: &str =
     "effect amb { read flip[coin]() -> Bool }\n\nfn go() -> Int =\n  with_cell[r](0) { c -> ";
 
-/// Two resumptions over one cell — ADR 0017 §3's deciding example, with the trace cell folded into
+/// Two resumptions over one cell — the region-kind rule's deciding example, with the trace cell folded into
 /// the answer so one integer carries both.
 const CAPTURING: &str = "{ let total = handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); if b { cell_get(c) } else { cell_get(c) * 10 } } with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x }; total + cell_get(c) * 1000 }";
 
@@ -98,7 +98,7 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
 
 /// The same question on a tail-resumptive region, which takes no pin.
 ///
-/// The staleness arm is vacuous since ADR 0034 §8 — `unique` is now the honest inference for this
+/// The staleness arm is vacuous since the tail-resumptive refinement — `unique` is now the honest inference for this
 /// shape, so injecting it injects the honest answer — and is kept as a regression guard: it reddens
 /// at the `Unique` assertion if the clause form goes back to forcing `shared`.
 #[test]
@@ -116,7 +116,7 @@ fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     assert_eq!(
         tail.machine().region_kind(span),
         Some(RegionKind::Unique),
-        "ADR 0034 §8: a tail-resumptive clause is not a capture that outlives its region"
+        "the tail-resumptive refinement: a tail-resumptive clause is not a capture that outlives its region"
     );
 
     let honest = int(tail.call("m.go"));
@@ -312,7 +312,7 @@ fn search() -> Int =
 "#;
 
 /// A callback builtin whose function argument the analysis cannot name is the second half of the
-/// same rule, and ADR 0017 §Consequences names it separately — "an escape the brand does not catch
+/// same rule, and the region model names it separately — "an escape the brand does not catch
 /// — through a closure, a constructor field, a Map key, a returned continuation, or a task".
 #[test]
 fn a_callback_builtin_over_a_local_makes_the_region_shared() {
@@ -421,7 +421,7 @@ fn a_local_shadowing_a_definitions_name_is_still_a_local() {
     }
 }
 
-/// The other half of the same defect, and the one ADR 0017 §3 states as a rule rather than as a
+/// The other half of the same defect, and the one the region-kind rule states as a rule rather than as a
 /// cost: `region_kind::check` must **refuse** a hand-written `unique` over a reachable capture.
 #[test]
 fn a_declared_unique_over_a_local_shadowing_a_definition_is_refused() {

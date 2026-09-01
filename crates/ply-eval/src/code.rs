@@ -38,7 +38,7 @@ pub enum NodeKind {
     Lambda {
         params: Rc<Vec<Symbol>>,
         body: Code,
-        /// The body's free variables, which is all a closure over it has to keep — ADR 0034 §4.
+        /// The body's free variables, which is all a closure over it has to keep — the slot rewrite.
         /// `None` means "capture the whole scope", as [`Clause::free`] does, so that an omitted set
         /// is the slow answer rather than a closure that captured nothing.
         /// Capturing the whole scope instead pins every other binding in it for the closure's life,
@@ -48,7 +48,7 @@ pub enum NodeKind {
     App {
         func: Code,
         args: Rc<Vec<Code>>,
-        /// Per argument, what the arguments to its right still read — ADR 0034 §11 S4's probe.
+        /// Per argument, what the arguments to its right still read — the sequence S4's probe.
         /// Empty unless the probe is armed, and then a shared empty `Rc`, so the shipped lowering
         /// allocates nothing for it and `carry` takes the branch it takes today.
         dead: Rc<Vec<crate::rc::Dead>>,
@@ -69,8 +69,8 @@ pub enum NodeKind {
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
         /// Per field, what the fields to its right still read — the same
-        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0034
-        /// §11 S4's probe covers. Empty unless the probe is armed.
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site the slot rewrite
+        /// the slot probe covers. Empty unless the probe is armed.
         dead: Rc<Vec<crate::rc::Dead>>,
     },
     Field {
@@ -150,7 +150,7 @@ pub struct Clause {
     pub resume: Option<Symbol>,
     pub body: Code,
     /// The body's free variables — what a clause needs from the scope its handler was installed in,
-    /// and nothing else. ADR 0034 §4.1: extending the whole prompt environment pins every binding in
+    /// and nothing else. what the machine has to become: extending the whole prompt environment pins every binding in
     /// it for the clause's life, and makes a flat slot index name the wrong thing.
     ///
     /// `None` means "do not narrow", which is what a hand-built `Clause` gets. An *empty* set means
@@ -505,10 +505,10 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
 }
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
-/// of — ADR 0034 §11 S4.
+/// of — the sequence S4.
 /// The empty per-argument dead set, shared rather than allocated per node.
 ///
-/// `App` and `Record` carry one of these on every lowering and it is empty unless the ADR 0034 §11
+/// `App` and `Record` carry one of these on every lowering and it is empty unless the the sequence
 /// S4 probe is armed, so allocating a fresh `Rc` per node put ~10 allocations on each `/health`
 /// request for a vector nothing reads.
 fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
@@ -717,7 +717,7 @@ fn lower_block(
     let entry = live.snapshot();
 
     // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
-    // ADR 0034 §8.1, which carries the case analysis for why this releases nothing still read.
+    // why releasing a parameter releases nothing still read, which carries the case analysis for why this releases nothing still read.
     // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
     // which are not in scope here.
     let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {

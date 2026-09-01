@@ -494,7 +494,7 @@ fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
     );
 }
 
-/// ADR 0011 §5: "Bisection and hybrids are skipped for a host-backed failure (`Skipped::Host`).
+/// Hermetic by default: "Bisection and hybrids are skipped for a host-backed failure (`Skipped::Host`).
 #[test]
 fn a_host_backed_failure_is_skipped_rather_than_attributed() {
     // v1: the test never reaches the host, passes hermetically, and its pass is recorded — which is

@@ -1,4 +1,4 @@
-//! ADR 0018 §1's kernel, and the claims the measurement rests on.
+//! The kernel re-pricing's kernel, and the claims the measurement rests on.
 
 use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_signature};
 use ply_codegen_spike::jit::Opts;
@@ -118,8 +118,8 @@ fn the_fragment_compiles_the_position_arithmetic_and_the_playout() {
     }
 }
 
-/// Every function that reads the tree is now **inside** the fragment, and this is the list ADR 0018
-/// §0's ranked census was a census of.
+/// Every function that reads the tree is now **inside** the fragment, and this is the list the compute-kernel record
+/// the ranked refusal census was a census of.
 #[test]
 fn every_function_that_touches_the_tree_is_inside_the_fragment() {
     let loaded = loaded();
@@ -392,7 +392,7 @@ fn a_runaway_recursion_is_the_machines_diagnostic_and_not_a_crash() {
     }
 }
 
-/// ADR 0018 §2 wants `Int`, `Bool` **and `Float`** unboxed.
+/// The unboxing lever wants `Int`, `Bool` **and `Float`** unboxed.
 #[test]
 fn the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time() {
     let dir = std::env::temp_dir().join(format!("ply-float-probe-{}", std::process::id()));

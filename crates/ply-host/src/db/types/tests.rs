@@ -89,7 +89,7 @@ fn a_parameter_outside_the_mapping_names_the_type_it_was_going_to_be_sent_as() {
     refused(Param::Int(0), Type::INTERVAL);
 }
 
-/// §4.2's table maps `Float` to `float8` as a **parameter** and to `float4` or `float8` only as a
+/// The type mapping maps `Float` to `float8` as a **parameter** and to `float4` or `float8` only as a
 /// *result*, so a `float4` parameter is outside the mapping.
 #[test]
 fn a_float4_parameter_is_refused_rather_than_narrowed() {

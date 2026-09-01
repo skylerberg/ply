@@ -44,7 +44,7 @@ effect state {
 }
 "#;
 
-/// **ADR 0005 §3.1's canonical state handler, in the general clause form.**
+/// **the canonical state handler's canonical state handler, in the general clause form.**
 #[test]
 fn a_general_clause_write_is_visible_to_the_computation_it_resumes() {
     holds(&format!(
@@ -85,7 +85,7 @@ test "a tail-resumptive put is seen by the following get" {{
     ));
 }
 
-/// **ADR 0005 §3.2's "resumes twice", which ADR 0017 §3 as amended requires the same answer for.**
+/// **the two-resumption example's "resumes twice", which the region-kind rule as amended requires the same answer for.**
 #[test]
 fn two_resumptions_thread_one_state_rather_than_branching_it() {
     holds(
@@ -110,7 +110,7 @@ test "the second resumption starts from the first one's writes" {
     );
 }
 
-/// **The same discriminator with `handle` and `with_cell` swapped**, which is the shape ADR 0017 §3
+/// **The same discriminator with `handle` and `with_cell` swapped**, which is the shape the region-kind rule
 /// writes its two-resumption example in.
 #[test]
 fn two_resumptions_thread_one_region_the_enclosing_handler_answers_for() {
@@ -135,7 +135,7 @@ test "the region under an enclosing handler is written by both resumptions" {
     );
 }
 
-/// Per-resumption state is what a handler *builds*, not what the machine imposes — ADR 0005 §3.3.
+/// Per-resumption state is what a handler *builds*, not what the machine imposes — per-resumption state, built by the handler.
 #[test]
 fn a_handler_builds_per_branch_state_out_of_threaded_state() {
     holds(
@@ -165,7 +165,8 @@ test "save and restore around each resumption gives both branches one start" {
     );
 }
 
-/// **ADR 0005 required test 6, which ADR 0017 §2 turns into a compile error.**
+/// **The escape case — a continuation resumed after the region that made its cell
+/// returned — which the brand turns into a compile error.**
 #[test]
 fn a_continuation_outliving_its_region_still_reads_that_regions_cell() {
     holds(

@@ -105,8 +105,8 @@ fn the_ply_blake3_agrees_with_the_crate_at_every_structural_boundary() {
     }
     assert!(
         disagreed.is_empty(),
-        "ADR 0033 §3's threshold T1 is zero disagreements, and this is {} of them.\n\
-         A disagreement here refutes the ADR's decision to write the hash in Ply \
+        "the hash written in Ply's threshold T1 is zero disagreements, and this is {} of them.\n\
+         A disagreement here refutes the decision to write the hash in Ply \
          rather than the code that failed: the follow-up it names in advance is a \
          `bytes_blake3` builtin, with this module kept as the readable definition \
          and this test kept as what holds the two together.\n\n{}",

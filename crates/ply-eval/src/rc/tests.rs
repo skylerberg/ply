@@ -212,7 +212,7 @@ fn a_last_use_the_scope_alone_can_see_is_moved_rather_than_cloned() {
     );
 }
 
-/// The case ADR 0017 §3 says decides the design, asked of reference counting rather than of the
+/// The case the region-kind rule says decides the design, asked of reference counting rather than of the
 /// world: a resumption may not observe what an earlier one wrote.
 #[test]
 fn a_list_reachable_from_several_resumptions_is_copied_by_all_but_the_last() {

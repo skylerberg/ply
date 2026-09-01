@@ -272,7 +272,7 @@ fn a_backend_is_never_offered_a_definition_that_performs() {
 
 // --- The result-cache rule --------------------------------------------------
 
-/// ADR 0026 §4.6, both stages, on the path where neither is an accident.
+/// The cache rule, both stages, on the path where neither is an accident.
 #[test]
 fn a_backend_run_reads_no_cached_pass() {
     let dir = project(CORPUS);
@@ -609,14 +609,14 @@ test "a runaway" { assert_eq(spin(0), 0) }
     assert!(
         arm(dir.path(), "wrong:exceeds-budget", Duration::from_secs(10)).is_none(),
         "`reference`'s unbounded runaway now terminates. That is a change in `Reference` and \
-         it makes ADR 0026 §4.7's account of why this configuration lived nowhere obsolete — \
+         it makes the backend authorisation's account of why this configuration lived nowhere obsolete — \
          update that section rather than this assertion"
     );
 }
 
 // --- The result-cache rule, over the code generator --------------------------
 
-/// ADR 0026 §4.6 again, on the backend that arrived after it was written.
+/// The cache rule again, on the backend that arrived after it was written.
 #[test]
 fn a_code_generator_run_reads_no_cached_pass() {
     let dir = project(CORPUS);

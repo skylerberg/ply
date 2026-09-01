@@ -1,4 +1,4 @@
-//! Every slot the resolver assigns names the variable it was resolved from — ADR 0034 §4.
+//! Every slot the resolver assigns names the variable it was resolved from — the slot rewrite.
 //!
 //! The runtime still answers every lookup by name, so a wrong slot costs nothing today. It would
 //! cost a wrong value the moment the machine reads by index, and that is a change no test can be
@@ -326,7 +326,7 @@ fn every_resolved_slot_names_its_own_variable() {
     );
 }
 
-/// How often the machine carries a scope, against how often it captures one — ADR 0034 §4.
+/// How often the machine carries a scope, against how often it captures one — the slot rewrite.
 ///
 /// The rewrite trades these against each other. A persistent chain makes capture cheap, because a
 /// continuation shares a pointer; a slot stack makes carrying cheap, because the frame records a
@@ -386,7 +386,7 @@ fn the_corpus_carries_far_more_often_than_it_captures() {
     );
 }
 
-/// The append counter measures what was copied, not only whether anything was — ADR 0034 §5.
+/// The append counter measures what was copied, not only whether anything was — the bounded worst case.
 ///
 /// `updates_in_place` answers "did this append copy the whole list", which is the right question
 /// only while a copy is all-or-nothing. A chunked representation copies a path instead of an array,
