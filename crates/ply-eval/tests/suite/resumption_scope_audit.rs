@@ -1,11 +1,11 @@
 //! What a resumption sees in its **scope**, as against what it sees in the world.
 //!
-//! `resumption_semantics_audit` covers the world: cells thread across resumptions, threaded resumption, and
-//! every test there asserts what a cell holds. Nothing asserts the other half — that a resumption
+//! `resumption_semantics_audit` covers the world: cells thread across resumptions, which is ADR
+//! 0005's rule, and every test there asserts what a cell holds. Nothing asserts the other half — that a resumption
 //! re-enters with the *bindings* it captured — because a persistent `Env` gives that for free. A
 //! continuation holds an immutable chain, so there is no way to get it wrong and nothing to test.
 //!
-//! what the machine has to become removes that guarantee. A machine-owned slot stack reuses indices across
+//! ADR 0034's slot frames remove that guarantee. A machine-owned slot stack reuses indices across
 //! activations and empties a slot at a last use, so "the scope a resumption re-enters with" becomes
 //! a thing an implementation can be wrong about, silently. These are the programs that would notice.
 //!
@@ -52,7 +52,7 @@ effect amb {
 }
 
 // `big` is read once, after the `perform`, so its read is the last use of the binding and
-// what the machine has to become step 3 would move the value out of its slot. The second resumption re-enters at the
+// ADR 0034's step 3 would move the value out of its slot. The second resumption re-enters at the
 // same point and reads it again: a slot emptied by the first resumption is empty for the second.
 test "a binding whose last use follows the capture" {
   let big = [1, 2, 3];
@@ -69,7 +69,7 @@ test "a binding whose last use follows the capture" {
 
 /// A last use inside a captured extent is not a last use, because the extent can run twice.
 ///
-/// This is the sharpest test of what the machine has to become step 3 and it is the one most likely to be got wrong:
+/// This is the sharpest test of ADR 0034's step 3, and the one most likely to be got wrong:
 /// `Own::Owned` says "nothing after this point reads the binding", which is true of the *code* and
 /// false of the *execution* once a continuation is resumed more than once. On the chain it is safe
 /// for a reason that disappears with the chain — `take_unique` refuses at a shared link, and a
@@ -87,7 +87,7 @@ fn a_binding_whose_last_use_follows_the_capture_survives_a_second_resumption() {
          This pin exists because the program's own `assert_eq` cannot arm itself on the chain — a \
          continuation holds an immutable copy and nothing can empty it, so the assertion passes \
          whatever the implementation does. The count is the mechanism, and it is a tripwire rather \
-         than a proof: if it moves under what the machine has to become, find out *which* binding started moving \
+         than a proof: if it moves under ADR 0034's slot frames, find out *which* binding started moving \
          before deciding the change is right, because a last use inside a captured extent is not a \
          last use"
     );
@@ -134,7 +134,7 @@ effect amb {
   read flip[coin]() -> Bool
 }
 
-// The two halves of threaded resumption in one program: `base` is a *binding* and must read the same on
+// The two halves of ADR 0005's rule in one program: `base` is a *binding* and must read the same on
 // both resumptions, while the cell is *state* and must accumulate across them. An implementation
 // that restores too much fails the cell assertion; one that restores too little fails the sum.
 test "a binding is restored while a cell threads" {
@@ -158,7 +158,7 @@ test "a binding is restored while a cell threads" {
 ///
 /// `base + cell` is 101 on the first resumption and 102 on the second: the binding is the same both
 /// times and the cell is not. Restoring the cell along with the scope gives 202 and reddens the
-/// second assertion; restoring neither gives a wrong sum. Only the split threaded resumption describes
+/// second assertion; restoring neither gives a wrong sum. Only the split ADR 0005 describes
 /// passes both, which is what makes this the test to run first.
 #[test]
 fn a_binding_is_restored_while_a_cell_threads() {
