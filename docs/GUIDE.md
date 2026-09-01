@@ -1039,7 +1039,7 @@ because the literal is not last in the call.
 `push` site and names the edit.
 
 > This subsection is scheduled for **deletion, not further correction**.
-> `docs/adr/0033-perceus-over-slots.md` argues the rule is an artifact of the
+> `docs/adr/0034-perceus-over-slots.md` argues the rule is an artifact of the
 > evaluator's environment representation rather than a property of the language,
 > and deletes these paragraphs when its gate goes green.
 > `crates/ply-eval/tests/suite/position_invariance_g1.rs` is the gate.

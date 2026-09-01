@@ -49,7 +49,7 @@ pub enum Frame {
 
     AppCallee {
         args: Rc<Vec<Code>>,
-        /// Per argument, what it is the last reader of. Empty unless ADR 0033
+        /// Per argument, what it is the last reader of. Empty unless ADR 0034
         /// §11 S4's probe is armed — see [`crate::code::NodeKind::App`].
         dead: Rc<Vec<crate::rc::Dead>>,
         env: Env,

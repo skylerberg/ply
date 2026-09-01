@@ -79,7 +79,7 @@ fn check_types_prints_signatures_and_footprints() {
     assert!(text.contains("effect db"));
 }
 
-/// `--costs` — ADR 0025 §Decision 2a, built at ADR 0033 §11 S2.
+/// `--costs` — ADR 0025 §Decision 2a, built at ADR 0034 §11 S2.
 #[test]
 fn check_costs_separates_two_spellings_of_one_computation() {
     let dir = project(

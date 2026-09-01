@@ -43,7 +43,7 @@ pub enum NodeKind {
         func: Code,
         args: Rc<Vec<Code>>,
         /// Per argument, the bindings that argument is the **last reader** of —
-        /// ADR 0033 §11 S4's probe. Empty everywhere unless the probe is armed,
+        /// ADR 0034 §11 S4's probe. Empty everywhere unless the probe is armed,
         /// so the shipped lowering allocates one empty `Rc` per `App` and the
         /// machine's `carry` takes exactly the branch it takes today.
         dead: Rc<Vec<crate::rc::Dead>>,
@@ -64,7 +64,7 @@ pub enum NodeKind {
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
         /// Per field, what that field's value is the last reader of — the same
-        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0033
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0034
         /// §11 S4's probe covers. Empty unless the probe is armed.
         dead: Rc<Vec<crate::rc::Dead>>,
     },
@@ -489,10 +489,10 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
 }
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
-/// of — ADR 0033 §11 S4.
+/// of — ADR 0034 §11 S4.
 /// The empty per-argument dead set, shared rather than allocated per node.
 ///
-/// `App` and `Record` carry one of these on every lowering and it is empty unless the ADR 0033 §11
+/// `App` and `Record` carry one of these on every lowering and it is empty unless the ADR 0034 §11
 /// S4 probe is armed, so allocating a fresh `Rc` per node put ~10 allocations on each `/health`
 /// request for a vector nothing reads.
 fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
@@ -602,7 +602,7 @@ fn lower_block(
     let entry = live.snapshot();
 
     // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
-    // ADR 0033 §8.1, which carries the case analysis for why this releases nothing still read.
+    // ADR 0034 §8.1, which carries the case analysis for why this releases nothing still read.
     // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
     // which are not in scope here.
     let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {

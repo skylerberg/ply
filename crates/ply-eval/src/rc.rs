@@ -18,7 +18,7 @@ pub enum Own {
     Owned,
 }
 
-/// Whether ADR 0033 §11 S4's probe is armed, read once per process. Off by default: it is a probe
+/// Whether ADR 0034 §11 S4's probe is armed, read once per process. Off by default: it is a probe
 /// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
 /// do not arm it in anything being timed.
 pub fn probe_armed() -> bool {
@@ -277,7 +277,7 @@ impl Live {
         }
     }
 
-    /// The current barrier's parameters — ADR 0033 §11 S3 / ADR 0025 P2.
+    /// The current barrier's parameters — ADR 0034 §11 S3 / ADR 0025 P2.
     pub fn barrier_params(&self) -> &[Symbol] {
         match (self.ownable.last(), self.params.last()) {
             (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
@@ -322,7 +322,7 @@ impl Live {
     }
 
     /// Whether this name is a binding of the current barrier — [`Live::tracked`]
-    /// in public form, for the ADR 0033 §11 S4 probe, which may only release a
+    /// in public form, for the ADR 0034 §11 S4 probe, which may only release a
     /// name whose last use this body can bound.
     pub fn is_ownable(&self, name: &Symbol) -> bool {
         self.tracked(name)
