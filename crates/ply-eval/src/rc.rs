@@ -244,6 +244,16 @@ pub struct Live {
     /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
     /// holding every name bound anywhere inside it.
     ownable: Vec<Vec<Symbol>>,
+    /// How many leading names of each `ownable` frame are that barrier's own
+    /// **parameters**, which [`Live::barrier_params`] hands back.
+    ///
+    /// A parameter is the one kind of ownable name in scope for the whole of a
+    /// barrier's body, so it is the only one a block can safely consider dead
+    /// at one of its statements without knowing where the name was bound.
+    /// `ownable` holds every name bound *anywhere* inside the barrier, nested
+    /// blocks and match arms included, and a name from a sibling scope is not
+    /// in scope at this block at all.
+    params: Vec<usize>,
 }
 
 impl Live {
@@ -251,6 +261,23 @@ impl Live {
         Live {
             later: Vec::new(),
             ownable: vec![ownable],
+            params: vec![0],
+        }
+    }
+
+    /// The current barrier's parameters — ADR 0032 §11 S3 / ADR 0025 P2.
+    pub fn barrier_params(&self) -> &[Symbol] {
+        match (self.ownable.last(), self.params.last()) {
+            (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
+            _ => &[],
+        }
+    }
+
+    /// Declares that the first `count` names of the current barrier's frame are
+    /// its parameters. Called once, immediately after the frame is opened.
+    pub fn params_are(&mut self, count: usize) {
+        if let Some(last) = self.params.last_mut() {
+            *last = count;
         }
     }
 
@@ -324,6 +351,7 @@ impl Live {
     /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
     pub fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
         self.ownable.push(bound);
+        self.params.push(0);
         std::mem::take(&mut self.later)
     }
 
@@ -331,6 +359,7 @@ impl Live {
     pub fn close(&mut self, outer: Vec<Symbol>) {
         let free = std::mem::replace(&mut self.later, outer);
         self.ownable.pop();
+        self.params.pop();
         for name in free {
             if !self.is_live(&name) {
                 self.later.push(name);
