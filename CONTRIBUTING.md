@@ -51,7 +51,7 @@ variant matched in every `match` and produced by nothing. A mitigation described
 in an ADR with no code path that reaches it. Each reads, at every point a
 reviewer would check, exactly like a mechanism that works.
 
-`crates/ply-span/tests/armed.rs` is what now catches it. It walks production
+`crates/ply-span-tests/tests/armed.rs` is what now catches it. It walks production
 source — `#[cfg(test)]` items blanked — and fails when a registered code or a
 covered enum variant is never constructed outside tests. Something genuinely
 reserved goes in `UNARMED_CODES` or `UNARMED_VARIANTS` **with a reason and a
@@ -78,9 +78,16 @@ The inner loop is fast; use it.
 
 ```
 cargo build --workspace                         # seconds warm
-cargo nextest run -p <crate>                    # seconds
+cargo nextest run -p <crate> -p <crate>-tests   # seconds
 ./target/debug/ply test examples/               # under a second
 ```
+
+A crate's integration suite is a package of its own, `crates/<crate>-tests`, so
+that it compiles at `opt-level = 0` while the crate stays at 2; the root
+manifest says why. Select the pair: cargo hands a package's binaries only to
+that package's own tests, and a test that looks for one beside itself skips
+when it is missing. `ply-cli` keeps its suite in-package for exactly that
+reason. Unit tests stay in `src/`.
 
 The outer loop, run before you call anything done:
 
@@ -491,7 +498,7 @@ raises it, and the test that proves the raise.** If you cannot, write "not
 enforced" instead.
 
 For a diagnostic code and for a variant of a covered enum, that test is now
-mechanical: `crates/ply-span/tests/armed.rs` fails if nothing in production
+mechanical: `crates/ply-span-tests/tests/armed.rs` fails if nothing in production
 constructs it. It does not decide reachability — see §"The shape it keeps
 taking" for what it reaches and what it does not — so for anything shaped like
 W1's footprint check, the paragraph above still stands on its own.
@@ -570,7 +577,7 @@ reader finding an ambiguous reference months later.
 > picked the same number before either pull request existed. Advice that assumes
 > a contributor can see the other contributor's work is not advice this
 > repository can follow. `no_two_adrs_share_a_number` in
-> `crates/ply-span/tests/armed.rs` is what catches the collision now.
+> `crates/ply-span-tests/tests/armed.rs` is what catches the collision now.
 
 A record superseded in part says so in its own opening, and the record that
 supersedes it says which part. ADR 0005 is the model: its opening says the
@@ -607,7 +614,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
 | `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today, on the default toolchain since the move to cranelift 0.132.3 (this used to read `cargo +1.94.0 test --release`): `cd crates/ply-codegen-spike && cargo test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
-| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 is the worked example |
+| how a `Value` is built or shared | `crates/ply-corpus-tests/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
@@ -689,7 +696,7 @@ original ones and the gaps are where closures used to be.
     registered, raised nowhere. Consequence is small and worth knowing — a
     consumer reading `Assertion::kind` to tell a runaway recursion from a failed
     `assert_eq` cannot, and the four tests that do tell them apart
-    (`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test/tests/suite/hybrid.rs`,
+    (`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test-tests/tests/suite/hybrid.rs`,
     `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) all match the rendered
     string instead. `limit.rs`'s doc is corrected in place; the code gap is
     **not** fixed, because deciding whether the fix is to construct the variant
@@ -700,7 +707,7 @@ original ones and the gaps are where closures used to be.
     disposition call has not been made; what changed is that the gap can no
     longer quietly close by being forgotten. All six unbuilt variants — `Bool`,
     `Panic`, `Runtime`, `UnhandledEffect`, `RecursionLimit`, `Deadlock` — are
-    rows in `UNARMED_VARIANTS` in `crates/ply-span/tests/armed.rs`, and
+    rows in `UNARMED_VARIANTS` in `crates/ply-span-tests/tests/armed.rs`, and
     `no_allowlist_entry_has_outlived_its_reason` fails the moment one of them is
     constructed or removed, so this item cannot go stale in silence. The line
     numbers above have drifted with the file: `AssertionKind` is declared at
@@ -712,7 +719,7 @@ original ones and the gaps are where closures used to be.
     slice is the fifth "declared, registered, raised nowhere" this file records;
     §"The shape it keeps taking" counts them.
     `ply_test::SliceBuilder` is constructed in exactly one place in the
-    workspace — `crates/ply-test/tests/suite/bisect_audit.rs`, four times, all tests —
+    workspace — `crates/ply-test-tests/tests/suite/bisect_audit.rs`, four times, all tests —
     and `grep -rn 'Event::Perform' --include=*.rs` matches only `slice.rs`'s own
     `match` arm and its own unit test. `Attribution::slice` starts `None`
     (`ply-test/src/lib.rs:305`) and its only writer is
@@ -752,7 +759,7 @@ original ones and the gaps are where closures used to be.
 
     **Held open by a test since 2026-08-27, and still not fixed.**
     `Event::Enter`, `Event::Return` and `Event::Perform` are rows in
-    `UNARMED_VARIANTS` in `crates/ply-span/tests/armed.rs`, reached by
+    `UNARMED_VARIANTS` in `crates/ply-span-tests/tests/armed.rs`, reached by
     `every_variant_of_a_covered_enum_is_constructed_in_production`. The type
     with no producer is caught only through its variants: there is no general
     "public constructor called only from tests" rule, because for a library

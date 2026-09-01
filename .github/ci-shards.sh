@@ -82,16 +82,27 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # in ~4.4s -- and the cranelift packages behind it are a build `ply-cli` pays
 # anyway.
 #
+# A crate's integration suite is a package of its own, `<crate>-tests`, so that
+# it compiles at `opt-level = 0` while the crate stays at 2 (the root manifest
+# says why). It sits in the same shard as its crate, and `verify` insists on
+# that, so that a suite is never green on a runner that never built the crate's
+# binaries. Tests that run one stay in the crate: cargo builds a package's
+# binaries only for that package's own integration tests, so `ply-cli` keeps
+# its whole suite, thirty files of which drive `ply`, and `ply-corpus` keeps
+# `tests/w6_alloc_sites.rs`, which runs `w6-alloc` from beside itself and skips
+# itself, passing, when it is not there — watched to do exactly that when the
+# file was moved with the rest.
+#
 # **This table's own gate caught an omission once.** Adding `ply-codegen`
 # without adding it here failed `ci-shards.sh verify` with *"workspace member
 # 'ply-codegen' is in no shard, so CI never tests it"* -- which is the failure
 # this file exists to produce, observed rather than assumed.
 SHARDS=(
-  "corpus:ply-corpus"
-  "cli:ply-cli ply-codegen"
-  "eval:ply-eval"
-  "light:ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
-  "postgres:ply-host"
+  "corpus:ply-corpus ply-corpus-tests"
+  "cli:ply-cli ply-codegen ply-codegen-tests"
+  "eval:ply-eval ply-eval-tests"
+  "light:ply-span ply-span-tests ply-syntax ply-derive ply-derive-tests ply-core ply-core-tests ply-hash ply-hash-tests ply-store ply-store-tests ply-test ply-test-tests ply-prove ply-std"
+  "postgres:ply-host ply-host-tests"
 )
 
 # The shard the postgres job owns. It is not in the parallel matrix.
@@ -116,7 +127,7 @@ POSTGRES_SHARD=postgres
 #
 # The reproduction was done on 2026-08-28 and the condition came back NOT
 # satisfied, so the entry is narrowed rather than deleted. Seven of the eight
-# configurations moved: five into crates/ply-eval/tests/suite/differential_corpus.rs
+# configurations moved: five into crates/ply-eval-tests/tests/suite/differential_corpus.rs
 # over ply_eval::backend::Reference at corpus scale, exceeds-budget=4 through
 # `ply test --backend` in crates/ply-cli/tests/suite/backend.rs, and answers= on the
 # offer count of zero that is its whole point. The eighth does not move, for a
@@ -185,13 +196,13 @@ declare -a KNOWN_OUTSIDE=(
 # measurement and asserts the remainder is positive, so contention does not slow it down, it
 # makes the answer negative.
 DEFERRED=(
-  "ply-eval:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
-  "ply-eval:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
-  "ply-eval:suite:simulation::a_long_sleep_is_a_jump"
-  "ply-test:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
-  "ply-test:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
-  "ply-test:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
-  "ply-test:suite:region_fixture_cost::a_group_with_no_fixture_opens_and_closes_in_constant_time"
+  "ply-eval-tests:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
+  "ply-eval-tests:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
+  "ply-eval-tests:suite:simulation::a_long_sleep_is_a_jump"
+  "ply-test-tests:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
+  "ply-test-tests:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
+  "ply-test-tests:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
+  "ply-test-tests:suite:region_fixture_cost::a_group_with_no_fixture_opens_and_closes_in_constant_time"
   "ply-corpus:lib:measure::tests::every_resumption_costs_about_what_the_first_one_did"
   "ply-corpus:lib:measure::tests::capture_and_resume_are_flat_in_the_frames_they_move"
   "ply-corpus:lib:measure::tests::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
@@ -216,7 +227,7 @@ DEFERRED=(
 # so renaming one, deleting it, or filtering it away turns CI red instead of
 # quietly reducing what CI checks.
 #
-# All seven are in `crates/ply-span/tests/armed.rs`. Six of them are one defect:
+# All seven are in `crates/ply-span-tests/tests/armed.rs`. Six of them are one defect:
 # a mechanism declared and registered everywhere a reader would look for it and
 # constructed nowhere. CONTRIBUTING.md s"The shape it keeps taking: declared,
 # registered, raised nowhere" has the catalogue; that file's header has the rule
@@ -229,13 +240,13 @@ DEFERRED=(
 # running reports nothing. This comment said "all six" for two commits after it
 # landed, which is the staleness this table exists to make expensive.
 TREE_CHECKS=(
-  "ply-span:armed:every_registered_code_is_constructed_in_production"
-  "ply-span:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
-  "ply-span:armed:every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-span:armed:the_code_registry_table_is_total_over_the_codes_module"
-  "ply-span:armed:no_allowlist_entry_has_outlived_its_reason"
-  "ply-span:armed:ambiguous_enum_names_are_declared"
-  "ply-span:armed:no_two_adrs_share_a_number"
+  "ply-span-tests:armed:every_registered_code_is_constructed_in_production"
+  "ply-span-tests:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
+  "ply-span-tests:armed:every_diagnostic_constructor_call_names_its_code_literally"
+  "ply-span-tests:armed:the_code_registry_table_is_total_over_the_codes_module"
+  "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
+  "ply-span-tests:armed:ambiguous_enum_names_are_declared"
+  "ply-span-tests:armed:no_two_adrs_share_a_number"
 )
 
 # Directories under `spikes/`, and the CI job that runs each.
@@ -415,6 +426,23 @@ cmd_verify() {
       echo "FAIL: a shard names '$package', which is not a workspace member" >&2
       failures=$((failures + 1))
     fi
+  done
+  for member in "${all_members[@]}"; do
+    [[ $member == *-tests ]] || continue
+    if [[ -d "$root/crates/$member/src" ]]; then
+      echo "FAIL: crates/$member has a src/, and a '-tests' package is tests only: it is what the opt-level override in Cargo.toml applies to" >&2
+      failures=$((failures + 1))
+    fi
+    if ! grep -q "^\[profile.dev.package.$member\]" "$root/Cargo.toml"; then
+      echo "FAIL: Cargo.toml has no [profile.dev.package.$member] override, so its suite compiles at the library's opt-level" >&2
+      failures=$((failures + 1))
+    fi
+    for entry in "${SHARDS[@]}"; do
+      if [[ " ${entry#*:} " == *" $member "* && " ${entry#*:} " != *" ${member%-tests} "* ]]; then
+        echo "FAIL: '$member' is in shard '${entry%%:*}' without '${member%-tests}', so its tests run without that crate's binaries beside them and any that look for one skip themselves" >&2
+        failures=$((failures + 1))
+      fi
+    done
   done
 
   for entry in ${KNOWN_OUTSIDE[@]+"${KNOWN_OUTSIDE[@]}"}; do

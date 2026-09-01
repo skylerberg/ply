@@ -188,7 +188,7 @@ is what actually holds. Asserting the test count does not substitute — a gated
 test returns early and passes, so the count is right with nothing behind it.
 ### Some tests assert on a wall clock and run by default
 
-`ply-eval/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+`ply-eval-tests/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a timing growth ratio and is **not** in the `ignored` set. It passes
 on a quiet machine and has been seen to fail on one busy compiling something
 else. **If it is your only failure, re-run before you believe it.**
@@ -421,7 +421,7 @@ and `crates/ply-cli/src/artifact.rs:253` and `crates/ply-cli/src/db.rs:539` are
 comments describing the check as future work. (The two `ply-span` numbers were
 `:414` and `:787` until 2026-08-27, when the `codes` module grew a doc comment;
 the finding is unchanged. This passage is now also a *test*: see
-`crates/ply-span/tests/armed.rs` and `CONTRIBUTING.md` §"The shape it keeps
+`crates/ply-span-tests/tests/armed.rs` and `CONTRIBUTING.md` §"The shape it keeps
 taking".)
 `--db-schema` resolves the name, checks it is a nullary function returning a
 `Schema`, evaluates it, and reads its table and column counts; **it never opens
@@ -623,17 +623,17 @@ absent, and CI forces each open:
   nothing builds. It has bit-rotted twice with nothing to say so.
 
 **And one check that is not a gate in that sense.** The tree checks in
-`crates/ply-span/tests/armed.rs` run a second time by name, so that a rename or
+`crates/ply-span-tests/tests/armed.rs` run a second time by name, so that a rename or
 a stray filter turns CI red rather than quietly reducing what CI checks. A test
 that stops running reports nothing, and reporting nothing is indistinguishable
 from passing — which is the failure this whole section is organised around.
 ### Exactly one test reads a prose document
 
-`crates/ply-corpus/tests/allocation/w6_report_allocations.rs`'s
+`crates/ply-corpus-tests/tests/allocation/w6_report_allocations.rs`'s
 `the_readme_still_describes_this_request_path` reads `README.md`'s *"One
 `/health` request makes N allocations and M bytes"* and compares both numbers
 against a freshly counted window, within 1%. Run it with
-`cargo test -p ply-corpus --test allocation -- w6_report_allocations --nocapture` and it
+`cargo test -p ply-corpus-tests --test allocation -- w6_report_allocations --nocapture` and it
 prints both sides. The count does not vary with the build profile.
 
 Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
