@@ -1,10 +1,17 @@
-//! Whether an append copies, decided before the program runs — the ownership design.
+//! Whether an append copies, decided before the program runs.
+//!
+//! Since ADR 0034 the machine moves a binding's value out of its slot at its last use, so the
+//! positional rule this checker once transcribed no longer exists: nothing is decided by where an
+//! expression sits in its enclosing call or literal. What is left — and what this reports — is the
+//! *residue*: the copies the semantics require, because something else genuinely owns the value
+//! when the append runs. A cell's arena, a map, a closure's capture, a caller that keeps reading
+//! what it passed, a binding read again later.
 
 use crate::builtins::Builtin;
 use crate::code::{self, Code, NodeKind, Stmt};
 use crate::rc::Own;
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::{BinOp, Item, Pattern, PatternKind, Program, QName};
+use ply_syntax::ast::{Item, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -29,14 +36,13 @@ impl Verdict {
 /// Why a site is not `Reuses`, in the form a diagnostic can dispatch on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum Cause {
-    /// The scope binding the list is still held by an enclosing frame, because the append is not in
-    /// the last position of every node above it.
-    Position,
+    /// The binding is read again after this use, so this use clones the value.
+    ReadAgain,
     /// The list came out of a cell, whose region arena holds it for the whole of the append.
     Cell,
     /// The list came out of a map, which still holds it.
     MapEntry,
-    /// A closure written in the same call captured the scope that still holds the list.
+    /// A closure captured the binding, and holds its own copy of the value.
     Capture,
     /// The list is a parameter and a caller keeps what it passes.
     CallerKeeps,
@@ -48,39 +54,30 @@ pub enum Cause {
     Call,
     /// The value a handler, a `handle` or a `simulate` answered.
     Handler,
-    /// A free variable of a closure, where whether the closure is still held is not a property of
-    /// this body.
+    /// A free variable of a closure, where whether the closure's copy is still held when the
+    /// append runs is not a property of this body.
     Closure,
-    /// A binding chain the analysis could not follow.
-    Chain,
 }
 
 impl Cause {
     /// The source edit that removes the copy, or `None` where no edit does.
     pub fn fix(self) -> Option<&'static str> {
         match self {
-            Cause::Position => Some(
-                "move the append into last position at every enclosing node, or bind it \
-                 to a `let` in the statement that is its last reader",
+            Cause::ReadAgain => Some(
+                "make the append the binding's last use: bind whatever you still need out of it \
+                 first",
             ),
             Cause::Cell => Some("`cell_update`"),
             Cause::MapEntry => Some("`map_update`"),
-            Cause::Capture => {
-                Some("bind the list before the call, or move the closure out of the argument list")
-            }
+            Cause::Capture => Some("bind the list before the closure captures it, or capture less"),
             Cause::CallerKeeps => Some("the edit is at the call site: the caller keeps the list"),
-            Cause::Element
-            | Cause::Program
-            | Cause::Call
-            | Cause::Handler
-            | Cause::Closure
-            | Cause::Chain => None,
+            Cause::Element | Cause::Program | Cause::Call | Cause::Handler | Cause::Closure => None,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Cause::Position => "position",
+            Cause::ReadAgain => "read-again",
             Cause::Cell => "cell",
             Cause::MapEntry => "map",
             Cause::Capture => "capture",
@@ -90,7 +87,6 @@ impl Cause {
             Cause::Call => "call",
             Cause::Handler => "handler",
             Cause::Closure => "closure",
-            Cause::Chain => "chain",
         }
     }
 }
@@ -128,9 +124,8 @@ pub struct Site {
     pub reason: String,
     /// `None` at a [`Verdict::Reuses`] site, which has no cause to name.
     pub cause: Option<Cause>,
-    /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the property
-    /// The ownership design proposed to assert on, recorded here so that proposal can be measured
-    /// rather than argued.
+    /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the machine's
+    /// own move decision, recorded so the checker can be judged against it.
     pub own_marked: bool,
 }
 
@@ -199,8 +194,7 @@ impl Report {
     }
 }
 
-/// Where a value's other owners are, expressed against the scope chain so the positional question
-/// can be asked again later at a different frontier.
+/// Who owns a value besides the place it is standing.
 #[derive(Clone, Debug)]
 enum Owner {
     /// Nothing else can reach it.
@@ -208,28 +202,32 @@ enum Owner {
     /// This definition's `k`th parameter, which is sole-owned exactly when every caller hands one
     /// over and stops reading it.
     Param(usize),
-    /// A clone was taken from the chain binding at this index, which therefore still holds it — and
-    /// so does whatever *that* binding holds.
-    Held(usize),
-    /// Provably held by something the drop cannot reach.
+    /// Provably held by something else when it is used.
     Blocked(Why),
     /// Not decidable from this body.
     Unknown(Why),
 }
 
-/// [`Owner`] with the positional question answered.
-#[derive(Clone, Debug)]
+/// [`Owner`], settled for a site or a callee demand.
+#[derive(Clone, Debug, Default)]
 enum Res {
-    /// One owner.
-    Unique {
-        via_chain: bool,
-    },
+    #[default]
+    Unique,
     Param(usize),
     Blocked(Why),
     Unknown(Why),
 }
 
-/// One binding in the scope chain the machine would have built.
+fn to_res(owner: Owner) -> Res {
+    match owner {
+        Owner::Fresh => Res::Unique,
+        Owner::Param(k) => Res::Param(k),
+        Owner::Blocked(why) => Res::Blocked(why),
+        Owner::Unknown(why) => Res::Unknown(why),
+    }
+}
+
+/// One binding in the scope the machine would have built.
 #[derive(Clone, Debug)]
 struct Binding {
     name: Symbol,
@@ -239,9 +237,6 @@ struct Binding {
 
 struct State {
     chain: Vec<Binding>,
-    /// Bindings at or inside this position are freed when the scope is dropped; everything outside
-    /// it is held by something this activation cannot drop.
-    frontier: usize,
     /// The module the body being walked belongs to, for name resolution.
     module: usize,
 }
@@ -250,10 +245,6 @@ impl State {
     /// The innermost binding of `name`, which is the one a lookup would find.
     fn index_of(&self, name: &Symbol) -> Option<usize> {
         self.chain.iter().rposition(|b| &b.name == name)
-    }
-
-    fn carried(&self) -> usize {
-        self.chain.len()
     }
 }
 
@@ -328,12 +319,6 @@ struct Found {
     demands: Vec<(Symbol, usize, Res)>,
     escaped: FxHashSet<Symbol>,
     ret: Res,
-}
-
-impl Default for Res {
-    fn default() -> Res {
-        Res::Unique { via_chain: false }
-    }
 }
 
 /// How many rounds the fixpoint is allowed.
@@ -459,7 +444,7 @@ impl<'a> Costs<'a> {
                     ),
                     _ => continue,
                 };
-                let code = code::lower_fn(&params, body);
+                let code = code::lower_fn(&params, body).code;
                 out.push(Body {
                     label,
                     qname,
@@ -500,11 +485,10 @@ impl<'a> Costs<'a> {
                     .collect();
                 let mut st = State {
                     chain,
-                    frontier: 0,
                     module: body.module,
                 };
-                let ret = walk.walk(&body.code, &mut st, 0);
-                walk.found.ret = resolve(ret, &st, 0);
+                let ret = walk.walk(&body.code, &mut st);
+                walk.found.ret = to_res(ret);
                 walk.found
             })
             .collect()
@@ -549,7 +533,7 @@ impl<'a> Costs<'a> {
                 rets.insert(
                     name.clone(),
                     match &found.ret {
-                        Res::Unique { .. } => RetState::Fresh,
+                        Res::Unique => RetState::Fresh,
                         Res::Param(k) => RetState::Param(*k),
                         Res::Blocked(why) => RetState::Shared(why.clone()),
                         Res::Unknown(why) => RetState::Unsure(why.clone()),
@@ -564,7 +548,7 @@ impl<'a> Costs<'a> {
 /// What one call site's argument says about the callee's parameter.
 fn interpret(res: &Res, caller: Option<&Symbol>, tables: &Tables, at: &str) -> ParamState {
     match res {
-        Res::Unique { .. } => ParamState::Sole,
+        Res::Unique => ParamState::Sole,
         Res::Blocked(why) => {
             ParamState::Shared(why.reworded(format!("{at} passes a value where {}", why.text)))
         }
@@ -598,7 +582,7 @@ fn finish(
     tables: &Tables,
 ) -> Site {
     let (verdict, reason, cause) = match res {
-        Res::Unique { .. } => (
+        Res::Unique => (
             Verdict::Reuses,
             "the list reaches `push` at one owner".to_string(),
             None,
@@ -659,94 +643,53 @@ struct Walk<'c, 'a> {
 }
 
 impl Walk<'_, '_> {
-    /// `vf` is the frontier the **value** this node produces is judged at, which is not the
-    /// frontier its sub-expressions are evaluated at.
-    fn walk(&mut self, code: &Code, st: &mut State, vf: usize) -> Owner {
-        crate::limit::grow(|| self.walk_node(code, st, vf))
+    fn walk(&mut self, code: &Code, st: &mut State) -> Owner {
+        crate::limit::grow(|| self.walk_node(code, st))
     }
 
-    fn walk_node(&mut self, code: &Code, st: &mut State, vf: usize) -> Owner {
+    fn walk_node(&mut self, code: &Code, st: &mut State) -> Owner {
         match &code.kind {
             NodeKind::Lit(..) => Owner::Fresh,
 
-            NodeKind::Var(q) => self.var_owner(q, code.own, st, vf),
+            NodeKind::Var { name, .. } => self.var_owner(name, code.own, st),
 
             NodeKind::Unary { operand, .. } => {
-                // `Frame::Unary` carries no scope.
-                let here = st.frontier;
-                self.walk(operand, st, here);
+                self.walk(operand, st);
                 Owner::Fresh
             }
 
-            NodeKind::Binary { op, lhs, rhs } => {
-                // `Frame::BinaryRhs` holds `env.clone()` unconditionally, and for `&&`/`||`
-                // `Frame::ShortCircuit` holds one over the right operand too.
-                let outer = st.frontier;
-                st.frontier = st.carried();
-                let carried = st.frontier;
-                self.walk(lhs, st, carried);
-                st.frontier = match op {
-                    BinOp::And | BinOp::Or => st.carried(),
-                    _ => outer,
-                };
-                let here = st.frontier;
-                self.walk(rhs, st, here);
-                st.frontier = outer;
+            NodeKind::Binary { lhs, rhs, .. } => {
+                self.walk(lhs, st);
+                self.walk(rhs, st);
                 Owner::Fresh
             }
 
-            NodeKind::Lambda { params, body, .. } => {
+            NodeKind::Lambda {
+                params,
+                body,
+                captures,
+                ..
+            } => {
                 self.barrier(params, body, st, &[]);
+                self.poison_captures(captures, st);
                 Owner::Fresh
             }
 
-            NodeKind::App { func, args, .. } => {
+            NodeKind::App { func, args } => {
                 let builtin = self.builtin_of(func, st);
                 let callee = self.callee_of(func, st);
-                // `Value::Closure` holds the whole chain, so a lambda written here keeps every
-                // other argument's binding alive for the length of the call.
-                let captures = args
-                    .iter()
-                    .any(|a| matches!(a.kind, NodeKind::Lambda { .. }));
-                let outer = st.frontier;
-                if !args.is_empty() {
-                    st.frontier = st.carried();
-                }
                 // A callee written as a name is not the definition *escaping*: it is the call.
-                if !matches!(func.kind, NodeKind::Var(_)) {
-                    let callee_frontier = st.frontier;
-                    self.walk(func, st, callee_frontier);
+                if !matches!(func.kind, NodeKind::Var { .. }) {
+                    self.walk(func, st);
                 }
                 let mut resolved: Vec<Res> = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
-                    st.frontier = if i + 1 == args.len() {
-                        outer
-                    } else {
-                        st.carried()
-                    };
                     let owner = match self.callback_owners(builtin, i, args.len(), &resolved) {
                         Some(owners) => self.walk_callback(&owners, arg, st),
-                        // `outer`, not `st.frontier`: see [`Walk::walk`].
-                        None => self.walk(arg, st, outer),
+                        None => self.walk(arg, st),
                     };
-                    let mut res = resolve(owner, st, outer);
-                    // A closure holds the *chain*, not the argument list, so only a value some
-                    // binding in that chain can still reach acquires a second owner from it.
-                    if captures && !matches!(arg.kind, NodeKind::Lambda { .. }) {
-                        res = match res {
-                            Res::Unique { via_chain: true } | Res::Param(_) => {
-                                Res::Blocked(Why::new(
-                                    Cause::Capture,
-                                    "a closure written in the same call captured the scope that \
-                                     still holds this value",
-                                ))
-                            }
-                            other => other,
-                        };
-                    }
-                    resolved.push(res);
+                    resolved.push(to_res(owner));
                 }
-                st.frontier = outer;
                 if builtin == Some(Builtin::Push) && args.len() == 2 {
                     self.found.sites.push((
                         code.span,
@@ -756,7 +699,7 @@ impl Walk<'_, '_> {
                 }
                 if let Some(name) = &callee {
                     for (j, res) in resolved.iter().enumerate() {
-                        if !matches!(res, Res::Unique { .. }) {
+                        if !matches!(res, Res::Unique) {
                             self.found.demands.push((name.clone(), j, res.clone()));
                         }
                     }
@@ -769,30 +712,19 @@ impl Walk<'_, '_> {
                 then_branch,
                 else_branch,
             } => {
-                let outer = st.frontier;
-                st.frontier = st.carried();
-                let carried = st.frontier;
-                self.walk(cond, st, carried);
-                st.frontier = outer;
-                let a = self.walk(then_branch, st, vf);
-                let b = self.walk(else_branch, st, vf);
-                join(a, b, st, vf)
+                self.walk(cond, st);
+                let a = self.walk(then_branch, st);
+                let b = self.walk(else_branch, st);
+                join(a, b)
             }
 
             NodeKind::Match { scrutinee, arms } => {
-                let outer = st.frontier;
-                st.frontier = st.carried();
-                let carried = st.frontier;
-                // `try_arms` binds the arm's pattern on top of a *clone* of the scope, so the
-                // scrutinee's source binding is still reachable for the whole arm body and is never
-                // taken.
-                let scrutinee_owner = self.walk(scrutinee, st, carried);
-                st.frontier = outer;
+                let scrutinee_owner = self.walk(scrutinee, st);
                 let mut joined: Option<Owner> = None;
                 for arm in arms.iter() {
                     let depth = st.chain.len();
                     let mut bound = Vec::new();
-                    binders_of(&arm.pat, &mut bound);
+                    arm.pat.binders(&mut bound);
                     for name in bound {
                         st.chain.push(Binding {
                             name,
@@ -800,18 +732,13 @@ impl Walk<'_, '_> {
                         });
                     }
                     if let Some(guard) = &arm.guard {
-                        // `Frame::MatchGuard` holds both the arm's scope and the enclosing one.
-                        st.frontier = st.carried();
-                        let carried = st.frontier;
-                        self.walk(guard, st, carried);
-                        st.frontier = outer;
+                        self.walk(guard, st);
                     }
-                    let owner = self.walk(&arm.body, st, vf);
-                    let owner = lift_out(owner, st, depth, vf);
+                    let owner = self.walk(&arm.body, st);
                     st.chain.truncate(depth);
                     joined = Some(match joined {
                         None => owner,
-                        Some(prev) => join(prev, owner, st, vf),
+                        Some(prev) => join(prev, owner),
                     });
                 }
                 joined.unwrap_or(Owner::Fresh)
@@ -819,14 +746,11 @@ impl Walk<'_, '_> {
 
             NodeKind::Block { stmts, tail } => {
                 let depth = st.chain.len();
-                let outer = st.frontier;
                 for stmt in stmts.iter() {
-                    st.frontier = statement_frontier(stmt, st, outer);
-                    let here = st.frontier;
-                    let owner = self.walk(stmt.code(), st, here);
+                    let owner = self.walk(stmt.code(), st);
                     if let Stmt::Let { pat, .. } = stmt {
                         let mut bound = Vec::new();
-                        binders_of(pat, &mut bound);
+                        pat.binders(&mut bound);
                         for name in bound {
                             st.chain.push(Binding {
                                 name,
@@ -835,39 +759,26 @@ impl Walk<'_, '_> {
                         }
                     }
                 }
-                st.frontier = outer;
                 let answer = match tail {
-                    // The tail runs with the scope moved into it: no block frame is left holding
-                    // one.
-                    Some(t) => self.walk(t, st, vf),
+                    Some(t) => self.walk(t, st),
                     None => Owner::Fresh,
                 };
-                // An answer naming a binding about to leave scope is settled here, while the index
-                // still means something.
-                let answer = lift_out(answer, st, depth, vf);
                 st.chain.truncate(depth);
                 answer
             }
 
-            NodeKind::Record { fields, .. } => {
-                let outer = st.frontier;
-                for (i, (_, value)) in fields.iter().enumerate() {
-                    st.frontier = if i + 1 == fields.len() {
-                        outer
-                    } else {
-                        st.carried()
-                    };
-                    let here = st.frontier;
-                    self.walk(value, st, here);
+            NodeKind::Record { fields } => {
+                for (_, value) in fields.iter() {
+                    self.walk(value, st);
                 }
-                st.frontier = outer;
                 Owner::Fresh
             }
 
             NodeKind::Field { base, field } => {
-                // `Frame::FieldAccess` carries no scope and answers `v.clone()`, then drops the
-                // record it read — so the field is at one owner exactly when the record was.
-                match self.walk(base, st, vf) {
+                // A projection takes the field out when the record arrives at one owner — the
+                // machine probes uniqueness at the access — and clones it otherwise, so the field
+                // is worth what the record was.
+                match self.walk(base, st) {
                     Owner::Blocked(why) => Owner::Blocked(why.reworded(format!(
                         "`.{}` was read out of a record something else still holds: {}",
                         field.name, why.text
@@ -877,32 +788,16 @@ impl Walk<'_, '_> {
             }
 
             NodeKind::List { items } => {
-                let outer = st.frontier;
-                for (i, item) in items.iter().enumerate() {
-                    st.frontier = if i + 1 == items.len() {
-                        outer
-                    } else {
-                        st.carried()
-                    };
-                    let here = st.frontier;
-                    self.walk(item, st, here);
+                for item in items.iter() {
+                    self.walk(item, st);
                 }
-                st.frontier = outer;
                 Owner::Fresh
             }
 
             NodeKind::Perform { args, .. } => {
-                let outer = st.frontier;
-                for (i, arg) in args.iter().enumerate() {
-                    st.frontier = if i + 1 == args.len() {
-                        outer
-                    } else {
-                        st.carried()
-                    };
-                    let here = st.frontier;
-                    self.walk(arg, st, here);
+                for arg in args.iter() {
+                    self.walk(arg, st);
                 }
-                st.frontier = outer;
                 Owner::Unknown(Why::new(
                     Cause::Handler,
                     "the value a handler answered, which the handler may still hold",
@@ -910,12 +805,14 @@ impl Walk<'_, '_> {
             }
 
             NodeKind::Handle { body, clauses, ret } => {
-                let outer = st.frontier;
-                // The prompt holds `env.clone()` for the whole delimited body.
-                st.frontier = st.carried();
-                let carried = st.frontier;
-                self.walk(body, st, carried);
-                st.frontier = outer;
+                // Clause captures are copied at handle entry, before the body runs.
+                for clause in clauses.iter() {
+                    self.poison_captures(&clause.captures, st);
+                }
+                if let Some(arm) = ret {
+                    self.poison_captures(&arm.captures, st);
+                }
+                self.walk(body, st);
                 for clause in clauses.iter() {
                     let mut params: Vec<Symbol> = clause.params.as_ref().clone();
                     params.extend(clause.resume.clone());
@@ -930,12 +827,7 @@ impl Walk<'_, '_> {
             NodeKind::WithCell {
                 init, binder, body, ..
             } => {
-                let outer = st.frontier;
-                // `Frame::WithCellBody` holds the scope while the initial value is built.
-                st.frontier = st.carried();
-                let carried = st.frontier;
-                self.walk(init, st, carried);
-                st.frontier = outer;
+                self.walk(init, st);
                 let depth = st.chain.len();
                 st.chain.push(Binding {
                     name: binder.clone(),
@@ -944,25 +836,24 @@ impl Walk<'_, '_> {
                         "a cell, whose region arena holds its contents",
                     )),
                 });
-                let answer = self.walk(body, st, vf);
-                let answer = lift_out(answer, st, depth, vf);
+                let answer = self.walk(body, st);
                 st.chain.truncate(depth);
                 answer
             }
 
-            NodeKind::Simulate { body } => {
+            NodeKind::Simulate { body, captures, .. } => {
+                self.poison_captures(captures, st);
                 self.barrier(&[], body, st, &[]);
                 Owner::Unknown(Why::new(Cause::Handler, "the value a `simulate` answered"))
             }
 
-            NodeKind::WithRegion { body } => self.walk(body, st, vf),
+            NodeKind::WithRegion { body } => self.walk(body, st),
         }
     }
 
     /// A construct whose body may run again, later, or beside another task.
     fn barrier(&mut self, params: &[Symbol], body: &Code, st: &mut State, owners: &[Owner]) {
         let held = std::mem::take(&mut st.chain);
-        let frontier = st.frontier;
         st.chain = params
             .iter()
             .enumerate()
@@ -976,24 +867,44 @@ impl Walk<'_, '_> {
                 }),
             })
             .collect();
-        st.frontier = 0;
-        self.walk(body, st, 0);
+        self.walk(body, st);
         st.chain = held;
-        st.frontier = frontier;
+    }
+
+    /// A capture that clones keeps a copy for the closure's whole life, so the binding's value has
+    /// a second owner from here on; a capture that moves leaves the binding dead, which the
+    /// liveness pass already guarantees nothing reads.
+    fn poison_captures(&mut self, captures: &code::Captures, st: &mut State) {
+        for (j, name) in captures.names.iter().enumerate() {
+            if captures.owns.get(j) == Some(&Own::Owned) {
+                continue;
+            }
+            if let Some(i) = st.index_of(name)
+                && !matches!(st.chain[i].owner, Owner::Blocked(_))
+            {
+                st.chain[i].owner = Owner::Blocked(Why::new(
+                    Cause::Capture,
+                    format!("a closure captured `{name}` and holds its own copy of the value"),
+                ));
+            }
+        }
     }
 
     /// What a name is worth where it is read.
-    fn var_owner(&mut self, q: &QName, own: Own, st: &State, vf: usize) -> Owner {
+    fn var_owner(&mut self, q: &QName, own: Own, st: &mut State) -> Owner {
         let bare = q.is_bare();
         if let Some(i) = bare.then(|| st.index_of(q.symbol())).flatten() {
-            // `Own::Owned` is a *move* only where `take_unique` can succeed, which is where the
-            // chain is unshared **at this occurrence** — `st.frontier`, not the frontier the value
-            // will be judged at.
-            let _ = vf;
-            return if own == Own::Owned && i >= st.frontier {
-                st.chain[i].owner.clone()
-            } else {
-                Owner::Held(i)
+            // A move takes the binding's value with whatever other owners it already had; a clone
+            // is itself the second owner.
+            return match own {
+                Own::Owned => st.chain[i].owner.clone(),
+                _ => Owner::Blocked(Why::new(
+                    Cause::ReadAgain,
+                    format!(
+                        "`{}` is read again after this point, so this use clones it",
+                        q.symbol()
+                    ),
+                )),
             };
         }
         // A definition named outside callee position is a definition applied by something this
@@ -1017,8 +928,8 @@ impl Walk<'_, '_> {
         Owner::Unknown(Why::new(
             Cause::Closure,
             format!(
-                "`{}` is free in this closure; whether whatever captured it is still held when \
-                 the append runs is not a property of this body",
+                "`{}` is free in this closure; whether the closure's copy is the only other \
+                 owner when the append runs is not a property of this body",
                 q.symbol()
             ),
         ))
@@ -1026,7 +937,7 @@ impl Walk<'_, '_> {
 
     /// The builtin a callee names, or `None` when it names something else.
     fn builtin_of(&self, func: &Code, st: &State) -> Option<Builtin> {
-        let NodeKind::Var(q) = &func.kind else {
+        let NodeKind::Var { name: q, .. } = &func.kind else {
             return None;
         };
         if !q.is_bare() {
@@ -1043,7 +954,7 @@ impl Walk<'_, '_> {
 
     /// The definition a callee names, when it names one.
     fn callee_of(&self, func: &Code, st: &State) -> Option<Symbol> {
-        let NodeKind::Var(q) = &func.kind else {
+        let NodeKind::Var { name: q, .. } = &func.kind else {
             return None;
         };
         if q.is_bare() && st.index_of(q.symbol()).is_some() {
@@ -1064,7 +975,7 @@ impl Walk<'_, '_> {
             return match callee.and_then(|name| self.tables.rets.get(name)) {
                 Some(RetState::Fresh) => Owner::Fresh,
                 Some(RetState::Param(k)) => match args.get(*k) {
-                    Some(Res::Unique { .. }) => Owner::Fresh,
+                    Some(Res::Unique) => Owner::Fresh,
                     Some(Res::Param(j)) => Owner::Param(*j),
                     Some(Res::Blocked(why)) => Owner::Blocked(why.clone()),
                     Some(Res::Unknown(why)) => Owner::Unknown(why.clone()),
@@ -1125,7 +1036,7 @@ impl Walk<'_, '_> {
         match builtin? {
             Builtin::Fold => {
                 let seed = match done.get(1) {
-                    Some(Res::Unique { .. }) => Owner::Fresh,
+                    Some(Res::Unique) => Owner::Fresh,
                     Some(Res::Param(k)) => Owner::Param(*k),
                     Some(Res::Blocked(why)) => Owner::Blocked(why.clone()),
                     Some(Res::Unknown(why)) => Owner::Unknown(why.clone()),
@@ -1141,12 +1052,18 @@ impl Walk<'_, '_> {
     /// A callback written at the call site, entered with the owners the builtin is known to hand it
     /// rather than with the `Unknown` a closure of unknown provenance gets.
     fn walk_callback(&mut self, owners: &[Owner], arg: &Code, st: &mut State) -> Owner {
-        let NodeKind::Lambda { params, body, .. } = &arg.kind else {
+        let NodeKind::Lambda {
+            params,
+            body,
+            captures,
+            ..
+        } = &arg.kind
+        else {
             // Named elsewhere: its body is checked where it is defined.
-            let here = st.frontier;
-            return self.walk(arg, st, here);
+            return self.walk(arg, st);
         };
         self.barrier(params, body, st, owners);
+        self.poison_captures(captures, st);
         Owner::Fresh
     }
 }
@@ -1179,103 +1096,14 @@ impl Costs<'_> {
     }
 }
 
-/// The frontier a block statement runs under.
-fn statement_frontier(stmt: &Stmt, st: &State, outer: usize) -> usize {
-    let dead = stmt.dead();
-    if dead.is_empty() {
-        return st.carried();
-    }
-    let found: Vec<usize> = dead.iter().filter_map(|name| st.index_of(name)).collect();
-    if found.is_empty() {
-        return st.carried();
-    }
-    if found.len() < dead.len() {
-        return outer;
-    }
-    outer.max(found.into_iter().min().expect("non-empty"))
-}
-
-/// Answers the positional question, leaving only what a caller can settle.
-fn resolve(owner: Owner, st: &State, vf: usize) -> Res {
-    let mut owner = owner;
-    let mut via_chain = false;
-    // Bounded rather than recursive: `Held` points strictly outward, so the walk is at most the
-    // depth of the chain.
-    for _ in 0..=st.chain.len() {
-        match owner {
-            Owner::Fresh => return Res::Unique { via_chain },
-            Owner::Param(k) => return Res::Param(k),
-            Owner::Blocked(why) => return Res::Blocked(why),
-            Owner::Unknown(why) => return Res::Unknown(why),
-            Owner::Held(i) => {
-                via_chain = true;
-                if i < vf {
-                    return Res::Blocked(Why::new(
-                        Cause::Position,
-                        format!(
-                            "the scope binding `{}` is still held by an enclosing frame — this \
-                             expression is not in the last position of every node above it",
-                            st.chain[i].name
-                        ),
-                    ));
-                }
-                owner = st.chain[i].owner.clone();
-            }
-        }
-    }
-    Res::Unknown(Why::new(
-        Cause::Chain,
-        "a binding chain this analysis could not follow",
-    ))
-}
-
-/// Joins two branch answers, settling anything that names a binding: the arms may name different
-/// ones and only one index fits in the answer.
-fn join(a: Owner, b: Owner, st: &State, vf: usize) -> Owner {
-    match (resolve(a, st, vf), resolve(b, st, vf)) {
-        (Res::Unique { .. }, Res::Unique { .. }) => Owner::Fresh,
+/// Joins two branch answers.
+fn join(a: Owner, b: Owner) -> Owner {
+    match (to_res(a), to_res(b)) {
+        (Res::Unique, Res::Unique) => Owner::Fresh,
         (Res::Blocked(r), _) | (_, Res::Blocked(r)) => Owner::Blocked(r),
         (Res::Unknown(r), _) | (_, Res::Unknown(r)) => Owner::Unknown(r),
         (Res::Param(k), _) | (_, Res::Param(k)) => Owner::Param(k),
     }
-}
-
-/// Settles an answer that names a binding about to leave scope.
-fn lift_out(owner: Owner, st: &State, depth: usize, vf: usize) -> Owner {
-    match owner {
-        Owner::Held(i) if i >= depth => match resolve(Owner::Held(i), st, vf) {
-            Res::Unique { .. } => Owner::Fresh,
-            Res::Param(k) => Owner::Param(k),
-            Res::Blocked(why) => Owner::Blocked(why),
-            Res::Unknown(why) => Owner::Unknown(why),
-        },
-        other => other,
-    }
-}
-
-fn binders_of(p: &Pattern, out: &mut Vec<Symbol>) {
-    crate::limit::grow(|| match &p.kind {
-        PatternKind::Wildcard | PatternKind::Lit(_) => {}
-        PatternKind::Var(id) => out.push(id.name.clone()),
-        PatternKind::Ctor { args, .. } => {
-            for arg in args {
-                binders_of(arg, out);
-            }
-        }
-        PatternKind::Record { fields, .. } => {
-            for (_, pat) in fields {
-                binders_of(pat, out);
-            }
-        }
-        PatternKind::List { items, rest } => {
-            for item in items {
-                binders_of(item, out);
-            }
-            if let Some(rest) = rest {
-                binders_of(rest, out);
-            }
-        }
-    });
 }
 
 fn qualified(resolved: &Resolved, module: usize, name: &Symbol) -> Option<Symbol> {

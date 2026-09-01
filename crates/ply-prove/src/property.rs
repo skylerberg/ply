@@ -11,7 +11,7 @@ use crate::{
 };
 use ply_core::{CtorInfo, Row, TyVar, Type};
 use ply_core::{LawBinder, prelude};
-use ply_eval::{Closure, ClosureKind, Decimal, Env, Value};
+use ply_eval::{Closure, ClosureKind, Decimal, Value};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, QName};
@@ -746,13 +746,18 @@ fn param_names(arity: usize) -> Vec<Symbol> {
 /// The synthesized body names only its own parameters and the values bound beside it, so the module
 /// scope is never consulted and index 0 is a placeholder rather than a claim about which module
 /// this came from.
-fn closure(params: Vec<Symbol>, body: Expr, env: Env, description: String) -> Value {
+fn closure(
+    params: Vec<Symbol>,
+    body: Expr,
+    bindings: Vec<(Symbol, Value)>,
+    description: String,
+) -> Value {
     Value::Closure(Arc::new(Closure {
         name: Some(Symbol::new(description)),
         kind: ClosureKind::Fn {
             params,
             body: Arc::new(body),
-            env,
+            bindings,
             module: 0,
         },
     }))
@@ -772,15 +777,16 @@ fn binder_list(arity: usize, names: &[Symbol]) -> String {
 /// `\(..) -> c`.
 pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
     let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
-    let env = Env::empty()
-        .bind(Symbol::new(FN_CONST), value.clone())
-        .bind(
+    let bindings = vec![
+        (Symbol::new(FN_CONST), value.clone()),
+        (
             Symbol::new(FN_SIZE),
             Value::Int(saturating_i64(
                 2u64.saturating_add(shrink::size(&value, world)),
             )),
-        );
-    closure(param_names(arity), var(FN_CONST), env, description)
+        ),
+    ];
+    closure(param_names(arity), var(FN_CONST), bindings, description)
 }
 
 /// `\(x0, ..) -> xi` where `xi` has the return type.
@@ -788,8 +794,8 @@ fn projection_fn(arity: usize, index: usize) -> Value {
     let names = param_names(arity);
     let picked = names[index].to_string();
     let description = format!("|{}| {picked}", binder_list(arity, &names));
-    let env = Env::empty().bind(Symbol::new(FN_SIZE), Value::Int(1));
-    closure(names, var(&picked), env, description)
+    let bindings = vec![(Symbol::new(FN_SIZE), Value::Int(1))];
+    closure(names, var(&picked), bindings, description)
 }
 
 /// `\(x0, ..) -> if x0 == k { v } else .. else d`: a lookup table over the first parameter with a
@@ -797,16 +803,15 @@ fn projection_fn(arity: usize, index: usize) -> Value {
 fn table_fn(arity: usize, table: Vec<(Value, Value)>, default: Value, world: &TypeWorld) -> Value {
     let names = param_names(arity);
     let subject = names[0].to_string();
-    let mut env = Env::empty().bind(Symbol::new(FN_DEFAULT), default.clone());
+    let mut bindings = vec![(Symbol::new(FN_DEFAULT), default.clone())];
     let mut size = 4u64.saturating_add(shrink::size(&default, world));
     let mut body = var(FN_DEFAULT);
     let mut description = default.render();
     for (i, (key, value)) in table.iter().enumerate().rev() {
         let key_slot = format!("#k{i}");
         let value_slot = format!("#v{i}");
-        env = env
-            .bind(Symbol::new(&key_slot), key.clone())
-            .bind(Symbol::new(&value_slot), value.clone());
+        bindings.push((Symbol::new(&key_slot), key.clone()));
+        bindings.push((Symbol::new(&value_slot), value.clone()));
         size = size
             .saturating_add(shrink::size(key, world))
             .saturating_add(shrink::size(value, world));
@@ -831,9 +836,9 @@ fn table_fn(arity: usize, table: Vec<(Value, Value)>, default: Value, world: &Ty
             span: Span::DUMMY,
         };
     }
-    env = env.bind(Symbol::new(FN_SIZE), Value::Int(saturating_i64(size)));
+    bindings.push((Symbol::new(FN_SIZE), Value::Int(saturating_i64(size))));
     let description = format!("|{}| {description}", binder_list(arity, &names));
-    closure(names, body, env, description)
+    closure(names, body, bindings, description)
 }
 
 fn saturating_i64(n: u64) -> i64 {
@@ -845,11 +850,12 @@ pub(crate) fn fn_size(value: &Value) -> Option<u64> {
     let Value::Closure(closure) = value else {
         return None;
     };
-    let ClosureKind::Fn { env, .. } = &closure.kind else {
+    let ClosureKind::Fn { bindings, .. } = &closure.kind else {
         return None;
     };
-    match env.lookup(&Symbol::new(FN_SIZE)) {
-        Some(ply_eval::ScopeSlot::Live(Value::Int(n))) => Some((*n).max(0) as u64),
+    let size = Symbol::new(FN_SIZE);
+    match bindings.iter().find(|(n, _)| *n == size) {
+        Some((_, Value::Int(n))) => Some((*n).max(0) as u64),
         _ => None,
     }
 }

@@ -202,9 +202,10 @@ fn go(x: Int) -> Int = {
     );
 }
 
-/// A lambda's body indexes its own table, so an outer name is free rather than a slot of the inner.
+/// A lambda's body indexes its own table: an outer name is free there, and a free name takes a
+/// **capture slot** of the lambda's own window, threaded from the slot it resolves to outside.
 #[test]
-fn a_lambda_body_does_not_index_the_enclosing_barriers_table() {
+fn a_lambda_body_gives_its_free_variable_a_capture_slot_of_its_own() {
     let src = "\
 fn go(xs: List<Int>, n: Int) -> List<Int> = map(xs, |y| y + n)
 ";
@@ -220,6 +221,7 @@ fn go(xs: List<Int>, n: Int) -> List<Int> = map(xs, |y| y + n)
         table.barriers.len()
     );
     let y = Symbol::new("y");
+    let n = Symbol::new("n");
     let inner = table
         .barriers
         .iter()
@@ -227,8 +229,13 @@ fn go(xs: List<Int>, n: Int) -> List<Int> = map(xs, |y| y + n)
         .expect("the lambda's table");
     assert_eq!(
         inner.names,
-        vec![y],
-        "`n` is free in the lambda, so it takes no slot there"
+        vec![y.clone(), n.clone()],
+        "`n` is free in the lambda, so it takes a capture slot after the parameter"
+    );
+    assert_eq!(
+        inner.captures,
+        vec![(1, 1)],
+        "the capture copies from `n`'s slot outside — parameter 1 of `go` — into slot 1 inside"
     );
 }
 
@@ -397,11 +404,14 @@ fn a_copying_append_reports_how_much_it_copied() {
     use ply_eval::{Machine, rc};
     use ply_syntax::resolve::resolve as resolve_names;
 
-    // `grow` appends in argument position 0 of 2, so every append copies the whole list: the copies
+    // `grow` reads `xs` again after the append — position no longer forces a copy, so the copy
+    // has to be forced by a genuine second owner. Every append copies the whole list: the copies
     // are 0 + 1 + .. + (n-1) elements for n appends.
     let src = "\
-fn grow(xs: List<Int>, n: Int) -> List<Int> =
-  if n == 0 { xs } else { grow(push(xs, n), n - 1) }
+fn grow(xs: List<Int>, n: Int) -> List<Int> = {
+  let ys = push(xs, n);
+  if len(xs) < 0 { xs } else if n == 1 { ys } else { grow(ys, n - 1) }
+}
 test \"grown\" { assert_eq(len(grow([], 20)), 20) }
 ";
     let mut map = SourceMap::new();

@@ -1,10 +1,16 @@
 //! The explicit control stack, and the delimited continuations cut out of it.
+//!
+//! Since ADR 0034 a frame holds no scope: the machine owns one slot stack and every frame records
+//! only the *relative* quantities needed to undo its window effect — sizes and offsets from the
+//! top, never an absolute index. That is what lets a captured extent splice back onto any stack at
+//! any height without a single frame being rewritten, which multi-shot resumption requires of a
+//! structure shared by `Rc`.
 
 use crate::arena::{Pin, RegionId};
 use crate::code::{Clause, Code, ReturnArm, Stmt};
-use crate::env::Env;
 use crate::pool::{self, Free, Link, Pooled};
 use crate::value::{Value, Vector};
+use crate::window::SlotVal;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, Ident, UnOp};
 use std::cell::Cell;
@@ -23,7 +29,6 @@ pub enum Frame {
     BinaryRhs {
         op: BinOp,
         rhs: Code,
-        env: Env,
         module: usize,
         lhs_span: Span,
         span: Span,
@@ -42,17 +47,12 @@ pub enum Frame {
     ShortCircuit {
         op: BinOp,
         rhs: Code,
-        env: Env,
         module: usize,
         rhs_span: Span,
     },
 
     AppCallee {
         args: Rc<Vec<Code>>,
-        /// Per argument, what it is the last reader of. Empty unless the slot rewrite
-        /// the slot probe is armed — see [`crate::code::NodeKind::App`].
-        dead: Rc<Vec<crate::rc::Dead>>,
-        env: Env,
         module: usize,
         span: Span,
     },
@@ -62,9 +62,7 @@ pub enum Frame {
         callee: Value,
         done: Vec<Value>,
         args: Rc<Vec<Code>>,
-        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
-        env: Env,
         module: usize,
         span: Span,
     },
@@ -76,6 +74,17 @@ pub enum Frame {
         /// This call is the one evaluating a nullary pure definition for the first time, so the
         /// value it receives is that definition's constant.
         memo: bool,
+        /// The callee's window size, truncated away when the call returns.
+        callee_window: u32,
+        /// The caller's window size, which is what re-derives its base from the top.
+        caller_window: u32,
+    },
+
+    /// A window boundary that is not a call: a handler clause's body, or a `return` arm. Undoes
+    /// its window exactly as [`Frame::Call`] does, without counting against the call budget.
+    Exit {
+        callee_window: u32,
+        caller_window: u32,
     },
 
     /// Hands the value it receives to a captured continuation.
@@ -83,10 +92,20 @@ pub enum Frame {
         k: Rc<Continuation>,
     },
 
+    /// The frame a resumption pushes under the segments it splices: when the value passes back
+    /// down out of the restored extent, drop the extent's windows and restore the base the
+    /// resumer had. Relative on both counts, so a later capture can carry it anywhere.
+    Restore {
+        /// What is left of the restored extent's windows when this dispatches: the window of the
+        /// activation that pushed the captured prompt.
+        spill: u32,
+        /// The resuming activation's window size.
+        base_offset: u32,
+    },
+
     If {
         then_branch: Code,
         else_branch: Code,
-        env: Env,
         module: usize,
         cond_span: Span,
     },
@@ -96,19 +115,16 @@ pub enum Frame {
         scrutinee: Value,
         arms: Rc<Vec<crate::code::Arm>>,
         next: usize,
-        env: Env,
         module: usize,
         scrutinee_span: Span,
     },
 
-    /// Waiting for an arm's guard, holding the bindings that arm's pattern made so a failing guard
-    /// can fall through without rematching.
+    /// Waiting for an arm's guard. The arm's pattern bindings are already in their slots, and a
+    /// failing guard falls through to the next arm, whose slots are its own.
     MatchGuard {
         scrutinee: Value,
         arms: Rc<Vec<crate::code::Arm>>,
         at: usize,
-        arm_env: Env,
-        env: Env,
         module: usize,
         scrutinee_span: Span,
     },
@@ -118,16 +134,13 @@ pub enum Frame {
         stmts: Rc<Vec<Stmt>>,
         next: usize,
         tail: Option<Code>,
-        scope: Env,
         module: usize,
     },
 
     RecordField {
         done: Vec<(Symbol, Value)>,
         fields: Rc<Vec<(Symbol, Code)>>,
-        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
-        env: Env,
         module: usize,
     },
 
@@ -140,7 +153,6 @@ pub enum Frame {
         done: Vec<Value>,
         items: Rc<Vec<Code>>,
         next: usize,
-        env: Env,
         module: usize,
     },
 
@@ -152,7 +164,6 @@ pub enum Frame {
         done: Vec<Value>,
         args: Rc<Vec<Code>>,
         next: usize,
-        env: Env,
         module: usize,
         span: Span,
     },
@@ -161,8 +172,9 @@ pub enum Frame {
     WithCellBody {
         resource: Symbol,
         binder: Symbol,
+        /// The binder's slot in the enclosing activation.
+        slot: Option<u32>,
         body: Code,
-        env: Env,
         module: usize,
         /// The whole `with_cell` expression, which is the key [`crate::region_kind`] filed its
         /// decision about this region under.
@@ -225,12 +237,28 @@ pub enum Frame {
     },
 }
 
+/// How many slots sit between the state just below this pending frame and the state just above
+/// it — what a capture walks to find the height at a delimiter's push.
+fn frame_delta(frame: &Frame) -> usize {
+    match frame {
+        Frame::Call { callee_window, .. } | Frame::Exit { callee_window, .. } => {
+            *callee_window as usize
+        }
+        Frame::Restore { spill, .. } => *spill as usize,
+        _ => 0,
+    }
+}
+
 pub struct Prompt {
     pub clauses: Rc<Vec<Clause>>,
     /// Each clause's effect under its program-wide name, resolved where the `handle` was written.
     pub effects: Rc<Vec<Symbol>>,
     pub ret: Option<Rc<ReturnArm>>,
-    pub env: Env,
+    /// Per clause, the values its body's free variables were bound to where the handler was
+    /// installed — copied at handle entry, written into the clause's window at each perform.
+    pub clause_captures: Vec<Rc<[Value]>>,
+    /// The same, for the `return` arm.
+    pub ret_captures: Rc<[Value]>,
     pub module: usize,
     pub span: Span,
 }
@@ -394,6 +422,13 @@ pub struct Segment {
     frames: Chain<Frame>,
     delimiter: Option<Delimiter>,
     calls: usize,
+    /// The window size of the activation that pushed this segment's delimiter — what a capture
+    /// subtracts to find the floor its snapshot starts at. A size, not a position, so a spliced
+    /// segment needs no rebasing.
+    window: u32,
+    /// The summed [`frame_delta`] of this segment's pending frames, kept incrementally so a
+    /// capture reads its slot height in O(segments) rather than walking every frame.
+    deltas: usize,
 }
 
 impl Segment {
@@ -402,14 +437,16 @@ impl Segment {
     }
 
     pub fn under(prompt: Rc<Prompt>) -> Segment {
-        Segment::below(Delimiter::Ply(prompt))
+        Segment::below(Delimiter::Ply(prompt), 0)
     }
 
-    pub fn below(delimiter: Delimiter) -> Segment {
+    pub fn below(delimiter: Delimiter, window: u32) -> Segment {
         Segment {
             frames: Chain::new(),
             delimiter: Some(delimiter),
             calls: 0,
+            window,
+            deltas: 0,
         }
     }
 
@@ -471,8 +508,8 @@ impl Stack {
         self.frames
     }
 
-    /// Pending calls — the [`Frame::Call`]s among [`Stack::frames`], counted the same way the
-    /// a recursive evaluator counts its own nesting.
+    /// Pending calls — the [`Frame::Call`]s among [`Stack::frames`], counted the same way a
+    /// recursive evaluator counts its own nesting.
     pub fn calls(&self) -> usize {
         self.calls
     }
@@ -492,6 +529,7 @@ impl Stack {
     /// The owned form.
     pub fn pushed(mut self, frame: Frame) -> Stack {
         let calls = is_call(&frame);
+        self.top.deltas += frame_delta(&frame);
         self.top.frames = std::mem::take(&mut self.top.frames).push(frame);
         self.top.calls += calls;
         self.frames += 1;
@@ -499,18 +537,22 @@ impl Stack {
         self
     }
 
-    pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack {
-        self.push_delimiter(Delimiter::Ply(prompt))
+    /// Opens a prompt's segment. `window` is the pushing activation's window size, which a
+    /// capture at this prompt subtracts to find its snapshot's floor.
+    pub fn push_prompt(&self, prompt: Rc<Prompt>, window: u32) -> Stack {
+        self.push_delimiter(Delimiter::Ply(prompt), window)
     }
 
-    /// Opens a segment under the seeded scheduler.
+    /// Opens a segment under a scheduler's delimiter. A task's control never reaches below the
+    /// region's entry height, so the window is zero and a capture snapshots the task's own slots
+    /// and nothing else.
     pub fn push_sim(&self, region: SimId) -> Stack {
-        self.push_delimiter(Delimiter::Sim(region))
+        self.push_delimiter(Delimiter::Sim(region), 0)
     }
 
-    pub fn push_delimiter(&self, delimiter: Delimiter) -> Stack {
+    pub fn push_delimiter(&self, delimiter: Delimiter, window: u32) -> Stack {
         let mut out = self.clone();
-        let displaced = std::mem::replace(&mut out.top, Segment::below(delimiter));
+        let displaced = std::mem::replace(&mut out.top, Segment::below(delimiter, window));
         out.under = std::mem::take(&mut out.under).push(displaced);
         out
     }
@@ -530,7 +572,8 @@ impl Stack {
             .map(|depth| depth + 1)
     }
 
-    /// The whole stack as one task's control, delimited by `region`.
+    /// The whole stack as one task's control, delimited by `region`. The caller owns the slot
+    /// stack and seals the extent onto the continuation itself.
     pub fn into_task(mut self, region: SimId, born: u64) -> Continuation {
         let (frames, calls) = (self.frames, self.calls);
         let mut taken = Vec::with_capacity(self.segments());
@@ -551,6 +594,10 @@ impl Stack {
             born,
             resumes: Rc::new(Cell::new(0)),
             pin: None,
+            extent: Extent::InPlace,
+            base_offset: 0,
+            cut_deltas: 0,
+            cut_window: 0,
         }
     }
 
@@ -568,6 +615,7 @@ impl Stack {
     pub fn into_next(mut self) -> Next {
         if let Some(frame) = self.top.frames.pop_front() {
             let calls = is_call(&frame);
+            self.top.deltas -= frame_delta(&frame);
             self.top.calls -= calls;
             self.frames -= 1;
             self.calls -= calls;
@@ -622,12 +670,16 @@ impl Stack {
         None
     }
 
-    /// Cuts the innermost `segments` segments away.
+    /// Cuts the innermost `segments` segments away, computing on the way the two relative
+    /// quantities the caller needs to seal the extent's windows: how many slots sit above the
+    /// outermost cut delimiter's push height, and that delimiter's activation window.
     pub fn capture(&self, segments: usize, born: u64) -> (Continuation, Stack) {
         let mut taken = Vec::with_capacity(segments);
         let mut rest = self.clone();
         let mut frames = 0;
         let mut calls = 0;
+        let mut cut_deltas = 0usize;
+        let mut cut_window = 0u32;
         for _ in 0..segments {
             let below = rest
                 .under
@@ -638,6 +690,8 @@ impl Stack {
             calls += cut.calls();
             rest.frames -= cut.frames();
             rest.calls -= cut.calls();
+            cut_deltas += cut.deltas;
+            cut_window = cut.window;
             taken.push(cut);
         }
         crate::rc::census4::capture(frames as u64);
@@ -649,6 +703,10 @@ impl Stack {
                 born,
                 resumes: Rc::new(Cell::new(0)),
                 pin: None,
+                extent: Extent::InPlace,
+                base_offset: 0,
+                cut_deltas,
+                cut_window,
             },
             rest,
         )
@@ -672,6 +730,19 @@ impl Stack {
     }
 }
 
+/// What a continuation carries of the slot stack.
+#[derive(Clone)]
+pub enum Extent {
+    /// Nothing: the slots are still in place on the machine's stack, and the splice that consumes
+    /// this continuation happens before anything below can touch them. The tail-resumptive path —
+    /// every plain perform — so a capture there costs no slot traffic at all.
+    InPlace,
+    /// A snapshot from the floor of the capturing prompt's activation to the top at capture,
+    /// restored — cloned — once per resumption: two futures need two copies, and the clone is a
+    /// refcount bump per slot rather than a deep copy.
+    Saved { slots: Rc<Vec<SlotVal>> },
+}
+
 /// A delimited continuation: the control captured at a `perform`, from the perform site down to and
 /// including the handler that answered it.
 pub struct Continuation {
@@ -689,6 +760,16 @@ pub struct Continuation {
     /// continuation can still read through: the escape case, where a continuation is
     /// resumed after the region that made its cell returned.
     pin: Option<Pin>,
+    /// The captured windows, or nothing for a tail-resumptive capture.
+    extent: Extent,
+    /// The innermost captured activation's base, as an offset back from the extent's top.
+    base_offset: u32,
+    /// Slots above the outermost cut delimiter's push height, summed from the cut frames'
+    /// relative records.
+    cut_deltas: usize,
+    /// The outermost cut segment's activation window — the part of the snapshot shared with the
+    /// activation continuing below the capture.
+    cut_window: u32,
 }
 
 impl Continuation {
@@ -698,11 +779,36 @@ impl Continuation {
         self
     }
 
+    /// Seals the captured windows and the base offset onto this continuation.
+    pub fn with_extent(mut self, extent: Extent, base_offset: u32) -> Continuation {
+        self.extent = extent;
+        self.base_offset = base_offset;
+        self
+    }
+
+    pub fn extent(&self) -> &Extent {
+        &self.extent
+    }
+
+    pub fn base_offset(&self) -> usize {
+        self.base_offset as usize
+    }
+
+    /// Slots above the outermost cut delimiter's push height at capture.
+    pub fn cut_deltas(&self) -> usize {
+        self.cut_deltas
+    }
+
+    /// The window of the activation that pushed the captured prompt.
+    pub fn cut_window(&self) -> usize {
+        self.cut_window as usize
+    }
+
     pub fn frames(&self) -> usize {
         self.frames
     }
 
-    /// [`Machine::host_ops`] when this continuation was captured.
+    /// [`crate::machine::Machine::host_ops`] when this continuation was captured.
     pub fn born(&self) -> u64 {
         self.born
     }
@@ -761,6 +867,14 @@ impl Continuation {
                 _ => None,
             })
     }
+
+    /// Slots above this continuation's `Sim` delimiter's push height, summed from the frames of
+    /// the segments at and inside it — what a resumer subtracts from the extent's length to find
+    /// where the delimiter lands after a splice.
+    pub fn deltas_through_sim(&self) -> Option<usize> {
+        let (_, at) = self.sim_at()?;
+        Some(self.segments[..=at].iter().map(|s| s.deltas).sum())
+    }
 }
 
 impl Clone for Continuation {
@@ -772,6 +886,10 @@ impl Clone for Continuation {
             born: self.born,
             resumes: Rc::clone(&self.resumes),
             pin: self.pin.clone(),
+            extent: self.extent.clone(),
+            base_offset: self.base_offset,
+            cut_deltas: self.cut_deltas,
+            cut_window: self.cut_window,
         }
     }
 }
@@ -800,7 +918,8 @@ mod tests {
             clauses: Rc::new(Vec::new()),
             effects: Rc::new(Vec::new()),
             ret: None,
-            env: Env::empty(),
+            clause_captures: Vec::new(),
+            ret_captures: Rc::from(Vec::new()),
             module: 0,
             span: Span::DUMMY,
         })
@@ -836,7 +955,7 @@ mod tests {
 
     #[test]
     fn an_exhausted_segment_yields_its_prompt_and_then_the_stack_under_it() {
-        let s = Stack::new().push(frame(1)).push_prompt(prompt());
+        let s = Stack::new().push(frame(1)).push_prompt(prompt(), 0);
         let Next::Leave(_, under) = s.next() else {
             panic!("expected to leave the segment");
         };
@@ -848,7 +967,7 @@ mod tests {
     fn capture_takes_the_segments_above_and_including_the_handler() {
         let s = Stack::new()
             .push(frame(0))
-            .push_prompt(prompt())
+            .push_prompt(prompt(), 0)
             .push(frame(1))
             .push(frame(2));
         assert_eq!(s.segments(), 2);
@@ -862,7 +981,7 @@ mod tests {
 
     #[test]
     fn resuming_reinstalls_the_handler_that_delimited_the_capture() {
-        let s = Stack::new().push_prompt(prompt()).push(frame(1));
+        let s = Stack::new().push_prompt(prompt(), 0).push(frame(1));
         let (k, below) = s.capture(1, 0);
         assert!(below.prompt().is_none());
 
@@ -873,7 +992,7 @@ mod tests {
 
     #[test]
     fn a_continuation_may_be_resumed_twice_onto_different_stacks() {
-        let s = Stack::new().push_prompt(prompt()).push(frame(9));
+        let s = Stack::new().push_prompt(prompt(), 0).push(frame(9));
         let (k, below) = s.capture(1, 0);
 
         let once = below.resume(&k);
@@ -897,7 +1016,7 @@ mod tests {
     #[test]
     fn popping_a_captured_frame_leaves_the_continuation_able_to_splice_it_again() {
         let s = Stack::new()
-            .push_prompt(prompt())
+            .push_prompt(prompt(), 0)
             .push(frame(1))
             .push(frame(2));
         let (k, below) = s.capture(1, 0);
@@ -918,6 +1037,30 @@ mod tests {
             panic!("expected a frame");
         };
         assert_eq!(field_of(&replayed), "f2");
+    }
+
+    /// The relative bookkeeping a capture reads off the cut: window-bearing frames say how many
+    /// slots sit above the captured prompt's push height, and the segment says how many below it
+    /// belong to the pushing activation.
+    #[test]
+    fn a_capture_reads_its_slot_metrics_off_the_frames_it_cuts() {
+        let s = Stack::new()
+            .push_prompt(prompt(), 3)
+            .push(frame(1))
+            .push(Frame::Call {
+                name: None,
+                call_site: Span::DUMMY,
+                memo: false,
+                callee_window: 4,
+                caller_window: 3,
+            })
+            .push(Frame::Exit {
+                callee_window: 2,
+                caller_window: 4,
+            });
+        let (k, _) = s.capture(1, 0);
+        assert_eq!(k.cut_deltas(), 6, "4 from the call, 2 from the exit");
+        assert_eq!(k.cut_window(), 3, "the prompt was pushed with window 3");
     }
 
     /// A stack may hold as many frames as the calls under `DEFAULT_MAX_CALLS` can pend, which no
@@ -942,11 +1085,11 @@ mod tests {
     #[test]
     fn capture_crosses_every_handler_between_the_perform_and_its_own() {
         let s = Stack::new()
-            .push_prompt(prompt())
+            .push_prompt(prompt(), 0)
             .push(frame(1))
-            .push_prompt(prompt())
+            .push_prompt(prompt(), 0)
             .push(frame(2))
-            .push_prompt(prompt())
+            .push_prompt(prompt(), 0)
             .push(frame(3));
 
         let (k, below) = s.capture(3, 0);
@@ -968,24 +1111,26 @@ mod tests {
             resource: resource.map(Symbol::new),
             params: Rc::new(Vec::new()),
             resume: None,
-            body: crate::code::lower(&crate::build::int(0)),
+            body: crate::code::lower(&crate::build::int(0)).code,
+            size: 0,
+            captures: crate::code::no_captures(),
             span: Span::DUMMY,
-            free: None,
         };
         let with = |c: Clause| {
             Rc::new(Prompt {
                 clauses: Rc::new(vec![c]),
                 effects: Rc::new(vec![effect.clone()]),
                 ret: None,
-                env: Env::empty(),
+                clause_captures: vec![Rc::from(Vec::new())],
+                ret_captures: Rc::from(Vec::new()),
                 module: 0,
                 span: Span::DUMMY,
             })
         };
 
         let s = Stack::new()
-            .push_prompt(with(clause(Some("users"))))
-            .push_prompt(with(clause(Some("orders"))));
+            .push_prompt(with(clause(Some("users"))), 0)
+            .push_prompt(with(clause(Some("orders"))), 0);
 
         let users = Symbol::new("users");
         let found = s
@@ -1003,7 +1148,7 @@ mod tests {
 
     #[test]
     fn an_unhandled_operation_finds_no_prompt() {
-        let s = Stack::new().push_prompt(prompt());
+        let s = Stack::new().push_prompt(prompt(), 0);
         assert!(
             s.find_handler(&Symbol::new("db"), &Symbol::new("get"), None)
                 .is_none()
@@ -1034,18 +1179,23 @@ mod tests {
             resource: None,
             params: Rc::new(Vec::new()),
             resume: None,
-            body: crate::code::lower(&crate::build::int(0)),
+            body: crate::code::lower(&crate::build::int(0)).code,
+            size: 0,
+            captures: crate::code::no_captures(),
             span: Span::DUMMY,
-            free: None,
         };
-        let inner = s.push_prompt(Rc::new(Prompt {
-            clauses: Rc::new(vec![clause]),
-            effects: Rc::new(vec![Symbol::new("clock")]),
-            ret: None,
-            env: Env::empty(),
-            module: 0,
-            span: Span::DUMMY,
-        }));
+        let inner = s.push_prompt(
+            Rc::new(Prompt {
+                clauses: Rc::new(vec![clause]),
+                effects: Rc::new(vec![Symbol::new("clock")]),
+                ret: None,
+                clause_captures: vec![Rc::from(Vec::new())],
+                ret_captures: Rc::from(Vec::new()),
+                module: 0,
+                span: Span::DUMMY,
+            }),
+            0,
+        );
         assert!(matches!(
             inner
                 .find_handler(&Symbol::new("clock"), &now, None)

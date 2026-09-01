@@ -79,14 +79,18 @@ fn check_types_prints_signatures_and_footprints() {
     assert!(text.contains("effect db"));
 }
 
-/// `--costs` — the ownership design, built at the sequence S2.
+/// `--costs` — the residue the checker reports since ADR 0034: an append copies only when
+/// something else genuinely owns the list, and a binding read again after the append is the
+/// plainest such owner. Position decides nothing any more.
 #[test]
 fn check_costs_separates_two_spellings_of_one_computation() {
     let dir = project(
         "fn grows_last(n: Int, xs: List<Int>) -> List<Int> =\n\
          \x20 if n == 0 { xs } else { grows_last(n - 1, push(xs, n)) }\n\
-         fn grows_first(xs: List<Int>, n: Int) -> List<Int> =\n\
-         \x20 if n == 0 { xs } else { grows_first(push(xs, n), n - 1) }\n",
+         fn grows_shared(xs: List<Int>, n: Int) -> List<Int> = {\n\
+         \x20 let ys = push(xs, n);\n\
+         \x20 if len(xs) < 0 { xs } else if n == 0 { ys } else { grows_shared(ys, n - 1) }\n\
+         }\n",
     );
     let out = ply(dir.path()).args(["check", "--costs"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -94,17 +98,16 @@ fn check_costs_separates_two_spellings_of_one_computation() {
 
     assert!(
         text.contains("m.grows_last  1 reuses"),
-        "the last-position spelling must read `reuses`:\n{text}"
+        "the last-use spelling must read `reuses`:\n{text}"
     );
     assert!(
-        text.contains("m.grows_first  1 COPIES"),
-        "the non-final spelling must read `COPIES`:\n{text}"
+        text.contains("m.grows_shared  1 COPIES"),
+        "the read-again spelling must read `COPIES`:\n{text}"
     );
-    // The fix is named, and `copy` is not what is offered — the ownership design
-    // The warning puts the reordering first and never recommends the
-    // pessimization.
+    // The fix is named, and `copy` is not what is offered: the warning names the restructuring
+    // and never recommends the pessimization.
     assert!(
-        text.contains("fix: move the append into last position"),
+        text.contains("fix: make the append the binding's last use"),
         "a copy must name its edit:\n{text}"
     );
     assert!(

@@ -944,7 +944,6 @@ mod tests {
     use super::*;
     use crate::arena::Slot;
     use crate::cont::{Prompt, Stack};
-    use crate::env::Env;
     use crate::sim::{Answer, Handlers, signature};
     use ply_core::{EffectAtom, Resource};
     use ply_span::Symbol;
@@ -959,11 +958,12 @@ mod tests {
             clauses: Rc::new(Vec::new()),
             effects: Rc::new(Vec::new()),
             ret: None,
-            env: Env::empty(),
+            clause_captures: Vec::new(),
+            ret_captures: Rc::from(Vec::new()),
             module: 0,
             span: Span::DUMMY,
         });
-        Stack::new().push_prompt(prompt).capture(1, 0).0
+        Stack::new().push_prompt(prompt, 0).capture(1, 0).0
     }
 
     /// What a task does, in the order it does it.
