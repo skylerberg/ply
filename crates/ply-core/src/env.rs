@@ -187,6 +187,15 @@ fn rename_row(r: &Row, rows: &FxHashMap<RowVar, RowVar>) -> Row {
 ///
 /// Called at a top-level definition and nowhere else: a local `let` binds
 /// monomorphically.
+///
+/// Since `MISSING_SIGNATURE` the answer is also the definition's declared
+/// generic list, on every accepted program in the corpus, the spikes and this
+/// crate's suite — the only disagreements are programs the checker rejects,
+/// where an unresolved annotation leaves a variable behind. Substituting the
+/// declared list measured no faster, because [`TypeEnv::free_vars`] prunes
+/// closed schemes and the component's own bindings are removed before this
+/// runs, and it would publish `<a>` for a definition that is not polymorphic if
+/// the two ever parted.
 pub fn generalize(subst: &Subst, env: &mut TypeEnv, ty: &Type) -> Scheme {
     let ty = subst.resolve_ty(ty);
     let (env_tys, env_rows) = env.free_vars(subst);
