@@ -11,7 +11,7 @@
 //! left of an occurrence and lowering walks right to left for liveness. The two meet through the
 //! occurrence's span.
 
-use ply_span::{Span, Symbol};
+use ply_span::Symbol;
 use ply_syntax::ast::{Expr, ExprKind, Pattern, PatternKind, Stmt as AstStmt};
 use rustc_hash::FxHashMap;
 
@@ -24,19 +24,27 @@ pub struct Barrier {
 /// What the pass answers.
 #[derive(Debug, Default)]
 pub struct Slots {
-    /// A bare variable occurrence, by span, and the slot it reads.
+    /// A bare variable occurrence, by node identity: the barrier it reads from, and the slot.
+    ///
+    /// **Keyed by the node's address, not its span.** Expansion — `?` and record update —
+    /// synthesizes nodes that reuse the span they came from, so one span can carry two different
+    /// occurrences and a span-keyed map answers for whichever it filed last. `?`'s expansion put an
+    /// `Err` constructor and a generated `?0` read at one span, which is how that was found. The
+    /// address is unique for as long as the tree is alive, which is as long as this map is.
     ///
     /// Absent for a name no binder in the barrier introduces — a definition, a constructor or a
     /// builtin — which is the same set `Live` declines to track.
-    pub of_var: FxHashMap<Span, u32>,
-    /// Every barrier this pass opened, keyed by its body's span.
-    pub barriers: FxHashMap<Span, Barrier>,
+    pub of_var: FxHashMap<usize, (u32, u32)>,
+    /// Every barrier this pass opened, in the order it opened them.
+    pub barriers: Vec<Barrier>,
 }
 
 struct Scope<'a> {
     /// Innermost last, so a shadowed name resolves to the binder nearest the occurrence.
     live: Vec<(Symbol, u32)>,
     barrier: Barrier,
+    /// Which barrier this scope is, as an index into [`Slots::barriers`].
+    at: u32,
     out: &'a mut Slots,
 }
 
@@ -58,10 +66,13 @@ impl Scope<'_> {
 }
 
 /// Resolves one barrier: `params` take the first slots, then the body is walked.
-fn barrier(params: &[Symbol], body: &Expr, out: &mut Slots) {
+fn barrier(params: &[Symbol], body: &Expr, out: &mut Slots) -> u32 {
+    let at = out.barriers.len() as u32;
+    out.barriers.push(Barrier::default());
     let mut scope = Scope {
         live: Vec::new(),
         barrier: Barrier::default(),
+        at,
         out,
     };
     for p in params {
@@ -69,7 +80,8 @@ fn barrier(params: &[Symbol], body: &Expr, out: &mut Slots) {
     }
     walk(body, &mut scope);
     let table = std::mem::take(&mut scope.barrier);
-    out.barriers.insert(body.span, table);
+    out.barriers[at as usize] = table;
+    at
 }
 
 fn pattern(pat: &Pattern, scope: &mut Scope) {
@@ -98,13 +110,17 @@ fn walk(e: &Expr, scope: &mut Scope) {
             if q.is_bare()
                 && let Some(slot) = scope.resolve(q.symbol())
             {
-                scope.out.of_var.insert(e.span, slot);
+                let at = scope.at;
+                scope
+                    .out
+                    .of_var
+                    .insert(std::ptr::from_ref(e) as usize, (at, slot));
             }
         }
         // A lambda is its own barrier: its body's names index its own table, not this one.
         ExprKind::Lambda { params, body } => {
             let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
-            barrier(&params, body, scope.out);
+            let _ = barrier(&params, body, scope.out);
         }
         ExprKind::Unary { operand, .. } => walk(operand, scope),
         ExprKind::Binary { lhs, rhs, .. } => {
@@ -190,10 +206,10 @@ fn walk(e: &Expr, scope: &mut Scope) {
                 let mut params: Vec<Symbol> =
                     clause.params.iter().map(|p| p.name.clone()).collect();
                 params.extend(clause.resume.iter().map(|r| r.name.clone()));
-                barrier(&params, &clause.body, scope.out);
+                let _ = barrier(&params, &clause.body, scope.out);
             }
             if let Some(ret) = return_clause {
-                barrier(std::slice::from_ref(&ret.binder.name), &ret.body, scope.out);
+                let _ = barrier(std::slice::from_ref(&ret.binder.name), &ret.body, scope.out);
             }
         }
         ExprKind::WithCell {
@@ -206,13 +222,15 @@ fn walk(e: &Expr, scope: &mut Scope) {
             scope.live.truncate(depth);
         }
         ExprKind::WithRegion { body, .. } => walk(body, scope),
-        ExprKind::Simulate { body, .. } => barrier(&[], body, scope.out),
+        ExprKind::Simulate { body, .. } => {
+            let _ = barrier(&[], body, scope.out);
+        }
     });
 }
 
 /// Resolves a function body and everything nested in it.
 pub fn resolve(params: &[Symbol], body: &Expr) -> Slots {
     let mut out = Slots::default();
-    barrier(params, body, &mut out);
+    let _ = barrier(params, body, &mut out);
     out
 }

@@ -29,17 +29,17 @@ fn check(params: &[Symbol], body: &Expr, src: &str) -> usize {
     while let Some(e) = stack.pop() {
         if let ExprKind::Var(q) = &e.kind
             && q.is_bare()
-            && let Some(slot) = table.of_var.get(&e.span)
+            && let Some((at, slot)) = table.of_var.get(&(std::ptr::from_ref(e) as usize))
         {
-            // The slot has to exist in *some* barrier and name this variable there.
+            // The slot names this variable in the barrier the occurrence reads from.
             let named = table
                 .barriers
-                .values()
-                .filter_map(|b| b.names.get(*slot as usize))
-                .any(|n| n == q.symbol());
-            assert!(
+                .get(*at as usize)
+                .and_then(|b| b.names.get(*slot as usize));
+            assert_eq!(
                 named,
-                "`{}` resolved to slot {slot}, which names no such binding\n{src}",
+                Some(q.symbol()),
+                "`{}` resolved to slot {slot}, which names {named:?} in its barrier\n{src}",
                 q.symbol()
             );
             checked += 1;
@@ -159,10 +159,7 @@ fn go(x: Int) -> Int = {
     let table = slots::resolve(&params, &f.body);
     let x = Symbol::new("x");
 
-    let body = table
-        .barriers
-        .get(&f.body.span)
-        .expect("the function's own table");
+    let body = &table.barriers[0];
     let of_x: Vec<u32> = body
         .names
         .iter()
@@ -186,7 +183,7 @@ fn go(x: Int) -> Int = {
         if let ExprKind::Var(q) = &e.kind
             && q.is_bare()
             && *q.symbol() == x
-            && let Some(slot) = table.of_var.get(&e.span)
+            && let Some((_, slot)) = table.of_var.get(&(std::ptr::from_ref(e) as usize))
         {
             reads.push((e.span.start, *slot));
         }
@@ -225,13 +222,82 @@ fn go(xs: List<Int>, n: Int) -> List<Int> = map(xs, |y| y + n)
     let y = Symbol::new("y");
     let inner = table
         .barriers
-        .values()
+        .iter()
         .find(|b| b.names.contains(&y))
         .expect("the lambda's table");
     assert_eq!(
         inner.names,
         vec![y],
         "`n` is free in the lambda, so it takes no slot there"
+    );
+}
+
+/// Every function the repository ships, rather than the eight shapes below.
+///
+/// The hand-written probes pin the cases a flat table gets wrong; this one is the breadth. When the
+/// machine starts reading by index, it reads these programs, and a slot that names the wrong
+/// binding in any of them is a wrong value.
+#[test]
+fn every_slot_in_every_shipped_module_names_its_own_variable() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the crate sits two levels under the workspace root");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for dir in ["examples", "crates/ply-std/ply"] {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for e in entries.filter_map(|e| e.ok()) {
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "ply")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                sources.push((path.display().to_string(), text));
+            }
+        }
+    }
+    sources.sort();
+    assert!(
+        sources.len() >= 8,
+        "found only {} shipped modules, so this measured almost nothing",
+        sources.len()
+    );
+
+    let (mut modules, mut checked) = (0usize, 0usize);
+    for (name, text) in &sources {
+        let mut map = SourceMap::new();
+        let id: SourceId = map.add(name, text.clone());
+        let Ok(mut program) =
+            parse_program([(id, ModuleName::from_dotted("probe"), text.as_str())])
+        else {
+            continue;
+        };
+        if resolve_names(&mut program).is_err() {
+            continue;
+        }
+        modules += 1;
+        for module in &program.modules {
+            for item in &module.items {
+                let (params, body) = match item {
+                    Item::Fn(f) => (
+                        f.params
+                            .iter()
+                            .map(|p| p.name.name.clone())
+                            .collect::<Vec<_>>(),
+                        &f.body,
+                    ),
+                    Item::Test(t) => (Vec::new(), &t.body),
+                    _ => continue,
+                };
+                checked += check(&params, body, name);
+            }
+        }
+    }
+    println!("\n  {modules} shipped modules, {checked} variable occurrences resolved");
+    assert!(
+        modules >= 8 && checked >= 500,
+        "{modules} modules and {checked} occurrences is too little breadth to be a check"
     );
 }
 
