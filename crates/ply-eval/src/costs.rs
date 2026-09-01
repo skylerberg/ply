@@ -1014,6 +1014,8 @@ impl Walk<'_, '_> {
                 Cause::Call,
                 "`fold` answers whatever its callback answered",
             )),
+            // `map_update` answers a map rebuilt around the callback's answer; `cell_update`
+            // answers `Unit`.
             _ => Owner::Fresh,
         }
     }
@@ -1045,6 +1047,17 @@ impl Walk<'_, '_> {
                 Some(vec![seed, element])
             }
             Builtin::Map | Builtin::Filter => Some(vec![element]),
+            // The whole point of the fused update: the contents leave the arena for the length
+            // of the call, so the function is handed them at one owner.
+            Builtin::CellUpdate => Some(vec![Owner::Fresh]),
+            // The entry leaves the map, so it is at one owner exactly when the map was.
+            Builtin::MapUpdate => Some(vec![match done.first() {
+                Some(Res::Unique) => Owner::Fresh,
+                Some(Res::Param(k)) => Owner::Param(*k),
+                Some(Res::Blocked(why)) => Owner::Blocked(why.clone()),
+                Some(Res::Unknown(why)) => Owner::Unknown(why.clone()),
+                None => Owner::Unknown(Why::new(Cause::MapEntry, "the map being updated")),
+            }]),
             _ => None,
         }
     }

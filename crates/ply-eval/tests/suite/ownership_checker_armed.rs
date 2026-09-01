@@ -303,3 +303,35 @@ fn the_two_shapes_get_different_verdicts_which_is_what_a_constant_answer_cannot_
          append is the last use; it is a constant and agreement with any corpus is vacuous"
     );
 }
+
+/// The fix the checker recommends for a `cell` cause, run: the contents leave the arena for the
+/// length of the function, so the append is at one owner.
+const REUSES_VIA_CELL_UPDATE: &str = r#"
+fn fill(c: Cell<r, List<Int>>, i: Int) -> Unit / {cell.read[r], cell.write[r]} =
+  if i >= 60 { () } else { cell_update(c, |xs| push(xs, i)); fill(c, i + 1) }
+
+test "an accumulator kept in a cell, appended through the fused update" {
+  with_cell[r]([]) { c -> { fill(c, 0); assert_eq(len(cell_get(c)), 60) } }
+}
+"#;
+
+#[test]
+fn an_append_through_cell_update_is_not_flagged_and_the_counters_confirm_it() {
+    let p = inline(REUSES_VIA_CELL_UPDATE);
+    let (verdict, reason, count) = only_site(&p);
+    println!("cell_update: {verdict:?} — {reason}\n  {count:?}");
+    assert_eq!(
+        count.copies, 0,
+        "the control is not linear after all: {count:?}, so this test arms nothing"
+    );
+    assert!(
+        count.in_place >= 50,
+        "the loop must actually have run: {count:?}"
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Reuses,
+        "the checker flagged the very edit it recommends for a `cell` cause — reason given: \
+         {reason}"
+    );
+}
