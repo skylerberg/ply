@@ -488,12 +488,6 @@ fn mangle(name: &str) -> String {
     format!("ply${}", name.replace('.', "$"))
 }
 
-/// The size of a lowered body, so a census can weight a refusal by how much of
-/// the program it takes out rather than by one function each.
-pub fn node_count(code: &Code) -> usize {
-    count_nodes(code)
-}
-
 fn count_nodes(code: &Code) -> usize {
     let mut n = 1;
     match &code.kind {
