@@ -1,33 +1,10 @@
 //! What replaced the fork, as a number rather than a slogan.
 
+use crate::counting::charge;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Value};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-
-thread_local! {
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        let _ = BYTES.try_with(|c| c.set(c.get() + layout.size()));
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
 
 struct Cost {
     allocs: usize,
@@ -35,14 +12,8 @@ struct Cost {
 }
 
 fn cost_of<T>(f: impl FnOnce() -> T) -> (T, Cost) {
-    ALLOCS.with(|c| c.set(0));
-    BYTES.with(|c| c.set(0));
-    let out = f();
-    let cost = Cost {
-        allocs: ALLOCS.with(Cell::get),
-        bytes: BYTES.with(Cell::get),
-    };
-    (out, cost)
+    let (out, allocs, bytes) = charge(f);
+    (out, Cost { allocs, bytes })
 }
 
 /// Records, so a copy of one is a copy of something rather than of an `i64`.

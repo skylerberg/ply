@@ -154,7 +154,7 @@ trade R2 took is only legible with both:
 - What replaced it is not free. Opening a 10,000-cell region-scoped fixture and
   writing one cell costs **about 100 µs per test**: ADR 0017 §6 published
   95.7 µs, and this audit re-ran
-  `crates/ply-eval/tests/fixture_open_cost.rs` and measured **105.8 µs**. Read it
+  `crates/ply-eval/tests/allocation/fixture_open_cost.rs` and measured **105.8 µs**. Read it
   as an order of magnitude — the test *prints* the figure and asserts only a
   2 ms ceiling, about twenty times the reading, deliberately, so it is a
   staleness guard and not a performance gate. It is paid per test rather than per
@@ -712,7 +712,7 @@ hoisted both — the region-kind analysis and the lowered bodies are now scoped 
 the *program*, so an engine built next over the same program is handed the answer
 instead of recomputing it (`Machine::share_region_kinds`,
 `Machine::share_lowering`; the new tests are
-`ply-eval/tests/suite/region_kind_sharing.rs`, `ply-eval/tests/lowering_sharing.rs` and
+`ply-eval/tests/suite/region_kind_sharing.rs`, `ply-eval/tests/allocation/lowering_sharing.rs` and
 `ply-corpus/tests/suite/region_kind_hoisted.rs`).
 
 R3 did **not** do unboxing, evidence passing or codegen. Those were the planned
@@ -758,7 +758,7 @@ delta.
 | | measured | command |
 | --- | --- | --- |
 | allocations per `/health`, 200 requests | **1,081.87**, 127,954.65 bytes | `./target/release/w6-alloc --repo . --requests 200` |
-| the same, against the file that holds the baseline | *"the report says 1035 allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128 MB"* | `cargo test -p ply-corpus --release --test w6_report_allocations -- --nocapture` |
+| the same, against the file that holds the baseline | *"the report says 1035 allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128 MB"* | `cargo test -p ply-corpus --release --test allocation -- w6_report_allocations --nocapture` |
 | the same at 800 requests | **961.92**, 277,417.23 bytes | `./target/release/w6-alloc --repo . --requests 800` |
 | the two-window fit | **911.5 per request + 34,465 once per `Machine`** | `cargo test -p ply-corpus --release --test w6_alloc_sites -- --nocapture` |
 
@@ -923,7 +923,7 @@ The same audit found `README.md`'s request-path allocation sentence stale for th
 **second** time in this milestone, the second time inside the correction block
 written for the first. That sentence is now the one line of prose in this
 repository that a test reads —
-`ply-corpus/tests/w6_report_allocations.rs:163
+`ply-corpus/tests/allocation/w6_report_allocations.rs:163
 the_readme_still_describes_this_request_path`, both numbers, within 1%.
 `docs/ONBOARDING.md` §7's checked/written boundary moved by exactly that line and
 says so.
@@ -943,7 +943,7 @@ safety property, not an allocation claim: the arena is what made a use-after-fre
 constructible in this language at all, and the brand is what refuses it at
 compile time (`crates/ply-eval/tests/suite/use_after_free_audit.rs`). And the **arena
 beats the persistent map it replaced**, re-taken here with
-`cargo test -p ply-eval --release --test region_arena_cost -- --nocapture`, which
+`cargo test -p ply-eval --release --test allocation -- region_arena_cost --nocapture`, which
 prints for 10,000 cells:
 
 ```

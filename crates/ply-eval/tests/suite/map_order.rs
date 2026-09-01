@@ -120,19 +120,39 @@ fn the_iteration_order_is_pinned() {
     );
 }
 
+/// This binary's own name for the test `leaf`, derived rather than written down.
+///
+/// libtest names a test by its module path *inside the binary*, so the moment a file moves — as
+/// every file in this directory did when the crate went to one test binary — a name spelled out in
+/// a string stops matching. It fails silently in the worst possible direction: a filter that
+/// matches nothing runs no test and exits **0**, which a parent checking `status.success()` cannot
+/// tell from a pass. This is the shape of that mistake, so it is derived.
+fn own_test_name(leaf: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_binary, module)) => format!("{module}::{leaf}"),
+        None => leaf.to_string(),
+    }
+}
+
 /// The process half of "across runs and processes", asserted rather than assumed: a second process
 /// builds the same map from a shuffled order and must print the same keys.
 #[test]
 fn a_second_process_iterates_in_the_same_order() {
     let exe = std::env::current_exe().expect("the test binary");
+    let name = own_test_name("the_iteration_order_is_pinned");
     let out = Command::new(exe)
-        .args(["the_iteration_order_is_pinned", "--exact", "--nocapture"])
+        .args([name.as_str(), "--exact", "--nocapture"])
         .output()
         .expect("the child test process runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "the pinned order did not reproduce in a second process:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        "the pinned order did not reproduce in a second process:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0 — so \
+         the check above passed having run nothing:\n{stdout}"
     );
 }
 
