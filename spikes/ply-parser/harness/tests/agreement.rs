@@ -287,12 +287,49 @@ fn the_ply_parser_agrees_with_ply_syntax_on_every_example() {
     tally.report("examples");
 }
 
+/// Modules this port cannot read, because their syntax postdates it.
+///
+/// The fifth feature to land after the spike was frozen, and the first the
+/// pre-expansion comparison cannot absorb: `?` and `{..b, f: e}` desugar into
+/// nodes the port already has, while `&`, `^`, `~`, the shifts and `0x` are
+/// tokens its lexer never learned. Porting them is a language surface, not a
+/// fix, so the file is named here instead — and both assertions below exist so
+/// the naming cannot rot into a permanent exemption.
+const POSTDATES_THE_PORT: &[&str] = &["hash.ply"];
+
 #[test]
 fn the_ply_parser_agrees_with_ply_syntax_on_the_shipped_standard_library() {
-    let files = read_all(&ply_files(&repo_root().join("crates/ply-std/ply")));
+    let all = ply_files(&repo_root().join("crates/ply-std/ply"));
+    let (skipped, covered): (Vec<PathBuf>, Vec<PathBuf>) = all.iter().cloned().partition(|p| {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        POSTDATES_THE_PORT.contains(&name.as_str())
+    });
+    assert_eq!(
+        skipped.len(),
+        POSTDATES_THE_PORT.len(),
+        "`POSTDATES_THE_PORT` names a module the standard library does not ship: {skipped:?}"
+    );
+
+    let files = read_all(&covered);
     let tally = check_all(&files, "stdlib", 1);
     assert_eq!(tally.inputs, files.len());
     tally.report("stdlib");
+
+    // Every skipped module still has to *fail*. A port that learned the syntax, or a module that
+    // stopped using it, makes this red — which is the only thing that gets the row deleted.
+    for path in &skipped {
+        let one = read_all(std::slice::from_ref(path));
+        let outcome = std::panic::catch_unwind(|| check_all(&one, "stdlib-skipped", 1));
+        assert!(
+            outcome.is_err(),
+            "`{}` now agrees with `ply_syntax`, so remove it from `POSTDATES_THE_PORT`",
+            path.display()
+        );
+    }
 }
 
 // --- the error paths -------------------------------------------------------
@@ -529,7 +566,7 @@ fn the_comparison_reaches_every_tag_the_reference_side_can_emit() {
 }
 
 /// Every tag the **reference** side of this dump can emit.
-const EMITTABLE: [&str; 95] = [
+const EMITTABLE: [&str; 100] = [
     // nodes
     "arm",
     "atm",
@@ -592,6 +629,9 @@ const EMITTABLE: [&str; 95] = [
     "%add",
     "%alias",
     "%and",
+    "%bitand",
+    "%bitor",
+    "%bitxor",
     "%bool",
     "%bytes",
     "%concat",
@@ -621,10 +661,12 @@ const EMITTABLE: [&str; 95] = [
     "%read",
     "%rem",
     "%requires",
+    "%shl",
     "%str",
     "%sub",
     "%sum",
     "%true",
     "%unit",
+    "%ushr",
     "%write",
 ];

@@ -203,6 +203,114 @@ fn unary_binds_tighter_than_arithmetic_and_nests() {
     assert_eq!(expr("!f(x)"), "(not (call f x))");
 }
 
+/// ADR 0033 §2.1 opened four levels between the comparisons and `++`. The
+/// numbers in `bin_op` all moved; what these assert is the thing that made that
+/// safe, which is the *order* — and the order of the bit operators is Rust's.
+#[test]
+fn the_bit_operators_sit_between_comparison_and_concatenation() {
+    assert_eq!(expr("a | b ^ c"), "(| a (^ b c))");
+    assert_eq!(expr("a ^ b & c"), "(^ a (& b c))");
+    assert_eq!(expr("a & b << c"), "(& a (<< b c))");
+    assert_eq!(expr("a << b ++ c"), "(<< a (++ b c))");
+    assert_eq!(expr("a == b | c"), "(== a (| b c))");
+    assert_eq!(expr("a | b == c"), "(== (| a b) c)");
+    assert_eq!(expr("a && b | c"), "(&& a (| b c))");
+    assert_eq!(expr("a & b + c"), "(& a (+ b c))");
+    assert_eq!(expr("a & b & c"), "(& (& a b) c)");
+    assert_eq!(expr("a | b | c"), "(| (| a b) c)");
+    assert_eq!(expr("a << b << c"), "(<< (<< a b) c)");
+    assert_eq!(expr("a >> b >> c"), "(>> (>> a b) c)");
+}
+
+/// A lambda's parameters end in a `|` and a parameter may carry a default, so the default's
+/// expression must not read that closing pipe as bit-or and swallow the body.
+///
+/// The parser spike's differential is what caught this: making `|` infix changed the recovery on
+/// `fixtures/35-err-named-arguments-and-updates.ply` from ten items to seven.
+#[test]
+fn a_lambda_parameter_default_does_not_swallow_the_closing_pipe() {
+    // A default is refused (`E0120`) and parsed anyway, so the closing `|` is what the parser
+    // meets next. Reading it as bit-or consumed the body and the errors multiplied.
+    let d = errs("fn t() = (|x = 1| x)(2)");
+    assert_eq!(
+        d.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["E0120".to_string()],
+        "the closing pipe was read as an operator: {d:#?}"
+    );
+    // And a `|` in the body is still bit-or, because the flag ends with the parameter list.
+    assert_eq!(
+        expr("(|a: Int| a | 1)(2)"),
+        "(call (lam ((a Int)) (| a 1)) 2)"
+    );
+}
+
+/// `>>` is not a token: it is two `Gt` the *expression* parser reads as
+/// adjacent. So the join has to be exactly as tight as the spans are, and
+/// `a > > b` — the same two tokens, written apart — stays the error it was.
+#[test]
+fn a_shift_is_adjacent_angle_brackets_and_a_space_still_separates_them() {
+    assert_eq!(expr("a >> b"), "(>> a b)");
+    assert_eq!(expr("a >>> b"), "(>>> a b)");
+    assert_eq!(expr("a << b"), "(<< a b)");
+    assert_eq!(expr("a > b"), "(> a b)");
+    for src in ["fn t() = a > > b", "fn t() = a < < b", "fn t() = a > >> b"] {
+        let d = errs(src);
+        assert_eq!(d[0].code, codes::UNEXPECTED_TOKEN, "{src}");
+    }
+}
+
+/// The reason `>>` is not lexed. A type's arguments close on `>` tokens that
+/// have to stay separate, and the join lives in a parser the types never enter.
+#[test]
+fn joining_angle_brackets_leaves_nested_type_arguments_alone() {
+    assert_eq!(
+        dump("fn f(m: Map<Int, List<Int>>) -> Int = 1"),
+        "(fn f ((m Map<Int, List<Int>>)) -> Int 1)"
+    );
+    assert_eq!(
+        expr("{ let m: Map<Int, List<Int>> = q; m }"),
+        "(block (let m Map<Int, List<Int>> q) m)"
+    );
+    assert_eq!(
+        dump("fn f(x: List<List<List<Int>>>) -> Int = 1"),
+        "(fn f ((x List<List<List<Int>>>)) -> Int 1)"
+    );
+    // The `>>=` that `expect_gt` splits, behind a second `>`: still three
+    // separate closings and an `=`, and never a shift.
+    assert_eq!(
+        dump("fn f() -> Map<Int, List<Int>>= 1"),
+        "(fn f () -> Map<Int, List<Int>> 1)"
+    );
+}
+
+#[test]
+fn bitwise_not_is_a_prefix_operator_like_the_other_two() {
+    assert_eq!(expr("~a & b"), "(& (bnot a) b)");
+    assert_eq!(expr("~a + b"), "(+ (bnot a) b)");
+    assert_eq!(expr("~~a"), "(bnot (bnot a))");
+    assert_eq!(expr("~f(x)"), "(bnot (call f x))");
+    assert_eq!(expr("~(a | b)"), "(bnot (| a b))");
+}
+
+/// An infix `|` is read only where an operator can appear, and none of the
+/// other three `|` — a lambda's parameters, a sum type's variants, a row's tail
+/// — can reach that position. `||` still munches first, so a nullary lambda is
+/// untouched.
+#[test]
+fn an_infix_pipe_disturbs_none_of_the_other_pipes() {
+    assert_eq!(expr("|x| x | 1"), "(lam ((x _)) (| x 1))");
+    assert_eq!(expr("|| 1 | 2"), "(lam () (| 1 2))");
+    assert_eq!(
+        dump("type Color = Red | Green"),
+        "(type Color = (| (v Red) (v Green)))"
+    );
+    assert_eq!(dump("fn go<|e>() / e = 1"), "(fn go < | e> () / {| e} 1)");
+    assert_eq!(
+        dump("fn a() / {db.read[users] | e} = 1"),
+        "(fn a () / {db.read[users] | e} 1)"
+    );
+}
+
 #[test]
 fn parentheses_override_precedence() {
     assert_eq!(expr("(1 + 2) * 3"), "(* (+ 1 2) 3)");
@@ -1250,6 +1358,12 @@ fn op_str(op: BinOp) -> &'static str {
         BinOp::And => "&&",
         BinOp::Or => "||",
         BinOp::Concat => "++",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        BinOp::Ushr => ">>>",
     }
 }
 
@@ -1276,6 +1390,7 @@ fn dump_expr(e: &Expr) -> String {
             let n = match op {
                 UnOp::Neg => "neg",
                 UnOp::Not => "not",
+                UnOp::BitNot => "bnot",
             };
             format!("({n} {})", dump_expr(operand))
         }

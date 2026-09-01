@@ -203,6 +203,7 @@ fn label(blocker: &Blocker) -> String {
         Blocker::CoefficientRange => "coefficient left range",
         Blocker::Lambda => "lambda",
         Blocker::StringConcat => "string concatenation",
+        Blocker::BitOperator => "bit operator or shift",
         Blocker::Region => "perform, handle or simulate",
         Blocker::UnexpandedSugar => "a parse-time node expansion should have removed",
         Blocker::UndecidableMatchArm => "pattern outside the fragment",

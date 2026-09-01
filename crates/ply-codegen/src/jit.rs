@@ -24,6 +24,10 @@ use std::rc::Rc;
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
+/// Refused rather than lowered: `<<` discards where the other arithmetic raises, and a shift
+/// count outside `0..=63` raises where Cranelift's `ishl` masks it.
+const BIT_OPERATORS: &str = "a bitwise operator or shift, which the fragment does not lower";
+
 /// What the fragment refused, and where.
 #[derive(Debug)]
 pub struct Refused {
@@ -715,8 +719,15 @@ impl Fx<'_, '_> {
             NodeKind::Unary { op, .. } => match op {
                 UnOp::Not => Kind::Bool,
                 UnOp::Neg => Kind::Int,
+                UnOp::BitNot => return self.refuse(BIT_OPERATORS),
             },
             NodeKind::Binary { op, .. } => match op {
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::Ushr => return self.refuse(BIT_OPERATORS),
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
                 BinOp::Eq
                 | BinOp::Ne
@@ -786,8 +797,15 @@ impl Fx<'_, '_> {
             },
 
             NodeKind::Unary { op, operand } => {
+                if matches!(op, UnOp::BitNot) {
+                    return self.refuse(BIT_OPERATORS);
+                }
                 let value = self.expr(operand, scope)?;
                 match op {
+                    // Unreachable past the guard above, and an arm rather than
+                    // a wildcard so that a *new* `UnOp` fails to compile here
+                    // instead of being refused by accident.
+                    UnOp::BitNot => self.refuse(BIT_OPERATORS),
                     UnOp::Not => {
                         let b = self.as_bool(value);
                         let one = self.builder.ins().iconst(types::I64, 1);
@@ -1038,6 +1056,12 @@ impl Fx<'_, '_> {
         let l = self.expr(lhs, scope)?;
         let r = self.expr(rhs, scope)?;
         match op {
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Ushr => self.refuse(BIT_OPERATORS),
             BinOp::Add | BinOp::Sub => {
                 let a = self.as_int(l);
                 let b = self.as_int(r);

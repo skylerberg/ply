@@ -2564,6 +2564,8 @@ pub(crate) fn apply_unary(
             }
         },
         UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
+        // Every bit of the two's-complement pattern flipped, so `~0` is `-1`.
+        UnOp::BitNot => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
     }
 }
 

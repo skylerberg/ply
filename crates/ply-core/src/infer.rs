@@ -753,6 +753,21 @@ impl<'a> Checker<'a> {
                 "range",
                 mono(vec![Type::int(), Type::int()], Type::list(Type::int())),
             ),
+            // The three arithmetic operators that answer rather than raise.
+            (
+                "wrap_add",
+                mono(vec![Type::int(), Type::int()], Type::int()),
+            ),
+            (
+                "wrap_sub",
+                mono(vec![Type::int(), Type::int()], Type::int()),
+            ),
+            (
+                "wrap_mul",
+                mono(vec![Type::int(), Type::int()], Type::int()),
+            ),
+            // The inverse of `bytes_at`, which had none.
+            ("byte_of_int", mono(vec![Type::int()], Type::bytes())),
             ("int_to_string", mono(vec![Type::int()], Type::string())),
             (
                 "string_concat",
@@ -2962,6 +2977,10 @@ impl<'a> Checker<'a> {
                     });
                     return (t, row);
                 }
+                if let UnOp::BitNot = op {
+                    self.expect_bits(operand.span, &t, "operand of `~`");
+                    return (Type::int(), row);
+                }
                 let want = Type::bool();
                 self.expect(operand.span, &want, &t, "operand of a unary operator");
                 (want, row)
@@ -3193,6 +3212,18 @@ impl<'a> Checker<'a> {
                 });
             }
             return (if arithmetic { lt } else { Type::bool() }, row);
+        }
+
+        // Each side is checked against `Int` rather than against the other, so `a & b` over
+        // two `Bool`s names both of them instead of hiding the second.
+        if matches!(
+            op,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Ushr
+        ) {
+            let what = op.text();
+            self.expect_bits(lhs.span, &lt, &format!("left operand of `{what}`"));
+            self.expect_bits(rhs.span, &rt, &format!("right operand of `{what}`"));
+            return (Type::int(), row);
         }
 
         let (operand, result) = match op {
@@ -5110,6 +5141,23 @@ impl<'a> Checker<'a> {
                  one of the clause's own parameters",
             ),
         );
+    }
+
+    /// A bit operand, with the note a `Bool` gets: `&` written where `&&` was meant.
+    fn expect_bits(&mut self, span: Span, found: &Type, context: &str) {
+        if self.expect(span, &Type::int(), found, context) {
+            return;
+        }
+        let bool_operand = match self.subst.resolve_ty(found) {
+            Type::Con(name, args) => args.is_empty() && name.as_str() == "Bool",
+            _ => false,
+        };
+        if !bool_operand {
+            return;
+        }
+        let Some(last) = self.diags.pop() else { return };
+        self.diags
+            .push(last.note("`Bool` has `&&`, `||` and `!`; the bit operators are `Int` only"));
     }
 
     fn expect(&mut self, span: Span, expected: &Type, found: &Type, context: &str) -> bool {

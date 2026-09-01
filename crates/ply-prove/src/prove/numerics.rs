@@ -1,28 +1,7 @@
 //! What `Float` and `Decimal` may and may not do to the `proved` tier.
 
-use super::tests::{Fixture, binders, fixture, not_proved, proof};
-use super::{Blocker, Decision, Goal, Limits, decide_and_diagnose};
-use ply_syntax::ast::Expr;
-
-/// [`decide_and_diagnose`] over a law, so a test can assert *why* an attempt was refused rather
-/// than only that it was.
-fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
-    let ctx = f.context();
-    let law = f.law(label);
-    let binders = binders(law);
-    let guards: Vec<&Expr> = law.guard.iter().collect();
-    decide_and_diagnose(
-        &ctx,
-        &Goal {
-            module: 0,
-            binders: &binders,
-            guards: &guards,
-            result: None,
-            body: &law.body,
-        },
-        &Limits::default(),
-    )
-}
+use super::tests::{attempt_for_test, fixture, not_proved, proof};
+use super::{Blocker, Decision};
 
 const FLOATS: &str = r#"
 law "a float equals itself" forall (x: Float) { x == x }

@@ -1,6 +1,7 @@
 use crate::style::ColorChoice;
 use clap::{Args, Parser, Subcommand};
 use ply_eval::Seed;
+use ply_host::fs::RootSpec;
 use ply_host::tls::CredentialSpec;
 use std::path::PathBuf;
 
@@ -194,6 +195,30 @@ pub struct TlsOptions {
     pub tls: Vec<CredentialSpec>,
 }
 
+/// The directories a run lets a program reach, named from it.
+///
+/// A resource label is the capability: `fs.read_file[src]` reads somewhere
+/// under whatever `src` names, and what it names is here rather than in the
+/// program — a path written in a definition would put a filesystem location
+/// into its hash and into a store designed never to forget, and the same
+/// program would then mean two things on two machines.
+///
+/// Resolved at bind time, before anything runs, for the reason [`TlsOptions`]
+/// gives: a run that discovers its output directory is a dangling symlink on
+/// the first write has already done the work it is about to lose.
+#[derive(Args, Clone, Debug, Default)]
+pub struct FsOptions {
+    /// Filesystem root: `--fs src=./crates`. Repeatable, one root per resource
+    /// label. An operation reaches only what is under the root its label names.
+    #[arg(
+        long = "fs",
+        value_name = "NAME=PATH",
+        value_parser = parse_root,
+        requires = "host",
+    )]
+    pub fs: Vec<RootSpec>,
+}
+
 /// What a `SIGINT` or a `SIGTERM` does to a serving run.
 ///
 /// Both knobs are the *run's* rather than the program's, which is why they are
@@ -251,6 +276,12 @@ impl ShutdownOptions {
 /// argument needs the form, and one whose PEM is broken needs the file.
 fn parse_credential(text: &str) -> Result<CredentialSpec, String> {
     CredentialSpec::parse(text)
+}
+
+/// The same split, one code along: the shape is a usage error and `E0454` is
+/// for a root that does not resolve.
+fn parse_root(text: &str) -> Result<RootSpec, String> {
+    RootSpec::parse(text)
 }
 
 /// A seed that parses loosely replays something other than what failed, so
@@ -379,6 +410,9 @@ pub struct TestArgs {
     pub tls: TlsOptions,
 
     #[command(flatten)]
+    pub fs: FsOptions,
+
+    #[command(flatten)]
     pub db: crate::db::DbOptions,
 
     #[command(flatten)]
@@ -475,6 +509,9 @@ pub struct ProveArgs {
     pub tls: TlsOptions,
 
     #[command(flatten)]
+    pub fs: FsOptions,
+
+    #[command(flatten)]
     pub db: crate::db::DbOptions,
 
     #[command(flatten)]
@@ -561,6 +598,9 @@ pub struct RunArgs {
     pub tls: TlsOptions,
 
     #[command(flatten)]
+    pub fs: FsOptions,
+
+    #[command(flatten)]
     pub db: crate::db::DbOptions,
 
     #[command(flatten)]
@@ -645,6 +685,9 @@ pub struct HostsArgs {
 
     #[command(flatten)]
     pub tls: TlsOptions,
+
+    #[command(flatten)]
+    pub fs: FsOptions,
 
     #[command(flatten)]
     pub db: crate::db::DbOptions,
