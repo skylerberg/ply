@@ -1479,7 +1479,7 @@ impl Decoder<'_> {
 /// The normalizer's byte table is the source of truth; this is its inverse, pinned by a round-trip
 /// test over every operator.
 fn binop_of(byte: u8) -> Decoded<BinOp> {
-    const ALL: [BinOp; 14] = [
+    const ALL: [BinOp; 20] = [
         BinOp::Add,
         BinOp::Sub,
         BinOp::Mul,
@@ -1494,6 +1494,12 @@ fn binop_of(byte: u8) -> Decoded<BinOp> {
         BinOp::And,
         BinOp::Or,
         BinOp::Concat,
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+        BinOp::Ushr,
     ];
     ALL.into_iter()
         .find(|op| binop_byte(*op) == byte)
@@ -1501,7 +1507,7 @@ fn binop_of(byte: u8) -> Decoded<BinOp> {
 }
 
 fn unop_of(byte: u8) -> Decoded<UnOp> {
-    [UnOp::Neg, UnOp::Not]
+    [UnOp::Neg, UnOp::Not, UnOp::BitNot]
         .into_iter()
         .find(|op| unop_byte(*op) == byte)
         .ok_or_else(|| bad(format!("`{byte}` is not a unary operator")))

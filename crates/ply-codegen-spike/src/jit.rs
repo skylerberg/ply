@@ -713,10 +713,20 @@ impl Fx<'_, '_> {
             },
             NodeKind::Unary { op, .. } => match op {
                 UnOp::Not => Kind::Bool,
-                UnOp::Neg => Kind::Int,
+                UnOp::Neg | UnOp::BitNot => Kind::Int,
             },
             NodeKind::Binary { op, .. } => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::Ushr => Kind::Int,
                 BinOp::Eq
                 | BinOp::Ne
                 | BinOp::Lt
@@ -785,6 +795,9 @@ impl Fx<'_, '_> {
             NodeKind::Unary { op, operand } => {
                 let value = self.expr(operand, scope)?;
                 match op {
+                    // Refused with the six binary bit operators, and for the
+                    // reason given at `binary`'s arm for them.
+                    UnOp::BitNot => self.refuse("`~`"),
                     UnOp::Not => {
                         let b = self.as_bool(value);
                         let one = self.builder.ins().iconst(types::I64, 1);
@@ -1126,6 +1139,20 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Concat => self.refuse("`++`"),
+            // ADR 0033 §2's bit operators, refused as a set rather than lowered
+            // as six instructions. `&`, `|` and `^` really are one instruction
+            // each; the shifts are not, because a count outside `0..=63` raises
+            // (§2.2) where Cranelift's `ishl` silently masks it to the low six
+            // bits. A native shift here would therefore answer where the
+            // interpreter refuses, and this spike's whole claim is that its
+            // ratio is measured over a fragment on which the two backends
+            // agree. Refusing by name is what §3.2 asks for when they do not.
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Ushr => self.refuse(format!("`{}`", op.text())),
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
         }
     }

@@ -28,6 +28,11 @@ impl Outcome {
 
 /// One `main.ply` in a temporary directory, run under `ply test`.
 fn ply_test(source: &str) -> Outcome {
+    ply_test_with(source, &[])
+}
+
+/// The same, with extra flags, for a caller that has to control how the suite is scheduled.
+fn ply_test_with(source: &str, flags: &[&str]) -> Outcome {
     let dir = tempfile::tempdir().expect("a temp dir");
     write(dir.path(), source);
     let out = Command::cargo_bin("ply")
@@ -35,6 +40,7 @@ fn ply_test(source: &str) -> Outcome {
         .arg("--color")
         .arg("never")
         .arg("test")
+        .args(flags)
         .current_dir(dir.path())
         .output()
         .expect("`ply test` ran");
@@ -580,14 +586,17 @@ fn escapes(k: Int) -> String = "/" ++ grow("%41", k)
 test "k" { assert_eq(router::route(table(), http::Get, escapes(11)), router::NotFound) }
 test "4k" { assert_eq(router::route(table(), http::Get, escapes(13)), router::NotFound) }
 "#;
-    let out = ply_test(source);
+    // `--jobs 1`, because the two tests have disjoint footprints and would otherwise be scheduled
+    // concurrently: the ratio would then be reporting how the workers shared a loaded machine.
+    let out = ply_test_with(source, &["--jobs", "1"]);
     out.green("the router refused a path of escapes rather than routing it");
     let one = duration_of(&out.output, "main.k");
     let four = duration_of(&out.output, "main.4k");
     assert!(
         four <= one * 9.0,
-        "four times the escapes cost {four:.1}ms against {one:.1}ms for k, which is {:.1}x — \
-         `std.router.percent_decode` is accumulating with an operation that copies\n\n{}",
+        "four times the escapes cost {four:.1}ms against {one:.1}ms for k, which is {:.1}x — the \
+         routing path is superlinear in the escapes, or these two measurements did not get \
+         comparable CPU\n\n{}",
         four / one,
         out.output
     );

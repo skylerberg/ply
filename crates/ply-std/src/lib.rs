@@ -17,6 +17,12 @@ pub const CONFIG: &str = include_str!("../ply/config.ply");
 /// The database effect and the values that cross it.
 pub const DB: &str = include_str!("../ply/db.ply");
 
+/// The filesystem effect, rooted on a resource label, and the in-memory twin a test handles it over.
+pub const FS: &str = include_str!("../ply/fs.ply");
+
+/// BLAKE3, written in Ply, so the hash content addressing is defined by is a definition you can read.
+pub const HASH: &str = include_str!("../ply/hash.ply");
+
 /// The JSON value, its parser and serializer, and the primitives a `derive json for T` composes out
 /// of.
 pub const JSON: &str = include_str!("../ply/json.ply");
@@ -42,6 +48,8 @@ pub const SIGNAL: &str = include_str!("../ply/signal.ply");
 pub const MODULES: &[(&str, &str)] = &[
     ("std.config", CONFIG),
     ("std.db", DB),
+    ("std.fs", FS),
+    ("std.hash", HASH),
     ("std.http", HTTP),
     ("std.json", JSON),
     ("std.net", NET),

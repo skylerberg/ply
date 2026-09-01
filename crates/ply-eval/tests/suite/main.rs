@@ -6,6 +6,8 @@
 //! `#[global_allocator]`, whose count would include every other test's, and
 //! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
+mod bit_operators;
+mod blake3_differential;
 mod byte_builtins;
 mod cell_arena_wiring;
 mod constant_memo;

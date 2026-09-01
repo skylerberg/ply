@@ -864,6 +864,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         &opened.check,
         args.host,
         &args.tls.tls,
+        &args.fs.fs,
         db,
         configuration,
         &args.trace,
