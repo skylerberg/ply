@@ -417,6 +417,14 @@ two by 2.29× against 1.46×, which is not a shape. Counting bytes separates the
 asks a question `imbl` can answer: a chunked append that copies a path instead of an array moves the
 quadratic ratio toward the linear one, which is visible where a boolean is not.
 
+**And the template does not carry to the standard library, which is where most of the forty-five
+are.** The synthetic pair works because both sides pay a near-zero fixed cost. A probe that imports
+`std.json` charges roughly 11 MB of module-level and memoised work that does not scale with it, and
+two runs are not independent — the second is measured against a warm memo and a warm interner.
+Doubling the subject read **0.98×**, and the byte count *fell* between k = 500 and k = 1,000, which
+is not a quantity a ratio can be taken of. Converting the stdlib assertions needs their fixed part
+subtracted or their accumulator driven directly, and neither is written.
+
 **That is one site of forty-five, and counting them changes what S5 is.** The copy counters are read
 **45 times across 8 files** — 16 of them in `ownership_checker_oracle`, 9 in
 `stdlib_accumulator_cost`, 7 in `ownership_checker_armed`. The whole ownership-checking edifice is
