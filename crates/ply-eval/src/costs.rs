@@ -127,6 +127,9 @@ pub struct Site {
     /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the machine's
     /// own move decision, recorded so the checker can be judged against it.
     pub own_marked: bool,
+    /// `Some(k)` when the list is the definition's parameter `k`, reaching the append at its last
+    /// use: whatever the verdict says about callers, the body itself hands the list over.
+    pub param: Option<usize>,
 }
 
 impl Site {
@@ -632,6 +635,10 @@ fn finish(
         reason,
         cause,
         own_marked,
+        param: match res {
+            Res::Param(k) => Some(*k),
+            _ => None,
+        },
     }
 }
 

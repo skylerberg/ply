@@ -136,6 +136,7 @@ fn fingerprint() -> SourceFingerprint {
                 span: FileSpan { start: 12, end: 18 },
             }],
             deps: vec![Symbol::new("store.db.get")],
+            reuse: false,
         }],
         tests: vec![CachedTest {
             name: "active_users excludes inactive".to_string(),
@@ -933,6 +934,7 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
         kind: DefKind::Effect,
         members: vec![],
         deps: vec![Symbol::new("")],
+        reuse: false,
     });
     fp.tests.push(CachedTest {
         name: String::new(),

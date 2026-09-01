@@ -152,6 +152,7 @@ pub(crate) fn exemplars() -> Exemplars {
                     kind: DefKind::Fn,
                     members: vec![],
                     deps: vec![sym("store.db.get")],
+                    reuse: false,
                 },
                 DefEntry {
                     name: sym("user.User"),
@@ -165,6 +166,7 @@ pub(crate) fn exemplars() -> Exemplars {
                         span: FileSpan { start: 60, end: 66 },
                     }],
                     deps: vec![],
+                    reuse: false,
                 },
                 DefEntry {
                     name: sym("user.db"),
@@ -184,6 +186,7 @@ pub(crate) fn exemplars() -> Exemplars {
                         },
                     }],
                     deps: vec![],
+                    reuse: false,
                 },
             ],
             tests: vec![CachedTest {
@@ -354,7 +357,7 @@ mod tests {
     use super::*;
 
     /// The digest of the shapes this build stores.
-    const PINNED: &str = "4f5a80b78f7e334090b798beae50579714462e8114aeb091757d1bfc52c4cdea";
+    const PINNED: &str = "00c3b67068e47ecd4484dc388cf9faf4bd04c642cb6c0e63247bc413164d4ed8";
 
     #[test]
     fn the_stored_schema_is_pinned() {

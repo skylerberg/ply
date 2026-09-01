@@ -1183,6 +1183,13 @@ impl<'s> Driver<'s> {
 
         let files = self.files.iter().map(|f| f.path.clone()).collect();
         let complete = self.files.iter().all(|f| f.parse);
+        let promised = self.files.iter().any(|f| match &f.ast {
+            Some(ast) => ast
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Fn(def) if def.reuse.is_some())),
+            None => f.cached_defs().iter().any(|d| d.reuse),
+        });
         Ok(Loaded {
             root: self.root,
             files,
@@ -1193,6 +1200,7 @@ impl<'s> Driver<'s> {
             hashes: merged,
             complete,
             frontend: report,
+            promised,
         })
     }
 
@@ -1702,6 +1710,7 @@ impl<'s> Driver<'s> {
                 kind,
                 members,
                 deps,
+                reuse: matches!(item, Item::Fn(def) if def.reuse.is_some()),
             });
         }
 
