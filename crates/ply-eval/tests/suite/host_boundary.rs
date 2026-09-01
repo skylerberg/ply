@@ -1,42 +1,16 @@
 //! The host effect boundary, end to end through the machine.
 
+use crate::fixture::Compiled;
 use ply_core::ty::{EffectAtom, Footprint, Resource};
-use ply_core::{CheckOutput, check_program};
+use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Pending,
 };
-use ply_eval::{Machine, Value};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_syntax::ast::{Mode, ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_syntax::ast::Mode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let check = check_program(&program, &resolved).expect("the fixture typechecks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-}
 
 /// A host handler that answers the ordinal of its own call.
 #[derive(Default)]
@@ -132,7 +106,7 @@ test/nondet "the packet goes out" {
 /// The default is the guarantee.
 #[test]
 fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let counter = Arc::new(Counter::default());
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
@@ -158,7 +132,7 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
 /// one.
 #[test]
 fn an_operation_no_handler_claims_is_still_e0303() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
     assert_eq!(
@@ -171,7 +145,8 @@ fn an_operation_no_handler_claims_is_still_e0303() {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
     )]);
-    let idle = compile(
+    let idle = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -194,7 +169,7 @@ test/nondet "closes without sending" {
 
 #[test]
 fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let counter = Arc::new(Counter::default());
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
@@ -216,7 +191,8 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
 /// The binding is the handler of **last resort**.
 #[test]
 fn a_handler_in_scope_shadows_the_host() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -267,7 +243,7 @@ test/nondet "resumed twice across a send" {
 
 #[test]
 fn a_second_resumption_across_an_at_most_once_operation_is_refused() {
-    let compiled = compile(MULTI_SHOT_OVER_HOST);
+    let compiled = Compiled::named("t", MULTI_SHOT_OVER_HOST);
     let counter = Arc::new(Counter::default());
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
@@ -294,7 +270,7 @@ fn a_second_resumption_across_an_at_most_once_operation_is_refused() {
 /// author makes: this replays without changing anything outside the program.
 #[test]
 fn the_same_program_with_a_repeatable_operation_resumes_twice() {
-    let compiled = compile(MULTI_SHOT_OVER_HOST);
+    let compiled = Compiled::named("t", MULTI_SHOT_OVER_HOST);
     let counter = Arc::new(Counter::default());
     let registry = registry_of(vec![(
         op("net", "send", Linearity::Repeatable),
@@ -324,7 +300,8 @@ fn the_same_program_with_a_repeatable_operation_resumes_twice() {
 /// capture.
 #[test]
 fn a_continuation_captured_after_the_last_send_resumes_twice() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -365,7 +342,8 @@ test/nondet "captured after the send" {
 /// change behaviour.
 #[test]
 fn hermetic_multi_shot_is_untouched() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect retry {
   read ask() -> Int
@@ -408,7 +386,7 @@ test/nondet "reached through a call" {
 }
 "#,
     ] {
-        let compiled = compile(source);
+        let compiled = Compiled::named("t", source);
         let counter = Arc::new(Counter::default());
         let registry = registry_of(vec![(
             op("net", "send", Linearity::AtMostOnce),
@@ -429,7 +407,8 @@ test/nondet "reached through a call" {
 /// nothing.
 #[test]
 fn a_host_operation_inside_a_region_is_refused_hermetically_too() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -455,7 +434,8 @@ test/nondet "hermetic, in a region" {
 /// Lock 2 of the three that keep `simulate` and the production scheduler apart.
 #[test]
 fn a_spawn_inside_a_region_reaches_the_seeded_scheduler_even_when_task_is_bound() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 fn detached() -> Int / {task.write} = {
   let t = task.spawn(|| 1);
@@ -499,7 +479,7 @@ test/nondet "the region's own scheduler answers" {
 /// The one mechanical defence in the system against a footprint that under-reports.
 #[test]
 fn an_answer_outside_the_declared_footprint_is_refused() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let counter = Arc::new(Counter::default());
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
@@ -523,7 +503,7 @@ fn an_answer_outside_the_declared_footprint_is_refused() {
 
 #[test]
 fn an_answer_inside_the_declared_footprint_is_allowed() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
@@ -545,7 +525,7 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
 /// no check at all.
 #[test]
 fn the_declared_footprint_survives_the_next_entry_point() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
@@ -567,7 +547,8 @@ fn the_declared_footprint_survives_the_next_entry_point() {
 /// until the token resolves.
 #[test]
 fn a_pending_answer_outside_a_region_blocks_and_returns_the_value() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -595,7 +576,7 @@ test/nondet "waits" {
 /// touches one — so this must be a diagnostic rather than a panic or a hang.
 #[test]
 fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Waits),
@@ -623,12 +604,7 @@ test "a det test reaching a socket" {
   net.send[socket](1)
 }
 "#;
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("parses");
-    let resolved = resolve(&mut program).expect("resolves");
-    let diagnostics =
-        check_program(&program, &resolved).expect_err("a det test may not reach a nondet effect");
+    let diagnostics = Compiled::rejected_in("t", source);
     assert!(
         diagnostics
             .iter()
@@ -641,7 +617,8 @@ test "a det test reaching a socket" {
 /// The counter is per entry point.
 #[test]
 fn the_host_operation_count_does_not_cross_an_entry_point() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -692,7 +669,7 @@ fn a_span_from_the_perform_reaches_the_handler() {
         }
     }
 
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let registry = registry_of(vec![(
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Spans),
@@ -717,7 +694,8 @@ fn task_registry(handler: Arc<dyn HostHandler>) -> HostRegistry {
 /// The whole point of the production scheduler: it is reachable from a program.
 #[test]
 fn a_bound_task_perform_opens_a_production_region_rather_than_calling_a_handler() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test/nondet "two tasks and a join" {
   let a = task.spawn(|| 1);
@@ -748,7 +726,8 @@ test/nondet "two tasks and a join" {
 /// Lock 3.
 #[test]
 fn a_hermetic_run_never_opens_a_production_region() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test/nondet "spawns" {
   assert_eq(task.join(task.spawn(|| 1)), 1)
@@ -767,7 +746,8 @@ test/nondet "spawns" {
 /// The two schedulers do not nest in *either* order.
 #[test]
 fn a_simulate_inside_a_production_region_is_refused() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test/nondet "a region inside the production one" {
   let t = task.spawn(|| 1);
@@ -790,7 +770,8 @@ test/nondet "a region inside the production one" {
 /// A production region answers `task` and nothing else.
 #[test]
 fn a_production_region_never_answers_clock_from_the_seeded_table() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test/nondet "reads a clock inside the production region" {
   let t = task.spawn(|| 1);
@@ -847,7 +828,8 @@ fn a_task_pending_on_a_host_token_parks_and_the_others_run() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write accept[s](listener: Int) -> Int
@@ -883,7 +865,8 @@ test/nondet "the sibling runs while one task waits" {
 /// resolves.
 #[test]
 fn a_pending_outside_a_region_blocks_the_one_thread_it_is_allowed_to() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write accept[s](listener: Int) -> Int

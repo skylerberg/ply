@@ -6,6 +6,8 @@
 //! `#[global_allocator]`, whose count would include every other test's, and
 //! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
+mod fixture;
+
 mod audit_coverage;
 mod bisect_audit;
 mod classification_audit;

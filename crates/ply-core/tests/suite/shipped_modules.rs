@@ -1,28 +1,12 @@
 //! The shipped modules, checked as one program.
 
-use ply_core::{CheckOutput, check_program};
-use ply_span::{Diagnostic, SourceId, Symbol};
-use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-fn compile(modules: &[(&str, &str)]) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let inputs: Vec<_> = modules
-        .iter()
-        .enumerate()
-        .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-        .collect();
-    let mut program = ply_syntax::parse_program(inputs)?;
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        return Err(diags);
-    }
-    let resolved = resolve(&mut program)?;
-    check_program(&program, &resolved)
-}
+use crate::fixture::expanded_modules;
+use ply_core::CheckOutput;
+use ply_span::Symbol;
 
 fn shipped() -> CheckOutput {
     let modules: Vec<(&str, &str)> = ply_std::sources().collect();
-    match compile(&modules) {
+    match expanded_modules(&modules) {
         Ok(out) => out,
         Err(d) => panic!("the shipped modules do not check: {d:#?}"),
     }

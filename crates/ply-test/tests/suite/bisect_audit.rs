@@ -1,11 +1,9 @@
 //! An adversarial audit of M5 bisection: inputs chosen to make it name the wrong definition.
 
-use ply_core::CheckOutput;
+use crate::fixture::Compiled;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::SourceId;
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_test::bisect::{
     Baseline, Budget, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Diff, EraTable,
     FusionReason, Hybrid, Regression, Renormalizer, Skipped, Trial, Unresolved, Verdict, bisect,
@@ -20,40 +18,7 @@ fn sym(s: &str) -> Symbol {
     Symbol::new(s)
 }
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-    hashes: HashOutput,
-}
-
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        Compiled::modules(&[("m", src)])
-    }
-
-    fn modules(modules: &[(&str, &str)]) -> Compiled {
-        use ply_syntax::ast::ModuleName;
-        let inputs: Vec<(SourceId, ModuleName, &str)> = modules
-            .iter()
-            .enumerate()
-            .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-            .collect();
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-            hashes,
-        }
-    }
-
     fn renormalizer(&self) -> Renormalizer<'_> {
         let test_keys: Vec<Symbol> = self.check.tests.iter().map(|t| t.key.clone()).collect();
         Renormalizer::new(&self.program, &self.resolved, &self.hashes, &test_keys)
