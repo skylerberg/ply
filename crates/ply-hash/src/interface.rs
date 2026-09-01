@@ -1,9 +1,4 @@
 //! What a *caller* can observe about a definition, hashed.
-//!
-//! A `DefHash` covers a definition's whole body and every body it reaches, which
-//! is right for an identity and far too much for a recheck decision: it moves
-//! for edits a caller cannot see. This is the complement — the published scheme,
-//! the published footprint and the published constraints, and nothing else.
 
 use ply_core::{DefConstraint, EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use rustc_hash::FxHashMap;
@@ -36,14 +31,9 @@ mod tag {
 /// Everything a caller is checked against: the type it calls at, the effects it
 /// inherits, and the constraints its arguments must satisfy.
 ///
-/// Quantified variables are renumbered by first occurrence in a traversal of the
-/// scheme's own type — the canonical form `ply-store` puts a scheme in before
-/// storing it, restated here because that crate depends on this one. It cannot
-/// be left to the caller: `ply_core::env::generalize` quantifies over whatever
-/// numbers the run's counter handed out, so one definition generalizes to
-/// alpha-equivalent schemes with different numbers depending on what subset of
-/// the program was checked. Hash those raw and every interface reads as changed
-/// on every run, and the cutoff this key exists for never fires.
+/// Quantified variables are renumbered here rather than by the caller, because
+/// `generalize` hands out whatever numbers the run's counter reached: hash a
+/// scheme raw and every interface reads as changed, so the cutoff never fires.
 pub fn interface_hash(
     scheme: &Scheme,
     footprint: &Footprint,
