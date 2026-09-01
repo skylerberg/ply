@@ -28,9 +28,9 @@ fn seed(cells: usize) -> impl Fn(&mut TaskRegions) -> Value {
 
 fn first_cell(handle: &Value) -> ply_eval::arena::Slot {
     match handle {
-        Value::List(items) => match items[0] {
-            Value::Cell(slot) => slot,
-            ref other => panic!("expected a cell, found {other:?}"),
+        Value::List(items) => match items.first() {
+            Some(Value::Cell(slot)) => *slot,
+            other => panic!("expected a cell, found {other:?}"),
         },
         other => panic!("expected the handle list, found {other:?}"),
     }

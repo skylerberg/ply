@@ -15,10 +15,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Whole-list sharing rather than structural sharing, which costs no persistent-vector dependency:
-/// `push` rewrites the array when its caller is the last owner of it, and copies the whole array
-/// when anything else can still see it.
-pub type Vector<T> = Arc<Vec<T>>;
+pub use crate::list::List;
 
 /// The `Map` primitive's representation.
 pub type Map = RedBlackTreeMap<Value, Value>;
@@ -151,7 +148,7 @@ pub enum Value {
     /// carrying its own refcount semantics into the enum the hygiene rules are written against.
     Bytes(Arc<[u8]>),
     Unit,
-    List(Vector<Value>),
+    List(List),
     /// Iterated in ascending key order by [`Value::cmp`], always.
     Map(Map),
     Record(Arc<Fields>),
@@ -250,7 +247,7 @@ impl Value {
 
     #[inline(never)]
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(Arc::new(items))
+        Value::List(List::from(items))
     }
 
     pub fn empty_map() -> Value {
@@ -364,7 +361,7 @@ impl Value {
         }
     }
 
-    pub fn as_list(&self, span: Span, what: &str) -> Result<&Vector<Value>, Diagnostic> {
+    pub fn as_list(&self, span: Span, what: &str) -> Result<&List, Diagnostic> {
         match self {
             Value::List(xs) => Ok(xs),
             other => Err(type_error(span, what, "List", other)),
@@ -555,7 +552,12 @@ fn nests(v: &Value) -> bool {
 /// Moves the children that can nest further onto `out`, leaving the value empty.
 fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     match v {
-        Value::List(xs) | Value::Ctor { args: xs, .. } => {
+        Value::List(xs) => {
+            let mut items = Vec::new();
+            xs.drain_unique(&mut items);
+            out.extend(items.into_iter().filter(nests));
+        }
+        Value::Ctor { args: xs, .. } => {
             if let Some(items) = Arc::get_mut(xs) {
                 out.extend(items.drain(..).filter(nests));
             }

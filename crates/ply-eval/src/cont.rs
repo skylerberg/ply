@@ -9,7 +9,7 @@
 use crate::arena::{Pin, RegionId};
 use crate::code::{Clause, Code, ReturnArm, Stmt};
 use crate::pool::{self, Free, Link, Pooled};
-use crate::value::{Value, Vector};
+use crate::value::{List, Value};
 use crate::window::SlotVal;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, Ident, UnOp};
@@ -212,7 +212,7 @@ pub enum Frame {
     /// captured across a native frame that cannot be re-entered.
     MapStep {
         f: Value,
-        items: Vector<Value>,
+        items: List,
         next: usize,
         done: Vec<Value>,
         span: Span,
@@ -220,7 +220,7 @@ pub enum Frame {
 
     FilterStep {
         f: Value,
-        items: Vector<Value>,
+        items: List,
         next: usize,
         done: Vec<Value>,
         span: Span,
@@ -228,7 +228,7 @@ pub enum Frame {
 
     FoldStep {
         f: Value,
-        items: Vector<Value>,
+        items: List,
         next: usize,
         span: Span,
     },

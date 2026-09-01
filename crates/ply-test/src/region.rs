@@ -87,9 +87,9 @@ mod tests {
 
     fn cell(handle: &Value, at: usize) -> Slot {
         match handle {
-            Value::List(items) => match items[at] {
-                Value::Cell(slot) => slot,
-                ref other => panic!("expected a cell at {at}, found {other:?}"),
+            Value::List(items) => match items.get(at) {
+                Some(Value::Cell(slot)) => *slot,
+                other => panic!("expected a cell at {at}, found {other:?}"),
             },
             other => panic!("expected the handle list, found {other:?}"),
         }

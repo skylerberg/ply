@@ -21,6 +21,8 @@ mod frame;
 pub mod handler;
 pub mod host;
 pub mod limit;
+pub mod list;
+pub use list::List;
 pub mod machine;
 pub mod map;
 mod memo;
@@ -82,7 +84,7 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
+    Closure, ClosureKind, Decimal, Fields, Map, SECRET_REDACTED, Value, constant_time_eq,
     first_difference, values_equal,
 };
 pub use window::{SlotVal, Windows};
