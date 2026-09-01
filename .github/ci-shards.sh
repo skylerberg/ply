@@ -48,76 +48,80 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Shard id, then its packages.
 #
-# Balanced against what the shards actually cost **in CI**, which is the machine
-# the balance is for. Taken from run 33338854134 (ubuntu-24.04, 2026-08-30) by
-# differencing the timestamps of consecutive `Running <binary>` lines in each
-# job log, so each figure is test execution only — the ~39s dependency build
-# every shard pays is excluded, and per-binary startup is counted in:
+# **Split on dependency weight, not on measured seconds.** Four packages need
+# the heavy half of the graph -- `ply-codegen` and `ply-cli` pull cranelift,
+# `ply-cli` and `ply-corpus` also pull tokio, rustls and a postgres client,
+# `ply-host` pulls the latter three. Everything else builds against about
+# eighty crates instead of about two hundred. That boundary is a property of
+# the manifests rather than a reading off one runner, so it does not go stale
+# between commits the way the figures below do.
 #
-#   ply-corpus 426s   ply-eval 404s   ply-cli 200s   ply-host ~60s
-#   the other nine packages, summed: 16s
+# It decides the table twice over. A test binary links its whole graph, so the
+# *same* test target costs materially more in a shard that carries cranelift
+# and a TLS stack than in one that does not -- which makes "put the light
+# packages where the light graph is" a win on total work even before it is a
+# win on balance. The previous arrangement did the opposite: nine light
+# packages sat in the `cli` shard, linking twelve-odd test binaries against the
+# heaviest graph in the tree.
 #
-# **The previous table's basis had drifted and the split it produced was the
-# slowest thing in CI.** It read, from `cargo test -p <package>` on the machine
-# in docs/ONBOARDING.md §Provenance, warm target, `-j 2 -- --test-threads=2`,
-# 2026-08-24:
+# What the previous arrangement cost, from run 33472886832 (`main`, warm
+# dependency cache -- the last such run before `df32f9b` poisoned it; see the
+# `rust-cache` note in `.github/workflows/ci.yml`):
 #
-#   ply-corpus 289s   ply-cli 149s   ply-eval 137s   ply-store  32s
-#   ply-hash    15s   ply-test 13s   ply-core   8s   ply-span    5s
-#   ply-syntax   3s   ply-prove 4s   ply-std    2s   ply-derive  1s
+#   shard   build   test    binaries
+#   cli     199s     43s    ~20
+#   corpus  144s     45s      9
+#   eval     62s     92s     10
 #
-#   "658s summed, and `ply-corpus` alone is 44% of it, so three shards is the
-#   useful number: a fourth cannot finish sooner than that one package takes,
-#   and every extra shard pays the dependency build again."
+# **The imbalance is compile and linking, not tests.** Test execution across
+# the whole `cli` shard is 42s, and 31s of that is `ply-cli` itself; the other
+# ten packages run in 11s between them. Balancing on test seconds -- which is
+# what every earlier revision of this comment did -- was measuring the smaller
+# half.
 #
-# The floor argument is still sound; the arrangement had stopped sitting on the
-# floor. `ply-eval` roughly tripled (137s -> 404s), so `cli-eval` became 604s
-# against `ply-corpus`'s 426s floor, while `core` finished its 1,604 tests in
-# **16s** — one runner idle for ten minutes while another held the whole run up.
-# Splitting `ply-eval` off and folding the nine fast packages in with `ply-cli`
-# puts the three parallel shards at 426s / 404s / 216s, which is the floor, and
-# keeps the shard count at three so no extra dependency build is paid.
+# So: `cli` keeps only what needs cranelift, `light` takes the rest, `corpus`
+# and `postgres` are unchanged.
 #
-# The figures above were taken **before** `[profile.dev] opt-level = 2` landed
-# in the root manifest -- the root `Cargo.toml`'s profile block holds that
-# measurement, its provenance and its caveats. Expect the jobs to become
-# compile-bound rather than test-bound.
+# **The arithmetic below is an estimate and has not been confirmed on a
+# runner.** Reassigning the light packages should move roughly twelve links out
+# of the heavy graph and into the light one, putting the three parallel shards
+# near 145s / 175s / 215s against the 242s / 190s / 155s above -- so the pole
+# moves from `cli` to `light` and comes down. Re-take it from the first warm
+# `main` run after this lands and correct these numbers in place; if `light` is
+# the pole while `cli` idles, move one or two packages back.
 #
-# Re-taken after the profile change, but **on the wrong machine and above the
-# load gate**: the three shards run locally (Apple M4, 10 cores, so not the
-# two-core runner these are balanced for) at 1-minute load between 6 and 24
-# against CONTRIBUTING.md s"Gate on an idle machine"'s threshold of 4 --
-# `corpus` 120s / 197 tests, `eval` 69s / 1,033, `cli` 41s / 2,319. Treat those
-# as a shape and not as figures. The shape is that `ply-corpus` stops being
-# level with `ply-eval` and becomes the clear long pole, roughly 1.7x it, which
-# is the ordering this table already assumes. **A re-take on a two-core runner
-# at load < 4 has not been done**, and it is what would justify moving anything.
+# **Three parallel shards, not four, and cache pressure is why.** Splitting
+# `ply-eval` away from the other light packages would balance better still --
+# it is one package with a 92s suite sharing a shard with ten that run in 11s.
+# But GitHub evicts Actions caches LRU past 10GB per repository and this one
+# measured 7.96GB across eight entries on 2026-09-01, with several generations
+# of each key alive at once. An eighth cache risks evicting a seventh, and an
+# evicted cache is a cold dependency build, which is the thing this whole file
+# is trying to avoid paying. Revisit if the cache budget grows.
 #
-# Your figures will differ; re-take with `cargo test -p <package>` if a package
-# grows a slow suite, and move it. Splitting `ply-corpus` further would mean
-# partitioning by test target, which would give up the property `verify` checks
-# — that every *package* is somewhere.
+# Splitting `ply-corpus` further would mean partitioning by test target, which
+# would give up the property `verify` checks -- that every *package* is
+# somewhere.
 #
 # `ply-host` is a shard of its own because it is the only package that needs a
 # database. The postgres job runs it and no other job does.
 #
-# `ply-codegen` joined the `cli` shard on 2026-08-31 and it costs that shard
-# almost nothing to run and something real to build: its own suite is 9 tests in
-# ~1.2s, and the ~31 cranelift packages behind it are a dependency build every
-# shard that builds `ply-cli` now pays anyway, because `ply-cli` depends on it.
-# It is in the same shard as `ply-cli` on purpose rather than by balance: the
+# `ply-codegen` sits with `ply-cli` on purpose rather than by balance: the
 # tests that decide whether a code generator is policeable are
-# `crates/ply-cli/tests/suite/backend.rs`, and a partition that could run one without
-# the other would let half of ADR 0026 §4.5's condition go green alone.
+# `crates/ply-cli/tests/suite/backend.rs`, and a partition that could run one
+# without the other would let half of ADR 0026 s4.5's condition go green alone.
+# It also costs that shard almost nothing to run -- its own suite is 12 tests
+# in ~4.4s -- and the cranelift packages behind it are a build `ply-cli` pays
+# anyway.
 #
-# **This table's own gate caught the omission.** Adding the crate without
-# adding it here failed `ci-shards.sh verify` with *"workspace member
-# 'ply-codegen' is in no shard, so CI never tests it"* — which is the failure
+# **This table's own gate caught an omission once.** Adding `ply-codegen`
+# without adding it here failed `ci-shards.sh verify` with *"workspace member
+# 'ply-codegen' is in no shard, so CI never tests it"* -- which is the failure
 # this file exists to produce, observed rather than assumed.
 SHARDS=(
   "corpus:ply-corpus"
-  "eval:ply-eval"
-  "cli:ply-cli ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std ply-codegen"
+  "cli:ply-cli ply-codegen"
+  "light:ply-eval ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
   "postgres:ply-host"
 )
 
