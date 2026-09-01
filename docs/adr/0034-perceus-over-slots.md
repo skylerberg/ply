@@ -196,6 +196,27 @@ never incorrect. **The ownership hint is not promoted to a permission.**
 
 ### What the machine has to become
 
+**Run `resumption_scope_audit` first, and read the note inside it.** It was written before this
+change and exists because the suite had a hole exactly here: every resumption test in the tree
+asserts what a *cell* holds across resumptions, and none asserted that a resumption re-enters with
+the *bindings* it captured — because a persistent `Env` gives that for free and there was nothing to
+get wrong. Its four probes are the four ways a slot machine takes it away:
+
+- a binding whose **last use follows the capture**, resumed twice. Step 3 empties the slot and the
+  second resumption re-reads it: `Own::Owned` means "no later *code* reads this", which stops
+  implying "no later *execution* reads this" once a continuation resumes more than once;
+- a binding read across **sixty intervening activations** between two resumptions, which a
+  machine-owned stack reuses the indices of;
+- a binding and a cell **in one expression**, where the binding must read the same both times and
+  the cell must not — restoring too much reddens one assertion and too little the other;
+- **nested captures** over overlapping windows.
+
+One caveat that file states about itself: the first probe's own `assert_eq` cannot fail on the
+chain, because a continuation holds an immutable copy nothing can empty. What arms it there is a pin
+on `takes_moved` — the mechanism rather than the answer — and it is a tripwire: if it moves, find
+out which binding started moving before concluding the change is right. **Sibling isolation — one
+resumption seeing another's slot writes — is not covered and wants a probe before the change.**
+
 Nine measurements narrow this to one design, and **it is not the "frame carries a
 narrowed scope" that every attempt kept reaching for. That framing is what made
 each of them cost something. A window is an allocation however rarely it is
