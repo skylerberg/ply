@@ -140,10 +140,14 @@ pub(crate) fn exemplars() -> Exemplars {
                 exports: ContentHash([2u8; 32]),
             }],
             deps: vec![NameRef::new("store.db.get", h(7))],
+            // Every hash on a `DefEntry` is distinct, so the pin moves if two
+            // of the three are ever swapped or one is dropped.
             defs: vec![
                 DefEntry {
                     name: sym("user.active_users"),
                     hash: h(2),
+                    own: h(8),
+                    iface: h(9),
                     span: FileSpan { start: 10, end: 42 },
                     kind: DefKind::Fn,
                     members: vec![],
@@ -152,6 +156,8 @@ pub(crate) fn exemplars() -> Exemplars {
                 DefEntry {
                     name: sym("user.User"),
                     hash: h(3),
+                    own: h(10),
+                    iface: h(11),
                     span: FileSpan { start: 50, end: 80 },
                     kind: DefKind::Type,
                     members: vec![Member {
@@ -163,6 +169,8 @@ pub(crate) fn exemplars() -> Exemplars {
                 DefEntry {
                     name: sym("user.db"),
                     hash: h(4),
+                    own: h(12),
+                    iface: h(13),
                     span: FileSpan {
                         start: 90,
                         end: 120,
@@ -346,7 +354,7 @@ mod tests {
     use super::*;
 
     /// The digest of the shapes this build stores.
-    const PINNED: &str = "7091c9ad2872af85b47eef81d2cf6060b78401f57550cd008a52bd139223c40d";
+    const PINNED: &str = "4f5a80b78f7e334090b798beae50579714462e8114aeb091757d1bfc52c4cdea";
 
     #[test]
     fn the_stored_schema_is_pinned() {

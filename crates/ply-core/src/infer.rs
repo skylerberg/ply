@@ -3256,21 +3256,8 @@ impl<'a> Checker<'a> {
     }
 
     /// `E0126`: a top-level `fn` left a parameter type or its return type to
-    /// inference.
-    ///
-    /// A published signature is a claim the author makes, not a summary the
-    /// compiler derives. `ply review --changed`'s load-bearing row is
-    /// *implementation changed, spec unchanged*, and a signature inferred from
-    /// the body it describes cannot hold still for that row to mean anything —
-    /// editing the body silently republishes the claim.
-    ///
-    /// The **effect row is deliberately not covered**. A row is derived from
-    /// what a body calls rather than chosen, so it stays inferred unless
-    /// written, and a written one is checked as an upper bound. That asymmetry
-    /// is the point: infer what is mechanical, write what is meant.
-    ///
-    /// A definition a `derive` generated is exempt. Nobody wrote it, so there
-    /// is nobody to ask for an annotation.
+    /// inference. Effect rows are deliberately not covered, and a definition a
+    /// `derive` generated is exempt.
     fn require_written_signature(&mut self, def: &FnDef, sig: &Signature) {
         const WHY: &str = "a signature is a claim about what a definition means, so it is written \
                            rather than inferred; the effect row is the exception and stays inferred";
@@ -3310,14 +3297,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The resolved form of `t`, rendered, when every type variable left in it
-    /// is one the signature's own generic list binds — so the text is something
-    /// the author can paste.
-    ///
-    /// An *unsolved* variable is not: printing it yields a letter that denotes
-    /// nothing in scope, and `write \`a: a\`` is worse than no suggestion. That
-    /// case is real rather than defensive — it is exactly what an operand
-    /// `E0210` also refused to settle leaves behind.
+    /// The resolved form of `t`, rendered, when every variable left in it is one
+    /// the signature's generic list binds — so the author can paste it. An
+    /// unsolved variable prints a letter denoting nothing in scope, which is
+    /// worse than no suggestion.
     fn writable(&self, sig: &Signature, t: &Type) -> Option<String> {
         fn vars(t: &Type, out: &mut Vec<TyVar>) {
             match t {
@@ -3349,10 +3332,10 @@ impl<'a> Checker<'a> {
 
     /// `E0210`: an operand whose numeric type nothing determines.
     ///
-    /// This arm used to *default* to `Int`, which put a tiebreak taken inside
-    /// the compiler into a published signature. With signatures written the
-    /// only way to reach here is a lambda binder or a `let` nothing
-    /// constrains, where choosing for the author is a guess.
+    /// `E0210`: an operand whose numeric type nothing determines. Defaulting to
+    /// `Int` is the obvious alternative and is refused, because the tiebreak
+    /// would be taken inside the compiler and published as the author's own
+    /// signature.
     fn numeric_undetermined(&mut self, entry: &Numeric) {
         let what = if matches!(entry.op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
             "ordered comparison"

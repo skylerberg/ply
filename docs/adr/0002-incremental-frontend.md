@@ -74,6 +74,61 @@ rather than restored: a declaration's signature comes from its own text and
 reaches no body, so deriving it costs less than looking one up and checking a
 witness.
 
+### Early cutoff, and why a `DefHash` is the wrong key for a recheck
+
+A `DefHash` is transitive by construction — a reference normalizes to the
+referent's hash — so editing one definition's body moves every transitive
+caller's hash and gate 2 rechecks the whole caller cone. Measured on
+`examples/desk.ply`: changing one string literal inside one function body, its
+signature untouched, rechecked 61 definitions, of which one had changed. Under
+the cutoff below the same edit rechecks 1.
+
+That was not waste while signatures were inferred. A caller's type could depend
+on a callee's body, so the cone was the honest answer. Written signatures
+(`E0126`) removed the dependency, and the transitive key is now answering a
+question nobody asked at that site: `DefHash` asks *"has anything in this
+definition's closure changed?"*, which is exactly right for the test cache and
+too strong for a recheck.
+
+So gate 2 keys on two narrower things, and `DefHash` keeps the test cache
+unchanged:
+
+* **own hash** — the definition normalized with references by *name*. It moves
+  when the definition's own text moves and not when something it calls is
+  re-implemented. A gate key and never an identity: nothing is selected, cached
+  or referenced by it, and its name-dependence errs toward more rechecking, the
+  same conservatism gate 1 accepts about formatting.
+* **interface hash** — over the published scheme, footprint and constraints,
+  which are everything a caller can observe. The footprint is in there because
+  effect rows are still inferred: a body edit that adds a `perform` does change
+  what callers must be checked against. Only the type half is immune.
+
+Two readings of that are wrong and both were tried on paper first. Accepting a
+definition because its *own* hash is unchanged is unsound — every caller of an
+edited definition has unchanged own text. Accepting it because its own hash is
+unchanged *and* every callee is stable, resolved bottom-up in one pass, is sound
+and buys nothing: a rechecked callee is not stable until its fresh interface is
+known, so the condition propagates exactly like `DefHash`.
+
+The cutoff therefore runs as waves. The first checks the definitions whose own
+hash moved; each later one compares a rechecked definition's fresh interface
+against the stored one and admits the callers of only those that actually
+differ. It terminates because the recheck set only grows. Only the final wave's
+`CheckOutput` and diagnostics escape — an intermediate wave can hand a caller a
+stale interface and report a diagnostic a from-scratch check would not.
+
+The invariant below is unchanged and still decides every ambiguous case: a
+missing entry, an absent fingerprint or a wave that cannot tell means recheck.
+
+Two costs are accepted rather than hidden. An own hash is written in names, so
+renaming a callee moves its callers' own hashes and buys a recheck nothing
+needed — the same trade gate 1 makes when it re-parses a file that was only
+reformatted. And a wave that restored any interface and then failed is thrown
+away and re-run restoring none, because a diagnostic raised against a restored
+interface can be one a from-scratch check would not raise; a type error
+therefore costs two checks, which is the "refusing only ever costs time" side of
+the invariant landing on the edit-and-fix loop.
+
 ### The ordering constraint
 
 The two gates use different keys, and the reason is temporal rather than

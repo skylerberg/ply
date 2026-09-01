@@ -7,7 +7,7 @@ use ply_cli::driver;
 use ply_cli::load::{LoadError, Loaded};
 use ply_span::Symbol;
 use ply_store::Store;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -860,4 +860,79 @@ fn a_skipped_file_still_contributes_its_reference_graph() {
 
     assert_eq!(warm.hashes.deps, full.hashes.deps);
     assert_eq!(warm.hashes.closure, full.hashes.closure);
+}
+
+/// What gate 2 could not restore, by qualified name.
+fn rechecked(loaded: &Loaded) -> BTreeSet<String> {
+    loaded
+        .frontend
+        .defs
+        .iter()
+        .filter(|d| !d.cached)
+        .map(|d| d.name.to_string())
+        .collect()
+}
+
+/// `base` performs from the start, so `log` is already in every caller's witness: an edit below
+/// moves the row and nothing else, which is the only thing that can tell the two halves apart.
+fn chain(base: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "lib.ply", &chain_lib(base));
+    write(
+        dir.path(),
+        "top.ply",
+        "import lib\npub fn top(n: Int) -> Int = lib::mid(n) + 1\n",
+    );
+    dir
+}
+
+fn chain_lib(base: &str) -> String {
+    format!(
+        "pub effect log {{ write note[r](msg: String) -> Int }}\n\
+         pub fn base(n: Int) -> Int = {base}\n\
+         pub fn mid(n: Int) -> Int = base(n) + 1\n"
+    )
+}
+
+/// The cutoff: a callee's body is not part of what a caller is checked against, so re-implementing
+/// one re-infers nothing above it.
+#[test]
+fn a_body_edit_that_leaves_the_interface_standing_stops_at_the_definition() {
+    let dir = chain(r#"log.note[a]("n") + n"#);
+    let cold = agree(dir.path(), "cold");
+    assert!(rechecked(&cold).contains("top.top"));
+
+    write(dir.path(), "lib.ply", &chain_lib(r#"log.note[a]("m") + n"#));
+    let after = agree(dir.path(), "one body edited");
+
+    assert_eq!(
+        rechecked(&after),
+        BTreeSet::from(["lib.base".to_string()]),
+        "only the edited definition's own text moved"
+    );
+}
+
+/// The other half, and the one an over-eager cutoff fails: a row is inferred, so a body that moves
+/// what it performs publishes something new and every caller has to be told.
+#[test]
+fn a_body_edit_that_moves_the_published_row_still_reaches_every_caller() {
+    let dir = chain(r#"log.note[a]("n") + n"#);
+    agree(dir.path(), "cold");
+
+    write(dir.path(), "lib.ply", &chain_lib(r#"log.note[b]("n") + n"#));
+    let after = agree(dir.path(), "the edited body performs elsewhere");
+
+    let names = rechecked(&after);
+    for name in ["lib.base", "lib.mid", "top.top"] {
+        assert!(
+            names.contains(name),
+            "`{name}` is checked against a row that moved, so it may not be restored: {names:?}"
+        );
+    }
+    assert_eq!(
+        after.check.defs[&Symbol::new("top.top")]
+            .footprint
+            .to_string(),
+        "{lib.log.write[b]}"
+    );
 }
