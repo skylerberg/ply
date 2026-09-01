@@ -18,46 +18,15 @@ pub enum Own {
     Owned,
 }
 
-<<<<<<< HEAD
 /// Whether ADR 0033 §11 S4's probe is armed, read once per process. Off by default: it is a probe
 /// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
 /// do not arm it in anything being timed.
-=======
-/// The scope a pending frame carries while the subexpression it is waiting for
-/// runs.
-///
-/// A frame needs a scope only for the subexpressions it has **not started**. It
-/// is the same rule that makes `drop(env)` before a call the difference between
-/// every argument being reused and none of them being: a frame that keeps a
-/// scope it will not read holds every binding in that scope at two owners for
-/// the whole of the last argument's evaluation, and the last argument is exactly
-/// where the value an update could rewrite is produced. `push(acc, x)` nested in
-/// a call reused nothing until this existed.
-///
-/// Correctness does not depend on the answer, only cost: the frames that take an
-/// empty scope are the ones whose next step is to apply, build or perform, and
-/// none of them looks at it.
-/// Whether ADR 0033 §11 S4's probe is armed, read once per process.
-///
-/// **This is a probe and not a landed change.** ADR 0033 §10 G1 asks whether
-/// position dependence survives a frame that carries only what it will read;
-/// §4 argues P1 and slot frames compute the same thing and differ in constant
-/// factor, so this is the cheap half, wired to `PLY_ADR0033_PROBE=1` and off by
-/// default. ADR 0025 §What would make this wrong item 1 is the reason it is not
-/// on: `Env::release` is O(scope depth) on the machine's hottest path, and that
-/// number is not taken. Do not turn it on in anything that is being timed.
->>>>>>> bcbf910 (Renumber to ADR 0033, rewrite the docs to the new convention, unbreak codegen)
 pub fn probe_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1"))
 }
 
-<<<<<<< HEAD
 /// [`carry`], minus the bindings the sub-expression just started is the last reader of.
-=======
-/// [`carry`], minus the bindings the sub-expression just started is the last
-/// reader of — ADR 0025 §Decision 3 P1, as ADR 0033 §11 S4's probe.
->>>>>>> bcbf910 (Renumber to ADR 0033, rewrite the docs to the new convention, unbreak codegen)
 ///
 /// Sound for the reason [`Own::Owned`] is: a wrong `dead` costs the continuation it was computed
 /// for an `INTERNAL_ERROR`, never a wrong value, because [`Env::release`] never writes through a
