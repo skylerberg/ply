@@ -327,7 +327,7 @@ Registered in code so a measurement file cannot supply a threshold, per
 `CONTRIBUTING.md` §"Measure an ADR's motivating claim before accepting the ADR".
 
 **G1 — the central claim, and the only one that can kill this ADR early.**
-*Position invariance*, in `crates/ply-eval/tests/position_invariance_g1.rs`. Five
+*Position invariance*, in `crates/ply-eval/tests/suite/position_invariance_g1.rs`. Five
 paired programs, each pair computing the same value with the growing
 sub-expression last and not-last; counted with `rc::sites()`, not a clock.
 `Criteria::default()` holds both bars: a per-pair gap of at most 0.02, and a

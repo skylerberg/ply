@@ -537,7 +537,7 @@ fn print_table(rows: &[(Pair, Measured)]) {
 #[test]
 #[ignore = "ADR 0033 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
             shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
-            Run it with `cargo test -p ply-eval --test position_invariance_g1 -- --ignored \
+            Run it with `cargo test -p ply-eval --test suite position_invariance -- --ignored \
             --nocapture`."]
 fn the_same_computation_costs_the_same_in_either_order() {
     let c = Criteria::default();
