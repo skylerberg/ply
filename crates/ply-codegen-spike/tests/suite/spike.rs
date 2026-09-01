@@ -217,6 +217,54 @@ fn a_measured_input_carries_four_times_and_an_agreement() {
     assert!(r.spike_best_micros > 0.0);
 }
 
+/// The seven operators of ADR 0033 §2, each refused by the operator it is.
+///
+/// The refusal is what the spike is claiming, so it is what a test has to hold.
+/// `&`, `|` and `^` would each be one Cranelift instruction and the temptation
+/// to lower them is real; the shifts must not be lowered at all, because
+/// `ishl` masks a count to the low six bits where Ply raises past 63. A wrong
+/// shift here would agree with the interpreter on every count anybody would
+/// think to measure with and disagree on the one that matters — so the arm that
+/// refuses them is armed here rather than trusted.
+#[test]
+fn every_bit_operator_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("ply-bitops-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    std::fs::write(
+        dir.join("bitops.ply"),
+        "pub fn m(a: Int, b: Int) -> Int = a & b\n\
+         pub fn o(a: Int, b: Int) -> Int = a | b\n\
+         pub fn x(a: Int, b: Int) -> Int = a ^ b\n\
+         pub fn l(a: Int, b: Int) -> Int = a << b\n\
+         pub fn r(a: Int, b: Int) -> Int = a >> b\n\
+         pub fn u(a: Int, b: Int) -> Int = a >>> b\n\
+         pub fn c(a: Int) -> Int = ~a\n",
+    )
+    .expect("the probe source");
+    let loaded: &'static Loaded = Box::leak(Box::new(
+        Loaded::project(&dir).expect("the probe program loads"),
+    ));
+    for (name, operator) in [
+        ("bitops.m", "`&`"),
+        ("bitops.o", "`|`"),
+        ("bitops.x", "`^`"),
+        ("bitops.l", "`<<`"),
+        ("bitops.r", "`>>`"),
+        ("bitops.u", "`>>>`"),
+        ("bitops.c", "`~`"),
+    ] {
+        let message = match Jit::compile(loaded, &[name]) {
+            Ok(_) => panic!("`{name}` is outside the fragment and was compiled anyway"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains(operator),
+            "`{name}` was refused as `{message}`, which does not name {operator}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The lambda refusal, reached where a higher-order *builtin* does not shadow it.
 #[test]
 fn a_lambda_is_refused_by_name() {

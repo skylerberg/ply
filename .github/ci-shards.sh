@@ -202,8 +202,11 @@ declare -a KNOWN_OUTSIDE=(
 #     via a `duration_of` helper, so no timing vocabulary appears in it. Run
 #     alone it passes three times out of three at load 20.
 #
-# Treat 13 as the current count and not as the answer. When a shard goes red on
-# a ratio or a budget, the fix is usually another row here.
+# The list is never finished. When a shard goes red on a ratio or a budget, the fix is usually
+# another row here — `payload::tests::the_map_rows_survive_subtracting_the_fold_around_them` is
+# the most recent, and it is the third survey's blind spot: it subtracts a scaffold from a
+# measurement and asserts the remainder is positive, so contention does not slow it down, it
+# makes the answer negative.
 DEFERRED=(
   "ply-eval:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
   "ply-eval:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
@@ -218,6 +221,7 @@ DEFERRED=(
   "ply-store:lib:tests::opening_a_ten_thousand_definition_cache_is_under_the_budget"
   "ply-store:lib:tests::a_baseline_for_every_test_does_not_slow_the_open"
   "ply-cli:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
+  "ply-corpus:lib:payload::tests::the_map_rows_survive_subtracting_the_fold_around_them"
 )
 
 # Tests that fail on a property of the *tree* rather than of a run, as

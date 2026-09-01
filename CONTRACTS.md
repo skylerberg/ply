@@ -1026,8 +1026,13 @@ impl<'a> Interp<'a> {
   prevent. ADR 0022.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `list_at`, `map`,
   `filter`, `fold`, `iterate`, `range`, `int_to_string`, `string_concat`,
-  `cell_get`, `cell_set`, `panic`, plus the `Bytes` and text builtins in the
-  host-boundary section below.
+  `cell_get`, `cell_set`, `panic`, `wrap_add`, `wrap_sub`, `wrap_mul`,
+  `byte_of_int`, plus the `Bytes` and text builtins in the host-boundary section
+  below.
+  The three `wrap_*` are the only arithmetic in the language that cannot raise;
+  `+`, `-` and `*` stay checked and `<<` is the only *operator* that discards
+  rather than raising (ADR 0033 §2.2). `byte_of_int` is `bytes_at`'s inverse and
+  raises outside `0..=255`.
   A failing `assert`/`assert_eq` is `ASSERTION_FAILED` with a structured
   expected/actual message.
 - An evaluator must be usable from a worker thread. If `Value` holds `Rc`, keep
