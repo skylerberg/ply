@@ -1,25 +1,4 @@
-//! The incremental front end: two gates decide how much of a run has to be
-//! redone.
-//!
-//! **Gate 1** is a file-level gate keyed on the file's raw bytes. A file whose
-//! bytes are unchanged and whose every free name still denotes the same
-//! `DefHash` is never parsed at all; its definitions' types, footprints and
-//! hashes are read back out of the store.
-//!
-//! **Gate 2** is a definition-level gate keyed on `DefHash`. Because a reference
-//! normalizes to the referent's hash rather than its name, a definition whose
-//! dependency changed already has a different hash, so one condition covers both
-//! "its own form changed" and "something it calls changed".
-//!
-//! The two keys differ because of when each gate runs: a `DefHash` cannot be
-//! computed without parsing, and gate 1 has to decide whether to parse. Gate 1
-//! is therefore conservative about formatting and gate 2 is exact.
-//!
-//! Everything here exists to make one thing impossible: a definition being
-//! handed a type that is no longer what a from-scratch check would produce. A
-//! stale *result* costs a test that did not need to run; a stale *type* corrupts
-//! the hashes every other cache is keyed on. Where the two gates cannot decide
-//! safely they refuse, and refusing only ever costs time.
+//! The incremental front end: two gates decide how much of a run has to be redone.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use indexmap::IndexMap;
@@ -43,18 +22,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Whether a run may consult the front-end cache. `Full` is what
-/// `--no-incremental` selects: every file is parsed, every definition is
-/// rechecked, and nothing is read from or written to the front-end cache.
+/// Whether a run may consult the front-end cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Full,
     Incremental,
 }
 
-/// Why a file could not take the fast path. Reported verbatim by `--explain`,
-/// because "it was slow again and I do not know why" is the failure mode an
-/// incremental front end is most likely to produce.
+/// Why a file could not take the fast path.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Refusal {
     None,
@@ -65,16 +40,12 @@ pub enum Refusal {
     Import(Symbol),
     /// The fingerprint survived but the interface it points at did not.
     InterfaceMissing,
-    /// A name this file reaches lost its `pub`. Normalization erases visibility
-    /// — deliberately, so that adding or removing `pub` moves no hash — so no
-    /// other condition in either gate can see the change, and only resolving
-    /// the reference again reports it.
+    /// A name this file reaches lost its `pub`.
     Private(Symbol),
-    /// Something that had to be parsed imports this file, so its interface has
-    /// to be derived rather than restored.
+    /// Something that had to be parsed imports this file, so its interface has to be derived rather
+    /// than restored.
     ImportedByParsed(Symbol),
-    /// A test that has to run lives here, or is reachable from one. Evaluation
-    /// needs a body, and a body only exists in an AST.
+    /// A test that has to run lives here, or is reachable from one.
     NeededToEvaluate,
 }
 
@@ -110,9 +81,7 @@ pub struct DefReport {
     pub cached: bool,
 }
 
-/// Where a front-end run's time went. Reported rather than inferred, because
-/// "the gates fired" and "the run got faster" are different claims and only the
-/// second one is the point.
+/// Where a front-end run's time went.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phases {
     pub read: Duration,
@@ -149,17 +118,14 @@ impl Phases {
     }
 }
 
-/// What the two gates decided, for `--explain` and for the tests that assert the
-/// gates actually fired.
+/// What the two gates decided, for `--explain` and for the tests that assert the gates actually
+/// fired.
 #[derive(Clone, Debug, Default)]
 pub struct FrontEnd {
     pub incremental: bool,
     pub files: Vec<FileReport>,
     pub defs: Vec<DefReport>,
     pub phases: Phases,
-    /// Trouble the cache took on the way out. Empty in the normal case; a caller
-    /// that never reports these turns an unwritable cache into a program that is
-    /// mysteriously slow forever.
     pub warnings: Vec<Diagnostic>,
 }
 
@@ -185,20 +151,12 @@ pub fn load_full(path: &Path) -> Result<Loaded, LoadError> {
     run(path, Mode::Full, None, &[])
 }
 
-/// The incremental path. `store` is both the source of cached interfaces and
-/// where this run's are written; passing `None` is exactly `--no-incremental`.
 pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadError> {
     run(path, Mode::Incremental, Some(store), &[])
 }
 
-/// The incremental path, with `needed` and everything they import parsed
-/// whatever the gates would have said.
-///
-/// Evaluating a test needs its body, and gate 1 skips a file without producing
-/// one. Naming the modules a run must actually execute keeps the rest of the
-/// project on the fast path — the alternative, reparsing and rechecking
-/// everything the moment one test is selected, costs the whole cache exactly
-/// when it is most valuable.
+/// The incremental path, with `needed` and everything they import parsed whatever the gates would
+/// have said.
 pub fn load_to_evaluate(
     path: &Path,
     store: &mut Store,
@@ -214,8 +172,8 @@ pub fn run(
     needed: &[ModuleName],
 ) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
-    // Pruning deletes every fingerprint the run did not see, which is only
-    // correct when the run saw everything. `ply check one.ply` did not.
+    // Pruning deletes every fingerprint the run did not see, which is only correct when the run saw
+    // everything.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     let needed = needed.iter().map(|m| m.as_symbol().clone()).collect();
     Driver::new(root, discovered, mode, store, whole_project, needed)?.finish()
@@ -232,16 +190,12 @@ struct FileState {
     parse: bool,
     recheck: bool,
     refusal: Refusal,
-    /// Embedded in the binary rather than discovered on disk. Only the pieces
-    /// that are genuinely about *provenance* branch on this — which module is a
-    /// project's entry point, whose tests a project's run selects — because a
-    /// stdlib definition is otherwise a definition like any other.
+    /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
 
 impl FileState {
-    /// The definitions this file publishes, as gate 1 knows them without a
-    /// parse. Only meaningful while the file is a skip candidate.
+    /// The definitions this file publishes, as gate 1 knows them without a parse.
     fn cached_defs(&self) -> &[DefEntry] {
         self.fingerprint
             .as_ref()
@@ -250,10 +204,6 @@ impl FileState {
     }
 
     /// Every module this file imports, whether or not it was parsed.
-    ///
-    /// A skipped file has no AST, and its fingerprint's import list is exactly
-    /// as trustworthy as the rest of it: nothing is read from a fingerprint
-    /// whose content hash did not already match the bytes on disk.
     fn imports(&self) -> Vec<ModuleName> {
         match &self.ast {
             Some(ast) => ast.imports.iter().map(|i| i.module_name()).collect(),
@@ -319,16 +269,12 @@ impl<'s> Driver<'s> {
             });
         }
 
-        // Naming is checked with the text already on hand so an unusable path is
-        // reported against the file itself rather than against nowhere.
+        // Naming is checked with the text already on hand so an unusable path is reported against
+        // the file itself rather than against nowhere.
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
                 // `std` is reserved before anything else looks at the file.
-                // Reserving it is what removes every precedence question between
-                // a project and the stdlib: because no project module can be
-                // named `std.*`, what `import std.net` denotes cannot depend on
-                // where a file happens to sit.
                 Ok(module) if ply_std::is_reserved(module.as_str()) => {
                     let diagnostic = ply_std::reserved_diagnostic(&file.path, module.as_str());
                     diagnostics.push(anchor(diagnostic, &sources, source));
@@ -391,8 +337,8 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// Gate 1's first condition, plus the two reasons a run can have that have
-    /// nothing to do with whether the file changed.
+    /// Gate 1's first condition, plus the two reasons a run can have that have nothing to do with
+    /// whether the file changed.
     fn forced(&mut self) {
         for i in 0..self.files.len() {
             let refusal = self.forced_refusal(&self.files[i]);
@@ -402,11 +348,8 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// The same decision for one file, so that a stdlib module pulled in after
-    /// [`forced`] has run reaches it by the same route rather than by a second
-    /// copy of the rule.
-    ///
-    /// [`forced`]: Driver::forced
+    /// The same decision for one file, so that a stdlib module pulled in after [`forced`] has run
+    /// reaches it by the same route rather than by a second copy of the rule.
     fn forced_refusal(&self, file: &FileState) -> Refusal {
         match &file.fingerprint {
             _ if self.mode == Mode::Full => Refusal::NotIncremental,
@@ -420,9 +363,8 @@ impl<'s> Driver<'s> {
     fn finish(mut self) -> Result<Loaded, LoadError> {
         self.forced();
 
-        // Gate 1 runs to a fixed point: parsing a file can change what its
-        // importers see, and refusing a file can pull in the files it imports.
-        // Each round can only add to the parse set, so it terminates.
+        // Gate 1 runs to a fixed point: parsing a file can change what its importers see, and
+        // refusing a file can pull in the files it imports.
         let (program, resolved, hashes, bodies) = loop {
             self.close_over_imports()?;
             let (program, resolved, hashes, bodies) = self.parse_and_hash()?;
@@ -445,9 +387,8 @@ impl<'s> Driver<'s> {
         self.merge(program, resolved, hashes, bodies, check, gate_two.cached)
     }
 
-    /// A parsed module's imports must be parsed too: `resolve` needs every
-    /// module a reference can name, and inference needs the imported
-    /// definitions' types.
+    /// A parsed module's imports must be parsed too: `resolve` needs every module a reference can
+    /// name, and inference needs the imported definitions' types.
     fn close_over_imports(&mut self) -> Result<(), LoadError> {
         loop {
             self.parse_pending()?;
@@ -482,16 +423,8 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// Loading is demand-driven: a module that ships with the compiler is pulled
-    /// out of the embedded table only when something already in the program
-    /// imports it, and then transitively.
-    ///
-    /// The consequence is the point. A program importing nothing from `std`
-    /// loads nothing, checks nothing extra, and has hashes byte-identical to
-    /// what it had before the stdlib existed.
-    ///
-    /// Returns whether anything was added, which is what makes the caller's
-    /// fixed point cover a stdlib module that imports another.
+    /// Loading is demand-driven: a module that ships with the compiler is pulled out of the
+    /// embedded table only when something already in the program imports it, and then transitively.
     fn pull_stdlib(&mut self) -> Result<bool, LoadError> {
         let mut diagnostics = Vec::new();
         let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
@@ -499,9 +432,7 @@ impl<'s> Driver<'s> {
 
         for (i, file) in self.files.iter().enumerate() {
             for imported in file.imports() {
-                // A shipped module may import only `std.*`. The user did not
-                // write it and cannot fix it, so calling it their error would
-                // send them looking in their own tree.
+                // A shipped module may import only `std.*`
                 if file.shipped && !ply_std::is_std(&imported) {
                     diagnostics.push(self.foreign_import(file, &imported));
                     continue;
@@ -523,8 +454,6 @@ impl<'s> Driver<'s> {
                     }
                     (false, _, true) => diagnostics.push(self.unknown_std(file, &imported)),
                     // A skipped file naming a module this build no longer ships.
-                    // Parsing it again is what turns the fingerprint's bare
-                    // module name into a diagnostic with a span in it.
                     (false, _, false) => stale.push((i, imported.as_symbol().clone())),
                 }
             }
@@ -547,10 +476,9 @@ impl<'s> Driver<'s> {
         Ok(added)
     }
 
-    /// An embedded module, filed under its pseudo-path so that gate 1 needs no
-    /// new mechanism: its `content_hash` is over the embedded bytes, and a
-    /// compiler upgrade that changes those bytes refuses the skip exactly as an
-    /// edited file would.
+    /// An embedded module, filed under its pseudo-path so that gate 1 needs no new mechanism: its
+    /// `content_hash` is over the embedded bytes, and a compiler upgrade that changes those bytes
+    /// refuses the skip exactly as an edited file would.
     fn add_shipped(&mut self, module: ModuleName) {
         let Some(source) = ply_std::source(&module) else {
             return;
@@ -586,9 +514,8 @@ impl<'s> Driver<'s> {
         self.files.push(file);
     }
 
-    /// Where a file writes an import, or nothing when the file was skipped and
-    /// its import list came from a fingerprint. [`anchor`] then falls back to the
-    /// file's first line, which is a better answer than none.
+    /// Where a file writes an import, or nothing when the file was skipped and its import list came
+    /// from a fingerprint.
     fn import_span(&self, file: &FileState, imported: &ModuleName) -> Span {
         file.ast
             .as_ref()
@@ -628,10 +555,9 @@ impl<'s> Driver<'s> {
                     continue;
                 }
                 match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
-                    // Expansion is part of parsing a file: it reads that file's
-                    // own type declarations and nothing else, which is what lets
-                    // gate 1 key on raw file content and still be right about a
-                    // generated definition.
+                    // Expansion is part of parsing a file: it reads that file's own type
+                    // declarations and nothing else, which is what lets gate 1 key on raw file
+                    // content and still be right about a generated definition.
                     Ok(mut module) => {
                         diagnostics.append(&mut ply_derive::expand_module(&mut module));
                         file.ast = Some(module);
@@ -650,17 +576,13 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// The `BodySet` is the normalizer's own byte stream, which the hash is
-    /// taken over — collecting it costs a copy, and recomputing it later would
-    /// mean re-normalizing the whole program.
+    /// The `BodySet` is the normalizer's own byte stream, which the hash is taken over — collecting
+    /// it costs a copy, and recomputing it later would mean re-normalizing the whole program.
     fn parse_and_hash(
         &mut self,
     ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
         let modules: Vec<Module> = self.files.iter().filter_map(|f| f.ast.clone()).collect();
-        // Mutable because `resolve` fills every call's defaults and places its
-        // named arguments. That has to happen here, between parsing and
-        // hashing: `f(x)` and `f(x, 1)` are one definition only if
-        // normalization sees one call.
+        // Mutable because `resolve` fills every call's defaults and places its named arguments.
         let mut program = Program { modules };
         let resolved =
             timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
@@ -680,8 +602,6 @@ impl<'s> Driver<'s> {
     }
 
     /// Program-wide name -> current hash, over parsed and skipped files alike.
-    /// A skipped file's entries come from its fingerprint, which is only ever
-    /// trusted after its content hash matched the bytes on disk.
     fn hash_table(&self, hashes: &HashOutput) -> BTreeMap<Symbol, DefHash> {
         let mut table: BTreeMap<Symbol, DefHash> = BTreeMap::new();
         for (name, hash) in hashes.defs.iter().chain(hashes.decls.iter()) {
@@ -698,9 +618,8 @@ impl<'s> Driver<'s> {
         table
     }
 
-    /// Everything gate 1 measures a skip candidate against, gathered once per
-    /// round: what every name in the program denotes now, and one digest per
-    /// module over what that module publishes.
+    /// Everything gate 1 measures a skip candidate against, gathered once per round: what every
+    /// name in the program denotes now, and one digest per module over what that module publishes.
     fn gate_one(&self, hashes: &HashOutput) -> Gate1 {
         Gate1 {
             table: self.hash_table(hashes),
@@ -713,8 +632,6 @@ impl<'s> Driver<'s> {
     }
 
     /// Gate 1's second condition, evaluated for every file still hoping to skip.
-    /// Returns whether any file was demoted, which means the round has to run
-    /// again with a larger parse set.
     fn refuse_candidates(&mut self, gate: &Gate1) -> bool {
         let mut demoted = false;
         let private = self.private_names();
@@ -731,9 +648,7 @@ impl<'s> Driver<'s> {
         demoted
     }
 
-    /// Qualified names a *parsed* module declares without `pub`. A skipped
-    /// module's bytes are unchanged, so nothing it declares can have changed
-    /// visibility, which is why only parsed files are consulted.
+    /// Qualified names a *parsed* module declares without `pub`.
     fn private_names(&self) -> BTreeSet<Symbol> {
         let mut out = BTreeSet::new();
         for file in &self.files {
@@ -755,9 +670,7 @@ impl<'s> Driver<'s> {
         private: &BTreeSet<Symbol>,
     ) -> Option<Refusal> {
         let file = &self.files[i];
-        // Written to fail closed. `None` here means "skipping is fine", and
-        // every condition below has to reach a decision on evidence rather than
-        // on the absence of it.
+        // Written to fail closed.
         let Some(fingerprint) = file.fingerprint.as_ref() else {
             return Some(Refusal::NoFingerprint);
         };
@@ -765,11 +678,8 @@ impl<'s> Driver<'s> {
             return Some(Refusal::NotIncremental);
         };
 
-        // The module-granular check, and the only one that sees a name this
-        // file *imports without using*. Such a name is in no `deps` entry —
-        // nothing references it — so deleting or renaming it downstream leaves
-        // both of this file's other conditions satisfied while its import list
-        // has gone dangling. A missing digest is the module deleted outright.
+        // The module-granular check, and the only one that sees a name this file *imports without
+        // using*.
         for edge in &fingerprint.imports {
             if gate.exports.get(&edge.module) != Some(&edge.exports) {
                 return Some(Refusal::Import(edge.module.clone()));
@@ -777,14 +687,12 @@ impl<'s> Driver<'s> {
         }
 
         // The exact condition: every free name still denotes what it denoted.
-        // A definition deleted, moved to another module, or renamed all land
-        // here, and so does a dependency whose body changed.
         for dep in &fingerprint.deps {
             if gate.table.get(&dep.name) != Some(&dep.hash) {
                 return Some(Refusal::Dependency(dep.name.clone()));
             }
-            // Every entry here crossed a module boundary to get in, so every one
-            // of them had to be `pub` for this file to have compiled.
+            // Every entry here crossed a module boundary to get in, so every one of them had to be
+            // `pub` for this file to have compiled.
             if private.contains(&dep.name) {
                 return Some(Refusal::Private(dep.name.clone()));
             }
@@ -792,9 +700,8 @@ impl<'s> Driver<'s> {
 
         let resolve = |name: &Symbol| gate.table.get(name).copied();
         for entry in &fingerprint.defs {
-            // Asked for by name, not by hash alone: several definitions can share
-            // a hash, and a `Scheme` written in another one's names is not this
-            // one's interface.
+            // Asked for by name, not by hash alone: several definitions can share a hash, and a
+            // `Scheme` written in another one's names is not this one's interface.
             let holds = match entry.kind {
                 DefKind::Fn => store
                     .def_of(entry.hash, &entry.name)
@@ -810,18 +717,7 @@ impl<'s> Driver<'s> {
         None
     }
 
-    /// Gate 2, decided one definition at a time. A parsed definition whose
-    /// `DefHash` is already in the store, under a witness this run would write
-    /// again, is handed to inference as a finished interface rather than
-    /// re-inferred. That is the compile-once mechanism: a module that imports a
-    /// definition being rechecked is *not* itself rechecked, because it takes
-    /// that definition's type from the store instead of from a fresh walk.
-    ///
-    /// `type` and `effect` declarations are always re-derived. A declaration's
-    /// signature comes from its own text and reaches no body, so deriving it
-    /// costs less than looking it up and checking a witness — but the report
-    /// still says `cached` when nothing about it moved, which is the question
-    /// `--explain` is asking.
+    /// Gate 2, decided one definition at a time.
     fn decide_rechecks(&mut self, hashes: &HashOutput) -> GateTwo {
         let witnesses = self.witnesses(hashes);
         let private = self.private_names();
@@ -841,8 +737,7 @@ impl<'s> Driver<'s> {
         gate
     }
 
-    /// Fills in what gate 2 accepted for one parsed file. Returns whether
-    /// anything in it has to be inferred.
+    /// Fills in what gate 2 accepted for one parsed file.
     fn gather(
         &self,
         i: usize,
@@ -856,9 +751,9 @@ impl<'s> Driver<'s> {
         let (Some(store), Some(ast)) = (self.store.as_deref(), file.ast.as_ref()) else {
             return true;
         };
-        // A referent that stopped being `pub` moves no hash and fails no
-        // witness, so nothing below would notice; the body has to be walked
-        // again for the error to be reported against the reference.
+        // A referent that stopped being `pub` moves no hash and fails no witness, so nothing below
+        // would notice; the body has to be walked again for the error to be reported against the
+        // reference.
         if self
             .free_names(i, hashes)
             .iter()
@@ -912,20 +807,8 @@ impl<'s> Driver<'s> {
         rechecked | self.gather_tests(i, hashes, one, private, gate)
     }
 
-    /// A test's footprint is written in effect *names*, which a hash erases, and
-    /// `CachedTest` carries no witness of its own. Reusing one is therefore only
-    /// safe for a file whose every free name still denotes what it denoted — a
-    /// file that would have skipped gate 1 outright had it not been dragged into
-    /// the parse set for some other reason.
-    ///
-    /// The pairing is by hash rather than by position. A test's label is not
-    /// part of its hash, so relabelling one, reordering two, or deleting a third
-    /// all leave the surviving hashes intact and the positions wrong.
-    ///
-    /// A hash two cached tests disagree about is dropped rather than guessed at.
-    /// Two tests can share a hash and still have different footprints — one
-    /// performs `a.op`, the other the identically declared `b.op` — because a
-    /// footprint is written in effect names and a hash erases them.
+    /// A test's footprint is written in effect *names*, which a hash erases, and `CachedTest`
+    /// carries no witness of its own.
     fn gather_tests(
         &self,
         i: usize,
@@ -988,9 +871,7 @@ impl<'s> Driver<'s> {
         rechecked
     }
 
-    /// Every top-level name this file mentions but does not declare. A
-    /// constructor reference reaches the type that owns it, so a variant's own
-    /// name never appears.
+    /// Every top-level name this file mentions but does not declare.
     fn free_names(&self, i: usize, hashes: &HashOutput) -> BTreeSet<Symbol> {
         let file = &self.files[i];
         let Some(ast) = &file.ast else {
@@ -1020,9 +901,9 @@ impl<'s> Driver<'s> {
         out
     }
 
-    /// `HashOutput::tests` is parallel to the program's tests walked module by
-    /// module in load order, and the parsed program holds the parsed files in
-    /// that same order, so the offsets line up by counting.
+    /// `HashOutput::tests` is parallel to the program's tests walked module by module in load
+    /// order, and the parsed program holds the parsed files in that same order, so the offsets line
+    /// up by counting.
     fn test_hashes_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
         self.item_hashes_of(i, &hashes.tests, |item| matches!(item, Item::Test(_)))
     }
@@ -1056,20 +937,6 @@ impl<'s> Driver<'s> {
     }
 
     /// The witness this run would write for every parsed definition and test.
-    ///
-    /// A `Scheme` and a `Footprint` are written in names — `Type::Con(Symbol)`
-    /// and effect labels — while a `DefHash` erases them. So the hash alone does
-    /// not determine the interface, and every cached interface records which
-    /// `type` and `effect` declarations it reached and what each hashed to.
-    ///
-    /// Three parts, and each earns its place. The definition's own name comes
-    /// first, so an entry written by a structurally identical definition
-    /// elsewhere is never mistaken for this one's. Then its direct declaration
-    /// references in normalization order, which is what tells two definitions
-    /// apart when they reach the same declarations in a different arrangement.
-    /// Then every declaration in its transitive closure, sorted, which is what
-    /// catches a `type` renamed three calls away — a rename changes no hash, so
-    /// nothing else would.
     fn witnesses(&self, hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
         let mut out = BTreeMap::new();
         let named = |name: &Symbol| -> Option<NameRef> {
@@ -1104,11 +971,9 @@ impl<'s> Driver<'s> {
         cached: BTreeSet<Symbol>,
     ) -> Result<Loaded, LoadError> {
         let hashes = &hashes;
-        // Inference walks modules in dependency order and a skipped module is
-        // not walked at all, so taking either map's order from the check would
-        // make the published order a function of what the cache happened to
-        // hold. Every map below is instead filled file by file, in the run's
-        // file order and each file's source order — a property of the program.
+        // Inference walks modules in dependency order and a skipped module is not walked at all, so
+        // taking either map's order from the check would make the published order a function of
+        // what the cache happened to hold.
         let checked = CheckOutput {
             defs: canonical_defs(&checked.defs),
             effects: canonical_effects(&checked.effects),
@@ -1119,10 +984,9 @@ impl<'s> Driver<'s> {
             defs: IndexMap::new(),
             tests: Vec::new(),
             laws: Vec::new(),
-            // The maps below are rebuilt file by file, and no file declares the
-            // prelude's effects or ADTs, so they have to be seeded here or a
-            // run's `CheckOutput` would answer that `clock` is not `nondet` and
-            // that no value of `Option<Int>` can be generated.
+            // The maps below are rebuilt file by file, and no file declares the prelude's effects
+            // or ADTs, so they have to be seeded here or a run's `CheckOutput` would answer that
+            // `clock` is not `nondet` and that no value of `Option<Int>` can be generated.
             effects: ply_core::prelude::effects(),
             ctors: ply_core::prelude::ctors(),
             modules: IndexMap::new(),
@@ -1194,10 +1058,6 @@ impl<'s> Driver<'s> {
         })
     }
 
-    /// A parsed module. Every type, footprint, name and span comes from the
-    /// check, whether it inferred the definition or published an interface gate
-    /// 2 handed it; only the *order* has to be rebuilt, so that it follows the
-    /// run's files rather than the checked program's.
     fn restate_checked(
         &self,
         i: usize,
@@ -1246,8 +1106,8 @@ impl<'s> Driver<'s> {
                         }
                     }
                 }
-                // None declares a name, so none is reached: all four are
-                // filtered out by `item.name()` above.
+                // None declares a name, so none is reached: all four are filtered out by
+                // `item.name()` above.
                 Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
             }
         }
@@ -1258,9 +1118,9 @@ impl<'s> Driver<'s> {
                 ..test.clone()
             });
         }
-        // A law declares no name, so the loop above never reaches it, and its
-        // obligation would be silently absent from a run that read it — a claim
-        // nobody checked and nobody was told about.
+        // A law declares no name, so the loop above never reaches it, and its obligation would be
+        // silently absent from a run that read it — a claim nobody checked and nobody was told
+        // about.
         for law in checked.laws.iter().filter(|l| l.module == file.module) {
             let index = out.laws.len();
             out.laws.push(LawInfo {
@@ -1273,8 +1133,7 @@ impl<'s> Driver<'s> {
         merged.law_texts.extend(self.law_texts_of(i, hashes));
     }
 
-    /// A module gate 1 skipped. There is no AST at all: every name, span, type
-    /// and hash comes out of the fingerprint and the interface store.
+    /// A module gate 1 skipped.
     fn restore_skipped(&self, i: usize, into: &mut Merged) -> Result<(), LoadError> {
         let Merged {
             out,
@@ -1334,24 +1193,14 @@ impl<'s> Driver<'s> {
                             footprint: cached.footprint.clone(),
                             performed: cached.performed.clone(),
                             row_aliases: cached.row_aliases.clone(),
-                            // Restored from `SourceFingerprint::specs` once the
-                            // store carries it; see CONTRACTS.md's Specs
-                            // section. A skipped file's clauses are
-                            // byte-identical to the ones whose hashes it holds.
+                            // Restored from `SourceFingerprint::specs` once the store carries it;
+                            // see CONTRACTS.md's Specs section.
                             spec: Vec::new(),
-                            // Needs `CachedDef` to carry them, which it does
-                            // not yet. Until it does, a call site in a parsed
-                            // file can be checked against a *skipped* callee's
-                            // signature with its `where` clauses missing, and
-                            // an `E0206` that should fire will not.
+                            // Needs `CachedDef` to carry them, which it does not yet.
                             constraints: Vec::new(),
-                            // There is no body to walk, so the answer is the
-                            // conservative one — which costs nothing, because a
-                            // skipped module contributes no AST and so no
-                            // closure the seam could be offered. Gate 1 forces
-                            // `parse` on any module a parsed module imports
-                            // (`close_over_imports`), so nothing a run can call
-                            // is restored this way.
+                            // There is no body to walk, so the answer is the conservative one —
+                            // which costs nothing, because a skipped module contributes no AST and
+                            // so no closure the seam could be offered.
                             internally_effectful: true,
                             span: entry.span.rebase(source),
                         },
@@ -1397,9 +1246,9 @@ impl<'s> Driver<'s> {
                     if entry.members.len() != ops.len() {
                         return Err(self.corrupt(&entry.name));
                     }
-                    // By name, never by position: normalization sorts an
-                    // effect's operations away, so their source order is not
-                    // part of the hash the signatures were stored under.
+                    // By name, never by position: normalization sorts an effect's operations away,
+                    // so their source order is not part of the hash the signatures were stored
+                    // under.
                     let by_name: BTreeMap<&Symbol, &CachedOp> =
                         ops.iter().map(|op| (&op.name, op)).collect();
                     let mut infos = IndexMap::new();
@@ -1453,8 +1302,7 @@ impl<'s> Driver<'s> {
         Ok(())
     }
 
-    /// The cache promised an interface it does not hold. Nothing the user wrote
-    /// caused this, so it names the cache and says how to clear it.
+    /// The cache promised an interface it does not hold.
     fn corrupt(&self, name: &Symbol) -> LoadError {
         LoadError {
             sources: self.sources.clone(),
@@ -1470,14 +1318,6 @@ impl<'s> Driver<'s> {
     }
 
     /// What a compiler upgrade did to this project, said once.
-    ///
-    /// Correctness needs nothing here: the stdlib is source, so a stdlib edit
-    /// moves exactly the hashes it should and selection stays exact. **The
-    /// digest is deliberately in no cache key** — a digest in the key would
-    /// invalidate a project on an edit to a `std` module it never imports, which
-    /// is precisely the conservative selection Ply exists to beat. This is
-    /// visibility, so that the work an upgrade caused is a number rather than a
-    /// mystery, and so that zero is reported as zero.
     fn stdlib_notice(&self, merged: &HashOutput) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
@@ -1493,9 +1333,7 @@ impl<'s> Driver<'s> {
             return Vec::new();
         }
 
-        // What the last run recorded for the shipped modules, against what they
-        // hash to now. A module this run did not load contributes nothing: its
-        // definitions are not in this program, so nothing here reaches them.
+        // What the last run recorded for the shipped modules, against what they hash to now.
         let mut moved: BTreeSet<Symbol> = BTreeSet::new();
         for path in store.source_paths() {
             if !ply_std::is_pseudo_path(&path) {
@@ -1553,8 +1391,8 @@ impl<'s> Driver<'s> {
             return Vec::new();
         }
         let witnesses = self.witnesses(hashes);
-        // The same call gate 1 makes, so that what is written now is exactly
-        // what a later run will compare against.
+        // The same call gate 1 makes, so that what is written now is exactly what a later run will
+        // compare against.
         let exports = self.export_table(hashes);
         let table = self.hash_table(hashes);
         let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
@@ -1583,31 +1421,24 @@ impl<'s> Driver<'s> {
                 Interface::Decl(decl) => store.put_decl(hash, decl),
             }
         }
-        // Only the definitions this run normalized. A skipped file's bodies were
-        // written by the run that parsed it and are immutable, so there is
-        // nothing to refresh — a body is a function of the hash it is filed
-        // under.
+        // Only the definitions this run normalized.
         for (hash, body) in bodies.defs() {
             store.put_body(hash, DefBody::of(body.clone()));
         }
         for (i, fingerprint) in fingerprints {
             store.put_source(&paths[i], fingerprint);
         }
-        // `paths` already holds the pseudo-paths of the shipped modules this run
-        // loaded, so a `std` module the project stopped importing is pruned like
-        // any other file that left the program — correct, and recomputable.
+        // `paths` already holds the pseudo-paths of the shipped modules this run loaded, so a `std`
+        // module the project stopped importing is pruned like any other file that left the program
+        // — correct, and recomputable.
         if whole_project {
             store.prune(&paths);
         }
         store.set_stdlib_digest(ply_std::digest_short());
         match store.flush() {
             Ok(()) => Vec::new(),
-            // A flush writes both caches and either half can be the one that
-            // failed, so naming one here would be a guess. The error's own
-            // chain already says which, which is why it is the whole message.
-            //
-            // A cache that could not be written costs the next run its work and
-            // costs this one nothing, so it is a warning rather than a failure.
+            // A flush writes both caches and either half can be the one that failed, so naming one
+            // here would be a guess.
             Err(e) => vec![
                 Diagnostic::warning(
                     codes::CACHE_UNREADABLE,
@@ -1618,14 +1449,8 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// Every module's `(name, hash)` pairs, which is what an importer's
-    /// `ImportEdge` digest is taken over.
-    ///
-    /// Deliberately every top-level name, not only the `pub` ones: a skipped
-    /// module's entries come from a fingerprint, and a `DefEntry` carries no
-    /// visibility. Filtering the parsed side alone would make the two disagree,
-    /// and a digest that means different things on either side of a skip is
-    /// worse than a coarse one.
+    /// Every module's `(name, hash)` pairs, which is what an importer's `ImportEdge` digest is
+    /// taken over.
     fn export_table(&self, hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
         let mut out: BTreeMap<Symbol, Vec<NameRef>> = BTreeMap::new();
         for file in &self.files {
@@ -1756,8 +1581,8 @@ impl<'s> Driver<'s> {
         Some(fingerprint)
     }
 
-    /// Only parsed files contribute: a skipped file's entries are already in the
-    /// store and were the very thing that let it skip.
+    /// Only parsed files contribute: a skipped file's entries are already in the store and were the
+    /// very thing that let it skip.
     fn interfaces(
         &self,
         hashes: &HashOutput,
@@ -1859,25 +1684,22 @@ struct Merged {
     report: FrontEnd,
 }
 
-/// What gate 1 measures a skip candidate against. Both maps cover parsed and
-/// skipped files alike — a skipped file's half comes from the fingerprint whose
-/// content hash already matched the bytes on disk.
+/// What gate 1 measures a skip candidate against.
 struct Gate1 {
     table: BTreeMap<Symbol, DefHash>,
     exports: BTreeMap<Symbol, ContentHash>,
 }
 
-/// What gate 2 decided: the interfaces inference may publish without walking a
-/// body, and every name it accepted, which is what `--explain` reports.
+/// What gate 2 decided: the interfaces inference may publish without walking a body, and every name
+/// it accepted, which is what `--explain` reports.
 #[derive(Default)]
 struct GateTwo {
     known: Known,
     cached: BTreeSet<Symbol>,
 }
 
-/// Merges rather than overwrites, because two entries can share a name — a
-/// `type` and a `fn` may, as may two tests. Mirrors what a from-scratch run
-/// does, so that the two land on the same map.
+/// Merges rather than overwrites, because two entries can share a name — a `type` and a `fn` may,
+/// as may two tests.
 fn record_deps(merged: &mut HashOutput, name: &Symbol, deps: &[Symbol]) {
     match merged.deps.get_mut(name) {
         Some(existing) => {
@@ -1893,10 +1715,7 @@ fn record_deps(merged: &mut HashOutput, name: &Symbol, deps: &[Symbol]) {
     }
 }
 
-/// The transitive closure of the reference graph, each name included in its
-/// own. Recomputed from the merged edges on every path rather than taken from
-/// the parsed program's, because a skipped file contributes edges to that map
-/// and nothing else would fold them in.
+/// The transitive closure of the reference graph, each name included in its own.
 fn closure_of(deps: &IndexMap<Symbol, Vec<Symbol>>) -> IndexMap<Symbol, BTreeSet<Symbol>> {
     let names: Vec<&Symbol> = deps.keys().collect();
     let index: BTreeMap<&Symbol, usize> = names
@@ -1978,9 +1797,7 @@ fn simple_name(module: &ModuleName, qualified: &Symbol) -> Symbol {
     }
 }
 
-/// Two witnesses agree when they name the same declarations with the same
-/// hashes. Compared as sets: the store canonicalizes what it holds, and this
-/// side must not depend on which order it chose.
+/// Two witnesses agree when they name the same declarations with the same hashes.
 fn same_witness(stored: &[NameRef], fresh: &[NameRef]) -> bool {
     let mut a = stored.to_vec();
     let mut b = fresh.to_vec();
@@ -2006,11 +1823,9 @@ fn canonical_defs(defs: &IndexMap<Symbol, DefInfo>) -> IndexMap<Symbol, DefInfo>
     out
 }
 
-/// Constructors are renumbered per *type*, not per constructor: a type's
-/// parameters are shared by every variant, and numbering each alone would make
-/// `P(a)` and `Q(b)` of `type Pair<a, b>` both mention `t0`. Going through
-/// [`canonicalize_decl_body`] is what keeps a freshly checked declaration
-/// byte-identical to the same declaration restored from the store.
+/// Constructors are renumbered per *type*, not per constructor: a type's parameters are shared by
+/// every variant, and numbering each alone would make `P(a)` and `Q(b)` of `type Pair<a, b>` both
+/// mention `t0`.
 fn canonical_ctors(ctors: &IndexMap<Symbol, CtorInfo>) -> IndexMap<Symbol, CtorInfo> {
     let mut owners: IndexMap<Symbol, Vec<Symbol>> = IndexMap::new();
     for (name, ctor) in ctors {

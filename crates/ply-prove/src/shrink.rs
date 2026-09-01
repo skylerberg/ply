@@ -1,27 +1,4 @@
 //! Shrinking a counterexample.
-//!
-//! M5 shrank the definition *set* to find a culprit. This shrinks the *inputs*
-//! to find a minimal witness, and its whole honesty is two requirements that are
-//! easy to get wrong and silent when they are:
-//!
-//! 1. **A shrunk value must still falsify the obligation.** Every candidate is
-//!    re-evaluated and only an actually-falsifying one is accepted. No
-//!    monotonicity of any kind is assumed — a property that fails at `[4, 9]`
-//!    and holds at `[4]` and at `[9]` is ordinary, not pathological.
-//! 2. **A shrunk value must still satisfy the guard.** A candidate outside the
-//!    guard's domain is not a smaller counterexample; it is a counterexample to
-//!    a different claim, and reporting one would name an input the obligation
-//!    never spoke about. It is rejected before the body is ever evaluated.
-//!
-//! **Termination is structural, not budgetary.** Every value has a saturating
-//! [`size`], a candidate is accepted only when its size is *strictly* smaller,
-//! and the walk is greedy — so the process terminates whatever the budget is,
-//! and `--shrink-budget` bounds wall clock rather than correctness.
-//!
-//! **The result is deterministic**, being a function of the original tuple, the
-//! obligation and the candidate order fixed below. Two runs over one refutation
-//! produce byte-identical bindings, which is what makes today's artifact
-//! diffable against yesterday's.
 
 #[cfg(test)]
 mod tests;
@@ -37,12 +14,7 @@ use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The property the original input had, and which every accepted candidate must
-/// still have.
-///
-/// A raising input is shrunk exactly as a falsifying one is: a spec that raises
-/// is not false, so it is a gap rather than a refutation, but a minimal raising
-/// input is worth what a minimal falsifying one is.
+/// The property the original input had, and which every accepted candidate must still have.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     Falsifies,
@@ -53,8 +25,7 @@ pub enum Target {
 #[derive(Debug)]
 pub struct Shrunk {
     pub values: Vec<Value>,
-    /// Accepted steps. Zero means the first case drawn was already minimal, and
-    /// a reader can tell that from a lucky hit only because this number is here.
+    /// Accepted steps.
     pub steps: u32,
     /// Candidates actually evaluated, against `--shrink-budget`.
     pub evaluations: u32,
@@ -62,8 +33,7 @@ pub struct Shrunk {
     pub diagnostic: Option<Diagnostic>,
 }
 
-/// Greedy descent: the first accepted candidate becomes the new value and the
-/// walk restarts.
+/// Greedy descent: the first accepted candidate becomes the new value and the walk restarts.
 pub fn shrink(
     values: &[Value],
     types: &[Type],
@@ -114,12 +84,6 @@ pub fn shrink(
 }
 
 /// A saturating structural measure, and the reason the walk terminates.
-///
-/// It is not a byte count. It is chosen so that every candidate order below
-/// descends it: a negative integer outweighs its absolute value so `-n` is
-/// progress, a constructor's position outweighs a nullary one so a lower-index
-/// variant is progress, and a character's code point counts so lowering it
-/// toward `'a'` is progress.
 pub fn size(value: &Value, world: &TypeWorld) -> u64 {
     let mut total: u64 = 0;
     let mut pending: Vec<&Value> = vec![value];
@@ -128,10 +92,8 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             Value::Int(n) => int_size(*n),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
-            // Ordered so that every candidate below is a strict descent:
-            // toward zero, and positive before its negation. `NaN` and the
-            // infinities are the largest values there are, so a counterexample
-            // reaches a finite one whenever a finite one still fails.
+            // Ordered so that every candidate below is a strict descent: toward zero, and positive
+            // before its negation.
             Value::Float(f) => float_size(*f),
             Value::Decimal(d) => decimal_size(*d),
             Value::Str(s) => s
@@ -144,9 +106,9 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
                 pending.extend(items.iter());
                 items.len() as u64
             }
-            // Keys count as well as values: two maps with one entry each are
-            // ordered by what is in them, which is what makes removing an entry
-            // a strict shrink and replacing a key with a smaller one another.
+            // Keys count as well as values: two maps with one entry each are ordered by what is in
+            // them, which is what makes removing an entry a strict shrink and replacing a key with
+            // a smaller one another.
             Value::Map(entries) => {
                 pending.extend(entries.keys());
                 pending.extend(entries.values());
@@ -161,13 +123,11 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
                 let index = world.ctor(name).map(|(_, i)| i).unwrap_or(0) as u64;
                 1u64.saturating_add(index).saturating_add(args.len() as u64)
             }
-            // A closure this crate generated carries the size it was built with;
-            // anything else is left alone rather than guessed at.
+            // A closure this crate generated carries the size it was built with; anything else is
+            // left alone rather than guessed at.
             Value::Closure(_) => fn_size(v).unwrap_or(1),
-            // A `Secret` is unreachable here: `forall (s: Secret<a>)` is `E0418`,
-            // so the generator never mints one and no counterexample holds one.
-            // Zero rather than a walk of the payload, because a shrinker that
-            // measured a credential would be a shrinker steering toward it.
+            // A `Secret` is unreachable here: `forall (s: Secret<a>)` is `E0418`, so the generator
+            // never mints one and no counterexample holds one.
             Value::Cell(_) | Value::Task(_) | Value::Continuation(_) | Value::Secret(_) => 0,
         };
         total = total.saturating_add(here);
@@ -175,8 +135,8 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
     total
 }
 
-/// Finite values by magnitude, with a negative outweighing its absolute value,
-/// and everything non-finite above every finite value.
+/// Finite values by magnitude, with a negative outweighing its absolute value, and everything
+/// non-finite above every finite value.
 fn float_size(f: f64) -> u64 {
     if f.is_nan() {
         return u64::MAX;
@@ -185,25 +145,19 @@ fn float_size(f: f64) -> u64 {
         return u64::MAX - 1;
     }
     let magnitude = f.abs();
-    // A `Float` spans more magnitudes than a `u64` counts, so the measure is
-    // over the exponent and the mantissa rather than over the value: it only has
-    // to order candidates, and a saturating cast would make every large float
-    // one size and stall the walk.
+    // A `Float` spans more magnitudes than a `u64` counts, so the measure is over the exponent and
+    // the mantissa rather than over the value: it only has to order candidates, and a saturating
+    // cast would make every large float one size and stall the walk.
     let bits = magnitude.to_bits();
     bits.saturating_mul(2)
         .saturating_add(u64::from(f.is_sign_negative()))
 }
 
-/// Magnitude, then whether there is a fraction at all, then the scale, then the
-/// sign — strictly layered, so each is a tiebreak on the one above it.
-///
-/// The mantissa is deliberately **not** the measure. `1.500m` halves to
-/// `0.750m`, whose mantissa is larger and whose value is smaller, so a measure
-/// over the mantissa would call the obvious shrink a growth and stall the walk
-/// at the first fraction it met.
+/// Magnitude, then whether there is a fraction at all, then the scale, then the sign — strictly
+/// layered, so each is a tiebreak on the one above it.
 fn decimal_size(d: Decimal) -> u64 {
-    // The layers: a magnitude step is worth more than every tiebreak together,
-    // and having a fraction is worth more than the scale it is written at.
+    // The layers: a magnitude step is worth more than every tiebreak together, and having a
+    // fraction is worth more than the scale it is written at.
     const MAGNITUDE: u64 = 64;
     const FRACTION: u64 = 32;
     let magnitude = d.trunc().abs().to_u64().unwrap_or(u64::MAX / MAGNITUDE);
@@ -221,8 +175,8 @@ fn int_size(n: i64) -> u64 {
         .saturating_add(u64::from(n < 0))
 }
 
-/// The smallest value of a type: the shrinker's floor, and what fills a field a
-/// candidate constructor has and the current value does not.
+/// The smallest value of a type: the shrinker's floor, and what fills a field a candidate
+/// constructor has and the current value does not.
 pub fn minimal(ty: &Type, world: &TypeWorld) -> Result<Value, Ungeneratable> {
     minimal_at(ty, world, 0)
 }
@@ -256,8 +210,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
         }
         Type::Con(name, args) => match name.as_str() {
             "Int" => Ok(Value::Int(0)),
-            // `0.0`, not `-0.0`: the two are different values and the positive
-            // one is the floor.
+            // `0.0`, not `-0.0`: the two are different values and the positive one is the floor.
             "Float" => Ok(Value::Float(0.0)),
             "Decimal" => Ok(Value::Decimal(Decimal::ZERO)),
             "Bool" => Ok(Value::Bool(false)),
@@ -284,9 +237,8 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
     }
 }
 
-/// The variant a minimal value of `Con(name, args)` uses: fewest nested
-/// constructors, then lowest declaration index. Both halves matter — the first
-/// is what terminates, the second is what makes two runs agree.
+/// The variant a minimal value of `Con(name, args)` uses: fewest nested constructors, then lowest
+/// declaration index.
 fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol, Vec<Type>)> {
     let variants = world.variants(name)?;
     variants
@@ -303,10 +255,6 @@ fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol
 }
 
 /// Candidates for one value, in the order two runs must agree on.
-///
-/// Order is the contract, not an implementation detail: the walk is greedy, so
-/// a different order is a different minimal witness and yesterday's artifact
-/// stops being diffable against today's.
 pub fn candidates(value: &Value, ty: &Type, world: &TypeWorld) -> Vec<Value> {
     candidates_at(value, ty, world, 0)
 }
@@ -358,9 +306,9 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
         (Value::Ctor { name, args }, Type::Con(ty_name, ty_args)) => {
             ctor_candidates(name, args, ty_name, ty_args, ty, world, depth)
         }
-        // Toward the constant function returning the smallest value of the
-        // return type, which is the family's floor, so a second application
-        // proposes the same value and the size test ends the walk.
+        // Toward the constant function returning the smallest value of the return type, which is
+        // the family's floor, so a second application proposes the same value and the size test
+        // ends the walk.
         (Value::Closure(_), Type::Fn { params, ret, .. }) => minimal(ret, world)
             .map(|v| vec![const_fn(params.len(), v, world)])
             .unwrap_or_default(),
@@ -368,8 +316,7 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
     }
 }
 
-/// `0`, then halving toward zero, then one step toward zero, then the positive
-/// of a negative.
+/// `0`, then halving toward zero, then one step toward zero, then the positive of a negative.
 fn int_candidates(n: i64) -> Vec<Value> {
     if n == 0 {
         return Vec::new();
@@ -394,10 +341,6 @@ fn int_candidates(n: i64) -> Vec<Value> {
 }
 
 /// Toward `0.0`, and a specific value before a special one.
-///
-/// A `NaN` or an infinity offers `0.0` and nothing else: there is no halving
-/// that reaches a finite value from one, and a counterexample that still fails
-/// at `0.0` is the one worth reporting.
 fn float_candidates(f: f64) -> Vec<Value> {
     if f == 0.0 && f.is_sign_positive() {
         return Vec::new();
@@ -406,8 +349,8 @@ fn float_candidates(f: f64) -> Vec<Value> {
         return vec![Value::Float(0.0)];
     }
     let mut out: Vec<f64> = vec![0.0];
-    // The truncation is the point: a fraction shrinks to the whole number below
-    // it, which is what makes `0.30000000000000004` reach `0.0` in two steps.
+    // The truncation is the point: a fraction shrinks to the whole number below it, which is what
+    // makes `0.30000000000000004` reach `0.0` in two steps.
     let truncated = f.trunc();
     if truncated != f {
         out.push(truncated);
@@ -423,19 +366,14 @@ fn float_candidates(f: f64) -> Vec<Value> {
     if f.is_sign_negative() {
         out.push(-f);
     }
-    // `!=` and not `total_cmp`, so `-0.0` is dropped against a `0.0` candidate
-    // and the walk cannot cycle between two values the language calls equal.
+    // `!=` and not `total_cmp`, so `-0.0` is dropped against a `0.0` candidate and the walk cannot
+    // cycle between two values the language calls equal.
     out.retain(|c| *c != f);
     out.into_iter().map(Value::Float).collect()
 }
 
-/// Toward `0m`, and toward scale 0 — the trailing zeros go before the digits do,
-/// so a witness reads `1.5m` rather than `1.500000m`.
-///
-/// Nothing that *raises* the scale is offered, halving included: `0.75m / 2` is
-/// `0.375m`, which is a smaller value written at a longer scale, and admitting
-/// it would let the walk trade a digit of magnitude for a digit of precision
-/// forever.
+/// Toward `0m`, and toward scale 0 — the trailing zeros go before the digits do, so a witness reads
+/// `1.5m` rather than `1.500000m`.
 fn decimal_candidates(d: Decimal) -> Vec<Value> {
     if d.is_zero() && d.scale() == 0 {
         return Vec::new();
@@ -445,9 +383,7 @@ fn decimal_candidates(d: Decimal) -> Vec<Value> {
     if normalized.scale() != d.scale() {
         out.push(normalized);
     }
-    // Truncation, shortest first: `12.345m` offers `12m`, then `12.3m`, then
-    // `12.34m`. Truncating never raises the magnitude and never raises the
-    // scale, which is what makes each one a descent.
+    // Truncation, shortest first: `12.345m` offers `12m`, then `12.3m`, then `12.34m`.
     for places in 0..d.scale() {
         out.push(d.round_dp_with_strategy(places, RoundingStrategy::ToZero));
     }
@@ -471,8 +407,8 @@ fn decimal_candidates(d: Decimal) -> Vec<Value> {
     out.into_iter().map(Value::Decimal).collect()
 }
 
-/// Length before content, which is the order that makes a minimal witness
-/// readable: `b""`, then the two halves, then each byte lowered toward zero.
+/// Length before content, which is the order that makes a minimal witness readable: `b""`, then the
+/// two halves, then each byte lowered toward zero.
 fn bytes_candidates(b: &[u8]) -> Vec<Value> {
     if b.is_empty() {
         return Vec::new();
@@ -496,8 +432,7 @@ fn bytes_candidates(b: &[u8]) -> Vec<Value> {
     out
 }
 
-/// `""`, the two halves, then each character lowered toward `'a'`, left to
-/// right.
+/// `""`, the two halves, then each character lowered toward `'a'`, left to right.
 fn string_candidates(s: &str) -> Vec<Value> {
     let chars: Vec<char> = s.chars().collect();
     if chars.is_empty() {
@@ -531,8 +466,7 @@ fn string_candidates(s: &str) -> Vec<Value> {
     out
 }
 
-/// `[]`, the two halves, each single element removed, then each element shrunk
-/// in place.
+/// `[]`, the two halves, each single element removed, then each element shrunk in place.
 fn list_candidates(
     items: &Vector<Value>,
     elem: &Type,
@@ -563,14 +497,7 @@ fn list_candidates(
     out
 }
 
-/// The empty map, then each entry dropped, then each value shrunk, then each key
-/// shrunk.
-///
-/// Entries come out before values because that is the contract, and it is the
-/// right order for the same reason it is for a list: dropping an entry can end
-/// the walk in one step where shrinking a value inside it cannot. Keys go last
-/// because replacing one re-sorts the map, which is the most disruptive edit
-/// available and the least likely to still refute.
+/// The empty map, then each entry dropped, then each value shrunk, then each key shrunk.
 fn map_candidates(
     entries: &ply_eval::Map,
     key: &Type,
@@ -608,13 +535,7 @@ fn map_candidates(
     out
 }
 
-/// A recursive field, then a lower-index constructor, then each field shrunk in
-/// place.
-///
-/// Taking a recursive field first is what turns a deep tree into a shallow one
-/// in a step rather than in a thousand, and it is only sound because the field's
-/// type is the value's own — which is checked here rather than guessed from the
-/// shape.
+/// A recursive field, then a lower-index constructor, then each field shrunk in place.
 fn ctor_candidates(
     ctor: &Symbol,
     args: &Arc<Vec<Value>>,

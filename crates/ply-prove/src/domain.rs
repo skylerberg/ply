@@ -1,23 +1,4 @@
 //! Finite domains, and the proof that comes from covering one.
-//!
-//! ADR 0007 §5.1(f): when every binder's type is finite and the product of their
-//! cardinalities is at most [`ENUMERATION_BOUND`], the obligation is decided by
-//! evaluating the body at every point. That is a genuine proof — the domain was
-//! *covered*, not sampled — and it is why `forall (b: Bool) { b || !b }` is
-//! `proved` for two evaluations rather than sampled for two hundred.
-//!
-//! §5.3 is the degenerate case with a domain of one: a closed obligation
-//! evaluates to exactly one value, and evaluating it to `true` is a decision
-//! procedure for it. Stating it here rather than leaving it implicit is what
-//! stops an implementer from reporting `example` for the strongest possible
-//! evidence.
-//!
-//! **A type is finite only when this module can say so.** `Int`, `String`,
-//! `List<_>`, a function type and anything in a constructor cycle are not, and
-//! neither is a type variable — an uninterpreted sort has no cardinality, and
-//! guessing one would turn a claim about every instantiation into a claim about
-//! `Int`. Everything unrecognized is infinite, which costs a proof and never
-//! buys a wrong one.
 
 use crate::ENUMERATION_BOUND;
 use crate::property::TypeWorld;
@@ -27,10 +8,6 @@ use ply_span::Symbol;
 use std::collections::BTreeMap;
 
 /// A domain small enough to walk, and how to walk it.
-///
-/// `points` is the product of the binders' cardinalities, so it is what
-/// [`crate::Rule::ExhaustiveEnumeration`] reports and what an audit checks
-/// against [`ENUMERATION_BOUND`].
 #[derive(Clone, Debug)]
 pub struct Finite {
     pub types: Vec<Type>,
@@ -40,9 +17,7 @@ pub struct Finite {
 }
 
 impl Finite {
-    /// The binders' types rendered as the product they are, for the
-    /// certificate. `unit` for a ground claim, whose domain is the one empty
-    /// tuple.
+    /// The binders' types rendered as the product they are, for the certificate.
     pub fn name(&self) -> Symbol {
         if self.types.is_empty() {
             return Symbol::new("unit");
@@ -51,10 +26,7 @@ impl Finite {
         Symbol::new(parts.join(" × "))
     }
 
-    /// The `index`-th point, in a fixed order — the first binder varying
-    /// slowest. Fixed because a refutation found by enumeration reports its
-    /// point as the counterexample with no shrinking, so two runs must agree on
-    /// which point that is.
+    /// The `index`-th point, in a fixed order — the first binder varying slowest.
     pub fn point(&self, world: &TypeWorld, index: u64) -> Option<Vec<Value>> {
         let mut rest = index;
         let mut out = Vec::with_capacity(self.types.len());
@@ -67,17 +39,14 @@ impl Finite {
     }
 }
 
-/// The binders' domain, when every one of them is finite and the product is
-/// within budget. `None` means "sample it", which is always available and never
-/// wrong.
+/// The binders' domain, when every one of them is finite and the product is within budget.
 pub fn finite(binders: &[LawBinder], world: &TypeWorld) -> Option<Finite> {
     let mut sizes = Vec::with_capacity(binders.len());
     let mut points: u64 = 1;
     for binder in binders {
         let size = cardinality(&binder.ty, world)?;
-        // An empty type makes the whole product empty, and a domain of no
-        // points is a vacuity rather than a proof. It is reported through the
-        // ordinary guard path, so it must not be enumerated as if it had one.
+        // An empty type makes the whole product empty, and a domain of no points is a vacuity
+        // rather than a proof.
         if size == 0 {
             return None;
         }
@@ -94,21 +63,15 @@ pub fn finite(binders: &[LawBinder], world: &TypeWorld) -> Option<Finite> {
     })
 }
 
-/// How many values inhabit a type, or `None` when it is infinite, unknown, or
-/// larger than [`ENUMERATION_BOUND`].
-///
-/// A recursive type is infinite: its constructor graph has a cycle, so it has
-/// values of every nesting depth. That is exactly the boundary §5.1(c) draws —
-/// a split reaches depth 1 and no further — and it is why finiteness is decided
-/// here by a walk that refuses to enter a type it is already inside.
+/// How many values inhabit a type, or `None` when it is infinite, unknown, or larger than
+/// [`ENUMERATION_BOUND`].
 pub fn cardinality(ty: &Type, world: &TypeWorld) -> Option<u64> {
     size_of(ty, world, &mut Vec::new())
 }
 
 fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> {
     match ty {
-        // An uninterpreted sort has no cardinality. Reading one as `Int` would
-        // enumerate a domain the law does not have.
+        // An uninterpreted sort has no cardinality.
         Type::Var(_) => None,
         Type::Fn { .. } => None,
         Type::Record(fields) => fields.values().try_fold(1u64, |acc, f| {
@@ -118,10 +81,9 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(1),
             "Bool" => Some(2),
-            // `Float` and `Decimal` are finite sets of machine values and are
-            // still not enumerable: a proof by covering 2^64 points is not a
-            // proof anybody runs, and claiming a cardinality here would put the
-            // whole domain inside `ENUMERATION_BOUND`'s arithmetic.
+            // `Float` and `Decimal` are finite sets of machine values and are still not enumerable:
+            // a proof by covering 2^64 points is not a proof anybody runs, and claiming a
+            // cardinality here would put the whole domain inside `ENUMERATION_BOUND`'s arithmetic.
             "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
             _ => {
                 if open.contains(name) {
@@ -146,9 +108,8 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
     }
 }
 
-/// The `index`-th value of a finite type, in the order [`cardinality`] counts:
-/// constructors in declaration order, then fields left to right with the last
-/// varying fastest.
+/// The `index`-th value of a finite type, in the order [`cardinality`] counts: constructors in
+/// declaration order, then fields left to right with the last varying fastest.
 fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
     match ty {
         Type::Con(name, args) => match name.as_str() {
@@ -252,17 +213,14 @@ mod tests {
         );
     }
 
-    /// An uninterpreted sort has no cardinality. Reading one as `Int` would let
-    /// an enumeration over the wrong domain report `proved` for a polymorphic
-    /// law it never covered.
+    /// An uninterpreted sort has no cardinality.
     #[test]
     fn a_type_variable_is_never_finite() {
         assert_eq!(cardinality(&Type::Var(ply_core::TyVar(0)), &kinds()), None);
     }
 
-    /// A type in a constructor cycle has values of every nesting depth, so it
-    /// has no finite domain to cover — which is exactly where induction would
-    /// be needed and is not available.
+    /// A type in a constructor cycle has values of every nesting depth, so it has no finite domain
+    /// to cover — which is exactly where induction would be needed and is not available.
     #[test]
     fn a_recursive_type_is_infinite_even_with_a_nullary_base_case() {
         let ctors = vec![
@@ -286,8 +244,8 @@ mod tests {
         assert_eq!(finite(&narrow, &world).map(|d| d.points), Some(81));
     }
 
-    /// A ground claim is the degenerate finite domain: one point, the empty
-    /// tuple, and no way to miss any of it.
+    /// A ground claim is the degenerate finite domain: one point, the empty tuple, and no way to
+    /// miss any of it.
     #[test]
     fn a_ground_claim_has_exactly_one_point() {
         let domain = finite(&[], &kinds()).expect("no binders is a finite domain");
@@ -296,8 +254,8 @@ mod tests {
         assert_eq!(domain.point(&kinds(), 0).map(|p| p.len()), Some(0));
     }
 
-    /// Every point exactly once, in an order two runs agree on — a refutation
-    /// found here reports its point as the counterexample with no shrinking.
+    /// Every point exactly once, in an order two runs agree on — a refutation found here reports
+    /// its point as the counterexample with no shrinking.
     #[test]
     fn enumeration_covers_the_domain_once_each_in_a_fixed_order() {
         let world = kinds();

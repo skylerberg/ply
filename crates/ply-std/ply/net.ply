@@ -1,82 +1,6 @@
-// The network effect. `import std.net (net)` and the operations below are the
-// ones `ply_host::tcp` registers against.
-//
-// This module is the declaration and nothing else: a program that reaches a
-// socket imports it rather than copying it, so the signature the host binds to
-// and the signature the program performs are one text that cannot drift. An
-// operation renamed on either side is E0421 at bind time, naming the operation
-// that moved.
-//
-// `nondet` is load-bearing. It is what makes a `det` test that reaches a socket
-// E0412 at compile time, with `--host` and without it, and it is checked against
-// the handler at bind time — a `Nondeterministic` handler over an effect
-// declared without it is E0423. The declaration is the authority; the handler is
-// what gets refused.
-//
-// Every operation is resource-parameterized, and that is the whole reason the
-// scheduler can run two connections at once: `net.write[a]` and `net.write[b]`
-// name different resources, so they do not conflict and the tests, tasks or
-// requests that hold them are free to interleave. The label is the *static*
-// identity conflict detection speaks in; the `Int` handle each operation takes
-// and returns is the *dynamic* one the host's socket table is keyed on. Two
-// sockets accepted at one source site share a label and therefore contend —
-// resource labels are ground identifiers in the source, so nothing else is
-// expressible yet.
-//
-// Every operation is `write`, `recv` included. A read consumes bytes from the
-// kernel's receive buffer, so two tasks reading one socket race exactly as two
-// writers do, and calling that a `read` would let the conflict graph run them
-// side by side.
-//
-// **A deadline is an argument, not a cancellation** (ADR 0013 §7.2). A cancel
-// path on a pending operation needs a token registry, a race between the cancel
-// and the completion, a rule for what a cancelled operation returns, and a
-// decision about what happens to bytes already read off the socket. A deadline
-// on the operation needs one `setsockopt`, inside a blocking job that already
-// owns the socket for its duration. The second is one line and has no race.
-//
-// One rule, stated once: **`None` is a deadline; an empty `Some` is an ending.**
-//
-//   recv -> None       the deadline expired with no bytes
-//   recv -> Some(b"")  the peer has stopped sending
-//   recv -> Some(bs)   those bytes, possibly fewer than `max`
-//   send -> None       the deadline expired
-//   send -> Some(0)    the peer is gone
-//   send -> Some(n)    `n` bytes were written
-//
-// `accept` takes no deadline: a server accepts until it is shut down, and
-// graceful shutdown is W5. It answers `0` when the listener is finished; handles
-// ascend from 1 and are never reused, so `0` is never a live socket and no new
-// convention is needed.
-//
-// A peer's misbehaviour is not the program's error. A reset, a broken pipe, an
-// aborted connection or a failed TLS handshake is end of stream, not a
-// diagnostic — a server that dies because a client reset a connection is not a
-// server. What stays a diagnostic is the program's own fault: an unknown handle,
-// a handle used under two resource labels, a port outside `1..=65535`, a
-// non-positive read bound, a non-positive timeout, an empty `send` payload.
+// The network effect.
 
-// TLS is not a separate effect. It is this one, with one extra operation for
-// creating a listener, because an effect row claims which resources a
-// computation touches and whether two computations contend — and a TLS
-// connection and a plaintext one are the same resource, contend the same way,
-// and are read and written by the same code. Encryption is a property of the
-// transport rather than of the resource. A separate `tls` effect with the same
-// five operations would make every function that touches a socket exist twice,
-// since Ply has no effect polymorphism over effect *names*, and `std.http`
-// would fork into two framing parsers that disagree.
-//
-// So the row does not say whether a connection is encrypted. The listener does,
-// and `ply hosts` prints `net.listen_tls` as its own line with its own handler
-// path: "this program can serve TLS" is a fact in the trusted computing base
-// listing rather than an inference from a row.
-//
-// `credential` is a *name*, never certificate bytes and never a path.
-// Certificate bytes would put a private key into a definition's hash and into a
-// store designed never to forget; a path would put a file read inside a `net`
-// operation, where `ply hosts` discloses a socket and nothing discloses the
-// file. The material is configured beside the run — `ply run --host --tls
-// api=certs/api.pem,certs/api.key` — and validated before anything runs.
+// TLS is not a separate effect.
 pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
@@ -86,9 +10,8 @@ pub nondet effect net {
   write close[s](socket: Int) -> Unit
 }
 
-// A `recv` shorter than `max` is ordinary — TCP preserves the byte stream and
-// not the boundaries a peer wrote it in — and an empty answer means the peer is
-// done sending. Anything that needs a whole message loops.
+// A `recv` shorter than `max` is ordinary — TCP preserves the byte stream and not the boundaries a
+// peer wrote it in — and an empty answer means the peer is done sending.
 pub fn drain(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.write[conn]} =
   match net.recv[conn](c, 4096, timeout_ms) {
     None -> so_far,
@@ -100,18 +23,11 @@ pub fn drain(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.write[conn]
       },
   }
 
-// What programs call, and what `std.http` writes every response through. One
-// `send` is free to take fewer bytes than it was given, so anything that needs
-// the whole payload on the wire loops — and a program that assumed otherwise
-// would ship a truncated response the client reads as a complete one. `false` is
-// a deadline or a dead peer; the raw `send` is for programs counting bytes.
+// What programs call, and what `std.http` writes every response through.
 pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[conn]} =
   send_from(c, payload, 0, timeout_ms, max_writes())
 
-// One call per partial write. Bounded, because every loop in Ply is a tail call
-// charged against the evaluator's call budget: a peer that accepts one byte per
-// write would otherwise turn a response into a recursion-limit diagnostic that
-// ends the whole run rather than a `false` that ends one connection.
+// One call per partial write.
 fn max_writes() -> Int = 4096
 
 fn send_from(c: Int, payload: Bytes, at: Int, timeout_ms: Int, left: Int) -> Bool
@@ -131,11 +47,9 @@ fn head(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -
 
 fn tail(queued: List<Bytes>) -> List<Bytes> = match queued { [_, ..rest] -> rest, _ -> [] }
 
-// A shipped module's tests are the compiler's, not a project's: `ply test` in a
-// project that imports this module does not select them and writes nothing about
-// them to that project's cache, because a project's test count must not change
-// with a compiler upgrade. `ply test --std` selects them, and the compiler's own
-// suite runs them.
+// A shipped module's tests are the compiler's, not a project's: `ply test` in a project that
+// imports this module does not select them and writes nothing about them to that project's cache,
+// because a project's test count must not change with a compiler upgrade.
 test "drain stops at end of stream rather than at the first short read" {
   with_cell[inbox]([b"ab", b"c", b"", b"unread"]) { inbox -> {
     handle {
@@ -151,8 +65,8 @@ test "drain stops at end of stream rather than at the first short read" {
   } }
 }
 
-// A deadline and an ending are different answers, and a caller that could not
-// tell them apart would answer 408 to a peer that had simply finished.
+// A deadline and an ending are different answers, and a caller that could not tell them apart would
+// answer 408 to a peer that had simply finished.
 test "a deadline is not an ending" {
   with_cell[inbox]([b"ab"]) { inbox -> {
     handle {

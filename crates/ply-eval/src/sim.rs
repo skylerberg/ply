@@ -1,21 +1,5 @@
-//! Deterministic simulation: the seed, the plan, the dependence relation, and
-//! the seeded handlers for `clock` and `random`.
-//!
-//! A simulated run is a pure function of its definition set and its seed. This
-//! module owns the half of that promise that is a value rather than a machine —
-//! what a seed *is*, how it expands into random streams, what a step's accesses
-//! are, and how two steps are decided to commute — plus the two clause sets that
-//! are pure functions of the seed and the requests made so far: [`Clock`] and
-//! [`Rand`], reached through [`Handlers`]. `task.*` belongs to the scheduler,
-//! which decides *who* runs; everything here answers *what a running task
-//! observes*. `docs/adr/0006-deterministic-simulation.md` §3 and §6 specify the
-//! scheduler.
-//!
-//! Nothing here may name a hash-based collection, read a clock, a thread
-//! identity, an address or an allocation order. A run that is not a function of
-//! its seed invalidates every artifact the simulation produces, and the way that
-//! property breaks is never loudly — so `hygiene` at the bottom of this file
-//! checks the rule that is checkable.
+//! Deterministic simulation: the seed, the plan, the dependence relation, and the seeded handlers
+//! for `clock` and `random`.
 
 use ply_core::ty::{EffectAtom, Resource, Type};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -28,16 +12,6 @@ use crate::interp::arity_error;
 use crate::value::Value;
 
 /// The repro artifact.
-///
-/// `root` seeds the streams. `path` is a choice-sequence prefix: at scheduling
-/// point `i` the scheduler resumes `enabled[path[i]]` when `i < path.len()`, and
-/// draws from the [`Domain::Sched`] stream otherwise.
-///
-/// A bare `u64` cannot name the sibling of an interleaving — "like this one but
-/// taking the other branch at point 3" — which is exactly what a systematic
-/// search has to say. The alternative is two artifacts a consumer has to carry
-/// together; this is one, and it still prints as a bare number in the sampling
-/// case.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Seed {
     pub root: u64,
@@ -60,8 +34,7 @@ impl Seed {
         self.path.is_empty()
     }
 
-    /// `"7"` or `"7:3.0.2"`. Rejects everything else — a seed that parses
-    /// loosely is a seed that replays something other than what failed.
+    /// `"7"` or `"7:3.0.2"`.
     pub fn parse(s: &str) -> Option<Seed> {
         let (root, rest) = match s.split_once(':') {
             Some((root, rest)) => (root, Some(rest)),
@@ -80,9 +53,8 @@ impl Seed {
         Some(Seed { root, path })
     }
 
-    /// Canonical bytes for a cache key, which is a different job from the text
-    /// form: it must be unambiguous rather than readable, so the path is length
-    /// prefixed.
+    /// Canonical bytes for a cache key, which is a different job from the text form: it must be
+    /// unambiguous rather than readable, so the path is length prefixed.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + 2 * self.path.len());
         out.extend_from_slice(&self.root.to_le_bytes());
@@ -93,10 +65,8 @@ impl Seed {
         out
     }
 
-    /// The seed naming the interleaving that agrees with this one up to
-    /// scheduling point `at` and takes `choice` there. Beyond `at` the stream
-    /// chooses again, which is what makes a backtrack point a seed rather than a
-    /// whole schedule.
+    /// The seed naming the interleaving that agrees with this one up to scheduling point `at` and
+    /// takes `choice` there.
     pub fn branch(&self, at: usize, choice: u16) -> Seed {
         let mut path: Vec<u16> = self.path.iter().copied().take(at).collect();
         path.resize(at, 0);
@@ -107,16 +77,13 @@ impl Seed {
         }
     }
 
-    /// The choice fixed at scheduling point `i`, or `None` when the stream
-    /// decides.
+    /// The choice fixed at scheduling point `i`, or `None` when the stream decides.
     pub fn choice(&self, i: usize) -> Option<u16> {
         self.path.get(i).copied()
     }
 }
 
-/// Decimal, or `0x`-prefixed hexadecimal. No sign, no separators: a seed is
-/// copied out of an artifact and pasted into a command line, and every form that
-/// parses is a form that has to round-trip.
+/// Decimal, or `0x`-prefixed hexadecimal.
 fn parse_u64(s: &str) -> Option<u64> {
     match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) if !hex.is_empty() => u64::from_str_radix(hex, 16).ok(),
@@ -146,10 +113,7 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// The two streams a root expands into. They must have **separate counters**:
-/// sharing one makes adding a `random.next()` call shift the interleaving, so a
-/// change to the data becomes a change to the schedule and a bisection over it
-/// names the wrong definition.
+/// The two streams a root expands into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Domain {
     /// Which enabled task to resume.
@@ -159,8 +123,8 @@ pub enum Domain {
 }
 
 impl Domain {
-    /// Written into every draw, so the two streams cannot be made to coincide by
-    /// any choice of root.
+    /// Written into every draw, so the two streams cannot be made to coincide by any choice of
+    /// root.
     fn tag(self) -> u8 {
         match self {
             Domain::Sched => 0,
@@ -179,11 +143,6 @@ impl Domain {
 const STREAM_DOMAIN: &[u8] = b"ply.sim.stream.1";
 
 /// Counter-mode BLAKE3 rather than a PRNG crate.
-///
-/// "The same seed produces the same result on any machine" is a promise across
-/// versions as well as across machines, and a generator crate's version is not
-/// something this project controls. BLAKE3 is already in the workspace, is
-/// byte-specified, and is its own test vector.
 #[derive(Clone, Debug)]
 pub struct Stream {
     root: u64,
@@ -196,9 +155,7 @@ impl Stream {
         Stream::at(root, domain, 0)
     }
 
-    /// A stream that has already served `counter` draws. One entry point's
-    /// regions share a stream rather than each restarting it, so a domain's
-    /// counter counts the draws of the *run* — which is what §4.2 says it is.
+    /// A stream that has already served `counter` draws.
     pub fn at(root: u64, domain: Domain, counter: u64) -> Stream {
         Stream {
             root,
@@ -213,12 +170,8 @@ impl Stream {
         value
     }
 
-    /// Uniform over `0..n`, by rejection: with `limit = (u64::MAX / n) * n`,
-    /// draw until `x < limit`, answer `x % n`.
-    ///
-    /// Specified exactly rather than described as "unbiased", because a
-    /// different unbiased rule is a different sequence and every seed in every
-    /// artifact ever printed would name a different run.
+    /// Uniform over `0..n`, by rejection: with `limit = (u64::MAX / n) * n`, draw until `x <
+    /// limit`, answer `x % n`.
     pub fn below(&mut self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;
@@ -232,14 +185,13 @@ impl Stream {
         }
     }
 
-    /// How many draws this stream has served. Part of a replay's self-check: two
-    /// runs of one seed that disagree here disagree about the run.
+    /// How many draws this stream has served.
     pub fn drawn(&self) -> u64 {
         self.counter
     }
 
-    /// Pure, so a caller replaying a recorded run can ask for draw *i* without
-    /// having served the ones before it.
+    /// Pure, so a caller replaying a recorded run can ask for draw *i* without having served the
+    /// ones before it.
     pub fn draw(root: u64, domain: Domain, counter: u64) -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(STREAM_DOMAIN);
@@ -257,14 +209,11 @@ impl Stream {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SimMode {
-    /// One interleaving, the one the seed names. The replay path.
+    /// One interleaving, the one the seed names.
     Once,
-    /// One interleaving per root. No state, and the roots are independent, which
-    /// is the only reason a per-root cache key is a standalone claim.
+    /// One interleaving per root.
     Random,
-    /// The search of ADR 0006 §6.2. The default, because it never runs two
-    /// interleavings from one equivalence class — so every unit of work is new
-    /// information, and a small state space finishes *exhaustively*.
+    /// The search of ADR 0006 §6.2.
     #[default]
     Dpor,
 }
@@ -288,31 +237,22 @@ impl SimMode {
     }
 
     /// Whether a root's exploration decomposes into independent per-seed claims.
-    /// Only [`SimMode::Random`]'s does: a `dpor` root visits interleavings whose
-    /// choice depends on what the earlier ones observed, so "seed *s* passed" is
-    /// not a fact that survives being lifted out of its search.
     pub fn caches_per_seed(self) -> bool {
         matches!(self, SimMode::Random)
     }
 }
 
-/// The default interleavings explored per root under [`SimMode::Dpor`]. Only a
-/// test that spawns pays it, and only when its hash changed.
+/// The default interleavings explored per root under [`SimMode::Dpor`].
 pub const DEFAULT_BUDGET: u32 = 256;
 
 /// The default scheduling steps one interleaving may take before the region is
-/// [`ply_span::codes::DEADLOCK`]. This is what bounds a livelock; a runaway
-/// *recursion* inside one step is still bounded by
-/// [`crate::limit::DEFAULT_MAX_CALLS`].
+/// [`ply_span::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
 
-/// Under `random`, one root is a sample of one. Under `dpor`, one root already
-/// enumerates equivalence classes and a second explores the same ones in a
-/// different order.
+/// Under `random`, one root is a sample of one.
 pub const DEFAULT_RANDOM_ROOTS: u32 = 64;
 
-/// What a run searches. Part of a seeded test's cache key, because a green run
-/// under one plan is not a green run under another.
+/// What a run searches.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     pub mode: SimMode,
@@ -322,8 +262,8 @@ pub struct Plan {
     pub budget: u32,
     /// Scheduling steps per interleaving.
     pub steps: u32,
-    /// The fixed path under [`SimMode::Once`], so that `--seed 7:3.0.2` names
-    /// one interleaving rather than one root. Empty in every other mode.
+    /// The fixed path under [`SimMode::Once`], so that `--seed 7:3.0.2` names one interleaving
+    /// rather than one root.
     pub path: Vec<u16>,
 }
 
@@ -362,8 +302,6 @@ impl Plan {
     }
 
     /// Ascending, deduplicated roots, and no path outside [`SimMode::Once`].
-    /// Two plans that search the same thing must have the same digest, or the
-    /// cache splits on the order a caller happened to write its flags in.
     pub fn normalized(mut self) -> Plan {
         self.roots.sort_unstable();
         self.roots.dedup();
@@ -387,16 +325,6 @@ impl Plan {
     }
 
     /// Whether running this plan can drive the entry point more than once.
-    ///
-    /// The question a host-backed test turns on: a search re-runs a test whole
-    /// per interleaving, so anything irreversible in it happens once per run
-    /// this answers `true` for. [`SimMode::Once`] and [`SimMode::Random`] take
-    /// one interleaving per root, so they re-execute only when a caller widened
-    /// the root set; [`SimMode::Dpor`] explores up to `budget` per root.
-    ///
-    /// An upper bound, deliberately: a `Dpor` plan that turns out to have one
-    /// interleaving is still refused, because whether it has two is not known
-    /// until it has been run — and finding out costs the packet.
     pub fn re_executes(&self) -> bool {
         let plan = self.clone().normalized();
         let per_root = match plan.mode {
@@ -406,8 +334,8 @@ impl Plan {
         plan.roots.len() as u64 * per_root > 1
     }
 
-    /// Covers every field, length-prefixed, so no two plans can serialize alike
-    /// and the digest never depends on the struct's field order at a call site.
+    /// Covers every field, length-prefixed, so no two plans can serialize alike and the digest
+    /// never depends on the struct's field order at a call site.
     pub fn digest(&self) -> [u8; 32] {
         let plan = self.clone().normalized();
         let mut hasher = blake3::Hasher::new();
@@ -432,11 +360,6 @@ impl Plan {
 }
 
 /// One access a step made.
-///
-/// Finer than a [`ply_core::Footprint`] in exactly one place: a cell is a
-/// *location*, so it is keyed by [`Slot`] rather than by the `[r]` label
-/// several cells may share. The label would be sound and coarser; the slot is
-/// sound and exact, and it costs nothing because a `cell_get` already holds it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
     Atom(EffectAtom),
@@ -445,21 +368,12 @@ pub enum Access {
         mode: Mode,
     },
     /// A `with_cell` took the next slot from the arena's bump pointer.
-    ///
-    /// Allocation has no location to name — that is the point of it — so it is
-    /// its own kind of access, dependent with every other allocation and with
-    /// nothing else. Without it two tasks that each open a private cell look
-    /// like tasks that touch nothing, and §6.1's soundness condition is false of
-    /// them: run in the other order they reach a *different arena*, because the
-    /// two ids are swapped.
     Alloc,
 }
 
 impl Access {
-    /// Two atoms contend by the relation the whole language is built on; two
-    /// cells iff they are the same location and one writes; two allocations
-    /// always, since they take ids from one counter. Anything else never,
-    /// because they name disjoint kinds of state.
+    /// Two atoms contend by the relation the whole language is built on; two cells iff they are the
+    /// same location and one writes; two allocations always, since they take ids from one counter.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         match (self, other) {
             (Access::Atom(a), Access::Atom(b)) => a.conflicts_with(b),
@@ -494,17 +408,6 @@ impl fmt::Display for Access {
 }
 
 /// What one step of one task touched.
-///
-/// The scheduler's own bookkeeping is **not** in here: a step ends in a
-/// `task.*` or `clock.*` perform, all of which write one singleton resource, so
-/// including them would make every pair of steps dependent and the reduction
-/// exactly 1×. That is sound because the scheduler is the *explorer* — its state
-/// is a function of the choice sequence and the search enumerates choice
-/// sequences — and synchronization is carried by enabledness instead.
-///
-/// `random.write` is the exception and stays: the value a draw returns is
-/// observed by the program rather than by the scheduler, so a draw is a genuine
-/// read-modify-write of shared state and two steps that both draw are dependent.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct StepFootprint(BTreeSet<Access>);
 
@@ -533,17 +436,14 @@ impl StepFootprint {
         self.0.iter()
     }
 
-    /// The dependence relation. Two steps that do not conflict commute, so
-    /// executing them in either order reaches the same world and the same
-    /// result, so exploring both orders is provably redundant.
+    /// The dependence relation.
     pub fn conflicts_with(&self, other: &StepFootprint) -> bool {
         self.0
             .iter()
             .any(|a| other.0.iter().any(|b| a.conflicts_with(b)))
     }
 
-    /// The atoms and cells common to both, as a diagnostic renders them. Empty
-    /// exactly when the two commute.
+    /// The atoms and cells common to both, as a diagnostic renders them.
     pub fn contention(&self, other: &StepFootprint) -> Vec<&Access> {
         self.0
             .iter()
@@ -552,25 +452,19 @@ impl StepFootprint {
     }
 }
 
-/// One end of a race, as the failure artifact prints it. Not a *step* — that
-/// is the unit the scheduler runs; this is where one of them was standing.
+/// One end of a race, as the failure artifact prints it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RaceSite {
     pub task: TaskId,
-    /// The definition the step was inside. `None` when the failure was not
-    /// traced — never guessed.
+    /// The definition the step was inside.
     pub definition: Option<Symbol>,
     /// The contended access, rendered.
     pub access: String,
     pub span: Span,
 }
 
-/// The two steps whose reordering flipped a passing interleaving to a failing
-/// one, and the scheduling point where the search flipped them.
-///
-/// Far more actionable than a shorter schedule, and it falls out of the search
-/// for free. `Some` only when the search actually observed the flip: under
-/// `once` and `random` there is nothing to observe and it is `None`.
+/// The two steps whose reordering flipped a passing interleaving to a failing one, and the
+/// scheduling point where the search flipped them.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Race {
     pub left: RaceSite,
@@ -578,9 +472,7 @@ pub struct Race {
     pub at: u32,
 }
 
-/// What an unpruned search would have explored. `bounded` means its own budget
-/// was spent, so the count is a lower bound and must be rendered `>= n` — never
-/// as an exact number nobody observed.
+/// What an unpruned search would have explored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Naive {
     pub explored: u32,
@@ -597,19 +489,14 @@ impl fmt::Display for Naive {
     }
 }
 
-/// What one entry point's search did. Absent — not zeroed — on a test that
-/// reached no `simulate` region, because a consumer cannot tell a zero from a
-/// test that never simulated anything.
+/// What one entry point's search did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Exploration {
     pub explored: u32,
-    /// The frontier emptied within the budget: **every** interleaving ran, up to
-    /// an equivalence that provably preserves outcomes. This is the headline —
-    /// it is a proof rather than a sample.
+    /// The frontier emptied within the budget: **every** interleaving ran, up to an equivalence
+    /// that provably preserves outcomes.
     pub exhaustive: bool,
-    /// The budget was spent. A green run that is `exhausted` is reported green
-    /// and **not cached**: it proved nothing about the interleavings it did not
-    /// reach.
+    /// The budget was spent.
     pub exhausted: bool,
     /// `--measure-reduction` only.
     pub naive: Option<Naive>,
@@ -622,8 +509,7 @@ pub struct Exploration {
 }
 
 impl Exploration {
-    /// How many times over an unpruned search would have run. `None` unless the
-    /// naive count was measured, and never computed from an assumption.
+    /// How many times over an unpruned search would have run.
     pub fn reduction(&self) -> Option<f64> {
         let naive = self.naive?;
         (self.explored > 0).then(|| f64::from(naive.explored) / f64::from(self.explored))
@@ -635,10 +521,7 @@ impl Exploration {
     }
 }
 
-/// The types the seeded operations speak in. `clock` and `random` say only
-/// `Int` and `Unit`, so a full [`Type`] in the table would be more machinery
-/// than the signatures have content; [`SimTy::ply`] is the bridge to the
-/// declared type, which is what the compatibility test compares against.
+/// The types the seeded operations speak in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimTy {
     Int,
@@ -646,9 +529,7 @@ pub enum SimTy {
 }
 
 impl SimTy {
-    /// The declared type this stands for. A simulated handler that disagreed
-    /// with its declaration here would be a test double that does not satisfy
-    /// the signature it claims to — the drift handlers exist to prevent.
+    /// The declared type this stands for.
     pub fn ply(self) -> Type {
         match self {
             SimTy::Int => Type::int(),
@@ -671,10 +552,7 @@ impl SimTy {
     }
 }
 
-/// One operation the seeded handlers answer, with the signature it answers it
-/// at. [`Handlers::dispatch`] is driven by this table, so a simulated handler
-/// cannot answer an operation the language does not declare, take an argument
-/// the declaration does not have, or return a type it does not promise.
+/// One operation the seeded handlers answer, with the signature it answers it at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpSignature {
     pub effect: &'static str,
@@ -691,14 +569,6 @@ impl OpSignature {
     }
 
     /// What this operation contributes to the access set of the step it ends.
-    ///
-    /// `clock.*` contributes nothing: every step ends in a scheduler-visible
-    /// perform against a singleton resource, so counting the scheduler's own
-    /// bookkeeping would make every pair of steps dependent and the reduction
-    /// exactly 1×. `random.write` stays, because the value a draw returns is
-    /// observed by the *program* rather than by the scheduler — a draw is a
-    /// genuine read-modify-write of shared state and two steps that both draw do
-    /// not commute.
     pub fn step_access(&self) -> Option<Access> {
         (self.effect == "random").then(|| Access::Atom(self.atom()))
     }
@@ -710,10 +580,8 @@ impl fmt::Display for OpSignature {
     }
 }
 
-/// The clause set [`Handlers`] installs, which is ADR 0006 §1.1's declaration of
-/// `clock` and `random` and nothing besides. `task` is absent deliberately: its
-/// signature is polymorphic, it is the scheduler's own state, and a second table
-/// naming it is a second place for the two to disagree.
+/// The clause set [`Handlers`] installs, which is ADR 0006 §1.1's declaration of `clock` and
+/// `random` and nothing besides.
 pub const SEEDED_OPS: &[OpSignature] = &[
     OpSignature {
         effect: "clock",
@@ -745,29 +613,22 @@ pub const SEEDED_OPS: &[OpSignature] = &[
     },
 ];
 
-/// The effects [`Handlers`] discharges. `simulate` also discharges `task`, which
-/// the scheduler answers.
+/// The effects [`Handlers`] discharges.
 pub const SEEDED_EFFECTS: &[&str] = &["clock", "random"];
 
-/// The signature of a seeded operation, or `None` when the operation is not one
-/// of them — which for the scheduler means `task.*` or a user's own effect,
-/// neither of which this module may answer.
+/// The signature of a seeded operation, or `None` when the operation is not one of them — which for
+/// the scheduler means `task.*` or a user's own effect, neither of which this module may answer.
 pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
     SEEDED_OPS
         .iter()
         .find(|sig| sig.effect == effect && sig.op == op)
 }
 
-/// The three `task` operations, which the scheduler answers rather than
-/// [`Handlers`]: their signature is polymorphic and their state is the
-/// scheduler's own.
+/// The three `task` operations, which the scheduler answers rather than [`Handlers`]: their
+/// signature is polymorphic and their state is the scheduler's own.
 pub const TASK_OPS: &[&str] = &["spawn", "join", "yield"];
 
 /// Whether a `simulate` region's delimiter answers this operation.
-///
-/// It is deliberately the *declared* operations of the three simulated effects
-/// and nothing else: an unknown `clock.tick` reaches no clause and is reported
-/// as unhandled, exactly as a `handle` that names no such operation would.
 pub fn is_scheduled(effect: &str, op: &str) -> bool {
     match effect {
         "task" => TASK_OPS.contains(&op),
@@ -778,8 +639,7 @@ pub fn is_scheduled(effect: &str, op: &str) -> bool {
 /// What `clock.sleep(d)` did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sleep {
-    /// `d <= 0`. The task stays enabled and no timer is registered: sleeping for
-    /// no time is a yield, and a yield is a scheduling point rather than a wait.
+    /// `d <= 0`.
     Yield,
     /// The task is blocked until virtual time reaches this deadline.
     Until(i64),
@@ -789,46 +649,31 @@ pub enum Sleep {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Wake {
     pub now: i64,
-    /// Every task whose deadline was exactly `now`, ascending by id. They wake
-    /// **together**: their relative order is then a scheduler choice like any
-    /// other, which is what makes the timer-coalescing race explorable.
+    /// Every task whose deadline was exactly `now`, ascending by id.
     pub woken: Vec<TaskId>,
 }
 
 /// Virtual time, in nanoseconds since the region was entered.
-///
-/// > Time advances at exactly one moment: when no task is enabled and at least
-/// > one is blocked on a timer. It jumps to the earliest deadline among them.
-///
-/// [`Clock::advance`] is the only thing in the language that moves it, which is
-/// why `now` is private: `clock.now()` observes and `clock.sleep()` schedules,
-/// and neither can make time pass. Two properties follow and both are what a
-/// test suite actually wants — a sleeping test costs no wall clock, and a
-/// timeout can never fire while another task could still run.
 #[derive(Clone, Debug, Default)]
 pub struct Clock {
     now: i64,
-    /// Ascending by `(deadline, task)`, so ties come back in task order rather
-    /// than in whatever order a heap resolves them — an ordering the host must
-    /// not get a vote in.
+    /// Ascending by `(deadline, task)`, so ties come back in task order rather than in whatever
+    /// order a heap resolves them — an ordering the host must not get a vote in.
     timers: BTreeSet<(i64, TaskId)>,
 }
 
 impl Clock {
-    /// Time starts at zero. It is time since the region was entered, not since
-    /// an epoch: an epoch would be a host reading, and a program that could tell
-    /// the two apart would not be a function of its seed.
+    /// Time starts at zero.
     pub fn new() -> Clock {
         Clock::default()
     }
 
-    /// `clock.now()`. Observes; never advances.
+    /// `clock.now()`.
     pub fn now(&self) -> i64 {
         self.now
     }
 
-    /// `clock.sleep(nanos)`. Registers a timer and answers what the scheduler
-    /// should do with the calling task.
+    /// `clock.sleep(nanos)`.
     pub fn sleep(&mut self, task: TaskId, nanos: i64, span: Span) -> Result<Sleep, Diagnostic> {
         if nanos <= 0 {
             return Ok(Sleep::Yield);
@@ -843,8 +688,7 @@ impl Clock {
         Ok(Sleep::Until(deadline))
     }
 
-    /// Every task waiting on a timer, ascending by `(deadline, task)`. This is
-    /// what an `E0414` message names on the timer side.
+    /// Every task waiting on a timer, ascending by `(deadline, task)`.
     pub fn sleeping(&self) -> impl Iterator<Item = (TaskId, i64)> + '_ {
         self.timers.iter().map(|&(deadline, task)| (task, deadline))
     }
@@ -860,8 +704,8 @@ impl Clock {
             .map(|&(deadline, _)| deadline)
     }
 
-    /// When the next timer can fire, or `None` when none can — which, with
-    /// nothing enabled, is the region being stuck.
+    /// When the next timer can fire, or `None` when none can — which, with nothing enabled, is the
+    /// region being stuck.
     pub fn next_deadline(&self) -> Option<i64> {
         self.timers.first().map(|&(deadline, _)| deadline)
     }
@@ -871,16 +715,6 @@ impl Clock {
     }
 
     /// Jump to the earliest deadline and wake every task waiting on it.
-    ///
-    /// **The scheduler calls this only when no task is enabled.** That
-    /// precondition is what §5.2 rests on and it cannot be checked from here —
-    /// the enabled set is the scheduler's. Advancing while anything is runnable
-    /// would let a timeout fire ahead of work that could still complete, which
-    /// is the wall-clock failure mode simulation exists to delete.
-    ///
-    /// `None` when no timer is pending: nothing is enabled and nothing can
-    /// become enabled, so the region is stuck and the scheduler reports
-    /// [`codes::DEADLOCK`].
     pub fn advance(&mut self) -> Option<Wake> {
         let deadline = self.next_deadline()?;
         let mut woken = Vec::new();
@@ -900,12 +734,6 @@ impl Clock {
 }
 
 /// The seeded `random` handler: one stream per region, drawn from the root.
-///
-/// Deliberately *not* one stream per task. Per-task streams would make draws
-/// order-independent and shrink the state space, and they would hide an order
-/// dependence that production code sharing one generator really has. A simulated
-/// handler does not get to be kinder than the real one; a user who wants split
-/// streams writes the handler that splits, and their type says they did.
 #[derive(Clone, Debug)]
 pub struct Rand {
     stream: Stream,
@@ -916,17 +744,14 @@ impl Rand {
         Rand::at(root, 0)
     }
 
-    /// Picks the `rand` stream up where an earlier region of the same entry
-    /// point left it.
+    /// Picks the `rand` stream up where an earlier region of the same entry point left it.
     pub fn at(root: u64, drawn: u64) -> Rand {
         Rand {
             stream: Stream::at(root, Domain::Rand, drawn),
         }
     }
 
-    /// `random.next()`. Full range: `Int` is 64 bits and a handler answering
-    /// only non-negative values would be a different distribution from the one a
-    /// production handler over the same signature would produce.
+    /// `random.next()`.
     pub fn next_int(&mut self) -> i64 {
         self.stream.next_u64() as i64
     }
@@ -941,8 +766,7 @@ impl Rand {
         }
     }
 
-    /// How many draws this region has served. Two runs of one seed that disagree
-    /// here disagree about the run, whatever their assertions said.
+    /// How many draws this region has served.
     pub fn drawn(&self) -> u64 {
         self.stream.drawn()
     }
@@ -953,19 +777,12 @@ impl Rand {
 pub enum Answer {
     /// Resume the performing task with this value.
     Value(Value),
-    /// The task is blocked until virtual time reaches `deadline`. It is out of
-    /// the enabled set until [`Clock::advance`] wakes it, and it resumes with
-    /// `Value::Unit` — `clock.sleep`'s declared return.
+    /// The task is blocked until virtual time reaches `deadline`.
     Sleeping { deadline: i64 },
 }
 
-/// The seeded clause set for the effects `simulate` handles and the scheduler
-/// does not implement itself.
-///
-/// One per `simulate` region, built from that region's root: everything it
-/// produces is a function of the seed and the requests made so far, which is
-/// step 2 of ADR 0006 §7.2's induction and therefore why a time-dependent,
-/// randomized test can be an ordinary `det`, cacheable one.
+/// The seeded clause set for the effects `simulate` handles and the scheduler does not implement
+/// itself.
 #[derive(Clone, Debug)]
 pub struct Handlers {
     clock: Clock,
@@ -977,9 +794,8 @@ impl Handlers {
         Handlers::at(root, 0)
     }
 
-    /// Virtual time restarts per region — it is time since *this* region was
-    /// entered — while the `rand` stream carries on, because a draw is a draw of
-    /// the run.
+    /// Virtual time restarts per region — it is time since *this* region was entered — while the
+    /// `rand` stream carries on, because a draw is a draw of the run.
     pub fn at(root: u64, drawn: u64) -> Handlers {
         Handlers {
             clock: Clock::new(),
@@ -991,8 +807,8 @@ impl Handlers {
         &self.clock
     }
 
-    /// The scheduler needs this to call [`Clock::advance`], which it may do only
-    /// with nothing enabled.
+    /// The scheduler needs this to call [`Clock::advance`], which it may do only with nothing
+    /// enabled.
     pub fn clock_mut(&mut self) -> &mut Clock {
         &mut self.clock
     }
@@ -1002,9 +818,6 @@ impl Handlers {
     }
 
     /// Answer one `clock.*` or `random.*` perform on behalf of `task`.
-    ///
-    /// `sig` comes from [`signature`], so the arity and the argument types below
-    /// are the declared ones rather than a second opinion about them.
     pub fn dispatch(
         &mut self,
         sig: &OpSignature,
@@ -1114,8 +927,8 @@ mod tests {
 
     #[test]
     fn canonical_bytes_distinguish_a_path_from_a_longer_root() {
-        // `7:1` and `7` differ, and no length prefix ambiguity can make the
-        // path of one seed look like the root of another.
+        // `7:1` and `7` differ, and no length prefix ambiguity can make the path of one seed look
+        // like the root of another.
         assert_ne!(Seed::root(7).to_bytes(), Seed::at(7, vec![1]).to_bytes());
         assert_ne!(
             Seed::at(7, vec![1, 0]).to_bytes(),
@@ -1128,9 +941,8 @@ mod tests {
         let seed = Seed::at(3, vec![1, 2, 3, 4]);
         assert_eq!(seed.branch(2, 9), Seed::at(3, vec![1, 2, 9]));
         assert_eq!(seed.branch(0, 5), Seed::at(3, vec![5]));
-        // Branching past the recorded path pads rather than panicking: a search
-        // may reach a scheduling point the prefix never named, and the choice
-        // has to land at that index.
+        // Branching past the recorded path pads rather than panicking: a search may reach a
+        // scheduling point the prefix never named, and the choice has to land at that index.
         let branched = seed.branch(6, 1);
         assert_eq!(branched.choice(6), Some(1));
         assert_eq!(branched.path.len(), 7);
@@ -1141,8 +953,8 @@ mod tests {
         let sched: Vec<u64> = (0..8).map(|i| Stream::draw(11, Domain::Sched, i)).collect();
         let rand: Vec<u64> = (0..8).map(|i| Stream::draw(11, Domain::Rand, i)).collect();
         assert_ne!(sched, rand);
-        // Serving the rand stream must not disturb the sched stream, which is
-        // what stops a new `random.next()` call from shifting the interleaving.
+        // Serving the rand stream must not disturb the sched stream, which is what stops a new
+        // `random.next()` call from shifting the interleaving.
         let mut a = Stream::new(11, Domain::Sched);
         let mut r = Stream::new(11, Domain::Rand);
         let mut b = Stream::new(11, Domain::Sched);
@@ -1172,10 +984,8 @@ mod tests {
         }
     }
 
-    /// Not a statistical test — a distribution check that fails one run in a
-    /// thousand is exactly the flake this project exists to delete. This pins
-    /// the *rule*: every value below the rejection limit maps by `%`, and a
-    /// bound that divides 2^64 rejects nothing.
+    /// Not a statistical test — a distribution check that fails one run in a thousand is exactly
+    /// the flake this project exists to delete.
     #[test]
     fn below_rejects_only_above_the_limit() {
         let n = 3u64;
@@ -1221,8 +1031,8 @@ mod tests {
         assert_eq!(r.contention(&w).len(), 1);
     }
 
-    /// The relation is at cell granularity, not label granularity: two cells
-    /// allocated under one `with_cell[users]` are two locations.
+    /// The relation is at cell granularity, not label granularity: two cells allocated under one
+    /// `with_cell[users]` are two locations.
     #[test]
     fn two_cells_are_two_locations_whatever_they_were_labelled() {
         let one = StepFootprint::from_accesses([Access::Cell {
@@ -1241,10 +1051,8 @@ mod tests {
         assert!(one.conflicts_with(&also_one));
     }
 
-    /// The mistake ADR 0006 §6.1 exists to prevent: two tasks share one world,
-    /// so a `cell` access is part of the dependence relation. Dropping it —
-    /// which `ply_test::shared_footprint` does, correctly, for *tests* — prunes
-    /// away every shared-memory race while reporting a larger reduction for it.
+    /// The mistake ADR 0006 §6.1 exists to prevent: two tasks share one world, so a `cell` access
+    /// is part of the dependence relation.
     #[test]
     fn cell_accesses_are_in_the_relation() {
         let write = StepFootprint::from_accesses([Access::Cell {
@@ -1339,9 +1147,9 @@ mod tests {
         assert_eq!(Plan::once(seed.clone()).seeds(), vec![seed]);
     }
 
-    /// An exhausted search proved nothing about the interleavings it did not
-    /// reach, so its green verdict may not be cached — the first green `det`
-    /// test in the language that is not cacheable, and correctly so.
+    /// An exhausted search proved nothing about the interleavings it did not reach, so its green
+    /// verdict may not be cached — the first green `det` test in the language that is not
+    /// cacheable, and correctly so.
     #[test]
     fn an_exhausted_search_is_not_cacheable() {
         let exhausted = Exploration {
@@ -1409,10 +1217,7 @@ mod tests {
         signature(effect, op).expect("a seeded operation")
     }
 
-    /// Every answer a region delivered, rendered. Comparing outcomes alone
-    /// passes on a run whose sequence differed and whose assertions happened not
-    /// to notice, which is the failure this whole module exists to make
-    /// impossible.
+    /// Every answer a region delivered, rendered.
     fn transcript(answers: &[Answer]) -> Vec<String> {
         answers
             .iter()
@@ -1467,10 +1272,7 @@ mod tests {
         assert_ne!(transcript(&a), transcript(&b));
     }
 
-    /// There is no `clock` stream. Virtual time is a function of the sleeps that
-    /// were requested and of nothing else, so two roots agree about it exactly —
-    /// which is what makes a simulated timeout fire at its deadline rather than
-    /// near it.
+    /// There is no `clock` stream.
     #[test]
     fn the_clock_is_not_drawn_from_the_seed() {
         let clock_of = |root| {
@@ -1493,8 +1295,8 @@ mod tests {
         assert_eq!(clock_of(1), clock_of(999_999));
     }
 
-    /// The whole of "virtual time advances only via the scheduler": `now()`
-    /// observes, `sleep` schedules, a draw is a draw, and none of them moves it.
+    /// The whole of "virtual time advances only via the scheduler": `now()` observes, `sleep`
+    /// schedules, a draw is a draw, and none of them moves it.
     #[test]
     fn nothing_a_task_performs_moves_virtual_time() {
         let mut handlers = Handlers::new(3);
@@ -1520,8 +1322,8 @@ mod tests {
         assert_eq!(clock.next_deadline(), None);
     }
 
-    /// Thirty simulated seconds are a jump, not thirty seconds: nothing here
-    /// waits on anything, so the only cost of a long sleep is the arithmetic.
+    /// Thirty simulated seconds are a jump, not thirty seconds: nothing here waits on anything, so
+    /// the only cost of a long sleep is the arithmetic.
     #[test]
     fn a_long_sleep_advances_exactly_that_far() {
         let mut clock = Clock::new();
@@ -1537,8 +1339,8 @@ mod tests {
         assert!(!clock.is_sleeping(TaskId(1)));
     }
 
-    /// Sleeps are relative to the time the sleeping task observed, so a task
-    /// that sleeps twice for 40ns wakes at 80ns rather than at 40ns again.
+    /// Sleeps are relative to the time the sleeping task observed, so a task that sleeps twice for
+    /// 40ns wakes at 80ns rather than at 40ns again.
     #[test]
     fn a_deadline_is_measured_from_the_time_the_task_saw() {
         let mut clock = Clock::new();
@@ -1562,10 +1364,8 @@ mod tests {
         assert_eq!(clock.deadline_of(TaskId(4)), Some(20));
     }
 
-    /// A timeout is `clock.sleep` racing something else, and the earliest
-    /// deadline is the only one that can fire. The timeout at 5s does not
-    /// pre-empt the retry at 100ms, however long the work between them takes on
-    /// the host — because the host has no vote.
+    /// A timeout is `clock.sleep` racing something else, and the earliest deadline is the only one
+    /// that can fire.
     #[test]
     fn a_timeout_fires_at_its_deadline_and_never_before_a_nearer_one() {
         let mut clock = Clock::new();
@@ -1587,9 +1387,8 @@ mod tests {
         assert_eq!(wake.woken, vec![timeout]);
     }
 
-    /// With nothing enabled and no timer pending the region is stuck, which the
-    /// scheduler reports as `E0414`. The clock's job is to answer the question,
-    /// not to guess an answer.
+    /// With nothing enabled and no timer pending the region is stuck, which the scheduler reports
+    /// as `E0414`.
     #[test]
     fn no_timer_means_no_advance() {
         let mut clock = Clock::new();
@@ -1642,9 +1441,9 @@ mod tests {
         assert!(negatives > 0, "`random.next` answers the whole of `Int`");
     }
 
-    /// Excluding the terminating scheduler op is what leaves a reduction to
-    /// measure; keeping `random.write` is what stops the search from calling two
-    /// draws commutative when the program can tell them apart.
+    /// Excluding the terminating scheduler op is what leaves a reduction to measure; keeping
+    /// `random.write` is what stops the search from calling two draws commutative when the program
+    /// can tell them apart.
     #[test]
     fn only_a_draw_is_an_access_of_the_step_it_ends() {
         for sig in SEEDED_OPS {
@@ -1705,9 +1504,7 @@ mod tests {
         assert_eq!(err.code, codes::RUNTIME_ERROR);
     }
 
-    /// A sleeping task is not enabled, so the scheduler cannot resume it into a
-    /// second sleep. Reaching this is Ply's fault, and it says so rather than
-    /// quietly holding two deadlines for one task.
+    /// A sleeping task is not enabled, so the scheduler cannot resume it into a second sleep.
     #[test]
     fn a_task_cannot_hold_two_timers() {
         let mut clock = Clock::new();
@@ -1719,9 +1516,8 @@ mod tests {
         assert_eq!(clock.sleepers(), 1);
     }
 
-    /// A rule about how a type is *used* is a rule nobody enforces; a rule about
-    /// which types may be *named* is greppable. A hash map's iteration order
-    /// would put the host's memory layout into a seeded run's answer.
+    /// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
+    /// *named* is greppable.
     #[test]
     fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
         let source = include_str!("sim.rs");

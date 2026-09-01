@@ -1,24 +1,5 @@
-//! The two files behind the front-end cache: a small index, rewritten whole and
-//! atomically, over an append-only data file that is mapped and whose entries
-//! are decoded one at a time.
-//!
-//! A `DefHash -> entry` mapping can never change, so entries are only ever
-//! added. Two properties follow, and everything here depends on both: the data
-//! file is never rewritten except by compaction, and **a reader needs no lock**,
-//! because an append cannot move a byte another process has already mapped.
-//!
-//! ```text
-//! frontend.dat   magic ‖ format ‖ flags ‖ schema ‖ nonce, then frames forever
-//! frame          kind u8 ‖ len u32 ‖ checksum u64 ‖ payload
-//!
-//! frontend.idx   magic ‖ format ‖ flags ‖ schema ‖ nonce ‖ data_len ‖
-//!                version ‖ sections ‖ checksum, then descriptors and sections
-//! ```
-//!
-//! The length and the checksum are what make a torn append *detectable* rather
-//! than misparsed: a frame is only ever reached through an index entry that
-//! already claims its `(offset, len, kind)`, and a frame that disagrees with
-//! that claim yields "not cached", never a value.
+//! The two files behind the front-end cache: a small index, rewritten whole and atomically, over an
+//! append-only data file that is mapped and whose entries are decoded one at a time.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
 use ply_hash::DefHash;
@@ -72,8 +53,7 @@ pub(crate) struct HashSlot {
     pub(crate) at: Located,
 }
 
-/// Why a front-end cache was refused. Every variant degrades to an empty cache
-/// with a warning; none of them is ever a value.
+/// Why a front-end cache was refused.
 pub(crate) enum CacheError {
     Missing,
     Io(std::io::Error),
@@ -151,9 +131,9 @@ pub(crate) fn version_hash() -> [u8; 32] {
     *blake3::hash(FRONTEND_VERSION.as_bytes()).as_bytes()
 }
 
-/// A nonce pairs an index with the data file it was written against, so that
-/// restoring one of the two from a backup, or deleting one, is detected rather
-/// than read as though the offsets still meant something.
+/// A nonce pairs an index with the data file it was written against, so that restoring one of the
+/// two from a backup, or deleting one, is detected rather than read as though the offsets still
+/// meant something.
 pub(crate) fn fresh_nonce() -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&std::process::id().to_le_bytes());
@@ -177,10 +157,7 @@ struct Section {
     count: usize,
 }
 
-/// The index, held as the bytes that were read. Records are fixed width, so a
-/// lookup binary-searches them where they lie rather than building a map — which
-/// is what keeps `Store::open` from touching a definition it will never be
-/// asked about.
+/// The index, held as the bytes that were read.
 pub(crate) struct Index {
     bytes: Vec<u8>,
     nonce: u64,
@@ -242,9 +219,7 @@ impl Index {
         }
     }
 
-    /// Every slot filed under a hash, in index order. `DEFS` and `DECLS` admit a
-    /// run of them: two structurally identical definitions in different modules
-    /// share a `DefHash` by design, and their interfaces still differ.
+    /// Every slot filed under a hash, in index order.
     pub(crate) fn slots(&self, kind: u8, hash: DefHash) -> Vec<HashSlot> {
         let section = self.section(kind);
         if section.count == 0 {
@@ -308,8 +283,7 @@ impl Index {
         None
     }
 
-    /// Every byte of the data file some index record names. What is left is what
-    /// compaction would reclaim.
+    /// Every byte of the data file some index record names.
     pub(crate) fn live_bytes(&self) -> u64 {
         let frames = self.defs.count + self.decls.count + self.bodies.count + self.sources.count;
         let mut total = FRAME_HEADER * frames as u64;
@@ -321,9 +295,7 @@ impl Index {
     }
 }
 
-/// Reads and fully validates the index. Nothing here decodes an entry: the cost
-/// is one read plus one BLAKE3 pass over half a megabyte at ten thousand
-/// definitions.
+/// Reads and fully validates the index.
 pub(crate) fn read_index(path: &Path, schema: ContentHash) -> Result<Index, CacheError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -431,10 +403,6 @@ pub(crate) fn read_index(path: &Path, schema: ContentHash) -> Result<Index, Cach
 }
 
 /// The mapped data file, cut to exactly the length the index vouches for.
-///
-/// Cutting it there is what makes a concurrent writer safe: a flush truncates
-/// the file back to that same length to drop a torn tail, and a mapping that
-/// never covered the tail is never invalidated by its removal.
 pub(crate) struct Data {
     map: Option<memmap2::Mmap>,
     len: u64,
@@ -488,8 +456,7 @@ impl Data {
         })
     }
 
-    /// The payload of the frame an index record claims, or the reason it cannot
-    /// be believed. A disagreement is always "not cached", never a value.
+    /// The payload of the frame an index record claims, or the reason it cannot be believed.
     pub(crate) fn frame(&self, at: Located, kind: u8) -> Result<&[u8], &'static str> {
         let Some(map) = self.map.as_ref() else {
             return Err("the front-end cache has no data file");
@@ -532,19 +499,15 @@ fn data_header(nonce: u64, schema: ContentHash) -> [u8; DATA_HEADER as usize] {
     header
 }
 
-/// The append half of a flush. Frames are made durable before the index that
-/// names them, which is the one ordering requirement the format has: an index
-/// entry may never point at bytes that are not there. The reverse — data no
-/// index names — is garbage, and garbage is what compaction is for.
+/// The append half of a flush.
 pub(crate) struct Appender {
     file: File,
     at: u64,
 }
 
 impl Appender {
-    /// Truncates to the length the index vouches for, which is how a torn tail
-    /// left by a killed writer is recovered: no indexed entry ever lies above
-    /// it, so nothing indexed is lost.
+    /// Truncates to the length the index vouches for, which is how a torn tail left by a killed
+    /// writer is recovered: no indexed entry ever lies above it, so nothing indexed is lost.
     pub(crate) fn open(path: &Path, data_len: u64) -> std::io::Result<Appender> {
         let file = OpenOptions::new()
             .read(true)
@@ -606,8 +569,7 @@ impl Appender {
     }
 }
 
-/// Everything the index names, ready to be written. Sorted on the way out so a
-/// reader can binary-search it in place.
+/// Everything the index names, ready to be written.
 #[derive(Default)]
 pub(crate) struct Directory {
     pub(crate) defs: Vec<HashSlot>,

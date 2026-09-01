@@ -1,21 +1,5 @@
-//! Why the leak ADR 0017 §4 accepts is not reachable yet, pinned so that the day
-//! it becomes reachable is a failing test rather than a silent leak.
-//!
-//! §4 accepts that a cycle among escaped values leaks and asks the diagnostics
-//! to say so where one is constructible. `ply_eval::rc::cell_cycle` is that
-//! diagnostic and it fires on the one shape that would leak — a cell whose
-//! contents reach the cell. What this file records is that **no type-correct
-//! program writes that shape**, for two independent reasons, neither of which
-//! belongs to reference counting:
-//!
-//! - a `Cell<T>` inside `T` written structurally is the infinite type the occurs
-//!   check refuses;
-//! - written as a declared variant it is `REGION_ESCAPE` at the declaration,
-//!   because a declared field's region would be pinned by whichever cell reached
-//!   it first (ADR 0005's demoted region check, still load-bearing here).
-//!
-//! Take either away and the leak arrives. That is why the argument is a test and
-//! not a paragraph.
+//! Why the leak ADR 0017 §4 accepts is not reachable yet, pinned so that the day it becomes
+//! reachable is a failing test rather than a silent leak.
 
 use ply_core::check_program;
 use ply_span::{Diagnostic, SourceId, codes};
@@ -53,8 +37,8 @@ test "a cell that reaches itself" {
     );
 }
 
-/// And declaring a type to hold the cell moves the refusal to the declaration,
-/// which is the other half of why the shape has nowhere to be written.
+/// And declaring a type to hold the cell moves the refusal to the declaration, which is the other
+/// half of why the shape has nowhere to be written.
 #[test]
 fn a_declared_field_cannot_hold_a_cell_for_a_cycle_to_run_through() {
     let diags = rejected(
@@ -75,11 +59,8 @@ test "a cell that reaches itself through a variant" {
     );
 }
 
-/// The detector itself still answers, so the guard is not vacuous code that
-/// stopped working while nothing could reach it.
-///
-/// Driven through the evaluator's own value representation rather than through
-/// source, which is the only way to build the shape the type system refuses.
+/// The detector itself still answers, so the guard is not vacuous code that stopped working while
+/// nothing could reach it.
 #[test]
 fn the_detector_still_finds_the_shape_it_guards_against() {
     use ply_eval::TaskRegions;

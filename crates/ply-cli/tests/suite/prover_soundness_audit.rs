@@ -1,20 +1,4 @@
 //! An adversarial audit of the one thing this milestone cannot get wrong.
-//!
-//! `tiers.rs` checks that the prover's certificates are well formed and that the
-//! corpus survives a wider sample. This file is the other half: it goes looking
-//! for a **lie**, by writing claims that are false, unevaluable, or true only
-//! outside the fragment, and asserting that none of them comes back wearing a
-//! certificate.
-//!
-//! Two kinds of test live here and they are labelled as such.
-//!
-//! - The **soundness pins** assert a property that holds today and must keep
-//!   holding. A failure is a regression in the prover.
-//! - The **closed gaps** (`gap_*`) are the reproductions an audit found the tier
-//!   label over-claiming at. Each one keeps the program that produced the wrong
-//!   label and now asserts the honest one, so the defect stays pinned from the
-//!   side it has to be pinned from: a failure here means the over-claim came
-//!   back.
 
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
@@ -102,8 +86,8 @@ impl Run {
     }
 }
 
-/// The whole file in one assertion: whatever else happened, this claim is not
-/// carrying a certificate.
+/// The whole file in one assertion: whatever else happened, this claim is not carrying a
+/// certificate.
 #[track_caller]
 fn never_proved(source: &str, needle: &str) -> Discharge {
     let run = Run::of(source);
@@ -118,17 +102,12 @@ fn never_proved(source: &str, needle: &str) -> Discharge {
 
 // --- Soundness pins: nothing false is ever proved ---------------------------
 
-/// A battery of claims that are **false** over Ply's own semantics. Each one is
-/// inside or adjacent to a rule the prover has, and each one is a place where a
-/// slightly wrong rule would produce a certificate.
-///
-/// Written as one test over a table because the interesting output is *which*
-/// entry broke, and a table names it without twenty near-identical functions.
+/// A battery of claims that are **false** over Ply's own semantics.
 #[test]
 fn no_false_claim_is_ever_proved() {
     let false_claims: &[(&str, &str)] = &[
-        // Division is uninterpreted, so nothing may be concluded from it — not
-        // even by a literal divisor, where the arithmetic is tempting and wrong.
+        // Division is uninterpreted, so nothing may be concluded from it — not even by a literal
+        // divisor, where the arithmetic is tempting and wrong.
         (
             "halving",
             "law \"halving\" forall (x: Int) { x / 2 * 2 == x }",
@@ -137,22 +116,22 @@ fn no_false_claim_is_ever_proved() {
         ("modulo", "law \"modulo\" forall (x: Int) { x % 1 == 0 }"),
         // `x * y` with both factors symbolic is not linear arithmetic.
         ("square", "law \"square\" forall (x: Int) { x * x >= x }"),
-        // Two distinct uninterpreted symbols are not equal, and are also not
-        // provably distinct: neither direction may be claimed.
+        // Two distinct uninterpreted symbols are not equal, and are also not provably distinct:
+        // neither direction may be claimed.
         (
             "two functions",
             "law \"two functions\" forall (f: (Int) -> Int, g: (Int) -> Int, x: Int) { f(x) == g(x) }",
         ),
-        // A case analysis that reaches every constructor still has to evaluate
-        // each arm, and one of them is 3.
+        // A case analysis that reaches every constructor still has to evaluate each arm, and one of
+        // them is 3.
         (
             "under three",
             "type Color = Red | Green | Blue\n\
              fn score(c: Color) -> Int = match c { Red -> 1, Green -> 2, Blue -> 3 }\n\
              law \"under three\" forall (c: Color) { score(c) < 3 }",
         ),
-        // A nested constructor pattern is not split, so the `match` stays
-        // uninterpreted rather than being guessed at.
+        // A nested constructor pattern is not split, so the `match` stays uninterpreted rather than
+        // being guessed at.
         (
             "always two",
             "type Color = Red | Green | Blue\n\
@@ -160,20 +139,18 @@ fn no_false_claim_is_ever_proved() {
              fn f(w: Wrap) -> Int = match w { W(Red) -> 1, _ -> 2 }\n\
              law \"always two\" forall (w: Wrap) { f(w) == 2 }",
         ),
-        // `++` is uninterpreted, and congruence over it says nothing about
-        // whether it commutes.
+        // `++` is uninterpreted, and congruence over it says nothing about whether it commutes.
         (
             "concat commutes",
             "law \"concat commutes\" forall (s: String, t: String) { s ++ t == t ++ s }",
         ),
-        // List literals are injective in their elements, which is exactly why
-        // this is false rather than unknown.
+        // List literals are injective in their elements, which is exactly why this is false rather
+        // than unknown.
         (
             "one element",
             "law \"one element\" forall (x: Int, y: Int) { [x] == [y] }",
         ),
-        // A record is its fields, so two records agreeing on one field is not
-        // extensionality.
+        // A record is its fields, so two records agreeing on one field is not extensionality.
         (
             "half a record",
             "law \"half a record\" forall (x: Int, y: Int) { { a: x, b: 0 } == { a: x, b: y } }",
@@ -198,14 +175,8 @@ fn no_false_claim_is_ever_proved() {
     }
 }
 
-/// Two calls to a definition that performs may answer differently, so they may
-/// not share a term: `f() - f() == 0` reported `proved` is the shape of that
-/// mistake.
-///
-/// The owner's *body* is lowered into the goal even when the owner performs —
-/// the static tier is attempted first, before the unhandled-effect gap — so this
-/// is the one place an effectful call still reaches the congruence closure. It
-/// has to come back as the gap, not as a proof that the difference is zero.
+/// Two calls to a definition that performs may answer differently, so they may not share a term:
+/// `f() - f() == 0` reported `proved` is the shape of that mistake.
 #[test]
 fn an_effectful_call_is_not_a_function_of_its_arguments() {
     const SOURCE: &str = "\
@@ -226,10 +197,8 @@ fn difference(k: Int) -> Int / {db.read[main]}
     );
 }
 
-/// The other half of the same rule, and the one the type system owns: a spec
-/// expression's row must be empty, so a clause cannot call an effectful
-/// definition at all. Without this the congruence closure would be reasoning
-/// about a term whose value depends on the world.
+/// The other half of the same rule, and the one the type system owns: a spec expression's row must
+/// be empty, so a clause cannot call an effectful definition at all.
 #[test]
 fn a_clause_that_performs_is_rejected_before_the_prover_sees_it() {
     const SOURCE: &str = "\
@@ -261,11 +230,7 @@ fn echo(k: Int) -> Int / {db.read[main]}
     );
 }
 
-/// An unsatisfiable guard makes `guard ⟹ body` valid and meaningless. Deciding
-/// vacuity **before** the body is what stops a typo in a guard from becoming a
-/// proof of everything, and the second entry checks it through an uninterpreted
-/// operator, where the contradiction comes from congruence rather than from the
-/// arithmetic.
+/// An unsatisfiable guard makes `guard ⟹ body` valid and meaningless.
 #[test]
 fn an_unsatisfiable_guard_is_vacuous_and_never_proved() {
     for source in [
@@ -286,9 +251,8 @@ fn an_unsatisfiable_guard_is_vacuous_and_never_proved() {
     }
 }
 
-/// `guard ⟹ body` over a domain with no values is valid and says nothing, so a
-/// binder of an uninhabited type may not carry a proof however trivial the body
-/// is.
+/// `guard ⟹ body` over a domain with no values is valid and says nothing, so a binder of an
+/// uninhabited type may not carry a proof however trivial the body is.
 #[test]
 fn a_binder_of_an_uninhabited_type_never_carries_a_proof() {
     const SOURCE: &str = "\
@@ -303,10 +267,8 @@ law \"a claim about nothing\" forall (b: Bad) { b == b }
     );
 }
 
-/// A member of a recursive component is never unfolded, so nothing about its
-/// behaviour over unbounded data is decided. The positive control beside it is
-/// what keeps this test honest: the non-recursive definition *is* unfolded, and
-/// to a depth the certificate names.
+/// A member of a recursive component is never unfolded, so nothing about its behaviour over
+/// unbounded data is decided.
 #[test]
 fn recursion_stops_the_unfolding_and_the_bound_is_named() {
     const SOURCE: &str = "\
@@ -338,16 +300,8 @@ law \"twice is doubling\" forall (x: Int) where x > -1000 && x < 1000
     );
 }
 
-/// A `proved` obligation is a claim about every plan, so the two tiers must
-/// never disagree in the direction that matters. This is `tiers.rs`'s
-/// differential audit narrowed onto the constructs this file attacks, at a plan
-/// wide enough that a sampled run reaches every edge the generator draws.
-///
-/// A **raise** counts as a disagreement, not only a refutation. Ply's
-/// arithmetic is checked and its recursion is bounded, so an obligation the
-/// prover got wrong about totality can never come back false — it comes back
-/// `E0502`, and an audit blind to that could not fail on the defect it exists
-/// for.
+/// A `proved` obligation is a claim about every plan, so the two tiers must never disagree in the
+/// direction that matters.
 #[test]
 fn nothing_proved_here_is_refutable_by_sampling() {
     let sources: &[&str] = &[
@@ -358,8 +312,8 @@ fn nothing_proved_here_is_refutable_by_sampling() {
          law \"score is positive\" forall (c: Color) { score(c) > 0 }",
         "law \"records are their fields\" forall (x: Int, y: Int) \
            { { a: x, b: y } == { b: y, a: x } }",
-        // The prelude's `Option`, not a local one: declaring a second would be
-        // `E0105`, and a language with two `Option`s is worse than one with none.
+        // The prelude's `Option`, not a local one: declaring a second would be `E0105`, and a
+        // language with two `Option`s is worse than one with none.
         "fn or_else(o: Option<Int>, d: Int) -> Int = match o { None -> d, Some(v) -> v }\n\
          law \"or_else is a function\" forall (o: Option<Int>, d: Int) \
            { or_else(o, d) == or_else(o, d) }",
@@ -416,8 +370,7 @@ fn nothing_proved_here_is_refutable_by_sampling() {
 
 // --- Soundness pins: concurrency --------------------------------------------
 
-/// A `simulate` region reached by two tasks, with a handler standing in for the
-/// resource. The binder is the variable under test in the three cases below.
+/// A `simulate` region reached by two tasks, with a handler standing in for the resource.
 fn concurrency_law(header: &str, spawned: &str) -> String {
     format!(
         "\
@@ -450,10 +403,6 @@ law \"two writers land twice\"{header} {{
 }
 
 /// ADR 0007 §6's five conditions plus the sixth, one case each.
-///
-/// The ground law is the positive control; the `Bool` binder is the only shape
-/// in which a *quantified* concurrency law may be proved, and the certificate
-/// has to carry both coverage claims because they are independent.
 #[test]
 fn a_concurrency_law_is_proved_only_when_both_domains_were_covered() {
     let ground = Run::of(&concurrency_law("", "1"));
@@ -484,8 +433,6 @@ fn a_concurrency_law_is_proved_only_when_both_domains_were_covered() {
     );
 }
 
-/// The condition an implementer drops. `exhaustive: true` is a claim about
-/// **schedules**, and this law also ranges over 2⁶⁴ values of `amount`.
 #[test]
 fn an_int_binder_drops_a_concurrency_law_to_property() {
     let run = Run::at(
@@ -495,9 +442,7 @@ fn an_int_binder_drops_a_concurrency_law_to_property() {
     assert_eq!(run.tier("no interleaving"), Some(Tier::Property));
 }
 
-/// A sampled schedule search has no exhaustiveness to claim, whatever it
-/// reports. Both non-`Dpor` modes, because it is one `match` away from being
-/// only one of them.
+/// A sampled schedule search has no exhaustiveness to claim, whatever it reports.
 #[test]
 fn a_sampled_schedule_search_never_proves() {
     let source = concurrency_law("", "1");
@@ -515,12 +460,9 @@ fn a_sampled_schedule_search_never_proves() {
     }
 }
 
-/// The sixth condition, which no signature over an `Exploration` can express: a
-/// body that entered no `simulate` region emptied a frontier it never filled,
-/// and `exhaustive: true` over it is a claim about nothing.
-///
-/// Half the domain here takes the branch with no region, so the law must not be
-/// proved even though every search that *did* run was exhaustive.
+/// The sixth condition, which no signature over an `Exploration` can express: a body that entered
+/// no `simulate` region emptied a frontier it never filled, and `exhaustive: true` over it is a
+/// claim about nothing.
 #[test]
 fn a_search_that_reached_no_region_never_proves() {
     const SOURCE: &str = "\
@@ -558,11 +500,9 @@ law \"sometimes concurrent\" forall (flip: Bool) {
 
 // --- Soundness pins: a cached proof is never a stale one --------------------
 
-/// A proof written under the bare obligation key survives every widening of the
-/// plan, so the *only* thing standing between a cached `proved` and a proof of
-/// something no longer true is the key covering the implementation's whole
-/// transitive closure. Each edit below must re-open exactly the obligations it
-/// invalidates.
+/// A proof written under the bare obligation key survives every widening of the plan, so the *only*
+/// thing standing between a cached `proved` and a proof of something no longer true is the key
+/// covering the implementation's whole transitive closure.
 #[test]
 fn editing_what_a_proof_rests_on_re_opens_it() {
     use assert_cmd::Command;
@@ -593,8 +533,8 @@ fn editing_what_a_proof_rests_on_re_opens_it() {
             .collect()
     }
 
-    // Two links between the claim and the value it is about, so the second edit
-    // tests the transitive half rather than the direct one.
+    // Two links between the claim and the value it is about, so the second edit tests the
+    // transitive half rather than the direct one.
     let good = "\
 fn leaf() -> Int = 1
 
@@ -653,25 +593,7 @@ law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
 
 // --- Characterizations: where the tier label over-claims ---------------------
 
-/// **Closed.** `proved` was reported for an obligation that is not valid at
-/// every input, because at the `Int` boundary the program raises rather than
-/// answering.
-///
-/// ADR 0007 §5.1(a) disclosed that the prover reasons over ℤ and named a
-/// mitigation — "the generator draws `i64::MIN` and `i64::MAX` on every property
-/// run, so the *sampled* tier catches what the proved tier assumes" — which
-/// could not fire, for two independent reasons:
-///
-/// 1. `Prover::discharge_with` returns the static proof before the sampled tier
-///    is reached, so a `proved` obligation is never sampled by an ordinary run;
-/// 2. Ply's arithmetic is `checked_*`, so the boundary can only ever surface as
-///    a raise, and §11's differential tier audit treated only
-///    `Discharge::Refuted` as a defect.
-///
-/// Both halves are fixed. A proof now discharges the definedness of every
-/// arithmetic term it reasoned about, so this is not proved at all; and the
-/// differential audit treats a raise on a proved obligation as a defect, so the
-/// mitigation has teeth even where a future rule loses them.
+/// **Closed.**
 #[test]
 fn gap_a_proved_obligation_may_raise_at_the_int_boundary() {
     const SOURCE: &str = "\
@@ -692,21 +614,12 @@ fn bounded_inc(x: Int) -> Int
         "`x + 1 > x` has no answer at `i64::MAX`, so no tier covers every input: {discharge:?}"
     );
 
-    // The reach is recovered by a guard rather than by a disclosure: the same
-    // claim over a domain the arithmetic fits in is decided outright.
+    // The reach is recovered by a guard rather than by a disclosure: the same claim over a domain
+    // the arithmetic fits in is decided outright.
     assert_eq!(run.tier("bounded_inc"), Some(Tier::Proved));
 }
 
-/// **Closed.** An uninterpreted function symbol is total, so congruence proved
-/// claims about definitions that provably never return — and the definition then
-/// counted as *covered*, telling a reviewer they may stop reading a function
-/// that cannot answer.
-///
-/// ADR 0007 §12 says of `DEFAULT_MAX_CALLS` that an obligation hitting it is
-/// "`Unattempted { Raised }`, never `proved` and never `refuted`". The static
-/// tier answered first, so that sentence was false as implemented. It is true
-/// now: a call this prover did not inline carries a definedness requirement, and
-/// a member of a recursive component is never inlined.
+/// **Closed.**
 #[test]
 fn gap_a_definition_that_never_returns_still_carries_a_proof() {
     const SOURCE: &str = "\
@@ -756,20 +669,7 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     assert!(coverage.uncovered.iter().any(|n| n.as_str() == "m.go"));
 }
 
-/// **Closed.** A guard the generator cannot satisfy was reported as `E0420`,
-/// "the guard admits no value" — a statement about the program that is false —
-/// and the static argument the prover had already made for the body was dropped
-/// on the way.
-///
-/// `x > 1000000 && x < 1000010` admits nine values. The prover *decides*
-/// `guard ⟹ body` here; all it could not do is witness the domain, which
-/// `Proof::certify` correctly refuses to assume. So the domain is now looked for
-/// directly, by evaluating the guard at the points its own literals name, and a
-/// value found there vouches for the argument exactly as a kept case would.
-///
-/// Where no witness is found the vacuity stands: `kept == 0` with nothing to
-/// show for the domain is still ADR 0007 §5.4's row, and
-/// `tests/fixtures/vacuous_law.ply` is the fixture for it.
+/// **Closed.**
 #[test]
 fn gap_a_guard_outside_the_generators_range_is_called_vacuous() {
     const SOURCE: &str =
@@ -782,8 +682,8 @@ fn gap_a_guard_outside_the_generators_range_is_called_vacuous() {
         "the guard admits nine values and the body is decided over all of them: {discharge:?}"
     );
 
-    // The same window over a body nothing decides: not a proof, and still not a
-    // claim that the guard admits nothing.
+    // The same window over a body nothing decides: not a proof, and still not a claim that the
+    // guard admits nothing.
     const UNDECIDED: &str = "\
 fn seen(xs: List<Int>, x: Int) -> Bool =
   match xs {
@@ -806,16 +706,7 @@ law \"a narrow window nobody samples\" forall (xs: List<Int>, x: Int)
     );
 }
 
-/// **Closed.** `concurrency::audit_interleaving_proof` rejected a *correct*
-/// proof whenever the covered value domain had exactly one point.
-///
-/// `Totals::certificate` emitted `Rule::ExhaustiveEnumeration` only when
-/// `points > 1`, while the audit demands that rule whenever the law has binders.
-/// A law over `Unit` has its domain covered — one point, and no way to miss any
-/// of it — and still failed the check, so `tiers.rs`'s certificate audit panicked
-/// on a correct program. The certificate now names the coverage whenever the law
-/// has binders, whatever the point count, so the audit is checking the condition
-/// rather than a proxy for it.
+/// **Closed.**
 #[test]
 fn gap_a_one_point_domain_fails_the_interleaving_audit() {
     let run = Run::of(&concurrency_law(" forall (u: Unit)", "1"));
@@ -835,8 +726,8 @@ fn gap_a_one_point_domain_fails_the_interleaving_audit() {
         Ok(())
     );
 
-    // The ground law next door still names the interleaving search and nothing
-    // else: there is no value domain to have covered.
+    // The ground law next door still names the interleaving search and nothing else: there is no
+    // value domain to have covered.
     let ground = Run::of(&concurrency_law("", "1"));
     assert!(
         ground

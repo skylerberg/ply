@@ -1,9 +1,4 @@
 //! What the reference-counting pass claims, checked against what a run does.
-//!
-//! The two numbers this milestone is judged on — the fraction of operations
-//! elided and the fraction of updates that happen in place — are read off
-//! [`stats`] here rather than asserted in prose, and the cases that would make
-//! either of them a lie are the ones with the longest comments.
 
 use super::*;
 use crate::build::*;
@@ -11,14 +6,8 @@ use crate::{Machine, Value};
 use ply_span::codes;
 use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
-/// Runs `e` on the machine with the counters cleared, and answers the value
-/// beside what reference counting did while producing it.
-///
-/// The machine only, deliberately: the tree-walker holds its scope on the host
-/// stack and releases nothing, so it makes every value shared and would report
-/// zero in place. That is a difference in cost and not in meaning — every test
-/// below that has an answer asserts the answer, and `crate::tests` already runs
-/// both engines over the same expressions.
+/// Runs `e` on the machine with the counters cleared, and answers the value beside what reference
+/// counting did while producing it.
 #[track_caller]
 fn run(items: Vec<Item>, e: Expr) -> (Value, Stats) {
     let (program, resolved) = standalone(items);
@@ -57,10 +46,8 @@ fn list_of(v: &Value) -> Vec<i64> {
     }
 }
 
-/// The point of the whole milestone: a list whose last owner is the caller grows
-/// in place, and the same program written so that somebody else can still see it
-/// copies. Both answer the same value — that is what makes the choice an
-/// optimization rather than a semantics.
+/// The point of the whole milestone: a list whose last owner is the caller grows in place, and the
+/// same program written so that somebody else can still see it copies.
 #[test]
 fn a_uniquely_owned_list_is_updated_in_place_and_a_shared_one_is_copied() {
     let unique = block(
@@ -78,8 +65,8 @@ fn a_uniquely_owned_list_is_updated_in_place_and_a_shared_one_is_copied() {
         "`xs` is dead after the push, so nothing else can see the list it was handed"
     );
 
-    // The only difference is that the tail reads `xs` as well, so the binding is
-    // still live when `push` runs and the list has two owners.
+    // The only difference is that the tail reads `xs` as well, so the binding is still live when
+    // `push` runs and the list has two owners.
     let shared = block(
         vec![
             letv("xs", ints(&[1, 2, 3])),
@@ -100,8 +87,8 @@ fn a_uniquely_owned_list_is_updated_in_place_and_a_shared_one_is_copied() {
     );
 }
 
-/// Appending in a fold is the shape reference counting exists for: without reuse
-/// every element copies the whole accumulator, which is quadratic.
+/// Appending in a fold is the shape reference counting exists for: without reuse every element
+/// copies the whole accumulator, which is quadratic.
 #[test]
 fn an_accumulator_folded_over_is_reused_rather_than_recopied() {
     let e = callv(
@@ -122,9 +109,9 @@ fn an_accumulator_folded_over_is_reused_rather_than_recopied() {
     assert_eq!(stats.in_place(), Some(1.0));
 }
 
-/// A value built inside a region and returned from it outlives the region, and
-/// is still an ordinary refcounted value on the other side — including for
-/// reuse, which is the observable half of "what escapes is reference-counted".
+/// A value built inside a region and returned from it outlives the region, and is still an ordinary
+/// refcounted value on the other side — including for reuse, which is the observable half of "what
+/// escapes is reference-counted".
 #[test]
 fn a_value_that_outlives_its_region_is_still_reference_counted_after_it() {
     let e = block(
@@ -149,11 +136,6 @@ fn a_value_that_outlives_its_region_is_still_reference_counted_after_it() {
 }
 
 /// The elision the pass performs, as a number.
-///
-/// Every occurrence of a tracked binding is a `dup` in the naive scheme and every
-/// binding is a `drop`; what survives is a `dup` at a read that is not the last
-/// one, and a `drop` the machine actually runs. A straight-line body elides
-/// everything.
 #[test]
 fn a_straight_line_body_elides_every_reference_counting_operation() {
     let e = block(
@@ -167,14 +149,14 @@ fn a_straight_line_body_elides_every_reference_counting_operation() {
     assert_eq!(int_of(&value), 2);
     // `a` and `b` are read once each, and each read is the last one.
     assert_eq!((stats.dup_sites, stats.dup_emitted), (2, 0));
-    // Two bindings; `a` dies at the second statement and is dropped there, while
-    // `b` is still live at the tail and its scope's end frees it for nothing.
+    // Two bindings; `a` dies at the second statement and is dropped there, while `b` is still live
+    // at the tail and its scope's end frees it for nothing.
     assert_eq!((stats.drop_sites, stats.drop_emitted), (2, 1));
     assert_eq!(stats.elided(), Some(0.75));
 }
 
-/// A binding read twice keeps its `dup`, which is the half of the accounting
-/// that would make the elision figure a lie if it were dropped.
+/// A binding read twice keeps its `dup`, which is the half of the accounting that would make the
+/// elision figure a lie if it were dropped.
 #[test]
 fn a_binding_read_twice_keeps_the_duplication_at_its_earlier_read() {
     let e = block(
@@ -194,8 +176,8 @@ fn a_binding_read_twice_keeps_the_duplication_at_its_earlier_read() {
     );
 }
 
-/// A free variable of a closure is never a last use: the closure holds the scope
-/// for as long as it lives, and nothing in this body bounds that.
+/// A free variable of a closure is never a last use: the closure holds the scope for as long as it
+/// lives, and nothing in this body bounds that.
 #[test]
 fn a_variable_captured_by_a_closure_is_never_owned() {
     let e = block(
@@ -216,9 +198,9 @@ fn a_variable_captured_by_a_closure_is_never_owned() {
     );
 }
 
-/// A last use in a position the machine holds the scope alone moves the value
-/// out instead of cloning it — Perceus' "a last use is a move", and the only
-/// place the analysis has a runtime effect of its own.
+/// A last use in a position the machine holds the scope alone moves the value out instead of
+/// cloning it — Perceus' "a last use is a move", and the only place the analysis has a runtime
+/// effect of its own.
 #[test]
 fn a_last_use_the_scope_alone_can_see_is_moved_rather_than_cloned() {
     let e = block(vec![letv("xs", ints(&[1, 2, 3]))], Some(var("xs")));
@@ -230,21 +212,8 @@ fn a_last_use_the_scope_alone_can_see_is_moved_rather_than_cloned() {
     );
 }
 
-/// The case ADR 0017 §3 says decides the design, asked of reference counting
-/// rather than of the world: a resumption may not observe what an earlier one
-/// wrote.
-///
-/// The guard is structural rather than a special case. A frame resumed from a
-/// segment the continuation still holds is *cloned* out of it, so its scope is
-/// shared and `push` finds two owners and copies. What the reference count then
-/// permits — and what the answer is the evidence for — is the **last**
-/// resumption reusing the value: once `k` has been consumed by its final call,
-/// the count is one because nothing can resume again, which is the same proof
-/// `Arc::get_mut` performs. An implementation that reused it any earlier would
-/// answer 7 here instead of 6.
-///
-/// `n` resumptions, so the claim is not read off the one case where "all but the
-/// last" and "none" agree.
+/// The case ADR 0017 §3 says decides the design, asked of reference counting rather than of the
+/// world: a resumption may not observe what an earlier one wrote.
 #[test]
 fn a_list_reachable_from_several_resumptions_is_copied_by_all_but_the_last() {
     for resumptions in 2..5usize {
@@ -278,8 +247,7 @@ fn a_list_reachable_from_several_resumptions_is_copied_by_all_but_the_last() {
     }
 }
 
-/// A cell made to contain itself leaks, and says so. ADR 0017 §4 accepts the
-/// leak; what it does not accept is the silence.
+/// A cell made to contain itself leaks, and says so.
 #[test]
 fn a_cell_that_contains_itself_is_reported_rather_than_collected() {
     let e = with_cell(
@@ -315,8 +283,8 @@ fn a_cell_that_contains_itself_is_reported_rather_than_collected() {
     );
 }
 
-/// A value stored into a cell it does not reach is not a cycle, so the detector
-/// cannot turn into noise on every `cell_set`.
+/// A value stored into a cell it does not reach is not a cycle, so the detector cannot turn into
+/// noise on every `cell_set`.
 #[test]
 fn an_ordinary_cell_write_reports_nothing() {
     let e = with_cell(
@@ -334,9 +302,8 @@ fn an_ordinary_cell_write_reports_nothing() {
     assert!(take_cycles().is_empty());
 }
 
-/// Releasing a binding builds a new scope rather than writing through a shared
-/// link, which is what keeps a closure that captured the scope reading what it
-/// captured.
+/// Releasing a binding builds a new scope rather than writing through a shared link, which is what
+/// keeps a closure that captured the scope reading what it captured.
 #[test]
 fn releasing_a_binding_leaves_a_scope_that_captured_it_intact() {
     use crate::Env;
@@ -361,8 +328,8 @@ fn releasing_a_binding_leaves_a_scope_that_captured_it_intact() {
     ));
 }
 
-/// Taking refuses whenever anything else can reach the binding, which is the
-/// whole safety argument stated as a unit test.
+/// Taking refuses whenever anything else can reach the binding, which is the whole safety argument
+/// stated as a unit test.
 #[test]
 fn taking_refuses_a_scope_anybody_else_holds() {
     use crate::Env;
@@ -386,9 +353,8 @@ fn taking_refuses_a_scope_anybody_else_holds() {
     ));
 }
 
-/// A binding released and then read is Ply's fault and stops the run, rather
-/// than walking past the released slot to an outer binding of the same name and
-/// answering with a value nobody wrote.
+/// A binding released and then read is Ply's fault and stops the run, rather than walking past the
+/// released slot to an outer binding of the same name and answering with a value nobody wrote.
 #[test]
 fn reading_a_released_binding_is_an_internal_error_and_not_an_outer_binding() {
     use crate::Env;
@@ -405,12 +371,6 @@ fn reading_a_released_binding_is_an_internal_error_and_not_an_outer_binding() {
 }
 
 /// A binding read again after an inner scope reused its name.
-///
-/// The live set is keyed by name, so before [`Live::shadow`] the inner `let x`
-/// erased the outer `x`'s liveness for the whole of the walk to its left. What
-/// came out was a `dead` set naming a binding the tail still reads, and the
-/// machine released it out from under the read: a legal program answered
-/// `E0505`, which is meaning changing rather than cost changing.
 #[test]
 fn a_binding_reread_after_an_inner_scope_shadowed_it_survives() {
     let inner = block(vec![letv("x", int(9))], Some(int(0)));
@@ -426,8 +386,8 @@ fn a_binding_reread_after_an_inner_scope_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// The same shape with the shadow inside a `match` arm, which is the other
-/// construct that binds without opening a barrier.
+/// The same shape with the shadow inside a `match` arm, which is the other construct that binds
+/// without opening a barrier.
 #[test]
 fn a_binding_reread_after_a_match_arm_shadowed_it_survives() {
     let e = block(
@@ -442,8 +402,8 @@ fn a_binding_reread_after_a_match_arm_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// And with `with_cell`'s binder, whose region makes it look unlike the other
-/// two and whose live set is the same one.
+/// And with `with_cell`'s binder, whose region makes it look unlike the other two and whose live
+/// set is the same one.
 #[test]
 fn a_binding_reread_after_a_region_binder_shadowed_it_survives() {
     let e = block(
@@ -461,9 +421,9 @@ fn a_binding_reread_after_a_region_binder_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// A read to the left of a shadowing scope is not a last use when the outer
-/// binding is read to the right of it, and marking it one would let the machine
-/// move the value out of a scope something else still reads.
+/// A read to the left of a shadowing scope is not a last use when the outer binding is read to the
+/// right of it, and marking it one would let the machine move the value out of a scope something
+/// else still reads.
 #[test]
 fn a_read_left_of_a_shadowing_scope_is_not_owned_when_the_outer_binding_lives_on() {
     let shadow = block(vec![letv("xs", int(9))], Some(int(0)));
@@ -479,9 +439,9 @@ fn a_read_left_of_a_shadowing_scope_is_not_owned_when_the_outer_binding_lives_on
     assert_eq!(int_of(&value), 6);
 }
 
-/// A shadowing binder that the enclosing activation does not read again is
-/// still a last use, so the fix costs no reuse where there was nothing to
-/// protect: the inner list has one owner at the `push` and is rewritten.
+/// A shadowing binder that the enclosing activation does not read again is still a last use, so the
+/// fix costs no reuse where there was nothing to protect: the inner list has one owner at the
+/// `push` and is rewritten.
 #[test]
 fn shadowing_costs_no_reuse_where_the_outer_binding_is_dead() {
     let e = block(
@@ -502,9 +462,8 @@ fn shadowing_costs_no_reuse_where_the_outer_binding_is_dead() {
     assert_eq!((stats.updates, stats.updates_in_place), (1, 1));
 }
 
-/// The converse, and the one the fix is for: the outer binding is read after the
-/// shadowing scope, so the inner `push` reuses the inner list while the outer
-/// read still finds the outer one.
+/// The converse, and the one the fix is for: the outer binding is read after the shadowing scope,
+/// so the inner `push` reuses the inner list while the outer read still finds the outer one.
 #[test]
 fn a_shadowed_outer_binding_is_neither_reused_nor_released() {
     let e = block(
@@ -530,15 +489,8 @@ fn a_shadowed_outer_binding_is_neither_reused_nor_released() {
     );
 }
 
-/// A generated corpus, because the shapes somebody thinks to write down are not
-/// the shapes that break a liveness analysis.
-///
-/// The pass is keyed by name, and every hazard it has had so far has been a
-/// name meaning two bindings at once — so the generator draws from three names
-/// only and every construct that binds prefers to reuse one. The oracle is the
-/// tree-walker, which holds its scope on the host stack and releases nothing: a
-/// disagreement is reference counting having changed what a program means,
-/// which is the one thing ADR 0017 does not permit it to do.
+/// A generated corpus, because the shapes somebody thinks to write down are not the shapes that
+/// break a liveness analysis.
 mod generated {
     use super::*;
     use crate::Interp;
@@ -661,8 +613,8 @@ mod generated {
                 } else {
                     Sort::List
                 };
-                // The value is generated before the binding enters scope, so a
-                // read inside it is a read of whatever this name meant before.
+                // The value is generated before the binding enters scope, so a read inside it is a
+                // read of whatever this name meant before.
                 let value = self.of_sort(sort, depth);
                 stmts.push(letv(name, value));
                 self.scope.push((name, sort));
@@ -679,9 +631,8 @@ mod generated {
             self.scope.push((name, Sort::Int));
             let bound = self.ints(depth);
             self.scope.pop();
-            // Half the time every arm binds the name, because an arm that does
-            // not is enough on its own to keep the outer binding's liveness and
-            // would hide a construct that drops it.
+            // Half the time every arm binds the name, because an arm that does not is enough on its
+            // own to keep the outer binding's liveness and would hide a construct that drops it.
             let catch_all = if self.pick(2) == 0 {
                 arm(pwild(), self.ints(depth))
             } else {
@@ -718,8 +669,8 @@ mod generated {
         }
     }
 
-    /// Every generated program answers the same thing on both engines, and none
-    /// of them reaches the released-binding path.
+    /// Every generated program answers the same thing on both engines, and none of them reaches the
+    /// released-binding path.
     #[test]
     fn the_reference_counted_engine_answers_what_the_uncounted_one_does() {
         let (program, resolved) = standalone(Vec::new());
@@ -749,15 +700,8 @@ mod generated {
         }
     }
 
-    /// The same corpus under a handler that resumes twice, which the tree-walker
-    /// refuses and so cannot audit. The oracle instead is arithmetic: the two
-    /// resumptions are independent, so the `handle` must answer exactly twice
-    /// what one of them does — `2 * (3 + g)`, where the pushed list is two
-    /// elements long and `g` is the generated tail evaluated on its own.
-    ///
-    /// That is the check ADR 0017 §3 asks for, stated as a number. A `push` that
-    /// rewrote a list both resumptions can reach would make the second one see
-    /// three elements instead of two and the total would be odd.
+    /// The same corpus under a handler that resumes twice, which the tree-walker refuses and so
+    /// cannot audit.
     #[test]
     fn each_resumption_answers_as_though_it_were_the_only_one() {
         let items = vec![effect_def("amb", &[("flip", Mode::Read, false)])];

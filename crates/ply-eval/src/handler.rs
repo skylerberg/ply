@@ -1,21 +1,4 @@
 //! `perform`, `handle`, `with_cell`, and the continuations that connect them.
-//!
-//! These are the transitions of ADR 0005 §1.3 that are not mechanical, factored
-//! out of the machine's loop so that the rules they encode are stated once and
-//! testable on their own. Each returns a [`Transition`]: the stack that results
-//! and what the machine does next. The machine's own state maps onto [`State`]
-//! one to one.
-//!
-//! Two rules carry the whole design and both are visible in [`perform`]:
-//!
-//! - **A clause body runs on the stack *below* its own handler.** [`Stack::capture`]
-//!   cuts the handler's own segment away, so a clause that performs the
-//!   operation it handles reaches the next handler out instead of catching
-//!   itself forever.
-//! - **State is threaded, never snapshotted.** Nothing here reads or writes the
-//!   cell arena except [`open_cell`], which allocates. A resumption therefore
-//!   observes the arena as of the handler's call to `resume`, which is what
-//!   makes a cell-backed state handler writable.
 
 use crate::arena::{Pin, RegionKind};
 use crate::code::{Clause, Code, ReturnArm};
@@ -29,8 +12,8 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Mode;
 use std::rc::Rc;
 
-/// The machine's own state has these same three shapes plus `Halt`, which no
-/// handler transition can produce.
+/// The machine's own state has these same three shapes plus `Halt`, which no handler transition can
+/// produce.
 pub enum State {
     Eval { code: Code, env: Env, module: usize },
     Return(Value),
@@ -39,8 +22,6 @@ pub enum State {
 
 pub struct Request {
     /// The program-wide effect name, resolved where the `perform` was written.
-    /// A clause names the same effect from its own module and the two only meet
-    /// once both are qualified.
     pub effect: Symbol,
     pub op: Symbol,
     pub resource: Option<Symbol>,
@@ -48,9 +29,8 @@ pub struct Request {
     pub span: Span,
 }
 
-/// Inference rules every failure below out, so reaching one means the evaluator
-/// was handed a module that was never checked; naming the mistake beats
-/// guessing at it.
+/// Inference rules every failure below out, so reaching one means the evaluator was handed a module
+/// that was never checked; naming the mistake beats guessing at it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpDecl {
     Declared {
@@ -58,15 +38,11 @@ pub enum OpDecl {
         mode: Mode,
     },
     NoSuchOp,
-    /// Nothing in view declares this effect. The stack still decides: a perform
-    /// and the clause meant to handle it agree on the name either way.
+    /// Nothing in view declares this effect.
     UnknownEffect,
 }
 
-/// The atom this `perform` contributes to the observed footprint. It must be
-/// built exactly as inference builds the declared one, or an observed footprint
-/// cannot be read against a declared row. An undeclared operation contributes
-/// nothing: the perform that named it is already a diagnostic.
+/// The atom this `perform` contributes to the observed footprint.
 pub fn performed_atom(
     effect: &Symbol,
     resource: Option<&Symbol>,
@@ -90,34 +66,20 @@ pub struct Transition {
 /// Who answered a `perform`.
 pub enum Answered {
     Handler(Transition),
-    /// A `simulate` region's delimiter was reached first. The machine holds the
-    /// scheduler, so [`perform`] does the search and the split and hands over
-    /// the pieces rather than deciding anything about tasks.
+    /// A `simulate` region's delimiter was reached first.
     Scheduler(Scheduled),
-    /// Nothing on the stack handles this. The host binding is the handler of
-    /// **last resort** — consulted only here, after the whole stack has been
-    /// walked innermost-first — so a `handle` or a `simulate` in scope shadows a
-    /// real socket by the ordinary rule and with no special case. The machine
-    /// holds the binding, so the request comes back untouched rather than being
-    /// resolved here.
+    /// Nothing on the stack handles this.
     Unhandled(Request),
 }
 
-/// A `task.*`, `clock.*` or `random.*` perform, split at its region's
-/// delimiter.
+/// A `task.*`, `clock.*` or `random.*` perform, split at its region's delimiter.
 pub struct Scheduled {
     pub region: SimId,
     pub effect: Symbol,
     pub op: Symbol,
     pub args: Vec<Value>,
     pub span: Span,
-    /// The performing task's control, up to and including the region's
-    /// delimiter. Resuming it reinstalls the delimiter, so the task's next
-    /// perform finds the scheduler again.
-    ///
-    /// The stack it was cut from is not carried: it is the stack the region
-    /// itself sits on, which the region already holds, and two copies of one
-    /// stack is two things that can disagree.
+    /// The performing task's control, up to and including the region's delimiter.
     pub k: Continuation,
 }
 
@@ -134,10 +96,7 @@ impl Transition {
     }
 }
 
-/// `⟨Eval(handle b with H, ρ, m), K, W⟩ → ⟨Eval(b, ρ, m), K ◁ Prompt(H, ρ, m), W⟩`
-///
-/// `effects` is parallel to `clauses`: each clause's effect under its
-/// program-wide name, which only the machine can resolve.
+/// `⟨Eval(handle b with H, ρ, m), K, W⟩ → ⟨Eval(b, ρ, m), K ◁ Prompt(H, ρ, m), W⟩`.
 #[allow(clippy::too_many_arguments)]
 pub fn enter_handle(
     stack: &Stack,
@@ -161,9 +120,6 @@ pub fn enter_handle(
 }
 
 /// `Next::Leave` — the delimited body finished.
-///
-/// A resumption reinstalls the prompt along with the rest of the captured
-/// control, so this runs once per resumption rather than once per `handle`.
 pub fn leave_handle(prompt: &Prompt, value: Value, below: Stack) -> Transition {
     match &prompt.ret {
         Some(arm) => Transition::eval(
@@ -179,10 +135,7 @@ pub fn leave_handle(prompt: &Prompt, value: Value, below: Stack) -> Transition {
     }
 }
 
-/// Drives a `perform`'s arguments left to right and then hands the machine the
-/// [`Request`]. Entering a `perform` is this with `done` empty and `next` zero;
-/// a `Frame::PerformArgs` firing is this with the value it received pushed onto
-/// `done`.
+/// Drives a `perform`'s arguments left to right and then hands the machine the [`Request`].
 #[allow(clippy::too_many_arguments)]
 pub fn perform_args(
     stack: &Stack,
@@ -225,20 +178,6 @@ pub fn perform_args(
 }
 
 /// `⟨Perform(e, op, r, v̄, σ), K, W⟩` — search, split, dispatch.
-///
-/// A tail-resumptive clause gets a [`Frame::Resume`] pushed for it, which is
-/// the whole of `op(x̄) -> e` being `op(x̄) resume κ -> κ(e)`.
-///
-/// The arena is not a parameter, and capture and resumption still do not read
-/// or write it. `pin` is the one thing it hands over: the claim a capture makes
-/// on every region open at it, taken by the caller — which is the only party
-/// holding an arena — and carried by whatever continuation this cuts out, so a
-/// region's lexical close can tell "no one can reach this" from "a continuation
-/// still can".
-///
-/// `born` is the machine's at-most-once host-operation count, stamped onto
-/// every continuation this captures. It is what the linearity rule compares
-/// against later.
 pub fn perform(
     stack: &Stack,
     request: Request,
@@ -268,8 +207,8 @@ pub fn perform(
         Target::Ply { prompt, clause } => (prompt, clause),
         Target::Sim(region) => {
             let (k, _region_stack) = stack.capture(found.segments, born);
-            // The scheduler holds this until it resumes the task, which may be
-            // after every region open here has closed.
+            // The scheduler holds this until it resumes the task, which may be after every region
+            // open here has closed.
             let k = k.pinned(pin());
             return Ok(Answered::Scheduler(Scheduled {
                 region,
@@ -299,28 +238,18 @@ pub fn perform(
 
     let stack = match &clause.resume {
         Some(binder) => {
-            // A named continuation may be stored, returned or resumed after the
-            // regions open here have closed, so it claims them.
+            // A named continuation may be stored, returned or resumed after the regions open here
+            // have closed, so it claims them.
             scope = scope.bind(
                 binder.clone(),
                 Value::Continuation(Rc::new(k.pinned(pin()))),
             );
             below
         }
-        // A tail-resumptive clause takes no pin, and that is a claim about the
-        // stack rather than a saving: the only thing that will ever splice this
-        // continuation is the `Resume` frame pushed here, one frame above the
-        // `CloseRegion` frames of every region open at the capture. It is
-        // consumed before any of them runs, and it is reachable from nothing
-        // else — there is no binder for a clause body to store it through.
-        //
-        // Where the clause's own body performs an operation answered further
-        // out, the capture that answers *that* takes the segments this frame
-        // sits in, so a claim on these regions is made there if one is needed.
-        //
-        // It matters: `perform` is on the request path, a pin is an `Rc`, and
-        // tail-resumptive is what essentially every handler in the standard
-        // library is.
+        // A tail-resumptive clause takes no pin, and that is a claim about the stack rather than a
+        // saving: the only thing that will ever splice this continuation is the `Resume` frame
+        // pushed here, one frame above the `CloseRegion` frames of every region open at the
+        // capture.
         None => below.pushed(Frame::Resume { k: Rc::new(k) }),
     };
     Ok(Answered::Handler(Transition::eval(
@@ -331,26 +260,12 @@ pub fn perform(
     )))
 }
 
-/// A resumption refused because replaying the control would replay an
-/// irreversible host operation. Carries the ordinal so the diagnostic can say
-/// which resumption it is; the machine holds the operation being protected and
-/// builds `E0426` from both.
+/// A resumption refused because replaying the control would replay an irreversible host operation.
 pub struct Replayed {
     pub resumes: u32,
 }
 
 /// `Frame::Resume(k)` — hand a value to a captured continuation.
-///
-/// The segments splice onto whatever stack is current, which may be a different
-/// stack from the one they were cut out of and may already carry a previous
-/// resumption's leftovers. Each captured segment carries its own prompt, so the
-/// handler is reinstalled by the act of resuming: handlers are deep.
-///
-/// **Every** resumption in the language goes through here, which is why the
-/// linearity check is a parameter of this function rather than something its
-/// callers remember to do. A second resumption across a host operation is the
-/// one defect in this system that is silent and sends a packet twice, so it may
-/// not be reachable by adding a call site.
 pub fn resume(
     stack: &Stack,
     k: &Continuation,
@@ -364,8 +279,7 @@ pub fn resume(
     })
 }
 
-/// Applying a `Value::Continuation`. It takes exactly one argument — the value
-/// the `perform` it was captured at should have produced.
+/// Applying a `Value::Continuation`.
 pub fn continuation_argument(mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     if args.len() != 1 {
         return Err(arity_error(span, "a continuation", 1, args.len()));
@@ -373,7 +287,7 @@ pub fn continuation_argument(mut args: Vec<Value>, span: Span) -> Result<Value, 
     Ok(args.pop().expect("a one-argument call has an argument"))
 }
 
-/// `⟨Eval(with_cell[r](i){x→b}, ρ, m), K, W⟩ → ⟨Eval(i, ρ, m), K·WithCellBody, W⟩`
+/// `⟨Eval(with_cell[r](i){x→b}, ρ, m), K, W⟩ → ⟨Eval(i, ρ, m), K·WithCellBody, W⟩`.
 #[allow(clippy::too_many_arguments)]
 pub fn enter_with_cell(
     stack: &Stack,
@@ -397,16 +311,6 @@ pub fn enter_with_cell(
 }
 
 /// `Frame::WithCellBody`.
-///
-/// `kind` is what [`crate::region_kind::Regions`] decided about this span, and
-/// `None` says the span opens no region of its own — either the inference never
-/// saw it, or it is a `with_cell[r]` nested in a `with_region[r]` that already
-/// opened `r`. Opening nothing is the safe answer to both: the cell lands in the
-/// enclosing region and nothing reclaims it before that region's close.
-///
-/// When a region does open, a [`Frame::CloseRegion`] goes under the body. What
-/// that close does with the slots is decided by the pins a capture took, not by
-/// `kind` — see [`TaskRegions::close_region`].
 #[allow(clippy::too_many_arguments)]
 pub fn open_cell(
     cells: &mut TaskRegions,
@@ -438,10 +342,6 @@ pub fn open_cell(
 }
 
 /// `⟨Eval(with_region[r]{b}, ρ, m), K, W⟩` — the region with no cell in it.
-///
-/// `None` for `kind` is the inference never having seen this span, and then the
-/// body runs in the enclosing region exactly as it did before this construct
-/// opened anything.
 pub fn enter_with_region(
     cells: &mut TaskRegions,
     stack: &Stack,
@@ -462,8 +362,6 @@ pub fn enter_with_region(
 }
 
 /// The declaration-level checks a `perform` makes before it looks at the stack.
-/// [`perform`] calls this; it is public so a machine that wants to report the
-/// mistake earlier can.
 pub fn check_operation(
     decl: OpDecl,
     effect: &Symbol,
@@ -501,11 +399,8 @@ pub(crate) fn err_cells_exhausted(span: Span) -> Diagnostic {
     .note("hoist the region out of the loop, or reuse one cell across the iterations")
 }
 
-/// `E0303`, and deliberately not `E0424`: this one means inference should have
-/// prevented the perform and did not, so it is a bug-catcher. A run that
-/// reaches the boundary with a host handler registered for the operation is a
-/// correctly-typed program in a hermetic run, which is the opposite situation
-/// and calls for the opposite response.
+/// `E0303`, and deliberately not `E0424`: this one means inference should have prevented the
+/// perform and did not, so it is a bug-catcher.
 #[cold]
 #[inline(never)]
 pub fn err_unhandled(

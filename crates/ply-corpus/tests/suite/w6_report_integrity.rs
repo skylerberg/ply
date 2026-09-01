@@ -1,14 +1,5 @@
-//! Whether the W6 measurement files still describe the tree they ship in, and
-//! whether the decision machinery can be made to answer without checking C3.
-//!
-//! ADR 0016's whole structural argument is that the thresholds live in code so
-//! that no measurement can supply the bar it is about to clear. That protects
-//! the *thresholds*. It does not protect the two things a verdict is read from:
-//! the ladder — a file, which the code has no way to know is older than the
-//! program it describes — and the alternatives list, which is also a file and
-//! which `decide` treats as exhaustive.
-//!
-//! Every assertion below is about one of those two.
+//! Whether the W6 measurement files still describe the tree they ship in, and whether the decision
+//! machinery can be made to answer without checking C3.
 
 use ply_corpus::w6::{self, Alternative, Criteria, Layer, Report, Verdict};
 use std::path::{Path, PathBuf};
@@ -38,14 +29,8 @@ fn shipped() -> Report {
         .expect("the merged measurements are a W6 report")
 }
 
-/// The interpreter share is what M9's case rests on, and a share summed from
-/// nine differences would be an additive fiction the moment one rung's
-/// `without` stopped being the rung below it.
-///
-/// It is not one here: rungs 1–5 telescope, so `interpreter_micros` is the
-/// single absolute the `machine` rung measured. This asserts that, because a
-/// later ladder that broke the chain would report the same field with a
-/// different meaning and nothing would say so.
+/// The interpreter share is what M9's case rests on, and a share summed from nine differences would
+/// be an additive fiction the moment one rung's `without` stopped being the rung below it.
 #[test]
 fn the_interpreter_share_telescopes_to_one_measured_absolute() {
     let report = shipped();
@@ -74,14 +59,8 @@ fn the_interpreter_share_telescopes_to_one_measured_absolute() {
     );
 }
 
-/// The share's numerator and its denominator are taken in different arenas on
-/// different stacks, and the ladder says so in a column. What it does not say
-/// is that a *negative* residue is evidence the numerator over-counts against
-/// that denominator — which is the one direction ADR 0016 §8.1 claims the share
-/// is conservative in.
-///
-/// This does not assert the share is wrong. It asserts the two facts that make
-/// "a lower bound twice over" an overstatement are both present and readable.
+/// The share's numerator and its denominator are taken in different arenas on different stacks, and
+/// the ladder says so in a column.
 #[test]
 fn a_negative_residue_is_evidence_the_share_is_not_a_lower_bound() {
     let report = shipped();
@@ -133,16 +112,7 @@ fn a_negative_residue_is_evidence_the_share_is_not_a_lower_bound() {
     );
 }
 
-/// **The C3 hole, closed.** ADR 0016 §2.1's third criterion is "*every*
-/// alternative in §4 is priced", and `decide` used to implement it as "no entry
-/// in the list I was handed has `priced: false`" — over a list that is a field
-/// of the same measurement file the ladder comes from. Deleting that one field
-/// turned "keep deferring M9" into "advance M9", and `Report::audit` said
-/// nothing about it.
-///
-/// §4's roster now lives in `w6::LEVERS`, beside the criteria and out of reach
-/// of the run being judged, so a file that says nothing about a lever has
-/// priced nothing.
+/// **The C3 hole, closed.**
 #[test]
 fn an_absent_alternatives_list_cannot_advance_m9() {
     let mut report = shipped();
@@ -170,14 +140,9 @@ fn an_absent_alternatives_list_cannot_advance_m9() {
     }
 }
 
-/// The same hole through the other field: `priced` and `end_to_end` are numbers
-/// in a file, so a report could claim all seven levers were priced at 1.00x and
-/// advance M9 without any of them having been measured.
-///
-/// A priced lever that bought nothing is a result ADR 0016 §4 explicitly wants
-/// recorded — so the fix is not to refuse `1.00x`, it is to require the claim
-/// to say what it is a ratio between. A number with nothing behind it is not a
-/// measurement, and `decide` treats it as unpriced.
+/// The same hole through the other field: `priced` and `end_to_end` are numbers in a file, so a
+/// report could claim all seven levers were priced at 1.00x and advance M9 without any of them
+/// having been measured.
 #[test]
 fn a_measurement_file_cannot_price_a_lever_by_asserting_it() {
     let mut report = shipped();
@@ -199,8 +164,8 @@ fn a_measurement_file_cannot_price_a_lever_by_asserting_it() {
     );
 }
 
-/// What the shipped file *does* price, and that the lever it prices is one of
-/// §4's rather than one of its own invention.
+/// What the shipped file *does* price, and that the lever it prices is one of §4's rather than one
+/// of its own invention.
 #[test]
 fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
     let report = shipped();
@@ -238,10 +203,7 @@ fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
     );
 }
 
-/// The shipped files may not carry a verdict or a threshold. ADR 0016 §7.10
-/// asserts this of the *type*; this asserts it of the two files a reader
-/// actually runs `ply-corpus w6` over, which is where a hand-edited field would
-/// appear.
+/// The shipped files may not carry a verdict or a threshold.
 #[test]
 fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
     for name in ["benches/w6-ladder.json", "benches/w6-spike.json"] {
@@ -278,28 +240,6 @@ fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
 }
 
 /// **The staleness guard, and the one this audit exists because nothing had.**
-///
-/// A ladder is a file. `decide` cannot tell that the program it describes has
-/// changed underneath it, and nothing else in the workspace re-takes it — so a
-/// change to the evaluator moves every rung and the published table, the
-/// projection and the reopen threshold all keep their old values.
-///
-/// This re-takes the cheap half of the ladder — rungs 1 through 4, which need
-/// no database, no child process and no socket — and compares it two ways:
-///
-/// - **The shape, in every profile.** Each rung as a fraction of the `framing`
-///   rung, which is what a change to the request path moves and what a slower
-///   build does not: `debug_assertions` costs every rung about the same factor,
-///   so it cancels in a ratio. This is the assertion that would have caught the
-///   constant memo, which took the `endpoint` rung from 53% of `framing` to
-///   1.2% of it.
-/// - **The absolute microseconds, in release only.** The shipped file says
-///   `release` in its provenance, and ADR 0016 §1.6 says a debug measurement of
-///   an interpreter is a measurement of `debug_assertions` — so comparing one
-///   against the other would be comparing two profiles and failing for the
-///   wrong reason. The band is a factor of four either way: far outside
-///   anything a warm cache, a thermal state or a busy machine produces, and far
-///   inside what a change to the request path produces.
 #[test]
 fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     let report = shipped();
@@ -389,14 +329,8 @@ fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     );
 }
 
-/// The pinned criteria and the shipped numbers together, so a reader can see
-/// which criterion the verdict turned on rather than being told.
-///
-/// C3 is asserted because it is what the verdict rests on, and it is the one
-/// criterion that reads no measurement of the share. C1 and C2 are computed and
-/// printed rather than asserted: which side of its bar the share falls on is a
-/// property of the tree, and a test that asserted it would be asserting the
-/// answer this milestone exists to compute.
+/// The pinned criteria and the shipped numbers together, so a reader can see which criterion the
+/// verdict turned on rather than being told.
 #[test]
 fn the_shipped_verdict_turns_on_c3() {
     let report = shipped();
@@ -453,18 +387,6 @@ fn the_shipped_verdict_turns_on_c3() {
 }
 
 /// **The file is the command's output, not a document assembled around it.**
-///
-/// `benches/w6-ladder.json` used to be hand-built: `ply-corpus w6-ladder` wrote
-/// a differently shaped object with `alternatives: []`, and the seven levers C3
-/// is decided against were typed in afterwards. Both staleness guards told a
-/// contributor to re-take the ladder, and following that instruction would have
-/// deleted them.
-///
-/// The command writes the whole report now, so this asserts the property that
-/// makes the instruction true: the shipped file is exactly `Report`'s own
-/// serialization, byte for byte. A field added by hand, a field the type does
-/// not carry, or an edit that reflowed the file fails here — which is the only
-/// way a reader can tell the two apart by looking.
 #[test]
 fn the_shipped_ladder_is_what_the_command_writes() {
     let path = repo().join("benches/w6-ladder.json");

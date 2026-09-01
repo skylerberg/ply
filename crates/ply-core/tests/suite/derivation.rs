@@ -1,11 +1,4 @@
 //! Derivation end to end: expansion, then resolution, then inference.
-//!
-//! The `std.json` module below is a **stub of the protocol a generated codec
-//! calls**, not a copy of the real one: every body is `panic`, and the signatures
-//! are the whole content. If the shipped `std.json` ever stops matching it,
-//! every derivation in the language stops checking — so this file is the
-//! contract between the deriver and the codec, written where a compiler failure
-//! reports it.
 
 use ply_core::{CheckOutput, check_program};
 use ply_span::{Diagnostic, SourceId, codes};
@@ -13,8 +6,6 @@ use ply_syntax::ast::ModuleName;
 use ply_syntax::resolve::resolve;
 
 /// The signatures a generated `json` dictionary references, and nothing else.
-/// Leaf codecs are `<snake(Type)>_json()`, which is the same rule the deriver
-/// names a user type's codec by.
 const JSON: &str = r#"
 pub type Json = Null | Bool(Bool) | Number(Decimal) | Str(String)
               | Array(List<Json>) | Object(Map<String, Json>)
@@ -105,8 +96,6 @@ fn has(d: &Diagnostic, text: &str) -> bool {
         || d.notes.iter().any(|n| n.contains(text))
         || d.labels.iter().any(|l| l.message.contains(text))
 }
-
-// ---------------------------------------------------------------- json
 
 #[test]
 fn a_record_codec_checks() {
@@ -202,8 +191,6 @@ fn a_module_that_does_not_import_std_json_is_told_to() {
     assert!(has(&d, "import std.json"), "{d:#?}");
 }
 
-// ---------------------------------------------------------------- eq and ord
-
 #[test]
 fn eq_and_ord_need_no_import() {
     let out = compile(&[(
@@ -234,8 +221,6 @@ derive ord for Order
 fn same(a: Order, b: Order) -> Bool = order_eq().eq(a, b)
 fn rank(a: Order, b: Order) -> Ordering = order_ord().compare(a, b)");
 }
-
-// ---------------------------------------------------------------- refusals
 
 #[test]
 fn a_function_field_names_the_field() {
@@ -308,8 +293,6 @@ fn two_derivations_generating_one_name_are_a_duplicate() {
     assert!(has(&diags[0], "rename one of the types"), "{:#?}", diags[0]);
 }
 
-// ---------------------------------------------------------------- constraints
-
 #[test]
 fn a_call_site_instantiating_a_constrained_parameter_is_checked_there() {
     let d = only_code(
@@ -370,14 +353,12 @@ derive json for Order
 fn go(o: Order) -> json::Json = ship(o, order_json())");
 }
 
-/// The stub above is a claim about `std.json`. This is the claim being checked:
-/// the same derivations, against the module that actually ships. When this fails
-/// and the stub tests pass, `std.json` moved out from under the deriver.
+/// The stub above is a claim about `std.json`.
 #[test]
 fn the_shipped_std_json_satisfies_the_protocol() {
-    // Read from the source tree rather than from `ply_std::MODULES`, so that
-    // this holds whether or not `std.json` has been added to the embedded table
-    // yet: what is being checked is the module the deriver targets.
+    // Read from the source tree rather than from `ply_std::MODULES`, so that this holds whether or
+    // not `std.json` has been added to the embedded table yet: what is being checked is the module
+    // the deriver targets.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-std/ply/json.ply");
     let json = std::fs::read_to_string(&path).expect("`std.json` ships with the compiler");
     let mut modules: Vec<(&str, &str)> = ply_std::sources()

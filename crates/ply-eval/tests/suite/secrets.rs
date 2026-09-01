@@ -1,14 +1,8 @@
-//! ADR 0015 §2 at the evaluator: what a credential renders as, what comparing
-//! two of them does, and what happens when one reaches the host boundary.
-//!
-//! `ply-core/tests/suite/secrets.rs` covers the routes the type checker closes. These
-//! are the two that no type can close, because they take *any* value —
-//! `Value::render` and `values_equal` — plus the one that leaves the language
-//! entirely.
+//! ADR 0015 §2 at the evaluator: what a credential renders as, what comparing two of them does, and
+//! what happens when one reaches the host boundary.
 
-// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not
-// `Send`; that is `ply-eval`'s design and this is the same allow, for the same
-// reason, that `ply-host` carries.
+// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; that is
+// `ply-eval`'s design and this is the same allow, for the same reason, that `ply-host` carries.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_core::{CheckOutput, check_program};
@@ -69,10 +63,8 @@ fn fails(source: &str) -> Diagnostic {
 
 // --- rendering --------------------------------------------------------------
 
-/// The line that closes the assertion diff, the panic payload, `ply run`'s
-/// result line, M5's failure JSON, `--json`, the result cache and every
-/// `Diagnostic` that interpolates a value. It has no payload-dependent branch,
-/// so there is nothing for a later change to get wrong per payload.
+/// The line that closes the assertion diff, the panic payload, `ply run`'s result line, M5's
+/// failure JSON, `--json`, the result cache and every `Diagnostic` that interpolates a value.
 #[test]
 fn a_secret_renders_redacted_whatever_it_holds() {
     for payload in [
@@ -90,9 +82,8 @@ fn a_secret_renders_redacted_whatever_it_holds() {
     }
 }
 
-/// Nesting does not reach it either: a variant, a list and a map all render
-/// through the same walk, and the redaction is the leaf rather than a guard the
-/// walk applies at the top.
+/// Nesting does not reach it either: a variant, a list and a map all render through the same walk,
+/// and the redaction is the leaf rather than a guard the walk applies at the top.
 #[test]
 fn a_nested_secret_renders_redacted() {
     let inner = Value::secret(Value::str("hunter2"));
@@ -106,9 +97,8 @@ fn a_nested_secret_renders_redacted() {
     assert_eq!(rendered.matches(SECRET_REDACTED).count(), 3, "{rendered}");
 }
 
-/// A failing `assert_eq` over two records holding credentials prints the diff
-/// and prints neither credential. This is the route that leaks in every other
-/// language's test runner.
+/// A failing `assert_eq` over two records holding credentials prints the diff and prints neither
+/// credential.
 #[test]
 fn a_failing_assertion_prints_no_payload() {
     let d = fails(
@@ -126,8 +116,8 @@ test "two logins differ" {
     assert!(text.contains(SECRET_REDACTED), "{text}");
 }
 
-/// `type_error` interpolates the offending value, so a builtin handed a
-/// `Secret` is a diagnostic that names the type and prints nothing else.
+/// `type_error` interpolates the offending value, so a builtin handed a `Secret` is a diagnostic
+/// that names the type and prints nothing else.
 #[test]
 fn a_runtime_type_error_over_a_secret_prints_no_payload() {
     let d = values_equal(
@@ -158,9 +148,7 @@ test "equality works and prints nothing" {
     );
 }
 
-/// A `Secret` is never equal to a non-`Secret`. Checked at the Rust level
-/// because the type checker refuses to write the comparison in Ply, which is
-/// the point — but the evaluator must not be the reason it holds.
+/// A `Secret` is never equal to a non-`Secret`.
 #[test]
 fn a_secret_is_never_equal_to_its_payload() {
     let span = ply_span::Span::DUMMY;
@@ -171,9 +159,8 @@ fn a_secret_is_never_equal_to_its_payload() {
     assert!(values_equal(&secret, &secret.clone(), span).unwrap());
 }
 
-/// The comparison scans both operands to their full length whatever the answer,
-/// so the *comparison* is not the oracle. What a caller does with the `Bool` is
-/// (ADR 0015 §2.5 (4)), and nothing here claims otherwise.
+/// The comparison scans both operands to their full length whatever the answer, so the *comparison*
+/// is not the oracle.
 #[test]
 fn the_comparison_is_over_the_whole_of_both_operands() {
     assert!(constant_time_eq(b"", b""));
@@ -187,9 +174,7 @@ fn the_comparison_is_over_the_whole_of_both_operands() {
 
 // --- ordering ---------------------------------------------------------------
 
-/// The runtime backstop under `derivable(ord, ·)`. A well-typed program cannot
-/// arrive here — `compare` and `compare_values` both carry the constraint — so
-/// this is what a defect in either walk meets instead of an ordering oracle.
+/// The runtime backstop under `derivable(ord, ·)`.
 #[test]
 fn compare_values_refuses_a_secret_at_run_time() {
     let mut regions = ply_eval::TaskRegions::new();
@@ -211,8 +196,7 @@ fn compare_values_refuses_a_secret_at_run_time() {
     assert!(!format!("{d:#?}").contains("\"a\""), "{d:#?}");
 }
 
-/// And the same for the map operations, which are the other consumer of the
-/// order. `Map<Secret<a>, v>` is `E0206`, so this too is a backstop.
+/// And the same for the map operations, which are the other consumer of the order.
 #[test]
 fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
     let mut regions = ply_eval::TaskRegions::new();
@@ -260,10 +244,8 @@ test "the three builtins" {
     );
 }
 
-/// §2.5 (2), stated as a test rather than only as prose: the plaintext the
-/// secret was built from is still in scope and is still a `String`. Containment
-/// starts where the `Secret` starts, and pretending otherwise would be the
-/// unstated hole the ADR refuses to leave.
+/// §2.5 (2), stated as a test rather than only as prose: the plaintext the secret was built from is
+/// still in scope and is still a `String`.
 #[test]
 fn the_plaintext_the_secret_was_built_from_is_not_consumed() {
     passes(
@@ -346,9 +328,7 @@ fn bound(compiled: &Compiled, handler: Arc<Counter>, secrets: bool) -> HostBindi
     registry.bind(&compiled.check).expect("binds")
 }
 
-/// The tripwire. No W5 operation declares `secrets: true`, so this is the
-/// answer every host operation gives today — and the handler is never entered,
-/// which is the whole point: the credential has not crossed when this fires.
+/// The tripwire.
 #[test]
 fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
     let compiled = compile(SEND);
@@ -373,9 +353,8 @@ fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
     assert!(!format!("{d:#?}").contains("hunter2"), "{d:#?}");
 }
 
-/// A credential is almost never the whole argument — it is a field of the
-/// record a request is built from — so the check is a walk rather than a
-/// top-level test.
+/// A credential is almost never the whole argument — it is a field of the record a request is built
+/// from — so the check is a walk rather than a top-level test.
 #[test]
 fn a_secret_nested_in_an_argument_is_found() {
     let compiled = compile(SEND_NESTED);
@@ -388,10 +367,8 @@ fn a_secret_nested_in_an_argument_is_found() {
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
 }
 
-/// The check is a gate rather than a ban: an operation that declares it may
-/// receive a credential does, and becomes a reviewed member of the trusted
-/// computing base. Nothing in W5 declares it, so this fixture is the only
-/// caller.
+/// The check is a gate rather than a ban: an operation that declares it may receive a credential
+/// does, and becomes a reviewed member of the trusted computing base.
 #[test]
 fn an_operation_that_declares_secrets_receives_one() {
     let compiled = compile(SEND);
@@ -401,13 +378,12 @@ fn an_operation_that_declares_secrets_receives_one() {
 
     machine.eval_test(0).expect("the handler answers");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
-    // Even there, what the handler can *render* is redacted: the boundary hands
-    // over the value, and the value still refuses to print itself.
+    // Even there, what the handler can *render* is redacted: the boundary hands over the value, and
+    // the value still refuses to print itself.
     assert_eq!(handler.seen.lock().unwrap().as_slice(), [SECRET_REDACTED]);
 }
 
-/// An ordinary operation is untouched. A check that made every host operation
-/// pay a walk over a `Secret`-free argument would be a cost with no user.
+/// An ordinary operation is untouched.
 #[test]
 fn an_argument_with_no_secret_reaches_the_handler_as_before() {
     let compiled = compile(SEND_PLAIN);
@@ -419,8 +395,8 @@ fn an_argument_with_no_secret_reaches_the_handler_as_before() {
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
 
-/// The listing's digest covers the column, so a handler that quietly became
-/// able to receive credentials moves the one line CI pins.
+/// The listing's digest covers the column, so a handler that quietly became able to receive
+/// credentials moves the one line CI pins.
 #[test]
 fn the_secrets_column_moves_the_listing_digest() {
     let compiled = compile(SEND);
@@ -434,32 +410,8 @@ fn the_secrets_column_moves_the_listing_digest() {
 }
 
 // --- the ordering-oracle backstop, and the hole it was reached through ------
-//
-// ADR 0015 §2.2 installs a runtime backstop as "what a defect in either walk
-// meets instead of an ordering oracle over a credential". A W5 audit found it
-// guarded `compare`, `compare_values`, `map_insert`, `map_get`, `map_contains`
-// and `map_remove` but NOT `map_of_entries` or `map_merge`, both of which order
-// their keys through `Value::cmp` — which, for two `Secret`s, compared the
-// payloads. That was a total ordering oracle over a plaintext, recovering it in
-// comparisons proportional to its length.
-//
-// Two things were wrong and both are fixed here. The backstop now lives under
-// `crate::map`'s single key gate rather than at six call sites, so there is one
-// place a key reaches `Value::cmp` from; and the vehicle that reached it — an
-// effect operation with a polymorphic return, whose handler clause was checked
-// against a *fresh* instantiation never unified with the perform site's — is a
-// type error, because a clause is now checked with the operation's own type
-// variables rigid.
 
-/// The vehicle, closed at the type checker. An operation declared `-> a` is
-/// answered by one clause for every perform site there will ever be, so the
-/// clause may not choose the type; `vault.fetch[k](s) -> s` answering a
-/// `Secret<String>` where the caller read a `String` is `E0201`.
-///
-/// This is general type soundness rather than anything about secrets — a clause
-/// answering a `String` for an `-> Int` caller was accepted the same way — but
-/// it is the route §2.3's "Map key ordering" row was reached through, so it is
-/// pinned here beside the leak it enabled.
+/// The vehicle, closed at the type checker.
 #[test]
 fn a_clause_may_not_answer_a_concrete_type_for_a_polymorphic_operation() {
     let source = r#"
@@ -492,9 +444,9 @@ test "launder" {
     );
 }
 
-/// The same hole with no `Secret` in sight, so that closing it is recorded as
-/// what it is: a clause answering an `Int` where the caller unified `String`
-/// was accepted and failed at run time with `E0502`.
+/// The same hole with no `Secret` in sight, so that closing it is recorded as what it is: a clause
+/// answering an `Int` where the caller unified `String` was accepted and failed at run time with
+/// `E0502`.
 #[test]
 fn a_clause_may_not_answer_the_wrong_type_for_a_polymorphic_operation() {
     let source = r#"
@@ -520,15 +472,8 @@ test "confuse" {
     );
 }
 
-/// The builtin-level check that the gap itself is gone, independent of whether
-/// any source program can still reach it. `map_of_entries` handed two `Secret`
-/// keys refuses rather than building a map ordered by their plaintexts.
-///
-/// At this level because there is no longer a well-typed program that reaches
-/// it: a `Secret` typed honestly as a map key is `E0206`, and the effect route
-/// that laundered one is now `E0201`. A backstop is exactly the thing that has
-/// to hold when both of those have been defeated, so it is tested where a defect
-/// in either would arrive.
+/// The builtin-level check that the gap itself is gone, independent of whether any source program
+/// can still reach it.
 #[test]
 fn map_of_entries_refuses_a_secret_key() {
     let mut regions = ply_eval::TaskRegions::new();
@@ -550,14 +495,13 @@ fn map_of_entries_refuses_a_secret_key() {
     );
 }
 
-/// `map_merge` shares the gate, because it inserts the right map's keys into
-/// the left through the same one place a key enters a `Map`.
+/// `map_merge` shares the gate, because it inserts the right map's keys into the left through the
+/// same one place a key enters a `Map`.
 #[test]
 fn map_merge_refuses_a_secret_key() {
     let mut regions = ply_eval::TaskRegions::new();
-    // No map builtin will build the right-hand side, so it is assembled
-    // directly: the gate is what `merge` has to apply, and this is the value a
-    // defect elsewhere would hand it.
+    // No map builtin will build the right-hand side, so it is assembled directly: the gate is what
+    // `merge` has to apply, and this is the value a defect elsewhere would hand it.
     let right = Value::map([(Value::secret(Value::str("hunter2")), Value::Int(1))]);
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapMerge,
@@ -570,9 +514,7 @@ fn map_merge_refuses_a_secret_key() {
     assert!(d.message.contains("cannot order a `Secret`"), "{d:#?}");
 }
 
-/// Every map builtin that touches a key, refused for the same reason and by the
-/// same gate. Written as a table so a seventh builder is a row rather than a
-/// forgotten call site — which is what the two missing ones were.
+/// Every map builtin that touches a key, refused for the same reason and by the same gate.
 #[test]
 fn every_map_operation_that_orders_a_key_refuses_a_secret() {
     let secret = Value::secret(Value::str("hunter2"));

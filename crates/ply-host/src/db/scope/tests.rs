@@ -1,17 +1,4 @@
 //! Two suites, and the second is the one that matters.
-//!
-//! The first drives [`ScopeTable`] with no database at all: depth arithmetic,
-//! savepoint names, the isolation and access rules, and the ownership refusal.
-//! Those are decidable without a server and a test that needed one to check them
-//! would be a slower test of the same thing.
-//!
-//! The second runs every step the first produces against **real postgres**,
-//! because the property this module exists for is not "the table popped a
-//! scope". It is *after a rollback nothing the body wrote is visible, and the
-//! connection is clean enough to reuse* — and a rollback that works in memory
-//! and leaks in postgres is the exact failure W4 is supposed to make impossible.
-//! Those tests read `PLY_PG_URL` and are skipped without it, loudly, with the
-//! reason printed.
 
 use super::*;
 use crate::db::pool::Cleanup;
@@ -24,21 +11,19 @@ fn span() -> Span {
     Span::DUMMY
 }
 
-/// One machine, since every test in this module is about one entry point's own
-/// tasks. The machine half of the key is exercised by
-/// `two_machines_are_two_entry_points_and_never_one`.
+/// One machine, since every test in this module is about one entry point's own tasks.
 const MACHINE: MachineId = MachineId(1);
 
 fn owner(n: u32) -> Owner {
     (MACHINE, Some(TaskId(n)))
 }
 
-/// The entry point that opened no region — one thread of control, and an
-/// identity rather than an absence of one.
+/// The entry point that opened no region — one thread of control, and an identity rather than an
+/// absence of one.
 const ALONE: Owner = (MACHINE, None);
 
-/// Where a statement performed by `who` would run, with the operation's name
-/// fixed so a caller reads as the question rather than as the plumbing.
+/// Where a statement performed by `who` would run, with the operation's name fixed so a caller
+/// reads as the question rather than as the plumbing.
 fn route(table: &ScopeTable, who: Owner) -> Result<Option<LeaseId>, String> {
     table
         .route(who, "`db.execute`", span())
@@ -54,9 +39,9 @@ fn open(table: &mut ScopeTable, who: Owner, level: Isolation, access: Access, on
     step
 }
 
-/// A level names one thing in three places — the Ply constructor a `Value`
-/// carries, the SQL a `BEGIN` writes, and the word a refusal prints — and the
-/// round trip is what keeps the three from drifting into two enumerations.
+/// A level names one thing in three places — the Ply constructor a `Value` carries, the SQL a
+/// `BEGIN` writes, and the word a refusal prints — and the round trip is what keeps the three from
+/// drifting into two enumerations.
 #[test]
 fn every_level_and_access_round_trips_through_its_constructor() {
     for level in [
@@ -70,8 +55,8 @@ fn every_level_and_access_round_trips_through_its_constructor() {
     for access in [Access::ReadWrite, Access::ReadOnly] {
         assert_eq!(Access::from_ctor(access.as_str()), Some(access));
     }
-    // `ReadUncommitted` is not offered: postgres implements it as read
-    // committed, and a name that promised dirty reads would be a name that lies.
+    // `ReadUncommitted` is not offered: postgres implements it as read committed, and a name that
+    // promised dirty reads would be a name that lies.
     assert_eq!(Isolation::from_ctor("ReadUncommitted"), None);
 }
 
@@ -84,10 +69,9 @@ fn the_outermost_begin_carries_its_level_and_its_access() {
             sql: "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY".to_string()
         }
     );
-    // One statement rather than a `BEGIN` followed by two `SET TRANSACTION`s: a
-    // `BEGIN` that succeeded and a `SET` that failed would leave a scope open at
-    // a level the call site did not ask for, which is the one outcome neither
-    // the caller nor the driver could recover from.
+    // One statement rather than a `BEGIN` followed by two `SET TRANSACTION`s: a `BEGIN` that
+    // succeeded and a `SET` that failed would leave a scope open at a level the call site did not
+    // ask for, which is the one outcome neither the caller nor the driver could recover from.
     assert_eq!(
         table.begin(ALONE, Isolation::ReadCommitted, Access::ReadWrite),
         Step::Open {
@@ -231,12 +215,8 @@ fn a_nested_begin_at_another_level_is_25001_naming_both() {
     assert_eq!(table.depth(ALONE), 1, "the refusal opened nothing");
 }
 
-/// A narrowing is documentation and not enforcement — postgres has no read-only
-/// savepoint and the statements inside one are still writable — and saying so is
-/// the only honest thing available. A *widening* is the other direction: the
-/// call site asks for something the open transaction will refuse at the first
-/// write, so it is refused here where the reader can still see which two scopes
-/// disagreed.
+/// A narrowing is documentation and not enforcement — postgres has no read-only savepoint and the
+/// statements inside one are still writable — and saying so is the only honest thing available.
 #[test]
 fn a_nested_read_only_narrows_and_a_nested_read_write_widens() {
     let mut table = ScopeTable::new();
@@ -307,9 +287,8 @@ fn a_close_with_nothing_open_is_25p01() {
     assert_eq!(error.code, sqlstate::NO_ACTIVE_TRANSACTION);
 }
 
-/// Two tasks each in their own transaction are two stacks on two connections,
-/// which is what a pool exists to serve. Nothing about one is visible to the
-/// other, and neither is refused.
+/// Two tasks each in their own transaction are two stacks on two connections, which is what a pool
+/// exists to serve.
 #[test]
 fn two_owners_hold_two_scopes_on_two_connections() {
     let mut table = ScopeTable::new();
@@ -340,11 +319,8 @@ fn two_owners_hold_two_scopes_on_two_connections() {
     assert_eq!(table.depth(owner(2)), 1, "and owner 2 is untouched");
 }
 
-/// The refusal the fixture for `E0436` is written against: a statement from a
-/// task spawned inside somebody else's `transaction` body. Running it on the
-/// owner's connection interleaves two conversations into one stream, and
-/// borrowing a second connection runs it outside the transaction its author
-/// believed it was inside — so it refuses and the program says which it meant.
+/// The refusal the fixture for `E0436` is written against: a statement from a task spawned inside
+/// somebody else's `transaction` body.
 #[test]
 fn a_statement_from_a_task_that_owns_no_scope_is_e0436() {
     let mut table = ScopeTable::new();
@@ -411,8 +387,8 @@ fn end_entry_point_names_every_connection_still_holding_a_scope() {
         Access::ReadWrite,
         lease(8),
     );
-    // A savepoint inside one of them: `ROLLBACK` discards every savepoint under
-    // it, so the connection is named once rather than once per depth.
+    // A savepoint inside one of them: `ROLLBACK` discards every savepoint under it, so the
+    // connection is named once rather than once per depth.
     open(
         &mut table,
         owner(1),

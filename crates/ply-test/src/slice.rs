@@ -1,9 +1,4 @@
 //! The dynamic half of a failure: which definitions actually ran.
-//!
-//! A test's closure is what it *could* reach. The causal slice is what it *did*
-//! reach on the way to the assertion that failed. Forty definitions in the
-//! closure and three on the stack is the difference between a list to read and
-//! an answer to act on, and the two are not derivable from each other.
 
 use ply_core::{EffectAtom, Footprint};
 use ply_hash::DefHash;
@@ -15,8 +10,7 @@ pub struct Entered {
     /// The program-wide name.
     pub name: Symbol,
     pub hash: Option<DefHash>,
-    /// How many times it was entered. A count in the thousands next to an
-    /// assertion about a list length is itself a finding.
+    /// How many times it was entered.
     pub calls: u32,
 }
 
@@ -25,54 +19,30 @@ pub struct Entered {
 pub struct Frame {
     pub name: Symbol,
     pub hash: Option<DefHash>,
-    /// Where the *caller* made this call, so the frames read as a path through
-    /// the source rather than a list of names.
+    /// Where the *caller* made this call, so the frames read as a path through the source rather
+    /// than a list of names.
     pub call_site: Span,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CausalSlice {
-    /// False when nothing was traced, in which case every other field is empty
-    /// rather than meaningfully absent.
+    /// False when nothing was traced, in which case every other field is empty rather than
+    /// meaningfully absent.
     pub traced: bool,
     /// Whether the traced execution failed the same way the untraced one did.
-    /// A `det` test always reproduces; `test/nondet` may not, and a slice from a
-    /// run that went green is evidence about a different execution.
     pub reproduced: bool,
     /// First-entry order.
     pub entered: Vec<Entered>,
-    /// Outermost first, innermost last. The last frame is where the failure
-    /// happened.
+    /// Outermost first, innermost last.
     pub stack: Vec<Frame>,
     /// The atoms actually performed.
-    ///
-    /// > **Corrected in place (2026-08-24): it is not a subset of the declared
-    /// > footprint.** This read *"The atoms actually performed, which is a
-    /// > subset of the declared footprint. A declared atom that never fired
-    /// > means a branch was not taken."* The second sentence stands. The first
-    /// > does not, and no change was needed to refute it: both engines record
-    /// > **every** `perform` (`ply_eval::machine`'s `State::Perform`,
-    /// > `ply_eval::interp`'s `perform`), including one a `handle` inside the
-    /// > call discharges — and discharging is exactly what keeps an atom out of
-    /// > a row. Measured on a definition that performs `state.get` and handles
-    /// > it itself: its published `footprint` and its inferred `performed` are
-    /// > both empty and `ply_eval::Trace` holds `state.read`. So `observed` and
-    /// > the declared footprint are two sets that overlap, and a reader may
-    /// > conclude "a branch was not taken" from a declared atom that is absent
-    /// > here, but may **not** conclude that an atom present here was declared.
-    /// >
-    /// > Nothing outside `ply-test/tests/suite/bisect_audit.rs` builds one of these
-    /// > yet — see `CONTRIBUTING.md` §"Things known to be broken" item 15 —
-    /// > so the correction is to the contract rather than to an output anyone
-    /// > has seen.
     pub observed: Footprint,
-    /// A trace that hit its size cap. The stack is still exact; `entered` is not.
+    /// A trace that hit its size cap.
     pub truncated: bool,
 }
 
 impl CausalSlice {
-    /// A slice from a run where tracing was never switched on. Distinct from an
-    /// empty slice, which would claim nothing ran.
+    /// A slice from a run where tracing was never switched on.
     pub fn untraced() -> CausalSlice {
         CausalSlice::default()
     }
@@ -81,12 +51,7 @@ impl CausalSlice {
         self.entered.iter().any(|e| &e.name == name)
     }
 
-    /// `ran`, but honest about a roster that hit its cap. ADR 0004 defines
-    /// `ran: false` as "it cannot have caused this, whatever its hash did", which
-    /// a truncated roster is in no position to claim: past the cap a definition
-    /// that ran is simply not recorded. `None` — "was not traced" — is the only
-    /// answer available then, and a consumer that cannot tell the two apart acts
-    /// on the wrong one.
+    /// `ran`, but honest about a roster that hit its cap.
     pub fn did_run(&self, name: &Symbol) -> Option<bool> {
         if self.ran(name) || self.stack.iter().any(|f| &f.name == name) {
             return Some(true);
@@ -94,9 +59,7 @@ impl CausalSlice {
         (!self.truncated).then_some(false)
     }
 
-    /// How far above the failure a definition sits, counting the innermost frame
-    /// as zero. `None` when it is not on the failing stack at all — it ran, but
-    /// it had returned by the time the assertion blew up.
+    /// How far above the failure a definition sits, counting the innermost frame as zero.
     pub fn depth_of(&self, name: &Symbol) -> Option<usize> {
         self.stack
             .iter()
@@ -109,18 +72,14 @@ impl CausalSlice {
     }
 }
 
-// -------------------------------------------------------------- recording
-
 /// `--trace`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tracing {
-    /// Trace a failing test's re-run. The green path stays untraced, which is
-    /// the whole reason tracing happens on a replay: a push and a pop per call
-    /// sit on the interpreter's hottest path.
+    /// Trace a failing test's re-run.
     #[default]
     Auto,
-    /// Trace the first execution too — what a `test/nondet` that will not
-    /// reproduce needs, since for it there is no replay worth having.
+    /// Trace the first execution too — what a `test/nondet` that will not reproduce needs, since
+    /// for it there is no replay worth having.
     Always,
     Never,
 }
@@ -154,8 +113,7 @@ impl Tracing {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A named definition was entered. `call_site` is where the *caller* made
-    /// the call, so the frames read as a path through the source.
+    /// A named definition was entered.
     Enter {
         name: Symbol,
         hash: Option<DefHash>,
@@ -166,9 +124,8 @@ pub enum Event {
     Perform(EffectAtom),
 }
 
-/// The stack is captured at [`SliceBuilder::failed`] rather than at the end,
-/// because by the end every frame has unwound and the path to the assertion is
-/// gone. Everything on that stack ran; not everything that ran is on it.
+/// The stack is captured at [`SliceBuilder::failed`] rather than at the end, because by the end
+/// every frame has unwound and the path to the assertion is gone.
 pub struct SliceBuilder {
     /// First-entry order, which is what makes the artifact readable top-down.
     entered: Vec<Entered>,
@@ -176,9 +133,9 @@ pub struct SliceBuilder {
     live: Vec<Frame>,
     failed: Option<Vec<Frame>>,
     observed: BTreeSet<EffectAtom>,
-    /// Distinct definitions, not calls: a call count is a counter, but a program
-    /// that generates names without bound would grow `entered` without bound,
-    /// and the test being explained is often the one that ran away.
+    /// Distinct definitions, not calls: a call count is a counter, but a program that generates
+    /// names without bound would grow `entered` without bound, and the test being explained is
+    /// often the one that ran away.
     cap: usize,
     truncated: bool,
 }
@@ -208,10 +165,9 @@ impl SliceBuilder {
         }
     }
 
-    /// Every enter and return moves the live stack, whatever the cap says: a
-    /// dropped frame would leave the stack claiming a call that had already
-    /// returned, and the stack is the part of the artifact that has to stay
-    /// exact.
+    /// Every enter and return moves the live stack, whatever the cap says: a dropped frame would
+    /// leave the stack claiming a call that had already returned, and the stack is the part of the
+    /// artifact that has to stay exact.
     pub fn record(&mut self, event: Event) {
         match event {
             Event::Return => {
@@ -246,17 +202,14 @@ impl SliceBuilder {
         }
     }
 
-    /// Freezes the stack. Called where the assertion blew up; calling it twice
-    /// keeps the first, because the first failure is the one being explained.
+    /// Freezes the stack.
     pub fn failed(&mut self) {
         if self.failed.is_none() {
             self.failed = Some(self.live.clone());
         }
     }
 
-    /// `reproduced` is whether the traced run failed the same way the untraced
-    /// one did. A slice from a run that went green is evidence about a different
-    /// execution and is reported rather than mixed in.
+    /// `reproduced` is whether the traced run failed the same way the untraced one did.
     pub fn finish(self, reproduced: bool) -> CausalSlice {
         CausalSlice {
             traced: true,
@@ -269,8 +222,8 @@ impl SliceBuilder {
     }
 }
 
-/// What the assertion was checking, in a form a consumer does not have to parse
-/// out of a rendered message.
+/// What the assertion was checking, in a form a consumer does not have to parse out of a rendered
+/// message.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssertionKind {
     /// `assert_eq`.
@@ -279,16 +232,13 @@ pub enum AssertionKind {
     Bool,
     /// `panic`.
     Panic,
-    /// Something the evaluator refused to do — a bad cast, a runaway `range`, a
-    /// borrowed cell.
+    /// Something the evaluator refused to do — a bad cast, a runaway `range`, a borrowed cell.
     Runtime,
-    /// A `perform` reached no handler. Inference should have ruled this out.
+    /// A `perform` reached no handler.
     UnhandledEffect,
     RecursionLimit,
-    /// A simulated region stopped making progress: nothing was enabled and no
-    /// timer could fire, or the per-interleaving step budget was spent. One kind
-    /// for both, because from the program's side they are the same finding and
-    /// the fix is in the same place.
+    /// A simulated region stopped making progress: nothing was enabled and no timer could fire, or
+    /// the per-interleaving step budget was spent.
     Deadlock,
 }
 
@@ -308,15 +258,15 @@ impl AssertionKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Difference {
-    /// A path into the compared values, `.entries[2].amount`. Empty for scalars.
+    /// A path into the compared values, `.entries[2].amount`.
     pub path: String,
     pub expected: String,
     pub actual: String,
 }
 
-/// Rendered strings rather than a value tree: an agent acts on `expected` versus
-/// `actual` and on where they first differ, and a faithful serialization of a
-/// `Value` would commit this schema to the evaluator's representation.
+/// Rendered strings rather than a value tree: an agent acts on `expected` versus `actual` and on
+/// where they first differ, and a faithful serialization of a `Value` would commit this schema to
+/// the evaluator's representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assertion {
     pub kind: AssertionKind,
@@ -396,8 +346,6 @@ mod tests {
     }
 
     /// Everything on the stack ran, but not everything that ran is on the stack.
-    /// Confusing the two would rank a definition that had already returned as if
-    /// it were where the failure happened.
     #[test]
     fn a_definition_that_returned_before_the_failure_ran_but_has_no_depth() {
         let s = slice();
@@ -437,9 +385,8 @@ mod tests {
         b
     }
 
-    /// The two halves of the slice answer different questions, and confusing
-    /// them ranks a definition that had already returned as if it were where the
-    /// failure happened.
+    /// The two halves of the slice answer different questions, and confusing them ranks a
+    /// definition that had already returned as if it were where the failure happened.
     #[test]
     fn the_stack_is_the_path_and_entered_is_everything_that_ran() {
         let mut b = built(&[
@@ -478,8 +425,7 @@ mod tests {
         assert_eq!(slice.entered[0].calls, 3);
     }
 
-    /// The cap bounds how many *distinct* definitions are remembered. Letting it
-    /// bound the stack too would leave frames on it that had already returned.
+    /// The cap bounds how many *distinct* definitions are remembered.
     #[test]
     fn hitting_the_cap_truncates_the_roster_and_not_the_stack() {
         let mut b = SliceBuilder::with_cap(2);
@@ -508,8 +454,8 @@ mod tests {
         assert_eq!(slice.observed.atoms().collect::<Vec<_>>(), vec![&atom]);
     }
 
-    /// A failure that is never reported leaves no path, which is different from
-    /// a path of length zero and has to stay so.
+    /// A failure that is never reported leaves no path, which is different from a path of length
+    /// zero and has to stay so.
     #[test]
     fn a_builder_that_was_never_told_of_a_failure_reports_no_stack() {
         let slice = built(&[enter("f")]).finish(true);

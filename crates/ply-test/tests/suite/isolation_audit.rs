@@ -1,29 +1,6 @@
-//! An attack on the scheduler's claim under ADR 0017 §6: that a test's
-//! allocations live in a region closed when the test ends, so tests still
-//! cannot observe each other's allocations — while a region *label* two tests
-//! both write is one piece of state and colours them apart.
-//!
-//! The claim converts a correctness property into a scheduling decision, so if
-//! it is wrong it is wrong in the worst available way — two tests run at once,
-//! one of them fails on Tuesday, and the cache remembers the pass. Four things
-//! have to hold for it, and each gets an attack here:
-//!
-//! 1. Only real region state can produce a `cell` atom, and only the builtin
-//!    `sim` can claim the one exemption that is left, so neither can be spoofed
-//!    by naming an effect after it.
-//! 2. Two tests naming one label are coloured apart, and two tests naming
-//!    different labels are not — the cost is the collisions, never the
-//!    population.
-//! 3. Tests the colouring puts in one group really cannot see each other — run
-//!    concurrently, on real threads, with every one of them writing the cell
-//!    that every other one also allocated at the same id.
-//! 4. The group's fixture is built once and mutated in place, the test's own
-//!    region closes on top of it, and a verdict does not move between one
-//!    worker and eight.
-//!
-//! Everything here goes through real inference: a footprint that was injected by
-//! the test proves the colouring and nothing about whether that footprint was
-//! reachable.
+//! An attack on the scheduler's claim under ADR 0017 §6: that a test's allocations live in a region
+//! closed when the test ends, so tests still cannot observe each other's allocations — while a
+//! region *label* two tests both write is one piece of state and colours them apart.
 
 use ply_core::{CheckOutput, Footprint};
 use ply_eval::{EngineChoice, Plan, TaskRegions, Value};
@@ -38,8 +15,6 @@ use ply_test::{
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ------------------------------------------------------------------ harness
 
 struct TempRoot(PathBuf);
 
@@ -116,22 +91,8 @@ impl Compiled {
     }
 }
 
-/// Each test allocates its cell at the same id as every other one, reads and
-/// writes it, and checks every value it wrote. If two of them shared a region,
-/// `assert_eq` inside the test is what would say so: the audit is written in
-/// Ply, not in Rust assertions about Ply.
-///
-/// The `cell` atoms reach the footprint through a **declared row** rather than
-/// through a cell smuggled out of its region. ADR 0017 §2 closed every carrier
-/// that used to take one out — a closure carrying it in its effect row was the
-/// last, and `ply-core/tests/suite/region_escape_audit.rs` is where each is pinned —
-/// so a written annotation is now the only way a `cell` atom reaches a published
-/// footprint at all. The call sits *outside* the region on purpose: a region
-/// discharges its own label, so calling it inside would discharge the atoms the
-/// scheduling this file is about depends on.
-///
-/// `label` decides whether the corpus is a clique or an independent set, which
-/// is the difference between what ADR 0017 §6 costs and what it does not.
+/// Each test allocates its cell at the same id as every other one, reads and writes it, and checks
+/// every value it wrote.
 fn contending_source(tests: usize, label: impl Fn(usize) -> String) -> String {
     let mut out = String::new();
     let mut declared: Vec<String> = Vec::new();
@@ -174,12 +135,7 @@ fn a_label_each(i: usize) -> String {
     format!("table{i}")
 }
 
-// --------------------------------------- 1. neither name can be impersonated
-
-/// `is_region_scoped` and `is_ambient` both trust one effect name. The ambient
-/// one is an exemption a program could claim for state the language knows
-/// nothing about, and the region-scoped one is what a report blames a
-/// contention on, so both reservations are load-bearing rather than niceties.
+/// `is_region_scoped` and `is_ambient` both trust one effect name.
 #[test]
 fn a_program_cannot_declare_either_effect_the_scheduler_names() {
     for name in ply_test::REGION_SCOPED.iter().chain(ply_test::AMBIENT) {
@@ -214,9 +170,7 @@ test "claim the name" {{
     }
 }
 
-/// The classification is by exact effect name, so a neighbouring name gains
-/// nothing. Two tests that both write `cells.write[rows]` are two writers of one
-/// resource and must stay in separate groups.
+/// The classification is by exact effect name, so a neighbouring name gains nothing.
 #[test]
 fn an_effect_whose_name_merely_resembles_the_builtin_is_not_region_scoped() {
     let compiled = Compiled::new(
@@ -242,11 +196,9 @@ test "two" { cells.put[rows](2) }
     );
 }
 
-// ------------------------------ 2. the cost is the collisions, not the count
-
-/// ADR 0017 §6's lost case, reached by inference rather than by injection: six
-/// tests whose only atoms name one label are six colours wide, and every one of
-/// them is `shared` on the line `--explain` prints.
+/// ADR 0017 §6's lost case, reached by inference rather than by injection: six tests whose only
+/// atoms name one label are six colours wide, and every one of them is `shared` on the line
+/// `--explain` prints.
 #[test]
 fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
     let compiled = Compiled::new(&contending_source(6, one_label));
@@ -266,10 +218,7 @@ fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
     assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 6);
 }
 
-/// A label nobody else names conflicts with nothing, so losing the fork bought
-/// it nothing to lose. Counting the population that carries a `cell` atom rather
-/// than the collisions between them is the single easiest way to over-state what
-/// ADR 0017 costs.
+/// A label nobody else names conflicts with nothing, so losing the fork bought it nothing to lose.
 #[test]
 fn tests_on_distinct_region_labels_still_share_one_group() {
     let compiled = Compiled::new(&contending_source(16, a_label_each));
@@ -282,9 +231,7 @@ fn tests_on_distinct_region_labels_still_share_one_group() {
     assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 1);
 }
 
-/// The classification subtracts atoms; it never subtracts tests. A footprint
-/// that mixes a region label with a real resource conflicts through both, and it
-/// is not reported as a contention a rename would fix.
+/// The classification subtracts atoms; it never subtracts tests.
 #[test]
 fn a_cell_atom_beside_a_real_one_does_not_launder_the_real_one() {
     let compiled = Compiled::new(
@@ -344,10 +291,8 @@ test "a real read" {
     );
 }
 
-/// The colouring's own invariant, checked against the corpus rather than
-/// asserted about it: no two tests sharing a group conflict at all. Under
-/// ADR 0005 this had an exemption carved out of it; there is nothing left to
-/// carve, which is the whole of what §6 changes here.
+/// The colouring's own invariant, checked against the corpus rather than asserted about it: no two
+/// tests sharing a group conflict at all.
 #[test]
 fn no_pair_in_a_group_conflicts_at_all() {
     let source = format!(
@@ -383,19 +328,8 @@ test "other writer" {{ db.log[audit](1) }}
     }
 }
 
-// ------------------------ 3. tests in a group really cannot see each other
-
-/// The claim, executed: one group, real threads, every test writing the cell
-/// every other test also allocated at `#0`.
-///
-/// What this catches on its own is a shared *value* — two tests reaching one
-/// entry — because each test's first assertion is that its cell still holds the
-/// initial value only it wrote. It does not catch a region that merely grew,
-/// since the next test would then allocate a fresh id and pass anyway; that half
-/// is [`the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else`],
-/// which inspects the arena instead of trusting the program.
-///
-/// Run more than once because interference is a race, and once is a sample.
+/// The claim, executed: one group, real threads, every test writing the cell every other test also
+/// allocated at `#0`.
 #[test]
 fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
@@ -444,18 +378,9 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     }
 }
 
-/// The white-box half, and the strongest statement the audit can make about the
-/// region: after every test in the group, the arena its worker holds contains
-/// exactly one cell — slot index 0, holding that test's own last write. A region
-/// carried from a previous test would hold two, and one shared with a concurrent
-/// test would hold somebody else's number.
-///
-/// The slot's *generation* is deliberately not compared. It rises each time the
-/// worker reuses the index for a new entry point — which is what makes a
-/// `Value::Cell` from the last test read `None` rather than this test's cell —
-/// so it counts how many tests that worker has run and therefore moves with
-/// `--jobs`. [`a_slot_is_never_handed_to_two_tests_under_one_identity`] is where
-/// it is pinned as the property it is.
+/// The white-box half, and the strongest statement the audit can make about the region: after every
+/// test in the group, the arena its worker holds contains exactly one cell — slot index 0, holding
+/// that test's own last write.
 #[test]
 fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     const TESTS: usize = 24;
@@ -499,9 +424,9 @@ fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     );
 }
 
-/// Wraps the real executor to look at each worker's arena the moment its test
-/// finishes — the only place from which one test's leftovers would be visible —
-/// and at the group's region, which is what must not have grown.
+/// Wraps the real executor to look at each worker's arena the moment its test finishes — the only
+/// place from which one test's leftovers would be visible — and at the group's region, which is
+/// what must not have grown.
 struct Recording<'a> {
     inner: ply_test::InterpExecutor<'a>,
     seen: Mutex<Vec<(usize, Vec<String>, usize)>>,
@@ -517,9 +442,9 @@ impl<'a> ply_test::Executor for Recording<'a> {
     }
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), ply_span::Diagnostic> {
-        // What the test's region reclaimed at its close, because that is where
-        // its cells are: a region hands its slots back at its lexical end and
-        // the arena afterwards holds only the group's fixture.
+        // What the test's region reclaimed at its close, because that is where its cells are: a
+        // region hands its slots back at its lexical end and the arena afterwards holds only the
+        // group's fixture.
         worker.cells_mut().journal();
         let outcome = self.inner.execute(worker, index);
         let cells = worker
@@ -542,15 +467,9 @@ impl<'a> ply_test::Executor for Recording<'a> {
     }
 }
 
-// ------------------------------------- 4. the fixture, and the job count
-
-/// The mechanism that makes a closed region unreadable rather than merely
-/// forgotten, on the real runner: one worker, so every test reuses slot index 0,
-/// and the generation at that index must rise every time.
-///
-/// A generation that repeated would hand two tests one slot identity, and a
-/// `Value::Cell` that outlived its test — the shape ADR 0005 §2 made a cell a
-/// key to prevent — would read the *next* test's cell instead of nothing.
+/// The mechanism that makes a closed region unreadable rather than merely forgotten, on the real
+/// runner: one worker, so every test reuses slot index 0, and the generation at that index must
+/// rise every time.
 #[test]
 fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     const TESTS: usize = 16;
@@ -595,13 +514,8 @@ fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     );
 }
 
-/// ADR 0017 §6's fixture, at the runner: built once for the group, mutated in
-/// place by every test in it, and the test's own allocations closed on top.
-///
-/// One worker, so the order is the corpus order and "test *k* opened the region
-/// on test *k−1*'s write" is a statement with a witness. The executor is a stub
-/// because the mechanism under test is the region rather than the evaluator —
-/// there is no source-level fixture to write this in Ply with.
+/// ADR 0017 §6's fixture, at the runner: built once for the group, mutated in place by every test
+/// in it, and the test's own allocations closed on top.
 #[test]
 fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     const TESTS: usize = 12;
@@ -656,9 +570,8 @@ struct Observation {
     fixture_len: usize,
 }
 
-/// A worker whose "test" reads the fixture, writes it, and allocates a cell of
-/// its own — the three things a real test does to a region, with nothing else in
-/// the way.
+/// A worker whose "test" reads the fixture, writes it, and allocates a cell of its own — the three
+/// things a real test does to a region, with nothing else in the way.
 #[derive(Default)]
 struct FixtureProbe {
     built: AtomicUsize,
@@ -703,18 +616,8 @@ impl ply_test::Executor for FixtureProbe {
     }
 }
 
-/// The same fixture at eight workers, which is where "built once per group" is
-/// not what the runner does and saying so would over-claim.
-///
-/// A region stack holds `Rc` and cannot cross a thread, so a group is served by
-/// one region **per worker**: *w* builds, not one, and the write chain restarts
-/// on each. The invariant that survives — and the only one the design needs — is
-/// that every worker's first test opens on the seed and no test ever opens on a
-/// value nothing wrote, with the region never growing by a test's own cells.
-///
-/// ADR 0008 §6's trap is a count that stops being true and is still printed;
-/// this is the same trap one level down, in a property a reader would otherwise
-/// assume from the word "group".
+/// The same fixture at eight workers, which is where "built once per group" is not what the runner
+/// does and saying so would over-claim.
 #[test]
 fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     const TESTS: usize = 24;
@@ -765,14 +668,9 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     );
 }
 
-/// W4's and W5's shared-state defects surfaced as a verdict that moved with the
-/// job count, so that is what the region model is checked against: one worker
-/// and eight, over a corpus that has colliding labels, disjoint labels and pure
-/// tests all at once.
-///
-/// The schedule is not what is being compared — a colouring is a pure function
-/// of the footprints and cannot move — but the verdicts under it, which is what
-/// a shared fixture or a region that failed to close would change.
+/// W4's and W5's shared-state defects surfaced as a verdict that moved with the job count, so that
+/// is what the region model is checked against: one worker and eight, over a corpus that has
+/// colliding labels, disjoint labels and pure tests all at once.
 #[test]
 fn verdicts_do_not_move_between_one_worker_and_eight() {
     let source = format!(
@@ -843,9 +741,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
     );
 }
 
-/// A region-isolated test may not create a group, for any corpus size. This is
-/// the number a project watches: adding isolated tests is free, and the group
-/// count is decided by the tests that contend alone.
+/// A region-isolated test may not create a group, for any corpus size.
 #[test]
 fn adding_isolated_tests_never_adds_a_group() {
     let shared = r#"

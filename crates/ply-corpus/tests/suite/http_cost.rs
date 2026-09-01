@@ -1,22 +1,4 @@
 //! What one head costs `std.http.parse_head`, and what the cost is a function of.
-//!
-//! ADR 0013 §4 states the hazard plainly: W2 removed the property that a
-//! request's cost is proportional to its bytes, and a parser that re-scans its
-//! buffer, or that folds over the whole head per field, restores it quietly.
-//! This is the harness that would notice.
-//!
-//! **Two sweeps, because there are two questions and one number cannot answer
-//! both.** Growing a head by lengthening the *value* of one field gives the
-//! parser no more fields to parse, so the time must be flat — that is the W2
-//! property, and it is the one that would break if a scan started at zero on
-//! every read or if a field's value were folded over per byte. Growing a head by
-//! adding *fields* gives the parser more to do, so the time must rise, and it
-//! must rise linearly rather than quadratically — a parser whose per-field work
-//! crossed the whole buffer would be O(fields²) and is the shape this catches.
-//!
-//! The numbers are asserted as *ratios*, never as absolute microseconds: a
-//! threshold in microseconds is a test that fails on a loaded CI machine and
-//! teaches people to ignore it.
 
 use ply_core::CheckOutput;
 use ply_eval::{Machine, Value};
@@ -25,8 +7,8 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::time::{Duration, Instant};
 
-/// The caller `parse_head` is measured through: one call, one `Bytes` argument,
-/// and an answer small enough that building it is not what is being timed.
+/// The caller `parse_head` is measured through: one call, one `Bytes` argument, and an answer small
+/// enough that building it is not what is being timed.
 const BENCH: &str = "
 import std.http (parse_head, default_limits, Parsed, Refused, Incomplete)
 
@@ -84,9 +66,9 @@ impl Bench {
         }
     }
 
-    /// The best of a few runs rather than the mean: the fastest run is the one
-    /// with the least interference from everything else on the machine, and a
-    /// mean over a noisy box measures the box.
+    /// The best of a few runs rather than the mean: the fastest run is the one with the least
+    /// interference from everything else on the machine, and a mean over a noisy box measures the
+    /// box.
     fn cost(&self, head: &[u8], calls: u32) -> Duration {
         let mut best: Option<Duration> = None;
         for _ in 0..5 {
@@ -115,8 +97,7 @@ impl Bench {
     }
 }
 
-/// One field whose value is `pad` bytes long. The parser sees the same number of
-/// fields whatever `pad` is, so this is head length with no extra work in it.
+/// One field whose value is `pad` bytes long.
 fn long_value(pad: usize) -> Vec<u8> {
     let mut head = b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Pad: ".to_vec();
     head.extend(std::iter::repeat_n(b'a', pad));
@@ -124,8 +105,7 @@ fn long_value(pad: usize) -> Vec<u8> {
     head
 }
 
-/// `fields` filler fields, each short. This is the axis the cost is allowed to
-/// be proportional to.
+/// `fields` filler fields, each short.
 fn many_fields(fields: usize) -> Vec<u8> {
     let mut head = b"GET /hello HTTP/1.1\r\nHost: x\r\n".to_vec();
     for i in 0..fields {
@@ -135,9 +115,7 @@ fn many_fields(fields: usize) -> Vec<u8> {
     head
 }
 
-/// The W2 property, re-run against the module that replaced the endpoint's
-/// hand-written parser. 8 KB of field the parser never reads must cost what 0
-/// bytes of it cost, to within the noise of an unoptimized interpreter.
+/// The W2 property, re-run against the module that replaced the endpoint's hand-written parser.
 #[test]
 #[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
@@ -153,16 +131,16 @@ fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
         println!("  {:>8}  {:>10.2}  {:>8.2}", head.len(), per, per / base);
         worst = worst.max(per / base);
     }
-    // A parser that scanned the buffer per field, or re-scanned from zero, would
-    // be tens of times this. The bound is loose because the claim is the shape.
+    // A parser that scanned the buffer per field, or re-scanned from zero, would be tens of times
+    // this.
     assert!(
         worst < 3.0,
         "8 KB of unread field cost {worst:.2}x what none did; the cost has become a function of bytes"
     );
 }
 
-/// The other axis, and the one a smuggling-safe parser is allowed to pay for:
-/// cost rises with the number of fields, and rises *linearly*.
+/// The other axis, and the one a smuggling-safe parser is allowed to pay for: cost rises with the
+/// number of fields, and rises *linearly*.
 #[test]
 #[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_linear_in_the_number_of_fields() {
@@ -195,11 +173,8 @@ fn the_cost_of_a_head_is_linear_in_the_number_of_fields() {
     );
 }
 
-// ------------------------------------------------- a whole request, end to end
-
-/// The service the end-to-end rung serves: `std.http`'s loop, a handler that
-/// touches the request, and nothing else. Comparable to `ply-corpus serve`'s
-/// `host-sim` rung, which is the same shape over the W2 example's parser.
+/// The service the end-to-end rung serves: `std.http`'s loop, a handler that touches the request,
+/// and nothing else.
 const SERVICE: &str = r#"
 import std.net (net)
 import std.http (Request, Response, serve_connection, text_response, default_limits, method_name)
@@ -222,10 +197,8 @@ fn accept_loop(l: Int, count: Int) -> Int / {net.write[listener], net.write[conn
   }
 "#;
 
-/// One request per connection, answered over the simulated network — every layer
-/// of `std.http` and the host boundary, and no syscall. What this measures that
-/// the sweeps above do not is the whole path: the head parse, the framing
-/// decision, the (empty) body read, the response encode and the write.
+/// One request per connection, answered over the simulated network — every layer of `std.http` and
+/// the host boundary, and no syscall.
 #[test]
 #[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn a_whole_request_through_the_host_boundary() {

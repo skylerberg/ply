@@ -1,39 +1,4 @@
 //! Reading a slot after its region reclaimed it.
-//!
-//! Before R2 a region's memory was never actually handed back, so an escape the
-//! checks missed was harmless: the cell was still there. R2 makes the close a
-//! real free, and the same escape becomes this language's first use-after-free.
-//! Every program in this file is written to *produce* one, and the assertion is
-//! what happened instead.
-//!
-//! Three answers are acceptable and one is not. A route may be **refused
-//! statically** — the brand, over the resolved type. It may be **retained** — a
-//! continuation or a task that can still reach the slots holds a
-//! [`ply_eval::arena::Pin`] and the close defers. It may be **diagnosed** — the
-//! generation in a [`Slot`] makes a reclaimed position fail to resolve, so a
-//! stale access is a diagnostic rather than an answer. A **stale read that
-//! returns a value** is the one outcome that is a defect, and it is what the
-//! control programs here exist to make possible: an attack is paired with the
-//! same shape minus the thing that saves it, so "the slot was not reused" is a
-//! measurement rather than a coincidence.
-//!
-//! Where the attacks are aimed:
-//!
-//! 1. every carrier a value can leave a region through, including the two the
-//!    brief names that no other file walks — a `Map` key and a `Map` value —
-//!    and the type-alias round trip that is W2's hole restated;
-//! 2. the one escape ADR 0017 §2 *permits* — a cell reaching a task — pushed
-//!    past the point the ADR argues from, to a task that outlives the region's
-//!    lexical close, sleeps across it, and spawns a child after it;
-//! 3. the one capture that deliberately takes no pin, a tail-resumptive clause,
-//!    with a region open across it;
-//! 4. §2's documented open route, with a second region positioned to take the
-//!    freed slot;
-//! 5. the inference, on shapes `region_reclamation_audit` does not walk — and
-//!    the reason a wrong answer from it is survivable, stated as a property of
-//!    [`Arena::close`] rather than as a hope;
-//! 6. the generation counter, whose wrap is the one way a stale read comes back
-//!    as a value.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
@@ -42,10 +7,7 @@ use ply_span::{Diagnostic, SourceId, Span, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 
-// ------------------------------------------------------------------ harness
-
-/// The tree-walker's refusal of a construct only the machine has. Not a
-/// disagreement about the program, so it is not compared against.
+/// The tree-walker's refusal of a construct only the machine has.
 const MACHINE_ONLY: &str = "E0504";
 
 struct Compiled {
@@ -90,10 +52,6 @@ impl Compiled {
     }
 
     /// The machine's answer and the arena it left behind.
-    ///
-    /// The tree-walker runs the same program wherever it can — it refuses every
-    /// clause that binds a continuation and every `simulate`, which is most of
-    /// this file — and its answer is compared whenever it has one.
     #[track_caller]
     fn run(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
         let mut machine = self.machine();
@@ -146,13 +104,7 @@ fn codes_of(diags: &[Diagnostic]) -> Vec<&str> {
     diags.iter().map(|d| d.code).collect()
 }
 
-// ------------------------- 1. the carriers a value can leave a region through
-
-/// ADR 0017 §2's list, walked to the end. `region_isolation_audit` covers the
-/// list element and the record field; a `Map` key and a `Map` value are the two
-/// the brief names that nothing walked, and the key is the sharper of them — a
-/// key is compared, so a dangling one would decide an ordering rather than only
-/// be read back.
+/// ADR 0017 §2's list, walked to the end.
 #[test]
 fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     let carriers: &[(&str, &str)] = &[
@@ -194,17 +146,8 @@ fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     }
 }
 
-/// W2's hole was a check that ran *before* alias resolution, and ADR 0017's
-/// Consequences name it as the way an escape gets past the brand. Three halves
-/// together say that it does not, and the first two are the ones that would both
-/// pass under a check that expanded no aliases:
-///
-/// - a cell passes through a definition whose parameter is written as an alias
-///   for `Cell<Int>` and comes back, and the read *inside* the region is right;
-/// - the same value handed out of the region is refused, so the alias did not
-///   erase the brand on the way through;
-/// - and the definition it passed through cannot dereference it, which is what
-///   keeps an escaped cell unreadable rather than merely unreachable.
+/// W2's hole was a check that ran *before* alias resolution, and ADR 0017's Consequences name it as
+/// the way an escape gets past the brand.
 #[test]
 fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
     const ALIAS: &str = "type Held = Cell<Int>\nfn keep(c: Held) -> Held = c\n";
@@ -233,9 +176,8 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
     );
 }
 
-/// A `law` body opens regions like any other body, so `check_regions` has to
-/// have filed a site for it. `region_escape_audit` pins the `test` form; a law is
-/// the other labelled item, and the one nothing enumerates as a definition.
+/// A `law` body opens regions like any other body, so `check_regions` has to have filed a site for
+/// it.
 #[test]
 fn a_region_in_a_law_body_reports_its_escape() {
     let diags = Compiled::refused(
@@ -248,22 +190,7 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
-// --------------------------------------- 2. the escape ADR 0017 §2 permits
-
-/// The route the ADR deliberately leaves open, taken past the argument that
-/// opens it.
-///
-/// §2 excludes `task.spawn` from a bare `with_cell`'s rule and §3 justifies the
-/// exclusion with "a `shared` region's slots outlive its close". Under R2 they
-/// outlive it only while something holds a pin, so the shape that tests the claim
-/// is not the landed one — where the task is joined inside the region — but this
-/// one: the task handle leaves the region, the region's `}` is reached with the
-/// task never having run, and a *second* region then opens over the position the
-/// first would otherwise have handed back.
-///
-/// The control is the same program with the task removed, and it is what makes
-/// this an attack rather than an illustration: there the two cells share one
-/// slot, so 999 is what a missing pin would have answered.
+/// The route the ADR deliberately leaves open, taken past the argument that opens it.
 #[test]
 fn a_task_outliving_its_regions_close_reads_that_region_and_not_the_one_after_it() {
     let attack = Compiled::new(
@@ -302,8 +229,8 @@ pub fn control() -> Int = simulate {
     );
 }
 
-/// The same route with the task asleep across the close, so that it is live and
-/// unfinished when the second region opens rather than merely unscheduled.
+/// The same route with the task asleep across the close, so that it is live and unfinished when the
+/// second region opens rather than merely unscheduled.
 #[test]
 fn a_task_asleep_across_its_regions_close_still_reads_it() {
     let compiled = Compiled::new(
@@ -323,13 +250,9 @@ pub fn attack() -> Int = simulate {
     );
 }
 
-/// A task spawned **after** the region closed, which is where the pin discipline
-/// runs out: `TaskRegions::pin` answers `None` when no program region is open, so
-/// the grandchild's own `spawn` claims nothing at all. What holds `s` is the pin
-/// its *parent* took, and the parent has already finished — so this reads the
-/// right value only because a scheduler never reaps a finished task's record.
-/// That is load-bearing rather than incidental, and a change that dropped a
-/// finished task's state would turn this program into a stale read.
+/// A task spawned **after** the region closed, which is where the pin discipline runs out:
+/// `TaskRegions::pin` answers `None` when no program region is open, so the grandchild's own
+/// `spawn` claims nothing at all.
 #[test]
 fn a_grandchild_task_spawned_after_the_close_still_reads_the_region() {
     let compiled = Compiled::new(
@@ -351,10 +274,9 @@ pub fn attack() -> Int = simulate {
     );
 }
 
-/// The asymmetry that pays for the three above, and the reason it is a decision
-/// rather than an oversight: `with_region` is new syntax with no program
-/// depending on the loose rule, so the identical escape is a compile error that
-/// names the task.
+/// The asymmetry that pays for the three above, and the reason it is a decision rather than an
+/// oversight: `with_region` is new syntax with no program depending on the loose rule, so the
+/// identical escape is a compile error that names the task.
 #[test]
 fn the_same_escape_out_of_a_with_region_is_refused_statically() {
     let diags = Compiled::refused(
@@ -376,20 +298,9 @@ pub fn attack() -> Int = simulate {
     );
 }
 
-// ------------------------------ 3. the capture that deliberately takes no pin
-
-/// `handler::perform` takes no pin for a tail-resumptive clause, on the argument
-/// that the only thing which will ever splice that continuation is the
-/// `Frame::Resume` pushed for it, above the `CloseRegion` frames of every region
-/// open at the capture.
-///
-/// The shape that tests the argument rather than restating it: the
-/// tail-resumptive clause's own body performs, and the handler answering *that*
-/// is multi-shot and outside everything. The tail continuation is therefore
-/// inside a continuation resumed twice, and it carries `r`'s `CloseRegion` frame
-/// — so `r` closes during the first resumption and is read during the second.
-/// What the answer pins is that the capture one level up took the pin the
-/// tail-resumptive one did not.
+/// `handler::perform` takes no pin for a tail-resumptive clause, on the argument that the only
+/// thing which will ever splice that continuation is the `Frame::Resume` pushed for it, above the
+/// `CloseRegion` frames of every region open at the capture.
 #[test]
 fn a_tail_resumptive_continuation_crossing_a_region_is_covered_from_above() {
     let compiled = Compiled::new(
@@ -405,9 +316,7 @@ pub fn attack() -> Int =
   } with { f.g() resume k -> k(1) + k(2) }
 "#,
     );
-    // (1 + 7) + (2 + 7). The second resumption re-enters a region that closed
-    // during the first, and reads 7 rather than nothing and rather than whatever
-    // a later region put at that position.
+    // (1 + 7) + (2 + 7).
     let stats = answers(&compiled, "m.attack", 17);
     assert_eq!(
         stats.pins_taken, 1,
@@ -416,12 +325,8 @@ pub fn attack() -> Int =
     assert_eq!(stats.closes_deferred, 1);
 }
 
-/// The other half of the pin's shape: it claims every region open at the capture
-/// and **none opened afterwards**, which is what keeps a region opened inside a
-/// handler clause cheap. So a region opened inside a clause body is covered by
-/// nothing the outer capture took, and must be covered by a capture taken inside
-/// it — which is what this program arranges by performing again from within the
-/// new region and resuming that twice.
+/// The other half of the pin's shape: it claims every region open at the capture and **none opened
+/// afterwards**, which is what keeps a region opened inside a handler clause cheap.
 #[test]
 fn a_region_opened_inside_a_clause_body_is_covered_by_the_capture_inside_it() {
     let compiled = Compiled::new(
@@ -437,23 +342,15 @@ pub fn attack() -> Int =
   } with { f.g() resume j -> j(1) + j(2) }
 "#,
     );
-    // (5 + 1) + (5 + 2). `inner` closes when the first resumption leaves it, and
-    // the second reads it after that.
+    // (5 + 1) + (5 + 2).
     let stats = answers(&compiled, "m.attack", 13);
     assert_eq!(stats.closes_deferred, 1);
     assert_eq!(stats.slots_reclaimed_late, 1);
 }
 
-// -------------------------------------------- 4. the documented open route
-
-/// ADR 0017 §2's one open route — a continuation parked in an enclosing region's
-/// cell, where a nominal constructor's field type erases the brand — with a
-/// second region placed where the freed slot would be.
-///
-/// `region_isolation_audit` asks whether the resumption reads *this run's* cell.
-/// This asks the question reclamation added: whether it reads the cell of the
-/// region it was captured in, or the one that opened over that position
-/// afterwards. The two answers are 0 and 999.
+/// ADR 0017 §2's one open route — a continuation parked in an enclosing region's cell, where a
+/// nominal constructor's field type erases the brand — with a second region placed where the freed
+/// slot would be.
 #[test]
 fn a_parked_continuation_reads_its_own_region_and_not_the_one_that_replaced_it() {
     let compiled = Compiled::new(
@@ -477,13 +374,7 @@ pub fn attack() -> Int =
     answers(&compiled, "m.attack", 0);
 }
 
-// --------------------------------------------------------- 5. the inference
-
-/// The shapes `region_reclamation_audit` does not walk. A capture reachable
-/// through two definitions, through a callback builtin the analysis cannot name,
-/// through a definition that spawns rather than performs, and through a value
-/// applied out of a binding — each of them a region whose own body writes no
-/// `handle`, no `perform` and no `simulate`.
+/// The shapes `region_reclamation_audit` does not walk.
 #[test]
 fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
@@ -524,8 +415,7 @@ fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
     }
 }
 
-/// The capture is in another module, so a whole-program call graph is what has to
-/// find it. A per-module analysis would call `r` unique.
+/// The capture is in another module, so a whole-program call graph is what has to find it.
 #[test]
 fn a_capture_installed_in_another_module_still_makes_the_region_shared() {
     let compiled = Compiled::modules(&[
@@ -545,15 +435,8 @@ pub fn attack() -> Int = handle { a::body() } with { a::e.op() resume k -> k(1) 
     answers(&compiled, "b.attack", 17);
 }
 
-/// Why a wrong answer from the inference is survivable, stated as a property of
-/// the allocator rather than as a hope: [`Arena::close`] never reads the region's
-/// kind. What it reads is whether a live pin covers the region, so the four
-/// combinations of kind and pin collapse to two answers decided entirely by the
-/// pin.
-///
-/// This is what makes `region_kind` a report rather than a memory-safety
-/// component, and it is what a future precision improvement there must not
-/// quietly trade away.
+/// Why a wrong answer from the inference is survivable, stated as a property of the allocator
+/// rather than as a hope: [`Arena::close`] never reads the region's kind.
 #[test]
 fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
@@ -587,20 +470,8 @@ fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
     }
 }
 
-// ------------------------------------------------------------ 6. generations
-
-/// The generation is what turns a stale read into a diagnostic instead of a wrong
-/// value, so the one way a wrong value comes back is the counter coming back
-/// around. This states the bound rather than assuming it: a position's generation
-/// is exactly the number of invalidating truncations that covered it, it never
-/// falls, and the identity it carries today is one no earlier slot at that
-/// position held.
-///
-/// The wrap is `u32::MAX + 1` closes over one position within one arena's life,
-/// and an arena lives for one task of one machine. No program in this repository
-/// comes near it — `region_reclamation_census` counts 709 closes over the whole
-/// corpus — but it is a `wrapping_add`, so the bound is written down here rather
-/// than left to be rediscovered.
+/// The generation is what turns a stale read into a diagnostic instead of a wrong value, so the one
+/// way a wrong value comes back is the counter coming back around.
 #[test]
 fn a_positions_generation_only_rises_and_never_hands_back_an_identity() {
     const ROUNDS: u32 = 2_000;

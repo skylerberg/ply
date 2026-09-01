@@ -1,13 +1,4 @@
-//! The byte builtins on real source, through parse, resolve, check and both
-//! engines.
-//!
-//! Unit tests in `ply-eval` drive `builtins::call` directly, which is where the
-//! edge cases belong. This is the other half: the same builtins reached the way
-//! a program reaches them, with `Option` coming from the prelude and the two
-//! engines run against each other — `--engine both` on a corpus using every new
-//! builtin is what ADR 0012's required test 40 asks for, and a `bytes_position`
-//! whose frame the machine handled differently from the tree-walker's host loop
-//! would be caught here rather than in a user's cache.
+//! The byte builtins on real source, through parse, resolve, check and both engines.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Interp, Machine};
@@ -142,10 +133,8 @@ test "a position predicate may perform, and the search still exits early" {
     );
 }
 
-/// The claim the milestone rests on, checked rather than asserted: the native
-/// searches answer what W1's folds answered. The folds are kept here verbatim
-/// so the comparison is against the code that was replaced, not against a
-/// paraphrase of it.
+/// The claim the milestone rests on, checked rather than asserted: the native searches answer what
+/// W1's folds answered.
 #[test]
 fn the_builtins_agree_with_the_folds_they_replaced() {
     run_both(
@@ -221,9 +210,7 @@ test "the native searches answer what the folds answered" {
     );
 }
 
-/// Out of range is refused rather than clamped, following `bytes_slice`. A
-/// clamp turns an off-by-one into a shorter answer that every later assertion
-/// agrees with, which is the silent-wrong-answer shape this project refuses.
+/// Out of range is refused rather than clamped, following `bytes_slice`.
 #[test]
 fn a_position_outside_the_buffer_is_a_diagnostic_under_both_engines() {
     let source = r#"

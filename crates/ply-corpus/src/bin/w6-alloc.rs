@@ -1,13 +1,4 @@
 //! What one served request allocates, counted rather than timed.
-//!
-//! Its own binary because a `#[global_allocator]` is a whole-binary decision: a
-//! counter on every allocation in `ply-corpus` would perturb every number the
-//! ladder takes. `ply-corpus w6-ladder` runs this the way it runs `ply`, and
-//! folds the count into the report — so the published figure is produced by the
-//! command a reader is told to re-run rather than written in by hand.
-//!
-//! An allocation count does not move with a machine, which is what makes it the
-//! staleness guard that cannot be blamed on load.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -1,8 +1,7 @@
-//! Registration is the one part of the boundary that can be got wrong before a
-//! single Ply expression evaluates, and every failure here is silent if it is
-//! not loud: a handler bound to nothing serves nothing, two handlers bound to
-//! one atom serve whichever, and a nondeterministic handler under a `det`
-//! declaration turns a flakiness guarantee off without saying so.
+//! Registration is the one part of the boundary that can be got wrong before a single Ply
+//! expression evaluates, and every failure here is silent if it is not loud: a handler bound to
+//! nothing serves nothing, two handlers bound to one atom serve whichever, and a nondeterministic
+//! handler under a `det` declaration turns a flakiness guarantee off without saying so.
 
 use super::*;
 use ply_span::SourceId;
@@ -24,8 +23,8 @@ fn check(source: &str) -> CheckOutput {
     ply_core::check_module(&module).expect("the fixture typechecks")
 }
 
-/// The same, inside a named module, so every effect the source declares is
-/// program-wide `<module>.<name>` as a real load produces it.
+/// The same, inside a named module, so every effect the source declares is program-wide
+/// `<module>.<name>` as a real load produces it.
 fn qualified(module: &str, source: &str) -> CheckOutput {
     let mut program =
         ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted(module), source)])
@@ -59,9 +58,8 @@ fn registry(ops: Vec<HostOp>) -> HostRegistry {
     registry
 }
 
-/// Every fixture below is a program that performs `db.get[users]` and
-/// `db.put[orders]`, so `Any` has two labels to expand over and `Only` has one
-/// atom that exists and several that do not.
+/// Every fixture below is a program that performs `db.get[users]` and `db.put[orders]`, so `Any`
+/// has two labels to expand over and `Only` has one atom that exists and several that do not.
 const DB: &str = r#"
 nondet effect db {
   read  get[r](key: Int) -> Int
@@ -98,8 +96,8 @@ fn hermetic_is_not_bound_and_serves_nothing() {
     )));
 }
 
-/// The whole reason a hermetic binding keeps its registry: `E0424` has to be
-/// able to say what would have served the operation.
+/// The whole reason a hermetic binding keeps its registry: `E0424` has to be able to say what would
+/// have served the operation.
 #[test]
 fn hermetic_still_names_the_handler_that_would_serve() {
     let binding = HostBinding::hermetic_with(registry(vec![op("db", "get", HostResource::Any)]));
@@ -143,8 +141,7 @@ fn an_unknown_operation_is_e0421_and_lists_the_declared_ones() {
     );
 }
 
-/// A resource label the program never performs is a rename the Rust side did not
-/// follow. `Any` resolving to nothing is a different thing entirely.
+/// A resource label the program never performs is a rename the Rust side did not follow.
 #[test]
 fn an_unperformed_resource_is_e0421_but_an_idle_any_is_not() {
     let diagnostics = registry(vec![op("db", "get", named("customers"))])
@@ -199,8 +196,8 @@ fn two_handlers_claiming_one_atom_is_e0422_naming_both() {
     );
 }
 
-/// The arrow points from the declaration to the handler and never the other
-/// way: a binding may not change what inference computed.
+/// The arrow points from the declaration to the handler and never the other way: a binding may not
+/// change what inference computed.
 #[test]
 fn a_nondet_handler_for_a_det_effect_is_e0423() {
     let source = r#"
@@ -224,8 +221,8 @@ fn lookup(k: Int) -> Int / {store.read[rows]} = store.get[rows](k)
         .expect("a deterministic handler may serve an effect declared without `nondet`");
 }
 
-/// The listing is one row per atom, never one per registration: an `Any` handler
-/// must not hide a resource behind a `*`.
+/// The listing is one row per atom, never one per registration: an `Any` handler must not hide a
+/// resource behind a `*`.
 #[test]
 fn any_expands_to_the_labels_the_program_uses() {
     let binding = registry(vec![
@@ -246,8 +243,8 @@ fn any_expands_to_the_labels_the_program_uses() {
     assert!(!atoms.iter().any(|a| a.contains('*')));
 }
 
-/// A read registration must not pick up a write atom of the same effect, or a
-/// reader would be declared to serve a writer's resource.
+/// A read registration must not pick up a write atom of the same effect, or a reader would be
+/// declared to serve a writer's resource.
 #[test]
 fn any_does_not_cross_modes() {
     let binding = registry(vec![op("db", "get", HostResource::Any)])
@@ -302,9 +299,8 @@ fn the_footprint_is_exactly_what_resolve_answers() {
     );
 }
 
-/// An [`EffectAtom`] carries no operation, so two operations of one effect at
-/// one mode and resource are one atom and two rows. Keying the registry by the
-/// atom would report these as a conflict.
+/// An [`EffectAtom`] carries no operation, so two operations of one effect at one mode and resource
+/// are one atom and two rows.
 #[test]
 fn two_operations_sharing_one_atom_are_not_a_conflict() {
     let source = r#"
@@ -354,8 +350,8 @@ fn reaches_is_footprint_intersection() {
     assert!(!binding.reaches(&Footprint::empty()));
 }
 
-/// The digest is what CI diffs, so every column has to move it — a handler that
-/// quietly became repeatable is exactly the change worth a reviewer's attention.
+/// The digest is what CI diffs, so every column has to move it — a handler that quietly became
+/// repeatable is exactly the change worth a reviewer's attention.
 #[test]
 fn the_digest_covers_every_column() {
     let base = registry(vec![op("db", "get", HostResource::Any)])
@@ -391,9 +387,7 @@ fn the_digest_covers_every_column() {
     assert_ne!(baseline, moved, "the handler path alone moves the digest");
 }
 
-/// Registration order is not content. A listing that diffed on it would report a
-/// change for a reordering that changed nothing, and reviewers would learn to
-/// ignore the diff.
+/// Registration order is not content.
 #[test]
 fn the_digest_is_stable_under_registration_order() {
     let forward = registry(vec![
@@ -428,8 +422,8 @@ fn a_row_carries_the_declaration_it_was_checked_against() {
     assert_eq!(row.linearity, Linearity::AtMostOnce);
 }
 
-/// Several mistakes in one registry are reported together: a host author fixing
-/// them one run at a time is a host author who stops running the check.
+/// Several mistakes in one registry are reported together: a host author fixing them one run at a
+/// time is a host author who stops running the check.
 #[test]
 fn every_registration_failure_is_reported_at_once() {
     let mut unknown_effect = op("dbx", "get", named("users"));
@@ -442,8 +436,8 @@ fn every_registration_failure_is_reported_at_once() {
     assert_eq!(diagnostics.len(), 2);
 }
 
-/// The listing is the trusted computing base, and a member it cannot name is a
-/// member review cannot reach.
+/// The listing is the trusted computing base, and a member it cannot name is a member review cannot
+/// reach.
 #[test]
 fn a_registration_with_no_rust_path_is_e0421() {
     let mut anonymous = op("db", "get", named("users"));
@@ -454,16 +448,8 @@ fn a_registration_with_no_rust_path_is_e0421() {
     assert_eq!(codes_of(&diagnostics), [codes::HOST_OPERATION_UNKNOWN]);
 }
 
-/// A registration names the effect as its declaration writes it, and the row it
-/// resolves to carries the *program-wide* name.
-///
-/// Both halves matter and neither is optional. The registration side is fixed at
-/// compile time in `ply-host` and cannot know the consumer's module, so a
-/// registry keyed on `store.db` could not be written down at all. The row side
-/// is what the machine looks up and what `ply hosts` prints beside the operation,
-/// and an atom that was not program-wide would be a different atom from the one
-/// the program's own footprints carry — the scheduler would then see two
-/// resources where there is one.
+/// A registration names the effect as its declaration writes it, and the row it resolves to carries
+/// the *program-wide* name.
 #[test]
 fn a_registration_names_the_declared_effect_and_resolves_to_the_program_wide_one() {
     let check = qualified(
@@ -491,14 +477,9 @@ fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
     );
 }
 
-/// The one exception, and the reason it is safe: a declaration that ships with
-/// the compiler has a module fixed at compile time, so `ply_host::tcp` can name
-/// `std.net.net` exactly rather than matching whatever a program happens to
-/// spell `net`.
-///
-/// That is what stops a copied declaration from silently acquiring a real
-/// socket. The consumer's own `effect net` is a different capability, and it
-/// binds to nothing.
+/// The one exception, and the reason it is safe: a declaration that ships with the compiler has a
+/// module fixed at compile time, so `ply_host::tcp` can name `std.net.net` exactly rather than
+/// matching whatever a program happens to spell `net`.
 #[test]
 fn a_registration_may_spell_a_program_wide_name_under_the_reserved_root() {
     const DECL: &str = r#"
@@ -518,9 +499,7 @@ pub fn out(x: Int) -> Int / {net.write[socket]} = net.send[socket](x)
     assert_eq!(rows[0].effect.as_str(), "std.net.net");
     assert_eq!(rows[0].atom.effect.as_str(), "std.net.net");
 
-    // The same text in a project module is a different capability. `Any` over an
-    // effect nothing declares is idle rather than wrong, so the honest evidence
-    // is that it resolves to no row at all.
+    // The same text in a project module is a different capability.
     let copied = qualified("app", DECL);
     let binding = registry(vec![op("std.net.net", "send", HostResource::Any)])
         .bind(&copied)
@@ -538,9 +517,8 @@ pub fn out(x: Int) -> Int / {net.write[socket]} = net.send[socket](x)
     assert_eq!(codes_of(&diagnostics), [codes::HOST_OPERATION_UNKNOWN]);
 }
 
-/// Registering the program-wide name is the mistake the asymmetry above invites,
-/// and it has to be loud: `store.db` is not what any declaration writes, so it
-/// resolves to nothing.
+/// Registering the program-wide name is the mistake the asymmetry above invites, and it has to be
+/// loud: `store.db` is not what any declaration writes, so it resolves to nothing.
 #[test]
 fn a_registration_spelling_the_program_wide_name_is_e0421() {
     let check = qualified(
@@ -566,12 +544,6 @@ fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
 }
 
 /// The price of resolving by the declared name, paid where it is visible.
-///
-/// Two modules declaring `db` are two nominally different effects that share a
-/// spelling. Serving both from one registration would put one real resource
-/// behind two capabilities the type system keeps apart, and serving whichever
-/// sorted first would be a coin flip over which resource gets touched — which is
-/// exactly what E0422 exists to refuse.
 #[test]
 fn one_registration_over_two_declarations_of_the_name_is_e0422() {
     let mut program = ply_syntax::parse_program(vec![

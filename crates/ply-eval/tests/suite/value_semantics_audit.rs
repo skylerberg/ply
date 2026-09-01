@@ -1,43 +1,7 @@
 //! An adversarial audit of what a `Value` *means* after ADR 0019 §1 and §2.
-//!
-//! R4 changed how two kinds of `Value` are built: a call's argument vector now
-//! comes off a thread-local free list (`ply_eval::argv`) and a compile-time
-//! constant — a literal, a nullary constructor, a constructor closure — is built
-//! once and cloned (`code.rs`'s `NodeKind::Lit`, `interp::ctor_value`). Neither
-//! is supposed to be observable. Equality, ordering, matching, rendering and
-//! every derived encoding read the representation, so "not observable" is a
-//! claim about six mechanisms at once and a divergence in any of them is silent.
-//!
-//! `literal_value_sharing.rs` and `ctor_value_sharing.rs` own the claim that a
-//! shared value equals a fresh one. This file is what those two do not reach:
-//!
-//! 1. **The paths `--engine both` is structurally blind to.** The differential
-//!    harness refuses a clause that binds a continuation
-//!    (`codes::MACHINE_ONLY_CLAUSE`; `resumption_semantics_audit.rs` states this
-//!    as a finding), so multi-shot resumption is audited by nothing — and
-//!    multi-shot resumption is exactly where one argument vector becomes two.
-//!    And a mention of a constructor is answered from **one memo shared by both
-//!    engines**, so comparing them is not an independent reading of it.
-//! 2. **A credential in an argument vector**, measured through the machine
-//!    rather than at `argv::give`'s seam, at every arity the free list serves
-//!    and one it does not, and after a recursion deep enough to exceed the
-//!    list's bound.
-//! 3. **Rendering paths other than `Value::write`.** `first_difference` walks a
-//!    value structurally to build an assertion's note, and that note is stored
-//!    (`Outcome::Fail { message }`). ADR 0019 §0.1's second row is about exactly
-//!    this shape of path and names `secrets.rs`, which tests the end-to-end
-//!    diagnostic and not this function.
-//! 4. **Equal values that do not render alike.** `Value::cmp` is the `Map`'s
-//!    order and `values_equal` is the language's `==`; the module note on
-//!    [`ply_eval::Map`] rests four guarantees on a value having one canonical
-//!    form. `Decimal` broke it: two spellings of one number are one key and two
-//!    strings, so a map held whichever arrived last. The last section asserts
-//!    the fix — `ply_eval::value::canonical_key`, a key reduced to one
-//!    representative per class on the way in — and each of those tests carries
-//!    what it used to assert.
 
-// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not
-// `Send`; the same allow `secrets.rs` carries, for the same reason.
+// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; the same
+// allow `secrets.rs` carries, for the same reason.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_core::{CheckOutput, check_program};
@@ -99,19 +63,6 @@ impl Compiled {
 // --- 1. the argument vector under multi-shot resumption ---------------------
 
 /// A continuation captured **inside an argument list**, resumed twice.
-///
-/// This is the shape the free list has no other coverage of. `Frame::AppArgs`
-/// holds the buffer `argv::take` handed out and the arguments filled into it so
-/// far; capturing there and resuming twice means one `Frame::AppArgs` becomes
-/// two, each of which finishes filling a buffer and hands one back at
-/// `Machine::enter_code`. If the two ever shared a buffer, or if a buffer came
-/// back out of the list with a residue in it, the second resumption's call would
-/// be built from the first one's arguments — a wrong answer, not a crash.
-///
-/// `four` and its siblings encode their arguments positionally, so a shifted,
-/// duplicated or stale argument is a different integer rather than a different
-/// shape. Every arity the list serves is exercised, plus arity 5, which it does
-/// not (`argv::CLASSES` is 4).
 const RESUMED_ARGUMENTS: &str = r#"
 effect amb {
   read flip[coin]() -> Bool
@@ -209,12 +160,6 @@ fn an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_argu
 }
 
 /// The engine that cannot run any of the above, stated rather than assumed.
-///
-/// `--engine both` is offered by ADR 0019 §1 as what checks the free list did
-/// not move meaning. It cannot check the case above at all: a clause binding a
-/// continuation is `E0504` in the tree-walker, so the differential harness
-/// counts every test in `RESUMED_ARGUMENTS` as machine-only and compares
-/// nothing. That is why this file runs them and asserts their values directly.
 #[test]
 fn the_tree_walker_refuses_every_resumption_case_so_engine_both_compares_none_of_them() {
     let compiled = compile(RESUMED_ARGUMENTS);
@@ -259,18 +204,6 @@ pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 
 "#;
 
 /// ADR 0015 §2 as a bound on the free list, measured through the machine.
-///
-/// `argv::tests::a_secret_handed_back_is_not_held_by_the_pool` asserts this at
-/// the seam, by calling `give` directly. This asserts it of the evaluator: the
-/// credential goes in as a Ply function's argument, through
-/// `Frame::AppCallee` → `Frame::AppArgs` → `Machine::enter_code` → `argv::give`.
-///
-/// The `Machine` is dropped before the count is read, so what a surviving
-/// reference would have to live in is something that outlives it — which is
-/// exactly the two thread-locals R4 and W6 added: `argv`'s free list and
-/// `pool`'s scope links. That is the point rather than a weakness: a buffer kept
-/// with its contents is a credential with the *thread's* lifetime, not the
-/// call's.
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     let compiled = compile(SECRET_ARGUMENTS);
@@ -308,8 +241,6 @@ fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
 }
 
 /// A buffer that carried a credential is handed to the next call of that arity.
-/// It must arrive empty: a residue would shift every argument, and the shift is
-/// the observable.
 #[test]
 fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments() {
     let compiled = compile(SECRET_ARGUMENTS);
@@ -335,16 +266,9 @@ fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments()
 
 // --- 3. rendering paths other than `Value::write` ---------------------------
 
-/// `first_difference` is a second structural walk over a value and it builds
-/// text that is **stored** — `builtins::assert_failure` puts it in the note of a
-/// failing assertion and `ply-store` caches that as `Outcome::Fail { message }`.
-/// ADR 0019 §0.1's second row is about a rendering path that descends into a
-/// compound before `Value::write`'s `Secret` arm sees it; this is the only other
-/// such walk in the crate, and `secrets.rs` tests the diagnostic it feeds rather
-/// than the function.
-///
-/// Every shape below is one where a walk that descended by one more level would
-/// print a payload.
+/// `first_difference` is a second structural walk over a value and it builds text that is
+/// **stored** — `builtins::assert_failure` puts it in the note of a failing assertion and
+/// `ply-store` caches that as `Outcome::Fail { message }`.
 #[test]
 fn the_assertion_differ_never_descends_into_a_credential() {
     let hidden = "hunter2";
@@ -419,23 +343,6 @@ pub fn literal(ignored: Int) -> String = "abcd"
 "#;
 
 /// **An audit gap, asserted rather than described.**
-///
-/// ADR 0019 §2's "what it must not break" table offers `--engine both` for the
-/// constant-value lever, on the reasoning that *"the tree-walker keeps building
-/// per evaluation; the two must still produce the same value"*. That is true of
-/// a **literal** — `interp.rs`'s `ExprKind::Lit` arm calls `interp::literal`
-/// on every evaluation while the machine clones `NodeKind::Lit`'s value — and it
-/// is **false of a constructor mention**: `interp.rs:712` and `machine.rs:2093`
-/// both call `interp::ctor_value`, which answers from one thread-local memo. The
-/// two engines therefore hand back *the same `Arc`*, and comparing them is not
-/// an independent reading of it. The same section's *"The tree-walker is not
-/// changed"* is false for the same reason — §2 item 2 changed `ctor_value`'s
-/// body, and the tree-walker calls it.
-///
-/// This is not a claim that the memo is wrong. It is the claim that the evidence
-/// named for it cannot see it, which is the defect class `CONTRIBUTING.md`
-/// §"The one rule" lists twice (M8, W5). `ctor_value_sharing.rs` is what
-/// actually audits the memo, and its own module note says so.
 #[test]
 fn both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two() {
     let c = compile(MENTIONS);
@@ -466,9 +373,9 @@ fn both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_tw
         other => panic!("a mention of `Box` is not a closure: {other:?}"),
     }
 
-    // The control, and the reason the sentence in ADR 0019 §2 is half right: a
-    // literal really is built twice, so a divergence in the literal half would
-    // be visible to the differential harness.
+    // The control, and the reason the sentence in ADR 0019 §2 is half right: a literal really is
+    // built twice, so a divergence in the literal half would be visible to the differential
+    // harness.
     match &on_both("m.literal") {
         (Value::Str(a), Value::Str(b)) => {
             assert!(
@@ -535,27 +442,8 @@ fn probe_values() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The language's `==` and the `Map`'s order, checked against each other over
-/// every pair of the probe corpus.
-///
-/// **`Value::cmp`'s doc comment is wrong about how many disagreements there
-/// are, and a test in this crate has known so since W2.** `value.rs:625` says
-/// *"The one place they part is a `Float` NaN, where `cmp` is `Equal` and
-/// `values_equal` is false"*. There are **two** places: `value.rs:639`, fourteen
-/// lines above it, says `total_cmp` *"separates `0.0` from `-0.0`"* while IEEE
-/// `==` does not. `map_order.rs::signed_zeros_are_two_keys_and_are_one_value`
-/// asserts the second, and
-/// `map_order.rs::the_order_and_the_language_agree_except_on_float` allows for
-/// both — so the comment is stale against its own crate's tests rather than
-/// against an unknown.
-///
-/// Neither disagreement is reachable from a well-typed program — `Float` is not
-/// an ordered type, transitively (`Map<List<Float>, _>`, `Map<{x: Float}, _>`
-/// and `Map<WF(Float), _>` are each `E0206`, checked) — so this is a
-/// documentation defect, not a semantic one. What this adds to `map_order.rs`
-/// is the **exhaustive** form: the set is pinned, so a *third* disagreement, on
-/// a type that **is** an ordered key, fails here rather than being absorbed by a
-/// predicate named `float_peculiarity`.
+/// The language's `==` and the `Map`'s order, checked against each other over every pair of the
+/// probe corpus.
 #[test]
 fn the_order_and_the_language_equality_part_at_a_nan_and_also_at_negative_zero() {
     let mut disagreements = Vec::new();
@@ -585,29 +473,6 @@ fn the_order_and_the_language_equality_part_at_a_nan_and_also_at_negative_zero()
 }
 
 /// **The defect this test pinned is fixed; it now asserts the fix.**
-///
-/// Three written claims said this could not happen and were false when it was
-/// written: `crates/ply-eval/src/value.rs`'s [`Map`] note rests four guarantees
-/// on *"a value having one canonical form"* and names a `map_keys` that is *"a
-/// function of … insertion history"* as the failure it avoids; the note on
-/// `Value::cmp` said *"`map_keys` is a function of the values and of nothing
-/// else"*; and `crates/ply-core/src/infer.rs` says a fold over a map is *"a
-/// function of the map's contents rather than of how it was built"*.
-///
-/// None held for `Decimal`. `Value::cmp` and `values_equal` compare a `Decimal`
-/// by numeric value — deliberately, so that `1.50m` and `1.5m` are one key —
-/// while `Value::write` prints the scale as stored, deliberately, because the
-/// scale is the digit count the value carries. Two values that were one key
-/// therefore did not render alike, and which spelling a map held was decided by
-/// which was inserted last.
-///
-/// **Both deliberate decisions stand and the conjunction is closed**:
-/// `ply_eval::value::canonical_key` reduces a key to the one representative of
-/// its class on the way in. The two `Decimal`s below still render two strings —
-/// that half is the deliberate part and is asserted here so a "fix" that
-/// rounded the scale away everywhere would fail — and the two *maps* built from
-/// them now render one. `map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
-/// is the same claim at the unit level and carries what it used to assert.
 #[test]
 fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     let short = Value::Decimal(Decimal::try_from_i128_with_scale(15, 1).expect("1.5"));
@@ -647,20 +512,8 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     );
 }
 
-/// The same claim where a program meets it: `map_insert` with a key equal to
-/// one already present replaces the value, and the key a program reads back is
-/// the canonical spelling either way.
-///
-/// `decimal_to_string` is not an incidental choice of observer. It is what
-/// `std.json`'s number writer calls — `crates/ply-std/ply/json.ply:534`,
-/// `Number(d) -> bytes_of_string(decimal_to_string(d))` — so the strings below
-/// are **encoded response bodies** for two maps that `assert_eq` as one value.
-/// **Before `canonical_key` they were two bodies**, differing in the key's
-/// spelling, for a pair of maps a test had proved equal; the assertion here is
-/// that they are now one.
-/// `ply-cli/tests/suite/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`
-/// is the same claim through a real `derive json` codec, whose body is the one
-/// to read rather than a sentence about it.
+/// The same claim where a program meets it: `map_insert` with a key equal to one already present
+/// replaces the value, and the key a program reads back is the canonical spelling either way.
 #[test]
 fn map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling() {
     let compiled = compile(
@@ -697,17 +550,8 @@ test "the two maps are equal" {
 
 // --- 6. a shared constant inside a seeded simulation ------------------------
 
-/// Two spawned tasks, each mentioning a nullary constructor, a constructor
-/// closure and a string literal, writing what they built into a cell.
-///
-/// The point is the **first** mention. `interp::ctor_value`'s memo and
-/// `NodeKind::Lit`'s value are both cold on the first schedule of a process and
-/// warm on every schedule after it, so the work a mention does is not the same
-/// on schedule 1 as on schedule 200. `Machine::constant` refuses its memo inside
-/// a `simulate` region for exactly this reason — an arena allocation is an
-/// `Access::Alloc` and the search reads it — and `interp::ctor_value` takes no
-/// such precaution. ADR 0019 §2 argues it does not need one because building a
-/// `Ctor` is not an `Access`; this is that argument run rather than read.
+/// Two spawned tasks, each mentioning a nullary constructor, a constructor closure and a string
+/// literal, writing what they built into a cell.
 const SIMULATED_CONSTANTS: &str = r#"
 type Colour = Red | Green
 type Boxed = Box(Int)
@@ -734,10 +578,8 @@ test "two tasks build constants" {
 }
 "#;
 
-/// One seed, run as the very first thing this thread does and again after two
-/// hundred other schedules have warmed both memos. Same interleaving, same
-/// world, same verdict — or a seeded replay is a function of what the process
-/// did before it, which is the one thing a seed is supposed to exclude.
+/// One seed, run as the very first thing this thread does and again after two hundred other
+/// schedules have warmed both memos.
 #[test]
 fn a_seeded_schedule_is_the_same_cold_and_warm_over_the_constant_memos() {
     use ply_eval::{Plan, Seed, explore};
@@ -782,8 +624,8 @@ fn a_seeded_schedule_is_the_same_cold_and_warm_over_the_constant_memos() {
         "the fixture must pass under every schedule: {:?}",
         report.exploration.failure
     );
-    // Not vacuous: the fixture has to have real choices in it, or "the same
-    // schedule cold and warm" is a statement about a program with one schedule.
+    // Not vacuous: the fixture has to have real choices in it, or "the same schedule cold and warm"
+    // is a statement about a program with one schedule.
     assert!(
         report.seeds.len() > 1,
         "the fixture only ever ran one schedule, so this test compares nothing"
@@ -806,16 +648,8 @@ fn a_seeded_schedule_is_the_same_cold_and_warm_over_the_constant_memos() {
 
 // --- 7. one memo, many programs ---------------------------------------------
 
-/// `interp::ctor_value`'s cache is a **process-wide thread-local keyed by the
-/// constructor's name**, and nothing clears it between programs. `ply test`
-/// runs many programs on a pool of worker threads, so the second program on a
-/// thread meets the first program's entries.
-///
-/// The cache stores the arity beside the value and rebuilds on a mismatch,
-/// which its module note gives as the reason. That is checked at the unit level
-/// (`interp::tests`); this is the same claim made of two whole programs
-/// compiled separately and run in one thread, in both orders, which is the
-/// shape the note is actually about.
+/// `interp::ctor_value`'s cache is a **process-wide thread-local keyed by the constructor's name**,
+/// and nothing clears it between programs.
 #[test]
 fn two_programs_on_one_thread_do_not_read_each_others_constructor_of_the_same_name() {
     let nullary = compile(
@@ -857,8 +691,8 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
         );
     }
 
-    // And the closure half: a mention of the arity-1 `Marker` is a function
-    // whose arity is 1, whatever the nullary program left in the cache.
+    // And the closure half: a mention of the arity-1 `Marker` is a function whose arity is 1,
+    // whatever the nullary program left in the cache.
     let _ = nullary
         .call("m.mention", vec![Value::Int(0)])
         .expect("runs");
@@ -875,17 +709,9 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
 
 // --- 8. the width ADR 0019 §4 rejected narrowing at -------------------------
 
-/// ADR 0019 §4 refuses to narrow `Value` and §"What would make this ADR wrong"
-/// names *"if a build agent has to widen `Value` past 32 bytes to land any of
-/// this"* as one of five conditions that would sink the document. **Nothing in
-/// the workspace asserts the number.** `r4_value_construction` prints it and
-/// `argv::tests::the_pools_upper_bound_is_stated_in_bytes` multiplies by it;
-/// neither fails if it moves.
-///
-/// It is a value-representation invariant with three consumers — the argument
-/// vectors (885.6 `Value`-wide slots a request, per that ADR), the region
-/// arena's per-slot cost (`arena.rs:349`), and the free list's bound — so it is
-/// armed here rather than left as a number in a document.
+/// ADR 0019 §4 refuses to narrow `Value` and §"What would make this ADR wrong" names *"if a build
+/// agent has to widen `Value` past 32 bytes to land any of this"* as one of five conditions that
+/// would sink the document.
 #[test]
 fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     assert_eq!(
@@ -902,15 +728,8 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     );
 }
 
-/// The blast radius the defect had, now the blast radius the fix has to cover:
-/// it was never only `Map<Decimal, _>`.
-///
-/// A `Decimal` inside a record is an ordered key — `Map<{sku: String, price:
-/// Decimal}, Int>` typechecks — so an order-line-keyed map had the same
-/// property, and the field a program read back was not the one it wrote.
-/// `canonical_key` walks every position `Value::cmp` descends into for that
-/// reason. **Before the fix the two functions below answered `"1.5"` and
-/// `"1.50"`.**
+/// The blast radius the defect had, now the blast radius the fix has to cover: it was never only
+/// `Map<Decimal, _>`.
 #[test]
 fn a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too() {
     let compiled = compile(
@@ -951,20 +770,8 @@ test "one line, either way" {
     );
 }
 
-/// A credential under a key the canonical form rebuilds is **not** descended
-/// into and **not** rebuilt.
-///
-/// `canonical_key` walks every position `Value::cmp` descends into, and
-/// `Value::cmp` descends into a `Secret`. ADR 0019 §0.1's third row is about a
-/// new representation that keeps or copies a credential; ADR 0015 §2 is why the
-/// payload has one owner and no second spelling. So the rule is that
-/// canonicalization clones the `Arc` and stops — asserted here on the pointer,
-/// which is the only way to tell a clone from a rebuild — and that the rebuilt
-/// key still redacts.
-///
-/// Reachable from Rust and not from Ply: `derivable(ord, Secret<a>)` is false,
-/// so `Map<{p: Secret<String>, d: Decimal}, _>` is `E0206`, and `map::key`
-/// refuses a bare `Secret` key at run time as the backstop under that.
+/// A credential under a key the canonical form rebuilds is **not** descended into and **not**
+/// rebuilt.
 #[test]
 fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
     let payload = Arc::new(Value::str("hunter2"));

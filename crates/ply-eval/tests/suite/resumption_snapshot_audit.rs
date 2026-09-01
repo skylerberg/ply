@@ -1,35 +1,5 @@
-//! Whether a region that a continuation is captured across is recognised as
-//! one, and whether the arena's save-and-restore primitive covers what it says
-//! it covers.
-//!
-//! This file was written when ADR 0017 §3 still asked for snapshot-at-capture,
-//! and it asserted three defects as facts with the correct answer written into
-//! each assertion message. All three are now fixed and every assertion here
-//! states the corrected answer instead. What moved, and why, is worth keeping:
-//!
-//! 1. **The inference missed the capture.** [`ply_eval::region_kind`] treated a
-//!    `handle` that lexically *encloses* a region as if it were inside it, so a
-//!    `perform` written in the region contributed nothing and the region
-//!    inferred `unique`. `unique` is a claim that the region's memory can go
-//!    back to the bump pointer at its close, and it is a use-after-free when a
-//!    continuation can still reach it. Fixed by clearing `Ctx::handled` at every
-//!    region boundary.
-//! 2. **A snapshot covered the wrong extent.** [`Arena::snapshot`] copies one
-//!    region and the regions nested inside it, which is not what a checkpoint
-//!    needs: a write to an *enclosing* region survives the restore. Fixed by
-//!    adding [`Arena::snapshot_open`], which covers every open region, and by
-//!    documenting `snapshot` as the narrow form.
-//! 3. **A restore did not restore the region structure.** A `Snapshot` recorded
-//!    a bump range and not the scope stack, so a region closed since the
-//!    snapshot had its slots resurrected with nothing left to free them, and a
-//!    region opened since it was stranded with a mark above the bump pointer.
-//!    Fixed by recording the scopes in the snapshot and putting them back.
-//!
-//! ADR 0017 §3's snapshot-at-capture *semantics* was separately retracted — the
-//! language threads one state, per ADR 0005 §3 — so `snapshot`/`restore` are a
-//! save-and-restore primitive and not the capture path.
-//! `resumption_semantics_audit.rs` and `region_meaning_audit.rs` are where that
-//! is pinned.
+//! Whether a region that a continuation is captured across is recognised as one, and whether the
+//! arena's save-and-restore primitive covers what it says it covers.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::arena::{Arena, RegionKind, Slot};
@@ -39,8 +9,6 @@ use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
-
-// ------------------------------------------------------------------ harness
 
 fn load(src: &str) -> (Program, Resolved) {
     let mut map = SourceMap::new();
@@ -88,8 +56,8 @@ fn cells_after(src: &str, test: &str) -> Vec<String> {
         .position(|t| t.name == test)
         .unwrap_or_else(|| panic!("no test named {test:?}"));
     let mut machine = Machine::new(&program, &resolved, &checked);
-    // The reclamation journal, not the residue: a region hands its slots back at
-    // its close, so what a run leaves behind is empty whatever it wrote.
+    // The reclamation journal, not the residue: a region hands its slots back at its close, so what
+    // a run leaves behind is empty whatever it wrote.
     machine.cells_mut().journal();
     machine
         .eval_test(index)
@@ -111,14 +79,8 @@ fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     }
 }
 
-// ================================================================== 1. inference
-
-/// ADR 0017 §3's two-resumption example with the `handle` written *outside* the
-/// `with_cell` instead of inside it. Nothing else moves.
-///
-/// The cell is allocated before the `perform`, so one cell serves both
-/// resumptions; the body writes it between the capture and the return; and the
-/// clause resumes twice. That is precisely the shape §3 says must be `shared`.
+/// ADR 0017 §3's two-resumption example with the `handle` written *outside* the `with_cell` instead
+/// of inside it.
 const HANDLE_ENCLOSES: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
@@ -137,18 +99,7 @@ test "handler outside the region" {
 }
 "#;
 
-/// A capture crosses `trace` on every resumption, so `trace` is `shared` and
-/// the site is named.
-///
-/// The defect this replaces was [`ply_eval::region_kind`]'s `Ctx::handled`. A
-/// `handle` records the operations it answers into the context its *body* is
-/// walked under, and `walk_region` inherited that context wholesale — so a
-/// `perform` written inside the region and answered by a handler outside it hit
-/// the early return in `walk_perform` and contributed nothing. The premise of
-/// that early return is that the handler is *inside* the region; `walk_region`
-/// now clears `handled` so the premise holds, because a handler installed
-/// outside the region answers across its boundary, which is exactly what
-/// `Cause::Escapes` means.
+/// A capture crosses `trace` on every resumption, so `trace` is `shared` and the site is named.
 #[test]
 fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     let (program, resolved) = load(HANDLE_ENCLOSES);
@@ -172,13 +123,7 @@ fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     );
 }
 
-/// The same program, run. Both resumptions write the one cell the region
-/// allocated before the capture, which is what makes `unique` an unavailable
-/// answer for it: the cell is reachable from a continuation that outlives the
-/// region body's first pass.
-///
-/// The `2` is also ADR 0005 §3.2's number — one threaded state, each resumption
-/// incrementing it once.
+/// The same program, run.
 #[test]
 fn the_region_that_infers_shared_is_written_by_both_resumptions() {
     assert_eq!(
@@ -188,15 +133,8 @@ fn the_region_that_infers_shared_is_written_by_both_resumptions() {
     );
 }
 
-/// Two spellings of one program must agree, which is how the hole was diagnosed
-/// rather than merely observed.
-///
-/// Hoisting the `perform` into a helper is a refactoring no reader would expect
-/// to change a memory model, and it used to: in the helper's body there is no
-/// enclosing `handle`, so `walk_perform` recorded `Cause::Escapes` and only the
-/// hoisted spelling was right. The analysis has to be conservative rather than
-/// syntax-sensitive, and it used to err `unique` on exactly the spelling ADR
-/// 0017 §3 uses as its worked example.
+/// Two spellings of one program must agree, which is how the hole was diagnosed rather than merely
+/// observed.
 #[test]
 fn hoisting_the_perform_into_a_helper_does_not_flip_the_inferred_kind() {
     let inline = r#"
@@ -228,15 +166,11 @@ fn f() -> Int =
 }
 
 /// The hole was not confined to one spelling of the region or one clause form.
-/// Every row is a region a continuation is captured across, and every row used
-/// to infer `unique`.
 #[test]
 fn the_enclosing_handle_hides_the_capture_for_no_shape_of_region() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
 
-    // A tail-resumptive clause. `region_kind`'s own doc calls this out as the
-    // case a rule counting only `resume` binders would miss — and it missed it
-    // anyway when the handler enclosed the region.
+    // A tail-resumptive clause.
     let tail = format!(
         r#"{AMB}
 fn f() -> Int =
@@ -262,8 +196,8 @@ fn f() -> Int =
     );
     assert_eq!(kind_of(&with_region, "r"), RegionKind::Shared);
 
-    // Nested regions: the capture crosses both, so a snapshot of either would
-    // have been required and neither may be freed at its close.
+    // Nested regions: the capture crosses both, so a snapshot of either would have been required
+    // and neither may be freed at its close.
     let nested = format!(
         r#"{AMB}
 fn f() -> Int =
@@ -286,8 +220,8 @@ fn f() -> Int =
         ]
     );
 
-    // Through a callback builtin, where the region is opened per element and the
-    // capture is taken inside it.
+    // Through a callback builtin, where the region is opened per element and the capture is taken
+    // inside it.
     let callback = format!(
         r#"{AMB}
 fn f() -> List<Int> =
@@ -302,13 +236,8 @@ fn f() -> List<Int> =
     assert_eq!(kind_of(&callback, "r"), RegionKind::Shared);
 }
 
-/// ADR 0017 §3: "forcing `unique` where a capture is reachable is a compile
-/// error naming the capture site".
-///
-/// Worth its own test because it is the one place the design promised the
-/// mistake would be caught by hand when the inference could not catch it by
-/// proof. Both halves used to fail together, so a program that declared
-/// `unique` over a backtracking handler compiled clean.
+/// ADR 0017 §3: "forcing `unique` where a capture is reachable is a compile error naming the
+/// capture site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {
     let (program, resolved) = load(HANDLE_ENCLOSES);
@@ -330,29 +259,7 @@ fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {
     );
 }
 
-// ==================================================================== 2. extent
-
-/// [`Arena::snapshot`] covers one region and the regions nested inside it. It
-/// does not cover the regions *enclosing* it, so a write an enclosing region's
-/// cell takes after the snapshot is still there after the restore.
-///
-/// That is a documented limit of the narrow form rather than a defect, and this
-/// is where it is documented. What made it a defect was that it was the only
-/// form: a checkpoint has to cover every region open at it, which is the
-/// canonical Ply shape and not a corner —
-///
-/// ```ply
-/// with_cell[a](0) { x ->                       // the handler's own state
-///   handle {
-///     with_cell[b](0) { y -> { .. flip .. cell_set(x, ..) .. } }
-///   } with { amb.flip[coin]() resume k -> k(true) + k(false) }
-/// }
-/// ```
-///
-/// — where the inner region is the one `Arena::current()` names and `a`'s write
-/// is the one that would survive. [`Arena::snapshot_open`] is the form that
-/// covers it, and the outermost open region may be `Unique`, in which case it
-/// reports *which* rather than silently taking a partial copy.
+/// [`Arena::snapshot`] covers one region and the regions nested inside it.
 #[test]
 fn only_the_open_form_of_snapshot_covers_an_enclosing_regions_writes() {
     let mut arena = Arena::new();
@@ -392,9 +299,8 @@ fn only_the_open_form_of_snapshot_covers_an_enclosing_regions_writes() {
     arena.close(outer);
 }
 
-/// The same statement as a cost: covering every open region costs the whole
-/// live arena, not the innermost scope. ADR 0017 §3's "the region's arena is
-/// snapshotted at capture" reads as the latter and is the former.
+/// The same statement as a cost: covering every open region costs the whole live arena, not the
+/// innermost scope.
 #[test]
 fn covering_every_open_region_costs_the_whole_live_arena_at_every_capture() {
     let mut arena = Arena::new();
@@ -420,10 +326,8 @@ fn covering_every_open_region_costs_the_whole_live_arena_at_every_capture() {
     arena.close(outer);
 }
 
-/// A `unique` region open at the point of a checkpoint is the inference and the
-/// machine disagreeing, and the caller has to be told *which* region so it can
-/// name it. Taking a partial copy would hide the disagreement; taking none
-/// would be the missing isolation.
+/// A `unique` region open at the point of a checkpoint is the inference and the machine
+/// disagreeing, and the caller has to be told *which* region so it can name it.
 #[test]
 fn a_unique_region_open_at_a_checkpoint_is_reported_rather_than_skipped() {
     let mut arena = Arena::new();
@@ -437,19 +341,8 @@ fn a_unique_region_open_at_a_checkpoint_is_reported_rather_than_skipped() {
     arena.close(outer);
 }
 
-// ================================================================= 3. structure
-
-/// A [`Snapshot`] records the scope stack as well as the bump range, so a
-/// restore restores the arena's state rather than a range of it.
-///
-/// **Closed since the snapshot.** The inner region's slots were freed and their
-/// generations bumped. The restore brings both the slots *and the region that
-/// owns them* back, which is what makes the resurrection sound: the region is
-/// open again, so its close frees them again. Without the scope half, the slots
-/// resolved with nothing left to free them, and `Arena`'s claim that a physical
-/// position's generation "only ever rises" failed in `restore`.
-///
-/// [`Snapshot`]: ply_eval::arena::Snapshot
+/// A [`Snapshot`] records the scope stack as well as the bump range, so a restore restores the
+/// arena's state rather than a range of it.
 #[test]
 fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     let mut arena = Arena::new();
@@ -482,15 +375,7 @@ fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     assert_eq!(arena.live(), 0);
 }
 
-/// **Opened since the snapshot.** A region that did not exist at the snapshot
-/// does not exist after the restore.
-///
-/// Left behind, its mark sat above the restored bump pointer: its close
-/// truncated to a mark the arena was already below and freed nothing, so a slot
-/// allocated "inside" it outlived it. The same mismatch made [`Arena::extent`]
-/// and [`Arena::snapshot`] compute `live - mark` with `mark > live` — an
-/// overflow panic in a debug build, a wrapped `usize` in a release one, and a
-/// `Diagnostic` in neither.
+/// **Opened since the snapshot.**
 #[test]
 fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     let mut arena = Arena::new();
@@ -520,9 +405,8 @@ fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     assert_eq!(arena.live(), 0);
 }
 
-/// The precondition [`Arena::extent`] and [`Arena::snapshot`] subtract on, held
-/// across the open/alloc/close/snapshot/restore cycle rather than asserted once.
-/// A stranded region used to break it and there was no diagnostic to report.
+/// The precondition [`Arena::extent`] and [`Arena::snapshot`] subtract on, held across the
+/// open/alloc/close/snapshot/restore cycle rather than asserted once.
 #[test]
 fn no_regions_mark_ever_sits_above_the_bump_pointer() {
     let mut arena = Arena::new();
@@ -548,15 +432,8 @@ fn no_regions_mark_ever_sits_above_the_bump_pointer() {
     arena.close(r);
 }
 
-/// A slot's generation is the number of times its physical position has been
-/// freed, and it is a `u32` incremented with `wrapping_add`. A process that
-/// opens and closes one region per unit of work — a region per request, which is
-/// what ADR 0017 §5 makes a task — wraps it after 2^32 closes, and a stale slot
-/// held from before the wrap resolves against whatever now lives at its index.
-///
-/// That is the one property [`ply_eval::arena`] claims outright: "a physical
-/// position's generation only ever rises, so a stale slot can never match the
-/// value now living there". It rises modulo 2^32.
+/// A slot's generation is the number of times its physical position has been freed, and it is a
+/// `u32` incremented with `wrapping_add`.
 #[test]
 fn a_slots_generation_counts_frees_and_is_a_wrapping_u32() {
     let mut arena = Arena::new();

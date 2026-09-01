@@ -1,24 +1,4 @@
 //! The regions a *program* opens, on the evaluation path of both engines.
-//!
-//! `crates/ply-eval/tests/region_arena_cost.rs` and `region_reclamation_audit.rs`
-//! attack the allocator directly, and `region_kind_inference.rs` attacks the
-//! analysis. Neither says anything about whether an engine consults either one:
-//! R1 built the arena, the kinds and the pins and connected none of them, and
-//! the gap was found by a benchmark rather than by a report.
-//!
-//! So what is asserted here is the wiring itself:
-//!
-//! - a `with_cell` opens an arena scope of the kind [`ply_eval::region_kind`]
-//!   decided for **its own span**, which is what makes the analysis load-bearing
-//!   rather than decorative;
-//! - the scope closes at the region's lexical end, so a region in a loop costs
-//!   one slot rather than one per iteration;
-//! - a continuation captured across a region and still live **defers** that
-//!   close, so ADR 0005 required test 6 still reads its cell;
-//! - `with_region` opens one too, on both engines, having been lowered away to
-//!   its body until now;
-//! - a capture outside every program region takes no pin, because a pin is an
-//!   `Rc` allocation and `perform` is on the request path.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Interp, Machine, RegionKind, Value};
@@ -60,9 +40,8 @@ impl Compiled {
     }
 }
 
-/// Regions every run opens before the program does: the fixture's, the entry
-/// region the stack was built with, and the one the entry point's reset opens in
-/// its place.
+/// Regions every run opens before the program does: the fixture's, the entry region the stack was
+/// built with, and the one the entry point's reset opens in its place.
 const SCAFFOLD_REGIONS: u64 = 3;
 
 fn machine_stats(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
@@ -74,9 +53,8 @@ fn machine_stats(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     machine.cells().stats()
 }
 
-/// `None` where the tree-walker declines the program — a clause that binds a
-/// continuation is `E0504`, which is ADR 0005 required test 3 and not something
-/// this file may work around.
+/// `None` where the tree-walker declines the program — a clause that binds a continuation is
+/// `E0504`, which is ADR 0005 required test 3 and not something this file may work around.
 fn treewalk_stats(compiled: &Compiled, name: &str) -> Option<ply_eval::arena::Stats> {
     let index = compiled.index_of(name);
     let mut treewalk = Interp::new(&compiled.program, &compiled.resolved, &compiled.check);
@@ -96,8 +74,6 @@ fn stats(compiled: &Compiled, name: &str) -> Vec<(&'static str, ply_eval::arena:
     out
 }
 
-// -------------------------------------------- 1. the analysis is consulted
-
 const PURE: &str = r#"
 fn scratch(n: Int) -> Int = with_cell[r](n) { c -> { cell_set(c, cell_get(c) + 1); cell_get(c) } }
 
@@ -106,12 +82,8 @@ test "a region with no capture anywhere near it" {
 }
 "#;
 
-/// The claim R1 could not make about `region_kind`: an engine asks it, and asks
-/// it about the span of the `with_cell` expression rather than about the body's.
-///
-/// A mismatch there is silent and total — `Regions::at` answers `None` for a
-/// span it never saw, every region opens no scope, and the arena goes back to
-/// being monotone with nothing to show it. The count is what catches it.
+/// The claim R1 could not make about `region_kind`: an engine asks it, and asks it about the span
+/// of the `with_cell` expression rather than about the body's.
 #[test]
 fn a_with_cell_opens_the_scope_the_inference_decided_for_its_span() {
     let compiled = Compiled::new(PURE);
@@ -146,9 +118,9 @@ fn a_with_cell_opens_the_scope_the_inference_decided_for_its_span() {
     }
 }
 
-/// The engines must agree about the region structure, not merely about the
-/// answer: two engines that opened different scopes would reclaim at different
-/// points, and `--engine both` compares what each reclaimed.
+/// The engines must agree about the region structure, not merely about the answer: two engines that
+/// opened different scopes would reclaim at different points, and `--engine both` compares what
+/// each reclaimed.
 #[test]
 fn both_engines_open_the_same_regions_for_the_same_program() {
     for source in [PURE, LOOPED, CAPTURED, PARKED, NESTED_REGION] {
@@ -168,8 +140,6 @@ fn both_engines_open_the_same_regions_for_the_same_program() {
     }
 }
 
-// ------------------------------------------------ 2. the close is the point
-
 const LOOPED: &str = r#"
 fn once(n: Int) -> Int = with_cell[r](n) { c -> cell_get(c) }
 
@@ -178,9 +148,8 @@ fn upto(n: Int) -> Int = if n == 0 { once(0) } else { once(n) + upto(n - 1) }
 test "a region per iteration" { assert_eq(upto(99), 4950) }
 "#;
 
-/// The shape ADR 0005 §2 charged one retained world entry per iteration for, and
-/// which R1's wiring still charged one arena slot per iteration for. A hundred
-/// regions, a hundred bumps, and never two slots live at once.
+/// The shape ADR 0005 §2 charged one retained world entry per iteration for, and which R1's wiring
+/// still charged one arena slot per iteration for.
 #[test]
 fn a_region_in_a_loop_costs_one_slot_rather_than_one_per_iteration() {
     let compiled = Compiled::new(LOOPED);
@@ -196,8 +165,6 @@ fn a_region_in_a_loop_costs_one_slot_rather_than_one_per_iteration() {
         );
     }
 }
-
-// ------------------------------- 3. a live continuation defers the close
 
 const CAPTURED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -218,9 +185,7 @@ test "two resumptions over one cell" {
 }
 "#;
 
-/// The capture path pins. Zero pins over a program that captured a continuation
-/// would mean a region could be freed while a resumption can still read it,
-/// which is the one defect this milestone exists to make impossible.
+/// The capture path pins.
 #[test]
 fn a_capture_inside_a_region_pins_it() {
     let compiled = Compiled::new(CAPTURED);
@@ -261,12 +226,6 @@ test "a continuation outlives the region whose cell it reads" {
 "#;
 
 /// ADR 0005 required test 6, at the reclamation event R2 added.
-///
-/// The `log` region closes lexically while a continuation parked in the
-/// enclosing region's cell can still read its slot. The close must **defer**;
-/// `assert_eq(k(true), 7)` inside the program is what would fail if it did not,
-/// and `closes_deferred` is what says the deferral is why it passed rather than
-/// an accident of the slot not having been reused yet.
 #[test]
 fn a_close_a_live_continuation_can_reach_is_deferred_rather_than_taken() {
     let compiled = Compiled::new(PARKED);
@@ -281,8 +240,6 @@ fn a_close_a_live_continuation_can_reach_is_deferred_rather_than_taken() {
     );
 }
 
-// --------------------------------------------------- 4. `with_region` itself
-
 const NESTED_REGION: &str = r#"
 fn doubled(n: Int) -> Int = with_region[r] {
   with_cell[r](n) { c -> { cell_set(c, cell_get(c) * 2); cell_get(c) } }
@@ -291,10 +248,8 @@ fn doubled(n: Int) -> Int = with_region[r] {
 test "a with_region around a cell of its own brand" { assert_eq(doubled(21), 42) }
 "#;
 
-/// `with_region` lowered to its body until now, on both engines, so nothing at
-/// run time distinguished it from the code inside it. It opens a scope now — and
-/// the `with_cell[r]` written inside it opens **none**, because ADR 0017 §1 makes
-/// a cell of an already-open brand a value allocated in that region.
+/// `with_region` lowered to its body until now, on both engines, so nothing at run time
+/// distinguished it from the code inside it.
 #[test]
 fn a_with_region_opens_one_region_and_the_cell_inside_it_opens_none() {
     let compiled = Compiled::new(NESTED_REGION);
@@ -321,8 +276,6 @@ fn a_with_region_opens_one_region_and_the_cell_inside_it_opens_none() {
     }
 }
 
-// ------------------------------------------------- 5. what a pin costs
-
 const NO_REGION: &str = r#"
 effect ask { read get[q]() -> Int }
 
@@ -333,9 +286,8 @@ fn asked() -> Int = handle { ask.get[q]() + ask.get[q]() } with {
 test "a capture outside every region" { assert_eq(asked(), 6) }
 "#;
 
-/// A pin is an `Rc` allocation and `handler::perform` is on the request path, so
-/// a program with no region of its own must not pay for one. `/health` is such a
-/// program: it performs and it opens nothing.
+/// A pin is an `Rc` allocation and `handler::perform` is on the request path, so a program with no
+/// region of its own must not pay for one.
 #[test]
 fn a_capture_outside_every_program_region_takes_no_pin() {
     let compiled = Compiled::new(NO_REGION);
@@ -350,12 +302,9 @@ fn a_capture_outside_every_program_region_takes_no_pin() {
     );
 }
 
-// -------------------------------------- 6. the entry point still resets
-
-/// The reset is what replaced `World::fork`, and a pin must not be able to
-/// outlive it: a continuation parked in a cell of the region that pins it is a
-/// cycle, and honouring it at the entry point's end would leak the run and let
-/// the next one read its slots.
+/// The reset is what replaced `World::fork`, and a pin must not be able to outlive it: a
+/// continuation parked in a cell of the region that pins it is a cycle, and honouring it at the
+/// entry point's end would leak the run and let the next one read its slots.
 #[test]
 fn a_parked_continuation_does_not_survive_the_entry_point_that_made_it() {
     let compiled = Compiled::new(PARKED);
@@ -382,9 +331,8 @@ fn a_parked_continuation_does_not_survive_the_entry_point_that_made_it() {
     );
 }
 
-/// A fixture cell is not a program region's, so it survives every entry point —
-/// the property `TaskRegions::reset` exists for, restated now that a lexical
-/// close reclaims.
+/// A fixture cell is not a program region's, so it survives every entry point — the property
+/// `TaskRegions::reset` exists for, restated now that a lexical close reclaims.
 #[test]
 fn the_fixture_survives_what_the_regions_give_back() {
     let compiled = Compiled::new(PURE);

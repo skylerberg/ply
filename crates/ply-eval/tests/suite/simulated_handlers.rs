@@ -1,18 +1,4 @@
 //! The seeded handlers against the signatures they claim.
-//!
-//! DESIGN.md §2's argument for handlers is that a test double and the real
-//! resource cannot drift, *because both satisfy one declared signature*. The
-//! seeded `clock` and `random` are test doubles for the operating system, so the
-//! argument applies to them or it applies to nothing: an operation the clause
-//! set omits is one a region cannot answer, an operation it invents is one no
-//! program can perform, and a return type it disagrees with is a value the
-//! checker permitted and the run cannot produce.
-//!
-//! So this file checks the seeded table against a declaration written in Ply and
-//! against a handler for the same declaration written in Ply, and it checks that
-//! nothing in the evaluator can reach the host's clock or entropy — because a
-//! simulated run that could would be a function of the machine rather than of
-//! its seed, and every artifact it produced would be worthless.
 
 use ply_core::{CheckOutput, EffectInfo, Type, check_program};
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
@@ -22,14 +8,8 @@ use ply_syntax::parse_module;
 use ply_syntax::resolve::resolve;
 use std::path::{Path, PathBuf};
 
-/// ADR 0006 §1.1's declaration of the two effects the seeded handlers answer,
-/// plus a hand-written handler for it.
-///
-/// It lives in a named module so that its program-wide names are `sig.clock` and
-/// `sig.random` rather than the prelude's: the point is that *a* declaration of
-/// this shape types both handlers, not that this one is the prelude's copy.
-/// `task` is absent — its signature is polymorphic, there is no surface syntax
-/// for that in M7, and it is the scheduler's rather than these handlers'.
+/// ADR 0006 §1.1's declaration of the two effects the seeded handlers answer, plus a hand-written
+/// handler for it.
 const SOURCE: &str = r#"
 nondet effect clock {
   read now() -> Int
@@ -75,8 +55,7 @@ fn span() -> Span {
     Span::new(SourceId(0), 0, 1)
 }
 
-/// What the run would report a value's type as. `None` for a value no declared
-/// signature here can mention.
+/// What the run would report a value's type as.
 fn type_of(value: &Value) -> Option<Type> {
     match value {
         Value::Int(_) => Some(Type::int()),
@@ -123,10 +102,8 @@ fn every_seeded_operation_has_the_declared_mode_and_types() {
     }
 }
 
-/// The signature is a promise about what a perform site receives, so it is only
-/// kept if the value the handler actually produces has the declared type. A
-/// table that agreed with the declaration and a dispatch that did not would be
-/// two documents rather than one mechanism.
+/// The signature is a promise about what a perform site receives, so it is only kept if the value
+/// the handler actually produces has the declared type.
 #[test]
 fn what_the_handlers_answer_has_the_declared_type() {
     let (_, check) = program();
@@ -142,8 +119,8 @@ fn what_the_handlers_answer_has_the_declared_type() {
             .iter()
             .map(|param| {
                 assert_eq!(*param, Type::int(), "`{sig}` takes something else now");
-                // Positive: `random.below` has no value to answer below zero,
-                // and a sleep of zero is a yield rather than a deadline.
+                // Positive: `random.below` has no value to answer below zero, and a sleep of zero
+                // is a yield rather than a deadline.
                 Value::Int(3)
             })
             .collect();
@@ -164,10 +141,8 @@ fn what_the_handlers_answer_has_the_declared_type() {
     }
 }
 
-/// Three handlers for one signature — this stub, the seeded one, and the
-/// threaded one M9 will write — and no way for them to drift, because the
-/// declaration types all three. The stub discharges every atom `work` performs,
-/// which is the same set the seeded clause set names.
+/// Three handlers for one signature — this stub, the seeded one, and the threaded one M9 will write
+/// — and no way for them to drift, because the declaration types all three.
 #[test]
 fn a_hand_written_handler_and_the_seeded_one_answer_the_same_operations() {
     let (program, check) = program();
@@ -225,15 +200,8 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// `clock.now()` is the only way a Ply program can ask what time it is, and a
-/// `simulate` region handles it. That is only a *proof* that no wall clock
-/// reaches a simulated run if the evaluator underneath it cannot read one
-/// either, which is a property of this crate's sources rather than of any
-/// argument about them.
-///
-/// Test code is excluded: a module that greps itself for these words carries
-/// them as data, and a test that asserts a clock is unreachable is not a read of
-/// one.
+/// `clock.now()` is the only way a Ply program can ask what time it is, and a `simulate` region
+/// handles it.
 #[test]
 fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -273,9 +241,8 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     }
 }
 
-/// The same rule one level down: a generator crate would put the host's entropy
-/// — and its own version — inside a seed's meaning. The seeded streams are
-/// counter-mode BLAKE3 for exactly that reason.
+/// The same rule one level down: a generator crate would put the host's entropy — and its own
+/// version — inside a seed's meaning.
 #[test]
 fn the_crate_depends_on_no_generator_and_no_entropy_source() {
     let manifest =

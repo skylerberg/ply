@@ -1,22 +1,4 @@
 //! The drain, against a real postgres.
-//!
-//! ADR 0015 §4.4 pins the teardown order and calls a wrong one a *data-loss bug
-//! rather than a mess*. This file is the check on that claim, and it is written
-//! the way `db_transaction_audit.rs` is written for the same reason: **every
-//! assertion about what postgres holds is made through `psql`**, a channel the
-//! driver has no part in. The driver's own bookkeeping is not evidence about the
-//! driver — W4's audit found a rollback that worked in memory and leaked in
-//! postgres, and a drain that abandons an open transaction is the same class.
-//!
-//! What is asked of each phase is the only question a shutdown has to answer:
-//! **is the write there, and is the connection clean?** A transaction the drain
-//! abandoned shows up as a row that should not exist, or as a session left
-//! `idle in transaction` holding the locks the rest of a rolling restart is
-//! waiting on, and both are visible from `pg_stat_activity` and from the table.
-//!
-//! One `#[test]`, one cluster, one sequence of phases, for the reason
-//! `db_driver.rs` gives: `#[test]`s in a binary run in parallel threads of one
-//! process, and a server shared between them would have no owner.
 
 use crate::support::cluster::{self, Cluster};
 use ply_core::ty::Resource;
@@ -104,14 +86,13 @@ fn host(cluster: &Cluster, shutdown: &Arc<Shutdown>) -> Host {
     .stopping_on(Arc::clone(shutdown))
 }
 
-/// The teardown, as `ply run` reaches it: through the `HostRuntime` the machine
-/// was given, on the machine's own thread, after the entry point ended.
+/// The teardown, as `ply run` reaches it: through the `HostRuntime` the machine was given, on the
+/// machine's own thread, after the entry point ended.
 fn tear_down(host: &Host, drain_ms: u64) -> ShutdownReport {
     host.runtime().shutdown(drain_ms)
 }
 
-/// Sessions this cluster has sitting inside a transaction. The number that says
-/// whether a drain left a `BEGIN` for postgres to clean up whenever it noticed.
+/// Sessions this cluster has sitting inside a transaction.
 fn idle_in_transaction(cluster: &Cluster) -> i64 {
     cluster
         .psql(
@@ -145,15 +126,7 @@ fn the_drain_never_commits_and_never_leaks() {
     the_drain_reports_what_it_rolled_back(&cluster);
 }
 
-/// **The one that matters.** W4 made a transaction a scoped handler over a
-/// pooled connection, so a drain that closed the pool under a request holding
-/// one would lose whatever that request had written — and a drain that
-/// *committed* it would be worse, because a half-finished body would be durable
-/// and no retry could undo it.
-///
-/// The assertion is against the table and against `pg_stat_activity`, never
-/// against the driver: a driver that believes it rolled back and left a `BEGIN`
-/// on the wire is exactly the defect this is looking for.
+/// **The one that matters.**
 fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
@@ -190,8 +163,8 @@ fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
          assertion mean something"
     );
 
-    // The signal arrives while the request is inside the transaction, and the
-    // drain runs out before the body could finish.
+    // The signal arrives while the request is inside the transaction, and the drain runs out before
+    // the body could finish.
     shutdown.request(Signal::Terminate);
     let until = Instant::now() + Duration::from_secs(5);
     while !shutdown.drain_expired() && Instant::now() < until {
@@ -227,9 +200,8 @@ fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
     );
 }
 
-/// The other half of the claim, and the one that would make the first vacuous: a
-/// drain rolls back what was *open*, and takes nothing back that a body already
-/// committed.
+/// The other half of the claim, and the one that would make the first vacuous: a drain rolls back
+/// what was *open*, and takes nothing back that a body already committed.
 fn a_committed_transaction_survives_the_drain(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds::default());
     let host = host(cluster, &shutdown);
@@ -269,11 +241,9 @@ fn a_committed_transaction_survives_the_drain(cluster: &Cluster) {
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// The pinned order, checked at the one place it is observable: the sink is
-/// flushed **while the pool is still open**, so a record naming a rolled-back
-/// transaction is written by a run that still holds the connection that rolled
-/// it back. A flush after the pool closed would be a log that says nothing about
-/// the shutdown that produced it.
+/// The pinned order, checked at the one place it is observable: the sink is flushed **while the
+/// pool is still open**, so a record naming a rolled-back transaction is written by a run that
+/// still holds the connection that rolled it back.
 fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     use ply_host::trace::{Level, Record, Sink, Trace};
     use std::sync::Mutex;
@@ -329,8 +299,8 @@ fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     let db = host.database().expect("a database").clone();
     *sink.db.lock().unwrap() = Some(Arc::clone(&db));
 
-    // One statement, so a connection has actually been established: a pool that
-    // never opened one would make the assertion below true for the wrong reason.
+    // One statement, so a connection has actually been established: a pool that never opened one
+    // would make the assertion below true for the wrong reason.
     execute(
         &db,
         "ledger",
@@ -362,10 +332,8 @@ fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// A run that shut down uncleanly still shut down, so what the teardown could
-/// not hand back is `W0606` and data rather than a verdict. The counts have to
-/// be the run's own, because the shutdown banner prints them and a number
-/// computed for a banner is a number that can be wrong without anything failing.
+/// A run that shut down uncleanly still shut down, so what the teardown could not hand back is
+/// `W0606` and data rather than a verdict.
 fn the_drain_reports_what_it_rolled_back(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds::default());
     let host = host(cluster, &shutdown);
@@ -429,9 +397,8 @@ fn the_drain_reports_what_it_rolled_back(cluster: &Cluster) {
     assert_eq!(idle_in_transaction(cluster), 0);
 }
 
-/// The coordinator holds the socket side by trait, so a `Host` built with a
-/// database still answers phase 2's questions. Cheap, and it is the wiring a
-/// second signal's abandoned-line reads.
+/// The coordinator holds the socket side by trait, so a `Host` built with a database still answers
+/// phase 2's questions.
 #[test]
 fn a_host_with_a_database_still_answers_what_phase_two_asks() {
     let shutdown = Shutdown::new(Bounds::default());

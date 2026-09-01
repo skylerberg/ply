@@ -1,31 +1,4 @@
 //! What operating the service costs: a trace call, a drain, and a deploy.
-//!
-//! W3 priced HTTP and W4 priced the database. W5 adds the three things every
-//! service acquires — a log, a configuration and a way to stop — and each is an
-//! effect rather than an ambient global. That buys the rows in `ply check
-//! --types`; what it costs is what this module measures.
-//!
-//! | section | question |
-//! | --- | --- |
-//! | [`events`] | what one trace operation costs, per sink, against the same loop performing nothing |
-//! | [`tracing`] | what the *service* pays for tracing it turned off, and for tracing it turned on |
-//! | [`drain`] | how long a stop takes with N requests in flight, and what the deadline does to them |
-//! | [`transaction_at_deadline`] | whether a transaction open at the deadline commits, rolls back, or is lost — a correctness result reported as a measurement |
-//! | [`deploy`] | the artifact's bytes, the binary's bytes, and what an incremental transfer would have saved |
-//!
-//! **The discipline is `w3`'s and `w4`'s: substitution, never instrumentation.**
-//! Every row of [`events`] runs one Ply definition — `crates/ply-corpus/ply/w5.ply`'s
-//! fold — and changes only which handler answers it. Every row of [`tracing`]
-//! serves `examples/desk.ply` verbatim and changes only `--trace`. A difference
-//! between two rows is that one substitution and nothing else.
-//!
-//! The one rung that is not a configuration a Ply service can be in is `bare`,
-//! and it is the most important one. There is no disabled path — a row cannot be
-//! conditional on a flag — so `bare` is the program with the perform *deleted*,
-//! which is what every other language gets from a level check at the call site.
-//! The gap between `bare` and `discard` is therefore precisely what ADR 0015
-//! §1.4 owes a number for: what a service pays, on every request, forever, for
-//! tracing it turned off.
 
 use anyhow::{Context, Result, bail};
 use ply_core::CheckOutput;
@@ -47,9 +20,7 @@ use std::time::{Duration, Instant};
 use crate::serve::{Server, reserve_port};
 use crate::w3;
 
-/// The program [`events`] runs. Ply source checked by the real front end on
-/// every run, so a loop that stopped typechecking is a failed benchmark rather
-/// than a wrong number.
+/// The program [`events`] runs.
 const BENCH: &str = include_str!("../ply/w5.ply");
 
 /// The TLS credential name the served project uses, matching `w3`'s.
@@ -125,8 +96,8 @@ impl Program {
             .map(|d| d.footprint.clone())
     }
 
-    /// One call over a hermetic machine: no host at all, which is what the
-    /// `bare` and `twin` rungs run on.
+    /// One call over a hermetic machine: no host at all, which is what the `bare` and `twin` rungs
+    /// run on.
     fn call_pure(&self, simple: &str, n: i64) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
@@ -137,9 +108,8 @@ impl Program {
         Ok((started.elapsed(), value))
     }
 
-    /// One call with a real `trace` binding, which is the whole of what the
-    /// bound rungs add: a `perform` that leaves the program and a sink that
-    /// answers it.
+    /// One call with a real `trace` binding, which is the whole of what the bound rungs add: a
+    /// `perform` that leaves the program and a sink that answers it.
     fn call_traced(
         &self,
         host: &ply_host::Host,
@@ -167,15 +137,7 @@ impl Program {
 
 // --- A sink whose destination is a parameter --------------------------------
 
-/// `ply_host::trace::json`'s formatting with somewhere other than this process's
-/// stderr to put it.
-///
-/// The shipped `Json` writes to the real fd 2, which an in-process benchmark
-/// cannot separate from its own output — so the format cost and the write cost
-/// are priced here with the destination swapped, and the *shipped* sink is
-/// measured where it belongs, under [`tracing`], with a whole `ply run` between
-/// the harness and the file. `write_json` is the shipped one's own encoder,
-/// called directly, so the bytes on both sides are the same bytes.
+/// `ply_host::trace::json`'s formatting with somewhere other than this process's stderr to put it.
 struct FileJson {
     level: Level,
     out: Mutex<std::io::BufWriter<std::fs::File>>,
@@ -235,21 +197,20 @@ pub struct EventPoint {
     pub operations: u32,
     pub per_operation_micros: f64,
     pub per_second: f64,
-    /// Microseconds this rung adds over `bare` at the same operation, which is
-    /// the number ADR 0015 §1.4 owes.
+    /// Microseconds this rung adds over `bare` at the same operation, which is the number ADR 0015
+    /// §1.4 owes.
     pub over_bare_micros: f64,
 }
 
 /// Which sink a rung installs, and what it is called in the table.
 #[derive(Clone, Copy)]
 enum Rung {
-    /// The same loop with no perform in it. Not a configuration a Ply service
-    /// can be in, and the denominator for every row that is.
+    /// The same loop with no perform in it.
     Bare,
     /// `--trace off`: the shipped `ply_host::trace::discard`.
     Discard,
-    /// `--trace json --trace-level warn` over `Debug` events: the shipped
-    /// filter, refusing before a name is decoded or a field list is built.
+    /// `--trace json --trace-level warn` over `Debug` events: the shipped filter, refusing before a
+    /// name is decoded or a field list is built.
     Filtered,
     /// `ply_host::trace::json`'s encoder, written to `/dev/null`.
     JsonNull,
@@ -273,14 +234,6 @@ impl Rung {
 }
 
 /// Every operation, under every sink, against the same loop.
-///
-/// The bound sinks are measured at `iterations` and the twin at
-/// `twin_iterations`, which is smaller and is not a hedge: `std.trace`'s `Sink`
-/// builds its record list with `push`, so collecting N records is O(N²) and a
-/// twin row taken at twenty thousand would be a number about list append rather
-/// than about the twin. A twin sink lives inside one test and holds tens of
-/// records, which is the size the row is taken at. The `ops` column carries the
-/// count so the two are never read as one measurement.
 pub fn events(
     iterations: u32,
     twin_iterations: u32,
@@ -290,9 +243,8 @@ pub fn events(
     let program = Program::parse()?;
     let mut out: Vec<EventPoint> = Vec::new();
 
-    // The denominator, taken once per size, because the fold, the list and the
-    // `Fields` map are the program's cost at every rung and charging them to
-    // tracing would overstate what a sink costs.
+    // The denominator, taken once per size, because the fold, the list and the `Fields` map are the
+    // program's cost at every rung and charging them to tracing would overstate what a sink costs.
     let bare_big = time(&program, Rung::Bare, "bare", iterations, repeats, dir)?;
     let bare_small = time(&program, Rung::Bare, "bare", twin_iterations, repeats, dir)?;
     out.push(point(Rung::Bare, "none", iterations, bare_big, bare_big));
@@ -344,8 +296,7 @@ fn time(
     repeats: usize,
     dir: &Path,
 ) -> Result<f64> {
-    // Answered by every rung, so a rung whose loop did not run is a failure
-    // rather than a fast row.
+    // Answered by every rung, so a rung whose loop did not run is a failure rather than a fast row.
     let n = iterations as i64;
     let expect = Value::Int(2 * n);
     let mut best = Duration::MAX;
@@ -401,14 +352,13 @@ fn sink_for(rung: Rung, dir: &Path) -> Result<Arc<Trace>> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sinking {
-    /// `--trace off` — `ply_host::trace::discard`, a listed handler and not an
-    /// absence.
+    /// `--trace off` — `ply_host::trace::discard`, a listed handler and not an absence.
     Off,
-    /// `--trace json`, with stderr on `/dev/null`: the encoder's cost with the
-    /// destination's taken out.
+    /// `--trace json`, with stderr on `/dev/null`: the encoder's cost with the destination's taken
+    /// out.
     JsonNull,
-    /// `--trace json`, with stderr on a file the harness reads afterwards, so
-    /// the records are counted rather than assumed.
+    /// `--trace json`, with stderr on a file the harness reads afterwards, so the records are
+    /// counted rather than assumed.
     JsonFile,
 }
 
@@ -434,7 +384,6 @@ impl Sinking {
 #[serde(rename_all = "kebab-case")]
 pub enum Stack {
     /// `run_memory`: the twin behind the routes, no host database, no host sink.
-    /// W3's shape, re-taken on this machine.
     Twin,
     /// `run`: postgres behind the routes, over plaintext.
     Postgres,
@@ -453,16 +402,9 @@ impl Stack {
 }
 
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
-///
-/// The service is read from the repository and its tests are cut; the only
-/// rewrite is which entry point `main` calls, because which store a service uses
-/// is not configuration. The port, the connection budget and the credential are
-/// `--set`, which is the whole of what W5 bought here.
 fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Result<()> {
-    // The twin discharges every `db`, `trace` and `signal` atom in Ply, so its
-    // entry point's row is narrower than the real desk's and moves with the
-    // call. `w3::Service::source` has already widened every row by the one atom
-    // spawning adds, so the needle depends on which accept loop is in the file.
+    // The twin discharges every `db`, `trace` and `signal` atom in Ply, so its entry point's row is
+    // narrower than the real desk's and moves with the call.
     let spawning = variant == w3::Variant::TaskPerConn;
     let task = if spawning { "task.write, " } else { "" };
     let from = format!(
@@ -543,9 +485,7 @@ impl Serving {
             key_set,
             "--trace".into(),
             sinking.flag().into(),
-            // Every record `desk.ply` writes is `Info` or above, so the sink
-            // admits all of them. What a *filtered* record costs is priced in
-            // `events`, where it can be separated from a request.
+            // Every record `desk.ply` writes is `Info` or above, so the sink admits all of them.
             "--trace-level".into(),
             "info".into(),
         ];
@@ -589,8 +529,8 @@ impl Serving {
         })
     }
 
-    /// Records the sink actually wrote, so a `json` row is a row about a sink
-    /// that wrote something rather than one that was configured to.
+    /// Records the sink actually wrote, so a `json` row is a row about a sink that wrote something
+    /// rather than one that was configured to.
     fn records_written(&self) -> usize {
         let Some(path) = &self.records else {
             return 0;
@@ -606,8 +546,8 @@ impl Serving {
 #[derive(Clone, Debug, Serialize)]
 pub struct ServedPoint {
     pub stack: &'static str,
-    /// Which accept loop served it: `sequential` is `examples/desk.ply` as
-    /// written, `task-per-conn` is the same service with a spawn in its loop.
+    /// Which accept loop served it: `sequential` is `examples/desk.ply` as written, `task-per-conn`
+    /// is the same service with a spawn in its loop.
     pub accept: &'static str,
     pub sink: &'static str,
     pub route: String,
@@ -618,13 +558,10 @@ pub struct ServedPoint {
     pub p95_micros: f64,
     pub p99_micros: f64,
     pub max_micros: f64,
-    /// Lines the sink wrote, counted from the file it wrote them to, and `0`
-    /// on every row whose sink has no file to count — `off`, `/dev/null`, and
-    /// every route but the last of a point, because one server serves the
-    /// routes of a point and its file does not say which line came from which.
-    /// So the last row of a `json → file` point carries the whole point, and
-    /// divided by that point's requests it is records per request, which is what
-    /// reconciles this table with [`events`].
+    /// Lines the sink wrote, counted from the file it wrote them to, and `0` on every row whose
+    /// sink has no file to count — `off`, `/dev/null`, and every route but the last of a point,
+    /// because one server serves the routes of a point and its file does not say which line came
+    /// from which.
     pub records: usize,
 }
 
@@ -682,9 +619,9 @@ pub fn tracing(
                 }
                 let written = serving.records_written().saturating_sub(before);
                 serving.server.finish()?;
-                // Charged to the last route of the point, because the sink is
-                // shared across the routes a server served and splitting it
-                // would be inventing an attribution the file does not carry.
+                // Charged to the last route of the point, because the sink is shared across the
+                // routes a server served and splitting it would be inventing an attribution the
+                // file does not carry.
                 if let Some(last) = out.last_mut() {
                     last.records = written;
                 }
@@ -700,8 +637,7 @@ pub fn tracing(
 pub struct DrainPoint {
     /// How the point was set up, in one phrase.
     pub scenario: String,
-    /// Connections holding a request the server had not answered when the signal
-    /// was delivered.
+    /// Connections holding a request the server had not answered when the signal was delivered.
     pub in_flight: u32,
     pub drain_ms: u64,
     pub lead_ms: u64,
@@ -710,20 +646,14 @@ pub struct DrainPoint {
     pub exit_code: i32,
     /// Requests that got a response after the signal.
     pub answered: u32,
-    /// Requests whose connection was closed with no response, which is what W5
-    /// costs at the deadline for want of cancellation.
+    /// Requests whose connection was closed with no response, which is what W5 costs at the
+    /// deadline for want of cancellation.
     pub abandoned: u32,
     /// Whether the run printed `W0608`.
     pub drain_incomplete: bool,
 }
 
-/// A stop with N requests in flight, under a drain that is long enough and under
-/// one that is not.
-///
-/// "In flight" is a request whose head the client has begun and not finished, so
-/// the server is inside `net.recv` with the connection accepted and nothing
-/// written back. That is the shape a request has for most of its life and the
-/// one the drain has to wait out.
+/// A stop with N requests in flight, under a drain that is long enough and under one that is not.
 pub fn drain(
     repo: &Path,
     ply: &Path,
@@ -747,8 +677,8 @@ pub fn drain(
             "completes",
         )?);
     }
-    // The deadline case: the clients hold their requests open for longer than
-    // the drain, so the run runs out of time with them still in flight.
+    // The deadline case: the clients hold their requests open for longer than the drain, so the run
+    // runs out of time with them still in flight.
     let &widest = in_flight.last().unwrap_or(&1);
     out.push(one_drain(
         repo,
@@ -761,9 +691,8 @@ pub fn drain(
         api_key,
         "expires",
     )?);
-    // And the lead: accept keeps running while `signal.stopping()` already
-    // answers true, which is what lets a readiness route shed before the
-    // listener closes.
+    // And the lead: accept keeps running while `signal.stopping()` already answers true, which is
+    // what lets a readiness route shed before the listener closes.
     out.push(one_drain(
         repo,
         ply,
@@ -829,23 +758,21 @@ fn one_drain(
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     w3::wait_until_serving(&mut server, addr)?;
 
-    // N connections, each with a request head begun and not finished. The
-    // server has accepted every one of them and is inside `net.recv`.
+    // N connections, each with a request head begun and not finished.
     let mut held = Vec::new();
     for _ in 0..in_flight {
         held.push(crate::w5::Partial::open(addr, hold_ms)?);
     }
-    // Give the accept loop time to take every one of them, so the signal finds
-    // them in flight rather than in the listen backlog.
+    // Give the accept loop time to take every one of them, so the signal finds them in flight
+    // rather than in the listen backlog.
     std::thread::sleep(Duration::from_millis(200));
 
     let pid = server.pid().context("the server has already been reaped")?;
     let signalled = Instant::now();
     signal(pid, "TERM")?;
 
-    // The clients run on their own threads, because the time under measurement
-    // is the signal to the process exiting and a harness that finished its
-    // clients first would be timing its own sleep.
+    // The clients run on their own threads, because the time under measurement is the signal to the
+    // process exiting and a harness that finished its clients first would be timing its own sleep.
     let clients: Vec<_> = held
         .into_iter()
         .map(|conn| std::thread::spawn(move || conn.finish().unwrap_or(false)))
@@ -940,41 +867,22 @@ fn signal(pid: u32, name: &str) -> Result<()> {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TxnOutcome {
-    /// The order sequence before and after. A sequence is **not** transactional,
-    /// so an advance across the run is proof the `INSERT` really executed —
-    /// without it, a table whose row count did not move is equally consistent
-    /// with a transaction that never got as far as writing anything.
+    /// The order sequence before and after.
     pub sequence_before: i64,
     pub sequence_after: i64,
     /// Orders in the table before the request was made.
     pub orders_before: i64,
-    /// Orders after the process exited. Equal to `orders_before` is a rollback;
-    /// one more is a commit, which is the outcome ADR 0015 §4.4 exists to make
-    /// unreachable.
+    /// Orders after the process exited.
     pub orders_after: i64,
     /// What the run's own teardown reported.
     pub verdict: String,
     pub exit_code: i32,
     pub stop_to_exit_ms: f64,
-    /// Backends left `idle in transaction` after the process exited. A
-    /// connection closed with a `BEGIN` still open leaves postgres to abort it
-    /// whenever it notices, which is the same outcome by luck rather than by
-    /// construction — so this being zero is the interesting half.
+    /// Backends left `idle in transaction` after the process exited.
     pub sessions_left: i64,
 }
 
-/// Whether a transaction open at the drain deadline commits, rolls back, or is
-/// lost.
-///
-/// The transaction is held open by the database rather than by a sleep in the
-/// program: a second session takes a row lock on the item the order draws down,
-/// so `place_order` gets as far as inserting its order row and then blocks on
-/// the `UPDATE`. The drain deadline expires with the `INSERT` done and the
-/// `COMMIT` not issued, which is exactly the state the ordering in §4.4 is about.
-///
-/// Asserted against the table's contents and `pg_stat_activity`, never against
-/// the driver's own bookkeeping — a driver that believed it had rolled back is
-/// the failure this is written to catch.
+/// Whether a transaction open at the drain deadline commits, rolls back, or is lost.
 pub fn transaction_at_deadline(
     repo: &Path,
     ply: &Path,
@@ -998,13 +906,10 @@ pub fn transaction_at_deadline(
         format!("DESK_API_KEY={api_key}"),
     ];
     let drain = drain_ms.to_string();
-    // Above the drain, so what stops the run is the deadline under measurement
-    // rather than postgres losing patience first — and not far above it, because
-    // the *teardown* is bounded by this and not by `--drain-ms`: a `ROLLBACK`
-    // queues behind the statement the connection is still executing, and that
-    // statement is blocked on a lock. That relationship is what makes
-    // `stop→exit` longer than `--drain-ms`, and it is the driver's own deadline
-    // doing the job ADR 0015 §4.4 says it does.
+    // Above the drain, so what stops the run is the deadline under measurement rather than postgres
+    // losing patience first — and not far above it, because the *teardown* is bounded by this and
+    // not by `--drain-ms`: a `ROLLBACK` queues behind the statement the connection is still
+    // executing, and that statement is blocked on a lock.
     let statement = (drain_ms + 5_000).to_string();
     let mut args: Vec<&str> = vec![
         "--config-schema",
@@ -1037,8 +942,8 @@ pub fn transaction_at_deadline(
 
     blocker.lock_bolt()?;
     let order = post_order(addr, api_key)?;
-    // Wait until the desk's own connection is the one waiting on the lock, which
-    // is the state the measurement is about.
+    // Wait until the desk's own connection is the one waiting on the lock, which is the state the
+    // measurement is about.
     wait_until_blocked(url, Duration::from_secs(30))?;
 
     let pid = server.pid().context("the server has already been reaped")?;
@@ -1048,8 +953,8 @@ pub fn transaction_at_deadline(
     let stop_to_exit = signalled.elapsed();
     drop(order);
 
-    // The lock is released only now, so nothing the desk left behind could have
-    // been resolved by this harness getting out of the way first.
+    // The lock is released only now, so nothing the desk left behind could have been resolved by
+    // this harness getting out of the way first.
     blocker.release()?;
 
     let orders_after = count_orders(url)?;
@@ -1231,20 +1136,14 @@ pub struct DeployReport {
     pub changed_definitions: usize,
     pub unchanged_definitions: usize,
     /// The bodies a transfer of only the changed definitions would have carried.
-    /// The number §5.1's refusal has to be judged against.
     pub changed_body_bytes: u64,
-    /// Those bodies as a fraction of a whole artifact, and of an artifact plus
-    /// the binary a deploy must also ship.
+    /// Those bodies as a fraction of a whole artifact, and of an artifact plus the binary a deploy
+    /// must also ship.
     pub of_artifact: f64,
     pub of_deploy: f64,
 }
 
-/// Artifact size, reproducibility, and what an incremental transfer would have
-/// saved.
-///
-/// `edit` is `(needle, replacement)` — one definition's body, rewritten. It
-/// asserts it found what it replaced, because a silent miss would report a
-/// second build that changed nothing as evidence that a change costs nothing.
+/// Artifact size, reproducibility, and what an incremental transfer would have saved.
 pub fn deploy(repo: &Path, ply: &Path, edit: (&str, &str)) -> Result<DeployReport> {
     let service = std::fs::read_to_string(repo.join("examples/desk.ply"))
         .context("reading `examples/desk.ply`")?;
@@ -1277,8 +1176,8 @@ pub fn deploy(repo: &Path, ply: &Path, edit: (&str, &str)) -> Result<DeployRepor
         .collect();
     let changed_body_bytes: u64 = changed
         .iter()
-        // The record as the `BODIES` section holds it: the key, the length and
-        // the bytes, because a transfer ships all three.
+        // The record as the `BODIES` section holds it: the key, the length and the bytes, because a
+        // transfer ships all three.
         .map(|(_, body)| body.len() as u64 + 32 + 4)
         .sum();
     let unchanged = new.bodies.len() - changed.len();
@@ -1476,8 +1375,8 @@ pub fn render(m: &Measurements) -> String {
 mod tests {
     use super::*;
 
-    /// The program every row of [`events`] runs has to be a program, and the
-    /// rows it publishes have to be the ones the substitution rests on.
+    /// The program every row of [`events`] runs has to be a program, and the rows it publishes have
+    /// to be the ones the substitution rests on.
     #[test]
     fn the_bench_program_checks_and_publishes_one_channel() {
         let program = Program::parse().expect("the bench program checks");
@@ -1502,8 +1401,8 @@ mod tests {
         );
     }
 
-    /// The twin discharges every `trace` atom, which is what makes the `twin`
-    /// rung a rung rather than a stub: it runs on a machine with no host at all.
+    /// The twin discharges every `trace` atom, which is what makes the `twin` rung a rung rather
+    /// than a stub: it runs on a machine with no host at all.
     #[test]
     fn a_twin_entry_point_reaches_nothing() {
         let program = Program::parse().unwrap();
@@ -1516,8 +1415,8 @@ mod tests {
         }
     }
 
-    /// Every rung answers the same count, which is the whole of what makes a
-    /// difference between two rows the operation rather than the work.
+    /// Every rung answers the same count, which is the whole of what makes a difference between two
+    /// rows the operation rather than the work.
     #[test]
     fn every_rung_runs_the_same_loop() {
         let program = Program::parse().unwrap();

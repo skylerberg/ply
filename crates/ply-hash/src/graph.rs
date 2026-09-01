@@ -1,11 +1,5 @@
-//! The reference graph over every top-level definition in a program, and the
-//! strongly connected components that decide which definitions must be hashed
-//! together.
-//!
-//! The index is deliberately module-*aware* and the hashes it feeds are
-//! module-*blind*: which module owns a definition decides only what a name
-//! denotes, and a resolved reference is written as the referent's hash. Moving a
-//! definition therefore changes the keys of the output maps and nothing else.
+//! The reference graph over every top-level definition in a program, and the strongly connected
+//! components that decide which definitions must be hashed together.
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -28,8 +22,7 @@ pub enum NodeBody<'a> {
 
 #[derive(Clone, Debug)]
 pub struct Node<'a> {
-    /// The program-wide name, `store.orders.place`. It keys the output maps and
-    /// never enters a hash.
+    /// The program-wide name, `store.orders.place`.
     pub name: Symbol,
     pub simple: &'a Symbol,
     /// Index into [`ProgramIndex::modules`].
@@ -39,19 +32,19 @@ pub struct Node<'a> {
 
 #[derive(Clone, Debug)]
 pub struct TestNode<'a> {
-    /// `<module>.<label>`, which is what keeps two identically-labelled tests in
-    /// different modules distinct.
+    /// `<module>.<label>`, which is what keeps two identically-labelled tests in different modules
+    /// distinct.
     pub key: Symbol,
     pub module: usize,
     pub def: &'a TestDef,
 }
 
-/// A `law`, which is an item with a body and no name a reference could reach —
-/// so it is indexed beside the tests rather than among the definitions.
+/// A `law`, which is an item with a body and no name a reference could reach — so it is indexed
+/// beside the tests rather than among the definitions.
 #[derive(Clone, Debug)]
 pub struct LawNode<'a> {
-    /// `<module>.<label>`, which is what keeps two identically-labelled laws in
-    /// different modules distinct.
+    /// `<module>.<label>`, which is what keeps two identically-labelled laws in different modules
+    /// distinct.
     pub key: Symbol,
     pub module: usize,
     pub def: &'a LawDef,
@@ -68,8 +61,8 @@ pub enum Entry {
 #[derive(Clone, Debug)]
 pub enum ValueTarget {
     Fn(NodeId),
-    /// The type that declares the variant, plus the variant's own name — a
-    /// constructor has no node of its own.
+    /// The type that declares the variant, plus the variant's own name — a constructor has no node
+    /// of its own.
     Ctor {
         owner: NodeId,
         name: Symbol,
@@ -85,14 +78,10 @@ struct ModuleItems {
     ctors: FxHashMap<Symbol, NodeId>,
 }
 
-/// A declaring module and the name it declares the referent under. Resolution is
-/// carried as a `(module, name)` pair rather than a qualified string so that
-/// nothing here depends on how [`ModuleName::qualify`] spells a program-wide
-/// name.
+/// A declaring module and the name it declares the referent under.
 type Target = (usize, Symbol);
 
-/// The unqualified names one module's bodies see, projected onto nodes. It is a
-/// view of what resolution already decided, never a second decision.
+/// The unqualified names one module's bodies see, projected onto nodes.
 #[derive(Debug, Default)]
 struct ScopeIndex {
     values: FxHashMap<Symbol, Target>,
@@ -107,21 +96,15 @@ pub struct ProgramIndex<'a> {
     pub tests: Vec<TestNode<'a>>,
     pub laws: Vec<LawNode<'a>>,
     pub order: Vec<Entry>,
-    /// The binder an `ensures` clause introduces beside the parameters. Owned
-    /// here so the normalizer can push a reference to it onto its scope without
-    /// borrowing from itself.
+    /// The binder an `ensures` clause introduces beside the parameters.
     pub result: Symbol,
     items: Vec<ModuleItems>,
     scopes: Vec<ScopeIndex>,
     effect_sketches: FxHashMap<usize, Vec<u8>>,
 }
 
-/// Each effect declaration's own normalized bytes, written against empty tables
-/// so that they are a function of that declaration and of nothing else in the
-/// program. They are a tie-break and never a hash input, which is why they may
-/// be this coarse: a reference inside them is `REF_SELF`, so two effects whose
-/// operations differ only in the types they name sketch alike and fall back to
-/// the order they were written in.
+/// Each effect declaration's own normalized bytes, written against empty tables so that they are a
+/// function of that declaration and of nothing else in the program.
 fn sketch_effects(index: &ProgramIndex<'_>) -> FxHashMap<usize, Vec<u8>> {
     let no_hashes = crate::normalize::HashTable::default();
     let no_component = crate::normalize::ComponentIndices::default();
@@ -149,8 +132,7 @@ fn qualifier(q: &QName) -> Option<&Symbol> {
     q.module.as_ref().map(|m| &m.name)
 }
 
-/// The name `qualified` has inside the module that declares it. Inverse of
-/// [`ModuleName::qualify`], and the identity for the anonymous module.
+/// The name `qualified` has inside the module that declares it.
 fn simple_of(qualified: &Symbol, owner: &ModuleName) -> Symbol {
     if owner.is_anonymous() {
         return qualified.clone();
@@ -164,17 +146,13 @@ fn simple_of(qualified: &Symbol, owner: &ModuleName) -> Symbol {
 }
 
 impl<'a> ProgramIndex<'a> {
-    /// One module with no project root, which can neither import nor be
-    /// imported.
+    /// One module with no project root, which can neither import nor be imported.
     pub fn single(module: &'a Module) -> Result<ProgramIndex<'a>, Vec<Diagnostic>> {
         ProgramIndex::build(vec![module], None)
     }
 
-    /// Without a [`Resolved`] there is no module namespace, so an imported name
-    /// would be written into the hash as the name the file spelled it with.
-    /// Two files importing different modules under one binder would then hash
-    /// alike, and editing the referent would move no hash here — a green cache
-    /// over changed code, which nothing downstream can detect.
+    /// Without a [`Resolved`] there is no module namespace, so an imported name would be written
+    /// into the hash as the name the file spelled it with.
     fn imports_need_a_program(modules: &[&'a Module]) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         for module in modules {
@@ -207,10 +185,7 @@ impl<'a> ProgramIndex<'a> {
         ProgramIndex::build(program.modules.iter().collect(), Some(resolved))
     }
 
-    /// `resolved` is the single source of truth for what an unqualified name
-    /// means. Without it each module sees only its own items, and a module that
-    /// imports is refused rather than hashed against a namespace that is not
-    /// there.
+    /// `resolved` is the single source of truth for what an unqualified name means.
     pub fn build(
         modules: Vec<&'a Module>,
         resolved: Option<&Resolved>,
@@ -291,9 +266,8 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
-                    // A law hashes like a test: an item with a body, its own
-                    // discriminant, its binder types and guard and body
-                    // normalized together.
+                    // A law hashes like a test: an item with a body, its own discriminant, its
+                    // binder types and guard and body normalized together.
                     Item::Law(d) => {
                         order.push(Entry::Law(laws.len()));
                         laws.push(LawNode {
@@ -302,10 +276,8 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
-                    // Expansion has already appended this derive's generated
-                    // definitions as `Item::Fn`, and those are the nodes. An
-                    // `effect set` stands for no definition at all: the parser
-                    // expanded every row that named it.
+                    // Expansion has already appended this derive's generated definitions as
+                    // `Item::Fn`, and those are the nodes.
                     Item::Derive(_) | Item::EffectSet(_) => {}
                 }
             }
@@ -332,9 +304,8 @@ impl<'a> ProgramIndex<'a> {
         Ok(index)
     }
 
-    /// The declaration bytes an effect reference is *ordered* by when the atom
-    /// bytes cannot separate two effects. Never written into a hash: see
-    /// [`crate::normalize::Normalizer::row`].
+    /// The declaration bytes an effect reference is *ordered* by when the atom bytes cannot
+    /// separate two effects.
     pub fn effect_sketch(&self, node: NodeId) -> Option<&[u8]> {
         self.effect_sketches.get(&node.0).map(Vec::as_slice)
     }
@@ -376,11 +347,8 @@ impl<'a> ProgramIndex<'a> {
         self.items.get(owner)?.effects.get(&name).copied()
     }
 
-    /// A qualified name consults only the named module's declarations and never
-    /// the current scope; a bare one consults only the current scope. Visibility
-    /// is deliberately not checked: `pub` decides whether a reference is *legal*,
-    /// which inference reports, and never which definition it denotes — so
-    /// adding or removing it cannot move a hash.
+    /// A qualified name consults only the named module's declarations and never the current scope;
+    /// a bare one consults only the current scope.
     fn target(
         &self,
         module: usize,
@@ -488,10 +456,7 @@ fn declare(
     map.insert(name.name.clone(), id);
 }
 
-/// Tarjan's algorithm, iterative so that a deep dependency chain cannot blow the
-/// stack. Components come out in reverse topological order: a component is
-/// emitted only after every component it references, which is exactly the order
-/// definitions have to be hashed in.
+/// Tarjan's algorithm, iterative so that a deep dependency chain cannot blow the stack.
 pub fn tarjan(n: usize, edges: &[Vec<NodeId>]) -> Vec<Vec<usize>> {
     const UNVISITED: usize = usize::MAX;
     let mut index = vec![UNVISITED; n];

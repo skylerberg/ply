@@ -1,23 +1,7 @@
 //! Escape enforcement at the runtime boundaries ADR 0017 §2's brand cannot see.
-//!
-//! §2 makes escape a type error and `brand_in` implements it over resolved
-//! types, a function type's effect row included. This file is about the places
-//! where no type is left to look at: a host handler, which outlives every
-//! region; a value a handler or a runtime answers with; an argument handed to an
-//! entry point from Rust.
-//!
-//! Every attack here is written to *succeed* if it can. The one route ADR 0017
-//! §2 leaves deliberately open — a continuation parked in an enclosing region's
-//! cell, where a nominal constructor's field type erases the brand — is used as
-//! the carrier rather than being worked around, because it is the only carrier
-//! the language has and closing the boundaries is what makes its consequences
-//! bounded.
-//!
-//! What each boundary's answer is, and where it lives, is `ply_eval::escape`'s
-//! module documentation. This file is the evidence for it.
 
-// A `Value`'s shared payloads are `Arc` and are deliberately thread-confined,
-// which is the crate's own allow rather than something these fixtures choose.
+// A `Value`'s shared payloads are `Arc` and are deliberately thread-confined, which is the crate's
+// own allow rather than something these fixtures choose.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_core::{CheckOutput, check_program};
@@ -32,8 +16,6 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// ------------------------------------------------------------------- harness
 
 struct Compiled {
     program: Program,
@@ -81,9 +63,8 @@ impl Compiled {
     }
 }
 
-/// A `Value::Cell` over a slot from a region that is still open — the shape a
-/// legitimate one has, so that what is under test is the boundary and not the
-/// slot being stale.
+/// A `Value::Cell` over a slot from a region that is still open — the shape a legitimate one has,
+/// so that what is under test is the boundary and not the slot being stale.
 fn live_cell() -> (Arena, Value) {
     let mut arena = Arena::new();
     arena.open(RegionKind::Shared, Span::DUMMY);
@@ -112,12 +93,8 @@ fn bound(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> H
     registry.bind(&compiled.check).expect("the registry binds")
 }
 
-// ------------------------------------------------------------------ programs
-
-/// ADR 0017 §2's open route, and ADR 0005 required test 6: a continuation parked
-/// in an enclosing region's cell and resumed after the region whose cell it
-/// reads has returned. `Just`'s field type is `(Bool) -> Int`, which mentions no
-/// brand, so no type after the constructor says `log`.
+/// ADR 0017 §2's open route, and ADR 0005 required test 6: a continuation parked in an enclosing
+/// region's cell and resumed after the region whose cell it reads has returned.
 const PARKED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
@@ -143,9 +120,7 @@ test "the parked continuation still reads its region's cell" {
 }
 "#;
 
-/// A constant whose value is a slot in *this run's* arena. Nullary with an empty
-/// published row — `with_cell` discharges its own atoms — so it is a constant by
-/// the memo's rule and exactly the shape `memo.rs` says must not be remembered.
+/// A constant whose value is a slot in *this run's* arena.
 const CONSTANT_OVER_A_CELL: &str = r#"
 fn boxed() -> Int = with_cell[log](41) { c -> cell_get(c) }
 
@@ -154,8 +129,8 @@ test "the constant reads this run's cell" {
 }
 "#;
 
-/// One host-backed operation with nothing to shadow it, so a handler's answer
-/// goes straight back into the program.
+/// One host-backed operation with nothing to shadow it, so a handler's answer goes straight back
+/// into the program.
 const ASKS: &str = r#"
 nondet effect ext {
   write ask[s](n: Int) -> Int
@@ -166,12 +141,7 @@ test/nondet "the answer comes back" {
 }
 "#;
 
-// ------------------------------------------- 1. the open route stays open
-
 /// ADR 0017 §2 records one route as open and this milestone does not close it.
-/// A test that only asserted the refusals would pass just as well if the
-/// language had stopped compiling the shape, so this is asserted first and on
-/// both engines.
 #[test]
 fn the_documented_open_route_still_behaves_as_adr_0017_section_2_says() {
     let compiled = Compiled::new(PARKED);
@@ -182,19 +152,15 @@ fn the_documented_open_route_still_behaves_as_adr_0017_section_2_says() {
         .eval_test(index)
         .unwrap_or_else(|d| panic!("the open route must still run on the machine: {d:#?}"));
 
-    // The tree-walker refuses every clause that binds a continuation (`E0504`,
-    // ADR 0005 required test 3), so its answer here is that refusal and not a
-    // different reading of the program. Asserted rather than skipped, because
-    // "the other engine agreed" and "the other engine never ran it" are
-    // different facts and ADR 0017's §"What must be measured" turns on which.
+    // The tree-walker refuses every clause that binds a continuation (`E0504`, ADR 0005 required
+    // test 3), so its answer here is that refusal and not a different reading of the program.
     let treewalk = compiled.interp().eval_test(index).expect_err("E0504");
     assert_eq!(treewalk.code, codes::MACHINE_ONLY_CLAUSE);
     assert!(ply_eval::is_machine_only(&treewalk));
     let _ = Engine::Machine;
 }
 
-/// And the value it carries is found by the walk the boundaries use. If this
-/// stopped being true every refusal below would pass vacuously.
+/// And the value it carries is found by the walk the boundaries use.
 #[test]
 fn the_value_the_open_route_produces_is_one_the_walk_finds() {
     let compiled = Compiled::new(PARKED);
@@ -212,18 +178,8 @@ fn the_value_the_open_route_produces_is_one_the_walk_finds() {
     );
 }
 
-/// The obvious extension of the open route — the same constructor erasure
-/// carrying a **cell inside a closure** rather than a continuation — and it does
-/// not exist.
-///
-/// A field type is declared once for the whole program, so `Wrap`'s is
-/// `() -> Int` with an empty row, and the row on `|| cell_get(c)` has nothing to
-/// unify with at the constructor's *application*. That is `E0302` before any
-/// region check is consulted, which is why §2's open route is specifically a
-/// continuation: `ρ_κ` is a variable the `handle` solves, and it unifies.
-///
-/// Recorded here because "the erasure route also launders cells" is the
-/// plausible-sounding claim a reader would otherwise carry away from §2.
+/// The obvious extension of the open route — the same constructor erasure carrying a **cell inside
+/// a closure** rather than a continuation — and it does not exist.
 #[test]
 fn the_constructor_erasure_does_not_also_launder_a_cell_inside_a_closure() {
     let diags = Compiled::refused(
@@ -245,15 +201,7 @@ fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
     );
 }
 
-// ------------------------------------------------------ 2. the entry point
-
 /// The boundary that got sharper rather than softer under regions.
-///
-/// Under the forkable world this was half-closed: a `CellId` the new world did
-/// not hold was named by `E0505`, and one it happened to hold was read. A region
-/// stack resets by *restoring* the fixture's generations, so a slot carried out
-/// of one entry point resolves in the next one — the half that used to be caught
-/// is not caught by anything downstream any more.
 #[test]
 fn a_continuation_from_an_earlier_run_is_refused_at_the_entry_point() {
     let compiled = Compiled::new(PARKED);
@@ -279,8 +227,7 @@ fn a_continuation_from_an_earlier_run_is_refused_at_the_entry_point() {
     assert!(notes.contains("resets its region stack"), "{notes}");
 }
 
-/// A bare slot, which is what the check has to catch when no constructor is
-/// involved at all.
+/// A bare slot, which is what the check has to catch when no constructor is involved at all.
 #[test]
 fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     let compiled = Compiled::new(PARKED);
@@ -295,8 +242,8 @@ fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     assert!(d.message.contains("`Cell`"), "{}", d.message);
 }
 
-/// Both engines, at the same point and with the same message, or `--engine
-/// both` reports the refusal itself as a divergence.
+/// Both engines, at the same point and with the same message, or `--engine both` reports the
+/// refusal itself as a divergence.
 #[test]
 fn both_engines_refuse_an_entry_point_argument_identically() {
     let compiled = Compiled::new(PARKED);
@@ -316,8 +263,7 @@ fn both_engines_refuse_an_entry_point_argument_identically() {
     assert_eq!(machine.notes, treewalk.notes);
 }
 
-/// Data crosses. A boundary that refused everything would be a boundary nobody
-/// could call an entry point through, and the prover calls one per obligation.
+/// Data crosses.
 #[test]
 fn data_still_crosses_the_entry_point() {
     let compiled = Compiled::new(PARKED);
@@ -330,16 +276,15 @@ fn data_still_crosses_the_entry_point() {
     );
 }
 
-/// The refusal happens **before** the reset, so a run that was refused has not
-/// also discarded the previous run's arena. Otherwise a caller that recovered
-/// from the diagnostic would be standing on a region stack the refusal emptied.
+/// The refusal happens **before** the reset, so a run that was refused has not also discarded the
+/// previous run's arena.
 #[test]
 fn a_refused_entry_point_leaves_the_previous_runs_state_alone() {
     let compiled = Compiled::new(PARKED);
     let mut machine = compiled.machine();
-    // Seeded, because what a run allocates in a region of its own is handed back
-    // at that region's close: the state a refusal must not disturb is the
-    // fixture, which is what outlives an entry point.
+    // Seeded, because what a run allocates in a region of its own is handed back at that region's
+    // close: the state a refusal must not disturb is the fixture, which is what outlives an entry
+    // point.
     let fixture = ply_eval::Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(1_000))));
     let (regions, _) = fixture.open();
     machine.set_regions(regions);
@@ -362,11 +307,9 @@ fn a_refused_entry_point_leaves_the_previous_runs_state_alone() {
     );
 }
 
-/// The reason the entry-point check is load-bearing rather than belt-and-braces,
-/// stated over the allocator: a reset restores the fixture's generations, so a
-/// slot taken out of an earlier run resolves afterwards. That is correct — a
-/// `Value::Cell` handed to the caller as part of a fixture has to keep working —
-/// and it is exactly why the boundary above cannot rely on the slot going stale.
+/// The reason the entry-point check is load-bearing rather than belt-and-braces, stated over the
+/// allocator: a reset restores the fixture's generations, so a slot taken out of an earlier run
+/// resolves afterwards.
 #[test]
 fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
     let mut regions = TaskRegions::new();
@@ -385,11 +328,7 @@ fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
     );
 }
 
-// -------------------------------------------------------- 3. the host boundary
-
-/// A handler that answers with a handle it minted. `TaskId` is constructible
-/// from outside `ply-eval`, which is what makes this attack writable at all —
-/// and what makes the check on the answer necessary rather than theoretical.
+/// A handler that answers with a handle it minted.
 struct Forges;
 
 impl HostHandler for Forges {
@@ -398,8 +337,8 @@ impl HostHandler for Forges {
     }
 }
 
-/// Wraps the forged handle in a constructor, so what is under test is the walk
-/// rather than a top-level match.
+/// Wraps the forged handle in a constructor, so what is under test is the walk rather than a
+/// top-level match.
 struct ForgesInside;
 
 impl HostHandler for ForgesInside {
@@ -474,9 +413,7 @@ fn a_handle_wrapped_in_a_constructor_by_a_handler_is_refused_too() {
     );
 }
 
-/// The boundary is not a wall. A handler answering with data is the ordinary
-/// case and stays untouched — including the linearity accounting beside it,
-/// which a refusal placed in the wrong order would have skipped.
+/// The boundary is not a wall.
 #[test]
 fn a_handler_answering_with_data_is_untouched() {
     let compiled = Compiled::new(ASKS);
@@ -496,11 +433,8 @@ fn a_handler_answering_with_data_is_untouched() {
     assert_eq!(machine.host_ops(), 1);
 }
 
-/// `E0449` is the machine's verdict about its own memory, so a handler may not
-/// mint it: `attribute` rewrites a reserved code to `E0502` and adds the note
-/// naming the handler. Without this, a handler could answer with the code that
-/// says "the run handed me a handle into a region" and send the reader looking
-/// for a defect in the program.
+/// `E0449` is the machine's verdict about its own memory, so a handler may not mint it: `attribute`
+/// rewrites a reserved code to `E0502` and adds the note naming the handler.
 struct ClaimsTheCode;
 
 impl HostHandler for ClaimsTheCode {
@@ -537,11 +471,7 @@ fn a_handler_may_not_answer_with_the_boundarys_own_code() {
     );
 }
 
-/// The argument half of the same boundary. No source-level route reaches it
-/// today — §2's static checks refuse a branded value at every `perform` — so it
-/// is driven through the check itself, which is what a backstop's test can
-/// honestly assert. The wiring beside it is covered by the answer tests, which
-/// share `perform_host`.
+/// The argument half of the same boundary.
 #[test]
 fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
     let (_arena, cell) = live_cell();
@@ -562,9 +492,9 @@ fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
     );
 }
 
-/// A trace span attribute and a log line are this boundary and not a new one:
-/// `std.trace` is served by a host handler, so a value reaching a field crosses
-/// `perform_host` exactly as a database parameter does.
+/// A trace span attribute and a log line are this boundary and not a new one: `std.trace` is served
+/// by a host handler, so a value reaching a field crosses `perform_host` exactly as a database
+/// parameter does.
 #[test]
 fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     let (_arena, cell) = live_cell();
@@ -585,24 +515,16 @@ fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     .expect_err("a field carrying a handle is refused");
     assert!(d.message.contains("item 0"), "{}", d.message);
 
-    // And what a sink writes is text: a handle renders opaquely and is never
-    // dereferenced, so the record cannot carry the region into the log.
+    // And what a sink writes is text: a handle renders opaquely and is never dereferenced, so the
+    // record cannot carry the region into the log.
     let (_a, c) = live_cell();
     let rendered = c.render();
     assert!(rendered.starts_with("<cell "), "{rendered}");
     assert!(!rendered.contains("41"), "the slot's contents are not read");
 }
 
-// ------------------------------------------------------- 4. the result cache
-
-/// `boxed` is nullary and publishes an empty row, which makes it a constant by
-/// the memo's rule, and its value is a slot in this run's arena — the exact
-/// shape `memo.rs` says must not be remembered. Two entry points on one machine
-/// is what catches it: the second one runs after a reset, so a remembered value
-/// would hand it a slot the first run allocated.
-///
-/// Driven through the machine rather than through `Memo` directly, because what
-/// is under test is that the rule is *applied* and not that it is written down.
+/// `boxed` is nullary and publishes an empty row, which makes it a constant by the memo's rule, and
+/// its value is a slot in this run's arena — the exact shape `memo.rs` says must not be remembered.
 #[test]
 fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
     let compiled = Compiled::new(CONSTANT_OVER_A_CELL);
@@ -614,8 +536,8 @@ fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
             .unwrap_or_else(|d| panic!("run {run} must read this run's own cell: {d:#?}"));
     }
 
-    // And the same on the other engine, or the two disagree about a resource
-    // bound and `--engine both` reports it as `E0503`.
+    // And the same on the other engine, or the two disagree about a resource bound and `--engine
+    // both` reports it as `E0503`.
     let mut interp = compiled.interp();
     for run in 0..3 {
         interp
@@ -624,11 +546,9 @@ fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
     }
 }
 
-// -------------------------------------------- 5. a stale access, not a value
-
-/// The property that makes every refusal above a bound rather than a hope: when
-/// a handle does reach a slot whose region has closed, the read is a diagnostic
-/// and never the value that now lives at that position.
+/// The property that makes every refusal above a bound rather than a hope: when a handle does reach
+/// a slot whose region has closed, the read is a diagnostic and never the value that now lives at
+/// that position.
 #[test]
 fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
     let mut arena = Arena::new();
@@ -650,17 +570,9 @@ fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
     arena.close(second);
 }
 
-// ------------------------------------- 6. the boundaries closed elsewhere
-
-/// An M8 counterexample and a shrunk witness are closed at the law, not at the
-/// runtime: `E0418` refuses a binder whose type the generator cannot inhabit, so
-/// no generated value and no shrunk witness can hold a handle in the first
-/// place.
-///
-/// `ply-core`'s `a_law_cannot_quantify_over_a_type_the_generator_cannot_inhabit`
-/// pins the bare and the variant shapes. The record is here because it is the
-/// shape a counterexample most plausibly has and because it is the one that
-/// needs `ungeneratable` to walk a field rather than an argument.
+/// An M8 counterexample and a shrunk witness are closed at the law, not at the runtime: `E0418`
+/// refuses a binder whose type the generator cannot inhabit, so no generated value and no shrunk
+/// witness can hold a handle in the first place.
 #[test]
 fn a_law_cannot_quantify_over_a_record_that_reaches_a_region() {
     let diags = Compiled::refused(r#"law "no" forall (r: {c: Cell<Int>}) { true }"#);
@@ -670,11 +582,10 @@ fn a_law_cannot_quantify_over_a_record_that_reaches_a_region() {
     );
 }
 
-/// A value crossing into a task is deliberately *not* refused — ADR 0017 §2
-/// excludes `task.spawn` from a bare `with_cell`'s rule because a cell reaching
-/// a task is how tasks share memory — and §3 is what makes that safe: a `task`
-/// operation anywhere in a region infers `shared`, and a shared region's slots
-/// outlive its close.
+/// A value crossing into a task is deliberately *not* refused — ADR 0017 §2 excludes `task.spawn`
+/// from a bare `with_cell`'s rule because a cell reaching a task is how tasks share memory — and §3
+/// is what makes that safe: a `task` operation anywhere in a region infers `shared`, and a shared
+/// region's slots outlive its close.
 #[test]
 fn a_cell_reaching_a_task_still_runs_and_its_region_is_shared() {
     let src = r#"

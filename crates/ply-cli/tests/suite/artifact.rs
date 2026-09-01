@@ -1,11 +1,4 @@
 //! Deployment over the content-addressed store: ADR 0015 §5.
-//!
-//! Three claims carry this file. An artifact is a *function of the source tree*,
-//! so two builds agree byte for byte from any directory. It is *verifiable*,
-//! because the hashes a body is filed under are the integrity check and a
-//! corrupted transfer is a per-definition refusal. And it is *the closure of one
-//! entry point*, so a deployed program carries no test, no law and no fixture —
-//! which falls out of the closure rather than being filtered.
 
 use assert_cmd::Command;
 use ply_cli::artifact::{self, Artifact};
@@ -16,9 +9,7 @@ use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// An effect, a type, a mutually recursive pair, a definition nothing reaches, a
-/// test and a law. Everything the closure has to include and everything it has
-/// to leave out, in one module.
+/// An effect, a type, a mutually recursive pair, a definition nothing reaches, a test and a law.
 const PROGRAM: &str = r#"
 effect log { write emit[c](msg: String) -> Unit }
 
@@ -79,13 +70,8 @@ fn json_of(output: &std::process::Output) -> Value {
 
 // --- reproducibility ---------------------------------------------------------
 
-/// Two builds of one source tree, from two different absolute roots, one over a
-/// cold cache and one over a cache a full `ply test` warmed. Byte-identical, and
-/// the same digest.
-///
-/// Nothing is engineered for this: bodies are the normalizer's stream and carry
-/// no names, spans or paths, every section is sorted by content, and no field
-/// records a time.
+/// Two builds of one source tree, from two different absolute roots, one over a cold cache and one
+/// over a cache a full `ply test` warmed.
 #[test]
 fn two_builds_from_two_roots_are_byte_identical() {
     let cold = project(PROGRAM);
@@ -126,10 +112,8 @@ fn ply_build_twice_writes_the_same_bytes() {
 
 // --- what is in one ----------------------------------------------------------
 
-/// A test is a definition nothing calls, so it is not in an entry point's
-/// closure — and neither is a law, nor a definition nothing reaches. The
-/// property falls out of the closure rather than being applied, which is the
-/// better kind of property, and this is what checks it did fall out.
+/// A test is a definition nothing calls, so it is not in an entry point's closure — and neither is
+/// a law, nor a definition nothing reaches.
 #[test]
 fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
     let dir = project(PROGRAM);
@@ -170,8 +154,8 @@ fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
     assert!(!opened.located, "a bodies-only artifact locates nothing");
 }
 
-/// Every definition in the artifact is filed under the hash `ply hash` gives it,
-/// which is what makes the artifact and the store one namespace rather than two.
+/// Every definition in the artifact is filed under the hash `ply hash` gives it, which is what
+/// makes the artifact and the store one namespace rather than two.
 #[test]
 fn every_body_is_filed_under_the_hash_ply_hash_prints() {
     let dir = project(PROGRAM);
@@ -217,8 +201,8 @@ fn an_artifact_runs_to_the_same_value_as_its_source() {
     assert!(artifact_value.contains("42"), "{artifact_value}");
 }
 
-/// `--engine both` over an artifact is the claim that decoding a body did not
-/// change what it does, and a deployed program is not a place to relax it.
+/// `--engine both` over an artifact is the claim that decoding a body did not change what it does,
+/// and a deployed program is not a place to relax it.
 #[test]
 fn an_artifact_runs_on_both_engines_without_divergence() {
     let dir = project(PROGRAM);
@@ -236,8 +220,8 @@ fn an_artifact_runs_on_both_engines_without_divergence() {
     assert_eq!(report["located"], false);
 }
 
-/// A run out of an artifact is hermetic for the same reason a run out of source
-/// is: nothing is bound unless `--host` is written in the command.
+/// A run out of an artifact is hermetic for the same reason a run out of source is: nothing is
+/// bound unless `--host` is written in the command.
 #[test]
 fn an_artifact_run_binds_nothing_without_host() {
     let dir = project(PROGRAM);
@@ -254,9 +238,9 @@ fn an_artifact_run_binds_nothing_without_host() {
     assert_eq!(report["binding"], "hermetic");
 }
 
-/// With sources the text is re-parsed and re-checked, and then re-hashed and
-/// compared against the artifact — so a failure carries a line number and the
-/// sources cannot be a different program than the digest names.
+/// With sources the text is re-parsed and re-checked, and then re-hashed and compared against the
+/// artifact — so a failure carries a line number and the sources cannot be a different program than
+/// the digest names.
 #[test]
 fn an_artifact_built_with_sources_locates_its_failures() {
     let dir = project("fn main() -> Int = 1 / 0\n");
@@ -307,17 +291,16 @@ fn embedded_sources_that_are_not_the_sources_are_refused() {
 
 // --- verification ------------------------------------------------------------
 
-/// A flipped bit in one body is refused at that definition, naming the hash it
-/// was filed under and where in the file it was — a per-definition refusal
-/// rather than a plausible wrong program.
+/// A flipped bit in one body is refused at that definition, naming the hash it was filed under and
+/// where in the file it was — a per-definition refusal rather than a plausible wrong program.
 #[test]
 fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
     let dir = project(PROGRAM);
     let artifact = artifact_of(dir.path());
     let mut bytes = artifact.encode();
 
-    // The first record starts past the header and three descriptors; its payload
-    // starts past the 32-byte key and the length prefix.
+    // The first record starts past the header and three descriptors; its payload starts past the
+    // 32-byte key and the length prefix.
     let record = 188 + 24 * 3;
     bytes[record + 36] ^= 0x40;
     let path = dir.path().join("bad.plyx");
@@ -342,8 +325,8 @@ fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
     assert_eq!(report["diagnostics"][0]["code"], "E0443");
 }
 
-/// Every truncation, not one: a reader that believed any prefix would believe a
-/// transfer that stopped halfway.
+/// Every truncation, not one: a reader that believed any prefix would believe a transfer that
+/// stopped halfway.
 #[test]
 fn no_prefix_of_an_artifact_is_believed() {
     let dir = project(PROGRAM);
@@ -357,15 +340,13 @@ fn no_prefix_of_an_artifact_is_believed() {
     assert!(artifact::decode(&bytes, &path).is_ok());
 }
 
-/// A body naming a hash the artifact does not hold is a closure computed wrong
-/// or a file assembled wrong, and either way it is not a program.
+/// A body naming a hash the artifact does not hold is a closure computed wrong or a file assembled
+/// wrong, and either way it is not a program.
 #[test]
 fn a_body_referring_to_a_hash_the_artifact_lacks_is_e0443() {
     let dir = project(PROGRAM);
     let mut artifact = artifact_of(dir.path());
-    // A solo definition something else references. A member of a mutually
-    // recursive component would not do: its payload carries the whole component,
-    // so dropping one member's record leaves nothing dangling.
+    // A solo definition something else references.
     let victim = artifact
         .names
         .iter()
@@ -375,8 +356,8 @@ fn a_body_referring_to_a_hash_the_artifact_lacks_is_e0443() {
     artifact.bodies.remove(&victim);
     artifact.names.retain(|(_, h)| *h != victim);
 
-    // Re-encoded, so the digest and every remaining body still verify: the only
-    // thing wrong with this file is that its closure is open.
+    // Re-encoded, so the digest and every remaining body still verify: the only thing wrong with
+    // this file is that its closure is open.
     let bytes = artifact.encode();
     let path = dir.path().join("open.plyx");
     let (decoded, _) = artifact::decode(&bytes, &path).expect("the container still verifies");
@@ -387,8 +368,8 @@ fn a_body_referring_to_a_hash_the_artifact_lacks_is_e0443() {
     assert_eq!(diags[0].code, codes::ARTIFACT_INVALID);
 }
 
-/// The two call for opposite responses — rebuild the artifact, versus transfer
-/// it again — so they are two codes.
+/// The two call for opposite responses — rebuild the artifact, versus transfer it again — so they
+/// are two codes.
 #[test]
 fn a_foreign_encoding_is_e0444_and_not_e0443() {
     let dir = project(PROGRAM);
@@ -415,9 +396,8 @@ fn a_foreign_encoding_is_e0444_and_not_e0443() {
     assert_eq!(err.code, codes::ARTIFACT_VERSION);
 }
 
-/// A differing stdlib digest is a fact, not a fault: a shipped definition is
-/// content-addressed like any other, and the artifact's own definitions are what
-/// it runs.
+/// A differing stdlib digest is a fact, not a fault: a shipped definition is content-addressed like
+/// any other, and the artifact's own definitions are what it runs.
 #[test]
 fn a_differing_stdlib_digest_is_w0605_and_the_run_proceeds() {
     let dir = project(PROGRAM);
@@ -456,8 +436,8 @@ fn a_file_that_is_not_an_artifact_says_so() {
 
 // --- the digest ---------------------------------------------------------------
 
-/// `--digest` is one line and nothing else, and it is the same digest the build
-/// reports — otherwise a deployment pins one number and ships another.
+/// `--digest` is one line and nothing else, and it is the same digest the build reports — otherwise
+/// a deployment pins one number and ships another.
 #[test]
 fn the_digest_is_one_line_and_agrees_with_the_build() {
     let dir = project(PROGRAM);
@@ -483,8 +463,8 @@ fn the_digest_is_one_line_and_agrees_with_the_build() {
     assert_eq!(report["digest"], digest);
 }
 
-/// Embedding sources changes the digest, so "was this built with sources" is
-/// answerable from the digest alone.
+/// Embedding sources changes the digest, so "was this built with sources" is answerable from the
+/// digest alone.
 #[test]
 fn sources_change_the_digest() {
     let dir = project(PROGRAM);
@@ -494,8 +474,7 @@ fn sources_change_the_digest() {
     assert_eq!(bare.bodies, with.bodies, "only the sources differ");
 }
 
-/// A change to any definition in the closure moves the digest; a change to one
-/// outside it does not. That is selection's exactness, restated for a deploy.
+/// A change to any definition in the closure moves the digest; a change to one outside it does not.
 #[test]
 fn the_digest_moves_with_the_closure_and_with_nothing_else() {
     let dir = project(PROGRAM);
@@ -557,8 +536,8 @@ fn diff_reports_added_changed_dropped_and_what_a_change_is_reached_by() {
     assert_eq!(report["added"].as_array().unwrap().len(), 0, "{report}");
     assert_eq!(report["dropped"].as_array().unwrap().len(), 0, "{report}");
 
-    // The reached set is the reverse closure: every definition that reaches a
-    // changed one, and a definition reaches itself.
+    // The reached set is the reverse closure: every definition that reaches a changed one, and a
+    // definition reaches itself.
     let reached: Vec<&str> = report["reached"]
         .as_array()
         .unwrap()
@@ -574,8 +553,7 @@ fn diff_reports_added_changed_dropped_and_what_a_change_is_reached_by() {
     assert!(report["artifact_bytes"].as_u64().unwrap() > 0);
 }
 
-/// A definition that appears and one that goes away, counted apart from the ones
-/// that merely moved.
+/// A definition that appears and one that goes away, counted apart from the ones that merely moved.
 #[test]
 fn diff_counts_an_addition_and_a_removal() {
     let dir = project("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
@@ -600,8 +578,8 @@ fn diff_counts_an_addition_and_a_removal() {
     assert_eq!(report["changed"], serde_json::json!(["m.main"]));
 }
 
-/// Renaming a definition is a namespace edit, so the hash does not move — and
-/// the diff says exactly that: one name added, one dropped, nothing changed.
+/// Renaming a definition is a namespace edit, so the hash does not move — and the diff says exactly
+/// that: one name added, one dropped, nothing changed.
 #[test]
 fn a_rename_moves_a_name_and_no_hash() {
     let dir = project("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
@@ -625,9 +603,7 @@ fn a_rename_moves_a_name_and_no_hash() {
 
 // --- what the command prints ---------------------------------------------------
 
-/// ADR 0015 §5.1 refused incremental transfer because the binary is the part that
-/// actually changes. The decision has a number attached, and this is where the
-/// number is printed, so it can be re-opened against a measurement.
+/// ADR 0015 §5.1 refused incremental transfer because the binary is the part that actually changes.
 #[test]
 fn the_build_prints_the_artifacts_size_beside_the_binarys() {
     let dir = project(PROGRAM);
@@ -657,8 +633,8 @@ fn the_build_prints_the_artifacts_size_beside_the_binarys() {
     );
 }
 
-/// A directory with two `main`s is refused the same way `ply run` refuses it,
-/// and `--entry` is how a program says which closure it meant.
+/// A directory with two `main`s is refused the same way `ply run` refuses it, and `--entry` is how
+/// a program says which closure it meant.
 #[test]
 fn entry_names_the_closure_and_ambiguity_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -680,8 +656,8 @@ fn entry_names_the_closure_and_ambiguity_is_refused() {
     assert_eq!(report["value"], "1");
 }
 
-/// `--entry` also ships a closure that is not `main`'s, which is what a service
-/// with several roles needs.
+/// `--entry` also ships a closure that is not `main`'s, which is what a service with several roles
+/// needs.
 #[test]
 fn entry_can_name_something_other_than_main() {
     let dir = project("fn serve() -> Int = 7\nfn main() -> Int = 1\n");
@@ -701,8 +677,7 @@ fn entry_can_name_something_other_than_main() {
     assert_eq!(ran["value"], "7");
 }
 
-/// The output path defaults to the entry point's module, so the ordinary case
-/// needs no flag.
+/// The output path defaults to the entry point's module, so the ordinary case needs no flag.
 #[test]
 fn the_default_output_is_named_after_the_module() {
     let dir = project(PROGRAM);
@@ -710,8 +685,8 @@ fn the_default_output_is_named_after_the_module() {
     assert!(dir.path().join("m.plyx").exists());
 }
 
-/// A build is a full check of the source tree, so a program that does not check
-/// produces no artifact at all rather than a broken one.
+/// A build is a full check of the source tree, so a program that does not check produces no
+/// artifact at all rather than a broken one.
 #[test]
 fn a_program_that_does_not_check_produces_no_artifact() {
     let dir = project("fn main() -> Int = true\n");
@@ -734,22 +709,13 @@ fn the_output_directory_is_created() {
     assert!(dir.path().join("dist/nested/m.plyx").exists());
 }
 
-/// A program that reaches the host boundary, so the artifact's namespace has a
-/// job to do.
+/// A program that reaches the host boundary, so the artifact's namespace has a job to do.
 const SERVICE: &str = r#"
 import std.net (net)
 
 fn main() -> Int / {net.write[listener]} = net.listen[listener](0)
 "#;
 
-/// The namespace is not decoration, and this is the test that says why.
-///
-/// A host handler is registered against an effect's **program-wide name**, and
-/// so are `--db-schema` and `--config-schema`. An artifact rebuilt under
-/// synthesized names would bind nothing at all, and its refusal would name
-/// `d<hash16>` rather than the operation an operator has to go and bind. So the
-/// artifact carries the names and the loader uses them, and the artifact's
-/// diagnostic is the source's diagnostic without a line number.
 #[test]
 fn an_artifact_keeps_the_names_a_host_handler_is_registered_against() {
     let dir = project(SERVICE);
@@ -785,9 +751,8 @@ fn an_artifact_keeps_the_names_a_host_handler_is_registered_against() {
     assert!(from_artifact["diagnostics"][0]["labels"][0]["start"].is_null());
 }
 
-/// The entry point answers to the name it was built under, so `--entry`,
-/// `--db-schema` and `--config-schema` all name the same thing on both sides of
-/// a deploy.
+/// The entry point answers to the name it was built under, so `--entry`, `--db-schema` and
+/// `--config-schema` all name the same thing on both sides of a deploy.
 #[test]
 fn the_entry_point_keeps_its_program_wide_name() {
     let dir = project(PROGRAM);
@@ -798,9 +763,8 @@ fn the_entry_point_keeps_its_program_wide_name() {
     assert!(opened.check.defs.contains_key(&opened.entry));
 }
 
-/// A namespace that cannot be applied consistently falls back to the synthesized
-/// naming that always works, rather than producing a program named half one way
-/// and half the other.
+/// A namespace that cannot be applied consistently falls back to the synthesized naming that always
+/// works, rather than producing a program named half one way and half the other.
 #[test]
 fn an_inconsistent_namespace_falls_back_rather_than_failing() {
     let dir = project(PROGRAM);
@@ -808,8 +772,8 @@ fn an_inconsistent_namespace_falls_back_rather_than_failing() {
     for (name, _) in artifact.names.iter_mut() {
         *name = "collides".to_string();
     }
-    // Every name is now the same, so no namespace can be applied; the entry
-    // point is still found by hash and the program still runs.
+    // Every name is now the same, so no namespace can be applied; the entry point is still found by
+    // hash and the program still runs.
     let opened = artifact::open(&artifact, Path::new("t.plyx"))
         .expect("a useless namespace is not a broken artifact");
     assert!(
@@ -819,9 +783,8 @@ fn an_inconsistent_namespace_falls_back_rather_than_failing() {
     );
 }
 
-/// An artifact is started by calling its entry point with nothing, so an entry
-/// point that takes an argument is one nothing could ever run. Refused where the
-/// person who can fix it is standing.
+/// An artifact is started by calling its entry point with nothing, so an entry point that takes an
+/// argument is one nothing could ever run.
 #[test]
 fn an_entry_point_that_takes_an_argument_is_refused() {
     let dir = project("fn serve(port: Int) -> Int = port\nfn main() -> Int = serve(1)\n");
@@ -838,12 +801,10 @@ fn an_entry_point_that_takes_an_argument_is_refused() {
 
 // --- a deployed artifact is a service, not only a program --------------------
 
-/// The gap `ply build` and the shutdown sequence each left on the other's side:
-/// a run from a `.plyx` bound no signal handler, so a readiness route that
-/// consults `signal.stopping()` — which ADR 0015 §6.1 says is *the* thing a
-/// readiness route checks — answered `E0424` in the deployed form and `false` in
-/// the source form. A service that drains when run from `.ply` and is killed
-/// outright when run from `.plyx` is a service W5's §4 does not apply to.
+/// The gap `ply build` and the shutdown sequence each left on the other's side: a run from a
+/// `.plyx` bound no signal handler, so a readiness route that consults `signal.stopping()` — which
+/// ADR 0015 §6.1 says is *the* thing a readiness route checks — answered `E0424` in the deployed
+/// form and `false` in the source form.
 #[test]
 fn an_artifact_run_binds_the_signal_handler_a_source_run_binds() {
     const READY: &str = r#"
@@ -871,8 +832,8 @@ fn main() -> Int = ready()
     assert_eq!(built["value"], source["value"]);
     assert_eq!(built["value"], "200");
 
-    // And the drain is reported the same way, so a deployment reads one shape of
-    // `shutdown` object whichever form it shipped.
+    // And the drain is reported the same way, so a deployment reads one shape of `shutdown` object
+    // whichever form it shipped.
     assert_eq!(built["shutdown"]["requested"], false);
     assert_eq!(
         built["shutdown"]["drain_ms"],
@@ -880,8 +841,8 @@ fn main() -> Int = ready()
     );
     assert_eq!(built["shutdown"]["transactions_rolled_back"], 0);
 
-    // Without `--host` it is still `E0424`, naming the twin: an artifact is
-    // configured exactly as a source tree is, and the flag is the only way out.
+    // Without `--host` it is still `E0424`, naming the twin: an artifact is configured exactly as a
+    // source tree is, and the flag is the only way out.
     let hermetic = ply(dir.path())
         .args(["run", "m.plyx", "--json"])
         .output()
@@ -891,9 +852,7 @@ fn main() -> Int = ready()
     assert_eq!(hermetic["diagnostics"][0]["code"], codes::HERMETIC_BOUNDARY);
 }
 
-/// A configuration schema, the entry point, and a definition only the schema
-/// reaches. A `--config-schema` function is nullary and nothing in `main` calls
-/// it, which is what put it outside the closure.
+/// A configuration schema, the entry point, and a definition only the schema reaches.
 const WITH_SCHEMA: &str = r#"
 import std.config
 
@@ -907,24 +866,12 @@ fn main() -> Int = 1
 "#;
 
 /// **A `.plyx` has to be able to carry its own `--config-schema`.**
-///
-/// ADR 0015 §5.2 said an artifact is the closure of one entry point; §3.4 said a
-/// deployed service refuses to start when a required key is unset. A schema is a
-/// nullary function nothing in `main` calls, so the two were in direct conflict
-/// and the implementation resolved it against the deploy story: the artifact did
-/// not carry `spec`, `ply run m.plyx --config-schema m.spec` was `E0440`, and
-/// the artifact only served with the flag dropped — at which point `E0441
-/// CONFIG_MISSING` could never fire and `config.get` could hand back the API key
-/// as an ordinary `String`.
-///
-/// So the roots are the entry point *plus the start-up definitions the build
-/// names*, and the deployed form keeps the refusal.
 #[test]
 fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     let dir = project(WITH_SCHEMA);
 
-    // Without the flag, the schema is outside the closure and naming it is a
-    // refusal — the behaviour that made the deployed form lose its guarantee.
+    // Without the flag, the schema is outside the closure and naming it is a refusal — the
+    // behaviour that made the deployed form lose its guarantee.
     ply(dir.path())
         .args(["build", "-o", "bare.plyx"])
         .assert()
@@ -948,8 +895,8 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
         "{bare_run}"
     );
 
-    // Named at build time, the schema ships, and the deployed artifact refuses
-    // to start on the missing key exactly as the source tree does.
+    // Named at build time, the schema ships, and the deployed artifact refuses to start on the
+    // missing key exactly as the source tree does.
     let build = String::from_utf8(
         ply(dir.path())
             .args(["build", "--config-schema", "m.spec", "-o", "with.plyx"])
@@ -979,8 +926,8 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
         "{missing}"
     );
 
-    // And it starts once the key is supplied, which is the other half of the
-    // claim: the schema is applied rather than merely present.
+    // And it starts once the key is supplied, which is the other half of the claim: the schema is
+    // applied rather than merely present.
     let served = json_of(
         &ply(dir.path())
             .args([
@@ -1000,8 +947,8 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     );
     assert_eq!(served["ok"], true, "{served}");
 
-    // The extra definitions are the schema's closure and nothing else, and the
-    // build says so in `--json` so a deploy pipeline can assert on it.
+    // The extra definitions are the schema's closure and nothing else, and the build says so in
+    // `--json` so a deploy pipeline can assert on it.
     let bare = json_of(
         &ply(dir.path())
             .args(["build", "--json", "-o", "b2.plyx"])
@@ -1033,7 +980,6 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     );
 
     // And it is still the closure of its roots: no test, no law, no fixture.
-    // A schema is start-up code, not an exception to the rule.
     let (_, built) = built(dir.path(), false);
     assert!(
         !built.artifact.names.iter().any(|(n, _)| n.contains("test")),
@@ -1042,9 +988,8 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     );
 }
 
-/// A `--config-schema` at build time that names nothing is refused where it can
-/// be fixed, rather than shipping an artifact whose flag will fail on a machine
-/// nobody is holding the source on.
+/// A `--config-schema` at build time that names nothing is refused where it can be fixed, rather
+/// than shipping an artifact whose flag will fail on a machine nobody is holding the source on.
 #[test]
 fn a_build_schema_that_names_nothing_is_refused_at_build_time() {
     let dir = project(WITH_SCHEMA);

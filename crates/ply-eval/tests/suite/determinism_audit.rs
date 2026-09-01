@@ -1,30 +1,4 @@
-//! An adversarial audit of the one property the milestone sells: **a simulated
-//! run is a pure function of its definition set and its seed.**
-//!
-//! Everything else M7 ships is downstream of it. A seed that does not reproduce
-//! makes the repro artifact worthless and makes simulation strictly worse than
-//! no simulation, because it promises reproduction and does not deliver. So this
-//! file does not test that the feature works — `simulation.rs` does that — it
-//! tries to break the promise, and each test states the attack it is making.
-//!
-//! Two attacks are worth naming because they are the ones that are invisible
-//! when they succeed:
-//!
-//! - **A run whose *outcome* is stable while its *interleaving* is not.** Every
-//!   comparison here is over the whole recorded step sequence — the enabled set
-//!   at each point, the choice taken, the access set, the vector clock — and the
-//!   final world, never over the verdict alone. An assertion that happens not to
-//!   notice a reordering would hide exactly the defect being hunted.
-//! - **A search that is cheaper than it should be.** Pruning is sound only over
-//!   a complete access set, and a step that forgets an access produces a
-//!   *smaller* number rather than a failing test. `pruning_hides_no_outcome_...`
-//!   below compares the pruned search against the unpruned one on the real
-//!   machine, over the set of final worlds each observed, which is the only
-//!   check that fails rather than flatters.
-//!
-//! The converse is audited too: a seed that changes nothing would mean the
-//! search is theatre, so `different_seeds_really_do_explore_different_...`
-//! fails if the seed stops mattering.
+//! A simulated run is a pure function of its definition set and its seed.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::explore::{Interleaving, Step};
@@ -54,10 +28,6 @@ fn compile(source: &str) -> Compiled {
 }
 
 /// Everything one interleaving is allowed to be a function of, rendered.
-///
-/// The step sequence rather than the verdict, because a verdict agrees far more
-/// often than a schedule does; the world rather than the return value, because
-/// two tasks share memory and that is where a lost update lands.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Transcript {
     verdict: String,
@@ -94,8 +64,7 @@ impl Compiled {
         Transcript {
             verdict: match &outcome {
                 Ok(()) => "passed".to_string(),
-                // The code and the message, so that two different failures
-                // cannot compare equal.
+                // The code and the message, so that two different failures cannot compare equal.
                 Err(d) => format!("{}: {}", d.code, d.message),
             },
             virtual_time,
@@ -112,8 +81,8 @@ impl Compiled {
         self.transcript_of(0, seed)
     }
 
-    /// The choice sequence a run realized, which is not its seed's path: beyond
-    /// the path the `sched` stream chose.
+    /// The choice sequence a run realized, which is not its seed's path: beyond the path the
+    /// `sched` stream chose.
     fn choices_of(&self, index: usize, seed: &Seed) -> Vec<u16> {
         self.at(index, seed)
             .steps
@@ -122,19 +91,14 @@ impl Compiled {
             .collect()
     }
 
-    /// The interleaving as [`explore`] consumes it, for the tests that drive a
-    /// whole search rather than one run.
+    /// The interleaving as [`explore`] consumes it, for the tests that drive a whole search rather
+    /// than one run.
     fn at(&self, index: usize, seed: &Seed) -> Interleaving {
         self.run(index, seed).0
     }
 
-    /// One call of a named function, with both of the things a search wants from
-    /// it: what it interleaved, and the value it answered.
-    ///
-    /// The answer rather than the arena, because a region hands its cells back
-    /// at its lexical close and there is nothing left to read afterwards. A
-    /// program that reports its own outcome is the stronger oracle anyway: it
-    /// observes what the program computed rather than what the allocator kept.
+    /// One call of a named function, with both of the things a search wants from it: what it
+    /// interleaved, and the value it answered.
     fn answer(&self, name: &str, seed: &Seed) -> (Interleaving, Vec<String>) {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.set_seed(seed.clone(), 100_000);
@@ -154,8 +118,8 @@ impl Compiled {
         (interleaving, world)
     }
 
-    /// One run, with both of the things a search wants from it: what it
-    /// interleaved, and the world it left behind.
+    /// One run, with both of the things a search wants from it: what it interleaved, and the world
+    /// it left behind.
     fn run(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.set_seed(seed.clone(), 100_000);
@@ -183,13 +147,7 @@ fn dpor(budget: u32) -> Plan {
     }
 }
 
-// --------------------------------------------------------------- the fixtures
-
-/// The lost update. The `clock.now()` between the read and the write is what
-/// makes it reachable: ADR 0006 §3.3's steps end at a *scheduler-visible*
-/// perform, and `counter.*` is answered by a handler outside the region, so
-/// without it `bump` would run as one step and no schedule would separate the
-/// two.
+/// The lost update.
 const LOST_UPDATE: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -220,9 +178,9 @@ test "two increments" {
 }
 "#;
 
-/// Every shape that could plausibly reach something the seed does not name:
-/// a three-deep spawn tree, a task that fails half way through, two tasks woken
-/// by one timer, and two tasks drawing from one `random` stream.
+/// Every shape that could plausibly reach something the seed does not name: a three-deep spawn
+/// tree, a task that fails half way through, two tasks woken by one timer, and two tasks drawing
+/// from one `random` stream.
 const SHAPES: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -319,19 +277,13 @@ const SHAPE_NAMES: [&str; 4] = [
     "two tasks drawing from one stream",
 ];
 
-// ------------------------------------------------- one seed, one run, always
-
-/// The property everything else rests on, hammered rather than sampled: one
-/// seed, two hundred runs in one process, compared over the whole recording.
-///
-/// Two hundred rather than two because the failure modes being hunted — a hash
-/// map's iteration order, an allocation-order dependence, a stale counter — are
-/// the kind that agree for a while and then do not.
+/// The property everything else rests on, hammered rather than sampled: one seed, two hundred runs
+/// in one process, compared over the whole recording.
 #[test]
 fn one_seed_is_one_interleaving_across_hundreds_of_runs_in_one_process() {
     let compiled = compile(LOST_UPDATE);
-    // A bare root, and the same root with its own realized path pinned — the
-    // two halves of what a seed is.
+    // A bare root, and the same root with its own realized path pinned — the two halves of what a
+    // seed is.
     let pinned = Seed::at(3, compiled.choices_of(0, &Seed::root(3)));
     for seed in [Seed::root(0), Seed::root(7), pinned] {
         let first = compiled.transcript(&seed);
@@ -349,12 +301,8 @@ fn one_seed_is_one_interleaving_across_hundreds_of_runs_in_one_process() {
     }
 }
 
-/// The same, over a wide seed range and every fixture shape, so that a
-/// dependence on something the seed does not name has many chances to show.
-///
-/// A failing task, a timer, a draw and a three-deep spawn tree are each a place
-/// where a run could pick up something the seed does not fix, and all four are
-/// covered here rather than only the one the happy path exercises.
+/// The same, over a wide seed range and every fixture shape, so that a dependence on something the
+/// seed does not name has many chances to show.
 #[test]
 fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
     let compiled = compile(SHAPES);
@@ -368,10 +316,8 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
     }
 }
 
-/// The converse defect, and an equally fatal one: a seed that changes nothing
-/// means the search is theatre. Distinct *recordings* rather than distinct
-/// outcomes, because a program whose assertions cannot tell two schedules apart
-/// still has two schedules.
+/// The converse defect, and an equally fatal one: a seed that changes nothing means the search is
+/// theatre.
 #[test]
 fn different_seeds_really_do_explore_different_interleavings() {
     let compiled = compile(SHAPES);
@@ -388,24 +334,8 @@ fn different_seeds_really_do_explore_different_interleavings() {
     }
 }
 
-/// A path is the other half of a seed, and every claim the search makes rests on
-/// it meaning one run.
-///
-/// Three properties, and the third is the one a reader is likely to assume
-/// wrongly:
-///
-/// - a run's **whole** realized choice sequence, pinned, replays that run
-///   exactly — this is what makes `--seed 7:3.0.2` a repro;
-/// - a **prefix** pins exactly the points it names, choice for choice, which is
-///   what makes a backtrack point a seed rather than a whole schedule;
-/// - a prefix does **not** extend the run it was taken from. Pinning a point
-///   serves no draw, so a run with `k` choices pinned meets the `sched` stream
-///   `k` draws earlier than the run those choices came from, and the two part
-///   company after the prefix. `7:0` and `7` are therefore different seeds even
-///   when seed `7` chose `0` at point 0. That is consistent and reproducible —
-///   which is all the search needs — but it is not what "prefix" suggests, so it
-///   is pinned here rather than left to be discovered by someone truncating a
-///   seed to get closer to a failure.
+/// A path is the other half of a seed, and every claim the search makes rests on it meaning one
+/// run.
 #[test]
 fn a_path_pins_what_it_names_and_a_whole_path_replays_its_run() {
     let compiled = compile(LOST_UPDATE);
@@ -437,10 +367,7 @@ fn a_path_pins_what_it_names_and_a_whole_path_replays_its_run() {
     }
 }
 
-/// A run must be a function of the *definition set*, not of the source text. An
-/// edit that changes no hash — a comment, a rename of a local, whitespace —
-/// must not move a single scheduling decision, or a seed printed before the edit
-/// names a different run after it.
+/// A run must be a function of the *definition set*, not of the source text.
 #[test]
 fn an_edit_that_changes_no_hash_changes_no_interleaving() {
     let plain = compile(LOST_UPDATE);
@@ -463,12 +390,8 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
     }
 }
 
-// ------------------------------------------------------------- the search
-
-/// The search is itself part of the run's determinism: which interleaving comes
-/// next is as much a function of the seed as which task comes next. Two searches
-/// over one plan must visit the same seeds in the same order, or neither the
-/// reduction number nor the failure it reports is reproducible.
+/// The search is itself part of the run's determinism: which interleaving comes next is as much a
+/// function of the seed as which task comes next.
 #[test]
 fn the_whole_search_is_a_function_of_its_plan() {
     let compiled = compile(SHAPES);
@@ -485,9 +408,8 @@ fn the_whole_search_is_a_function_of_its_plan() {
     }
 }
 
-/// A budget is a search parameter and not a semantics: the value and the world a
-/// region delivers are those of the interleaving its seed names, whatever else
-/// the search went on to explore.
+/// A budget is a search parameter and not a semantics: the value and the world a region delivers
+/// are those of the interleaving its seed names, whatever else the search went on to explore.
 #[test]
 fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
     let compiled = compile(SHAPES);
@@ -522,12 +444,6 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
 }
 
 /// The shapes the pruned and the unpruned search are compared over.
-///
-/// Every assertion here is order-insensitive on purpose: a search that stops at
-/// a failure has seen a prefix of its space, and comparing two prefixes says
-/// nothing. Each test must therefore run to its frontier under *both*
-/// relations, which also caps how large the unpruned space may be — a fixture
-/// whose naive search spends its budget is a fixture this audit cannot use.
 const PRUNING: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -637,11 +553,8 @@ pub fn two_tasks_one_stream() -> Int = {
 }
 "#;
 
-/// The five fixtures are **functions** rather than tests, and the outcome a
-/// search compares is what one answers rather than what it left in the arena.
-/// A region hands its cells back at its lexical close, so a counter read after
-/// the run is a read of nothing on every interleaving alike — an oracle that
-/// cannot tell two outcomes apart is an audit that passes for the wrong reason.
+/// The five fixtures are **functions** rather than tests, and the outcome a search compares is what
+/// one answers rather than what it left in the arena.
 const PRUNING_NAMES: [&str; 5] = [
     "t.two_tasks_contending",
     "t.a_racer_behind_a_barrier",
@@ -651,17 +564,6 @@ const PRUNING_NAMES: [&str; 5] = [
 ];
 
 /// The audit that fails rather than flatters.
-///
-/// Pruning is sound only over a *complete* access set, and a step that forgets
-/// an access does not produce a failing test — it produces a smaller number and
-/// a larger claimed reduction. So the pruned search is compared against the
-/// unpruned one over the set of final worlds each observed: an outcome the
-/// pruned search cannot reach is a race the milestone would report as proved
-/// absent.
-///
-/// The comparison runs on the real machine rather than on a model scheduler,
-/// because the access set is assembled by the machine — the tracer's atoms plus
-/// the world's cells — and a model cannot be wrong in the way the machine can.
 #[test]
 fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
     let compiled = compile(PRUNING);
@@ -682,9 +584,8 @@ fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
             interleaving
         });
 
-        // A search that stopped at a failure saw a prefix of its space, and
-        // comparing two prefixes says nothing. These fixtures assert only what
-        // survives every interleaving, so a failure here is a defect of its own.
+        // A search that stopped at a failure saw a prefix of its space, and comparing two prefixes
+        // says nothing.
         assert!(
             a.exploration.failure.is_none() && b.exploration.failure.is_none(),
             "`{name}`: an order-insensitive fixture failed, so the comparison below would be \
@@ -703,8 +604,8 @@ fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
              is missing something two tasks share ({} interleavings against {})",
             a.exploration.explored, b.exploration.explored
         );
-        // A fixture whose outcome does not depend on the order would make the
-        // comparison above vacuous, so each one is required to have two.
+        // A fixture whose outcome does not depend on the order would make the comparison above
+        // vacuous, so each one is required to have two.
         assert!(
             whole.len() > 1,
             "`{name}`: every interleaving reached the same world, so this fixture proves nothing \
@@ -720,11 +621,7 @@ fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
     }
 }
 
-// ------------------------------------------------------- more than one region
-
-/// Two `simulate` regions in one test, in sequence. Nothing refuses the program:
-/// nesting is `E0416` and this is not nesting, so it typechecks, runs, and is
-/// reported on.
+/// Two `simulate` regions in one test, in sequence.
 const TWO_REGIONS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -761,8 +658,8 @@ test "a race in the first region and a quiet second one" {
 }
 "#;
 
-/// A `simulate` region reached twice through an ordinary call, which is the same
-/// shape without the syntax pointing at it.
+/// A `simulate` region reached twice through an ordinary call, which is the same shape without the
+/// syntax pointing at it.
 const REGION_IN_A_HELPER: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -798,24 +695,7 @@ test "the same region twice through a call" {
 }
 "#;
 
-/// **BLOCKER.** A test with more than one `simulate` region is searched over one
-/// of them and reported `exhaustive` about all of them.
-///
-/// `Machine::record` holds the steps of the last region that *completed*, so the
-/// backtrack points the search derives describe that region only. The race in
-/// every other region is never explored, the search empties a frontier that
-/// covers one region's choice points, and the run is reported green, exhaustive
-/// — a proof over every interleaving — and cached under its plan key.
-///
-/// The same program under `--sim random` fails at root 4 within sixty-four
-/// samples, so this is not a race the search decided was unreachable: it is one
-/// the search never looked at. An `exhaustive: true` that is wrong is the worst
-/// artifact this milestone can produce, because it is the one a project is
-/// invited to watch go up.
-///
-/// `ply_eval::region::Record`'s own documentation says "the first region's
-/// record is the one kept", which is neither what happens nor sufficient: no
-/// single region's record covers the test.
+/// **BLOCKER.**
 #[test]
 fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
     for (source, name) in [
@@ -850,16 +730,7 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
     }
 }
 
-/// **BLOCKER.** The same defect from the other side: when a later region's shape
-/// depends on what an earlier one raced to, replaying a seed does not reproduce
-/// the recorded schedule, and the run is reported as `E0415` — *Ply's* fault,
-/// `Status::Panicked`, no bisection — on an ordinary program.
-///
-/// Every region takes its choices from `path[0..]` with a counter of its own, so
-/// a backtrack point named against one region's trace re-aims every other
-/// region's schedule as well. Here that changes how many tasks the second region
-/// spawns, so the enabled set at the point the seed names is a different set,
-/// and the replay self-check fires.
+/// **BLOCKER.**
 #[test]
 fn a_legal_program_is_never_reported_as_a_simulation_divergence() {
     let compiled = compile(
@@ -928,17 +799,8 @@ test "the second region's shape depends on what the first raced to" {
     }
 }
 
-// ------------------------------------------------------------------ hygiene
-
-/// The rule `ply-eval::sim`, `sched`, `explore` and `region` each enforce on
-/// themselves, enforced across the seam that binds them instead.
-///
-/// Each of those four greps its own source; none of them greps the machine, and
-/// the machine is where a step's access set is assembled, where the site of a
-/// race is found and where a region is entered and left. A hash map iterated on
-/// that path would put the host's memory layout into a seeded run's answer just
-/// as surely as one in the scheduler, and the four existing greps would all
-/// still pass.
+/// The rule `ply-eval::sim`, `sched`, `explore` and `region` each enforce on themselves, enforced
+/// across the seam that binds them instead.
 #[test]
 fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
     let source = include_str!("../../src/machine.rs");
@@ -946,10 +808,8 @@ fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
         .split_once("mod tests")
         .map(|(body, _)| body)
         .unwrap_or(source);
-    // The machine legitimately holds hash maps for its name tables, which are
-    // looked up by key and never iterated. What it may not do is read a clock,
-    // a thread, an address or an entropy source on the path a simulated run
-    // takes.
+    // The machine legitimately holds hash maps for its name tables, which are looked up by key and
+    // never iterated.
     for banned in [
         "SystemTime",
         "Instant",

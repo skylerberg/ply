@@ -1,42 +1,4 @@
 //! Where a run's configuration comes from, and what it refuses at start-up.
-//!
-//! [`DECLARATION`] is the Ply source this registers against — the module
-//! `std.config`, which ships with the compiler — and `HostRegistry::bind` is
-//! what checks the two still agree: an operation renamed on either side is
-//! `E0421` before anything runs.
-//!
-//! Three properties decide everything below, and the first is the whole of this
-//! module's soundness.
-//!
-//! - **The sources are read exactly once, at bind time, into an immutable map,
-//!   and the process environment is never consulted again.** That is one line of
-//!   implementation carrying three properties. It is what makes `config.read[k]`
-//!   honestly a *read*, so two definitions that read configuration do not
-//!   conflict and the scheduler is right to run them side by side. It is what
-//!   stops one test's `setenv` from being seen by another — the pooled-connection
-//!   defect of ADR 0014 in a new costume, and the one W5 hazard that a
-//!   `BTreeMap` closes outright. And it is what makes a run reproducible: the
-//!   snapshot is a fact of the run, it is printed, and its non-secret half is in
-//!   `ply hosts --json`.
-//! - **A missing, malformed or wrongly-shaped value is a start-up refusal.**
-//!   [`Snapshot::resolve`] runs before anything is bound. A service that starts,
-//!   serves two hundred requests and then answers wrongly because a key was
-//!   unset is the failure this module exists to prevent, and a service that
-//!   refuses to start is strictly better than one that dies on its first
-//!   request.
-//! - **A `SSecret` key never leaves as a `String`.** [`Snapshot::get`] answers
-//!   `None` for a key the schema declares `SSecret`, and [`Snapshot::secret`]
-//!   answers `None` for a key it declares anything else. Without that the
-//!   type-level containment of ADR 0015 §2 would be one call site away from a
-//!   plaintext, and the `Secret` a program holds would be a suggestion. Without
-//!   a schema there is no `SSecret` key, so a run with no `--config-schema` can
-//!   read a password as a `String`; that is stated here because it is the exact
-//!   boundary of the claim.
-//!
-//! The format is `KEY=VALUE`, one per line. TOML, YAML and JSON are refused for
-//! one reason: the effect's return type is `Option<String>`, so a nested typed
-//! format would carry structure this program cannot receive, and a format richer
-//! than the type it feeds is a format whose extra structure is silently dropped.
 
 use ply_eval::Value;
 use ply_eval::host::{
@@ -55,15 +17,10 @@ pub const DECLARATION: &str = ply_std::CONFIG;
 /// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.config";
 
-/// The program-wide effect name. Effect names are qualified, so the `config`
-/// declared by `std.config` is `std.config.config`, and a program that declares
-/// its own `config` instead is `E0421` rather than silently acquiring the
-/// environment.
+/// The program-wide effect name.
 pub const EFFECT: &str = "std.config.config";
 
-/// What every rendering of a secret configuration value is. The same four
-/// characters `ply_cli::db::Secret` prints, because they make the same promise
-/// at two layers.
+/// What every rendering of a secret configuration value is.
 pub const REDACTED: &str = "****";
 
 /// The two operations a program can perform.
@@ -91,8 +48,8 @@ impl Op {
         }
     }
 
-    /// The Rust path `ply hosts` prints — the reviewable identity of a member of
-    /// the trusted computing base.
+    /// The Rust path `ply hosts` prints — the reviewable identity of a member of the trusted
+    /// computing base.
     pub fn path(self) -> &'static str {
         match self {
             Op::Get => "ply_host::config::get",
@@ -104,27 +61,20 @@ impl Op {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever namespaces the program writes. `bind` expands this
-            // against the program's own atoms and `ply hosts` prints one row per
-            // expansion, so a run that reads credentials has a
-            // `config.read[credentials]` line of its own rather than one row
-            // claiming everything.
+            // Whichever namespaces the program writes.
             resource: HostResource::Any,
-            // The environment is not a function of the program's state, so a
-            // `det` test that reaches this is E0412 at compile time and has to
-            // supply the values itself.
+            // The environment is not a function of the program's state, so a `det` test that
+            // reaches this is E0412 at compile time and has to supply the values itself.
             determinism: Determinism::Nondeterministic,
-            // Reading a frozen map twice is the definition of harmless, which is
-            // the only reason a `Repeatable` claim is safe here: it is true
-            // because of `Snapshot`'s immutability and of nothing else.
+            // Reading a frozen map twice is the definition of harmless, which is the only reason a
+            // `Repeatable` claim is safe here: it is true because of `Snapshot`'s immutability and
+            // of nothing else.
             linearity: Linearity::Repeatable,
-            // No file is opened and no syscall is made: every source was read
-            // before this handler existed.
+            // No file is opened and no syscall is made: every source was read before this handler
+            // existed.
             blocking: false,
-            // `config.secret` **answers** a `Secret`; neither operation is ever
-            // handed one, because both take a key. The column is about what
-            // crosses the boundary downward, which is where the type system
-            // stops being able to say anything.
+            // `config.secret` **answers** a `Secret`; neither operation is ever handed one, because
+            // both take a key.
             secrets: false,
             path: self.path(),
         }
@@ -143,9 +93,7 @@ pub enum Shape {
 }
 
 impl Shape {
-    /// The constructor `std.config` declares, by simple name. This is the one
-    /// mapping between the Ply schema and the Rust one, so a rename on either
-    /// side is a resolution failure rather than a shape silently read as `SText`.
+    /// The constructor `std.config` declares, by simple name.
     pub fn from_ctor(name: &str) -> Option<Shape> {
         Some(match name {
             "SText" => Shape::Text,
@@ -165,20 +113,12 @@ impl Shape {
         }
     }
 
-    /// Whether a value of this shape may be printed. The answer is the whole
-    /// difference between an operator who can debug a wrong value and a
-    /// credential in a log line.
+    /// Whether a value of this shape may be printed.
     pub fn is_secret(self) -> bool {
         self == Shape::Secret
     }
 
     /// Why a value is not of this shape, or `None` when it is.
-    ///
-    /// A secret's rule is that it is not empty. That is not arbitrary: an empty
-    /// credential is the shape an unset environment variable takes after a shell
-    /// expands it, so accepting one is accepting the exact mistake `--config-schema`
-    /// exists to catch, one layer further in and with the failure moved to
-    /// whichever request first authenticates.
     fn refuse(self, value: &str) -> Option<String> {
         match self {
             Shape::Text => None,
@@ -218,11 +158,6 @@ pub struct Spec {
 
 impl Spec {
     /// Every key, checked to be declared once.
-    ///
-    /// Two declarations of one name is refused rather than resolved by taking
-    /// the first: the two may disagree about the shape, and then whether a value
-    /// is valid would depend on the order the schema function happened to build
-    /// its list in.
     pub fn new(keys: Vec<Key>) -> Result<Spec, Diagnostic> {
         let mut seen = BTreeSet::new();
         for key in &keys {
@@ -247,9 +182,6 @@ impl Spec {
 // --- where a value came from ------------------------------------------------
 
 /// Which of the four sources supplied a value, highest precedence first.
-///
-/// Printed beside every key, because "it connected to the wrong thing" is
-/// answered by which source won and by nothing else.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Source {
     /// `--set KEY=VALUE`.
@@ -273,10 +205,7 @@ impl Source {
         }
     }
 
-    /// Whether a person typed this key on purpose. Only the explicit sources
-    /// raise `W0607` for an undeclared key: an environment is full of names that
-    /// have nothing to do with this program, while a `--set` is something
-    /// somebody meant and a typo in one is the classic silent deploy failure.
+    /// Whether a person typed this key on purpose.
     pub fn is_explicit(&self) -> bool {
         matches!(self, Source::Set | Source::File(_))
     }
@@ -296,28 +225,19 @@ impl fmt::Display for Source {
 // --- the sources, read exactly once -----------------------------------------
 
 /// Every key any source supplies, with the source that won.
-///
-/// Built once, at bind time. Nothing mutates one and nothing re-reads the
-/// process environment after it exists.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Sources {
     resolved: BTreeMap<String, (String, Source)>,
-    /// How many `--set` arguments and `--config` files the command line carried,
-    /// and how many variables the environment held. Counts rather than contents,
-    /// because the report prints "environment 217" and must never print 217
-    /// variable names that have nothing to do with this program.
+    /// How many `--set` arguments and `--config` files the command line carried, and how many
+    /// variables the environment held.
     pub sets: usize,
     pub files: Vec<PathBuf>,
     pub environment: usize,
 }
 
 impl Sources {
-    /// The empty sources: what a run with no `--host` has, and what it keeps
-    /// whatever the environment holds.
-    ///
-    /// ADR 0011's rule is untouched here — a reviewer reads `--host` in the
-    /// command or the run reached nothing. Configuration may supply a value and
-    /// may never cause a binding.
+    /// The empty sources: what a run with no `--host` has, and what it keeps whatever the
+    /// environment holds.
     pub fn unopened() -> Sources {
         Sources::default()
     }
@@ -330,13 +250,6 @@ impl Sources {
     }
 
     /// [`read`], against an explicit environment and an explicit reader.
-    ///
-    /// Tests take this rather than `std::env`, which is process-global and
-    /// therefore a race between two of them under one test binary — which is the
-    /// same hazard this module exists to close for a *run*, so closing it for
-    /// the suite too costs one parameter.
-    ///
-    /// [`read`]: Sources::read
     pub fn read_with(
         set: &[String],
         files: &[PathBuf],
@@ -346,9 +259,8 @@ impl Sources {
         let mut diagnostics = Vec::new();
         let mut resolved: BTreeMap<String, (String, Source)> = BTreeMap::new();
 
-        // Lowest precedence first, each overwriting what is under it, so the
-        // last write for a key is the winner and the source recorded with it is
-        // the one that won.
+        // Lowest precedence first, each overwriting what is under it, so the last write for a key
+        // is the winner and the source recorded with it is the one that won.
         for (key, value) in env {
             if key_shape(key).is_ok() {
                 resolved.insert(key.clone(), (value.clone(), Source::Environment));
@@ -380,8 +292,8 @@ impl Sources {
                 Ok(Some((key, value))) => {
                     resolved.insert(key, (value, Source::Set));
                 }
-                // A `--set` is never blank and never a comment: somebody typed
-                // it, so a line the file format would ignore is a mistake here.
+                // A `--set` is never blank and never a comment: somebody typed it, so a line the
+                // file format would ignore is a mistake here.
                 Ok(None) => diagnostics.push(err_bad_set(argument, "it supplies no key")),
                 Err(why) => diagnostics.push(err_bad_set(argument, &why)),
             }
@@ -402,8 +314,7 @@ impl Sources {
         self.resolved.get(key)
     }
 
-    /// Every key an explicit source supplied, ascending. What `W0607` is
-    /// computed from.
+    /// Every key an explicit source supplied, ascending.
     fn explicit(&self) -> impl Iterator<Item = &str> {
         self.resolved
             .iter()
@@ -413,11 +324,6 @@ impl Sources {
 }
 
 /// A key must be an identifier extended with `.`, in every source alike.
-///
-/// The environment is filtered by this rather than refused by it: a process
-/// environment holds names no program chose, and `BASH_FUNC_x%%` is not a
-/// mistake somebody made in this run's configuration. A `--set` or a file line
-/// is refused, because there it is.
 fn key_shape(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("it has an empty key".to_string());
@@ -438,12 +344,6 @@ fn key_shape(key: &str) -> Result<(), String> {
 }
 
 /// One `KEY=VALUE` line, or `None` for a blank line or a comment.
-///
-/// A `#` begins a comment only where a *key* would begin. With no quoting there
-/// would otherwise be no way to write a `#` in a value, and a password silently
-/// truncated at one is exactly the class of failure this module exists to
-/// prevent — so the value is the rest of the line, horizontal whitespace
-/// trimmed off each end, and nothing in it is interpreted.
 fn parse_line(line: &str) -> Result<Option<(String, String)>, String> {
     let trimmed = line.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\r');
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -470,7 +370,7 @@ pub struct Resolved {
 }
 
 impl Resolved {
-    /// What a report may print. A secret's value never leaves this type.
+    /// What a report may print.
     pub fn shown(&self) -> &str {
         match self.shape {
             Some(Shape::Secret) => REDACTED,
@@ -480,21 +380,13 @@ impl Resolved {
 }
 
 /// The frozen configuration of one run.
-///
-/// Immutable by construction: there is no method that changes one, which is
-/// what makes `config.read[k]` a read and two readers non-conflicting. There is
-/// deliberately no live reload — a configuration that can change mid-run is a
-/// nondeterminism that would have to be in every reader's row, and two requests
-/// in one run that saw different values is a class of bug with no repro.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Snapshot {
     values: BTreeMap<String, Resolved>,
-    /// Only the keys a schema declared, so the `SSecret` gate can tell "declared
-    /// as something else" from "not declared at all".
+    /// Only the keys a schema declared, so the `SSecret` gate can tell "declared as something else"
+    /// from "not declared at all".
     declared: BTreeMap<String, Shape>,
-    /// Whether this run named a `--config-schema`. Without one there are no
-    /// `SSecret` keys, and containment for configured values is only as strong
-    /// as the schema.
+    /// Whether this run named a `--config-schema`.
     has_spec: bool,
     /// Counts, for the start-up banner and `ply hosts`.
     pub sets: usize,
@@ -509,10 +401,6 @@ impl Snapshot {
     }
 
     /// Resolve the sources against the schema, before anything is bound.
-    ///
-    /// Returns the snapshot and the warnings it produced. Every *error* here is
-    /// the run's configuration at fault rather than the program's, and every one
-    /// of them is raised before a socket is opened.
     pub fn resolve(sources: &Sources, spec: Option<&Spec>) -> Result<Report, Vec<Diagnostic>> {
         let mut diagnostics = Vec::new();
         let mut warnings = Vec::new();
@@ -586,12 +474,6 @@ impl Snapshot {
     }
 
     /// What `config.get` answers.
-    ///
-    /// `None` for a key the schema declares `SSecret`, whatever any source
-    /// holds. This is the line that closes the window in which a credential
-    /// would exist as an ordinary `String`: without it the containment claim
-    /// would hold for every route except the one the credential actually
-    /// arrives on.
     pub fn get(&self, key: &str) -> Option<&str> {
         let resolved = self.values.get(key)?;
         if resolved.shape == Some(Shape::Secret) {
@@ -600,15 +482,7 @@ impl Snapshot {
         Some(&resolved.value)
     }
 
-    /// The plaintext behind `config.secret`, for the one caller that turns it
-    /// into a `Secret`.
-    ///
-    /// `None` for a key the schema declares as anything other than `SSecret`,
-    /// so a schema is the thing that decides which keys are credentials and a
-    /// program cannot launder a plain key into one. With no schema every key a
-    /// source supplies is available here, which is the same latitude
-    /// [`Snapshot::get`] has and is why a run that wants containment names a
-    /// `--config-schema`.
+    /// The plaintext behind `config.secret`, for the one caller that turns it into a `Secret`.
     fn plaintext(&self, key: &str) -> Option<&str> {
         let resolved = self.values.get(key)?;
         if self.has_spec && resolved.shape != Some(Shape::Secret) {
@@ -617,11 +491,7 @@ impl Snapshot {
         Some(&resolved.value)
     }
 
-    /// Every key the schema declared and the run resolved, ascending. What the
-    /// `keys` line of `ply hosts` prints, and the only accessor a report has:
-    /// there is none that walks the environment, because printing 217 variables
-    /// that have nothing to do with this program is how a listing becomes
-    /// something nobody reads.
+    /// Every key the schema declared and the run resolved, ascending.
     pub fn declared(&self) -> impl Iterator<Item = (&str, &Resolved)> {
         self.values
             .iter()
@@ -663,11 +533,8 @@ pub struct Counts {
     pub secret: usize,
 }
 
-/// A resolution's outcome: the snapshot, and what it wants to say about the
-/// command line that produced it.
-///
-/// The warnings are carried rather than printed here, because `ply-host` has no
-/// output and a `W0607` belongs in whichever report the command is writing.
+/// A resolution's outcome: the snapshot, and what it wants to say about the command line that
+/// produced it.
 #[derive(Debug)]
 pub struct Report {
     pub snapshot: Snapshot,
@@ -677,10 +544,6 @@ pub struct Report {
 // --- the handlers -----------------------------------------------------------
 
 /// Register both operations against a snapshot.
-///
-/// The snapshot is shared by `Arc` across every worker in the run and is never
-/// mutated, which is the whole reason two host-backed tests that read
-/// configuration are not coupled: there is no state to couple them through.
 pub fn register(registry: &mut HostRegistry, snapshot: Arc<Snapshot>) {
     for op in Op::ALL {
         registry.register(
@@ -720,12 +583,6 @@ impl HostHandler for Operation {
 }
 
 /// The one place in this crate a Ply-level `Secret` is built.
-///
-/// A credential resolved from a source becomes a `Secret` here and is a
-/// `Secret` everywhere above, so there is no window in which it is an ordinary
-/// `String` a trace field, a `++` or a derived codec could reach. The plaintext
-/// exists in this function's argument and in the snapshot, and nowhere in the
-/// program.
 fn secret(plain: &str) -> Value {
     Value::secret(Value::Str(plain.into()))
 }
@@ -829,11 +686,7 @@ fn err_missing(key: &Key, sources: &Sources) -> Diagnostic {
 
 #[cold]
 fn err_invalid(key: &Key, resolved: &Resolved, why: &str) -> Diagnostic {
-    // The value is printed for every shape but a secret. An operator debugging
-    // "it used the wrong region" needs to see `eu-wesst`; one debugging a
-    // credential needs to know only which source won, and printing the value
-    // would put it in this diagnostic's message — which reaches stderr, `--json`
-    // and, for a failure inside a run, the result cache.
+    // The value is printed for every shape but a secret.
     let mut diagnostic = Diagnostic::error(
         codes::CONFIG_INVALID,
         format!(

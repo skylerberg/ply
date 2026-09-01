@@ -1,15 +1,5 @@
-//! What the code generator compiles, what it refuses, and that what it answers
-//! is what the interpreter answers.
-//!
-//! `crates/ply-cli/tests/suite/backend.rs` is the other half and it asks a different
-//! question: whether a *wrong* backend is caught from a command a user runs.
-//! This file asks whether the right one is right, over Ply source, through the
-//! same `ply_eval::Compiled` seam the machine uses.
-//!
-//! Every test here loads the shipped standard library alongside its own module,
-//! because the fixpoint is a whole-program analysis: a definition survives only
-//! if every Ply function it can reach survives, and a corpus of one module
-//! would exercise a closure with nothing in it.
+//! What the code generator compiles, what it refuses, and that what it answers is what the
+//! interpreter answers.
 
 use ply_codegen::Cranelift;
 use ply_eval::{Provider, Value};
@@ -23,10 +13,6 @@ struct Loaded {
 }
 
 /// The shipped standard library plus `source` as a module named `m`.
-///
-/// Leaked rather than owned: a backend may not borrow the program the machine
-/// is running (`ply_eval::Machine`'s `compiled` field says why), and a test that
-/// owned one would be fighting the same lifetime the shipping path pays.
 fn load(source: &str) -> Loaded {
     let mut sources = ply_span::SourceMap::new();
     let mut owned: Vec<(ModuleName, &'static str)> = ply_std::sources()
@@ -60,8 +46,8 @@ fn unit(source: &str) -> (&'static Loaded, &'static Cranelift) {
     (loaded, unit)
 }
 
-/// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a
-/// call between two members — the fragment ADR 0016 §3.2 pins, in one module.
+/// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a call between two
+/// members — the fragment ADR 0016 §3.2 pins, in one module.
 const ARITHMETIC: &str = r#"
 fn double(x: Int) -> Int = x * 2
 
@@ -91,13 +77,8 @@ fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
-/// The control every other test here is read against: the fragment is not
-/// empty, and it is not everything.
-///
-/// Both halves are load-bearing. A fragment of zero would make every `enter`
-/// below a registry miss, and every test would pass by declining. A fragment of
-/// *everything* would mean `Denotes::Uncompiled` never fires and the closure is
-/// not a fixpoint at all.
+/// The control every other test here is read against: the fragment is not empty, and it is not
+/// everything.
 #[test]
 fn the_fragment_is_neither_empty_nor_everything() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -110,17 +91,15 @@ fn the_fragment_is_neither_empty_nor_everything() {
         total,
         unit.compiled().len()
     );
-    // `shaped` returns a `List<Int>`, so the seam could never carry its answer
-    // and it is not registered — which is the gap `Mutation::Unoffered` lives
-    // in. Without a definition in it that corruption has nothing to invent an
-    // answer for.
+    // `shaped` returns a `List<Int>`, so the seam could never carry its answer and it is not
+    // registered — which is the gap `Mutation::Unoffered` lives in.
     assert!(!unit.compiled().is_empty());
     let members: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
     assert!(members.contains(&"m.double"), "{members:?}");
 }
 
-/// The whole point: a call the seam admits is answered by native code, and the
-/// answer is the interpreter's.
+/// The whole point: a call the seam admits is answered by native code, and the answer is the
+/// interpreter's.
 #[test]
 fn a_compiled_body_answers_what_the_interpreter_answers() {
     let (_, unit) = unit(ARITHMETIC);
@@ -156,8 +135,8 @@ fn a_definition_the_fragment_has_no_body_for_is_declined() {
     assert_eq!(call(unit, "m.no_such_function", &[Value::Int(1)]), None);
 }
 
-/// A call with the wrong number of arguments declines rather than reading past
-/// the argument array it was handed.
+/// A call with the wrong number of arguments declines rather than reading past the argument array
+/// it was handed.
 #[test]
 fn a_call_of_the_wrong_arity_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
@@ -173,11 +152,6 @@ fn a_call_of_the_wrong_arity_is_declined() {
 }
 
 /// `budget` is the machine's remaining nested calls and not a hint.
-///
-/// A body that would recurse past it answers `None` — the machine then
-/// re-evaluates and raises its own `recursion limit`, which is the guarantee
-/// `ply_eval::limit` keeps in both engines. The pair is what makes this a test
-/// rather than a coincidence: the same definition on a *larger* budget answers.
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
@@ -195,18 +169,16 @@ fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     );
 }
 
-/// Arithmetic that raises in the interpreter declines here rather than
-/// answering a wrapped value.
+/// Arithmetic that raises in the interpreter declines here rather than answering a wrapped value.
 #[test]
 fn an_overflow_declines_rather_than_wrapping() {
     let (_, unit) = unit(ARITHMETIC);
     assert_eq!(call(unit, "m.double", &[Value::Int(i64::MAX)]), None);
 }
 
-/// Pointer identity, as `code::Lowering::describes` is and for the same reason:
-/// a bisection builds programs whose definitions carry the names of the ones
-/// they replace, and a registry keyed on a bare name would answer for the wrong
-/// body.
+/// Pointer identity, as `code::Lowering::describes` is and for the same reason: a bisection builds
+/// programs whose definitions carry the names of the ones they replace, and a registry keyed on a
+/// bare name would answer for the wrong body.
 #[test]
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -217,12 +189,8 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 }
 
 /// The set is closed under calls, which is the property that makes the promise
-/// `ply_codegen::backend` gives the machine true by construction: from inside a
-/// member there is no reachable call that leaves compiled code.
-///
-/// Checked by the only means that is not a re-implementation of the analysis —
-/// compiling the set again and asserting it refuses nothing. A set that was not
-/// closed would have `Denotes::Uncompiled` fire on the second pass.
+/// `ply_codegen::backend` gives the machine true by construction: from inside a member there is no
+/// reachable call that leaves compiled code.
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -241,13 +209,8 @@ fn the_compiled_set_is_closed_under_calls() {
     );
 }
 
-/// The census this crate exists to move, printed so that a run of the suite
-/// says what the fragment reached rather than only that it did not crash.
-///
-/// Asserted rather than only printed, and the assertion is a floor: a change
-/// that made the fragment reach *less* over the shipped standard library is a
-/// regression somebody should be told about, and a change that made it reach
-/// more should update the floor deliberately.
+/// The census this crate exists to move, printed so that a run of the suite says what the fragment
+/// reached rather than only that it did not crash.
 #[test]
 fn the_census_over_the_standard_library() {
     let (loaded, unit) = unit(ARITHMETIC);

@@ -1,31 +1,4 @@
-//! The pinned mapping between a Ply value and a postgres wire type, in both
-//! directions.
-//!
-//! It is pinned rather than open, and every edge of it is a named refusal
-//! rather than a coercion, because each of those edges is a place a driver
-//! quietly loses data and the loss is invisible from the program:
-//!
-//! - **A `numeric` beyond `Decimal`'s 96 bits or scale 28 is a decode failure
-//!   naming the column, never a rounding.** This is the whole of W2's argument —
-//!   a total that quietly lost a cent — applied to the wire. `NaN` and
-//!   `±Infinity` are decode failures for the same reason: `Decimal` has no
-//!   representation for them and substituting zero is the silent-wrong-answer
-//!   shape.
-//! - **A one-dimensional array only.** A multi-dimensional array, or an array
-//!   with a `NULL` element, is a decode failure naming the column, because
-//!   [`Datum::Array`] has no shape for either and flattening one would answer a
-//!   list that is not what the column held.
-//! - **No date, time, timestamp or interval.** Ply has no time type. A column
-//!   of one is refused rather than rendered to text, and a program stores a
-//!   `timestamptz` as `int8` microseconds by its own schema, with the value
-//!   coming from `clock.now()` **as a parameter** — which is better than
-//!   `now()` in the statement, because it puts the nondeterminism in the row
-//!   where `E0412` can see it.
-//!
-//! A parameter is always checked against the type the server described for it,
-//! before anything is sent. That is what makes [`Bound`] infallible to write and
-//! what lets a refusal name the parameter's position and the postgres type it
-//! was going to be sent as.
+//! The pinned mapping between a Ply value and a postgres wire type, in both directions.
 
 use ply_span::{Diagnostic, Span, codes};
 use postgres_protocol::types as wire;
@@ -35,19 +8,6 @@ use tokio_postgres::types::private::BytesMut;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 /// A JSON document, as the driver holds one.
-///
-/// A second JSON implementation, and that deserves the sentence ADR 0013 §2
-/// asks for. The driver needs a `Json` **value** in Rust — `jsonb` is the wire
-/// form of a mapped Ply type, and a program's `CJson` has to arrive as the same
-/// ADT `std.json` parses to — so the choice was between this and shipping the
-/// wire bytes into Ply as text for `std.json` to parse. The second was refused
-/// because it would make every `jsonb` column a `String` at the type level and
-/// put the decode failure after the row rather than at it.
-///
-/// It is deliberately the **strict** grammar and nothing more: no comments, no
-/// trailing commas, no unquoted keys, no `NaN`. `Number` is a [`Decimal`], with
-/// the same rule `std.json` states — a number outside `Decimal`'s range is a
-/// decode failure naming the offset rather than a value that quietly rounded.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Json {
     Null,
@@ -55,19 +15,15 @@ pub enum Json {
     Number(Decimal),
     Str(String),
     Array(Vec<Json>),
-    /// Insertion order as the document had it. The Ply side is a `Map`, which
-    /// canonicalises the order; keeping a vector here means the driver does not
-    /// decide what "the same document" means.
+    /// Insertion order as the document had it.
     Object(Vec<(String, Json)>),
 }
 
-/// Deeper than this and the driver is walking a document a peer chose the shape
-/// of. `std.json` bounds its own nesting for the same reason.
+/// Deeper than this and the driver is walking a document a peer chose the shape of.
 const MAX_JSON_DEPTH: usize = 64;
 
 impl Json {
-    /// Parse strict JSON. `where` is what a failure names — a column, or a
-    /// parameter's position.
+    /// Parse strict JSON.
     pub fn parse(bytes: &[u8], at: &str) -> Result<Json, String> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| format!("{at} is not UTF-8, so it is not JSON"))?;
@@ -85,8 +41,8 @@ impl Json {
         Ok(value)
     }
 
-    /// Canonical text: no whitespace, keys in the order held, `Decimal`'s own
-    /// rendering for a number so a scale survives the round trip.
+    /// Canonical text: no whitespace, keys in the order held, `Decimal`'s own rendering for a
+    /// number so a scale survives the round trip.
     pub fn render(&self) -> String {
         let mut out = String::new();
         self.write(&mut out);
@@ -276,9 +232,8 @@ impl JsonParser<'_> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let unit = self.hex4()?;
-                            // A surrogate pair is two escapes and one character;
-                            // pushing the halves separately would produce text
-                            // that is not what the document held.
+                            // A surrogate pair is two escapes and one character; pushing the halves
+                            // separately would produce text that is not what the document held.
                             if (0xd800..0xdc00).contains(&unit) {
                                 if self.src.get(self.at) != Some(&b'\\')
                                     || self.src.get(self.at + 1) != Some(&b'u')
@@ -354,11 +309,8 @@ impl JsonParser<'_> {
     }
 }
 
-/// What a program hands a `db` operation, decoded and ready to be checked
-/// against the type the server described for it.
-///
-/// `PartialEq` and not `Eq`: it holds a `Float`, whose `==` is IEEE's and is
-/// therefore not an equivalence relation. The same sentence `Value` carries.
+/// What a program hands a `db` operation, decoded and ready to be checked against the type the
+/// server described for it.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Param {
     Null,
@@ -405,10 +357,6 @@ pub enum Datum {
 }
 
 /// The SQLSTATE the server returned and the object it named.
-///
-/// The message is **not** compared anywhere: it is postgres's prose, it moves
-/// between server versions and locales, and an engine that had to reproduce it
-/// would be reproducing English rather than behaviour.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DbError {
     pub code: String,
@@ -425,8 +373,7 @@ impl DbError {
         }
     }
 
-    /// The connection went away mid-statement. A peer that went away is not a
-    /// diagnostic — the same line W3 draws for a client that reset a socket.
+    /// The connection went away mid-statement.
     pub fn connection(detail: impl Into<String>) -> DbError {
         DbError::new("08006", "", detail)
     }
@@ -434,21 +381,13 @@ impl DbError {
 
 /// A parameter that failed before anything was sent.
 pub enum BindError {
-    /// The program's claim and the statement's shape disagree, every time, for
-    /// this statement text. A diagnostic rather than a value: it will never
-    /// succeed on a retry, so making it a value would invite a loop on it.
+    /// The program's claim and the statement's shape disagree, every time, for this statement text.
     Refused(Diagnostic),
-    /// A value the column cannot hold. The server's own answer for it, produced
-    /// here because the extended protocol describes a parameter's type before
-    /// the value is sent and there is no round trip in which the server could
-    /// have said it.
+    /// A value the column cannot hold.
     Failed(DbError),
 }
 
 /// A parameter checked against the type the server described for it.
-///
-/// Infallible to write, which is the point of the split: every refusal has
-/// already happened, with a position and a type name, before a byte moved.
 #[derive(Clone, Debug)]
 pub struct Bound {
     ty: Type,
@@ -510,23 +449,20 @@ impl ToSql for Bound {
             BoundValue::Numeric(v) => v.to_sql(&Type::NUMERIC, out),
             BoundValue::Json(text) => {
                 if self.ty == Type::JSONB {
-                    // The jsonb binary format is a version byte and then the
-                    // text. Writing the text without it is a document postgres
-                    // reads as garbage.
+                    // The jsonb binary format is a version byte and then the text.
                     out.extend_from_slice(&[1u8]);
                 }
                 out.extend_from_slice(text.as_bytes());
                 Ok(IsNull::No)
             }
-            // One dimension, framed by `postgres-types` itself: a hand-rolled
-            // framer here would be a second implementation of a format the
-            // decoder already reads through theirs.
+            // One dimension, framed by `postgres-types` itself: a hand-rolled framer here would be
+            // a second implementation of a format the decoder already reads through theirs.
             BoundValue::Array(items) => items.to_sql(&self.ty, out),
         }
     }
 
-    /// Every `Bound` was built against the type the server described, so this is
-    /// the check having already happened rather than one being skipped.
+    /// Every `Bound` was built against the type the server described, so this is the check having
+    /// already happened rather than one being skipped.
     fn accepts(_ty: &Type) -> bool {
         true
     }
@@ -563,10 +499,7 @@ fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bou
         (Param::Null, _) => BoundValue::Null,
         (Param::Bool(v), &Type::BOOL) => BoundValue::Bool(*v),
         (Param::Int(v), &Type::INT8) => BoundValue::Int8(*v),
-        // An `Int` is always an `Int`; the column decides the width. Postgres
-        // describes the parameter's type from context, so a narrowing that does
-        // not fit is `22003` — the server's own answer for it, and never a
-        // truncation.
+        // An `Int` is always an `Int`; the column decides the width.
         (Param::Int(v), &Type::INT4) => match i32::try_from(*v) {
             Ok(n) => BoundValue::Int4(n),
             Err(_) => return Err(BindError::Failed(out_of_range(*v, "integer", position))),
@@ -590,14 +523,8 @@ fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bou
         },
         (Param::Bytes(v), &Type::BYTEA) => BoundValue::Bytes(v.clone()),
         (Param::Float(v), &Type::FLOAT8) => BoundValue::Float8(*v),
-        // §4.2's table maps `Float` to `float8` **as a parameter** and to
-        // `float4` or `float8` only as a *result*, so a `float4` parameter is
-        // outside the pinned mapping. Narrowing it here is a rounding the
-        // program never asked for and cannot see — `1e300` becomes `Infinity`
-        // and `0.1234567890123` becomes `0.12345679` — which is the one answer
-        // this module may not give. The row above it is the shape to follow:
-        // `Int` into an `int4` column is `22003` from the server rather than a
-        // truncation in the driver.
+        // §4.2's table maps `Float` to `float8` **as a parameter** and to `float4` or `float8` only
+        // as a *result*, so a `float4` parameter is outside the pinned mapping.
         (Param::Float(_), &Type::FLOAT4) => {
             return Err(BindError::Refused(
                 Diagnostic::error(
@@ -611,13 +538,8 @@ fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bou
             ));
         }
         (Param::Numeric(v), &Type::NUMERIC) => BoundValue::Numeric(*v),
-        // An `Int` bound to a `numeric` parameter, which is what a statement
-        // assigning to a `numeric` column describes. Lossless in every case —
-        // `i64` is inside `Decimal`'s 96 bits with room to spare — and it is a
-        // widening of §4.2's table rather than a coercion: the alternative is
-        // that `update part set price = $1` with `PInt(0)` is `E0432` in the
-        // driver and `Count(1)` in the twin, which is exactly the drift this
-        // milestone exists to measure. Found by the agreement law.
+        // An `Int` bound to a `numeric` parameter, which is what a statement assigning to a
+        // `numeric` column describes.
         (Param::Int(v), &Type::NUMERIC) => BoundValue::Numeric(Decimal::from(*v)),
         (Param::Json(v), &Type::JSON) | (Param::Json(v), &Type::JSONB) => {
             BoundValue::Json(v.render())
@@ -736,10 +658,9 @@ impl<'a> FromSql<'a> for Datum {
                 Datum::Json(Json::parse(body, "this column").map_err(as_error)?)
             }
             _ => match ty.kind() {
-                // `Vec<T>`'s own decoder refuses more than one dimension, and
-                // `Element`'s refuses a `NULL` element — which is the shape
-                // `List<a>` has nowhere to put, so it is a decode failure naming
-                // the column rather than a hole in the list.
+                // `Vec<T>`'s own decoder refuses more than one dimension, and `Element`'s refuses a
+                // `NULL` element — which is the shape `List<a>` has nowhere to put, so it is a
+                // decode failure naming the column rather than a hole in the list.
                 Kind::Array(_) => Datum::Array(
                     Vec::<Element>::from_sql(ty, raw)?
                         .into_iter()
@@ -761,11 +682,6 @@ impl<'a> FromSql<'a> for Datum {
 }
 
 /// One element of an array column.
-///
-/// Its own type because [`Datum`]'s `from_sql_null` answers `Datum::Null`, which
-/// is right for a column and wrong for an element: `List<a>` is a list of `a`
-/// and has no shape for a hole, so an element decodes a `NULL` as a failure
-/// naming the column instead of as a value the column did not hold.
 struct Element(Datum);
 
 impl<'a> FromSql<'a> for Element {
@@ -786,18 +702,7 @@ fn as_error(message: String) -> Box<dyn Error + Sync + Send> {
     message.into()
 }
 
-/// `numeric`, decoded from the wire rather than through `rust_decimal`'s own
-/// `FromSql`.
-///
-/// Its implementation **rounds** a value past scale 28 — `0.123…9` at
-/// twenty-nine places comes back at twenty-eight — and a rounding is the one
-/// answer this mapping may not give. W2's whole argument is a total that quietly
-/// lost a cent, and a driver that rounded on the way in would be the same defect
-/// one layer down. So the wire form is read here and the digits are handed to
-/// [`Decimal::from_str_exact`], which refuses rather than rounds.
-///
-/// The format is postgres's own: a count of base-10000 digits, the weight of the
-/// first of them, a sign, a display scale, and the digits.
+/// `numeric`, decoded from the wire rather than through `rust_decimal`'s own `FromSql`.
 fn numeric_from_sql(raw: &[u8]) -> Result<Decimal, Box<dyn Error + Sync + Send>> {
     fn i16_at(raw: &[u8], at: usize) -> Result<i16, Box<dyn Error + Sync + Send>> {
         let bytes: [u8; 2] = raw
@@ -813,8 +718,8 @@ fn numeric_from_sql(raw: &[u8]) -> Result<Decimal, Box<dyn Error + Sync + Send>>
     let sign = i16_at(raw, 4)? as u16;
     let scale = i16_at(raw, 6)?;
 
-    // `Decimal` has no representation for these and substituting zero is the
-    // silent-wrong-answer shape, so they are a decode failure naming the column.
+    // `Decimal` has no representation for these and substituting zero is the silent-wrong-answer
+    // shape, so they are a decode failure naming the column.
     match sign {
         0x0000 | 0x4000 => {}
         0xC000 => return Err("this column holds `NaN`, which `Decimal` has no value for".into()),
@@ -889,10 +794,6 @@ fn render_uuid(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
 }
 
 /// Whether a postgres type is in the pinned mapping at all.
-///
-/// One function so that the prepare-time check and the decode agree by
-/// construction: a column this admits and the decoder refuses would be a
-/// failure per row instead of one before the first row.
 pub fn mapped(ty: &Type) -> bool {
     match *ty {
         Type::BOOL
@@ -911,17 +812,15 @@ pub fn mapped(ty: &Type) -> bool {
         | Type::JSON
         | Type::JSONB => true,
         _ => match ty.kind() {
-            // One dimension is a property of the value rather than of the type,
-            // so the refusal for a two-dimensional one is at decode.
+            // One dimension is a property of the value rather than of the type, so the refusal for
+            // a two-dimensional one is at decode.
             Kind::Array(member) => !matches!(member.kind(), Kind::Array(_)) && mapped(member),
             _ => false,
         },
     }
 }
 
-/// What a program should write instead, for the types W4 deliberately does not
-/// map. Named in the refusal, because "unsupported" without an alternative is a
-/// dead end.
+/// What a program should write instead, for the types W4 deliberately does not map.
 pub fn advice(ty: &Type) -> Option<&'static str> {
     match *ty {
         Type::TIMESTAMP | Type::TIMESTAMPTZ => Some(

@@ -1,27 +1,12 @@
 //! `ply check --types` over a service, and the provenance `--explain` adds.
-//!
-//! W3's exit criterion is that an endpoint's declared signature says which
-//! resources it touches, read off one command. Everything here is a claim about
-//! that output — which means about the *bytes*, because this is an artifact a
-//! reviewer diffs, not a debug dump.
-//!
-//! Two rules from ADR 0013 §1.7 are what most of these tests check:
-//!
-//! - **The expansion is printed, always, and the alias never is.** The truth
-//!   needs no flag; `--explain` adds the abbreviation back as provenance.
-//! - **`--explain`'s bytes do not depend on the cache.** Gate 1 skips a file
-//!   whose bytes are unchanged, and the set table is read from the AST — so a
-//!   warm run and a cold one must print the same thing or the reviewing command
-//!   is reporting on what the cache held.
 
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A service with two `effect set`s, an endpoint that performs less than it
-/// declares, and endpoints that write their rows out. Small enough to pin
-/// exactly and wide enough that every branch of the printer runs.
+/// A service with two `effect set`s, an endpoint that performs less than it declares, and endpoints
+/// that write their rows out.
 const SERVICE: &str = r#"
 effect store {
   read  all[table]() -> List<Int>
@@ -75,10 +60,7 @@ fn module_block(text: &str) -> String {
     text[start + 1..].trim_end().to_string()
 }
 
-/// Every line a row occupies: the `/ {` line and the continuations hanging
-/// under it. A type is not wrapped — it is one token stream and breaking it
-/// would cost more legibility than it bought — so the width claim is about the
-/// part that grows without bound, which is the row.
+/// Every line a row occupies: the `/ {` line and the continuations hanging under it.
 fn row_lines(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut hanging = None;
@@ -111,10 +93,6 @@ fn types(dir: &Path, extra: &[&str]) -> String {
 
 // --- the signatures ---------------------------------------------------------
 
-/// The exit criterion, pinned whole. A row on its own wrapped line under the
-/// type, a pure definition with no row at all, and the atoms of an aliased row
-/// spelled out — because a row that runs off the right edge is a row nobody
-/// reads, which is the failure this milestone exists to prevent.
 #[test]
 fn a_services_per_endpoint_footprints_are_legible_in_one_command() {
     let dir = project(SERVICE);
@@ -143,9 +121,7 @@ fn a_services_per_endpoint_footprints_are_legible_in_one_command() {
     );
 }
 
-/// ADR 0013 §1.7 in its strongest form: the truth needs no flag. An alias that
-/// hid what a definition touches would defeat its own purpose, so the reviewing
-/// command prints the expansion and the name appears nowhere.
+/// ADR 0013 §1.7 in its strongest form: the truth needs no flag.
 #[test]
 fn the_expansion_is_printed_without_a_flag_and_the_alias_is_not() {
     let dir = project(SERVICE);
@@ -159,9 +135,9 @@ fn the_expansion_is_printed_without_a_flag_and_the_alias_is_not() {
     assert!(text.contains("m.store.write[orders]"), "{text}");
 }
 
-/// No line may exceed the fixed width, and the width is fixed rather than the
-/// terminal's: this output is diffed, so a run in a narrow window and a run in
-/// a wide one have to produce the same bytes.
+/// No line may exceed the fixed width, and the width is fixed rather than the terminal's: this
+/// output is diffed, so a run in a narrow window and a run in a wide one have to produce the same
+/// bytes.
 #[test]
 fn no_signature_line_runs_past_the_column_it_wraps_at() {
     let dir = project(SERVICE);
@@ -178,9 +154,7 @@ fn no_signature_line_runs_past_the_column_it_wraps_at() {
 
 // --- --explain --------------------------------------------------------------
 
-/// The set table and the provenance, pinned whole. The alias is here and only
-/// here, beside the row it stands for — an abbreviation printed without its
-/// expansion is the abbreviation without the definition.
+/// The set table and the provenance, pinned whole.
 #[test]
 fn explain_prints_the_set_table_the_alias_and_the_difference_it_hides() {
     let dir = project(SERVICE);
@@ -230,10 +204,7 @@ fn explain_prints_the_set_table_the_alias_and_the_difference_it_hides() {
     );
 }
 
-/// A set used through another set is used. `Reads` is named directly by
-/// `list_orders` and reached by `create_order` through `Web`, and an included
-/// set reporting zero uses while its atoms are in half the module would be a
-/// number that reads as dead code.
+/// A set used through another set is used.
 #[test]
 fn an_included_set_counts_the_definitions_that_reach_it() {
     let dir = project(SERVICE);
@@ -249,10 +220,8 @@ fn an_included_set_counts_the_definitions_that_reach_it() {
     );
 }
 
-/// ADR 0013 §1.6: `--explain` must print the same bytes for a warm run and a
-/// cold one, or the reviewing command's output is a function of what the cache
-/// held. Gate 1 skips a file whose bytes are unchanged and the set table is
-/// read from the AST, so this is the test that keeps the two from drifting.
+/// ADR 0013 §1.6: `--explain` must print the same bytes for a warm run and a cold one, or the
+/// reviewing command's output is a function of what the cache held.
 #[test]
 fn explain_prints_the_same_bytes_whether_gate_one_parsed_the_file_or_skipped_it() {
     let dir = project(SERVICE);
@@ -268,9 +237,7 @@ fn explain_prints_the_same_bytes_whether_gate_one_parsed_the_file_or_skipped_it(
     assert_eq!(module_block(&cold), module_block(&fresh));
 }
 
-/// The front-end report says what the gates actually decided. Completing the
-/// parse so the set table can be printed must not rewrite it into a run that
-/// parsed everything.
+/// The front-end report says what the gates actually decided.
 #[test]
 fn completing_the_parse_does_not_rewrite_the_report_of_what_the_gates_decided() {
     let dir = project(SERVICE);
@@ -297,10 +264,9 @@ fn json_types(dir: &Path, extra: &[&str]) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("stdout was not one object: {e}\n{text}"))
 }
 
-/// The provenance an agent reads, and the rule that keeps it honest: present
-/// only under `--explain`, where the parse is completed first, so the object
-/// either carries these fields or does not — and never carries a subset that
-/// depends on which files gate 1 skipped.
+/// The provenance an agent reads, and the rule that keeps it honest: present only under
+/// `--explain`, where the parse is completed first, so the object either carries these fields or
+/// does not — and never carries a subset that depends on which files gate 1 skipped.
 #[test]
 fn the_json_report_carries_the_provenance_only_under_explain() {
     let dir = project(SERVICE);
@@ -340,8 +306,8 @@ fn the_json_report_carries_the_provenance_only_under_explain() {
     assert!(explained.is_object());
 }
 
-/// `--json --explain` completes the parse too, so its provenance cannot be a
-/// function of what the cache held either.
+/// `--json --explain` completes the parse too, so its provenance cannot be a function of what the
+/// cache held either.
 #[test]
 fn the_json_provenance_is_the_same_warm_and_cold() {
     let dir = project(SERVICE);
@@ -362,9 +328,9 @@ fn repo(rel: &str) -> std::path::PathBuf {
         .join(rel)
 }
 
-/// The claim on the example service rather than on a fixture only this file has
-/// ever seen: every endpoint that touches a resource prints a row, the pure
-/// parts of routing print none, and no alias name reaches the output.
+/// The claim on the example service rather than on a fixture only this file has ever seen: every
+/// endpoint that touches a resource prints a row, the pure parts of routing print none, and no
+/// alias name reaches the output.
 #[test]
 fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
     let desk = repo("examples/desk.ply");
@@ -410,11 +376,8 @@ fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
 
 // --- ply prove --------------------------------------------------------------
 
-/// ADR 0013 §1.6: the footprint is the frame condition, so an annotation wider
-/// than the body promises less about less — at the same tier and with no other
-/// sign that anything was lost. On a definition carrying an obligation that is
-/// a weakened claim rather than a scheduling cost, so `ply prove --explain`
-/// names the atoms too.
+/// ADR 0013 §1.6: the footprint is the frame condition, so an annotation wider than the body
+/// promises less about less — at the same tier and with no other sign that anything was lost.
 #[test]
 fn prove_explain_names_what_an_over_broad_row_gave_up() {
     let dir = project(
@@ -447,8 +410,8 @@ pub fn count() -> Int / {Web}
         "the alias name is provenance, never the claim:\n{text}"
     );
 
-    // A definition whose row is exactly its body's gives nothing up, so there
-    // is nothing to report and the line is absent rather than empty.
+    // A definition whose row is exactly its body's gives nothing up, so there is nothing to report
+    // and the line is absent rather than empty.
     let tight = project("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
     let text = stdout_of(
         &ply(tight.path())

@@ -1,21 +1,4 @@
-//! An adversarial audit of transactions, the pool and parameter safety, against
-//! a real postgres.
-//!
-//! `db_driver.rs` asserts that the driver does what W4 says it does. This file
-//! asks the opposite question: what does it do when the program, the server or a
-//! second entry point misbehaves. Both failure modes it hunts are silent — a row
-//! that was lost and a row that leaked — so **every assertion about what
-//! postgres holds is made through `psql`**, a channel the driver has no part in.
-//! The driver's own bookkeeping is not evidence about the driver.
-//!
-//! Six phases here were `defect_` characterisations of behaviour that was wrong.
-//! Each now asserts the answer its own doc comment named, and each doc comment
-//! still says what the wrong answer was and why it was silent — a fix whose
-//! shape nobody can find is a fix that comes back.
-//!
-//! One `#[test]`, one cluster, one sequence of phases, for the reason
-//! `db_driver.rs` gives: `#[test]`s in a binary run in parallel threads of one
-//! process, and a server shared between them would have no owner.
+//! An adversarial audit of transactions, the pool and parameter safety, against a real postgres.
 
 use crate::support::cluster::{self, Cluster};
 use ply_core::ty::{EffectAtom, Footprint, Resource};
@@ -33,12 +16,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One entry point that never spawned. The owner every scope in this file
-/// belongs to unless a phase says otherwise.
+/// One entry point that never spawned.
 const ALONE: Owner = (MachineId(0), None);
 
-/// A second machine: a different entry point, on a worker of its own. What
-/// `ply test` gives every member of a non-conflicting concurrency group.
+/// A second machine: a different entry point, on a worker of its own.
 const OTHER: Owner = (MachineId(1), None);
 
 /// A task of [`ALONE`]'s machine, which owns no scope of its own.
@@ -55,9 +36,7 @@ create table child (
 create table wide (id int8 primary key, small float4, exact numeric, scaled numeric(12,4));
 ";
 
-// ---------------------------------------------------------------------------
-// Driving one operation the way the machine does.
-// ---------------------------------------------------------------------------
+// the way the machine does.
 
 fn settle(db: &Postgres, answered: Result<HostAnswer, Diagnostic>) -> Result<Value, Diagnostic> {
     match answered? {
@@ -79,8 +58,8 @@ fn scan_of(sql: &str) -> db::Scan {
     db::scan::scan(sql, Span::DUMMY).unwrap_or_else(|d| panic!("`{sql}`: {}", d.message))
 }
 
-/// One data statement through the driver, labelled `table`, with no declared row
-/// — so the only footprint check that applies is the label's own.
+/// One data statement through the driver, labelled `table`, with no declared row — so the only
+/// footprint check that applies is the label's own.
 fn perform(
     db: &Postgres,
     op: Op,
@@ -162,8 +141,7 @@ fn abort(db: &Postgres) -> Value {
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("an abort is never a diagnostic")
 }
 
-/// A raw statement on a pooled connection, bypassing the scope table. For the
-/// pool phases, whose subject is the connection rather than the driver.
+/// A raw statement on a pooled connection, bypassing the scope table.
 fn raw(reactor: &Reactor, sql: &str, params: Vec<Param>) -> Result<Answer, Diagnostic> {
     let text = sql.to_string();
     let pending = reactor
@@ -230,12 +208,8 @@ fn transactions_the_pool_and_parameters_under_adversarial_conditions() {
     long_values_and_embedded_nul_bytes_are_data_or_a_named_failure(&cluster);
 }
 
-// ---------------------------------------------------------------------------
-// Transactions.
-// ---------------------------------------------------------------------------
-
-/// The property W4 exists to make impossible, checked from the one vantage point
-/// where "committed" means anything: a connection that did not write the rows.
+/// The property W4 exists to make impossible, checked from the one vantage point where "committed"
+/// means anything: a connection that did not write the rows.
 fn a_rollback_is_invisible_to_a_second_connection(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -269,9 +243,8 @@ fn a_rollback_is_invisible_to_a_second_connection(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// Nesting is a savepoint, and the question that matters is whether an inner
-/// `commit` can smuggle its writes past an outer rollback. It cannot: a
-/// `RELEASE SAVEPOINT` is not a commit, and the outer scope still decides.
+/// Nesting is a savepoint, and the question that matters is whether an inner `commit` can smuggle
+/// its writes past an outer rollback.
 fn a_nested_rollback_keeps_the_outer_and_an_outer_rollback_takes_the_inner(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -322,16 +295,6 @@ fn a_nested_rollback_keeps_the_outer_and_an_outer_rollback_takes_the_inner(clust
 }
 
 /// A commit of a transaction a failed statement already aborted is `Failed`.
-///
-/// Postgres answers `COMMIT` on an aborted transaction block with the command
-/// tag `ROLLBACK` and **no error**, and `tokio_postgres::SimpleQueryMessage`
-/// does not carry the tag — so a driver that asked only whether the server
-/// errored would answer `Count(0)`, a success, for a transaction whose every
-/// write is gone. `std.db`'s `transaction` matches only `Failed` on the commit,
-/// so the caller would get `Ok(value)` and be told its writes are durable.
-///
-/// The scope remembers instead: the first `Failed` inside it poisons it and the
-/// close answers `25P02`.
 fn a_commit_after_a_failed_statement_reports_the_aborted_scope(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -373,16 +336,9 @@ fn a_commit_after_a_failed_statement_reports_the_aborted_scope(cluster: &Cluster
 }
 
 /// The same shape, reached the way a service reaches it.
-///
-/// `--db-statement-ms` firing mid-transaction is `57014`, which aborts the scope
-/// exactly as a constraint violation does. A program that treats a slow query as
-/// recoverable, keeps going and commits must not be told it succeeded.
 fn a_commit_after_a_statement_timeout_reports_the_aborted_scope(cluster: &Cluster) {
     let db = driver(cluster, |c| c.statement = Duration::from_millis(200));
     // A table big enough that a nested loop over it outlives the deadline.
-    // Loaded through `psql`, because the load is not what is under test and
-    // `generate_series` in a `from` is a set-returning function the scanner
-    // refuses.
     cluster.psql(
         "audit",
         "insert into t (id, n) select g, g from generate_series(1, 20000) g",
@@ -415,8 +371,8 @@ fn a_commit_after_a_statement_timeout_reports_the_aborted_scope(cluster: &Cluste
     finish(cluster, db);
 }
 
-/// The exit the ADR's table names first, and the one the driver gets right: a
-/// constraint that can only fail at `COMMIT` is a `Failed` the program reads.
+/// The exit the ADR's table names first, and the one the driver gets right: a constraint that can
+/// only fail at `COMMIT` is a `Failed` the program reads.
 fn a_deferred_constraint_that_fails_at_commit_is_a_value(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -445,9 +401,7 @@ fn a_deferred_constraint_that_fails_at_commit_is_a_value(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// A backend killed out of band mid-transaction. Both the next statement and the
-/// commit are values the program matches on, nothing is committed, and the pool
-/// refills rather than handing the dead session on.
+/// A backend killed out of band mid-transaction.
 fn a_connection_lost_mid_transaction_is_a_value_and_commits_nothing(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 2);
 
@@ -490,8 +444,8 @@ fn a_connection_lost_mid_transaction_is_a_value_and_commits_nothing(cluster: &Cl
     finish(cluster, db);
 }
 
-/// A spawned task has no scope of its own, and both answers available to the
-/// driver are wrong — so it refuses, at the statement and at the close alike.
+/// A spawned task has no scope of its own, and both answers available to the driver are wrong — so
+/// it refuses, at the statement and at the close alike.
 fn a_task_that_does_not_own_the_scope_is_refused(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -509,13 +463,8 @@ fn a_task_that_does_not_own_the_scope_is_refused(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-// ---------------------------------------------------------------------------
-// The pool.
-// ---------------------------------------------------------------------------
-
-/// Every transaction holds a connection from `db.begin` to its close, so a pool
-/// smaller than the transactions in flight cannot make progress. The bound turns
-/// that from a hang into a sentence naming the size and the operation.
+/// Every transaction holds a connection from `db.begin` to its close, so a pool smaller than the
+/// transactions in flight cannot make progress.
 fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
     let db = driver(cluster, |c| {
         c.size = 1;
@@ -525,8 +474,8 @@ fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
 
     begin(&db, Isolation::ReadCommitted, Access::ReadWrite);
 
-    // A second entry point, on a thread of its own, asking for the connection
-    // the first one is holding.
+    // A second entry point, on a thread of its own, asking for the connection the first one is
+    // holding.
     let contender = Arc::clone(&db);
     let started = std::time::Instant::now();
     let refused = std::thread::spawn(move || {
@@ -565,9 +514,8 @@ fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
     finish_shared(cluster, db);
 }
 
-/// A scope nothing closed, through the driver rather than through the reactor:
-/// `end_entry_point` rolls it back, and the *next* borrower sees neither the
-/// rows nor the transaction.
+/// A scope nothing closed, through the driver rather than through the reactor: `end_entry_point`
+/// rolls it back, and the *next* borrower sees neither the rows nor the transaction.
 fn an_abandoned_transaction_is_gone_before_the_connection_is_reused(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 1);
 
@@ -584,10 +532,7 @@ fn an_abandoned_transaction_is_gone_before_the_connection_is_reused(cluster: &Cl
     assert!(report.is_clean(), "{:?}", report.describe());
     assert_eq!(rows_in(cluster, "t"), 0);
 
-    // The same connection, since the pool holds exactly one. `vacuum` is the
-    // check because postgres refuses it inside a transaction block, and a
-    // backend running a query is `active` in `pg_stat_activity` whether or not
-    // one is open.
+    // The same connection, since the pool holds exactly one.
     let vacuumed = raw(db.reactor(), "select id from t", Vec::new());
     assert!(vacuumed.is_ok(), "{vacuumed:?}");
     let idle = cluster.psql(
@@ -604,20 +549,6 @@ fn an_abandoned_transaction_is_gone_before_the_connection_is_reused(cluster: &Cl
 }
 
 /// A pooled connection carries no session state to its next borrower.
-///
-/// A checkout used to run `ROLLBACK` and the two timeouts and nothing else — ADR
-/// 0014 §4.3 refuses `DISCARD ALL` so that the prepared-statement cache
-/// survives, and the consequence was that **every other piece of session state
-/// survived too**. A pooled connection is the only thing two host-backed tests
-/// share: a `search_path` one borrower set decides which relation an unqualified
-/// name resolves to for the next, a session-level advisory lock blocks a later
-/// borrower until `--db-statement-ms`, and a temporary table shadows a real one
-/// of the same name. None of it is visible from either borrower and the
-/// footprint graph cannot see it at all.
-///
-/// `RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); CLOSE ALL;
-/// DISCARD TEMP` costs nothing extra — the checkout is already a round trip —
-/// and does not drop the statement cache the way `DISCARD ALL` would.
 fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 1);
     let reactor = db.reactor();
@@ -639,14 +570,7 @@ fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
             search_path: r#""$user", public"#.to_string(),
             temp_tables: 0,
             advisory_locks: 0,
-            // The one that survives, and it is stated rather than silently
-            // tolerated. A SQL-level `PREPARE` shares `pg_prepared_statements`
-            // with the protocol-level statements `deadpool`'s cache is built
-            // from, so `DEALLOCATE ALL` would invalidate a cache the pool still
-            // believes is live — §4.3's whole reason for refusing `DISCARD ALL`.
-            // Nothing a program performs can reach it: `PREPARE` is not one of
-            // the five statement shapes §2.4 admits, and the phase below asserts
-            // that.
+            // The one that survives, and it is stated rather than silently tolerated.
             prepared: 1,
             listening: 0,
         },
@@ -665,14 +589,6 @@ fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
 }
 
 /// The reachability half of the one above, and the second half of §2.4.
-///
-/// The scanner decides *statement shapes*; a function call lives inside every
-/// shape it admits, and it is the one place an admitted statement can reach
-/// state no footprint names. `select set_config('search_path', …, false) from t`
-/// reports `db.read[t]` — the atom two read-only endpoints are scheduled side by
-/// side on — and rebinds which relation an unqualified name resolves to for
-/// every later borrower of that connection. So the scanner calls only what it
-/// will vouch for, and everything else is `E0432` naming the function.
 fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
     for sql in [
         "select set_config('search_path', 'pg_catalog', false) from t",
@@ -719,8 +635,8 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
         .scan(sql, Span::DUMMY)
         .expect_err("a session-mutating call never reaches a connection");
     assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED);
-    // And the scan is what the handler runs before it acquires anything, so the
-    // pool's session is what it was.
+    // And the scan is what the handler runs before it acquires anything, so the pool's session is
+    // what it was.
     query(&db, "t", "select count(*) from t", Vec::new());
     assert_ne!(
         inspect_session(db.reactor()).search_path,
@@ -732,34 +648,10 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-// ---------------------------------------------------------------------------
-// Two entry points, one driver.
-// ---------------------------------------------------------------------------
+// driver.
 
-/// Two entry points, one driver, and the property that makes `ply test --jobs n`
-/// mean anything against a real database.
-///
-/// `Host` holds **one** `Arc<Postgres>` and `Hosts::runtime_factory` hands every
-/// worker thread a `Facilities` over that same one, so the driver's account of
-/// who is inside what is shared by construction. What keeps two entry points
-/// apart is the **owner**: the machine *and* the task. Keyed on the task alone
-/// every one of them is `None` — `Machine::performing_task` answers `None`
-/// outside a production region, which every `ply test` entry point is — and the
-/// three failures below all follow, silently:
-///
-/// 1. B's statement is routed onto A's connection, inside A's transaction, so B
-///    reads A's uncommitted rows and B's writes are rolled back with A's.
-/// 2. B's teardown — which the machine runs on **every** exit from **every**
-///    entry point, including one that never touched the database — rolls back
-///    A's open transaction. A's own `commit` then answers `Failed(25P01)`.
-/// 3. B's teardown clears the driver's pending table, so a statement A already
-///    has in flight resolves to `E0505`, a defect diagnostic attributed to A for
-///    something B did.
-///
-/// The scheduler cannot prevent any of it: transaction control carries the
-/// singleton `db.write`, which only serialises transaction-*opening* tests
-/// against each other, and a test whose row is empty is in a different
-/// concurrency group by construction.
+/// Two entry points, one driver, and the property that makes `ply test --jobs n` mean anything
+/// against a real database.
 fn two_entry_points_are_two_scope_stacks(cluster: &Cluster) {
     let db = Arc::new(driver(cluster, |c| c.size = 4));
 
@@ -773,8 +665,6 @@ fn two_entry_points_are_two_scope_stacks(cluster: &Cluster) {
     );
 
     // Entry point B, on a worker of its own, on a machine of its own.
-    // A `Value` never crosses a thread, so the worker reduces its answer to the
-    // one integer this is about.
     let b = Arc::clone(&db);
     let seen = std::thread::spawn(move || {
         count_of(
@@ -851,21 +741,7 @@ fn two_entry_points_are_two_scope_stacks(cluster: &Cluster) {
     finish_shared(cluster, db);
 }
 
-// ---------------------------------------------------------------------------
-// Parameters.
-// ---------------------------------------------------------------------------
-
 /// Every route a value could take into statement text, tried both ways.
-///
-/// As a **parameter** the payload is stored and read back byte for byte and the
-/// schema is untouched — §4.1's claim, which holds. As **statement text** the
-/// same payload is either refused before a connection is acquired, or refused by
-/// the footprint check because the table it smuggled in is not in the row.
-///
-/// The last case is the honest limit and is asserted rather than hidden: a
-/// payload that changes a predicate *within one table*, and stacks no statement
-/// and names no new relation, is accepted. `stmt` takes a `String` and Ply has no
-/// way to demand a literal, so statement text is the program's own to get right.
 fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -934,8 +810,8 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
         assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED, "{route}");
     }
 
-    // A spliced identifier that names a second relation is caught by the
-    // footprint rather than by the scanner, which is the second lock working.
+    // A spliced identifier that names a second relation is caught by the footprint rather than by
+    // the scanner, which is the second lock working.
     let scan = scan_of("select id from t, other");
     let refused = db::check_footprint(
         &scan,
@@ -947,8 +823,7 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
     .expect_err("`other` is not in the row");
     assert_eq!(refused.code, codes::DB_FOOTPRINT_UNDECLARED);
 
-    // The limit, stated. A predicate the program built itself, over the table it
-    // declared, stacking nothing: accepted, and it changes which rows come back.
+    // The limit, stated.
     let tautology = "select id from t where s like '%' or 1=1 -- '";
     let scan = scan_of(tautology);
     assert_eq!(scan.tables.all().into_iter().collect::<Vec<_>>(), ["t"]);
@@ -959,14 +834,6 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
 }
 
 /// A `float4` parameter is a named refusal rather than a silent narrowing.
-///
-/// §4.2's table maps `Float` to `float8` **as a parameter** and to `float4` or
-/// `float8` only as a *result*, so a `float4` parameter is outside the pinned
-/// mapping. Binding one with `as f32` stored `1e300` as `Infinity` and
-/// `0.1234567890123` as `0.12345679` — a rounding the program never asked for
-/// and cannot see, which is the one answer this mapping may not give. The row
-/// above it is the shape: `Int` into an `int4` column is `22003` from the server
-/// rather than a truncation in the driver.
 fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -991,8 +858,8 @@ fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
         "a refused parameter still reached the column"
     );
 
-    // The narrowing the program writes for itself still runs, and it is visible
-    // in the statement a reader reads.
+    // The narrowing the program writes for itself still runs, and it is visible in the statement a
+    // reader reads.
     raw(
         reactor,
         "insert into wide (id, small) values ($1, $2::float8::float4)",
@@ -1008,9 +875,7 @@ fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// W2's argument — a total that quietly lost a cent — applied to the wire. Every
-/// value outside `Decimal`'s 96 bits and scale 0..=28 is a decode failure naming
-/// the column, and every value inside it round-trips exactly.
+/// W2's argument — a total that quietly lost a cent — applied to the wire.
 fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -1076,8 +941,8 @@ fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
         );
     }
 
-    // A column's own scale is the server's answer and the driver is faithful to
-    // it rather than to the literal's.
+    // A column's own scale is the server's answer and the driver is faithful to it rather than to
+    // the literal's.
     raw(
         reactor,
         "insert into wide (id, scaled) values ($1, $2)",
@@ -1105,8 +970,8 @@ fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// A Ply value and a postgres column type that disagree is a refusal naming the
-/// position and the type, before anything is sent — never a coercion.
+/// A Ply value and a postgres column type that disagree is a refusal naming the position and the
+/// type, before anything is sent — never a coercion.
 fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -1144,8 +1009,8 @@ fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Clu
         );
     }
 
-    // An array with a `PNull`, and a nested array: `List<a>` has no shape for
-    // either, so both refuse rather than flattening.
+    // An array with a `PNull`, and a nested array: `List<a>` has no shape for either, so both
+    // refuse rather than flattening.
     for params in [
         vec![Param::Array(vec![Param::Int(1), Param::Null])],
         vec![Param::Array(vec![Param::Array(vec![Param::Int(1)])])],
@@ -1173,9 +1038,8 @@ fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Clu
     finish(cluster, db);
 }
 
-/// Bytes with embedded nulls are data; text with an embedded null is the server's
-/// own `22021` rather than a truncated string; four megabytes of either survives
-/// the round trip.
+/// Bytes with embedded nulls are data; text with an embedded null is the server's own `22021`
+/// rather than a truncated string; four megabytes of either survives the round trip.
 fn long_values_and_embedded_nul_bytes_are_data_or_a_named_failure(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -1226,18 +1090,14 @@ fn long_values_and_embedded_nul_bytes_are_data_or_a_named_failure(cluster: &Clus
     finish(cluster, db);
 }
 
-// ---------------------------------------------------------------------------
-// Harness.
-// ---------------------------------------------------------------------------
-
 fn driver(cluster: &Cluster, edit: impl FnOnce(&mut PoolConfig)) -> Postgres {
     let mut config = PoolConfig::new(cluster.url());
     edit(&mut config);
     Postgres::start(config).expect("the driver starts")
 }
 
-/// Close a phase: nothing is left open, and nothing is left for the next phase
-/// to inherit through the server.
+/// Close a phase: nothing is left open, and nothing is left for the next phase to inherit through
+/// the server.
 fn finish(cluster: &Cluster, db: Postgres) {
     let _ = db.end_entry_point(ALONE.0);
     let _ = db.end_entry_point(OTHER.0);

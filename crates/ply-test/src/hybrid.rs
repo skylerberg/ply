@@ -1,23 +1,4 @@
 //! Building and running one mixed definition graph.
-//!
-//! ADR 0004's central claim is that the system can *run the question*: a hybrid
-//! program — some definitions at their old hashes, the rest at their new ones —
-//! is a legitimate program, so "which of my twelve edits broke this" is answered
-//! by evaluating rather than by reading. Without this the only reachable verdicts
-//! are the ones that need no mixture, and the artifact hands a ranked list back
-//! to the reader with no culprit in it.
-//!
-//! Three things have to line up for a mixture to be a program:
-//!
-//! - **One body per name, chosen per era.** The choice is by [`DefKey`], not by
-//!   name, so a `fn` and a `type` sharing one are swapped independently.
-//! - **Relinking.** A body names its referents by hash, so a caller kept at its
-//!   baseline still names its callee's *baseline* hash. Every reference is
-//!   redirected to whichever version the mixture chose, or flipping a callee
-//!   alone would silently measure the baseline and pass.
-//! - **The test as it is written now.** The failure being explained is this
-//!   test's failure; the old test asserting something else is not evidence about
-//!   it.
 
 use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
 use crate::key::result_key;
@@ -32,12 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// What makes two failures the same failure.
-///
-/// The code and the message, deliberately without the span: every span in a
-/// reconstructed program is `Span::DUMMY`, so comparing spans would answer
-/// "different" for every mixture. The message carries the expected/actual pair,
-/// which is what stops an `assert_eq` now reporting different numbers from being
-/// read as a reproduction of this one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Signature {
     pub code: &'static str,
@@ -53,12 +28,11 @@ impl Signature {
     }
 }
 
-/// Every definition the two configurations know about, and where its body comes
-/// from on each side.
+/// Every definition the two configurations know about, and where its body comes from on each side.
 pub struct Mixture {
-    /// Baseline hash per key. Absent means the definition did not exist then.
+    /// Baseline hash per key.
     before: BTreeMap<DefKey, DefHash>,
-    /// Current hash per key. Absent means it has since been deleted.
+    /// Current hash per key.
     after: BTreeMap<DefKey, DefHash>,
 }
 
@@ -78,8 +52,7 @@ impl Mixture {
         self.after.insert(key, hash);
     }
 
-    /// Everything either side names, which is the set a trial has to decide
-    /// about. A key present on only one side is decided by whether it is flipped.
+    /// Everything either side names, which is the set a trial has to decide about.
     fn keys(&self) -> BTreeSet<&DefKey> {
         self.before.keys().chain(self.after.keys()).collect()
     }
@@ -123,27 +96,17 @@ pub fn mixture_for(hashes: &HashOutput, key: &Symbol, baseline: &crate::Baseline
 
 pub struct BodyHybrid<'a> {
     store: &'a Store,
-    /// This run's own normalized bytes, consulted before the store: a definition
-    /// this run introduced has no stored body until the cache is flushed, and a
-    /// bisection that could not see the *current* side would have nothing to
-    /// flip to.
+    /// This run's own normalized bytes, consulted before the store: a definition this run
+    /// introduced has no stored body until the cache is flushed, and a bisection that could not see
+    /// the *current* side would have nothing to flip to.
     fresh: &'a BodySet,
     mixture: Mixture,
     /// The failing test's body as it is written now.
     test: StoredBody,
     signature: Signature,
-    /// Hybrid test hashes that went green. A hybrid's test hash covers its whole
-    /// closure, so `Pass` under it is true of exactly that configuration — but
-    /// writing it needs a mutable store, which the diagnosis path does not hold,
-    /// so the caller drains these afterwards.
+    /// Hybrid test hashes that went green.
     proved: Vec<DefHash>,
     /// The interleaving the failure being explained happened in, pinned.
-    ///
-    /// A hybrid that explores its own interleavings answers a different question
-    /// from the one the search asked, and a bisection over it names whichever
-    /// definition the *other* interleaving happened to run through. That is a
-    /// confidently wrong culprit rather than an obvious breakage, which is the
-    /// worst shape a defect can take.
     plan: Plan,
 }
 
@@ -166,20 +129,14 @@ impl<'a> BodyHybrid<'a> {
         }
     }
 
-    /// Pins every trial to the interleaving the failure happened in. Called with
-    /// [`crate::Failure::seed`]; without it a simulated failure is bisected by
-    /// re-searching, and the answer is about a different execution.
+    /// Pins every trial to the interleaving the failure happened in.
     pub fn at_seed(mut self, seed: &Seed) -> BodyHybrid<'a> {
         self.plan = Plan::once(seed.clone());
         self
     }
 
-    /// The current test's stored body, found by the hash the run published for
-    /// it rather than by position.
-    ///
-    /// Position would be wrong: the incremental front end hands `ply-test` only
-    /// the modules it re-parsed, so `bodies` is indexed over those while the
-    /// published test list covers the whole program.
+    /// The current test's stored body, found by the hash the run published for it rather than by
+    /// position.
     pub fn test_body(bodies: &BodySet, published: DefHash) -> Option<StoredBody> {
         bodies
             .tests()
@@ -199,13 +156,8 @@ impl<'a> BodyHybrid<'a> {
         self.store.body(hash)?.stored()
     }
 
-    /// Which version of each definition this mixture takes, and the redirection
-    /// that makes every reference point at it.
-    ///
-    /// A source hash mapping to two different targets means two names share one
-    /// definition and the mixture wants them at different versions. They are the
-    /// same bytes, so nothing can tell the references apart, and the honest
-    /// answer is that this mixture is not a program.
+    /// Which version of each definition this mixture takes, and the redirection that makes every
+    /// reference point at it.
     fn choose(&self, flipped: &BTreeSet<DefKey>) -> Result<Chosen, Unresolved> {
         let mut hashes = Vec::new();
         let mut relink: BTreeMap<DefHash, DefHash> = BTreeMap::new();
@@ -258,9 +210,7 @@ impl Hybrid for BodyHybrid<'_> {
         let Ok(mut rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
             return Trial::unresolved(Unresolved::MissingBody);
         };
-        // `resolve` also fills defaults, which it needs the program mutably
-        // for. Here that is a no-op: a reconstructed program's calls were
-        // positional and fully applied before they were ever encoded.
+        // `resolve` also fills defaults, which it needs the program mutably for.
         let Ok(resolved) = ply_syntax::resolve(&mut rebuilt.program) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
@@ -279,14 +229,8 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
-        // The hybrid's own test hash covers its whole closure, so a `Pass`
-        // recorded under it is a claim about exactly this configuration. This is
-        // what makes `H(∅)` under an unedited test free: it *is* the hash the
-        // baseline test passed at.
-        //
-        // Under a pinned seed the claim is about that seed too, so the key is
-        // the plan's — a trial that passed at one interleaving says nothing
-        // about a search that visited others.
+        // The hybrid's own test hash covers its whole closure, so a `Pass` recorded under it is a
+        // claim about exactly this configuration.
         let seeded = is_seeded(&check.tests[index].footprint);
         let hash = rehashed
             .tests
@@ -298,19 +242,13 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::passes().from_cache();
         }
 
-        // The authoritative engine, for the reason a cached `Pass` is a claim
-        // about that engine and this trial may write one. It is also the engine
-        // whose answer the failure being explained came from, so a divergence
-        // between the two cannot turn a reproduction into a `DifferentFailure`.
+        // The authoritative engine, for the reason a cached `Pass` is a claim about that engine and
+        // this trial may write one.
         let plan = self.plan.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            // Hermetic, always, whatever the run around it was configured with:
-            // a search asks this question up to `Budget::max_trials` times, and
-            // a binding threaded in here would answer each of them with a real
-            // packet. A host-backed failure never reaches a trial at all —
-            // `Skipped::Host` refuses it two levels up — and this is the reason
-            // there is no `set_host_binding` call to make that refusal
-            // load-bearing rather than merely tidy.
+            // Hermetic, always, whatever the run around it was configured with: a search asks this
+            // question up to `Budget::max_trials` times, and a binding threaded in here would
+            // answer each of them with a real packet.
             let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
             seed_run(&mut machine, &plan.seeds()[0], plan.steps);
             machine.eval_test(index)
@@ -324,15 +262,15 @@ impl Hybrid for BodyHybrid<'_> {
             }
             Ok(Err(d)) if Signature::of(&d) == self.signature => Trial::fails(),
             Ok(Err(_)) => Trial::unresolved(Unresolved::DifferentFailure),
-            // A panic inside a mixture says nothing about the program the user
-            // wrote, and must not be reported as either outcome.
+            // A panic inside a mixture says nothing about the program the user wrote, and must not
+            // be reported as either outcome.
             Err(_) => Trial::unresolved(Unresolved::DifferentFailure),
         }
     }
 }
 
-/// Whether a mixture can be built at all, which is the difference between
-/// `no_bodies` — go and stop pruning — and a bisection that will run.
+/// Whether a mixture can be built at all, which is the difference between `no_bodies` — go and stop
+/// pruning — and a bisection that will run.
 pub fn bodies_available(store: &Store, fresh: &BodySet, mixture: &Mixture) -> bool {
     mixture
         .before

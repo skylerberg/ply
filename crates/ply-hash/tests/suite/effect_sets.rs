@@ -1,19 +1,4 @@
 //! An `effect set` is an abbreviation, and abbreviations do not change meaning.
-//!
-//! The claim, from ADR 0013 §1.5, is exact:
-//!
-//! | edit | hashes that move |
-//! | --- | --- |
-//! | declaring a set nothing uses | none |
-//! | renaming a set | none |
-//! | reordering its members, or writing one twice | none |
-//! | rewriting `/ {a, b}` as `/ {S}` where `S` expands to exactly that | **none** |
-//! | changing which atoms a set contains | the definitions annotated with it |
-//!
-//! The last row is not a concession: a `/ {..}` annotation is the *published*
-//! signature, so widening a set widens the bound every definition annotated
-//! with it publishes, and a caller checked against the narrower bound has to be
-//! rechecked. Gate 2 only rechecks a definition whose own hash moved.
 
 use ply_hash::{DefHash, HashOutput, hash_ast};
 use ply_span::{SourceId, Symbol};
@@ -50,8 +35,7 @@ fn with_effects(rest: &str) -> String {
     format!("{EFFECTS}{rest}")
 }
 
-/// The headline property. Two definitions differing only in whether their row is
-/// written out or named must hash identically.
+/// The headline property.
 #[test]
 fn a_named_row_and_a_written_one_are_one_definition() {
     let named = with_effects(
@@ -149,9 +133,7 @@ fn declaring_a_set_nothing_uses_moves_no_hash() {
     assert_eq!(def(&before, "f"), def(&after, "f"));
 }
 
-/// Not a concession. `footprint` is the *published* row, so widening the set
-/// widens what `f` promises callers, and a caller checked against the narrower
-/// bound has to be rechecked.
+/// Not a concession.
 #[test]
 fn changing_which_atoms_a_set_contains_moves_the_annotated_definitions_hash() {
     let before = with_effects(
@@ -181,10 +163,8 @@ fn changing_a_set_moves_no_hash_of_a_definition_that_does_not_name_it() {
     assert_ne!(def(&before, "f"), def(&after, "f"));
 }
 
-/// `BODY_ENCODING` does not move for an alias, because an alias expands to
-/// atoms the row encoder already writes. A corpus carrying no `effect set` must
-/// hash byte-identically to what it hashed under W2, and this pin is what says
-/// so from inside this crate.
+/// `BODY_ENCODING` does not move for an alias, because an alias expands to atoms the row encoder
+/// already writes.
 #[test]
 fn a_row_with_no_effect_set_normalizes_to_its_w2_hash() {
     let source = with_effects("fn f() -> Int / {db.read[users], log.write} = db.all[users]()\n");
@@ -196,11 +176,10 @@ fn a_row_with_no_effect_set_normalizes_to_its_w2_hash() {
     );
 }
 
-/// The property the sort in `normalize::row` claims, tested without an
-/// `effect set` in sight — because an alias splices a set's atoms in beside
-/// hand-written ones and can produce any order at all, so a row whose meaning
-/// depends on how it was typed would make the headline property above hold only
-/// by coincidence.
+/// The property the sort in `normalize::row` claims, tested without an `effect set` in sight —
+/// because an alias splices a set's atoms in beside hand-written ones and can produce any order at
+/// all, so a row whose meaning depends on how it was typed would make the headline property above
+/// hold only by coincidence.
 #[test]
 fn reordering_a_written_row_moves_no_hash() {
     let before = with_effects("fn f() -> Int / {db.read[users], log.write} = db.all[users]()\n");
@@ -208,8 +187,8 @@ fn reordering_a_written_row_moves_no_hash() {
     assert_eq!(def(&before, "f"), def(&after, "f"));
 }
 
-/// The alias and the explicit row are written in *opposite* orders, which is
-/// the case the property is actually about.
+/// The alias and the explicit row are written in *opposite* orders, which is the case the property
+/// is actually about.
 #[test]
 fn a_set_matches_an_explicit_row_written_in_the_other_order() {
     let named = with_effects(

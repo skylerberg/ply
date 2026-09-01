@@ -1,14 +1,11 @@
-//! Human-facing rendering of types, rows and schemes. `ty::Type`'s own
-//! `Display` prints raw variable numbers, which is right for debugging and wrong
-//! for a signature a person reads; this module renames variables to `a, b, c`
-//! and `e, f, g` per printed item.
+//! Human-facing rendering of types, rows and schemes.
 
 use crate::ty::{Row, RowVar, Scheme, TyVar, Type};
 use rustc_hash::FxHashMap;
 
-/// A cell's region has to be visible to inference — it decides which resource
-/// the `cell.read` / `cell.write` atoms name — but must not collide with a user
-/// type, hence a constructor name no lexer can produce.
+/// A cell's region has to be visible to inference — it decides which resource the `cell.read` /
+/// `cell.write` atoms name — but must not collide with a user type, hence a constructor name no
+/// lexer can produce.
 pub const REGION_PREFIX: &str = "#region:";
 
 pub fn region_type_name(resource: &str) -> String {

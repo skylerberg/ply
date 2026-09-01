@@ -1,12 +1,4 @@
 //! Cross-module content addressing.
-//!
-//! The claim under test is the one the whole language rests on: the namespace is
-//! metadata over hashes. A cross-module reference normalizes to the referent's
-//! `DefHash` exactly as a same-module one does, so renaming a definition is free
-//! and — the stronger, newer property — so is *moving* one between modules.
-//!
-//! Everything here is written at the source level, because that is the surface a
-//! user edits.
 
 use ply_hash::{DefHash, HashOutput, hash_ast, hash_program_ast};
 use ply_span::{SourceId, Symbol};
@@ -33,10 +25,7 @@ fn hashes(files: &[(&str, &str)]) -> HashOutput {
     hash_program_ast(&program, &resolved).expect("program should hash")
 }
 
-/// Resolution for a program whose modules import each other, which the real
-/// resolver rejects. Hashing consumes only what a name denotes, and that is
-/// well defined even when the load order is not — so the two tests below can
-/// show that a definition-level cycle spanning modules costs this crate nothing.
+/// Resolution for a program whose modules import each other, which the real resolver rejects.
 fn hashes_ignoring_cycles(files: &[(&str, &str)]) -> HashOutput {
     let program = program_of(files);
     let index: Vec<Symbol> = program
@@ -99,8 +88,6 @@ fn def(out: &HashOutput, name: &str) -> DefHash {
         .unwrap_or_else(|| panic!("no definition named `{name}`; have {:?}", out.defs.keys()))
 }
 
-// ---- the two headline properties ----
-
 const A_BEFORE: &str = "\
 pub fn shared(x: Int) -> Int = x + 1
 fn helper(x: Int) -> Int = x - 1
@@ -120,9 +107,9 @@ fn before() -> HashOutput {
     hashes(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)])
 }
 
-/// The property the module system exists to preserve: `shared` is called from
-/// two other modules and is moved to a third, which rewrites two `import`s and
-/// four qualified references, and not one hash in the program moves.
+/// The property the module system exists to preserve: `shared` is called from two other modules and
+/// is moved to a third, which rewrites two `import`s and four qualified references, and not one
+/// hash in the program moves.
 #[test]
 fn moving_a_definition_between_modules_changes_no_hash() {
     let after = hashes(&[
@@ -175,8 +162,8 @@ fn renaming_a_definition_imported_by_two_modules_changes_no_hash() {
     assert_eq!(before.tests, after.tests);
 }
 
-/// Renaming a module is renaming its file, so every importer's `import` line and
-/// every qualified reference changes. None of that is a definition.
+/// Renaming a module is renaming its file, so every importer's `import` line and every qualified
+/// reference changes.
 #[test]
 fn renaming_a_module_changes_no_hash() {
     let after = hashes(&[
@@ -248,8 +235,6 @@ fn visibility_and_imports_are_erased() {
     }
 }
 
-// ---- a cross-module reference is an ordinary reference ----
-
 #[test]
 fn editing_a_definition_moves_its_dependents_in_other_modules() {
     let before = before();
@@ -304,9 +289,8 @@ fn one_name_in_two_modules_is_two_definitions() {
     assert_eq!(out.defs.len(), 2);
 }
 
-/// A module binder lives in its own namespace, so `a` the parameter cannot hide
-/// `a` the module — and if it ever did, the reference would fall back to a free
-/// name and this hash would drift.
+/// A module binder lives in its own namespace, so `a` the parameter cannot hide `a` the module —
+/// and if it ever did, the reference would fall back to a free name and this hash would drift.
 #[test]
 fn a_local_binder_does_not_hide_a_module_binder() {
     let shadowing = hashes(&[
@@ -342,8 +326,6 @@ fn deps_and_closures_are_keyed_by_the_program_wide_name() {
     assert_eq!(test_closure, vec!["a.shared", "b.b uses shared", "b.use_b"]);
 }
 
-// ---- tests are keyed per module ----
-
 #[test]
 fn identically_labelled_tests_in_two_modules_stay_distinct() {
     let out = hashes(&[
@@ -361,8 +343,7 @@ fn identically_labelled_tests_in_two_modules_stay_distinct() {
     assert_ne!(out.tests[0], out.tests[1]);
 }
 
-/// Two identical tests in different modules are one computation and share one
-/// cache entry. That is correct, not a collision to break.
+/// Two identical tests in different modules are one computation and share one cache entry.
 #[test]
 fn identical_tests_in_two_modules_share_a_hash() {
     let out = hashes(&[
@@ -372,8 +353,6 @@ fn identical_tests_in_two_modules_share_a_hash() {
     assert_eq!(out.tests[0], out.tests[1]);
 }
 
-// ---- effects stay nominal across modules ----
-
 const LOOK_ALIKE: &str = "\
 pub effect db {
   write emit[r](v: Int) -> Int
@@ -381,14 +360,9 @@ pub effect db {
 pub fn log(v: Int) -> Int / {db.write[audit]} = db.emit[audit](v)
 ";
 
-/// Two modules each declaring `effect db` declare two capabilities, not one —
-/// and `a.log` and `b.log` are still one definition, because they differ only by
-/// which of the two identical declarations they name. Separating them would
-/// have to be done by a name or by a file position, and both of those make
-/// unrelated edits move unrelated hashes.
-///
-/// The capabilities stay apart where it counts: a handler that discharges one
-/// of them, with both in view, records which.
+/// Two modules each declaring `effect db` declare two capabilities, not one — and `a.log` and
+/// `b.log` are still one definition, because they differ only by which of the two identical
+/// declarations they name.
 #[test]
 fn performers_of_two_identically_declared_effects_are_one_definition() {
     let out = hashes(&[("a", LOOK_ALIKE), ("b", LOOK_ALIKE)]);
@@ -426,8 +400,8 @@ fn performing_an_imported_effect_hashes_like_performing_a_local_one() {
     assert_eq!(def(&split, "b.read_one"), def(&together, "a.read_one"));
 }
 
-/// Look-alike effects are ranked by the name the source wrote, program-wide, so
-/// the rank — and every performer's hash — survives one of them moving.
+/// Look-alike effects are ranked by the name the source wrote, program-wide, so the rank — and
+/// every performer's hash — survives one of them moving.
 #[test]
 fn moving_a_look_alike_effect_between_modules_changes_no_hash() {
     let audit = LOOK_ALIKE
@@ -479,13 +453,9 @@ fn a_type_and_its_constructors_survive_a_move() {
     assert_eq!(def(&before, "b.describe"), def(&after, "b.describe"));
 }
 
-// ---- a definition graph that spans modules ----
-
-/// Import cycles are rejected upstream, but the definition graph is built over
-/// resolved references and is module-blind, so an SCC that happens to span two
-/// files must be hashed exactly like one that does not. Lifting the restriction
-/// on cycles is meant to cost this crate nothing; these two tests are the
-/// evidence.
+/// Import cycles are rejected upstream, but the definition graph is built over resolved references
+/// and is module-blind, so an SCC that happens to span two files must be hashed exactly like one
+/// that does not.
 #[test]
 fn a_strongly_connected_component_may_span_modules() {
     let split = hashes_ignoring_cycles(&[
@@ -547,8 +517,6 @@ fn mutual_recursion_inside_one_module_is_unaffected() {
     assert_eq!(closure, vec!["a.caller", "a.is_even", "a.is_odd"]);
 }
 
-// ---- the entry points agree ----
-
 #[test]
 fn a_one_module_program_hashes_like_a_bare_module() {
     let source = "fn double(n: Int) -> Int = n * 2\ntest \"t\" { assert_eq(double(2), 4) }\n";
@@ -581,9 +549,7 @@ fn a_duplicate_definition_is_still_reported_per_module() {
     assert_eq!(diags[0].code, ply_span::codes::DUPLICATE_DEFINITION);
 }
 
-/// The entry point the CLI actually calls. It takes the check output for the
-/// caller's convenience and must not consult it: a hash is a function of
-/// resolved source structure alone.
+/// The entry point the CLI actually calls.
 #[test]
 fn the_checked_entry_point_agrees_with_the_unchecked_one() {
     let mut program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
@@ -606,11 +572,8 @@ fn hashing_a_multi_module_program_is_stable_across_runs() {
     }
 }
 
-/// `HashOutput::tests` is indexed in parallel with `CheckOutput::tests`, and
-/// the two crates build that order independently. If they ever disagree, a test
-/// is selected on another test's hash — a cached pass would silence an edit —
-/// so the pairing is checked against a layout where the load order and the
-/// dependency order are deliberately different.
+/// `HashOutput::tests` is indexed in parallel with `CheckOutput::tests`, and the two crates build
+/// that order independently.
 #[test]
 fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
     let paired = |files: &[(&str, &str)]| -> Vec<(String, DefHash)> {

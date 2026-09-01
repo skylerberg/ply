@@ -1,20 +1,4 @@
 //! The differential tier audit, over generated corpora.
-//!
-//! `ply-cli`'s copy of this audit runs over `examples/` and four fixtures, which
-//! is every proof a human wrote. ADR 0007 §11 asks for the generated corpus too,
-//! and it is the half that matters for a prover: a hand-written corpus exercises
-//! the shapes its author thought of, and a generated one reaches call graphs
-//! nobody chose. A `proved` obligation that a sampled run refutes is a defect in
-//! Ply, and this is where one would first show up.
-//!
-//! **A raise counts.** Ply's arithmetic is `checked_*` and its recursion is
-//! bounded, so an obligation that is valid over ℤ and over total function
-//! symbols but wrong about Ply cannot surface as a refutation — it surfaces as
-//! `Gap::Raised`. An audit that looked only for `Discharge::Refuted` would look
-//! straight past the exact defect it was written for.
-//!
-//! Seeds are swept because one seed is one call graph, exactly as
-//! `differential_sweep.rs` argues for the two engines.
 
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
@@ -58,10 +42,7 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
                 continue;
             }
             audited += 1;
-            // A refutation and a raise are both defects. A vacuity is not: it
-            // is a claim about the sample, because a guard the prover showed
-            // valid can still reject every drawn tuple and the proved path
-            // established its own guard.
+            // A refutation and a raise are both defects.
             if let Some(defect) = disagreement(&prover.resample(obligation, &wide)) {
                 panic!(
                     "seed {seed}: `{}` is reported `proved` and a sampled run {defect} — a \
@@ -76,11 +57,6 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
 }
 
 /// How a sampled run contradicts a proof, or `None` when it does not.
-///
-/// A proof claims that every input satisfying the guard has an answer and that
-/// the answer is `true`. A refutation denies the second; a raise denies the
-/// first, and denying the first is the shape ADR 0007 §5.1(a)'s disclosed
-/// ℤ-versus-`i64` divergence has to take, because nothing in Ply wraps.
 pub fn disagreement(discharge: &Discharge) -> Option<String> {
     match discharge {
         Discharge::Refuted(counterexample) => Some(format!(

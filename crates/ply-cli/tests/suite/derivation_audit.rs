@@ -1,15 +1,4 @@
 //! An adversarial audit of derived codecs, written against the wire.
-//!
-//! The failure this file hunts is silent: a derived codec that does not
-//! round-trip corrupts data with no error anywhere, and nothing else in the
-//! system notices. `derivation.rs` in `ply-core` proves a generated body
-//! *checks*; `json_endpoint.rs` proves one shape reaches a socket. Neither says
-//! `decode(encode(x)) == x` over the space of shapes the deriver accepts, and
-//! that is the claim a payload milestone lives on.
-//!
-//! Every assertion below runs the real binary over a real project, because the
-//! bytes are the artifact. A codec that only round-trips inside the language has
-//! demonstrated nothing about a payload.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -93,9 +82,6 @@ fn obligations(dir: &Path) -> (i32, Value) {
     (out.status.code().unwrap_or(-1), v)
 }
 
-/// Every law in the project is sampled and holds. `prove` rather than `test`
-/// because the generator is the only thing that visits a shape nobody thought
-/// to write down, which is where a codec's corner cases live.
 fn laws_hold(dir: &Path) {
     let (code, v) = obligations(dir);
     let list = v["obligations"].as_array().expect("an obligations array");
@@ -113,12 +99,9 @@ fn laws_hold(dir: &Path) {
     assert_eq!(code, 0, "{v}");
 }
 
-// ------------------------------------------------------------- the wide corpus
-
-/// Nested records, an ADT with four variants of differing arity, a recursive
-/// type, lists of ADTs, maps keyed by three different ordered types, `Option`,
-/// `Result`, and every leaf the deriver admits. One type, so one law reaches all
-/// of it, and the generator draws the empty collections on its own.
+/// Nested records, an ADT with four variants of differing arity, a recursive type, lists of ADTs,
+/// maps keyed by three different ordered types, `Option`, `Result`, and every leaf the deriver
+/// admits.
 const CORPUS: &str = r#"import std.json
 
 pub type Colour = Red | Green | Blue
@@ -178,26 +161,16 @@ law "printing a parsed document reproduces it"
   forall (j: json::Json) { reprint(j) }
 "#;
 
-/// The headline claim, over generated values rather than over the handful of
-/// shapes a human writes down.
+/// The headline claim, over generated values rather than over the handful of shapes a human writes
+/// down.
 #[test]
 fn every_shape_the_deriver_accepts_round_trips_over_generated_values() {
     let dir = one(CORPUS);
     laws_hold(dir.path());
 }
 
-/// `Float` is left out of `CORPUS` for a reason worth stating: a record with a
-/// `Float` field has no *unguarded* round-trip law the generator can discharge.
-/// The `Float` generator draws `NaN` on purpose — a generator that never did
-/// would make `property` a lie about the type — and JSON has no non-finite
-/// literal, so encoding one raises and the obligation comes back `unattempted`
-/// with a gap rather than held or refuted.
-///
-/// The codec's domain is `decimal_of_float(f) != None`, and a law that says so
-/// **is** discharged, over the same generator: that is the finite-only mode a
-/// law can ask for, and it is what stops a `Float` field costing a type the
-/// strongest evidence M8 offers. Both halves are pinned, because the unguarded
-/// verdict is only honest if the guarded one is reachable.
+/// `Float` is left out of `CORPUS` for a reason worth stating: a record with a `Float` field has no
+/// *unguarded* round-trip law the generator can discharge.
 #[test]
 fn a_float_field_leaves_a_round_trip_law_unattemptable() {
     let fixture = |law: &str| {
@@ -241,13 +214,8 @@ pub fn round(r: Reading) -> Bool =
     laws_hold(dir.path());
 }
 
-// --------------------------------------------------- nominally distinct types
-
-/// Derivation is **structural**, so two nominally distinct types with the same
-/// shape have the same wire format and decode each other's documents. That is
-/// not a defect — a JSON object carries no type name — but it is the property
-/// somebody will assume the other way round, so it is pinned rather than left to
-/// be discovered by a client that sent the wrong body to the right endpoint.
+/// Derivation is **structural**, so two nominally distinct types with the same shape have the same
+/// wire format and decode each other's documents.
 #[test]
 fn structurally_identical_types_share_a_wire_format_and_cross_decode() {
     let dir = project(&[
@@ -299,18 +267,8 @@ test "an ADT is distinguished only by its variant names" {
     assert_eq!(run.code, 0, "{}", run.text);
 }
 
-// --------------------------------------------------------- the `null` overlap
-
-/// `option_json` writes `None` as `null` and `Some(x)` as `x`, so any inner type
-/// whose encoding **can be `null`** collapses the two. `Unit` encodes as `null`
-/// and `Option` itself encodes `None` as `null`, so `Option<Unit>` and
-/// `Option<Option<a>>` are both lossy — and the deriver accepts both.
-///
-/// The assertion is deliberately fix-agnostic: either the derivation is refused
-/// (`E0206`, naming the field, which is what `std.json`'s own comment says
-/// should happen) or the codec round-trips. What may not happen is the third
-/// thing, which is what happens today: it derives, it type-checks, it runs, and
-/// `Some(None)` comes back as `None` with no error anywhere.
+/// `option_json` writes `None` as `null` and `Some(x)` as `x`, so any inner type whose encoding
+/// **can be `null`** collapses the two.
 #[test]
 fn an_encoding_that_can_be_null_is_never_wrapped_in_an_option() {
     for (label, field) in [
@@ -353,9 +311,7 @@ law "a derived codec round-trips" forall (w: Wrap) {{ round(w) }}
     }
 }
 
-/// The same defect where it is worst: as a `Map` key. Two distinct keys encode
-/// to one, so the map loses an entry rather than a field, and `map_len` changes
-/// across the wire.
+/// The same defect where it is worst: as a `Map` key.
 #[test]
 fn two_map_keys_that_encode_alike_do_not_survive_the_wire() {
     let dir = one(r#"import std.json
@@ -385,18 +341,8 @@ law "a map survives its own codec" forall (h: Holder) { round(h) }
     );
 }
 
-// -------------------------------------------------------------- recursive types
-
-/// A recursive type's codec terminates, which is required test 19 — and the
-/// depth it writes is the depth its own parser accepts. An ADT level costs two
-/// JSON levels (an object wrapping an array), so a derived codec reaches the
-/// bound at about half of `max_depth`, and it reaches it **at the encoder**.
-///
-/// Encoding total where decoding is partial would be a codec that writes a
-/// document it cannot read: a service persists a payload and can never load it
-/// back, and the failure appears at the consumer rather than at the producer.
-/// The two halves now refuse the same values. The bound is pinned here so that
-/// moving it is a decision rather than an accident.
+/// A recursive type's codec terminates, which is required test 19 — and the depth it writes is the
+/// depth its own parser accepts.
 #[test]
 fn a_recursive_codec_refuses_to_write_what_it_cannot_read() {
     let source = r#"import std.json
@@ -430,8 +376,7 @@ test "and the wire round-trips up to half of max_depth" {
 "#;
     passes(source);
 
-    // Past the bound the *encoder* refuses, so nothing is written that `parse`
-    // would later reject.
+    // Past the bound the *encoder* refuses, so nothing is written that `parse` would later reject.
     let dir = one(&format!(
         "{source}\ntest \"past it, the encoder is the one that refuses\" \
          {{ assert_eq(through_the_wire(100), \"unreachable\") }}\n"
@@ -447,16 +392,6 @@ test "and the wire round-trips up to half of max_depth" {
     );
 }
 
-// ----------------------------------------------------------- schema evolution
-
-/// A type that gained a field. The deriver emits `field` for every field,
-/// including an `Option` one, so an added optional field is **required on the
-/// wire** — `std.json` has `optional_field`, which treats absent and `null`
-/// alike, and no generated body ever calls it.
-///
-/// Pinned rather than asserted to be right: it means adding an `Option<T>` field
-/// to a response type is a breaking change for every client that does not send
-/// the key, which is the opposite of what `Option` reads as.
 #[test]
 fn an_added_optional_field_is_still_required_on_the_wire() {
     passes(
@@ -490,11 +425,9 @@ test "a duplicate key resolves to the last, deterministically" {
     );
 }
 
-// ------------------------------------------------------------- numeric edges
-
-/// `Int` at both ends of `i64`, `Decimal` at its maximum mantissa and its
-/// maximum scale, and — the one a value comparison cannot see — the scale
-/// itself, which `==` ignores and `decimal_to_string` does not.
+/// `Int` at both ends of `i64`, `Decimal` at its maximum mantissa and its maximum scale, and — the
+/// one a value comparison cannot see — the scale itself, which `==` ignores and `decimal_to_string`
+/// does not.
 #[test]
 fn integers_and_decimals_survive_their_own_edges_scale_included() {
     passes(
@@ -540,14 +473,9 @@ test "a fractional value is not silently truncated into an Int field" {
     );
 }
 
-/// `Float`'s JSON encoding is **partial on finite values**, not only on the
-/// non-finite ones ADR 0012 names: a number needing more than 28 significant
-/// digits of scale, or larger than `Decimal`'s maximum, has no `Number` to
-/// become. `1.0e-30` is an ordinary finite `f64` and it raises.
-///
-/// It raises rather than corrupting, which is the right shape of failure — but
-/// it is a `RUNTIME_ERROR` from inside a definition the user did not write, and
-/// pinning it is what keeps the reason in the message.
+/// `Float`'s JSON encoding is **partial on finite values**, not only on the non-finite ones ADR
+/// 0012 names: a number needing more than 28 significant digits of scale, or larger than
+/// `Decimal`'s maximum, has no `Number` to become.
 #[test]
 fn a_float_field_encodes_partially_and_says_which_value_broke_it() {
     let dir = one(r#"import std.json
@@ -597,11 +525,8 @@ test "an infinity raises and names itself" { assert_eq(wire(1.0 / 0.0), "unreach
     }
 }
 
-// ------------------------------------------------------- text and byte strings
-
-/// `\u{0001}` is written as `CTL` and substituted in, because a literal control
-/// byte in a Rust source file is a thing an editor silently rewrites. Everything
-/// else — the astral-plane character included — is the bytes a client sends.
+/// `\u{0001}` is written as `CTL` and substituted in, because a literal control byte in a Rust
+/// source file is a thing an editor silently rewrites.
 const TEXT: &str = r#"import std.json
 
 pub type T = { s: String, b: Bytes }
@@ -646,18 +571,9 @@ fn text_and_bytes_survive_escaping_in_both_directions() {
     assert_eq!(run.code, 0, "{}", run.text);
 }
 
-// ------------------------------------------------ the wire depends on spelling
-
-/// `Map<String, v>` gets a JSON object and every other `Map` gets an array of
-/// pairs, and the deriver decides that from the key's **type** — following this
-/// module's own aliases — rather than from how the key was spelled.
-///
-/// An alias is transparent to the checker, so `type Key = String` makes
-/// `Map<Key, Int>` and `Map<String, Int>` the *same type*: `direct_json()` and
-/// `aliased_json()` substitute for each other at every call site, and two wire
-/// formats would be two codecs that disagree about the protocol with nothing to
-/// read at the `derive` line. That is exactly the coherence hazard ADR 0010 has
-/// no resolution layer to prevent, and this is what closes it inside a module.
+/// `Map<String, v>` gets a JSON object and every other `Map` gets an array of pairs, and the
+/// deriver decides that from the key's **type** — following this module's own aliases — rather than
+/// from how the key was spelled.
 #[test]
 fn a_map_key_written_through_an_alias_gets_the_same_wire_format() {
     passes(
@@ -698,15 +614,10 @@ test "a key that is not a string is an array of pairs" {
     );
 }
 
-// -------------------------------------------------------------- refusals hold
-
-/// `Float` may not reach a `Map` key by any route: not directly, not through a
-/// nominal ADT in another module, not through a recursive one, not through a
-/// generic instantiation, not through an alias, not inside an anonymous record,
-/// not inside an `Option`, and not by instantiating a constrained type parameter
-/// at a call site. A `Float` key is a `NaN` key, and a `NaN` key is a lookup
-/// that cannot find what it just inserted — the one way `Map`'s iteration order
-/// could stop being a function of its contents.
+/// `Float` may not reach a `Map` key by any route: not directly, not through a nominal ADT in
+/// another module, not through a recursive one, not through a generic instantiation, not through an
+/// alias, not inside an anonymous record, not inside an `Option`, and not by instantiating a
+/// constrained type parameter at a call site.
 #[test]
 fn no_route_lets_a_float_become_a_map_key() {
     let dir = project(&[
@@ -733,8 +644,8 @@ fn no_route_lets_a_float_become_a_map_key() {
     ]);
     let run = Run::of(dir.path(), &["check"]);
     assert_ne!(run.code, 0, "{}", run.text);
-    // One diagnostic per route, each naming the key type it walked into rather
-    // than only the `Float` at the bottom of it.
+    // One diagnostic per route, each naming the key type it walked into rather than only the
+    // `Float` at the bottom of it.
     for named in [
         "`n.Wrapper`",
         "`n.Recursive`",
@@ -762,10 +673,9 @@ fn no_route_lets_a_float_become_a_map_key() {
     );
 }
 
-/// The other refusals the wire depends on, in one place: a function field names
-/// the field rather than producing a partial encoder, a `derive` for another
-/// module's type is an orphan, and a second `derive` of one deriver for one type
-/// is a duplicate.
+/// The other refusals the wire depends on, in one place: a function field names the field rather
+/// than producing a partial encoder, a `derive` for another module's type is an orphan, and a
+/// second `derive` of one deriver for one type is a duplicate.
 #[test]
 fn the_refusals_that_keep_a_codec_total_all_fire() {
     let cases: [(&str, &str); 3] = [

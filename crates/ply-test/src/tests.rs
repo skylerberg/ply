@@ -13,8 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// ---------------------------------------------------------------- fixtures
-
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -82,8 +80,8 @@ impl Program {
         select(&self.check, &self.hashes, store, plan)
     }
 
-    /// Both engines, so that every scheduling and caching test in this file is
-    /// also a differential test over a real Ply program.
+    /// Both engines, so that every scheduling and caching test in this file is also a differential
+    /// test over a real Ply program.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
         run(
             selection,
@@ -125,8 +123,8 @@ fn reads(resources: &[&str]) -> Footprint {
     Footprint::from_atoms(resources.iter().map(|r| atom("db", Some(r), Mode::Read)))
 }
 
-/// The colouring `group_by_conflict` replaces, so that "largest footprint first
-/// packs better" is checked rather than asserted.
+/// The colouring `group_by_conflict` replaces, so that "largest footprint first packs better" is
+/// checked rather than asserted.
 fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
     let mut classes: Vec<Vec<usize>> = Vec::new();
     for (p, (_, footprint)) in tests.iter().enumerate() {
@@ -143,8 +141,8 @@ fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
     classes.len()
 }
 
-/// Sharing a group is a claim about the atoms that contend: a seed is an input
-/// handed to one test and never a resource two of them reach.
+/// Sharing a group is a claim about the atoms that contend: a seed is an input handed to one test
+/// and never a resource two of them reach.
 fn assert_groups_are_conflict_free(groups: &[Vec<usize>], tests: &[(usize, Footprint)]) {
     let footprint = |index: usize| {
         crate::shared_footprint(
@@ -174,8 +172,6 @@ fn sorted(indices: impl IntoIterator<Item = usize>) -> Vec<usize> {
     out.sort_unstable();
     out
 }
-
-// ---------------------------------------------------------------- scheduling
 
 #[test]
 fn pure_tests_all_land_in_the_first_group() {
@@ -241,17 +237,15 @@ fn the_largest_footprint_claims_the_first_group() {
         (1, writes(&["b"])),
         (2, writes(&["a", "b"])),
     ];
-    // Source order would pair 0 and 1 and push 2 into a second group; colouring
-    // the two-atom test first inverts which group each ends up in.
+    // Source order would pair 0 and 1 and push 2 into a second group; colouring the two-atom test
+    // first inverts which group each ends up in.
     assert_eq!(group_by_conflict(&tests), vec![vec![2], vec![0, 1]]);
 }
 
 #[test]
 fn largest_footprint_first_uses_fewer_groups_than_source_order() {
-    // A 2-colourable conflict graph — a 6-cycle, one shared resource per edge —
-    // laid out so that colouring in index order needs three groups. The private
-    // `p*` reads add no edges; they exist only to make one side of the cycle
-    // look larger than the other.
+    // A 2-colourable conflict graph — a 6-cycle, one shared resource per edge — laid out so that
+    // colouring in index order needs three groups.
     let tests = vec![
         (
             0,
@@ -312,8 +306,6 @@ fn grouping_is_deterministic_and_handles_an_empty_input() {
     assert_eq!(group_by_conflict(&tests), group_by_conflict(&tests));
 }
 
-// ------------------------------------------------------ region isolation
-
 fn cells(resources: &[&str]) -> Footprint {
     Footprint::from_atoms(resources.iter().map(|r| atom("cell", Some(r), Mode::Write)))
 }
@@ -335,8 +327,8 @@ fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
         Mode::Write
     )));
 
-    // A user effect is module-qualified and `cell` is a reserved name, so the
-    // one effect the report names cannot be impersonated.
+    // A user effect is module-qualified and `cell` is a reserved name, so the one effect the report
+    // names cannot be impersonated.
     assert!(!crate::is_region_scoped(&atom(
         "m.cell",
         Some("users"),
@@ -357,9 +349,8 @@ fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
     assert!(!crate::contends_only_over_regions(&Footprint::empty()));
 }
 
-/// What ADR 0017 §6 costs, at the smallest size that has it: three tests over
-/// two labels colour into two groups, and the two that share `users` are the
-/// pair that used to be free.
+/// What ADR 0017 §6 costs, at the smallest size that has it: three tests over two labels colour
+/// into two groups, and the two that share `users` are the pair that used to be free.
 #[test]
 fn tests_naming_one_region_label_are_coloured_apart() {
     let tests = vec![
@@ -376,8 +367,8 @@ fn tests_naming_one_region_label_are_coloured_apart() {
     assert_groups_are_conflict_free(&groups, &tests);
 }
 
-/// The rest of a mixed footprint is unaffected: a label collides with a label,
-/// a resource with a resource, and neither launders the other.
+/// The rest of a mixed footprint is unaffected: a label collides with a label, a resource with a
+/// resource, and neither launders the other.
 #[test]
 fn a_region_label_and_a_real_resource_conflict_independently() {
     let tests = vec![
@@ -442,9 +433,8 @@ fn every_region_isolated_test_lands_in_group_zero() {
     }
 }
 
-/// ADR 0005 §5's property, with the population ADR 0017 §6 leaves it: what is
-/// free to add is a test that names nothing another test can reach. For
-/// N = 0, 1 and 100.
+/// ADR 0005 §5's property, with the population ADR 0017 §6 leaves it: what is free to add is a test
+/// that names nothing another test can reach.
 #[test]
 fn adding_region_isolated_tests_does_not_change_the_group_count() {
     let shared: Vec<(usize, Footprint)> = vec![
@@ -495,8 +485,6 @@ fn a_selection_of_only_isolated_tests_needs_one_group_and_no_shared_ones() {
     assert!(empty.holds(), "{empty:?}");
 }
 
-// ---------------------------------------------------------------- selection
-
 const ARITHMETIC: &str = r#"
 fn add(a: Int, b: Int) -> Int = a + b
 fn mul(a: Int, b: Int) -> Int = a * b
@@ -537,8 +525,6 @@ test "both branches" {
 "#;
 
 /// ADR 0005 §6: under `both` a machine-only test runs once, on the machine.
-/// Auditing a refusal against an answer would fail every run over a corpus that
-/// contains one, which is every corpus the choice exists to audit.
 #[test]
 fn a_test_only_the_machine_can_run_is_not_reported_as_a_divergence() {
     let root = TempRoot::new();
@@ -618,8 +604,7 @@ fn an_edit_selects_only_the_tests_that_reach_it() {
     let report = before.run(&selection, &mut store);
     assert_eq!(report.failed, 0, "{:#?}", report.failures);
 
-    // `mul` changes and `twice` calls it, so both hashes move. `add` is
-    // untouched and its test must stay cached.
+    // `mul` changes and `twice` calls it, so both hashes move.
     let after = Program::compile(&ARITHMETIC.replace(
         "fn mul(a: Int, b: Int) -> Int = a * b",
         "fn mul(a: Int, b: Int) -> Int = a * b * 1",
@@ -749,8 +734,6 @@ fn a_test_with_no_hash_runs_and_is_never_cached() {
     assert_eq!(program.select(&store).reason(0), Some(Reason::Cached));
 }
 
-// ---------------------------------------------------------------- running
-
 const ONE_RED: &str = r#"
 fn good() -> Int = 1
 fn bad() -> Int = 2
@@ -817,9 +800,8 @@ fn a_fix_that_reproduces_a_green_definition_is_green_without_running() {
     let selection = program.select(&store);
     assert_eq!(program.run(&selection, &mut store).failed, 1);
 
-    // `bad` is repaired into something structurally identical to `good`, so it
-    // hashes identically and so does its test. The cache already holds that
-    // hash, green — selection is exact enough to notice.
+    // `bad` is repaired into something structurally identical to `good`, so it hashes identically
+    // and so does its test.
     let fixed = Program::compile(&ONE_RED.replace("fn bad() -> Int = 2", "fn bad() -> Int = 1"));
     assert_eq!(fixed.def_hash("bad"), fixed.def_hash("good"));
     assert!(fixed.select(&store).to_run.is_empty());
@@ -910,10 +892,7 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
     let selection = green.select(&store);
     assert_eq!(green.run(&selection, &mut store).failed, 0);
 
-    // `credit` is rewritten so that its own test stays green while its hash
-    // moves. Both tests re-run in one batch, so if the passing test's writes
-    // were visible to the failing one, `credit` would drop off the suspect list
-    // — exactly the attribution bug worth guarding.
+    // `credit` is rewritten so that its own test stays green while its hash moves.
     let red = Program::compile(
         &LEDGER
             .replace(
@@ -943,9 +922,8 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
     );
 }
 
-/// Two tests over an overlapping closure: `base is right` covers `base`, and
-/// `total is right` covers `base` and `total`. Both definitions are supplied as
-/// expressions so a variant can move one hash without touching the other.
+/// Two tests over an overlapping closure: `base is right` covers `base`, and `total is right`
+/// covers `base` and `total`.
 fn shared(base: &str, total: &str) -> String {
     format!(
         "fn base(x: Int) -> Int = {base}\n\
@@ -965,8 +943,8 @@ fn a_green_sibling_never_clears_a_suspect_on_a_later_run() {
     let selection = green.select(&store);
     assert_eq!(green.run(&selection, &mut store).failed, 0);
 
-    // `base` is rewritten into something value-identical, so its hash moves
-    // while the test covering it stays green; `total` is broken outright.
+    // `base` is rewritten into something value-identical, so its hash moves while the test covering
+    // it stays green; `total` is broken outright.
     let red = Program::compile(&shared("1 + x", "base(x) + 11"));
     let doomed = red.index_of("total is right");
 
@@ -1009,8 +987,8 @@ fn a_run_that_skipped_a_test_does_not_vouch_for_what_it_would_have_covered() {
     let base = red.index_of("base is right");
     let doomed = red.index_of("total is right");
 
-    // What `--filter base` narrows a selection to: `total is right` keeps its
-    // reason but is never handed to a group.
+    // What `--filter base` narrows a selection to: `total is right` keeps its reason but is never
+    // handed to a group.
     let mut filtered = red.select(&store);
     filtered.to_run.retain(|&i| i == base);
     filtered.groups = vec![vec![base]];
@@ -1155,8 +1133,6 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
     assert!(report.warnings[0].message.contains("99"));
 }
 
-// ---------------------------------------------------------------- panics
-
 struct PanickingExecutor {
     panic_on: usize,
 }
@@ -1233,8 +1209,8 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
 
-    // One group per test forces the sequential path, so the worker that unwound
-    // is the one asked to run the next test.
+    // One group per test forces the sequential path, so the worker that unwound is the one asked to
+    // run the next test.
     let selection = Selection {
         total: 3,
         cached: Vec::new(),
@@ -1270,11 +1246,7 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
     );
 }
 
-// ------------------------------------------------- defects versus red tests
-
-/// An executor whose test reports that Ply broke one of its own invariants,
-/// without unwinding. `catch_unwind` cannot see this one, so the diagnostic's
-/// code is the only evidence there is.
+/// An executor whose test reports that Ply broke one of its own invariants, without unwinding.
 struct InternalErrorExecutor {
     fail_on: usize,
 }
@@ -1295,10 +1267,9 @@ impl Executor for InternalErrorExecutor {
     }
 }
 
-/// The reverse of the recursion-limit misclassification, and the more expensive
-/// direction: a defect in Ply reported as an ordinary red test is a bug the user
-/// goes looking for in their own code, and a suspect set invents a culprit for
-/// something no change in the program caused.
+/// The reverse of the recursion-limit misclassification, and the more expensive direction: a defect
+/// in Ply reported as an ordinary red test is a bug the user goes looking for in their own code,
+/// and a suspect set invents a culprit for something no change in the program caused.
 #[test]
 fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     let root = TempRoot::new();
@@ -1337,10 +1308,7 @@ fn spin(n: Int) -> Int = spin(step(n))
 test "spins" { assert_eq(spin(0), 0) }
 "#;
 
-/// Exceeding a documented resource limit is the program's behaviour, not Ply
-/// falling over. Reading `panicked` off `RUNTIME_ERROR` said otherwise, which
-/// printed "this is a defect in Ply" over a plain runaway recursion and — the
-/// part that costs more — suppressed bisection for the whole class.
+/// Exceeding a documented resource limit is the program's behaviour, not Ply falling over.
 #[test]
 fn a_runaway_recursion_is_a_red_test_and_not_a_defect_in_ply() {
     let root = TempRoot::new();
@@ -1367,8 +1335,6 @@ fn a_runaway_recursion_is_a_red_test_and_not_a_defect_in_ply() {
     );
 }
 
-// ---------------------------------------------------------------- reporting
-
 #[test]
 fn the_json_report_carries_the_diagnostic_and_the_suspects() {
     let root = TempRoot::new();
@@ -1394,8 +1360,8 @@ fn the_json_report_carries_the_diagnostic_and_the_suspects() {
         failure["diagnostic"]["code"],
         ply_span::codes::ASSERTION_FAILED
     );
-    // Only the expectation inside the test moved, so no definition is under
-    // suspicion — the test is the thing that changed.
+    // Only the expectation inside the test moved, so no definition is under suspicion — the test is
+    // the thing that changed.
     assert_eq!(failure["suspects"], serde_json::json!([]));
 
     assert_eq!(json["tests"][0]["status"], "failed");
@@ -1481,8 +1447,6 @@ fn explain_covers_every_test_and_every_group() {
     assert_eq!(json["tests"][0]["reason"], "cached");
 }
 
-// ---------------------------------------------------------------- concurrency
-
 const DISJOINT_CELLS: &str = r#"
 test "users cell" {
   with_cell[users](1) { c ->
@@ -1511,8 +1475,8 @@ fn a_module_whose_tests_are_all_isolated_runs_as_a_single_group() {
     let mut store = root.store();
     let program = Program::compile(DISJOINT_CELLS);
 
-    // `with_cell` discharges its atoms at the region boundary, so each of these
-    // tests is observably pure and they all share one group.
+    // `with_cell` discharges its atoms at the region boundary, so each of these tests is observably
+    // pure and they all share one group.
     assert!(program.check.tests.iter().all(|t| t.footprint.is_empty()));
 
     let selection = program.select(&store);
@@ -1528,19 +1492,16 @@ fn a_module_whose_tests_are_all_isolated_runs_as_a_single_group() {
     assert!(report.results.iter().all(|r| r.group == 0));
 }
 
-/// A `cell` atom surviving into a test's footprint needs a continuation
-/// captured inside a `with_cell` region, which no program can write until the
-/// machine lands — so the footprint is injected rather than inferred. Every
-/// other input here is the real thing: real hashes, real selection, real
-/// execution.
+/// A `cell` atom surviving into a test's footprint needs a continuation captured inside a
+/// `with_cell` region, which no program can write until the machine lands — so the footprint is
+/// injected rather than inferred.
 fn with_footprint(program: &mut Program, name: &str, footprint: Footprint) {
     let index = program.index_of(name);
     program.check.tests[index].footprint = footprint;
 }
 
-/// ADR 0017 §6's lost case, end to end on the real runner: two tests whose only
-/// atoms name one label used to share a group and are coloured apart now. Both
-/// still pass, because the region each of them allocates in is still its own.
+/// ADR 0017 §6's lost case, end to end on the real runner: two tests whose only atoms name one
+/// label used to share a group and are coloured apart now.
 #[test]
 fn two_tests_retaining_the_same_cell_resource_are_coloured_apart() {
     let root = TempRoot::new();
@@ -1565,9 +1526,7 @@ fn two_tests_retaining_the_same_cell_resource_are_coloured_apart() {
     );
 }
 
-/// Two labels nobody shares are still one group. Counting the population that
-/// carries a `cell` atom rather than the collisions between them is the single
-/// easiest way to over-state what this change costs.
+/// Two labels nobody shares are still one group.
 #[test]
 fn two_tests_on_distinct_cell_resources_still_run_in_one_group() {
     let root = TempRoot::new();
@@ -1699,12 +1658,9 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
     );
 }
 
-/// The region ADR 0017 §6 asks `ply-test` for: a worker outlives a single test,
-/// so a test that inherited the previous one's cells would be sharing state
-/// through the back door the whole design exists to close.
-///
-/// The fixture is built once for the worker and every test runs against that one
-/// seed; what closes between tests is the region above its mark.
+/// The region ADR 0017 §6 asks `ply-test` for: a worker outlives a single test, so a test that
+/// inherited the previous one's cells would be sharing state through the back door the whole design
+/// exists to close.
 #[test]
 fn a_test_region_closes_and_the_group_fixture_does_not() {
     let program = Program::compile(DISJOINT_CELLS);
@@ -1785,10 +1741,8 @@ fn every_group_is_run_in_sequence() {
     assert_eq!(report.results.iter().filter(|r| r.group == 1).count(), 2);
 }
 
-// -------------------------------------------------------------- attribution
-
-/// The rich suspect list and the flat one are two views of one set, so a
-/// consumer that reads either gets the same answer about *what* is suspect.
+/// The rich suspect list and the flat one are two views of one set, so a consumer that reads either
+/// gets the same answer about *what* is suspect.
 #[test]
 fn the_attribution_covers_exactly_the_suspect_set() {
     let root = TempRoot::new();
@@ -1822,8 +1776,8 @@ fn the_attribution_covers_exactly_the_suspect_set() {
             .iter()
             .all(|s| s.hash.is_some())
     );
-    // Nothing has been compared or traced yet, so every judgement is withheld
-    // rather than guessed at.
+    // Nothing has been compared or traced yet, so every judgement is withheld rather than guessed
+    // at.
     assert!(failure.attribution.suspects.iter().all(|s| s.ran.is_none()));
     assert!(
         failure
@@ -1854,9 +1808,8 @@ fn a_run_that_did_not_bisect_says_so_rather_than_naming_nobody() {
     assert!(!bisection.is_conclusive());
 }
 
-/// A `test/nondet` outcome is not a function of the definition set, so the
-/// artifact has to say the question was not asked rather than leave a consumer
-/// to infer it from an empty culprit list.
+/// A `test/nondet` outcome is not a function of the definition set, so the artifact has to say the
+/// question was not asked rather than leave a consumer to infer it from an empty culprit list.
 #[test]
 fn a_nondet_failure_is_marked_unbisectable_at_the_point_it_fails() {
     let root = TempRoot::new();
@@ -1932,8 +1885,8 @@ fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
     assert_eq!(attribution.culprits(), vec![Symbol::new("m.debit")]);
 }
 
-/// A definition can be a cause without the store having noticed it change —
-/// dropping it because it is not in the suspect set would discard the answer.
+/// A definition can be a cause without the store having noticed it change — dropping it because it
+/// is not in the suspect set would discard the answer.
 #[test]
 fn a_culprit_outside_the_suspect_set_is_added_rather_than_dropped() {
     let mut attribution =
@@ -2011,13 +1964,10 @@ fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
     assert!(failure["assertion"].is_null());
 }
 
-// ------------------------------------------------------ seeds and the plan
-
 use ply_eval::{Exploration, Naive, Race, RaceSite, Seed, SimMode};
 
-/// An executor that reports a search without running one, so every cache rule
-/// in this section is exercised against the outcomes a real scheduler produces
-/// without waiting for one.
+/// An executor that reports a search without running one, so every cache rule in this section is
+/// exercised against the outcomes a real scheduler produces without waiting for one.
 struct SimExecutor {
     explorations: BTreeMap<usize, Exploration>,
     failing: BTreeSet<usize>,
@@ -2111,10 +2061,8 @@ fn failed_at(seed: Seed, explored: u32) -> Exploration {
     }
 }
 
-/// `simulate` is not yet something a fixture can write, and none of the rules
-/// below are about the source that produced the atom. What they are about is a
-/// footprint carrying `sim.read`, which is exactly what the front end publishes
-/// for a test that entered a region.
+/// `simulate` is not yet something a fixture can write, and none of the rules below are about the
+/// source that produced the atom.
 fn make_seeded(program: &mut Program, name: &str) -> usize {
     let index = program.index_of(name);
     program.check.tests[index].footprint =
@@ -2134,8 +2082,7 @@ fn seeded_program() -> (Program, usize) {
     (program, index)
 }
 
-/// The rule whose absence is silent: a run under one plan reading a pass another
-/// plan earned.
+/// The rule whose absence is silent: a run under one plan reading a pass another plan earned.
 #[test]
 fn a_seeded_test_is_never_written_under_its_bare_hash() {
     let root = TempRoot::new();
@@ -2160,8 +2107,8 @@ fn a_seeded_test_is_never_written_under_its_bare_hash() {
         passed(&store, crate::sim_key(hash, &plan)),
         "the plan key is where the claim lives"
     );
-    // Every other test is unaffected: nothing about the existing cache changes
-    // for a test whose row never mentions a seed.
+    // Every other test is unaffected: nothing about the existing cache changes for a test whose row
+    // never mentions a seed.
     let plain = program.hashes.tests[program.index_of("add is right")];
     assert!(passed(&store, plain));
 }
@@ -2202,8 +2149,7 @@ fn widening_the_budget_re_runs_a_seeded_test_and_changing_nothing_does_not() {
     assert_eq!(widened.reason(seeded), Some(Reason::New));
 }
 
-/// A `random` root is a standalone claim, so widening a root set costs only the
-/// roots that are new.
+/// A `random` root is a standalone claim, so widening a root set costs only the roots that are new.
 #[test]
 fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
     let root = TempRoot::new();
@@ -2247,13 +2193,13 @@ fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
         Some(vec![4, 5, 6, 7]),
         "the run must search only what it owes"
     );
-    // The widened plan's own key is what a third run reads, and it is published
-    // even though only half the roots ran.
+    // The widened plan's own key is what a third run reads, and it is published even though only
+    // half the roots ran.
     assert!(program.select_under(&store, &eight).to_run.is_empty());
 }
 
-/// A `dpor` root's exploration does not decompose, so nothing about it can be
-/// lifted out of its search.
+/// A `dpor` root's exploration does not decompose, so nothing about it can be lifted out of its
+/// search.
 #[test]
 fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
     let root = TempRoot::new();
@@ -2299,8 +2245,8 @@ fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
     );
 }
 
-/// The first green `det` test in the language that is not cacheable, and it is
-/// correct that it is not.
+/// The first green `det` test in the language that is not cacheable, and it is correct that it is
+/// not.
 #[test]
 fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
     let root = TempRoot::new();
@@ -2461,9 +2407,8 @@ fn an_unsimulated_failure_carries_no_seed_and_no_race() {
     assert!(json["simulation"]["simulated"] == 0);
 }
 
-/// A test whose row says it simulated and whose evaluator reported no search is
-/// a run nobody watched. Green, said out loud, and not cached — the direction to
-/// err in, because the other one is silent.
+/// A test whose row says it simulated and whose evaluator reported no search is a run nobody
+/// watched.
 #[test]
 fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     let root = TempRoot::new();
@@ -2541,8 +2486,8 @@ fn the_summary_counts_the_seeds_the_interleavings_and_the_exhaustive_searches() 
     assert_eq!(simulated["simulation"]["explored"], 12);
     assert_eq!(simulated["simulation"]["exhaustive"], true);
     assert_eq!(simulated["cached"], true);
-    // Absent, never zeroed: a consumer cannot tell an explored count of zero
-    // from a test that never simulated.
+    // Absent, never zeroed: a consumer cannot tell an explored count of zero from a test that never
+    // simulated.
     let plain = json["tests"]
         .as_array()
         .unwrap()

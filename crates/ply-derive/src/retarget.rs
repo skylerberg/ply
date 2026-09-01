@@ -1,9 +1,4 @@
 //! Every span in a generated definition becomes the `derive` item's.
-//!
-//! The alternative is an offset into text the user never wrote, which is the
-//! difference between an error a reader can act on and one that sends them
-//! looking for a line that does not exist. It also makes `DefEntry::span` — the
-//! `derive` line — agree with every span inside the body it stands for.
 
 use ply_span::Span;
 use ply_syntax::ast::*;

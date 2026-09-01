@@ -1,22 +1,5 @@
-//! What an over-broad `effect set` costs the scheduler — ADR 0013 §11's
-//! required test 8, and the other half of "an alias is annotation-only".
-//!
-//! The alias itself reaches nothing here: colouring reads `Footprint`, which is
-//! atoms. But a `/ {..}` annotation is the *published* signature, so a set
-//! wider than the bodies that carry it publishes atoms those bodies never
-//! touch, and two tests reaching two endpoints that share one set contend on
-//! every atom in it. ADR 0013 §1.6 states that cost; this file measures it,
-//! against a control where the same two endpoints write their rows out and land
-//! in two groups.
-//!
-//! It is written this way round on purpose. The failure worth catching is not
-//! "the set widened the graph" — that is the documented consequence — but "the
-//! set widened the graph and nobody could see which atoms did it", which is the
-//! shape of a scheduling regression nobody attributes.
-//!
-//! A "group" here is what `group_by_conflict` produces: one round of tests that
-//! may run at once. Two tests that contend therefore land in *different*
-//! groups, and more groups is less concurrency.
+//! What an over-broad `effect set` costs the scheduler — ADR 0013 §11's required test 8, and the
+//! other half of "an alias is annotation-only".
 
 use ply_core::{CheckOutput, Footprint};
 use ply_span::SourceId;
@@ -60,8 +43,7 @@ effect store {
 }
 ";
 
-/// Two endpoints, one reading `items` and one writing `orders`, and one test
-/// reaching each. Written precisely, their footprints are disjoint.
+/// Two endpoints, one reading `items` and one writing `orders`, and one test reaching each.
 const PRECISE: &str = "\
 fn list_items() -> Int / {store.read[items]} = store.all[items]()
 
@@ -73,7 +55,6 @@ test \"orders\" { assert_eq(place_order(), 2) }
 ";
 
 /// The same two endpoints, both annotated with one set that covers the union.
-/// Neither body changed.
 const ALIASED: &str = "\
 effect set Desk = {store.read[items], store.write[orders]}
 
@@ -102,8 +83,6 @@ fn precise_rows_let_two_disjoint_endpoints_run_side_by_side() {
 }
 
 /// The headline: one set, two endpoints, and now they cannot share a round.
-/// The bodies are byte for byte what they were above — only the annotation
-/// moved, and the scheduler serialised two tests that could have run together.
 #[test]
 fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
     let compiled = Compiled::new(&format!("{STORE}{ALIASED}"));
@@ -120,9 +99,8 @@ fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
     );
 }
 
-/// And the atoms that did it are nameable, which is what makes the cost a
-/// finding rather than a mystery. The contended atoms are the set's, not the
-/// set's *name* — nothing downstream of the parser has ever heard of `Desk`.
+/// And the atoms that did it are nameable, which is what makes the cost a finding rather than a
+/// mystery.
 #[test]
 fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     let compiled = Compiled::new(&format!("{STORE}{ALIASED}"));
@@ -153,10 +131,8 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     );
 }
 
-/// The claim ADR 0013 §1.6 makes about *why* it is only a cost and never a
-/// soundness defect: the widening is upward. A test's footprint under an alias
-/// is a superset of what it is without one, so nothing the scheduler had to
-/// separate is now free to run alongside anything.
+/// The claim ADR 0013 §1.6 makes about *why* it is only a cost and never a soundness defect: the
+/// widening is upward.
 #[test]
 fn an_alias_only_ever_widens_a_tests_footprint() {
     let precise = Compiled::new(&format!("{STORE}{PRECISE}")).footprints();

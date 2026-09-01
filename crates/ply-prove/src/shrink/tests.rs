@@ -16,8 +16,8 @@ fn con(name: &str) -> Type {
     Type::Con(Symbol::new(name), Vec::new())
 }
 
-/// Saturating, because a single `i64::MIN` already saturates [`size`] and a
-/// tuple containing one must still be measurable.
+/// Saturating, because a single `i64::MIN` already saturates [`size`] and a tuple containing one
+/// must still be measurable.
 fn total_size(values: &[Value], world: &TypeWorld) -> u64 {
     values
         .iter()
@@ -34,9 +34,9 @@ fn plan() -> ProvePlan {
     }
 }
 
-/// A judge that watches the shrinker rather than only answering it: every tuple
-/// the walk accepts is checked against the guard and the property from the
-/// outside, so the two requirements are asserted rather than assumed.
+/// A judge that watches the shrinker rather than only answering it: every tuple the walk accepts is
+/// checked against the guard and the property from the outside, so the two requirements are
+/// asserted rather than assumed.
 struct Watchful<G, B> {
     guard: G,
     body: B,
@@ -83,16 +83,14 @@ where
     (counterexample, judge.accepted)
 }
 
-// ------------------------------------------------------------------- the size
-
 #[test]
 fn a_negative_outweighs_its_own_magnitude() {
     let world = TypeWorld::default();
     assert_eq!(size(&Value::Int(0), &world), 0);
     assert!(size(&Value::Int(-5), &world) > size(&Value::Int(5), &world));
     assert!(size(&Value::Int(5), &world) > size(&Value::Int(2), &world));
-    // Saturating, so the boundary the generator draws on every run does not
-    // wrap the measure that terminates the walk.
+    // Saturating, so the boundary the generator draws on every run does not wrap the measure that
+    // terminates the walk.
     assert_eq!(size(&Value::Int(i64::MIN), &world), u64::MAX);
 }
 
@@ -115,8 +113,6 @@ fn a_lower_constructor_is_smaller_than_a_higher_one() {
     assert!(size(&some, &world) > size(&none, &world));
 }
 
-// ------------------------------------------------------------------- minimal
-
 #[test]
 fn the_floor_of_every_type_is_its_smallest_value() {
     let fixture = Fixture::compile(ADTS);
@@ -134,8 +130,8 @@ fn the_floor_of_every_type_is_its_smallest_value() {
     assert_eq!(minimal(&con("Tree"), &world).unwrap().render(), "Leaf");
 }
 
-/// A recursive type's floor is the constructor that terminates, not the one
-/// declared first — otherwise the floor would not exist.
+/// A recursive type's floor is the constructor that terminates, not the one declared first —
+/// otherwise the floor would not exist.
 #[test]
 fn a_recursive_types_floor_terminates() {
     let fixture = Fixture::compile("type Tree = Node(Tree, Int, Tree) | Leaf");
@@ -146,10 +142,8 @@ fn a_recursive_types_floor_terminates() {
 /// A body, and what the minimal witness against it renders as.
 type Property = fn(&[Value]) -> bool;
 
-// ------------------------------------------------------------------ the walk
-
-/// The two requirements, asserted from outside the shrinker: an accepted value
-/// still falsifies and still satisfies the guard.
+/// The two requirements, asserted from outside the shrinker: an accepted value still falsifies and
+/// still satisfies the guard.
 #[test]
 fn every_accepted_value_still_falsifies_and_still_satisfies_the_guard() {
     let world = TypeWorld::default();
@@ -171,15 +165,13 @@ fn every_accepted_value_still_falsifies_and_still_satisfies_the_guard() {
     }
 }
 
-/// A guard-violating candidate is not a smaller counterexample. It is a
-/// counterexample to a different claim.
+/// A guard-violating candidate is not a smaller counterexample.
 #[test]
 fn a_candidate_that_leaves_the_guards_domain_is_rejected() {
     let world = TypeWorld::default();
     let binders = vec![binder("n", Type::int())];
-    // Only odd values are in the domain, so `0`, halving and `n - 1` are all
-    // out of it half the time; a shrinker that skipped the guard would land on
-    // an even witness.
+    // Only odd values are in the domain, so `0`, halving and `n - 1` are all out of it half the
+    // time; a shrinker that skipped the guard would land on an even witness.
     let (counterexample, _) = refute(
         &binders,
         &world,
@@ -192,9 +184,9 @@ fn a_candidate_that_leaves_the_guards_domain_is_rejected() {
     assert!(value.unsigned_abs() <= 7, "{value} is not minimal");
 }
 
-/// No monotonicity is assumed: this property holds at every proper sublist of
-/// its counterexample, so a shrinker that trusted a smaller value to keep
-/// failing would report something that does not fail.
+/// No monotonicity is assumed: this property holds at every proper sublist of its counterexample,
+/// so a shrinker that trusted a smaller value to keep failing would report something that does not
+/// fail.
 #[test]
 fn a_property_that_fails_only_at_a_pair_shrinks_to_a_pair() {
     let world = TypeWorld::default();
@@ -241,8 +233,8 @@ fn shrinking_reaches_a_genuinely_minimal_witness() {
             },
             "b\"\\x00\"",
         ),
-        // `false` is the only candidate `Bool` has, so a property that fails
-        // only at `true` reports the value it failed at and shrinks no further.
+        // `false` is the only candidate `Bool` has, so a property that fails only at `true` reports
+        // the value it failed at and shrinks no further.
         (Type::bool(), |v| !matches!(v[0], Value::Bool(true)), "true"),
     ];
     for (ty, body, expected) in cases {
@@ -266,8 +258,7 @@ fn an_adt_shrinks_toward_a_lower_constructor_and_a_recursive_field() {
         "an unconditional falsehood must shrink to the floor of the type"
     );
 
-    // A property that needs a `Node` shrinks to the smallest `Node` rather than
-    // past it.
+    // A property that needs a `Node` shrinks to the smallest `Node` rather than past it.
     let needs_a_node =
         |v: &[Value]| !matches!(&v[0], Value::Ctor { name, .. } if name.as_str() == "Node");
     let (counterexample, _) = refute(&binders, &world, |_| true, needs_a_node);
@@ -302,16 +293,16 @@ fn a_function_shrinks_toward_the_constant_of_the_minimal_return() {
     let (counterexample, _) = refute(&binders, &world, |_| true, |_| false);
     assert_eq!(counterexample.bindings[0].rendered, "<fn |_| 0>");
 
-    // And the floor is a fixed point: shrinking it again proposes itself, whose
-    // size is not strictly smaller, so the walk stops.
+    // And the floor is a fixed point: shrinking it again proposes itself, whose size is not
+    // strictly smaller, so the walk stops.
     let floor = minimal(&ty, &world).unwrap();
     let again = candidates(&floor, &ty, &world);
     assert_eq!(again.len(), 1);
     assert_eq!(size(&again[0], &world), size(&floor, &world));
 }
 
-/// Structural, not budgetary: the measure has to fall at every accepted step or
-/// the walk is only terminating by luck.
+/// Structural, not budgetary: the measure has to fall at every accepted step or the walk is only
+/// terminating by luck.
 #[test]
 fn the_size_measure_strictly_decreases_at_every_accepted_step() {
     let world = TypeWorld::default();
@@ -365,8 +356,7 @@ fn the_size_measure_strictly_decreases_at_every_accepted_step() {
     );
 }
 
-/// The budget bounds wall clock. Termination does not depend on it, so an
-/// unbounded walk still stops.
+/// The budget bounds wall clock.
 #[test]
 fn shrinking_terminates_with_an_unbounded_budget() {
     let fixture = Fixture::compile(ADTS);
@@ -392,8 +382,8 @@ fn shrinking_terminates_with_an_unbounded_budget() {
     );
 }
 
-/// `--shrink-budget` can only change how minimal a counterexample is, which is
-/// why it is deliberately absent from the cache key.
+/// `--shrink-budget` can only change how minimal a counterexample is, which is why it is
+/// deliberately absent from the cache key.
 #[test]
 fn a_spent_budget_stops_the_walk_without_breaking_it() {
     let world = TypeWorld::default();
@@ -454,9 +444,8 @@ fn two_walks_over_one_failure_agree_byte_for_byte() {
     assert_eq!(walk(), walk());
 }
 
-/// The original is kept because "shrank from a list of 400 to `[0, 1]` in 11
-/// steps" is what tells a reader the space was searched; a minimal value alone
-/// does not.
+/// The original is kept because "shrank from a list of 400 to `[0, 1]` in 11 steps" is what tells a
+/// reader the space was searched; a minimal value alone does not.
 #[test]
 fn the_original_and_the_step_count_are_both_reported() {
     let world = TypeWorld::default();
@@ -469,8 +458,8 @@ fn the_original_and_the_step_count_are_both_reported() {
     assert_ne!(counterexample.original[0].rendered, "4");
 }
 
-/// A first hit that is already minimal reports zero steps, which is exactly the
-/// distinction a reader needs the number for.
+/// A first hit that is already minimal reports zero steps, which is exactly the distinction a
+/// reader needs the number for.
 #[test]
 fn an_already_minimal_first_hit_reports_no_steps() {
     let world = TypeWorld::default();
@@ -488,11 +477,7 @@ fn an_already_minimal_first_hit_reports_no_steps() {
     assert_eq!(shrunk.evaluations, 0);
 }
 
-// ------------------------------------------------- adversarial: the two rules
-
-/// A law that is false only far from zero. Every candidate the walk offers is
-/// nearer zero, so a shrinker that assumed a smaller value keeps failing would
-/// report an input that falsifies nothing at all.
+/// A law that is false only far from zero.
 #[test]
 fn a_witness_that_exists_only_far_from_zero_is_never_shrunk_away() {
     let world = TypeWorld::default();
@@ -508,9 +493,9 @@ fn a_witness_that_exists_only_far_from_zero_is_never_shrunk_away() {
     }
 }
 
-/// A guard that couples two binders, against a walk that moves one at a time:
-/// lowering `lo` past `hi` leaves the domain the law spoke about, and the only
-/// thing stopping that is the guard being asked again about every candidate.
+/// A guard that couples two binders, against a walk that moves one at a time: lowering `lo` past
+/// `hi` leaves the domain the law spoke about, and the only thing stopping that is the guard being
+/// asked again about every candidate.
 #[test]
 fn a_guard_coupling_two_binders_holds_at_every_accepted_step() {
     let world = TypeWorld::default();
@@ -543,9 +528,9 @@ fn left_is_a_node(value: &Value) -> bool {
         && matches!(args.first(), Some(Value::Ctor { name, .. }) if name.as_str().ends_with("Node"))
 }
 
-/// The recursive-field candidate replaces a `Node` with one of its subtrees,
-/// which is the step that collapses a deep tree in one move — and the step that
-/// would destroy a witness that needs the nesting.
+/// The recursive-field candidate replaces a `Node` with one of its subtrees, which is the step that
+/// collapses a deep tree in one move — and the step that would destroy a witness that needs the
+/// nesting.
 #[test]
 fn a_nested_adt_witness_survives_the_recursive_field_candidate() {
     let fixture = Fixture::compile(ADTS);
@@ -564,10 +549,8 @@ fn a_nested_adt_witness_survives_the_recursive_field_candidate() {
     }
 }
 
-/// A constructor's field types are written in the owning type's parameters, so
-/// the walk has to substitute the `Type::Con`'s arguments before it can shrink a
-/// field. Without that, `B([9, 9])` shrinks its payload as if it were an `Int`
-/// and produces nothing.
+/// A constructor's field types are written in the owning type's parameters, so the walk has to
+/// substitute the `Type::Con`'s arguments before it can shrink a field.
 #[test]
 fn a_polymorphic_adt_shrinks_through_its_substituted_field_type() {
     let fixture = Fixture::compile(BOXES);
@@ -585,9 +568,8 @@ fn a_polymorphic_adt_shrinks_through_its_substituted_field_type() {
     assert_eq!(counterexample.bindings[0].rendered, "B([0])");
 }
 
-/// A long list is where a shrinker that only removes one element at a time takes
-/// forever and a shrinker that halves blindly overshoots. The halves are offered
-/// first, and the witness — a length nothing below 100 has — is kept.
+/// A long list is where a shrinker that only removes one element at a time takes forever and a
+/// shrinker that halves blindly overshoots.
 #[test]
 fn a_long_list_shrinks_to_the_shortest_length_the_witness_needs() {
     let world = TypeWorld::default();
@@ -618,9 +600,7 @@ fn a_long_list_shrinks_to_the_shortest_length_the_witness_needs() {
     assert!(size(&shrunk.values[0], &world) < size(&original, &world));
 }
 
-/// `i64::MIN` is drawn on every property run, and its [`size`] saturates. The
-/// walk must neither loop on a candidate whose size ties nor accept one that
-/// stops raising the witness's own flag.
+/// `i64::MIN` is drawn on every property run, and its [`size`] saturates.
 #[test]
 fn the_integer_boundary_neither_loops_nor_loses_its_witness() {
     let world = TypeWorld::default();
@@ -644,9 +624,9 @@ fn the_integer_boundary_neither_loops_nor_loses_its_witness() {
         "candidates were offered and refused"
     );
 
-    // `i64::MIN + 1` ties the saturated measure rather than falling below it, so
-    // the walk refuses it without evaluating — which is the only reason a
-    // measure that cannot separate the two ends of the range still terminates.
+    // `i64::MIN + 1` ties the saturated measure rather than falling below it, so the walk refuses
+    // it without evaluating — which is the only reason a measure that cannot separate the two ends
+    // of the range still terminates.
     let floor = size(&Value::Int(i64::MIN), &world);
     assert_eq!(floor, u64::MAX);
     assert_eq!(size(&Value::Int(i64::MIN + 1), &world), floor);
@@ -658,8 +638,8 @@ fn the_integer_boundary_neither_loops_nor_loses_its_witness() {
     );
 }
 
-/// A raising input is shrunk with "still raises" as the predicate, so every
-/// accepted candidate has to raise — not merely the last one.
+/// A raising input is shrunk with "still raises" as the predicate, so every accepted candidate has
+/// to raise — not merely the last one.
 #[test]
 fn every_accepted_raising_candidate_still_raises() {
     struct Watch {
@@ -701,8 +681,8 @@ fn every_accepted_raising_candidate_still_raises() {
     assert!(judge.raised_at.contains(&value));
 }
 
-/// The budget bounds wall clock and nothing else: a walk cut short still reports
-/// a value that falsifies and that the guard admits.
+/// The budget bounds wall clock and nothing else: a walk cut short still reports a value that
+/// falsifies and that the guard admits.
 #[test]
 fn every_shrink_budget_reports_a_legal_witness() {
     let world = TypeWorld::default();
@@ -730,10 +710,9 @@ fn every_shrink_budget_reports_a_legal_witness() {
     }
 }
 
-/// The only candidate a function value has is the constant of its minimal
-/// return, so a witness that needs a function telling two inputs apart must
-/// survive that candidate being refused — and the other binders must still
-/// shrink around it.
+/// The only candidate a function value has is the constant of its minimal return, so a witness that
+/// needs a function telling two inputs apart must survive that candidate being refused — and the
+/// other binders must still shrink around it.
 #[test]
 fn a_witness_needing_a_non_constant_function_keeps_it() {
     let world = TypeWorld::default();
@@ -743,9 +722,8 @@ fn a_witness_needing_a_non_constant_function_keeps_it() {
         effects: Row::empty(),
     };
     let binders = vec![binder("f", ty), binder("n", Type::int())];
-    // Holds for every function that answers the same thing everywhere, which is
-    // exactly the constant the shrinker walks toward — so the one candidate `f`
-    // has is refused at every step.
+    // Holds for every function that answers the same thing everywhere, which is exactly the
+    // constant the shrinker walks toward — so the one candidate `f` has is refused at every step.
     let constant = |v: &[Value]| !v[0].render().contains("if ");
     let (counterexample, accepted) = refute(&binders, &world, |_| true, constant);
 
@@ -764,9 +742,8 @@ fn a_witness_needing_a_non_constant_function_keeps_it() {
     }
 }
 
-/// The walk reads its types from the obligation's binders, and a value that does
-/// not match one is a defect elsewhere. It has to come back with no candidates
-/// rather than with a candidate of the wrong shape.
+/// The walk reads its types from the obligation's binders, and a value that does not match one is a
+/// defect elsewhere.
 #[test]
 fn a_value_the_type_does_not_describe_offers_nothing() {
     let fixture = Fixture::compile(ADTS);
@@ -818,8 +795,7 @@ fn a_candidate_order_is_fixed() {
         rendered(&Value::str("bc"), &Type::string())[..3],
         ["\"\"".to_string(), "\"b\"".to_string(), "\"c\"".to_string()]
     );
-    // Length first, then content: `b""`, the two halves, then each byte
-    // lowered toward zero.
+    // Length first, then content: `b""`, the two halves, then each byte lowered toward zero.
     assert_eq!(
         rendered(&Value::bytes([2, 4]), &Type::bytes()),
         [

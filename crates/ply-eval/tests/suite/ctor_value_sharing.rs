@@ -1,33 +1,4 @@
 //! One `Value` per constructor per thread, and what that may not change.
-//!
-//! A mention of a constructor is a compile-time constant: `Red` evaluates to a
-//! `Value::Ctor` that is a function of the name and the arity alone, and `Box`
-//! to an `Arc<Closure>` that is a function of the same two. Until ADR 0019 §2
-//! both were rebuilt on every mention — 21.0 and 24.0 allocations per `/health`
-//! request, re-taken by `cargo test -p ply-corpus --release --test
-//! r4_value_construction -- --nocapture` — and `ply_eval::interp::ctor_value`
-//! now answers from a thread-local cache instead.
-//!
-//! `crates/ply-corpus/tests/r4_value_construction.rs` owns the allocation
-//! count. What this file owns is that the shared value is the same value:
-//!
-//! - **shared, not equal.** Two mentions answer with one `Arc`, on both
-//!   engines — an equal value would mean it was rebuilt and nothing was saved.
-//! - **meaning did not move.** The shared value matches the arm a fresh one
-//!   matched, is equal to a fresh one, and both engines answer the same thing.
-//!   **`--engine both` is not the mechanical form of that claim here** — this
-//!   note said it was — because `interp::ctor_value` is what both engines call
-//!   (`interp.rs:712`, `machine.rs:2093`), so the differential harness compares
-//!   one memo against itself and `Arc::ptr_eq` across the two engines is *true*
-//!   (`value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`).
-//!   This file is the evidence, not the corroboration; `on_both`'s note below
-//!   has always said why.
-//! - **it holds nothing.** A cached value has the program's lifetime, so a
-//!   region that closes underneath it must not be able to reclaim anything it
-//!   points at, and it must not be reachable from a `Secret`. A nullary
-//!   constructor's `args` are empty, which is what makes both true, and
-//!   [`a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds`]
-//!   is the statement of the first.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Arena, Interp, Machine, RegionKind, Value, values_equal};
@@ -56,9 +27,8 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// `twice` mentions one nullary constructor twice and `boxes` mentions one
-/// constructor of arity 1 twice, each in a fresh position, so a list of two
-/// holds what two separate mentions evaluated to.
+/// `twice` mentions one nullary constructor twice and `boxes` mentions one constructor of arity 1
+/// twice, each in a fresh position, so a list of two holds what two separate mentions evaluated to.
 const SOURCE: &str = r#"
 type Colour = Red | Green
 type Boxed = Box(Int)
@@ -74,9 +44,9 @@ pub fn ranked(ignored: Int) -> Int = rank(Red) + rank(Green)
 pub fn built(ignored: Int) -> List<Boxed> = [Box(1), Box(2)]
 "#;
 
-/// Both engines run every case here: `ctor_value` is shared by the two, so a
-/// cache in it is a change to both, and `--engine both` reporting no divergence
-/// is what the change is allowed to cost.
+/// Both engines run every case here: `ctor_value` is shared by the two, so a cache in it is a
+/// change to both, and `--engine both` reporting no divergence is what the change is allowed to
+/// cost.
 fn on_both(c: &Compiled, name: &str) -> [Value; 2] {
     let call = |v: Result<Value, ply_span::Diagnostic>| match v {
         Ok(value) => value,
@@ -128,8 +98,8 @@ fn two_mentions_of_a_constructor_of_arity_one_are_one_closure_on_both_engines() 
     }
 }
 
-/// The shared value is the value a fresh one was: it matches the arm a fresh
-/// one matched, and it is equal to one built here.
+/// The shared value is the value a fresh one was: it matches the arm a fresh one matched, and it is
+/// equal to one built here.
 #[test]
 fn a_shared_constructor_still_matches_and_still_compares_equal() {
     let c = compile(SOURCE);
@@ -151,11 +121,8 @@ fn a_shared_constructor_still_matches_and_still_compares_equal() {
     }
 }
 
-/// A cached value outlives every region in the program, so the one thing it may
-/// not do is point at something a region reclaims. It does not, and the reason
-/// is that a nullary constructor's arguments are empty rather than that the
-/// arena is careful: the region here allocates the shared value, closes, and the
-/// value the cache still holds is unchanged.
+/// A cached value outlives every region in the program, so the one thing it may not do is point at
+/// something a region reclaims.
 #[test]
 fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
     let c = compile(SOURCE);
@@ -183,13 +150,7 @@ fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
     );
 }
 
-/// Sharing the *function* a constructor of arity >= 1 evaluates to may not
-/// share what it builds.
-///
-/// The cache holds the `Arc<Closure>` a mention of `Box` answers with. If it
-/// ever held what applying that closure produced, every `Box` in a program
-/// would be one value — and the tests above would all still pass, because they
-/// only ever mention `Box` and never apply it.
+/// Sharing the *function* a constructor of arity >= 1 evaluates to may not share what it builds.
 #[test]
 fn applying_one_shared_constructor_twice_builds_two_values() {
     let c = compile(SOURCE);
@@ -213,15 +174,8 @@ fn applying_one_shared_constructor_twice_builds_two_values() {
     }
 }
 
-/// A shared constructor orders against a fresh one exactly as two fresh ones
-/// do, and a `Map` is where that is load-bearing.
-///
-/// `Map`'s iteration order is [`Value`]'s `cmp` and four guarantees rest on a
-/// value having one canonical form (`map_order.rs`). A shared key that ordered
-/// even one step differently from a fresh one would not raise anything: it
-/// would put a second entry where the program wrote one, and `map_get` with the
-/// other spelling would answer nothing. So the assertion is a lookup by the
-/// *other* value, both ways round, rather than a comparison.
+/// A shared constructor orders against a fresh one exactly as two fresh ones do, and a `Map` is
+/// where that is load-bearing.
 #[test]
 fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
     let c = compile(SOURCE);
@@ -244,9 +198,9 @@ fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
             );
         }
 
-        // A map built from both spellings has one entry, which is the same
-        // claim from the other side: `map_insert` is a fold and a second key
-        // equal to the first replaces it rather than joining it.
+        // A map built from both spellings has one entry, which is the same claim from the other
+        // side: `map_insert` is a fold and a second key equal to the first replaces it rather than
+        // joining it.
         let both_spellings = Value::map([
             (shared.clone(), Value::Int(1)),
             (fresh.clone(), Value::Int(2)),

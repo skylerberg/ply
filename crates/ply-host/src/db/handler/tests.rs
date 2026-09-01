@@ -14,17 +14,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-/// A poisoned lock here holds one `Option`, which has no invariant a panicking
-/// test thread can break.
+/// A poisoned lock here holds one `Option`, which has no invariant a panicking test thread can
+/// break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// An implementation that answers nothing and counts what reached it.
-///
-/// The counter is the assertion: every check the adapter makes has to happen
-/// **before** an implementation is called, or a refusal would be a statement
-/// that already ran.
 #[derive(Default)]
 struct Counting {
     statements: AtomicUsize,
@@ -86,8 +82,8 @@ fn perform(
     perform_declared(driver, op, at, args, None)
 }
 
-/// The same, with the entry point's row, which is what `check_footprint`
-/// refuses against before a connection is acquired.
+/// The same, with the entry point's row, which is what `check_footprint` refuses against before a
+/// connection is acquired.
 fn perform_declared(
     driver: &Arc<Counting>,
     op: Op,
@@ -153,9 +149,9 @@ fn a_statement_reaches_the_implementation_with_every_table_it_touches() {
     assert!(atoms.iter().any(|a| a.contains("orders")), "{atoms:?}");
 }
 
-/// ADR 0014 §2.3's preventer, end to end through the handler: a join reaches a
-/// table the entry point's row never declared, and the refusal happens at
-/// prepare — before a connection is acquired and before a row is read.
+/// ADR 0014 §2.3's preventer, end to end through the handler: a join reaches a table the entry
+/// point's row never declared, and the refusal happens at prepare — before a connection is acquired
+/// and before a row is read.
 #[test]
 fn a_join_outside_the_declared_row_is_refused_before_the_statement_runs() {
     let join = || {
@@ -194,8 +190,8 @@ fn a_join_outside_the_declared_row_is_refused_before_the_statement_runs() {
     assert_eq!(atoms.len(), 2, "{atoms:?}");
 }
 
-/// The ordering that makes the refusal a preventer rather than a report: the
-/// implementation is never called, so nothing was acquired and no row moved.
+/// The ordering that makes the refusal a preventer rather than a report: the implementation is
+/// never called, so nothing was acquired and no row moved.
 #[test]
 fn a_refused_statement_never_reaches_the_implementation() {
     for (sql, code) in [
@@ -233,8 +229,8 @@ fn a_refused_statement_never_reaches_the_implementation() {
     }
 }
 
-/// `db.query` is the only `read`, so a statement that changes rows performed
-/// through it is refused rather than recorded as a read.
+/// `db.query` is the only `read`, so a statement that changes rows performed through it is refused
+/// rather than recorded as a read.
 #[test]
 fn a_write_through_query_is_refused_before_anything_runs() {
     let driver = Arc::new(Counting::default());
@@ -286,8 +282,8 @@ fn transaction_control_takes_no_statement_and_no_table() {
     perform(&driver, Op::Abort, "items", Vec::new()).expect("it aborts");
 }
 
-/// Inference checks a perform's arity, so this is Ply's fault rather than the
-/// program's and it says which.
+/// Inference checks a perform's arity, so this is Ply's fault rather than the program's and it says
+/// which.
 #[test]
 fn a_perform_of_the_wrong_arity_is_plys_fault() {
     let driver = Arc::new(Counting::default());
@@ -303,8 +299,8 @@ fn a_perform_of_the_wrong_arity_is_plys_fault() {
     assert_eq!(driver.statements.load(Ordering::Relaxed), 0);
 }
 
-/// The listing is the artifact ADR 0008 §2 exists to produce, and the
-/// implementation gets a say in exactly one column of it.
+/// The listing is the artifact ADR 0008 §2 exists to produce, and the implementation gets a say in
+/// exactly one column of it.
 #[test]
 fn every_operation_a_driver_serves_appears_with_the_implementations_own_path() {
     let registry = registry(Arc::new(Counting::default()) as Arc<dyn Driver>);

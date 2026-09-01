@@ -1,20 +1,13 @@
-//! TLS as the command line sees it: `--tls NAME=CERT,KEY`, and what
-//! `ply hosts` discloses about the stack it added to the trusted computing
-//! base.
-//!
-//! ADR 0013 §6.4's rule is the one every test here checks: **a listing that
-//! hides the TLS stack is the failure ADR 0008 §2 exists to prevent.**
-//! `net.recv` and `net.send` serve both transports and resolve to
-//! `ply_host::tcp::*` either way, so "this program can serve TLS" cannot be
-//! inferred from a row — it has to be written down.
+//! TLS as the command line sees it: `--tls NAME=CERT,KEY`, and what `ply hosts` discloses about the
+//! stack it added to the trusted computing base.
 
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// A program that can create a TLS listener, which is what puts
-/// `ply_host::tls::listen` into the listing.
+/// A program that can create a TLS listener, which is what puts `ply_host::tls::listen` into the
+/// listing.
 const SECURE: &str = "\
 import std.net
 
@@ -25,9 +18,8 @@ fn main() -> Int / {net::net.write[listener]} = {
 }
 ";
 
-/// A program that opens a plaintext listener — and whose row nonetheless admits
-/// `net.listen_tls`, because a row names a resource and a mode rather than an
-/// operation.
+/// A program that opens a plaintext listener — and whose row nonetheless admits `net.listen_tls`,
+/// because a row names a resource and a mode rather than an operation.
 const PLAIN: &str = "\
 import std.net
 
@@ -38,8 +30,8 @@ fn main() -> Int / {net::net.write[listener]} = {
 }
 ";
 
-/// A program that reaches the boundary without touching a socket at all, so
-/// nothing in its trusted computing base is a TLS stack.
+/// A program that reaches the boundary without touching a socket at all, so nothing in its trusted
+/// computing base is a TLS stack.
 const NO_SOCKET: &str = "\
 fn main() -> Int = simulate { spawn { 1 }; 2 }
 ";
@@ -64,12 +56,8 @@ fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
 }
 
-/// A self-signed leaf, generated rather than checked in: a private key in a
-/// repository is a private key that leaks.
-///
-/// `rcgen` is what ADR 0013 §9 puts in the workspace for exactly this, so a TLS
-/// test needs no fixture on disk and no network. It is a dev-dependency of
-/// `ply-host`, so this suite shells out to nothing.
+/// A self-signed leaf, generated rather than checked in: a private key in a repository is a private
+/// key that leaks.
 fn credential(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -89,10 +77,6 @@ fn spec(name: &str, cert: &Path, key: &Path) -> String {
 
 // --- the listing ------------------------------------------------------------
 
-/// The transport block, whole. This is the artifact a reviewer reads and CI
-/// diffs, so what is pinned is the block: a line silently dropped or renamed
-/// changes what the reader is told, and every one of those passes a
-/// per-substring check.
 #[test]
 fn the_listing_discloses_the_tls_stack_and_the_credential_it_was_given() {
     let dir = project(SECURE);
@@ -124,9 +108,8 @@ fn the_listing_discloses_the_tls_stack_and_the_credential_it_was_given() {
     assert!(text.contains("digest: b3:"), "{text}");
 }
 
-/// A program that reaches no socket has no TLS stack in its trusted computing
-/// base, and says nothing about one. The block is conditional for this reason:
-/// a transport line on every listing would be a line nobody reads.
+/// A program that reaches no socket has no TLS stack in its trusted computing base, and says
+/// nothing about one.
 #[test]
 fn a_program_that_touches_no_socket_reports_no_transport() {
     let dir = project(NO_SOCKET);
@@ -136,11 +119,10 @@ fn a_program_that_touches_no_socket_reports_no_transport() {
     assert!(!text.contains("ply_host::tls"), "{text}");
 }
 
-/// A program that only calls `net.listen` still discloses the TLS stack, and
-/// that is deliberate rather than a leak: a row names a resource and a mode,
-/// not an operation, so `{net.write[listener]}` admits `net.listen_tls` and the
-/// listing has to say the handler is reachable. Inferring "no TLS here" from a
-/// row is exactly the reasoning ADR 0013 §6.1 says a row cannot support.
+/// A program that only calls `net.listen` still discloses the TLS stack, and that is deliberate
+/// rather than a leak: a row names a resource and a mode, not an operation, so
+/// `{net.write[listener]}` admits `net.listen_tls` and the listing has to say the handler is
+/// reachable.
 #[test]
 fn a_plaintext_program_whose_row_admits_listen_tls_still_discloses_it() {
     let dir = project(PLAIN);
@@ -150,9 +132,8 @@ fn a_plaintext_program_whose_row_admits_listen_tls_still_discloses_it() {
     assert!(text.contains("   transport"), "{text}");
 }
 
-/// A program that can call `net.listen_tls` with nothing configured is a run
-/// that will answer `E0429` at the perform site. The listing says so, rather
-/// than leaving the reader to find out from a running server.
+/// A program that can call `net.listen_tls` with nothing configured is a run that will answer
+/// `E0429` at the perform site.
 #[test]
 fn a_tls_program_with_no_credential_is_told_what_will_happen() {
     let dir = project(SECURE);
@@ -164,9 +145,8 @@ fn a_tls_program_with_no_credential_is_told_what_will_happen() {
     );
 }
 
-/// ADR 0013 §6.4: the digest covers the credential names, the provider and the
-/// library version, and **not** the fingerprint. A CI check that broke on every
-/// renewal is a CI check people learn to ignore.
+/// ADR 0013 §6.4: the digest covers the credential names, the provider and the library version, and
+/// **not** the fingerprint.
 #[test]
 fn the_digest_is_stable_across_a_rotation_and_moves_when_a_credential_is_added() {
     let dir = project(SECURE);
@@ -208,9 +188,7 @@ fn the_digest_is_stable_across_a_rotation_and_moves_when_a_credential_is_added()
     assert_ne!(before, digest(Vec::new()), "removing one must move it");
 }
 
-/// `--json` carries the whole fingerprint; the table abbreviates it. A reader
-/// comparing against what a CA issued needs every byte, and a reader scanning
-/// the listing needs none of them.
+/// `--json` carries the whole fingerprint; the table abbreviates it.
 #[test]
 fn the_json_object_carries_the_transport_and_the_full_fingerprint() {
     let dir = project(SECURE);
@@ -245,8 +223,6 @@ fn the_json_object_carries_the_transport_and_the_full_fingerprint() {
 
 // --- refusals ---------------------------------------------------------------
 
-/// E0430 before anything runs. A server that discovers its certificate is
-/// unusable on the first handshake has already told a client it was listening.
 #[test]
 fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
     let dir = project(SECURE);
@@ -268,8 +244,8 @@ fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
         assert!(rendered.contains("E0430"), "{rendered}");
     }
 
-    // A key that is not the leaf's is the check that needs both files, and it
-    // is the one a deploy gets wrong.
+    // A key that is not the leaf's is the check that needs both files, and it is the one a deploy
+    // gets wrong.
     let (_, other_key) = credential(dir.path(), "other");
     let output = ply(dir.path())
         .arg("run")
@@ -282,8 +258,8 @@ fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
     assert!(rendered.contains("E0430"), "{rendered}");
 }
 
-/// The shape is a usage error rather than E0430: a reader who mistyped the
-/// argument needs the form, and one whose PEM is broken needs the file.
+/// The shape is a usage error rather than E0430: a reader who mistyped the argument needs the form,
+/// and one whose PEM is broken needs the file.
 #[test]
 fn a_malformed_argument_is_refused_with_the_form_rather_than_a_diagnostic() {
     let dir = project(SECURE);
@@ -303,8 +279,7 @@ fn a_malformed_argument_is_refused_with_the_form_rather_than_a_diagnostic() {
     assert!(!rendered.contains("E0430"), "{rendered}");
 }
 
-/// Credentials configure a binding, and without `--host` there is none. A
-/// `--tls` that was silently ignored would read as a run that served TLS.
+/// Credentials configure a binding, and without `--host` there is none.
 #[test]
 fn tls_without_host_is_refused() {
     let dir = project(SECURE);
@@ -322,9 +297,7 @@ fn tls_without_host_is_refused() {
     }
 }
 
-/// Hermetic is the default and the flag is the only way out — for credentials
-/// too. A hermetic run reads no private key, because reading one for a run that
-/// cannot use it is exactly the residual ADR 0008 §2 refuses to widen.
+/// Hermetic is the default and the flag is the only way out — for credentials too.
 #[test]
 fn a_hermetic_run_reaches_no_credential_and_says_so() {
     let dir = project(SECURE);

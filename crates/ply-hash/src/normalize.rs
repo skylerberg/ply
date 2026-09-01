@@ -1,14 +1,4 @@
 //! Normalized serialization of a definition.
-//!
-//! The bytes produced here are the definition's identity. Two rules do the real
-//! work: a local binder is replaced by the de Bruijn *level* at which it was
-//! bound, and a reference to another top-level definition is replaced by that
-//! definition's hash. Neither a local's name nor a referent's name can reach the
-//! byte stream, which is what makes renaming free.
-//!
-//! Every node starts with a distinct tag byte and every variable-length field
-//! carries a `u32` length prefix, so the encoding is uniquely decodable and two
-//! differently-shaped trees cannot produce the same bytes.
 
 use ply_span::Symbol;
 use ply_syntax::ast::*;
@@ -21,10 +11,8 @@ fn qualifier(q: &QName) -> Option<&Symbol> {
     q.module.as_ref().map(|m| &m.name)
 }
 
-/// The parser's nesting limit does not bound this walk: a left-leaning operator
-/// chain is parsed iteratively at constant depth but is still an arbitrarily
-/// deep tree. Overflowing here aborts the process, taking every unrelated test
-/// sharing it down too.
+/// The parser's nesting limit does not bound this walk: a left-leaning operator chain is parsed
+/// iteratively at constant depth but is still an arbitrarily deep tree.
 fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -38,8 +26,8 @@ pub(crate) mod tag {
     pub const REF_INDEX: u8 = 4;
     pub const FREE: u8 = 5;
     pub const FREE_QUALIFIED: u8 = 9;
-    /// Only ever written by a [`super::Normalizer::by_name`] encoding, which no
-    /// definition hash is derived from.
+    /// Only ever written by a [`super::Normalizer::by_name`] encoding, which no definition hash is
+    /// derived from.
     pub const REF_NAME: u8 = 12;
     pub const CTOR: u8 = 6;
     pub const TY_PARAM: u8 = 7;
@@ -47,16 +35,9 @@ pub(crate) mod tag {
 
     pub const NONE: u8 = 10;
     pub const SOME: u8 = 11;
-    /// A `fn` parameter carrying a default, written *in place of* the
-    /// [`NONE`]/[`SOME`] its type annotation would otherwise open with, and
-    /// followed by that annotation and the default expression.
-    ///
-    /// Deliberately not a field appended to every parameter. A parameter with
-    /// no default writes the byte it wrote before this tag existed, so adding
-    /// defaults to the language moved **no** definition's hash — ADR 0023
-    /// refused to touch this stream at all precisely because "a cache-format
-    /// change moves every cached result everywhere", and an additive tag is how
-    /// that is avoided rather than paid.
+    /// A `fn` parameter carrying a default, written *in place of* the [`NONE`]/[`SOME`] its type
+    /// annotation would otherwise open with, and followed by that annotation and the default
+    /// expression.
     pub const PARAM_DEFAULT: u8 = 13;
 
     pub const FN: u8 = 20;
@@ -79,16 +60,11 @@ pub(crate) mod tag {
     pub const LIT_BOOL: u8 = 41;
     pub const LIT_STR: u8 = 42;
     pub const LIT_UNIT: u8 = 43;
-    /// A distinct tag from [`LIT_STR`], so `b"ab"` and `"ab"` are different
-    /// definitions. They have different types and must not share a hash.
+    /// A distinct tag from [`LIT_STR`], so `b"ab"` and `"ab"` are different definitions.
     pub const LIT_BYTES: u8 = 44;
-    /// The IEEE **bit pattern**, eight bytes. Not the numeric value: `0.0` and
-    /// `-0.0` are two definitions because `1.0 / -0.0` tells them apart, and a
-    /// NaN payload is part of what a program can observe through `to_bits`-like
-    /// arithmetic. Distinct from [`LIT_INT`] so `1` and `1.0` never share a hash.
+    /// The IEEE **bit pattern**, eight bytes.
     pub const LIT_FLOAT: u8 = 45;
-    /// Mantissa then scale. The scale is kept, so `1.5m` and `1.50m` are two
-    /// definitions even though they are one value — the literal said which one.
+    /// Mantissa then scale.
     pub const LIT_DECIMAL: u8 = 46;
 
     pub const E_LIT: u8 = 50;
@@ -124,9 +100,7 @@ pub(crate) mod tag {
     pub const ARM: u8 = 92;
     pub const CLAUSE: u8 = 93;
     pub const RETURN_CLAUSE: u8 = 94;
-    /// A `where derivable(D, a)`. Part of the published signature, so it is
-    /// kept; the parameter enters as its de Bruijn level, so renaming it moves
-    /// no hash.
+    /// A `where derivable(D, a)`.
     pub const CONSTRAINT: u8 = 95;
 }
 
@@ -163,24 +137,17 @@ pub(crate) fn mode_byte(mode: Mode) -> u8 {
     }
 }
 
-/// How a reference to a member of the component currently being hashed is
-/// written. A node that is in neither this map nor the hash table — a reference
-/// made before anything about the component is known — falls back to a bare
-/// marker that says only "one of us".
+/// How a reference to a member of the component currently being hashed is written.
 pub type ComponentIndices = FxHashMap<usize, u32>;
 pub type HashTable = FxHashMap<usize, DefHash>;
 
-/// Effect node -> its slot in the enumeration built for the component being
-/// encoded. See [`crate::effect_order`].
+/// Effect node -> its slot in the enumeration built for the component being encoded.
 pub type EffectIndex = FxHashMap<usize, u32>;
 
-/// `'a` is the AST's lifetime and `'t` the tables'. They are separate because
-/// the effect enumeration a second pass runs against is built *from* the first
-/// pass, so it cannot outlive the walk that produced it.
+/// `'a` is the AST's lifetime and `'t` the tables'.
 pub struct Normalizer<'a, 't> {
     index: &'a ProgramIndex<'a>,
-    /// Which module's bodies are being walked. It decides what a name denotes
-    /// and nothing else: no byte written below depends on it.
+    /// Which module's bodies are being walked.
     module: usize,
     hashes: &'t HashTable,
     component: &'t ComponentIndices,
@@ -191,24 +158,10 @@ pub struct Normalizer<'a, 't> {
     values: Vec<&'a Symbol>,
     ty_params: Vec<&'a Symbol>,
     row_params: Vec<&'a Symbol>,
-    /// Encode a reference as the referent's program-wide **name** rather than
-    /// its hash. This is the identity of a claim *as a sentence*: it moves when
-    /// the sentence is rewritten and stays put when the definitions it mentions
-    /// are re-implemented, which is what lets `ply review` separate "the
-    /// implementation moved" from "the claim moved".
-    ///
-    /// No definition, test or law hash is ever encoded this way — a hash that
-    /// referred to its dependencies by name would reintroduce exactly the
-    /// name-dependence content addressing exists to remove.
+    /// Encode a reference as the referent's program-wide **name** rather than its hash.
     refs_by_name: bool,
-    /// While a row's atoms are being encoded for sorting, the references they
-    /// mention are held here instead of joining [`Self::refs`].
-    ///
-    /// `refs` is in first-mention order and that order is what numbers the
-    /// effect slots an atom's encoding carries. A row is a set, so the order its
-    /// atoms were *written* in may not reach that numbering — or reordering an
-    /// annotation would move the definition's hash, which is the one thing the
-    /// sort below exists to prevent.
+    /// While a row's atoms are being encoded for sorting, the references they mention are held here
+    /// instead of joining [`Self::refs`].
     deferred: Option<Vec<NodeId>>,
 }
 
@@ -237,14 +190,13 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// Encode references by name instead of by hash. See [`Self::refs_by_name`].
+    /// Encode references by name instead of by hash.
     pub fn by_name(mut self) -> Self {
         self.refs_by_name = true;
         self
     }
 
-    /// The normalized bytes, and the definitions they reference in first-mention
-    /// order.
+    /// The normalized bytes, and the definitions they reference in first-mention order.
     pub fn finish(self) -> (Vec<u8>, Vec<NodeId>) {
         (self.out, self.refs)
     }
@@ -294,8 +246,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// Records a reference in first-mention order, unless a row is holding its
-    /// mentions back until it knows the order its atoms sort into.
+    /// Records a reference in first-mention order, unless a row is holding its mentions back until
+    /// it knows the order its atoms sort into.
     fn mention(&mut self, node: NodeId) {
         if let Some(held) = &mut self.deferred {
             held.push(node);
@@ -326,9 +278,7 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// A name nothing in the index answers to. The qualifier is kept because
-    /// `a::log` and `b::log` are different references even when neither module
-    /// is in the index — dropping it would alias them.
+    /// A name nothing in the index answers to.
     fn free_ref(&mut self, qual: Option<&Symbol>, name: &Symbol) {
         match qual {
             None => {
@@ -349,8 +299,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         self.strv(name);
     }
 
-    /// A local binder wins over everything, and only a bare name can be one: a
-    /// module binder is a fourth namespace reachable only through `::`.
+    /// A local binder wins over everything, and only a bare name can be one: a module binder is a
+    /// fourth namespace reachable only through `::`.
     fn value_ref(&mut self, q: &QName) {
         if q.is_bare()
             && let Some(level) = self.values.iter().rposition(|s| **s == q.name.name)
@@ -379,17 +329,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// Effects are nominal: `db` and `audit` may declare byte-identical
-    /// operations and are still different capabilities, performed as different
-    /// atoms and discharged by different handlers. A declaration alone therefore
-    /// cannot identify one, so a reference carries its slot in the enclosing
-    /// component's effect enumeration as well.
-    ///
-    /// The slot is what a de Bruijn level is for a local binder: it says *which*
-    /// of the effects this definition can see is meant, without naming it and
-    /// without consulting anything the definition cannot reach. Two definitions
-    /// that differ only by a consistent renaming of their effects therefore
-    /// hash alike, and any context that can tell them apart differs itself.
+    /// Effects are nominal: `db` and `audit` may declare byte-identical operations and are still
+    /// different capabilities, performed as different atoms and discharged by different handlers.
     fn effect_ref(&mut self, q: &QName) {
         if let Some(node) = self.index.effect(self.module, q) {
             self.node_ref(node);
@@ -417,9 +358,8 @@ impl<'a, 't> Normalizer<'a, 't> {
             self.row_params.push(&g.name);
         }
         self.len(d.params.len());
-        // Before the parameter names reach `self.values`, which is what a
-        // default must not see: it is closed, and a mention of a sibling
-        // parameter is `E0121` rather than a de Bruijn level.
+        // Before the parameter names reach `self.values`, which is what a default must not see: it
+        // is closed, and a mention of a sibling parameter is `E0121` rather than a de Bruijn level.
         for p in &d.params {
             if let Some(default) = &p.default {
                 self.tag(tag::PARAM_DEFAULT);
@@ -438,10 +378,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         self.expr(&d.body);
     }
 
-    /// Sorted and deduplicated, so that writing the same two constraints in the
-    /// other order is the same definition. A constraint naming a parameter this
-    /// signature does not bind is dropped: it is an error the checker reports,
-    /// and a hash may not depend on a name the definition cannot reach.
+    /// Sorted and deduplicated, so that writing the same two constraints in the other order is the
+    /// same definition.
     fn constraints(&mut self, cs: &'a [Constraint]) {
         let mut levels: Vec<(u32, u8)> = cs
             .iter()
@@ -486,8 +424,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// Operations are looked up by name, never by position, so their declaration
-    /// order carries no meaning and is sorted away.
+    /// Operations are looked up by name, never by position, so their declaration order carries no
+    /// meaning and is sorted away.
     fn effect_def(&mut self, d: &'a EffectDef) {
         self.tag(tag::EFFECT);
         self.boolv(d.nondet);
@@ -521,15 +459,9 @@ impl<'a, 't> Normalizer<'a, 't> {
         self.expr(&d.body);
     }
 
-    /// A law's binder *types* are part of its identity — they are what the
-    /// claim quantifies over — while their names are levels like any other
-    /// binder, and the label is erased exactly as a test's is.
-    ///
-    /// The host flag is written **after the tag**, exactly where `test_def`
-    /// writes `nondet`, because a law that changed from `law` to `law/host` is a
-    /// different claim — the first says nothing outside the program decides it —
-    /// and it must re-discharge rather than reuse a certificate about a claim it
-    /// no longer makes.
+    /// A law's binder *types* are part of its identity — they are what the claim quantifies over —
+    /// while their names are levels like any other binder, and the label is erased exactly as a
+    /// test's is.
     pub fn law_def(&mut self, d: &'a LawDef) {
         self.tag(tag::LAW);
         self.boolv(d.host);
@@ -544,14 +476,9 @@ impl<'a, 't> Normalizer<'a, 't> {
         self.expr(&d.body);
     }
 
-    /// One `requires` or `ensures`, in the scope its owner gives it: the
-    /// owner's generics and parameters, plus `result` for an `ensures` —
-    /// introduced **beside** the parameters, which is what makes a parameter
-    /// named `result` a duplicate rather than a shadow.
-    ///
-    /// Neither the owner's signature nor its hash is written here: the hash is
-    /// the first field of [`crate::spec_hash`], where it belongs, and it already
-    /// covers the signature. What this stream carries is the claim alone.
+    /// One `requires` or `ensures`, in the scope its owner gives it: the owner's generics and
+    /// parameters, plus `result` for an `ensures` — introduced **beside** the parameters, which is
+    /// what makes a parameter named `result` a duplicate rather than a shadow.
     pub fn spec_clause(&mut self, owner: &'a FnDef, clause: &'a SpecClause) {
         let index = self.index;
         self.tag(tag::SPEC);
@@ -564,10 +491,9 @@ impl<'a, 't> Normalizer<'a, 't> {
         for g in &owner.generics.effects {
             self.row_params.push(&g.name);
         }
-        // A parameter's default is not written here, and that is the claim: an
-        // obligation is about what the body promises, and a default changes
-        // what *callers* pass rather than what the promise says. The owner's
-        // parameters enter as binders, which is all a clause can mention.
+        // A parameter's default is not written here, and that is the claim: an obligation is about
+        // what the body promises, and a default changes what *callers* pass rather than what the
+        // promise says.
         self.len(owner.params.len());
         for p in &owner.params {
             self.values.push(&p.name.name);
@@ -612,10 +538,8 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.type_expr(ret);
                 self.opt(effects.as_ref(), Self::row);
             }
-            // A record type is a map from label to type — `{a: Int, b: String}`
-            // and `{b: String, a: Int}` are the same type — so field order is
-            // sorted away here. A record *expression* keeps its order: its
-            // fields are evaluated left to right.
+            // A record type is a map from label to type — `{a: Int, b: String}` and `{b: String, a:
+            // Int}` are the same type — so field order is sorted away here.
             TypeExpr::Record { fields, .. } => {
                 self.tag(tag::TY_RECORD);
                 let mut sorted: Vec<Vec<u8>> = fields
@@ -637,17 +561,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// A row is a set, so its atoms are sorted by their own encoding and
-    /// deduplicated before being written: reordering an annotation is as free as
-    /// reformatting it.
-    ///
-    /// The references an atom mentions are held back until the sort has run and
-    /// then committed in sorted order, because first-mention order is what
-    /// numbers the effect slots the atoms themselves carry. Committing them as
-    /// written would leave the sorted *bytes* canonical and the numbering inside
-    /// them decided by the order somebody typed — which is the same annotation
-    /// hashing two ways, and an `effect set` makes it routine: a set's expansion
-    /// is spliced in wherever the set is named, beside atoms written by hand.
+    /// A row is a set, so its atoms are sorted by their own encoding and deduplicated before being
+    /// written: reordering an annotation is as free as reformatting it.
     fn row(&mut self, r: &'a RowExpr) {
         self.tag(tag::ROW);
         let mut atoms: Vec<(Vec<u8>, &[u8], Vec<NodeId>)> = Vec::with_capacity(r.atoms.len());
@@ -663,26 +578,12 @@ impl<'a, 't> Normalizer<'a, 't> {
                 .unwrap_or_default();
             atoms.push((bytes, tie, held));
         }
-        // By the bytes, then by the declaration the atom's effect names. A
-        // `NodeId` is a source position and breaking a tie with one would put
-        // the order of the file back into the hash — but the bytes alone do not
-        // separate two atoms either, because the first pass runs with no hash
-        // table and writes every effect reference as `REF_SELF`. So
-        // `{x.write, y.write}` and `{y.write, x.write}` would number `x` and `y`
-        // in the order somebody typed, which is the one thing this sort exists
-        // to prevent. The declaration bytes are the referent's own and reach
-        // nothing the definition does not, so ordering by them keeps a slot a
-        // function of what the definition can see.
+        // By the bytes, then by the declaration the atom's effect names.
         atoms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         let distinct =
             usize::from(!atoms.is_empty()) + atoms.windows(2).filter(|w| w[0].0 != w[1].0).count();
         self.len(distinct);
-        // Every atom is mentioned, including one the dedup drops. The first pass
-        // runs with no hash table, so two atoms naming *different* effects at the
-        // same mode and resource encode alike there; dropping the second one's
-        // mention would leave an effect this definition reaches out of the
-        // enumeration entirely, and `effect_ref` would then write it as slot 0 —
-        // the slot of whichever effect the enumeration does begin with.
+        // Every atom is mentioned, including one the dedup drops.
         let mut previous: Option<Vec<u8>> = None;
         for (bytes, _, held) in atoms {
             for node in held {
@@ -725,8 +626,8 @@ impl<'a, 't> Normalizer<'a, 't> {
 
     fn expr_inner(&mut self, e: &'a Expr) {
         match &e.kind {
-            // `{ e }` and `e` are the same computation; treating them alike is
-            // what makes wrapping a body in braces a formatting change.
+            // `{ e }` and `e` are the same computation; treating them alike is what makes wrapping
+            // a body in braces a formatting change.
             ExprKind::Block {
                 stmts,
                 tail: Some(tail),
@@ -812,20 +713,12 @@ impl<'a, 't> Normalizer<'a, 't> {
                     self.expr(value);
                 }
             }
-            // The one arm that must never guess. Hashing the sugar as if it
-            // were the record it is written beside would make `{..s, a: 1}` and
-            // its longhand two definitions computing one value; hashing it as a
-            // new tag would do the same. Expansion is upstream so that neither
-            // is representable.
+            // The one arm that must never guess.
             ExprKind::RecordUpdate { .. } => unreachable!(
                 "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_record_update_survives_parse_module_anywhere_in_the_tree`"
             ),
-            // The other arm that must never guess. A tag for `?` would make
-            // `e?` and the `match` it stands for two definitions computing one
-            // value, which is the thing this file exists to prevent, and it
-            // would be a `BODY_ENCODING` change on top. Expansion is upstream so
-            // that neither is representable.
+            // The other arm that must never guess.
             ExprKind::Try { .. } => unreachable!(
                 "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_try_survives_parse_module_anywhere_in_the_tree`"
@@ -875,11 +768,9 @@ impl<'a, 't> Normalizer<'a, 't> {
                     for p in &c.params {
                         self.values.push(&p.name);
                     }
-                    // Whether a clause binds a continuation is part of what the
-                    // definition *is* — the two forms have different typing and
-                    // different semantics — so the marker is hashed. The name is
-                    // not: it is a local, and becomes a de Bruijn level like
-                    // every other.
+                    // Whether a clause binds a continuation is part of what the definition *is* —
+                    // the two forms have different typing and different semantics — so the marker
+                    // is hashed.
                     match &c.resume {
                         None => self.tag(tag::NONE),
                         Some(binder) => {
@@ -928,9 +819,8 @@ impl<'a, 't> Normalizer<'a, 't> {
         }
     }
 
-    /// Consecutive `let`s that commute are emitted in the order their own
-    /// encodings sort in, so which one the author typed first is not part of the
-    /// definition's identity. Everything else stays where it is.
+    /// Consecutive `let`s that commute are emitted in the order their own encodings sort in, so
+    /// which one the author typed first is not part of the definition's identity.
     fn stmt_order(&mut self, stmts: &'a [Stmt]) -> Vec<usize> {
         let mut order = Vec::with_capacity(stmts.len());
         let mut i = 0;
@@ -947,9 +837,7 @@ impl<'a, 't> Normalizer<'a, 't> {
         order
     }
 
-    /// The members of the run, ordered by their encodings. Every member encodes
-    /// the same way wherever it lands in the run, because none of them can see a
-    /// binder the run introduces — that is what [`commutable_run`] establishes.
+    /// The members of the run, ordered by their encodings.
     fn sorted_run(&mut self, stmts: &'a [Stmt], from: usize, to: usize) -> Vec<usize> {
         let mark = self.values.len();
         let mut keyed: Vec<(Vec<u8>, usize)> = (from..to)
@@ -1054,11 +942,8 @@ impl<'a, 't> Normalizer<'a, 't> {
     }
 }
 
-/// How many statements from `from` are `let`s that may be written in any order
-/// without changing what the block does. Two conditions make that safe: no value
-/// can call or perform, so every one of them is evaluated whatever the order and
-/// none can observe another's effect; and no value mentions a name the run
-/// binds, so no reordering can change what any of them resolves to.
+/// How many statements from `from` are `let`s that may be written in any order without changing
+/// what the block does.
 fn commutable_run(stmts: &[Stmt], from: usize) -> usize {
     let mut to = from;
     while let Some(Stmt::Let { value, .. }) = stmts.get(to) {
@@ -1113,17 +998,10 @@ fn pattern_binders(p: &Pattern, out: &mut FxHashSet<Symbol>) -> usize {
     })
 }
 
-// `is_pure` used to live here. It moved to `ply_syntax::ast` (reached by the
-// glob above) in ADR 0027, so that `?` expansion and `commutable_run` ask *one*
-// implementation whether an expression may be reordered rather than two that can
-// drift apart — they are the same question, and a drift would mean
-// normalization reordering something `?` refused to, or the reverse. Nothing
-// else about it changed: `crates/ply-hash/tests/suite/map.rs`'s pinned digest is the
-// guard on the move being free.
+// `is_pure` used to live here.
 
-/// Deliberately blind to scope: any occurrence of the name counts, even one that
-/// a nested binder would have shadowed. Over-reporting only costs a reordering
-/// that would have been safe.
+/// Deliberately blind to scope: any occurrence of the name counts, even one that a nested binder
+/// would have shadowed.
 fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
     grow(|| match &e.kind {
         ExprKind::Lit(_) => false,

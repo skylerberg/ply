@@ -1,7 +1,4 @@
 //! `plydump <file.ply>` — the reference token dump, for reading by eye.
-//!
-//! The comparison itself is `tests/agreement.rs`; this exists so that a
-//! disagreement can be looked at without a test harness in the way.
 
 use std::io::Read;
 

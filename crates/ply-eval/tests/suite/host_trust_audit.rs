@@ -1,30 +1,4 @@
 //! What a **hostile** host handler can do, and what — if anything — notices.
-//!
-//! `host_boundary.rs` establishes that the boundary works when the handler
-//! behind it is honest. This file assumes the opposite. ADR 0008 §2 accepts that
-//! a host handler's footprint declaration is trusted and unverifiable; the
-//! question these tests answer is how much damage a wrong or hostile declaration
-//! does, and which of the guarantees above the boundary survive it.
-//!
-//! Two kinds of test live here and the names say which is which:
-//!
-//! - `documents_` pins present behaviour that is **worse** than the ADRs claim,
-//!   so that closing the gap shows up as a diff rather than as silence. These
-//!   are not endorsements.
-//! - everything else pins a defence that does hold, because a defence nobody
-//!   tested is a defence that will be refactored away.
-//!
-//! The rule the whole milestone is built on — a wrong declaration is loud, a
-//! missing declaration is fatal — is only half true at this boundary, and this
-//! file is where the other half is written down.
-//!
-//! Two declarations are now loud: `blocking` (a `true` handler that answers a
-//! value did the work on this thread, and that is `E0428`) and the code a
-//! handler attaches to its own refusal (rewritten out of the reserved set, so it
-//! cannot classify its failure as a defect in Ply). Two are still silent by
-//! construction — the footprint's mode and resource, and `Linearity::Repeatable`
-//! over an irreversible operation — and the `documents_` tests below are what
-//! that costs.
 
 use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_core::{CheckOutput, check_program};
@@ -38,8 +12,6 @@ use ply_syntax::ast::{Mode, ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// ------------------------------------------------------------------- fixtures
 
 struct Compiled {
     program: Program,
@@ -111,13 +83,8 @@ fn diagnostic(outcome: Result<(), Diagnostic>) -> Diagnostic {
     outcome.expect_err("the program was expected to fail")
 }
 
-/// A handler registered against a **read** operation on one resource, which
-/// mutates state of its own on every call and answers the new value.
-///
-/// This is the handler ADR 0008 §2 says nothing can catch. Everything it does
-/// outside the value it returns is invisible to the runtime: the atom the
-/// machine records comes from the *registration*, never from the handler, so a
-/// handler cannot even accidentally tell the truth about doing more.
+/// A handler registered against a **read** operation on one resource, which mutates state of its
+/// own on every call and answers the new value.
 #[derive(Default)]
 struct Mutates {
     writes: AtomicU64,
@@ -131,9 +98,6 @@ impl HostHandler for Mutates {
 }
 
 /// One `read` operation over one resource, and a program that only ever reads.
-///
-/// Nothing in this source says the word "write". Under the handler above, every
-/// call mutates.
 const READS: &str = r#"
 nondet effect db {
   read get[r](key: Int) -> Int
@@ -146,17 +110,7 @@ test/nondet "first" { assert_eq(lookup(1), 1) }
 test/nondet "second" { assert_eq(lookup(1), 2) }
 "#;
 
-// ------------------------------------------------------- the footprint is a lie
-
-/// **The headline.** A handler registered `db.read[users]` that writes on every
-/// call is recorded as a read, reported as a read, and scheduled as a read.
-///
-/// The check ADR 0011 §7 calls "the only mechanical defence in the system
-/// against a footprint that under-reports" is installed here at its tightest
-/// possible setting — exactly the atom the registration named — and it passes,
-/// because the atom it compares is the one the *registry* computed. A handler
-/// has no way to name an atom, so §7 can only ever catch a disagreement between
-/// the registry and inference, never a handler that did more than it declared.
+/// **The headline.**
 #[test]
 fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     let compiled = compile(READS);
@@ -183,13 +137,8 @@ fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     );
 }
 
-/// The same fact stated where it is dangerous: two entry points, one machine,
-/// and a handler whose Rust-side state carries between them.
-///
-/// M6's world isolation says a test cannot observe another test's writes. It is
-/// true of everything the world holds — and a host handler's state is not in the
-/// world. The second test here **passes only because** it observed the first
-/// one's mutation, and both are green.
+/// The same fact stated where it is dangerous: two entry points, one machine, and a handler whose
+/// Rust-side state carries between them.
 #[test]
 fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
     let compiled = compile(READS);
@@ -202,9 +151,8 @@ fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
         .expect("the second test is green *because* it saw the first one's write");
 
     assert_eq!(handler.writes.load(Ordering::SeqCst), 2);
-    // And the machine's own reset is honest about everything it owns: the
-    // per-entry-point counters really did restart. The leak is not in the
-    // machine, which is exactly why nothing in the machine can see it.
+    // And the machine's own reset is honest about everything it owns: the per-entry-point counters
+    // really did restart.
     assert_eq!(machine.host_ops(), 0, "`get` is registered `Repeatable`");
     assert_eq!(
         machine.host_use().expect("reached the host").operations,
@@ -214,11 +162,6 @@ fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
 }
 
 /// The narrow-resource lie, which is the same hole one level down.
-///
-/// One registration for `db.read[users]` and one for `db.write[orders]`, each
-/// served by a handler that touches the *other* one's state. Their declared
-/// footprints do not conflict — different resources — so nothing in the language
-/// would ever serialize them, and the coupling is total.
 #[test]
 fn documents_a_narrow_registration_may_touch_a_resource_it_never_named() {
     /// Answers from a counter that another registration also owns.
@@ -284,22 +227,8 @@ test/nondet "writes orders" { assert_eq(writers(), 2) }
     assert_eq!(cell.load(Ordering::SeqCst), 2);
 }
 
-// ------------------------------------------------------ declarations nobody reads
-
-/// `blocking: true` means "the work leaves this thread and a token comes back",
-/// and the boundary now holds a handler to the half of that which is checkable.
-///
-/// ADR 0011 §2: a handler declared `blocking` is dispatched to a dedicated pool
-/// and answers `Pending` immediately, so a handler that calls a blocking library
-/// cannot stall the tasks it is sharing a thread with. A value returned from
-/// `call` is this thread having done the work, which is exactly the stall the
-/// declaration promised not to cause — so it is `E0428` rather than a green run
-/// over a scheduler that was blocked and never said so.
-///
-/// What this does **not** catch is the other direction: a handler declared
-/// `blocking: false` that blocks anyway. Nothing can — there is no budget on
-/// `call` and no cancellation in W1 — and ADR 0008 §8 says so rather than
-/// implying a defence that does not exist.
+/// `blocking: true` means "the work leaves this thread and a token comes back", and the boundary
+/// now holds a handler to the half of that which is checkable.
 #[test]
 fn a_blocking_handler_that_answers_a_value_inline_is_refused() {
     struct Inline;
@@ -330,25 +259,22 @@ test/nondet "blocking, allegedly" { assert_eq(net.send[socket](1), 1) }
         d.message
     );
 
-    // The same handler, declared honestly, is green: the check is about the
-    // declaration disagreeing with the answer, not about answering a value.
+    // The same handler, declared honestly, is green: the check is about the declaration disagreeing
+    // with the answer, not about answering a value.
     let mut machine = compiled.bound(vec![(any("net", "send"), Arc::new(Inline))]);
     machine.eval_test(0).expect("green");
 }
 
-/// And the residual, stated so nobody reads `E0428` as more than it is: the
-/// machine still calls **every** handler's `call` on its own thread, `blocking`
-/// or not. The flag obliges the handler to dispatch and return, and dispatching
-/// is the handler's own work — `ply-eval` cannot do it, because a `Value` is not
-/// `Send` and a handler's job may be.
+/// And the residual, stated so nobody reads `E0428` as more than it is: the machine still calls
+/// **every** handler's `call` on its own thread, `blocking` or not.
 #[test]
 fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
     struct Reports(AtomicU64);
 
     impl HostHandler for Reports {
         fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-            // A `ThreadId` is opaque, so identity is established by hashing it
-            // into a `u64` the test can compare against its own.
+            // A `ThreadId` is opaque, so identity is established by hashing it into a `u64` the
+            // test can compare against its own.
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&std::thread::current().id(), &mut hasher);
             self.0
@@ -360,8 +286,8 @@ fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
         }
     }
 
-    /// Resolves whatever it is handed, which is what a dispatched job that has
-    /// already finished looks like.
+    /// Resolves whatever it is handed, which is what a dispatched job that has already finished
+    /// looks like.
     struct Resolves;
 
     impl HostRuntime for Resolves {
@@ -404,12 +330,6 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
 }
 
 /// A handler that unwinds takes the machine with it.
-///
-/// This is the right layering — `ply_test` wraps every entry point in
-/// `catch_unwind` and reports `Status::Panicked` — but it is worth pinning that
-/// `ply-eval` itself offers no guard, because every *other* consumer of
-/// `Machine` (`ply run`, `ply-corpus`) is then responsible for its own, and a
-/// panic there is a process exit rather than a diagnostic.
 #[test]
 fn documents_a_panicking_handler_unwinds_out_of_the_machine() {
     struct Panics;
@@ -443,16 +363,8 @@ test/nondet "panics" { assert_eq(net.send[socket](1), 1) }
     );
 }
 
-// --------------------------------------------------- a handler answering nonsense
-
-/// A host answer is not type-checked against the operation it answers, so a
-/// handler can inject a value the program's own types say is impossible.
-///
-/// The good news, and the reason this is not a blocker: every consumer of a
-/// value in the evaluator refuses a wrong one with a real diagnostic rather than
-/// a panic. The bad news is the diagnostic's span and text, which accuse the Ply
-/// source of a type error inference already proved it does not have — and
-/// nothing in the message names the handler.
+/// A host answer is not type-checked against the operation it answers, so a handler can inject a
+/// value the program's own types say is impossible.
 #[test]
 fn documents_a_wrongly_typed_host_answer_is_a_diagnostic_that_blames_the_program() {
     struct Wrong;
@@ -483,17 +395,6 @@ test/nondet "arithmetic on a host answer" { assert_eq(net.send[socket](1) + 1, 2
 }
 
 /// A fabricated task handle is refused rather than used as an index.
-///
-/// `Value::Task` is a key into a scheduler's table and `TaskId`'s field is
-/// public, so a handler can mint one for a task that does not exist.
-///
-/// It used to be the scheduler that caught this, answering `E0413` instead of
-/// indexing — a diagnostic rather than an out-of-bounds panic, but only for a
-/// forged handle the program went on to `join`. ADR 0017 §2's boundary check
-/// now refuses the answer itself, so the handle never enters the program and
-/// the refusal names the handler that minted it. `E0413` is unchanged and still
-/// what a *real* handle outliving its region gets; `simulation.rs` and
-/// `resumption_semantics_audit.rs` are where that is pinned.
 #[test]
 fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
     struct Fake;
@@ -533,19 +434,8 @@ test/nondet "a handle from nowhere" {
     );
 }
 
-/// The defence that does hold, and the one worth keeping: a cell cannot be
-/// written into a host operation's declared signature at all.
-///
-/// A handler is `Send + Sync` and a `Value` is not, so nothing can be held in a
-/// handler's own fields — but a thread local can hold one, and the test runner
-/// reuses a worker thread across tests. If a `Cell` could cross the boundary, a
-/// handler could hand test *b* a slot into test *a*'s region stack, and two
-/// stacks bump from the same floor, so it would silently alias a live cell
-/// rather than dangle.
-///
-/// It cannot, and by two independent checks: the region on a `Cell` has nothing
-/// to unify with in an operation's signature, and a closure carrying cell access
-/// carries a row an operation argument's declared row does not admit.
+/// The defence that does hold, and the one worth keeping: a cell cannot be written into a host
+/// operation's declared signature at all.
 #[test]
 fn a_cell_cannot_cross_a_host_operations_signature() {
     let cell = compile_error(
@@ -588,15 +478,7 @@ test/nondet "smuggle a closure over a cell" {
     );
 }
 
-// --------------------------------------------------- escaping hermetic mode
-
 /// Every route into the boundary that is not a bare `perform` in a test body.
-///
-/// The hermetic default is the guarantee ADR 0008 §4 rests everything on, so the
-/// question is not whether one path is closed but whether *all* of them are. A
-/// perform reaches the boundary through exactly one place — `Stack::find_handler`
-/// answering `None` — which is why this holds, and pinning it is what stops a
-/// second route being added.
 #[test]
 fn no_indirection_reaches_the_host_in_a_hermetic_run() {
     const CASES: [(&str, &str); 6] = [
@@ -664,10 +546,9 @@ fn helper(k: Int) -> Int / {{net.write[socket]}} = net.send[socket](k)
     }
 }
 
-/// A `simulate` region is the one route that must be refused even *with*
-/// `--host`, and it must be refused before the handler is called: DPOR re-runs
-/// the region once per interleaving, so a socket inside one sends a packet per
-/// schedule explored and then calls the total a proof.
+/// A `simulate` region is the one route that must be refused even *with* `--host`, and it must be
+/// refused before the handler is called: DPOR re-runs the region once per interleaving, so a socket
+/// inside one sends a packet per schedule explored and then calls the total a proof.
 #[test]
 fn a_region_never_reaches_the_host_bound_or_not() {
     let compiled = compile(
@@ -702,9 +583,9 @@ test/nondet "a socket inside a region" { simulate { assert_eq(helper(1), 1) } }
     }
 }
 
-/// A registration for an effect the program never declares is silently idle when
-/// it is `Any` — by design, so that one registry can be compiled into every
-/// program — and the thing worth checking is that idle really means unreachable.
+/// A registration for an effect the program never declares is silently idle when it is `Any` — by
+/// design, so that one registry can be compiled into every program — and the thing worth checking
+/// is that idle really means unreachable.
 #[test]
 fn an_idle_any_registration_contributes_no_atom_and_serves_nothing() {
     let compiled = compile(
@@ -746,13 +627,8 @@ test/nondet "only net" { assert_eq(net.send[socket](1), 1) }
     assert!(!binding.serves(&atom("t.postgres", "rows", Mode::Read)));
 }
 
-/// The linearity counter is what stands between a multi-shot handler and a
-/// packet sent twice, and `Linearity::Repeatable` is a handler author's
-/// unverifiable claim that replay costs nothing.
-///
-/// A hostile handler declaring `Repeatable` over an irreversible operation gets
-/// the replay, and the count below is what it costs. Nothing detects it, and the
-/// column is printed by `ply hosts` for exactly that reason.
+/// The linearity counter is what stands between a multi-shot handler and a packet sent twice, and
+/// `Linearity::Repeatable` is a handler author's unverifiable claim that replay costs nothing.
 #[test]
 fn documents_a_false_repeatable_claim_buys_a_replay_and_nothing_notices() {
     let compiled = compile(
@@ -798,14 +674,8 @@ test/nondet "resumed three times over a send" {
     );
 }
 
-/// The claim a caller states once per entry point is never cleared, and the test
-/// runner never states it at all.
-///
-/// Both halves matter. `ply_test` builds one `Machine` per worker and runs many
-/// tests on it, so a footprint claim that outlives its entry point would be
-/// checked against the wrong row — and today the point is moot only because
-/// nothing in `ply-test` calls `set_declared_footprint`, which leaves E0427
-/// unarmed in the one command that runs a corpus.
+/// The claim a caller states once per entry point is never cleared, and the test runner never
+/// states it at all.
 #[test]
 fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
     let compiled = compile(READS);
@@ -814,8 +684,7 @@ fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
 
     machine.set_declared_footprint(Footprint::from_atoms([atom("t.db", "users", Mode::Read)]));
     machine.eval_test(0).expect("green under its own claim");
-    // A second entry point, whose row nobody restated, is still judged by the
-    // first one's claim.
+    // A second entry point, whose row nobody restated, is still judged by the first one's claim.
     machine.set_declared_footprint(Footprint::empty());
     assert_eq!(
         diagnostic(machine.eval_test(1)).code,
@@ -824,19 +693,7 @@ fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
     assert_eq!(handler.writes.load(Ordering::SeqCst), 1);
 }
 
-/// A handler may refuse, and it does not get to choose the class its failure is
-/// reported under.
-///
-/// The classification codes are the machine-readable contract with an agent
-/// consumer, and three of them — `INTERNAL_ERROR` and the two divergence codes —
-/// mean "the run watched its own invariants break". `ply_test` reads them as a
-/// defect in Ply: the failure becomes `Status::Panicked`, bisection is skipped,
-/// and the reader is told to file a bug against the language. A handler minting
-/// one has redirected the reader away from itself.
-///
-/// So the boundary takes the classification back. The message, the labels and
-/// the notes are the handler's and survive intact; the code becomes
-/// `RUNTIME_ERROR`, and two notes say what was claimed and who claimed it.
+/// A handler may refuse, and it does not get to choose the class its failure is reported under.
 #[test]
 fn a_handler_may_not_choose_the_code_its_failure_is_classified_under() {
     struct Impersonates(&'static str);
@@ -903,9 +760,9 @@ test/nondet "a handler that lies about why" { assert_eq(net.send[socket](1), 1) 
     }
 }
 
-/// And an ordinary refusal is left alone except for the attribution, which every
-/// host failure gets: a reader must never have to guess whether a diagnostic
-/// came from the evaluator or from a member of the trusted computing base.
+/// And an ordinary refusal is left alone except for the attribution, which every host failure gets:
+/// a reader must never have to guess whether a diagnostic came from the evaluator or from a member
+/// of the trusted computing base.
 #[test]
 fn an_unreserved_code_from_a_handler_is_kept_and_attributed() {
     struct Refuses;
@@ -950,16 +807,7 @@ test/nondet "a handler that refuses honestly" { assert_eq(net.send[socket](1), 1
     );
 }
 
-/// The one blocking failure the runtime *can* see, pinned because it is the
-/// only one.
-///
-/// Inside a production region a task that parks on a token nothing resolves is
-/// caught by two budgets — the fruitless-park count and the deadlock check —
-/// so a handler that answers `Pending` forever is a diagnostic rather than a
-/// hang. Outside a region the same handler reaches `HostRuntime::block_on`,
-/// which has no budget at all, and a handler that blocks *inside* `call` never
-/// reaches the runtime in the first place. Those two have no defence and no
-/// test can have one: they hang.
+/// The one blocking failure the runtime *can* see, pinned because it is the only one.
 #[test]
 fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
     struct NeverReady;
@@ -981,8 +829,8 @@ fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
         }
     }
 
-    /// A reactor that always wakes and never resolves: the shape a broken host
-    /// runtime takes, and the shape a livelock takes.
+    /// A reactor that always wakes and never resolves: the shape a broken host runtime takes, and
+    /// the shape a livelock takes.
     struct NeverResolves;
 
     impl HostRuntime for NeverResolves {

@@ -1,40 +1,11 @@
-//! Which tables a statement touches, and a refusal for every statement whose
-//! answer this cannot compute.
-//!
-//! This is the file the milestone is about. A `db.query[orders]` call site
-//! writes one label; the statement may join three tables, and nothing in the
-//! type system can see it because the SQL is a `String`. So the driver computes
-//! the table set from the text, once per statement at prepare time, and the
-//! answer is what refuses an undeclared table before a row moves and what the
-//! machine checks the handler's report against afterwards.
-//!
-//! Two rules decide every line below:
-//!
-//! - **Conservative in the safe direction, by construction.** A construct this
-//!   scanner does not model is [`codes::DB_STATEMENT_REFUSED`] naming the byte
-//!   offset and the token — never an empty table set and never a silent skip. A
-//!   defect here is a refusal to run rather than a footprint that under-reports,
-//!   because an under-reporting footprint corrupts scheduling and isolation with
-//!   a green result rather than a red one. The residual is a defect that
-//!   *mis*-recognises a construct, which can still under-report; that is why the
-//!   scanner is disclosed in `ply hosts` and why the differential test against
-//!   `EXPLAIN (GENERIC_PLAN)` exists.
-//! - **Over-reporting costs concurrency; under-reporting costs correctness.** A
-//!   partition the planner prunes, a branch that is constant-false, an arm of a
-//!   `UNION` that returns nothing — all of them are tables this names and
-//!   `EXPLAIN` does not, and that is the direction to be wrong in.
-//!
-//! It is Rust rather than Ply for one reason that does not apply to W3's HTTP
-//! framing: the driver needs the answer and the driver is Rust, so a Ply
-//! implementation would mean two scanners, and two parsers that disagree is
-//! exactly the hazard being avoided — here the disagreement would be between the
-//! footprint a test observes and the footprint the scheduler was given.
+//! Which tables a statement touches, and a refusal for every statement whose answer this cannot
+//! compute.
 
 use ply_span::{Diagnostic, Span, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// Statement shapes W4 admits. Everything else is a refusal.
+/// Statement shapes W4 admits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Select,
@@ -55,27 +26,19 @@ impl Kind {
         }
     }
 
-    /// Whether the statement can change a row. `query` over one of these is the
-    /// call site claiming a read of something that writes, and the driver
-    /// refuses it rather than recording a `read` atom for a `write`.
+    /// Whether the statement can change a row.
     pub fn writes(self) -> bool {
         matches!(self, Kind::Insert | Kind::Update | Kind::Delete)
     }
 }
 
-/// The accepted statement set, as `ply hosts` prints it. A reviewer reads this
-/// line to know what the trusted computing base will run at all.
+/// The accepted statement set, as `ply hosts` prints it.
 pub const ACCEPTED: &str = "select insert update delete values with";
 
 /// What one statement touches.
-///
-/// Split by mode rather than pooled, because an `update … from other` writes one
-/// relation and reads another, and a row that called both writes would serialise
-/// every reader of `other` against it for nothing.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Tables {
-    /// Relations the statement can change. At most one for the shapes admitted,
-    /// plus any a data-modifying CTE names.
+    /// Relations the statement can change.
     pub written: BTreeSet<String>,
     /// Relations it reads and does not change.
     pub read: BTreeSet<String>,
@@ -122,14 +85,7 @@ impl fmt::Display for Scan {
     }
 }
 
-/// Functions whose value is not a function of the program's state, refused in
-/// statement text.
-///
-/// The workaround is the point rather than an inconvenience: a timestamp comes
-/// from `clock.now()` **as a parameter**, which puts the nondeterminism in the
-/// row where `E0412` can see it instead of hiding it inside a string. A `now()`
-/// spliced into SQL is a `det` test that reads a different value on every run
-/// and a compiler that cannot tell.
+/// Functions whose value is not a function of the program's state, refused in statement text.
 const NONDETERMINISTIC: &[&str] = &[
     "now",
     "random",
@@ -146,19 +102,6 @@ const NONDETERMINISTIC: &[&str] = &[
 ];
 
 /// The functions a statement may call.
-///
-/// An allowlist rather than a denylist, and that is the whole of §2.4's "refuses
-/// everything else" applied one level below the statement shape. A function call
-/// is the one place an admitted statement can reach outside its own table set:
-/// `set_config` rebinds the `search_path` every later borrower of the pooled
-/// connection inherits, `pg_advisory_lock` holds a session lock the next borrower
-/// blocks on, `pg_read_file` reads the server's disk — and every one of them
-/// reports the footprint of the relation it was selected `from`, which is what
-/// two read-only endpoints are scheduled side by side on.
-///
-/// Everything here is a function of its arguments alone: no session state, no
-/// catalogue, no clock, no relation. Adding a name is a change to the trusted
-/// computing base and a line in a diff.
 const CALLABLE: &[&str] = &[
     // Aggregates the scanner models a footprint for.
     "avg",
@@ -217,8 +160,8 @@ const CALLABLE: &[&str] = &[
     "translate",
     "trim",
     "upper",
-    // json / jsonb, encode-side only: every set-returning one is a `from` item
-    // and is refused there.
+    // json / jsonb, encode-side only: every set-returning one is a `from` item and is refused
+    // there.
     "json_build_array",
     "json_build_object",
     "jsonb_array_length",
@@ -233,15 +176,9 @@ const CALLABLE: &[&str] = &[
 ];
 
 /// Words that may precede a `(` without being a function call.
-///
-/// Syntax rather than functions: `array(select …)` is a subquery constructor,
-/// `cast(x as int)` is a cast, `exists (…)` and `row(…)` are expressions. Every
-/// other spelling is covered by [`is_reserved`], which is where `not (…)`,
-/// `in (…)` and `case … end` are already keywords.
 const SYNTACTIC: &[&str] = &["array", "cast", "exists", "row", "any", "some", "nullif"];
 
-/// Words that end an expression at depth zero. Collected once so that a clause
-/// added to the grammar cannot be added to the parser and forgotten here.
+/// Words that end an expression at depth zero.
 const CLAUSE_WORDS: &[&str] = &[
     "from",
     "where",
@@ -295,20 +232,16 @@ pub fn scan(sql: &str, span: Span) -> Result<Scan, Diagnostic> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TokenKind {
-    /// An identifier or a keyword. `text` is folded to lower case unless it was
-    /// double-quoted, which is postgres's own rule and the reason `"Items"` and
-    /// `items` are different relations.
+    /// An identifier or a keyword.
     Word,
     Number,
-    /// A string literal, in any of postgres's spellings. Its contents are never
-    /// looked at: the whole point is that a `;` inside one is not a statement
-    /// separator.
+    /// A string literal, in any of postgres's spellings.
     Text,
-    /// `$1`. Not a value: the driver never sees one become syntax.
+    /// `$1`.
     Placeholder,
     Punct,
-    /// Its own kind because it is the one token whose presence is always a
-    /// refusal, and the message for it is specific.
+    /// Its own kind because it is the one token whose presence is always a refusal, and the message
+    /// for it is specific.
     Semicolon,
 }
 
@@ -355,10 +288,9 @@ fn tokenize(sql: &str, span: Span) -> Result<Vec<Token>, Diagnostic> {
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // Postgres nests block comments, so a naive scan to the first
-                // `*/` would leave the tail of an outer comment as statement
-                // text — which is a construct the parser would then refuse, but
-                // for the wrong reason and at the wrong offset.
+                // Postgres nests block comments, so a naive scan to the first `*/` would leave the
+                // tail of an outer comment as statement text — which is a construct the parser
+                // would then refuse, but for the wrong reason and at the wrong offset.
                 let start = i;
                 let mut nesting = 1usize;
                 i += 2;
@@ -517,10 +449,7 @@ fn text_token(start: usize, end: usize) -> Token {
     }
 }
 
-/// From the opening quote to just past the closing one. `''` is an escaped
-/// quote in every spelling; `\'` is one only in an `E''` string, and treating it
-/// as one elsewhere would end a literal early and hand the rest of it to the
-/// parser as statement text.
+/// From the opening quote to just past the closing one.
 fn string_literal(
     bytes: &[u8],
     open: usize,
@@ -539,8 +468,7 @@ fn string_literal(
     }
 }
 
-/// `$tag$ … $tag$`, where the tag may be empty. The body is opaque, which is
-/// what makes a `;` inside a function body not a statement separator.
+/// `$tag$ … $tag$`, where the tag may be empty.
 fn dollar_quoted(sql: &str, open: usize, span: Span) -> Result<usize, Diagnostic> {
     let bytes = sql.as_bytes();
     let mut j = open + 1;
@@ -563,9 +491,8 @@ fn dollar_quoted(sql: &str, open: usize, span: Span) -> Result<usize, Diagnostic
 
 // --- The parser -------------------------------------------------------------
 
-/// A statement nested this deep is a program the scanner will not vouch for,
-/// and a bound here is what keeps a pathological input from recursing the host's
-/// own stack.
+/// A statement nested this deep is a program the scanner will not vouch for, and a bound here is
+/// what keeps a pathological input from recursing the host's own stack.
 const MAX_NESTING: usize = 32;
 
 struct Parser<'a> {
@@ -631,9 +558,9 @@ impl<'a> Parser<'a> {
             let recursive = self.eat_word("recursive");
             loop {
                 let name = self.identifier("a common table expression's name")?;
-                // A `recursive` CTE names itself inside its own body, so the
-                // name has to be in scope before the body is walked or the
-                // self-reference reads as a relation the database does not have.
+                // A `recursive` CTE names itself inside its own body, so the name has to be in
+                // scope before the body is walked or the self-reference reads as a relation the
+                // database does not have.
                 if recursive {
                     ctes.insert(name.clone());
                 }
@@ -649,9 +576,8 @@ impl<'a> Parser<'a> {
                 let inner = self.statement_within(&ctes)?;
                 self.expect_punct(")")?;
                 tables.absorb(inner.tables);
-                // Resolved to its own sources: a later reference to this name is
-                // the CTE and not a relation, and the relations it read are
-                // already in the set.
+                // Resolved to its own sources: a later reference to this name is the CTE and not a
+                // relation, and the relations it read are already in the set.
                 ctes.insert(name);
                 if !self.eat_punct(",") {
                     break;
@@ -728,9 +654,8 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        // The tail clauses hold expressions and nothing that introduces a
-        // relation of its own except a scalar subquery, which `skip_expr`
-        // recurses into.
+        // The tail clauses hold expressions and nothing that introduces a relation of its own
+        // except a scalar subquery, which `skip_expr` recurses into.
         if self.eat_word("order") {
             self.expect_word("by")?;
             self.skip_expr(
@@ -751,9 +676,8 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at_word("fetch") || self.at_word("for") {
-                // `FOR UPDATE` takes a row lock, which is a write in every sense
-                // that matters to a conflict graph, and the scanner has no way
-                // to say so through a `read` atom.
+                // `FOR UPDATE` takes a row lock, which is a write in every sense that matters to a
+                // conflict graph, and the scanner has no way to say so through a `read` atom.
                 let t = self.peek().expect("checked");
                 let (start, text) = (t.start, t.display(self.sql));
                 return Err(self.refuse(
@@ -889,9 +813,7 @@ impl<'a> Parser<'a> {
                 let inner = self.statement_within(ctes)?;
                 tables.absorb(inner.tables);
             } else {
-                // A parenthesised join. Nothing new is reachable through it, but
-                // it is a shape this parser does not model, and modelling half of
-                // it is how a relation goes unseen.
+                // A parenthesised join.
                 let start = self.tokens[self.at.saturating_sub(1)].start;
                 return Err(self.refuse(
                     start,
@@ -905,8 +827,8 @@ impl<'a> Parser<'a> {
         }
         self.eat_word("only");
         let name = self.qualified_name("a table name")?;
-        // `f(x)` in a from position is a set-returning function, whose relations
-        // are inside a function body no scanner can see.
+        // `f(x)` in a from position is a set-returning function, whose relations are inside a
+        // function body no scanner can see.
         if self.peek().is_some_and(|t| t.is_punct("(")) {
             let start = self.peek().expect("checked").start;
             return Err(self.refuse(
@@ -1014,14 +936,6 @@ impl<'a> Parser<'a> {
     // --- pieces ---
 
     /// The select list, one target at a time.
-    ///
-    /// `AS` is a clause boundary everywhere else in the grammar and is an output
-    /// column name here, so the target list cannot be one `skip_expr`: walking it
-    /// as one stops at the first alias, never eats the `from`, and comes back
-    /// with an empty table set. That is the shape `derive row` needs whenever a
-    /// statement joins two tables, and the shape `E0433`'s own advice — "alias
-    /// one of them: `select a.id as a_id, b.id as b_id`" — tells a reader to
-    /// write.
     fn target_list(
         &mut self,
         ctes: &BTreeSet<String>,
@@ -1030,8 +944,8 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_expr(ctes, tables, CLAUSE_WORDS, true)?;
             if self.eat_word("as") {
-                // Any word: postgres reserves almost nothing after `AS`, and a
-                // refusal here would be the scanner inventing a rule.
+                // Any word: postgres reserves almost nothing after `AS`, and a refusal here would
+                // be the scanner inventing a rule.
                 self.identifier("an output column name")?;
             }
             if !self.eat_punct(",") {
@@ -1040,14 +954,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Whether the word at `self.at` opens a function call, and whether that call
-    /// is one the trusted computing base will run.
-    ///
-    /// This is the second half of §2.4. The first decides statement *shapes*; a
-    /// call in an expression is inside every shape the scanner admits, and it is
-    /// the only way an admitted statement reaches state the footprint cannot
-    /// name — the connection's own session, which is the thing two host-backed
-    /// tests share.
+    /// Whether the word at `self.at` opens a function call, and whether that call is one the
+    /// trusted computing base will run.
     fn check_call(&self) -> Result<(), Diagnostic> {
         let token = self.peek().expect("called with a token");
         if token.kind != TokenKind::Word || token.quoted {
@@ -1071,12 +979,8 @@ impl<'a> Parser<'a> {
             .note(format!("the scanner calls: {}", CALLABLE.join(" "))))
     }
 
-    /// Walk an expression, following any subquery inside it and stopping at the
-    /// next clause keyword at depth zero.
-    ///
-    /// A subquery is followed rather than refused because following it keeps the
-    /// table set a superset, and refusing `where id in (select …)` would make
-    /// half the statements a service writes inexpressible for no gain.
+    /// Walk an expression, following any subquery inside it and stopping at the next clause keyword
+    /// at depth zero.
     fn skip_expr(
         &mut self,
         ctes: &BTreeSet<String>,
@@ -1151,13 +1055,6 @@ impl<'a> Parser<'a> {
     }
 
     /// `[schema.]name`, answering the **last** segment.
-    ///
-    /// A resource label in Ply is a ground identifier, so `public.items` and
-    /// `items` are one resource: the schema qualifies where the relation lives
-    /// and not what it is. Two relations of one name in two schemas would
-    /// therefore share a label, which is stated in `ply hosts` rather than
-    /// silently true — a `search_path` with two schemas is outside what W4
-    /// models.
     fn qualified_name(&mut self, what: &str) -> Result<String, Diagnostic> {
         let mut name = self.identifier(what)?;
         while self.peek().is_some_and(|t| t.is_punct("."))
@@ -1288,11 +1185,6 @@ fn unterminated(span: Span, offset: usize, what: &str) -> Diagnostic {
 }
 
 /// Words that cannot be an alias without `AS`.
-///
-/// Deliberately over-inclusive rather than postgres's exact reserved list: a
-/// word wrongly treated as reserved makes the parser expect a clause and refuse,
-/// which is loud, while a clause keyword wrongly taken as an alias would swallow
-/// the clause and lose whatever relation it named.
 fn is_reserved(word: &str) -> bool {
     CLAUSE_WORDS.contains(&word)
         || matches!(

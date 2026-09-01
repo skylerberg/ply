@@ -1,13 +1,4 @@
 //! Building the list of claims a run has to discharge.
-//!
-//! One obligation per `ensures` clause and one per law. A `requires` is **not**
-//! one: it is a filter on the domain of the `ensures` clauses beside it, not a
-//! contract checked at every call, and a reader of a Ply spec must not read it
-//! as "the compiler enforces this".
-//!
-//! The order is a property of the program — every definition in load order, then
-//! every law — so two runs produce one artifact and `--jobs 1` and `--jobs 16`
-//! agree byte for byte.
 
 use ply_core::{CheckOutput, LawBinder, Type};
 use ply_hash::HashOutput;
@@ -18,25 +9,12 @@ use std::collections::HashMap;
 
 pub struct Collected {
     pub obligations: Vec<Obligation>,
-    /// Trouble that cost the run an obligation. Never empty silently: an
-    /// obligation that was not collected is a claim nobody checked, and
-    /// reporting a clean run with one missing is exactly the over-claim this
-    /// milestone exists to avoid.
+    /// Trouble that cost the run an obligation.
     pub warnings: Vec<Diagnostic>,
 }
 
-/// A project's own view of a checked program: the definitions and laws declared
-/// by the modules that ship with the compiler removed.
-///
-/// The same rule and the same reason as `ply test`'s (ADR 0012 §1). A project's
-/// obligation count and the denominator of its coverage line must not move
-/// because the compiler was upgraded, for claims the project did not write and
-/// cannot fix; the stdlib's own laws are discharged by the compiler's suite.
-/// `--std` keeps them, for someone debugging the stdlib itself.
-///
-/// `LawInfo::index` is a position in the *unfiltered* list and is what
-/// `HashOutput::laws` is keyed by, so it is carried across untouched rather than
-/// renumbered.
+/// A project's own view of a checked program: the definitions and laws declared by the modules that
+/// ship with the compiler removed.
 pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, CheckOutput> {
     if std {
         return std::borrow::Cow::Borrowed(check);
@@ -63,9 +41,9 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
     };
 
     for (name, info) in &check.defs {
-        // A definition carrying only `requires` has no obligation: a
-        // precondition is a filter on the domain of the `ensures` clauses beside
-        // it, and on its own it claims nothing to discharge.
+        // A definition carrying only `requires` has no obligation: a precondition is a filter on
+        // the domain of the `ensures` clauses beside it, and on its own it claims nothing to
+        // discharge.
         if !info.spec.iter().any(|s| s.kind == SpecKind::Ensures) {
             continue;
         }
@@ -78,11 +56,9 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
         let binders = clause_binders(def, info);
         let frame = frame_of(&info.footprint);
 
-        // The key is looked up by the clause's position among **all** of the
-        // owner's clauses, because that is what `spec_hash` covers — so
-        // reordering a `requires` past an `ensures` re-opens it. What is
-        // *reported* is the postcondition's own ordinal, which is what a reader
-        // counts.
+        // The key is looked up by the clause's position among **all** of the owner's clauses,
+        // because that is what `spec_hash` covers — so reordering a `requires` past an `ensures`
+        // re-opens it.
         for (ordinal, clause) in info
             .spec
             .iter()
@@ -117,10 +93,9 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
             owner: law.key.clone(),
             kind: ObligationKind::Law,
             span: law.span,
-            // A law is a claim about the definitions it names rather than about
-            // one definition's effects, and its own row is `{}` or `{sim.read}`
-            // — a read of an input no program can write. There is nothing it
-            // could disturb.
+            // A law is a claim about the definitions it names rather than about one definition's
+            // effects, and its own row is `{}` or `{sim.read}` — a read of an input no program can
+            // write.
             frame: Frame::Pure,
             binders: law.binders.clone(),
             guarded: law.has_guard,
@@ -133,15 +108,11 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
 }
 
 /// The owner's parameters, then `result`.
-///
-/// The names come from the AST and the types from the inferred scheme, which is
-/// the only pairing available: a parameter's declared type is optional in the
-/// surface syntax and the checker is what resolved it.
 fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_core::DefInfo) -> Vec<LawBinder> {
     let (params, ret) = match &info.scheme.ty {
         Type::Fn { params, ret, .. } => (params.as_slice(), (**ret).clone()),
-        // A definition with no parameters is still a function of nothing whose
-        // `ensures` speaks about its value.
+        // A definition with no parameters is still a function of nothing whose `ensures` speaks
+        // about its value.
         other => (&[][..], other.clone()),
     };
     let mut binders: Vec<LawBinder> = def

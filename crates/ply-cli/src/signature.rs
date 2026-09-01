@@ -1,15 +1,5 @@
-//! How `ply check --types` renders a signature, and the effect-set provenance
-//! `--explain` adds to it.
-//!
-//! Two rules decide everything here, and both come from ADR 0013 §1.7:
-//!
-//! - **The expansion is printed, always, and the alias never is.** A row is a
-//!   list of atoms wrapped across as many lines as it needs; naming a set in
-//!   place of its atoms would make the reviewing command the one place the
-//!   truth is not written down.
-//! - **The width is fixed rather than the terminal's.** `ply check --types` is
-//!   diffed in review and pinned in tests, so a run in a narrow window and a run
-//!   in a wide one have to produce the same bytes.
+//! How `ply check --types` renders a signature, and the effect-set provenance `--explain` adds to
+//! it.
 
 use ply_core::print::Printer;
 use ply_core::ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
@@ -19,36 +9,28 @@ use ply_syntax::ast::{AtomExpr, Item, ModuleName, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
 use std::collections::{BTreeSet, HashMap};
 
-/// The column a wrapped line may reach, counted from the left edge of the
-/// terminal — so every function below takes the indent it will be printed at
-/// and subtracts it. Deliberately not the terminal's own width: this output is
-/// diffed, so a run in a narrow window and a run in a wide one have to produce
-/// the same bytes.
+/// The column a wrapped line may reach, counted from the left edge of the terminal — so every
+/// function below takes the indent it will be printed at and subtracts it.
 pub const WIDTH: usize = 80;
 
 /// The builtin effect `cell`, which is written bare and resolves to itself.
-/// `ply_core::infer` keeps its own copy for the same reason: it is in no
-/// module's scope, so a lookup for it always fails.
 const CELL: &str = "cell";
 
 /// A signature split at its top-level effect row.
-///
-/// The row is separated because it is the part a reviewer is reading for, it is
-/// the part that grows without bound, and it is the only part that wraps.
 pub struct Split {
     /// Everything up to the row: quantifiers, parameters and result.
     pub head: String,
-    /// `None` for a pure definition — which prints no row at all, so that an
-    /// empty one is the absence of a line rather than a `{}` to skip over.
+    /// `None` for a pure definition — which prints no row at all, so that an empty one is the
+    /// absence of a line rather than a `{}` to skip over.
     pub row: Option<RowText>,
 }
 
-/// A row as the pieces a line filler can place: never a pre-joined string, so
-/// that no atom is ever broken across a line.
+/// A row as the pieces a line filler can place: never a pre-joined string, so that no atom is ever
+/// broken across a line.
 pub struct RowText {
     pub atoms: Vec<String>,
-    /// The row variable, already named by the same [`Printer`] the head was
-    /// printed with, so `{net.write[conn] | e}` and `<s | e>` agree.
+    /// The row variable, already named by the same [`Printer`] the head was printed with, so
+    /// `{net.write[conn] | e}` and `<s | e>` agree.
     pub tail: Option<String>,
 }
 
@@ -56,8 +38,8 @@ impl RowText {
     fn of_row(row: &Row, printer: &mut Printer) -> RowText {
         RowText {
             atoms: row.atoms.iter().map(|a| a.to_string()).collect(),
-            // A tail alone prints as its own name, which is how the name this
-            // printer chose is read back out of it.
+            // A tail alone prints as its own name, which is how the name this printer chose is read
+            // back out of it.
             tail: row.tail.map(|v| {
                 printer.row(&Row {
                     atoms: BTreeSet::new(),
@@ -75,10 +57,6 @@ impl RowText {
     }
 }
 
-/// Splits a scheme into its head and its top-level row.
-///
-/// One [`Printer`] does both, so a row variable is named once and the head and
-/// the row cannot disagree about what `e` is.
 pub fn split(scheme: &Scheme) -> Split {
     let mut printer = Printer::new();
     match &scheme.ty {
@@ -110,11 +88,8 @@ pub fn split(scheme: &Scheme) -> Split {
     }
 }
 
-/// Places `items` across as many lines as they need, `first` before the first
-/// and `rest` before every other.
-///
-/// An item is never split: an atom broken across a line is a name a reader
-/// cannot search for, which defeats the only reason the row is printed.
+/// Places `items` across as many lines as they need, `first` before the first and `rest` before
+/// every other.
 pub fn fill(first: &str, rest: &str, items: &[String], suffix: &str, width: usize) -> Vec<String> {
     if items.is_empty() {
         return vec![format!("{first}{suffix}")];
@@ -132,8 +107,8 @@ pub fn fill(first: &str, rest: &str, items: &[String], suffix: &str, width: usiz
         } else {
             format!("{item}, ")
         };
-        // The separator's trailing space ends the line rather than overflowing
-        // it, so a row that fits exactly is not wrapped for one blank column.
+        // The separator's trailing space ends the line rather than overflowing it, so a row that
+        // fits exactly is not wrapped for one blank column.
         let printed = piece.chars().count() - usize::from(!last);
         let fresh = if lines.is_empty() { opened } else { start };
         if col > fresh && col + printed > width {
@@ -149,9 +124,6 @@ pub fn fill(first: &str, rest: &str, items: &[String], suffix: &str, width: usiz
 }
 
 /// The lines one definition contributes to `ply check --types`.
-///
-/// `label_width` aligns the names within a module, so the signatures line up
-/// and the rows hang under them.
 pub fn definition_lines(
     indent: usize,
     label_width: usize,
@@ -161,9 +133,7 @@ pub fn definition_lines(
     let split = split(scheme);
     let mut lines = vec![format!("{label:label_width$} : {}", split.head)];
     if let Some(row) = &split.row {
-        // Under the head, not under the name: the row belongs to the type. A
-        // label wider than the column pushes its own row along with it rather
-        // than leaving the row pointing at the middle of the name above.
+        // Under the head, not under the name: the row belongs to the type.
         let gutter = " ".repeat(label_width.max(label.chars().count()) + 3);
         lines.extend(row_lines(indent, &gutter, row));
     }
@@ -187,17 +157,17 @@ fn row_lines(indent: usize, gutter: &str, row: &RowText) -> Vec<String> {
 /// One `effect set` as `--explain` reports it.
 pub struct EffectSetView {
     pub name: String,
-    /// The expansion, resolved to program-wide atoms and sorted exactly as a
-    /// row is — so that these are the same strings the definitions below print.
+    /// The expansion, resolved to program-wide atoms and sorted exactly as a row is — so that these
+    /// are the same strings the definitions below print.
     pub atoms: Vec<String>,
-    /// Definitions in this module whose written row names it, directly or
-    /// through another set that does.
+    /// Definitions in this module whose written row names it, directly or through another set that
+    /// does.
     pub used_by: usize,
 }
 
 impl EffectSetView {
-    /// The block ADR 0013 §1.7 specifies: the name, the expansion, and how much
-    /// of the module is annotated with it.
+    /// The block ADR 0013 §1.7 specifies: the name, the expansion, and how much of the module is
+    /// annotated with it.
     pub fn lines(&self, indent: usize) -> Vec<String> {
         let mut lines = vec![format!("effect set {}", self.name)];
         lines.extend(fill("  = {", "     ", &self.atoms, "}", WIDTH - indent));
@@ -210,18 +180,16 @@ impl EffectSetView {
     }
 }
 
-/// What a definition's row was *written* as, and what its body actually
-/// performed — the two things the expansion alone cannot show.
+/// What a definition's row was *written* as, and what its body actually performed — the two things
+/// the expansion alone cannot show.
 #[derive(Default)]
 pub struct Provenance {
-    /// The sets its row named, in source order. Empty for a row written out.
+    /// The sets its row named, in source order.
     pub aliases: Vec<String>,
-    /// The body's inferred row, and `None` when it equals the declared one —
-    /// which is every unannotated definition, and would otherwise print the
-    /// same row twice under most of a file.
+    /// The body's inferred row, and `None` when it equals the declared one — which is every
+    /// unannotated definition, and would otherwise print the same row twice under most of a file.
     pub performed: Option<RowText>,
-    /// Declared minus performed: what the annotation admits that the body never
-    /// reaches. ADR 0013 §1.6's two costs, made countable.
+    /// Declared minus performed: what the annotation admits that the body never reaches.
     pub unperformed: Vec<String>,
 }
 
@@ -266,11 +234,6 @@ impl Provenance {
 }
 
 /// What `--explain` adds to one definition's signature.
-///
-/// The body's row is reported only when it is narrower than the declared one.
-/// For an unannotated definition the two are equal by construction, and
-/// printing a row twice under every pure function would bury the one case the
-/// flag exists to surface.
 pub fn provenance(def: &DefInfo) -> Provenance {
     let aliases: Vec<String> = def.row_aliases.iter().map(|a| a.to_string()).collect();
     let unperformed: Vec<String> = def
@@ -287,12 +250,6 @@ pub fn provenance(def: &DefInfo) -> Provenance {
 }
 
 /// Every `effect set` a parsed module declares, in source order.
-///
-/// Nothing outside the AST carries a set: it declares no name a reference can
-/// reach and generates no definition, so a module gate 1 skipped contributes
-/// nothing here. That is why `ply check --explain` completes the parse before
-/// calling this — a table assembled from whatever the cache happened not to
-/// hold would make the reviewing command's output a function of the cache.
 pub fn effect_sets(
     program: &Program,
     resolved: &Resolved,
@@ -321,9 +278,7 @@ pub fn effect_sets(
         return Vec::new();
     }
 
-    // A row names a set directly; that set may include others. A definition
-    // uses every set in that closure, which is what keeps an included set from
-    // reporting zero uses while its atoms are in half the module.
+    // A row names a set directly; that set may include others.
     let mut uses: HashMap<Symbol, usize> = HashMap::new();
     for def in defs {
         let mut reached: BTreeSet<Symbol> = BTreeSet::new();
@@ -359,11 +314,6 @@ pub fn effect_sets(
 }
 
 /// A written atom as the program-wide atom a row would carry.
-///
-/// Mirrors `ply_core::infer::Checker::conv_atom`, and is checked against it:
-/// an effect the program does not declare yields nothing rather than a name
-/// invented here, so a set's printed expansion can never name an atom no
-/// footprint could contain.
 fn atom_of(
     atom: &AtomExpr,
     resolved: &Resolved,
@@ -441,9 +391,9 @@ mod tests {
         assert_eq!(lines, ["endpoint_of  : (Request) -> Response"]);
     }
 
-    /// The property W3's exit criterion rests on: an endpoint's row is legible
-    /// at a glance, which means wrapped at a fixed column with the atoms
-    /// hanging under the first one rather than run off the right edge.
+    /// The property W3's exit criterion rests on: an endpoint's row is legible at a glance, which
+    /// means wrapped at a fixed column with the atoms hanging under the first one rather than run
+    /// off the right edge.
     #[test]
     fn a_long_row_wraps_inside_the_brace_and_aligns() {
         let scheme = fn_scheme(
@@ -475,8 +425,8 @@ mod tests {
         );
     }
 
-    /// A row variable is named once, by one printer, so the quantifier and the
-    /// row cannot drift apart across the split.
+    /// A row variable is named once, by one printer, so the quantifier and the row cannot drift
+    /// apart across the split.
     #[test]
     fn a_row_variable_survives_the_split_with_one_name() {
         let v = RowVar(3);
@@ -532,9 +482,8 @@ mod tests {
         assert_eq!(fill("= {", "   ", &[], "}", 40), ["= {}"]);
     }
 
-    /// The set block is the one place an alias is allowed to appear, and it has
-    /// to carry its expansion beside it or it is the abbreviation without the
-    /// definition.
+    /// The set block is the one place an alias is allowed to appear, and it has to carry its
+    /// expansion beside it or it is the abbreviation without the definition.
     #[test]
     fn the_set_block_names_the_set_and_spells_out_its_expansion() {
         let view = EffectSetView {
@@ -580,9 +529,7 @@ effect set Web
             row_aliases: aliases.iter().copied().map(Symbol::new).collect(),
             constraints: Vec::new(),
             spec: Vec::new(),
-            // Provenance rendering reads the two rows and nothing else. `true`
-            // rather than `false` because it is the value inference constructs
-            // and the value a reader should have to justify lowering.
+            // Provenance rendering reads the two rows and nothing else.
             internally_effectful: true,
             span: ply_span::Span::DUMMY,
         }
@@ -612,8 +559,8 @@ effect set Web
         );
     }
 
-    /// An alias whose expansion the body reaches entirely costs nothing, so
-    /// there is no difference to report and the row is not printed twice.
+    /// An alias whose expansion the body reaches entirely costs nothing, so there is no difference
+    /// to report and the row is not printed twice.
     #[test]
     fn an_alias_the_body_uses_completely_reports_only_how_it_was_written() {
         let exact = Footprint::from_atoms([atom("log", Mode::Write, None)]);
@@ -629,8 +576,7 @@ effect set Web
         assert!(p.lines(5).is_empty());
     }
 
-    /// A row written out by hand can be over-broad too, and the cost is the
-    /// same one. The flag reports it whether or not a set was involved.
+    /// A row written out by hand can be over-broad too, and the cost is the same one.
     #[test]
     fn a_written_row_wider_than_its_body_is_reported_without_any_alias() {
         let p = provenance(&def(

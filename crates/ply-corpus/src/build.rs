@@ -1,8 +1,4 @@
 //! Turning a [`CorpusSpec`] and a seed into a [`Corpus`].
-//!
-//! Three passes: modules and their import DAG, then definitions in dependency
-//! order, then tests. Nothing looks forward, so a definition's callees always
-//! already have a footprint and a weight.
 
 use crate::model::*;
 use crate::rng::Rng;
@@ -87,8 +83,8 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
     corpus
 }
 
-/// A label list long enough for `count` entries: the vocabulary first, then
-/// numbered extensions of it, so a corpus with 40 tables still reads like one.
+/// A label list long enough for `count` entries: the vocabulary first, then numbered extensions of
+/// it, so a corpus with 40 tables still reads like one.
 fn labels(words: &[&str], count: usize) -> Vec<String> {
     (0..count)
         .map(|i| {
@@ -138,8 +134,8 @@ fn plan_modules(spec: &CorpusSpec, root: &Rng) -> Vec<Module> {
     planned
 }
 
-/// Imports run strictly downward through the layers, which is what makes the
-/// module graph acyclic by construction rather than by a check afterwards.
+/// Imports run strictly downward through the layers, which is what makes the module graph acyclic
+/// by construction rather than by a check afterwards.
 fn choose_imports(rng: &mut Rng, planned: &[Module], layer: usize, hubs: &[usize]) -> Vec<usize> {
     if layer == 0 {
         return Vec::new();
@@ -360,8 +356,8 @@ fn choose_shape(
     }
 }
 
-/// Picks `n` distinct callees whose combined weight leaves room under `budget`,
-/// preferring the front of the pool so hubs form. `None` when nothing fits.
+/// Picks `n` distinct callees whose combined weight leaves room under `budget`, preferring the
+/// front of the pool so hubs form.
 fn affordable(
     rng: &mut Rng,
     corpus: &Corpus,
@@ -443,9 +439,8 @@ fn choose_extras(
     extras
 }
 
-/// `pub` is not decoration: a definition is exported exactly when another module
-/// reaches it, so removing an import removes an export and the corpus keeps
-/// being a real test of visibility.
+/// `pub` is not decoration: a definition is exported exactly when another module reaches it, so
+/// removing an import removes an export and the corpus keeps being a real test of visibility.
 fn mark_public(corpus: &mut Corpus) {
     let mut exported = vec![false; corpus.defs.len()];
     for def in &corpus.defs {
@@ -465,15 +460,8 @@ fn mark_public(corpus: &mut Corpus) {
     }
 }
 
-/// Attaches a claim to a share of the definitions, keyed per definition so that
-/// raising the density adds claims rather than moving the ones already there.
-///
-/// The claim is that the result stays inside `prim::clamp`'s range, which every
-/// generated body satisfies because every one of them ends in a `clamp` — so a
-/// corpus is green at any density and the density is free to be the independent
-/// variable of a measurement. A definition that performs an effect nothing hands
-/// it a handler for still gets one: an obligation that cannot be attempted is a
-/// population a measurement needs, not one it should be spared.
+/// Attaches a claim to a share of the definitions, keyed per definition so that raising the density
+/// adds claims rather than moving the ones already there.
 fn attach_claims(spec: &CorpusSpec, root: &Rng, corpus: &mut Corpus) {
     if spec.spec_fraction <= 0.0 {
         return;
@@ -492,10 +480,8 @@ fn attach_claims(spec: &CorpusSpec, root: &Rng, corpus: &mut Corpus) {
     }
 }
 
-/// One specimen per index, cycling the three shapes, so a density of two puts a
-/// linear and a status specimen in every module and a density of three adds the
-/// recursive one. Nothing here is drawn: a tier distribution that moved with the
-/// seed would not be a distribution a measurement could compare across runs.
+/// One specimen per index, cycling the three shapes, so a density of two puts a linear and a status
+/// specimen in every module and a density of three adds the recursive one.
 fn generate_specimens(spec: &CorpusSpec, corpus: &Corpus) -> Vec<Specimen> {
     let mut out = Vec::new();
     for module in &corpus.modules {
@@ -528,10 +514,7 @@ fn specimen_verb(kind: SpecimenKind) -> &'static str {
     }
 }
 
-/// One law per specimen. A `Length` specimen gets a law over the same recursive
-/// definition, so the pair reports the same tier from a clause and from a law;
-/// the other two get a ground claim and a four-point one, which are the two ways
-/// a decision procedure closes something without reasoning about it at all.
+/// One law per specimen.
 fn generate_laws(root: &Rng, corpus: &Corpus) -> Vec<Law> {
     let mut out = Vec::with_capacity(corpus.specimens.len());
     for specimen in &corpus.specimens {
@@ -654,8 +637,8 @@ fn build_test(
         .map(|&r| (r, live.region(r)))
         .collect::<Vec<_>>();
 
-    // A clock atom that no handler discharges survives into the test's own
-    // footprint, and a `det` test may not carry one.
+    // A clock atom that no handler discharges survives into the test's own footprint, and a `det`
+    // test may not carry one.
     let undischarged_clock = footprint
         .iter()
         .any(|a| a.effect == Eff::Clock && !granted.contains(a));
@@ -680,22 +663,14 @@ fn build_test(
 }
 
 /// Concurrency, generated at a chosen conflict density.
-///
-/// The shape is fixed and only the contention varies, because a measurement of
-/// how exploration scales with contention has to hold everything else still:
-/// same task count, same step count, same arithmetic, and the assignment of
-/// tasks to shards as the only independent variable. At density 0 no two steps
-/// conflict and the search should collapse to one interleaving; at density 1
-/// every pair conflicts and there is nothing to prune.
 fn generate_concurrent_tests(
     spec: &CorpusSpec,
     root: &Rng,
     corpus: &Corpus,
 ) -> Vec<ConcurrentTest> {
     let mut out = Vec::with_capacity(spec.concurrent_tests);
-    // One task is a sequential program with a `simulate` around it, and a
-    // corpus of those measures nothing. `validate` refuses the spec; this is
-    // what keeps `generate` alone from emitting a test with no tasks in it.
+    // One task is a sequential program with a `simulate` around it, and a corpus of those measures
+    // nothing.
     if spec.tasks_per_test < 2 || corpus.modules.is_empty() || corpus.shards.is_empty() {
         return out;
     }
@@ -786,10 +761,9 @@ mod tests {
         assert!(generate(&small()).concurrent.is_empty());
     }
 
-    /// The knob's two ends, which are the two ends of the claim: at 0.0 the
-    /// dependence relation has nothing to relate and the search should collapse
-    /// to one interleaving, at 1.0 it relates everything and there is nothing to
-    /// prune. Anything in between is an interpolation of these.
+    /// The knob's two ends, which are the two ends of the claim: at 0.0 the dependence relation has
+    /// nothing to relate and the search should collapse to one interleaving, at 1.0 it relates
+    /// everything and there is nothing to prune.
     #[test]
     fn density_zero_gives_every_task_its_own_shard_and_density_one_gives_them_all_the_same() {
         let disjoint = generate(&concurrent(0.0));
@@ -822,9 +796,8 @@ mod tests {
         assert!(low < mid && mid < high, "{low} {mid} {high}");
     }
 
-    /// Only the shard assignment may move with the density, or a measurement
-    /// across densities is comparing two different programs and attributing the
-    /// difference to contention.
+    /// Only the shard assignment may move with the density, or a measurement across densities is
+    /// comparing two different programs and attributing the difference to contention.
     #[test]
     fn density_changes_the_shard_assignment_and_nothing_else() {
         let disjoint = generate(&concurrent(0.0));
@@ -1030,10 +1003,8 @@ mod tests {
         assert_eq!(generate(&specified(0.0, 0)).specified_defs(), 0);
     }
 
-    /// A claim's stream is keyed by the definition it is attached to, so raising
-    /// the density adds claims rather than moving the ones already there. Without
-    /// it, two densities would be two different specified corpora and a
-    /// measurement across them would be comparing the wrong pair.
+    /// A claim's stream is keyed by the definition it is attached to, so raising the density adds
+    /// claims rather than moving the ones already there.
     #[test]
     fn raising_the_density_only_ever_adds_claims() {
         let thin = generate(&specified(0.3, 0));
@@ -1048,10 +1019,9 @@ mod tests {
         assert!(thick.specified_defs() > thin.specified_defs());
     }
 
-    /// An obligation on an effectful definition cannot be attempted — nothing
-    /// hands `ply prove` a handler — and a corpus that spared itself that
-    /// population would be measuring a tier distribution the real one does not
-    /// have.
+    /// An obligation on an effectful definition cannot be attempted — nothing hands `ply prove` a
+    /// handler — and a corpus that spared itself that population would be measuring a tier
+    /// distribution the real one does not have.
     #[test]
     fn a_claim_on_an_effectful_definition_is_built_as_a_gap() {
         let corpus = generate(&specified(1.0, 0));
@@ -1069,9 +1039,9 @@ mod tests {
         assert!(gaps > 0, "no effectful definition carried a claim");
     }
 
-    /// The tier distribution has to span the table, and it has to do so the same
-    /// way under every seed: a distribution that moved with the seed is not one a
-    /// measurement can compare two runs against.
+    /// The tier distribution has to span the table, and it has to do so the same way under every
+    /// seed: a distribution that moved with the seed is not one a measurement can compare two runs
+    /// against.
     #[test]
     fn specimens_span_the_tiers_and_do_not_move_with_the_seed() {
         let corpus = generate(&specified(0.0, 3));

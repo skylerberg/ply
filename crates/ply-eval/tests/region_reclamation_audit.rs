@@ -1,28 +1,7 @@
 //! When a region's memory goes back — ADR 0017 §3's other half.
-//!
-//! §3 fixes what a resumption *observes*: state is threaded, resumption *n*
-//! reads resumption *n−1*'s writes, and nothing on the capture path saves or
-//! restores anything. What the two region kinds decide is when the slots may be
-//! reclaimed, and that is what this file attacks:
-//!
-//! - **`unique`** — no continuation is captured across it, so nothing can reach
-//!   its slots after its lexical close. The close is a truncation and it is
-//!   free, which is asserted here as a count from the global allocator rather
-//!   than as an adjective.
-//! - **`shared`** — a continuation may be resumed after the region's lexical
-//!   close and read its slots, so they may **not** go back to the bump pointer
-//!   there. They are reference counted through [`Pin`] and handed back when the
-//!   last continuation that can reach them dies.
-//!
-//! The failure this file exists to make impossible is a `shared` region freed at
-//! its lexical close while a continuation still points into it: a use-after-free
-//! in a language that has never had one. Every reclamation here is therefore
-//! checked twice — once that the slots went back, and once that a slot naming a
-//! reclaimed position resolves to *nothing* rather than to whatever the next
-//! region allocated in its place.
 
-// A `Value`'s payloads are `Arc` and thread-confined by design, which is the
-// crate's own decision rather than something to lint here.
+// A `Value`'s payloads are `Arc` and thread-confined by design, which is the crate's own decision
+// rather than something to lint here.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_eval::Value;
@@ -68,8 +47,8 @@ fn counted<R>(f: impl FnOnce() -> R) -> (usize, R) {
     (ALLOCS.with(Cell::get), out)
 }
 
-/// A value whose payload is behind an `Arc`, so `strong_count` says whether the
-/// arena freed it or is still holding it for a continuation.
+/// A value whose payload is behind an `Arc`, so `strong_count` says whether the arena freed it or
+/// is still holding it for a continuation.
 fn payload(n: i64) -> (Arc<Vec<Value>>, Value) {
     let items = Arc::new(vec![Value::Int(n)]);
     (Arc::clone(&items), Value::List(items))
@@ -84,16 +63,14 @@ fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     }
 }
 
-/// What the machine does at a `perform` whose handler binds a continuation:
-/// take the pin, and hold it for exactly as long as the continuation.
+/// What the machine does at a `perform` whose handler binds a continuation: take the pin, and hold
+/// it for exactly as long as the continuation.
 fn capture(arena: &mut Arena) -> Pin {
     arena.pin().expect("a capture inside a region pins it")
 }
 
-// ------------------------------------------------------------------- `unique`
-
-/// The free case, stated as the only thing that could make it not free: the
-/// close hands the slots back and the values are dropped there.
+/// The free case, stated as the only thing that could make it not free: the close hands the slots
+/// back and the values are dropped there.
 #[test]
 fn a_unique_regions_close_is_a_truncation() {
     let mut arena = Arena::new();
@@ -111,9 +88,7 @@ fn a_unique_regions_close_is_a_truncation() {
     assert_eq!(Arc::strong_count(&arc), 1, "the close dropped the value");
 }
 
-/// "Free" as a number rather than an adjective. A warm arena opens a `unique`
-/// region, fills it and closes it without touching the global allocator, and the
-/// reclamation bookkeeping does not put an allocation back on that path.
+/// "Free" as a number rather than an adjective.
 #[test]
 fn a_unique_close_costs_the_allocator_nothing_even_beside_a_live_continuation() {
     let mut arena = Arena::new();
@@ -135,8 +110,8 @@ fn a_unique_close_costs_the_allocator_nothing_even_beside_a_live_continuation() 
     });
     assert_eq!(allocations, 0);
 
-    // And with a continuation live over a region opened *after* its capture,
-    // which is the shape a handler clause allocating its own scratch cell takes.
+    // And with a continuation live over a region opened *after* its capture, which is the shape a
+    // handler clause allocating its own scratch cell takes.
     let root = arena.open(RegionKind::Shared, Span::DUMMY);
     arena.alloc(Value::Int(0));
     let pin = capture(&mut arena);
@@ -153,11 +128,8 @@ fn a_unique_close_costs_the_allocator_nothing_even_beside_a_live_continuation() 
     arena.close(root);
 }
 
-// ------------------------------------------------------------------- `shared`
-
-/// The rule, at its sharpest: the region has lexically closed and its slots are
-/// still there, because the continuation captured across it can still be
-/// resumed and read them.
+/// The rule, at its sharpest: the region has lexically closed and its slots are still there,
+/// because the continuation captured across it can still be resumed and read them.
 #[test]
 fn a_shared_regions_close_reclaims_nothing_while_a_continuation_lives() {
     let mut arena = Arena::new();
@@ -181,8 +153,7 @@ fn a_shared_regions_close_reclaims_nothing_while_a_continuation_lives() {
     drop(pin);
 }
 
-/// Reclamation is the *last* continuation dying, not the first. Two clones of
-/// one continuation are one continuation.
+/// Reclamation is the *last* continuation dying, not the first.
 #[test]
 fn the_slots_go_back_when_the_last_continuation_dies_and_not_before() {
     let mut arena = Arena::new();
@@ -212,9 +183,8 @@ fn the_slots_go_back_when_the_last_continuation_dies_and_not_before() {
     assert_eq!(arena.stats().closes_deferred, 1);
 }
 
-/// A continuation that died before the region's lexical close costs the region
-/// nothing: the close is the same truncation a `unique` region's is. This is
-/// what makes `shared` a cost paid per *live* capture rather than per region.
+/// A continuation that died before the region's lexical close costs the region nothing: the close
+/// is the same truncation a `unique` region's is.
 #[test]
 fn a_shared_region_whose_continuation_already_died_closes_by_truncation() {
     let mut arena = Arena::new();
@@ -231,9 +201,9 @@ fn a_shared_region_whose_continuation_already_died_closes_by_truncation() {
     assert!(arena.get(cell).is_none());
 }
 
-/// The close of a region a live continuation crosses is deferred, and the next
-/// close after the continuation dies is what hands the slots back — a program
-/// that keeps opening regions reclaims without anyone asking it to.
+/// The close of a region a live continuation crosses is deferred, and the next close after the
+/// continuation dies is what hands the slots back — a program that keeps opening regions reclaims
+/// without anyone asking it to.
 #[test]
 fn a_later_close_reclaims_what_an_earlier_one_could_not() {
     let mut arena = Arena::new();
@@ -246,24 +216,14 @@ fn a_later_close_reclaims_what_an_earlier_one_could_not() {
     assert_eq!(arena.close(inner), Reclaim::Retained(1));
     drop(pin);
 
-    // The next close reaps the dead continuation before deciding anything, so
-    // the held run goes back there and this close accounts only for its own.
+    // The next close reaps the dead continuation before deciding anything, so the held run goes
+    // back there and this close accounts only for its own.
     assert_eq!(arena.close(outer), Reclaim::Freed(1));
     assert_eq!(arena.stats().slots_reclaimed_late, 1);
     assert_eq!(arena.live(), 0);
     assert_eq!(arena.retained_slots(), 0);
 }
 
-// ------------------------------------------------------- the use-after-free
-
-/// The defect this milestone exists to make impossible, attacked directly: a
-/// region reclaimed late, its positions handed to a new region, and the
-/// continuation's slot read through the identity it was holding.
-///
-/// The generation is what makes the answer `None` instead of the new region's
-/// value, and `None` is what a diagnostic is built from. A wrong integer here
-/// would be a use-after-free that no test could distinguish from an ordinary
-/// answer.
 #[test]
 fn a_slot_reclaimed_late_reads_nothing_rather_than_the_next_regions_value() {
     let mut arena = Arena::new();
@@ -291,11 +251,7 @@ fn a_slot_reclaimed_late_reads_nothing_rather_than_the_next_regions_value() {
     arena.close(next);
 }
 
-/// And that `None` is a diagnostic rather than a shrug. It is
-/// [`codes::INTERNAL_ERROR`] because a value cannot outlive its region — ADR
-/// 0017 §2 makes that a type error — so reaching a reclaimed slot at runtime is
-/// Ply's fault and there is nothing in the user's definition graph to attribute
-/// it to.
+/// And that `None` is a diagnostic rather than a shrug.
 #[test]
 fn a_stale_access_is_reported_against_ply_rather_than_the_program() {
     let d = stale_slot(Slot::new(3, 1), Span::DUMMY);
@@ -304,12 +260,7 @@ fn a_stale_access_is_reported_against_ply_rather_than_the_program() {
     assert!(!d.notes.is_empty(), "it says how it could have happened");
 }
 
-// ------------------------------------------------------------------- nesting
-
-/// Mixed kinds, nested. The `unique` region is opened inside the `shared` one
-/// *after* the capture, which is where a handler clause's own scratch region
-/// sits, and it is reclaimed at its own close while the region enclosing it is
-/// held.
+/// Mixed kinds, nested.
 #[test]
 fn a_unique_region_nested_in_a_held_shared_one_is_still_reclaimed_at_its_close() {
     let mut arena = Arena::new();
@@ -331,9 +282,9 @@ fn a_unique_region_nested_in_a_held_shared_one_is_still_reclaimed_at_its_close()
     assert_eq!(arena.live(), 0);
 }
 
-/// A region opened *at* a capture's bump pointer, having allocated nothing, is
-/// still not covered by it: coverage is "was this region open at the capture",
-/// which the marks cannot tell apart and the open ordinals can.
+/// A region opened *at* a capture's bump pointer, having allocated nothing, is still not covered by
+/// it: coverage is "was this region open at the capture", which the marks cannot tell apart and the
+/// open ordinals can.
 #[test]
 fn a_region_opened_after_a_capture_that_allocated_nothing_is_not_covered_by_it() {
     let mut arena = Arena::new();
@@ -359,10 +310,7 @@ fn a_region_opened_after_a_capture_that_allocated_nothing_is_not_covered_by_it()
     assert_eq!(arena.retained_slots(), 0);
 }
 
-/// A bump pointer frees a suffix and not a hole. A run held past its close, with
-/// a still-open region's slots sitting above it, waits for that region however
-/// dead its own continuation is — and goes back the moment the truncation covers
-/// both.
+/// A bump pointer frees a suffix and not a hole.
 #[test]
 fn a_retained_run_under_a_live_regions_slots_waits_for_that_region() {
     let mut arena = Arena::new();
@@ -392,10 +340,8 @@ fn a_retained_run_under_a_live_regions_slots_waits_for_that_region() {
     assert_eq!(arena.retained_slots(), 0);
 }
 
-/// Runs held inside a region are absorbed into that region's own run when it
-/// closes, rather than accumulating one entry per iteration. A backtracking
-/// search opens, captures inside and closes a region per branch, and what it
-/// leaves behind is one run and not a hundred.
+/// Runs held inside a region are absorbed into that region's own run when it closes, rather than
+/// accumulating one entry per iteration.
 #[test]
 fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
     let mut arena = Arena::new();
@@ -423,13 +369,8 @@ fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
     assert_eq!(arena.stats().slots_reclaimed_late, 64);
 }
 
-// ------------------------------------------------ the inference this depends on
-
-/// The interaction ADR 0017's Consequences call the hardest to see: `unique`
-/// inferred where a capture is reachable frees memory a continuation still
-/// holds. Reclamation is built on the inference answering `shared` for every
-/// region a capture can be taken inside, so the shapes it depends on are checked
-/// here rather than assumed.
+/// The interaction ADR 0017's Consequences call the hardest to see: `unique` inferred where a
+/// capture is reachable frees memory a continuation still holds.
 #[test]
 fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
@@ -485,9 +426,9 @@ fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
     }
 }
 
-/// And when the machine and the inference do disagree anyway, the answer is a
-/// report and not a free: the pin is taken across the `unique` region, so its
-/// slots survive, and the region is named so the run can say what happened.
+/// And when the machine and the inference do disagree anyway, the answer is a report and not a
+/// free: the pin is taken across the `unique` region, so its slots survive, and the region is named
+/// so the run can say what happened.
 #[test]
 fn a_capture_across_a_unique_region_is_named_rather_than_freed() {
     let mut arena = Arena::new();
@@ -517,12 +458,7 @@ fn a_capture_outside_every_region_has_nothing_to_pin() {
     assert_eq!(arena.stats().pins_taken, 0);
 }
 
-// ------------------------------------------------------- meaning, and the leak
-
 /// Reclamation must not become the retracted snapshot reading by another route.
-/// The region is held across the resumptions, and what the second resumption
-/// reads is what the first wrote — one threaded state, ADR 0005 §3 and ADR 0017
-/// §3 as amended.
 #[test]
 fn holding_a_region_for_a_continuation_does_not_save_or_restore_it() {
     let mut arena = Arena::new();
@@ -547,9 +483,8 @@ fn holding_a_region_for_a_continuation_does_not_save_or_restore_it() {
     drop(pin);
 }
 
-/// A checkpoint may not undo an allocation a live continuation can reach: that
-/// is the same free, taken from the other end. `snapshot`/`restore` are not on
-/// the capture path, so refusing here costs no program anything.
+/// A checkpoint may not undo an allocation a live continuation can reach: that is the same free,
+/// taken from the other end.
 #[test]
 fn a_restore_is_refused_while_a_continuation_is_pinned() {
     let mut arena = Arena::new();
@@ -570,22 +505,16 @@ fn a_restore_is_refused_while_a_continuation_is_pinned() {
     arena.close(r);
 }
 
-/// ADR 0017 §4 accepts that a cycle leaks, and this is what one looks like in
-/// the allocator: a continuation parked in a cell of a region it pins. The
-/// region holds the continuation and the continuation holds the region, so
-/// neither end dies and the slots stay held until the arena itself is dropped.
-///
-/// Recorded rather than fixed — collecting it needs a tracing collector, which
-/// the ADR declines — and [`Arena::retained_slots`] is what keeps it visible
-/// instead of silent.
+/// ADR 0017 §4 accepts that a cycle leaks, and this is what one looks like in the allocator: a
+/// continuation parked in a cell of a region it pins.
 #[test]
 fn a_continuation_parked_in_the_region_that_pins_it_is_the_leak_adr_0017_accepts() {
     let mut arena = Arena::new();
     let (arc, value) = payload(1);
     let r = arena.open(RegionKind::Shared, Span::DUMMY);
     arena.alloc(value).expect("inside a region");
-    // `cell_set(s, Just(k))`: the continuation becomes reachable only from a
-    // slot of the region it is holding open, so nothing outside will drop it.
+    // `cell_set(s, Just(k))`: the continuation becomes reachable only from a slot of the region it
+    // is holding open, so nothing outside will drop it.
     let parked = capture(&mut arena);
 
     assert_eq!(arena.close(r), Reclaim::Retained(1));
@@ -599,14 +528,11 @@ fn a_continuation_parked_in_the_region_that_pins_it_is_the_leak_adr_0017_accepts
     assert_eq!(arena.stats().slots_reclaimed_late, 0);
     assert_eq!(Arc::strong_count(&arc), 2, "so the value is still held");
 
-    // The arena's own drop is what ends it — a task ending, rather than any
-    // region closing.
+    // The arena's own drop is what ends it — a task ending, rather than any region closing.
     drop(arena);
     assert_eq!(Arc::strong_count(&arc), 1);
     drop(parked);
 }
-
-// -------------------------------------------------------------------- harness
 
 fn load(src: &str) -> (Program, Resolved) {
     let mut map = SourceMap::new();

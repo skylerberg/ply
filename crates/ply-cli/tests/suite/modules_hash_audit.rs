@@ -1,8 +1,4 @@
 //! Where content addressing under modules meets the incremental front end.
-//!
-//! The equivalence property is the front end's whole safety argument: for every
-//! corpus and after every edit, the incremental path must produce
-//! byte-identical `DefHash`es to a from-scratch check.
 
 use ply_cli::driver;
 use ply_cli::load::Loaded;
@@ -85,12 +81,7 @@ test \"touch is handled\" {
 }
 ";
 
-/// The shape that used to desynchronize the two front ends. A file that merely
-/// *performs* an effect passes both of gate 1's checks when a new module
-/// declares a look-alike — its bytes are unchanged and the declaration it
-/// depends on still hashes the same — so it is skipped and keeps whatever it
-/// was hashed under last time. Nothing about an effect's identity may therefore
-/// depend on which other effects the program happens to declare.
+/// The shape that used to desynchronize the two front ends.
 #[test]
 fn adding_a_look_alike_effect_keeps_the_two_front_ends_in_agreement() {
     let dir = tempfile::tempdir().unwrap();
@@ -107,8 +98,8 @@ fn adding_a_look_alike_effect_keeps_the_two_front_ends_in_agreement() {
     agree(dir.path(), "after a new file declared a look-alike effect");
 }
 
-/// The control: the same corpus, the same warm store, and a new file whose
-/// effect is *not* a look-alike. If this ever fails the cause is not the rank.
+/// The control: the same corpus, the same warm store, and a new file whose effect is *not* a
+/// look-alike.
 #[test]
 fn adding_an_unrelated_effect_keeps_the_two_front_ends_in_agreement() {
     let dir = tempfile::tempdir().unwrap();

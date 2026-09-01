@@ -1,21 +1,6 @@
-//! What a cell operation costs now that the store is a region, and what it cost
-//! when the store was a persistent map — so "the forkable world and the
-//! zero-cost path are mutually exclusive" stays a number rather than a slogan.
-//!
-//! ADR 0017 opens on 9,343 allocations for one `/health` response and concludes
-//! that the persistent forkable world has to go. That conclusion is about
-//! *uniqueness* — Perceus fires only on a uniquely-owned value — but it is easy
-//! to read it as "the red-black tree is the allocation", and the two claims have
-//! very different price tags. This file measures the second one directly, on
-//! both sides of the change.
-//!
-//! The world is gone, so its side is measured against the data structure it
-//! **was**: an `rpds::RedBlackTreeMap` keyed by a dense integer, allocated and
-//! written exactly as `World` allocated and wrote. That keeps the denominator
-//! honest without keeping the type alive.
-//!
-//! The numbers are printed as well as asserted. An assertion pins a ceiling so
-//! a regression is caught; the print is what a design decision gets read off.
+//! What a cell operation costs now that the store is a region, and what it cost when the store was
+//! a persistent map — so "the forkable world and the zero-cost path are mutually exclusive" stays a
+//! number rather than a slogan.
 
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, TaskRegions, Value};
@@ -66,9 +51,8 @@ fn filled(n: usize) -> (TaskRegions, Vec<Slot>) {
     (regions, slots)
 }
 
-/// The store `World` was, rebuilt from the same crate it was built on, so the
-/// comparison below is against the thing that was removed rather than against a
-/// guess at it.
+/// The store `World` was, rebuilt from the same crate it was built on, so the comparison below is
+/// against the thing that was removed rather than against a guess at it.
 fn persistent(n: usize) -> RedBlackTreeMap<u32, Value> {
     let mut map = RedBlackTreeMap::new();
     for i in 0..n {
@@ -78,12 +62,6 @@ fn persistent(n: usize) -> RedBlackTreeMap<u32, Value> {
 }
 
 /// What a `cell_set` costs in the region store: nothing, at every size.
-///
-/// The persistent map charged one allocation and 56 bytes per write, flat from
-/// one cell to ten thousand — `rpds` mutates in place once the nodes on the path
-/// are uniquely owned, and in a real run they were, so persistence was charged
-/// only where sharing was real. A slot write is an indexed store, so the
-/// constant goes to zero rather than getting smaller.
 #[test]
 fn a_cell_write_into_the_region_store_costs_nothing() {
     println!("\n  cells   region allocs/write   map allocs/write   region allocs/read");
@@ -139,18 +117,15 @@ fn a_cell_write_into_the_region_store_costs_nothing() {
     );
 }
 
-/// Allocating a cell is a bump once the arena has been through a region of the
-/// size before, where the persistent map allocated a node every time.
-///
-/// This is the part of ADR 0017's 9,343 that removing persistence recovers, and
-/// it is per `with_cell` rather than a share of a request.
+/// Allocating a cell is a bump once the arena has been through a region of the size before, where
+/// the persistent map allocated a node every time.
 #[test]
 fn allocating_a_cell_is_a_bump_once_the_arena_is_warm() {
     const CELLS: usize = 4_096;
 
     let mut regions = TaskRegions::new();
-    // A steady state: a service opens a region per request and a test opens one
-    // per test, so the interesting number is the second pass and not the first.
+    // A steady state: a service opens a region per request and a test opens one per test, so the
+    // interesting number is the second pass and not the first.
     for _ in 0..CELLS {
         regions.alloc_cell(Value::Unit);
     }
@@ -178,10 +153,9 @@ fn allocating_a_cell_is_a_bump_once_the_arena_is_warm() {
     );
 }
 
-/// The entry point's reset is what `World::fork` was, and it is what makes the
-/// arena's memory a steady state rather than a leak: whatever a run allocated,
-/// the next one starts from the fixture and takes nothing further from the
-/// allocator.
+/// The entry point's reset is what `World::fork` was, and it is what makes the arena's memory a
+/// steady state rather than a leak: whatever a run allocated, the next one starts from the fixture
+/// and takes nothing further from the allocator.
 #[test]
 fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
     let (mut regions, _) = Fixture::empty().open();
@@ -208,16 +182,7 @@ fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
     assert_eq!(again, 0, "the second run reuses the first run's chunks");
 }
 
-/// The fixture every real run starts from is empty, so opening it copies
-/// nothing.
-///
-/// A fixture is non-empty only through `ply_test`'s `with_fixture`, whose only
-/// callers are Rust tests; the CLI never sets one. **No Ply program opens a
-/// non-empty fixture**, which is what made ADR 0017 §6's isolation question
-/// answerable in the first place: whatever the fork bought the scheduler, it was
-/// not buying it by forking, because the fork was empty. Two tests do not
-/// observe each other's cells because each worker evaluates on its own machine
-/// holding its own region stack, and that argument is unchanged.
+/// The fixture every real run starts from is empty, so opening it copies nothing.
 #[test]
 fn the_fixture_every_ply_program_opens_is_empty() {
     let base = Fixture::empty();
@@ -226,9 +191,7 @@ fn the_fixture_every_ply_program_opens_is_empty() {
     assert_eq!(regions.live(), 0);
     assert_eq!(regions.base_len(), 0);
     println!("\n  opening the empty fixture: {allocs} allocations / {bytes} bytes");
-    // Not zero: a fresh stack pushes its root scope and takes a checkpoint of
-    // it. It is a small constant that does not depend on the run, which is the
-    // property `World::fork`'s zero was standing in for.
+    // Not zero: a fresh stack pushes its root scope and takes a checkpoint of it.
     assert!(
         allocs <= 8,
         "opening the empty fixture cost {allocs} allocations"

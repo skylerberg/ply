@@ -1,14 +1,4 @@
 //! An adversarial audit of the prover's W2 surface.
-//!
-//! `Float`, `Decimal`, `Map` and the byte builtins are new types reaching M8's
-//! `proved` tier. The rule they arrived under is ADR 0012 corollary 3: *a
-//! verdict may only get stronger when the evidence does, and a type arriving is
-//! not evidence.* A false `proved` is a blocker without exception.
-//!
-//! The sharpest instrument available is the one the milestone already owns: an
-//! obligation the static tier certified, resampled by the property tier over the
-//! generator's whole range. If sampling refutes what a certificate covers, the
-//! certificate is a lie, and the disagreement names the input.
 
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
@@ -87,14 +77,8 @@ fn never_proved(source: &str, needle: &str) {
 
 // --- The refusal `Float` is supposed to get --------------------------------
 
-/// `==` on `Float` is not reflexive, so congruence closure over it is unsound
-/// and **no** obligation mentioning one may be proved. Every entry here is a
-/// place the type is reachable, and the last four are the ones where the type
-/// does not appear in the binder's own written form.
-///
-/// The four `hidden_*` entries are a known defect and this test fails on them
-/// today; see `a_certificate_over_a_hidden_float_is_refuted_by_sampling`, which
-/// is the same defect with the counterexample attached.
+/// `==` on `Float` is not reflexive, so congruence closure over it is unsound and **no** obligation
+/// mentioning one may be proved.
 #[test]
 fn no_obligation_that_can_reach_a_float_is_proved() {
     let claims: &[(&str, &str)] = &[
@@ -122,9 +106,8 @@ fn no_obligation_that_can_reach_a_float_is_proved() {
             "visible parameter",
             "type Box<a> = B(a)\nlaw \"visible parameter\" forall (b: Box<Float>) { b == b }",
         ),
-        // The four below reach a `Float` through a *declaration* rather than
-        // through the binder's written type. Nothing in the obligation's surface
-        // says `Float`, and the value it quantifies over still can be a `NaN`.
+        // The four below reach a `Float` through a *declaration* rather than through the binder's
+        // written type.
         (
             "hidden in a variant",
             "type Money = Cents(Float)\nlaw \"hidden in a variant\" forall (m: Money) { m == m }",
@@ -157,19 +140,6 @@ fn no_obligation_that_can_reach_a_float_is_proved() {
     );
 }
 
-/// The blocker, with the input that makes it one.
-///
-/// `ply_core::derivable` already answers "does this type reach a `Float`?"
-/// correctly — it walks a nominal type's declaration, transitively and across
-/// modules, which is what refuses `Map<Money, v>` for `type Money = Cents(Float)`.
-/// `ply_prove::lower::mentions_float` asks the same question of the same type and
-/// answers no, because it walks only the type's *arguments*. So the prover
-/// certifies `forall (m: Money) { m == m }`, which is false at `Cents(NaN)` —
-/// and the property tier finds that value on its own.
-///
-/// The assertion is deliberately the differential one rather than "this is not
-/// proved": a tier label is a truth claim, and the evidence that it is wrong is
-/// a run of the program disagreeing with it.
 #[test]
 fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let source = "type Money = Cents(Float)\n\
@@ -220,18 +190,9 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     );
 }
 
-/// The same defect on a definition's own `ensures`, and the tightest statement
-/// of it available: one file where the spec is `proved` and a law asserting the
-/// very thing the proof would have to cover is *refuted*, at the value the
-/// proof does not hold at.
-///
-/// `fn keep(m: Money) -> Money = m ensures result == m` is false at
-/// `Cents(NaN)`, because `values_equal` compares a `Float` field with IEEE `==`.
-/// The law beside it destructures instead, which gives the binder a sort the
-/// lowering can see — so the refusal fires there and not here, which is exactly
-/// where the gap is.
-///
-/// **This test fails today.**
+/// The same defect on a definition's own `ensures`, and the tightest statement of it available: one
+/// file where the spec is `proved` and a law asserting the very thing the proof would have to cover
+/// is *refuted*, at the value the proof does not hold at.
 #[test]
 fn an_ensures_over_a_hidden_float_is_not_proved() {
     let run = Run::of(
@@ -255,10 +216,8 @@ fn an_ensures_over_a_hidden_float_is_not_proved() {
 
 // --- `Decimal`, `Map`, `Bytes`: the refusals that must stay refusals --------
 
-/// `Decimal`'s `==` is an equivalence relation, so congruence over it is sound
-/// and reflexivity is a genuine proof. Its arithmetic is not in the fragment and
-/// must not become so by the type arriving — `+` on `Decimal` raises on mantissa
-/// overflow, so `x + 0m == x` is not even true of every input.
+/// `Decimal`'s `==` is an equivalence relation, so congruence over it is sound and reflexivity is a
+/// genuine proof.
 #[test]
 fn decimal_is_congruent_and_never_arithmetic() {
     let run = Run::of(
@@ -280,10 +239,8 @@ fn decimal_is_congruent_and_never_arithmetic() {
     }
 }
 
-/// A `Map` is opaque: there is no theory of arrays here, so nothing about
-/// `map_get` after `map_insert` may be concluded, and neither may anything about
-/// `map_len`. Reflexivity over a `Map` whose key and value types are themselves
-/// reflexive is sound and is the control.
+/// A `Map` is opaque: there is no theory of arrays here, so nothing about `map_get` after
+/// `map_insert` may be concluded, and neither may anything about `map_len`.
 #[test]
 fn a_map_is_opaque_to_the_prover() {
     let run = Run::of(
@@ -305,9 +262,6 @@ fn a_map_is_opaque_to_the_prover() {
     }
 }
 
-/// The byte builtins are uninterpreted. `bytes_index_of` finding an empty needle
-/// at 0 is true and unprovable here, and `bytes_scan`'s bound is a statement
-/// about the implementation rather than about a symbol the fragment knows.
 #[test]
 fn the_byte_builtins_are_uninterpreted() {
     for (needle, source) in [
@@ -336,18 +290,16 @@ fn the_byte_builtins_are_uninterpreted() {
         never_proved(source, needle);
     }
 
-    // Two occurrences of one `Bytes` literal are deliberately not one term, so
-    // even the trivially true claim about them is `property`.
+    // Two occurrences of one `Bytes` literal are deliberately not one term, so even the trivially
+    // true claim about them is `property`.
     never_proved(
         "law \"two literals\" forall (n: Int) { b\"ab\" == b\"ab\" }",
         "two literals",
     );
 }
 
-/// A derived dictionary is an ordinary record of closures, so an obligation
-/// stated through one is outside the fragment. It must not become provable by
-/// the deriver having generated it — a derived `compare` is whatever the
-/// generated body calls, and the prover has no theory of that either.
+/// A derived dictionary is an ordinary record of closures, so an obligation stated through one is
+/// outside the fragment.
 #[test]
 fn a_derived_dictionary_carries_no_proof() {
     for (needle, source) in [

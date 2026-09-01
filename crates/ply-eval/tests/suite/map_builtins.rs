@@ -1,11 +1,4 @@
-//! The `Map` builtins on real source, through parse, resolve, check and both
-//! engines.
-//!
-//! The engines are run against each other deliberately: `--engine both`
-//! reporting `E0503` on correct code is one of the four failures a
-//! non-canonical iteration order would produce, so a map that iterated
-//! differently under the machine than under the tree-walker would be caught
-//! here rather than in a user's cache.
+//! The `Map` builtins on real source, through parse, resolve, check and both engines.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Interp, Machine};
@@ -132,11 +125,7 @@ test "a map nests, as a key and as a value" {
     run_both(source);
 }
 
-/// Pattern matching. There is no map *pattern* in W2 — a literal would be sugar
-/// over `map_of_entries` and buys no semantics — so what has to work is that a
-/// map flows through the patterns the language does have: the `Option` a lookup
-/// answers, the `{key, value}` record an entry is, and a binder over a map
-/// itself.
+/// Pattern matching.
 #[test]
 fn a_map_flows_through_the_patterns_the_language_has() {
     let source = r#"
@@ -173,9 +162,7 @@ test "a map binds to a variable pattern" {
     run_both(source);
 }
 
-/// `map_fold` calls user code, so its loop is a frame rather than host
-/// recursion. A fold over ten thousand entries must therefore neither overflow
-/// the host stack nor lose an entry.
+/// `map_fold` calls user code, so its loop is a frame rather than host recursion.
 #[test]
 fn a_long_fold_runs_on_frames_rather_than_on_the_host_stack() {
     let source = r#"
@@ -190,8 +177,8 @@ test "a ten-thousand entry fold is exact" {
     run_both(source);
 }
 
-/// A `map_fold` whose function performs an effect threads its row, which is the
-/// one thing about `map_fold` that is not pure.
+/// A `map_fold` whose function performs an effect threads its row, which is the one thing about
+/// `map_fold` that is not pure.
 #[test]
 fn a_fold_threads_its_functions_row() {
     let source = r#"

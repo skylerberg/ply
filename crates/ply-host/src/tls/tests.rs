@@ -1,12 +1,4 @@
 //! What the TLS handler claims, and whether it is telling the truth.
-//!
-//! Three halves, and the middle one is the reason this file is long. The first
-//! is the credential: everything that can be wrong with a certificate and a key
-//! is wrong *before anything runs*, so each of those is a diagnostic here. The
-//! second is a real TLS connection, made by a real client, against a
-//! certificate generated in the test — nothing about a record layer can be
-//! asserted in the abstract. The third is what happens when a handshake fails,
-//! which is the case a server has to survive rather than report.
 
 use super::*;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -24,8 +16,8 @@ struct Material {
     der: rustls::pki_types::CertificateDer<'static>,
 }
 
-/// Generated per test rather than checked in: a fixture certificate is either
-/// expired, or committed with its private key, and this suite may have neither.
+/// Generated per test rather than checked in: a fixture certificate is either expired, or committed
+/// with its private key, and this suite may have neither.
 fn material() -> Material {
     let dir = tempfile::tempdir().expect("a temp dir");
     let issued =
@@ -95,10 +87,6 @@ fn a_generated_certificate_loads_and_is_reported_by_name_and_fingerprint() {
     );
 }
 
-/// The failure this milestone exists to move to bind time. Two files that each
-/// load perfectly well and do not go together fail *every* handshake, and a
-/// server that discovers that on the first one has already told a client it was
-/// listening.
 #[test]
 fn a_key_that_does_not_match_the_leaf_is_refused_before_anything_runs() {
     let mine = material();
@@ -186,9 +174,7 @@ fn a_malformed_pem_a_certificate_free_file_and_a_key_free_file_are_each_refused(
     );
 }
 
-/// One run, three broken paths, three diagnostics. An operator fixing a
-/// deployment should learn about all of them at once rather than one per
-/// attempt.
+/// One run, three broken paths, three diagnostics.
 #[test]
 fn every_credential_that_fails_is_reported_rather_than_the_first() {
     let material = material();
@@ -239,8 +225,8 @@ fn the_argument_shape_is_a_usage_error_with_the_form_in_it() {
     }
 }
 
-/// `E0429`, and the fix is a `--tls` argument rather than an edit to the
-/// program — so the diagnostic has to say what the run was given.
+/// `E0429`, and the fix is a `--tls` argument rather than an edit to the program — so the
+/// diagnostic has to say what the run was given.
 #[test]
 fn an_unconfigured_credential_lists_the_ones_there_are() {
     let material = material();
@@ -296,9 +282,9 @@ fn nothing_about_a_credential_renders_its_key() {
 
 // --- A real connection ------------------------------------------------------
 
-/// The client half: an ordinary rustls client that trusts exactly the
-/// certificate the test generated, so a round trip proves the handler served a
-/// real TLS session rather than that verification was switched off.
+/// The client half: an ordinary rustls client that trusts exactly the certificate the test
+/// generated, so a round trip proves the handler served a real TLS session rather than that
+/// verification was switched off.
 fn client(der: &rustls::pki_types::CertificateDer<'static>, alpn: &[&str]) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.add(der.clone()).expect("the generated certificate");
@@ -333,9 +319,8 @@ impl Peer {
         self.listener.local_addr().expect("a bound port").port()
     }
 
-    /// Accept one connection and wrap it, doing no I/O — which is the claim:
-    /// `accept` never handshakes, so a client sending garbage cannot take the
-    /// loop down with it.
+    /// Accept one connection and wrap it, doing no I/O — which is the claim: `accept` never
+    /// handshakes, so a client sending garbage cannot take the loop down with it.
     fn accept(&self) -> Session {
         let (stream, _) = self.listener.accept().expect("a connection");
         Session::new(
@@ -346,8 +331,7 @@ impl Peer {
     }
 }
 
-/// A client that completes a handshake, sends `REQUEST`, and reports what came
-/// back.
+/// A client that completes a handshake, sends `REQUEST`, and reports what came back.
 fn speak(
     port: u16,
     der: rustls::pki_types::CertificateDer<'static>,
@@ -409,9 +393,6 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
     assert_eq!(session.write(RESPONSE), 0);
 }
 
-/// ADR 0013 §6.3. Every browser offers `h2` first, and a server that negotiated
-/// it and then spoke 1.1 would produce a connection error the client reports as
-/// the server being broken.
 #[test]
 fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     let material = material();
@@ -431,8 +412,8 @@ fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     assert_eq!(counts.completed, 0);
     assert_eq!(counts.reasons, [(REASON_ALPN, 1)]);
 
-    // The listener is still there, which is the half of the claim one refused
-    // connection cannot make.
+    // The listener is still there, which is the half of the claim one refused connection cannot
+    // make.
     let client = speak(
         peer.port(),
         material.der.clone(),
@@ -455,8 +436,8 @@ fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     assert_eq!(peer.handshakes.snapshot().completed, 1);
 }
 
-/// A peer that is not speaking TLS at all — the plaintext request sent to the
-/// TLS port, which is what a misconfigured deployment produces every time.
+/// A peer that is not speaking TLS at all — the plaintext request sent to the TLS port, which is
+/// what a misconfigured deployment produces every time.
 #[test]
 fn a_peer_that_does_not_speak_tls_closes_that_connection_and_nothing_else() {
     let material = material();
@@ -483,9 +464,7 @@ fn a_peer_that_does_not_speak_tls_closes_that_connection_and_nothing_else() {
     assert_eq!(counts.reasons, [(REASON_NOT_TLS, 1)]);
 }
 
-/// A client that goes away mid-flight. The accept loop must survive it, and the
-/// reason must say what happened rather than being counted as a protocol
-/// failure the operator would go looking for.
+/// A client that goes away mid-flight.
 #[test]
 fn a_client_that_disconnects_mid_handshake_is_counted_as_the_peer_going_away() {
     let material = material();
@@ -505,10 +484,8 @@ fn a_client_that_disconnects_mid_handshake_is_counted_as_the_peer_going_away() {
     assert_eq!(counts.reasons, [(REASON_GONE, 1)]);
 }
 
-/// A deadline is not an ending: nothing was handed to the program, rustls keeps
-/// whatever partial record it read, and the next read resumes. Closing here
-/// would leave a header timeout unanswerable over TLS while the plaintext path
-/// answers it with a 408.
+/// A deadline is not an ending: nothing was handed to the program, rustls keeps whatever partial
+/// record it read, and the next read resumes.
 #[test]
 fn a_read_deadline_answers_none_and_leaves_the_session_open() {
     let material = material();
@@ -521,8 +498,8 @@ fn a_read_deadline_answers_none_and_leaves_the_session_open() {
         let connection = ClientConnection::new(config, name).expect("a client connection");
         let socket = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let mut stream = StreamOwned::new(connection, socket);
-        // Handshake, then say nothing for long enough that the server's first
-        // read expires, then send the request.
+        // Handshake, then say nothing for long enough that the server's first read expires, then
+        // send the request.
         stream.flush().expect("the handshake completes");
         std::thread::sleep(std::time::Duration::from_millis(300));
         stream.write_all(REQUEST).expect("the request is written");
@@ -553,11 +530,8 @@ fn a_read_deadline_answers_none_and_leaves_the_session_open() {
 
 // --- What a refusal is called ----------------------------------------------
 
-/// The reasons are a fixed set, and that is a security property rather than
-/// tidiness: they key a map that lives as long as the run, and rustls's own
-/// error text embeds values a peer chose. Counting those would let a client
-/// grow the server's memory by sending malformed handshakes, which is a denial
-/// of service in the code that exists to report one.
+/// The reasons are a fixed set, and that is a security property rather than tidiness: they key a
+/// map that lives as long as the run, and rustls's own error text embeds values a peer chose.
 #[test]
 fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
     let cases = [
@@ -595,20 +569,19 @@ fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
         assert_eq!(reason(true, &wrapped), expected, "{error:?}");
     }
 
-    // An unsupported protocol version says which versions there are, because
-    // "unsupported" without them is a sentence a reader cannot act on.
+    // An unsupported protocol version says which versions there are, because "unsupported" without
+    // them is a sentence a reader cannot act on.
     assert!(REASON_VERSION.contains("TLS 1.3") && REASON_VERSION.contains("TLS 1.2"));
     assert!(REASON_ALPN.contains("http/1.1"));
 
-    // After the handshake, a failure is an ordinary transport failure: counting
-    // it as a refused handshake would make the summary lie in the direction of
-    // alarm.
+    // After the handshake, a failure is an ordinary transport failure: counting it as a refused
+    // handshake would make the summary lie in the direction of alarm.
     let after = io::Error::new(io::ErrorKind::InvalidData, TlsError::DecryptError);
     assert_eq!(reason(false, &after), REASON_TRANSPORT);
 }
 
-/// The count is what the run's summary reports, so its order may not depend on
-/// which failure happened first.
+/// The count is what the run's summary reports, so its order may not depend on which failure
+/// happened first.
 #[test]
 fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
     let handshakes = Handshakes::default();
@@ -629,9 +602,8 @@ fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
 
 // --- What the listing says about itself -------------------------------------
 
-/// The `transport` block names a version, and a listing that named a version
-/// other than the one linked would be the trusted computing base lying about
-/// itself. There is no constant in `rustls` to read, so the lockfile is.
+/// The `transport` block names a version, and a listing that named a version other than the one
+/// linked would be the trusted computing base lying about itself.
 #[test]
 fn the_listing_names_the_version_that_is_actually_linked() {
     let lock =
@@ -651,16 +623,15 @@ fn the_listing_names_the_version_that_is_actually_linked() {
         VERSION, resolved,
         "`ply hosts` would print {VERSION} for a build linking {resolved}"
     );
-    // Never the pre-release: `cargo search` surfaces `0.24.0-dev.1` and it must
-    // not be what a trusted computing base is built on.
+    // Never the pre-release: `cargo search` surfaces `0.24.0-dev.1` and it must not be what a
+    // trusted computing base is built on.
     assert!(!resolved.contains("dev"), "{resolved} is a pre-release");
     assert!(resolved.starts_with("0.23."), "{resolved}");
 }
 
-/// Nothing in the trusted computing base may depend on a provider some other
-/// library installed first, so the provider is put on the builder rather than
-/// taken from the process-wide default — and the default is left unset, which
-/// this asserts by there being no way to have set it.
+/// Nothing in the trusted computing base may depend on a provider some other library installed
+/// first, so the provider is put on the builder rather than taken from the process-wide default —
+/// and the default is left unset, which this asserts by there being no way to have set it.
 #[test]
 fn the_provider_is_the_one_this_module_names() {
     assert_eq!(PROVIDER, "ring");
@@ -669,21 +640,19 @@ fn the_provider_is_the_one_this_module_names() {
         "a process-wide default provider was installed, and `ply hosts` names one that was not consulted"
     );
     let material = material();
-    // Proof that a credential builds without one: `Credentials::load` would
-    // have failed had it needed the default.
+    // Proof that a credential builds without one: `Credentials::load` would have failed had it
+    // needed the default.
     assert!(!material.credentials("api").is_empty());
 }
 
-/// One connection is one session, and the mutex is what keeps a second
-/// operation from interleaving records with the first. The claim is that it
-/// serialises rather than corrupts; a stall would show up as a test that never
-/// returns.
+/// One connection is one session, and the mutex is what keeps a second operation from interleaving
+/// records with the first.
 #[test]
 fn two_operations_on_one_session_serialise_rather_than_interleave() {
     let material = material();
     let peer = peer(&material);
-    // The client reads every byte the writers produce, so no write can lose a
-    // race with a peer that stopped listening and the count below is exact.
+    // The client reads every byte the writers produce, so no write can lose a race with a peer that
+    // stopped listening and the count below is exact.
     let client = speak(
         peer.port(),
         material.der.clone(),
@@ -697,9 +666,7 @@ fn two_operations_on_one_session_serialise_rather_than_interleave() {
         request.extend_from_slice(&session.read(4096).expect("no deadline"));
     }
 
-    // Ten writers of one response, from ten threads. Every byte of every write
-    // must land whole and in order, which is what a shared record layer would
-    // fail to do.
+    // Ten writers of one response, from ten threads.
     let written = Arc::new(AtomicUsize::new(0));
     let mut writers = Vec::new();
     for _ in 0..10 {
