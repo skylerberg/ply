@@ -214,7 +214,30 @@ just the remaining arguments' reads is what turns a legal program into
 That is the argument for slot frames stated as a measurement: a frame that holds
 slot indices does not *construct* anything, so "carrying less" is a fact settled
 at lowering rather than a chain built per call. There is no cheaper approximation
-left to try — these were the two. ADR 0025 separately concedes that P1 is a `Code` IR change plus
+left to try — these were the two.
+
+**And the frame's narrowed view has to be inline, which is what forces the rest of
+the rewrite.** Modelled over a scope of depth *d*, allocations per carry:
+
+| what the frame carries | d = 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: |
+| the chain, cloned — today | 0 | 0 | 0 | 0 |
+| the chain minus one binding — P1 | 4 | 9 | 18 | 35 |
+| a heap window of the live values | 1 | 1 | 1 | 1 |
+| **an inline window of the live values** | **0** | **0** | **0** | **0** |
+
+Today's carry is *free* — one refcount bump — so every scheme that narrows the
+view is a cost on the common path, and only the inline one is free again. That
+settles the shape: the window lives in the frame, not behind a pointer.
+
+**It also settles that S4 has no cheap first step.** An inline window is only
+usable if the sub-expressions that read it resolve their names to *indices into
+it*, because a window that has to answer lookups by name is an `Env`, and
+building one is the row above. Indexed lookup is the slot rewrite. Pooling does
+not rescue the intermediate design either: a carried scope lives as long as its
+frame, so deep recursion holds every link at once and outruns the free list,
+which is why `keep_only` measured what it did. **The rewrite is the unit of
+work.** ADR 0025 separately concedes that P1 is a `Code` IR change plus
 lowering rather than an edit to eight call sites. **If the IR is changing anyway,
 change it to slots and get an O(1) answer instead of an O(depth) one.**
 
