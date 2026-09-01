@@ -204,7 +204,7 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
 /// handles it.
 #[test]
 fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-eval/src");
     let mut files = Vec::new();
     sources(&src, &mut files);
     files.sort();
@@ -245,9 +245,10 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
 /// version — inside a seed's meaning.
 #[test]
 fn the_crate_depends_on_no_generator_and_no_entropy_source() {
-    let manifest =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("the crate has a manifest");
+    let manifest = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-eval/Cargo.toml"),
+    )
+    .expect("the crate has a manifest");
     for line in manifest.lines() {
         let Some((key, _)) = line.split_once('=') else {
             continue;

@@ -290,9 +290,9 @@ caller threads the sink.
 > its slot at its last use, so sole ownership arrives at the append wherever
 > the caller wrote it — a copy means a genuine second owner, such as a binding
 > read again after the append or a cell still holding the list.
-> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts the standard
+> `crates/ply-eval-tests/tests/suite/stdlib_accumulator_cost.rs` asserts the standard
 > library's accumulators stay linear, and
-> `crates/ply-eval/tests/allocation/accumulator_shape.rs` that an accumulator
+> `crates/ply-eval-tests/tests/allocation/accumulator_shape.rs` that an accumulator
 > with a second owner does too. A `reuse fn` makes the same claim about one
 > function an obligation `ply check` enforces (`E0127`), and the standard
 > library's lexer, parser and encoder loops are marked.
@@ -435,7 +435,7 @@ from three minutes to twenty-nine, and the high ones describe a loaded machine
 rather than the tree.
 
 And `ignored` is not the whole of the timing-sensitive suite —
-`ply-eval/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
+`ply-eval-tests/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
 asserts on a wall-clock growth ratio and runs by default, and it failed for us on
 a machine that was busy compiling something else. On a quiet machine it passes.
 

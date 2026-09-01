@@ -74,7 +74,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
     ),
     (
         "Event::Enter",
-        "CONTRIBUTING.md item 15: nothing outside crates/ply-test/tests/ \
+        "CONTRIBUTING.md item 15: nothing outside crates/ply-test-tests/tests/ \
          constructs a SliceBuilder, so nothing calls SliceBuilder::record, so no \
          Event is ever built. SliceBuilder::record does match on all three \
          variants — that is a consumer, not a producer.",
@@ -1081,7 +1081,7 @@ fn tree() -> &'static Tree {
 fn how_to_fix(what: &str, list: &str) -> String {
     format!(
         "\n\nEither construct it — {what} — or, if it is reserved on purpose, add a row to \
-         `{list}` in crates/ply-span/tests/armed.rs with a reason and a citation. \
+         `{list}` in crates/ply-span-tests/tests/armed.rs with a reason and a citation. \
          An entry there is not absolution: it is what makes \"reserved on purpose\" and \
          \"we forgot\" stop looking identical. Do NOT loosen the rule to make an entry \
          disappear; that inverts the point of this gate.\n\
@@ -1248,7 +1248,7 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
          wrapper is invisible to every_registered_code_is_constructed_in_production, which \
          would then report it dead — or, if the wrapper were quietly allowlisted by file, hide \
          a real death. Add the wrapper to CODE_INDIRECTION in \
-         crates/ply-span/tests/armed.rs with a reason, or pass codes::NAME literally.",
+         crates/ply-span-tests/tests/armed.rs with a reason, or pass codes::NAME literally.",
         unlisted.len(),
         unlisted.join("\n")
     );

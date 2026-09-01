@@ -193,7 +193,7 @@ This one, in its serializer, is not documented anywhere I could find.
 > the serializer is linear **on the machine engine**. Confirmed on the shipped
 > module with `ply_eval::rc::stats()` rather than a clock — whole-accumulator
 > copies per encode went from exactly k to **0** at k up to 32,000 — and guarded
-> by `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs`. Column 3's warning was
+> by `crates/ply-eval-tests/tests/suite/stdlib_accumulator_cost.rs`. Column 3's warning was
 > confirmed at the same time and on the shipped module: built as two `push`es
 > that are each last, the largest string `encode_string` can encode under the
 > call budget halves, from **9,993 escapes to 4,996**. The line citation
@@ -271,7 +271,7 @@ The text as it stood:
 update, because `..` cannot begin a statement. Expansion runs inside
 `ply_syntax::parse_module`, so `{..s, toks: xs}` and the field list it stands for
 are one definition with one `DefHash`
-(`crates/ply-hash/tests/suite/audit.rs record_update_hashes_as_its_expansion`).
+(`crates/ply-hash-tests/tests/suite/audit.rs record_update_hashes_as_its_expansion`).
 
 Every state transition in `lexer.ply` therefore lists every field:
 

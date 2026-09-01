@@ -1,15 +1,15 @@
 //! The counting allocator every test in this binary measures against.
 //!
 //! There is one of these because a `#[global_allocator]` is a whole-binary
-//! decision, and seven copies of it meant seven binaries. It counts on the
+//! decision, and three copies of it meant three binaries. It counts on the
 //! calling thread only — the counters are `thread_local!` — which is what lets
 //! the tests here run in parallel with each other the way the tests inside any
-//! one of those seven already did.
+//! one of those three already did.
 //!
 //! `ARMED` is why the counters can be read at all: without it every test would
 //! also charge itself the harness's own allocations between measured regions.
 //!
-//! `crates/ply-corpus/tests/allocation/counting.rs` is the same file. Integration
+//! `crates/ply-eval-tests/tests/allocation/counting.rs` is the same file. Integration
 //! tests in different crates cannot share a module, so closing that last seam
 //! would mean a workspace member existing only to hold this — a member
 //! `ci-shards.sh verify` would then require a shard for. Two copies is the

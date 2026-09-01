@@ -2623,7 +2623,7 @@ Ply call. Reach for it when a hash is what you need and the input is small. `ply
 itself hashes in Rust, and ADR 0033 §3 carries the measurement and the bar it
 was taken against.
 
-What holds it to the truth is `crates/ply-eval/tests/blake3_differential.rs`,
+What holds it to the truth is `crates/ply-eval-tests/tests/blake3_differential.rs`,
 which hashes the same input with this module and with the `blake3` crate the
 compiler links, at every structural boundary the algorithm has — the block, the
 chunk, and the tree above it. Zero disagreements, or the suite is red.
