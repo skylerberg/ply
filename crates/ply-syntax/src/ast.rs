@@ -492,6 +492,9 @@ pub struct FnDef {
     pub derived: Option<Derived>,
     /// `requires` / `ensures`, in source order.
     pub spec: Vec<SpecClause>,
+    /// The span of a `reuse` before `fn`: the callee-side promise that every append in the body
+    /// reuses its list, checked by the cost checker and refused with E0127 when it cannot show it.
+    pub reuse: Option<Span>,
     pub body: Expr,
     pub span: Span,
 }

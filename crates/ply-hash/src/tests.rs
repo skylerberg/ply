@@ -164,6 +164,7 @@ fn func(name: &str, params: &[&str], body: Expr) -> Item {
         constraints: Vec::new(),
         derived: None,
         spec: Vec::new(),
+        reuse: None,
         body,
         span: Span::DUMMY,
     }))
@@ -305,6 +306,7 @@ fn renaming_a_type_changes_no_hash_of_its_users() {
                 constraints: Vec::new(),
                 derived: None,
                 spec: Vec::new(),
+                reuse: None,
                 body: e(ExprKind::Match {
                     scrutinee: Box::new(var("u")),
                     arms: vec![
@@ -663,6 +665,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body: int(0),
             span: Span::DUMMY,
         }))]
@@ -1095,6 +1098,7 @@ fn an_absent_annotation_differs_from_a_written_one() {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -1119,6 +1123,7 @@ fn a_generic_parameter_is_positional_not_named() {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body: var("x"),
             span: Span::DUMMY,
         }))]
@@ -1146,6 +1151,7 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -1165,6 +1171,7 @@ fn a_free_type_name_is_not_a_generic_parameter() {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body: var("x"),
             span: Span::DUMMY,
         }))],
@@ -2228,6 +2235,7 @@ fn constrained(param: &str, constraints: &[(Deriver, &str)]) -> Vec<Item> {
             .collect(),
         derived: None,
         spec: Vec::new(),
+        reuse: None,
         body: var("x"),
         span: Span::DUMMY,
     }))]

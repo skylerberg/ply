@@ -1,8 +1,8 @@
 //! `ply check --costs`: where an append copies, before the program runs.
 
 use ply_eval::costs::{Costs, DefKind, Definition, Report, Verdict};
-use ply_span::{SourceMap, Span};
-use ply_syntax::ast::Program;
+use ply_span::{Diagnostic, SourceMap, Span, codes};
+use ply_syntax::ast::{FnDef, Item, Program};
 use ply_syntax::resolve::Resolved;
 
 use crate::style::Style;
@@ -70,6 +70,71 @@ pub fn lines(
     out.push(String::new());
     out.push(format!("  {}", style.dim(&summary(&report))));
     Some(out)
+}
+
+/// The promise a `reuse fn` makes, checked: every append in its body reuses its list for every
+/// reason the body controls. An append onto the definition's own parameter keeps the promise
+/// whatever a caller does with what it passed — the promise says nothing about callers, which is
+/// what keeps the multi-shot counterexample from reaching it — and every other copy or undecided
+/// site is E0127, with the edit that would keep the promise where one exists. Only the modules in
+/// `program` are checked: a command that parsed part of a project checks the promises it parsed.
+pub fn promises(program: &Program, resolved: &Resolved) -> Vec<Diagnostic> {
+    let promised: Vec<(usize, &FnDef)> = program
+        .modules
+        .iter()
+        .enumerate()
+        .flat_map(|(module, m)| {
+            m.items.iter().filter_map(move |item| match item {
+                Item::Fn(def) if def.reuse.is_some() => Some((module, &**def)),
+                _ => None,
+            })
+        })
+        .collect();
+    if promised.is_empty() {
+        return Vec::new();
+    }
+    let report = Costs::new(program, resolved).check();
+    let mut out = Vec::new();
+    for def in report.all() {
+        if def.kind != DefKind::Fn {
+            continue;
+        }
+        let Some((_, decl)) = promised.iter().find(|(module, decl)| {
+            *module == def.module && def.name.ends_with(&format!(".{}", decl.name.name))
+        }) else {
+            continue;
+        };
+        let promise = decl
+            .reuse
+            .expect("a promised definition carries its marker");
+        for site in &def.sites {
+            if site.verdict == Verdict::Reuses || site.param.is_some() {
+                continue;
+            }
+            let what = match site.verdict {
+                Verdict::Copies => "copies its list",
+                _ => "cannot be shown to reuse its list",
+            };
+            let mut d = Diagnostic::error(
+                codes::REUSE_BROKEN,
+                format!(
+                    "`{}` is a `reuse fn`, and this append {what}: {}",
+                    decl.name.name, site.reason
+                ),
+            )
+            .primary(site.span, "this append")
+            .secondary(promise, "the promise");
+            d = match site.fix() {
+                Some(fix) => d.note(format!("fix: {fix}")),
+                None => d.note(
+                    "no edit inside this body removes the copy; the promise cannot be kept as \
+                     written, so either restructure the append or drop `reuse`",
+                ),
+            };
+            out.push(d);
+        }
+    }
+    out
 }
 
 fn tally(def: &Definition) -> String {
