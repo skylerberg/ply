@@ -2,541 +2,363 @@
 
 Status: **rejected for now, with two pieces of the spike kept.**
 
-> **Why anyone wanted this:** [ADR 0021](0021-why-bootstrap.md). This document
-> prices whether Ply can host its own front end and decides that it cannot yet.
-> It does not state the goal, and read alone it is a rejection with nothing
-> behind it. 0021 records the claim — Ply's verification loop is O(the change)
-> where every toolchain it competes with is O(the project) — and the four
-> preconditions that would change this answer.
+**Why anyone wanted this:** [ADR 0021](0021-why-bootstrap.md). This document
+prices whether Ply can host its own front end and decides that it cannot yet. It
+does not state the goal, **and read alone it is a rejection with nothing behind
+it.**
 
 - **Rejected:** writing Ply's front end in Ply on today's interpreter. §6 prices
-  it. The blocker is throughput, not expressiveness. **This decision stands and
-  the evidence for it has strengthened** — see the block below.
-- ~~**Accepted:** §1's finding is a defect in shipped code and is tracked as one…
-  `escape_runs` is quadratic in a client-chosen input.~~ **Fixed** (§7 item 3).
-- **Accepted:** the differential-harness pattern in `spikes/ply-lexer/harness`
-  is the right shape for pricing any future port, with the amendment in §3.2.
-  Re-used, and it held: `spikes/ply-parser/harness` is built on it.
-- ~~**Not decided here:** whether the fragment should grow to cover a front
-  end.~~ **Decided elsewhere:** [ADR 0026](0026-a-reachable-backend.md).
+  it. **The blocker is throughput, not expressiveness**, and the evidence for it
+  has strengthened.
+- **Accepted:** the differential-harness pattern in `spikes/ply-lexer/harness` is
+  the right shape for pricing any future port, with §3.2's amendment. Re-used,
+  and it held: `spikes/ply-parser/harness` is built on it.
+- **Decided elsewhere:** whether the fragment should grow to cover a front end —
+  [ADR 0026](0026-a-reachable-backend.md).
+- **Closed:** §1's shipped defect, fixed in §7 item 3.
 
-> ## What has happened since, and what a reader should not trust
->
-> This document was written on **2026-08-24** and re-run rather than re-read.
-> Five later documents have moved parts of it, and the corrections are in place
-> throughout — but the *pricing* in §6 is the reason anyone reads this ADR, and
-> §6.1 and §6.2 were both overtaken. **Read this block before §6.**
->
-> | what moved | where | now |
-> | --- | --- | --- |
-> | §5.1's premise — that a recursive-descent parser recurses per element | ADR 0022 | **refuted.** `parser.rs` drives every sequence with a loop; `iterate` gives Ply the same shape at depth 1 |
-> | §6.1's throughput figures | `spikes/ply-parser` | **do not reproduce.** Both engines 2–3× faster than recorded; the *ratio* holds |
-> | §6.2's multiplier, assumed at 5–10× | `spikes/ply-parser` | **measured at 2.62** for lex+parse, with two of six phases written |
-> | §6.2's premise — lexing is 10–20% of front-end time | `spikes/ply-parser` | **wrong.** It is 30–40% after two phases |
-> | §6.3's 11.68× on `read_line`-shaped code | ADR 0026 | **`read_line` cannot cross the seam.** §6.3's own arithmetic rests on a function `admit` refuses on its first line |
-> | §7 item 2, "a lint … is the only one" | [0024](0024-ownership-as-a-checked-property.md), [0025](0025-ownership-design.md) | **refuted.** The lint was built and failed in both directions |
-> | §4.1's `push` mechanism | mechanism sweep | **`push` does not copy a `List`.** Sharing decides it, and sharing is decided by position |
->
-> **The decision is not one of the things that moved, and the case for it is
-> stronger than this document makes it.** §6.1 priced one phase at 12.6× the
-> Rust front end. Two phases now measure at **30×** — 3.01 s user against 0.10 s
-> for six Rust phases, no extrapolation. Redoing §6.2's own arithmetic on
-> today's measured lexer term gives **58–115×** against the 60–130× below:
-> both absolute halves halved and the ratio did not move.
+## What has happened since, and what a reader should not trust
 
-This ADR reviews the spike at `spikes/ply-lexer/`, merged as `73ebd1c`. It was
-written by re-running the spike rather than by reading its write-up. Where a
-claim of the spike's is repeated here it was re-checked; where it was refuted,
-the refutation is in place with the withdrawn text quoted.
+This document was written by re-running the spike rather than by reading its
+write-up. Five later documents have moved parts of it, and **the *pricing* in §6
+is the reason anyone reads this ADR. Read this before §6.**
+
+| what moved | where | now |
+| --- | --- | --- |
+| §5.1's premise — that a recursive-descent parser recurses per element | ADR 0022 | **refuted.** `parser.rs` drives every sequence with a loop; `iterate` gives Ply the same shape at depth 1 |
+| §6.1's throughput figures | `spikes/ply-parser` | **do not reproduce.** Both engines several times faster than recorded; the *ratio* holds |
+| §6.2's multiplier, assumed | `spikes/ply-parser` | **measured**, for two of six phases |
+| §6.2's premise — lexing is a tenth to a fifth of front-end time | `spikes/ply-parser` | **wrong.** It is a third after two phases |
+| §6.3's ratio on `read_line`-shaped code | ADR 0026 | **`read_line` cannot cross the seam.** §6.3's arithmetic rests on a function `admit` refuses on its first line |
+| §7 item 2, "a lint … is the only one" | ADRs 0024, 0025 | **refuted.** The lint was built and failed in both directions |
+| §4.1's `push` mechanism | mechanism sweep | **`push` does not copy a `List`.** Sharing decides it, and sharing is decided by position |
+
+**The decision is not one of the things that moved, and the case for it is
+stronger than this document makes it.** §6.1 priced one phase; two phases now
+measure at a multiple three times larger, with no extrapolation. Redoing §6.2's
+own arithmetic on the re-taken lexer term gives a band that overlaps the one
+below: **both absolute halves halved and the ratio did not move.**
 
 ---
 
 ## §0 What this reviewed, and the instrument problem it started with
 
-The spike ports `crates/ply-syntax/src/lexer.rs` to Ply (`lexer.ply`, 647
-lines), and compares the two lexers token by token over 33 `.ply` files. Its
-deliverable is `GAPS.md`.
+The spike ports `crates/ply-syntax/src/lexer.rs` to Ply and compares the two
+lexers token by token over a corpus of `.ply` files. Its deliverable is
+`GAPS.md`.
 
 **The first thing found was not about lexers.** `crates/ply-eval/src/frame.rs`
-carried a modification timestamp of `14:30:37` on a tree whose every other
-source file read `14:05:23`, and `target/release/ply` — the binary behind every
-wall-clock number in `GAPS.md` — was built at `14:31:21`, fifty-four seconds
-later. `frame.rs` holds four of the eight `ply_eval::rc::carry` call sites, and
-`carry` is the mechanism `GAPS.md` §1 rests on. The change was an unattributed
-edit making a field projection out of a uniquely-owned record *move* the field
-rather than clone it: the precise operation §1 measures.
+carried a modification timestamp minutes newer than every other source file on
+the tree, and `target/release/ply` — the binary behind every wall-clock number in
+`GAPS.md` — was built a minute after that. `frame.rs` holds half the
+`ply_eval::rc::carry` call sites, and `carry` is the mechanism `GAPS.md` §1 rests
+on. **The change was an unattributed edit making a field projection out of a
+uniquely-owned record *move* the field rather than clone it: the precise
+operation §1 measures.**
 
 So §1 was measured with an instrument that had been altered in the place it was
-measuring. That is not a hypothetical: it is the W1/M8 shape — a result whose
-provenance nobody checked because the result looked right.
+measuring. **That is the W1/M8 shape — a result whose provenance nobody checked
+because the result looked right.** It was re-taken three times on a clean binary,
+by two parties, and it survived.
 
-It was then re-taken three times on a clean binary, by two parties, and it
-survived. §4.1 gives the third of those. The file in the merged tree is clean:
-`grep -c "Arc::get_mut" crates/ply-eval/src/frame.rs` is **0** and `frame.rs:281`
-reads `Some(v) => self.go_return(v.clone())`.
-
-**The lesson is worth more than the outcome.** The finding was correct and the
+**The lesson is worth more than the outcome. The finding was correct and the
 instrument was not, and only one of those two was checked before the work was
-merged. Nothing in this repository's loop would have caught it: there is no CI,
-`cargo test --workspace` does not reach `spikes/`, and a modified working tree
-is invisible to every command in `CONTRIBUTING.md` §"The loop".
+merged.** Nothing in this repository's loop would have caught it: CI's spike job
+reaches `crates/ply-codegen-spike` and nothing in it reaches `spikes/ply-lexer`,
+whose harness declares its own `[workspace]`; `cargo test --workspace` does not
+reach `spikes/`; and a modified working tree is invisible to every command in
+`CONTRIBUTING.md` §"The loop".
 
-> **Two of those three still hold; one is withdrawn, and something now catches
-> it (2026-08-27).** The withdrawn clause is *"there is no CI"* —
-> `.github/workflows/ci.yml` has existed since 2026-08-24 with nine jobs.
-> It still would not have caught this: its `spike` job runs
-> `crates/ply-codegen-spike` and nothing in it reaches `spikes/ply-lexer`, whose
-> harness declares its own `[workspace]`. The other two clauses are re-checked
-> and stand.
->
-> **And this hazard turned out to have a second, worse form.** The rule this
-> project used for checking a binary against its tree,
-> `find crates -name '*.rs' -newer target/release/ply`, cannot see an edit to a
-> stdlib module at all: `crates/ply-std/src/lib.rs` `include_str!`s all eight
-> `crates/ply-std/ply/*.ply` into the binary, so editing one changes what
-> `import std.http` means and moves no `.rs`. A round-1 workstream lost a
-> headline count to exactly that, which makes §0's story the first of two.
-> Both are now mechanical: `.github/binary-is-current.sh` reads rustc's
-> dep-info — `target/release/ply.d`, which lists all eight `.ply` files beside
-> the 144 `.rs` — and diffs the stdlib the binary actually holds against the
-> files on disk. `CONTRIBUTING.md` §"The binary is an instrument too" carries
-> the reproduction, the corrected rule, and the list of measurements in this
-> ADR that were taken through a pre-built binary. **§1 and §4.1 of this
-> document are on that list**, and are not withdrawn by it: §1 was re-taken
-> three times by two parties on a clean binary and survived, and §9 records the
-> binary as built from the reviewed tree.
+**And this hazard turned out to have a second, worse form.** The rule this
+project used for checking a binary against its tree —
+`find crates -name '*.rs' -newer target/release/ply` — **cannot see an edit to a
+stdlib module at all**: `crates/ply-std/src/lib.rs` `include_str!`s every
+`crates/ply-std/ply/*.ply` into the binary, **so editing one changes what
+`import std.http` means and moves no `.rs`.** A later workstream lost a headline
+count to exactly that. Both are now mechanical: `.github/binary-is-current.sh`
+reads rustc's dep-info, which lists the `.ply` files beside the `.rs`, and diffs
+the stdlib the binary actually holds against the files on disk.
+`CONTRIBUTING.md` §"The binary is an instrument too" carries the reproduction and
+the list of measurements in this ADR taken through a pre-built binary — **§1 and
+§4.1 are on that list, and are not withdrawn by it.**
 
 ---
 
 ## §1 What was verified
 
-Re-run in `~/.worktrees/ply/lexer-verify` at `73ebd1c`, release binary built
-from that tree.
+`ply test` over the Ply lexer and the harness's own suite are green, and the
+agreement corpus covers the whole shipped standard library and the largest file
+in the tree, on **spans, payloads *and* diagnostics**.
 
-| check | result |
-| --- | --- |
-| `ply test spikes/ply-lexer/lexer.ply --no-cache` | **15 passed, 0 failed**, 0.03 s |
-| `cd spikes/ply-lexer/harness && cargo test` | **22 passed, 0 failed** (18 integration, 4 lib), 4.71 s |
-| agreement corpus | **33 files, 768,760 bytes** — re-counted with `wc -c` |
-| token stream | **120,490 tokens + 25 diagnostics** |
+**The token count was re-derived independently rather than quoted.** Dumping
+every corpus file and counting record kinds sums to the spike's figure to the
+token.
 
-The token count was re-derived independently rather than quoted. Dumping all 33
-files with `plydump` and counting record kinds gives punctuation 69,347,
-identifiers 39,429, keywords 5,256, strings 3,055, integers 2,483, byte strings
-766, decimals 97, EOF 33, floats 24 — which sums to **exactly 120,490** — plus
-25 diagnostics. The spike's figure is right to the token.
+The code citations behind §1's mechanism were checked and hold: `rc::carry`,
+`Env::take_unique_inner`'s `Rc::get_mut` refusal with its *"refuses at the first
+shared link"* comment, `DEFAULT_MAX_CALLS`, and the count of `carry` call sites.
 
-The code citations behind §1's mechanism were checked and all hold:
-`rc::carry` at `crates/ply-eval/src/rc.rs:98`; `Env::take_unique_inner`'s
-`Rc::get_mut` refusal with its *"Refuses at the first shared link"* comment;
-`DEFAULT_MAX_CALLS = 10_000`; and **exactly eight** `carry` call sites, which is
-still eight. `crates/ply-std/ply/json.ply` is as described.
-
-> **Corrected while §7 item 3 was taken — one substantive error and four stale
-> line numbers.** This paragraph used to end: *"`crates/ply-std/ply/json.ply:589-599`
-> is as described: the inner `push(acc, ..)` is argument 0 of 2 of `escape_runs`."*
-> The inner `push` is argument 0 of 2 **of the outer `push`**, not of
-> `escape_runs`; `escape_runs` takes three arguments and the offending
-> sub-expression is nested inside its third. The distinction is the whole
-> mechanism — the outer `push` *is* `escape_runs`' last argument and was always
-> fine, which is why only one of the two copied. `GAPS.md` §1 states it
-> correctly and this paraphrase of it did not.
->
-> The line numbers had drifted with later edits and are given above without
-> them. Re-read in this tree: `env.rs:131` for the refusal comment
-> (`take_unique_inner` begins at `:127`), not `env.rs:133`; `limit.rs:50` for
-> `DEFAULT_MAX_CALLS`, not `limit.rs:35` — `GAPS.md` §5 carries the same stale
-> `:35`; and `machine.rs:1035/1092/1122`, not `machine.rs:1007/1064/1094`. The
-> `handler.rs:208` and `frame.rs:107/142/263/301` sites are unmoved, and the
-> count is unchanged at eight.
+**One substantive error in this section was corrected while §7 item 3 was
+taken.** It said the inner `push` in `json.ply`'s `escape_runs` is "argument 0 of
+2 of `escape_runs`". It is argument 0 of 2 **of the outer `push`**;
+`escape_runs` takes three arguments and the offending sub-expression is nested
+inside its third. **The distinction is the whole mechanism** — the outer `push`
+*is* `escape_runs`' last argument and was always fine, **which is why only one of
+the two copied.** `GAPS.md` §1 states it correctly and this paraphrase did not.
 
 ### §1.1 The comparison is armed — checked with corruptions of my own
 
-A green agreement over a comparator that cannot go red is this project's
-signature defect, and the spike's own six mutation tests are not evidence that
-*mine* would be caught. Two fresh corruptions of `lexer.ply`, neither used by
-the spike (`++` → `plus`) nor by the pre-merge check (`{` → `|`):
+**A green agreement over a comparator that cannot go red is this project's
+signature defect**, and the spike's own mutation tests are not evidence that
+*mine* would be caught. Two fresh corruptions of `lexer.ply`, neither used by the
+spike nor by the pre-merge check:
 
 | corruption | axis | result |
 | --- | --- | --- |
-| `emit(done, n, n, TEof)` → `emit(done, n - 1, n, TEof)` | span only; kind and payload identical | **caught** |
-| `t == b"handle"` deleted from `is_keyword` | kind and payload | **caught** |
+| an off-by-one in the EOF token's start | span only; kind and payload identical | **caught** |
+| a keyword deleted from `is_keyword` | kind and payload | **caught** |
 
-A span-only corruption is the one a token-stream comparator is usually blind to.
-This one is not.
+**A span-only corruption is the one a token-stream comparator is usually blind
+to. This one is not.**
 
 ---
 
 ## §2 What the spike proved
 
 1. **Ply can express a lexer for its own language, to the token.** Agreement is
-   on spans, payloads *and* diagnostics across 768,760 bytes, including the
-   whole shipped standard library and the largest file in the tree.
-2. **It can lex itself.** `lexer.ply` (26,404 bytes, containing a 1,024-character
-   byte-table literal) is lexed by `lexer.ply` without error. This is the
-   canonical self-hosting question for a lexer and it was not in the spike's own
-   test set; it was run here and it passes.
+   on spans, payloads *and* diagnostics, including the whole shipped standard
+   library.
+2. **It can lex itself**, byte-table literal and all. **This is the canonical
+   self-hosting question for a lexer and it was not in the spike's own test set**;
+   it was run here and it passes.
 3. **§1's finding is real, is positional, and is already being paid in shipped
-   code.** Three independent measurements now agree, and the shipped instance
+   code.** Three independent measurements agree, and the shipped instance
    reproduces on the real `std.json` module (§4.1).
 4. **The type checker carried the port.** `ply check` passed first try on a
-   647-line hand port of 1,069 lines of Rust. That is a real result about the
-   language and it is easy to overlook next to the gap list.
+   hand port of over a thousand lines of Rust. **That is a real result about the
+   language and it is easy to overlook next to the gap list.**
 5. **The divergence is honestly bounded.** The two lexers differ at exactly one
-   decision point — `char::is_alphabetic`/`is_whitespace` at a token's first
-   byte — and the three shapes are pinned by exact-dump tests rather than
-   described.
+   decision point — `char::is_alphabetic`/`is_whitespace` at a token's first byte
+   — and the three shapes are pinned by exact-dump tests rather than described.
 
 ---
 
 ## §3 What the spike did not prove
 
-The agreement figure is 768,760 bytes. That number does a lot of rhetorical work
-and the coverage underneath it is narrower than it sounds.
+**The agreement figure does a lot of rhetorical work and the coverage underneath
+it is narrower than it sounds.**
 
 ### §3.1 The error paths are 0.15% of the corpus
 
-All **25** diagnostics in the entire corpus come from the 10 hand-written
-fixtures, which total **1,122 bytes**. Not one of the 23 real `.ply` files in
-the tree raises a single lexer diagnostic. The spike's README says the fixtures
-exist because no real file reaches the error paths, so this is disclosed — but
-the disclosure and the 768,760 figure appear in different paragraphs, and half
-of what `lexer.rs` does is error handling.
+**Every diagnostic in the entire corpus comes from the ten hand-written fixtures,
+which together are about a kilobyte.** Not one real `.ply` file in the tree
+raises a lexer diagnostic. The spike's README says the fixtures exist because no
+real file reaches the error paths, **so this is disclosed — but the disclosure
+and the byte count appear in different paragraphs, and half of what `lexer.rs`
+does is error handling.** Float coverage is thinner still: a couple of dozen
+float tokens in the whole corpus, every one short.
 
-Float coverage is thinner still: **24 float tokens in the whole corpus**, 12 of
-them in `fixtures/numbers.ply` and 12 in `crates/ply-std/ply/json.ply`. Every one
-is short — `1.5`, `2.0`, `1e9`, `1.5e-3`. Decimals: 97.
+**Demonstrated rather than counted.** A census of a corpus is an argument about
+what that corpus *could* catch, so the claim was made biting instead. Both sites
+in `lexer.ply::punct` that raise a diagnostic were replaced so the mutant raises
+neither. **The token stream is byte-identical**; the mutant differs only in that
+it silently accepts what `ply_syntax` refuses — **the one failure a token-only
+comparison is built to miss, and the reason the dump carries diagnostics at
+all.**
 
-**Demonstrated rather than counted (second verification pass, 2026-08-24).** The
-paragraphs above are a census, and a census of a corpus is an argument about what
-that corpus *could* catch. The claim underneath it was made biting instead. Both
-sites in `lexer.ply::punct` that raise a diagnostic —
-`err(seek(s, start + 1), start, start + 1, unexpected())`, the lone `&` and the
-unrecognised byte — were replaced by `seek(s, start + 1)`, so the mutant raises
-neither. **The token stream is byte-identical**; the mutant differs from the real
-lexer only in that it silently accepts what `ply_syntax` refuses, which is the
-one failure a token-only comparison is built to miss and the reason the dump
-carries diagnostics at all.
+**Every agreement test over real source passed. Only the hand-written fixtures
+failed.** So the whole corpus of real source cannot tell the real lexer from one
+that never raises a punctuation diagnostic, and the kilobyte of fixtures is the
+entire difference between that mutant and a green board — **a ratio of hundreds
+to one by weight, on half of what `lexer.rs` does.** The spike disclosed the
+shape of this; what was missing is that **it is not a caveat about breadth but a
+load-bearing dependency on ten small files**, and any future port should size its
+fixtures against that rather than against the corpus.
 
-| agreement test | corpus it reads | verdict against the mutant |
-| --- | ---: | --- |
-| `..._on_every_example` | 13 files, 333,595 bytes | **passed** |
-| `..._on_the_kernel_benchmarks` | 2 files, 14,634 bytes | **passed** |
-| `..._on_the_shipped_standard_library` | 8 files, 419,409 bytes | **passed** |
-| `..._on_the_hand_written_edge_cases` | 10 files, **1,122 bytes** | **FAILED** — `rust: Some("84:85:!:E0001")`, `ply : None` |
-
-So the 767,638 bytes of real source cannot tell the real lexer from one that
-never raises a punctuation diagnostic at all. The 1,122 bytes of hand-written
-fixtures are the entire difference between that mutant and a green board — a
-ratio of **684 to 1** by weight, on half of what `lexer.rs` does. The spike
-disclosed the shape of this; what was missing was that it is not a caveat about
-breadth but a load-bearing dependency on ten small files, and any future port
-should size its fixtures against that rather than against the corpus.
-
-`lexer.ply` was restored byte-identical afterwards (`cmp` clean, 15 Ply tests and
-22 harness tests green).
+`lexer.ply` was restored byte-identical afterwards, `cmp` clean and every test
+green.
 
 ### §3.2 The float comparison cannot see the digits, and the README says it can
 
-`spikes/ply-lexer/README.md` states that what the comparison checks is that the
-Ply lexer *"classified the literal as a float, spanned the same bytes, and
-extracted the same digits."*
+The spike's README states that the comparison checks that the Ply lexer
+*"classified the literal as a float, spanned the same bytes, and extracted the
+same digits."*
 
-> **Withdrawn: "and extracted the same digits".** It does not check that. The
-> harness runs the Ply lexer's float text through Rust's `f64` parser
-> (`harness/src/lib.rs::floats_to_bits`) before comparing, so any digit string
-> that rounds to the same `f64` passes. What is checked is the *value*, not the
-> digits.
+> **Withdrawn: "and extracted the same digits".** The harness runs the Ply
+> lexer's float text through Rust's `f64` parser before comparing, **so any
+> digit string that rounds to the same `f64` passes. What is checked is the
+> *value*, not the digits.**
 
-Demonstrated, not reasoned, with two further corruptions of `lexer.ply`:
+Demonstrated, not reasoned, with two further corruptions: appending a zero to
+every fraction, and truncating every fraction to seventeen significant digits.
+**Both agree.** The second is an ordinary fixed-buffer bug and it is invisible.
 
-| corruption | what it does to every float in the input | result |
-| --- | --- | --- |
-| `float_text` appends `"0"` to the fraction | `1.5` → `1.50`, `1.5e-3` → `1.50e-3` | **AGREE** |
-| `float_text` truncates the fraction to 17 significant digits | `1.00000000000000000000001` → `1.00000000000000000` | **AGREE** |
+**The consequence is bounded — for a *lexer* the observable output is the `f64`
+— but it stops being bounded the moment a self-hosted front end converts that
+text itself**, which `GAPS.md` §5 says it must eventually. **The harness as built
+cannot certify the digit extraction it is relied on to certify.**
 
-The second is an ordinary fixed-buffer bug and it is invisible. The consequence
-is bounded — for a *lexer* the observable output is the `f64`, and the value is
-checked — but it stops being bounded the moment a self-hosted front end converts
-that text itself, which §5 of `GAPS.md` says it must eventually. The harness as
-built cannot certify the digit extraction it is relied on to certify.
-
-**One thing this found that came back green.** `1e400` — the inf-saturation case
-`GAPS.md` §3 is written around — appears in no corpus file and in no fixture. It
-was run here: both lexers produce `7ff0000000000000`, and the comparison agrees.
-Unexplored space, now explored, no defect.
+**One thing this found that came back green.** The inf-saturation case `GAPS.md`
+§3 is written around appears in no corpus file and in no fixture. It was run
+here: both lexers saturate identically. **Unexplored space, now explored, no
+defect.**
 
 ### §3.3 The Ply lexer cannot lex the files the harness writes to feed it
 
-The harness embeds each corpus file in a generated `probe.ply` as a `b"..."`
-literal. For `examples/desk.ply` that literal is 173,451 bytes and holds **5,902
-escapes**. `ply_syntax::lexer` lexes it into 27 tokens. `lexer.ply` cannot lex it
-at all:
+The harness embeds each corpus file in a generated `probe.ply` as a byte literal.
+For the largest example that literal holds thousands of escapes. `ply_syntax`
+lexes it into a couple of dozen tokens. **`lexer.ply` cannot lex it at all** —
+`E0502 recursion limit of 10000 nested calls exceeded`.
 
-```
-E0502 recursion limit of 10000 nested calls exceeded
-```
+**So the lexer agrees with the reference on the corpus and cannot process the
+files that were written in order to ask it about them.** This is not a defect the
+spike introduced — it is `GAPS.md` §6, which calls the corpus margin "a fact about
+the corpus, not about the lexer". **It is worth stating in the stronger form,
+because the corpus that refutes it is the spike's own scaffolding.**
 
-So the lexer agrees with the reference on 33 files and cannot process the 33
-files that were written in order to ask it about them. This is not a defect the
-spike introduced — it is `GAPS.md` §6's second bullet, which says
-`string_lit`/`bytes_body` recurse once per escape and calls the corpus margin
-"a fact about the corpus, not about the lexer". It is worth stating in the
-stronger form, because the corpus that refutes it is the spike's own scaffolding.
-
-Both cliffs were located rather than estimated:
-
-| shape | survives | fails |
-| --- | --- | --- |
-| consecutive comment lines (`skip_trivia`) | 9,000 | 10,000 |
-| escapes in one literal (`string_escape`) | 4,500 | 5,000 |
-
-Against a shipped corpus whose deepest trivia run is 135 lines and whose largest
-single literal holds **256** escapes (the byte tables in `json.ply`,
-`router.ply` and `lexer.ply`). The margin on real code is **18x** for escapes
-and **67x** for trivia runs. The margin on generated code is negative.
+Both cliffs were located rather than estimated: consecutive comment lines survive
+into the thousands and escapes in one literal into the low thousands, against a
+shipped corpus whose deepest trivia run is in the hundreds and whose largest
+literal holds a few hundred escapes. **The margin on real code is one to two
+orders of magnitude. The margin on generated code is negative.**
 
 ---
 
 ## §4 The gaps, ranked by what they cost
 
-The spike's `GAPS.md` numbers its fifteen entries in the order it met them. This
-is the order they cost, and it separates the three kinds the review was asked to
-separate.
-
-**Notation:** a bold **§N** leading an item in this section is `GAPS.md`'s
-section N, not this ADR's. Plain §N references elsewhere are this ADR's.
+`GAPS.md` numbers its fifteen entries in the order it met them. **This is the
+order they cost.** A bold **§N** leading an item here is `GAPS.md`'s section N.
 
 ### §4.1 The language expresses it, and slowly — and this one is a shipped defect
 
 **§1, the positional trap.** A growing container must be built in the last
 sub-expression of its enclosing node or the program is quadratic. Re-measured
-here from a reproduction written off the prose rather than copied, on the clean
-binary, **user CPU** as the primary statistic because it survives contention far
-better than wall clock, minimum of 3, load 33→44:
+from a reproduction written off the prose rather than copied, on a clean binary,
+**user CPU as the primary statistic because it survives contention far better
+than wall clock**, against a rule fixed before any data existed. **Accept.**
 
-| n | `toks` third of five | `toks` last of five | `toks` third, others `let`-bound first |
-| ---: | ---: | ---: | ---: |
-| 8,000 | 0.28 s | 0.02 s | 0.29 s |
-| 16,000 | 1.09 s | 0.05 s | 1.12 s |
-| 32,000 | 4.34 s | 0.09 s | 4.37 s |
+**The third arm is the important one.** Binding every other field to a `let`
+before the push makes the growing field the last *mention* of the record **and
+the program stays quadratic.** The rule is positional in the enclosing node, not
+about the variable. **Two people have now written the last-mention explanation
+down and both were wrong.**
 
-Against a rule fixed before any data existed (`/tmp/verify-preregistration.md`,
-written at load 85.87 before the binary finished building): accept if the
-non-final column is ≥ 3.0x per doubling at two consecutive doublings and the
-final column ≤ 2.5x. Measured **3.89x and 3.98x** against **2.5x and 1.8x**.
-**Accept.**
-
-The third column is the important one. It reproduces `GAPS.md`'s own correction:
-binding every other field to a `let` before the push makes `s.toks` the last
-*mention* of `s` and the program stays quadratic. The rule is positional in the
-enclosing node, not about the variable. Two people have now written the
-last-mention explanation down and both were wrong; the corrected text is in
-`GAPS.md` §1 and in `spikes/ply-lexer-rc/fieldorder.ply` lines 9-20.
-
-> **Residual, not corrected by the merge.** `fieldorder.ply:46` and `:50` still
-> carry the inline comments *"`s.toks` is not the last mention of `s`"* and
-> *"`s.toks` is the last mention of `s`. Nothing else changed."* — the withdrawn
-> framing, restated as the salient difference, twenty-six lines below the block
-> that withdraws it. Both are true of those two functions and neither states the
-> rule. Worth a one-line fix.
-
-The call-argument form confirms it is not record-specific — `sink(push(xs,i),i,i)`
-at 0.28/1.09/4.33 against `sink2(i,i,push(xs,i))` at 0.01/0.03/0.06, user CPU,
-same conditions. (The fast column's first doubling is 3.0x, above my threshold,
-at 0.01 s where timer granularity dominates; the second is 2.0x. Stated rather
-than smoothed.)
+The call-argument form confirms it is not record-specific.
 
 **It is being paid in shipped code, and this was re-measured on the shipped
-module rather than a copy.** A program calling `json::encode_string` on a string
-of *k* characters that all require escaping, running the real
-`crates/ply-std/ply/json.ply`, user CPU, min of 3, load ~41:
+module rather than a copy.** `json::encode_string` on a string whose characters
+all require escaping is quadratic in the number of escapes, approaching a
+four-fold cost per doubling as the linear start-up term washes out. `GAPS.md`
+measured a standalone reproduction; **the shipped module reproduces it. The
+spike's figure is confirmed on better evidence than the spike had.**
 
-| k escapes in one string | user |
-| ---: | ---: |
-| 1,000 | 0.03 s |
-| 2,000 | 0.07 s |
-| 4,000 | 0.22 s |
-| 8,000 | 0.79 s |
-
-Ratios 2.33x, 3.14x, 3.59x — approaching 4x as the linear start-up term washes
-out. `GAPS.md` measured a standalone reproduction and got 0.06/0.22/0.81 at
-k = 2,000/4,000/8,000; the shipped module gives 0.07/0.22/0.79. **The spike's
-figure is confirmed on better evidence than the spike had.**
-
-This is the highest-cost item in the whole gap list and it has nothing to do
-with self-hosting. It is quadratic behaviour in the standard library's JSON
-serializer, in the length of a string, and a served response that echoes
-attacker-influenced text through `encode_string` pays it. **Not traced to a
-concrete request path here** — that is the next step, not a claim.
+**This is the highest-cost item in the whole gap list and it has nothing to do
+with self-hosting.** It is quadratic behaviour in the standard library's JSON
+serializer, in the length of a string, **and a served response that echoes
+attacker-influenced text through `encode_string` pays it.**
 
 ### §4.2 The language cannot express it
 
-**§3, `Float`.** There is no `float_of_string`, no `float_to_string`, no
-`parse`; `float_of_decimal` cannot reach `inf`. Confirmed against the builtin
-table: the numeric surface is `decimal_of_string`, `decimal_to_string`,
-`decimal_of_int`, `decimal_of_float`, `int_of_decimal`, `float_of_decimal`,
-`decimal_round`, `decimal_div` and nothing else. A Ply lexer therefore cannot
-produce `TokenKind::Float(f64)`; it produces the literal's text and something
-else converts it. This is the one item in `GAPS.md` that is a hole rather than a
-tax, and §3.2 above shows the harness cannot check the substitute.
+**§3, `Float`.** There is no `float_of_string`, no `float_to_string`, no `parse`;
+`float_of_decimal` cannot reach `inf`. **A Ply lexer therefore cannot produce
+`TokenKind::Float(f64)`; it produces the literal's text and something else
+converts it.** This is the one item in `GAPS.md` that is a hole rather than a
+tax, **and §3.2 shows the harness cannot check the substitute.**
 
 **§8, no file IO.** No shipped effect has a file operation, so a source file
-reaches a Ply program as a literal or not at all. Cheap today (§3.3 shows the
-literal costs 0.01 s to parse) and absolute: a self-hosted front end needs
-either a file effect or a Rust driver that hands it bytes.
+reaches a Ply program as a literal or not at all. Cheap today and absolute: **a
+self-hosted front end needs either a file effect or a Rust driver that hands it
+bytes.**
 
 ### §4.3 Merely unfamiliar — and one of them is simply wrong
 
-**§4, the numeric bounds.** `GAPS.md` says:
+**§4, the numeric bounds.** `GAPS.md` says Ply has no `int_of_string`, that
+`decimal_of_string` "tops out below both bounds", and that checked `Int`
+arithmetic defeats the accumulate-and-watch-the-sign trick.
 
-> *"Ply has **no `int_of_string`**. `decimal_of_string` exists but tops out at 28
-> significant digits, which is below both bounds. And Int arithmetic is
-> *checked* (`interp.rs:1215`, `checked_add`), so the usual trick — accumulate
-> and look at the sign — raises before the overflow can be observed."*
-
-> **Withdrawn: "which is below both bounds".** The first sentence is wrong and
-> the workaround it justifies is largely unnecessary. The real signatures are
-> `decimal_of_string : (String) -> Option<Decimal>` and
-> `int_of_decimal : (Decimal, Rounding) -> Option<Int>`
-> (`crates/ply-core/src/numerics.rs:285-288`, and `string_of_bytes : (Bytes) ->
-> String` bridges the lexer's `Bytes`). Both answer an `Option`, so neither
-> raises and nothing needs to be accumulated. Run on the six boundary values
-> `fixtures/numbers.ply` tests:
+> **Withdrawn: "which is below both bounds".** `decimal_of_string` and
+> `int_of_decimal` both answer an `Option`, **so neither raises and nothing needs
+> to be accumulated.** Run on the six boundary values the fixtures test, they are
+> **exactly the two bounds `lexer.rs` decides with**: `decimal_of_string` accepts
+> the full mantissa maximum and declines one above it, which *is* the mantissa
+> test, and `int_of_decimal` is the other.
 >
-> | input | result |
-> | --- | --- |
-> | `9223372036854775807` (`i64::MAX`) | `Some(Int 9223372036854775807)` |
-> | `9223372036854775808` | Decimal fine, `int_of_decimal` → **`None`** |
-> | `99999999999999999999` | Decimal fine, `int_of_decimal` → **`None`** |
-> | `79228162514264337593543950335` (mantissa max) | Decimal fine |
-> | `79228162514264337593543950336` | `decimal_of_string` → **`None`** |
-> | `1000000000000000000000000000000` | `decimal_of_string` → **`None`** |
->
-> Those are exactly the two bounds `lexer.rs` decides with `parse::<i64>()` and
-> `parse::<i128>().filter(|m| *m <= (1<<96)-1)`. `decimal_of_string` does not
-> "top out below both bounds": it accepts the full 29-digit mantissa maximum and
-> declines one above it, which *is* the mantissa test, and 19 digits is well
-> inside it, which makes `int_of_decimal` the other test.
->
-> **The second sentence is true and this review first called it wrong.** Int
-> arithmetic *is* checked (`crates/ply-eval/src/interp.rs:1215`,
-> `BinOp::Add => a.checked_add(b)`, verified), so accumulate-and-look-at-the-sign
-> genuinely does raise before the overflow is observable. It is simply not
-> load-bearing, because accumulating is not the only route to the value.
+> **The second sentence is true and this review first called it wrong.** `Int`
+> arithmetic *is* checked, so accumulate-and-look-at-the-sign genuinely does
+> raise before the overflow is observable. **It is simply not load-bearing,
+> because accumulating is not the only route to the value.**
 
-Consequence, stated narrowly because the first draft of this paragraph
-overstated it: `int_max()`, `dec_max()`, `int_of_digits()` and the two
-comparison arms at `lexer.ply:345` and `:371` — roughly ten lines — are
-replaceable by two builtin calls that already exist.
+Consequence, stated narrowly **because the first draft of this paragraph
+overstated it**: about ten lines of `lexer.ply` are replaceable by two builtin
+calls that already exist. *(An earlier version of that sentence named twice as
+many lines and included `strip_zeros`, which is not only a bound-check helper —
+it builds the decimal mantissa payload, which has no builtin, and stays.)*
 
-> **Withdrawn: "`int_max()`, `dec_max()`, `strip_zeros` and `int_of_digits` ...
-> about 25 lines of `lexer.ply` ... exist for no reason."** `strip_zeros` is not
-> only a bound-check helper: `lexer.ply:369` uses it to build the `TDec`
-> mantissa payload, which is a digit string and has no builtin. It stays. And
-> the four functions are about fourteen lines, not twenty-five.
+**This is a discoverability gap, not a language gap**, and it belongs in a
+different bucket from §1 and §3. **It was found by running the builtins rather
+than by reading the gap list — which is also how the overstatement above was
+found, one step later.**
 
-This is a **discoverability** gap, not a language gap, and it belongs in a
-different bucket from §1 and §3. It is the clearest instance of the review's
-third category, and it was found by running the builtins rather than by reading
-the gap list — which is also how the overstatement above was found, one step
-later.
-
-**§13, no dispatch mechanism.** `GAPS.md` records this as a negative result and
-it is right to: a lexer has nowhere that wants open dispatch.
-
-**§14, mutable state.** Never reached for. Also a negative result.
+**§13, no dispatch mechanism**, and **§14, mutable state** — both recorded as
+negative results, correctly: a lexer has nowhere that wants either.
 
 ### §4.4 Real taxes, correctly ranked as taxes
 
-§2 (no record update — `http.ply:1016-1029` writes 13 `Limits` fields to change
-one, confirmed; **closed by W4**, see `docs/adr/0023-record-update.md`, and the
-"silently wrong limit rather than a type error" half of `GAPS.md` §2 was
-withdrawn there — it is a type error, and the surviving hazard is a mispairing),
-§7 (no `byte_of_int`; the 1,024-character table appears in
-`json.ply:627` and `lexer.ply:29` for the identical reason), §9 (no tuples),
-§10 (~~the `List` surface is `len/push/map/filter/fold/range` — confirmed against
-the builtin table: no index, concat, reverse, prepend or sort~~ — see the
-correction below), §11 (`bytes_at_or`, still **not measured**, as `GAPS.md`
-says).
+**§2** (no record update — **closed by ADR 0023**, which also withdrew the
+"silently wrong limit rather than a type error" half; it is a type error, and the
+surviving hazard is a mispairing), **§7** (no `byte_of_int`; two independent
+byte-table literals exist for the identical reason), **§9** (no tuples), **§10**
+(the `List` surface), **§11** (`bytes_at_or`, still **not measured**).
 
-§12's count was re-derived: **57 of 129** `fn` definitions in `json.ply` return a
-`Result`, against the 58 `GAPS.md` reports with an explicit "close rather than
-exact" hedge. The hedge is honest and the figure stands.
+§12's count of `Result`-returning functions in `json.ply` was re-derived and the
+spike's figure stands, with its own "close rather than exact" hedge.
 
-> **§10's enumeration is corrected (list index, 2026-08-30).** The struck text
-> was an accurate reading of the builtin table when it was written and is
-> quoted rather than deleted for that reason. Two builtins have been added to
-> the table since: `iterate` (`docs/adr/0022-the-call-ceiling.md`) and the index
-> this paragraph says is absent — `list_at` (`docs/adr/0027-a-list-index.md`).
-> The surface is now `len/push/list_at/map/filter/fold/range/iterate`, and **"no
-> index" is the half that is now false**; concat, reverse, prepend and sort are
-> still absent. §11's `bytes_at_or` is still not measured, and ADR 0027 §8 now
-> carries a prior against it: the equivalent *list* form was measured, missed a
-> 1.5× bar at 1.26×, and was refused.
+**§10's enumeration has since been corrected.** It read that `List` has no index,
+concat, reverse, prepend or sort, **which was an accurate reading of the builtin
+table when written.** Two builtins have been added since: `iterate` (ADR 0022)
+and `list_at` (ADR 0027). **"No index" is the half that is now false**; the
+others stand. **ADR 0027 §8 also carries a prior against §11's `bytes_at_or`:
+the equivalent *list* form was measured, missed its bar, and was refused.**
 
 ### §4.5 Five stale claims in the merged tree, all fixed while this was written
 
-> **The count in this heading moved twice, which is the point of the section.**
-> It read *"One stale claim in the merged tree"*, then *"Two stale claims in the
-> merged tree, both fixed while this was written"*. Each re-read of the spike
-> found another. Three of the five are in `lexer.ply` and are recorded at the
-> foot of this section; the two below were the ones the first passes saw.
+**The count in this heading moved twice, which is the point of the section.** It
+read "one", then "two". **Each re-read of the spike found another.**
 
-`spikes/ply-lexer/harness/tests/agreement.rs:241-245` opened:
+The harness's agreement test opened with *"the corpus above is every `.ply` file
+in the tree and **all of it is ASCII** — checked, and the reason this test
+exists."* **Both halves are false.** The corpus is a third of the `.ply` files
+outside `spikes/`, and it holds over a thousand non-ASCII bytes — a figure a test
+four lines below pins with an `assert_eq!`, **in a test carrying two correction
+blocks of its own that say so.** The spike withdrew this claim in its README and
+in that test's doc comment **and left it standing in the doc comment one test
+above.**
 
-> *"The corpus above is every `.ply` file in the tree and **all of it is ASCII**
-> — checked, and the reason this test exists."*
+`GAPS.md` §5 called one module "the largest `.ply` file in the tree". It is the
+file with the most **tokens** and the second largest by **bytes**. The claim §5
+rests on holds either way.
 
-Both halves are false. The corpus is 33 of the **109** `.ply` files in the tree
-outside `spikes/` (`find . -name '*.ply' -not -path './target/*' -not -path
-'./spikes/*' | wc -l`), and it holds **1,543** non-ASCII bytes — a figure
-`every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree` pins with an
-`assert_eq!` at `:314`, in a test carrying two correction blocks of its own that
-say so. The spike withdrew this claim in its README and in that test's doc
-comment and left it standing in the doc comment one test above.
+**Three more, all in `lexer.ply`, none found by the spike's own review or by the
+first pass of this one:** a header comment naming the wrong accumulator data
+structure, and two counts off by one.
 
-`GAPS.md` §5 called `crates/ply-std/ply/db.ply` *"the largest `.ply` file in the
-tree ... is **29,212**"*. It is the file with the most **tokens** (29,213 by
-`plydump`) and the second largest by **bytes** (135,285 against `desk.ply`'s
-159,683). The claim §5 rests on — that a recursive scanner dies a third of the
-way through it — holds either way.
-
-> **Both were corrected in the tree during this review**, by the author of the
-> spike, with the withdrawn text quoted in place, so the present tense above
-> describes the tree as it was reviewed rather than as it now stands. Recorded
-> in the past tense here because an ADR that silently describes a fixed defect
-> as live is the same failure in the other direction.
-
-**Three more, all in `lexer.ply`, none of them found by the spike's own review
-or by the first pass of this one.** They were corrected in place during a second
-verification pass, withdrawn text quoted beside each:
-
-| line | withdrawn | actual |
-| --- | --- | --- |
-| `:16-19` | *"Tokens accumulate in a `Map<Int, Token>` and not a `List<Token>`, because `push(s.toks, t)` where `s` is a record is **quadratic**: the field read leaves the list aliased by the record it came out of, so `push` copies rather than updating in place. Measured; `GAPS.md` §1."* | the accumulator **is** a `List<Token>` (`Scan`, `:93`), and the mechanism given is the one `GAPS.md` §1 spends a correction block withdrawing |
-| `:14` | *"`examples/desk.ply` alone is 24,847 tokens"* | **19,576**, which is what `GAPS.md` §5 and §15 both say |
-| `:146` | *"The deepest run in the corpus this is checked against is 136 lines"* | **135**, which is what `GAPS.md` §6 says |
-
-The first is worth more than the other two together, and it is the strongest
+**The first is worth more than the other two together, and it is the strongest
 single illustration in this review of why the repository keeps finding this
-defect. It is `lexer.ply`'s **header comment** — the first prose a reader of the
-file meets — and it does not merely name the wrong data structure. It restates,
-in the voice of a measurement and with a citation to `GAPS.md` §1, precisely the
-explanation that `GAPS.md` §1 exists to withdraw. The corrected statement was
-already in the same file, 60 lines below, on `Scan`. So the spike carried the
-withdrawn claim and its withdrawal simultaneously, with the withdrawn one first
-and better placed, and three reviews read past it — because a header comment
-reads as orientation rather than as a claim, and nothing in this project's loop
-treats it as one.
+defect.** It is `lexer.ply`'s **header comment** — the first prose a reader of
+the file meets — and it does not merely name the wrong data structure. **It
+restates, in the voice of a measurement and with a citation to `GAPS.md` §1,
+precisely the explanation that `GAPS.md` §1 exists to withdraw.** The corrected
+statement was already in the same file sixty lines below. **So the spike carried
+the withdrawn claim and its withdrawal simultaneously, with the withdrawn one
+first and better placed, and three reviews read past it — because a header
+comment reads as orientation rather than as a claim, and nothing in this
+project's loop treats it as one.**
 
-The correction to `agreement.rs` also closed a hole this review had left open.
-The 86 uncompared files hold **95,419** bytes, and one of them —
-`tests/fixtures/unterminated_string.ply` — is the only file outside the spike
-that raises a lexer diagnostic. It was compared by hand and the two lexers agree
-on it exactly, `E0002` included. That is a real narrowing of §3.1's gap: the
-error-path evidence is now ten fixtures **and** the one real file in the tree
-that reaches an error path, rather than ten fixtures alone.
+Correcting the agreement test also closed a hole this review had left open: the
+uncompared files include **the only file outside the spike that raises a lexer
+diagnostic.** It was compared by hand and the two lexers agree on it exactly.
+**That is a real narrowing of §3.1's gap: the error-path evidence is now ten
+fixtures *and* the one real file in the tree that reaches an error path.**
 
 ---
 
@@ -547,155 +369,100 @@ is the finding of this section rather than a list of aggravations.
 
 ### §5.1 The gap that changes category
 
-> **Its premise is withdrawn by ADR 0022 (2026-08-27).** This section's two
-> load-bearing sentences were:
-> *"A recursive-descent parser consuming N top-level definitions, or N list
-> elements, or N arguments, recurses once per element unless it is folded"* and
-> *"The lexer's fold-over-a-range escape hatch does not generalise, because a
-> recursive-descent parser's recursion **is** the grammar."*
+> **Its premise is withdrawn by ADR 0022.** The two load-bearing sentences were
+> that a recursive-descent parser *"recurses once per element unless it is
+> folded"* and that *"the lexer's fold-over-a-range escape hatch does not
+> generalise, because a recursive-descent parser's recursion **is** the
+> grammar."*
 >
-> Neither holds of the reference implementation this repository ships.
-> `crates/ply-syntax/src/parser.rs` drives **every** sequence with a loop — 16
-> `while` and 5 `loop`, one per sequence, with the shared `comma_list`
-> (`:2059`, loop at `:2065`) called from **fourteen** sites covering argument
-> lists, list and record literals, parameters, generic arguments and pattern
-> arguments. It even climbs precedence iteratively (`bin_expr` `:1222`, `while`
-> at `:1224`), recursing only for the right operand, so its depth is bounded by
-> the six binding powers `bin_op` (`:2096`) declares rather than by operand
-> count — which also withdraws *"at perhaps 15 precedence levels that is ~255
-> frames"* below.
+> **Neither holds of the reference implementation this repository ships.**
+> `crates/ply-syntax/src/parser.rs` drives **every** sequence with a loop, with
+> one shared `comma_list` called from a dozen-plus sites covering argument lists,
+> literals, parameters and pattern arguments. It even climbs precedence
+> iteratively, recursing only for the right operand, **so its depth is bounded by
+> the binding powers it declares rather than by operand count.**
 >
-> It reserves recursion for grammar nesting, and **bounds that itself**:
-> `const MAX_DEPTH: u32 = 128` (`parser.rs:23`), enforced by `deeper()` (`:244`)
-> at `ty_inner` (`:1035`), `unary_expr` (`:1244`) and `pattern` (`:1846`). Against
-> the corpus maximum of 17 this section measures, and a ceiling of 10,000,
-> grammar nesting in this design cannot reach the ceiling — the parser refuses
-> at 128 first.
->
-> ADR 0022 also adds `iterate`, an early-terminating loop that is depth 1 on
-> both engines, so the escape hatch generalises further than "fold over a
-> range": it no longer has to run to a conservative bound. See ADR 0022 §2 for
-> the citations, re-verified, and §3 for `fold` at 500,000 elements in 22.3 MiB
-> at depth 1.
+> It reserves recursion for grammar nesting **and bounds that itself** at
+> `MAX_DEPTH`, far below the call ceiling and far above the corpus maximum this
+> section measures. **Grammar nesting in this design cannot reach the ceiling —
+> the parser refuses first.** ADR 0022 also adds `iterate`, an early-terminating
+> loop that is depth 1 on both engines, **so the escape hatch generalises further
+> than "fold over a range": it no longer has to run to a conservative bound.**
 >
 > **What is not withdrawn:** §6's throughput finding, which is this ADR's actual
 > reason for deciding against self-hosting today. §5.1 was a second, independent
-> objection; only that one falls.
+> objection; **only that one falls.**
 
 **§5, the 10,000-call ceiling, stops being a tax and becomes an architecture
-constraint.** The lexer escaped it with `fold(range(0, n + 1), start, one)` — a
-loop over an eagerly materialised list of integers, driven by the machine's step
-protocol so it nests nothing. That trick works because lexing is a *flat* state
-machine: one step per byte, no nesting.
+constraint.** The lexer escaped it with a fold over an eagerly materialised range
+— **a loop driven by the machine's step protocol, so it nests nothing.** That
+works because lexing is a *flat* state machine: one step per byte, no nesting.
 
-Recursive descent is not flat. Two separate depths, and both are bounded by
-10,000:
-
-- **Grammar nesting.** Measured across the 23 real `.ply` files (the 10
-  fixtures are too small to matter): the deepest bracket nesting is **17**
-  (`desk.ply`), and 12 or less everywhere else. At perhaps 15
-  precedence levels that is ~255 frames. Comfortable.
-- **Sequence recursion, which is the problem.** A recursive-descent parser
-  consuming *N* top-level definitions, or *N* list elements, or *N* arguments,
-  recurses once per element unless it is folded. `desk.ply` is 19,576 tokens.
-  Any parse function that recurses per token or per item dies at 10,000, and
-  there is no flag: `grep max_calls crates/ply-cli/src/` returns exactly one
-  line, `engine.rs:244`.
-
-The lexer's fold-over-a-range escape hatch does not generalise, because a
-recursive-descent parser's recursion *is* the grammar. To stay under the ceiling
-a Ply parser must be an explicit-stack pushdown automaton with its state in a
-fold accumulator — a different program from `crates/ply-syntax/src/parser.rs`,
-which cannot then be ported function-for-function and cannot be differentially
-compared function-for-function either.
+Two depths are bounded by the ceiling. **Grammar nesting** is comfortable: the
+deepest bracket nesting measured across the real files is well under twenty.
+**Sequence recursion is the problem** — a parser consuming *N* items recurses
+once per item unless it is folded, the largest example is tens of thousands of
+tokens, **and there is no flag.**
 
 ### §5.2 Gaps that get worse
 
 - **§1 gets worse in two ways and better in one, and the first draft of this
-  bullet had it wrong.**
+  bullet had it wrong.** It asserted "much worse … one such site per grammar
+  production" with **no measurement behind it.** The direction is right and the
+  magnitude was guessed. Measured:
 
-  > **Withdrawn: "§1 gets much worse ... a parser has one such site per grammar
-  > production", asserted with no measurement behind it.** The direction is
-  > right and the magnitude was guessed. Measured below.
+  | where the *caller* puts a correctly-written callee | |
+  | --- | --- |
+  | the whole body — nothing follows it | linear |
+  | argument 0 of 2, followed by a variable | **quadratic** |
+  | argument 0 of 2, followed by a **constant** | **quadratic** |
+  | argument 1 of 2 — nothing follows it | linear |
 
-  `spikes/ply-lexer-nesting/nesting.ply` — written by another lane during this
-  review, and run here rather than cited — isolates the two questions a parser
-  raises. User CPU, min of 3, load 44–54:
+  **The rule composes, and it is not local.** The callee is written correctly in
+  all four rows — its `push` is the last sub-expression of its own record literal
+  — **and the caller destroys it anyway.** The third row is the sharp one:
+  `carry` is *"if remaining, clone the env"* and **never asks what the remaining
+  sub-expression reads**, so a literal `0` sitting after the call is enough.
+  **For a parser this means a correct combinator gives its caller no protection,
+  and the thing that removes the protection can be a constant.**
 
-  | where the *caller* puts a correctly-written callee | n=8,000 | n=16,000 | |
-  | --- | ---: | ---: | --- |
-  | the whole body — nothing follows it | 0.02 s | 0.04 s | linear |
-  | argument 0 of 2, followed by a variable | 0.31 s | 1.13 s | **quadratic** |
-  | argument 0 of 2, followed by a **constant** | 0.31 s | 1.15 s | **quadratic** |
-  | argument 1 of 2 — nothing follows it | 0.03 s | 0.05 s | linear |
-
-  **The rule composes, and it is not local.** `node` is written correctly in all
-  four rows — its `push` is the last sub-expression of its own record literal —
-  and the caller destroys it anyway. The third row is the sharp one: `carry` is
-  `if remaining { env.clone() }` and never asks what the remaining
-  sub-expression *reads*, so a literal `0` sitting after the call is enough to
-  make the program quadratic. For a parser this means a correct combinator gives
-  its caller no protection, and the thing that removes the protection can be a
-  constant.
-
-  **What gets better** is the grouping. The copy is O(the list's current
-  length), so the cost is O(k·m) for k pushes spread over lists of length m:
-
-  | k pushes, all in the non-final position | k=8,000 | k=16,000 | |
-  | --- | ---: | ---: | --- |
-  | into one list (the lexer's shape) | 0.29 s | 1.12 s | **quadratic** |
-  | into lists of ten (a parser's shape) | 0.02 s | 0.03 s | linear |
-
-  A lexer accumulates one list of every token in the file — m = k = 19,576 for
-  `desk.ply`, the worst case. A parser accumulates mostly short lists: a block's
-  statements, a call's arguments, a match's arms. So per site a parser is far
-  cheaper, and the honest statement is that **a parser trades one catastrophic
-  accumulator for hundreds of cheap ones plus a non-local rule** — except for
-  whatever is module-wide, which is the lexer's shape again.
-- **§9 (no tuples) becomes the dominant shape.** Every parse function returns
-  "a node and the next index". That is the single most common type in a
-  recursive-descent parser and it is a record declaration each time.
+  **What gets better is the grouping.** The copy is O(the list's current length),
+  so the cost is O(k·m) for k pushes over lists of length m. Pushing into one
+  list is quadratic; **pushing into lists of ten is linear.** A lexer accumulates
+  one list of every token in the file — the worst case. A parser accumulates
+  mostly short lists: a block's statements, a call's arguments, a match's arms.
+  **So per site a parser is far cheaper, and the honest statement is that a
+  parser trades one catastrophic accumulator for hundreds of cheap ones plus a
+  non-local rule** — except for whatever is module-wide, which is the lexer's
+  shape again.
+- **§9 (no tuples) becomes the dominant shape.** Every parse function returns "a
+  node and the next index". **That is the single most common type in a
+  recursive-descent parser and it is a record declaration each time.**
 - **§12 stops being free.** `GAPS.md` §12 records that error accumulation cost
-  nothing *because a lexer never fails* — it answers with tokens beside
-  diagnostics. A parser with error recovery does fail, and `json.ply` is the
-  preview: 57 of 129 functions returning `Result`, and hand-written
-  `decode_map`/`decode_and_then`.
+  nothing *because a lexer never fails*. **A parser with error recovery does
+  fail**, and `json.ply` is the preview: nearly half its functions return
+  `Result`, with hand-written `decode_map`/`decode_and_then`.
 
-  > **The rest of this bullet is withdrawn.** It read:
-  >
-  > > … 57 of 129 functions returning `Result`, **no `?`, no do-notation**,
-  > > hand-written `decode_map`/`decode_and_then`, and **one number literal
-  > > split across seven functions purely to bind an `Ok`**.
-  >
-  > Two things. **`?` exists** as of `docs/adr/0027`, and `json.ply` now uses it
-  > at 7 sites; do-notation still does not exist and `?` is not it — `?` is
-  > sugar the parser expands into the `match` this file already wrote.
-  >
-  > And **the seven-function number chain has no `Ok` bind in it**. Checked
-  > function by function during that work: not one of `number`,
-  > `number_fraction`, `number_fraction_digits`, `number_exponent`,
-  > `exponent_first`, `number_exponent_digits`, `number_of` contains an
-  > `Ok`-binding arm or an `Err` rethrow. Each ends in a tail call inside a
-  > branch, because a check that fails must answer `Err` *there* while a check
-  > that passes carries on, and Ply has no early `return` with which to write
-  > that in one function. `?` collapses none of it, and the seven are unchanged
-  > by the conversion. The claim came from `spikes/ply-lexer/GAPS.md` §12, which
-  > is corrected in place for the same reason. **What the chain is evidence for
-  > is the absence of `return`, not the absence of `?`** — which matters to this
-  > ADR, because a self-hosted parser inherits it.
+  *(An earlier version of this bullet cited "no `?`" and "one number literal
+  split across seven functions purely to bind an `Ok`". `?` exists as of ADR
+  0027 and `json.ply` uses it. **And the seven-function chain has no `Ok` bind in
+  it** — checked function by function: each ends in a tail call inside a branch,
+  because a check that fails must answer `Err` *there* while a check that passes
+  carries on, **and Ply has no early `return` with which to write that in one
+  function.** `?` collapses none of it. **What the chain is evidence for is the
+  absence of `return`, not the absence of `?`** — which matters here, because a
+  self-hosted parser inherits it.)*
 - **§10 (the `List` surface)** starts to bite: list patterns, argument lists and
-  match arms want index, `nth` and reverse, and there are none.
+  match arms want index, `nth` and reverse.
 
 ### §5.3 A gap a lexer cannot hit
 
-**Value depth.** `MAX_VALUE_DEPTH = DEFAULT_MAX_CALLS = 10_000`
-(`crates/ply-eval/src/limit.rs:45`) bounds how deep a value may nest before a
-*structural walk* over it refuses. The lexer's `Tok` is flat — nine variants, no
-recursion — so nothing in the spike touches this. An AST is recursive by
-definition, and every comparison, hash and render of it is a structural walk.
-The bound is generous relative to the measured nesting of 17, but it is a
-distinct ceiling from the call ceiling and the lexer provides no evidence about
-it.
+**Value depth.** `MAX_VALUE_DEPTH` bounds how deep a value may nest before a
+*structural walk* over it refuses. The lexer's token type is flat, so nothing in
+the spike touches this. **An AST is recursive by definition, and every
+comparison, hash and render of it is a structural walk.** The bound is generous
+relative to the measured nesting, but **it is a distinct ceiling from the call
+ceiling and the lexer provides no evidence about it.**
 
 ---
 
@@ -703,632 +470,397 @@ it.
 
 ### §6.1 Measured
 
-All figures: release binary from `73ebd1c`, front-end cache cleared before each
-run, **user CPU seconds** as the primary statistic and wall clock beside it, with
-the load recorded. User CPU is used because this machine carried three other
-agent worktrees running test suites throughout and its 1-minute load average
-ranged 17–88; wall clock at that contention is not reproducible and user CPU
-very nearly is. Minimum of N, N stated.
+**User CPU seconds as the primary statistic**, with wall clock beside it and the
+load recorded, because this machine carried three other agent worktrees running
+test suites throughout. Minimum of N, N stated.
 
-**The Ply lexer, four files, min of 3, load 41–45:**
+Across four large files the Ply lexer's throughput in KB/s varies by half again
+and **its throughput in tokens/s varies by a fifth, so tokens is the right
+unit.** `GAPS.md`'s figure survives the re-take; it was a wall-clock figure under
+load and is somewhat pessimistic against the load-corrected one. **The
+`bytes_len` control re-takes at essentially zero, confirming that essentially all
+of it is the Ply lexer running.**
 
-| file | bytes | tokens | user | KB/s | tokens/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `examples/desk.ply` | 159,683 | 19,576 | 1.19 s | 131 | 16,451 |
-| `crates/ply-std/ply/db.ply` | 135,285 | 29,213 | 1.53 s | 86 | 19,094 |
-| `crates/ply-std/ply/http.ply` | 124,749 | 17,539 | 1.13 s | 108 | 15,521 |
-| `crates/ply-std/ply/json.ply` | 63,370 | 11,668 | 0.69 s | 90 | 16,910 |
+For scale, `ply check examples/` — lex, parse, resolve, typecheck, effect-infer
+and content-hash the same files and their modules — is **an order of magnitude
+faster in tokens per second, for six phases against one.** *(`GAPS.md` reports
+this slower, at lower load. The re-take is faster on a busier machine: **the
+spike's figure was pessimistic, and correcting it makes the comparison worse for
+self-hosting, not better.**)*
 
-KB/s varies by 1.5x across the four; **tokens/s varies by 1.2x**, so tokens is
-the right unit and the figure is **~17,000 tokens/s**.
+**That is roughly a dozen times slower for the first phase of six.**
 
-`GAPS.md` §15 reports 85 KB/s and 10,470 tokens/s for `desk.ply`, taken as wall
-clock at load 13–18. Re-taken here: 1.76 s wall (against its 1.87 s) and 1.19 s
-user. **The spike's figure survives**; it was a wall-clock figure under load and
-is about 1.6x pessimistic against the load-corrected one. The `bytes_len`
-control re-takes at 0.00 s user / 0.01 s wall, confirming that essentially all
-of it is the Ply lexer running.
-
-**The Rust front end, for scale, min of 5, load 37:** `ply check examples/` —
-lex, parse, resolve, typecheck, effect-infer and content-hash 13 files and 21
-modules, 333,595 bytes of project source and 45,041 tokens — is **0.21 s user /
-0.28 s wall cold**, and **0.03 s user / 0.04 s warm**.
-
-> `GAPS.md` §15 reports 0.43 s for this at load ~29. The re-take is 0.28 s wall
-> at load 37 — *faster* on a busier machine. The spike's figure was pessimistic;
-> correcting it makes the comparison worse for self-hosting, not better.
-
-That is **~215,000 tokens/s for the whole front end**, against ~17,000 tokens/s
-for a Ply lexer alone: **12.6x slower for the first phase of six.**
-
-> **The absolutes here do not reproduce; the ratio does (2026-08-29,
-> `spikes/ply-parser` §13).** All three figures were re-taken **in one sitting**
-> — this section's were not, and its own §9 records load 17–88 across the series.
+> **The absolutes here do not reproduce; the ratio does.** All three figures were
+> re-taken **in one sitting** — this section's were not, and §9 records load
+> ranging by a factor of five across the series. **Both engines are two to three
+> times faster than recorded and the ratio between them is not**, so the headline
+> survives its own sensitivity note while every absolute under it is wrong by two
+> to three times.
 >
-> | | §6.1 | re-taken |
-> | --- | ---: | ---: |
-> | Ply lexer through `dump`, this section's probe shape | ~17,000 tok/s | **26,083–36,462** |
-> | `ply check examples/` cold | 0.21 s user | **0.10 s user** |
-> | Rust front end ÷ Ply lexer | 12.6× | **10.0–13.4×** |
->
-> **Both engines are 2–3× faster than recorded and the ratio between them is
-> not**, so the 12.6× headline survives its own sensitivity note while every
-> absolute under it is wrong by two to three times. One cause is identified
-> rather than guessed: the `dump` step this section timed *with* the lexer is
-> **15–22% of the figure it produced**, so ~17,000 tok/s charged the Ply lexer
-> with a rendering step worth about a fifth of its own cost.
+> **One cause is identified rather than guessed:** the `dump` step this section
+> timed *with* the lexer is about a fifth of the figure it produced, **so the Ply
+> lexer was charged with a rendering step worth about a fifth of its own cost.**
 >
 > Nothing in §6.2 or §7 turns on the absolutes — they are used to form a ratio,
-> and the ratio held. The lesson is §9's own, arriving from outside: figures
-> taken across sittings at load 17–88 are not comparable with each other, and
-> this section compared them anyway.
+> and the ratio held. **The lesson is §9's own, arriving from outside: figures
+> taken across sittings at wildly different loads are not comparable with each
+> other, and this section compared them anyway.**
 
 ### §6.2 Assumed
 
 To get from a lexer to a front end needs a multiplier, and there is no way to
 measure one without writing the rest. **This is an assumption and it is labelled
-as one.** In conventional compilers lexing is 10–20% of front-end time, which
-puts a full Ply front end at 5–10x the lexer's cost — call it 1,700–3,400
-tokens/s. If anything that is optimistic for Ply specifically, because the
-phases after lexing are the ones that build records and lists, which is where
-§1's tax and §9's absence land.
+as one.** In conventional compilers lexing is a tenth to a fifth of front-end
+time, which puts a full Ply front end at five to ten times the lexer's cost.
+**If anything that is optimistic for Ply specifically, because the phases after
+lexing are the ones that build records and lists — which is where §1's tax and
+§9's absence land.**
 
-At that rate `ply check examples/` — 45,041 tokens, 0.21 s today — becomes
-**13–27 seconds**. Roughly **60–130x**.
+At that rate a cold `ply check examples/` becomes tens of seconds. **Roughly two
+orders of magnitude.**
 
-> **The multiplier is no longer assumed (2026-08-29). It is 2.62 for two phases
-> of six, and this section's *premise* is the part that was wrong.**
-> `spikes/ply-parser` ports the parser and measures lex+parse ÷ lex at **2.62**
-> over `examples/`, 2.49–3.31 per file — and lexing is **still 30–40% of
-> front-end time after two phases**, against the "10–20%" this section borrowed
-> from conventional compilers and built the 5–10× band on.
+> **The multiplier is no longer assumed. It is measured for two phases of six,
+> and this section's *premise* is the part that was wrong.**
+> `spikes/ply-parser` ports the parser and measures lex+parse against lex — **and
+> lexing is still a third of front-end time after two phases**, against the
+> "tenth to a fifth" this section borrowed from conventional compilers and built
+> its band on.
 >
 > **The band itself is not refuted**, and the honest statement is narrower than
-> either direction: at 2.62 for two phases, 5–10× overall requires the four
-> unwritten phases to cost **1.5–4.6× what parsing cost**, which is plausible —
-> `resolve.rs` is 62% of `parser.rs` and inference is larger. Two phases of six
-> cannot say whether the band is optimistic or pessimistic, and the spike
-> declines to.
+> either direction: at the measured two-phase multiplier, the assumed overall
+> band requires the four unwritten phases to cost a few times what parsing cost,
+> **which is plausible.** Two phases of six cannot say whether the band is
+> optimistic or pessimistic, **and the spike declines to.**
 >
 > **What replaces the projection is a measurement.** Ply lex+parse over the
-> identical 13 files `ply check` reads costs **3.01 s user** against **0.10 s**
-> for six Rust phases: **30×, two phases against six**, warm 301×. And redoing
-> this section's own arithmetic on the re-taken lexer term gives 5.8–11.5 s and
-> **58–115×** against the 60–130× below — both absolute halves halved, the ratio
-> unmoved. So the sentence that follows is *more* true than when it was written,
-> on better evidence, and it is the one thing here that did not need correcting.
+> identical files `ply check` reads costs **thirty times** what six Rust phases
+> cost, with no extrapolation — and redoing this section's own arithmetic on the
+> re-taken lexer term halves both absolute halves and leaves the ratio unmoved.
+> **So the sentence that follows is more true than when it was written, on
+> better evidence, and it is the one thing here that did not need correcting.**
 
-That is the answer to whether this is acceptable for the loop it is meant to make
-fast, and it is not close. `CONTRIBUTING.md` §"The loop" puts
-`./target/debug/ply test examples/` at 0.31 s warm; the verification loop this
-work exists to accelerate is currently sub-second, and a self-hosted front end at
-today's interpreter speed would make it the slowest thing in the build by two
-orders of magnitude. **The incrementality argument does not rescue it either:**
-the warm path is 0.03 s, so the cache is already buying 7x, and a self-hosted
-front end would have to be cached by machinery that is itself in Rust.
+**That is the answer to whether this is acceptable for the loop it is meant to
+make fast, and it is not close.** The verification loop this work exists to
+accelerate is currently sub-second, **and a self-hosted front end at today's
+interpreter speed would make it the slowest thing in the build by two orders of
+magnitude.** **The incrementality argument does not rescue it either:** the warm
+path is already an order of magnitude under the cold one, **and a self-hosted
+front end would have to be cached by machinery that is itself in Rust.**
 
 ### §6.3 The compiled fragment does not obviously close this, and the reason is specific
 
 The natural objection is that the fragment being built in parallel makes this
-moot. It does not, and the reason is worth stating precisely because it prices
-that work.
+moot. **It does not, and the reason is worth stating precisely because it prices
+that work.**
 
-`crates/ply-codegen-spike` compiles a Ply definition to native code through
-cranelift, and `benches/w6-spike-r4.json` supports **11.68x** on `read_line`-shaped kernel
-code. That file holds raw microsecond pairs, not a ratio: 11.68x is the most
-conservative expression in it — interpreter *best* against spike *worst*,
-minimised across its five inputs (`5.8615625 / 0.5019375`). The optimistic
-reading of the same file is 14.2x. Re-derived here from the file rather than
-quoted from `CONTRIBUTING.md`.
+The spike's headline ratio is measured on `read_line`-shaped kernel code, and it
+is **the most conservative expression the file supports** — interpreter *best*
+against spike *worst*, minimised across its inputs. Re-derived from the file
+rather than quoted.
 
-> **`read_line` cannot cross the seam (2026-08-29, ADR 0026 §3).** This
-> paragraph's 11.68× is measured on `read_line`-shaped kernel code, and
-> `crates/ply-std/ply/http.ply`'s `read_line` is
-> `fn read_line(buf: Bytes, ..) -> Line`. `crossable` is `Int | Bool`, and
-> `admit`'s first line is
-> `if !args.iter().all(crossable) { return Err(Gate::ArgumentShape) }`. The
-> spike's own `measure.rs` labels its path *"a direct native call, outside any
-> machine"*.
+> **`read_line` cannot cross the seam (ADR 0026).** `read_line` takes `Bytes`;
+> `crossable` is `Int | Bool`, and `admit`'s first line refuses on argument
+> shape. The spike's own `measure.rs` labels its path *"a direct native call,
+> outside any machine"*.
 >
-> So the number is real and it is **not a number about this seam**: the
+> **So the number is real and it is not a number about this seam:** the
 > arithmetic below applies a speedup measured outside the machine to a function
-> the machine's own gate refuses on its first line. It is not that the transfer
-> is unmeasured — for this shape it is **unmeasurable** without widening
-> `crossable`. The conclusion the paragraph draws is unaffected in direction
-> (the fragment does not make a self-hosted front end competitive on the cold
-> path) and its magnitude should not be quoted. Applying that to 1,700–3,400 tokens/s would give 20,000–40,000
-tokens/s and a 1.1–2.3 s `ply check examples/` — still **5–11x** worse than
-today's 0.21 s. So even at its full measured speedup the fragment does not make a
-self-hosted front end competitive on the cold path.
+> the machine's own gate refuses on its first line. **It is not that the transfer
+> is unmeasured — for this shape it is *unmeasurable* without widening
+> `crossable`.** The conclusion is unaffected in direction and **its magnitude
+> should not be quoted.**
+
+Even at the full measured speedup, applying it to §6.2's projected front end
+still leaves a cold `ply check` several times worse than today's. **So the
+fragment does not make a self-hosted front end competitive on the cold path.**
 
 **And the speedup should not be assumed to transfer at all.** I first wrote that
-the fragment lowers no `Bytes` builtins and would refuse a lexer outright. That
-is wrong and is withdrawn:
+the fragment lowers no `Bytes` builtins and would refuse a lexer outright. **That
+is wrong and is withdrawn:** there is a generic path — `admissible_builtin`
+refuses only higher-order builtins, the cell operations and `secret_of_string`;
+every other builtin, `bytes_at` and `bytes_scan` included, is admitted and
+dispatched through one runtime helper.
 
-> **Withdrawn: "the fragment lowers no `Bytes` builtins, so a lexer is outside
-> it."** There is a generic path. `jit.rs:508 admissible_builtin` refuses only
-> higher-order builtins, `cell_get`/`cell_set` and `secret_of_string`; every
-> other builtin, `bytes_at` and `bytes_scan` included, is admitted and
-> dispatched through the `rt_builtin` helper (`jit.rs:295`, `:1169-1172`).
->
-> > **Line number corrected (2026-08-27, ADR 0022).** `admissible_builtin` is
-> > at `jit.rs:537`, not `:508`; the citation above is left as written and
-> > corrected here rather than edited. What it refuses is unchanged and now
-> > includes `iterate`, whose `Builtin::higher_order()` is true — refused by the
-> > same first branch that refuses `fold`, which is expected and is not a
-> > regression.
-
-What `rt_builtin` does is the point (`rt.rs:353-372`): it calls
-`ply_eval::builtins::call(b, args, ..)` — **the identical interpreter builtin
-body**. So compiled code gets native arithmetic, native control flow and no
-per-call frame protocol, and pays interpreter price for every byte operation. A
-lexer's inner loop is `bytes_at`, `bytes_scan`, `bytes_slice`,
-`bytes_concat_all` — builtin dispatch, not arithmetic — which is exactly the half
-the fragment does not accelerate. The 11.68x was measured on a workload whose hot
-operations *are* the half it does accelerate.
+**What that helper does is the point:** it calls `ply_eval::builtins::call` —
+**the identical interpreter builtin body.** So compiled code gets native
+arithmetic, native control flow and no per-call frame protocol, **and pays
+interpreter price for every byte operation.** A lexer's inner loop is
+`bytes_at`, `bytes_scan`, `bytes_slice`, `bytes_concat_all` — builtin dispatch,
+not arithmetic — **which is exactly the half the fragment does not accelerate.**
 
 **The transfer was unmeasured. It has now been measured, and the answer is the
-one that favours the fragment.**
-
-> **Superseded within this ADR.** This paragraph read: *"So the transfer is
-> unmeasured, and this ADR does not guess it. The measurement that would settle
-> it is one attribution run splitting the Ply lexer's time between
-> `ply_eval::builtins::call` and everything else. If builtins dominate, the
-> fragment buys the front end little and needs open-coded `Bytes` primitives
-> before it is relevant. If dispatch dominates, the fragment is the right lever.
-> That is one profile, it is cheap, and nothing in the tree has taken it."* The
-> profile was taken rather than left as a recommendation, because it was named
-> as the highest-value decision-relevant measurement in the document and it cost
-> six seconds.
+one that favours the fragment.** The profile was taken rather than left as a
+recommendation, **because it was named as the highest-value decision-relevant
+measurement in the document and it cost six seconds.**
 
 `/usr/bin/sample` against the release binary running `lexer.ply` over four
-distinct slices of `examples/desk.ply` (distinct so a pure-function memo cannot
-collapse them), 1 ms interval, 6 s window, attribution by walking the call graph
-and charging each subtree to its outermost matching frame. **Two independent
-windows, load ~40:**
+distinct slices of a large example — distinct so a pure-function memo cannot
+collapse them — attributing by walking the call graph and charging each subtree
+to its outermost matching frame. **Two independent windows agree: samples under
+builtin bodies are a twentieth of the samples under evaluation.**
 
-| | window 1 | window 2 |
-| --- | ---: | ---: |
-| samples under `run::evaluate` | 3,930 | 4,909 |
-| of those, anywhere under `ply_eval::builtins::*` | 179 — **4.6%** | 200 — **4.1%** |
+**Dispatch dominates builtin bodies by roughly twenty to one.** By leaf sample,
+the machine's own step and dispatch is the largest share, reference-counting and
+`Drop` traffic next, then the continuation stack — **and every builtin body
+together is about a percent.** `memcmp`/`memcpy`, where a byte-scanning
+workload's "real work" lives, is a couple of percent.
 
-**Dispatch dominates builtin bodies by roughly twenty to one.** Where the CPU
-actually is, by leaf sample (window 1): the machine's own step and dispatch
-**43.8%**, reference-counting and `Drop` traffic — `Value`, `Env`, `Chain`,
-`pool::link` — **26.5%**, the continuation stack **15.0%**, `malloc`/`free`
-**2.8%**, and every builtin body together **1.3%**. `memcmp`/`memcpy`, which is
-where a byte-scanning workload's "real work" lives, is **2.8%**.
-
-So the objection this section was written to answer does not hold: a lexer is
-*not* builtin-bound. Its cost is the interpreter's per-step protocol and the
-refcount churn around it, which is precisely the half the fragment removes. That
-makes the fragment the right lever for a front end on this evidence, and it
+**So the objection this section was written to answer does not hold: a lexer is
+*not* builtin-bound.** Its cost is the interpreter's per-step protocol and the
+refcount churn around it, **which is precisely the half the fragment removes.**
+That makes the fragment the right lever for a front end on this evidence, and it
 makes open-coded `Bytes` primitives a second-order concern rather than a
 prerequisite.
 
 **Three things this does not license, and the first is the one that bites.**
 
 - **The fragment cannot take the loop.** `admissible_builtin` refuses every
-  higher-order builtin, and `lex`'s whole scan is
-  `fold(range(0, n + 1), start, ..)` while `dump` is two `map`s. So `lex`,
-  `dump`, `hex` and `int_of_digits` are refused outright, and what the fragment
-  could accept is the per-token work beneath them — `token_at`, `punct`, `ident`,
-  `number`, `string_lit` and the predicates. That means **one entry per token**,
-  not one per file.
-- ~~**One entry per token meets `CONTRIBUTING.md` item 12 head on.**~~ **The
-  premise was withdrawn hours after this was written.**
+  higher-order builtin, and the lexer's whole scan is a `fold` while `dump` is
+  two `map`s. **So the top-level functions are refused outright, and what the
+  fragment could accept is the per-token work beneath them. That means one entry
+  per token, not one per file.**
+- **The per-entry arena cost is now a small constant rather than a cliff.** This
+  bullet first cited a carry-over where **every entry cost O(the previous entry's
+  peak arena)** — a two-orders-of-magnitude multiplier — **which was fixed the
+  same day.** `Ctx::end` clears the arena at the end of the entry that filled it,
+  so an entry pays for its own work and its successor pays for nothing. Checked
+  here at the mechanism rather than the ratio: `begin` is a single emptiness
+  check, and `end` costs a few nanoseconds per slot the entry itself used, with
+  the shrink amortized. Arithmetic puts a token-granularity front end's arena
+  cost **under a percent** of current lexing time. **Still unmeasured for this
+  workload and still worth measuring, but it is now an open question about a
+  small constant rather than a cliff — the difference between *probably fatal*
+  and *probably fine, go and check*.**
+- **The builtin share is a share of the interpreter's time, not a predicted
+  speedup.** Removing dispatch for the compiled fraction does not make the
+  compiled fraction free, **and the only measured speedup was taken on a workload
+  with no such entry pattern.**
 
-  > **Corrected (2026-08-24).** This bullet read: *"One entry per token meets
-  > `CONTRIBUTING.md` item 12 head on: every entry costs O(the previous entry's
-  > peak arena), measured there at 181x. At one entry per token that is on the
-  > hot path rather than beside it. Not measured for this workload, and it could
-  > plausibly erase the gain entirely."* Item 12 was fixed in PR #24 and 181x is
-  > a withdrawn figure. It is corrected here rather than deleted because it was
-  > this ADR's stated reason to doubt the fragment.
-
-  `Ctx::begin` no longer touches the arena; `Ctx::end` clears it at the end of
-  the entry that filled it, so an entry pays for its own work and its successor
-  pays for nothing. Re-measured by the lane that fixed it, paired arms in one
-  binary: **180.888x / 181.667x before, 1.202x / 1.499x after.** Checked here at
-  the mechanism rather than the ratio, since a re-run at this load would be
-  noise: `begin` is a single `is_empty` check plus a recovery path
-  (`crates/ply-codegen-spike/src/rt.rs`), read at the unit as **0 ns at every
-  rung**, against `end` at **4.168 ns per slot the entry itself used**, with the
-  shrink amortized over `SHRINK_EVERY` = 64 entries.
-
-  **The question therefore changed shape — it is no longer carry-over but a
-  per-entry constant, and the constant is small.** Arithmetic, not measurement:
-  at a generous 100 slots per token-sized entry, the corpus's 120,490 tokens
-  cost 120,490 x 417 ns of arena work, about **50 ms**, against the ~7.1 s this
-  lexer spends on that corpus at its measured 17,000 tokens/s — **under 1%**.
-  **Still unmeasured for this workload** and still worth measuring, but it is now
-  an open question about a ~1.2x carry-over and a sub-1% constant rather than a
-  181x multiplier. That is the difference between *probably fatal* and *probably
-  fine, go and check*. A second lane is refining the fix further, so the figure
-  may move down again.
-- **The 4.6% is a share of the interpreter's time, not a predicted speedup.**
-  Removing dispatch for the compiled fraction does not make the compiled
-  fraction free; the 11.68x on `read_line` is the only measured speedup and it
-  was taken on a workload with no such entry pattern.
-
-The profile is checked in as a method rather than a file: the command is in §9.
-
-Two further interactions, both recorded rather than resolved:
-
-- `admissible_builtin` refuses `cell_get`/`cell_set`, so the cell-based lexer
-  `GAPS.md` §14 priced as the alternative to the fold is *excluded from the
-  fragment*. The two routes to making a Ply lexer fast are mutually exclusive
-  today.
-- ~~`CONTRIBUTING.md` §"Things known to be broken" item 12: every entry into the
-  fragment costs O(the previous entry's peak arena), measured at 181x. A front
-  end entered once per `lex()` is fine; one entered per parse function is not.
-  **Not measured for this workload.**~~ **Withdrawn: item 12 was fixed
-  (2026-08-24, PR #24), and both the figure and the conclusion drawn from it are
-  void.** An entry now pays for its own arena and its successor pays for nothing
-  — 181x carry-over became 1.202x / 1.499x — so "one entered per parse function
-  is not [fine]" no longer follows. §6.3 carries the re-measurement, the
-  mechanism check, and the per-entry arithmetic that replaces this.
+Two further interactions, recorded rather than resolved: `admissible_builtin`
+refuses the cell operations, **so the cell-based lexer `GAPS.md` §14 priced as
+the alternative to the fold is *excluded from the fragment*. The two routes to
+making a Ply lexer fast are mutually exclusive today.**
 
 ---
 
 ## §7 Decision
 
 **Do not write Ply's front end in Ply on today's interpreter.** Not because Ply
-cannot express one — it expressed a lexer that agrees with the reference on
-768,760 bytes and lexes itself — but because §6 prices it at 60–130x the loop it
-is meant to make fast, and §6.3 shows the fragment cannot be assumed to close
-that.
+cannot express one — it expressed a lexer that agrees with the reference across
+the whole corpus and lexes itself — **but because §6 prices it two orders of
+magnitude above the loop it is meant to make fast, and §6.3 shows the fragment
+cannot be assumed to close that.**
 
-> **Still the decision, on better evidence (2026-08-29).** The 60–130× was a
-> projection from an assumed multiplier. `spikes/ply-parser` wrote the parser and
-> measured it: **30× for two phases against six**, no extrapolation, and 58–115×
-> when this section's own arithmetic is redone on re-taken figures. Ply now also
-> *expresses* a parser — 763 inputs, 780,456 bytes, 126,565 nodes, **zero
-> disagreements** with `ply_syntax` — so the "not because Ply cannot express one"
-> clause covers two phases rather than one. The rejection was right and it is the
-> throughput objection, alone, that carries it.
+**Still the decision, on better evidence.** The original figure was a projection
+from an assumed multiplier. `spikes/ply-parser` wrote the parser and measured it:
+**two phases against six, no extrapolation.** Ply now also *expresses* a parser,
+with **zero disagreements** against `ply_syntax` over a large corpus, so the "not
+because Ply cannot express one" clause covers two phases rather than one. **The
+rejection was right and it is the throughput objection, alone, that carries it.**
 
 Ranked, what would change the answer:
 
 1. ~~**An attribution run splitting the Ply lexer's time between builtin bodies
-   and dispatch** (§6.3).~~ **Taken.** Builtin bodies are **4.6% / 4.1%** of
-   evaluation across two windows; dispatch and refcount traffic are the rest.
-   The fragment is the lever, not a distraction — with the entry-rate caveat
-   §6.3 now carries. **What replaces it at the top of this list** is the
-   measurement that caveat names: **the fragment's actual throughput at one
-   entry per token**, which is the entry pattern a front end would produce.
-   The reason to worry has shrunk since this item was written: it first cited
-   item 12's 181x carry-over, which was **fixed the same day** (1.202x / 1.499x
-   after — §6.3). What is left is a per-entry constant that arithmetic puts
-   under 1% of current lexing time, so this is now *confirm the expectation*
-   rather than *check for a cliff*.
+   and dispatch.**~~ **Taken** (§6.3): builtin bodies are a twentieth of
+   evaluation; dispatch and refcount traffic are the rest. **The fragment is the
+   lever, not a distraction.** What replaces it at the top of this list is **the
+   fragment's actual throughput at one entry per token**, which is the entry
+   pattern a front end would produce.
 
-   > **Overtaken (2026-08-29, [ADR 0026](0026-a-reachable-backend.md)).** This
-   > item asks for the fragment's throughput at one entry per token. Two things
-   > have to happen before that measurement means anything, and neither had when
-   > this was written. **A lexer's arguments are `Bytes`, and `crossable` is
-   > `Int | Bool`** — the same gate that refuses `read_line` in §6.3 refuses a
-   > lexer's per-token functions, so today the entry rate is not "one per token",
-   > it is **zero**. And a backend is now reachable from a shipping command,
-   > which is what makes such a measurement takeable at all. So the item stands
-   > as the right question and its precondition moved: widen `crossable`, or
-   > measure something whose arguments already cross.
+   > **Overtaken by ADR 0026.** Two things have to happen before that measurement
+   > means anything. **A lexer's arguments are `Bytes`, and `crossable` is
+   > `Int | Bool`** — the same gate that refuses `read_line` refuses a lexer's
+   > per-token functions, **so today the entry rate is not "one per token", it is
+   > zero.** And a backend is now reachable from a shipping command, which is
+   > what makes such a measurement takeable at all. **The item stands as the
+   > right question and its precondition moved.**
 2. **Making §1 visible.** A lint, a `--explain` line, anything that says *this
-   `push` will copy*. `GAPS.md` calls this the highest-value change and this
-   review agrees, for two reasons the spike could not see. §4.1 shows the trap
-   is already in the standard library, so the lint pays for itself with no
-   self-hosting at all. And §5.2 shows the precondition is **not local**: a
-   correctly written function is made quadratic by its caller, and by a caller
-   whose offending sub-expression can be a constant. That rules out the cheap
-   remedy — a coding convention — because there is no local property an author
-   can check. ~~A lint is not the convenient fix here; it is the only one.~~
+   `push` will copy*. §4.1 shows the trap is already in the standard library, **so
+   it pays for itself with no self-hosting at all.** And §5.2 shows the
+   precondition is **not local**: a correctly written function is made quadratic
+   by its caller, **and by a caller whose offending sub-expression can be a
+   constant.** That rules out a coding convention, because **there is no local
+   property an author can check.**
 
-   > **Corrected (mechanism sweep, 2026-08-28): the lint was built and it was
-   > refuted.** The withdrawn sentence is *"A lint is not the convenient fix
-   > here; it is the only one."* Everything above it survives — the trap is
-   > already in the standard library, the precondition is non-local, and a coding
-   > convention cannot check it — but "the only one" was reached by eliminating
-   > the alternatives rather than by trying the remedy, and the remedy was tried
-   > and failed. `W0611`, a field-order lint in `ply-core` (`fieldorder.rs`, on
-   > PR #41 — not in this tree; the pass is closed), was written for exactly this
-   > rule, and adversarial review put it against the interpreter's own counters:
-   > it **fires** on `len(push([], i))` at argument 0 of 2, which copies nothing,
-   > and is **silent** on `{a: s.a, b: push(s.a, i)}`, which is fully quadratic —
-   > a false negative on the exact shape it existed for. ADR 0024, *"Ownership as
-   > a checked property, not an inferred hint"* (branch `adr/ownership`, PR #43),
-   > records the trial and supersedes this item: a lint is a partial oracle over a
-   > dynamic property, so a better lint is not what was missing.
+   > **The lint was built and it was refuted.** *"A lint is not the convenient
+   > fix here; it is the only one"* is withdrawn. Everything above it survives —
+   > **but "the only one" was reached by eliminating the alternatives rather than
+   > by trying the remedy, and the remedy was tried and failed.** A field-order
+   > lint written for exactly this rule **fires** on a shape that copies nothing
+   > and is **silent** on one that is fully quadratic — a false negative on the
+   > exact shape it existed for. ADR 0024 records the trial: **a lint is a
+   > partial oracle over a dynamic property, so a better lint is not what was
+   > missing.**
    >
    > **The rest of this item's menu is worse, not better.** A `--explain` line
    > shows the property only to someone who already suspects it and runs a tool
-   > with a flag — a diagnostic for the reader who least needs one. Under the
+   > with a flag — **a diagnostic for the reader who least needs one.** Under the
    > authorship model this ADR is written inside, where most Ply is written by
-   > agents that cannot see a refcount and read a signature instead, a property
-   > visible only behind a flag is not visible at all. What survives is the item's
-   > title: §1 must be made visible somewhere an author cannot miss it, which
-   > ADR 0024 answers by putting it in the type rather than in a warning.
+   > agents that cannot see a refcount and read a signature instead, **a property
+   > visible only behind a flag is not visible at all.**
    >
-   > **And ADR 0025 then declined that answer's mechanism**, on a measurement:
-   > a parameter with one occurrence, its last use, free in no closure, cell or
-   > record still reports `owners = 2` under a resumption — and under a *single
-   > tail* resumption too, so it is capture rather than multiplicity. What
-   > survives across both is this item's title, not its remedy: §1 must be
+   > **And ADR 0025 then declined ADR 0024's mechanism**, on a measurement. What
+   > survives across both is **this item's title, not its remedy**: §1 must be
    > visible somewhere an author cannot miss it. `ply check --costs` and a
    > per-site oracle are where that landed.
-3. ~~**Fixing `escape_runs`** (§4.1). Shipped, quadratic, client-influenced
-   input. `GAPS.md` §1 records that the obvious fix — splitting so each `push`
-   is last — doubles the recursion depth and breaks the module at k = 8,000; the
-   fix that works is one `push` per escape in last-argument position.~~
-   **Taken.** `escape_runs` performs one `push` per escape, in last-argument
-   position, with the run and the escape that ends it merged by `bytes_concat`.
+3. ~~**Fixing `escape_runs`.**~~ **Taken.** `escape_runs` performs one `push` per
+   escape, in last-argument position. Counted in-process with
+   `ply_eval::rc::stats()` **on the shipped module, not on a copy**:
+   whole-accumulator copies per encode went from one per escape to **zero** at
+   every size measured.
 
-   Counted in-process with `ply_eval::rc::stats()` on the shipped module, not on
-   a copy: whole-accumulator copies per encode went from **exactly k** to **0**,
-   at k = 1,000 / 2,000 / 4,000 / 8,000 / 16,000 / 32,000, and pushes from
-   2k + 1 to k + 1.
-
-   > **The fix is the machine engine's, and this item did not say so. Corrected
-   > 2026-08-27 by counting on both engines.** Every figure in this item — the
-   > paragraph above, the clock ratios below it, and the two further sites at
-   > the end — was taken on the **machine** engine and stated without naming
+   > **The fix is the machine engine's, and this item did not say so.** Every
+   > figure in it was taken on the **machine** engine and stated without naming
    > one. Ply ships two, `--engine both` is the audit that catches one drifting
-   > from the other, and it compares *answers*: diagnostics, footprints, cell
-   > state. A divergence in **cost** passes it in silence, which is exactly what
-   > this is.
+   > from the other, **and it compares *answers*. A divergence in *cost* passes
+   > it in silence, which is exactly what this is.**
    >
-   > On `--engine treewalk` `escape_runs` is **still quadratic after the fix**,
-   > and no spelling of it is not. The tree-walker runs no reference counting at
+   > On `--engine treewalk` `escape_runs` is **still quadratic after the fix, and
+   > no spelling of it is not.** The tree-walker runs no reference counting at
    > all: it evaluates the AST, which carries no `Own` — that field is on the
-   > lowered `code::Node` only, and lowering is the step this engine does not
-   > have; `Interp::lookup` answers every `Var` with `v.clone()`; and `interp.rs`
-   > contains no `Env::take_unique` and no `rc::carry` call site, so a pending
-   > "frame" is a native stack frame holding the caller's scope by shared
-   > reference for the whole of every subexpression. The accumulator is
-   > therefore at two owners at every `push`, `Arc::get_mut` fails, and position
-   > cannot help.
+   > lowered node only, and lowering is the step this engine does not have — and
+   > it has no `take_unique` and no `carry` call site, **so a pending "frame" is
+   > a native stack frame holding the caller's scope by shared reference for the
+   > whole of every subexpression.** The accumulator is therefore at two owners
+   > at every `push`, and **position cannot help.**
    >
-   > Counted on the shipped modules, after the fix, machine against tree-walker:
+   > **All three of the survey's fixes are engine-conditional**, not just this
+   > one. What the fix buys on the tree-walker is a halved constant.
    >
-   > | site | n | machine copies | treewalk copies |
-   > | :--- | ---: | ---: | ---: |
-   > | `json.ply` `escape_runs` | 1,000 → 8,000 | **0** at every size | **n + 1** at every size |
-   > | `router.ply` `numbered` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
-   > | `trace.ply` `append` | 200 / 400 / 800 | **0 / 0 / 0** | **200 / 400 / 800** |
-   >
-   > So all three of the survey's fixes are engine-conditional, not just this
-   > one. What the fix buys on the tree-walker is a halved constant: with
-   > `escape_runs` reverted the tree-walker copies 2k + 1 times, with it in place
-   > k + 1 — measured here, not reasoned about.
-   >
-   > On the clock, `ply test --no-cache --no-incremental`, minimum of 5, both
-   > engines back to back on one machine state at load 11–22 (the 4.0 the
-   > workstream pre-registered was waited for and never reached, as in round 1):
-   > over 1,000 → 8,000 escapes the machine grows **7.8x** where linear predicts
-   > 8x, and the tree-walker **82.8x** and **74.1x** across two series where
-   > quadratic predicts 64x. At k = 8,000 the tree-walker is **12.9x** slower
-   > than the machine on the same program; at k = 1,000, 1.2x. The reviewer who
-   > raised this measured 22.1 / 81.1 / 330.2 ms and 3.67x / 4.07x per doubling;
-   > the shape reproduces, the per-doubling ratios here are 4.85 / 2.98 / 5.73
-   > and 5.47 / 2.85 / 4.75, and **the pre-registered "≥ 3.0x at two consecutive
-   > doublings" rule is therefore not met at 2,000 → 4,000 in either series**.
-   > That is stated rather than smoothed: the verdict rests on the counts, which
-   > are exact at any load, and the clock corroborates the direction only.
-   >
-   > **Disclosed rather than fixed, and the reason is in `CONTRACTS.md`.**
-   > Reuse on the tree-walker needs the Perceus pass the machine gets at
-   > lowering — a backward liveness walk over the AST, a by-value scope threaded
-   > through a recursive evaluator, and a `carry` discipline that a walker
-   > holding `&Env` on the native stack has no way to express. That is a new
-   > evaluator feature, and §"Deleted with the machine" retires `Interp`,
-   > `Engine` and `--engine` outright. The disclosure carries an assertion so it
-   > cannot go stale in silence:
+   > **Disclosed rather than fixed, and the reason is in `CONTRACTS.md`.** Reuse
+   > on the tree-walker needs the Perceus pass the machine gets at lowering,
+   > which a walker holding `&Env` on the native stack has no way to express —
+   > **and §"Deleted with the machine" retires that engine outright.** The
+   > disclosure carries an assertion so it cannot go stale in silence:
    > `stdlib_accumulator_cost.rs::all_three_fixes_are_the_machine_engines_only`
-   > pins one copy per element on the tree-walker at all three sites, and names
-   > the documents to correct on the day it fails.
+   > pins one copy per element on the tree-walker at all three sites, **and names
+   > the documents to correct on the day it fails.**
 
-   On the clock, which is the statistic §4.1 used: per-test milliseconds at
-   k = 1,000 / 2,000 / 4,000 / 8,000 were 13.6 / 40.9 / 134.5 / 497.0 before and
-   7.0 / 13.9 / 29.0 / 57.9 after — **3.29x and 3.70x** per doubling against
-   **2.09x and 2.00x**, and 8.6x faster at k = 8,000. §4.1 measured 3.14x and
-   3.59x for the same defect on a different machine, so it reproduced. **Both
-   series ran at load 16–19**: the machine never reached the load of 4.0 this
-   workstream pre-registered as the condition for starting a timed series, six
-   worktrees being on it throughout. The counted and bisected figures above are
-   what the claim rests on; these corroborate and are reported with that caveat
-   rather than as the pre-registered result.
+   **The depth was checked, not assumed.** The largest input `encode_string`
+   completes under the call budget is **the same integer before and after**, by
+   bisection. `GAPS.md` §1's refusal of the split shape is confirmed here on the
+   shipped module for the first time: built that way, the same bisection gives
+   **half the ceiling. So of the three shapes, only this one is both linear and
+   no deeper.**
 
-   **The depth was checked, not assumed.** The largest k that `encode_string`
-   completes under the 10,000-call budget is **9,993 before and 9,993 after**,
-   by bisection — the same integer. `GAPS.md` §1 column 3's refusal of the split
-   shape is confirmed here on the shipped module for the first time (the spike
-   measured a standalone reproduction): built that way, the same bisection gives
-   **4,996**, half the ceiling. So of the three shapes, only this one is both
-   linear and no deeper.
+   Behaviour is byte-identical over a corpus covering all 256 code points singly
+   and in one string, every named escape form, escapes first, last and adjacent,
+   and a large escape string, on both engines. The gate asserts a **count** and so
+   needs no deferred row; **it was seen red on the shipped defect before the fix
+   existed, and red again on a deliberate revert.**
 
-   Behaviour is byte-identical over a 276-case corpus — all 256 code points
-   singly and in one string, every named escape form, a `\u00XX` control, `/`,
-   `é`, `😀`, escapes first, last and adjacent, and a 4,000-escape string —
-   compared against a binary kept aside from before the edit, on both engines:
-   one sha256 across all four captures.
+   **Item 2 is still the general answer.** This fixes one instance; a survey with
+   the same counter found and fixed two more of the same shape — a trace sink's
+   `append` **on a serving path** and a router's table builder. A module with
+   dozens of `push` sites was **not** measured and is the obvious next place to
+   point the counter.
 
-   The gate is `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs::encoding_a_
-   string_of_escapes_copies_the_accumulator_a_constant_number_of_times`, which
-   asserts a **count** and so needs no `DEFERRED` row. It was seen red on the
-   shipped defect before the fix existed, and red again on a deliberate revert.
+   > **Both of those were fixed and neither was gated at first.** The sentence
+   > that stood in for a test leaned on one that **asserts nothing**: it prints a
+   > figure and returns, **and would have passed with both fixes reverted.**
+   > `stdlib_accumulator_cost.rs` now covers all three sites with counts, **each
+   > bound armed against a revert of its own literal** — demonstrated rather than
+   > assumed.
+4. ~~**A loop, or a raisable call ceiling.**~~ **The loop is delivered and the
+   raisable ceiling is refused, by ADR 0022.** `iterate` is an early-terminating
+   loop that is depth 1 on both engines. **A bare `--max-calls` flag is refused
+   because results are cached and shipping code writes only `Pass`: raising the
+   bound is monotone and safe, and lowering it silently returns a `Pass` for a
+   program that would now raise.** And §5.1's premise, which is what put this
+   item on the list, does not hold.
+5. **`Float` construction** (§4.2). **The only absolute hole, and the smallest of
+   the five in impact**, because §3.2 shows the text-passing substitute works.
 
-   **Item 2 is still the general answer.** This fixes one instance; a survey of
-   `crates/ply-std/ply/` with the same counter found two more of the same shape
-   and fixed them — `trace.ply`'s `append` (the growing field first of three,
-   200/400/800 copies for 200/400/800 records, on a serving path) and
-   `router.ply`'s `numbered` (first of two, same counts, on the build-time table
-   check). `trace.ply`'s own comment had restated the reading `GAPS.md` §1
-   withdrew and is corrected in place. `db.ply` has 78 `push` sites and was
-   **not** measured; it is the obvious next place to point the counter.
+**Keep** the differential harness. It is the right shape and it is armed on every
+axis but one — kind, payload, span, dropped token and dropped diagnostic all go
+red under mutation (§1.1) — **and the one exception is the float digits, which
+pass two deliberate corruptions (§3.2).** Amend it so the digits are compared as
+digits.
 
-   > **Both of those were fixed and neither was gated, until 2026-08-27.** This
-   > paragraph reported two further fixes and named no test, and the sentence
-   > that stood in for one — *"`ply-corpus` is in the set because the survey
-   > changed `router.ply`, and its `what_the_route_table_costs_to_rebuild` is
-   > the test nearest that change; it passed"* — leans on a test that
-   > **asserts nothing**: it prints a microsecond figure and returns. It would
-   > have passed with both fixes reverted. `stdlib_accumulator_cost.rs` now
-   > covers all three sites with counts, each bound armed against a revert of
-   > **its own** literal — reverting `numbered` leaves the `trace` rows at 0
-   > copies and vice versa, which was demonstrated rather than assumed.
-4. ~~**A loop, or a raisable call ceiling.** §5.1 makes this the difference
-   between a portable parser and a rewritten one.~~ **The loop is delivered and
-   the raisable ceiling is refused, by ADR 0022 (2026-08-27).** `iterate(seed,
-   budget, step)` is an early-terminating loop that is depth 1 on both engines
-   — asserted at
-   `crates/ply-eval/tests/suite/equivalence_audit.rs:2194`, which runs 500,000 steps
-   under `with_max_calls(8)` while the same loop written as tail recursion
-   raises at the same cap. A bare `--max-calls` flag is refused because results
-   are cached as `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code
-   writes only `Outcome::Pass` (`ply-test/src/lib.rs:1429`, `:1558`): raising
-   the bound is monotone and safe, **lowering it silently returns a `Pass` for a
-   program that would now raise**. ADR 0022 §5. And §5.1's premise, which is
-   what put this item on the list, does not hold — see the correction there.
-5. **`Float` construction** (§4.2). The only absolute hole, and the smallest of
-   the five in impact, because §3.2 shows the text-passing substitute works.
-
-**Keep** the differential harness. It is the right shape and it is armed on
-every axis but one — kind, payload, span, dropped token and dropped diagnostic
-all go red under mutation (§1.1) — and the one exception is the float digits,
-which pass two deliberate corruptions (§3.2). Amend it so the digits are
-compared as digits. The stale doc comment §4.5 opened on was fixed while this
-was being written.
-
-**Do not keep** the implication that 768,760 bytes of agreement is broad
-coverage. It is 0.15% error paths and 24 float tokens (§3.1).
+**Do not keep** the implication that the corpus size is broad coverage. **It is
+0.15% error paths and two dozen float tokens (§3.1).**
 
 ---
 
 ## §8 What would make this wrong
 
-- **The multiplier in §6.2 is assumed, not measured.** If a Ply parser and
-  typechecker cost only 2x the lexer rather than 5–10x, the estimate falls to
-  5–11 s and the conclusion weakens without reversing. If they cost 20x it gets
-  worse. Writing the parser is the only thing that settles it, and this ADR
-  recommends against writing it — so the number that would refute this ADR is
-  one it declines to take. That is a real weakness and it is why §7's first item
-  is a profile rather than a port.
+- **§6.2's multiplier is assumed, not measured.** If a Ply parser and typechecker
+  cost only twice the lexer the conclusion weakens without reversing; if they
+  cost twenty times it gets worse. **Writing the parser is the only thing that
+  settles it, and this ADR recommends against writing it — so the number that
+  would refute this ADR is one it declines to take.** That is a real weakness and
+  it is why §7's first item is a profile rather than a port.
 - **`ply check examples/` is not a like-for-like baseline, and the two errors
-  push opposite ways.** Counting only `examples/`' 45,041 tokens while the run
-  also resolves eight `std` modules **understates** the Rust front end's
-  throughput, so the 12.6x in §6.1 is a floor rather than an estimate. Against
-  that, crediting the Rust side with six phases where the Ply side does one
-  **overstates** the gap for the phase actually compared. Neither was separated
-  here; the honest reading is that lexing alone is at least 12.6x off and the
-  whole-front-end comparison in §6.2 is where the assumption lives.
-- **Every wall-clock figure was taken at load 17–88** on a machine shared with
-  three other worktrees. User CPU is reported precisely because it is the robust
-  half; if user CPU is itself distorted by cache contention at this load — not
-  checked — the absolute figures move. The *shape* results in §4.1 (4x per
-  doubling against 2x) do not depend on it.
-- ~~**§6.3's conclusion rests on reading `rt_builtin`, not on profiling it.**~~
-  **Closed by measurement**, and it resolved against the reading: the machine's
-  per-call overhead *does* dominate the builtin bodies (4.6% / 4.1% builtins
-  over two windows), so the fragment transfers better than §6.3 first argued and
-  §7's ranking moved accordingly. What is still unmeasured is narrower and is
-  stated in §6.3: the per-entry arena cost at one entry per token.
+  push opposite ways.** Counting only the examples' tokens while the run also
+  resolves the standard library **understates** the Rust front end's throughput,
+  so §6.1's ratio is a floor. Against that, crediting the Rust side with six
+  phases where the Ply side does one **overstates** the gap for the phase
+  actually compared. **Neither was separated here.**
+- **Every wall-clock figure was taken on a machine shared with three other
+  worktrees.** User CPU is reported precisely because it is the robust half; **if
+  user CPU is itself distorted by cache contention at this load — not checked —
+  the absolute figures move.** The *shape* results in §4.1 do not depend on it.
+- ~~**§6.3's conclusion rests on reading the runtime helper, not on profiling
+  it.**~~ **Closed by measurement**, and it resolved against the reading.
 - **The profile is a sampling profile of one workload on one input.** Symbol
-  attribution in a release build can be distorted by inlining — a builtin body
-  inlined into `Machine::step` would be charged to dispatch. The leaf histogram
-  corroborates rather than assumes (builtins 1.3% of leaves, `memcmp`/`memcpy`
-  2.8%), but a counter-based attribution would settle it and none exists.
-- **The 12.6x in §6.1 divides two numbers taken at different loads** (17,000
-  tokens/s at load 41–45, 215,000 at load 37). Both are user CPU and the gap is
-  an order of magnitude, so the conclusion is not sensitive to it, but the ratio
-  is not a clean single-sitting figure.
+  attribution in a release build can be distorted by inlining — **a builtin body
+  inlined into `Machine::step` would be charged to dispatch.** The leaf histogram
+  corroborates rather than assumes, **but a counter-based attribution would
+  settle it and none exists.**
+- **§6.1's ratio divides two numbers taken at different loads.** Both are user
+  CPU and the gap is an order of magnitude, so the conclusion is not sensitive to
+  it, **but the ratio is not a clean single-sitting figure.**
 
 ---
 
 ## §9 Provenance
 
-Machine: the one in `docs/ONBOARDING.md` §Provenance, shared throughout with
-three other agent worktrees, two of them running `cargo test --workspace`.
-1-minute load average recorded with every series and ranging **17.40 to 88.73**.
+Machine shared throughout with three other agent worktrees, two of them running
+`cargo test --workspace`. **1-minute load average recorded with every series and
+ranging by a factor of five.**
 
-Tree: `~/.worktrees/ply/lexer-verify` at `73ebd1c`, detached. Release binary
-built from that tree; `crates/ply-eval/src/frame.rs` verified clean (§0).
+Two files in the reviewed tree were written by another party **during** this
+review. `lexer.ply` was re-checked afterwards — unchanged, three content windows
+byte-identical to the ones read before the move, tests and agreement still green
+— so §1 stands. **It is recorded because §0 is about exactly this and a second
+instance should not go unwritten.**
 
-Two files in that tree were written by another party during this review:
-`spikes/ply-lexer/lexer.ply`'s mtime moved at 15:07, and
-`spikes/ply-lexer-nesting/` appeared at 15:21. `lexer.ply` was re-checked
-afterwards — 647 lines and 26,404 bytes, unchanged, three content windows
-byte-identical to the ones read before the move, and its 15 tests and the 33-file
-agreement still green — so the verification in §1 stands. It is recorded because
-§0 is about exactly this and a second instance should not go unwritten.
-`spikes/ply-lexer-nesting/nesting.ply` is that party's reproduction; §5.2's
-measurements are mine, taken by running it.
-
-Statistic pre-registered before any measurement existed — written down at load
-85.87, while the binary was still building, and reproduced here in full so a
-reader does not have to take it on trust:
+Statistic pre-registered before any measurement existed, written down while the
+binary was still building, and reproduced here so a reader does not have to take
+it on trust:
 
 > Minimum of N runs; N = 5 where a run is under 2 s, N = 3 otherwise. Minimum,
-> because on a loaded machine the minimum is the closest estimate of the
-> unloaded time and no run is discarded after the fact. Load (`uptime`, 1-minute)
-> recorded immediately before and after every series. Prefer any deterministic
-> counter over wall clock if one exists.
+> because on a loaded machine the minimum is the closest estimate of the unloaded
+> time and no run is discarded after the fact. Load recorded immediately before
+> and after every series. **Prefer any deterministic counter over wall clock if
+> one exists.**
 >
 > Decision rule for §1's shape claim: **accept** if, over two consecutive
-> doublings of n, the non-final column is ≥ 3.0x per doubling at both and the
-> final column is ≤ 2.5x at both; **reject** if either fails. Chosen because the
-> prediction is 4x against 2x and load noise multiplies both columns roughly
-> equally, so the ratio is the load-robust statistic.
+> doublings, the non-final column is ≥ 3.0× per doubling at both and the final
+> column is ≤ 2.5× at both. Chosen because the prediction is 4× against 2× and
+> load noise multiplies both columns roughly equally, **so the ratio is the
+> load-robust statistic.**
 
-~~No deterministic counter turned out to exist — `ply run --json` reports no step,
-call or allocation count — so wall clock was unavoidable and user CPU was used
-as the robust half.~~ No run was discarded after the fact.
+No run was discarded after the fact.
 
-> **Corrected (2026-08-30): one existed, and nothing outside `ply-eval` could
-> read it.** `ply_eval::rc::Stats` had counted `updates` against
-> `updates_in_place`, `dup_sites` against `dup_emitted`, and `takes_attempted`
-> against `takes_moved` since the reference-counting pass was written. It was
-> read by three test files and had **no CLI surface at all**, so this sentence
-> was true of the command and false of the codebase — and the consequence is the
-> one §6.1 now carries: a document that needed a count timed something instead,
-> at load 17–88, and its absolutes did not reproduce.
+> **A deterministic counter existed, and nothing outside `ply-eval` could read
+> it.** `ply_eval::rc::Stats` had counted updates against in-place updates, and
+> takes attempted against takes moved, since the reference-counting pass was
+> written. It was read by three test files and had **no CLI surface at all**, so
+> "no counter exists" was true of the command and false of the codebase — **and
+> the consequence is the one §6.1 now carries: a document that needed a count
+> timed something instead, and its absolutes did not reproduce.**
 >
-> `ply run --json` now reports them. `in_place` is **`null` on the tree-walker**
-> rather than `0.0`, because that engine runs no reference counting at all, and
-> a zero there reads as a fact about the program when it is a fact about the
-> engine. Under `--engine both` the whole object is `null`: the two engines do
-> not count the same thing, and their sum is a figure about neither.
+> `ply run --json` now reports them. **In-place counts are `null` on the
+> tree-walker rather than zero**, because that engine runs no reference counting
+> at all **and a zero there reads as a fact about the program when it is a fact
+> about the engine.** Under `--engine both` the whole object is `null`: the two
+> engines do not count the same thing, **and their sum is a figure about
+> neither.**
 
-Commands, all from the worktree root:
-
-```
-./target/release/ply test spikes/ply-lexer/lexer.ply --no-cache
-cd spikes/ply-lexer/harness && PLY_BIN=../../../target/release/ply \
-  cargo test -j 2 -- --test-threads=2 --nocapture
-./spikes/ply-lexer/harness/target/release/plydump <file.ply>
-
-# §6.3's attribution profile. The probe is `lexer.ply` plus a generated
-# `probe.ply` holding examples/desk.ply as a b"..." literal, whose entry point is
-#   fn main() -> Int =
-#     fold(range(0, 4), 0, |a: Int, i: Int|
-#       a + string_len(dump(bytes_slice(source(), 0, bytes_len(source()) - i))))
-# — four distinct slices so a pure-function memo cannot collapse them into one.
-./target/release/ply run <probe-dir> & PID=$!
-sleep 1; /usr/bin/sample $PID 6 1 -file sample.txt; wait $PID
-# Attribution: walk the call graph, charge each subtree to its outermost
-# matching frame, and divide by the subtree under `run::evaluate`.
-```
-
-Not re-run here, and stated as not re-run: `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets` and `cargo test --workspace`. This
-review changed no file outside `docs/adr/`, so the workspace gates are
-untouched by it — but they were also not taken, and another lane was running the
-suite concurrently. `spikes/ply-lexer/harness` has its own `[workspace]` and is
-reached by none of them; it will bit-rot exactly as `crates/ply-codegen-spike`
-did, which its own README says.
-
-One measurement in this document was discarded and re-taken: the first attempt
-at §4.1's shipped-`json.ply` series used `json.encode_string` where the module
-member is `json::encode_string`, so every run failed to compile and the harness
-timed the failure at 0.01 s and reported it as a row. The harness now refuses to
-record a run whose `--json` output does not carry `"ok": true`. Recorded because
-it is the same defect this ADR is about: a green number over a program that
-never ran.
+**One measurement in this document was discarded and re-taken.** The first
+attempt at §4.1's shipped-module series used the wrong member spelling, so every
+run failed to compile **and the harness timed the failure and reported it as a
+row.** The harness now refuses to record a run whose output does not carry
+`"ok": true`. **Recorded because it is the same defect this ADR is about: a green
+number over a program that never ran.**

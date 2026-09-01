@@ -8,13 +8,12 @@ one under "The argument that carries the most weight". One further candidate was
 investigated and rejected; the reasoning is recorded so it does not get
 re-proposed.
 
-> **Amended by the W6 documentation audit.** Two things in this ADR stopped
-> being true and nothing said so. First, decision 6 says the deciding evidence
-> "does not exist yet" and that "after W3 and W4 that is a number rather than a
-> guess"; W3, W4, W5 and W6 have all shipped and no such number was produced —
-> not in ADR 0013, 0014, 0015 or 0016, and not in `benches/`. Second, the
-> coherence divergence this ADR treats as a distant risk arrived during W2
-> itself, twice, in a form this document did not anticipate.
+**Two things in this ADR stopped being true and nothing said so.** Decision 6
+says the deciding evidence "does not exist yet" and that "after W3 and W4 that is
+a number rather than a guess" — **W3 through W6 have all shipped and no such
+number was produced**, not in any ADR and not in `benches/`. And **the coherence
+divergence this ADR treats as a distant risk arrived during W2 itself, twice, in
+a form this document did not anticipate.**
 
 ## Context
 

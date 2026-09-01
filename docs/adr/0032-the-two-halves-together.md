@@ -1,54 +1,49 @@
-# ADR 0032 — The two halves together: 10.0× on a kernel, 0.94× on a front end, and the one sentence that predicts which
+# ADR 0032 — The two halves together, and the one sentence that predicts which
 
 - **Status.** Accepted.
-- **Date.** 2026-08-31.
 - **Supersedes nothing. Amends** ADR 0030 §10 and ADR 0031 §5.2, which priced a
-  callback-free code generator's ceiling at 2.074× and 2.104× — both taken with
-  `ply_eval::backend::Reference` narrowed by `PLY_BACKEND_ONLY`, because no real
-  code generator could be put in that position. One can now, and it reproduces
-  their entry line to the call while reading a *time* neither could take.
-- **Closes** the disagreement PR #64's review opened: *"on that corpus
-  `reference` enters 190,617 of 190,703 offers over 69 definitions; `cranelift`
-  enters 89,912 of 294,538 over 6. 89,912 is exactly the number ADR 0030 names
-  as the pre-`Bytes`-widening `Int | Bool` rung. The code generator's fragment
-  on the front end is narrower than the tree-walker's."*
+  callback-free code generator's ceiling with `ply_eval::backend::Reference`
+  narrowed by `PLY_BACKEND_ONLY`, **because no real code generator could be put
+  in that position.** One can now, and it reproduces their entry line to the
+  call while reading a *time* neither could take.
+- **Closes** the disagreement the code generator's review opened: **the code
+  generator's fragment on the front end is narrower than the tree-walker's**, and
+  its entry count is exactly the figure ADR 0030 names as the pre-`Bytes`
+  `Int | Bool` rung.
 
 ## Why this ADR exists
 
-Two changes landed a day apart and neither was ever run with the other. PR #64
-put a cranelift code generator behind `ply test --backend cranelift`; PR #65
-closed the seam's fragment, taking admitted body calls from 12.205% to 84.014%
-and entries from 306,931 to 26. ADR 0031 §2 then measured the closed fragment
-end to end and found the run **1.46× slower**, because the only backend that
-could inhabit the widened seam was a tree-walker. Its §5.2 named the way out and
-could not take it: *"A cranelift backend as that file stands would decline the
+Two changes landed a day apart and **neither was ever run with the other.** One
+put a cranelift code generator behind `ply test --backend cranelift`; the other
+closed the seam's fragment, taking admitted body calls from a twelfth to most of
+them and collapsing the entry count to one per file. ADR 0031 §2 then measured
+the closed fragment end to end and found the run **1.46× slower**, because the
+only backend that could inhabit the widened seam was a tree-walker. Its §5.2
+named the way out and could not take it: *"A cranelift backend as that file stands would decline the
 entry this whole line of work opened."*
 
 This document runs the combination. It is the experiment both prior ADRs
 describe and neither could perform.
 
-**Pre-registered** at `/tmp/arc-together/PREREGISTRATION.md`, with two
-amendments each written before the series it registers, and every registered
-prediction — four of them — recorded before its arm was timed. The unblinded
-entry lines that motivated each amendment are quoted inside it, so what was
-known when each prediction was made is on the record.
+**Pre-registered** outside the repository, with two amendments each written
+before the series it registers, and **every registered prediction recorded
+before its arm was timed.** The unblinded entry lines that motivated each
+amendment are quoted inside it, **so what was known when each prediction was
+made is on the record.**
 
 ## The workloads, checked rather than cited
 
-**W1** — `/tmp/arc-typegate/W1`, ADR 0030's and ADR 0031's corpus:
-`spikes/ply-parser`'s six modules re-verified byte-identical to the tree this
-sitting (six `identical`), plus `probe.ply` (md5
-`eabc0e6ba4012edbe2e2a9263b3e15a4`), whose 13 `test` blocks each parse one
-`examples/*.ply`. **13 files, 333,851 bytes**, confirmed by `cat examples/*.ply
-| wc -c` this sitting.
+**W1** — ADR 0030's and ADR 0031's corpus: `spikes/ply-parser`'s modules,
+re-verified byte-identical to the tree this sitting, plus a generated `probe.ply`
+whose `test` blocks each parse one `examples/*.ply`. **The byte count was
+confirmed this sitting rather than carried over.**
 
 ```
 ply test /tmp/arc-typegate/W1 --no-cache -j 1 --filter probe.parse [--backend ..]
 ```
 
-**W3** — `ply test benches/kernel --no-cache -j 1`: the three-heap-Nim MCTS and
-`work.ply`, 8 tests. ADR 0018's corpus, and the one on which compiled code has
-ever paid.
+**W3** — `ply test benches/kernel --no-cache -j 1`: the three-heap-Nim MCTS.
+ADR 0018's corpus, **and the one on which compiled code has ever paid.**
 
 ## 1. The seam's widening reached cranelift. Its registry did not.
 
@@ -60,31 +55,31 @@ reference  ·      26 of      26 offers entered ·       0 declined · 413 in th
 cranelift  ·   89912 of 2028112 offers entered · 1938200 declined ·   6 in the fragment
 ```
 
-**89,912 reproduces exactly. The denominator does not: 2,028,112 against the
-review's 294,538 — the closed fragment's admitted set.** And `reference` no
-longer reads 190,617 of 190,703 over 69 definitions but 26 of 26 over 413, which
-is ADR 0031 §1's collapse. So lever 1's type gate *did* reach cranelift, on the
-*offer* side, the day it landed: the machine now offers it 6.9× more calls.
+**The entry count reproduces exactly and the denominator does not** — it is now
+the closed fragment's admitted set, an order of magnitude larger. And `reference`
+no longer enters at the leaves but once per file, which is ADR 0031 §1's
+collapse. **So the type gate *did* reach cranelift, on the *offer* side, the day
+it landed: the machine now offers it several times more calls.**
 
-**What did not reach it is the *registry*.** Cranelift holds 6 enterable
-definitions against `Reference`'s 413, so it declines 1,938,200 of those offers
-and enters 89,912 times at the bottom instead of 26 times at the root.
+**What did not reach it is the *registry*.** Cranelift holds a handful of
+enterable definitions against `Reference`'s hundreds, so it declines almost every
+offer and **enters at the bottom instead of once at the root.**
 
 The two registries are two functions, and they had parted company in the one
 place nobody looked:
 
-| backend | registration filter | on W1 |
-| --- | --- | ---: |
-| `Reference` | `backend.rs:630` `carried_signature(types, name)` — lever 1's `CarriedTypes` | 413 |
-| `Cranelift` | `ply-codegen/backend.rs:589` `scalar_signature` — `Int \| Bool`, hand-rolled | 6 |
+| backend | registration filter |
+| --- | --- |
+| `Reference` | `backend.rs`'s `carried_signature` — the type gate's `CarriedTypes` |
+| `Cranelift` | `ply-codegen/backend.rs`'s `scalar_signature` — `Int \| Bool`, hand-rolled |
 
-`scalar_signature` predates lever 1 and was never revisited by it.
+**`scalar_signature` predates the type gate and was never revisited by it.**
 
 ### It is not a safety gate, and this is checkable
 
 Its own doc says so — *"Necessary and not sufficient, and the machine's boundary
 is the authority on both sides anyway"* — and the runtime backs the claim:
-`rt.rs:386 rt_unbox_int` on a non-`Int` calls `ctx.fail`, `rt_unbox_bool` the
+`rt.rs rt_unbox_int` on a non-`Int` calls `ctx.fail`, `rt_unbox_bool` the
 same, and `backend.rs run` maps a set `failed` to `None`, counting it as
 `Declines::failed`. **A wrongly registered body declines; it cannot answer
 wrongly.** What `scalar_signature` buys is therefore *time* — *"declining before
@@ -94,28 +89,18 @@ settled by a clock, not by a review.
 ### How narrow it actually is
 
 `crates/ply-codegen/tests/suite/parser_census.rs`, added by this change, runs the
-fixpoint over `spikes/ply-parser`:
+fixpoint over `spikes/ply-parser` and reports how many functions survive it and
+how many of those are enterable. **All but a twentieth of the already-compiled
+bodies are dropped at registration.** So `PLY_CODEGEN_REGISTER=all` —
+measurement scaffolding on `PLY_BACKEND_ONLY`'s model, off by default, read once
+per process — registers them all.
 
-```
-1075 functions offered, 489 survived the fixpoint, 22 enterable
-```
+**That reproduces ADR 0031 §5.2's `Bfo` entry line to the call, by a real code
+generator**, where §5.2 could only reach it by narrowing the tree-walker.
+**The two instruments agree on the *set* and disagree by two definitions.**
 
-**467 of 489 already-compiled bodies are dropped at registration.** So
-`PLY_CODEGEN_REGISTER=all` — measurement scaffolding on `PLY_BACKEND_ONLY`'s
-model, off by default, read once per process — registers them all:
-
-```
-cranelift, register=all · 495152 of 1049245 offers entered · 554093 declined · 222 in the fragment
-```
-
-**That is ADR 0031 §5.2's `Bfo` line — `495152 of 1049245 offers entered ·
-554093 declined · 220 in the fragment` — reproduced to the call by a real code
-generator**, where §5.2 could only reach it by narrowing the tree-walker with
-`PLY_BACKEND_ONLY`. The two instruments agree on the *set* and disagree by two
-definitions.
-
-Correctness, taken before any time: 13/13 on W1, 186/186 on `examples --engine
-both`, `corruption: nothing`, `fired: 0`, identical under both registries.
+Correctness, taken before any time: every test green on both corpora, under
+`--engine both`, and identical under both registries.
 
 ## 2. End to end on W1 — every backend arm is slower than no backend
 
@@ -193,26 +178,26 @@ wrong and W1 needs another. **It held.**
 
 The entry lines are the mechanism, and they are the whole of it:
 
-| | definitions registered | entries | shape |
-| --- | ---: | ---: | --- |
-| W1, `scalar` | 6 | 89,912 | leaf islands |
-| W1, `all` | 222 | **495,152** | *more* leaf islands |
-| W3, `scalar` | 25 | 2,974 | leaf islands |
-| W3, `all` | 44 | **63** | **63 of 63 offers, 0 declined — the root** |
+| | entries | shape |
+| --- | ---: | --- |
+| W1, `scalar` | tens of thousands | leaf islands |
+| W1, `all` | **half a million** | *more* leaf islands |
+| W3, `scalar` | thousands | leaf islands |
+| W3, `all` | **dozens** | **every offer entered, none declined — the root** |
 
-On W3 the root is compilable, so widening collapses 2,974 shallow entries into
-63 at the top: PR #30's 721→1 shape, and ADR 0031 §1's 7,331× collapse, in a
-third instance. On W1 the roots are **not** compilable, so widening registered
-more *singleton* islands reached from interpreted parents, and each additional
-island is one more boundary crossing rather than one fewer.
+**On W3 the root is compilable, so widening collapses thousands of shallow
+entries into dozens at the top** — the same shape PR #30 found and ADR 0031 §1
+measured, in a third instance. **On W1 the roots are not compilable, so widening
+registered more *singleton* islands reached from interpreted parents, and each
+additional island is one more boundary crossing rather than one fewer.**
 
 **A boundary crossing is not free and this is the number that governs.**
 `backend.rs run` pays, per entry: a registry lookup, a `RefCell` borrow,
 `ctx.begin`, a `Value` clone and an arena push *per argument*, the call, two
 post-conditions, a `Value` clone on the way out, and `ctx.end`. For a body the
 size of `spine.t_lparen` — a nullary returning a constant — that exceeds what
-the machine's own dispatch costs. Entering it 495,152 times is how W1's `D` arm
-became 1.66× slower than no backend at all.
+the machine's own dispatch costs. **Entering it half a million times is how W1's
+`D` arm became 1.66× slower than no backend at all.**
 
 ## 5. What this says about the gap, and it is not what was hoped
 
@@ -220,17 +205,16 @@ ADR 0031 §3 measured the ceiling of an infinitely fast backend on the closed
 fragment at **56.8×** and called the prize *"real and unclaimed"*. It is still
 unclaimed and this ADR narrows why.
 
-- The ceiling is **not** reachable by widening a registry. `D` registers 222 of
-  the 489 compilable bodies and moves *away* from it.
+- The ceiling is **not** reachable by widening a registry. `D` registers most of
+  the compilable bodies and moves *away* from it.
 - ADR 0030 §10's and ADR 0031 §5.2's **2.10× ceiling for a callback-free code
   generator is confirmed as the right target and shown to be optimistic as a
   prediction of *this* generator**: `D` sits at exactly their entry line and
-  reads 0.604× rather than 2.10×. Their arithmetic is not wrong — it prices an
-  *infinitely fast* backend at those 495,152 entries, and the finding here is
-  that at that entry height no real backend can be fast enough, because the
-  boundary is paid 495,152 times whatever is on the other side of it.
-  **`Bfo`'s 2.10× should be read as a bound that the entry count makes
-  unreachable, not as a target.**
+  reads 0.604×. **Their arithmetic is not wrong — it prices an *infinitely fast*
+  backend at that entry count, and the finding here is that at that entry height
+  no real backend can be fast enough, because the boundary is paid every time
+  whatever is on the other side of it.** `Bfo`'s ceiling **should be read as a
+  bound that the entry count makes unreachable, not as a target.**
 - The absolute gap on W1 is unchanged: **31.7× against the Rust front end**, and
   the best backend arm makes it 33.8×.
 
@@ -243,46 +227,38 @@ unclaimed and this ADR narrows why.
    default, read once per process, on `PLY_BACKEND_ONLY`'s model — because the
    arm it enables is the one that produced §4, and a knob that took a finding is
    worth keeping to re-take it.
-3. **`crates/ply-codegen/tests/suite/parser_census.rs` ships**, with a floor of 20 on
-   the enterable set, set below the 22 it measures over that corpus. (W1 reads 6
-   through the shipping command; the corpora differ by `probe.ply`, which changes
-   what is reachable. The two numbers are not in conflict and the test asserts on
-   the one it actually runs.) `fragment.rs`'s census runs over the standard library plus
-   one arithmetic module and cannot see the registry narrowing at all; this one
-   is over the bootstrap target, and it is what made a one-line filter visible
-   after two ADRs had measured around it.
+3. **`crates/ply-codegen/tests/suite/parser_census.rs` ships**, with a floor on the
+   enterable set set below what it measures. (It reads a different count from the
+   shipping command, because the corpora differ by `probe.ply`, which changes
+   what is reachable; **the two are not in conflict and the test asserts on the
+   one it actually runs.**) `fragment.rs`'s census runs over the standard library
+   and **cannot see the registry narrowing at all**; this one is over the
+   bootstrap target, **and it is what made a one-line filter visible after two
+   ADRs had measured around it.**
 4. **The next lever is the code generator's constructs, and it is now ranked
-   rather than guessed.** From the new census, over `spikes/ply-parser` —
-   **586 refusals in total**:
+   rather than guessed.** The new census ranks the refusals over
+   `spikes/ply-parser`, and the ranking is what matters rather than the counts.
+   **The largest row is not a construct at all** — it is *a call to a function
+   outside the unit*, **cascade rather than cause**: the fixpoint drops a
+   function, and on the next round every caller is refused for calling it. So the
+   rows below it are the *roots* and that row is their blast radius, **which is
+   the leverage argument for fixing them, and it is why the compiled set sits
+   scattered at the leaves instead of connected up to the parser's root.**
 
-   | refusals | construct |
-   | ---: | --- |
-   | **275** | *a call to a function outside the unit* — **cascade, not a cause** |
-   | 68 | `++` |
-   | 58 | a record pattern nested inside the constructor pattern `Ok` |
-   | 41 | `fold`, a builtin that calls user code |
-   | 35 | `map`, a builtin that calls user code |
-   | 30 | a named function used as a value rather than called |
-   | 19 | `iterate`, a builtin that calls user code |
-   | 18 | a lambda |
-   | 6 | a `Decimal` literal, which the fragment has no path for |
-   | 5 | a call whose callee is an expression |
-   | 5 | a constructor pattern nested inside a list pattern |
-   | 4 | a call through a local binding |
+   Ranked, the roots are: `++`; a record pattern nested inside a constructor
+   pattern; the three callback builtins `fold`, `map` and `iterate`; a named
+   function used as a value rather than called; a lambda; a `Decimal` literal,
+   which the fragment has no path for; a call whose callee is an expression; a
+   constructor pattern nested inside a list pattern; and a call through a local
+   binding.
 
-   **The first row is 47% of all refusals and is not a construct at all.** It is
-   the fixpoint propagating: `closure()` drops a function, and on the next round
-   every caller is refused for calling it. So the 311 refusals below it are the
-   *roots*, and the 275 above are their blast radius — which is the leverage
-   argument for fixing them, and it is why the compiled set sits scattered at
-   the leaves instead of connected up to `items.parse`.
-
-   **The top two roots — `++` and nested record patterns, 126 between them — are
-   not the callback problem** ADR 0030 §10.2 priced as expensive (breaking
+   **The top two roots — `++` and nested record patterns — are not the callback
+   problem** ADR 0030 §10.2 priced as expensive (breaking
    `Machine::compiled_answer`'s `&self`, moving the `Frame::Call` push above
-   `enter`, deleting the `compiled_witness` tripwire). They are plain missing
-   lowerings in `jit.rs`. **They are the cheap half of the distance between
-   0.94× and the kernel's 10×**, and nothing in `ply-eval` has to move for them.
+   `enter`, deleting the `compiled_witness` tripwire). **They are plain missing
+   lowerings in `jit.rs` — the cheap half of the distance between the front
+   end's loss and the kernel's win — and nothing in `ply-eval` has to move for
+   them.**
 
 ## 7. What would make this wrong
 
@@ -305,16 +281,14 @@ unclaimed and this ADR narrows why.
 
 ## Provenance
 
-Pre-registration and both amendments: `/tmp/arc-together/PREREGISTRATION.md`.
-Raw series: `/tmp/arc-together/raw.tsv` (W1, 60 timed runs),
-`/tmp/arc-together/kernel.tsv` (W3, 75 timed runs). Both carry `uptime` beside
-every block. Tree: `main` at 9d699c7 — PR #64 and PR #65 merged — plus this
-change.
+Pre-registration, both amendments and the raw series are outside the repository.
+Both series carry `uptime` beside every block, and every arm is counterbalanced
+with a null control in the series rather than argued.
 
-One harness defect is on the record because it silently produced empty fields
-rather than an error: the first series spelled the arm
-`/usr/bin/time -p CMD >/dev/null 2>/dev/null`, which silences `time`'s own
-stderr along with the command's. It was found before any number was taken from
-it, fixed by silencing the command inside a subshell, and the fix was proved to
+**One harness defect is on the record because it silently produced empty fields
+rather than an error:** the first series spelled the arm
+`/usr/bin/time -p CMD >/dev/null 2>/dev/null`, **which silences `time`'s own
+stderr along with the command's.** It was found before any number was taken from
+it, fixed by silencing the command inside a subshell, **and the fix was proved to
 report a number before the series was restarted. The arm now fails loudly on an
-empty measurement rather than writing a blank field.
+empty measurement rather than writing a blank field.**

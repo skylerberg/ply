@@ -690,18 +690,16 @@ record is where a program's bounds are readable, and it is a bound at all becaus
 a server that streams without one streams forever. Exhausting it terminates the
 message and answers `false`.
 
-> **Corrected by ADR 0022 (2026-08-27).** The second reason given here was
-> *"and it is a bound at all because every loop in Ply is a tail call charged
-> against the evaluator's nested-call budget"*. That was true of `stream_chunks`
-> and it made this field's largest usable value a fact about
-> `ply_eval::limit::DEFAULT_MAX_CALLS` rather than about HTTP —
-> `max_stream_chunks: 50000` raised `recursion limit of 10000 nested calls
-> exceeded`. `stream_chunks` and `stream_raw` now drive their loops with
-> `iterate`, which is depth 1 however long it runs, so the field bounds only
-> what it says it bounds. The sentence is **not** true of the whole language
-> either: `map`, `filter`, `fold`, `map_fold`, `bytes_position` and `iterate`
-> are all depth 1. It remains true of `serve` and `connection_loop` in the same
-> file, which ADR 0022 records as out of its scope.
+**A second reason once given here is withdrawn by ADR 0022**: *"and it is a bound
+at all because every loop in Ply is a tail call charged against the evaluator's
+nested-call budget"*. That was true of the streaming helpers, **and it made this
+field's largest usable value a fact about the evaluator's call budget rather than
+about HTTP** — a large `max_stream_chunks` raised the recursion diagnostic. They
+now drive their loops with `iterate`, which is depth 1 however long it runs, **so
+the field bounds only what it says it bounds.** The sentence was **never** true
+of the whole language: `map`, `filter`, `fold`, `map_fold`, `bytes_position` and
+`iterate` are all depth 1. **It remains true of `serve` and `connection_loop`**,
+which ADR 0022 records as out of its scope.
 
 **The bound must cost the bound.** Every scan in the head parser passes a
 `Limits`-derived `max` to `bytes_scan` / `bytes_scan_until`, and the read loop
@@ -799,30 +797,22 @@ gives that, and it costs one `match`.
   plain path, at a length the default `max_request_line` admits. §4's rule is
   not only about the head parser.
 
-  > **Corrected (mechanism sweep, 2026-08-28): the measurement stands, the
-  > parenthetical does not.** This read *"an accumulator built with `push` —
-  > **which copies a `List`** — made k escapes cost O(k²)"*. The 125.8 ms against
-  > 0.1 ms is re-affirmed, and so is everything §4 draws from it; only the cause
-  > is withdrawn. `push` does not copy a `List`. It grows one **in place** when
-  > the caller is its last owner — that is what `Arc::get_mut` decides in
-  > `crates/ply-eval/src/builtins.rs` — and copies the whole array only when
-  > something else still holds a reference. What put the old `percent_decode` in
-  > the copying branch was **position**: `rc::carry`
-  > (`crates/ply-eval/src/rc.rs:98`) hands a pending frame a live clone of the
-  > scope whenever any sub-expression of the enclosing node remains, and never
-  > asks what those remaining sub-expressions read — so an accumulator grown
-  > anywhere but last is at two owners by the time `push` looks, and the
-  > sub-expression that costs the copy can be a literal constant. The rule
-  > composes across call boundaries: a correctly written callee is made quadratic
-  > by its caller. `spikes/ply-lexer/GAPS.md` §1 is the rule; ADR 0020 §5.2 is
-  > the measurement of the composition.
-  >
-  > The difference is not pedantry, because *avoid `push`* is not a fix anyone
-  > can apply: `push` is the language's only list primitive and
-  > `crates/ply-std/ply/trace.ply`'s own `cons` is written out of it. The remedy
-  > that landed here removed the *accumulator* — one native split, one call per
-  > escape, one allocation for the join. Where an accumulator is the right shape,
-  > the fix is to build it in the last sub-expression of its enclosing node.
+  **The measurement stands and the mechanism is not `push` copying a `List`.**
+  `push` grows one **in place** when the caller is its last owner and copies the
+  whole array only when something else still holds a reference. **What put the
+  old `percent_decode` in the copying branch was *position*:** `rc::carry` hands
+  a pending frame a live clone of the scope whenever any sub-expression of the
+  enclosing node remains, **and never asks what those remaining sub-expressions
+  read** — so an accumulator grown anywhere but last is at two owners by the time
+  `push` looks, **and the sub-expression that costs the copy can be a literal
+  constant.** The rule composes across call boundaries: **a correctly written
+  callee is made quadratic by its caller.**
+
+  **The difference is not pedantry, because *avoid `push`* is not a fix anyone
+  can apply:** `push` is the language's only list primitive. **The remedy that
+  landed here removed the *accumulator*** — one native split, one call per
+  escape, one allocation for the join. Where an accumulator is the right shape,
+  the fix is to build it in the last sub-expression of its enclosing node.
 - An invalid percent escape — `%` not followed by two hex digits — leaves the
   bytes as written rather than raising; a segment is a `String` and the request
   already parsed.
@@ -1240,7 +1230,7 @@ The ones whose absence would let W3 ship broken rather than merely incomplete.
     `std.http.parse_head` over heads grown to 8 KB of fields the parser never
     reads, and the time is flat in the head's length.
     *Enforced by `the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read`
-    (`crates/ply-corpus/tests/suite/http_cost.rs:143`), which sweeps pad lengths
+    (`crates/ply-corpus/tests/suite/http_cost.rs`), which sweeps pad lengths
     `0, 64, 256, 1024, 4096, 8192` and asserts on the ratio rather than on
     absolute microseconds. A second sweep in the same file covers the
     field-**count** direction, which this entry does not mention and should:
@@ -1250,18 +1240,18 @@ The ones whose absence would let W3 ship broken rather than merely incomplete.
     longer than the interpreter's nested-call limit returns a value rather than
     ending the run.
     *First clause enforced by `routing_a_path_of_escapes_costs_its_length_and_not_its_square`
-    (`crates/ply-cli/tests/suite/w3_http_audit.rs:694`), comparing `escapes(11)`
+    (`crates/ply-cli/tests/suite/w3_http_audit.rs`), comparing `escapes(11)`
     against `escapes(13)`. Note the assertion is `four <= one * 9.0`, not "about
     four": the test's own doc explains the slack — quadratic would be 16x and
     9x is chosen so a contended machine cannot redden it while a reintroduced
     copying accumulator cannot green it. That is a defensible threshold, and it
     is looser than this line reads.*
     **Second clause not demonstrated.** `ply_eval::DEFAULT_MAX_CALLS` is
-    `10_000` (`crates/ply-eval/src/limit.rs:23`). The largest escape path any
+    `10_000` (`crates/ply-eval/src/limit.rs`). The largest escape path any
     test builds is `escapes(13)` = `3 · 2^13` = 24,576 bytes, i.e. 8,192
     escapes — under the limit, so it does not exercise the case. The nearest
     thing is `"a path with two thousand segments is answered"`
-    (`crates/ply-cli/tests/suite/routing_audit.rs:322`), which is 2,000 *segments*,
+    (`crates/ply-cli/tests/suite/routing_audit.rs`), which is 2,000 *segments*,
     also under the limit and not escapes. So nothing checks that a path of
     escapes past 10,000 returns a value rather than ending the run with a
     recursion-limit diagnostic. Whichever way that case actually behaves, it is

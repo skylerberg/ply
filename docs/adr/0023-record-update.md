@@ -229,35 +229,28 @@ happened to be in the file".
 > > definition in `examples/` (1428 entries, 0 moved) or in the other seven
 > > shipped modules.
 >
-> **The `0` is what a stale binary reports.** `crates/ply-std/src/lib.rs`
-> `include_str!`s every `crates/ply-std/ply/*.ply` **into the binary**, so
-> `import std.http` resolves to the copy compiled in and never to the file that
-> was edited: re-running `ply hash` after editing `http.ply` without rebuilding
-> compares a binary against itself. CONTRIBUTING's prescribed instrument check
-> cannot see it either, because the stale input is a `.ply` and that check looks
-> only at `.rs`. Use
-> `find crates \( -name '*.rs' -o -name '*.ply' \) -newer target/release/ply`.
-> Re-taken on binaries verified fresh against both extensions, on corpora copied
-> out of each checkout with `.ply-cache` excluded, twice and identical both
-> times: the `chunk_trailers`-only tree moves **84 of 1,428** in `examples/`,
-> every one a dependent. The 91 above is that tree plus the three `Limits`
-> helpers this ADR originally left alone.
->
-> **And "40 of 206" was a scope, not a total.** It counted the 20 definitions
-> and 20 tests of `std.http` that moved, which is right, but "40" alone reads as
-> "40 definitions". A neighbouring reading of "60 moved (40 definitions + 20
-> tests)" is not a second measurement of the same thing and is not a
-> contradiction: it comes from hashing the whole `crates/ply-std/ply/` directory,
-> where `http.ply` is listed **twice** — once as the module `http`, the file, and
-> once as `std.http`, the copy compiled into the binary and reached through
-> another module's `import` — and then keying the comparison on the bare name.
-> That key deduplicates one half and not the other: a definition's name already
-> carries its module, so `http.serve` and `std.http.serve` survive as two rows,
-> while a test's name is its title, so the titles that appear under both modules
-> collapse into one. Definitions doubled, tests not: 40 + 20. Keyed on
-> `(module, name)` the same corpus reports 80. Both are artefacts of the corpus
-> and the key. One file, one honest denominator: `ply hash` on `http.ply`
-> itself.
+**A zero here is what a stale binary reports, and this is the trap.**
+`crates/ply-std/src/lib.rs` `include_str!`s every `crates/ply-std/ply/*.ply`
+**into the binary**, so `import std.http` resolves to the copy compiled in and
+never to the file that was edited: **re-running `ply hash` after editing a
+stdlib module without rebuilding compares a binary against itself.** The
+prescribed instrument check could not see it either, **because the stale input is
+a `.ply` and that check looked only at `.rs`.**
+`.github/binary-is-current.sh` is what closes it. Re-taken on binaries verified
+fresh against both extensions, on corpora copied out of each checkout with
+`.ply-cache` excluded, twice and identical both times.
+
+**And a second reading of "how many moved" disagreed with the first for a reason
+that is entirely about the key.** Hashing the whole `crates/ply-std/ply/`
+directory lists `http.ply` **twice** — once as the module `http`, the file, and
+once as `std.http`, the copy compiled into the binary and reached through another
+module's `import` — and keying the comparison on the *bare* name **deduplicates
+one half and not the other**: a definition's name already carries its module, so
+two rows survive, while a test's name is its title, so titles appearing under
+both modules collapse into one. **Definitions doubled, tests not.** Keyed on
+`(module, name)` the same corpus reports a third figure. **All of them are
+artefacts of the corpus and the key. One file, one honest denominator: `ply hash`
+on the file itself.**
 
 No `FRONTEND_VERSION` or `RUNTIME_VERSION` bump. Nothing about normalization's
 byte stream changed and no stored type moved; the sugar is gone before `ply-hash`
@@ -309,7 +302,7 @@ is now the **only** such site.
 > **`limits_with`, `limits_keeping` and `limits_streaming` are no longer on this
 > list.** This paragraph continued:
 >
-> > nor `limits_with` / `limits_keeping` / `limits_streaming` (`http.ply:1654`,
+> > nor `limits_with` / `limits_keeping` / `limits_streaming` (`http.ply`,
 > > `:2388`, `:2833`), which re-spell `Limits` by hand and were left alone so
 > > that no `DefHash` outside `chunk_trailers`' cone moved in this change.
 > > `limits_keeping` and `limits_streaming` are exactly the

@@ -246,22 +246,20 @@ correct code, which is the failure class this project audits for. Ordered
 iteration is the whole reason `Map` is a language primitive rather than a
 library.
 
-> **Corrected (regression audit, 2026-08-21). Ordered iteration was necessary
-> and was not sufficient, and three of the four failures above were reachable
-> for four milestones.** `Value::cmp` compares a `Decimal` by numeric value so
-> that `1.50m` and `1.5m` are one key, while `Value::write` and
-> `decimal_to_string` print the scale as stored — so a map held whichever of the
-> two spellings was inserted last, and `map_keys`, a derived JSON encoding and a
-> `map_fold`'s branch were functions of insertion history through the **key**
-> rather than through the order. Two maps that `assert_eq` as one value served
-> two different response bodies. `--engine both` reported nothing, because it
-> was not an engine disagreement.
->
-> Fixed in the representation: `ply_eval::value::canonical_key` reduces a key to
-> one representative per equivalence class on the way in, at every position
-> `Value::cmp` descends into. `docs/adr/0019-value-representation.md` §7 is the
-> write-up, and `crates/ply-eval/tests/suite/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
-> carries what the tree asserted until then.
+**Ordered iteration was necessary and was not sufficient, and three of the four
+failures above were reachable for four milestones.** `Value::cmp` compares a
+`Decimal` by numeric value so that `1.50m` and `1.5m` are one key, while
+rendering prints the scale as stored — **so a map held whichever of the two
+spellings was inserted last, and `map_keys`, a derived JSON encoding and a
+`map_fold`'s branch were functions of insertion history through the *key* rather
+than through the order.** Two maps that `assert_eq` as one value served two
+different response bodies. **`--engine both` reported nothing, because it was not
+an engine disagreement.**
+
+Fixed in the representation: `ply_eval::value::canonical_key` reduces a key to
+one representative per equivalence class on the way in, at every position
+`Value::cmp` descends into. **ADR 0019 §7 is the write-up**, and
+`crates/ply-eval/tests/suite/map_order.rs` carries what the tree asserted until then.
 
 ### What it requires of key types
 
