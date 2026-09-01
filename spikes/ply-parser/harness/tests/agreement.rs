@@ -566,7 +566,7 @@ fn the_comparison_reaches_every_tag_the_reference_side_can_emit() {
 }
 
 /// Every tag the **reference** side of this dump can emit.
-const EMITTABLE: [&str; 100] = [
+const EMITTABLE: [&str; 101] = [
     // nodes
     "arm",
     "atm",
@@ -595,6 +595,7 @@ const EMITTABLE: [&str; 100] = [
     "eun",
     "evar",
     "fn",
+    "reu",
     "hcl",
     "ident",
     "imp",
