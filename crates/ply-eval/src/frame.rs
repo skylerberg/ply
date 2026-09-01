@@ -82,6 +82,7 @@ impl Machine<'_> {
 
             Frame::AppCallee {
                 args,
+                dead,
                 env,
                 module,
                 span,
@@ -94,12 +95,21 @@ impl Machine<'_> {
                     return self.apply(value, Vec::new(), span);
                 }
                 let first = args[0].clone();
-                let carried = crate::rc::carry(&env, args.len() > 1);
+                // ADR 0033 §11 S4: the frame carries the scope minus what
+                // argument 0 is the last reader of, rather than all of it.
+                // `dead` is empty unless the probe is armed, and then this is
+                // `carry` exactly.
+                let carried = crate::rc::carry_released(
+                    &env,
+                    args.len() > 1,
+                    dead.first().map(|d| &**d).unwrap_or(&[]),
+                );
                 self.push(
                     Frame::AppArgs {
                         callee: value,
                         done: crate::argv::take(args.len()),
                         args,
+                        dead,
                         next: 1,
                         env: carried,
                         module,
@@ -114,6 +124,7 @@ impl Machine<'_> {
                 callee,
                 mut done,
                 args,
+                dead,
                 next,
                 env,
                 module,
@@ -129,12 +140,17 @@ impl Machine<'_> {
                     }
                     Some(arg) => {
                         let arg = arg.clone();
-                        let carried = crate::rc::carry(&env, next + 1 < args.len());
+                        let carried = crate::rc::carry_released(
+                            &env,
+                            next + 1 < args.len(),
+                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
+                        );
                         self.push(
                             Frame::AppArgs {
                                 callee,
                                 done,
                                 args,
+                                dead,
                                 next: next + 1,
                                 env: carried,
                                 module,
@@ -238,6 +254,7 @@ impl Machine<'_> {
             Frame::RecordField {
                 mut done,
                 fields,
+                dead,
                 next,
                 env,
                 module,
@@ -250,11 +267,16 @@ impl Machine<'_> {
                     }
                     Some((_, code)) => {
                         let code = code.clone();
-                        let carried = crate::rc::carry(&env, next + 1 < fields.len());
+                        let carried = crate::rc::carry_released(
+                            &env,
+                            next + 1 < fields.len(),
+                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
+                        );
                         self.push(
                             Frame::RecordField {
                                 done,
                                 fields,
+                                dead,
                                 next: next + 1,
                                 env: carried,
                                 module,

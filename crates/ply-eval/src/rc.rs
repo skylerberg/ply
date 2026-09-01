@@ -18,6 +18,25 @@ pub enum Own {
     Owned,
 }
 
+/// Whether ADR 0033 §11 S4's probe is armed, read once per process. Off by default: it is a probe
+/// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
+/// do not arm it in anything being timed.
+pub fn probe_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1"))
+}
+
+/// [`carry`], minus the bindings the sub-expression just started is the last reader of.
+pub(crate) fn carry_released(env: &Env, remaining: bool, dead: &[Symbol]) -> Env {
+    if !remaining {
+        return Env::empty();
+    }
+    if dead.is_empty() {
+        return env.clone();
+    }
+    env.release(dead)
+}
+
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
 pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
     if remaining { env.clone() } else { Env::empty() }
@@ -117,12 +136,11 @@ impl SiteCount {
     }
 }
 
-/// Arms or disarms per-site attribution of [`Stats::updates`].
+/// Arms or disarms per-site attribution of [`Stats::updates`], clearing the map
+/// in both directions so a measurement starts empty whatever ran before it.
 pub fn record_sites(on: bool) {
     let _ = RECORDING.try_with(|c| c.set(on));
-    if !on {
-        let _ = SITES.try_with(|c| c.borrow_mut().clear());
-    }
+    let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
 /// What each `push` site has done since [`record_sites`] armed it.
@@ -245,6 +263,9 @@ pub struct Live {
     /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
     /// holding every name bound anywhere inside it.
     ownable: Vec<Vec<Symbol>>,
+    /// How many leading names of each `ownable` frame are that barrier's own
+    /// **parameters**, which [`Live::barrier_params`] hands back.
+    params: Vec<usize>,
 }
 
 impl Live {
@@ -252,6 +273,23 @@ impl Live {
         Live {
             later: Vec::new(),
             ownable: vec![ownable],
+            params: vec![0],
+        }
+    }
+
+    /// The current barrier's parameters — ADR 0033 §11 S3 / ADR 0025 P2.
+    pub fn barrier_params(&self) -> &[Symbol] {
+        match (self.ownable.last(), self.params.last()) {
+            (Some(scope), Some(&n)) => &scope[..n.min(scope.len())],
+            _ => &[],
+        }
+    }
+
+    /// Declares that the first `count` names of the current barrier's frame are
+    /// its parameters. Called once, immediately after the frame is opened.
+    pub fn params_are(&mut self, count: usize) {
+        if let Some(last) = self.params.last_mut() {
+            *last = count;
         }
     }
 
@@ -281,6 +319,13 @@ impl Live {
         self.ownable
             .last()
             .is_some_and(|scope| scope.iter().any(|n| n == name))
+    }
+
+    /// Whether this name is a binding of the current barrier — [`Live::tracked`]
+    /// in public form, for the ADR 0033 §11 S4 probe, which may only release a
+    /// name whose last use this body can bound.
+    pub fn is_ownable(&self, name: &Symbol) -> bool {
+        self.tracked(name)
     }
 
     pub fn is_live(&self, name: &Symbol) -> bool {
@@ -325,6 +370,7 @@ impl Live {
     /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
     pub fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
         self.ownable.push(bound);
+        self.params.push(0);
         std::mem::take(&mut self.later)
     }
 
@@ -332,6 +378,7 @@ impl Live {
     pub fn close(&mut self, outer: Vec<Symbol>) {
         let free = std::mem::replace(&mut self.later, outer);
         self.ownable.pop();
+        self.params.pop();
         for name in free {
             if !self.is_live(&name) {
                 self.later.push(name);

@@ -58,6 +58,7 @@ fn call(func: Code, args: Vec<Code>) -> Code {
     node(NodeKind::App {
         func,
         args: Rc::new(args),
+        dead: Rc::new(Vec::new()),
     })
 }
 

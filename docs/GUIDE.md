@@ -1027,10 +1027,22 @@ which is inside what that measurement could resolve; at 128,000, where it can,
 are what you have, not because you were promised a speed-up.
 
 `push` grows the list in place when the caller is its last owner, and copies
-otherwise. Which branch you get is decided by *position*: an accumulator written
-in the **last** position of its enclosing expression stays linear, and one
-written earlier copies. `{..s, toks: push(s.toks, t)}` is the linear spelling;
-`{toks: push(s.toks, t), pos: p}` is not.
+otherwise. Which branch you get is decided by *position*, and the rule
+**compounds at every enclosing node** on the path up from the `push`: an
+accumulator is linear only if it sits in the last position of its record
+literal, *and* that literal in the last position of the call it is an argument
+to, and so on outwards. `{..s, toks: push(s.toks, t)}` is the linear spelling of
+the literal — and `go({..s, toks: push(s.toks, t)}, i)` is quadratic anyway,
+because the literal is not last in the call.
+
+**Do not work this out by hand. Run `ply check --costs`**, which answers it per
+`push` site and names the edit.
+
+> This subsection is scheduled for **deletion, not further correction**.
+> `docs/adr/0033-perceus-over-slots.md` argues the rule is an artifact of the
+> evaluator's environment representation rather than a property of the language,
+> and deletes these paragraphs when its gate goes green.
+> `crates/ply-eval/tests/suite/position_invariance_g1.rs` is the gate.
 
 ### 6.8 Effect performs, `handle`, `with_cell`, `with_region`, `simulate`
 
@@ -2766,6 +2778,7 @@ and then emits exactly one JSON object on stdout and nothing else.
 | flag | meaning |
 | --- | --- |
 | `--types` | print the inferred signature and footprint of every definition |
+| `--costs` | for every `push`, whether it grows its list in place or copies it, and what would remove the copy (§6.7) |
 | `--explain` | which files were parsed and which definitions rechecked, with the reason a skip was refused |
 | `--no-incremental` | neither read nor write the front-end cache |
 | `--json` | |
@@ -3102,7 +3115,9 @@ rather than left to be discovered.
 * A task that reads shared state and writes it back with no scheduler operation
   in between runs both as one step, and no schedule separates them.
 * An accumulator written anywhere but the last position of its enclosing
-  expression copies instead of growing in place.
+  expression copies instead of growing in place — and "enclosing expression"
+  means *every* node above it, not just the nearest one. Do not work it out by
+  hand: `ply check --costs` answers it per site.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
 * `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
   answers `None`. The two containers are indexed by different conventions on
