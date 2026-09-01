@@ -2082,6 +2082,12 @@ impl<'a> Checker<'a> {
             // body at a time would decide `Int` before the other body said
             // `Decimal`.
             self.settle_numerics();
+            // After `settle_numerics` for the same reason it runs after the
+            // whole component: the type this reports is the one a reader would
+            // have to write, and one body in the group can be what pins it.
+            for (slot, &i) in comp.iter().enumerate() {
+                self.require_written_signature(fns[i], &sigs[slot]);
+            }
             for sig in &sigs {
                 self.close_unreachable_row(sig);
             }
@@ -3398,16 +3404,16 @@ impl<'a> Checker<'a> {
                     self.expect(value.span, &want, &vt, "`let` annotation");
                     vt = want;
                 }
-                let generalizable = matches!(pat.kind, PatternKind::Var(_) | PatternKind::Wildcard);
+                // A local `let` binds monomorphically. Generalizing here bought
+                // a locally-defined function usable at two types, which no
+                // definition in the tree wants, and it put generalization on
+                // the path of every statement in every body. A polymorphic
+                // helper is a `fn`, where its signature is written and
+                // therefore reviewable.
                 let mut bindings = Vec::new();
                 self.bind_pattern(pat, &vt, &mut bindings);
                 for (name, t) in bindings {
-                    let scheme = if generalizable {
-                        generalize(&self.subst, &mut self.env, &t)
-                    } else {
-                        Scheme::mono(t)
-                    };
-                    self.env.bind(name, scheme);
+                    self.env.bind(name, Scheme::mono(t));
                 }
                 row
             }
@@ -3480,7 +3486,7 @@ impl<'a> Checker<'a> {
             let ty = self.subst.resolve_ty(&entry.ty);
             let name = match &ty {
                 Type::Var(_) => {
-                    let _ = unify(&mut self.subst, &mut self.fresh, &ty, &Type::int());
+                    self.numeric_undetermined(&entry);
                     continue;
                 }
                 Type::Con(name, args) if args.is_empty() => name.clone(),
@@ -3511,6 +3517,121 @@ impl<'a> Checker<'a> {
                 _ => self.numeric_mismatch(&entry, &ty),
             }
         }
+    }
+
+    /// `E0126`: a top-level `fn` left a parameter type or its return type to
+    /// inference.
+    ///
+    /// A published signature is a claim the author makes, not a summary the
+    /// compiler derives. `ply review --changed`'s load-bearing row is
+    /// *implementation changed, spec unchanged*, and a signature inferred from
+    /// the body it describes cannot hold still for that row to mean anything —
+    /// editing the body silently republishes the claim.
+    ///
+    /// The **effect row is deliberately not covered**. A row is derived from
+    /// what a body calls rather than chosen, so it stays inferred unless
+    /// written, and a written one is checked as an upper bound. That asymmetry
+    /// is the point: infer what is mechanical, write what is meant.
+    ///
+    /// A definition a `derive` generated is exempt. Nobody wrote it, so there
+    /// is nobody to ask for an annotation.
+    fn require_written_signature(&mut self, def: &FnDef, sig: &Signature) {
+        const WHY: &str = "a signature is a claim about what a definition means, so it is written \
+                           rather than inferred; the effect row is the exception and stays inferred";
+        if def.derived.is_some() {
+            return;
+        }
+        for (p, t) in def.params.iter().zip(&sig.params) {
+            if p.ty.is_some() {
+                continue;
+            }
+            let label = match self.writable(sig, t) {
+                Some(shown) => format!("write `{}: {}`", p.name.name, shown),
+                None => "write a type here".to_string(),
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    codes::MISSING_SIGNATURE,
+                    format!("parameter `{}` has no written type", p.name.name),
+                )
+                .primary(p.span, label)
+                .note(WHY),
+            );
+        }
+        if def.ret.is_none() {
+            let label = match self.writable(sig, &sig.ret) {
+                Some(shown) => format!("write `-> {shown}`"),
+                None => "write a return type here".to_string(),
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    codes::MISSING_SIGNATURE,
+                    format!("`{}` has no written return type", def.name.name),
+                )
+                .primary(def.name.span, label)
+                .note(WHY),
+            );
+        }
+    }
+
+    /// The resolved form of `t`, rendered, when every type variable left in it
+    /// is one the signature's own generic list binds — so the text is something
+    /// the author can paste.
+    ///
+    /// An *unsolved* variable is not: printing it yields a letter that denotes
+    /// nothing in scope, and `write \`a: a\`` is worse than no suggestion. That
+    /// case is real rather than defensive — it is exactly what an operand
+    /// `E0210` also refused to settle leaves behind.
+    fn writable(&self, sig: &Signature, t: &Type) -> Option<String> {
+        fn vars(t: &Type, out: &mut Vec<TyVar>) {
+            match t {
+                Type::Var(v) => out.push(*v),
+                Type::Con(_, args) => args.iter().for_each(|a| vars(a, out)),
+                Type::Fn { params, ret, .. } => {
+                    params.iter().for_each(|p| vars(p, out));
+                    vars(ret, out);
+                }
+                Type::Record(fields) => fields.values().for_each(|f| vars(f, out)),
+            }
+        }
+        let resolved = self.subst.resolve_ty(t);
+        let bound: FxHashSet<TyVar> = sig
+            .ty_params
+            .values()
+            .filter_map(|p| match self.subst.resolve_ty(p) {
+                Type::Var(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let mut found = Vec::new();
+        vars(&resolved, &mut found);
+        if found.iter().any(|v| !bound.contains(v)) {
+            return None;
+        }
+        Some(Printer::new().ty(&resolved))
+    }
+
+    /// `E0210`: an operand whose numeric type nothing determines.
+    ///
+    /// This arm used to *default* to `Int`, which put a tiebreak taken inside
+    /// the compiler into a published signature. With signatures written the
+    /// only way to reach here is a lambda binder or a `let` nothing
+    /// constrains, where choosing for the author is a guess.
+    fn numeric_undetermined(&mut self, entry: &Numeric) {
+        let what = if matches!(entry.op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            "ordered comparison"
+        } else {
+            "arithmetic"
+        };
+        self.diags.push(
+            Diagnostic::error(
+                codes::NUMERIC_UNDETERMINED,
+                format!("the numeric type of this {what} is not determined"),
+            )
+            .primary(entry.span, "nothing here says which numeric type this is")
+            .note("`Int`, `Float` and `Decimal` are the numeric types, and there is no tower")
+            .note("annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)"),
+        );
     }
 
     fn numeric_mismatch(&mut self, entry: &Numeric, ty: &Type) {

@@ -480,6 +480,16 @@ Requirements:
   is what keeps one test's cells out of the next one's arena.
 - A `/ {...}` annotation is an upper bound: inference must produce a subset, and
   the annotation becomes the published signature. Violation is `EFFECT_NOT_PERMITTED`.
+- Every parameter type and return type on a top-level `fn` is **written**. An
+  omitted one is `MISSING_SIGNATURE` (`E0126`), reported after the component's
+  numerics settle so the diagnostic can name the type inference would have
+  given. A definition a `derive` generated is exempt: nobody wrote it. This is
+  the deliberate asymmetry with the row above — a row is derived from what a
+  body calls and stays inferred, a type is chosen and is written.
+- A local `let` binds **monomorphically**. Generalization happens at a top-level
+  definition and nowhere else.
+- An arithmetic or ordered-comparison operand whose numeric type nothing
+  determines is `NUMERIC_UNDETERMINED` (`E0210`). There is no defaulting rule.
 - After solving, a definition's row must be closed. A surviving row variable in a
   top-level signature that was not generalized is `UNBOUND_ROW_VAR`.
 - A `test` that is not `nondet` whose final footprint contains an atom belonging

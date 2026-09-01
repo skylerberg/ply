@@ -28,6 +28,28 @@ fn one(source: &str) -> TempDir {
     project(&[("m.ply", source)])
 }
 
+/// A `derive` writes definitions nobody authored, so `MISSING_SIGNATURE`
+/// (`E0126`) exempts them — `Checker::require_written_signature` keys that on
+/// `FnDef::derived`. Without the exemption every `derive` in the language stops
+/// checking at once, so this is worth naming rather than leaving to be inferred
+/// from the round-trip tests below happening to still pass.
+#[test]
+fn a_derived_definition_is_exempt_from_the_written_signature_rule() {
+    let dir = one("import std.json\n\
+                   pub type Box = {label: String, n: Int}\n\
+                   derive json for Box\n\
+                   derive eq for Box\n\
+                   derive ord for Box\n");
+    let out = ply(dir.path()).arg("check").output().expect("a run");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !text.contains("E0126"),
+        "a derived definition must not be asked for an annotation: {text}"
+    );
+    assert!(out.status.success(), "the project should check: {text}");
+}
+
 fn ply(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ply").expect("the `ply` binary");
     cmd.arg("--color").arg("never").current_dir(dir);

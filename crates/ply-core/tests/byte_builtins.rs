@@ -38,26 +38,37 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
 
 #[test]
 fn the_byte_builtins_have_the_types_the_contract_states() {
+    // The middle column is the probe's generic list: only `bytes_position`'s
+    // type names a row variable, so only it binds one.
     let expected = [
-        ("bytes_index_of", "(Bytes, Bytes) -> Option<Int>"),
-        ("bytes_index_of_from", "(Bytes, Bytes, Int) -> Option<Int>"),
-        ("bytes_index_of_byte", "(Bytes, Int) -> Option<Int>"),
-        ("bytes_starts_with", "(Bytes, Bytes) -> Bool"),
-        ("bytes_ends_with", "(Bytes, Bytes) -> Bool"),
-        ("bytes_split", "(Bytes, Bytes) -> List<Bytes>"),
-        ("bytes_scan", "(Bytes, Int, Bytes, Int) -> Int"),
-        ("bytes_scan_until", "(Bytes, Int, Bytes, Int) -> Int"),
+        ("bytes_index_of", "", "(Bytes, Bytes) -> Option<Int>"),
+        (
+            "bytes_index_of_from",
+            "",
+            "(Bytes, Bytes, Int) -> Option<Int>",
+        ),
+        ("bytes_index_of_byte", "", "(Bytes, Int) -> Option<Int>"),
+        ("bytes_starts_with", "", "(Bytes, Bytes) -> Bool"),
+        ("bytes_ends_with", "", "(Bytes, Bytes) -> Bool"),
+        ("bytes_split", "", "(Bytes, Bytes) -> List<Bytes>"),
+        ("bytes_scan", "", "(Bytes, Int, Bytes, Int) -> Int"),
+        ("bytes_scan_until", "", "(Bytes, Int, Bytes, Int) -> Int"),
         (
             "bytes_position",
+            "<| e>",
             "(Bytes, Int, (Int) -> Bool / e) -> Option<Int> / e",
         ),
     ];
     let source: String = expected
         .iter()
-        .map(|(name, _)| format!("fn probe_{name}() = {name}\n"))
+        .map(|(name, generics, ty)| format!("fn probe_{name}{generics}() -> {ty} = {name}\n"))
         .collect();
     let out = ok(&source);
-    for (name, ty) in expected {
+    for (name, _, ty) in expected {
+        // The probe now *writes* the contract's type rather than reading the
+        // builtin's off inference (`MISSING_SIGNATURE`), which makes this
+        // strictly stronger: the builtin has to unify with the type the
+        // contract names, not merely print the same way it does.
         assert_eq!(
             sig(&out, &format!("probe_{name}")),
             format!("() -> {ty}"),
