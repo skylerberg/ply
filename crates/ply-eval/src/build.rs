@@ -105,6 +105,15 @@ pub fn param(name: &str) -> Param {
     }
 }
 
+/// `name: ty`. A `fn` parameter has to be written now, so every parameter of a
+/// definition that will be checked comes through here.
+pub fn param_ty(name: &str, ty: TypeExpr) -> Param {
+    Param {
+        ty: Some(ty),
+        ..param(name)
+    }
+}
+
 pub fn lam(params: &[&str], body: Expr) -> Expr {
     ex(ExprKind::Lambda {
         params: params.iter().map(|p| param(p)).collect(),
@@ -329,6 +338,35 @@ pub fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
     })
 }
 
+/// A nullary type constructor: `Int`, `Bool`, `Bytes`, `Unit`, `String`,
+/// `Float`.
+pub fn tcon(name: &str) -> TypeExpr {
+    TypeExpr::Con {
+        name: qname(name),
+        args: Vec::new(),
+        span: sp(),
+    }
+}
+
+/// A type constructor applied to arguments: `List<Int>`, `Map<String, Int>`.
+pub fn tapp(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
+    TypeExpr::Con {
+        name: qname(name),
+        args,
+        span: sp(),
+    }
+}
+
+/// A type parameter, bound by the enclosing definition's `<..>` rather than by
+/// any module. Only [`fn_def_poly`] binds one.
+pub fn tvar(name: &str) -> TypeExpr {
+    TypeExpr::Var(id(name))
+}
+
+/// A definition with **no** written signature, which the checker now rejects
+/// with E0126 MISSING_SIGNATURE. For hashing and evaluation fixtures only —
+/// neither reads a written type, and neither runs the checker. A fixture that
+/// will be checked wants [`fn_def_sig`].
 pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
     Item::Fn(Box::new(FnDef {
         vis: Visibility::Private,
@@ -345,6 +383,46 @@ pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
     }))
 }
 
+/// [`fn_def`] with the signature written: every parameter typed and a return
+/// type, which is what a definition needs to clear E0126. The effect row stays
+/// absent, because rows are still inferred.
+pub fn fn_def_sig(name: &str, params: &[(&str, TypeExpr)], ret: TypeExpr, body: Expr) -> Item {
+    Item::Fn(Box::new(FnDef {
+        vis: Visibility::Private,
+        name: id(name),
+        generics: Generics::default(),
+        params: params.iter().map(|(n, t)| param_ty(n, t.clone())).collect(),
+        ret: Some(ret),
+        effects: None,
+        constraints: Vec::new(),
+        derived: None,
+        spec: Vec::new(),
+        body,
+        span: sp(),
+    }))
+}
+
+/// [`fn_def_sig`] with `generics` bound, so a parameter can be written at a
+/// [`tvar`].
+///
+/// A signature the checker cannot suggest — `fn head(xs) = len(xs)` publishes
+/// `<a>(List<a>) -> Int` — has to be written at the same generality it was
+/// inferred at, because a `Type::Var` is what `compiled`'s argument gate refuses
+/// and a monomorphic `List<Int>` in its place would be carried instead.
+pub fn fn_def_poly(
+    name: &str,
+    generics: &[&str],
+    params: &[(&str, TypeExpr)],
+    ret: TypeExpr,
+    body: Expr,
+) -> Item {
+    let Item::Fn(mut def) = fn_def_sig(name, params, ret, body) else {
+        unreachable!("`fn_def_sig` builds an `Item::Fn`")
+    };
+    def.generics.types = generics.iter().map(|g| id(g)).collect();
+    Item::Fn(def)
+}
+
 pub fn test_def(name: &str, body: Expr) -> Item {
     Item::Test(Box::new(TestDef {
         name: name.to_string(),
@@ -356,11 +434,7 @@ pub fn test_def(name: &str, body: Expr) -> Item {
 }
 
 pub fn type_def(name: &str, variants: &[(&str, usize)]) -> Item {
-    let int_ty = TypeExpr::Con {
-        name: qname("Int"),
-        args: Vec::new(),
-        span: sp(),
-    };
+    let int_ty = tcon("Int");
     Item::Type(Box::new(TypeDef {
         vis: Visibility::Private,
         name: id(name),
@@ -380,11 +454,7 @@ pub fn type_def(name: &str, variants: &[(&str, usize)]) -> Item {
 }
 
 pub fn effect_def(name: &str, ops: &[(&str, Mode, bool)]) -> Item {
-    let int_ty = TypeExpr::Con {
-        name: qname("Int"),
-        args: Vec::new(),
-        span: sp(),
-    };
+    let int_ty = tcon("Int");
     Item::Effect(Box::new(EffectDef {
         vis: Visibility::Private,
         name: id(name),

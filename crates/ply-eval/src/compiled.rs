@@ -1565,7 +1565,7 @@ pub(crate) fn admit_with<'a>(
 /// > |---|---|
 /// > | `CarriedTypes::args_cross` stubbed to `true` — the whole gate | **6**: `a_closure_bearing_record_is_refused_on_its_declared_type`, `a_recursive_type_that_reaches_a_closure_is_refused`, `a_value_whose_kind_is_not_its_declared_types_is_refused`, `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_call_taking_a_non_scalar_is_never_offered`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate` |
 /// > | `Denotes::matches` dropped — a carried declared type licenses a value of **any** kind | **2**: `a_value_whose_kind_is_not_its_declared_types_is_refused`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate` |
-/// > | the childless-value clause dropped — the `crossable(value)` half of `args_cross` | **4**: `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_bytes_crosses_in_as_an_argument_and_out_as_an_answer`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `an_entered_definition_that_opens_its_own_region_skips_an_allocation` |
+/// > | the childless-value clause dropped — the `crossable(value)` half of `args_cross` | **5**, re-taken when signatures became written: `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_bytes_crosses_in_as_an_argument_and_out_as_an_answer`, `an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate`, `an_entered_definition_that_opens_its_own_region_skips_an_allocation`, and **`a_bool_crosses_in_both_directions_and_a_float_crosses_in_neither`**, which is the new one — its `twice` is now written `(Float) -> Float`, so the `Int` control that proves the backend is live is admitted by the childless clause and by nothing else |
 /// > | the declaration fixpoint replaced by a **single pass** | `a_recursive_type_that_reaches_a_closure_is_refused`, **and nothing else** |
 /// > | `Type::Var` admitted | **2**: `a_type_variable_parameter_is_refused_unless_the_value_is_childless`, `a_call_taking_a_non_scalar_is_never_offered` |
 /// > | a nominal type read off its **head** — no declaration walk, `Cell`/`Task`/`Secret` unnamed | **2**: `a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type`, `a_recursive_type_that_reaches_a_closure_is_refused` |
@@ -1895,7 +1895,12 @@ mod tests {
     }
 
     fn double_def() -> Item {
-        fn_def("double", &["x"], bin(BinOp::Mul, var("x"), int(2)))
+        fn_def_sig(
+            "double",
+            &[("x", tcon("Int"))],
+            tcon("Int"),
+            bin(BinOp::Mul, var("x"), int(2)),
+        )
     }
 
     #[test]
@@ -1916,9 +1921,24 @@ mod tests {
     fn a_backend_that_declines_everything_changes_nothing() {
         let items = vec![
             double_def(),
-            fn_def("half", &["x"], bin(BinOp::Div, var("x"), int(2))),
-            fn_def("boom", &["x"], bin(BinOp::Div, var("x"), int(0))),
-            fn_def("table", &[], list(vec![int(1), int(2), int(3)])),
+            fn_def_sig(
+                "half",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Div, var("x"), int(2)),
+            ),
+            fn_def_sig(
+                "boom",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Div, var("x"), int(0)),
+            ),
+            fn_def_sig(
+                "table",
+                &[],
+                tapp("List", vec![tcon("Int")]),
+                list(vec![int(1), int(2), int(3)]),
+            ),
         ];
         let subjects = [
             callv("double", vec![int(21)]),
@@ -1985,8 +2005,18 @@ mod tests {
     #[test]
     fn a_bool_crosses_in_both_directions_and_a_float_crosses_in_neither() {
         let c = checked(vec![
-            fn_def("not", &["b"], un(ply_syntax::ast::UnOp::Not, var("b"))),
-            fn_def("twice", &["f"], bin(BinOp::Add, var("f"), var("f"))),
+            fn_def_sig(
+                "not",
+                &[("b", tcon("Bool"))],
+                tcon("Bool"),
+                un(ply_syntax::ast::UnOp::Not, var("b")),
+            ),
+            fn_def_sig(
+                "twice",
+                &[("f", tcon("Float"))],
+                tcon("Float"),
+                bin(BinOp::Add, var("f"), var("f")),
+            ),
         ]);
 
         let backend = Double::answering(&c.program, "not", Value::Bool(true));
@@ -2084,7 +2114,12 @@ mod tests {
     /// definitions carry the names of the ones they replace.
     #[test]
     fn a_backend_built_over_another_program_is_ignored() {
-        let elsewhere = checked(vec![fn_def("double", &["x"], int(1000))]);
+        let elsewhere = checked(vec![fn_def_sig(
+            "double",
+            &[("x", tcon("Int"))],
+            tcon("Int"),
+            int(1000),
+        )]);
         let backend = Double::answering(&elsewhere.program, "double", Value::Int(84));
 
         let c = checked(vec![double_def()]);
@@ -2302,18 +2337,33 @@ mod tests {
     /// > [`crossable`] test on the answer"*. The first is
     /// > [`crossable_argument_kind`] plus [`Gate::ArgumentType`]; the second is
     /// > [`CarriedTypes::answer_crosses`]. What this test still asserts is
-    /// > unchanged, and it is worth knowing why: `head` is declared
-    /// > `(Bytes) -> Bytes`, so both ends clear on the **childless** clause,
-    /// > which is [`crossable`] itself. That is what makes this test the control
-    /// > for both widenings — it goes red if either one stops being a superset
-    /// > of the rule it replaced, and it did go red when the childless clause was
+    /// > unchanged, and it is worth knowing why: neither end's **type** clause
+    /// > can clear `head`, so both clear on the **childless** clause, which is
+    /// > [`crossable`] itself. That is what makes this test the control for both
+    /// > widenings — it goes red if either one stops being a superset of the
+    /// > rule it replaced, and it did go red when the childless clause was
     /// > deleted from `answer_crosses`.
+    /// >
+    /// > **Corrected again when signatures became written.** The sentence above
+    /// > read *"`head` is declared `(Bytes) -> Bytes`"*, which no declaration in
+    /// > this file ever made: `head` was built by an untyped `fn_def` and
+    /// > inference published `<a>(a) -> a`. It is written at that generality
+    /// > now, and it has to be — a written `Bytes` at either end is carried, so
+    /// > [`Denotes::Bytes`] would match and this test would stop being the
+    /// > control for the childless clause it exists to guard. The `Bytes` is in
+    /// > the call rather than in the signature, which is where it always was.
     #[test]
     fn a_bytes_crosses_in_as_an_argument_and_out_as_an_answer() {
         // `head` takes whatever it is given and hands it straight back, so the
         // machine's own answer is a `Bytes` too and the comparison below is
         // between two answers of the same kind.
-        let c = checked(vec![fn_def("head", &["b"], var("b"))]);
+        let c = checked(vec![fn_def_poly(
+            "head",
+            &["a"],
+            &[("b", tvar("a"))],
+            tvar("a"),
+            var("b"),
+        )]);
         let call = callv("head", vec![bytes(b"GET /orders HTTP/1.1")]);
 
         // The control: no backend, and the machine's own answer.
@@ -2424,9 +2474,10 @@ mod tests {
         let c = checked(vec![
             double_def(),
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def(
+            fn_def_sig(
                 "touch",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 perform("state", "get", None, vec![var("x")]),
             ),
         ]);
@@ -2544,12 +2595,18 @@ mod tests {
     fn a_definition_whose_published_row_is_not_empty_is_never_offered() {
         let c = checked(vec![
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def(
+            fn_def_sig(
                 "touch",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 perform("state", "get", None, vec![var("x")]),
             ),
-            fn_def("bump", &["x"], bin(BinOp::Add, var("x"), int(0))),
+            fn_def_sig(
+                "bump",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Add, var("x"), int(0)),
+            ),
         ]);
         assert!(
             !c.check.defs[&Symbol::new("touch")].footprint.is_empty(),
@@ -2601,14 +2658,16 @@ mod tests {
     fn self_handled() -> Checked {
         checked(vec![
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def(
+            fn_def_sig(
                 "touch",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 perform("state", "get", None, vec![var("x")]),
             ),
-            fn_def(
+            fn_def_sig(
                 "handled",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 handle(
                     callv("touch", vec![var("x")]),
                     vec![clause(
@@ -2620,8 +2679,18 @@ mod tests {
                     )],
                 ),
             ),
-            fn_def("wrapper", &["x"], callv("handled", vec![var("x")])),
-            fn_def("bump", &["x"], bin(BinOp::Add, var("x"), int(0))),
+            fn_def_sig(
+                "wrapper",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("handled", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "bump",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Add, var("x"), int(0)),
+            ),
         ])
     }
 
@@ -2775,7 +2844,7 @@ mod tests {
     /// side still goes through `Frame::Call { memo }`.
     #[test]
     fn a_nullary_constant_is_entered_once_and_memoized_afterwards() {
-        let c = checked(vec![fn_def("answer", &[], int(1))]);
+        let c = checked(vec![fn_def_sig("answer", &[], tcon("Int"), int(1))]);
         let backend = Double::answering(&c.program, "answer", Value::Int(7));
         let mut machine = c.machine();
         machine.set_compiled(backend.clone());
@@ -2800,9 +2869,10 @@ mod tests {
     /// exactly what it raises with no backend at all.
     #[test]
     fn the_budget_is_the_machines_remaining_depth_and_never_reaches_zero() {
-        let c = checked(vec![fn_def(
+        let c = checked(vec![fn_def_sig(
             "down",
-            &["n"],
+            &[("n", tcon("Int"))],
+            tcon("Int"),
             if_(
                 bin(BinOp::Eq, var("n"), int(0)),
                 int(0),
@@ -2866,8 +2936,20 @@ mod tests {
     fn a_call_taking_a_non_scalar_is_never_offered() {
         let c = checked(vec![
             double_def(),
-            fn_def("head", &["xs"], callv("len", vec![var("xs")])),
-            fn_def("width", &["s"], callv("len", vec![var("s")])),
+            fn_def_poly(
+                "head",
+                &["a"],
+                &[("xs", tapp("List", vec![tvar("a")]))],
+                tcon("Int"),
+                callv("len", vec![var("xs")]),
+            ),
+            fn_def_poly(
+                "width",
+                &["a"],
+                &[("s", tapp("List", vec![tvar("a")]))],
+                tcon("Int"),
+                callv("len", vec![var("s")]),
+            ),
         ]);
         let backend = Double::declining(&c.program);
         let mut machine = c.machine();
@@ -2970,7 +3052,12 @@ mod tests {
     fn a_multi_shot_resume_over_an_entered_call_answers_what_the_machine_answers() {
         let c = checked(vec![
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def("triple", &["x"], bin(BinOp::Mul, var("x"), int(3))),
+            fn_def_sig(
+                "triple",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Mul, var("x"), int(3)),
+            ),
         ]);
         let e = handle(
             bin(
@@ -3020,7 +3107,12 @@ mod tests {
     fn a_discarded_continuation_over_an_entered_call_halts_with_the_handlers_value() {
         let c = checked(vec![
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def("triple", &["x"], bin(BinOp::Mul, var("x"), int(3))),
+            fn_def_sig(
+                "triple",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Mul, var("x"), int(3)),
+            ),
         ]);
         let e = handle(
             bin(
@@ -3053,9 +3145,10 @@ mod tests {
     /// alone. Here the entered definition touches no cell and its caller does.
     #[test]
     fn a_cell_touching_caller_agrees_slot_for_slot_with_an_entered_callee() {
-        let c = checked(vec![fn_def(
+        let c = checked(vec![fn_def_sig(
             "bump",
-            &["x"],
+            &[("x", tcon("Int"))],
+            tcon("Int"),
             bin(BinOp::Add, var("x"), int(1)),
         )]);
         let e = with_cell(
@@ -3090,9 +3183,11 @@ mod tests {
     /// may not be quoted from a run without one.
     #[test]
     fn an_entered_definition_that_opens_its_own_region_skips_an_allocation() {
-        let c = checked(vec![fn_def(
+        let c = checked(vec![fn_def_poly(
             "boxed",
-            &["n"],
+            &["a"],
+            &[("n", tvar("a"))],
+            tvar("a"),
             with_cell("s", var("n"), "c", callv("cell_get", vec![var("c")])),
         )]);
         assert!(
@@ -3133,8 +3228,18 @@ mod tests {
     #[test]
     fn a_failure_after_an_accepted_call_is_the_machines_own_diagnostic() {
         let c = checked(vec![
-            fn_def("safe", &["x"], bin(BinOp::Add, var("x"), int(1))),
-            fn_def("risky", &["x"], bin(BinOp::Div, int(10), var("x"))),
+            fn_def_sig(
+                "safe",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Add, var("x"), int(1)),
+            ),
+            fn_def_sig(
+                "risky",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Div, int(10), var("x")),
+            ),
         ]);
         let subjects = [
             bin(BinOp::Div, callv("safe", vec![int(1)]), int(0)),
@@ -3207,9 +3312,10 @@ mod tests {
     fn a_definition_that_opens_its_own_simulate_region_is_never_offered() {
         let c = checked(vec![
             double_def(),
-            fn_def(
+            fn_def_sig(
                 "searched",
-                &["n"],
+                &[("n", tcon("Int"))],
+                tcon("Int"),
                 ex(ExprKind::Simulate {
                     body: Box::new(bin(BinOp::Add, var("n"), int(1))),
                 }),
@@ -3645,14 +3751,16 @@ mod tests {
     fn the_effects_gate_follows_a_call_chain_to_a_fixpoint_rather_than_one_hop() {
         let c = checked(vec![
             effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-            fn_def(
+            fn_def_sig(
                 "touch",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 perform("state", "get", None, vec![var("x")]),
             ),
-            fn_def(
+            fn_def_sig(
                 "handled",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 handle(
                     callv("touch", vec![var("x")]),
                     vec![clause(
@@ -3664,34 +3772,81 @@ mod tests {
                     )],
                 ),
             ),
-            fn_def("hop1", &["x"], callv("handled", vec![var("x")])),
-            fn_def("hop2", &["x"], callv("hop1", vec![var("x")])),
-            fn_def("hop3", &["x"], callv("hop2", vec![var("x")])),
-            fn_def("hop4", &["x"], callv("hop3", vec![var("x")])),
+            fn_def_sig(
+                "hop1",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("handled", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "hop2",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("hop1", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "hop3",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("hop2", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "hop4",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("hop3", vec![var("x")]),
+            ),
             // Only `ping` can reach the handler; `pong` reaches it through the
             // recursion, which a propagation that stopped at a cycle would miss.
-            fn_def(
+            fn_def_sig(
                 "ping",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 if_(
                     bin(BinOp::Lt, var("x"), int(1)),
                     callv("handled", vec![var("x")]),
                     callv("pong", vec![bin(BinOp::Sub, var("x"), int(1))]),
                 ),
             ),
-            fn_def("pong", &["x"], callv("ping", vec![var("x")])),
-            fn_def(
+            fn_def_sig(
+                "pong",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("ping", vec![var("x")]),
+            ),
+            fn_def_sig(
                 "via_lambda",
-                &["x"],
+                &[("x", tcon("Int"))],
+                tcon("Int"),
                 block(
                     vec![letv("f", lam(&["y"], callv("handled", vec![var("y")])))],
                     Some(call(var("f"), vec![var("x")])),
                 ),
             ),
-            fn_def("clean1", &["x"], bin(BinOp::Add, var("x"), int(1))),
-            fn_def("clean2", &["x"], callv("clean1", vec![var("x")])),
-            fn_def("clean3", &["x"], callv("clean2", vec![var("x")])),
-            fn_def("clean4", &["x"], callv("clean3", vec![var("x")])),
+            fn_def_sig(
+                "clean1",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                bin(BinOp::Add, var("x"), int(1)),
+            ),
+            fn_def_sig(
+                "clean2",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("clean1", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "clean3",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("clean2", vec![var("x")]),
+            ),
+            fn_def_sig(
+                "clean4",
+                &[("x", tcon("Int"))],
+                tcon("Int"),
+                callv("clean3", vec![var("x")]),
+            ),
         ]);
 
         let refused = ["hop1", "hop2", "hop3", "hop4", "ping", "pong", "via_lambda"];
@@ -3929,14 +4084,20 @@ mod tests {
     fn a_definition_that_calls_one_that_opens_a_simulate_region_is_never_offered() {
         let c = checked(vec![
             double_def(),
-            fn_def(
+            fn_def_sig(
                 "searched",
-                &["n"],
+                &[("n", tcon("Int"))],
+                tcon("Int"),
                 ex(ExprKind::Simulate {
                     body: Box::new(bin(BinOp::Add, var("n"), int(1))),
                 }),
             ),
-            fn_def("outer", &["n"], callv("searched", vec![var("n")])),
+            fn_def_sig(
+                "outer",
+                &[("n", tcon("Int"))],
+                tcon("Int"),
+                callv("searched", vec![var("n")]),
+            ),
         ]);
         assert!(
             !c.check.defs[&Symbol::new("outer")].footprint.is_empty(),
