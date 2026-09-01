@@ -157,8 +157,8 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
 /// only thing that has ever caught that here is a reader.
 ///
 /// Re-take it with `./target/release/w6-alloc --repo . --requests 200` and
-/// correct the sentence in place, keeping the withdrawn figure beside the new
-/// one — `CONTRIBUTING.md` §"Correct, do not delete".
+/// correct the sentence in place. Do not leave the old figure beside the new
+/// one — `CONTRIBUTING.md` §"Correct in place; git holds what it used to say".
 ///
 /// The line number in the message below drifts with every edit above it in
 /// `README.md` — it moved 363 → 387 on 2026-08-27 — so the marker this searches
