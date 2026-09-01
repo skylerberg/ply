@@ -260,7 +260,7 @@ library.
 > Fixed in the representation: `ply_eval::value::canonical_key` reduces a key to
 > one representative per equivalence class on the way in, at every position
 > `Value::cmp` descends into. `docs/adr/0019-value-representation.md` §7 is the
-> write-up, and `crates/ply-eval/tests/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
+> write-up, and `crates/ply-eval/tests/suite/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
 > carries what the tree asserted until then.
 
 ### What it requires of key types

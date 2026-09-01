@@ -76,7 +76,7 @@
 //!   > measured rather than read:
 //!   > `ply test <a failing fixture> --trace always --json` answers
 //!   > `"causal_slice": null`, because `ply_test::SliceBuilder` is constructed
-//!   > nowhere outside `ply-test/tests/bisect_audit.rs` — see
+//!   > nowhere outside `ply-test/tests/suite/bisect_audit.rs` — see
 //!   > `CONTRIBUTING.md` §"Things known to be broken" item 15.
 //! - **Continuations.** Nothing runs in the machine while a body runs, so no
 //!   continuation can be captured beneath a native activation and no handler
@@ -205,7 +205,7 @@
 //! >
 //! > **A corpus in this tree now catches it.**
 //! > `tests/fixtures/self_handled_effect.ply` declares an effect and discharges
-//! > it, and `crates/ply-eval/tests/differential_corpus.rs` reads it. Measured
+//! > it, and `crates/ply-eval/tests/suite/differential_corpus.rs` reads it. Measured
 //! > by deleting [`Gate::InternalEffects`] and running
 //! > `cargo test -p ply-eval --test differential_corpus`:
 //! > `a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk` and
@@ -293,7 +293,7 @@
 //! > nothing to it, with `backend_escapes` in `ply test` failing the run if a
 //! > `Pass` is written by a test that entered native code anyway. Both halves
 //! > were seen to fail before either was believed —
-//! > `crates/ply-cli/tests/backend.rs` records which corruption produced which
+//! > `crates/ply-cli/tests/suite/backend.rs` records which corruption produced which
 //! > red.
 //!
 //! # What polices this seam, and what does not
@@ -305,7 +305,7 @@
 //! | polices it | what it is |
 //! | --- | --- |
 //! | this module's tests | **38** tests over doubles built here: every gate in [`admit`] with a deletion recorded against it, the budget, the memo interaction, continuations, cells, regions, `Secret`, arity, and the two kinds of `Bytes` crossing |
-//! | `crates/ply-eval/tests/differential_corpus.rs` | **6** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
+//! | `crates/ply-eval/tests/suite/differential_corpus.rs` | **6** tests, two hand-built backends over `examples/` and `tests/fixtures/` — an answering one and a tree-walking one |
 //! | `crates/ply-codegen-spike/tests/mutations.rs` | **13** tests, eight deliberately wrong backends, each asserted to have *fired* before it is asserted to be caught |
 //! | `crates/ply-codegen-spike/tests/hazards.rs`, `mcts_kernel.rs` | **25** tests over the real cranelift backend |
 //! | `mcts --mutate <corruption>` | the same eight corruptions at corpus scale — 2,396 generated cases; run by hand, nothing runs it for you |
@@ -331,8 +331,8 @@
 //! >
 //! > | polices it | what it is |
 //! > | --- | --- |
-//! > | `crates/ply-eval/tests/differential_corpus.rs` | **14** tests: the two hand-built backends, plus the eight corruptions over `Reference` on the same 1,116-test corpus |
-//! > | `crates/ply-cli/tests/backend.rs` | **14** tests through `ply test --backend`, which is the shipping command. Seven of the eight configurations are caught; the eighth escapes and the file says which and why |
+//! > | `crates/ply-eval/tests/suite/differential_corpus.rs` | **14** tests: the two hand-built backends, plus the eight corruptions over `Reference` on the same 1,116-test corpus |
+//! > | `crates/ply-cli/tests/suite/backend.rs` | **14** tests through `ply test --backend`, which is the shipping command. Seven of the eight configurations are caught; the eighth escapes and the file says which and why |
 //!
 //! > **Re-taken again the same day, for the ANSWER test (2026-08-31).** Three
 //! > rows move and none is a new file. Re-counted from the runs rather than by
@@ -341,8 +341,8 @@
 //! > | polices it | what it is |
 //! > | --- | --- |
 //! > | this module's tests | **51**, from 44. Seven came with the answer test, and the split is the point: three are the widening itself — a record answer crossing, an answer whose kind is not its declared return's, a closure-bearing return refused — and **four are the SUBTREE**, which is a different claim from any of the 44. An entered call used to be a leaf over scalars; `items.parse` is now entered once per file and hides 2.4 million calls, so the effects gate, the `simulate` gate, the budget and the offer count all had to be re-asked of a subtree rather than of a call |
-//! > | `crates/ply-eval/tests/differential_corpus.rs` | **15**, from 14: `backend::Mutation::Handle`, the ninth wrong backend, which exists because the answer widening gave up a structural claim |
-//! > | `crates/ply-cli/tests/backend.rs` | **15**, from 14, the same ninth through the shipping command. Its corpus changed too — `pair(Int) -> List<Int>` moved *inside* the fragment and `label(Int) -> String` replaced it as the definition [`Mutation::Unoffered`] bites on. Two tests failed rather than passing quietly when it moved |
+//! > | `crates/ply-eval/tests/suite/differential_corpus.rs` | **15**, from 14: `backend::Mutation::Handle`, the ninth wrong backend, which exists because the answer widening gave up a structural claim |
+//! > | `crates/ply-cli/tests/suite/backend.rs` | **15**, from 14, the same ninth through the shipping command. Its corpus changed too — `pair(Int) -> List<Int>` moved *inside* the fragment and `label(Int) -> String` replaced it as the definition [`Mutation::Unoffered`] bites on. Two tests failed rather than passing quietly when it moved |
 //! >
 //! > `cargo test -p ply-eval --lib` reports **553 passed / 0 failed / 1
 //! > ignored**.
@@ -410,7 +410,7 @@
 //!   *entirely* over a **non-terminating** recursion is not a wrong answer: the
 //!   run never comes back, and every candidate reporter is inside the process it
 //!   took down. Measured — no output and no exit in 45 seconds, against 0.03s
-//!   for the run that reports. `crates/ply-cli/tests/backend.rs`'s header has
+//!   for the run that reports. `crates/ply-cli/tests/suite/backend.rs`'s header has
 //!   the table.
 //!
 //!   > **The count was wrong and is corrected in place (2026-08-28).** It read
@@ -418,8 +418,8 @@
 //!   > a test or the spike's own harness."* `grep -rn '\.set_compiled('
 //!   > --include=*.rs` over the tree counts **42** across six files: this
 //!   > module's own tests 27, `ply-codegen-spike/tests/hazards.rs` 5,
-//!   > `ply-eval/tests/differential_corpus.rs` 3,
-//!   > `ply-eval/tests/equivalence_audit.rs` 3,
+//!   > `ply-eval/tests/suite/differential_corpus.rs` 3,
+//!   > `ply-eval/tests/suite/equivalence_audit.rs` 3,
 //!   > `ply-codegen-spike/tests/mutations.rs` 2, and
 //!   > `ply-codegen-spike/src/measure.rs` 2. `CONTRIBUTING.md`'s copy of this
 //!   > bullet carries the same "five" over a parenthetical list that sums to 39
@@ -485,7 +485,7 @@ pub trait Compiled {
     /// Whether these bodies were compiled from `program`. Pointer identity, as
     /// [`crate::code::Lowering::describes`] is and for the same reason: a
     /// bisection builds programs whose definitions carry the names of the ones
-    /// they replace (`crates/ply-eval/tests/hoist_staleness_audit.rs`).
+    /// they replace (`crates/ply-eval/tests/suite/hoist_staleness_audit.rs`).
     fn describes(&self, program: &Program) -> bool;
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
@@ -1618,8 +1618,8 @@ pub(crate) fn admit_with<'a>(
 /// > `Some(Denotes::Int)` instead of `table.denotes(ret)`, so the precompute and
 /// > a walk over the same declared types disagree — 681,277 == 882,207, 200,930
 /// > apart. And a ninth wrong backend, `backend::Mutation::Handle`, is in
-/// > `crates/ply-eval/tests/differential_corpus.rs` and
-/// > `crates/ply-cli/tests/backend.rs`; it is not a deletion but an addition,
+/// > `crates/ply-eval/tests/suite/differential_corpus.rs` and
+/// > `crates/ply-cli/tests/suite/backend.rs`; it is not a deletion but an addition,
 /// > because what the widening gave up needed a test that did not exist.
 ///
 /// > **The published-row row re-taken again (2026-08-31): 4 -> 6.** Two tests
@@ -3288,7 +3288,7 @@ mod tests {
     /// inert. `Machine::for_program` is what the corpus harness, the prover's
     /// generators and most of this crate's own tests build, so this is the
     /// common case rather than a corner: found by the entry counter in
-    /// `tests/differential_corpus.rs`, which was green over a seam it had never
+    /// `tests/suite/differential_corpus.rs`, which was green over a seam it had never
     /// once reached.
     #[test]
     fn a_machine_with_no_check_output_offers_nothing() {

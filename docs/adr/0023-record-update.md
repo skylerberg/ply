@@ -40,7 +40,7 @@ So the requirement is not "record update should work". It is:
 If it were not, every definition in the tree that adopted the sugar would move,
 and the two spellings of one value would become two definitions, each re-running
 its own tests. That is asserted, not argued:
-`crates/ply-hash/tests/audit.rs record_update_hashes_as_its_expansion`.
+`crates/ply-hash/tests/suite/audit.rs record_update_hashes_as_its_expansion`.
 
 ## Decision 1 — Expansion runs inside `ply_syntax::parse_module`
 
@@ -86,7 +86,7 @@ deleting the row fails the build with `E0004`.
 
 Both halves are load-bearing.
 
-**Sorted, not the type's declaration order.** `crates/ply-hash/tests/audit.rs
+**Sorted, not the type's declaration order.** `crates/ply-hash/tests/suite/audit.rs
 reordering_the_fields_of_a_record_type_is_free` is an invariant the suite
 asserts: `normalize.rs` sorts `TY_RECORD`, so `{a: Int, b: Int}` and
 `{b: Int, a: Int}` are one type. Expanding in declaration order would make
@@ -100,7 +100,7 @@ says nothing about which one ran. One mixed-length pair is not enough either: it
 only rules out the length direction it happens to disagree with. So the three
 tests that pin the order — `copies_are_sorted_by_name_and_not_by_length`
 (`crates/ply-syntax/src/tests.rs`), `record_update_hashes_as_its_expansion` and
-`a_projected_base_hashes_as_its_expansion` (`crates/ply-hash/tests/audit.rs`) —
+`a_projected_base_hashes_as_its_expansion` (`crates/ply-hash/tests/suite/audit.rs`) —
 each carry a pair whose longer name sorts first *and* a pair whose shorter one
 does. A length-first comparator in either direction goes red.
 
@@ -195,7 +195,7 @@ The second is **not total**, and this ADR says so rather than dressing it up: a
 What closes it in practice is that the shape is computed from the *same written
 annotation* inference uses to type the binder, so there is no independent "real"
 field set to disagree with — the residual risk is a bug in this pass, not a
-program a user can write. `crates/ply-core/tests/record_update.rs` is what checks
+program a user can write. `crates/ply-core/tests/suite/record_update.rs` is what checks
 that claim; a per-node assertion is **not enforced**.
 
 ## Consequences
@@ -326,7 +326,7 @@ is now the **only** such site.
 > `max_chunk_line` there left `ply check` reporting
 > `checked 2 modules, 150 definitions, 56 tests` and every targeted suite green.
 > What is asserted now is the property, not the spelling:
-> `crates/ply-cli/tests/stdlib.rs the_limits_helpers_vary_only_the_bounds_they_are_named_for`.
+> `crates/ply-cli/tests/suite/stdlib.rs the_limits_helpers_vary_only_the_bounds_they_are_named_for`.
 >
 > One mispairing survives conversion and is named rather than implied.
 > `limits_with` writes seven bounds from seven `Int` parameters, so

@@ -11,8 +11,7 @@
 //! needs the host says so — and the alternative, a green result from a suite
 //! that ran nothing, is the failure this project audits for.
 
-mod support;
-
+use crate::support::cluster::{self, Cluster};
 use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
@@ -25,7 +24,6 @@ use ply_host::db::{Driver, Postgres, Statement};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use support::cluster::{self, Cluster};
 
 /// One entry point that never spawned: one machine, no task. The owner every
 /// scope in this file belongs to.

@@ -79,19 +79,19 @@
 //!   nullary pure definition for the whole run.
 //!
 //! Every one of those is safe today because the guard in `push` catches it.
-//! What they cost is precision, and `tests/ownership_checker_oracle.rs` is
+//! What they cost is precision, and `tests/suite/ownership_checker_oracle.rs` is
 //! where the cost is measured against the counters rather than asserted.
 //!
 //! ## How this is kept from being green over unexplored space
 //!
 //! Two test files, and neither can pass by the checker being a constant:
 //!
-//! - `tests/ownership_checker_armed.rs` holds a quadratic loop and the *same
+//! - `tests/suite/ownership_checker_armed.rs` holds a quadratic loop and the *same
 //!   loop written linearly*, each asserted against both this module and
 //!   [`crate::rc::sites`]. Forcing every verdict to `Reuses` reddens the
 //!   quadratic; forcing every verdict to `Copies` reddens both linear controls.
 //!   Both mutations were run.
-//! - `tests/ownership_checker_oracle.rs` asserts three things over the shipped
+//! - `tests/suite/ownership_checker_oracle.rs` asserts three things over the shipped
 //!   corpus: that no site the run shows copying is called `Reuses`, that
 //!   agreement with the counters stays at or above 0.80, and that **no append
 //!   the run counted is missing a verdict** — blindness would flatter every

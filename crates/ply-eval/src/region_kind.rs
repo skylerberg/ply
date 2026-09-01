@@ -110,7 +110,7 @@
 //! A cache keyed by the region's definition hash would therefore answer
 //! `unique` where a fresh inference answers `shared`, which frees an arena a
 //! continuation can still reach. `a_capture_in_an_unrelated_module_makes_a_region_shared`
-//! in `crates/ply-eval/tests/region_kind_inference.rs` is that program, written
+//! in `crates/ply-eval/tests/suite/region_kind_inference.rs` is that program, written
 //! down so the key cannot be narrowed by accident. The sound key is the whole
 //! `(Program, Resolved)` pair, which is what [`Kinds`] is keyed by:
 //! construction, one per loaded program.

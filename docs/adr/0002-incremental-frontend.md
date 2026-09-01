@@ -12,7 +12,7 @@ file written atomically" does not.
 > (its module doc states them in this ADR's own terms), `--no-incremental` is
 > `crates/ply-cli/src/cli.rs` on four subcommands and `Refusal::NotIncremental`
 > in the driver, and the equivalence test is
-> `crates/ply-cli/tests/incremental.rs`, which compares `DefHash`, `Scheme` and
+> `crates/ply-cli/tests/suite/incremental.rs`, which compares `DefHash`, `Scheme` and
 > `Footprint` by equality rather than alpha-equivalence and asserts that gate 1
 > actually fired before it credits an agreement. The one item below that is
 > still outstanding is name-erased schemes, and it is still deferred by choice.

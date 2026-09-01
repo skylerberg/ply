@@ -18,8 +18,7 @@
 //! `db_driver.rs` gives: `#[test]`s in a binary run in parallel threads of one
 //! process, and a server shared between them would have no owner.
 
-mod support;
-
+use crate::support::cluster::{self, Cluster};
 use ply_core::ty::Resource;
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending, ShutdownReport};
@@ -32,7 +31,6 @@ use ply_host::{Host, db::PoolConfig};
 use ply_span::{Diagnostic, Span, Symbol};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use support::cluster::{self, Cluster};
 
 /// One entry point that never spawned.
 const ALONE: Owner = (MachineId(0), None);

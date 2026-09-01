@@ -606,7 +606,7 @@ then `group 0 · 179 tests`, followed by groups of 1, 2, 2 and 2.
 assertions cited above compare `regions::colour` against
 `ply_test::group_by_conflict` on a synthetic seven-test set
 (`crates/ply-corpus/src/regions.rs:666`) and on real corpora
-(`crates/ply-corpus/tests/region_isolation_cost.rs:150`), and neither pins a
+(`crates/ply-corpus/tests/suite/region_isolation_cost.rs:150`), and neither pins a
 group size. The sizes here are only as current as the last hand re-run, and the
 group *count*, which is what the surrounding paragraph is about, is what the
 tests actually protect.)

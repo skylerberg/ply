@@ -148,7 +148,7 @@
 //! `ply test --engine both` catches **none** of these, on any corpus: no
 //! shipping command can install a backend (`Machine::set_compiled` has no CLI
 //! caller), so the whole compiled path is invisible to it. What plays that role
-//! is `crates/ply-eval/tests/differential_corpus.rs`, whose answering backend
+//! is `crates/ply-eval/tests/suite/differential_corpus.rs`, whose answering backend
 //! over `examples/` and `tests/fixtures/` was corrupted the same four ways and
 //! failed every time — `off-by-one` on
 //! `a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk` names

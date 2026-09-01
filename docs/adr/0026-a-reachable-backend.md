@@ -158,7 +158,7 @@ That is the tree-walker against the control-stack machine, and nothing else.
 > `crates/ply-eval/src/compiled.rs:203` and `CONTRIBUTING.md` §"Things known to
 > be broken" item 13. `grep -rn '\.set_compiled(' --include=*.rs` counts **42**
 > across six files: `ply-eval/src/compiled.rs` 27, `ply-codegen-spike/tests/hazards.rs`
-> 5, `ply-eval/tests/differential_corpus.rs` 3, **`ply-eval/tests/equivalence_audit.rs`
+> 5, `ply-eval/tests/suite/differential_corpus.rs` 3, **`ply-eval/tests/suite/equivalence_audit.rs`
 > 3**, `ply-codegen-spike/tests/mutations.rs` 2, `ply-codegen-spike/src/measure.rs`
 > 2. CONTRIBUTING's own parenthetical list sums to 39 and calls it five, and it
 > omits `equivalence_audit.rs` entirely.
@@ -171,7 +171,7 @@ That is the tree-walker against the control-stack machine, and nothing else.
 
 ### 1.2 The seam is not inert on the shipping corpus
 
-`crates/ply-eval/tests/differential_corpus.rs` attaches two hand-built
+`crates/ply-eval/tests/suite/differential_corpus.rs` attaches two hand-built
 `Compiled` implementations — one that declines everything, one that answers by
 tree-walking — to the machine over `examples/` and `tests/fixtures/`. Re-run
 today:
@@ -798,7 +798,7 @@ the record has been assuming.
 > > mutations are lifted off `Reference` onto a trait that carries those two
 > > operations, and `with_backend` stops naming a concrete type.
 > >
-> > `crates/ply-cli/tests/backend.rs`'s 14 green tests are therefore evidence
+> > `crates/ply-cli/tests/suite/backend.rs`'s 14 green tests are therefore evidence
 > > about `Reference` and are read, in the sentence above and in
 > > `CONTRIBUTING.md` item 13, as evidence about the shipping path's ability to
 > > catch a wrong backend. **The gap is exactly the shape §"The one rule" names**
@@ -820,9 +820,9 @@ the record has been assuming.
 > > > **This clause is discharged per backend, not per seam, and that is why
 > > > the table is run twice.** What a corruption can bite depends on which
 > > > definitions the backend has a body for, and the two fragments are very
-> > > different: over `crates/ply-cli/tests/backend.rs`'s corpus `Reference`
+> > > different: over `crates/ply-cli/tests/suite/backend.rs`'s corpus `Reference`
 > > > holds 5 definitions where `cranelift` holds 3, and over `examples/` the
-> > > two hold **153** and **27**. So `crates/ply-cli/tests/backend.rs` runs
+> > > two hold **153** and **27**. So `crates/ply-cli/tests/suite/backend.rs` runs
 > > > every configuration against each installed backend and reports the counts
 > > > separately — 28 tests where there were 14.
 > > >
@@ -1070,7 +1070,7 @@ is not a shipping component and the path to one does not run through it.
 > - **§4.5's condition is met before speed is argued.** The code generator was
 >   made policeable in the same change that made it installable — the mutations
 >   were lifted onto `ply_eval::Policed` first, and the eight configurations run
->   against it in `crates/ply-cli/tests/backend.rs`. Nothing in this change
+>   against it in `crates/ply-cli/tests/suite/backend.rs`. Nothing in this change
 >   quotes a ratio that was not taken against a backend the eight can corrupt.
 >
 > **What is not authorised by this and was not done.** Nothing here permits a
@@ -1142,13 +1142,13 @@ undone in ADR 0016 §11 and again in `ROADMAP.md` §"What is next":
 >
 > | configuration | where it now runs | tests reporting it | answers changed |
 > | --- | --- | ---: | ---: |
-> | `off-by-one` | `ply-eval/tests/differential_corpus.rs` | 146 of 1,116 | 9,451 |
+> | `off-by-one` | `ply-eval/tests/suite/differential_corpus.rs` | 146 of 1,116 | 9,451 |
 > | `inverted` | same | 51 | 216 |
 > | `stale` | same | 259 | 501 |
 > | `wrong-type` | same | 515 | 460 |
 > | `unoffered` | same | 901 | 487 |
 > | `answers=` | same — **an offer count of 0, which is the gate** | 0 | 0 |
-> | `exceeds-budget=4` | `ply-cli/tests/backend.rs`, on a corpus that outruns the bound | 1 | 1 |
+> | `exceeds-budget=4` | `ply-cli/tests/suite/backend.rs`, on a corpus that outruns the bound | 1 | 1 |
 > | `exceeds-budget` unbounded, terminating body | same | 1 | 1 |
 > | **`exceeds-budget` unbounded, non-terminating body** | **nowhere** | — | — |
 >
@@ -1187,7 +1187,7 @@ undone in ADR 0016 §11 and again in `ROADMAP.md` §"What is next":
 > The block above named exactly what would discharge it — *"a reporter outside
 > the run **and** a backend whose runaway actually dies"* — and was half wrong
 > about which half was missing. The reporter was never absent: every test in
-> `crates/ply-cli/tests/backend.rs` runs `ply` as a child through `assert_cmd`,
+> `crates/ply-cli/tests/suite/backend.rs` runs `ply` as a child through `assert_cmd`,
 > so `run_guarded`'s shape has been in the workspace since that file was
 > written. What was missing was only the second half, and a code generator
 > supplies it, because native frames sit on a fixed stack.
@@ -1208,7 +1208,7 @@ undone in ADR 0016 §11 and again in `ROADMAP.md` §"What is next":
 >    disagreements** on both cranelift versions, with the defect plausibly in the
 >    harness's own refused-kind check rather than in the backend. Deleting the
 >    crate deletes the evidence for an open finding before anybody has decided
->    what it means. `crates/ply-codegen/tests/kernel.rs` reproduces the kernel
+>    what it means. `crates/ply-codegen/tests/suite/kernel.rs` reproduces the kernel
 >    *fragment* but not that corpus.
 > 2. **ADR 0018 §0.5's 6.199× has no other instrument.** The figure is quoted in
 >    three documents and `crates/ply-codegen-spike/src/bin/mcts.rs` is the only
@@ -1300,7 +1300,7 @@ at all.
 exactly what the tree-walker reaches — the fixpoint refuses *nothing* in
 `benches/kernel`, all 44 definitions compile as one closed unit. On a program
 built out of the standard library it reaches 1.1%, and
-`crates/ply-codegen/tests/fragment.rs`'s census says why, ranked: **`++` (68
+`crates/ply-codegen/tests/suite/fragment.rs`'s census says why, ranked: **`++` (68
 definitions), `fold` (33), `map` (28), a lambda (18)**. That is ADR 0018 §0's
 roadmap re-derived on the shipping standard library, four milestones later,
 unchanged in its ordering.

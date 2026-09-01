@@ -84,7 +84,7 @@ iterate(seed, budget, step)    where step : (s) -> Iter<s, r> / e
 type Iter<s, r> = Continue(s) | Stop(r)         // prelude, not a module
 ```
 
-Type, pinned at `crates/ply-core/tests/iterate_builtin.rs`:
+Type, pinned at `crates/ply-core/tests/suite/iterate_builtin.rs`:
 
 ```
 (a, Int, (a) -> Iter<a, b> / e) -> b / e
@@ -162,7 +162,7 @@ contain the string "recursion limit". An exhausted budget is
 because zero steps is a bound nobody writes on purpose. Neither says
 **"recursion limit"**, deliberately: nothing nested, and things classify on that
 string. `limit.rs`'s own correction block names four
-(`ply-cli/tests/failure_classification_audit.rs`, `ply-test/tests/hybrid.rs`,
+(`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test/tests/suite/hybrid.rs`,
 `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) — that list is quoted from
 there and was not independently re-derived here; what *is* checked is that the
 new diagnostics do not contain the phrase, asserted at
@@ -177,11 +177,11 @@ cached results. A flag could not do that.
 
 A new prelude type name. `Iter` joins `builtin_types()`, so a project's own
 `type Iter` is now `E0105`
-(`crates/ply-core/tests/iterate_builtin.rs::a_project_may_not_declare_its_own_iter`).
+(`crates/ply-core/tests/suite/iterate_builtin.rs::a_project_may_not_declare_its_own_iter`).
 `grep -rnw Iter` over the tree found the name free outside prose. `Step` and
 `Loop` were **not** available: `crates/ply-std/ply/json.ply:116` and
 `examples/twin_divergence_audit.ply:60` declare `type Step`, and
-`crates/ply-eval/tests/reference_cycles.rs:61` declares `type Loop` — naming
+`crates/ply-eval/tests/suite/reference_cycles.rs:61` declares `type Loop` — naming
 the ADT `Step` would have broken a shipped `std` module.
 
 Constructor names are a separate namespace and are **not** globally reserved, so
@@ -596,7 +596,7 @@ required. `respond_chunked` with `max_stream_chunks: 50000` — five times
 
 Without the first row the second is a claim about a bound nothing reached, and
 the user-visible motivation in §0 would be false. It is now
-`crates/ply-cli/tests/w3_http_audit.rs:689`.
+`crates/ply-cli/tests/suite/w3_http_audit.rs:689`.
 
 **The terminating-chunk guarantee survives, and it is why the budget is spent
 inside the step.** `w3_http_audit.rs::a_streamed_response_always_ends_with_its_terminating_chunk`

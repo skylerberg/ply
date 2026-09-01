@@ -48,7 +48,7 @@ The same one ADR 0023 states, and for the same reason:
 If it were not, converting a site would move its `DefHash` and every dependent's,
 split one value into two cache entries, and turn "the module's behaviour is
 unchanged" into an assertion rather than a measurement. It is asserted by
-`crates/ply-hash/tests/audit.rs try_hashes_as_its_longhand`, and measured over
+`crates/ply-hash/tests/suite/audit.rs try_hashes_as_its_longhand`, and measured over
 the corpus under "Consequences — the measurement".
 
 ## Decision 1 — Expansion runs inside `ply_syntax::parse_module`
@@ -209,7 +209,7 @@ is a reordering, and the licence is the same one: *a failure that happens in one
 order happens in every order*, and a call or a `perform` breaks that. Two
 implementations could drift, and a drift would mean normalization reordering
 something `?` refused to, or the reverse. The move was free — the pinned digest
-`crates/ply-hash/tests/map.rs a_map_body_normalizes_to_a_pinned_hash` is
+`crates/ply-hash/tests/suite/map.rs a_map_body_normalizes_to_a_pinned_hash` is
 unmoved, and `a_run_of_pure_lets_still_commutes_after_the_predicate_moved`
 asserts the behaviour it licenses.
 
@@ -261,7 +261,7 @@ function is an ordinary `E0201`. **`?` does no error conversion**: there is no
 > not a defect and is not fixed: what disagrees there is the *function body*
 > against its declared return type, so the span is the body, and a hand-written
 > `match` in the same place gets exactly the same diagnostic.
-> `crates/ply-core/tests/try_op.rs
+> `crates/ply-core/tests/suite/try_op.rs
 > a_try_over_a_different_error_type_is_an_ordinary_type_mismatch` asserts both
 > halves — that some `E0201` underlines `g(n)?`, and that the block shape fails
 > the same way its longhand fails — rather than the stronger claim the design
@@ -406,17 +406,17 @@ Full table in `/tmp/ply-try-operator/RESULTS-IMPL.md`.
 | the lambda barrier removed | `a_try_with_no_readable_return_type_is_e0118` |
 | `try_op::expand` made a no-op | 17 tests, including `no_try_survives_parse_module_anywhere_in_the_tree` |
 | the conditional-crossing check deleted | `a_try_behind_a_conditional_is_e0119`, **and a running fixture** |
-| `Result` and `Option` modes swapped | 4 of `ply-core/tests/try_op.rs`'s 6, including `a_try_adds_nothing_to_the_row` |
+| `Result` and `Option` modes swapped | 4 of `ply-core/tests/suite/try_op.rs`'s 6, including `a_try_adds_nothing_to_the_row` |
 | the cross-module check on the return type deleted | `a_return_type_named_through_another_module_refuses` |
 | the `match` carries the operand's span rather than the `?`'s | `a_try_over_a_different_error_type_is_an_ordinary_type_mismatch` |
-| the failure arm's pattern can never match | both `ply-eval/tests/equivalence_audit.rs` cases |
+| the failure arm's pattern can never match | both `ply-eval/tests/suite/equivalence_audit.rs` cases |
 | `expand_bare` made a no-op | `parse_expr_refuses_a_try_rather_than_leaking_one` |
 | `is_pure` says a call is pure | `a_run_of_pure_lets_still_commutes_after_the_predicate_moved` **and** `a_try_with_an_impure_prefix_is_e0119` |
 | **`is_pure` replaced by `\|_\| true`** | **nothing, on the first attempt** |
 
 **All 33 tests this change adds** — 22 in `ply-syntax/src/tests.rs`, 3 in
-`ply-hash/tests/audit.rs`, 6 in `ply-core/tests/try_op.rs`, 2 in
-`ply-eval/tests/equivalence_audit.rs` — have been watched red at least once, and
+`ply-hash/tests/suite/audit.rs`, 6 in `ply-core/tests/suite/try_op.rs`, 2 in
+`ply-eval/tests/suite/equivalence_audit.rs` — have been watched red at least once, and
 that is a count taken by re-running every corruption above and unioning the tests
 that failed, rather than a recollection. (It read **29 / 18** before review; the
 four added under "What the adversarial review found" were each watched red under

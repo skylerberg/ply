@@ -31,7 +31,7 @@
 //! carrying the caller's scope, **7.4%** of updates were in place across the
 //! corpora on disk; not carrying a scope past the subexpressions that read it
 //! took the same measurement to **75.3%**, with no change to the analysis at
-//! all. `tests/reference_counting_cost.rs` is where both numbers are taken.
+//! all. `tests/suite/reference_counting_cost.rs` is where both numbers are taken.
 //!
 //! ## Why the analysis cannot make a program mean something else
 //!
@@ -305,7 +305,7 @@ pub fn take_cycles() -> Vec<Diagnostic> {
 ///   is the infinite type the occurs check refuses, and as a declared variant it
 ///   is `REGION_ESCAPE` at the declaration, because a declared field's region
 ///   would be pinned by whichever cell reached it first.
-///   `tests/reference_cycles.rs` pins both refusals, so the day either moves is
+///   `tests/suite/reference_cycles.rs` pins both refusals, so the day either moves is
 ///   the day this stops being unreachable.
 ///
 /// So it is a guard rather than a diagnostic anybody sees, and it stays because

@@ -699,7 +699,7 @@ fn renaming_a_test_is_free_but_its_body_is_not() {
 
 #[test]
 fn hashing_is_stable_across_repeated_runs() {
-    let source = include_str!("../../../examples/ledger.ply");
+    let source = include_str!("../../../../examples/ledger.ply");
     let first = hashes(source);
     for _ in 0..8 {
         assert_eq!(first, hashes(source));
@@ -708,7 +708,7 @@ fn hashing_is_stable_across_repeated_runs() {
 
 #[test]
 fn every_definition_in_a_realistic_module_gets_a_distinct_hash_unless_identical() {
-    let out = hashes(include_str!("../../../examples/ledger.ply"));
+    let out = hashes(include_str!("../../../../examples/ledger.ply"));
     let mut by_hash: std::collections::BTreeMap<DefHash, Vec<Symbol>> = Default::default();
     for (name, hash) in &out.defs {
         by_hash.entry(*hash).or_default().push(name.clone());

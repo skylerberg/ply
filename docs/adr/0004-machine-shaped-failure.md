@@ -424,7 +424,7 @@ than defended:
 > **Correction in place (2026-08-24): four rows of this table describe a field
 > no report has ever carried.** `causal_slice` is `null` in every report the
 > shipped binary writes, because nothing in the workspace constructs a
-> `ply_test::SliceBuilder` outside `crates/ply-test/tests/bisect_audit.rs`.
+> `ply_test::SliceBuilder` outside `crates/ply-test/tests/suite/bisect_audit.rs`.
 > Measured on the tree, not read off the code:
 >
 > ```
