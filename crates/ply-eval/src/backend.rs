@@ -588,9 +588,9 @@ fn forge_handle(value: &Value) -> Option<Value> {
             })
         }
         Value::List(items) if !items.is_empty() => {
-            let mut items = (**items).clone();
+            let mut items = items.to_vec();
             items[0] = handle;
-            Some(Value::List(std::sync::Arc::new(items)))
+            Some(Value::list(items))
         }
         _ => None,
     }

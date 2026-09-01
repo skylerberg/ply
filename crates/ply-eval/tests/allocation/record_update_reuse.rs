@@ -46,10 +46,11 @@ fn a_threaded_record_update_allocates_nothing_per_round() {
     let allocs = allocations(&src);
     let per_round = allocs as f64 / ROUNDS as f64;
     println!("  {ROUNDS} rounds: {allocs} allocations, {per_round:.3} per round");
-    // The list doubles its capacity about ten times over a thousand rounds; anything per round
-    // would be the record or its vector being rebuilt.
+    // A list past its first leaf allocates a node and a fresh tail per leaf of thirty-two, a
+    // tenth of an allocation per round; anything near one per round would be the record or its
+    // vector being rebuilt.
     assert!(
-        allocs < ROUNDS / 10,
+        allocs < ROUNDS / 4,
         "{allocs} allocations over {ROUNDS} rounds: the update is rebuilding the record"
     );
 }

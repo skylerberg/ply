@@ -995,7 +995,8 @@ tree-walker". The block is the M2 record.
 ```rust
 pub enum Value {
     Int(i64), Bool(bool), Str(Arc<str>), Unit,
-    List(Vector<Value>),                    // persistent or Arc<Vec<_>>; cheap clone
+    List(List),                             // ply-eval::list — a radix trie with its newest
+                                            // leaf held apart (ADR 0034); cheap clone
     Record(Arc<BTreeMap<Symbol, Value>>),
     Ctor { name: Symbol, args: Arc<Vec<Value>> },
     Closure(Arc<Closure>),
@@ -1518,7 +1519,7 @@ than being forbidden.
 ```rust
 pub enum Value {
     Int(i64), Bool(bool), Str(Arc<str>), Unit,
-    List(Vector<Value>),
+    List(List),
     Record(Arc<BTreeMap<Symbol, Value>>),
     Ctor { name: Symbol, args: Arc<Vec<Value>> },
     Closure(Arc<Closure>),
@@ -4680,8 +4681,12 @@ All pure except `map_fold`; every `k` carries `derivable(ord, k)`.
 
 ### `List`
 
-`Value::List` is `Arc<Vec<Value>>`, so a position is a bounds-checked load and a
-clone of the element. All pure, all total.
+`Value::List` is a radix trie of 32-wide nodes with its newest leaf held apart
+(`ply-eval::list`, ADR 0034), so a position is a bounds-checked load for a list
+no longer than a leaf and a walk of one node per level past that, then a clone
+of the element. A push down a uniquely held path writes in place; a push onto
+a shared list copies one leaf and one node per level; a `[x, ..rest]` pattern
+is an offset, not a copy. All pure, all total.
 
 | builtin | type |
 | --- | --- |

@@ -24,7 +24,13 @@ fn counted<R>(f: impl FnOnce() -> R) -> (usize, R) {
 /// is still holding it for a continuation.
 fn payload(n: i64) -> (Arc<Vec<Value>>, Value) {
     let items = Arc::new(vec![Value::Int(n)]);
-    (Arc::clone(&items), Value::List(items))
+    (
+        Arc::clone(&items),
+        Value::Ctor {
+            name: "Box".into(),
+            args: items,
+        },
+    )
 }
 
 #[track_caller]

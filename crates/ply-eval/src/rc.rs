@@ -85,14 +85,12 @@ pub struct Stats {
     pub updates: u64,
     /// Updates that rewrote the value rather than copying it.
     pub updates_in_place: u64,
-    /// Elements copied by the updates that did not rewrite in place.
+    /// Slots copied by the updates that did not rewrite in place.
     ///
-    /// The boolean above answers "did this append copy the whole list", which is the right question
-    /// only while a copy is all-or-nothing. Under a chunked representation an append that cannot
-    /// rewrite copies a path rather than an array, so the boolean would read `false` for something
-    /// costing O(log n) and the rate would be uniformly bad while the program got faster. This
-    /// counts what was actually copied, which is the question that survives the representation —
-    /// ADR 0034's S5b.
+    /// The boolean above answers "did this append copy", and this answers how much: since ADR
+    /// 0034's bounded representation a copy is one leaf and the path above it, so an append that
+    /// cannot rewrite is a bounded cost rather than a whole-list one, and the two counters
+    /// together tell a genuine second owner from a quadratic accumulator.
     pub elements_copied: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
@@ -197,10 +195,6 @@ pub(crate) fn note_take(moved: bool) {
         s.takes_attempted += 1;
         s.takes_moved += u64::from(moved);
     });
-}
-
-pub(crate) fn note_update(in_place: bool, span: Span) {
-    note_update_of(in_place, 0, span);
 }
 
 /// [`note_update`], with the number of elements the update had to copy.
