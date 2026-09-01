@@ -38,6 +38,10 @@ pub enum NodeKind {
     Lambda {
         params: Rc<Vec<Symbol>>,
         body: Code,
+        /// The body's free variables, which is all a closure over it has to keep — ADR 0034 §4.
+        /// Capturing the whole scope instead pins every other binding in it for the closure's life,
+        /// which `costs.rs` records as its third blindness.
+        free: Rc<Vec<Symbol>>,
     },
     App {
         func: Code,
@@ -299,8 +303,9 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
         }
         ExprKind::Lambda { params, body } => {
             let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
-            let body = lower_barrier(&params, body, live);
+            let (body, free) = lower_barrier_free(&params, body, live);
             NodeKind::Lambda {
+                free: Rc::new(free),
                 params: Rc::new(params),
                 body,
             }
@@ -467,7 +472,8 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
 
 /// A construct whose body may run more than once, or later, or beside another task: a lambda, a
 /// handler clause, a `return` clause, a `simulate` region.
-fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
+/// [`lower_barrier`], also answering the barrier's free variables.
+fn lower_barrier_free(params: &[Symbol], body: &Expr, live: &mut Live) -> (Code, Vec<Symbol>) {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(body, &mut ownable);
     let outer = live.open(ownable);
@@ -477,8 +483,12 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     for p in params {
         live.kill(p);
     }
-    live.close(outer);
-    code
+    let free = live.close(outer);
+    (code, free)
+}
+
+fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
+    lower_barrier_free(params, body, live).0
 }
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
