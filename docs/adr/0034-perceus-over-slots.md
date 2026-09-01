@@ -355,6 +355,27 @@ when the slot array has one owner, and the array has one owner exactly when it i
 rather than each frame's. That is the whole content of the rewrite, and it is why the pieces do not
 land separately — steps 1 and 2 are inert without 3, and 3 is unsound without 1.
 
+**Run `resumption_scope_audit` first, and read the note in it before writing any of this.** It was
+written before the change for that purpose, and it exists because the suite had a hole exactly here:
+every resumption test in the tree asserts what a *cell* holds, and none asserted that a resumption
+re-enters with the *bindings* it captured — because a persistent `Env` gives that for free and there
+was nothing to get wrong. Its four probes are the four ways a slot machine takes it away:
+
+- a binding whose **last use follows the capture**, resumed twice — step 3 empties the slot and the
+  second resumption re-reads it. `Own::Owned` means "no later *code* reads this", which is not "no
+  later *execution* reads this" once a continuation resumes more than once;
+- a binding read **across sixty intervening activations** between two resumptions — a machine-owned
+  stack reuses the indices the captured frames named;
+- a binding and a cell **in one expression**, where the binding must read the same on both
+  resumptions and the cell must not. Restoring too much reddens one assertion and too little the
+  other, so only ADR 0005 §3's split passes;
+- **nested captures** over overlapping windows.
+
+One caveat the file states about itself: the first probe's own `assert_eq` cannot fail on the chain,
+because a continuation holds an immutable copy that nothing can empty. What arms it there is a
+**pin on `takes_moved`** — the mechanism rather than the answer — and it is a tripwire: if it moves,
+find out which binding started moving before concluding the change is right.
+
 **What it must not break, and where that would show.** `resumption_semantics_audit` and
 `exploration_soundness` hold the multi-shot rules: ADR 0005 §3 threads *state* across resumptions
 while each resumption re-enters with the scope it captured. A persistent chain gets that for free; a

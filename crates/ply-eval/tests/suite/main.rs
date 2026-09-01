@@ -33,6 +33,7 @@ mod region_meaning_adversarial;
 mod region_meaning_audit;
 mod region_reclamation_census;
 mod region_wiring_audit;
+mod resumption_scope_audit;
 mod resumption_semantics_audit;
 mod resumption_snapshot_audit;
 mod secrets;
