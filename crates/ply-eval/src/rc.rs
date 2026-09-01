@@ -47,7 +47,37 @@ pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env
 }
 
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
+/// Counters for ADR 0034 §4's capture-against-carry census. Diagnostics only.
+pub mod census4 {
+    use std::cell::Cell;
+    thread_local! {
+        pub static CARRIES: Cell<u64> = const { Cell::new(0) };
+        pub static CAPTURES: Cell<u64> = const { Cell::new(0) };
+        pub static CAPTURED_FRAMES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn carry() {
+        let _ = CARRIES.try_with(|c| c.set(c.get() + 1));
+    }
+    pub fn capture(frames: u64) {
+        let _ = CAPTURES.try_with(|c| c.set(c.get() + 1));
+        let _ = CAPTURED_FRAMES.try_with(|c| c.set(c.get() + frames));
+    }
+    pub fn read() -> (u64, u64, u64) {
+        (
+            CARRIES.try_with(|c| c.get()).unwrap_or(0),
+            CAPTURES.try_with(|c| c.get()).unwrap_or(0),
+            CAPTURED_FRAMES.try_with(|c| c.get()).unwrap_or(0),
+        )
+    }
+    pub fn reset() {
+        let _ = CARRIES.try_with(|c| c.set(0));
+        let _ = CAPTURES.try_with(|c| c.set(0));
+        let _ = CAPTURED_FRAMES.try_with(|c| c.set(0));
+    }
+}
+
 pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
+    census4::carry();
     if remaining { env.clone() } else { Env::empty() }
 }
 

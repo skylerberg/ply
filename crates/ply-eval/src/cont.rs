@@ -640,6 +640,7 @@ impl Stack {
             rest.calls -= cut.calls();
             taken.push(cut);
         }
+        crate::rc::census4::capture(frames as u64);
         (
             Continuation {
                 segments: Rc::new(taken),

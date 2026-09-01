@@ -241,6 +241,23 @@ work.** ADR 0025 separately concedes that P1 is a `Code` IR change plus
 lowering rather than an edit to eight call sites. **If the IR is changing anyway,
 change it to slots and get an O(1) answer instead of an O(depth) one.**
 
+**The trade the rewrite makes, counted rather than assumed.** A persistent chain makes *capture*
+cheap — a continuation shares a pointer — and a slot stack makes *carrying* cheap, because the frame
+records a base index instead of building anything. The second is only worth having if programs carry
+far more often than they capture, and that is a property of real programs. Over `examples/`:
+
+| | |
+| --- | ---: |
+| carries | 2,012 |
+| captures | 162 |
+| frames those captures took | 562 |
+
+**12.4 carries per capture**, and the average capture is 3.5 frames deep. So the rewrite buys the
+reuse S3 measured — 10,461 appends that stop copying — for on the order of 562 frame-window copies
+on the same corpus. `slot_resolution::the_corpus_carries_far_more_often_than_it_captures` is the
+count and fails if the ratio ever inverts, which is the condition under which §4 stops being worth
+its size.
+
 **The shape the measurements leave standing, stated so the rewrite has a target.** With a slot
 stack, "the frame carries less" is not a construction at all: the slots stay where they are and the
 carry *clears* the dead ones. That is O(dead) writes and no allocation, which is the only row of
