@@ -247,7 +247,12 @@ test "shadowed" { assert_eq(go([1, 2, 3]), 5) }
 }
 
 /// The half of P2 that is the point of it: threaded as a parameter, an
-/// accumulator is now reused, and the count says so rather than the clock.
+/// A parameter accumulator whose `push` is in last-argument position is reused.
+///
+/// This does **not** discriminate ADR 0025's P2: it passes with and without it, because the
+/// caller's `drop(env)` before the call already delivers the value at one owner. The shape that
+/// does is `position_invariance_g1`'s "let binding against parameter" pair, where the append is a
+/// statement rather than a last argument.
 #[test]
 fn an_accumulator_threaded_as_a_parameter_is_rewritten_in_place() {
     let stats = passes(

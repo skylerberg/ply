@@ -381,7 +381,11 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             dead.reverse();
             NodeKind::Record {
                 fields: Rc::new(lowered),
-                dead: Rc::new(dead),
+                dead: if dead.is_empty() {
+                    no_arg_dead()
+                } else {
+                    Rc::new(dead)
+                },
             }
         }
         // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
@@ -486,9 +490,21 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
 /// of — ADR 0033 §11 S4.
+/// The empty per-argument dead set, shared rather than allocated per node.
+///
+/// `App` and `Record` carry one of these on every lowering and it is empty unless the ADR 0033 §11
+/// S4 probe is armed, so allocating a fresh `Rc` per node put ~10 allocations on each `/health`
+/// request for a vector nothing reads.
+fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
+    thread_local! {
+        static EMPTY: Rc<Vec<crate::rc::Dead>> = Rc::new(Vec::new());
+    }
+    EMPTY.with(Rc::clone)
+}
+
 fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
     if !crate::rc::probe_armed() {
-        return (lower_all(exprs, live), Rc::new(Vec::new()));
+        return (lower_all(exprs, live), no_arg_dead());
     }
     let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
     let mut dead: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
@@ -589,7 +605,11 @@ fn lower_block(
     // ADR 0033 §8.1, which carries the case analysis for why this releases nothing still read.
     // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
     // which are not in scope here.
-    let mut cumulative: Vec<Symbol> = live.barrier_params().to_vec();
+    let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {
+        live.barrier_params().to_vec()
+    } else {
+        Vec::new()
+    };
     let mut out: Vec<Stmt> = Vec::with_capacity(n);
     for i in 0..n {
         for name in &bound[i] {
