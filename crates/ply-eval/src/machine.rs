@@ -777,7 +777,10 @@ impl<'a> Machine<'a> {
             }
 
             NodeKind::Lambda { params, body, free } => {
-                let captured = env.keep_only(free);
+                let captured = match free {
+                    Some(free) => env.keep_only(free),
+                    None => env.clone(),
+                };
                 self.go_return(Value::Closure(Arc::new(Closure {
                     name: None,
                     kind: ClosureKind::Code {
