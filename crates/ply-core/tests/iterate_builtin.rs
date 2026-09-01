@@ -46,15 +46,19 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
         .to_string()
 }
 
-/// `fn probe_f() = f` returns the builtin itself, so the printed signature of
-/// the probe carries the builtin's whole type.
+/// `fn probe_iterate() -> <the contract's type> = iterate` returns the builtin
+/// itself, so the probe's own signature carries the builtin's whole type. The
+/// return type is *written* (`MISSING_SIGNATURE`), and the generic list binds
+/// the `a`, `b` and `e` it names — rigidly, so they cannot quietly absorb a
+/// wrong shape.
 #[test]
 fn iterate_has_the_type_the_contract_states() {
-    let out = ok("fn probe_iterate() = iterate\n");
-    assert_eq!(
-        sig(&out, "probe_iterate"),
-        "() -> (a, Int, (a) -> Iter<a, b> / e) -> b / e"
-    );
+    let want = "(a, Int, (a) -> Iter<a, b> / e) -> b / e";
+    let source = format!("fn probe_iterate<a, b | e>() -> {want} = iterate\n");
+    let out = ok(&source);
+    // Stronger than reading the type off inference was: `iterate` must now
+    // *unify* with the contract's type rather than merely print as it.
+    assert_eq!(sig(&out, "probe_iterate"), format!("() -> {want}"));
 }
 
 /// The budget sits **second** and the callback **last**. Not a matter of taste:

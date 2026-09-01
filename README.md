@@ -152,6 +152,12 @@ the tables it touches: `ply check --types` prints the exact atom set for every
 route in the example service, and the row is *inferred* — writing one is optional
 and checked as an upper bound, never as a widening.
 
+The row is the only half of a signature that works that way, and deliberately: a
+row is *derived* from what a body calls, while a type is *chosen*. Every
+parameter type and return type on a top-level `fn` is written (`E0126`), because
+a published signature a reviewer holds fixed cannot be a summary of the body it
+describes. Infer what is mechanical; write what is meant.
+
 **Definitions are content-addressed.** The unit of compilation is the definition,
 not the file. A definition's hash is computed over its normalized structure, with
 references to other definitions replaced by *their* hashes and local names

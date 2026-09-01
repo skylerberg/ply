@@ -1275,7 +1275,7 @@ Three things a new code has to satisfy, each of them checked by a named test:
    is why `E0002 UNTERMINATED_STRING` is armed: with that list empty the check
    reports `E0002` dead, and `E0002` is not dead.
 
-Ranges in use: `E0001`–`E0002` and `E01xx`–`E05xx` for errors (73 codes; the two
+Ranges in use: `E0001`–`E0002` and `E01xx`–`E05xx` for errors (75 codes; the two
 single-digit ones are the generic pair and are easy to miss when you assume the
 range starts at `E01xx`), and `W0601`–`W0610` for warnings. There is also a
 reserved list in `crates/ply-eval/src/host.rs` (`DB_SCHEMA_MISMATCH` is at

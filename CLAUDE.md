@@ -22,6 +22,7 @@ claims §"The one rule" enumerates were all noticed years late.
 | `crates/ply-syntax/src/lexer.rs` — `Kw`, `TokenKind`, literal forms, escapes | §3.3 keywords, §3.4 literals, §3.5 the token set |
 | `crates/ply-syntax/src/parser.rs` — `bin_op`, item forms, contextual keywords | §3.3, §3.5 precedence, §4 items, §6 expressions, §7 effects |
 | `crates/ply-syntax/src/ast.rs` — an `Item`, `ExprKind` or `PatternKind` variant | §4.1, §6.3 patterns, §6 expression forms |
+| `crates/ply-core/src/infer.rs` — `require_written_signature`, `settle_numerics`, `infer_stmt`'s `let` | §5.9, which states what is written and what is inferred, and §5.2's numeric rule |
 | `crates/ply-core/src/infer.rs` — `install_prelude` | §13, the builtin tables, **with the signature as inference publishes it** |
 | `crates/ply-core/src/infer.rs` — `BUILTIN_TYPE_CONS` | §5.1 scalars, §5.7 |
 | `crates/ply-core/src/prelude.rs` — `ADTS`, the prelude effects | §5.7, §10.2 |

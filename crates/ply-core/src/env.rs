@@ -204,6 +204,14 @@ fn rename_row(r: &Row, rows: &FxHashMap<RowVar, RowVar>) -> Row {
     }
 }
 
+/// Quantify a solved type over the variables the environment cannot reach.
+///
+/// Called at a **top-level definition and nowhere else**. A local `let` binds
+/// monomorphically (`Checker::infer_stmt`): generalizing there bought a
+/// locally-defined function usable at two types, which no definition in the
+/// shipped tree wants, and it put generalization on the path of every statement
+/// in every body. A polymorphic helper is a `fn`, where its signature is written
+/// and therefore reviewable.
 pub fn generalize(subst: &Subst, env: &mut TypeEnv, ty: &Type) -> Scheme {
     let ty = subst.resolve_ty(ty);
     let (env_tys, env_rows) = env.free_vars(subst);

@@ -552,13 +552,22 @@ usually still unknown there — but once the enclosing definition has been
 inferred. So both of these check:
 
 ```ply
-fn f(a) -> Float = a + 1.0        // f : (Float) -> Float
-fn g(a) -> Decimal = 1m + a       // g : (Decimal) -> Decimal
+fn f(a: Float) -> Float = a + 1.0
+fn g(a: Decimal) -> Decimal = 1m + a
 ```
 
-An operand type nothing pins **defaults to `Int`** before generalization, so
-`fn add(a, b) = a + b` publishes `(Int, Int) -> Int` rather than a bogus
-`<t>(t, t) -> t`.
+An operand type **nothing pins** is `E0210`, not a default. Since every
+top-level signature is written (§5.9) the only way to reach it is a lambda
+binder or a `let` no annotation and no literal constrains:
+
+```ply
+fn f() -> Int = { let g = |a, b| a + b; 1 }   // E0210 on `a + b`
+```
+
+This used to default to `Int`. A default is a tiebreak taken inside the compiler
+that then appears in a published signature, which is exactly the kind of claim
+nobody wrote and nobody can review; annotate the binder, or write a literal that
+pins it.
 
 Conversions are explicit: `decimal_of_int`, `int_of_decimal` (takes a rounding
 mode, answers `Option`), `float_of_decimal`, `decimal_of_float` (`Option`),
@@ -722,16 +731,40 @@ ordered or used as map keys.
 
 ### 5.9 What is checked, and what is inferred
 
-* Every parameter type, return type and effect row may be omitted and is
-  inferred.
-* Writing one makes it the **published signature**. Inference must produce a
-  type that unifies and a row that is a **subset** of what you wrote. So
-  declaring `/ {net.write[conn]}` on a function whose body performs nothing is
-  allowed and useful (it constrains callers); declaring less than the body needs
-  is `E0302`.
-* `forall` binders in a `law` are the one place an annotation is **mandatory**.
-* Where a record update's base needs a shape, it must be readable from this
-  file — see §6.6.
+The line runs between what a definition **means** and what it **does**, and it
+is not the line most languages draw:
+
+* **Types are written.** Every parameter type and every return type on a
+  top-level `fn` is mandatory. Omitting one is `E0126`, and the diagnostic names
+  the type inference would have given, so the fix is the text of the error.
+* **Effect rows are inferred.** Omit the `/ {...}` and the row is derived from
+  what the body performs. Write one and it becomes the published row, checked as
+  an **upper bound**: inference must produce a **subset**. So declaring
+  `/ {net.write[conn]}` on a function whose body performs nothing is allowed and
+  useful (it constrains callers); declaring less than the body needs is `E0302`.
+* **Inside a body, everything is inferred.** Lambda binders, `let` bindings and
+  every intermediate expression. Nothing there is published, so nothing there
+  has to be written.
+
+**Why the asymmetry.** A row is *derived* — it is a summary of what you called,
+it changes for good reasons, and 89% of the rows in the shipped tree are
+inferred. A type is *chosen*; it is a claim about what a definition means. Ply's
+premise is that what a human reviews is a specification (§11), and
+`ply review --changed`'s load-bearing row is *implementation changed, spec
+unchanged*. A signature inferred from the body it describes cannot hold still
+for that row to mean anything — editing the body would silently republish the
+claim. So: infer what is mechanical, write what is meant.
+
+Two consequences worth knowing:
+
+* **A local `let` binds monomorphically.** `let f = |x| x;` used at two
+  different types is `E0201`. A polymorphic helper is a `fn`, where its
+  signature is written and therefore reviewable.
+* **There is no numeric defaulting.** An operand no annotation and no literal
+  pins is `E0210` rather than silently becoming `Int` (§5.2).
+
+Also mandatory: `forall` binders in a `law`. And where a record update's base
+needs a shape, it must be readable from this file — see §6.6.
 
 ---
 
@@ -2702,6 +2735,7 @@ program.
 | `E0123` | a named argument that names no parameter, or names one twice |
 | `E0124` | a positional argument after a named one |
 | `E0125` | a parameter left unfilled by a call that used a name (plain under-application stays `E0202`) |
+| `E0126` | a top-level `fn` that left a parameter type or its return type to inference — the diagnostic names the type it would have given |
 
 ### Types
 
@@ -2716,6 +2750,7 @@ program.
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive` |
 | `E0209` | `/` applied to `Decimal` |
+| `E0210` | an arithmetic or comparison operand whose numeric type nothing determines |
 
 ### Effects
 
