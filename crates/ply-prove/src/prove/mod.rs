@@ -1,4 +1,4 @@
-//! The static proof tier: a decision procedure for ADR 0007 §5.1's fragment.
+//! The static proof tier: a decision procedure for the decidable fragment's fragment.
 
 mod arith;
 mod context;

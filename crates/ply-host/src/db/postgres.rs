@@ -93,8 +93,8 @@ fn aborted_or_ok(commit: bool, poisoned: bool) -> Value {
     opened_ok()
 }
 
-/// A peer that went away, which ADR 0014 §3.2 makes a value rather than a diagnostic: a database
-/// that restarted is a peer, and ADR 0013 §7.1 already decided what those are.
+/// A peer that went away, which the connection pool makes a value rather than a diagnostic: a database
+/// that restarted is a peer, and a peer's misbehaviour already decided what those are.
 fn unreachable(why: &str) -> Value {
     failed(&DbError::connection(why.to_string()))
 }

@@ -269,7 +269,7 @@ impl HostRuntime for Facilities {
         ))
     }
 
-    /// The process-level teardown, in the order ADR 0015 §4.4 pins.
+    /// The process-level teardown, in the order the teardown order pins.
     fn shutdown(&self, drain_ms: u64) -> ShutdownReport {
         let mut report = ShutdownReport {
             spans_abandoned: self.trace.open_spans(),

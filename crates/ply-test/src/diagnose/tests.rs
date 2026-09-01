@@ -269,7 +269,7 @@ fn a_multi_culprit_regression_names_both() {
     );
 }
 
-/// The case ADR 0004 calls common rather than exotic.
+/// The case the failure artifact calls common rather than exotic.
 #[test]
 fn a_hybrid_that_does_not_typecheck_is_not_evidence_and_costs_the_minimality_claim() {
     let case = Case::edits(&["a", "b", "c", "d"], &["a", "b", "c", "d"]);
@@ -988,7 +988,7 @@ fn a_failure_with_no_culprit_names_nobody() {
 }
 
 /// The JSON is the artifact an agent branches on, so the fields it branches on have to be there and
-/// have to mean what the ADR says.
+/// have to mean what the artifact's field table says.
 #[test]
 fn the_json_artifact_leads_with_the_verdict() {
     let case = Case::edits(&["a", "b"], &["a"]);

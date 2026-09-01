@@ -322,7 +322,7 @@ test "the whole message is bounded, not each read" {
 
 // --- Response correctness ---------------------------------------------------
 
-/// Response splitting, refused rather than sanitized — ADR 0013 §2.6.
+/// Response splitting, refused rather than sanitized — what response encoding refuses.
 #[test]
 fn a_program_supplied_header_value_with_cr_or_lf_refuses_the_encode() {
     let out = ply_test(
@@ -486,7 +486,7 @@ test \"gzip then chunked\" {{
     ));
     out.green(
         "`Transfer-Encoding: gzip, chunked` must be 501: accepting it hands the handler the \
-         undecoded gzip bytes as the body, and ADR 0013 §3.5 rule 17 says any coding other \
+         undecoded gzip bytes as the body, and the transfer-coding rules rule 17 says any coding other \
          than `chunked` is 501",
     );
 }

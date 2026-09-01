@@ -680,7 +680,7 @@ pub struct Continuation {
     resumes: Rc<Cell<u32>>,
     /// This continuation's claim on the regions that were open when it was captured, so their
     /// lexical close retains their slots instead of handing them back to a bump pointer this
-    /// continuation can still read through — ADR 0005 required test 6.
+    /// continuation can still read through — the escape case — a continuation resumed after the region that made its cell returned.
     pin: Option<Pin>,
 }
 

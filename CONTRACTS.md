@@ -444,7 +444,7 @@ Requirements:
 - `with_cell[r](init) { c -> body }` binds `c : Cell<T>` and discharges
   `cell.read[r]` / `cell.write[r]` from the body's row. `cell_get` / `cell_set`
   are prelude builtins that perform those atoms.
-- `with_region[r] { body }` (ADR 0017 §1) opens a lexical allocation scope
+- `with_region[r] { body }` (ADR 0017) opens a lexical allocation scope
   branded `r` and discharges the same two atoms at *its* boundary. A
   `with_cell[r]` written under a region of that name allocates **into** it: the
   cell may outlive the `with_cell`'s own braces and is discharged and checked at
@@ -467,13 +467,13 @@ Requirements:
   program. `E0449` joins `RESERVED_CODES` — it is the machine's verdict about its
   own memory, so a handler may not mint it. Both engines check at the same point
   with the same message, or the refusal would itself be an `--audit-backend`
-  divergence. `ply_eval::escape` documents what every other boundary ADR 0017 §2
+  divergence. `ply_eval::escape` documents what every other boundary ADR 0017
   names does instead, and which one route stays open.
 - **A region's slots go back at its lexical close**, for both
   kinds. What the kind decides is a claim about that close rather than whether it
   happens: a close no live continuation can reach truncates the arena, and one a
   continuation captured across the region can still reach retains its slots until
-  that continuation dies (ADR 0017 §3, §4). Meaning is unchanged either way —
+  that continuation dies (ADR 0017, §4). Meaning is unchanged either way —
   state is threaded, resumption *n* observes resumption *n−1*'s writes — because
   reclamation is decided by reachability and not by the region kind. An entry
   point's end closes whatever the run left open and abandons every claim, which
@@ -1022,7 +1022,7 @@ impl<'a> Interp<'a> {
   and `bytes_position` are driven by a step protocol — `Step::Apply` answered by
   a `Frame` the machine pushes and pops — so each costs **depth 1** however many
   rounds it runs. A driver that nested would make the bound a function of how a
-  loop is spelled, which is the defect ADR 0005 §7.1 removed tail-call elision to
+  loop is spelled, which is the defect ADR 0005 removed tail-call elision to
   prevent. ADR 0022.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `list_at`, `map`,
   `filter`, `fold`, `iterate`, `range`, `int_to_string`, `string_concat`,
@@ -1435,7 +1435,7 @@ Bisections are scheduled through `group_by_conflict` over the failing tests'
 footprints: a hybrid performs the same effects the real test does.
 
 `ply test --json` carries `"schema_version": 2` at the top level and the failure
-artifact of ADR 0004 §7. `failures[].suspects` becoming an array of objects is a
+artifact of ADR 0004 `failures[].suspects` becoming an array of objects is a
 breaking change against v1, ranked so a consumer reading only `suspects[0]` gets
 the best guess. `ply-test`'s own `report::failure_json` is the reference shape;
 `ply-cli` adds `location`, `module`, `test_hash` and `footprint` from the
@@ -1620,7 +1620,7 @@ pub enum NodeKind { Lit, Var, Unary, Binary, Lambda, App, If, Match, Block,
 // §"Before you open a change" item 5 is about.
 pub struct Node { pub kind: NodeKind, pub span: Span, pub own: Own }
 //   NodeKind::Lit carries the Value it denotes, built once at lowering rather
-//   than per evaluation — ADR 0019 §2. The Lit stays because
+//   than per evaluation — ADR 0019 The Lit stays because
 //   `crates/ply-codegen-spike` dispatches on it to pick a Cranelift type.
 Lit(Lit, Value),
 //   and Stmt::Expr is a struct variant, which is what bit-rotted the spike.
@@ -1647,7 +1647,7 @@ soon as the grammar below lands. It is the only place that has to learn about it
 Not designed here; recorded so the public surface is complete. A thread-local
 free list of `Vec<Value>` in four capacity classes, taken at
 `Frame::AppCallee` and given back by `Machine::enter_code` once the arguments
-are bound into scope. ADR 0019 §1 is the decision and its module note is the
+are bound into scope. ADR 0019 is the decision and its module note is the
 measurement.
 
 ```rust
@@ -1662,7 +1662,7 @@ module serves, rather than at a copy of it. `give` **refuses a non-empty
 vector** rather than emptying it — a caller still holding an argument has not
 finished with it, and a pooled buffer holding a `Value` would keep a `Cell` past
 the region that reclaims it and park a `Secret` where the next call reads
-(ADR 0015 §2). Every access is `try_with`, so a release during thread-local
+(ADR 0011). Every access is `try_with`, so a release during thread-local
 teardown falls back to the allocator instead of aborting a worker.
 
 ### `ply-eval::cont` — landed
@@ -1792,7 +1792,7 @@ The machine has also grown entry points this block predates, each introduced
 where its milestone is: `set_seed` / `simulated` (M7), `set_host_binding` /
 `set_declared_footprint` / `set_re_executed` / `host_ops` / `host_use` (W1).
 
-The transition rules are ADR 0005 §1.3 and are normative — in particular:
+The transition rules are ADR 0005 and are normative — in particular:
 
 - `W` is threaded through capture and through resumption **unchanged**;
 - a tail-resumptive clause runs on the post-capture stack with a `Frame::Resume`
@@ -1979,7 +1979,7 @@ applies is decided by what bounds the depth:
 `Stack::calls()` is the machine's count — the `Frame::Call`s pending, O(1)
 through push, pop, capture and splice. A tail call is charged like any other:
 eliding it left a tail-recursive runaway unbounded rather than a diagnostic,
-which is ADR 0005 §7.1.
+which is ADR 0005
 
 ### The constant memo — `ply-eval::memo`
 
@@ -2029,7 +2029,7 @@ the two:
   × 512 requests: `/health` **482.6µs → 264.0µs** (2,072 → 3,787 req/s, 1.83x)
   and `/items` **903.9µs → 813.8µs** (1.11x).
 - **Served, the real binary over postgres over TLS with `--trace json`**, both
-  variants served alternately at concurrency 1, best of 3 (ADR 0016 §10.1, which
+  variants served alternately at concurrency 1, best of 3 (ADR 0011, which
   prices this as one of its seven cheaper levers): `/health` **466.6µs →
   263.5µs** (1.77x) and `/items` **677.0µs → 589.4µs** (1.15x).
 - **On the task-per-connection accept loop, nothing:** `/health` 471.3µs against
@@ -2591,7 +2591,7 @@ The scheduler is a **native prompt**: a delimiter on the M6 stack whose clauses
 are Rust. `Segment` gains a native form and `Stack::find_handler` consults both;
 capture, splice, deep handlers and the threaded world are all unchanged. A task
 is `(TaskId, Continuation, TaskState)`, and resuming one is the transition
-ADR 0005 §1.3 already specifies for applying a continuation.
+ADR 0005 already specifies for applying a continuation.
 
 Six rules an implementer must get exactly right:
 
@@ -2722,8 +2722,7 @@ pub fn result_key(test_hash: DefHash, seeded: bool, plan: &Plan) -> DefHash;
 `world_isolated` — since renamed `region_isolated` — widened from "every atom is
 world-backed" to "no atom contends", because `sim.read` must not drop every
 simulated test out of the `isolated: n of m` number for no reason.
-`shared_footprint` dropped ambient atoms with the world-backed ones; under ADR
-0017 it drops **ambient only**, since a region label contends. Both are landed,
+`shared_footprint` dropped ambient atoms with the world-backed ones; under ADR 0017 it drops **ambient only**, since a region label contends. Both are landed,
 with tests.
 
 ### `ply-test` — landed
@@ -3330,7 +3329,7 @@ fresh symbolic constant.
    a total symbol and not about `fn spin(x) = spin(x)`. The requirement is
    conditioned on the path it was reached under, and a guard's own requirements
    may not assume the guard. Failing to discharge one is `Unknown`, never a
-   refutation. ADR 0007 §5.1(g) is the full statement.
+   refutation. ADR 0007(g) is the full statement.
 
 Everything else is **inconclusive**, and:
 
@@ -3417,7 +3416,7 @@ draw(root, obligation_key, counter) =
 
 Without the obligation in the key, adding a law would shift every later law's
 cases, so an unrelated edit would change which counterexample a failing
-obligation reports — ADR 0006 §4.2's argument for two separate streams, applied
+obligation reports — ADR 0006's argument for two separate streams, applied
 here.
 
 `Int` draws with edge bias including `0`, `1`, `-1`, `i64::MIN` and `i64::MAX`.
@@ -3461,7 +3460,7 @@ laws.
 
 Exit `0` when every obligation is `Held` or `Unattempted`; `1` on any `Refuted`
 or `Vacuous`; `2` on a compile error. `ply prove` **never calls
-`observe_definitions`** — ADR 0004 §4's rule: a definition exercised by an
+`observe_definitions`** — ADR 0004's rule: a definition exercised by an
 obligation has not been vindicated as a test subject.
 
 **Coverage is in the default output of both commands, ahead of the results, never
@@ -3571,7 +3570,7 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 - **An SMT integration.** No Z3, no CVC5, no external solver, ever. A solver is a
   trusted oracle whose version changes the answer, and a `proved` label must be
   reproducible from the definition set alone — the argument that put counter-mode
-  BLAKE3 in ADR 0006 §4.2 instead of a PRNG crate.
+  BLAKE3 in ADR 0006 instead of a PRNG crate.
 - **A termination checker.** An evaluation that hits `DEFAULT_MAX_CALLS` is
   `Unattempted { Raised }`, never `proved` and never `refuted`.
 - **Induction**, well-founded recursion, lemmas or proof hints. This is what puts
@@ -3586,7 +3585,7 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
   resource, because a spec may not name mutable state. **This is the largest gap
   in the milestone.** Closing it needs a pure term denoting a resource's contents
   and a model of the resource behind it.
-- **Handler-parametric laws.** A handler is syntax, not a value; ADR 0007 §3.2
+- **Handler-parametric laws.** A handler is syntax, not a value; ADR 0007
   lists the four things that would change.
 - **Bounded integer arithmetic**, runtime contract checking, spec-derived code,
   refinement types, dependent types, and a `--coverage` flag.
@@ -3596,7 +3595,7 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 ## Host boundary
 
 `docs/adr/0008-host-effect-boundary.md` has the reasoning and
-`docs/adr/0011-w1-contract.md` the decisions; this section is the contract.
+`docs/adr/0011-the-web-track.md` the decisions; this section is the contract.
 **Where it disagrees with any section above, this section wins** — it was
 written after them.
 
@@ -4000,7 +3999,7 @@ not the place it comes from.
 
 Grouping is otherwise **unchanged**: a host atom is an ordinary contending atom,
 so readers-writers over `db.read[users]` still decides what runs beside what,
-which is what ADR 0008 §6 asks for and it needs no special case.
+which is what ADR 0008 asks for and it needs no special case.
 
 ### `simulate` and the host are mutually exclusive
 
@@ -4145,7 +4144,7 @@ decides how much the boundary is trusted for:
 - it **cannot** catch a handler that does more than its registration declared.
   The atom compared is the one the registry computed and a handler has no way to
   report a different one, so `db.read[users]` that also writes is recorded as a
-  read, reported as a read and *scheduled* as a read. Since ADR 0008 §6 makes
+  read, reported as a read and *scheduled* as a read. Since ADR 0008 makes
   footprint conflict grouping the only isolation a host-backed test has, the
   isolation of such a test is exactly as good as its registration's mode and
   resource, and nothing checks either. `ply hosts` plus review is the whole
@@ -4258,8 +4257,7 @@ are not.
 The list index added by `docs/adr/0027-a-list-index.md` does **not** make it
 seven. `list_at` refuses no index — it answers `None` — so it is in
 `TOTAL_BUILTINS`. That `bytes_at` raises and `list_at` does not is the one place
-two containers in this language are indexed by different conventions, and ADR
-0027 §2 is the argument for it — the short version being that ~~a raising list
+two containers in this language are indexed by different conventions, and ADR 0027 is the argument for it — the short version being that ~~a raising list
 index would be excluded from `TOTAL_BUILTINS`, which would block a `property`
 over any function that peeks, at every peek.~~
 
@@ -4271,7 +4269,7 @@ unguarded raising peek is the *run*: the randomized case is out of range, the
 term raises, and the obligation is `unattempted` (`W0604`) rather than
 `property`. So the sentence keeps its conclusion — a raising list index would
 cost a `property` at every unguarded peek, and `list_at` does not — and drops
-`TOTAL_BUILTINS` from the reason. ADR 0027 §2 carries the two-law demonstration.
+`TOTAL_BUILTINS` from the reason. ADR 0027 carries the two-law demonstration.
 
 ### `ply hosts`
 
@@ -4340,7 +4338,7 @@ pub enum Skipped { /* ... */ Host }  // bisection refused: re-running replays I/
 pub struct TestResult { /* ... */ pub host: Option<HostUse> }  // NOT SHIPPED
 ```
 
-**Two of those four did not land, and the gap is the read half of ADR 0011 §5.**
+**Two of those four did not land, and the gap is the read half of ADR 0011**
 
 - `Record::Host` and `Skipped::Host` exist and are the *write* half: a run that
   reached a host handler records `Record::Host`, nothing is stored, and bisection
@@ -4532,7 +4530,7 @@ Plus one `tests/fixtures/` entry per new code, as every milestone owes.
 
 ## Payloads
 
-`docs/adr/0012-w2-contract.md` has the reasoning; this section is the contract.
+`docs/adr/0011-the-web-track.md` has the reasoning; this section is the contract.
 **Where it disagrees with any section above, this section wins** — it was
 written after them.
 
@@ -4696,7 +4694,7 @@ the `match` that `_or` removes are 0.34 µs of it. The same measurement prices
 `map_get` at ~1.7 µs, i.e. **within about a tenth of `list_at`** — so a
 `Map<Int, v>` used as an array is not the cost it looks like either. (2% apart
 at 14,742 elements, which is inside that rig's resolution; 1.10× at 128,000,
-where it resolves. ADR 0027 §7.)
+where it resolves. ADR 0027)
 
 The list side's early-exiting driver, which takes no list at all:
 
@@ -5026,7 +5024,7 @@ Cost model, which is the point of the section:
 `bytes_position` is the escape hatch: prefer `bytes_scan` wherever the predicate
 is a byte set, because `bytes_position` pays exactly the cost W1 measured,
 reduced by early exit rather than removed. `bytes_split` copies because
-`Value::Bytes` is `Arc<[u8]>` with no slicing, which ADR 0011 §8 deferred to W3.
+`Value::Bytes` is `Arc<[u8]>` with no slicing, which ADR 0011 deferred to W3.
 
 The prover treats every one of these as opaque. The total ones are in
 `TOTAL_BUILTINS`; `bytes_index_of_from`, `bytes_index_of_byte`, `bytes_split`,
@@ -5059,9 +5057,9 @@ fields:
 84 times the bytes cost **39 times** the time before and **0.95 times** the
 time now. A request's cost has stopped being a function of how long its head is
 and become a function of how many fields were parsed out of it, which is the
-exit criterion ADR 0012 §5 states.
+exit criterion ADR 0011 states.
 
-> **Audit note: ADR 0016 §0 reports this same sweep as 29.29x → 1.00x, and this
+> **Audit note: ADR 0011 reports this same sweep as 29.29x → 1.00x, and this
 > same request as 527.7µs → 109.8µs at 1,895 → 9,109 req/s.** Both documents
 > claim to be quoting W2. They cannot both be. This section is the one with a
 > rig attached, so it is the better of the two — but it is not confirmed either.
@@ -5075,10 +5073,10 @@ exit criterion ADR 0012 §5 states.
 > The absolute µs are machine-dependent and the audit's box is slower throughout,
 > so those are expected to move. The sweep *ratio* is not supposed to be — it is
 > a shape claim about an O(n) parser — and the three recorded values for it are
-> **39x** (here), **29.29x** (ADR 0016 §0) and **26.27x** (re-measured). Note
+> **39x** (here), **29.29x** (ADR 0011) and **26.27x** (re-measured). Note
 > also that the tool computes that ratio itself, as last-row µs over first-row
 > µs; **39** is what this table's own two rows divide to (8458/216 = 39.2), so
-> this section is at least self-consistent, whereas ADR 0016's 29.29x has no
+> this section is at least self-consistent, whereas ADR 0011's 29.29x has no
 > table under it anywhere. The qualitative claim — the second column is flat and
 > the first is not — reproduces on every take. A faster interpreter would have divided the
 first column; it would not have flattened it. What is left above the socket is
@@ -5130,7 +5128,7 @@ to all three is the same.
 
 ### Required tests
 
-The full list is ADR 0012's; these are the ones whose absence would let W2 ship
+The full list is ADR 0011's; these are the ones whose absence would let W2 ship
 broken rather than merely incomplete.
 
 1. A program importing nothing from `std` has hashes byte-identical to before.
@@ -5198,7 +5196,7 @@ second name for one operation is worse than the inconsistency. W3 may unify them
 
 ## A real server
 
-`docs/adr/0013-w3-contract.md` has the reasoning; this section is the contract.
+`docs/adr/0011-the-web-track.md` has the reasoning; this section is the contract.
 **Where it disagrees with any section above, this section wins** — it was
 written after them.
 
@@ -5256,11 +5254,11 @@ reference otherwise — one token of lookahead, no reserved word. A whole row th
 is a bare `IDENT` is still a row *variable*; a set is only ever written inside
 braces.
 
-- **A member is an atom, never a whole effect.** ADR 0009 §1's
+- **A member is an atom, never a whole effect.** ADR 0009's
   `effect set Web = {db, http}` is refused. "Every atom of `db`" is every
   resource label anywhere in the program, so an unrelated table in an unrelated
   module would change the expansion — and therefore the declared row, and
-  therefore the hash — of every definition annotated with it, which is ADR 0012
+  therefore the hash — of every definition annotated with it, which is ADR 0011
   corollary 1. A wildcard atom is refused for the same weight of reason: it
   would put a non-ground shape into `EffectAtom`, which is what
   `conflicts_with` and every scheduling decision are built on. Keeping members
@@ -5270,7 +5268,7 @@ braces.
   `E0114`. Gate 1 skips a file whose bytes are unchanged, so a set expanding
   across a module boundary would let an edit in the declaring module leave a
   stale published row behind — a footprint that under-reports, which is a
-  **green** result. ADR 0013 §1.3 records the mechanism a sound cross-module
+  **green** result. ADR 0011 records the mechanism a sound cross-module
   form would need (`ImportEdge::exports`, a `DefKind::EffectSet`, a fourth
   namespace, and a hygiene rule for substituted effect names) so that it is a
   deferral rather than an omission.
@@ -5293,7 +5291,7 @@ footprint all speak in atoms. An `E0302` against an aliased signature quotes the
 **expansion** in its secondary label, never the name.
 
 **An alias name never enters a hash; its expansion enters exactly as the row it
-stands for would.** ADR 0009 §3's "regrouping which atoms it contains must
+stands for would.** ADR 0009's "regrouping which atoms it contains must
 change no definition hash" is superseded:
 
 | edit | hashes that move |
@@ -5307,7 +5305,7 @@ declared row and `DefInfo::footprint` is what callers are inferred against, so
 widening a set widens a published bound — and gate 2 only rechecks a definition
 whose own hash moved. A set edit that moved no hash would leave a caller
 accepted against a signature that no longer admits it, and its stored footprint
-under-reporting what it can reach. Same argument as ADR 0012 §3's `where`
+under-reporting what it can reach. Same argument as ADR 0011's `where`
 clauses, same answer.
 
 `ply_hash::normalize::row` already sorts and deduplicates atoms, so both
@@ -5359,7 +5357,7 @@ parsed and its `RowExpr::aliases` are right there — a stored copy would be a
 second answer to a question the AST already answers, and the two could disagree.
 
 **`ply check --types` prints the expansion, always, and never the alias** —
-ADR 0009 §4 in its strongest form, with the truth behind no flag at all.
+ADR 0009 in its strongest form, with the truth behind no flag at all.
 `--explain` adds the set table, the alias a row was written with, the body's
 inferred row, and the declared-but-not-performed difference. `ply prove` prints
 the same difference for a definition carrying an obligation, where it is a
@@ -5579,7 +5577,7 @@ O(total²):
 | --- | --- | --- |
 | `bytes_concat_all` | `(List<Bytes>) -> Bytes` | pure; one allocation, O(total); the empty list is `b""` |
 
-**Cheap slicing of a shared `Bytes` is not in W3.** ADR 0011 §8 deferred the
+**Cheap slicing of a shared `Bytes` is not in W3.** ADR 0011 deferred the
 question here and the answer is no: with `bytes_concat_all` the read loop is
 O(total) once and the head/body split is one copy, so a slice representation
 buys a constant factor nothing has measured at the price of changing `Value`'s
@@ -5786,7 +5784,7 @@ of writing the protocol in Ply: a malformed request is a `400`, which is a
 
 ### Required tests
 
-The full list is ADR 0013 §11's; these are the ones whose absence would let W3
+The full list is ADR 0011's; these are the ones whose absence would let W3
 ship broken rather than merely incomplete.
 
 1. A definition written `/ {Web}` and one written with `Web`'s expansion have
@@ -5846,7 +5844,7 @@ A template language. Compression in either direction; `Content-Encoding` is
 passed through untouched. mTLS, SNI-based certificate selection, session
 resumption and OCSP. `Upgrade`, WebSockets and `CONNECT`; authority-form targets
 are `400`. Cross-module `effect set`s, and effect sets over row variables.
-Cheap slicing of a shared `Bytes` — ADR 0011 §8 deferred the question to W3 and
+Cheap slicing of a shared `Bytes` — ADR 0011 deferred the question to W3 and
 the answer is no, with the measurement W6 would need to change it. Cancellation
 of a `Pending` token: deadlines removed the need rather than deferring it again,
 and a host operation with no deadline still blocks until it completes or the run
@@ -5857,7 +5855,7 @@ operations in flight.
 
 ## Postgres
 
-`docs/adr/0014-w4-contract.md` has the reasoning; this section is the contract.
+`docs/adr/0011-the-web-track.md` has the reasoning; this section is the contract.
 **Where it disagrees with any section above, this section wins** — it was
 written after them.
 
@@ -5911,7 +5909,7 @@ cached and hermetic.
 
 **A SQLSTATE is a value, never a diagnostic.** A unique violation, a foreign-key
 violation, a serialization failure, a connection that died mid-statement — each
-is `Failed(e)` the program matches on, by ADR 0013 §7.1's rule about a peer's
+is `Failed(e)` the program matches on, by ADR 0011's rule about a peer's
 misbehaviour. `DbError::detail` carries the server's prose for a person and
 **nothing ever compares it**; `code` and `constraint` are what a program and the
 agreement law read.
@@ -5932,7 +5930,7 @@ clause **does not resume**: its value is the value of the whole `handle`, so the
 rest of the body — the rest of the function, its callers up to the boundary, the
 statements it was about to issue — is the continuation and the continuation is
 dropped. Nothing unwinds and no frame runs an epilogue. Zero resumptions
-satisfies ADR 0008 §7's `resumes <= 1` trivially, so rollback needs no exemption
+satisfies ADR 0008's `resumes <= 1` trivially, so rollback needs no exemption
 from the linearity rule and no change to `handler::resume`'s check.
 
 The data operations are **not** intercepted. A Ply clause names a concrete
@@ -6043,10 +6041,9 @@ The transaction control operations take **no** resource, so their atom is the
 singleton `db.write`. Stated rather than discovered: every definition that opens
 a transaction carries it, so two tests that open transactions are serialised
 even over disjoint tables. It is also true — they contend for one pool, which is
-exactly the host state ADR 0008 §6 says cannot be forked. Read-only endpoints
+exactly the host state ADR 0008 says cannot be forked. Read-only endpoints
 open no transaction and keep their concurrency. A program wanting finer
-granularity writes its own `handle` over `db.begin` with its own labels, as ADR
-0013 §2.4 says about `conn`.
+granularity writes its own `handle` over `db.begin` with its own labels, as ADR 0011 says about `conn`.
 
 **A statement may touch more tables than its label names.** `select … from
 orders join items` performed as `db.query[orders]` records one atom and touches
@@ -6138,7 +6135,7 @@ The preventer: the driver computes the table set at **prepare**
 time, once per statement text, and refuses `E0434` from `HostRequest::declared`
 before a row moves. The machine's check on `touched` was to have covered the case
 the driver's own scan got wrong; it does not exist, so **the scan is unbacked**
-and a scan that under-reports is undetected. Neither closes ADR 0008 §2 — a
+and a scan that under-reports is undetected. Neither closes ADR 0008 — a
 handler that lies about `touched` is as invisible as one that lies about its
 registration — and what the scan alone does close is the case where the *honest*
 handler could not tell the truth, which W4's driver is the first handler in the
@@ -6151,7 +6148,7 @@ text, in Rust, in the TCB, disclosed by `ply hosts`. It recognises `SELECT` /
 `INSERT` / `UPDATE` / `DELETE` / `VALUES` / `WITH` and **refuses everything
 else** with `E0432` naming the byte offset — never an empty table set, so a
 defect is a refusal rather than a footprint that under-reports. Written in Ply
-was considered, as ADR 0013 did for HTTP framing, and refused for the one reason
+was considered, as ADR 0011 did for HTTP framing, and refused for the one reason
 that differs: the driver needs the answer and is Rust, so a Ply copy would be
 two scanners, and the disagreement would be between the footprint a test
 observes and the footprint the scheduler was given.
@@ -6171,8 +6168,7 @@ check off is a flag whose default becomes the one nobody uses.
 ### The pool
 
 `deadpool-postgres` over `tokio-postgres`, driven by a **current-thread** tokio
-runtime on one OS thread owned by `ply_host::db::Reactor`. This resolves ADR
-0013 §9's open item — tokio was declared and unused; it is called now. No `Value`
+runtime on one OS thread owned by `ply_host::db::Reactor`. This resolves ADR 0011's open item — tokio was declared and unused; it is called now. No `Value`
 crosses to that thread: the reactor speaks postgres's types and conversion
 happens on the machine's thread inside `call` and `poll`. Every `db` operation is
 `blocking: true` and answers `Pending`.
@@ -6191,7 +6187,7 @@ happens on the machine's thread inside `call` and `poll`. Every `db` operation i
 The two server-side timeouts are set with `SET` at every checkout and are not
 optional: a statement with no timeout holds a pool slot until the server
 restarts and an idle transaction holds locks the rest of the service waits on,
-which is ADR 0013 §4's "a bound is part of the contract" applied to a second
+which is ADR 0011's "a bound is part of the contract" applied to a second
 protocol.
 
 Acquisition is at `begin` for a transaction and per statement otherwise; a
@@ -6264,7 +6260,7 @@ the column. At the edges, each a place a driver quietly loses data:
   element, is a decode failure naming the column. `PArray` whose elements are not
   all one non-null constructor is `E0432`; `PArray([])` is legal and takes its
   element type from the parameter description.
-- **`Option<Option<a>>` is refused** wherever it appears, as ADR 0012 A1 refuses
+- **`Option<Option<a>>` is refused** wherever it appears, as ADR 0011 refuses
   it for `json` and for the same reason: two values, one wire form.
 - **No date, time, timestamp or interval type.** A column of one is `E0432`. A
   `timestamptz` is `int8` microseconds and a `date` is `int4` days, in the
@@ -6296,7 +6292,7 @@ the two codecs are all Ply source in that file. Everything below is therefore th
 design, not the contract, and the reader should not expect to find it in
 `crates/ply-derive`.
 
-ADR 0010 named it and ADR 0012 §3 deferred it here "with the `Row` type it is a
+ADR 0010 named it and ADR 0011 deferred it here "with the `Row` type it is a
 codec over".
 
 ```ply
@@ -6308,8 +6304,7 @@ pub type RowCodec<a> = {
 }
 ```
 
-`derive row for Item` generates `fn item_row() -> RowCodec<Item>` under ADR 0012
-§3's naming, orphan, visibility, expansion-point, hashing and
+`derive row for Item` generates `fn item_row() -> RowCodec<Item>` under ADR 0011's naming, orphan, visibility, expansion-point, hashing and
 `E0505`-on-generated-body rules **unchanged**. Everything true of `json` is true
 of `row`. What it walks is narrower:
 
@@ -6330,8 +6325,7 @@ A rule that guessed would guess wrong once, silently. `columns` is in the record
 so the driver can check the result description against the codec at prepare time:
 a `select` missing a column the codec needs is `E0433` **before the first row**.
 
-Constraints are `where derivable(row, a)`, checked at the signature per ADR 0012
-§3, with the deriver tag added to `tag::CONSTRAINT`'s pinned enumeration.
+Constraints are `where derivable(row, a)`, checked at the signature per ADR 0011, with the deriver tag added to `tag::CONSTRAINT`'s pinned enumeration.
 
 ### The in-memory twin — Ply, and pure
 
@@ -6345,7 +6339,7 @@ pub fn abort_step(d: MemDb) -> { db: MemDb, out: Answer }
 ```
 
 Rows are `Map<String, Cell>` and answers are `Answer`, so the twin and the driver
-produce values of one type by construction — ADR 0008 §5's "the same declared
+produce values of one type by construction — ADR 0008's "the same declared
 signature", structural rather than promised. A program installs it with an
 ordinary `handle` over a region-scoped cell, one clause per `(operation,
 resource)`, which is `desk.ply`'s existing shape with the clause bodies changed.
@@ -6620,7 +6614,7 @@ written, and the machine checks no `touched` — see "Footprint granularity" abo
 `RUNTIME_VERSION` moved anyway, and correctly: `end_entry_point` alone changes
 what a cached `Pass` is a claim about.
 `FRONTEND_VERSION` to `0.12.0` — a new deriver (`row`), `LawDef::host`, and the
-`law/host` grammar; ADR 0012 §3's rule is that any change to a deriver bumps it.
+`law/host` grammar; ADR 0011's rule is that any change to a deriver bumps it.
 The deriver did not land, so the bump was paid for `LawDef::host` and the grammar
 alone; `Deriver` still enumerates `Json`, `Eq`, `Ord`.
 **`BODY_ENCODING` to `7`** — `law_def` writes a host flag after its tag, as
@@ -6692,7 +6686,7 @@ meaning.
 
 ### Required tests
 
-The full list is ADR 0014 §13's; these are the ones whose absence would let W4
+The full list is ADR 0011's; these are the ones whose absence would let W4
 ship broken rather than merely incomplete.
 
 1. A `db.rollback` deep inside a transaction discards the continuation: the
@@ -6776,7 +6770,7 @@ are the whole of the isolation, and they are less than a reader expects.
 
 ## Operations
 
-`docs/adr/0015-w5-contract.md` has the reasoning; this section is the contract.
+`docs/adr/0011-the-web-track.md` has the reasoning; this section is the contract.
 **Where it disagrees with any section above, this section wins** — it was
 written after them.
 
@@ -6789,8 +6783,7 @@ written after them.
 Three consequences decide everything below. **A trace call is a `perform`,
 always** — a row cannot be conditional on a flag, so there is no disabled path
 that skips it and `--trace off` binds a listed handler rather than an empty
-registry. **The environment supplies a value and never causes a binding** — ADR
-0011's rule is untouched, and the snapshot is frozen at bind time so that
+registry. **The environment supplies a value and never causes a binding** — ADR 0011's rule is untouched, and the snapshot is frozen at bind time so that
 `config.read` is honestly a read. **Teardown has one pinned order**, because a
 drain that commits a half-finished transaction is data loss rather than a mess.
 
@@ -6856,7 +6849,7 @@ program-maintained stack is wrong by construction.
   than per run because an id crosses back into the program — a `Span` is an
   ordinary record so a program can put its id in a field — and a run-global
   counter made a host-backed test's own answer a function of what a
-  footprint-disjoint test traced beside it (ADR 0015 §7). Correlating lines
+  footprint-disjoint test traced beside it (ADR 0011). Correlating lines
   across entry points is the record's `seq`, which stays run-global.
 - `exit[c](s, o)` closes `s` **and every span the same task opened above it**,
   the latter with `Outcome::Abandoned`. Not a warning: a discarded continuation
@@ -6868,7 +6861,7 @@ program-maintained stack is wrong by construction.
   a failure report carries, and a classification that consulted the run put
   another test's `MachineId` into this test's report and changed with `--jobs`.
 - Whatever is still open when an entry point ends is closed `Abandoned` by
-  `end_entry_point` (ADR 0014 §1.3, doing a second job with no new mechanism)
+  `end_entry_point` (ADR 0011, doing a second job with no new mechanism)
   and reported **`W0609 SPAN_ABANDONED`** with the count and the innermost name.
 
 ### What a span costs when nothing is collecting
@@ -6979,7 +6972,7 @@ Evaluator behaviour, each closing a route that is otherwise total:
   through it, and it is the only caller of `insert_mut` in that module. Written
   per call site it was written at four of six: `map_of_entries` and `map_merge`
   reach the tree by another route and were a total ordering oracle over a
-  plaintext, through a route ADR 0015 §2.3 lists as closed. A mitigation spelled
+  plaintext, through a route ADR 0011 lists as closed. A mitigation spelled
   once per call site is one the next call site does not have.
 - **`Secret<a>` is not quantifiable**: a `forall` binder over one is `E0418`,
   exactly as `Cell` and `Task` are. A generator that minted secrets and a
@@ -6987,7 +6980,7 @@ Evaluator behaviour, each closing a route that is otherwise total:
 - **Derivation**: `derivable(json, ·)`, `derivable(ord, ·)` and
   `derivable(row, ·)` are false for `Secret<a>` — `E0206 NOT_DERIVABLE`
   **naming the field** — and `derivable(eq, ·)` holds. Asked twice of one
-  predicate, as ADR 0012 specifies: `ply_derive::walk`, and `ply_core`'s walk
+  predicate, as ADR 0011 specifies: `ply_derive::walk`, and `ply_core`'s walk
   over the *solved* type so `type Password = Secret<String>` is caught too.
 - `Value::type_name` is `"Secret"`. `Value::render` truncates nothing, because
   it prints no payload.
@@ -7064,7 +7057,7 @@ and buys the thing that matters: `ply check --types` says which definitions read
 configuration and which read **credentials**.
 
 `get` answers `Option` rather than raising — a missing key is a value the program
-matches on, ADR 0014 §0's rule for a second peer. The failure an operator
+matches on, ADR 0011's rule for a second peer. The failure an operator
 actually suffers is caught at bind time instead.
 
 **Precedence**, highest first: `--set KEY=VALUE` (repeatable); `--config PATH`
@@ -7079,7 +7072,7 @@ whitespace trimmed. A line without `=`, an empty key, or a key that is not
 line. TOML, YAML and JSON are refused because the effect returns
 `Option<String>`: a format richer than the type it feeds is a format whose extra
 structure is silently dropped, and a parser in a trusted computing base is the
-line ADR 0013 says is worth a human's attention.
+line ADR 0011 says is worth a human's attention.
 
 **The environment is read exactly once**, at bind time, into an immutable
 `BTreeMap`, and `std::env::var` is never called at perform time. One line,
@@ -7149,7 +7142,7 @@ binds there and `ply hosts --host` prints which signals the run listens for.
 **`examples/desk.ply` drains with no source change.** Its `serve` is a sequential
 accept loop that exits on `accept` answering `0`, phase 2 makes it answer `0`,
 and its in-flight count at the signal is exactly one — so it cannot lose a
-request. That is the exit criterion and it falls straight out of ADR 0013's
+request. That is the exit criterion and it falls straight out of ADR 0011's
 decision that `accept` answers `0` rather than raising.
 
 **Teardown order is pinned**, and three of four steps are ordering-sensitive:
@@ -7163,7 +7156,7 @@ decision that `accept` answers `0` rather than raising.
 2. **flush the sink** — before the pool closes, so a trace naming a rolled-back
    transaction is written before the connection that rolled it back is gone.
 3. **close the pool** — connections closed rather than returned; one whose
-   `ROLLBACK` failed is discarded, which is ADR 0014 §1.3 unchanged.
+   `ROLLBACK` failed is discarded, which is ADR 0011 unchanged.
 4. exit.
 
 Any failure in 1–3 is `W0606 HOST_TEARDOWN` naming the driver and what it could
@@ -7218,7 +7211,7 @@ impl ShutdownReport { pub fn is_clean(&self) -> bool; }
 coordinator, which knows when the signal arrived and the report does not.
 
 **A request still running at the deadline is not cancelled.** W5 adds no
-cancellation — ADR 0011 deferred it, ADR 0013 §7.2 argued deadlines sufficed for
+cancellation — ADR 0011 deferred it, ADR 0011 argued deadlines sufficed for
 sockets, and that is still where it stands. The process tears down and exits, and
 the client sees a **connection closed with no response**, or a truncated one if
 bytes were written. `--drain-ms` should exceed the program's own
@@ -7250,7 +7243,7 @@ account rather than a hope:
 | the config snapshot | a `setenv` seen by another test; one key read twice differing | read **once**, at bind, into an immutable map; `std::env::var` is never called at perform time |
 | the stop flag | one stop ends every test after it | `signal` does not bind under `ply test` at all |
 
-**ADR 0008 §6 makes footprint conflict grouping the only isolation a host-backed
+**ADR 0008 makes footprint conflict grouping the only isolation a host-backed
 test has**, so each is exactly as isolated as its registration's mode and
 resource and nothing checks either. Every test reaching any of them is
 `Isolation::Host` — counted separately, excluded from `isolated: n of m`, never
@@ -7268,7 +7261,7 @@ decision of this shape should be re-openable against a measurement. What
 incremental transfer would additionally need — a target-side agent, an
 authenticated channel, a negotiation, a rollback story, an atomic switch, a
 garbage-collection policy — is a product, and a half-built one is worse than
-none (ADR 0014 §7's sentence about migrations).
+none (ADR 0011's sentence about migrations).
 
 What content addressing *is* worth, and nearly free because the store already
 does it, is identity and verification.
@@ -7418,7 +7411,7 @@ discipline) and `shutdown` (the signals, the two deadlines, the second-signal
 behaviour). The **digest covers** the `SECRET` column, the config schema
 function's name and its key names and shapes, the sink path, the channel list and
 the shutdown knobs; it does **not** cover resolved config values, the
-environment's size or the server version — ADR 0014 §11's rule, that a CI check
+environment's size or the server version — ADR 0011's rule, that a CI check
 which breaks on a deployment's own configuration is one people learn to ignore.
 
 `trace.*` is `Linearity::AtMostOnce` (replaying a continuation across an event
@@ -7466,7 +7459,7 @@ E0443 and E0444 are raised by the artifact loader before any binding exists.
 it is a refusal the trace driver is the only component in a position to compute —
 which task holds which span — and reserving it would have `attribute` rewrite the
 driver's own diagnosis to `E0502` and send a reader looking for a defect in Ply.
-That is ADR 0014 §8's rule unchanged, and E0445 belongs with E0432–E0434, E0436
+That is ADR 0011's rule unchanged, and E0445 belongs with E0432–E0434, E0436
 and E0437. E0445 and W0609 are attributed and bisected like any other program
 failure; W0608 and W0606 are run-level and change no verdict.
 
@@ -7543,7 +7536,7 @@ over three region-scoped cells and stays hermetic: its row is still
 
 ### Required tests
 
-The full list is ADR 0015 §12's; these are the ones whose absence would let W5
+The full list is ADR 0011's; these are the ones whose absence would let W5
 ship broken rather than merely incomplete.
 
 1. Two channels do **not** conflict in the concurrency graph and two definitions
@@ -7660,7 +7653,7 @@ transport, with the measurement that would re-open it. Artifact signing.
 Zeroization and every memory-level guarantee about a `Secret`. A `Secret` that
 survives concatenation, transformation or partial disclosure — no `secret_map`,
 `secret_concat` or `secret_slice`, because each would have to see the plaintext.
-**Rate limiting, backpressure and load shedding**: ADR 0014 §3.2 said W5 owns
+**Rate limiting, backpressure and load shedding**: ADR 0011 said W5 owns
 backpressure and W5 does not — `E0437 DB_POOL_EXHAUSTED` is still a diagnostic
 rather than a shed request, and turning it into a `503` needs a policy about
 which requests to refuse and a way to refuse one without ending the run. That is
@@ -7670,7 +7663,7 @@ a promise W4 made that W5 is breaking, stated rather than quietly dropped.
 
 ## Test isolation under regions
 
-ADR 0017 §6. The forkable world is gone, so the exemption that rested on it is
+ADR 0017 The forkable world is gone, so the exemption that rested on it is
 gone with it. `ply-test`'s scheduler and its report are what change.
 
 ### `ply-test::schedule` — landed
@@ -7690,7 +7683,7 @@ pub fn contends(atom: &EffectAtom) -> bool;          // !is_ambient
 pub fn region_isolated(f: &Footprint) -> bool;       // was `world_isolated`
 pub fn shared_footprint(f: &Footprint) -> Footprint; // now drops ambient only
 /// Shared, and only over region labels: isolated under the forkable world and
-/// coloured now. Exactly what ADR 0017 §6 costs.
+/// coloured now. Exactly what ADR 0017 costs.
 pub fn contends_only_over_regions(f: &Footprint) -> bool;
 
 pub enum Isolation { Region, Shared }                // was `World | Shared`
@@ -7714,7 +7707,7 @@ pub struct GroupRegion { /* fixture: Fixture */ }
 impl GroupRegion {
     pub fn empty() -> GroupRegion;
     /// Runs the seed once, on the caller's thread. A worker lives for exactly
-    /// one concurrency group, so "once per worker" is ADR 0017 §6's "once per
+    /// one concurrency group, so "once per worker" is ADR 0017's "once per
     /// group".
     pub fn build(seed: impl FnOnce(&mut TaskRegions) -> Value) -> GroupRegion;
     /// The boundary: below it is the group's, at or above it is the test's.
@@ -7737,7 +7730,7 @@ have pairwise non-conflicting footprints and a region label now conflicts, so no
 two tests in a group can name one piece of fixture state and the order they run
 in cannot decide a verdict.
 
-### Reporting — the ADR 0008 §6 trap, again
+### Reporting — the ADR 0008 trap, again
 
 A report that still says `world` after the world is gone is a lie, and a count
 that stopped being true is worse than one that was never printed. So:
@@ -7968,7 +7961,7 @@ because of that guard.
   writes `base.f` once per copied field, so a base that could perform or allocate
   would run once per field.
 - **The shape is read from this module's own `type` items and this file's
-  written annotations, and nothing else** — the ADR 0013 §1.3/§1.4 restriction,
+  written annotations, and nothing else** — the ADR 0011 restriction,
   for the ADR 0002 gate-1 reason. A shadowing binder *removes* the annotation
   rather than inheriting it.
 
@@ -7988,7 +7981,7 @@ field set, and the width meets the same exact-key-set unification
 (`crates/ply-core/src/unify.rs`) every record literal meets. A too-wide shape is
 `E0101` from `ExprKind::Field`; a too-narrow one is `E0201` wherever the result
 meets a known record type — which is **not total** for a `{..s}` no annotation
-ever constrains, and is marked so in ADR 0023 §5 rather than claimed.
+ever constrains, and is marked so in ADR 0023 rather than claimed.
 
 ### New diagnostic codes — landed
 

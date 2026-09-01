@@ -1,4 +1,4 @@
-//! What ADR 0017 §6's fixture costs, measured the way ADR 0005's fork was.
+//! What region isolation's fixture costs, measured the way the control-stack design's fork was.
 
 use ply_eval::{TaskRegions, Value};
 use ply_test::GroupRegion;

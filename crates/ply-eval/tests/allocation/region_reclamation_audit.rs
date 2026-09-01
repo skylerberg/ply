@@ -1,4 +1,4 @@
-//! When a region's memory goes back — ADR 0017 §3's other half.
+//! When a region's memory goes back — the region-kind rule's other half.
 
 // A `Value`'s payloads are `Arc` and thread-confined by design, which is the crate's own decision
 // rather than something to lint here.
@@ -342,7 +342,7 @@ fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
     assert_eq!(arena.stats().slots_reclaimed_late, 64);
 }
 
-/// The interaction ADR 0017's Consequences call the hardest to see: `unique` inferred where a
+/// The interaction the region model's Consequences call the hardest to see: `unique` inferred where a
 /// capture is reachable frees memory a continuation still holds.
 #[test]
 fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
@@ -448,7 +448,7 @@ fn holding_a_region_for_a_continuation_does_not_save_or_restore_it() {
     assert_eq!(
         int_at(&arena, trace),
         Some(2),
-        "snapshot-at-capture would answer 1, and it is the reading ADR 0017 retracted"
+        "snapshot-at-capture would answer 1, and it is the reading the region model retracted"
     );
     assert_eq!(arena.stats().snapshots, 0, "nothing on this path snapshots");
     assert_eq!(arena.stats().restores, 0);
@@ -478,7 +478,7 @@ fn a_restore_is_refused_while_a_continuation_is_pinned() {
     arena.close(r);
 }
 
-/// ADR 0017 §4 accepts that a cycle leaks, and this is what one looks like in the allocator: a
+/// the reference-counting pass accepts that a cycle leaks, and this is what one looks like in the allocator: a
 /// continuation parked in a cell of a region it pins.
 #[test]
 fn a_continuation_parked_in_the_region_that_pins_it_is_the_leak_adr_0017_accepts() {

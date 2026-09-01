@@ -137,7 +137,7 @@ fn explain_parallelism(p: &Parallelism) -> Vec<String> {
         "isolated: {} of {} — {} can contend with another test",
         p.isolated, p.total, p.shared
     )];
-    // ADR 0008 §6: when a population stops being isolated, the report has to say so, or the
+    // host effects having no region isolation: when a population stops being isolated, the report has to say so, or the
     // trivially-parallel count over-claims by exactly the tests that moved.
     if p.region_contended > 0 {
         lines.push(format!(

@@ -236,7 +236,7 @@ impl PoolConfig {
                     }
                 ))
                 .note("W4 accepts `sslmode=disable` and `sslmode=prefer` only")
-                .note("wiring rustls into the postgres client is a real decision about the trusted computing base, and ADR 0014 §10 puts it beside W5's secrets rather than shipping it as an untested line"));
+                .note("wiring rustls into the postgres client is a real decision about the trusted computing base, and the trusted computing base listing puts it beside W5's secrets rather than shipping it as an untested line"));
             }
         }
         if self.size == 0 {
@@ -258,7 +258,7 @@ impl PoolConfig {
             }
         }
         config.connect_timeout(self.connect);
-        // So an operator — and ADR 0014 §13's tests, which read `pg_stat_activity` rather than the
+        // So an operator — and the required tests's tests, which read `pg_stat_activity` rather than the
         // driver's own bookkeeping — can tell this run's backends from everything else on the
         // server.
         if config.get_application_name().is_none() {

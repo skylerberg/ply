@@ -820,7 +820,7 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
 
 // --- `law/host` -------------------------------------------------------------
 
-/// ADR 0014 §6.1: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
+/// a law that may reach the world: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
 /// `TestDef::nondet` is written after `tag::TEST`.
 #[test]
 fn declaring_a_law_host_changes_the_law_and_no_definition() {
@@ -880,8 +880,7 @@ fn record_update_hashes_as_its_expansion() {
     );
 
     // Names of *differing length*, because `a`/`b`/`c` cannot tell lexicographic order apart from
-    // any comparator that ties-breaks on length first — and a longhand a reader writes from ADR
-    // 0023 §Decision 2 has to match the emitted order for real field names, not just short ones.
+    // any comparator that ties-breaks on length first — and a longhand a reader writes from the canonical expansion has to match the emitted order for real field names, not just short ones.
     const WIDE: &str = "type R = {aa: Int, z: Int, k: Int}\nfn f(s: R) -> R = ";
     unchanged(
         "record update with field names of differing length",

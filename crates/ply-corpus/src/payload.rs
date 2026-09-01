@@ -263,8 +263,7 @@ pub struct ShapePoint {
     pub decode_micros_per_field: f64,
 }
 
-/// Whether a decode is priced by the fields it visits or by the bytes it crosses — the question ADR
-/// 0012 §5 asks of the request head, asked of the payload.
+/// Whether a decode is priced by the fields it visits or by the bytes it crosses — the question the byte builtins asked of the request head, asked of the payload.
 pub fn json_shape(
     points: &[(usize, usize)],
     iterations: u32,

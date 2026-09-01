@@ -458,7 +458,7 @@ fn many_concurrent_tasks_all_make_progress() {
     );
 }
 
-/// ADR 0008 §8, as a test rather than as a claim: a task waiting on a real operation on a real
+/// the blocking rule, as a test rather than as a claim: a task waiting on a real operation on a real
 /// thread must not stop the others from being stepped.
 #[test]
 fn a_blocking_operation_does_not_starve_the_tasks_beside_it() {

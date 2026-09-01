@@ -1,4 +1,4 @@
-//! ADR 0017 §6's number, taken against real projects rather than against footprints somebody typed.
+//! region isolation's number, taken against real projects rather than against footprints somebody typed.
 
 use ply_core::Footprint;
 use ply_corpus::regions::{self, Corpus, Hypothetical};
@@ -80,7 +80,7 @@ fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
     assert_eq!(cost.today.groups, cost.without_forking.groups);
 }
 
-/// The measured answer for the corpus ADR 0017 §6 quotes.
+/// The measured answer for the corpus region isolation quotes.
 #[test]
 fn the_examples_suite_loses_nothing_to_the_region_model() {
     let root = repo_root().join("examples");

@@ -63,7 +63,7 @@ enum Command {
     /// Writes the measurement half of a
     /// `ply_corpus::w6::Report`, which `w6` then judges.
     W6Ladder(W6LadderArgs),
-    /// Price ADR 0017 §6 before it is built: colour the same test set with and
+    /// Price region isolation before it is built: colour the same test set with and
     /// without the world-backed exemption, and report what the second colouring
     /// costs in groups, in critical path and in wall clock.
     Regions(RegionsArgs),
@@ -854,7 +854,7 @@ struct W6LadderArgs {
     rounds: usize,
     /// Which accept loop the **ladder's** rungs and total are read off.
     ///
-    /// ADR 0016 §1.6 pins `task-per-conn`, and the default here departs from it
+    /// what the ladder is measured on pins `task-per-conn`, and the default here departs from it
     /// for a measured reason: `task.spawn` opens a production region for the
     /// life of the server, and `Machine::constant` refuses the constant memo
     /// inside any open region — so a spawning service memoizes nothing. The
@@ -945,7 +945,7 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
         &args.api_key,
         args.served_repeats,
     )?;
-    // The other loop, reported once, separately and labelled — which is what §1.6 asks of whichever
+    // The other loop, reported once, separately and labelled — which is what the ladder's method asks of whichever
     // loop the ladder is not read off.
     let other_rows = w6_run::served(
         &args.repo,

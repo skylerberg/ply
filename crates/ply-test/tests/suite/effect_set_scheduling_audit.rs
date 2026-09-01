@@ -1,4 +1,4 @@
-//! What an over-broad `effect set` costs the scheduler — ADR 0013 §11's required test 8, and the
+//! What an over-broad `effect set` costs the scheduler — the required tests's required test 8, and the
 //! other half of "an alias is annotation-only".
 
 use ply_core::{CheckOutput, Footprint};
@@ -131,7 +131,7 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     );
 }
 
-/// The claim ADR 0013 §1.6 makes about *why* it is only a cost and never a soundness defect: the
+/// The claim the cost of an over-broad alias makes about *why* it is only a cost and never a soundness defect: the
 /// widening is upward.
 #[test]
 fn an_alias_only_ever_widens_a_tests_footprint() {

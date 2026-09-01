@@ -994,7 +994,7 @@ Python, that is the one thing to unlearn here. The last element is
 
 An index costs the same whatever the position, on today's representation — a
 `List` is a contiguous array, so `list_at(xs, 0)` and `list_at(xs, 99999)` cost
-the same. That is a fact about the representation and not a promise: ADR 0025
+the same. That is a fact about the representation and not a promise: ADR 0024
 records the conditions under which a `List` becomes a chunked structurally
 shared vector, and an index over one of those is logarithmic rather than
 constant.
@@ -1004,7 +1004,7 @@ instead**, and the GUIDE says so because the number surprised the people who
 added it: about 1.7 µs a peek either way, almost all of it interpreter dispatch
 rather than container access. At 14,742 elements the two came out 2% apart,
 which is inside what that measurement could resolve; at 128,000, where it can,
-`list_at` is about a tenth ahead (ADR 0027 §7). Index a list because positions
+`list_at` is about a tenth ahead (ADR 0027). Index a list because positions
 are what you have, not because you were promised a speed-up.
 
 `push` grows the list in place when the caller is its last owner, and copies
@@ -2049,7 +2049,7 @@ fn kind_at(c: Ctx, pos: Int, n: Int) -> Int =
 and the whole case for a second builtin was that this `match` costs something on
 a hot path. It costs **0.34 µs per peek out of 1.66**, which is a 1.26× saving
 against a bar of 1.5× fixed before the number existed, so the second name was
-not worth it. ADR 0027 §7 has the measurement.
+not worth it. ADR 0027 has the measurement.
 
 `list_at` does not raise, and where that shows up is the prover. A `law` over a
 function that peeks with `list_at` runs its randomized cases and reaches

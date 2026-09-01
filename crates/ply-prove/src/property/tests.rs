@@ -200,7 +200,7 @@ fn an_adt_draws_every_constructor() {
     assert_eq!(seen.len(), 3, "every variant of `Color` should be drawn");
 }
 
-/// The disclosed unsoundness in ADR 0007 §5.1(a) is that the prover reasons over ℤ while `Int` is
+/// The disclosed unsoundness in the decidable fragment(a) is that the prover reasons over ℤ while `Int` is
 /// an `i64`.
 #[test]
 fn the_integer_boundary_is_drawn_on_every_run() {

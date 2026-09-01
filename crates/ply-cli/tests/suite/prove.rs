@@ -483,7 +483,7 @@ fn bounded(x: Int) -> Int
     );
 }
 
-/// ADR 0014 §6.1: under a hermetic run — which is `ply prove`'s default — a `law/host` is reported
+/// a law that may reach the world: under a hermetic run — which is `ply prove`'s default — a `law/host` is reported
 /// `W0604 unattempted` with the reason, never green.
 #[test]
 fn a_law_host_is_unattempted_under_a_hermetic_run_and_never_green() {

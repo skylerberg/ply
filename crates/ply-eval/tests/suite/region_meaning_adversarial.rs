@@ -1,4 +1,4 @@
-//! Adversarial probes for the one property ADR 0017 may not break.
+//! Adversarial probes for the one property the region model may not break.
 
 use ply_core::check_program;
 use ply_eval::{Machine, Plan, Seed, explore};
@@ -580,7 +580,7 @@ test "a region abandoned mid-flight keeps the writes made before the perform" {
     );
 }
 
-/// **A route out of a region that ADR 0017 §2 says is closed, and is not.**
+/// **A route out of a region that the escape brand says is closed, and is not.**
 #[test]
 fn a_general_clause_inside_a_region_carries_that_regions_atoms_out_of_it() {
     let src = r#"
@@ -618,7 +618,7 @@ test "through a tail-resumptive one" { assert_eq(discharges(1), 2) }
     assert_eq!(
         atoms("through a general clause"),
         vec!["cell.read[t]".to_string(), "cell.write[t]".to_string()],
-        "if this is ever empty, ADR 0017 §2's claim has become true and should be re-read \
+        "if this is ever empty, the escape brand's claim has become true and should be re-read \
          rather than this test deleted"
     );
     assert_eq!(

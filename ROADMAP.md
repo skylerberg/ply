@@ -39,8 +39,7 @@ threshold was left alone rather than edited. §R4.
 **M9 is the one milestone deferred on a measurement.** W6 deferred it against
 criteria fixed in code before any number existed, and the deferral carries the
 numbers that would reopen it, so a future contributor re-measures rather than
-re-argues — see the M9 and W6 entries. It is *not* the only thing unbuilt: ADR
-0017 "Not in this ADR" names four separate milestones, three of which come
+re-argues — see the M9 and W6 entries. It is *not* the only thing unbuilt: ADR 0017 "Not in this ADR" names four separate milestones, three of which come
 *before* M9 and one of which is M9. **[What is next](#what-is-next)** is at the
 foot of this file and is the entry a reader continuing this project should start
 from.
@@ -135,7 +134,7 @@ definition graph (nearly free once builds are cached).
 Multi-shot continuations (evaluator moves to an explicit control stack). That
 half is load-bearing and untouched: it is what makes a task a suspended machine
 state in M7, a rollback a discarded continuation in W4, and a resumption's
-threaded state the thing ADR 0017 §3 must not move.
+threaded state the thing ADR 0017 must not move.
 
 Copy-on-write world state: build a fixture once, fork per test. **R2 deleted
 it.** `World` is gone from `ply-eval`, a `Value::Cell` is a `Slot` in a
@@ -147,12 +146,12 @@ Two numbers this entry used to imply, corrected rather than dropped, because the
 trade R2 took is only legible with both:
 
 - "fork per test in microseconds" understated it. `World::fork` was one pointer
-  clone at any fixture size, which ADR 0017 §6 records as **1 ns** and as making
+  clone at any fixture size, which ADR 0017 records as **1 ns** and as making
   fixture reuse 8,939x cheaper than rebuilding a 10,000-cell fixture. *Neither
   figure is re-checkable — `World` is deleted, so both are inherited from ADR
   0017 rather than verified here.*
 - What replaced it is not free. Opening a 10,000-cell region-scoped fixture and
-  writing one cell costs **about 100 µs per test**: ADR 0017 §6 published
+  writing one cell costs **about 100 µs per test**: ADR 0017 published
   95.7 µs, and this audit re-ran
   `crates/ply-eval/tests/allocation/fixture_open_cost.rs` and measured **105.8 µs**. Read it
   as an order of magnitude — the test *prints* the figure and asserts only a
@@ -244,7 +243,7 @@ a resource.
 are two different statements.**
 
 `ply test --backend cranelift` installs a real cranelift JIT from the shipping
-workspace — no feature flag, no second toolchain. It compiles the ADR 0016 §3.2
+workspace — no feature flag, no second toolchain. It compiles the ADR 0011
 fragment and the machine enters it.
 
 **What decides whether that is worth anything is fragment coverage, not backend
@@ -255,7 +254,7 @@ and code generation exceeds what entering them saves — so the run is *slower*.
 Both directions are measured; ADRs 0026 and 0030 carry the series, the
 pre-registration, the null controls and the load caveats.
 
-**What that discharges is ADR 0026 §4.5's precondition — "a backend must be
+**What that discharges is ADR 0026's precondition — "a backend must be
 policeable before it is fast" — and not M9's criteria.** The eight deliberately
 wrong backends now run against a real code generator from a shipping command.
 **C3 is untouched**: nothing cheaper has been priced on the workload being
@@ -264,7 +263,7 @@ decided.
 **And the request path is still the workload being decided.** The interpreter is
 roughly a third of a request, so even an infinitely fast backend sits under the
 bar fixed before any of these numbers existed. That is Amdahl, not Cranelift.
-[ADR 0016](docs/adr/0016-w6-performance.md) is the argument.
+[ADR 0011](docs/adr/0011-the-web-track.md) is the argument.
 
 > **The trap this section exists to prevent.** It is tempting to read a
 > disappointing multiplier as a number to improve. The multiplier is a
@@ -326,7 +325,7 @@ dispatch in a real stack.
 response, with the codec derived; and a law that decode-after-encode is identity,
 discharged at whatever tier it earns.
 
-`docs/adr/0010-generic-derivation.md`, `docs/adr/0012-w2-contract.md`
+`docs/adr/0010-generic-derivation.md`, `docs/adr/0011-the-web-track.md`
 
 ## W3 — A real server
 
@@ -360,7 +359,7 @@ the in-memory handler with no source change; and the agreement law discharged as
 `property` with its case count — the mock-drift claim every backend team makes
 and none of them check.
 
-`docs/adr/0014-w4-contract.md`. Not in W4: query building, an ORM,
+`docs/adr/0011-the-web-track.md`. Not in W4: query building, an ORM,
 connection-level `LISTEN`/`NOTIFY`, replication, migrations as a tool, cursors,
 a time type, and a database per test.
 
@@ -392,7 +391,7 @@ ambient is what the previous eight milestones exist to remove.
   wrong in the direction that flatters: `--config-schema` really is verified,
   and `--db-schema` is not — it evaluates the program's `Schema` function and
   reports its shape, and never asks the server. `E0435` is raised nowhere. See
-  the audit notes in `docs/adr/0014-w4-contract.md` §7 and §8.*
+  the audit notes in `docs/adr/0011-the-web-track.md` §7 and §8.*
 - **Graceful shutdown**: stop accepting, drain, then a pinned teardown order —
   roll back every open transaction, close every open span, flush the sink, close
   the pool. W5 still has no cancellation, so a request live at the deadline sees
@@ -409,7 +408,7 @@ in-flight requests — with `examples/desk.ply`'s accept loop draining with **no
 source change**, a credential that appears in no log line, no cache entry and no
 definition hash, and two builds of one tree producing identical digests.
 
-`docs/adr/0015-w5-contract.md`. Not in W5: metrics backends, log shipping,
+`docs/adr/0011-the-web-track.md`. Not in W5: metrics backends, log shipping,
 orchestration, autoscaling, distributed tracing propagation, sampling,
 cancellation, live config reload, incremental deploy transport, artifact signing,
 zeroization, and — breaking a promise W4 made — backpressure and load shedding.
@@ -447,10 +446,10 @@ The headline numbers, all on one machine in one run:
 | concurrency | buys nothing: `/health` 3,914 req/s at c=1 and 3,930 at c=32, p99 287µs → 252ms |
 | the constant memo, priced end to end | **1.77x** on `/health`, **1.15x** on `/items` — and **1.00x** on the accept loop that spawns, where the memo is inert |
 
-`docs/adr/0016-w6-performance.md` §8–§12. Not in W6, and held for the codegen
+`docs/adr/0011-the-web-track.md` §8–§12. Not in W6, and held for the codegen
 backend: whatever the verdict, none was built. **Not held for "optimizing
 anything":** the constant memo landed in `ply-eval` between W6's two takes, which
-is one of ADR 0016 §4's own cheaper levers built rather than priced, and the
+is one of ADR 0011's own cheaper levers built rather than priced, and the
 ladder was re-taken on the tree that has it. Two obligations are still open: the
 spike crate has not been deleted, and the memo is refused inside any open
 **task/simulation** region — so a service whose accept loop calls `task.spawn`
@@ -470,7 +469,7 @@ next reader inherits the corrections rather than rediscovering them:
 - **The in-memory twin is slower than the database it stands in for** — in
   process the twin's `/items` handler costs 544.6µs a call, 344.9µs of which is
   `std.db`'s memory engine parsing its SQL in Ply, and every twin clause writes
-  its whole state back through a persistent map. The substitution ADR 0016
+  its whole state back through a persistent map. The substitution ADR 0011
   planned to price the database with therefore prices the twin, and the ladder
   uses a route difference instead and says so. Test doubles being dearer than the
   real thing is a real cost of "the double and the real thing share one
@@ -556,7 +555,7 @@ the forkable world over branding the region **because branding looked heavy in
 the type system**; building regions for memory means building that branding
 anyway, so the objection that decided M6 stopped applying and the world went.
 
-`docs/adr/0017-regions.md`, which supersedes ADR 0005 §2 and amends ADR 0008 §6.
+`docs/adr/0017-regions.md`, which supersedes ADR 0005 and amends ADR 0008
 
 **It landed in three parts, and the split is the instructive part.** Describing
 regions as one milestone would hide the defect the shape produced, so all three
@@ -589,7 +588,7 @@ own terms:
 - Perceus reference counting for what does escape, and it is a compiler pass
   rather than a runtime check: `crates/ply-eval/src/rc.rs` holds the liveness
   analysis and `code.rs` runs it at lowering, so a last use moves and a dead
-  binding releases. Cycles are not collected; ADR 0017 §4 accepts that and
+  binding releases. Cycles are not collected; ADR 0017 accepts that and
   supplies diagnostics where a cycle is constructible
 
 **And none of it was connected to anything.** No engine consulted the kinds, no
@@ -603,10 +602,9 @@ throughout, because every one of them attacked the allocator or the analysis
 directly and none asked whether an engine had ever called either.
 
 **R1 also shipped a false claim, and it is the seventh of the defects this
-project's reviews have found.** ADR 0017 §3's first draft said each resumption
-observes the region as it was at capture and asserted that this "is exactly ADR
-0005's semantics". It was not, and the two readings are distinguishable **in one
-integer** on the section's own worked example: ADR 0005 §3 threads one state and
+project's reviews have found.** ADR 0017's first draft said each resumption
+observes the region as it was at capture and asserted that this "is exactly ADR 0005's semantics". It was not, and the two readings are distinguishable **in one
+integer** on the section's own worked example: ADR 0005 threads one state and
 pins the two-resumption example at `30` with its trace cell at `2` as a required
 test, and snapshot-at-capture answers `1` for that cell. Since ADR 0017's
 governing property is that program meaning does not change, ADR 0005 won and §3
@@ -821,15 +819,15 @@ guards read.
 
 The verdict is unchanged — **keep deferring M9** — and so is everything the
 verdict is composed from: interpreter share **35%** (34.3%–34.7% over its
-repeats), ceiling **1.53×**, projection **1.46×**, six of ADR 0016 §4's seven
+repeats), ceiling **1.53×**, projection **1.46×**, six of ADR 0011's seven
 levers unpriced.
 
-The absolutes are all larger than ADR 0016 §8.1's, and the control says why:
+The absolutes are all larger than ADR 0011's, and the control says why:
 the **Rust floor**, which has no Ply in it at all, moved from 15.68µs to
 **17.13µs**. This box measures about 9% slow against the one W6 used, so the
 absolutes are not comparable and the ratios are:
 
-| reading | ADR 0016 §8.1–8.3 | re-taken 2026-08-18 |
+| reading | ADR 0011 | re-taken 2026-08-18 |
 | --- | --- | --- |
 | total / floor | 37.8× | **38.5×** |
 | interpreter share, residue charged back | 35.3% | **34.5%** |
@@ -909,7 +907,7 @@ have too.
 | defect | what was wrong | what closed it |
 | --- | --- | --- |
 | `Lowering` keyed on a raw address, and the safety argument in its own doc comment was false | the argument needs `Lowering<'a>` invariant in `'a`; it was **covariant**, its only `'a`-carrying field being `&'a Program`, and `of` takes `&self` — so `&Lowering<'long>` coerced to `&Lowering<'short>` and accepted a body that does not outlive the cache. A `Box<Expr>` holding `111` keyed through that coercion and dropped, then a `Box<Expr>` holding `222` at the same address, was answered `111` on the **first** of a thousand attempts | an `invariant: PhantomData<fn(&'a Program) -> &'a Program>` field. Note `PhantomData<&'a mut Program>` does **not** do it — `&'a mut T` is invariant in `T` but covariant in `'a`, and it was tried first and compiled. The refusal is machine-checked by a `compile_fail` doc-test on the type, because a variance is a compile-time property no `#[test]` can observe |
-| `region_kind` had no local-binder scope | `Analysis::definition` resolved a bare name against `Resolved::scopes[module]` — the *module* scope — so a parameter, a `let` or a pattern binder shadowing a definition's name was read as that definition, and the region inferred **`unique` over a callee that could be any closure in the program**. That is the one direction ADR 0017 §Consequences says inference may never be wrong in | `Analysis::locals`, a lexical scope stack pushed at every binder the language has. It over-approximates on purpose: a `Var` pattern naming a nullary constructor is read as a local, which costs precision and lands on `shared` |
+| `region_kind` had no local-binder scope | `Analysis::definition` resolved a bare name against `Resolved::scopes[module]` — the *module* scope — so a parameter, a `let` or a pattern binder shadowing a definition's name was read as that definition, and the region inferred **`unique` over a callee that could be any closure in the program**. That is the one direction ADR 0017 says inference may never be wrong in | `Analysis::locals`, a lexical scope stack pushed at every binder the language has. It over-approximates on purpose: a `Var` pattern naming a nullary constructor is read as a local, which costs precision and lands on `shared` |
 
 Neither moved what a request allocates:
 `./target/release/w6-alloc --repo . --requests 200` reads
@@ -964,7 +962,7 @@ of that claim is kept for comparison.
 
 ### The premise was measured first, and it did not hold
 
-R4 was requested as **unboxed primitives**, on ADR 0018 §2's two sentences:
+R4 was requested as **unboxed primitives**, on ADR 0018's two sentences:
 *"Every `Int` is a heap-allocated `Value`. `interp::literal` allocates 111 times
 per request on a workload doing almost no arithmetic."*
 
@@ -972,7 +970,7 @@ The first is false — `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and
 `Task` are inline variants of a 32-byte enum and building one touches no
 allocator — and the second is a **20-request window** fitting to 65.0 per
 request plus 925 once per `Machine`, which is one-time work divided by twenty.
-Both are corrected in place in ADR 0018 §2 with the originals beside them.
+Both are corrected in place in ADR 0018 with the originals beside them.
 `cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture`
 prints the zeroes by name.
 
@@ -1008,7 +1006,7 @@ takes its `Vec<Value>` by value — so the most the mechanism could ever remove 
 178.0/911.5 = **19.53%**, and it removed all of it. **The floor was not edited
 and neither was the attributed share.** That is the whole point of putting a
 threshold in code: a documentation defect reported as `Short` is worth more than
-a passing number nobody can check. ADR 0019 §1 carries the four-way split
+a passing number nobody can check. ADR 0019 carries the four-way split
 (178.0 recycled / 31.0 retained as `Ctor.args` / 23.0 too wide / 140.4 freed
 where they cannot be handed back) and says what the next lever is.
 
@@ -1018,7 +1016,7 @@ narrowing `Value` below 32 bytes, is **rejected with its number** — it would
 save bytes and **zero** allocations, and cost one allocation per applied
 constructor.
 
-### ADR 0018 §1 is discharged, and it inverted that ADR's ordering
+### ADR 0018 is discharged, and it inverted that ADR's ordering
 
 The codegen spike compiles again (`+1.94.0`; see `CONTRIBUTING.md` §"Things
 known to be broken" item 1) and was re-priced against a real compute kernel —
@@ -1027,7 +1025,7 @@ known to be broken" item 1) and was re-priced against a real compute kernel —
 report.
 
 The premise held on **shape**: 81.0% of the kernel's executed work is inside the
-compiled fragment, against the 2–5% ADR 0016 measured for an HTTP request. The
+compiled fragment, against the 2–5% ADR 0011 measured for an HTTP request. The
 conclusion did not: end to end the hybrid is **0.998× [0.979–1.007]** against a
 floor of 1.000× [0.994–1.009], because **the interpreter cannot call compiled
 code** — a function the fragment accepts whose callers it refuses is compiled
@@ -1037,7 +1035,7 @@ a lever ADR 0018 does not list outranks most of the ones it does: Ply ships no
 `sqrt` and no `ln`, so the kernel computes its own, at 28.34µs a call against
 1.35µs without — **≈2.5× on the whole kernel from two prelude builtins**.
 
-ADR 0019 §5 lists the six things an amendment to ADR 0018 owes. Two are
+ADR 0019 lists the six things an amendment to ADR 0018 owes. Two are
 discharged; **the other four are open**, and the one that matters is that a
 backend the interpreter cannot enter buys nothing whatever the representation
 is.
@@ -1056,7 +1054,7 @@ bodies by hand. The claim that survives is the narrow one: `w6-alloc` reads
 
 `docs/adr/0018-compute-kernel-performance.md` §0.5 is the record;
 `benches/r5-timing/` holds the pre-registration, the raw report and the results.
-ADR 0018 §0 said **"make the interpreter able to enter compiled code, or the
+ADR 0018 said **"make the interpreter able to enter compiled code, or the
 ceiling is 5.26× however much of the fragment you accept"**, and named that as a
 different first milestone from anything in its own list. R5 is that milestone.
 
@@ -1071,15 +1069,14 @@ the whole shipping delta.
 
 **No shipping command can install a backend, and this is the sentence to read
 first.** `Compiled` and `set_compiled` appear nowhere in `ply-cli`; outside
-`crates/ply-eval`'s own tests and `crates/ply-codegen-spike`, which ADR 0016
-§3.5 requires be deletable, `set_compiled` has **no caller in `crates/*`**. So
+`crates/ply-eval`'s own tests and `crates/ply-codegen-spike`, which ADR 0011 requires be deletable, `set_compiled` has **no caller in `crates/*`**. So
 `ply test --engine both` cannot attach one, and the rule that a backend run is a
 third execution strategy whose results the result cache must not keep — written
 down on `Machine::set_compiled` — is **not enforced, because it is
 unreachable**. **Ply does not ship this.** Everything below is a measurement at
 a seam only the spike's harness and `ply-eval`'s differential corpus can reach.
 
-ADR 0016 §3.5 said deferring M9 "deletes one feature block and one dependency
+ADR 0011 said deferring M9 "deletes one feature block and one dependency
 line, and nothing else in the workspace knows it existed". After R5 that clause
 is false — `compiled.rs`, the trait, `set_compiled`, three counters on `Machine`
 and a branch on every interpreted call all survive the `rm -r` — and it is
@@ -1132,13 +1129,13 @@ reported as direction and magnitude rather than as a second result. A reviewer
 attacked it directly, controlled for the arm order R4 alternated and R5 did not
 (≤3%, sign flips with load), and could not break it.
 
-**So ADR 0018 §0's diagnosis was right: the binding constraint was
+**So ADR 0018's diagnosis was right: the binding constraint was
 architectural.** One-way calling was what made 81% of executed work inside the
 fragment worth 0.998×.
 
 ### 6.199× is above the ceiling that ordered ADR 0018, and the ceiling is what was wrong
 
-ADR 0018 §0 puts the Amdahl ceiling at **4.86×** for an enterable backend and
+ADR 0018 puts the Amdahl ceiling at **4.86×** for an enterable backend and
 **5.26×** at an infinitely fast fragment. 6.199× is above both, taken with 19 of
 34 functions accepted — nowhere near "however much of the fragment you accept".
 **A number that beats its own predicted ceiling means the model was wrong, not
@@ -1231,7 +1228,7 @@ A second row that table cannot show at all: its argument-set selection skips any
 set the interpreter raises on, which is exactly the fuel-decline path. Re-taken
 2026-08-22 with the shipped binary, `mcts --dir benches/kernel --probe machine`
 is **0.17 s** against `--probe compiled` at **11.82 s** — ~**69× slower with a
-backend attached** on a program that is about to raise either way. ADR 0018 §0
+backend attached** on a program that is about to raise either way. ADR 0018
 records it and RESULTS.md never mentions it.
 
 **3. A definition that handles its own effects is offered to a backend.**
@@ -1340,7 +1337,7 @@ The gaps, and what the ADR plans for each: boxed primitives, interpreted dispatc
 no unboxed mutable arrays, per-operation effect dispatch, no monomorphization, no
 vocabulary for shared mutable state across tasks, and no SIMD or layout control.
 
-**The first step is a measurement, not a build.** ADR 0016 priced the codegen
+**The first step is a measurement, not a build.** ADR 0011 priced the codegen
 spike at 11.67x on its compilable fragment and 1.02-1.05x end to end, because that
 fragment is 2-5% of an HTTP request. An MCTS inner loop may be *mostly* that
 fragment. Re-pricing the existing spike against a kernel is cheap, and every other

@@ -1,4 +1,4 @@
-//! The compute kernel ADR 0018 measured, compiled by the shipping code generator.
+//! The compute kernel the compute-kernel record measured, compiled by the shipping code generator.
 
 use ply_codegen::Cranelift;
 use ply_eval::{Provider, Value};

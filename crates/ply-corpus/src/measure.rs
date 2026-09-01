@@ -1,4 +1,4 @@
-//! The four numbers ADR 0005 spends and never priced.
+//! The four numbers the control-stack design spends and never priced.
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
@@ -143,7 +143,7 @@ fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
     Ok(performs)
 }
 
-/// What ADR 0017 §6's region-scoped fixture costs, measured the way `fork`'s 1 ns was.
+/// What region isolation's region-scoped fixture costs, measured the way `fork`'s 1 ns was.
 #[derive(Clone, Debug, Serialize)]
 pub struct FixturePoint {
     pub cells: usize,

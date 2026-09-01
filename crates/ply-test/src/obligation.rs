@@ -153,7 +153,7 @@ impl Answer {
     }
 }
 
-/// What the cache holds for one obligation, under the two keys ADR 0007 §4.3 allows.
+/// What the cache holds for one obligation, under the two keys the obligation cache rule allows.
 pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     if let Some(entry) = store.obligation(key) {
         return match from_cached(entry) {

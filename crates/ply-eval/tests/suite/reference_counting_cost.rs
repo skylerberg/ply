@@ -1,4 +1,4 @@
-//! The two numbers ADR 0017 §4 is judged on, taken on the source in the repository rather than on
+//! The two numbers the reference-counting pass is judged on, taken on the source in the repository rather than on
 //! shapes chosen to flatter them.
 
 use ply_eval::rc;

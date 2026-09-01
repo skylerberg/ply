@@ -86,7 +86,7 @@ test "two increments" {
 }
 "#;
 
-/// ADR 0006's first required test.
+/// deterministic simulation's first required test.
 #[test]
 fn the_search_finds_the_lost_update() {
     let compiled = compile(LOST_UPDATE);
@@ -238,7 +238,7 @@ fn two_writers_to_one_resource_explore_both_orders() {
     );
 }
 
-/// ADR 0006 §10's first validation: comparing outcomes alone would pass on a run whose interleaving
+/// the replay validation's first validation: comparing outcomes alone would pass on a run whose interleaving
 /// differed and whose assertions happened not to notice.
 #[test]
 fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
@@ -613,7 +613,7 @@ test "the handler never resumes" {
     assert!(refused.message.contains("abandoned"), "{}", refused.message);
 }
 
-/// ADR 0006 §1.6.
+/// control crossing a region delimiter.
 #[test]
 fn resuming_a_region_that_already_ended_is_a_diagnostic() {
     let compiled = compile(

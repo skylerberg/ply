@@ -228,7 +228,7 @@ fn all(n: Int) -> Int = a(n) + b(n) + c(n) + d(n) + e(n)
 test "sums" { assert_eq(all(0), 15) }
 "#;
 
-/// ADR 0004's required test 2: five edits, one culprit, named exactly and inside `2·log2(5)`
+/// the failure artifact's required test 2: five edits, one culprit, named exactly and inside `2·log2(5)`
 /// evaluations.
 #[test]
 fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {

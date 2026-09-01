@@ -73,7 +73,7 @@ evaluator buys less here than a faster type checker would. That is the shape of
 the argument that has kept native codegen deferred, and
 [Serving](#serving) is where it inverts — but the case for deferring M9 does not
 rest on this profile, it rests on the *served* one below, and
-[ADR 0016](docs/adr/0016-w6-performance.md) is where the decision actually lives.
+[ADR 0011](docs/adr/0011-the-web-track.md) is where the decision actually lives.
 
 `ply-corpus bench` prints all nine phases if you want them; they are not copied
 here, because a phase table in a README is a thing to re-take rather than a thing
@@ -201,7 +201,7 @@ not a profiler's attribution — and the total is measured rather than summed:
 | the TLS record layer, and tracing to JSON | about 1% each |
 | entering the interpreter, and the route's own body | near zero — see below |
 
-[ADR 0016](docs/adr/0016-w6-performance.md) carries the microsecond figures, the
+[ADR 0011](docs/adr/0011-the-web-track.md) carries the microsecond figures, the
 per-workload throughput table and the Rust floor each row is measured against.
 They live there because they move whenever the service does, and a reader who
 needs them needs the conditions with them.
@@ -227,7 +227,7 @@ agreeing with both interpreters on every input first — and applied to a
 one-third interpreter share it still projects **under the 1.50x bar fixed before
 any of these numbers existed**, and under the ceiling an infinitely fast backend
 would have. Three of the four criteria fail.
-[ADR 0016](docs/adr/0016-w6-performance.md) is the argument, including three
+[ADR 0011](docs/adr/0011-the-web-track.md) is the argument, including three
 measured reasons to think even that projection is optimistic. **The lesson is
 Amdahl's, not Cranelift's** — a faster backend cannot reach what it is not a
 large enough share of, so read a loss here as a fact about where the time is.
@@ -443,7 +443,7 @@ Read [DESIGN.md](DESIGN.md) for the language and the reasoning,
 
 Native codegen is the one planned milestone that has not landed, and it is
 deferred on measurement rather than on effort — see
-[ADR 0016](docs/adr/0016-w6-performance.md) for the exact number that would
+[ADR 0011](docs/adr/0011-the-web-track.md) for the exact number that would
 reopen it.
 
 ## Building

@@ -119,7 +119,7 @@ test "a growing accumulator in a non-last argument position" {
 }
 "#;
 
-/// The identical loop with the append moved into last position, which ADR 0025 §Context measures at
+/// The identical loop with the append moved into last position, which the ownership design measures at
 /// 200 of 200 in place.
 const LINEAR_BY_POSITION: &str = r#"
 fn grow(i: Int, n: Int, acc: List<Int>) -> List<Int> =

@@ -265,7 +265,7 @@ test "two regions in one test are two cells" {
 }
 "#;
 
-/// Every carrier ADR 0017 §2 names is refused, including the closure route it lists first among the
+/// Every carrier the escape brand names is refused, including the closure route it lists first among the
 /// ways this could go wrong.
 #[test]
 fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
@@ -565,7 +565,7 @@ test "a continuation resumed after its region returned reads that region's cell"
 }
 "#;
 
-/// ADR 0005 §3.2's "resumes twice", with the second resumption's write landing on the first one's:
+/// the two-resumption example's "resumes twice", with the second resumption's write landing on the first one's:
 /// one threaded world, not a snapshot per resumption.
 #[test]
 fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {

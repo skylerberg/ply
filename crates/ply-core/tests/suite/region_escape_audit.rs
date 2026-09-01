@@ -1,4 +1,4 @@
-//! An adversarial reading of ADR 0017 §2, taken as a claim to be falsified rather than as a design
+//! An adversarial reading of the escape brand, taken as a claim to be falsified rather than as a design
 //! to be illustrated.
 
 use ply_core::{CheckOutput, check_program};
@@ -202,7 +202,7 @@ fn consume() -> Int = with_cell[k](0) { other ->
     );
 }
 
-/// A footprint's resource is the region's **name** (ADR 0008 §6), so a caller whose own region is
+/// A footprint's resource is the region's **name** (host effects having no region isolation), so a caller whose own region is
 /// spelled `k` discharges `cell.read[k]` out of everything its region encloses.
 #[test]
 fn only_a_written_row_can_put_a_foreign_regions_atom_in_a_callers_row() {
@@ -240,7 +240,7 @@ fn inside() -> Int = with_cell[k](0) { c -> touches(cell_get(c)) }",
 
 // --- the routes out of a bare `with_cell` -----------------------------------
 
-/// ADR 0017 §2, the closure clause, applied to the region ADR 0017 §1 says a `with_cell` is.
+/// the escape brand, the closure clause, applied to the region the region model says a `with_cell` is.
 #[test]
 fn a_closure_capturing_a_bare_with_cells_cell_is_an_escape() {
     let d = code(
@@ -262,7 +262,7 @@ fn a_reader_and_writer_pair_over_a_bare_with_cells_cell_is_an_escape() {
     names(&d, "escapes its `with_cell[k]` region");
 }
 
-/// The operation route, which ADR 0017 calls "the route no other check can see" and closes for
+/// The operation route, which the region model calls "the route no other check can see" and closes for
 /// `with_region` in `Checker::check_region_handoffs`.
 #[test]
 fn a_bare_with_cells_cell_handed_to_a_generic_operation_is_an_escape() {
