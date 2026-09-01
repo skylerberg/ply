@@ -129,7 +129,7 @@ impl Harness {
         self.hybrid.compiled_counts()
     }
 
-    /// A direct native call, outside any machine: ADR 0016's original path, and the only one that
+    /// A direct native call, outside any machine: the performance verdict's original path, and the only one that
     /// can report the fragment's own failure.
     pub fn compiled_call(&mut self, name: &str, args: &[Value]) -> Result<Value> {
         self.bodies

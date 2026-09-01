@@ -86,7 +86,7 @@ fn codes_of(diags: &[Diagnostic]) -> Vec<&str> {
     diags.iter().map(|d| d.code).collect()
 }
 
-/// ADR 0017 §2's list, walked to the end.
+/// the escape brand's list, walked to the end.
 #[test]
 fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     let carriers: &[(&str, &str)] = &[
@@ -128,7 +128,7 @@ fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     }
 }
 
-/// W2's hole was a check that ran *before* alias resolution, and ADR 0017's Consequences name it as
+/// W2's hole was a check that ran *before* alias resolution, and the region model's Consequences name it as
 /// the way an escape gets past the brand.
 #[test]
 fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
@@ -172,7 +172,7 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
-/// The route the ADR deliberately leaves open, taken past the argument that opens it.
+/// The one route the brand deliberately leaves open, taken past the argument that opens it.
 #[test]
 fn a_task_outliving_its_regions_close_reads_that_region_and_not_the_one_after_it() {
     let attack = Compiled::new(
@@ -330,7 +330,7 @@ pub fn attack() -> Int =
     assert_eq!(stats.slots_reclaimed_late, 1);
 }
 
-/// ADR 0017 §2's one open route — a continuation parked in an enclosing region's cell, where a
+/// the escape brand's one open route — a continuation parked in an enclosing region's cell, where a
 /// nominal constructor's field type erases the brand — with a second region placed where the freed
 /// slot would be.
 #[test]

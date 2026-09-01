@@ -1236,7 +1236,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         assert_ne!(one, blocks, "blocking alone must move the digest");
 
         // The newest column, and the one whose value a reviewer most needs a diff for: a handler
-        // that quietly became able to receive a credential is where ADR 0015 §2.1's claim stops
+        // that quietly became able to receive a credential is where the secret containment claim's claim stops
         // being enforceable.
         let secrets = registry(vec![receives_secrets(op(
             "clock",
@@ -1496,7 +1496,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         );
     }
 
-    /// ADR 0014 §1.1 handles `db.rollback` in Ply, inside `transaction`, so a bound one would abort
+    /// transactions as handlers handles `db.rollback` in Ply, inside `transaction`, so a bound one would abort
     /// nothing and commit what the program meant to discard.
     #[test]
     fn a_bound_rollback_is_refused_as_a_defect_rather_than_listed() {
@@ -1636,7 +1636,7 @@ fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
         );
     }
 
-    /// ADR 0013 §6.4: a CI check that broke on every certificate renewal is a CI check people learn
+    /// the trusted computing base listing: a CI check that broke on every certificate renewal is a CI check people learn
     /// to ignore.
     #[test]
     fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {

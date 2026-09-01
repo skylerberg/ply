@@ -6,7 +6,7 @@ use ply_eval::host::Pending;
 use ply_syntax::ast::Mode;
 use std::sync::atomic::AtomicI64;
 
-/// A clock that counts, because the number §1.4 owes is "a discarded event reads the clock zero
+/// A clock that counts, because the number a span's cost owes is "a discarded event reads the clock zero
 /// times" and nothing else can assert it.
 #[derive(Default)]
 struct Counting {
@@ -463,7 +463,7 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
 
 // --- what a span costs when nothing is collecting ---------------------------------
 
-/// The claim §1.4 makes, in the one form that can be checked here: under `discard` no record is
+/// The claim a disabled span makes, in the one form that can be checked here: under `discard` no record is
 /// written and the clock is read **zero** times, whatever the operation.
 #[test]
 fn a_discarded_record_reads_no_clock_and_writes_nothing() {

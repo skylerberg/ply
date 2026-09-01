@@ -662,8 +662,7 @@ pub fn served(
 /// Rows within this much of the best throughput are the same measurement.
 const FLAT: f64 = 0.05;
 
-/// The row of a served sweep a rung is read off: the concurrency that maximizes throughput (ADR
-/// 0016 §1.4), with a flat curve resolved to its lowest concurrency rather than to its luckiest.
+/// The row of a served sweep a rung is read off: the concurrency that maximizes throughput (the ladder's own rule), with a flat curve resolved to its lowest concurrency rather than to its luckiest.
 pub fn best(points: &[Served], stack: &str, sink: &str, route: &str) -> Option<Served> {
     let matching: Vec<&Served> = points
         .iter()
@@ -797,7 +796,7 @@ fn replace_calls(source: &str, name: &str) -> String {
 }
 
 /// What the constant memo is worth **end to end on the served workload**, which is the only shape
-/// ADR 0016 §4 accepts as a price.
+/// the cheaper levers accepts as a price.
 #[allow(clippy::too_many_arguments)]
 pub fn memo_lever(
     repo: &Path,
@@ -1012,7 +1011,7 @@ pub fn report(
             stack.requests,
         ),
         from_served(w6::Layer::Tls, DB_ROUTE, &tls_with, &tls_without),
-        // ADR 0016 §1.2 pins this rung's `without` as `run_memory`.
+        // the workload ladder pins this rung's `without` as `run_memory`.
         from_served(
             w6::Layer::Database,
             "/items against /health",
@@ -1116,7 +1115,7 @@ pub fn report(
     })
 }
 
-/// What the ladder run priced of ADR 0016 §4, as measured numbers rather than as prose.
+/// What the ladder run priced of the cheaper levers, as measured numbers rather than as prose.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Levers {
     /// The served end-to-end ratio of the shipped service against the same service with its nullary
@@ -1190,7 +1189,7 @@ const LEVER_PROSE: [(&str, &str, &str); 7] = [
     ),
     (
         "the frame push",
-        "ADR 0005's four heap allocations per frame push, paid per node the machine suspends inside.",
+        "the control-stack design's four heap allocations per frame push, paid per node the machine suspends inside.",
         "A cheaper frame representation touches capture, splice and every frame kind.",
     ),
     (
@@ -1307,7 +1306,7 @@ fn limits(
     });
     limits.push(w6::Limit {
         what: "No cancellation, no backpressure, no load shedding".to_string(),
- why: "ADR 0011 left cancellation unresolved through W5, and W4's promise of backpressure was \
+ why: "the host boundary contract left cancellation unresolved through W5, and W4's promise of backpressure was \
        broken explicitly by W5's `not in` list."
             .to_string(),
         evidence: None,
@@ -1342,7 +1341,7 @@ fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
   and the only one available in process is std.db's memory engine, whose SQL scanner is on no \
   served request path. /items' own decode and encode therefore sit inside the database rung."
             .to_string(),
- "The TLS handshake. The tls rung is steady state over connections carrying 32 requests, as ADR \
+ "The TLS handshake. The tls rung is steady state over connections carrying 32 requests, as the ladder \
   0016 section 1.2 requires."
             .to_string(),
  "Multi-core throughput, deliberately: one machine is one core and a process-per-core number \
@@ -1351,7 +1350,7 @@ fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
         "Env::lookup's depth sweep, and the writes and copies a response makes.".to_string(),
         format!(
             "The ladder's rungs and total are taken on the {} accept loop rather than the \
-             task-per-connection one ADR 0016 section 1.6 pins, and the reason is measured rather \
+             task-per-connection one the performance verdict section 1.6 pins, and the reason is measured rather \
              than preferred: a spawning service opens a production region for its whole life and \
              the constant memo is refused inside an open region, so the two arenas would be in \
              different regimes — an in-process numerator that memoizes over a served denominator \
@@ -1382,7 +1381,7 @@ fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
         .collect();
     if !unpriced.is_empty() {
         out.push(format!(
- "As an end-to-end speedup on the served workload: {}. ADR 0016 section 2.5 makes an unpriced \
+ "As an end-to-end speedup on the served workload: {}. the performance verdict section 2.5 makes an unpriced \
   lever sufficient on its own to keep deferring.",
             unpriced.join(", ")
         ));

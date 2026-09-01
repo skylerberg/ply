@@ -349,7 +349,7 @@ fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
     assert!(!crate::contends_only_over_regions(&Footprint::empty()));
 }
 
-/// What ADR 0017 §6 costs, at the smallest size that has it: three tests over two labels colour
+/// What region isolation costs, at the smallest size that has it: three tests over two labels colour
 /// into two groups, and the two that share `users` are the pair that used to be free.
 #[test]
 fn tests_naming_one_region_label_are_coloured_apart() {
@@ -433,7 +433,7 @@ fn every_region_isolated_test_lands_in_group_zero() {
     }
 }
 
-/// ADR 0005 §5's property, with the population ADR 0017 §6 leaves it: what is free to add is a test
+/// the isolation rule's property, with the population region isolation leaves it: what is free to add is a test
 /// that names nothing another test can reach.
 #[test]
 fn adding_region_isolated_tests_does_not_change_the_group_count() {
@@ -1500,7 +1500,7 @@ fn with_footprint(program: &mut Program, name: &str, footprint: Footprint) {
     program.check.tests[index].footprint = footprint;
 }
 
-/// ADR 0017 §6's lost case, end to end on the real runner: two tests whose only atoms name one
+/// region isolation's lost case, end to end on the real runner: two tests whose only atoms name one
 /// label used to share a group and are coloured apart now.
 #[test]
 fn two_tests_retaining_the_same_cell_resource_are_coloured_apart() {
@@ -1658,7 +1658,7 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
     );
 }
 
-/// The region ADR 0017 §6 asks `ply-test` for: a worker outlives a single test, so a test that
+/// The region region isolation asks `ply-test` for: a worker outlives a single test, so a test that
 /// inherited the previous one's cells would be sharing state through the back door the whole design
 /// exists to close.
 #[test]

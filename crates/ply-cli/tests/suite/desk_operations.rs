@@ -93,7 +93,7 @@ fn desk_types() -> String {
 
 // --- liveness and readiness -------------------------------------------------
 
-/// ADR 0015 §6.1, and the reason the two routes exist rather than one.
+/// health and readiness as routes, and the reason the two routes exist rather than one.
 #[test]
 fn health_has_no_row_and_ready_names_what_it_verifies() {
     let types = desk_types();
@@ -174,7 +174,7 @@ fn two_channels_are_two_atoms_rather_than_one_recording_capability() {
 
 // --- configuration ----------------------------------------------------------
 
-/// ADR 0015 §3.6: configuration is read at start-up and is a value thereafter.
+/// start-up versus per-request configuration: configuration is read at start-up and is a value thereafter.
 #[test]
 fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
     let types = desk_types();
@@ -234,12 +234,12 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     let store = std::fs::read(dir.path().join(".ply-cache/frontend.dat")).unwrap_or_default();
     assert!(
         String::from_utf8_lossy(&store).contains("twin-key-not-a-credential"),
-        "ADR 0015 §2.5 (1) says a source literal enters the store; if that stopped \
-         being true the sentence in the ADR needs rewriting, not this test"
+        "what secrets do not prevent (1) says a source literal enters the store; if that stopped \
+         being true the sentence in the record needs rewriting, not this test"
     );
 }
 
-/// ADR 0015 §2.3 as a fixture: every route out of a `Secret` is a compile error, and this is the
+/// the closed exfiltration routes as a fixture: every route out of a `Secret` is a compile error, and this is the
 /// list.
 #[test]
 fn every_route_out_of_a_secret_is_a_compile_error() {
@@ -314,7 +314,7 @@ fn the_desks_laws_still_hold_over_a_service_that_records_and_authenticates() {
 
 // --- what an operator reads before starting it ------------------------------
 
-/// ADR 0015 §6.5's two new blocks, over the desk.
+/// the host listing's two new blocks, over the desk.
 #[test]
 fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     let desk = repo("examples/desk.ply");
@@ -340,7 +340,7 @@ fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     off.silent_about("→ nothing · level");
 }
 
-/// ADR 0015 §6.5's digest rule, which is the whole reason the blocks are hashed rather than only
+/// the host listing's digest rule, which is the whole reason the blocks are hashed rather than only
 /// printed: a structural change to the trusted computing base breaks CI, and a deployment's own
 /// configuration does not.
 #[test]

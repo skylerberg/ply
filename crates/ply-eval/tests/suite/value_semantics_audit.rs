@@ -1,4 +1,4 @@
-//! An adversarial audit of what a `Value` *means* after ADR 0019 §1 and §2.
+//! An adversarial audit of what a `Value` *means* after the argument-vector pool and the constant-value memo.
 
 // A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; the same
 // allow `secrets.rs` carries, for the same reason.
@@ -186,7 +186,7 @@ pub fn deep(s: Secret<String>) -> Int = descend(2000, s)
 pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 10 + d
 "#;
 
-/// ADR 0015 §2 as a bound on the free list, measured through the machine.
+/// the secret containment claim as a bound on the free list, measured through the machine.
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     let compiled = compile(SECRET_ARGUMENTS);
@@ -632,9 +632,9 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
     }
 }
 
-// --- 8. the width ADR 0019 §4 rejected narrowing at -------------------------
+// --- 8. the width the refusal to narrow `Value` rejected narrowing at -------------------------
 
-/// ADR 0019 §4 refuses to narrow `Value` and §"What would make this ADR wrong" names *"if a build
+/// the refusal to narrow `Value` names, among the things that would make it wrong, *"if a build
 /// agent has to widen `Value` past 32 bytes to land any of this"* as one of five conditions that
 /// would sink the document.
 #[test]
@@ -642,7 +642,7 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     assert_eq!(
         size_of::<Value>(),
         32,
-        "`Value` changed width; ADR 0019 §4's refusal to narrow it and §1's arithmetic over \
+        "`Value` changed width; the refusal to narrow it and the pool's arithmetic over \
          885.6 Value-wide slots per request were both taken at 32"
     );
     assert_eq!(

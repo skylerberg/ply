@@ -52,7 +52,7 @@ const AMB: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 "#;
 
-/// The case ADR 0017 §3 says is common and free: a region that allocates, reads and writes its own
+/// The case the region-kind rule says is common and free: a region that allocates, reads and writes its own
 /// cells and performs nothing.
 #[test]
 fn a_region_that_performs_nothing_and_handles_nothing_is_unique() {
@@ -82,7 +82,7 @@ fn nested() -> Int =
 }
 
 /// A `with_cell[r]` written inside `with_region[r]` allocates into that region rather than opening
-/// one of its own — ADR 0017 §1.
+/// one of its own — the region model.
 #[test]
 fn a_cell_inside_a_region_of_its_own_brand_opens_no_second_region() {
     let src = r#"
@@ -142,7 +142,7 @@ fn search() -> Int =
     assert!(site.through.is_empty(), "the site is written in the region");
 }
 
-/// A tail-resumptive clause captures too — ADR 0005 §1.3 runs `K.capture(n)` for both forms — and
+/// A tail-resumptive clause captures too — the machine's capture rule runs `K.capture(n)` for both forms — and
 /// the difference is observable, because the clause writes the region before it resumes.
 #[test]
 fn a_tail_resumptive_clause_inside_the_region_makes_it_shared() {
@@ -306,7 +306,7 @@ fn apply(f: () -> Int) -> Int =
     );
 }
 
-/// ADR 0017 §3's own two-resumption example with `handle` and `with_cell` swapped, which is the
+/// the region-kind rule's own two-resumption example with `handle` and `with_cell` swapped, which is the
 /// shape every backtracking handler over scratch state has.
 #[test]
 fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
@@ -354,7 +354,7 @@ fn once() -> Int =
 }
 
 /// Every shape of region, under one enclosing handler: `with_region[r]` with a `with_cell[r]`
-/// inside it — ADR 0017 §3's own syntax — two nested regions, and a region opened inside a `map`
+/// inside it — the region syntax — two nested regions, and a region opened inside a `map`
 /// callback.
 #[test]
 fn the_enclosing_handle_hides_the_capture_for_no_shape_of_region() {
@@ -420,8 +420,8 @@ fn search() -> Int =
     assert_eq!(kind_of(hoisted, "trace"), RegionKind::Shared);
 }
 
-/// The annotation is the backstop, so it has to fire on the same programs the inference does — ADR
-/// 0017 §3: forcing `unique` where a capture is reachable "is a compile error naming the capture
+/// The annotation is the backstop, so it has to fire on the same programs the inference does — the region-kind rule:
+/// forcing `unique` where a capture is reachable "is a compile error naming the capture
 /// site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {
@@ -485,7 +485,7 @@ fn refusals(src: &str, brand: &str, kind: RegionKind) -> Vec<Diagnostic> {
     }
 }
 
-/// ADR 0017 §3: forcing `unique` where a capture is reachable is a compile error naming the capture
+/// the region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
 /// site.
 #[test]
 fn forcing_unique_where_a_capture_is_reachable_is_refused_and_names_the_site() {

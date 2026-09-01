@@ -159,7 +159,7 @@ fn ask(k: Int) -> Int / {wire.read[log]} = wire.peek[log](k)
 test/nondet "reaches the host" { assert_eq(ask(1), 99) }
 "#;
 
-/// The claim ADR 0008 §3 and ADR 0011 §5 are built on, end to end: a run that reached a real
+/// The claim host determinism propagation and hermetic by default are built on, end to end: a run that reached a real
 /// handler writes nothing, so the next run cannot believe it.
 #[test]
 fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
@@ -206,7 +206,7 @@ fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
-/// A **deterministic** effect, which ADR 0011 §4 permits a host handler to serve and which nothing
+/// A **deterministic** effect, which determinism propagation permits a host handler to serve and which nothing
 /// in W1's trusted computing base currently does.
 const DETERMINISTIC: &str = r#"
 effect disk {
@@ -226,7 +226,7 @@ fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     let calls = Arc::new(AtomicUsize::new(0));
     let binding = registry("disk", "peek", Determinism::Deterministic, &calls)
         .bind(&compiled.check)
-        .expect("a deterministic handler over a `det` effect binds; ADR 0011 §4 permits it");
+        .expect("a deterministic handler over a `det` effect binds; determinism propagation permits it");
 
     assert!(
         binding.reaches(
@@ -259,7 +259,7 @@ fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached()
     assert_eq!(
         reason(&compiled, &store, name),
         Reason::Cached,
-        "ADR 0011 §5 requires `Reason::Host` here: a test whose footprint reaches the binding \
+        "hermetic by default requires `Reason::Host` here: a test whose footprint reaches the binding \
          always runs"
     );
 

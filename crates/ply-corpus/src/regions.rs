@@ -1,4 +1,4 @@
-//! ADR 0017 §6: what removing the forkable world costs the scheduler.
+//! region isolation: what removing the forkable world costs the scheduler.
 
 use crate::rng::Rng;
 use anyhow::{Context, Result, bail};
@@ -34,8 +34,8 @@ pub fn isolated_by_forking(f: &Footprint) -> bool {
     forked_footprint(f).is_empty() && f.atoms().any(ply_test::is_region_scoped)
 }
 
-/// Isolated under the forkable world: the classification `isolated n of m` counted before ADR 0017
-/// §6, kept here because the counterfactual's baseline is that number and `ply-test` no longer
+/// Isolated under the forkable world: the classification `isolated n of m` counted before the region model
+/// Region isolation, kept here because the counterfactual's baseline is that number and `ply-test` no longer
 /// computes it.
 fn was_world_isolated(f: &Footprint) -> bool {
     forked_footprint(f).is_empty()
@@ -163,7 +163,7 @@ pub struct IsolationCost {
     /// Of the isolated: how many have an empty footprint and therefore conflict with nothing
     /// whatever the memory model is.
     pub pure: usize,
-    /// Of the isolated: how many carry only `sim.read`, which ADR 0017 does not touch.
+    /// Of the isolated: how many carry only `sim.read`, which the region model does not touch.
     pub seeded_only: usize,
     /// Of the isolated: how many carry a `cell` atom — the exemption forking pays for, and the only
     /// population that can lose anything here.
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(cost.wall_clock_ratio(), 2.0);
     }
 
-    /// The overstatement ADR 0017 §6 warns about, stated as a test: a pure test is free either way,
+    /// The overstatement region isolation warns about, stated as a test: a pure test is free either way,
     /// so adding a hundred of them must move nothing.
     #[test]
     fn pure_tests_cost_nothing_under_either_model() {

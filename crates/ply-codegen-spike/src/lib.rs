@@ -1,4 +1,4 @@
-//! ADR 0016 §3's spike, and nothing else.
+//! the codegen spike's spike, and nothing else.
 
 pub mod entry;
 pub mod jit;

@@ -197,8 +197,8 @@ pub struct EventPoint {
     pub operations: u32,
     pub per_operation_micros: f64,
     pub per_second: f64,
-    /// Microseconds this rung adds over `bare` at the same operation, which is the number ADR 0015
-    /// §1.4 owes.
+    /// Microseconds this rung adds over `bare` at the same operation, which is the number the operations design
+    /// a span's cost owes.
     pub over_bare_micros: f64,
 }
 

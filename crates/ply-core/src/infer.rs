@@ -2662,9 +2662,9 @@ impl<'a> Checker<'a> {
                  inhabits and no value for a binder to range over",
             )
             .note(
-                "docs/adr/0007-specs.md §3.2 records what a handler-parametric law would take — \
-                 a handler type, a `Value::Handler`, a normalization story and a generator — and \
-                 why the evidence such a law could produce is too weak to be worth it yet",
+                "a handler-parametric law would take a handler type, a `Value::Handler`, a \
+                 normalization story and a generator, and the evidence such a law could produce \
+                 is too weak to be worth that yet",
             )
             .note("quantify over the values the handler would answer with instead"),
         );
@@ -4259,7 +4259,7 @@ impl<'a> Checker<'a> {
         (result_ty, row)
     }
 
-    /// ADR 0017 §1: a cell is a value allocated in `r`.
+    /// the region model: a cell is a value allocated in `r`.
     fn infer_with_cell(
         &mut self,
         e: &Expr,
@@ -4486,7 +4486,7 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// ADR 0017 §2, asked once the module is solved for the reason [`Checker::check_simulations`]
+    /// the escape brand, asked once the module is solved for the reason [`Checker::check_simulations`]
     /// is asked then: the brand a value carries is routinely still an unsolved variable while the
     /// region around it is being walked, and a check that ran at the closing brace would answer
     /// about a type that had not been decided yet.

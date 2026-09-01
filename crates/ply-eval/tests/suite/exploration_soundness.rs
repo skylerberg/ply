@@ -326,7 +326,7 @@ fn an_abandoned_region_does_not_hide_the_schedules_it_cut_short() {
     assert_reaches_every_outcome("an abandoned region", ABANDONED_REGION);
 }
 
-/// ADR 0006 §6.1: "Two steps that are not dependent commute: executing them in either order from
+/// the dependence relation: "Two steps that are not dependent commute: executing them in either order from
 /// the same configuration reaches the same world and the same result."
 const ALLOCATING_TASKS: &str = r#"
 test "two tasks that each allocate a cell" {

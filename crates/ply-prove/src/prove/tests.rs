@@ -315,7 +315,7 @@ fn two_operators_that_overflowed_are_not_one_term() {
     not_proved(&f, "an overflowing sum is itself");
 }
 
-/// ADR 0007 §5.1(a) reasons over ℤ.
+/// the decidable fragment(a) reasons over ℤ.
 #[test]
 fn arithmetic_is_proved_only_where_the_result_is_an_int() {
     let f = fixture(BOUNDARIES);
@@ -579,7 +579,7 @@ fn once() -> Int { let n = counter.next(); n - n }
 "#;
 
 /// An `ensures` on an effectful definition is attempted statically before it is reported as a gap
-/// (ADR 0007 §7.4), so the prover does see impure bodies — and **a call that performs is not a
+/// (the unhandled-effect gap), so the prover does see impure bodies — and **a call that performs is not a
 /// function of its arguments.**
 #[test]
 fn two_calls_to_an_effectful_definition_are_not_one_term() {
@@ -730,7 +730,7 @@ fn ensures_goal(source: &str, clause: &str) -> Decision {
     )
 }
 
-/// The postcondition of ADR 0007 §1.1, end to end: `result` is bound to the definition's own body,
+/// The postcondition of spec clause syntax, end to end: `result` is bound to the definition's own body,
 /// the constructor is injective, the accessors unfold, and the arithmetic closes.
 #[test]
 fn a_postcondition_over_a_definition_decides_both_directions() {

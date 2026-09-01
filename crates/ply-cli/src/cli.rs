@@ -595,7 +595,7 @@ pub struct BuildArgs {
     ///
     /// A schema is a nullary function nothing in the entry point's closure
     /// calls, so without this it is not in the artifact and the deployed form
-    /// loses the start-up refusal §3.4 exists for.
+    /// loses the start-up refusal a config schema exists for.
     #[arg(long = "config-schema", value_name = "MODULE.FN")]
     pub config_schema: Option<String>,
 

@@ -62,8 +62,7 @@ pub struct Cranelift {
     /// The subset of `compiled` whose whole signature is `Int` or `Bool`, which is the only part
     /// the machine can ever be offered.
     members: BTreeSet<Symbol>,
-    /// Definitions the fragment refused, with the construct that refused each — the ranking ADR
-    /// 0018 §0's roadmap is read off.
+    /// Definitions the fragment refused, with the construct that refused each — the ranking the compute-kernel record's roadmap is read off.
     refusals: Vec<(String, String)>,
     counters: Counters,
     /// Nanoseconds the fixpoint below took: whole-program, paid once, and the half that does

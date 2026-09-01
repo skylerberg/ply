@@ -149,7 +149,7 @@ fn restoring_a_snapshot_costs_the_allocator_nothing() {
     arena.close(r);
 }
 
-/// The measurement ADR 0017 asks for: what a capture costs as a function of the region it crosses.
+/// The measurement the region model asks for: what a capture costs as a function of the region it crosses.
 #[test]
 fn snapshot_cost_as_a_function_of_region_size() {
     const REPEATS: usize = 200;

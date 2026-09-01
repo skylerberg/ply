@@ -633,7 +633,7 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
     assert_eq!(footprint(&out, "isolated"), "{}");
 }
 
-/// ADR 0005 §4.1.
+/// the handle typing rule.
 #[test]
 fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
     let out = check(vec![
@@ -667,7 +667,7 @@ fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
     assert_eq!(sig(&out, "resumed"), "() -> Int");
 }
 
-/// ADR 0005 §4.2.
+/// footprint invariance under multi-shot.
 #[test]
 fn resuming_zero_once_or_twice_gives_one_footprint() {
     let program = |body: Expr| {
@@ -3424,7 +3424,7 @@ fn a_law_body_that_performs_an_ordinary_effect_is_rejected() {
     );
 }
 
-/// ADR 0014 §6.1.
+/// a law that may reach the world.
 #[test]
 fn a_law_host_relaxes_its_body_and_never_its_guard() {
     let diags = check_src_err(&format!(
@@ -3462,7 +3462,7 @@ fn a_law_cannot_quantify_over_a_handler() {
         let d = only(&diags, codes::UNQUANTIFIABLE_TYPE);
         assert!(d.message.contains("a handler"), "{}", d.message);
         assert!(
-            d.notes.iter().any(|n| n.contains("0007-specs.md §3.2")),
+            d.notes.iter().any(|n| n.contains("handler-parametric law")),
             "{}",
             render(&diags)
         );

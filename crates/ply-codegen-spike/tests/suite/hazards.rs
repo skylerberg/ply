@@ -314,7 +314,7 @@ fn a_cell_cannot_be_a_parameter_of_a_function_that_reads_it() {
     );
 }
 
-// -- 5. No `Float` path, and it is wider than ADR 0018 §0 states -------------
+// -- 5. No `Float` path, and it is wider than the compute-kernel record states -------------
 
 /// A `Float` or `Decimal` in the signature is refused twice and offered never.
 #[test]

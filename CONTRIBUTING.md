@@ -183,7 +183,7 @@ the timing suites need a job of their own.
    only check.** (Re-take the figure rather than quoting it; `docs/ONBOARDING.md`
    §7 gives the command.)
 4. If you changed something the shipped measurement files describe, re-take
-   them. The command is in `docs/adr/0016-w6-performance.md` §"Provenance"; the
+   them. The command is in `docs/adr/0011-the-web-track.md` §"Provenance"; the
    three tests that will fail otherwise are
    `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`,
    `w6_report_allocations::the_shipped_allocation_evidence_still_describes_this_request_path`
@@ -225,7 +225,7 @@ it should exist.
 - a **trap** — *a stale binary answers questions about the language wrongly*.
 - a **wrong instrument** — the right number measured for the wrong question. This
   is the one that a re-take cannot catch, because every figure stands and what
-  moved is the inference. ADR 0024 §4 is the worked example.
+  moved is the inference. ADR 0024 is the worked example.
 
 Each of those is frozen at birth. **If a note could ever need a note of its own,
 it should not have been a note** — that is the test, and everything nested in
@@ -465,7 +465,7 @@ the refusing and confirm it can fire. Two live examples of what this catches:
   statement, on first execution). `README.md` §"What is missing" had this right
   all along. This is the W1 defect exactly — a check advertised and never armed —
   and it is left legible rather than deleted for that reason.
-- ~~ADR 0016's spike figures cannot be re-taken because the spike does not
+- ~~ADR 0011's spike figures cannot be re-taken because the spike does not
   compile.~~ Stale twice over: R4 repaired the crate, and CI's `spike` job now
   builds and tests it on every push. See §"Things known to be broken" item 1,
   which has carried the correction since 2026-08-21.
@@ -558,8 +558,7 @@ reader finding an ambiguous `ADR NNNN` citation months later.
 
 ADR 0005 is superseded in part by ADR 0017, and it is the model for how to record
 that: 0005's *title* does not say so, but its header carries
-`Status: accepted — … §2's persistent forkable world is **superseded by ADR
-0017**` and `Superseded in part by: docs/adr/0017-regions.md (§2 only)`, and §2
+`Status: accepted — … §2's persistent forkable world is **superseded by ADR 0017**` and `Superseded in part by: docs/adr/0017-regions.md (§2 only)`, and §2
 itself opens with a `> **Superseded by ADR 0017.**` block. Do that in both files.
 
 **Amend an ADR in place; do not append a note saying what it used to say.** This
@@ -589,7 +588,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-core/src/ty.rs` `conflicts_with` | test scheduling, silently — tests still pass, they just stop running concurrently, or start racing |
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
 | `crates/ply-eval/src/code.rs` | `crates/ply-codegen-spike`, which **nothing in the workspace compiles**. It has now bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4. It builds today, on the default toolchain since the move to cranelift 0.132.3 (this used to read `cargo +1.94.0 test --release`): `cd crates/ply-codegen-spike && cargo test --release`. Run that after touching this file, or the only instrument for pricing codegen stops answering. CI's `spike` job runs exactly that command, so a break is caught at the pull request rather than at the next re-take |
-| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 §6 is the worked example |
+| how a `Value` is built or shared | `crates/ply-corpus/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 is the worked example |
 | the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |

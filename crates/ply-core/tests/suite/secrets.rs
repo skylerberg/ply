@@ -1,4 +1,4 @@
-//! ADR 0015 §2 at the type level: every route a credential could take out of a program, and the
+//! the secret containment claim at the type level: every route a credential could take out of a program, and the
 //! diagnostic that closes it.
 
 use ply_core::{CheckOutput, check_program, print_type};
@@ -139,7 +139,7 @@ fn derive_eq_accepts_a_secret_field() {
 derive eq for Login");
 }
 
-/// §2.5 (7): presence is deliberately observable, so a start-up can tell a missing credential from
+/// Presence is deliberately observable, so a start-up can tell a missing credential from
 /// a wrong one.
 #[test]
 fn presence_is_observable_and_answers_a_bool() {

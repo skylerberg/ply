@@ -912,7 +912,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// calls the runtime broken.
 const FRUITLESS_PARKS: u32 = 1024;
 
-/// A host operation reached a `simulate` region — ADR 0011 §7's `E0425`, caught at the scheduler
+/// A host operation reached a `simulate` region — the footprint check's `E0425`, caught at the scheduler
 /// because that is where it would otherwise take effect.
 #[cold]
 #[inline(never)]

@@ -177,7 +177,7 @@ pub struct TestResult {
     pub recorded: Option<Record>,
     /// Whether the backend oracle actually compared a pair on this test.
     pub audited: Option<bool>,
-    /// What this test asked of a compiled backend, and the fact ADR 0026 §4.6's stage two reads: a
+    /// What this test asked of a compiled backend, and the fact the cache rule's stage two reads: a
     /// written `Pass` beside a non-zero `entries` is a run that cached a third execution strategy's
     /// verdict.
     pub backend: Option<BackendUse>,
@@ -1081,7 +1081,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
     }
 }
 
-/// Turns each failure's raw suspect list into the ranked, annotated attribution of ADR 0004.
+/// Turns each failure's raw suspect list into the ranked, annotated attribution of the failure artifact.
 pub fn diagnose_failures(
     report: &mut RunReport,
     program: &Program,

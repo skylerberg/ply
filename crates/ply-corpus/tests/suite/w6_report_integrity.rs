@@ -128,7 +128,7 @@ fn an_absent_alternatives_list_cannot_advance_m9() {
     assert_eq!(
         decision.verdict,
         Verdict::Defer,
-        "an empty alternatives array prices none of §4's levers, so C3 fails at its widest"
+        "an empty alternatives array prices none of the cheaper levers, so C3 fails at its widest"
     );
     let findings = report.audit();
     for lever in &w6::LEVERS {
@@ -164,7 +164,7 @@ fn a_measurement_file_cannot_price_a_lever_by_asserting_it() {
     );
 }
 
-/// What the shipped file *does* price, and that the lever it prices is one of §4's rather than one
+/// What the shipped file *does* price, and that the lever it prices is one of the roster's rather than one
 /// of its own invention.
 #[test]
 fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
@@ -178,7 +178,7 @@ fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
     for name in &priced {
         assert!(
             w6::LEVERS.iter().any(|l| l.name == *name),
-            "`{name}` is priced and is not in ADR 0016 §4"
+            "`{name}` is priced and is not in the cheaper levers"
         );
     }
     for alternative in report.alternatives.iter().filter(|a| a.is_priced()) {
@@ -345,7 +345,7 @@ fn the_shipped_verdict_turns_on_c3() {
     assert!(judged.evidence, "C4: {:?}", judged.failures);
     assert!(
         !w6::c3_gaps(&report.alternatives).is_empty(),
-        "C3 is what the deferral rests on, so the report needs at least one unpriced §4 lever"
+        "C3 is what the deferral rests on, so the report needs at least one unpriced lever"
     );
 
     let share = ladder.conservative_share;

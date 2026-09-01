@@ -1,4 +1,4 @@
-//! ADR 0017 §4 asked of whole programs rather than of synthetic expressions.
+//! the reference-counting pass asked of whole programs rather than of synthetic expressions.
 
 use ply_eval::{Machine, rc};
 use ply_span::{SourceId, SourceMap};
@@ -72,7 +72,7 @@ test "a captured list keeps its length" {
     );
 }
 
-/// ADR 0017 §5 gives every task its own region stack, and a value two tasks reach is a value
+/// per-task region stacks gives every task its own region stack, and a value two tasks reach is a value
 /// neither may rewrite.
 #[test]
 fn a_list_two_tasks_reach_is_copied_rather_than_rewritten() {
@@ -143,7 +143,7 @@ test "a parked continuation reads a binding the block released" {
     );
 }
 
-/// A fold whose accumulator nothing else holds is the case §4 exists for, and the one the whole
+/// A fold whose accumulator nothing else holds is the case the reference-counting pass exists for, and the one the whole
 /// scheme is paid for by.
 #[test]
 fn a_fold_accumulator_nothing_else_holds_is_rewritten_in_place() {

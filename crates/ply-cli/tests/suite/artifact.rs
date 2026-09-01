@@ -1,4 +1,4 @@
-//! Deployment over the content-addressed store: ADR 0015 §5.
+//! Deployment over the content-addressed store: the deployment artifact.
 
 use assert_cmd::Command;
 use ply_cli::artifact::{self, Artifact};
@@ -584,7 +584,7 @@ fn a_rename_moves_a_name_and_no_hash() {
 
 // --- what the command prints ---------------------------------------------------
 
-/// ADR 0015 §5.1 refused incremental transfer because the binary is the part that actually changes.
+/// the refusal of incremental transfer refused incremental transfer because the binary is the part that actually changes.
 #[test]
 fn the_build_prints_the_artifacts_size_beside_the_binarys() {
     let dir = project(PROGRAM);
@@ -610,7 +610,7 @@ fn the_build_prints_the_artifacts_size_beside_the_binarys() {
     );
     assert!(
         binary_bytes > artifact_bytes,
-        "the ratio §5.1 argued from: artifact {artifact_bytes}, binary {binary_bytes}"
+        "the ratio the whole-artifact decision argued from: artifact {artifact_bytes}, binary {binary_bytes}"
     );
 }
 
@@ -784,7 +784,7 @@ fn an_entry_point_that_takes_an_argument_is_refused() {
 
 /// The gap `ply build` and the shutdown sequence each left on the other's side: a run from a
 /// `.plyx` bound no signal handler, so a readiness route that consults `signal.stopping()` — which
-/// ADR 0015 §6.1 says is *the* thing a readiness route checks — answered `E0424` in the deployed
+/// health and readiness as routes says is *the* thing a readiness route checks — answered `E0424` in the deployed
 /// form and `false` in the source form.
 #[test]
 fn an_artifact_run_binds_the_signal_handler_a_source_run_binds() {

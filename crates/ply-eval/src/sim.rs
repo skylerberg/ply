@@ -213,7 +213,7 @@ pub enum SimMode {
     Once,
     /// One interleaving per root.
     Random,
-    /// The search of ADR 0006 §6.2.
+    /// The search of the backtrack-set search.
     #[default]
     Dpor,
 }
@@ -580,7 +580,7 @@ impl fmt::Display for OpSignature {
     }
 }
 
-/// The clause set [`Handlers`] installs, which is ADR 0006 §1.1's declaration of `clock` and
+/// The clause set [`Handlers`] installs, which is the prelude effect declarations's declaration of `clock` and
 /// `random` and nothing besides.
 pub const SEEDED_OPS: &[OpSignature] = &[
     OpSignature {
@@ -1051,7 +1051,7 @@ mod tests {
         assert!(one.conflicts_with(&also_one));
     }
 
-    /// The mistake ADR 0006 §6.1 exists to prevent: two tasks share one world, so a `cell` access
+    /// The mistake the dependence relation exists to prevent: two tasks share one world, so a `cell` access
     /// is part of the dependence relation.
     #[test]
     fn cell_accesses_are_in_the_relation() {

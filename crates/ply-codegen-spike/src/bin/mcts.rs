@@ -1,4 +1,4 @@
-//! ADR 0018 §1 — re-pricing ADR 0016 §3's codegen spike against a compute kernel.
+//! the kernel re-pricing — re-pricing the codegen spike's codegen spike against a compute kernel.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::entry::{Declines, admissible, enterable, refusals_over};
@@ -676,7 +676,7 @@ struct Rung {
     compiled: Vec<String>,
     interpreter: Band,
     hybrid: Band,
-    /// Interpreter best over hybrid worst — the conservative direction, the same one ADR 0016's
+    /// Interpreter best over hybrid worst — the conservative direction, the same one the performance verdict's
     /// spike reports.
     speedup: f64,
     low: f64,
@@ -732,7 +732,7 @@ fn ladder_groups<'a>(everything: &[&'a str]) -> Vec<(&'static str, &'static str,
         ),
         (
             "the exploration term",
-            "`ucb` and its whole call graph: `ilog2`, `isqrt`, `isqrt_step`. ADR 0018 \
+            "`ucb` and its whole call graph: `ilog2`, `isqrt`, `isqrt_step`. the compute-kernel record \
              attributes 62.6% of the kernel to it, and its only caller is refused",
             exploration,
         ),
@@ -1332,7 +1332,7 @@ fn main() -> Result<()> {
         "\n== the number R5 exists to move ==\n   the interpreter entered compiled code \
          {} times over the agreement corpus.\n   Before R5 it could not enter compiled code at \
          all: the hybrid reached three functions, and\n   every `ucb`, `isqrt` and `rollout` \
-         under them ran in the machine (ADR 0018 §0).",
+         under them ran in the machine (the compute-kernel record).",
         agreement.entries
     );
     println!(

@@ -523,7 +523,7 @@ fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bou
         },
         (Param::Bytes(v), &Type::BYTEA) => BoundValue::Bytes(v.clone()),
         (Param::Float(v), &Type::FLOAT8) => BoundValue::Float8(*v),
-        // §4.2's table maps `Float` to `float8` **as a parameter** and to `float4` or `float8` only
+        // The type mapping maps `Float` to `float8` **as a parameter** and to `float4` or `float8` only
         // as a *result*, so a `float4` parameter is outside the pinned mapping.
         (Param::Float(_), &Type::FLOAT4) => {
             return Err(BindError::Refused(

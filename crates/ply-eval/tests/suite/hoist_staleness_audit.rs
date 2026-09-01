@@ -56,7 +56,7 @@ fn int(value: Value) -> i64 {
 const PRELUDE: &str =
     "effect amb { read flip[coin]() -> Bool }\n\nfn go() -> Int =\n  with_cell[r](0) { c -> ";
 
-/// Two resumptions over one cell — ADR 0017 §3's deciding example, with the trace cell folded into
+/// Two resumptions over one cell — the region-kind rule's deciding example, with the trace cell folded into
 /// the answer so one integer carries both.
 const CAPTURING: &str = "{ let total = handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); if b { cell_get(c) } else { cell_get(c) * 10 } } with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x }; total + cell_get(c) * 1000 }";
 
@@ -332,7 +332,7 @@ fn search() -> Int =
 "#;
 
 /// A callback builtin whose function argument the analysis cannot name is the second half of the
-/// same rule, and ADR 0017 §Consequences names it separately — "an escape the brand does not catch
+/// same rule, and the region model names it separately — "an escape the brand does not catch
 /// — through a closure, a constructor field, a Map key, a returned continuation, or a task".
 #[test]
 fn a_callback_builtin_over_a_local_makes_the_region_shared() {
@@ -441,7 +441,7 @@ fn a_local_shadowing_a_definitions_name_is_still_a_local() {
     }
 }
 
-/// The other half of the same defect, and the one ADR 0017 §3 states as a rule rather than as a
+/// The other half of the same defect, and the one the region-kind rule states as a rule rather than as a
 /// cost: `region_kind::check` must **refuse** a hand-written `unique` over a reachable capture.
 #[test]
 fn a_declared_unique_over_a_local_shadowing_a_definition_is_refused() {

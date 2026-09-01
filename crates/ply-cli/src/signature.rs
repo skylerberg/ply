@@ -166,7 +166,7 @@ pub struct EffectSetView {
 }
 
 impl EffectSetView {
-    /// The block ADR 0013 §1.7 specifies: the name, the expansion, and how much of the module is
+    /// The block what the reviewing command prints specifies: the name, the expansion, and how much of the module is
     /// annotated with it.
     pub fn lines(&self, indent: usize) -> Vec<String> {
         let mut lines = vec![format!("effect set {}", self.name)];

@@ -371,7 +371,7 @@ fn a_commit_after_a_statement_timeout_reports_the_aborted_scope(cluster: &Cluste
     finish(cluster, db);
 }
 
-/// The exit the ADR's table names first, and the one the driver gets right: a constraint that can
+/// The first of the four exits, and the one the driver gets right: a constraint that can
 /// only fail at `COMMIT` is a `Failed` the program reads.
 fn a_deferred_constraint_that_fails_at_commit_is_a_value(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
@@ -588,7 +588,7 @@ fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// The reachability half of the one above, and the second half of §2.4.
+/// The reachability half of the one above, and the second half of where the table set comes from.
 fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
     for sql in [
         "select set_config('search_path', 'pg_catalog', false) from t",

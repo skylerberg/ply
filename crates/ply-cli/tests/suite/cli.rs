@@ -377,12 +377,12 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
     assert!(text.contains("region-isolated and free"), "got:\n{text}");
 }
 
-/// ADR 0017 §6 through ADR 0008 §6: a report that still said `world` after the world was gone would
+/// region isolation through host effects having no region isolation: a report that still said `world` after the world was gone would
 /// over-claim by exactly the tests that moved, so `--explain` names the contention *and* what kind
 /// it is.
 #[test]
 fn explain_separates_a_region_label_contention_from_a_real_one() {
-    // The `cell` atoms reach the footprint through a written row: ADR 0017 §2 closed every route
+    // The `cell` atoms reach the footprint through a written row: the escape brand closed every route
     // that carried a cell out of its region, so an annotation is the only way one gets there.
     let dir = project(
         "fn touches(n: Int) -> Int / {cell.read[table], cell.write[table]} = n\n\
@@ -963,7 +963,7 @@ fn a_host_run_says_so_in_the_summary_a_person_reads() {
 }
 
 /// The trivially-parallel count is a claim, and a claim that grew when a socket was bound would be
-/// the over-claim ADR 0008 §6 exists to prevent.
+/// the over-claim host effects having no region isolation exists to prevent.
 #[test]
 fn explain_never_reports_more_isolation_under_host_than_without_it() {
     let dir = project(GREEN);
@@ -1004,7 +1004,7 @@ fn run_is_hermetic_by_default_and_reports_its_binding() {
     );
 }
 
-/// Corollary 1 of ADR 0011, checked end to end: if a binding moved a hash, a row or an E0412
+/// Corollary 1 of the host boundary contract, checked end to end: if a binding moved a hash, a row or an E0412
 /// verdict, `ply check` would answer differently under `--host` and every cache in the system would
 /// split on a flag.
 #[test]

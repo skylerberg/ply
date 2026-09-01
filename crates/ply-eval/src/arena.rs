@@ -19,7 +19,7 @@ const fn offset_of(index: usize) -> usize {
     index % CHUNK
 }
 
-/// Which of ADR 0017 §3's two kinds a region is.
+/// Which of the region-kind rule's two kinds a region is.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub enum RegionKind {
     /// The compiler proved no continuation is captured across this region.
@@ -107,7 +107,7 @@ struct Scope {
     span: Span,
 }
 
-/// A live continuation's claim on every region that was open when it was captured — ADR 0017 §3's
+/// A live continuation's claim on every region that was open when it was captured — the region-kind rule's
 /// "reference counted, and reclaimed when the last continuation that can reach them dies".
 #[derive(Clone)]
 pub struct Pin(Rc<PinCore>);
@@ -1117,7 +1117,7 @@ mod tests {
         arena.close(outer);
     }
 
-    /// The cost, stated as the number it actually is rather than the one ADR 0017 §3 advertised.
+    /// The cost, stated as the number it actually is rather than the one the region-kind rule advertised.
     #[test]
     fn covering_every_open_region_costs_the_whole_live_arena() {
         let mut arena = Arena::new();
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(arena.depth(), 0);
     }
 
-    /// The cost §3 says is paid at the capture, stated as a number: one copy per live slot of the
+    /// The cost the region-kind rule says is paid at the capture, stated as a number: one copy per live slot of the
     /// region, and nothing per allocation.
     #[test]
     fn a_snapshot_copies_the_regions_slots_and_no_others() {

@@ -8,7 +8,7 @@ use ply_syntax::parse_module;
 use ply_syntax::resolve::resolve;
 use std::path::{Path, PathBuf};
 
-/// ADR 0006 §1.1's declaration of the two effects the seeded handlers answer, plus a hand-written
+/// the prelude effect declarations's declaration of the two effects the seeded handlers answer, plus a hand-written
 /// handler for it.
 const SOURCE: &str = r#"
 nondet effect clock {
