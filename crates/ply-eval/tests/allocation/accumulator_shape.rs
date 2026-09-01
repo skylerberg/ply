@@ -59,19 +59,24 @@ fn linear(n: usize) -> String {
 }
 
 fn quadratic(n: usize) -> String {
+    // The binding is read again after the append, so every append clones the whole list. On the
+    // chain machine the pessimal *argument position* produced this shape; under ADR 0034's slot
+    // frames position decides nothing, and a genuine second owner is what quadratic costs.
     format!(
-        "fn grow(xs: List<Int>, n: Int) -> List<Int> =\n\
-         \x20 if n == 0 {{ xs }} else {{ grow(push(xs, n), n - 1) }}\n\
+        "fn grow(xs: List<Int>, n: Int) -> List<Int> = {{\n\
+         \x20 let ys = push(xs, n);\n\
+         \x20 if len(xs) < 0 {{ xs }} else if n == 1 {{ ys }} else {{ grow(ys, n - 1) }}\n\
+         }}\n\
          test \"quadratic\" {{ assert_eq(len(grow([], {n})), {n}) }}\n"
     )
 }
 
 /// Doubling `n` roughly doubles a linear accumulator and roughly quadruples a quadratic one.
 ///
-/// The two programs differ only in which argument the append is, which is the whole of the slot rewrite's
-/// subject. Bounds are loose because the measured region carries a fixed cost — lowering, the
-/// machine, the test harness — that does not scale with `n`; what they have to separate is 2× from
-/// 4×, and they do.
+/// The two programs differ only in whether the accumulator is read again after the append — the
+/// second owner the semantics genuinely require a copy for. Bounds are loose because the measured
+/// region carries a fixed cost — lowering, the machine, the test harness — that does not scale
+/// with `n`; what they have to separate is 2× from 4×, and they do.
 #[test]
 fn a_quadratic_accumulator_grows_faster_than_a_linear_one() {
     let (lin_1k, lin_2k) = (bytes(&linear(1000)), bytes(&linear(2000)));

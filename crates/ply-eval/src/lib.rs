@@ -15,7 +15,6 @@ mod compiled;
 pub mod cont;
 pub mod costs;
 pub mod differential;
-mod env;
 pub mod escape;
 pub mod explore;
 mod frame;
@@ -36,6 +35,7 @@ pub mod slots;
 pub mod task_regions;
 pub mod trace;
 mod value;
+pub mod window;
 
 // `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the allocator's own vocabulary
 // and each of those names means something else somewhere in this crate.
@@ -49,16 +49,15 @@ pub use backend::{
     Provider, Reference, Spec as BackendSpec,
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
-pub use code::{Code, Lowering, Node, NodeKind, lower};
+pub use code::{Captures, Code, Lowered, Lowering, Node, NodeKind, Pat, lower};
 pub use compiled::Compiled;
 pub use cont::{
-    Continuation, Delimiter, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
+    Continuation, Delimiter, Extent, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };
 pub use costs::{Cause as CostCause, Costs, DefKind as CostDefKind, Verdict as CostVerdict};
 pub use differential::{
     Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
 };
-pub use env::{Env, Slot as ScopeSlot};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
@@ -86,6 +85,7 @@ pub use value::{
     Closure, ClosureKind, Decimal, Fields, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
     first_difference, values_equal,
 };
+pub use window::{SlotVal, Windows};
 
 #[cfg(test)]
 mod build;

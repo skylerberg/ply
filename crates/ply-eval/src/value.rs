@@ -2,7 +2,6 @@ use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::code::Code;
 use crate::cont::Continuation;
-use crate::env::Env;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sim::TaskId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -179,7 +178,9 @@ pub enum ClosureKind {
     Fn {
         params: Vec<Symbol>,
         body: Arc<Expr>,
-        env: Env,
+        /// External bindings the body reads by name, lowered as leading parameters when the
+        /// machine enters it.
+        bindings: Vec<(Symbol, Value)>,
         /// Index into `Program::modules`: the scope the body's bare names are resolved in, which
         /// travels with the closure rather than the caller.
         module: usize,
@@ -189,7 +190,12 @@ pub enum ClosureKind {
     Code {
         params: Rc<Vec<Symbol>>,
         body: Code,
-        env: Env,
+        /// The body's window size.
+        size: u32,
+        /// Which slots the captured values fill, and their names.
+        captures: Rc<crate::code::Captures>,
+        /// The captured free-variable values, copied out of the defining window.
+        captured: Rc<[Value]>,
         module: usize,
     },
     Ctor {

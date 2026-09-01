@@ -1,13 +1,14 @@
 //! A live `simulate` region, and the trail every region of one entry point writes into.
 
-use crate::code::Code;
+use crate::code::{Captures, Code};
 use crate::cont::{SimId, Stack};
-use crate::env::Env;
 use crate::explore::{Interleaving, Step, Verdict};
 use crate::sched::{Scheduler, StepRecord};
 use crate::sim::{Access, Domain, Handlers, Seed, Stream};
+use crate::value::Value;
 
 use ply_span::{Diagnostic, Span, Symbol};
+use std::rc::Rc;
 
 /// Where a step was standing when it ended, which the scheduler does not know and a race report
 /// prints.
@@ -24,9 +25,18 @@ pub struct Region {
     pub below: Stack,
     /// What the root task evaluates.
     pub body: Option<Code>,
-    pub env: Env,
+    /// The root body's window size, and the values its free variables were bound to at the
+    /// region's entry.
+    pub size: u32,
+    pub captures: Rc<Captures>,
+    pub captured: Rc<[Value]>,
     pub module: usize,
     pub span: Span,
+    /// The slot-stack height at the region's entry, which every scheduling turn resets to: a
+    /// task's windows live above it and die with the task's turn.
+    pub floor: usize,
+    /// The entering activation's base, restored when the region delivers its value.
+    pub rbase: usize,
 }
 
 impl Region {
@@ -38,9 +48,13 @@ impl Region {
         steps: u32,
         below: Stack,
         body: Code,
-        env: Env,
+        size: u32,
+        captures: Rc<Captures>,
+        captured: Rc<[Value]>,
         module: usize,
         span: Span,
+        floor: usize,
+        rbase: usize,
     ) -> Region {
         Region {
             id,
@@ -48,9 +62,13 @@ impl Region {
             handlers: Handlers::at(root, drawn),
             below,
             body: Some(body),
-            env,
+            size,
+            captures,
+            captured,
             module,
             span,
+            floor,
+            rbase,
         }
     }
 
@@ -62,9 +80,13 @@ impl Region {
             handlers: Handlers::at(0, 0),
             below: Stack::new(),
             body: None,
-            env: Env::empty(),
+            size: 0,
+            captures: crate::code::no_captures(),
+            captured: Rc::from(Vec::new()),
             module: 0,
             span,
+            floor: 0,
+            rbase: 0,
         }
     }
 }

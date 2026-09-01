@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
-use ply_eval::{Env, Evaluator, Fixture, Machine, Value};
+use ply_eval::{Evaluator, Fixture, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -348,7 +348,8 @@ fn empty_prompt() -> Rc<Prompt> {
         clauses: Rc::new(Vec::new()),
         effects: Rc::new(Vec::new()),
         ret: None,
-        env: Env::empty(),
+        clause_captures: Vec::new(),
+        ret_captures: Rc::from(Vec::new()),
         module: 0,
         span: Span::DUMMY,
     })
@@ -360,12 +361,14 @@ fn stack_cost(repeats: usize) -> Vec<StackPoint> {
     [8usize, 1_000, 100_000]
         .into_iter()
         .map(|pending| {
-            let mut stack = Stack::new().push_prompt(empty_prompt());
+            let mut stack = Stack::new().push_prompt(empty_prompt(), 0);
             for _ in 0..pending {
                 stack = stack.push(Frame::Call {
                     name: None,
                     call_site: Span::DUMMY,
                     memo: false,
+                    callee_window: 0,
+                    caller_window: 0,
                 });
             }
             let (k, below) = stack.capture(1, 0);

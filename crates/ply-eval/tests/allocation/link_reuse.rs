@@ -2,7 +2,7 @@
 //! reusing a link cannot make two owners disagree.
 
 use crate::counting::charge;
-use ply_eval::{Env, Frame, Next, ScopeSlot, Stack, Value};
+use ply_eval::{Frame, Next, Stack, Value};
 use ply_span::{Span, Symbol};
 
 fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
@@ -69,24 +69,8 @@ fn a_warm_frame_push_allocates_nothing() {
     );
 }
 
-fn bind_and_drop(names: &[Symbol]) {
-    let mut env = Env::empty();
-    for (n, name) in names.iter().enumerate() {
-        env = env.bind(name.clone(), Value::Int(n as i64));
-    }
-    assert!(env.lookup(&names[0]).is_some());
-}
-
-#[test]
-fn a_warm_scope_binding_allocates_nothing() {
-    let names: Vec<Symbol> = (0..DEPTH).map(|n| Symbol::new(format!("x{n}"))).collect();
-    bind_and_drop(&names);
-    let (_, allocs) = counted(|| bind_and_drop(&names));
-    assert_eq!(
-        allocs, 0,
-        "{DEPTH} bindings allocated {allocs} times; the free list is not serving them"
-    );
-}
+// The scope-binding twin of the frame test above died with the persistent chain: a binding is a
+// slot write into the machine-owned window, which allocates only when the window vector grows.
 
 /// The hazard a free list introduces, and the only one: a link two owners hold must not be recycled
 /// when the first of them lets go.
@@ -115,27 +99,6 @@ fn a_chain_two_owners_hold_survives_the_first_letting_go() {
         "the surviving owner read frames the pool had handed out again"
     );
     assert_eq!(drain(later).len(), (DEPTH * 4) as usize);
-}
-
-/// The same statement for a scope: a closure captures its defining environment by cloning one
-/// pointer, and the pool must not be able to rewrite what that pointer reaches.
-#[test]
-fn a_captured_scope_survives_the_scope_it_was_taken_from() {
-    let name = Symbol::new("captured");
-    let outer = Env::empty().bind(name.clone(), Value::Int(7));
-    let captured = outer.clone();
-    drop(outer);
-
-    let mut churn = Env::empty();
-    for n in 0..DEPTH * 4 {
-        churn = churn.bind(name.clone(), Value::Int(n));
-    }
-    drop(churn);
-
-    assert!(
-        matches!(captured.lookup(&name), Some(ScopeSlot::Live(Value::Int(7)))),
-        "the captured scope read a binding the pool had handed out again"
-    );
 }
 
 /// What the free list can hold, so its memory cost is a number rather than a hope.
