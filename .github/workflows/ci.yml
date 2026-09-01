@@ -334,6 +334,30 @@ jobs:
       # names in `.github/ci-shards.sh` are a balance decision and they have
       # already moved once, and an `if:` naming a shard that no longer exists is
       # a check that silently never runs.
+      #
+      # Read out of the shard's own log rather than by running the binary a
+      # second time, which is what this step used to do.
+      #
+      # Two reasons, and the second is the one that matters. It is **cheaper**:
+      # the shard already ran this binary a moment ago. And it is **safer**,
+      # because the binary it re-ran is the one this repository's only known
+      # flake lives in: `free_port` hands `ply run --host` a port it has
+      # already released, and losing that race cost the full 60-second bind
+      # budget and a red run. Observed on `main` at 54a568d — one workspace
+      # run failed here after 60.02s and the same binary passed in 2.07s on
+      # the next. Running it twice per CI run doubled the exposure to that for
+      # no extra assurance whatsoever.
+      #
+      # `crates/ply-cli/tests/w5_shutdown.rs` now retries the race rather than
+      # waiting it out, so the flake should be gone either way. This step not
+      # rolling the dice a second time is independent of that and stands on
+      # its own.
+      #
+      # The guarantee is unchanged and is in fact slightly stronger: what the
+      # comment above wants to know is that a `#![cfg(unix)]` target was
+      # compiled and executed, and asserting it against the shard's log says
+      # it ran **in the shard** rather than that it runs when invoked on its
+      # own.
       - name: The unix-only shutdown suite really ran
         env:
           SHARD: ${{ matrix.shard }}
@@ -344,9 +368,38 @@ jobs:
             *" ply-cli "*) ;;
             *) echo "ply-cli is not in shard '$SHARD'; the shard that has it runs this"; exit 0 ;;
           esac
-          cargo test --locked -p ply-cli --test w5_shutdown | tee /tmp/w5.log
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/w5.log || {
-            echo "w5_shutdown ran no tests — #![cfg(unix)] compiled it away" >&2
+          # The `test result:` line that follows the binary's own `Running`
+          # line, and no other: `exit` after the first match keeps a later
+          # target's result from standing in for this one.
+          #
+          # **`gsub` first, because cargo colours that `Running` line and this
+          # check went red on exactly that.** Cargo emits
+          # `ESC[1mESC[92m     RunningESC[0m tests/w5_shutdown.rs (…)`, so a
+          # pattern wanting `Running` followed by a space matches nothing —
+          # the byte after `Running` is an escape. libtest's `test result:`
+          # lines are *not* coloured, which is why only this half needed it and
+          # why the other guards in this file do not.
+          #
+          # It was verified before it shipped and the verification was wrong:
+          # against three logs saved from local runs, where cargo had written
+          # to a pipe and emitted no colour at all. A fixture that cannot
+          # contain the defect cannot fail on it. It is now checked against a
+          # log pulled back from a real run of this job — with the escapes put
+          # back, because `gh run view --log` renders them as the two literal
+          # characters `^[` and a fixture that quietly drops the bytes under
+          # test is the same mistake a second time.
+          result=$(awk '
+            { gsub(/\033\[[0-9;]*m/, "") }
+            /Running .*\/w5_shutdown-/ { seen = 1; next }
+            seen && /^test result:/     { print; exit }
+          ' /tmp/shard.log)
+          [ -n "$result" ] || {
+            echo "the shard log never names w5_shutdown — #![cfg(unix)] compiled it away" >&2
+            exit 1
+          }
+          echo "w5_shutdown: $result"
+          grep -Eq 'ok\. [1-9][0-9]* passed' <<<"$result" || {
+            echo "w5_shutdown ran no tests" >&2
             exit 1
           }
 
