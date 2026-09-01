@@ -279,12 +279,14 @@ pub mod codes {
     /// determines.
     ///
     /// Ply has three numeric types and no numeric tower, so `a + b` is one of
-    /// three different operations. This used to be settled by *defaulting* the
-    /// operand to `Int` before generalization — a tiebreak inside the compiler
-    /// that landed in a published signature. With signatures written
-    /// ([`MISSING_SIGNATURE`]) an operand a definition's own parameters do not
-    /// pin is a lambda binder or a `let` nothing constrains, and choosing for
-    /// the author there is a guess. The diagnostic asks for the annotation
+    /// three different operations.
+    ///
+    /// **Defaulting the operand to `Int` is the obvious alternative, and it is
+    /// refused.** A tiebreak taken inside the compiler then appears in a
+    /// published signature — a claim nobody wrote and no reviewer can check
+    /// against intent. With signatures written ([`MISSING_SIGNATURE`]) the only
+    /// operand a definition's own parameters do not pin is a lambda binder or a
+    /// `let` nothing constrains, so the diagnostic asks for the annotation
     /// rather than making it.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
     pub const UNBOUND_ROW_VAR: &str = "E0301";

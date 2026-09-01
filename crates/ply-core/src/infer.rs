@@ -3349,10 +3349,11 @@ impl<'a> Checker<'a> {
 
     /// `E0210`: an operand whose numeric type nothing determines.
     ///
-    /// This arm used to *default* to `Int`, which put a tiebreak taken inside
-    /// the compiler into a published signature. With signatures written the
-    /// only way to reach here is a lambda binder or a `let` nothing
-    /// constrains, where choosing for the author is a guess.
+    /// Defaulting to `Int` here is the obvious alternative and is refused: the
+    /// tiebreak would be taken inside the compiler and then published as the
+    /// author's own signature. With signatures written the only way to reach
+    /// this arm is a lambda binder or a `let` nothing constrains, where
+    /// choosing for the author is a guess.
     fn numeric_undetermined(&mut self, entry: &Numeric) {
         let what = if matches!(entry.op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
             "ordered comparison"
