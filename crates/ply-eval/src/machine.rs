@@ -802,7 +802,7 @@ impl<'a> Machine<'a> {
         module: usize,
     ) -> Result<Rc<[Value]>, Diagnostic> {
         if captures.is_empty() {
-            return Ok(Rc::from(Vec::new()));
+            return Ok(code::no_captured());
         }
         let mut out: Vec<Value> = Vec::with_capacity(captures.len());
         for j in 0..captures.len() {
@@ -1018,6 +1018,36 @@ impl<'a> Machine<'a> {
                 }
             }
 
+            NodeKind::RecordUpdate { base, copies, sets } => {
+                if sets.is_empty() {
+                    self.push(
+                        Frame::UpdateApply {
+                            copies: copies.clone(),
+                            sets: sets.clone(),
+                            done: Vec::new(),
+                            span,
+                        },
+                        span,
+                    )?;
+                    self.go_eval(base.clone(), module);
+                } else {
+                    crate::rc::note_carry();
+                    self.push(
+                        Frame::UpdateField {
+                            base: base.clone(),
+                            copies: copies.clone(),
+                            sets: sets.clone(),
+                            done: crate::argv::take(sets.len()),
+                            next: 1,
+                            module,
+                            span,
+                        },
+                        span,
+                    )?;
+                    self.go_eval(sets[0].1.clone(), module);
+                }
+            }
+
             NodeKind::Field { base, field } => {
                 // Field-granular liveness: the last use of *this field* of a slot binding takes
                 // it out of the record in place — when the record is unshared — while the record
@@ -1133,7 +1163,7 @@ impl<'a> Machine<'a> {
                 }
                 let ret_captures = match ret {
                     Some(arm) => self.capture_values(&arm.captures, module)?,
-                    None => Rc::from(Vec::new()),
+                    None => code::no_captured(),
                 };
                 let prompt = Rc::new(Prompt {
                     clauses: clauses.clone(),
@@ -2503,7 +2533,7 @@ impl<'a> Machine<'a> {
                 size: body.size,
                 body: body.code,
                 captures: code::no_captures(),
-                captured: Rc::from(Vec::new()),
+                captured: code::no_captured(),
                 module,
             },
         };

@@ -295,6 +295,9 @@ pub(crate) struct Use {
     pub name: Symbol,
     /// `None` is a whole-value use; `Some(f)` a read of one field.
     pub field: Option<Symbol>,
+    /// A record update's base read: the record's cells are read, but no field's value is — an
+    /// earlier projection of a field the update writes is still that field's last use.
+    pub cells: bool,
 }
 
 impl Use {
@@ -302,6 +305,7 @@ impl Use {
         Use {
             name: name.clone(),
             field: None,
+            cells: false,
         }
     }
 }
@@ -358,7 +362,7 @@ impl Live {
         let whole_later = self
             .later
             .iter()
-            .any(|u| &u.name == name && u.field.is_none());
+            .any(|u| &u.name == name && u.field.is_none() && !u.cells);
         let field_later = self
             .later
             .iter()
@@ -376,6 +380,7 @@ impl Live {
         self.push(Use {
             name: name.clone(),
             field: Some(field.clone()),
+            cells: false,
         });
         if tracked {
             bump(|s| {
@@ -384,6 +389,37 @@ impl Live {
             });
         }
         own
+    }
+
+    /// Records the read of a record update's base, which consumes the binding but reads only the
+    /// fields the update *keeps*: a written field's old value is dead, so a projection of it
+    /// inside the written expression is still that field's last use.
+    pub fn use_base(&mut self, name: &Symbol, kept: &[Symbol]) -> Own {
+        let tracked = self.tracked(name);
+        let last = !self.any_later(name);
+        self.push(Use {
+            name: name.clone(),
+            field: None,
+            cells: true,
+        });
+        for field in kept {
+            self.push(Use {
+                name: name.clone(),
+                field: Some(field.clone()),
+                cells: false,
+            });
+        }
+        if tracked {
+            bump(|s| {
+                s.dup_sites += 1;
+                s.dup_emitted += u64::from(!last);
+            });
+        }
+        if last && tracked {
+            Own::Owned
+        } else {
+            Own::Borrowed
+        }
     }
 
     /// Whether this name is a binding of the current barrier, which is the only thing the counts

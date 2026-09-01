@@ -289,7 +289,9 @@ pub fn continuation_argument(mut args: Vec<Value>, span: Span) -> Result<Value, 
     if args.len() != 1 {
         return Err(arity_error(span, "a continuation", 1, args.len()));
     }
-    Ok(args.pop().expect("a one-argument call has an argument"))
+    let value = args.pop().expect("a one-argument call has an argument");
+    crate::argv::give(args);
+    Ok(value)
 }
 
 /// `⟨Eval(with_cell[r](i){x→b}, ρ, m), K, W⟩ → ⟨Eval(i, m), K·WithCellBody, W⟩`.

@@ -188,7 +188,7 @@ pub(crate) fn next_fold(
     };
     crate::builtins::Step::Apply {
         callee: f.clone(),
-        args: vec![acc, k, v],
+        args: crate::argv::of([acc, k, v]),
         frame: Frame::MapFoldStep {
             f,
             entries,
