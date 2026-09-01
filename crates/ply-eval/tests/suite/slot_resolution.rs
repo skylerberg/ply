@@ -259,3 +259,63 @@ fn every_resolved_slot_names_its_own_variable() {
         "the corpus resolved only {total} variables, which is too few to be checking anything"
     );
 }
+
+/// How often the machine carries a scope, against how often it captures one — ADR 0034 §4.
+///
+/// The rewrite trades these against each other. A persistent chain makes capture cheap, because a
+/// continuation shares a pointer; a slot stack makes carrying cheap, because the frame records a
+/// base index instead of building anything — and then capture has to *copy* the window it took.
+/// Which way that trade goes is a property of real programs, so it is counted over the corpus
+/// rather than argued.
+#[test]
+fn the_corpus_carries_far_more_often_than_it_captures() {
+    use ply_eval::{Machine, rc};
+    use ply_syntax::resolve::resolve as resolve_names;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the crate sits two levels under the workspace root")
+        .join("examples");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .expect("the repository ships examples")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ply"))
+        .collect();
+    files.sort();
+
+    let (mut carries, mut captures, mut frames) = (0u64, 0u64, 0u64);
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("an example is readable");
+        let mut map = SourceMap::new();
+        let id = map.add(path, text.clone());
+        let name = ModuleName::from_dotted("probe");
+        let Ok(mut program) = parse_program([(id, name, text.as_str())]) else {
+            continue;
+        };
+        let Ok(resolved) = resolve_names(&mut program) else {
+            continue;
+        };
+        rc::census4::reset();
+        let mut machine = Machine::for_program(&program, &resolved);
+        for i in 0..machine.test_count() {
+            let _ = machine.eval_test(i);
+        }
+        let (c, k, f) = rc::census4::read();
+        carries += c;
+        captures += k;
+        frames += f;
+    }
+
+    println!("\n  carries {carries}  captures {captures}  captured frames {frames}");
+    assert!(
+        carries > 0,
+        "the corpus carried nothing, so this measured nothing"
+    );
+    assert!(
+        carries > captures * 10,
+        "carries {carries} against captures {captures}: the rewrite's trade only pays if carrying \
+         is much the more common of the two, and on this corpus it is not"
+    );
+}
