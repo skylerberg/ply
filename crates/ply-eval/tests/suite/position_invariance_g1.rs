@@ -518,7 +518,7 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
             (200, 200, 1),
             (0, 200, 1),
         ),
-        // `(200, 200, 1)` under `PLY_ADR0033_PROBE=1`, which is ADR 0025's P2: a parameter may
+        // `(200, 200, 1)` under `PLY_ADR0034_PROBE=1`, which is ADR 0025's P2: a parameter may
         // then appear in a `Dead` set. Off by default, because P2 costs more allocations on the
         // request path than it saves there — ADR 0034 §11 S3 — so this pin is the default tree's.
         ("let binding against parameter", (200, 200, 1), (0, 200, 1)),

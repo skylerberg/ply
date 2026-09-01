@@ -171,9 +171,8 @@ calls with no annotation, which is why Koka needs no ownership in its surface
 types.
 
 **Measured, by §11's S4 probe rather than argued.** The probe is ADR 0025's P1 at
-the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0033_PROBE=1`
-— which arms S3 as well, for the reason §11 gives —
-at `rc::carry_released`: the frame carries the scope *minus* what the
+the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0034_PROBE`, which
+takes `params` for S3's half, `carry` for this one and `1` for both: the frame carries the scope *minus* what the
 sub-expression just started is the last reader of. Armed, **four of §10 G1's five
 pairs go to a gap of 0.000**, including ADR 0025 §Context row five — the case
 that refuted the documented rule.
@@ -191,11 +190,31 @@ different *field* of it, the slot has to be finer than the binding** — which p
 §6's flat record representation upstream of finishing §4 rather than after it,
 and §11 is sequenced accordingly.
 
-**This subsumes ADR 0025's P1, P2 and P3 rather than competing with them.** P1
-computes what slot frames compute — a frame holding exactly the live bindings —
-but pays `Env::release`'s O(scope-depth) chain rebuild at every sub-expression to
-get it, on the path ADR 0017's census puts at the largest share of marginal
-allocations. ADR 0025 separately concedes that P1 is a `Code` IR change plus
+**This subsumes ADR 0025's P1, P2 and P3 rather than competing with them, and the
+size of the constant that separates them is now measured rather than asserted.**
+P1 computes what slot frames compute — a frame holding exactly the live bindings
+— and both of the primitives ADR 0025 offered for it **double the allocations on
+the request path**, against a baseline of 773 per `/health`:
+
+| how the frame narrows its scope | allocations | over baseline |
+| --- | ---: | ---: |
+| `Env::release(dead)`, rebuilding down from the head | 1,554 | +101% |
+| `Env::keep_only(live)`, building up from empty | 1,451 | +88% |
+| parameter releases at statement level, alone | 808 | +4.6% |
+
+Neither is close, and the reason is the same for both: **the cost is inherent to
+building a narrowed scope at runtime out of a persistent chain.** `release` pays
+one link per binding above the deepest it drops, which for a parameter is the
+whole scope. `keep_only` pays one per live name — and the live set that is *safe*
+to use includes everything read after the call as well, because a name read both
+later and by a remaining argument is still the frame's to hold. Narrowing it to
+just the remaining arguments' reads is what turns a legal program into
+`cannot find` at the read, which is how that version was found.
+
+That is the argument for slot frames stated as a measurement: a frame that holds
+slot indices does not *construct* anything, so "carrying less" is a fact settled
+at lowering rather than a chain built per call. There is no cheaper approximation
+left to try — these were the two. ADR 0025 separately concedes that P1 is a `Code` IR change plus
 lowering rather than an edit to eight call sites. **If the IR is changing anyway,
 change it to slots and get an O(1) answer instead of an O(depth) one.**
 
@@ -423,7 +442,8 @@ the term. This supersedes ADR 0025's `Vector<T>` gate, for §5's reason.
 | **S1** | §8, the tail-resumptive refinement | done — sound, and worth zero regions |
 | **S2** | wire `ply check --costs` (ADR 0025 §2a, never built) | done |
 | **S3** | ADR 0025's P2 — a parameter may appear in a `Dead` set | **measured, gated, not landed** — it fails G2, see below |
-| **S4′** | §4's probe — P1 at the `App` and `Record` carry sites, behind `PLY_ADR0033_PROBE=1` | done — four of five pairs to 0.000; §4 has the narrowed claim |
+| **S4′** | §4's probe — P1 at the `App` and `Record` carry sites | done — four of five pairs to 0.000; §4 has the narrowed claim |
+| **S4″** | both of ADR 0025's fallback primitives for P1, priced | done — both roughly double request-path allocations; §4 has the table |
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
 | **S4** | §4, slot frames and flat closure conversion | gated on **G1**, then **G2** |
 | **S5** | §5, the chunked vector | gated on **G3** |
@@ -438,7 +458,7 @@ releases, and a *parameter* is the deepest binding in its barrier's chain, so re
 the whole scope. The benefit is real and the corpus rates reproduce — but they are the standard
 library's test suites, and `/health` pays the release without pushing the lists that would repay it.
 
-So S3 sits behind `PLY_ADR0033_PROBE=1` with S4's probe, and the flag now arms both. The case
+So S3 sits behind `PLY_ADR0034_PROBE=1` with S4's probe, and the flag now arms both. The case
 analysis (§8.1), the adversarial cases and the G1 pair all stand; what does not stand is landing it
 by default. `Env::keep_only(live)` built up from empty is ADR 0025's suggested alternative primitive
 and is the thing to try before P2 is proposed again — or `Env::release` writing through a link it
