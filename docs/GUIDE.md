@@ -977,6 +977,13 @@ the two spellings are one definition with one hash. Consequences:
   `E0116` too — annotate the binder;
 * a field the base does not have is `E0117`. Update replaces; it does not widen.
 
+An update **reuses the base's record** when nothing else holds it (ADR 0034):
+the written fields are set into the record the base binding is giving up, and
+no new one is built. A base something else still holds is copied once. A
+literal that rewrites every field, `{k: s.k + 1, out: push(s.out, i)}`, gets
+the same treatment when `s` dies there: it is the shape a state record
+threaded through a loop takes, and it allocates nothing per round.
+
 ### 6.7 Lists
 
 ```ply

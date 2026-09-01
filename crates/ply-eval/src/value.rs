@@ -101,10 +101,11 @@ impl std::ops::Index<&Symbol> for Fields {
     }
 }
 
-impl FromIterator<(Symbol, Value)> for Fields {
+impl Fields {
+    /// The fields in any order, sorted in place: a literal's frame hands over the vector it
+    /// collected the values into, and that vector is the record's storage — no second one.
     /// Later entries win, which is what collecting into a `BTreeMap` did.
-    fn from_iter<I: IntoIterator<Item = (Symbol, Value)>>(iter: I) -> Fields {
-        let mut v: Vec<(Symbol, Value)> = iter.into_iter().collect();
+    pub(crate) fn from_unsorted(mut v: Vec<(Symbol, Value)>) -> Fields {
         v.sort_by(|(a, _), (b, _)| a.cmp(b));
         v.dedup_by(|later, earlier| {
             if later.0 == earlier.0 {
@@ -115,6 +116,12 @@ impl FromIterator<(Symbol, Value)> for Fields {
             }
         });
         Fields(v)
+    }
+}
+
+impl FromIterator<(Symbol, Value)> for Fields {
+    fn from_iter<I: IntoIterator<Item = (Symbol, Value)>>(iter: I) -> Fields {
+        Fields::from_unsorted(iter.into_iter().collect())
     }
 }
 
@@ -228,14 +235,20 @@ impl Closure {
 }
 
 impl Value {
+    // The four constructors below are never inlined: `r4_value_construction` attributes the
+    // request path's allocations by the frame that made them, and an inlined constructor
+    // disappears from the backtrace and lands in "unattributed".
+    #[inline(never)]
     pub fn str(s: impl AsRef<str>) -> Value {
         Value::Str(Arc::from(s.as_ref()))
     }
 
+    #[inline(never)]
     pub fn bytes(b: impl AsRef<[u8]>) -> Value {
         Value::Bytes(Arc::from(b.as_ref()))
     }
 
+    #[inline(never)]
     pub fn list(items: Vec<Value>) -> Value {
         Value::List(Arc::new(items))
     }
@@ -254,6 +267,7 @@ impl Value {
         Value::Map(m)
     }
 
+    #[inline(never)]
     pub fn ctor(name: impl Into<Symbol>, args: Vec<Value>) -> Value {
         Value::Ctor {
             name: name.into(),

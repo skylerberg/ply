@@ -466,7 +466,7 @@ impl fmt::Debug for Step {
 
 /// `push`, with the reuse that is the point of reference counting — and with the defect that reuse
 /// arrives attached to.
-fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
+fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
     let (out, copied) = match &mut xs {
@@ -492,9 +492,25 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
 
 /// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
 /// write made before this call, including one a handler clause made before resuming.
+///
+/// The argument vector goes back to the free list whatever the builtin did with its contents:
+/// measured on the request path, builtin calls consuming their vectors were the single largest
+/// source of allocations, at a third of the total.
 pub fn call(
     b: Builtin,
-    args: Vec<Value>,
+    mut args: Vec<Value>,
+    cells: &mut Arena,
+    span: Span,
+) -> Result<Step, Diagnostic> {
+    let out = call_with(b, &mut args, cells, span);
+    args.clear();
+    crate::argv::give(args);
+    out
+}
+
+fn call_with(
+    b: Builtin,
+    args: &mut Vec<Value>,
     cells: &mut Arena,
     span: Span,
 ) -> Result<Step, Diagnostic> {
@@ -723,12 +739,12 @@ pub fn call(
 
         Builtin::BytesScan => {
             let b = args[0].as_bytes(span, "`bytes_scan`")?;
-            Ok(Step::Done(Value::Int(scan(&args, b, span, false)?)))
+            Ok(Step::Done(Value::Int(scan(args, b, span, false)?)))
         }
 
         Builtin::BytesScanUntil => {
             let b = args[0].as_bytes(span, "`bytes_scan_until`")?;
-            Ok(Step::Done(Value::Int(scan(&args, b, span, true)?)))
+            Ok(Step::Done(Value::Int(scan(args, b, span, true)?)))
         }
 
         Builtin::BytesPosition => {
@@ -857,27 +873,24 @@ pub fn call(
         // is behind.
         Builtin::MapNew => Ok(Step::Done(map::new())),
         Builtin::MapInsert => {
-            let mut args = args;
             let (k, v) = (args.remove(1), args.remove(1));
             Ok(Step::Done(map::insert(args.remove(0), k, v, span)?))
         }
         Builtin::MapGet => Ok(Step::Done(map::get(&args[0], &args[1], span)?)),
         Builtin::MapContains => Ok(Step::Done(map::contains(&args[0], &args[1], span)?)),
         Builtin::MapRemove => {
-            let mut args = args;
             let k = args.remove(1);
             Ok(Step::Done(map::remove(args.remove(0), &k, span)?))
         }
         // An absent key leaves the map as it was, for `map_remove`'s reason.
         Builtin::MapUpdate => {
-            let mut args = args;
             let f = args.remove(2);
             let key = args.remove(1);
             let (map, taken) = map::take(args.remove(0), &key, span)?;
             Ok(match taken {
                 Some(value) => Step::Apply {
                     callee: f,
-                    args: vec![value],
+                    args: crate::argv::of([value]),
                     frame: Frame::MapUpdateStep { map, key, span },
                 },
                 None => Step::Done(map),
@@ -920,7 +933,6 @@ pub fn call(
             // Reported rather than refused: refusing would change what a legal program means, and
             // the reference-counting pass accepts the leak and asks only that it be said out loud.
             crate::rc::cell_cycle(slot, &args[1], span);
-            let mut args = args;
             if cells.set(slot, args.remove(1)) {
                 Ok(Step::Done(Value::Unit))
             } else {
@@ -940,7 +952,7 @@ pub fn call(
             };
             Ok(Step::Apply {
                 callee: args[1].clone(),
-                args: vec![current],
+                args: crate::argv::of([current]),
                 frame: Frame::CellUpdateStep { slot, span },
             })
         }
@@ -1226,7 +1238,7 @@ fn next_map(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, span:
     };
     Step::Apply {
         callee: f.clone(),
-        args: vec![x],
+        args: crate::argv::of([x]),
         frame: Frame::MapStep {
             f,
             items,
@@ -1243,7 +1255,7 @@ fn next_filter(f: Value, items: Vector<Value>, next: usize, done: Vec<Value>, sp
     };
     Step::Apply {
         callee: f.clone(),
-        args: vec![x],
+        args: crate::argv::of([x]),
         frame: Frame::FilterStep {
             f,
             items,
@@ -1260,7 +1272,7 @@ fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span
     };
     Step::Apply {
         callee: f.clone(),
-        args: vec![acc, x],
+        args: crate::argv::of([acc, x]),
         frame: Frame::FoldStep {
             f,
             items,
@@ -1284,7 +1296,7 @@ fn next_iterate(
     }
     Ok(Step::Apply {
         callee: f.clone(),
-        args: vec![seed],
+        args: crate::argv::of([seed]),
         frame: Frame::IterateStep {
             f,
             budget,
@@ -1328,7 +1340,7 @@ fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span)
     };
     Step::Apply {
         callee: f.clone(),
-        args: vec![Value::Int(i64::from(byte))],
+        args: crate::argv::of([Value::Int(i64::from(byte))]),
         frame: Frame::BytesPositionStep {
             f,
             bytes,

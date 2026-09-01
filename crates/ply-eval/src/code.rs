@@ -57,6 +57,15 @@ pub fn no_captures() -> Rc<Captures> {
     EMPTY.with(Rc::clone)
 }
 
+/// The shared empty captured-value set, for the same reason at runtime: most handlers and every
+/// top-level definition capture nothing, and an `Rc` of nothing is still an allocation.
+pub fn no_captured() -> Rc<[Value]> {
+    thread_local! {
+        static EMPTY: Rc<[Value]> = Rc::from(Vec::new());
+    }
+    EMPTY.with(Rc::clone)
+}
+
 pub enum NodeKind {
     /// The literal, and the [`Value`] it denotes, built once here rather than per evaluation.
     Lit(Lit, Value),
@@ -101,6 +110,19 @@ pub enum NodeKind {
     },
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
+    },
+    /// A record literal that copies fields out of one slot variable and writes the rest — the
+    /// shape `{..b, f: e}` expands to. Evaluated as the written fields followed by the base, whose
+    /// record is updated in place when nothing else holds it (ADR 0034, decision 3): reuse of a
+    /// dying value's cells, which a fresh literal cannot do.
+    ///
+    /// The copies are kept by name so the machine can check the literal names exactly the base's
+    /// fields before reusing it; a hand-written literal that copies *some* of a record's fields
+    /// is built as written.
+    RecordUpdate {
+        base: Code,
+        copies: Rc<Vec<Ident>>,
+        sets: Rc<Vec<(Symbol, Code)>>,
     },
     Field {
         base: Code,
@@ -485,16 +507,19 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                 tail,
             }
         }
-        ExprKind::Record { fields } => {
-            let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
-            for (name, value) in fields.iter().rev() {
-                lowered.push((name.name.clone(), lower_in(value, cx)));
+        ExprKind::Record { fields } => match lower_record_update(fields, cx) {
+            Some(update) => update,
+            None => {
+                let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
+                for (name, value) in fields.iter().rev() {
+                    lowered.push((name.name.clone(), lower_in(value, cx)));
+                }
+                lowered.reverse();
+                NodeKind::Record {
+                    fields: Rc::new(lowered),
+                }
             }
-            lowered.reverse();
-            NodeKind::Record {
-                fields: Rc::new(lowered),
-            }
-        }
+        },
         // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
         // if it were a plain record would drop the base's untouched fields — a wrong value,
         // silently.
@@ -660,6 +685,112 @@ fn lower_barrier(
         })
     };
     (code, info.size(), captures)
+}
+
+/// A literal in which some field is `b.<its own name>` for one slot variable `b`, and every such
+/// copy is of that `b`: the base is read once, last, and the written fields are set into it.
+fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind> {
+    let mut base: Option<(&Expr, &QName, (u32, u32))> = None;
+    let mut copies: Vec<Ident> = Vec::new();
+    let mut sets: Vec<&(Ident, Expr)> = Vec::new();
+    for entry in fields {
+        let (name, value) = entry;
+        if let ExprKind::Field { base: b, field } = &value.kind
+            && field.name == name.name
+            && let ExprKind::Var(q) = &b.kind
+            && q.is_bare()
+            && let Some(slot) = cx.table.var(b)
+        {
+            match base {
+                None => base = Some((b, q, slot)),
+                Some((_, _, seen)) if seen == slot => {}
+                Some(_) => return None,
+            }
+            copies.push(field.clone());
+            continue;
+        }
+        sets.push(entry);
+    }
+    // A literal that rewrites every field has no copy to name its base, but a record it projects
+    // from inside a written field dies there just the same, and its cells are what to reuse. The
+    // machine's exact-shape check is what makes any candidate safe: a record of another shape is
+    // built as written.
+    let base = base.or_else(|| {
+        sets.iter()
+            .find_map(|(_, value)| projected_slot_var(value, cx))
+    });
+    let (b, q, (_, slot)) = base?;
+    // Reverse evaluation order: the base is read after every written field — and it reads only
+    // the copied fields, so a written field's expression may still take the old value's field.
+    let kept: Vec<Symbol> = copies.iter().map(|c| c.name.clone()).collect();
+    let own = cx.live.use_base(q.symbol(), &kept);
+    let base = Rc::new(Node {
+        kind: NodeKind::Var {
+            name: q.clone(),
+            slot: Some(slot),
+        },
+        span: b.span,
+        own,
+    });
+    let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(sets.len());
+    for (name, value) in sets.into_iter().rev() {
+        lowered.push((name.name.clone(), lower_in(value, cx)));
+    }
+    lowered.reverse();
+    Some(NodeKind::RecordUpdate {
+        base,
+        copies: Rc::new(copies),
+        sets: Rc::new(lowered),
+    })
+}
+
+/// The first slot variable projected anywhere inside `e`, without crossing into a barrier of
+/// its own (a lambda's projections read its own window).
+fn projected_slot_var<'e>(e: &'e Expr, cx: &Cx) -> Option<(&'e Expr, &'e QName, (u32, u32))> {
+    crate::limit::grow(|| {
+        if let ExprKind::Field { base, .. } = &e.kind
+            && let ExprKind::Var(q) = &base.kind
+            && q.is_bare()
+            && let Some(slot) = cx.table.var(base)
+        {
+            return Some((&**base, q, slot));
+        }
+        let children: Vec<&Expr> = match &e.kind {
+            ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Lambda { .. } => Vec::new(),
+            ExprKind::Unary { operand, .. } => vec![operand],
+            ExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+            ExprKind::App { func, args, .. } => {
+                std::iter::once(&**func).chain(args.iter()).collect()
+            }
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => vec![cond, then_branch, else_branch],
+            ExprKind::Match { scrutinee, .. } => vec![scrutinee],
+            ExprKind::Block { stmts, tail } => stmts
+                .iter()
+                .map(|s| match s {
+                    AstStmt::Let { value, .. } => &**value,
+                    AstStmt::Expr(e) => e,
+                })
+                .chain(tail.iter().map(|t| &**t))
+                .collect(),
+            ExprKind::Record { fields } => fields.iter().map(|(_, v)| v).collect(),
+            ExprKind::RecordUpdate { base, fields } => std::iter::once(&**base)
+                .chain(fields.iter().map(|(_, v)| v))
+                .collect(),
+            ExprKind::Field { base, .. } => vec![base],
+            ExprKind::Try { operand } => vec![operand],
+            ExprKind::List { items } => items.iter().collect(),
+            ExprKind::Perform { args, .. } => args.iter().collect(),
+            ExprKind::Handle { body, .. } => vec![body],
+            ExprKind::WithCell { init, body, .. } => vec![init, body],
+            ExprKind::WithRegion { body, .. } => vec![body],
+            ExprKind::Simulate { .. } => Vec::new(),
+        };
+        children.into_iter().find_map(|c| projected_slot_var(c, cx))
+    })
 }
 
 fn lower_all(exprs: &[Expr], cx: &mut Cx) -> Rc<Vec<Code>> {
