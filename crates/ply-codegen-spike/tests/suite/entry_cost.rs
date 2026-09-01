@@ -172,7 +172,7 @@ fn the_slope_is_a_function_of_what_the_slots_hold() {
         let mut fields = BTreeMap::new();
         fields.insert(Symbol::new("kind"), Value::Int(i as i64));
         fields.insert(Symbol::new("text"), Value::Str(Arc::from("ident")));
-        Value::Record(Arc::new(fields))
+        Value::Record(Arc::new(fields.into_iter().collect()))
     })
     .0;
 

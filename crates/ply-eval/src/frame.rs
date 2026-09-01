@@ -6,10 +6,9 @@ use crate::cont::Frame;
 use crate::handler;
 use crate::machine::{Machine, apply_unary, short_circuits};
 use crate::semantics::{err_let_mismatch, err_no_such_field, strict_binary};
-use crate::value::{Value, type_error};
-use ply_span::{Diagnostic, Symbol};
+use crate::value::{Fields, Value, type_error};
+use ply_span::Diagnostic;
 use ply_syntax::ast::BinOp;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl Machine<'_> {
@@ -262,7 +261,7 @@ impl Machine<'_> {
                 done.push((fields[next - 1].0.clone(), value));
                 match fields.get(next) {
                     None => {
-                        let map: BTreeMap<Symbol, Value> = done.into_iter().collect();
+                        let map: Fields = done.into_iter().collect();
                         self.go_return(Value::Record(Arc::new(map)));
                     }
                     Some((_, code)) => {

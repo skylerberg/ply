@@ -13,7 +13,6 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// An operation's declaration, by program-wide effect name and operation name.
@@ -400,7 +399,7 @@ pub(crate) fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub(crate) fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>) -> Diagnostic {
+pub(crate) fn err_no_such_field(field: &Ident, fields: &crate::value::Fields) -> Diagnostic {
     let known: Vec<String> = fields.keys().map(|k| format!("`{k}`")).collect();
     Diagnostic::error(
         codes::UNKNOWN_NAME,
