@@ -478,7 +478,7 @@ fn a_restore_is_refused_while_a_continuation_is_pinned() {
     arena.close(r);
 }
 
-/// the reference-counting pass accepts that a cycle leaks, and this is what one looks like in the allocator: a
+/// The reference-counting pass accepts that a cycle leaks, and this is what one looks like in the allocator: a
 /// continuation parked in a cell of a region it pins.
 #[test]
 fn a_continuation_parked_in_the_region_that_pins_it_is_the_leak_adr_0017_accepts() {

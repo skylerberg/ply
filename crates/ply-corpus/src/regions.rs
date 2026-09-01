@@ -1,4 +1,4 @@
-//! region isolation: what removing the forkable world costs the scheduler.
+//! Region isolation: what removing the forkable world costs the scheduler.
 
 use crate::rng::Rng;
 use anyhow::{Context, Result, bail};

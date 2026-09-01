@@ -565,7 +565,7 @@ test "a continuation resumed after its region returned reads that region's cell"
 }
 "#;
 
-/// the two-resumption example's "resumes twice", with the second resumption's write landing on the first one's:
+/// The two-resumption example's "resumes twice", with the second resumption's write landing on the first one's:
 /// one threaded world, not a snapshot per resumption.
 #[test]
 fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {

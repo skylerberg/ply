@@ -243,7 +243,7 @@ impl DbUrl {
                             return Err(format!(
                                 "`sslmode={other}` is not configurable in W4: TLS to postgres \
                                  is not wired up, so only `disable` and `prefer` are accepted \
-                                 and anything stronger would be a word that lies (the trusted computing base listing)"
+                                 and anything stronger would be a word that lies"
                             ));
                         }
                     }
@@ -403,7 +403,7 @@ pub const DEFAULT_ACQUIRE_MS: u64 = ply_host::db::pool::DEFAULT_ACQUIRE_MS;
 pub const DEFAULT_STATEMENT_MS: u64 = ply_host::db::pool::DEFAULT_STATEMENT_MS;
 pub const DEFAULT_IDLE_TXN_MS: u64 = ply_host::db::pool::DEFAULT_IDLE_TXN_MS;
 pub const DEFAULT_CONNECT_MS: u64 = ply_host::db::pool::DEFAULT_CONNECT_MS;
-/// statement preparation. Not in the pool's defaults: the statement cache is a property
+/// Statement preparation. Not in the pool's defaults: the statement cache is a property
 /// of a connection rather than of the pool.
 pub const DEFAULT_STATEMENT_CACHE: u32 = 256;
 
@@ -1156,14 +1156,14 @@ mod tests {
         }
     }
 
-    /// the trusted computing base listing: TLS to postgres is not wired up, so a word that promised
+    /// The trusted computing base listing: TLS to postgres is not wired up, so a word that promised
     /// encryption would be a word that lies.
     #[test]
     fn an_sslmode_stronger_than_prefer_is_refused_by_name() {
         for mode in ["require", "verify-ca", "verify-full", "allow"] {
             let why = DbUrl::parse(&format!("postgres://ply@h:5432/d?sslmode={mode}"))
                 .expect_err("`{mode}` is not configurable");
-            assert!(why.contains("the trusted computing base listing"), "{why}");
+            assert!(why.contains("a word that lies"), "{why}");
         }
         assert!(DbUrl::parse("postgres://ply@h:5432/d?sslmode=prefer").is_ok());
         assert!(DbUrl::parse("postgres://ply@h:5432/d?sslmode=disable").is_ok());
@@ -1260,7 +1260,7 @@ mod tests {
 
     // --- resolution ---------------------------------------------------------
 
-    /// the host boundary contract's rule is untouched: the environment says *which* database, and
+    /// The host boundary contract's rule is untouched: the environment says *which* database, and
     /// only `--host` decides that there is one.
     #[test]
     fn the_environment_supplies_the_url_and_never_the_binding() {

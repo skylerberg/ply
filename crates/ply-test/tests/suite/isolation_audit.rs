@@ -196,7 +196,7 @@ test "two" { cells.put[rows](2) }
     );
 }
 
-/// region isolation's lost case, reached by inference rather than by injection: six tests whose only
+/// Region isolation's lost case, reached by inference rather than by injection: six tests whose only
 /// atoms name one label are six colours wide, and every one of them is `shared` on the line
 /// `--explain` prints.
 #[test]
@@ -514,7 +514,7 @@ fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     );
 }
 
-/// region isolation's fixture, at the runner: built once for the group, mutated in place by every test
+/// Region isolation's fixture, at the runner: built once for the group, mutated in place by every test
 /// in it, and the test's own allocations closed on top.
 #[test]
 fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {

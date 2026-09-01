@@ -40,7 +40,7 @@ impl ValueDomain {
         }
     }
 
-    /// the concurrency-law conditions condition 5.
+    /// The concurrency-law conditions condition 5.
     pub fn covers_every_value(&self) -> bool {
         matches!(self, ValueDomain::Enumerated { .. })
     }
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(again.discharge.tier(), None);
     }
 
-    /// the concurrency-law conditions's condition 5, and the required test that goes with it: the same law with a
+    /// The concurrency-law conditions's condition 5, and the required test that goes with it: the same law with a
     /// binder is `property` however exhaustive the schedules were.
     #[test]
     fn an_exhaustive_search_over_sampled_values_is_never_proved() {

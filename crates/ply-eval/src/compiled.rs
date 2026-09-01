@@ -1443,7 +1443,7 @@ mod tests {
         );
     }
 
-    /// `argv.rs` is 40.9% of the argument-vector pool.
+    /// The free list serves an entered call's argument vector too.
     #[test]
     fn an_entered_call_returns_its_argument_vector_to_the_free_list() {
         let c = checked(vec![double_def()]);

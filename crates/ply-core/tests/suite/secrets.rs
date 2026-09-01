@@ -1,4 +1,4 @@
-//! the secret containment claim at the type level: every route a credential could take out of a program, and the
+//! The secret containment claim at the type level: every route a credential could take out of a program, and the
 //! diagnostic that closes it.
 
 use ply_core::{CheckOutput, check_program, print_type};

@@ -129,7 +129,7 @@ pub struct Site {
     /// `None` at a [`Verdict::Reuses`] site, which has no cause to name.
     pub cause: Option<Cause>,
     /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the property
-    /// the ownership design proposed to assert on, recorded here so that proposal can be measured
+    /// The ownership design proposed to assert on, recorded here so that proposal can be measured
     /// rather than argued.
     pub own_marked: bool,
 }

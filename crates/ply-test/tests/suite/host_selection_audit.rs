@@ -226,7 +226,9 @@ fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     let calls = Arc::new(AtomicUsize::new(0));
     let binding = registry("disk", "peek", Determinism::Deterministic, &calls)
         .bind(&compiled.check)
-        .expect("a deterministic handler over a `det` effect binds; determinism propagation permits it");
+        .expect(
+            "a deterministic handler over a `det` effect binds; determinism propagation permits it",
+        );
 
     assert!(
         binding.reaches(

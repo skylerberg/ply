@@ -236,7 +236,10 @@ impl PoolConfig {
                     }
                 ))
                 .note("W4 accepts `sslmode=disable` and `sslmode=prefer` only")
-                .note("wiring rustls into the postgres client is a real decision about the trusted computing base, and the trusted computing base listing puts it beside W5's secrets rather than shipping it as an untested line"));
+                .note(
+                    "wiring rustls into the postgres client is a real decision about the \
+                     trusted computing base, and it is not one this milestone takes",
+                ));
             }
         }
         if self.size == 0 {

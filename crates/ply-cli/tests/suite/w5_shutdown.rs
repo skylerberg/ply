@@ -446,7 +446,9 @@ test/nondet "a stop reaches the program" {
     }
 }
 
-/// The same service with a task per connection, which is the shape a real one has and the shape the drain's unfinished-request case is about: `desk.ply`'s in-flight count at a signal is exactly one, and a service that
+/// The same service with a task per connection, which is the shape a real one has
+/// and the shape the drain's unfinished-request case is about: `desk.ply`'s
+/// in-flight count at a signal is exactly one, and a service that
 /// spawns per connection has N.
 const CONCURRENT: &str = r#"
 import std.net

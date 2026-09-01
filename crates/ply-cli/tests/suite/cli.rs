@@ -377,7 +377,7 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
     assert!(text.contains("region-isolated and free"), "got:\n{text}");
 }
 
-/// region isolation through host effects having no region isolation: a report that still said `world` after the world was gone would
+/// A report that still said `world` after the forkable world was gone would
 /// over-claim by exactly the tests that moved, so `--explain` names the contention *and* what kind
 /// it is.
 #[test]

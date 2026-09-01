@@ -89,7 +89,7 @@ fn bound(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> H
     registry.bind(&compiled.check).expect("the registry binds")
 }
 
-/// the escape brand's open route, and the escape case — a continuation resumed after the region that made its cell returned: a continuation parked in an enclosing
+/// The brand's open route, and the escape case: a continuation parked in an enclosing
 /// region's cell and resumed after the region whose cell it reads has returned.
 const PARKED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -137,7 +137,7 @@ test/nondet "the answer comes back" {
 }
 "#;
 
-/// the escape brand records one route as open and this milestone does not close it.
+/// The escape brand records one route as open and this milestone does not close it.
 #[test]
 fn the_documented_open_route_still_behaves_as_adr_0017_section_2_says() {
     let compiled = Compiled::new(PARKED);

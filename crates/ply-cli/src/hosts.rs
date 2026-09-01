@@ -1496,7 +1496,7 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
         );
     }
 
-    /// transactions as handlers handles `db.rollback` in Ply, inside `transaction`, so a bound one would abort
+    /// Transactions as handlers handles `db.rollback` in Ply, inside `transaction`, so a bound one would abort
     /// nothing and commit what the program meant to discard.
     #[test]
     fn a_bound_rollback_is_refused_as_a_defect_rather_than_listed() {
@@ -1636,7 +1636,7 @@ fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
         );
     }
 
-    /// the trusted computing base listing: a CI check that broke on every certificate renewal is a CI check people learn
+    /// The trusted computing base listing: a CI check that broke on every certificate renewal is a CI check people learn
     /// to ignore.
     #[test]
     fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {

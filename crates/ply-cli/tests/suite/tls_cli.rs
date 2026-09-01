@@ -145,7 +145,7 @@ fn a_tls_program_with_no_credential_is_told_what_will_happen() {
     );
 }
 
-/// the trusted computing base listing: the digest covers the credential names, the provider and the library version, and
+/// The trusted computing base listing: the digest covers the credential names, the provider and the library version, and
 /// **not** the fingerprint.
 #[test]
 fn the_digest_is_stable_across_a_rotation_and_moves_when_a_credential_is_added() {

@@ -82,7 +82,7 @@ fn nested() -> Int =
 }
 
 /// A `with_cell[r]` written inside `with_region[r]` allocates into that region rather than opening
-/// one of its own — the region model.
+/// one of its own.
 #[test]
 fn a_cell_inside_a_region_of_its_own_brand_opens_no_second_region() {
     let src = r#"
@@ -306,7 +306,7 @@ fn apply(f: () -> Int) -> Int =
     );
 }
 
-/// the region-kind rule's own two-resumption example with `handle` and `with_cell` swapped, which is the
+/// The region-kind rule's own two-resumption example with `handle` and `with_cell` swapped, which is the
 /// shape every backtracking handler over scratch state has.
 #[test]
 fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
@@ -485,7 +485,7 @@ fn refusals(src: &str, brand: &str, kind: RegionKind) -> Vec<Diagnostic> {
     }
 }
 
-/// the region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
+/// The region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
 /// site.
 #[test]
 fn forcing_unique_where_a_capture_is_reachable_is_refused_and_names_the_site() {

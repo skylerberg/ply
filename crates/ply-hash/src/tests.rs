@@ -1219,7 +1219,7 @@ fn handler_clause_parameters_are_de_bruijn_bound() {
     assert_eq!(a, renamed);
 }
 
-/// the control-stack design, required tests 24 and 25.
+/// The control-stack design, required tests 24 and 25.
 #[test]
 fn binding_a_continuation_changes_the_hash_and_renaming_the_binder_does_not() {
     let with_binder = |binder: &str| {

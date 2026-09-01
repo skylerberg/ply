@@ -149,7 +149,7 @@ fn a_statement_reaches_the_implementation_with_every_table_it_touches() {
     assert!(atoms.iter().any(|a| a.contains("orders")), "{atoms:?}");
 }
 
-/// the driver's reported footprint's preventer, end to end through the handler: a join reaches a table the entry
+/// The driver's reported footprint's preventer, end to end through the handler: a join reaches a table the entry
 /// point's row never declared, and the refusal happens at prepare — before a connection is acquired
 /// and before a row is read.
 #[test]

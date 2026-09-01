@@ -489,7 +489,7 @@ pub struct Lever {
     pub what: &'static str,
 }
 
-/// the cheaper levers's seven levers.
+/// The cheaper levers's seven levers.
 pub const LEVERS: [Lever; 7] = [
     Lever {
         name: "more native builtins",
@@ -1802,7 +1802,7 @@ mod tests {
         assert!(decision.reasons[0].contains("negative"));
     }
 
-    /// the withdrawal of the ladder, in code: the ladder answers about what it measured.
+    /// The withdrawal of the ladder, in code: the ladder answers about what it measured.
     #[test]
     fn a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone() {
         let full = report(full_points());

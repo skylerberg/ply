@@ -262,7 +262,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     }
 }
 
-/// the teardown order's pinned order: every open transaction rolled back and never committed, every open
+/// The teardown order's pinned order: every open transaction rolled back and never committed, every open
 /// span closed `Abandoned`, the sink flushed, the pool closed.
 pub(crate) fn teardown(
     hosts: &Hosts,

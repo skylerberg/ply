@@ -165,7 +165,8 @@ test "save and restore around each resumption gives both branches one start" {
     );
 }
 
-/// **the escape case — a continuation resumed after the region that made its cell returned, which the escape brand turns into a compile error.**
+/// **The escape case — a continuation resumed after the region that made its cell
+/// returned — which the brand turns into a compile error.**
 #[test]
 fn a_continuation_outliving_its_region_still_reads_that_regions_cell() {
     holds(

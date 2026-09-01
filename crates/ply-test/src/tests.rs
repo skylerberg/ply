@@ -433,7 +433,7 @@ fn every_region_isolated_test_lands_in_group_zero() {
     }
 }
 
-/// the isolation rule's property, with the population region isolation leaves it: what is free to add is a test
+/// The isolation rule's property, with the population region isolation leaves it: what is free to add is a test
 /// that names nothing another test can reach.
 #[test]
 fn adding_region_isolated_tests_does_not_change_the_group_count() {
@@ -1500,7 +1500,7 @@ fn with_footprint(program: &mut Program, name: &str, footprint: Footprint) {
     program.check.tests[index].footprint = footprint;
 }
 
-/// region isolation's lost case, end to end on the real runner: two tests whose only atoms name one
+/// Region isolation's lost case, end to end on the real runner: two tests whose only atoms name one
 /// label used to share a group and are coloured apart now.
 #[test]
 fn two_tests_retaining_the_same_cell_resource_are_coloured_apart() {

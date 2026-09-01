@@ -4348,8 +4348,8 @@ pub struct TestResult { /* ... */ pub host: Option<HostUse> }  // NOT SHIPPED
   ever selected because it can reach the host**. A host-reaching test runs today
   only because `Reason::Nondet` covers it, and that covers it only because every
   registration in `ply_host::registry` is `Determinism::Nondeterministic`. ADR
-  0011 §4 explicitly permits a `Deterministic` registration and §5 says such a
-  handler is "still not cacheable"; it is cacheable. A hermetic pass by a test
+  0011 explicitly permits a `Deterministic` registration and says such a handler
+  is "still not cacheable"; it is cacheable. A hermetic pass by a test
   whose footprint reaches the binding is read back under `--host` and the test is
   skipped without the host being consulted.
   `crates/ply-test/tests/suite/host_selection_audit.rs` pins that behaviour under a

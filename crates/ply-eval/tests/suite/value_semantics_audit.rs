@@ -186,7 +186,7 @@ pub fn deep(s: Secret<String>) -> Int = descend(2000, s)
 pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 10 + d
 "#;
 
-/// the secret containment claim as a bound on the free list, measured through the machine.
+/// The secret containment claim as a bound on the free list, measured through the machine.
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     let compiled = compile(SECRET_ARGUMENTS);
@@ -634,7 +634,7 @@ pub fn func(ignored: Int) -> (Int) -> Tag = Marker
 
 // --- 8. the width the refusal to narrow `Value` rejected narrowing at -------------------------
 
-/// the refusal to narrow `Value` names, among the things that would make it wrong, *"if a build
+/// The refusal to narrow `Value` names, among the things that would make it wrong, *"if a build
 /// agent has to widen `Value` past 32 bytes to land any of this"* as one of five conditions that
 /// would sink the document.
 #[test]

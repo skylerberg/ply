@@ -1,4 +1,4 @@
-//! the reference-counting pass asked of whole programs rather than of synthetic expressions.
+//! The reference-counting pass asked of whole programs rather than of synthetic expressions.
 
 use ply_eval::{Machine, rc};
 use ply_span::{SourceId, SourceMap};
@@ -72,7 +72,7 @@ test "a captured list keeps its length" {
     );
 }
 
-/// per-task region stacks gives every task its own region stack, and a value two tasks reach is a value
+/// Per-task region stacks gives every task its own region stack, and a value two tasks reach is a value
 /// neither may rewrite.
 #[test]
 fn a_list_two_tasks_reach_is_copied_rather_than_rewritten() {

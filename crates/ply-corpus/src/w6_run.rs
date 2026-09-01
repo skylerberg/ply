@@ -796,7 +796,7 @@ fn replace_calls(source: &str, name: &str) -> String {
 }
 
 /// What the constant memo is worth **end to end on the served workload**, which is the only shape
-/// the cheaper levers accepts as a price.
+/// The cheaper levers accepts as a price.
 #[allow(clippy::too_many_arguments)]
 pub fn memo_lever(
     repo: &Path,

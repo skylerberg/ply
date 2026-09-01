@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(f.cmp(&g), std::cmp::Ordering::Equal);
     }
 
-    /// the secret invariant at this seam. A cached value has the program's lifetime, so
+    /// The secret invariant at this seam. A cached value has the program's lifetime, so
     /// what it may hold is the whole question: a nullary constructor's `args`
     /// are empty, so it can hold no [`Value::Cell`] past the region that would
     /// reclaim one and no [`Value::Secret`] past the call that made it — and
