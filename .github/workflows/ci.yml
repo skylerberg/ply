@@ -656,26 +656,82 @@ jobs:
       #
       # `--nocapture`, because every one of these prints a table, and a
       # measurement nobody can read is not a measurement.
+      # One build, then the binaries directly.
+      #
+      # This step used to be a loop of `cargo test -p <package>`, one per
+      # entry, and that shape cost more than everything it measured. Cargo
+      # resolves features over *the packages a single invocation selects*, and
+      # seven crates near the bottom of this graph resolve differently
+      # depending on which package is asked for: `serde` gains `rc` (from
+      # `ply-store`), `rust_decimal` gains `db-tokio-postgres` (from
+      # `ply-host`), and `syn`, `smallvec`, `memchr`, `proc-macro2` and `quote`
+      # each flip too. `ply-span` depends on `serde`, so the `rc` flip alone
+      # invalidates the whole workspace. Measured on run 33472886832: the step
+      # took 262s, of which **255s was cargo rebuilding** — `Compiling
+      # ply-span` five separate times in one job — against about 7s of the
+      # wall clocks this job exists to take.
+      #
+      # Selecting every package once resolves features once, so there is one
+      # build. Running the binaries by path afterwards is what keeps it at one:
+      # going back through `cargo test -p <package>` would narrow the selection
+      # again and re-resolve.
+      #
+      # `cd` into the package directory before running, because that is where
+      # cargo would have run the binary from. Nothing in the current table
+      # reads the working directory — every path in them comes from
+      # `env!("CARGO_MANIFEST_DIR")`, which is fixed at compile time — so this
+      # is insurance against the next test rather than a fix for one here.
+      - name: Build every package the table names, once
+        run: |
+          set -euo pipefail
+          packages_raw=$(.github/ci-shards.sh deferred-packages)
+          read -r -a packages <<<"$packages_raw"
+          [ "${#packages[@]}" -gt 0 ] || { echo "the deferred table names no packages" >&2; exit 1; }
+          selectors=()
+          for package in "${packages[@]}"; do
+            selectors+=(-p "$package")
+          done
+          cargo test --locked --no-run \
+            --message-format=json-render-diagnostics \
+            "${selectors[@]}" > /tmp/artifacts.json
       - name: Each timing test, alone
         run: |
           set -euo pipefail
+          ran=0
           while read -r package target test; do
             echo "::group::$package/$target $test"
-            # `lib` is the table's spelling for a unit test, which is reached by
-            # `--lib` and named by its full module path rather than by a binary.
+            # `lib` is the table's spelling for a unit test, which lives in the
+            # package's own test binary; anything else is a `tests/` target,
+            # whose entry point is either `<target>.rs` or `<target>/main.rs`.
+            # The same two spellings `ci-shards.sh`'s `test_source_file` knows.
             if [ "$target" = lib ]; then
-              selector=(--lib)
+              src="$PWD/crates/$package/src/lib.rs"
+            elif [ -f "crates/$package/tests/$target.rs" ]; then
+              src="$PWD/crates/$package/tests/$target.rs"
             else
-              selector=(--test "$target")
+              src="$PWD/crates/$package/tests/$target/main.rs"
             fi
-            cargo test --locked -p "$package" "${selector[@]}" \
-              -- --exact --test-threads=1 --nocapture "$test" | tee /tmp/timing.log
-            grep -Eq 'test result: ok\. 1 passed' /tmp/timing.log || {
-              echo "$test did not run: the shard table names a test cargo did not find" >&2
+            binary=$(jq -r --arg src "$src" '
+              select(.reason == "compiler-artifact")
+              | select(.executable != null)
+              | select(.target.src_path == $src)
+              | .executable
+            ' /tmp/artifacts.json | tail -1)
+            [ -n "$binary" ] || {
+              echo "no test binary was built from $src — the table names a target cargo did not build" >&2
               exit 1
             }
+            (cd "crates/$package" && "$binary" --exact --test-threads=1 --nocapture "$test") |
+              tee /tmp/timing.log
+            grep -Eq 'test result: ok\. 1 passed' /tmp/timing.log || {
+              echo "$test did not run: the shard table names a test the binary does not have" >&2
+              exit 1
+            }
+            ran=$((ran + 1))
             echo "::endgroup::"
           done < <(.github/ci-shards.sh deferred)
+          echo "$ran timing test(s) ran"
+          [ "$ran" -gt 0 ] || { echo "the deferred table is empty" >&2; exit 1; }
 
   spike:
     name: crates/ply-codegen-spike
