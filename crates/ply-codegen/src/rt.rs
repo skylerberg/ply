@@ -303,6 +303,18 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
+/// `++`, which is `String` concatenation only, built from the same two `Value::as_str` calls
+/// `interp::strict_binary` uses so a non-`Str` operand raises the identical error.
+pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (l, r) = (ctx.read(a).clone(), ctx.read(b).clone());
+    let joined = match (l.as_str(Span::DUMMY, "`++`"), r.as_str(Span::DUMMY, "`++`")) {
+        (Ok(x), Ok(y)) => format!("{x}{y}"),
+        (Err(d), _) | (_, Err(d)) => return ctx.fail(d),
+    };
+    ctx.push(Value::str(joined))
+}
+
 pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
@@ -376,6 +388,27 @@ pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64
     let ctx = unsafe { &mut *ctx };
     let args = args_of(ctx, args, n);
     ctx.push(Value::list(args))
+}
+
+/// Whether a value is a record whose field count a pattern admits: `exact` demands the count,
+/// because a pattern without `..` matches only a record of exactly its fields.
+pub unsafe extern "C" fn rt_record_fits(ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.read(value) {
+        Value::Record(fields) => i64::from(exact == 0 || fields.len() as i64 == len),
+        _ => 0,
+    }
+}
+
+/// Whether a record holds the field a pattern names, a missing one being a failed match rather
+/// than the error [`rt_field`] raises.
+pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let name = ctx.tables.fields[index as usize].clone();
+    match ctx.read(value) {
+        Value::Record(fields) => i64::from(fields.contains_key(&name)),
+        _ => 0,
+    }
 }
 
 /// Whether a value is a list long enough for a pattern: `exact` demands the length, and otherwise
@@ -473,11 +506,14 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_no_fuel", rt_no_fuel as *const u8),
         ("rt_lit", rt_lit as *const u8),
         ("rt_equal", rt_equal as *const u8),
+        ("rt_concat", rt_concat as *const u8),
         ("rt_builtin", rt_builtin as *const u8),
         ("rt_ctor", rt_ctor as *const u8),
         ("rt_record", rt_record as *const u8),
         ("rt_field", rt_field as *const u8),
         ("rt_list", rt_list as *const u8),
+        ("rt_record_fits", rt_record_fits as *const u8),
+        ("rt_record_has", rt_record_has as *const u8),
         ("rt_list_fits", rt_list_fits as *const u8),
         ("rt_list_at", rt_list_at as *const u8),
         ("rt_list_rest", rt_list_rest as *const u8),

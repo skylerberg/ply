@@ -89,6 +89,10 @@ pub struct Machine<'a> {
     fns: FxHashMap<Symbol, FnSlot<'a>>,
     /// The lowered form of the definitions this machine has actually called.
     lowered: FxHashMap<Symbol, Value>,
+    /// Non-local name resolution, memoised per `(module, qualifier, name)` — keyed by symbols
+    /// rather than by `QName`, whose `Eq` includes a `Span` and would miss on every mention after
+    /// the first.
+    globals: FxHashMap<(usize, Option<Symbol>, Symbol), Value>,
     /// Where the lowering itself is kept, and the reason `lowered` above is only a map from a name
     /// to a closure this machine has already built.
     lowering: Rc<Lowering<'a>>,
@@ -232,6 +236,7 @@ impl<'a> Machine<'a> {
             check,
             fns,
             lowered: FxHashMap::default(),
+            globals: FxHashMap::default(),
             lowering: Rc::new(Lowering::for_program(program)),
             closure_code: ClosureCode::default(),
             memo: Memo::default(),
@@ -2099,20 +2104,33 @@ impl<'a> Machine<'a> {
                 None => {}
             }
         }
+        let key = (
+            module,
+            q.module.as_ref().map(|m| m.name.clone()),
+            q.name.name.clone(),
+        );
+        if let Some(v) = self.globals.get(&key) {
+            return Ok(v.clone());
+        }
         if let Some(name) = self.global(module, Namespace::Value, q)
             && let Some(v) = self.definition(&name)
         {
+            self.globals.insert(key, v.clone());
             return Ok(v);
         }
         if let Some(name) = self.ctor_name(module, q)
             && let Some(&arity) = self.ctors.get(&name)
         {
-            return Ok(ctor_value(&name, arity));
+            let v = ctor_value(&name, arity);
+            self.globals.insert(key, v.clone());
+            return Ok(v);
         }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
         {
-            return Ok(Value::builtin(b));
+            let v = Value::builtin(b);
+            self.globals.insert(key, v.clone());
+            return Ok(v);
         }
         Err(err_unknown_name(q))
     }

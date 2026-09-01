@@ -66,6 +66,9 @@ struct Helpers {
     no_match: FuncId,
     lit: FuncId,
     equal: FuncId,
+    concat: FuncId,
+    record_fits: FuncId,
+    record_has: FuncId,
     builtin: FuncId,
     ctor: FuncId,
     list: FuncId,
@@ -279,6 +282,9 @@ impl Jit {
             no_match: declare(&mut module, "rt_no_match", 1, false)?,
             lit: declare(&mut module, "rt_lit", 2, true)?,
             equal: declare(&mut module, "rt_equal", 3, true)?,
+            concat: declare(&mut module, "rt_concat", 3, true)?,
+            record_fits: declare(&mut module, "rt_record_fits", 4, true)?,
+            record_has: declare(&mut module, "rt_record_has", 3, true)?,
             builtin: declare(&mut module, "rt_builtin", 4, true)?,
             ctor: declare(&mut module, "rt_ctor", 4, true)?,
             list: declare(&mut module, "rt_list", 3, true)?,
@@ -1122,7 +1128,16 @@ impl Fx<'_, '_> {
                     v,
                 })
             }
-            BinOp::Concat => self.refuse("`++`"),
+            BinOp::Concat => {
+                let a = self.boxed(l);
+                let b = self.boxed(r);
+                let v = self.helper(self.jit.helpers.concat, &[a, b]);
+                self.check();
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
         }
     }
@@ -1230,6 +1245,21 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// Whether a pattern binds anything at all, at any depth, so [`Fx::bind_pattern`] can skip
+    /// extracting a sub-value nothing will read.
+    fn binds_any(&self, pat: &ply_syntax::ast::Pattern) -> bool {
+        match &pat.kind {
+            PatternKind::Wildcard | PatternKind::Lit(_) => false,
+            PatternKind::Var(_) => self.binder(pat).is_some(),
+            PatternKind::Ctor { args, .. } => args.iter().any(|a| self.binds_any(a)),
+            PatternKind::Record { fields, .. } => fields.iter().any(|(_, p)| self.binds_any(p)),
+            PatternKind::List { items, rest } => {
+                items.iter().any(|p| self.binds_any(p))
+                    || rest.as_ref().is_some_and(|r| self.binds_any(r))
+            }
+        }
+    }
+
     /// The name a sub-pattern binds, and `None` for one that binds nothing — a wildcard, or a bare
     /// nullary constructor, which is a test rather than a binder ([`Fx::test_pattern`]).
     fn binder(&self, pat: &ply_syntax::ast::Pattern) -> Option<Symbol> {
@@ -1287,25 +1317,48 @@ impl Fx<'_, '_> {
                 self.builder.ins().brif(eq, hit, &[], miss, &[]);
             }
             PatternKind::List { items, rest } => {
-                if let Some(bad) = items
-                    .iter()
-                    .chain(rest.iter().map(|r| r.as_ref()))
-                    .find(|p| !self.irrefutable(p))
-                {
+                // A refutable `rest` would need the tail built before it could be tested;
+                // the corpus asks for none.
+                if let Some(bad) = rest.iter().find(|p| !self.irrefutable(p)) {
                     return self.refuse(format!(
-                        "a {} pattern nested inside a list pattern",
+                        "a {} pattern as a list pattern's rest",
                         pattern_name(&bad.kind)
                     ));
                 }
-                let v = self.boxed(value);
+                let base = self.boxed(value);
                 let len = self.builder.ins().iconst(types::I64, items.len() as i64);
                 let exact = self
                     .builder
                     .ins()
                     .iconst(types::I64, i64::from(rest.is_none()));
-                let fits = self.helper(self.jit.helpers.list_fits, &[v, len, exact]);
+                let fits = self.helper(self.jit.helpers.list_fits, &[base, len, exact]);
                 let fits = self.builder.ins().icmp_imm(IntCC::NotEqual, fits, 0);
-                self.builder.ins().brif(fits, hit, &[], miss, &[]);
+                let mut cur = self.builder.create_block();
+                self.builder.ins().brif(fits, cur, &[], miss, &[]);
+                for (i, item) in items.iter().enumerate() {
+                    if self.irrefutable(item) {
+                        continue;
+                    }
+                    self.builder.switch_to_block(cur);
+                    self.builder.seal_block(cur);
+                    let at = self.builder.ins().iconst(types::I64, i as i64);
+                    let sub = self.helper(self.jit.helpers.list_at, &[base, at]);
+                    self.check();
+                    let next = self.builder.create_block();
+                    self.test_pattern(
+                        item,
+                        Val {
+                            kind: Kind::Boxed,
+                            v: sub,
+                        },
+                        next,
+                        miss,
+                    )?;
+                    cur = next;
+                }
+                self.builder.switch_to_block(cur);
+                self.builder.seal_block(cur);
+                self.builder.ins().jump(hit, &[]);
             }
             PatternKind::Ctor { name, args } => {
                 let Some((index, arity)) = self.ctor_of(name) else {
@@ -1321,17 +1374,83 @@ impl Fx<'_, '_> {
                         args.len()
                     ));
                 }
-                if let Some(bad) = args.iter().find(|a| !self.irrefutable(a)) {
-                    return self.refuse(format!(
-                        "a {} pattern nested inside the constructor pattern `{}`",
-                        pattern_name(&bad.kind),
-                        name.symbol()
-                    ));
+                // The tag first, then each argument that can still fail, in
+                // `Machine::match_pattern`'s order: a sub-pattern may raise, and must not
+                // run under a tag that already failed.
+                let base = self.boxed(value);
+                let boxed = Val {
+                    kind: Kind::Boxed,
+                    v: base,
+                };
+                let mut cur = self.builder.create_block();
+                self.test_ctor(boxed, index, cur, miss);
+                for (i, arg) in args.iter().enumerate() {
+                    if self.irrefutable(arg) {
+                        continue;
+                    }
+                    self.builder.switch_to_block(cur);
+                    self.builder.seal_block(cur);
+                    let at = self.builder.ins().iconst(types::I64, i as i64);
+                    let sub = self.helper(self.jit.helpers.ctor_arg, &[base, at]);
+                    self.check();
+                    let next = self.builder.create_block();
+                    self.test_pattern(
+                        arg,
+                        Val {
+                            kind: Kind::Boxed,
+                            v: sub,
+                        },
+                        next,
+                        miss,
+                    )?;
+                    cur = next;
                 }
-                self.test_ctor(value, index, hit, miss);
+                self.builder.switch_to_block(cur);
+                self.builder.seal_block(cur);
+                self.builder.ins().jump(hit, &[]);
             }
-            other => {
-                return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
+            PatternKind::Record { fields, rest } => {
+                // Refutable despite the shape: a record pattern fails on a non-record, on
+                // a field count without `..`, and on a missing field.
+                let base = self.boxed(value);
+                let len = self.builder.ins().iconst(types::I64, fields.len() as i64);
+                let exact = self.builder.ins().iconst(types::I64, i64::from(!*rest));
+                let fits = self.helper(self.jit.helpers.record_fits, &[base, len, exact]);
+                let fits = self.builder.ins().icmp_imm(IntCC::NotEqual, fits, 0);
+                let mut cur = self.builder.create_block();
+                self.builder.ins().brif(fits, cur, &[], miss, &[]);
+                for (name, sub) in fields {
+                    self.builder.switch_to_block(cur);
+                    self.builder.seal_block(cur);
+                    let index = self.field_index(&name.name);
+                    let index = self.builder.ins().iconst(types::I64, index);
+                    let has = self.helper(self.jit.helpers.record_has, &[base, index]);
+                    let has = self.builder.ins().icmp_imm(IntCC::NotEqual, has, 0);
+                    let present = self.builder.create_block();
+                    self.builder.ins().brif(has, present, &[], miss, &[]);
+                    self.builder.switch_to_block(present);
+                    self.builder.seal_block(present);
+                    if self.irrefutable(sub) {
+                        cur = present;
+                        continue;
+                    }
+                    let field = self.helper(self.jit.helpers.field, &[base, index]);
+                    self.check();
+                    let next = self.builder.create_block();
+                    self.test_pattern(
+                        sub,
+                        Val {
+                            kind: Kind::Boxed,
+                            v: field,
+                        },
+                        next,
+                        miss,
+                    )?;
+                    cur = next;
+                }
+                self.builder.switch_to_block(cur);
+                self.builder.seal_block(cur);
+                self.builder.ins().jump(hit, &[]);
             }
         }
         Ok(())
@@ -1363,18 +1482,20 @@ impl Fx<'_, '_> {
             PatternKind::List { items, rest } => {
                 let base = self.boxed(value);
                 for (i, item) in items.iter().enumerate() {
-                    if let Some(name) = self.binder(item) {
-                        let i = self.builder.ins().iconst(types::I64, i as i64);
-                        let v = self.helper(self.jit.helpers.list_at, &[base, i]);
-                        self.check();
-                        scope.push((
-                            name,
-                            Val {
-                                kind: Kind::Boxed,
-                                v,
-                            },
-                        ));
+                    if !self.binds_any(item) {
+                        continue;
                     }
+                    let i = self.builder.ins().iconst(types::I64, i as i64);
+                    let v = self.helper(self.jit.helpers.list_at, &[base, i]);
+                    self.check();
+                    self.bind_pattern(
+                        item,
+                        Val {
+                            kind: Kind::Boxed,
+                            v,
+                        },
+                        scope,
+                    )?;
                 }
                 if let Some(rest) = rest
                     && let Some(name) = self.binder(rest)
@@ -1394,23 +1515,41 @@ impl Fx<'_, '_> {
             PatternKind::Ctor { args, .. } => {
                 let base = self.boxed(value);
                 for (i, arg) in args.iter().enumerate() {
-                    let Some(name) = self.binder(arg) else {
+                    if !self.binds_any(arg) {
                         continue;
-                    };
+                    }
                     let i = self.builder.ins().iconst(types::I64, i as i64);
                     let v = self.helper(self.jit.helpers.ctor_arg, &[base, i]);
                     self.check();
-                    scope.push((
-                        name,
+                    self.bind_pattern(
+                        arg,
                         Val {
                             kind: Kind::Boxed,
                             v,
                         },
-                    ));
+                        scope,
+                    )?;
                 }
             }
-            other => {
-                return self.refuse(format!("a {} pattern in a `match`", pattern_name(other)));
+            PatternKind::Record { fields, .. } => {
+                let base = self.boxed(value);
+                for (name, sub) in fields {
+                    if !self.binds_any(sub) {
+                        continue;
+                    }
+                    let index = self.field_index(&name.name);
+                    let index = self.builder.ins().iconst(types::I64, index);
+                    let v = self.helper(self.jit.helpers.field, &[base, index]);
+                    self.check();
+                    self.bind_pattern(
+                        sub,
+                        Val {
+                            kind: Kind::Boxed,
+                            v,
+                        },
+                        scope,
+                    )?;
+                }
             }
         }
         Ok(())
