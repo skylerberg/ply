@@ -1,26 +1,20 @@
-# 5. The control stack and the world
+# ADR 0005 — The control stack and the world
 
 Status: accepted — **the machine landed and is the default engine**; §2's
 persistent forkable world is **superseded by ADR 0017**. §3's resumption
 semantics stand unchanged and are what ADR 0017 §3 was rewritten to preserve.
-Date: 2026-07-25
 Supersedes: DESIGN.md §2's "v0 restriction: tail-resumptive only", and the
 ST-monad reading of `with_cell`'s region.
 Superseded in part by: `docs/adr/0017-regions.md` (§2 only).
 
-> **Corrected by the W6 documentation audit.** This line read "types landed,
-> machine outstanding". `Engine::Machine` is `#[default]` in
-> `crates/ply-eval/src/lib.rs`, so the machine is not merely landed — it is the
-> engine every run uses unless told otherwise, and `Engine::Treewalk` is now the
-> fallback that refuses a `resume` binder with `E0504`.
->
-> The status line also said nothing about §2 having been replaced. `ply_eval::world`
-> no longer exists: `World`, `World::fork`, `World::high_water` and
-> `set_base_world` are gone from `ply-eval`, and `Value::Cell` is a `Slot` in a
-> `TaskRegions` arena. What each of §2's operations became is stated inline in
-> §2 below. This matters because §2 is the section most likely to be read for a
-> cost model, and every cost in its table is now the cost of something that does
-> not exist.
+The machine is not merely landed — `Engine::Machine` is the default, so it is the
+engine every run uses unless told otherwise, and `Engine::Treewalk` is the
+fallback that refuses a `resume` binder with `E0504`.
+
+**`ply_eval::world` no longer exists**, and what each of §2's operations became
+is stated inline there. **This matters because §2 is the section most likely to
+be read for a cost model, and every cost in its table is now the cost of
+something that does not exist.**
 
 ## Context
 
@@ -749,43 +743,34 @@ change that deletes the tree-walker, together with the fuel budget a tail loop
 would then need — with only one engine left, "a tail-recursive loop is a loop"
 becomes an available answer.
 
-> **Still the decision, and cited at last — see ADR 0022 (2026-08-27).** This
-> paragraph settled the tail-call question, and ADR 0020 §5.1, ADR 0021 §3 and
-> `spikes/ply-lexer/GAPS.md` §5 each re-derived it as an open problem without
-> citing it. ADR 0022 records that, and takes the **second half** of the
-> sentence above — the fuel budget — without the first: `iterate(seed, budget,
-> step)` elides no call, costs exactly one `Frame::IterateStep` on the machine
-> and one host-loop iteration on the tree-walker, and takes its bound as an
-> argument so a runaway is a diagnostic naming a number the program wrote.
-> **Tail-call elision stays out**, and this decision is not altered.
+**Still the decision, and cited at last — ADR 0022.** This paragraph settled the
+tail-call question, **and three later documents each re-derived it as an open
+problem without citing it.** ADR 0022 takes the **second half** of the sentence
+above — the fuel budget — without the first: `iterate(seed, budget, step)` elides
+no call, costs exactly one frame per step on the machine and one host-loop
+iteration on the tree-walker, and **takes its bound as an argument so a runaway
+is a diagnostic naming a number the program wrote. Tail-call elision stays out.**
 
-`DEFAULT_MAX_FRAMES` stays as a resource limit on a heap that is nobody's native
-stack. A call costs at least one frame, so the call bound is reached first and
-the frame bound catches only a program that pends a million frames without
-nesting ten thousand calls.
+**A separate frame bound is gone, and the reason is worth keeping.** This section
+argued that a call costs at least one frame, so the *call* bound is reached first
+and a frame bound catches only a pathological program. **That is wrong, and it is
+the same error §7.1 was written to correct, made once more: a *call* costs one
+frame, a *body* costs as many as it pends**, so a body pending enough frames per
+call reaches the frame bound first.
 
-> **Superseded by the fix to this section's own §7.1 (2026-08-24).** The
-> paragraph above is wrong in its second sentence and the error is the same one
-> §7.1 was written to correct, made once more: a **call** costs one frame, a
-> **body** costs as many as it pends, so the call bound is *not* reached first
-> — a body pending more than `1_000_000 / 10_000` = 100 frames per call reaches
-> the frame bound. `DEFAULT_MAX_FRAMES` no longer exists as a default. What is
-> left is `Machine::with_max_frames`, an opt-in ceiling that is not part of what
-> a program means, and a machine carrying one enters no compiled body — a native
-> body pends no frames and cannot honour a limit counted in them.
->
-> The reason the ceiling had to go rather than be copied into the tree-walker:
-> it was a function of **spelling**, not of behaviour. Measured on the shipping
-> release binary, 2026-08-24, on two definitions of the same function making the
-> same 9,001 nested calls at `hog(9000)` — `hog(n - 1) + 150` answered
-> `1350000`, and `hog(n - 1) + 1 + 1 + ...` with 150 terms raised. Giving the
-> tree-walker the same ceiling would have made both engines refuse the second
-> program over how its additions were written, and would still have left a
-> backend answering where both raised.
->
-> This also retires the third bullet of §7.1's list of what the frame bound
-> counts: with no ceiling, `Stack::frames()` is an observation and
-> `Stack::calls()` is the bound.
+**The ceiling had to go rather than be copied into the tree-walker, because it
+was a function of *spelling*, not of behaviour.** Measured on two definitions of
+the same function making the same nested calls: written with a folded constant it
+answered, and written as a long chain of additions it raised. **Giving the
+tree-walker the same ceiling would have made both engines refuse a program over
+how its additions were written**, and would still have left a backend answering
+where both raised. What is left is `Machine::with_max_frames`, an opt-in ceiling
+that is **not part of what a program means**, and a machine carrying one enters
+no compiled body — **a native body pends no frames and cannot honour a limit
+counted in them.**
+
+This also retires §7.1's third bullet: with no ceiling, `Stack::frames()` is an
+observation and `Stack::calls()` is the bound.
 
 ## Consequences
 

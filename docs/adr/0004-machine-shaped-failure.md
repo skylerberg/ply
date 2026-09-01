@@ -1,20 +1,6 @@
-# 4. Machine-shaped failure
+# ADR 0004 — Machine-shaped failure
 
 Status: accepted — **implemented**
-Date: 2026-07-25
-
-> **Corrected by the W6 documentation audit.** This line read "interface landed,
-> implementation outstanding", and the "Not done here" section below listed four
-> things as unimplemented. All four have since shipped, verified against the
-> tree: `Hybrid` assembly, relinking and evaluation is
-> `crates/ply-test/src/hybrid.rs`; `Delta` construction by re-normalizing
-> against the baseline hash table is `crates/ply-test/src/bisect/renormalize.rs`
-> (with `classify.rs` beside it); the structured `Assertion` payload is emitted
-> by `crates/ply-test/src/report.rs::assertion_json`, so `assertion` is no
-> longer always `null`; and `--bisect-budget` is a real flag with a default of
-> 64 in `crates/ply-cli/src/cli.rs`. The paragraph below about `NoHybrid`
-> answering every mixture `Unresolved` described the tree as it stood then and
-> is kept, struck, because it is the measurement that motivated the work.
 Depends on: `docs/adr/0003` — the store must hold definition **bodies**, not
 only hashes and interfaces. Section 3 below states exactly what M5 needs from
 it, and what M5 degrades to if 0003 lands in a weaker form.
@@ -421,42 +407,28 @@ than defended:
 | `location` | where to open the editor. |
 | `diagnostic` | the rendered form, unchanged, for anything that already consumes it. |
 
-> **Correction in place (2026-08-24): four rows of this table describe a field
-> no report has ever carried.** `causal_slice` is `null` in every report the
-> shipped binary writes, because nothing in the workspace constructs a
-> `ply_test::SliceBuilder` outside `crates/ply-test/tests/suite/bisect_audit.rs`.
-> Measured on the tree, not read off the code:
->
-> ```
-> $ ./target/debug/ply test tests/fixtures/assertion_failed.ply --trace always --json \
->     | python3 -c 'import sys,json; d=json.load(sys.stdin); \
->         print([ (f["key"], f.get("causal_slice")) for f in d["failures"] ])'
-> [('assertion_failed.the running total of the journal', None)]
-> ```
->
-> So `causal_slice.stack`, `causal_slice.entered[].calls`,
-> `causal_slice.observed_footprint` and `causal_slice.reproduced` are
-> specifications rather than descriptions, and the example object above is an
-> example of a shape rather than of an output. The rows are left as written
-> because they are still what the fields are *for*, and because this ADR is the
-> only place the intended shape is recorded. `CONTRIBUTING.md` §"Things known to
-> be broken" item 15 carries the gap and the decision it needs — construct the
-> slice, or delete the type and the `--trace` surface with it.
->
-> One row is also **wrong on its own terms** and would stay wrong if the tracer
-> were armed tomorrow. `causal_slice.observed_footprint` is described as "which
-> branch was taken, and which handler fired", and the `footprint.declared` vs
-> `observed` row as "a declared atom that never fired is a branch not taken".
-> The second holds. The first does not, in one direction: both engines record
-> **every** `perform`, including one a `handle` inside the call discharges, and
-> discharging is exactly what keeps an atom out of a published row. So an atom
-> can appear in `observed` while appearing in no declared row anywhere —
-> measured on `tests/fixtures/self_handled_effect.ply`, whose `handled`
-> publishes `{}` and records `{tally.read[log], tally.write[log]}` when it runs.
-> A consumer may read a *missing* declared atom as a branch not taken; it may
-> not read a *present* observed atom as a declared branch that was.
-> `crates/ply-test/src/slice.rs` carries the same correction on the field
-> itself.
+**Four rows of this table describe a field no report has ever carried.**
+`causal_slice` is `null` in every report the shipped binary writes, because
+nothing in the workspace constructs a `ply_test::SliceBuilder` outside its own
+audit test. So `causal_slice.stack`, `.entered[].calls`, `.observed_footprint`
+and `.reproduced` are **specifications rather than descriptions**, and the
+example object above is an example of a *shape* rather than of an output. **The
+rows are left as written because they are still what the fields are for, and
+because this ADR is the only place the intended shape is recorded.**
+`CONTRIBUTING.md` §"Things known to be broken" carries the gap and the decision
+it needs — construct the slice, or delete the type and the `--trace` surface with
+it.
+
+**One row is also wrong on its own terms and would stay wrong if the tracer were
+armed tomorrow.** `causal_slice.observed_footprint` is described as "which branch
+was taken, and which handler fired". **Both engines record *every* `perform`,
+including one a `handle` inside the call discharges — and discharging is exactly
+what keeps an atom out of a published row.** So an atom can appear in `observed`
+while appearing in no declared row anywhere, which
+`tests/fixtures/self_handled_effect.ply` demonstrates. **A consumer may read a
+*missing* declared atom as a branch not taken; it may not read a *present*
+observed atom as a declared branch that was.** `crates/ply-test/src/slice.rs`
+carries the same correction on the field itself.
 
 `suspects` becoming an array of objects is a **breaking change** to the v1
 shape, which is why the schema is versioned. The array is ranked, so a consumer
