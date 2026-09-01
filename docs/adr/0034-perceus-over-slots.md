@@ -323,12 +323,26 @@ With slots the same rule is a write:
    an operation* rather than becoming cheap.
 3. **A read marked [`crate::rc::Own::Owned`] takes the value out of its slot**, leaving it empty.
    `slots.rs` has already resolved which slot, verified over 12 shipped modules and 1,682
-   occurrences. The pending frame sees the empty slot too, which is correct: `Owned` is exactly the
+   occurrences — though see below for why that assignment is not yet an *address*. The pending frame sees the empty slot too, which is correct: `Owned` is exactly the
    claim that nothing after this point reads the binding.
 4. **A closure copies its free variables** out of the window. Done — §11 S4a.
 5. **A capture copies the windows it took**, and each resumption restores them. This is the cost
    the design pays, and §10.1's census is what says it is affordable: 12.4 carries per capture, and
    the average capture is 3.5 frames deep.
+
+**Step 2 needs more than `slots.rs` currently gives it, and this is the first thing to fix.** A
+handler clause's body is a barrier to `lower_barrier` — it opens a fresh `ownable`, so only its own
+binders are ownable inside it — but at runtime `handler.rs` builds its scope as
+`prompt.env.clone()` *extended* with the clause's parameters. The same is true of a `return` clause.
+So a clause body's slot 0 is its first parameter, while the scope it actually runs in has the whole
+prompt environment underneath. **A flat per-barrier index is therefore not a runtime address**, even
+though `slots.rs` verifies it is internally consistent — the two passes agree with each other and
+disagree with the machine.
+
+Two ways out, and the second is likelier: give every occurrence a `(depth, index)` rather than an
+index, or make a clause body a real frame that copies in the free variables it needs, exactly as a
+closure now does (§11 S4a). The second keeps addressing flat and reuses machinery that already
+exists; the first keeps clause entry cheap. Neither is written.
 
 **What makes step 3 work is step 1**, and only step 1: a value can be moved out of a slot exactly
 when the slot array has one owner, and the array has one owner exactly when it is the machine's
