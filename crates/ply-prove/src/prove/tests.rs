@@ -118,6 +118,26 @@ fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
     )
 }
 
+/// [`decide_and_diagnose`] over a law, so a test can assert *why* an attempt was
+/// refused rather than only that it was.
+pub(super) fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
+    let ctx = f.context();
+    let law = f.law(label);
+    let binders = binders(law);
+    let guards: Vec<&Expr> = law.guard.iter().collect();
+    decide_and_diagnose(
+        &ctx,
+        &Goal {
+            module: 0,
+            binders: &binders,
+            guards: &guards,
+            result: None,
+            body: &law.body,
+        },
+        &Limits::default(),
+    )
+}
+
 #[track_caller]
 pub(super) fn proof(fixture: &Fixture, label: &str) -> Proof {
     match attempt(fixture, label) {

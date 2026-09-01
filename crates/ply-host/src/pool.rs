@@ -1,4 +1,7 @@
 //! Where a host operation goes when it has to wait.
+//!
+//! One [`Pool`] per facility, minting in disjoint token ranges so a composed runtime
+//! can tell whose answer a token is.
 
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, codes};
@@ -10,15 +13,29 @@ use std::time::Duration;
 /// How many host operations may be waiting at once, across every socket.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 
+/// The first token the socket pool mints.
+pub const NET_FIRST_TOKEN: u64 = 1;
+
+/// The first token the filesystem pool mints, far enough above [`NET_FIRST_TOKEN`] that
+/// neither range reaches the other and no token is owned by two pools.
+pub const FS_FIRST_TOKEN: u64 = 1 << 62;
+
 /// What a job hands back.
 pub enum Done {
     Int(i64),
+    /// Whether a write happened; a filesystem's state is not the program's error.
+    Bool(bool),
     /// `net.recv`'s answer.
     MaybeBytes(Option<Vec<u8>>),
-    /// `net.send`'s answer, under the same rule.
+    /// `net.send`'s answer; `fs.file_size` and `fs.modified_ms` under their own rule.
     MaybeInt(Option<i64>),
+    /// `fs.list_dir`'s answer, or `None` when it is not a directory this run can read.
+    MaybeStrings(Option<Vec<String>>),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
+    /// A refusal the job computed, carrying its own code, because a confinement check runs where
+    /// the syscalls do and `E0452` has to be tellable from a disk that was busy.
+    Refused(Diagnostic),
 }
 
 type Job = Box<dyn FnOnce() -> Done + Send + 'static>;
@@ -48,21 +65,18 @@ pub struct Pool {
     shared: Arc<Shared>,
 }
 
-impl Default for Pool {
-    fn default() -> Pool {
-        Pool::new()
-    }
-}
-
 impl Pool {
-    pub fn new() -> Pool {
+    /// `first` is where this pool's token range starts, and it is a parameter
+    /// rather than a constant because two pools counting from one would hand
+    /// out the same number twice. See [`NET_FIRST_TOKEN`].
+    pub fn new(first: u64) -> Pool {
         Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 finished: Condvar::new(),
-                // Token 0 is never minted, so a zeroed `Pending` is a token this pool does not own
-                // rather than its first job.
-                next: AtomicU64::new(1),
+                // Token 0 is never minted, so a zeroed `Pending` is a token no pool
+                // owns rather than one pool's first job.
+                next: AtomicU64::new(first),
             }),
         }
     }
@@ -201,8 +215,15 @@ fn take(state: &mut State, token: u64) -> Taken {
     };
     Taken::Ready(match done {
         Done::Int(i) => Ok(Value::Int(i)),
+        Done::Bool(b) => Ok(Value::Bool(b)),
         Done::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
         Done::MaybeInt(n) => Ok(option(n.map(Value::Int))),
+        Done::MaybeStrings(names) => {
+            Ok(option(names.map(|names| {
+                Value::list(names.into_iter().map(Value::str).collect())
+            })))
+        }
+        Done::Refused(diagnostic) => Err(diagnostic),
         Done::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("{what} failed: {message}"),
@@ -247,4 +268,42 @@ fn wait_timeout<'a, T>(
         .wait_timeout(guard, bound)
         .map(|(guard, _)| guard)
         .unwrap_or_else(|e| e.into_inner().0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariant `NET_FIRST_TOKEN` argues for, asserted rather than
+    /// described. A composed runtime asks each facility whether it minted a
+    /// token and the first one to say yes answers it, so two ranges that met
+    /// would not be a wrong answer — they would be a poll that never resolves.
+    #[test]
+    fn no_two_facilities_mint_the_same_token() {
+        let ranges = [
+            ("net", NET_FIRST_TOKEN),
+            ("fs", FS_FIRST_TOKEN),
+            ("db", crate::db::pool::FIRST_TOKEN),
+        ];
+        for (i, (whose, first)) in ranges.iter().enumerate() {
+            assert!(
+                *first > 0,
+                "`{whose}` would mint the token a zeroed `Pending` carries"
+            );
+            for (other, next) in &ranges[i + 1..] {
+                assert!(
+                    first < next,
+                    "`{whose}` starts at {first} and `{other}` at {next}: the ranges are not ordered"
+                );
+                // Unreachable rather than maximal: `net` starts at 1 because 0 is the token a
+                // zeroed `Pending` carries, so the gap below it is one short of a power of two
+                // and no choice of constants makes every gap exactly 2^62.
+                assert!(
+                    next - first >= 1 << 61,
+                    "`{whose}` reaches `{other}` after {} operations",
+                    next - first
+                );
+            }
+        }
+    }
 }

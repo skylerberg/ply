@@ -84,7 +84,7 @@ arm "expect_gt answers the whole >= as the >" \
   'node: {start: s.start, end: s.start + 1} }' \
   'node: {start: s.start, end: s.end} }'
 
-# 2. > **Withdrawn (ADR 0028, 2026-08-30): eight mutations that cannot be
+# 2. > **Withdrawn (the try operator, 2026-08-30): eight mutations that cannot be
 #    > written any more.** This block held six `arm`s and two `equiv`s, all of
 #    > the shape *"bail guard deleted from `expect`"* — replacing
 #    > `pub fn expect(..) -> R<Span> =\n  if p.bail {` with `if false {` — for
@@ -103,7 +103,7 @@ arm "expect_gt answers the whole >= as the >" \
 #    >
 #    > **There is no guard to delete.** `?` replaced the flag, so `p.bail` does
 #    > not exist, no function opens with one, and a mutation that removes a
-#    > guard has nothing to remove. That is ADR 0028's claim in its strongest
+#    > guard has nothing to remove. That is the try operator's claim in its strongest
 #    > form: the 63-of-83 unverifiable guards `GAPS.md` §2 measured are not now
 #    > verifiable, they are **unwritable**. The eight lines are deleted rather
 #    > than rewritten because a mutation that cannot be applied arms nothing,
@@ -118,7 +118,7 @@ arm "dedup rule: keyed on the code alone, not the span" \
   'l.code == d.code && ls.start == s.start && ls.end == s.end' \
   'l.code == d.code'
 
-# The two fields this used to corrupt are gone (ADR 0027): `push_diag` reads
+# The two fields this used to corrupt are gone (the list index decision): `push_diag` reads
 # `list_at(p.diags, len(p.diags) - 1)` instead. Corrupting the *index* is the
 # same corruption — it makes the rule look at the wrong diagnostic, which for a
 # one-element list is none at all.
@@ -224,7 +224,7 @@ arm "a name with two coloncolons is accepted rather than reported" \
   'if false {
       Err(push_diag'
 
-# 10. Depth, which is the one thing standing between the corpus and ADR 0022 §8.
+# 10. Depth, which is the one thing standing between the corpus and the call-ceiling decision.
 arm "deeper never fails, however deep the nesting" \
   'if q.depth <= max_depth() { Ok(q) }' \
   'if true { Ok(q) }'

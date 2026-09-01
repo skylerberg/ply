@@ -389,15 +389,7 @@ impl<'s> Driver<'s> {
             self.phases.check += started.elapsed();
             let more = match &outcome {
                 Ok(check) => self.callers_of_moved(check, &gate, &hashes),
-                // A diagnostic raised while any interface is restored can be one a from-scratch
-                // check would not raise, and an error carries no interfaces to compare, so the
-                // only honest next wave restores none.
-                Err(_) => hashes
-                    .defs
-                    .keys()
-                    .filter(|name| gate.cached.contains(*name))
-                    .cloned()
-                    .collect(),
+                Err(diagnostics) => self.restored_under(diagnostics, &gate, &hashes),
             };
             if more.is_empty() {
                 let check = outcome.map_err(|diagnostics| LoadError {
@@ -406,13 +398,79 @@ impl<'s> Driver<'s> {
                 })?;
                 break (check, gate.cached);
             }
+            // Every wave has to give up something it had not already given up, or it will run
+            // forever: a name gate 2 restores on a path that does not consult `widened` comes back
+            // unchanged however many times it is handed over. Spinning is the worst way to learn
+            // that, so it is an assertion rather than a hang.
+            let before = self.widened.len();
             self.widened.extend(more);
+            assert!(
+                self.widened.len() > before,
+                "a wave gave up only names it had already given up, so it cannot make progress"
+            );
         };
         self.merge(program, resolved, hashes, bodies, check, cached)
     }
 
     /// Definitions gate 2 restored that call one whose published interface turned out to have
     /// moved. Empty means the fixed point: nothing was checked against a stale interface.
+    /// What the definitions a failed wave reported against were checked against, and that this
+    /// wave restored.
+    ///
+    /// A diagnostic can be an artefact of a restored interface, but only for a definition that
+    /// reached one, so the whole cache does not have to be given up: re-checking a suspect's own
+    /// callees is what produces a fresh interface for it to be judged against, and if any of those
+    /// then move, `callers_of_moved` carries it from there. Empty means the report was produced
+    /// against interfaces this run computed, and it is the answer.
+    ///
+    /// A diagnostic that names no file widens everything, because there is nothing to narrow to.
+    fn restored_under(
+        &self,
+        diagnostics: &[Diagnostic],
+        gate: &GateTwo,
+        hashes: &HashOutput,
+    ) -> BTreeSet<Symbol> {
+        let every = || -> BTreeSet<Symbol> {
+            hashes
+                .defs
+                .keys()
+                .filter(|name| gate.cached.contains(*name))
+                .cloned()
+                .collect()
+        };
+        let mut blamed: BTreeSet<SourceId> = BTreeSet::new();
+        for d in diagnostics {
+            for label in &d.labels {
+                if label.span.is_dummy() {
+                    return every();
+                }
+                blamed.insert(label.span.source);
+            }
+        }
+        if blamed.is_empty() {
+            return every();
+        }
+        let mut out = BTreeSet::new();
+        for file in self.files.iter().filter(|f| blamed.contains(&f.source)) {
+            let Some(ast) = file.ast.as_ref() else {
+                return every();
+            };
+            for item in &ast.items {
+                let Some(ident) = item.name() else { continue };
+                let name = file.module.qualify(&ident.name);
+                for dep in hashes.deps.get(&name).into_iter().flatten() {
+                    // Definitions only. A `type` or `effect` is restored on a path that does not
+                    // consult `widened`, so returning one would hand back a name the next wave
+                    // still calls cached, and the loop would never grow its way out.
+                    if gate.cached.contains(dep) && hashes.defs.contains_key(dep) {
+                        out.insert(dep.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn callers_of_moved(
         &self,
         check: &CheckOutput,

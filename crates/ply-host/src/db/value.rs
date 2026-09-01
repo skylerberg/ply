@@ -230,7 +230,7 @@ pub fn error(e: &DbError) -> Value {
     fields.insert(Symbol::new("code"), Value::str(&e.code));
     fields.insert(Symbol::new("constraint"), Value::str(&e.constraint));
     fields.insert(Symbol::new("detail"), Value::str(&e.detail));
-    Value::Record(Arc::new(fields))
+    Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
 /// A `Failed` answer built from a SQLSTATE the driver produced rather than the server: a pool that

@@ -325,6 +325,48 @@ test/nondet "the clock is not deterministic" {
 }
 "#;
 
+/// Every operator the language has, so the byte table and its inverse are exercised over all of
+/// it rather than the handful an example uses.
+const EVERY_OPERATOR: &str = r#"
+fn arithmetic(a, b) = a + b - a * b / a % b
+fn comparison(a, b) = (a == b) && (a != b) || (a < b) && (a <= b) || (a > b) && (a >= b)
+fn concatenation(a, b) = a ++ b
+fn bits(a, b) = a & b | a ^ b
+fn shifts(a, b) = (a << b) + (a >> b) + (a >>> b)
+fn prefixes(a, p) = -a + ~a + (if !p { 1 } else { 0 })
+"#;
+
+/// The comment above `body::binop_of` called its table "pinned by a round-trip
+/// test over every operator" and no such test existed; the bit and filesystem surface added six
+/// operators to `binop_byte` and one to `unop_byte`, and the inverse is a
+/// second hand-written list, so an omission there is not a compile error — it
+/// is `W0602` at decode time, on a body that hashed and stored perfectly well.
+/// This is that test. It deliberately does not typecheck: what is under test is
+/// the byte table, not the prelude.
+#[test]
+fn every_operator_survives_the_byte_table_and_its_inverse() {
+    let (program, resolved) = parse(&[("m", EVERY_OPERATOR)]);
+    let (before, bodies) =
+        hash_program_with_bodies(&program, &resolved).expect("program should hash");
+    assert_eq!(before.defs.len(), 6, "the sample lost a definition");
+
+    let mut rebuilt = reconstruct(&bodies).expect("bodies should reconstruct");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
+    let (after, _) =
+        hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash again");
+
+    let keys = |out: &HashOutput| {
+        let mut v: Vec<DefHash> = out.defs.values().copied().collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        keys(&before),
+        keys(&after),
+        "a body carrying an operator did not survive the round trip"
+    );
+}
+
 #[test]
 fn every_item_kind_round_trips() {
     let original = assert_interfaces_survive(&[("m", EVERY_ITEM_KIND)]);

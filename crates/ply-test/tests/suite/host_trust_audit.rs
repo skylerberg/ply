@@ -1,18 +1,15 @@
 //! What a lying host handler does to the **runner** — scheduling, the cache and the failure
 //! artifact.
 
-use ply_core::CheckOutput;
+use crate::fixture::Compiled;
 use ply_core::ty::Resource;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Plan, Value};
-use ply_hash::HashOutput;
-use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
 use ply_test::{Hosting, Record, RunReport, Search, select};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,30 +38,6 @@ impl TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-    hashes: HashOutput,
-}
-
-impl Compiled {
-    fn new(source: &str) -> Compiled {
-        let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
-        let resolved = ply_syntax::resolve(&mut program).expect("the fixture resolves");
-        let check = ply_core::check_program(&program, &resolved).expect("the fixture typechecks");
-        let hashes =
-            ply_hash::hash_program(&program, &resolved, &check).expect("the fixture hashes");
-        Compiled {
-            program,
-            resolved,
-            check,
-            hashes,
-        }
     }
 }
 

@@ -1,26 +1,13 @@
 //! Why the leak the reference-counting pass accepts is not reachable yet, pinned so that the day it becomes
 //! reachable is a failing test rather than a silent leak.
 
-use ply_core::check_program;
-use ply_span::{Diagnostic, SourceId, codes};
-use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-fn rejected(src: &str) -> Vec<Diagnostic> {
-    let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-    let resolved =
-        resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    match check_program(&program, &resolved) {
-        Ok(_) => Vec::new(),
-        Err(diags) => diags,
-    }
-}
+use crate::fixture::Compiled;
+use ply_span::codes;
 
 /// Storing the cell inside itself structurally asks for `T = List<Cell<T>>`.
 #[test]
 fn a_cell_cannot_be_stored_in_a_list_it_holds() {
-    let diags = rejected(
+    let diags = Compiled::rejected(
         r#"
 test "a cell that reaches itself" {
   with_cell[log]([]) { c -> {
@@ -41,7 +28,7 @@ test "a cell that reaches itself" {
 /// half of why the shape has nowhere to be written.
 #[test]
 fn a_declared_field_cannot_hold_a_cell_for_a_cycle_to_run_through() {
-    let diags = rejected(
+    let diags = Compiled::rejected(
         r#"
 type Loop = Nil | Node(Cell<Loop>)
 

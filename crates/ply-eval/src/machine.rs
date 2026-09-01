@@ -23,7 +23,7 @@ use crate::semantics::{
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
-use crate::value::{Closure, ClosureKind, Value};
+use crate::value::{Closure, ClosureKind, Fields, Value};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -33,7 +33,6 @@ use ply_syntax::ast::{
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, OnceCell};
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -89,6 +88,10 @@ pub struct Machine<'a> {
     fns: FxHashMap<Symbol, FnSlot<'a>>,
     /// The lowered form of the definitions this machine has actually called.
     lowered: FxHashMap<Symbol, Value>,
+    /// Non-local name resolution, memoised per `(module, qualifier, name)` — keyed by symbols
+    /// rather than by `QName`, whose `Eq` includes a `Span` and would miss on every mention after
+    /// the first.
+    globals: FxHashMap<(usize, Option<Symbol>, Symbol), Value>,
     /// Where the lowering itself is kept, and the reason `lowered` above is only a map from a name
     /// to a closure this machine has already built.
     lowering: Rc<Lowering<'a>>,
@@ -232,6 +235,7 @@ impl<'a> Machine<'a> {
             check,
             fns,
             lowered: FxHashMap::default(),
+            globals: FxHashMap::default(),
             lowering: Rc::new(Lowering::for_program(program)),
             closure_code: ClosureCode::default(),
             memo: Memo::default(),
@@ -772,23 +776,28 @@ impl<'a> Machine<'a> {
                 self.go_eval(lhs.clone(), env, module);
             }
 
-            NodeKind::Lambda { params, body } => {
+            NodeKind::Lambda { params, body, free } => {
+                let captured = match free {
+                    Some(free) => env.keep_only(free),
+                    None => env.clone(),
+                };
                 self.go_return(Value::Closure(Arc::new(Closure {
                     name: None,
                     kind: ClosureKind::Code {
                         params: params.clone(),
                         body: body.clone(),
-                        env,
+                        env: captured,
                         module,
                     },
                 })));
             }
 
-            NodeKind::App { func, args } => {
+            NodeKind::App { func, args, dead } => {
                 let carried = crate::rc::carry(&env, !args.is_empty());
                 self.push(
                     Frame::AppCallee {
                         args: args.clone(),
+                        dead: dead.clone(),
                         env: carried,
                         module,
                         span,
@@ -837,15 +846,20 @@ impl<'a> Machine<'a> {
                 self.enter_block(stmts.clone(), 0, tail.clone(), env, module)?;
             }
 
-            NodeKind::Record { fields } => {
+            NodeKind::Record { fields, dead } => {
                 if fields.is_empty() {
-                    self.go_return(Value::Record(Arc::new(BTreeMap::new())));
+                    self.go_return(Value::Record(Arc::new(Fields::default())));
                 } else {
-                    let carried = crate::rc::carry(&env, fields.len() > 1);
+                    let carried = crate::rc::carry_released(
+                        &env,
+                        fields.len() > 1,
+                        dead.first().map(|d| &**d).unwrap_or(&[]),
+                    );
                     self.push(
                         Frame::RecordField {
                             done: Vec::with_capacity(fields.len()),
                             fields: fields.clone(),
+                            dead: dead.clone(),
                             next: 1,
                             env: carried,
                             module,
@@ -2099,20 +2113,33 @@ impl<'a> Machine<'a> {
                 None => {}
             }
         }
+        let key = (
+            module,
+            q.module.as_ref().map(|m| m.name.clone()),
+            q.name.name.clone(),
+        );
+        if let Some(v) = self.globals.get(&key) {
+            return Ok(v.clone());
+        }
         if let Some(name) = self.global(module, Namespace::Value, q)
             && let Some(v) = self.definition(&name)
         {
+            self.globals.insert(key, v.clone());
             return Ok(v);
         }
         if let Some(name) = self.ctor_name(module, q)
             && let Some(&arity) = self.ctors.get(&name)
         {
-            return Ok(ctor_value(&name, arity));
+            let v = ctor_value(&name, arity);
+            self.globals.insert(key, v.clone());
+            return Ok(v);
         }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
         {
-            return Ok(Value::builtin(b));
+            let v = Value::builtin(b);
+            self.globals.insert(key, v.clone());
+            return Ok(v);
         }
         Err(err_unknown_name(q))
     }
@@ -2546,6 +2573,8 @@ pub(crate) fn apply_unary(
             }
         },
         UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
+        // Every bit of the two's-complement pattern flipped, so `~0` is `-1`.
+        UnOp::BitNot => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
     }
 }
 

@@ -32,6 +32,7 @@ pub mod region_kind;
 pub mod sched;
 mod semantics;
 pub mod sim;
+pub mod slots;
 pub mod task_regions;
 pub mod trace;
 mod value;
@@ -82,7 +83,7 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
+    Closure, ClosureKind, Decimal, Fields, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
     first_difference, values_equal,
 };
 

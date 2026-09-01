@@ -1,11 +1,10 @@
 //! Every integration test in this crate, as one binary: cargo links one per
 //! `.rs` directly under `tests/`, and the link dominates the build.
-//!
-//! A test that reads process-global state keeps a binary of its own beside this
-//! one, because everything in here shares a process and runs in parallel — a
-//! `#[global_allocator]`, whose count would include every other test's, and
-//! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
+mod fixture;
+
+mod bit_operators;
+mod blake3_differential;
 mod byte_builtins;
 mod cell_arena_wiring;
 mod constant_memo;
@@ -22,6 +21,7 @@ mod map_builtins;
 mod map_order;
 mod ownership_checker_armed;
 mod ownership_checker_oracle;
+mod position_invariance_g1;
 mod reference_counting_audit;
 mod reference_counting_cost;
 mod reference_cycles;
@@ -33,11 +33,13 @@ mod region_meaning_adversarial;
 mod region_meaning_audit;
 mod region_reclamation_census;
 mod region_wiring_audit;
+mod resumption_scope_audit;
 mod resumption_semantics_audit;
 mod resumption_snapshot_audit;
 mod secrets;
 mod simulated_handlers;
 mod simulation;
+mod slot_resolution;
 mod stdlib_accumulator_cost;
 mod transaction_scope_audit;
 mod use_after_free_audit;

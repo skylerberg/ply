@@ -128,7 +128,7 @@ probe "op_param eats the documentation name it should skip" \
            } else { p };' \
   'let p2 = p;'
 
-# > **Withdrawn (ADR 0028, 2026-08-30): three probes that cannot be applied.**
+# > **Withdrawn (the try operator, 2026-08-30): three probes that cannot be applied.**
 # > They stood here as `probe "the bail guard on fn_body is deleted"`,
 # > `.. on law_def ..` and `.. on item ..`, each replacing `if p.bail {` at the
 # > head of the function with `if false {`. `fn_body`'s is the one `GAPS.md` §2

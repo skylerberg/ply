@@ -1,37 +1,8 @@
 //! A nullary pure definition is a constant, and the evaluator remembers it.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::{Machine, Value};
-use ply_span::{SourceId, Span, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = match ply_syntax::parse_program(inputs) {
-        Ok(p) => p,
-        Err(d) => panic!("did not parse: {d:#?}"),
-    };
-    let resolved = match resolve(&mut program) {
-        Ok(r) => r,
-        Err(d) => panic!("did not resolve: {d:#?}"),
-    };
-    let check = match check_program(&program, &resolved) {
-        Ok(c) => c,
-        Err(d) => panic!("did not typecheck: {d:#?}"),
-    };
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
+use ply_span::{Span, codes};
 
 /// `deep` costs 700 pending calls and `nest` costs one per step, so a budget of 1000 admits either
 /// alone and refuses `nest(400)` with a second `deep` under it.
@@ -75,7 +46,7 @@ fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
 
 #[test]
 fn a_nullary_pure_definition_is_evaluated_once() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     match probe(&c, "m.probe_constant") {
         Ok(value) => assert_eq!(value, Value::Int(1400)),
         Err(d) => panic!("the remembered constant did not survive the depth: {d:#?}"),
@@ -84,7 +55,7 @@ fn a_nullary_pure_definition_is_evaluated_once() {
 
 #[test]
 fn a_definition_with_a_parameter_is_not_a_constant_however_dead_the_parameter_is() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let d = probe(&c, "m.probe_parameterized")
         .expect_err("a parameterized definition must be re-evaluated");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
@@ -92,7 +63,7 @@ fn a_definition_with_a_parameter_is_not_a_constant_however_dead_the_parameter_is
 
 #[test]
 fn a_declared_row_the_body_never_performs_still_refuses_the_memo() {
-    let c = compile(SOURCE);
+    let c = Compiled::new(SOURCE);
     let d = probe(&c, "m.probe_over_declared")
         .expect_err("the published row is what decides, not the body's");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
@@ -102,7 +73,7 @@ fn a_declared_row_the_body_never_performs_still_refuses_the_memo() {
 /// handler sees every one of its calls.
 #[test]
 fn a_nullary_definition_that_performs_is_evaluated_on_every_call() {
-    let c = compile(
+    let c = Compiled::new(
         r#"
 effect counter {
   write bump() -> Unit
@@ -136,7 +107,7 @@ test "a nullary effectful definition performs once per call" {
 /// to be the first's.
 #[test]
 fn a_constant_built_behind_a_handler_is_remembered_with_its_value_intact() {
-    let c = compile(
+    let c = Compiled::new(
         r#"
 effect seed {
   read grain(i: Int) -> Int

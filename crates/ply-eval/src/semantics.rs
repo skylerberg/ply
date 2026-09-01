@@ -13,7 +13,6 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// An operation's declaration, by program-wide effect name and operation name.
@@ -228,6 +227,36 @@ pub(crate) fn strict_binary(
                 None => Err(err_overflow(span, what, a, b)),
             }
         }
+        // The two's-complement bit pattern of the `Int`, and nothing else: the checker
+        // refused every other operand type.
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            let a = l.as_int(lspan, "a bit operator")?;
+            let b = r.as_int(rspan, "a bit operator")?;
+            Ok(Value::Int(match op {
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                _ => a ^ b,
+            }))
+        }
+
+        // A count outside `0..=63` raises for the reason a zero divisor does, while `<<`
+        // itself discards rather than raising, because a mixing step is defined to drop
+        // the bits that leave.
+        BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
+            let a = l.as_int(lspan, "a shift")?;
+            let n = r.as_int(rspan, "a shift")?;
+            if !(0..64).contains(&n) {
+                return Err(err_shift_count(rspan, n));
+            }
+            let n = n as u32;
+            Ok(Value::Int(match op {
+                BinOp::Shl => ((a as u64) << n) as i64,
+                // Both shifts exist because `Int` is signed and there is no `UInt`.
+                BinOp::Shr => a >> n,
+                _ => ((a as u64) >> n) as i64,
+            }))
+        }
+
         BinOp::And | BinOp::Or => Err(Diagnostic::error(
             codes::INTERNAL_ERROR,
             "internal error: a short-circuiting operator reached strict evaluation",
@@ -370,7 +399,7 @@ pub(crate) fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub(crate) fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>) -> Diagnostic {
+pub(crate) fn err_no_such_field(field: &Ident, fields: &crate::value::Fields) -> Diagnostic {
     let known: Vec<String> = fields.keys().map(|k| format!("`{k}`")).collect();
     Diagnostic::error(
         codes::UNKNOWN_NAME,
@@ -382,6 +411,14 @@ pub(crate) fn err_no_such_field(field: &Ident, fields: &BTreeMap<Symbol, Value>)
     } else {
         format!("available fields: {}", known.join(", "))
     })
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn err_shift_count(span: Span, n: i64) -> Diagnostic {
+    Diagnostic::error(codes::RUNTIME_ERROR, "shift count out of range")
+        .primary(span, format!("{n} is not in 0..=63"))
+        .note("an `Int` is 64 bits, so no other count names a shift of it")
 }
 
 #[cold]

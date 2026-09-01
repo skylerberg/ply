@@ -1,11 +1,8 @@
 //! What `--audit-backend` actually compared, as a number the run reports.
 
-use ply_core::CheckOutput;
+use crate::fixture::Compiled;
 use ply_eval::Plan;
-use ply_hash::HashOutput;
-use ply_span::SourceId;
 use ply_store::Store;
-use ply_syntax::resolve::Resolved;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,34 +32,8 @@ impl Drop for TempRoot {
     }
 }
 
-struct Compiled {
-    program: ply_syntax::ast::Program,
-    resolved: Resolved,
-    check: CheckOutput,
-    hashes: HashOutput,
-}
-
-impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-            hashes,
-        }
-    }
-}
-
 fn report(src: &str, audit: bool) -> ply_test::RunReport {
-    let compiled = Compiled::new(src);
+    let compiled = Compiled::anonymous(src);
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());

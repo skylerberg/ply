@@ -1,25 +1,12 @@
 //! An adversarial reading of the escape brand, taken as a claim to be falsified rather than as a design
 //! to be illustrated.
 
-use ply_core::{CheckOutput, check_program};
-use ply_span::{Diagnostic, SourceId, codes};
-use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-fn compile(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs)?;
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        return Err(diags);
-    }
-    let resolved = resolve(&mut program)?;
-    check_program(&program, &resolved)
-}
+use crate::fixture::expanded;
+use ply_span::{Diagnostic, codes};
 
 #[track_caller]
 fn errors(source: &str) -> Vec<Diagnostic> {
-    match compile(source) {
+    match expanded(source) {
         Ok(_) => panic!("this escapes its region and was accepted:\n{source}"),
         Err(d) => d,
     }
@@ -216,7 +203,7 @@ fn only_a_written_row_can_put_a_foreign_regions_atom_in_a_callers_row() {
 
     // What remains is an annotation, and a region named `k` discharges it — inside the region, and
     // only there.
-    let out = compile(
+    let out = expanded(
         "fn touches(n: Int) -> Int / {cell.read[k]} = n
 fn outside() -> Int / {cell.read[k]} = { let seen = with_cell[k](0) { c -> cell_get(c) }; touches(seen) }
 fn inside() -> Int = with_cell[k](0) { c -> touches(cell_get(c)) }",

@@ -30,6 +30,13 @@ pub enum Builtin {
     /// The one loop that can stop before its bound.
     Iterate,
     Range,
+    /// The three arithmetic operations that answer instead of raising, so a step defined to
+    /// wrap says so in the name it calls.
+    WrapAdd,
+    WrapSub,
+    WrapMul,
+    /// One byte, from the number naming it: the inverse of `bytes_at`, which had none.
+    ByteOfInt,
     IntToString,
     StringConcat,
     BytesLen,
@@ -105,6 +112,10 @@ impl Builtin {
             "filter" => Builtin::Filter,
             "fold" => Builtin::Fold,
             "range" => Builtin::Range,
+            "wrap_add" => Builtin::WrapAdd,
+            "wrap_sub" => Builtin::WrapSub,
+            "wrap_mul" => Builtin::WrapMul,
+            "byte_of_int" => Builtin::ByteOfInt,
             "int_to_string" => Builtin::IntToString,
             "string_concat" => Builtin::StringConcat,
             "bytes_len" => Builtin::BytesLen,
@@ -180,6 +191,10 @@ impl Builtin {
             Builtin::Fold => "fold",
             Builtin::Iterate => "iterate",
             Builtin::Range => "range",
+            Builtin::WrapAdd => "wrap_add",
+            Builtin::WrapSub => "wrap_sub",
+            Builtin::WrapMul => "wrap_mul",
+            Builtin::ByteOfInt => "byte_of_int",
             Builtin::IntToString => "int_to_string",
             Builtin::StringConcat => "string_concat",
             Builtin::BytesLen => "bytes_len",
@@ -249,6 +264,7 @@ impl Builtin {
             // Ply has no top-level constants, so the empty map is a call.
             Builtin::Len
             | Builtin::IntToString
+            | Builtin::ByteOfInt
             | Builtin::CellGet
             | Builtin::Panic
             | Builtin::BytesLen
@@ -301,6 +317,9 @@ impl Builtin {
             | Builtin::IntOfDecimal
             | Builtin::SecretVerify
             | Builtin::Assert
+            | Builtin::WrapAdd
+            | Builtin::WrapSub
+            | Builtin::WrapMul
             | Builtin::Range => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
@@ -341,6 +360,10 @@ impl Builtin {
             Builtin::Fold,
             Builtin::Iterate,
             Builtin::Range,
+            Builtin::WrapAdd,
+            Builtin::WrapSub,
+            Builtin::WrapMul,
+            Builtin::ByteOfInt,
             Builtin::IntToString,
             Builtin::StringConcat,
             Builtin::BytesLen,
@@ -430,7 +453,7 @@ impl fmt::Debug for Step {
 fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
-    let copied = match &mut xs {
+    let (out, copied) = match &mut xs {
         Value::List(list) => match std::sync::Arc::get_mut(list) {
             Some(items) => {
                 items.push(x);
@@ -438,16 +461,17 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
                 return Ok(Step::Done(xs));
             }
             None => {
-                let mut out = Vec::with_capacity(list.len() + 1);
+                let copied = list.len();
+                let mut out = Vec::with_capacity(copied + 1);
                 out.extend(list.iter().cloned());
                 out.push(x);
-                out
+                (out, copied)
             }
         },
         other => return Err(type_error(span, "`push`", "List", other)),
     };
-    crate::rc::note_update(false, span);
-    Ok(Step::Done(Value::list(copied)))
+    crate::rc::note_update_of(false, copied, span);
+    Ok(Step::Done(Value::list(out)))
 }
 
 /// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
@@ -537,6 +561,33 @@ pub fn call(
                 .primary(span, "this range is too large to materialize"));
             }
             Ok(Step::Done(Value::list((lo..hi).map(Value::Int).collect())))
+        }
+
+        // Two's complement, modulo 2^64: the only arithmetic in the language that cannot raise.
+        Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
+            let what = b.name();
+            let x = args[0].as_int(span, &format!("`{what}`"))?;
+            let y = args[1].as_int(span, &format!("`{what}`"))?;
+            Ok(Step::Done(Value::Int(match b {
+                Builtin::WrapAdd => x.wrapping_add(y),
+                Builtin::WrapSub => x.wrapping_sub(y),
+                _ => x.wrapping_mul(y),
+            })))
+        }
+
+        // Out of range raises rather than masking, because a silent `& 0xFF` would write a
+        // byte nobody chose.
+        Builtin::ByteOfInt => {
+            let n = args[0].as_int(span, "`byte_of_int`")?;
+            match u8::try_from(n) {
+                Ok(byte) => Ok(Step::Done(Value::bytes([byte]))),
+                Err(_) => Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!("`byte_of_int` was given {n}"),
+                )
+                .primary(span, "a byte is 0 to 255")
+                .note("mask the value before the call if that is what you meant: `n & 0xFF`")),
+            }
         }
 
         Builtin::IntToString => Ok(Step::Done(Value::str(
@@ -2712,6 +2763,7 @@ mod tests {
             [
                 "assert",
                 "assert_eq",
+                "byte_of_int",
                 "bytes_at",
                 "bytes_concat",
                 "bytes_concat_all",
@@ -2778,10 +2830,53 @@ mod tests {
                 "string_starts_with",
                 "string_trim",
                 "string_upper",
+                "wrap_add",
+                "wrap_mul",
+                "wrap_sub",
             ],
             "a builtin was added to or removed from the enum without `Builtin::all()` being \
              updated — every table driven by `all()` silently skips it until this list agrees"
         );
+    }
+
+    /// The three that answer where `+`, `-` and `*` raise, at the boundaries
+    /// that are the only reason they exist. A value below 2^32 needs none of
+    /// them — the shift semantics says so — so every case here is at or across the
+    /// 64-bit edge.
+    #[test]
+    fn the_wrapping_builtins_are_modulo_two_to_the_sixty_fourth() {
+        let cases: &[(Builtin, i64, i64, i64)] = &[
+            (Builtin::WrapAdd, i64::MAX, 1, i64::MIN),
+            (Builtin::WrapAdd, i64::MIN, -1, i64::MAX),
+            (Builtin::WrapAdd, i64::MAX, i64::MAX, -2),
+            (Builtin::WrapAdd, 2, 3, 5),
+            (Builtin::WrapSub, i64::MIN, 1, i64::MAX),
+            (Builtin::WrapSub, i64::MAX, -1, i64::MIN),
+            (Builtin::WrapSub, 0, i64::MIN, i64::MIN),
+            (Builtin::WrapMul, i64::MAX, 2, -2),
+            (Builtin::WrapMul, i64::MIN, -1, i64::MIN),
+            (Builtin::WrapMul, 1 << 32, 1 << 32, 0),
+            (Builtin::WrapMul, 6, 7, 42),
+        ];
+        for &(b, x, y, want) in cases {
+            assert_eq!(
+                done(b, vec![Value::Int(x), Value::Int(y)]).unwrap(),
+                Value::Int(want),
+                "`{}`({x}, {y})",
+                b.name()
+            );
+        }
+    }
+
+    /// None of the three can fail, so the only diagnostic any of them produces
+    /// is about an argument that is not an `Int` — which the checker refused
+    /// before it got here, leaving this as the shape an unchecked body meets.
+    #[test]
+    fn a_wrapping_builtin_refuses_a_non_int_and_nothing_else() {
+        let d = done(Builtin::WrapAdd, vec![Value::Int(1), Value::str("2")])
+            .expect_err("a `String` is not an `Int`");
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("wrap_add"), "{}", d.message);
     }
 
     fn run(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {

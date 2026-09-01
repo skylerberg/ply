@@ -425,7 +425,7 @@ fn count_nodes(code: &Code) -> usize {
         NodeKind::Unary { operand, .. } => n += count_nodes(operand),
         NodeKind::Binary { lhs, rhs, .. } => n += count_nodes(lhs) + count_nodes(rhs),
         NodeKind::Lambda { body, .. } => n += count_nodes(body),
-        NodeKind::App { func, args } => {
+        NodeKind::App { func, args, .. } => {
             n += count_nodes(func);
             n += args.iter().map(count_nodes).sum::<usize>();
         }
@@ -454,7 +454,7 @@ fn count_nodes(code: &Code) -> usize {
                 n += count_nodes(t);
             }
         }
-        NodeKind::Record { fields } => {
+        NodeKind::Record { fields, .. } => {
             n += fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
         }
         NodeKind::Field { base, .. } => n += count_nodes(base),
@@ -713,10 +713,20 @@ impl Fx<'_, '_> {
             },
             NodeKind::Unary { op, .. } => match op {
                 UnOp::Not => Kind::Bool,
-                UnOp::Neg => Kind::Int,
+                UnOp::Neg | UnOp::BitNot => Kind::Int,
             },
             NodeKind::Binary { op, .. } => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::Ushr => Kind::Int,
                 BinOp::Eq
                 | BinOp::Ne
                 | BinOp::Lt
@@ -785,6 +795,9 @@ impl Fx<'_, '_> {
             NodeKind::Unary { op, operand } => {
                 let value = self.expr(operand, scope)?;
                 match op {
+                    // Refused with the six binary bit operators, and for the
+                    // reason given at `binary`'s arm for them.
+                    UnOp::BitNot => self.refuse("`~`"),
                     UnOp::Not => {
                         let b = self.as_bool(value);
                         let one = self.builder.ins().iconst(types::I64, 1);
@@ -891,9 +904,9 @@ impl Fx<'_, '_> {
 
             NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, scope),
 
-            NodeKind::App { func, args } => self.app(func, args, scope),
+            NodeKind::App { func, args, .. } => self.app(func, args, scope),
 
-            NodeKind::Record { fields } => {
+            NodeKind::Record { fields, .. } => {
                 let mut names = Vec::with_capacity(fields.len());
                 let mut handles = Vec::with_capacity(fields.len());
                 for (name, value) in fields.iter() {
@@ -1126,6 +1139,20 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Concat => self.refuse("`++`"),
+            // the operator decision's bit operators, refused as a set rather than lowered
+            // as six instructions. `&`, `|` and `^` really are one instruction
+            // each; the shifts are not, because a count outside `0..=63` raises
+            // where Cranelift's `ishl` silently masks it to the low six
+            // bits. A native shift here would therefore answer where the
+            // interpreter refuses, and this spike's whole claim is that its
+            // ratio is measured over a fragment on which the two backends
+            // agree. Refusing by name is what the fragment asks for when they do not.
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Ushr => self.refuse(format!("`{}`", op.text())),
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
         }
     }

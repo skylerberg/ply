@@ -2,7 +2,10 @@
 
 **Accepted as a direction. Its central mechanism was proposed, built against
 four times, and declined on a measurement.** This merges the direction (0024)
-and the design round that answered it (0025).
+and the design round that answered it (0025). **Continued by ADR 0034**, which
+takes up the `fip` pointer below, lands the parameter fix, subsumes the carry
+and projection changes into a slot-based environment, and re-poses the
+persistent-vector gate — accepting every measurement here and re-taking none.
 
 **What is decided.** That whether a value is uniquely owned stops being a
 runtime accident the evaluator discovers and becomes **a property the compiler

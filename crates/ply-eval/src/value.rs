@@ -11,7 +11,6 @@ use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -33,6 +32,105 @@ thread_local! {
     static BUILTIN_VALUES: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// A record's fields, sorted by name.
+///
+/// A flat vector rather than a `BTreeMap`: a record is built once and then read, its field set is
+/// statically known wherever its type is, and the tree cost an allocation per field plus a pointer
+/// chase per lookup. Iteration order is the same — both order by `Symbol`'s `Ord` — so nothing that
+/// compares, hashes or prints a record moves.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fields(Vec<(Symbol, Value)>);
+
+impl Fields {
+    pub fn get(&self, name: &Symbol) -> Option<&Value> {
+        self.0
+            .binary_search_by(|(k, _)| k.cmp(name))
+            .ok()
+            .map(|i| &self.0[i].1)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &Value)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn contains_key(&self, name: &Symbol) -> bool {
+        self.get(name).is_some()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &Symbol> {
+        self.0.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Adds or replaces one field, keeping the vector sorted.
+    pub fn insert(&mut self, name: Symbol, value: Value) -> Option<Value> {
+        match self.0.binary_search_by(|(k, _)| k.cmp(&name)) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, value)),
+            Err(i) => {
+                self.0.insert(i, (name, value));
+                None
+            }
+        }
+    }
+
+    pub fn into_values(self) -> impl Iterator<Item = Value> {
+        self.0.into_iter().map(|(_, v)| v)
+    }
+
+    /// Replaces one field's value, leaving the field set alone. `None` when the name is absent.
+    pub fn set(&mut self, name: &Symbol, value: Value) -> Option<Value> {
+        let i = self.0.binary_search_by(|(k, _)| k.cmp(name)).ok()?;
+        Some(std::mem::replace(&mut self.0[i].1, value))
+    }
+}
+
+impl std::ops::Index<&Symbol> for Fields {
+    type Output = Value;
+    fn index(&self, name: &Symbol) -> &Value {
+        self.get(name).expect("no such field")
+    }
+}
+
+impl FromIterator<(Symbol, Value)> for Fields {
+    /// Later entries win, which is what collecting into a `BTreeMap` did.
+    fn from_iter<I: IntoIterator<Item = (Symbol, Value)>>(iter: I) -> Fields {
+        let mut v: Vec<(Symbol, Value)> = iter.into_iter().collect();
+        v.sort_by(|(a, _), (b, _)| a.cmp(b));
+        v.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                *earlier = later.clone();
+                true
+            } else {
+                false
+            }
+        });
+        Fields(v)
+    }
+}
+
+impl<'a> IntoIterator for &'a Fields {
+    type Item = (&'a Symbol, &'a Value);
+    type IntoIter = std::vec::IntoIter<(&'a Symbol, &'a Value)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0
+            .iter()
+            .map(|(k, v)| (k, v))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
@@ -50,7 +148,7 @@ pub enum Value {
     List(Vector<Value>),
     /// Iterated in ascending key order by [`Value::cmp`], always.
     Map(Map),
-    Record(Arc<BTreeMap<Symbol, Value>>),
+    Record(Arc<Fields>),
     Ctor {
         name: Symbol,
         args: Arc<Vec<Value>>,

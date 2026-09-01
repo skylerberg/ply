@@ -2,12 +2,11 @@
 //! closed when the test ends, so tests still cannot observe each other's allocations — while a
 //! region *label* two tests both write is one piece of state and colours them apart.
 
-use ply_core::{CheckOutput, Footprint};
+use crate::fixture::Compiled;
+use ply_core::Footprint;
 use ply_eval::{Plan, TaskRegions, Value};
-use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
-use ply_syntax::resolve::Resolved;
 use ply_test::{
     GroupRegion, Isolation, contends_only_over_regions, group_by_conflict, is_region_scoped,
     region_isolated, shared_footprint,
@@ -42,31 +41,7 @@ impl Drop for TempRoot {
     }
 }
 
-struct Compiled {
-    program: ply_syntax::ast::Program,
-    resolved: Resolved,
-    check: CheckOutput,
-    hashes: HashOutput,
-}
-
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-            hashes,
-        }
-    }
-
     fn rejected(src: &str) -> Vec<ply_span::Diagnostic> {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
         let mut program = ply_syntax::ast::Program::single(module);
@@ -76,10 +51,6 @@ impl Compiled {
         ply_core::check_program(&program, &resolved)
             .err()
             .unwrap_or_default()
-    }
-
-    fn footprints(&self) -> Vec<&Footprint> {
-        self.check.tests.iter().map(|t| &t.footprint).collect()
     }
 
     fn scheduled(&self) -> Vec<(usize, Footprint)> {
@@ -173,7 +144,7 @@ test "claim the name" {{
 /// The classification is by exact effect name, so a neighbouring name gains nothing.
 #[test]
 fn an_effect_whose_name_merely_resembles_the_builtin_is_not_region_scoped() {
-    let compiled = Compiled::new(
+    let compiled = Compiled::anonymous(
         r#"
 effect cells {
   write put[rows](v: Int) -> Unit
@@ -201,14 +172,14 @@ test "two" { cells.put[rows](2) }
 /// `--explain` prints.
 #[test]
 fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
-    let compiled = Compiled::new(&contending_source(6, one_label));
+    let compiled = Compiled::anonymous(&contending_source(6, one_label));
     let footprints = compiled.footprints();
     assert!(
         footprints.iter().all(|f| f.atoms().any(is_region_scoped)),
         "the corpus must retain cell atoms, or it is not exercising anything"
     );
     assert!(footprints.iter().all(|f| !region_isolated(f)));
-    assert!(footprints.iter().all(|f| contends_only_over_regions(f)));
+    assert!(footprints.iter().all(contends_only_over_regions));
     assert!(
         footprints
             .iter()
@@ -221,20 +192,15 @@ fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
 /// A label nobody else names conflicts with nothing, so losing the fork bought it nothing to lose.
 #[test]
 fn tests_on_distinct_region_labels_still_share_one_group() {
-    let compiled = Compiled::new(&contending_source(16, a_label_each));
-    assert!(
-        compiled
-            .footprints()
-            .iter()
-            .all(|f| contends_only_over_regions(f))
-    );
+    let compiled = Compiled::anonymous(&contending_source(16, a_label_each));
+    assert!(compiled.footprints().iter().all(contends_only_over_regions));
     assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 1);
 }
 
 /// The classification subtracts atoms; it never subtracts tests.
 #[test]
 fn a_cell_atom_beside_a_real_one_does_not_launder_the_real_one() {
-    let compiled = Compiled::new(
+    let compiled = Compiled::anonymous(
         r#"
 effect db {
   read  get[users]() -> Int
@@ -260,15 +226,15 @@ test "a real read" {
     );
 
     let footprints = compiled.footprints();
-    let isolation: Vec<Isolation> = footprints.iter().map(|f| Isolation::of(f)).collect();
+    let isolation: Vec<Isolation> = footprints.iter().map(Isolation::of).collect();
     assert_eq!(isolation, vec![Isolation::Shared; 3]);
-    assert!(contends_only_over_regions(footprints[0]));
+    assert!(contends_only_over_regions(&footprints[0]));
     assert!(
-        !contends_only_over_regions(footprints[1]),
+        !contends_only_over_regions(&footprints[1]),
         "a test that also reaches `users` must not be blamed on its label"
     );
 
-    let shared = shared_footprint(footprints[1]);
+    let shared = shared_footprint(&footprints[1]);
     let atoms: Vec<String> = shared.atoms().map(|a| a.to_string()).collect();
     assert_eq!(
         atoms,
@@ -277,7 +243,7 @@ test "a real read" {
             "db.write[users]".to_string()
         ]
     );
-    assert!(shared.conflicts_with(&shared_footprint(footprints[2])));
+    assert!(shared.conflicts_with(&shared_footprint(&footprints[2])));
 
     let groups = group_by_conflict(&compiled.scheduled());
     assert_eq!(groups.len(), 2, "{groups:?}");
@@ -312,7 +278,7 @@ test "other writer" {{ db.log[audit](1) }}
 "#,
         contending_source(6, |i| format!("table{}", i % 3))
     );
-    let compiled = Compiled::new(&source);
+    let compiled = Compiled::anonymous(&source);
     let scheduled = compiled.scheduled();
 
     for group in group_by_conflict(&scheduled) {
@@ -333,7 +299,7 @@ test "other writer" {{ db.log[audit](1) }}
 #[test]
 fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
-    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
 
     assert!(
         compiled
@@ -384,7 +350,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
 #[test]
 fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     const TESTS: usize = 24;
-    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
@@ -473,7 +439,7 @@ impl<'a> ply_test::Executor for Recording<'a> {
 #[test]
 fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     const TESTS: usize = 16;
-    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
@@ -519,7 +485,7 @@ fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
 #[test]
 fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     const TESTS: usize = 12;
-    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
@@ -622,7 +588,7 @@ impl ply_test::Executor for FixtureProbe {
 fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     const TESTS: usize = 24;
     const JOBS: usize = 8;
-    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
@@ -681,7 +647,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
             .collect::<String>()
     );
-    let compiled = Compiled::new(&source);
+    let compiled = Compiled::anonymous(&source);
 
     let run_at = |jobs: usize| {
         let root = TempRoot::new();
@@ -760,7 +726,7 @@ test "real writer" { db.put[users](1) }
         let pure: String = (0..extra)
             .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
             .collect();
-        let compiled = Compiled::new(&format!("{shared}{pure}"));
+        let compiled = Compiled::anonymous(&format!("{shared}{pure}"));
         let root = TempRoot::new();
         let store = root.store();
         let selection =

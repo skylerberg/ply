@@ -125,7 +125,11 @@ pub fn leave_handle(prompt: &Prompt, value: Value, below: Stack) -> Transition {
         Some(arm) => Transition::eval(
             below,
             &arm.body,
-            prompt.env.bind(arm.binder.clone(), value),
+            match &arm.free {
+                Some(free) if crate::rc::probe_carries() => prompt.env.keep_only(free),
+                _ => prompt.env.clone(),
+            }
+            .bind(arm.binder.clone(), value),
             prompt.module,
         ),
         None => Transition {
@@ -231,7 +235,11 @@ pub fn perform(
     }
 
     let (k, below) = stack.capture(found.segments, born);
-    let mut scope = prompt.env.clone();
+    // The clause's own frame: what its body reads from the handler's scope, and nothing else.
+    let mut scope = match &clause.free {
+        Some(free) if crate::rc::probe_carries() => prompt.env.keep_only(free),
+        _ => prompt.env.clone(),
+    };
     for (p, v) in clause.params.iter().zip(args) {
         scope = scope.bind(p.clone(), v);
     }

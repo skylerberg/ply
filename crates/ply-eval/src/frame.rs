@@ -6,10 +6,9 @@ use crate::cont::Frame;
 use crate::handler;
 use crate::machine::{Machine, apply_unary, short_circuits};
 use crate::semantics::{err_let_mismatch, err_no_such_field, strict_binary};
-use crate::value::{Value, type_error};
-use ply_span::{Diagnostic, Symbol};
+use crate::value::{Fields, Value, type_error};
+use ply_span::Diagnostic;
 use ply_syntax::ast::BinOp;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl Machine<'_> {
@@ -82,6 +81,7 @@ impl Machine<'_> {
 
             Frame::AppCallee {
                 args,
+                dead,
                 env,
                 module,
                 span,
@@ -94,12 +94,21 @@ impl Machine<'_> {
                     return self.apply(value, Vec::new(), span);
                 }
                 let first = args[0].clone();
-                let carried = crate::rc::carry(&env, args.len() > 1);
+                // the sequence S4: the frame carries the scope minus what
+                // argument 0 is the last reader of, rather than all of it.
+                // `dead` is empty unless the probe is armed, and then this is
+                // `carry` exactly.
+                let carried = crate::rc::carry_released(
+                    &env,
+                    args.len() > 1,
+                    dead.first().map(|d| &**d).unwrap_or(&[]),
+                );
                 self.push(
                     Frame::AppArgs {
                         callee: value,
                         done: crate::argv::take(args.len()),
                         args,
+                        dead,
                         next: 1,
                         env: carried,
                         module,
@@ -114,6 +123,7 @@ impl Machine<'_> {
                 callee,
                 mut done,
                 args,
+                dead,
                 next,
                 env,
                 module,
@@ -129,12 +139,17 @@ impl Machine<'_> {
                     }
                     Some(arg) => {
                         let arg = arg.clone();
-                        let carried = crate::rc::carry(&env, next + 1 < args.len());
+                        let carried = crate::rc::carry_released(
+                            &env,
+                            next + 1 < args.len(),
+                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
+                        );
                         self.push(
                             Frame::AppArgs {
                                 callee,
                                 done,
                                 args,
+                                dead,
                                 next: next + 1,
                                 env: carried,
                                 module,
@@ -238,6 +253,7 @@ impl Machine<'_> {
             Frame::RecordField {
                 mut done,
                 fields,
+                dead,
                 next,
                 env,
                 module,
@@ -245,16 +261,21 @@ impl Machine<'_> {
                 done.push((fields[next - 1].0.clone(), value));
                 match fields.get(next) {
                     None => {
-                        let map: BTreeMap<Symbol, Value> = done.into_iter().collect();
+                        let map: Fields = done.into_iter().collect();
                         self.go_return(Value::Record(Arc::new(map)));
                     }
                     Some((_, code)) => {
                         let code = code.clone();
-                        let carried = crate::rc::carry(&env, next + 1 < fields.len());
+                        let carried = crate::rc::carry_released(
+                            &env,
+                            next + 1 < fields.len(),
+                            dead.get(next).map(|d| &**d).unwrap_or(&[]),
+                        );
                         self.push(
                             Frame::RecordField {
                                 done,
                                 fields,
+                                dead,
                                 next: next + 1,
                                 env: carried,
                                 module,

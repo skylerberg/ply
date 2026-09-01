@@ -49,6 +49,9 @@ pub enum Frame {
 
     AppCallee {
         args: Rc<Vec<Code>>,
+        /// Per argument, what it is the last reader of. Empty unless the slot rewrite
+        /// the slot probe is armed — see [`crate::code::NodeKind::App`].
+        dead: Rc<Vec<crate::rc::Dead>>,
         env: Env,
         module: usize,
         span: Span,
@@ -59,6 +62,7 @@ pub enum Frame {
         callee: Value,
         done: Vec<Value>,
         args: Rc<Vec<Code>>,
+        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
         env: Env,
         module: usize,
@@ -121,6 +125,7 @@ pub enum Frame {
     RecordField {
         done: Vec<(Symbol, Value)>,
         fields: Rc<Vec<(Symbol, Code)>>,
+        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
         env: Env,
         module: usize,
@@ -635,6 +640,7 @@ impl Stack {
             rest.calls -= cut.calls();
             taken.push(cut);
         }
+        crate::rc::census4::capture(frames as u64);
         (
             Continuation {
                 segments: Rc::new(taken),
@@ -964,6 +970,7 @@ mod tests {
             resume: None,
             body: crate::code::lower(&crate::build::int(0)),
             span: Span::DUMMY,
+            free: None,
         };
         let with = |c: Clause| {
             Rc::new(Prompt {
@@ -1029,6 +1036,7 @@ mod tests {
             resume: None,
             body: crate::code::lower(&crate::build::int(0)),
             span: Span::DUMMY,
+            free: None,
         };
         let inner = s.push_prompt(Rc::new(Prompt {
             clauses: Rc::new(vec![clause]),

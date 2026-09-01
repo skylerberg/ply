@@ -1,69 +1,12 @@
 //! Derivation end to end: expansion, then resolution, then inference.
 
-use ply_core::{CheckOutput, check_program};
-use ply_span::{Diagnostic, SourceId, codes};
-use ply_syntax::ast::ModuleName;
-use ply_syntax::resolve::resolve;
-
-/// The signatures a generated `json` dictionary references, and nothing else.
-const JSON: &str = r#"
-pub type Json = Null | Bool(Bool) | Number(Decimal) | Str(String)
-              | Array(List<Json>) | Object(Map<String, Json>)
-pub type DecodeError = {path: String, message: String}
-pub type JsonCodec<a> = {encode: (a) -> Json, decode: (Json) -> Result<a, DecodeError>}
-
-pub fn int_json() -> JsonCodec<Int> = panic("stub")
-pub fn bool_json() -> JsonCodec<Bool> = panic("stub")
-pub fn string_json() -> JsonCodec<String> = panic("stub")
-pub fn bytes_json() -> JsonCodec<Bytes> = panic("stub")
-pub fn float_json() -> JsonCodec<Float> = panic("stub")
-pub fn decimal_json() -> JsonCodec<Decimal> = panic("stub")
-pub fn unit_json() -> JsonCodec<Unit> = panic("stub")
-
-pub fn list_json<a>(a: JsonCodec<a>) -> JsonCodec<List<a>>
-  where derivable(json, a) = panic("stub")
-pub fn option_json<a>(a: JsonCodec<a>) -> JsonCodec<Option<a>>
-  where derivable(json, a) = panic("stub")
-pub fn result_json<a, e>(a: JsonCodec<a>, e: JsonCodec<e>) -> JsonCodec<Result<a, e>>
-  where derivable(json, a), derivable(json, e) = panic("stub")
-pub fn map_json<k, v>(k: JsonCodec<k>, v: JsonCodec<v>) -> JsonCodec<Map<k, v>>
-  where derivable(ord, k), derivable(json, k), derivable(json, v) = panic("stub")
-
-pub fn string_map_json<v>(value: JsonCodec<v>) -> JsonCodec<Map<String, v>> = panic("stub")
-
-pub type Member = {key: String, value: Json}
-pub type Tagged = {tag: String, values: List<Json>}
-
-pub fn object(fields: List<Member>) -> Json = panic("stub")
-pub fn field<a>(j: Json, name: String, codec: JsonCodec<a>) -> Result<a, DecodeError>
-  where derivable(json, a) = panic("stub")
-pub fn variant(tag: String, values: List<Json>) -> Json = panic("stub")
-pub fn variant_of(j: Json) -> Result<Tagged, DecodeError> = panic("stub")
-pub fn variant_value(v: Tagged, index: Int) -> Result<Json, DecodeError> = panic("stub")
-pub fn unknown_variant<a>(tag: String, expected: List<String>) -> Result<a, DecodeError> =
-  panic("stub")
-pub fn decode_and_then<a, b>(r: Result<a, DecodeError>, f: (a) -> Result<b, DecodeError>)
-  -> Result<b, DecodeError> = panic("stub")
-"#;
-
-fn compile(modules: &[(&str, &str)]) -> Result<CheckOutput, Vec<Diagnostic>> {
-    let inputs: Vec<_> = modules
-        .iter()
-        .enumerate()
-        .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-        .collect();
-    let mut program = ply_syntax::parse_program(inputs)?;
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        return Err(diags);
-    }
-    let resolved = resolve(&mut program)?;
-    check_program(&program, &resolved)
-}
+use crate::fixture::{JSON, expanded_modules};
+use ply_core::CheckOutput;
+use ply_span::{Diagnostic, codes};
 
 /// One project module, with the protocol stub beside it.
 fn with_json(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
-    compile(&[("std.json", JSON), ("m", source)])
+    expanded_modules(&[("std.json", JSON), ("m", source)])
 }
 
 fn ok(source: &str) -> CheckOutput {
@@ -147,7 +90,7 @@ derive json for Tree");
 
 #[test]
 fn derivation_composes_through_another_module_by_name() {
-    compile(&[
+    expanded_modules(&[
         ("std.json", JSON),
         (
             "users",
@@ -164,7 +107,7 @@ fn derivation_composes_through_another_module_by_name() {
 
 #[test]
 fn a_field_whose_type_has_no_derivation_is_reported_against_the_derive() {
-    let diags = compile(&[
+    let diags = expanded_modules(&[
         ("std.json", JSON),
         ("users", "pub type User = {name: String}"),
         (
@@ -193,7 +136,7 @@ fn a_module_that_does_not_import_std_json_is_told_to() {
 
 #[test]
 fn eq_and_ord_need_no_import() {
-    let out = compile(&[(
+    let out = expanded_modules(&[(
         "m",
         "type Order = {id: Int, name: String}\nderive eq for Order\nderive ord for Order",
     )])
@@ -205,7 +148,7 @@ fn eq_and_ord_need_no_import() {
 #[test]
 fn ord_refuses_a_float_field_and_json_accepts_one() {
     ok("import std.json\ntype P = {x: Float}\nderive json for P\nderive eq for P");
-    let diags = compile(&[("m", "type P = {x: Float}\nderive ord for P")])
+    let diags = expanded_modules(&[("m", "type P = {x: Float}\nderive ord for P")])
         .expect_err("`Float` has no total order");
     let d = &diags[0];
     assert_eq!(d.code, codes::NOT_DERIVABLE);
@@ -265,7 +208,7 @@ fn a_map_keyed_by_float_is_refused_at_the_derive() {
 
 #[test]
 fn a_derive_for_another_modules_type_is_an_orphan() {
-    let diags = compile(&[
+    let diags = expanded_modules(&[
         ("std.json", JSON),
         ("users", "pub type User = {name: String}"),
         ("m", "import std.json\nimport users\nderive json for User"),
@@ -276,14 +219,14 @@ fn a_derive_for_another_modules_type_is_an_orphan() {
 
 #[test]
 fn two_derivations_generating_one_name_are_a_duplicate() {
-    let diags = compile(&[(
+    let diags = expanded_modules(&[(
         "m",
         "type Order = {id: Int}\nderive eq for Order\nderive eq for Order",
     )])
     .expect_err("one name, generated twice");
     assert_eq!(diags[0].code, codes::DUPLICATE_DEFINITION);
 
-    let diags = compile(&[(
+    let diags = expanded_modules(&[(
         "m",
         "type HTTPRequest = {id: Int}\ntype HttpRequest = {id: Int}\n\
          derive eq for HTTPRequest\nderive eq for HttpRequest",
@@ -377,7 +320,7 @@ derive json for Status
 derive eq for Order
 derive ord for Line",
     ));
-    if let Err(d) = compile(&modules) {
+    if let Err(d) = expanded_modules(&modules) {
         panic!("derivation against the shipped `std.json` failed: {d:#?}");
     }
 }

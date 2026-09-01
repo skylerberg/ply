@@ -192,7 +192,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             for (name, field) in fields {
                 out.insert(name.clone(), minimal_at(field, world, depth + 1)?);
             }
-            Ok(Value::Record(Arc::new(out)))
+            Ok(Value::Record(Arc::new(out.into_iter().collect())))
         }
         Type::Fn {
             params,

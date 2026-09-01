@@ -470,7 +470,7 @@ impl Gen<'_> {
                 for (name, field) in fields {
                     out.insert(name.clone(), self.value(field, depth + 1)?);
                 }
-                Ok(Value::Record(Arc::new(out)))
+                Ok(Value::Record(Arc::new(out.into_iter().collect())))
             }
             Type::Fn {
                 params,

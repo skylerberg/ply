@@ -72,6 +72,26 @@ fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }
 fn shaped(x: Int) -> List<Int> = [x, x]
 "#;
 
+/// `++` and the pattern shapes the fixpoint gained: a record pattern, one with `..`, one nested
+/// inside a constructor, and a constructor nested inside a list.
+const SHAPES: &str = r#"
+type Step = { value: Int, next: Int }
+
+fn step(n: Int) -> Step = {value: n, next: n + 1}
+
+fn taken(n: Int) -> Int = match step(n) { {value, next} -> value + next }
+
+fn ignored(n: Int) -> Int = match step(n) { {value, ..} -> value }
+
+fn wrapped(n: Int) -> Result<Step, Int> = if n < 0 { Err(0 - n) } else { Ok(step(n)) }
+
+fn nested(n: Int) -> Int = match wrapped(n) { Ok({value, next}) -> value + next, Err(e) -> e }
+
+fn listed(n: Int) -> Int = match [Ok(n), Err(2)] { [Ok(a), Err(b)] -> a + b, _ -> 0 }
+
+fn joined(n: Int) -> Int = if "ab" ++ "cd" == "abcd" { n } else { 0 - n }
+"#;
+
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     backend.enter(&Symbol::new(name), args, 10_000)
@@ -128,6 +148,30 @@ fn a_compiled_body_answers_what_the_interpreter_answers() {
 }
 
 /// A body outside the fragment is a registry miss, not a wrong answer.
+/// Compiled code answers what the interpreter answers over `++` and the nested patterns.
+///
+/// These paths are compiled by every census over the parser but entered by no workload measured
+/// so far, so without this the fixpoint's own count is the only thing vouching for them.
+#[test]
+fn a_compiled_body_answers_over_concat_and_nested_patterns() {
+    let (_, unit) = unit(SHAPES);
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.taken", vec![Value::Int(4)], Value::Int(9)),
+        ("m.ignored", vec![Value::Int(7)], Value::Int(7)),
+        ("m.nested", vec![Value::Int(4)], Value::Int(9)),
+        ("m.nested", vec![Value::Int(-3)], Value::Int(3)),
+        ("m.listed", vec![Value::Int(5)], Value::Int(7)),
+        ("m.joined", vec![Value::Int(11)], Value::Int(11)),
+    ];
+    for (name, args, want) in cases {
+        assert_eq!(
+            call(unit, name, args),
+            Some(want.clone()),
+            "{name} answered differently through compiled code"
+        );
+    }
+}
+
 #[test]
 fn a_definition_the_fragment_has_no_body_for_is_declined() {
     let (_, unit) = unit(ARITHMETIC);

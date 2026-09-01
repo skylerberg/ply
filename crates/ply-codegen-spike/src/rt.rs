@@ -342,7 +342,7 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     for (name, value) in names.into_iter().zip(args) {
         map.insert(name, value);
     }
-    ctx.push(Value::Record(Arc::new(map)))
+    ctx.push(Value::Record(Arc::new(map.into_iter().collect())))
 }
 
 /// One field of a record, with the two failures the interpreter has here kept as failures rather

@@ -718,3 +718,30 @@ test "the trace cell ends at two, every time" {
             .unwrap_or_else(|d| panic!("run {run} must answer as run 0 did: {d:#?}"));
     }
 }
+
+/// A tail-resumptive clause writing the cell of the region that encloses its own
+/// handler — the shape the tail-resumptive refinement moved from `shared` to `unique`.
+#[test]
+fn a_tail_resumptive_clause_writing_its_own_region_still_threads() {
+    holds(
+        r#"
+effect amb { read flip[coin]() -> Bool }
+
+fn twice() -> Int =
+  with_cell[trace](0) { c ->
+    handle { { let a = amb.flip[coin](); let b = amb.flip[coin](); cell_get(c) } } with {
+      amb.flip[coin]() -> { cell_set(c, cell_get(c) + 1); true },
+      return x -> x } }
+
+fn nested() -> Int =
+  with_cell[outer](0) { o ->
+    with_cell[inner](0) { i ->
+      handle { { let a = amb.flip[coin](); cell_get(o) * 10 + cell_get(i) } } with {
+        amb.flip[coin]() -> { cell_set(o, 7); cell_set(i, 3); true },
+        return x -> x } } }
+
+test "the write is threaded through both resumptions" { assert(twice() == 2, None) }
+test "a nested region under the same clause is threaded too" { assert(nested() == 73, None) }
+"#,
+    );
+}

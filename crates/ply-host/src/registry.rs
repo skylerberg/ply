@@ -2,7 +2,7 @@
 
 use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{config, sched, tcp, trace};
+use crate::{config, fs, sched, tcp, trace};
 use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_span::{Diagnostic, Span, codes};
@@ -25,6 +25,17 @@ pub struct Host {
     trace: Arc<trace::Trace>,
     /// The stop flag and the phase machine, when this run listens for a signal.
     shutdown: Option<Arc<Shutdown>>,
+    /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on.
+    ///
+    /// Always present, and empty for a run that bound none — the same shape
+    /// `config` takes and for the same reason. The `fs` operations are
+    /// registered either way, so a hermetic run reaching one is `E0424` naming
+    /// the handler that *would* have served it, and a `--host` run that named
+    /// no root is `E0451` naming the label and the flag. Those are different
+    /// sentences and a reader needs both: the first says the run was hermetic,
+    /// the second says it was configured without the directory this program
+    /// asks for.
+    fs: Arc<fs::FsHost>,
 }
 
 impl Default for Host {
@@ -46,7 +57,30 @@ impl Host {
             config: Arc::new(config::Snapshot::unopened()),
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
+            fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
         }
+    }
+
+    /// The same facilities, reaching the roots this run named.
+    ///
+    /// A builder for the reason [`traced`] is one. Resolution happens before
+    /// this — [`Roots::bind`] is what raises `E0454`, and it does so before
+    /// anything runs, because a run that discovers its output directory is a
+    /// dangling symlink on the first write has already done the work it is
+    /// about to lose.
+    ///
+    /// [`traced`]: Host::traced
+    /// [`Roots::bind`]: crate::fs::Roots::bind
+    pub fn rooted(self, roots: fs::Roots) -> Host {
+        Host {
+            fs: Arc::new(fs::FsHost::new(roots)),
+            ..self
+        }
+    }
+
+    /// The roots this run bound, for the `filesystem` block of `ply hosts`.
+    pub fn roots(&self) -> &fs::Roots {
+        self.fs.roots()
     }
 
     /// The same facilities, writing records to the sink this run selected.
@@ -82,6 +116,7 @@ impl Host {
             config: Arc::new(crate::config::Snapshot::unopened()),
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
+            fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
         })
     }
 
@@ -126,6 +161,11 @@ impl Host {
             db::register(&mut registry, Arc::clone(driver) as Arc<dyn db::Driver>);
         }
 
+        // `fs.*` — nine operations over the roots this run named, registered whatever
+        // `--fs` said, so a run that bound no root is `E0451` at the perform rather than
+        // `E0424` naming a twin.
+        fs::register(&mut registry, Arc::clone(&self.fs));
+
         // `signal.*` — two reads of one flag, bound when this run listens for a stop and
         // **withheld** when it does not.
         signal::register(&mut registry, self.shutdown.as_ref());
@@ -138,6 +178,7 @@ impl Host {
         Rc::new(Facilities {
             net: Arc::clone(&self.net),
             db: self.db.clone(),
+            fs: Arc::clone(&self.fs),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
         })
@@ -197,6 +238,7 @@ pub fn registry_with_database() -> HostRegistry {
 struct Facilities {
     net: Arc<tcp::TcpHost>,
     db: Option<Arc<Postgres>>,
+    fs: Arc<fs::FsHost>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
 }
@@ -210,6 +252,9 @@ impl HostRuntime for Facilities {
             && db.owns(pending)
         {
             return db.poll(pending);
+        }
+        if self.fs.owns(pending) {
+            return self.fs.poll(pending);
         }
         Err(err_unowned(pending))
     }
@@ -228,6 +273,9 @@ impl HostRuntime for Facilities {
                 db.reactor().park_timeout(bound)?;
                 return Ok(());
             }
+            if self.fs.outstanding() > 0 {
+                return self.fs.park_until(bound);
+            }
             if let Some(shutdown) = &self.shutdown {
                 shutdown.park(bound);
             }
@@ -239,8 +287,13 @@ impl HostRuntime for Facilities {
             .db
             .as_ref()
             .is_some_and(|db| db.reactor().outstanding() > 0);
+        // A third facility, so the rule the comment above states has to be read
+        // as "park boundedly whenever anyone else has work", not "whenever the
+        // database does". A file read outstanding while a park blocks forever
+        // on a socket is the same hang, reached from a different pair.
+        let filesystem_waiting = self.fs.outstanding() > 0;
         if self.net.outstanding() > 0 {
-            if database_waiting {
+            if database_waiting || filesystem_waiting {
                 return self.net.park_until(ALTERNATE);
             }
             return self.net.park();
@@ -248,7 +301,14 @@ impl HostRuntime for Facilities {
         if let Some(db) = &self.db
             && database_waiting
         {
+            if filesystem_waiting {
+                db.reactor().park_timeout(ALTERNATE)?;
+                return Ok(());
+            }
             return db.reactor().park();
+        }
+        if filesystem_waiting {
+            return self.fs.park();
         }
         Err(err_nothing_outstanding())
     }
@@ -307,6 +367,9 @@ impl HostRuntime for Facilities {
             {
                 return db.block_on(pending);
             }
+            if self.fs.owns(&pending) {
+                return self.fs.block_on(pending);
+            }
             return Err(err_unowned(&pending));
         };
         loop {
@@ -322,6 +385,11 @@ impl HostRuntime for Facilities {
                     return Ok(value);
                 }
                 db.reactor().park_timeout(signal::DRAIN_POLL)?;
+            } else if self.fs.owns(&pending) {
+                if let Some(value) = self.fs.poll(&pending)? {
+                    return Ok(value);
+                }
+                self.fs.park_until(signal::DRAIN_POLL)?;
             } else {
                 return Err(err_unowned(&pending));
             }

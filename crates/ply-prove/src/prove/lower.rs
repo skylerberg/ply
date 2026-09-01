@@ -55,6 +55,14 @@ const TOTAL_BUILTINS: &[&str] = &[
     "float_of_decimal",
     "decimal_of_float",
     "int_of_decimal",
+    // The wrapping arithmetic (the shift semantics). Total by construction: they
+    // exist because `+`, `-` and `*` raise on overflow and a mixing step needs
+    // an answer there, so there is no input any of them declines. Uninterpreted
+    // still — `wrap_add(x, 0) == x` is `property` — and being total is what
+    // makes `wrap_mul(x, y) == wrap_mul(x, y)` a value rather than a guess.
+    "wrap_add",
+    "wrap_sub",
+    "wrap_mul",
 ];
 
 /// Where lowering left the decidable fragment, for measurement only.
@@ -78,6 +86,9 @@ pub enum Blocker {
     CoefficientRange,
     Lambda,
     StringConcat,
+    /// `&`, `|`, `^`, `<<`, `>>`, `>>>` or unary `~`: a statement about a
+    /// two's-complement word, uninterpreted in a fragment that is linear arithmetic over ℤ.
+    BitOperator,
     /// A `Float`-typed term anywhere in the graph.
     FloatTerm,
     /// `Decimal` arithmetic or a `Decimal` ordering.
@@ -263,6 +274,33 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.require(safe);
     }
 
+    /// `a << n`, `a >> n` and `a >>> n` raise unless `n` is a bit position of
+    /// an `Int`. Every count is one or none of them, so this is the whole of
+    /// the condition — a shift itself refuses nothing else, and `<<` discarding
+    /// what leaves the word is deliberate rather than a raise (the shift semantics).
+    fn require_shift_count(&mut self, count: TermId) {
+        let zero = self.terms.int_lit(0);
+        let width = self.terms.int_lit(63);
+        let low = self.terms.mk(
+            Node::Cmp {
+                op: CmpOp::Ge,
+                lhs: count,
+                rhs: zero,
+            },
+            Some(Type::bool()),
+        );
+        let high = self.terms.mk(
+            Node::Cmp {
+                op: CmpOp::Le,
+                lhs: count,
+                rhs: width,
+            },
+            Some(Type::bool()),
+        );
+        let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
+        self.require(both);
+    }
+
     /// Lowers under one more assumed condition.
     fn under<T>(&mut self, cond: TermId, f: impl FnOnce(&mut Self) -> T) -> T {
         self.path.push(cond);
@@ -321,6 +359,28 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let t = self.lower(operand);
                 match op {
                     UnOp::Not => self.terms.not(t),
+                    // `~x` is exactly `-x - 1` over ℤ, so folding it into that
+                    // polynomial would be *sound*: the value is right at every
+                    // `Int` and it never leaves the width. It is refused
+                    // anyway. `-x - 1` is not the same Ply expression — that
+                    // one raises at `i64::MIN`, where `~` answers `i64::MAX` —
+                    // and one bit operator inside the arithmetic while six sit
+                    // outside it is a rule with an exception in it. So: total,
+                    // uninterpreted, like `&`.
+                    UnOp::BitNot => {
+                        self.terms.force_int(t);
+                        self.blocked(Blocker::BitOperator);
+                        let head = self.terms.opaque(term::BIT_NOT, None);
+                        let term = self.terms.mk(
+                            Node::App {
+                                head,
+                                args: vec![t],
+                            },
+                            Some(Type::int()),
+                        );
+                        self.terms.force_int(term);
+                        term
+                    }
                     UnOp::Neg => {
                         self.terms.force_int(t);
                         match self.terms.neg(t) {
@@ -609,6 +669,48 @@ impl<'a, 'p> Lowering<'a, 'p> {
             BinOp::Ne => {
                 let eq = self.terms.eq(lhs, rhs);
                 self.terms.not(eq)
+            }
+            // The bit operators, uninterpreted. Each is a function of its
+            // arguments wherever it has an answer, so congruence over it is
+            // sound; nothing else is. Folding `x << 1` into `2·x` is the
+            // tempting one and it is wrong: that would prove `x << 1 > x` for
+            // every positive `x`, which the evaluator refutes at `x = 2^62`,
+            // where the bit that leaves is the sign.
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Ushr => {
+                self.terms.force_int(lhs);
+                self.terms.force_int(rhs);
+                self.blocked(Blocker::BitOperator);
+                // A shift is a value only where its count is a bit position
+                // (the shift semantics), which is a condition this fragment decides
+                // — so a shift under a guard that bounds its count is in
+                // reach, the way a division under one that establishes its
+                // divisor is. `&`, `|` and `^` refuse no input and owe nothing.
+                if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+                    self.require_shift_count(rhs);
+                }
+                let symbol = match op {
+                    BinOp::BitAnd => term::BIT_AND,
+                    BinOp::BitOr => term::BIT_OR,
+                    BinOp::BitXor => term::BIT_XOR,
+                    BinOp::Shl => term::SHL,
+                    BinOp::Shr => term::SHR,
+                    _ => term::USHR,
+                };
+                let head = self.terms.opaque(symbol, None);
+                let term = self.terms.mk(
+                    Node::App {
+                        head,
+                        args: vec![lhs, rhs],
+                    },
+                    Some(Type::int()),
+                );
+                self.terms.force_int(term);
+                term
             }
             BinOp::Concat => {
                 self.blocked(Blocker::StringConcat);

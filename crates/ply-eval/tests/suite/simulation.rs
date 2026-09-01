@@ -1,36 +1,10 @@
 //! The machine's simulated regions, end to end.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::explore::{Interleaving, Verdict};
-use ply_eval::{Machine, Plan, Seed, SimMode, Value, explore, measure_reduction};
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("parses");
-    let resolved = resolve(&mut program).expect("resolves");
-    let check = check_program(&program, &resolved).expect("checks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
+use ply_eval::{Plan, Seed, SimMode, Value, explore, measure_reduction};
 
 impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
     /// One interleaving of the first test, at `seed`.
     fn at(&self, seed: &Seed) -> Interleaving {
         let mut machine = self.machine();
@@ -89,7 +63,7 @@ test "two increments" {
 /// Deterministic simulation's first required test.
 #[test]
 fn the_search_finds_the_lost_update() {
-    let compiled = compile(LOST_UPDATE);
+    let compiled = Compiled::named("t", LOST_UPDATE);
     let explored = compiled.search(&dpor());
     assert!(
         explored.exploration.failure.is_some(),
@@ -113,7 +87,7 @@ fn the_search_finds_the_lost_update() {
 /// The same program under one seed that happens to serialize the two tasks.
 #[test]
 fn one_interleaving_can_pass_a_program_the_search_fails() {
-    let compiled = compile(LOST_UPDATE);
+    let compiled = Compiled::named("t", LOST_UPDATE);
     let explored = compiled.search(&dpor());
     let failing = explored
         .exploration
@@ -170,7 +144,7 @@ test "two shards that share nothing" {
 /// orders is run.
 #[test]
 fn tasks_touching_disjoint_resources_explore_one_interleaving() {
-    let compiled = compile(DISJOINT);
+    let compiled = Compiled::named("t", DISJOINT);
     let explored = measure_reduction(&dpor(), &mut |seed: &Seed| compiled.at(seed));
     assert!(explored.passed());
     assert!(explored.exploration.exhaustive);
@@ -228,7 +202,7 @@ test "two writers to one resource" {
 /// The other side of the same predicate.
 #[test]
 fn two_writers_to_one_resource_explore_both_orders() {
-    let compiled = compile(CONTENDED);
+    let compiled = Compiled::named("t", CONTENDED);
     let explored = compiled.search(&dpor());
     assert!(explored.passed());
     assert!(
@@ -242,7 +216,7 @@ fn two_writers_to_one_resource_explore_both_orders() {
 /// differed and whose assertions happened not to notice.
 #[test]
 fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
-    let compiled = compile(CONTENDED);
+    let compiled = Compiled::named("t", CONTENDED);
     let seed = Seed::at(3, vec![1, 0, 1]);
 
     let mut a = compiled.machine();
@@ -272,11 +246,14 @@ fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
 /// at any scheduling point that precedes it.
 #[test]
 fn a_later_draw_does_not_shift_an_earlier_choice() {
-    let without = compile(CONTENDED);
-    let with = compile(&CONTENDED.replace(
-        "assert_eq(cell_get(c), 30)",
-        "assert_eq(cell_get(c) + random.below(4) * 0, 30)",
-    ));
+    let without = Compiled::named("t", CONTENDED);
+    let with = Compiled::named(
+        "t",
+        &CONTENDED.replace(
+            "assert_eq(cell_get(c), 30)",
+            "assert_eq(cell_get(c) + random.below(4) * 0, 30)",
+        ),
+    );
     let seed = Seed::root(11);
     let before: Vec<u16> = without.at(&seed).steps.iter().map(|s| s.choice).collect();
     let after: Vec<u16> = with.at(&seed).steps.iter().map(|s| s.choice).collect();
@@ -309,7 +286,7 @@ test "a long sleep costs no wall clock" {
 /// function of its sleeps rather than of the machine.
 #[test]
 fn a_long_sleep_is_a_jump() {
-    let compiled = compile(SLEEPER);
+    let compiled = Compiled::named("t", SLEEPER);
     let started = std::time::Instant::now();
     let run = compiled.at(&Seed::default());
     assert!(passed(&run), "the sleeper should pass: {:?}", run.verdict);
@@ -355,7 +332,7 @@ test "a deadline cannot fire while the worker can still run" {
 /// still complete.
 #[test]
 fn a_timeout_never_fires_while_anything_can_run() {
-    let compiled = compile(TIMEOUT);
+    let compiled = Compiled::named("t", TIMEOUT);
     let explored = compiled.search(&dpor());
     assert!(
         explored.passed(),
@@ -389,7 +366,7 @@ test "a task still runnable when the body returns is run to completion" {
 /// made it, which is the whole of the structure rule.
 #[test]
 fn a_task_that_outlives_every_join_still_finishes_inside_the_region() {
-    let compiled = compile(OUTLIVES);
+    let compiled = Compiled::named("t", OUTLIVES);
     let explored = compiled.search(&dpor());
     assert!(
         explored.passed(),
@@ -425,7 +402,7 @@ test "two tasks waiting on each other stop the region" {
 /// rather than a hang.
 #[test]
 fn a_join_cycle_is_a_diagnostic_and_not_a_hang() {
-    let compiled = compile(DEADLOCK);
+    let compiled = Compiled::named("t", DEADLOCK);
     let run = compiled.at(&Seed::default());
     let Verdict::Failed(diagnostic) = &run.verdict else {
         panic!("a join cycle must not be reported as a pass");
@@ -444,7 +421,7 @@ fn a_join_cycle_is_a_diagnostic_and_not_a_hang() {
 /// test, never the value a region delivers.
 #[test]
 fn the_budget_does_not_change_what_a_passing_program_means() {
-    let compiled = compile(DISJOINT);
+    let compiled = Compiled::named("t", DISJOINT);
     let value = |budget: u32| {
         let plan = Plan { budget, ..dpor() };
         let explored = compiled.search(&plan);
@@ -458,7 +435,7 @@ fn the_budget_does_not_change_what_a_passing_program_means() {
 /// `once` is the replay path: one interleaving, the one the seed names.
 #[test]
 fn once_runs_exactly_one_interleaving() {
-    let compiled = compile(CONTENDED);
+    let compiled = Compiled::named("t", CONTENDED);
     let plan = Plan::once(Seed::at(0, vec![1, 0]));
     let explored = compiled.search(&plan);
     assert_eq!(plan.mode, SimMode::Once);
@@ -473,7 +450,8 @@ fn once_runs_exactly_one_interleaving() {
 /// in one region get distinct ids and joining answers the body's value.
 #[test]
 fn a_region_delivers_the_value_its_body_returned() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test "join answers the body" {
   simulate {
@@ -494,7 +472,7 @@ test "join answers the body" {
 /// through is the machine's, threaded, and it survives the region.
 #[test]
 fn the_world_a_region_wrote_survives_it() {
-    let compiled = compile(OUTLIVES);
+    let compiled = Compiled::named("t", OUTLIVES);
     let mut machine = compiled.machine();
     machine.cells_mut().journal();
     machine.set_seed(Seed::default(), 10_000);
@@ -513,7 +491,8 @@ fn the_world_a_region_wrote_survives_it() {
 /// search reads covers both of them.
 #[test]
 fn two_regions_in_sequence_are_one_record_and_one_choice_sequence() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test "two regions" {
   with_cell[n](0) { c -> {
@@ -553,7 +532,8 @@ test "two regions" {
 /// spliced it over, not onto the one `simulate` was entered on.
 #[test]
 fn a_region_resumed_from_a_clause_keeps_the_clauses_pending_work() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect pick {
   read choose[r]() -> Int
@@ -583,7 +563,8 @@ test "the clause has work after the resumption" {
 
 #[test]
 fn abandoning_a_region_is_a_diagnostic_rather_than_a_truncated_trace() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect bail {
   read stop[r]() -> Int
@@ -616,7 +597,8 @@ test "the handler never resumes" {
 /// Control crossing a region delimiter.
 #[test]
 fn resuming_a_region_that_already_ended_is_a_diagnostic() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect pick {
   read choose[r]() -> Int
@@ -651,7 +633,8 @@ test "resumed twice across a region" {
 /// A `handle` written inside the region encloses the tasks it lexically contains.
 #[test]
 fn a_task_runs_under_the_handlers_written_inside_the_region() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 effect counter {
   write bump[r]() -> Unit
@@ -683,7 +666,8 @@ test "a handler inside the region" {
 
 #[test]
 fn a_cell_allocation_is_an_access_of_the_step_that_made_it() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 test "two tasks that each allocate" {
   simulate {
@@ -714,7 +698,7 @@ test "two tasks that each allocate" {
 /// **A scheduling point inside an `iterate` step.**
 #[test]
 fn two_iterate_loops_interleave_and_each_keeps_its_own_countdown() {
-    let c = compile(ITERATE_TASKS);
+    let c = Compiled::named("t", ITERATE_TASKS);
     let explored = c.search(&dpor());
     assert!(
         explored.passed(),

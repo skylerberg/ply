@@ -114,7 +114,7 @@ arm "unary_expr stops counting depth, so MAX_DEPTH is never reached" \
 
 echo
 echo "==> the bail guards: withdrawn, because there are none"
-echo "   > **Withdrawn (ADR 0028, 2026-08-30).** Seven mutations stood here in"
+echo "   > **Withdrawn (the try operator, 2026-08-30).** Seven mutations stood here in"
 echo "   > two blocks. Four were \`equiv\`s under \"equivalent mutants: the bail"
 echo "   > guards this suite cannot arm, and why\" -- \`bin_expr\`,"
 echo "   > \`postfix_expr\`, \`block_expr\`, \`record_field\` -- and three were"

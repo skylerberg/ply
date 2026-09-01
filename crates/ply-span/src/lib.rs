@@ -376,6 +376,43 @@ pub mod codes {
     /// A compiled backend a run asked for cannot be attached: the spec does not name one, or the
     /// engine asked for has no compiled path to attach it to.
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
+    /// A `fs` operation named a resource label the run bound no root to.
+    ///
+    /// The label *is* the capability (the rooted filesystem effect): `fs.read_file[src]` says
+    /// "somewhere under whatever `src` names", and what it names is
+    /// `--fs src=./crates` beside the run rather than a path inside the
+    /// program — a path in the program would put a filesystem location into a
+    /// definition's hash and into a store designed never to forget. So an
+    /// unbound label is a run that was configured wrongly, and the diagnostic
+    /// names the label and the flag that would bind it rather than a file.
+    pub const FS_ROOT_UNBOUND: &str = "E0451";
+    /// A path that leaves the root its label is bound to: `..` above it, an
+    /// absolute path, or a symlink whose target resolves outside.
+    ///
+    /// Raised **before** the operation's own syscall, and after resolving
+    /// symlinks — a confinement check that did not resolve them would be
+    /// decorative, since a link is exactly how a path that looks contained
+    /// reaches somewhere it is not. It names the root and the resolved target,
+    /// because the two together are what makes the refusal checkable by
+    /// someone who did not write the path.
+    pub const FS_PATH_ESCAPES_ROOT: &str = "E0452";
+    /// A whole-file read of a file larger than the bound the run allows.
+    ///
+    /// `fs.read_file` answers `Option<Bytes>` and there are no file handles and
+    /// no streaming in v1, so the whole file becomes one value in the machine's
+    /// heap. The bound is on the allocation the host would make on the
+    /// program's word; without it, `read_file` on a large file is an
+    /// out-of-memory abort with no diagnostic attached to anything.
+    pub const FS_FILE_TOO_LARGE: &str = "E0453";
+    /// A `--fs NAME=PATH` root that does not load: the path does not exist, is
+    /// not a directory, or cannot be resolved to a real one.
+    ///
+    /// Raised before anything runs, for the reason [`TLS_CREDENTIAL_INVALID`]
+    /// gives: a run that discovers its output directory is a dangling symlink
+    /// on the first write has already done half the work it is about to lose.
+    /// Every root is resolved once, at load, and the resolved path is what
+    /// every later confinement check is against.
+    pub const FS_ROOT_INVALID: &str = "E0454";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A program-level failure the language defines: `panic`, division by zero, integer overflow, a
     /// resource limit.
@@ -644,6 +681,10 @@ mod tests {
                 "E0449",
             ),
             ("BACKEND_UNAVAILABLE", codes::BACKEND_UNAVAILABLE, "E0450"),
+            ("FS_ROOT_UNBOUND", codes::FS_ROOT_UNBOUND, "E0451"),
+            ("FS_PATH_ESCAPES_ROOT", codes::FS_PATH_ESCAPES_ROOT, "E0452"),
+            ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
+            ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
