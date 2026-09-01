@@ -111,6 +111,15 @@ pub struct Stats {
     pub updates: u64,
     /// Updates that rewrote the value rather than copying it.
     pub updates_in_place: u64,
+    /// Elements copied by the updates that did not rewrite in place.
+    ///
+    /// The boolean above answers "did this append copy the whole list", which is the right question
+    /// only while a copy is all-or-nothing. Under a chunked representation an append that cannot
+    /// rewrite copies a path rather than an array, so the boolean would read `false` for something
+    /// costing O(log n) and the rate would be uniformly bad while the program got faster. This
+    /// counts what was actually copied, which is the question that survives the representation —
+    /// ADR 0034 §5.
+    pub elements_copied: u64,
     /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
 }
@@ -145,6 +154,7 @@ thread_local! {
         takes_moved: 0,
         updates: 0,
         updates_in_place: 0,
+        elements_copied: 0,
         cycles: 0,
     }) };
     static CYCLES: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
@@ -216,9 +226,15 @@ pub(crate) fn note_take(moved: bool) {
 }
 
 pub(crate) fn note_update(in_place: bool, span: Span) {
+    note_update_of(in_place, 0, span);
+}
+
+/// [`note_update`], with the number of elements the update had to copy.
+pub(crate) fn note_update_of(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
         s.updates += 1;
         s.updates_in_place += u64::from(in_place);
+        s.elements_copied += copied as u64;
     });
     if RECORDING.try_with(Cell::get).unwrap_or(false) {
         let _ = SITES.try_with(|c| {
