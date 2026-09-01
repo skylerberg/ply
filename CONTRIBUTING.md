@@ -78,7 +78,7 @@ The inner loop is fast; use it.
 
 ```
 cargo build --workspace                         # seconds warm
-cargo test -p <crate>                           # seconds
+cargo nextest run -p <crate>                    # seconds
 ./target/debug/ply test examples/               # under a second
 ```
 
@@ -87,8 +87,20 @@ The outer loop, run before you call anything done:
 ```
 cargo fmt --all --check                         # must be silent
 cargo clippy --workspace --all-targets          # must be 0 warnings
-cargo test --workspace                          # a few minutes; must be 0 failed
+cargo nextest run --workspace                   # must be 0 failed
 ```
+
+**The suite runs under [nextest](https://nexte.st)**, which runs every test in
+every binary as one pool, one process per test, where `cargo test` runs the
+binaries one after another and lets one long test hold a binary's tail while
+the machine idles. Install it once with `cargo install cargo-nextest --locked`
+or from <https://nexte.st/docs/installation/pre-built-binaries/>; CI pins the
+version in `.github/workflows/ci.yml`. `cargo test --workspace` still works and
+is what runs doctests, of which there are none today. `.config/nextest.toml` is
+the configuration: the wall-clock tests `.github/ci-shards.sh` names run last
+and alone, with every test thread and their printed measurement shown, so a
+run's tail is fourteen short tests one at a time rather than a ratio taken
+under contention.
 
 **No test count here, and no wall clock to the decisecond.** Both change on
 commits that have nothing to do with either, nothing in the tree checks them, and
@@ -134,7 +146,10 @@ member is in no shard, in two shards, or named and absent from the tree — a
 partition is a chance to lose a package silently, and a package nothing builds
 is this repository's most expensive defect class. The same check covers
 `spikes/`, which was added after `spikes/ply-parser` sat in **no CI job at all**
-while its differential went red for two days.
+while its differential went red for two days, and `.config/nextest.toml`, which
+must name exactly the wall-clock tests the script's table names: each shard
+runs those last and alone and asserts, by exact name, that each one in its
+packages ran.
 
 Two things CI deliberately does not run, both recorded in §"Things known to be
 broken": `./spikes/ply-parser/run.sh --arm`, and
@@ -171,7 +186,7 @@ the timing suites need a job of their own.
 ## Before you open a change
 
 1. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`,
-   `cargo test --workspace` — all three, all clean.
+   `cargo nextest run --workspace` — all three, all clean.
 2. If you changed behaviour, there is a test asserting the new behaviour, named
    as an English sentence. See §Style.
 3. If you changed a *guarantee*, you found and updated the document that states
@@ -315,7 +330,7 @@ state:
   ```
   rsync -a --exclude 'target/' --exclude '.git' --exclude '.ply-cache' \
     ~/.worktrees/ply/<branch>/ /tmp/<branch>-frozen/
-  cd /tmp/<branch>-frozen && CARGO_INCREMENTAL=0 cargo test --workspace ...
+  cd /tmp/<branch>-frozen && cargo nextest run --workspace ...
   ```
 
 - **Digest the copy before and after anyway.** Prevention is what gets you a
