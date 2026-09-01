@@ -16,6 +16,7 @@ mod counting;
 #[global_allocator]
 static ALLOCATOR: counting::Counting = counting::Counting;
 
+mod accumulator_shape;
 mod cell_write_cost;
 mod fixture_open_cost;
 mod link_reuse;
